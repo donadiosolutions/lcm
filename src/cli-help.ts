@@ -230,8 +230,8 @@ const HELP: Record<string, CommandHelp> = {
     usage: "lcm connectors <list|install|remove|doctor> [options]",
     options: [
       ["list [--format text|json] [--global]", "List connectors in the current project or your global agent config"],
-      ["install <agent> [--type rules|mcp|skill] [--global]", "Install a connector for an agent"],
-      ["remove <agent> [--type rules|mcp|skill] [--global]", "Remove a connector for an agent"],
+      ["install <agent> [--type rules|hook|mcp|skill] [--global]", "Install a connector for an agent"],
+      ["remove <agent> [--type rules|hook|mcp|skill] [--global]", "Remove a connector for an agent"],
       ["doctor [agent] [--global]", "Check connector health in the current project or global agent config"],
     ],
     examples: [
@@ -239,8 +239,9 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm connectors list --global", "Show connectors from your global agent config"],
       ["lcm connectors list --format json", "Machine-readable connector list"],
       ["lcm connectors install github-copilot", "Install the GitHub Copilot workspace skill for VS Code"],
-      ["lcm connectors install codex", "Install default connector for Codex"],
+      ["lcm connectors install codex", "Install native Codex hooks"],
       ["lcm connectors install codex --global", "Install Codex into ~/.codex instead of the current project"],
+      ["lcm connectors install codex --type skill", "Install skill-only guidance for Codex"],
       ["lcm connectors install codex --type rules", "Install rules-based connector for Codex"],
       ["lcm connectors remove codex", "Remove the Codex connector"],
       ["lcm connectors remove codex --global", "Remove Codex from your global config"],
@@ -249,7 +250,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm connectors doctor github-copilot", "Check GitHub Copilot connector health"],
       ["lcm connectors doctor codex", "Check Codex connector health"],
     ],
-    notes: "Connector types: 'rules' (agent instruction file), 'mcp' (MCP server), 'skill' (skill file). GitHub Copilot uses a repo-local skill under .github/skills/. Codex can use repo-local or global skills. Codex MCP setup is manual today because .codex/config.toml is not edited automatically.",
+    notes: "Connector types: 'rules' (agent instruction file), 'hook' (native lifecycle hooks), 'mcp' (MCP server), 'skill' (skill file). GitHub Copilot uses a repo-local skill under .github/skills/. Codex defaults to native hooks in .codex/hooks.json and enables codex_hooks in .codex/config.toml.",
   },
 
   sensitive: {

@@ -819,7 +819,7 @@ async function main() {
   connectorsCmd
     .command("install <agent>")
     .description("Install a connector for an agent")
-    .option("--type <type>", "Connector type: rules, mcp, or skill")
+    .option("--type <type>", "Connector type: rules, hook, mcp, or skill")
     .option("--global", "Install into the global agent config in your home directory")
     .helpOption(false)
     .option("-h, --help", "Show help")
@@ -828,7 +828,7 @@ async function main() {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("connectors"); exit(0);
       }
-      if (!agentName) { console.error("Usage: lcm connectors install <agent> [--type rules|mcp|skill] [--global]"); exit(1); }
+      if (!agentName) { console.error("Usage: lcm connectors install <agent> [--type rules|hook|mcp|skill] [--global]"); exit(1); }
       const type: any = opts.type;
       const { installConnector } = await import("../src/connectors/installer.js");
       try {
@@ -850,7 +850,7 @@ async function main() {
   connectorsCmd
     .command("remove <agent>")
     .description("Remove a connector for an agent")
-    .option("--type <type>", "Connector type: rules, mcp, or skill")
+    .option("--type <type>", "Connector type: rules, hook, mcp, or skill")
     .option("--global", "Remove from the global agent config in your home directory")
     .helpOption(false)
     .option("-h, --help", "Show help")
@@ -859,7 +859,7 @@ async function main() {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("connectors"); exit(0);
       }
-      if (!agentName) { console.error("Usage: lcm connectors remove <agent> [--type rules|mcp|skill] [--global]"); exit(1); }
+      if (!agentName) { console.error("Usage: lcm connectors remove <agent> [--type rules|hook|mcp|skill] [--global]"); exit(1); }
       const type: any = opts.type;
       const { removeConnector } = await import("../src/connectors/installer.js");
       try {

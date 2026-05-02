@@ -1,6 +1,6 @@
 # VS Code and Codex setup
 
-This repository already has the shared memory backend needed for VS Code and Codex, but those integrations are not as automated as the Claude Code plugin path.
+This repository has the shared memory backend needed for VS Code and Codex. Codex now has a native hook connector; GitHub Copilot in VS Code remains skill/rules based.
 
 ## Install from a repo checkout
 
@@ -35,26 +35,52 @@ lcm connectors install codex
 lcm connectors doctor codex
 ```
 
-This writes a repo-local skill file at `.codex/skills/lcm-memory/SKILL.md`.
+This writes native Codex hook configuration:
+
+- `.codex/hooks.json`
+- `.codex/config.toml` with `[features].codex_hooks = true`
+
+The hook connector installs these Codex events:
+
+| Event | Command | Behavior |
+|---|---|---|
+| `SessionStart` | `lcm restore --client codex` | Restores project context when Codex starts, resumes, or clears a session |
+| `UserPromptSubmit` | `lcm user-prompt --client codex` | Searches memory and injects prompt-time hints |
+| `PostToolUse` | `lcm post-tool --client codex` | Captures passive learning signals from supported tool calls |
+| `Stop` | `lcm session-snapshot --client codex` | Ingests transcript deltas and triggers compaction once the configured token threshold is reached |
+
+Codex must trust the project `.codex/` layer for project-local hooks to load. For a global setup, run:
+
+```bash
+lcm connectors install codex --global
+lcm connectors doctor codex --global
+```
+
+If you only want instruction-based guidance instead of native hooks:
+
+```bash
+lcm connectors install codex --type skill
+```
 
 To import existing Codex sessions into LCM:
 
 ```bash
 lcm import --codex
+lcm import --provider all
 ```
 
 ## Current shortcomings
 
-1. `lcm install` is still Claude-Code-specific. It does not set up VS Code or Codex.
+1. `lcm install` is still Claude-Code-specific. Use `lcm connectors install codex` for Codex and `lcm connectors install github-copilot` for VS Code.
 2. GitHub Copilot in VS Code is skill-based today. There is no automatic session restore, turn ingestion, prompt-time search injection, or compaction hook.
 3. The GitHub Copilot connector does not register MCP automatically. The current supported path is instructions/skill guidance plus the `lcm` CLI.
 4. Codex MCP config lives in `.codex/config.toml`, but the connector installer does not edit TOML yet. `lcm connectors install codex --type mcp` only prints manual instructions.
-5. Codex has transcript import (`lcm import --codex`) and can be used as a summarizer provider, but it does not have Claude-style live turn capture and hook orchestration. The broader runtime support gap is tracked in issue #232.
+5. Codex `Stop` hooks are turn-scoped, not final-session hooks. LCM therefore uses rolling snapshots and thresholded compaction instead of marking Codex sessions complete on each `Stop`.
 6. The top-level branding and install flow were originally Claude-first, so documentation drift is still a risk whenever new clients are added.
 
 ## Improvement candidates
 
 1. Add first-class `lcm setup vscode` and `lcm setup codex` commands instead of overloading `lcm install`.
 2. Add TOML read/write support so Codex MCP setup can be automated.
-3. Add a real VS Code/Codex runtime adapter for restore, writeback, and prompt-time recall instead of skill-only guidance.
-4. Add connector tests that exercise GitHub Copilot and Codex default install flows explicitly.
+3. Add a real VS Code runtime adapter for restore, writeback, and prompt-time recall instead of skill-only guidance.
+4. Expand connector diagnostics to validate Codex feature flags and hook event coverage.

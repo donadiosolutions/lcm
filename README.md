@@ -29,7 +29,7 @@
 - Every message is stored in a project SQLite database.
 - Older context is compacted into a DAG of summaries instead of being dropped.
 - Durable decisions and findings are promoted into cross-session memory.
-- Claude Code already has end-to-end hook integration, while VS Code and Codex use connector-based workflows on the same backend today.
+- Claude Code and Codex have native hook integrations, while VS Code uses connector-based workflows on the same backend today.
 
 Humans and agents use the same backend. The integration surface differs by client, but the memory model is shared.
 
@@ -41,9 +41,11 @@ This repo started as a fork of [lossless-claw](https://github.com/Martian-Engine
 flowchart LR
   subgraph Clients["Clients"]
     CC["Claude Code<br/>hooks + MCP"]
+    CX["Codex<br/>native hooks"]
   end
 
   CC --> D["lossless-claude daemon"]
+  CX --> D
 
   D --> DB[("project SQLite DAG")]
   D --> PM[("promoted memory FTS5")]
@@ -56,7 +58,7 @@ flowchart LR
 |---|---|---|---|---|---|
 | Claude Code | Yes | Yes | Yes, via transcript/hooks | Yes | Primary hook-based integration |
 | GitHub Copilot (VS Code) | No | Yes, via skill/rules | No | No | Repo-local skill can teach Copilot to call `lcm`, but there is no automatic restore or turn capture yet |
-| Codex | No | Yes, via skill/rules | No | No | Repo-local or global skill plus `lcm import --codex`; MCP config in `.codex/config.toml` is still manual, and first-class runtime support is tracked in issue #232 |
+| Codex | Yes | Yes | Yes, via native hooks | Yes, thresholded | `lcm connectors install codex` writes native Codex hooks for restore, prompt hints, passive learning, rolling transcript snapshots, and thresholded compaction |
 
 ## LCM Model
 
@@ -138,19 +140,29 @@ lcm connectors install codex
 lcm connectors doctor codex
 ```
 
+This writes `.codex/hooks.json` and enables `[features].codex_hooks = true` in `.codex/config.toml`. The native hooks use:
+
+| Codex event | LCM command | Purpose |
+|---|---|---|
+| `SessionStart` | `lcm restore --client codex` | Restore project memory at startup, resume, or clear |
+| `UserPromptSubmit` | `lcm user-prompt --client codex` | Inject relevant memory before each prompt |
+| `PostToolUse` | `lcm post-tool --client codex` | Capture passive learning signals from tool use |
+| `Stop` | `lcm session-snapshot --client codex` | Ingest Codex transcript deltas and compact when the configured token threshold is reached |
+
 Import older Codex sessions when needed:
 
 ```bash
 lcm import --codex
+lcm import --provider all
 ```
 
 If you also want MCP inside Codex, run `lcm connectors install codex --type mcp`. Today that prints the TOML block you must add manually to `.codex/config.toml`.
 
-See [`docs/vscode-codex.md`](docs/vscode-codex.md) for the current VS Code/Codex setup path and known shortcomings.
+See [`docs/vscode-codex.md`](docs/vscode-codex.md) for the current VS Code/Codex setup path and remaining limitations.
 
 ## Hooks
 
-Claude Code uses four hooks. All hooks auto-heal: each validates that all required entries remain registered and repairs missing entries before continuing.
+Claude Code uses plugin-managed hooks. All Claude Code hooks auto-heal: each validates that all required entries remain registered and repairs missing entries before continuing. Codex uses native hooks from `.codex/hooks.json`.
 
 | Hook | Command | Purpose |
 |---|---|---|
@@ -211,6 +223,8 @@ lcm promote --all          # promote across all tracked projects
 # Import / export
 lcm import                 # import Claude Code sessions for the current project
 lcm import --all           # import all projects
+lcm import --codex         # import Codex CLI sessions
+lcm import --provider all  # import Claude Code and Codex CLI sessions
 lcm export                 # export promoted knowledge to JSON
 lcm import-knowledge <f>   # import a knowledge JSON file
 
