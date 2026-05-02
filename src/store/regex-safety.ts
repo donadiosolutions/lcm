@@ -1,9 +1,5 @@
 import safeRegex from "safe-regex";
 
-function escapeRegExpLiteral(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function validateRegexFlags(flags: string): void {
   if (!/^[dgimsuvy]*$/.test(flags)) {
     throw new Error(`Invalid regex flags: ${flags}`);
@@ -13,20 +9,16 @@ function validateRegexFlags(flags: string): void {
   }
 }
 
+function compileValidatedRegex(pattern: string, flags: string): RegExp {
+  return Reflect.construct(RegExp, [pattern, flags]) as RegExp;
+}
+
 export function validateRegex(pattern: string, flags = ""): RegExp {
   validateRegexFlags(flags);
-  const escapedPattern = escapeRegExpLiteral(pattern);
-
-  let compiled: RegExp;
-  try {
-    compiled = new RegExp(escapedPattern, flags);
-  } catch (err) {
-    throw new Error(`Invalid regex pattern: ${err instanceof Error ? err.message : "syntax error"}`);
-  }
 
   let safe: boolean;
   try {
-    safe = safeRegex(escapedPattern);
+    safe = safeRegex(pattern);
   } catch {
     safe = false;
   }
@@ -34,5 +26,9 @@ export function validateRegex(pattern: string, flags = ""): RegExp {
     throw new Error(`Unsafe regex pattern rejected (potential catastrophic backtracking): ${pattern}`);
   }
 
-  return compiled;
+  try {
+    return compileValidatedRegex(pattern, flags);
+  } catch (err) {
+    throw new Error(`Invalid regex pattern: ${err instanceof Error ? err.message : "syntax error"}`);
+  }
 }
