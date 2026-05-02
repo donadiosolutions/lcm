@@ -68,6 +68,8 @@ lcm sensitive list
 
 Patterns are JavaScript-compatible regular expressions. Use specific patterns (e.g., `MY_SECRET_[A-Z0-9]+`) rather than broad ones (e.g., `MY_.*`) to avoid over-redaction.
 
+Custom patterns are safety-checked before use. Invalid expressions and patterns that can trigger catastrophic backtracking are rejected by `lcm sensitive test`, doctor checks, search, promotion detection, and redaction. Built-in redaction patterns are maintained by lcm and are not affected by this custom-pattern guard.
+
 ## Data retention
 
 Messages and summaries persist until you explicitly remove them:
