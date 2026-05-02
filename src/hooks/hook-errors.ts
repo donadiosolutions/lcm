@@ -2,13 +2,32 @@
 import { EventsDb } from "./events-db.js";
 import { eventsDbPath } from "../db/events-path.js";
 import { appendFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+
+function isUnderDir(candidate: string, base: string): boolean {
+  const resolvedCandidate = resolve(candidate);
+  const resolvedBase = resolve(base);
+  const rel = relative(resolvedBase, resolvedCandidate);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
 
 /** Returns the log path — overridable via LCM_LOG_PATH env var for test isolation. */
 export function getLogPath(): string {
-  return process.env.LCM_LOG_PATH ?? join(homedir(), ".lossless-claude", "logs", "events.log");
+  const defaultPath = join(homedir(), ".lossless-claude", "logs", "events.log");
+  const override = process.env.LCM_LOG_PATH;
+  if (!override) return defaultPath;
+
+  const resolved = resolve(override);
+  const allowedBases = [
+    join(homedir(), ".lossless-claude", "logs"),
+    tmpdir(),
+  ];
+  if (!allowedBases.some((base) => isUnderDir(resolved, base))) {
+    throw new Error("LCM_LOG_PATH must be under the LCM logs directory or the system temp directory");
+  }
+  return resolved;
 }
 
 let dbCircuitOpen = false;

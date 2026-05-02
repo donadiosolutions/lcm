@@ -98,4 +98,12 @@ describe("safeLogError", () => {
     }
   });
 
+  it("rejects log path overrides outside temp or LCM logs", () => {
+    process.env.LCM_LOG_PATH = "/etc/lcm-events.log";
+    expect(() => {
+      safeLogError("PostToolUse", new Error("unsafe path"), {});
+    }).not.toThrow();
+    expect(existsSync("/etc/lcm-events.log")).toBe(false);
+  });
+
 });
