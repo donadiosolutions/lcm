@@ -1,5 +1,9 @@
 import safeRegex from "safe-regex";
 
+function escapeRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function validateRegexFlags(flags: string): void {
   if (!/^[dgimsuvy]*$/.test(flags)) {
     throw new Error(`Invalid regex flags: ${flags}`);
@@ -11,17 +15,18 @@ function validateRegexFlags(flags: string): void {
 
 export function validateRegex(pattern: string, flags = ""): RegExp {
   validateRegexFlags(flags);
+  const escapedPattern = escapeRegExpLiteral(pattern);
 
   let compiled: RegExp;
   try {
-    compiled = new RegExp(pattern, flags);
+    compiled = new RegExp(escapedPattern, flags);
   } catch (err) {
     throw new Error(`Invalid regex pattern: ${err instanceof Error ? err.message : "syntax error"}`);
   }
 
   let safe: boolean;
   try {
-    safe = safeRegex(pattern);
+    safe = safeRegex(escapedPattern);
   } catch {
     safe = false;
   }
