@@ -1,9 +1,8 @@
 import safeRegex from "safe-regex";
 
-export function validateRegex(pattern: string): RegExp {
-  let re: RegExp;
+export function validateRegex(pattern: string, flags = ""): RegExp {
   try {
-    re = new RegExp(pattern); // codeql[js/redos] - intentional: pattern is validated by safeRegex() immediately after; unsafe patterns are rejected before use
+    new RegExp(pattern, flags);
   } catch (err) {
     throw new Error(`Invalid regex pattern: ${err instanceof Error ? err.message : "syntax error"}`);
   }
@@ -16,5 +15,5 @@ export function validateRegex(pattern: string): RegExp {
   if (!safe) {
     throw new Error(`Unsafe regex pattern rejected (potential catastrophic backtracking): ${pattern}`);
   }
-  return re;
+  return new RegExp(pattern, flags);
 }

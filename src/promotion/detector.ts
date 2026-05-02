@@ -1,5 +1,6 @@
 import safeRegex from "safe-regex";
 import type { DaemonConfig } from "../daemon/config.js";
+import { validateRegex } from "../store/regex-safety.js";
 
 type Thresholds = DaemonConfig["compaction"]["promotionThresholds"];
 
@@ -32,7 +33,7 @@ export function shouldPromote(input: PromotionInput, thresholds: Thresholds): Pr
   });
   for (const pattern of safeArchPatterns) {
     try {
-      if (new RegExp(pattern).test(content)) { tags.push("architecture"); break; }
+      if (validateRegex(pattern).test(content)) { tags.push("architecture"); break; }
     } catch { continue; }
   }
 
