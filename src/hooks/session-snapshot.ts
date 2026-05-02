@@ -2,6 +2,7 @@ import { statSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
+import { daemonJsonRequest, normalizeDaemonPort } from "../daemon/http-url.js";
 
 export interface SnapshotDeps {
   statSync: (path: string) => { mtimeMs: number } | null;
@@ -64,8 +65,7 @@ export async function handleSessionSnapshot(
       const { readFileSync: _readFileSync } = await import("node:fs");
       const { homedir: _homedir } = await import("node:os");
       const config = loadDaemonConfig(join(_homedir(), ".lossless-claude", "config.json"));
-      const port = config.daemon?.port ?? 3737;
-      const baseUrl = `http://127.0.0.1:${port}`;
+      const port = normalizeDaemonPort(config.daemon?.port ?? 3737);
 
       // Read token from token file if available (silent fallback if not found)
       let token: string | null = null;
@@ -82,17 +82,12 @@ export async function handleSessionSnapshot(
         headers["Authorization"] = `Bearer ${token}`;
       }
 
-      const response = await fetch(`${baseUrl}/ingest`, {
+      ingestResult = await daemonJsonRequest<{ totalTokens?: number }>(port, "/ingest", {
         method: "POST",
         headers,
-        body: JSON.stringify({ session_id, cwd, transcript_path, client: clientName }),
-        signal: AbortSignal.timeout(5000),
+        body: { session_id, cwd, transcript_path, client: clientName },
+        timeoutMs: 5000,
       });
-      try {
-        ingestResult = await response.json() as { totalTokens?: number };
-      } catch {
-        ingestResult = undefined;
-      }
     }
 
     if (!_post && clientName === "codex" && typeof ingestResult?.totalTokens === "number") {
@@ -104,7 +99,7 @@ export async function handleSessionSnapshot(
         const minTokens = config.compaction.autoCompactMinTokens;
         if (!disableCompact && ingestResult.totalTokens >= minTokens) {
           const { fireCompactRequest } = await import("./session-end.js");
-          fireCompactRequest(config.daemon?.port ?? 3737, {
+          fireCompactRequest(normalizeDaemonPort(config.daemon?.port ?? 3737), {
             session_id,
             cwd,
             skip_ingest: true,
@@ -126,7 +121,7 @@ export async function handleSessionSnapshot(
       const { loadDaemonConfig: _loadConfig } = await import("../daemon/config.js");
       const { homedir: _homedir2 } = await import("node:os");
       const _config = _loadConfig(join(_homedir2(), ".lossless-claude", "config.json"));
-      const port = _config.daemon?.port ?? 3737;
+      const port = normalizeDaemonPort(_config.daemon?.port ?? 3737);
       const { firePromoteEventsRequest } = await import("./session-end.js");
       firePromoteEventsRequest(port, { cwd: input.cwd });
     } catch {

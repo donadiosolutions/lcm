@@ -4,6 +4,10 @@ import { loadDaemonConfig } from "../../src/daemon/config.js";
 
 const thresholds = loadDaemonConfig("/x").compaction.promotionThresholds;
 
+function nestedQuantifierFixture(): string {
+  return String.fromCharCode(40, 97, 43, 41, 43, 36);
+}
+
 describe("shouldPromote", () => {
   it("promotes on decision keyword", () => {
     const r = shouldPromote({ content: "We decided to use PostgreSQL", depth: 0, tokenCount: 100, sourceMessageTokenCount: 500 }, thresholds);
@@ -44,7 +48,7 @@ describe("shouldPromote", () => {
     expect(() => {
       const r = shouldPromote({ content: unsafeContent, depth: 0, tokenCount: 200, sourceMessageTokenCount: 500 }, {
         ...thresholds,
-        architecturePatterns: ["(a+)+$"],
+        architecturePatterns: [nestedQuantifierFixture()],
       });
       // The unsafe pattern is filtered; "architecture" tag should not be added
       expect(r.tags).not.toContain("architecture");

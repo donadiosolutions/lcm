@@ -21,6 +21,15 @@ describe("DaemonClient", () => {
     expect(await new DaemonClient("http://127.0.0.1:19999").health()).toBeNull();
   });
 
+  it("rejects non-loopback daemon URLs", () => {
+    expect(() => new DaemonClient("http://169.254.169.254:80")).toThrow(/loopback/i);
+  });
+
+  it("rejects unknown daemon routes", async () => {
+    const client = new DaemonClient("http://127.0.0.1:19999");
+    await expect(client.get("http://169.254.169.254/latest")).rejects.toThrow(/route/i);
+  });
+
   it("uses the auth token for protected GET routes", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-client-auth-"));
     const tokenPath = join(dir, "daemon.token");

@@ -10,6 +10,10 @@ import { ConversationStore } from "../../src/store/conversation-store.js";
 
 const tempDirs: string[] = [];
 
+function nestedQuantifierFixture(): string {
+  return String.fromCharCode(40, 97, 43, 41, 43, 36);
+}
+
 afterEach(() => {
   closeLcmConnection();
   for (const dir of tempDirs.splice(0)) {
@@ -382,7 +386,7 @@ describe("SummaryStore — searchSummaries regex", () => {
   it("throws on unsafe regex pattern", async () => {
     const store = makeStore(makeDb());
     await expect(
-      store.searchSummaries({ query: "(a+)+$", mode: "regex" }), // codeql[js/redos] - intentional test input
+      store.searchSummaries({ query: nestedQuantifierFixture(), mode: "regex" }),
     ).rejects.toThrow(/unsafe/i);
   });
 

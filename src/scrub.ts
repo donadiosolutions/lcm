@@ -3,6 +3,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { GITLEAKS_PATTERNS } from "./generated-patterns.js";
+import { validateRegex } from "./store/regex-safety.js";
 
 const _thisDir = dirname(fileURLToPath(import.meta.url));
 
@@ -139,15 +140,16 @@ export class ScrubEngine {
     this._globalPatternCount = globalPatterns.length;
 
     // Merge order: gitleaks → native → global → project
-    const all: Array<{ source: string; isGitleaks: boolean; flags: string }> = [
+    const trustedPatterns: Array<{ source: string; isGitleaks: boolean; flags: string }> = [
       ...GITLEAKS_PATTERNS.map((p) => ({ source: p.regex, isGitleaks: true, flags: p.flags })),
       ...NATIVE_PATTERNS.map((p) => ({ source: p, isGitleaks: false, flags: "" })),
-      ...globalPatterns.map((p) => ({ source: p, isGitleaks: false, flags: "" })),
-      ...projectPatterns.map((p) => ({ source: p, isGitleaks: false, flags: "" })),
     ];
-
-    for (let i = 0; i < all.length; i++) {
-      const { source, isGitleaks, flags } = all[i];
+    const userPatterns: Array<{ source: string; isGitleaks: false; flags: string }> = [
+      ...globalPatterns.map((p) => ({ source: p, isGitleaks: false as const, flags: "" })),
+      ...projectPatterns.map((p) => ({ source: p, isGitleaks: false as const, flags: "" })),
+    ];
+    for (let i = 0; i < trustedPatterns.length; i++) {
+      const { source, isGitleaks, flags } = trustedPatterns[i];
       try {
         const regex = new RegExp(source, "g" + flags);
         // Gitleaks patterns always run against full text (bypass spanning check)
@@ -157,6 +159,23 @@ export class ScrubEngine {
         } else {
           this.tokenPatterns.push({ source, regex });
           this._tokenOrigIdx.push(i);
+        }
+      } catch {
+        this.invalidPatterns.push(source);
+      }
+    }
+
+    for (let i = 0; i < userPatterns.length; i++) {
+      const { source, flags } = userPatterns[i];
+      const originalIndex = trustedPatterns.length + i;
+      try {
+        const regex = validateRegex(source, "g" + flags);
+        if (isSpanningPattern(source)) {
+          this.spanningPatterns.push({ source, regex });
+          this._spanningOrigIdx.push(originalIndex);
+        } else {
+          this.tokenPatterns.push({ source, regex });
+          this._tokenOrigIdx.push(originalIndex);
         }
       } catch {
         this.invalidPatterns.push(source);

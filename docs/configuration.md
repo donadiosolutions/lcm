@@ -148,6 +148,14 @@ In practice, the hook asks the daemon for ranked candidates, the daemon dedupes 
 - Smaller chunks create summaries more frequently from less material.
 - This also affects the condensed minimum input threshold (10% of this value).
 
+## Daemon safety
+
+The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon requests to loopback HTTP origins and known daemon routes, so a malformed config or caller cannot redirect daemon traffic to another host.
+
+Daemon port values must be integers from `1` through `65535` when connecting to an existing daemon. The daemon server also accepts port `0` for test and ephemeral-port binding. `daemon.idleTimeoutMs` must be an integer from `0` through `86400000` milliseconds; `0` disables the idle timer.
+
+Hook error fallback logs write to `~/.lossless-claude/logs/events.log`.
+
 ## Model selection
 
 LCM defaults to `LCM_SUMMARY_PROVIDER=auto`.

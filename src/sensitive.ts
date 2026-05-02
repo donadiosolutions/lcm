@@ -7,6 +7,7 @@ import { NATIVE_PATTERNS, ScrubEngine, readGitleaksSyncDate } from "./scrub.js";
 import { GITLEAKS_PATTERNS } from "./generated-patterns.js";
 import { projectDir } from "./daemon/project.js";
 import { loadDaemonConfig } from "./daemon/config.js";
+import { validateRegex } from "./store/regex-safety.js";
 
 function defaultConfigPath(): string {
   return join(homedir(), ".lossless-claude", "config.json");
@@ -276,7 +277,7 @@ async function sensitiveTest(
   ];
   for (const { source, kind } of userPatterns) {
     try {
-      if (new RegExp(source).test(input)) {
+      if (validateRegex(source).test(input)) {
         matched.push(`  [${kind}]  ${source}`);
       }
     } catch {

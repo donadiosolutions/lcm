@@ -19,7 +19,7 @@ vi.mock("../../src/db/events-path.js", async () => {
 });
 
 // Import after mocks
-import { safeLogError, _resetCircuitBreaker } from "../../src/hooks/hook-errors.js";
+import { safeLogError, _resetCircuitBreaker, _setLogPathForTesting } from "../../src/hooks/hook-errors.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
 import { eventsDbPath } from "../../src/db/events-path.js";
 
@@ -29,12 +29,12 @@ describe("safeLogError", () => {
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "hook-errors-test-"));
     mockEventsDir = join(tempDir, "events");
-    process.env.LCM_LOG_PATH = join(tempDir, "events.log");
+    _setLogPathForTesting(join(tempDir, "events.log"));
     _resetCircuitBreaker();
   });
 
   afterEach(() => {
-    delete process.env.LCM_LOG_PATH;
+    _setLogPathForTesting(undefined);
     rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -85,17 +85,23 @@ describe("safeLogError", () => {
   });
 
   it("Layer 3: swallows silently when both DB and file fail", () => {
-    // Make file writes fail by setting LCM_LOG_PATH to an unwritable location
-    const oldLogPath = process.env.LCM_LOG_PATH;
-    process.env.LCM_LOG_PATH = "/dev/null/impossible/events.log";
+    _setLogPathForTesting("/dev/null/impossible/events.log");
     
     try {
       expect(() => {
         safeLogError("PostToolUse", new Error("total fail"), {});
       }).not.toThrow();
     } finally {
-      process.env.LCM_LOG_PATH = oldLogPath;
+      _setLogPathForTesting(join(tempDir, "events.log"));
     }
+  });
+
+  it("rejects log path overrides outside temp or LCM logs", () => {
+    _setLogPathForTesting("/etc/lcm-events.log");
+    expect(() => {
+      safeLogError("PostToolUse", new Error("unsafe path"), {});
+    }).not.toThrow();
+    expect(existsSync("/etc/lcm-events.log")).toBe(false);
   });
 
 });

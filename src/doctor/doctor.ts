@@ -9,6 +9,7 @@ import { NATIVE_PATTERNS, ScrubEngine, readGitleaksSyncDate } from "../scrub.js"
 import { GITLEAKS_PATTERNS } from "../generated-patterns.js";
 import { projectDir } from "../daemon/project.js";
 import { collectEventStats, collectDetailedEventStats } from "../db/events-stats.js";
+import { validateRegex } from "../store/regex-safety.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -470,7 +471,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, verbose = false
   if (projectPatterns.length > 0) {
     const invalidPatterns: string[] = [];
     for (const pat of projectPatterns) {
-      try { new RegExp(pat); } catch { invalidPatterns.push(pat); }
+      try { validateRegex(pat); } catch { invalidPatterns.push(pat); }
     }
     if (invalidPatterns.length > 0) {
       results.push({

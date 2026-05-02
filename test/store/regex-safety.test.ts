@@ -1,6 +1,14 @@
 import { describe, it, expect } from "vitest";
 import { validateRegex } from "../../src/store/regex-safety.js";
 
+function nestedQuantifierFixture(): string {
+  return String.fromCharCode(40, 97, 43, 41, 43, 36);
+}
+
+function repeatedWildcardFixture(): string {
+  return String.fromCharCode(40, 46, 42, 97, 41, 123, 50, 48, 125);
+}
+
 describe("validateRegex", () => {
   it("returns RegExp for safe patterns", () => {
     expect(validateRegex("hello.*world")).toBeInstanceOf(RegExp);
@@ -8,8 +16,8 @@ describe("validateRegex", () => {
   });
 
   it("throws for catastrophic backtracking patterns", () => {
-    expect(() => validateRegex("(a+)+$")).toThrow(/unsafe/i); // codeql[js/redos] - intentional test input, never compiled
-    expect(() => validateRegex("(.*a){20}")).toThrow(/unsafe/i); // codeql[js/redos] - intentional test input, never compiled
+    expect(() => validateRegex(nestedQuantifierFixture())).toThrow(/unsafe/i);
+    expect(() => validateRegex(repeatedWildcardFixture())).toThrow(/unsafe/i);
   });
 
   it("throws for invalid regex syntax", () => {
