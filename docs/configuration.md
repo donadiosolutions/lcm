@@ -40,7 +40,10 @@ Import historical Codex sessions with:
 
 ```bash
 lcm import --codex
+lcm import --provider all
 ```
+
+The default Codex connector writes native hooks to `.codex/hooks.json` and enables `codex_hooks` in `.codex/config.toml`. Use `lcm connectors install codex --type skill` only when you want instruction-based guidance without hooks.
 
 For current limitations and the manual MCP step for Codex TOML config, see [`docs/vscode-codex.md`](vscode-codex.md).
 
@@ -59,7 +62,7 @@ The connector manager can install into either the current project or your global
 agent config. For Codex, the global target is `~/.codex/`. GitHub Copilot is repo-scoped in this project today.
 
 ```bash
-# Install the Codex skill globally instead of into the current repo
+# Install the Codex native hook connector globally instead of into the current repo
 lcm connectors install codex --global
 
 # Inspect or remove the global connector later

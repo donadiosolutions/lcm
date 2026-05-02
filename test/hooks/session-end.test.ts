@@ -41,7 +41,7 @@ describe("handleSessionEnd", () => {
     const stdin = JSON.stringify({ session_id: "s1", cwd: "/tmp" });
     const result = await handleSessionEnd(stdin, client, 3737);
     expect(result.exitCode).toBe(0);
-    expect(client.post).toHaveBeenCalledWith("/ingest", { session_id: "s1", cwd: "/tmp" });
+    expect(client.post).toHaveBeenCalledWith("/ingest", { session_id: "s1", cwd: "/tmp", client: "claude" });
   });
 
   it("fires compact via http.request when totalTokens exceeds threshold", async () => {
@@ -109,6 +109,22 @@ describe("handleSessionEnd", () => {
       (args: any[]) => args[0]?.path === "/session-complete",
     );
     expect(manifestCalls.length).toBe(1);
+  });
+
+  it("does not mark Codex sessions complete because Stop is turn-scoped", async () => {
+    const { request } = await import("node:http");
+    const client = createMockClient({ ingested: 5, totalTokens: 100 });
+    await handleSessionEnd(
+      JSON.stringify({ session_id: "s1", cwd: "/tmp", client: "codex" }),
+      client,
+      3737,
+    );
+    const httpReqMock = vi.mocked(request);
+    const manifestCalls = httpReqMock.mock.calls.filter(
+      (args: any[]) => args[0]?.path === "/session-complete",
+    );
+    expect(manifestCalls.length).toBe(0);
+    expect(client.post).toHaveBeenCalledWith("/ingest", { session_id: "s1", cwd: "/tmp", client: "codex" });
   });
 
   it("calls socket.unref() so the process does not wait for a compact response", async () => {

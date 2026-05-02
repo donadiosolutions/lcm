@@ -1,6 +1,7 @@
 import { statSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { normalizeTranscriptClient } from "../transcript-provider.js";
 
 export interface SnapshotDeps {
   statSync: (path: string) => { mtimeMs: number } | null;
@@ -27,6 +28,7 @@ export async function handleSessionSnapshot(
     if (!session_id || !cwd || !transcript_path) {
       return { exitCode: 0, stdout: "" };
     }
+    const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
 
     const safeSessionId = session_id.replace(/[^a-zA-Z0-9_-]/g, "_");
     const cursorDir = join(homedir(), ".lossless-claude", "tmp");
@@ -53,9 +55,10 @@ export async function handleSessionSnapshot(
     }
 
     // POST to /ingest — daemon handles delta via storedCount
+    let ingestResult: { totalTokens?: number } | undefined;
     const _post = deps?.post;
     if (_post) {
-      await _post("/ingest", { session_id, cwd, transcript_path });
+      ingestResult = await _post("/ingest", { session_id, cwd, transcript_path, client: clientName }) as { totalTokens?: number };
     } else {
       const { loadDaemonConfig } = await import("../daemon/config.js");
       const { readFileSync: _readFileSync } = await import("node:fs");
@@ -79,12 +82,38 @@ export async function handleSessionSnapshot(
         headers["Authorization"] = `Bearer ${token}`;
       }
 
-      await fetch(`${baseUrl}/ingest`, {
+      const response = await fetch(`${baseUrl}/ingest`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ session_id, cwd, transcript_path }),
+        body: JSON.stringify({ session_id, cwd, transcript_path, client: clientName }),
         signal: AbortSignal.timeout(5000),
       });
+      try {
+        ingestResult = await response.json() as { totalTokens?: number };
+      } catch {
+        ingestResult = undefined;
+      }
+    }
+
+    if (!_post && clientName === "codex" && typeof ingestResult?.totalTokens === "number") {
+      try {
+        const { loadDaemonConfig } = await import("../daemon/config.js");
+        const { homedir: _homedir3 } = await import("node:os");
+        const config = loadDaemonConfig(join(_homedir3(), ".lossless-claude", "config.json"));
+        const disableCompact = config.hooks?.disableAutoCompact ?? false;
+        const minTokens = config.compaction.autoCompactMinTokens;
+        if (!disableCompact && ingestResult.totalTokens >= minTokens) {
+          const { fireCompactRequest } = await import("./session-end.js");
+          fireCompactRequest(config.daemon?.port ?? 3737, {
+            session_id,
+            cwd,
+            skip_ingest: true,
+            client: "codex",
+          });
+        }
+      } catch {
+        // Best-effort only
+      }
     }
 
     // Touch cursor file

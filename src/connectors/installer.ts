@@ -6,6 +6,7 @@ import { requiresRestart } from "./types.js";
 import { LCM_MARKERS } from "./constants.js";
 import { generateContent } from "./template-service.js";
 import { findAgent, AGENTS } from "./registry.js";
+import { CODEX_CONFIG_PATH, hasCodexHooks, installCodexHooks, removeCodexHooks } from "./codex-hooks.js";
 
 export interface InstallResult {
   success: boolean;
@@ -87,6 +88,17 @@ export function installConnector(agentIdOrName: string, type?: ConnectorType, cw
   }
 
   if (connectorType === 'hook') {
+    if (agent.id === 'codex') {
+      const hooksPath = resolveConfigPath(agent.configPaths.hook ?? '', cwd);
+      const configPath = resolveConfigPath(CODEX_CONFIG_PATH, cwd);
+      installCodexHooks(hooksPath, configPath);
+      return {
+        success: true,
+        path: hooksPath,
+        requiresRestart: requiresRestart(connectorType),
+      };
+    }
+
     return {
       success: true,
       path: '',
@@ -141,6 +153,10 @@ export function removeConnector(agentIdOrName: string, type?: ConnectorType, cwd
 
   const resolvedPath = resolveConfigPath(configPath, cwd);
 
+  if (connectorType === 'hook' && agent.id === 'codex') {
+    return removeCodexHooks(resolvedPath);
+  }
+
   if (connectorType === 'mcp') {
     return removeMcpJson(resolvedPath);
   }
@@ -188,6 +204,10 @@ export function listConnectors(cwd: string = process.cwd()): InstalledConnector[
           } catch {
             // ignore malformed JSON
           }
+        }
+      } else if (type === 'hook' && agent.id === 'codex') {
+        if (hasCodexHooks(resolvedPath)) {
+          installed.push({ agentId: agent.id, agentName: agent.name, type, path: resolvedPath });
         }
       } else if (type === 'skill') {
         const skillPath = join(resolvedPath, 'lcm-memory', 'SKILL.md');

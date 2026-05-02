@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { installConnector, removeConnector, listConnectors } from '../../src/connectors/installer.js';
@@ -102,6 +102,57 @@ describe('installConnector — skill', () => {
   it('returns requiresRestart: true for skill', () => {
     const result = installConnector('claude-code', 'skill', tmpDir);
     expect(result.requiresRestart).toBe(true);
+  });
+});
+
+describe('installConnector — Codex native hooks', () => {
+  it('writes hooks.json and enables codex_hooks in config.toml by default', () => {
+    const result = installConnector('codex', undefined, tmpDir);
+    expect(result.success).toBe(true);
+    expect(result.path).toBe(join(tmpDir, '.codex', 'hooks.json'));
+
+    const hooks = JSON.parse(readFileSync(result.path, 'utf-8'));
+    expect(hooks.hooks.SessionStart[0].hooks[0].command).toBe('lcm restore --client codex');
+    expect(hooks.hooks.UserPromptSubmit[0].hooks[0].command).toBe('lcm user-prompt --client codex');
+    expect(hooks.hooks.PostToolUse[0].hooks[0].command).toBe('lcm post-tool --client codex');
+    expect(hooks.hooks.Stop[0].hooks[0].command).toBe('lcm session-snapshot --client codex');
+
+    const config = readFileSync(join(tmpDir, '.codex', 'config.toml'), 'utf-8');
+    expect(config).toContain('[features]');
+    expect(config).toContain('codex_hooks = true');
+  });
+
+  it('is idempotent and preserves existing Codex hooks', () => {
+    const hooksPath = join(tmpDir, '.codex', 'hooks.json');
+    mkdirSync(join(tmpDir, '.codex'), { recursive: true });
+    writeFileSync(hooksPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          {
+            matcher: 'startup',
+            hooks: [{ type: 'command', command: 'echo existing' }],
+          },
+        ],
+      },
+    }, null, 2));
+
+    installConnector('codex', 'hook', tmpDir);
+    installConnector('codex', 'hook', tmpDir);
+
+    const hooks = JSON.parse(readFileSync(hooksPath, 'utf-8'));
+    const commands = hooks.hooks.SessionStart.flatMap((group: any) => group.hooks.map((hook: any) => hook.command));
+    expect(commands).toContain('echo existing');
+    expect(commands.filter((command: string) => command === 'lcm restore --client codex')).toHaveLength(1);
+  });
+
+  it('lists and removes Codex hooks', () => {
+    const result = installConnector('codex', 'hook', tmpDir);
+    const installed = listConnectors(tmpDir);
+    expect(installed.some(c => c.agentId === 'codex' && c.type === 'hook')).toBe(true);
+
+    expect(removeConnector('codex', 'hook', tmpDir)).toBe(true);
+    expect(listConnectors(tmpDir).some(c => c.agentId === 'codex' && c.type === 'hook')).toBe(false);
+    expect(existsSync(result.path)).toBe(false);
   });
 });
 

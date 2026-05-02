@@ -1,12 +1,12 @@
 ---
 name: lcm-import
-description: Import Claude Code session transcripts into lcm memory
+description: Import Claude Code and Codex session transcripts into lcm memory
 user_invocable: true
 ---
 
 # /lcm-import
 
-Import Claude Code session transcripts into lcm memory.
+Import Claude Code and Codex session transcripts into lcm memory.
 
 ## Instructions
 
@@ -26,12 +26,16 @@ node "${CLAUDE_PLUGIN_ROOT}/lcm.mjs" import
 
 If the user specifies options, append them to the command:
 - `--all` — Import all projects instead of just the current project
+- `--provider claude|codex|all` — Choose which transcript provider to import
+- `--codex` — Shorthand for `--provider codex`
 - `--verbose` — Show per-session details
 - `--dry-run` — Preview without writing
 - `--replay` — Re-import all sessions in chronological order and compact each one immediately, threading context between sessions to build a temporal summary DAG. Use to rebuild memory from scratch.
 
 For example:
 - `/lcm-import --all` → `lcm import --all`
+- `/lcm-import --codex` → `lcm import --codex`
+- `/lcm-import --provider all` → `lcm import --provider all`
 - `/lcm-import --all --verbose` → `lcm import --all --verbose`
 - `/lcm-import --dry-run` → `lcm import --dry-run`
 - `/lcm-import --replay` → `lcm import --replay`
@@ -51,6 +55,8 @@ After importing, suggest running `lcm compact` to summarize the imported session
 
 - `lcm import` — import current project's sessions
 - `lcm import --all` — import all projects
+- `lcm import --codex` — import Codex CLI sessions
+- `lcm import --provider all` — import Claude Code and Codex CLI sessions
 - `lcm import --verbose` — show per-session details
 - `lcm import --dry-run` — preview without writing
 - `lcm compact --all` — summarize all uncompacted sessions (run after import)

@@ -159,9 +159,11 @@ const HELP: Record<string, CommandHelp> = {
   },
 
   import: {
-    summary: "Import Claude Code session transcripts into lossless memory.",
-    usage: "lcm import [--all] [--verbose] [--dry-run] [--replay]",
+    summary: "Import Claude Code and Codex session transcripts into lossless memory.",
+    usage: "lcm import [--provider claude|codex|all] [--codex] [--all] [--verbose] [--dry-run] [--replay]",
     options: [
+      ["--provider <name>", "Transcript provider: claude, codex, or all (default: claude)"],
+      ["--codex", "Shorthand for --provider codex"],
       ["--all", "Import all projects (default: current project only)"],
       ["--verbose", "Show per-session import detail"],
       ["--dry-run", "Preview without importing"],
@@ -169,11 +171,13 @@ const HELP: Record<string, CommandHelp> = {
     ],
     examples: [
       ["lcm import", "Import current Claude Code project sessions"],
+      ["lcm import --codex", "Import Codex CLI sessions"],
+      ["lcm import --provider all", "Import Claude Code and Codex CLI sessions"],
       ["lcm import --all", "Import all tracked Claude Code projects"],
       ["lcm import --all --replay", "Import and compact with threaded context"],
       ["lcm import --dry-run", "Preview what would be imported"],
     ],
-    notes: "Claude sessions are read from ~/.claude/projects/. Already-imported sessions are skipped. First-class Codex import support is tracked separately in issue #232.",
+    notes: "Claude sessions are read from ~/.claude/projects/. Codex sessions are read from ~/.codex/sessions and ~/.codex/archived_sessions. Already-imported completed sessions are skipped.",
   },
 
   promote: {
@@ -226,8 +230,8 @@ const HELP: Record<string, CommandHelp> = {
     usage: "lcm connectors <list|install|remove|doctor> [options]",
     options: [
       ["list [--format text|json] [--global]", "List connectors in the current project or your global agent config"],
-      ["install <agent> [--type rules|mcp|skill] [--global]", "Install a connector for an agent"],
-      ["remove <agent> [--type rules|mcp|skill] [--global]", "Remove a connector for an agent"],
+      ["install <agent> [--type rules|hook|mcp|skill] [--global]", "Install a connector for an agent"],
+      ["remove <agent> [--type rules|hook|mcp|skill] [--global]", "Remove a connector for an agent"],
       ["doctor [agent] [--global]", "Check connector health in the current project or global agent config"],
     ],
     examples: [
@@ -235,8 +239,9 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm connectors list --global", "Show connectors from your global agent config"],
       ["lcm connectors list --format json", "Machine-readable connector list"],
       ["lcm connectors install github-copilot", "Install the GitHub Copilot workspace skill for VS Code"],
-      ["lcm connectors install codex", "Install default connector for Codex"],
+      ["lcm connectors install codex", "Install native Codex hooks"],
       ["lcm connectors install codex --global", "Install Codex into ~/.codex instead of the current project"],
+      ["lcm connectors install codex --type skill", "Install skill-only guidance for Codex"],
       ["lcm connectors install codex --type rules", "Install rules-based connector for Codex"],
       ["lcm connectors remove codex", "Remove the Codex connector"],
       ["lcm connectors remove codex --global", "Remove Codex from your global config"],
@@ -245,7 +250,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm connectors doctor github-copilot", "Check GitHub Copilot connector health"],
       ["lcm connectors doctor codex", "Check Codex connector health"],
     ],
-    notes: "Connector types: 'rules' (agent instruction file), 'mcp' (MCP server), 'skill' (skill file). GitHub Copilot uses a repo-local skill under .github/skills/. Codex can use repo-local or global skills. Codex MCP setup is manual today because .codex/config.toml is not edited automatically.",
+    notes: "Connector types: 'rules' (agent instruction file), 'hook' (native lifecycle hooks), 'mcp' (MCP server), 'skill' (skill file). GitHub Copilot uses a repo-local skill under .github/skills/. Codex defaults to native hooks in .codex/hooks.json and enables codex_hooks in .codex/config.toml.",
   },
 
   sensitive: {
@@ -340,7 +345,7 @@ const HELP: Record<string, CommandHelp> = {
     examples: [
       ["lcm user-prompt", "Record user prompt context (called by UserPromptSubmit hook)"],
     ],
-    notes: "Invoked automatically by the Claude Code UserPromptSubmit hook. Not intended for direct use.",
+    notes: "Invoked automatically by Claude Code and Codex UserPromptSubmit hooks. Not intended for direct use.",
   },
 
   "post-tool": {
@@ -349,7 +354,16 @@ const HELP: Record<string, CommandHelp> = {
     examples: [
       ["lcm post-tool", "Record post-tool events (called by PostToolUse hook)"],
     ],
-    notes: "Invoked automatically by the Claude Code PostToolUse hook. Not intended for direct use.",
+    notes: "Invoked automatically by Claude Code and Codex PostToolUse hooks. Not intended for direct use.",
+  },
+
+  "session-snapshot": {
+    summary: "Dispatch the rolling session snapshot hook.",
+    usage: "lcm session-snapshot",
+    examples: [
+      ["lcm session-snapshot", "Ingest transcript deltas (called by Stop hook)"],
+    ],
+    notes: "Used by Codex Stop hooks for rolling writeback, and by Claude Code Stop hooks for best-effort snapshots. Not intended for direct use.",
   },
 };
 
@@ -379,7 +393,7 @@ const GROUPS = [
       { name: "expand <nodeId> [--depth N]", summary: "Expand a summary node into source detail" },
       { name: "store <text> [--tag ...]", summary: "Store a durable memory entry" },
       { name: "compact [--all] [--dry-run] [--replay] [--no-promote]", summary: "Compact conversations into DAG summaries (auto-promotes after)" },
-      { name: "import [--all] [--verbose] [--dry-run] [--replay]", summary: "Import Claude Code session transcripts" },
+      { name: "import [--provider ...] [--all] [--verbose] [--dry-run] [--replay]", summary: "Import Claude Code and Codex session transcripts" },
       { name: "promote [--all] [--verbose] [--dry-run]", summary: "Promote insights to long-term memory" },
       { name: "stats [-v]", summary: "Memory inventory and compression ratios" },
       { name: "diagnose [--all] [--days N] [--verbose] [--json]", summary: "Scan sessions for hook failures and issues" },
@@ -423,6 +437,7 @@ const GROUPS = [
     commands: [
       { name: "restore", summary: "SessionStart hook — restore prior context" },
       { name: "session-end", summary: "Stop hook — finalize and store session memory" },
+      { name: "session-snapshot", summary: "Stop hook — ingest rolling transcript snapshots" },
       { name: "user-prompt", summary: "UserPromptSubmit hook — record user prompt context" },
       { name: "post-tool", summary: "PostToolUse hook — record tool invocation events" },
     ],

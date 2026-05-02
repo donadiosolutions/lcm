@@ -7,6 +7,7 @@ import { formatNumber, formatRatio } from "./stats.js";
 import { findAllCodexTranscripts, extractCodexSessionCwd } from "./codex-transcript.js";
 import type { ProgressState } from "./cli/progress-state.js";
 import { projectDbPath, projectId } from "./daemon/project.js";
+import type { TranscriptClient } from "./transcript-provider.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
 
@@ -160,6 +161,7 @@ interface SessionEntry {
   path: string;
   sessionId: string;
   cwd: string;
+  client: TranscriptClient;
 }
 
 /**
@@ -197,7 +199,7 @@ async function ingestSessionList(
   let previousSummary: string | undefined;
   const total = sessions.length;
 
-  for (const { path, sessionId, cwd } of sessions) {
+  for (const { path, sessionId, cwd, client: clientName } of sessions) {
     if (options.dryRun) {
       if (options.verbose) {
         const replayNote = options.replay ? " (would compact)" : "";
@@ -222,6 +224,7 @@ async function ingestSessionList(
         session_id: sessionId,
         cwd,
         transcript_path: path,
+        client: clientName,
       });
       if (res.ingested === 0 && res.totalTokens === 0) {
         result.skippedEmpty++;
@@ -251,7 +254,7 @@ async function ingestSessionList(
             session_id: sessionId,
             cwd,
             skip_ingest: true,
-            client: 'claude',
+            client: clientName,
             ...(previousSummary !== undefined ? { previous_summary: previousSummary } : {}),
           });
           const hadPrevious = previousSummary !== undefined;
@@ -335,7 +338,7 @@ export async function importSessions(
       const sessionFiles = findSessionFiles(dir);
       await ingestSessionList(
         client,
-        sessionFiles.map(f => ({ ...f, cwd })),
+        sessionFiles.map(f => ({ ...f, cwd, client: "claude" as const })),
         options,
         result,
       );
@@ -350,6 +353,7 @@ export async function importSessions(
       sessionId: f.sessionId,
       // Prefer the cwd embedded in the transcript; fall back to process.cwd()
       cwd: extractCodexSessionCwd(f.path) ?? process.cwd(),
+      client: "codex",
     }));
 
     await ingestSessionList(client, codexSessions, options, result);

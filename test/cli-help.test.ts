@@ -101,6 +101,15 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("--layer <name>");
   });
 
+  it("prints import command help with Codex provider flags", () => {
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    printHelp("import");
+    const text = out.mock.calls.map(c => c[0]).join("");
+    expect(text).toContain("--provider <name>");
+    expect(text).toContain("--codex");
+    expect(text).toContain("Codex CLI sessions");
+  });
+
   it("prints connector help with global scope option", () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     printHelp("connectors");

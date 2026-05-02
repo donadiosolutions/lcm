@@ -26,6 +26,7 @@ describe("handleSessionSnapshot", () => {
       session_id: "abc-123",
       cwd: "/tmp/test",
       transcript_path: "/tmp/session.jsonl",
+      client: "claude",
     });
     expect(deps.writeFileSync).toHaveBeenCalled();
   });
@@ -54,6 +55,30 @@ describe("handleSessionSnapshot", () => {
     );
     expect(result.exitCode).toBe(0);
     expect(deps.post).toHaveBeenCalled();
+  });
+
+  it("passes Codex client through when invoked by Codex hooks", async () => {
+    const deps = makeDeps({
+      statSync: vi.fn().mockImplementation(() => { throw new Error("ENOENT"); }),
+    });
+    const { handleSessionSnapshot } = await import("../../src/hooks/session-snapshot.js");
+    const previous = process.env.LCM_CLIENT;
+    process.env.LCM_CLIENT = "codex";
+    try {
+      await handleSessionSnapshot(
+        JSON.stringify({ session_id: "codex-123", cwd: "/tmp/test", transcript_path: "/tmp/codex.jsonl" }),
+        deps,
+      );
+    } finally {
+      if (previous === undefined) delete process.env.LCM_CLIENT;
+      else process.env.LCM_CLIENT = previous;
+    }
+    expect(deps.post).toHaveBeenCalledWith("/ingest", {
+      session_id: "codex-123",
+      cwd: "/tmp/test",
+      transcript_path: "/tmp/codex.jsonl",
+      client: "codex",
+    });
   });
 
   it("returns exitCode 0 on error (never blocks Claude)", async () => {

@@ -22,6 +22,17 @@ function readStdin(): Promise<string> {
   });
 }
 
+function withHookClient(stdinText: string, client: unknown): string {
+  if (client !== "claude" && client !== "codex") return stdinText;
+  try {
+    const parsed = JSON.parse(stdinText || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return stdinText;
+    return JSON.stringify({ ...parsed, client });
+  } catch {
+    return stdinText;
+  }
+}
+
 async function withCustomHelp(cmd: Command, commandName: string): Promise<void> {
   const { printHelp } = await import("../src/cli-help.js");
   printHelp(commandName);
@@ -307,6 +318,7 @@ async function main() {
     .option("--no-promote", "Skip the automatic promote step")
     .option("-v, --verbose", "Show per-session token details")
     .addOption(new Option("--hook", "Hook dispatch mode (internal)").hideHelp())
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
@@ -402,7 +414,7 @@ async function main() {
       }
       // Piped stdin — hook dispatch (PreCompact hook invocation)
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = await readStdin();
+      const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("compact", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
@@ -413,6 +425,7 @@ async function main() {
     .command("restore")
     .description("Dispatch the restore hook")
     .helpOption(false)
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
@@ -420,7 +433,7 @@ async function main() {
         printHelp("restore"); exit(0);
       }
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = await readStdin();
+      const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("restore", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
@@ -431,6 +444,7 @@ async function main() {
     .command("session-end")
     .description("Dispatch the session-end hook")
     .helpOption(false)
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
@@ -438,7 +452,7 @@ async function main() {
         printHelp("session-end"); exit(0);
       }
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = await readStdin();
+      const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("session-end", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
@@ -449,6 +463,7 @@ async function main() {
     .command("user-prompt")
     .description("Dispatch the user-prompt hook")
     .helpOption(false)
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
@@ -456,7 +471,7 @@ async function main() {
         printHelp("user-prompt"); exit(0);
       }
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = await readStdin();
+      const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("user-prompt", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
@@ -467,6 +482,7 @@ async function main() {
     .command("post-tool")
     .description("Dispatch the post-tool hook (PostToolUse event)")
     .helpOption(false)
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
@@ -474,7 +490,7 @@ async function main() {
         printHelp("post-tool"); exit(0);
       }
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = await readStdin();
+      const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("post-tool", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
@@ -485,9 +501,15 @@ async function main() {
     .command("session-snapshot")
     .description("Rolling ingest snapshot (called by Stop hook)")
     .helpOption(false)
-    .action(async () => {
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
+    .option("-h, --help", "Show help")
+    .action(async (opts) => {
+      if (opts.help) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("session-snapshot"); exit(0);
+      }
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = await readStdin();
+      const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("session-snapshot", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
@@ -797,7 +819,7 @@ async function main() {
   connectorsCmd
     .command("install <agent>")
     .description("Install a connector for an agent")
-    .option("--type <type>", "Connector type: rules, mcp, or skill")
+    .option("--type <type>", "Connector type: rules, hook, mcp, or skill")
     .option("--global", "Install into the global agent config in your home directory")
     .helpOption(false)
     .option("-h, --help", "Show help")
@@ -806,7 +828,7 @@ async function main() {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("connectors"); exit(0);
       }
-      if (!agentName) { console.error("Usage: lcm connectors install <agent> [--type rules|mcp|skill] [--global]"); exit(1); }
+      if (!agentName) { console.error("Usage: lcm connectors install <agent> [--type rules|hook|mcp|skill] [--global]"); exit(1); }
       const type: any = opts.type;
       const { installConnector } = await import("../src/connectors/installer.js");
       try {
@@ -828,7 +850,7 @@ async function main() {
   connectorsCmd
     .command("remove <agent>")
     .description("Remove a connector for an agent")
-    .option("--type <type>", "Connector type: rules, mcp, or skill")
+    .option("--type <type>", "Connector type: rules, hook, mcp, or skill")
     .option("--global", "Remove from the global agent config in your home directory")
     .helpOption(false)
     .option("-h, --help", "Show help")
@@ -837,7 +859,7 @@ async function main() {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("connectors"); exit(0);
       }
-      if (!agentName) { console.error("Usage: lcm connectors remove <agent> [--type rules|mcp|skill] [--global]"); exit(1); }
+      if (!agentName) { console.error("Usage: lcm connectors remove <agent> [--type rules|hook|mcp|skill] [--global]"); exit(1); }
       const type: any = opts.type;
       const { removeConnector } = await import("../src/connectors/installer.js");
       try {
@@ -913,8 +935,10 @@ async function main() {
   // ─── import ────────────────────────────────────────────────────────────────
   program
     .command("import")
-    .description("Import Claude Code session transcripts into lossless memory")
+    .description("Import Claude Code and Codex session transcripts into lossless memory")
     .option("--all", "Import all projects")
+    .option("--provider <provider>", "Transcript provider: claude, codex, or all", "claude")
+    .option("--codex", "Shorthand for --provider codex")
     .option("--verbose", "Show per-session import detail")
     .option("--dry-run", "Preview without importing")
     .option("--replay", "Replay compaction for each imported session")
@@ -939,6 +963,7 @@ async function main() {
       const { homedir } = await import("node:os");
       const { existsSync, readdirSync } = await import("node:fs");
       const { importSessions, cwdToProjectHash, findSessionFiles } = await import("../src/import.js");
+      const { findAllCodexTranscripts } = await import("../src/codex-transcript.js");
       type ImportProvider = import("../src/import.js").ImportProvider;
 
       // --codex is a shorthand for --provider codex
@@ -964,18 +989,23 @@ async function main() {
       // Pre-scan for session count (enables accurate live progress bar)
       const claudeProjectsDir = join(homedir(), ".claude", "projects");
       let sessionCount = 0;
-      if (all) {
-        if (existsSync(claudeProjectsDir)) {
-          for (const entry of readdirSync(claudeProjectsDir, { withFileTypes: true })) {
-            if (!entry.isDirectory()) continue;
-            sessionCount += findSessionFiles(join(claudeProjectsDir, entry.name)).length;
+      if (provider === "claude" || provider === "all") {
+        if (all) {
+          if (existsSync(claudeProjectsDir)) {
+            for (const entry of readdirSync(claudeProjectsDir, { withFileTypes: true })) {
+              if (!entry.isDirectory()) continue;
+              sessionCount += findSessionFiles(join(claudeProjectsDir, entry.name)).length;
+            }
           }
+        } else {
+          const cwd = process.cwd();
+          const hash = cwdToProjectHash(cwd);
+          const dir = join(claudeProjectsDir, hash);
+          if (existsSync(dir)) sessionCount = findSessionFiles(dir).length;
         }
-      } else {
-        const cwd = process.cwd();
-        const hash = cwdToProjectHash(cwd);
-        const dir = join(claudeProjectsDir, hash);
-        if (existsSync(dir)) sessionCount = findSessionFiles(dir).length;
+      }
+      if (provider === "codex" || provider === "all") {
+        sessionCount += findAllCodexTranscripts().length;
       }
 
       const isTTY = process.stdout.isTTY ?? false;

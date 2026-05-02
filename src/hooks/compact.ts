@@ -2,6 +2,7 @@ import type { DaemonClient } from "../daemon/client.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { normalizeTranscriptClient } from "../transcript-provider.js";
 
 export async function handlePreCompact(stdin: string, client: DaemonClient, port?: number): Promise<{ exitCode: number; stdout: string }> {
   const daemonPort = port ?? 3737;
@@ -11,9 +12,10 @@ export async function handlePreCompact(stdin: string, client: DaemonClient, port
 
   try {
     const input = JSON.parse(stdin || "{}");
+    const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
     const result = await client.post<{ summary: string; latestSummaryContent?: string }>("/compact", {
       ...input,
-      client: "claude",
+      client: clientName,
     });
 
     try {

@@ -10,7 +10,7 @@ import { upsertRedactionCounts } from "../../db/redaction-stats.js";
 import { ConversationStore } from "../../store/conversation-store.js";
 import { SummaryStore } from "../../store/summary-store.js";
 import { CompactionEngine } from "../../compaction.js";
-import { parseTranscript } from "../../transcript.js";
+import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
 import type { LcmSummarizeFn } from "../../llm/types.js";
 import { ScrubEngine } from "../../scrub.js";
 import { resolveEffectiveProvider, createSummarizer, type EffectiveProvider } from "../summarizer.js";
@@ -155,7 +155,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
           // Ingest new messages from the transcript into the DB.
           const safeTranscriptPath = transcript_path ? isSafeTranscriptPath(transcript_path, cwd) : false;
           if (!skip_ingest && safeTranscriptPath && existsSync(safeTranscriptPath)) {
-            const parsed = parseTranscript(safeTranscriptPath);
+            const parsed = parseTranscriptForClient(safeTranscriptPath, normalizeTranscriptClient(client));
             const storedCount = await conversationStore.getMessageCount(conversation.conversationId);
             const newMessages = parsed.slice(storedCount);
             if (newMessages.length > 0) {
