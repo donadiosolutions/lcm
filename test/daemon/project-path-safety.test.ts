@@ -11,6 +11,13 @@ describe("isSafeTranscriptPath", () => {
     expect(isSafeTranscriptPath(p, cwd)).toBeTruthy();
   });
 
+  it("allows Codex session transcript paths", () => {
+    const active = join(homedir(), ".codex", "sessions", "session-1", "session-1.jsonl");
+    const archived = join(homedir(), ".codex", "archived_sessions", "session-2.jsonl");
+    expect(isSafeTranscriptPath(active, cwd)).toBeTruthy();
+    expect(isSafeTranscriptPath(archived, cwd)).toBeTruthy();
+  });
+
   it("allows paths under the project cwd", () => {
     expect(isSafeTranscriptPath(join(cwd, "transcript.jsonl"), cwd)).toBeTruthy();
   });

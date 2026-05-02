@@ -22,6 +22,17 @@ function readStdin(): Promise<string> {
   });
 }
 
+function withHookClient(stdinText: string, client: unknown): string {
+  if (client !== "claude" && client !== "codex") return stdinText;
+  try {
+    const parsed = JSON.parse(stdinText || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return stdinText;
+    return JSON.stringify({ ...parsed, client });
+  } catch {
+    return stdinText;
+  }
+}
+
 async function withCustomHelp(cmd: Command, commandName: string): Promise<void> {
   const { printHelp } = await import("../src/cli-help.js");
   printHelp(commandName);
@@ -307,6 +318,7 @@ async function main() {
     .option("--no-promote", "Skip the automatic promote step")
     .option("-v, --verbose", "Show per-session token details")
     .addOption(new Option("--hook", "Hook dispatch mode (internal)").hideHelp())
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
@@ -402,7 +414,7 @@ async function main() {
       }
       // Piped stdin — hook dispatch (PreCompact hook invocation)
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = await readStdin();
+      const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("compact", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
@@ -413,6 +425,7 @@ async function main() {
     .command("restore")
     .description("Dispatch the restore hook")
     .helpOption(false)
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
@@ -420,7 +433,7 @@ async function main() {
         printHelp("restore"); exit(0);
       }
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = await readStdin();
+      const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("restore", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
@@ -431,6 +444,7 @@ async function main() {
     .command("session-end")
     .description("Dispatch the session-end hook")
     .helpOption(false)
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
@@ -438,7 +452,7 @@ async function main() {
         printHelp("session-end"); exit(0);
       }
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = await readStdin();
+      const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("session-end", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
@@ -449,6 +463,7 @@ async function main() {
     .command("user-prompt")
     .description("Dispatch the user-prompt hook")
     .helpOption(false)
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
@@ -456,7 +471,7 @@ async function main() {
         printHelp("user-prompt"); exit(0);
       }
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = await readStdin();
+      const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("user-prompt", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
@@ -467,6 +482,7 @@ async function main() {
     .command("post-tool")
     .description("Dispatch the post-tool hook (PostToolUse event)")
     .helpOption(false)
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
@@ -474,7 +490,7 @@ async function main() {
         printHelp("post-tool"); exit(0);
       }
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = await readStdin();
+      const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("post-tool", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
@@ -485,9 +501,15 @@ async function main() {
     .command("session-snapshot")
     .description("Rolling ingest snapshot (called by Stop hook)")
     .helpOption(false)
-    .action(async () => {
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
+    .option("-h, --help", "Show help")
+    .action(async (opts) => {
+      if (opts.help) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("session-snapshot"); exit(0);
+      }
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = await readStdin();
+      const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("session-snapshot", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);

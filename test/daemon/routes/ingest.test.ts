@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -89,6 +89,52 @@ describe("POST /ingest", () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ingested: 2, totalTokens: 3 });
+  });
+
+  it("parses Codex transcript_path when client is codex", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-ingest-codex-"));
+    tempDirs.push(tempDir);
+    const transcriptPath = join(tempDir, "codex-session.jsonl");
+    writeFileSync(
+      transcriptPath,
+      [
+        JSON.stringify({
+          type: "session_meta",
+          payload: { id: "codex-ingest-1", cwd: tempDir },
+        }),
+        JSON.stringify({
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "Hello Codex" }],
+          },
+        }),
+        JSON.stringify({
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Hello from Codex" }],
+          },
+        }),
+      ].join("\n"),
+    );
+
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const res = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "codex-ingest-1",
+        cwd: tempDir,
+        transcript_path: transcriptPath,
+        client: "codex",
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ingested: 2, totalTokens: 7 });
   });
 
   it("scrubs secrets from message content before SQLite write", async () => {

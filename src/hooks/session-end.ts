@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { request } from "node:http";
 import { Buffer } from "node:buffer";
+import { normalizeTranscriptClient } from "../transcript-provider.js";
 
 /**
  * Fire a compact request to the daemon without blocking the hook process.
@@ -114,12 +115,13 @@ export async function handleSessionEnd(
 
   try {
     const input = JSON.parse(stdin || "{}");
+    const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
     const ingestResult = await client.post<{
       ingested: number;
       totalTokens?: number;
       redacted?: number;
       redactedCategories?: string[];
-    }>("/ingest", input);
+    }>("/ingest", { ...input, client: clientName });
 
     const configPath = join(homedir(), ".lossless-claude", "config.json");
     const config = loadDaemonConfig(configPath);
@@ -141,7 +143,7 @@ export async function handleSessionEnd(
         session_id: input.session_id,
         cwd: input.cwd,
         skip_ingest: true,
-        client: "claude",
+        client: clientName,
       });
     }
 
@@ -151,14 +153,15 @@ export async function handleSessionEnd(
     // Promote events for passive learning
     firePromoteEventsRequest(daemonPort, { cwd: input.cwd });
 
-    // Record session completion in manifest.
-    // Note: ingestResult.ingested is the delta (new messages this call), not the total.
-    // We pass it as-is since we don't have the total without an extra DB query.
-    fireSessionCompleteRequest(daemonPort, {
-      session_id: input.session_id,
-      cwd: input.cwd,
-      message_count: ingestResult.ingested ?? 0,
-    });
+    if (clientName === "claude") {
+      // Record session completion in manifest. Codex Stop is turn-scoped, so
+      // marking complete there would block later turn snapshots for the session.
+      fireSessionCompleteRequest(daemonPort, {
+        session_id: input.session_id,
+        cwd: input.cwd,
+        message_count: ingestResult.ingested ?? 0,
+      });
+    }
 
     return { exitCode: 0, stdout: "" };
   } catch {

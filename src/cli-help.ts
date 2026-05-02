@@ -340,7 +340,7 @@ const HELP: Record<string, CommandHelp> = {
     examples: [
       ["lcm user-prompt", "Record user prompt context (called by UserPromptSubmit hook)"],
     ],
-    notes: "Invoked automatically by the Claude Code UserPromptSubmit hook. Not intended for direct use.",
+    notes: "Invoked automatically by Claude Code and Codex UserPromptSubmit hooks. Not intended for direct use.",
   },
 
   "post-tool": {
@@ -349,7 +349,16 @@ const HELP: Record<string, CommandHelp> = {
     examples: [
       ["lcm post-tool", "Record post-tool events (called by PostToolUse hook)"],
     ],
-    notes: "Invoked automatically by the Claude Code PostToolUse hook. Not intended for direct use.",
+    notes: "Invoked automatically by Claude Code and Codex PostToolUse hooks. Not intended for direct use.",
+  },
+
+  "session-snapshot": {
+    summary: "Dispatch the rolling session snapshot hook.",
+    usage: "lcm session-snapshot",
+    examples: [
+      ["lcm session-snapshot", "Ingest transcript deltas (called by Stop hook)"],
+    ],
+    notes: "Used by Codex Stop hooks for rolling writeback, and by Claude Code Stop hooks for best-effort snapshots. Not intended for direct use.",
   },
 };
 
@@ -423,6 +432,7 @@ const GROUPS = [
     commands: [
       { name: "restore", summary: "SessionStart hook — restore prior context" },
       { name: "session-end", summary: "Stop hook — finalize and store session memory" },
+      { name: "session-snapshot", summary: "Stop hook — ingest rolling transcript snapshots" },
       { name: "user-prompt", summary: "UserPromptSubmit hook — record user prompt context" },
       { name: "post-tool", summary: "PostToolUse hook — record tool invocation events" },
     ],

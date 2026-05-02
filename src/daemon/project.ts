@@ -25,6 +25,15 @@ function tryRealpath(p: string): string {
   try { return realpathSync(p); } catch { return p; }
 }
 
+function allowedTranscriptBases(cwd: string): string[] {
+  return [
+    tryRealpath(pathJoin(homedir(), ".claude", "projects")),
+    tryRealpath(pathJoin(homedir(), ".codex", "sessions")),
+    tryRealpath(pathJoin(homedir(), ".codex", "archived_sessions")),
+    tryRealpath(resolve(cwd)),
+  ];
+}
+
 /**
  * Like realpathSync but handles non-existent paths by resolving the nearest
  * existing ancestor and appending the remaining components.
@@ -60,10 +69,7 @@ export function isSafeTranscriptPath(transcriptPath: string, cwd: string): strin
     // Follow symlink to real path and re-validate against allowed bases
     let real: string;
     try { real = realpathSync(resolved); } catch { return false; }
-    const allowedBases = [
-      tryRealpath(pathJoin(homedir(), ".claude", "projects")),
-      tryRealpath(resolve(cwd)),
-    ];
+    const allowedBases = allowedTranscriptBases(cwd);
     for (const base of allowedBases) {
       const normalBase = normalize(base + "/");
       if (real.startsWith(normalBase) || real === normalize(base)) {
@@ -80,10 +86,7 @@ export function isSafeTranscriptPath(transcriptPath: string, cwd: string): strin
   // Use realpathDeep so non-existent leaf paths still get their parent directories
   // resolved (e.g. /tmp/transcript.jsonl -> /private/tmp/transcript.jsonl on macOS).
   const candidate = realpathDeep(resolved);
-  const allowedBases = [
-    tryRealpath(pathJoin(homedir(), ".claude", "projects")),
-    tryRealpath(resolve(cwd)),
-  ];
+  const allowedBases = allowedTranscriptBases(cwd);
   for (const base of allowedBases) {
     const normalBase = normalize(base + "/");
     if (candidate.startsWith(normalBase) || candidate === normalize(base)) {

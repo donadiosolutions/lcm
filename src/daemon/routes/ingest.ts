@@ -8,7 +8,8 @@ import { runLcmMigrations } from "../../db/migration.js";
 import { upsertRedactionCounts } from "../../db/redaction-stats.js";
 import { ConversationStore } from "../../store/conversation-store.js";
 import { SummaryStore } from "../../store/summary-store.js";
-import { parseTranscript, type ParsedMessage } from "../../transcript.js";
+import type { ParsedMessage } from "../../transcript.js";
+import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 
@@ -24,7 +25,7 @@ function isParsedMessage(value: unknown): value is ParsedMessage {
   );
 }
 
-function resolveMessages(input: { messages?: unknown; transcript_path?: string }, cwd: string): ParsedMessage[] {
+function resolveMessages(input: { client?: unknown; messages?: unknown; provider?: unknown; transcript_path?: string }, cwd: string): ParsedMessage[] {
   if (Array.isArray(input.messages)) {
     return input.messages.filter(isParsedMessage);
   }
@@ -32,7 +33,7 @@ function resolveMessages(input: { messages?: unknown; transcript_path?: string }
   if (input.transcript_path) {
     const safePath = isSafeTranscriptPath(input.transcript_path, cwd);
     if (safePath && existsSync(safePath)) {
-      return parseTranscript(safePath);
+      return parseTranscriptForClient(safePath, normalizeTranscriptClient(input.client ?? input.provider));
     }
   }
 
