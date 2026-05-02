@@ -22,6 +22,7 @@ import { createStatsHandler } from "./routes/stats.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
 import { createReviewStaleHandler } from "./routes/review-stale.js";
 import { PKG_VERSION } from "./version.js";
+import { normalizeDaemonPort, normalizeIdleTimeoutMs } from "./http-url.js";
 export { PKG_VERSION };
 
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse, body: string) => Promise<void>;
@@ -60,6 +61,8 @@ export function sendJson(res: ServerResponse, status: number, data: unknown): vo
 export async function createDaemon(config: DaemonConfig, options?: DaemonOptions): Promise<DaemonInstance> {
   const startTime = Date.now();
   const proxyManager = options?.proxyManager;
+  const listenPort = normalizeDaemonPort(config.daemon.port, { allowZero: true });
+  const idleTimeoutMs = normalizeIdleTimeoutMs(config.daemon.idleTimeoutMs);
   const serverToken = options?.tokenPath ? readAuthToken(options.tokenPath) : null;
   if (options?.tokenPath && serverToken === null) {
     throw new Error(`Auth token file specified but could not be read: ${options.tokenPath}`);
@@ -74,12 +77,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   });
 
   function resetIdleTimer() {
-    if (config.daemon.idleTimeoutMs <= 0) return;
+    if (idleTimeoutMs <= 0) return;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       idleTriggered = true;
       onIdle();
-    }, config.daemon.idleTimeoutMs);
+    }, idleTimeoutMs);
   }
 
   routes.set("GET /health", async (_req, res) =>
@@ -190,7 +193,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   }
 
   return new Promise((resolve) => {
-    server.listen(config.daemon.port, "127.0.0.1", () => {
+    server.listen(listenPort, "127.0.0.1", () => {
       resetIdleTimer();
       const addr = server.address() as AddressInfo;
       const actualPort = addr.port;

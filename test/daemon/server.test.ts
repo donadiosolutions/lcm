@@ -55,6 +55,13 @@ describe("daemon server", () => {
 });
 
 describe("daemon idle timeout", () => {
+  it("rejects out-of-range idle timeout values", async () => {
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    config.daemon.idleTimeoutMs = Number.MAX_SAFE_INTEGER;
+    await expect(createDaemon(config)).rejects.toThrow(/idle timeout/i);
+  });
+
   it("calls onIdle after idle timeout", async () => {
     let idleCalled = false;
     const config = loadDaemonConfig("/nonexistent");
