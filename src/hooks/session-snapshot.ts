@@ -2,7 +2,7 @@ import { statSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
-import { daemonHttpUrl, normalizeDaemonPort } from "../daemon/http-url.js";
+import { daemonJsonRequest, normalizeDaemonPort } from "../daemon/http-url.js";
 
 export interface SnapshotDeps {
   statSync: (path: string) => { mtimeMs: number } | null;
@@ -82,17 +82,12 @@ export async function handleSessionSnapshot(
         headers["Authorization"] = `Bearer ${token}`;
       }
 
-      const response = await fetch(daemonHttpUrl(port, "/ingest"), {
+      ingestResult = await daemonJsonRequest<{ totalTokens?: number }>(port, "/ingest", {
         method: "POST",
         headers,
-        body: JSON.stringify({ session_id, cwd, transcript_path, client: clientName }),
-        signal: AbortSignal.timeout(5000),
+        body: { session_id, cwd, transcript_path, client: clientName },
+        timeoutMs: 5000,
       });
-      try {
-        ingestResult = await response.json() as { totalTokens?: number };
-      } catch {
-        ingestResult = undefined;
-      }
     }
 
     if (!_post && clientName === "codex" && typeof ingestResult?.totalTokens === "number") {

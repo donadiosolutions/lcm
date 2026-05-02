@@ -1,3 +1,6 @@
+import { request } from "node:http";
+import { Buffer } from "node:buffer";
+
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
 const DAEMON_PATHS = new Set([
@@ -61,8 +64,63 @@ export function normalizeDaemonPath(path: string): string {
   return path;
 }
 
-export function daemonHttpUrl(portValue: unknown, path: string): string {
+export async function daemonJsonRequest<T>(
+  portValue: unknown,
+  path: string,
+  options: {
+    method: "GET" | "POST";
+    headers?: Record<string, string>;
+    body?: unknown;
+    timeoutMs?: number;
+  },
+): Promise<T> {
   const port = normalizeDaemonPort(portValue);
   const routePath = normalizeDaemonPath(path);
-  return `http://127.0.0.1:${port}${routePath}`;
+  const json = options.body === undefined ? undefined : JSON.stringify(options.body);
+  const headers = { ...(options.headers ?? {}) };
+  if (json !== undefined) {
+    headers["Content-Length"] = String(Buffer.byteLength(json));
+  }
+
+  return await new Promise<T>((resolve, reject) => {
+    const req = request({
+      hostname: "127.0.0.1",
+      port,
+      path: routePath,
+      method: options.method,
+      headers,
+    }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer | string) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      res.on("end", () => {
+        try {
+          const statusCode = res.statusCode ?? 500;
+          const raw = Buffer.concat(chunks).toString("utf-8");
+          const data = raw ? JSON.parse(raw) as T & { error?: string } : undefined as T;
+          if (statusCode < 200 || statusCode >= 300) {
+            const message = data && typeof data === "object" && "error" in data && typeof data.error === "string"
+              ? data.error
+              : `HTTP ${statusCode}`;
+            reject(new Error(message));
+            return;
+          }
+          resolve(data);
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+    req.on("error", reject);
+    if (options.timeoutMs !== undefined) {
+      req.setTimeout(options.timeoutMs, () => {
+        req.destroy(new Error("Daemon request timed out"));
+      });
+    }
+    if (json !== undefined) {
+      req.write(json);
+    }
+    req.end();
+  });
 }

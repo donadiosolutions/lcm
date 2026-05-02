@@ -148,14 +148,10 @@ export class ScrubEngine {
       ...globalPatterns.map((p) => ({ source: p, isGitleaks: false as const, flags: "" })),
       ...projectPatterns.map((p) => ({ source: p, isGitleaks: false as const, flags: "" })),
     ];
-    const all = [...trustedPatterns, ...userPatterns];
-
-    for (let i = 0; i < all.length; i++) {
-      const { source, isGitleaks, flags } = all[i];
+    for (let i = 0; i < trustedPatterns.length; i++) {
+      const { source, isGitleaks, flags } = trustedPatterns[i];
       try {
-        const regex = i < trustedPatterns.length
-          ? new RegExp(source, "g" + flags)
-          : validateRegex(source, "g" + flags);
+        const regex = new RegExp(source, "g" + flags);
         // Gitleaks patterns always run against full text (bypass spanning check)
         if (isGitleaks || isSpanningPattern(source)) {
           this.spanningPatterns.push({ source, regex });
@@ -163,6 +159,23 @@ export class ScrubEngine {
         } else {
           this.tokenPatterns.push({ source, regex });
           this._tokenOrigIdx.push(i);
+        }
+      } catch {
+        this.invalidPatterns.push(source);
+      }
+    }
+
+    for (let i = 0; i < userPatterns.length; i++) {
+      const { source, flags } = userPatterns[i];
+      const originalIndex = trustedPatterns.length + i;
+      try {
+        const regex = validateRegex(source, "g" + flags);
+        if (isSpanningPattern(source)) {
+          this.spanningPatterns.push({ source, regex });
+          this._spanningOrigIdx.push(originalIndex);
+        } else {
+          this.tokenPatterns.push({ source, regex });
+          this._tokenOrigIdx.push(originalIndex);
         }
       } catch {
         this.invalidPatterns.push(source);

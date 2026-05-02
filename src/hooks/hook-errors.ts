@@ -13,19 +13,24 @@ function isUnderDir(candidate: string, base: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-/** Returns the log path — overridable via LCM_LOG_PATH env var for test isolation. */
+let testLogPath: string | undefined;
+
+export function _setLogPathForTesting(path: string | undefined): void {
+  testLogPath = path;
+}
+
+/** Returns the log path. */
 export function getLogPath(): string {
   const defaultPath = join(homedir(), ".lossless-claude", "logs", "events.log");
-  const override = process.env.LCM_LOG_PATH;
-  if (!override) return defaultPath;
+  if (!testLogPath) return defaultPath;
 
-  const resolved = resolve(override);
+  const resolved = resolve(testLogPath);
   const allowedBases = [
     join(homedir(), ".lossless-claude", "logs"),
     tmpdir(),
   ];
   if (!allowedBases.some((base) => isUnderDir(resolved, base))) {
-    throw new Error("LCM_LOG_PATH must be under the LCM logs directory or the system temp directory");
+    throw new Error("Test log path must be under the LCM logs directory or the system temp directory");
   }
   return resolved;
 }

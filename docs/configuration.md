@@ -154,7 +154,7 @@ The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon 
 
 Daemon port values must be integers from `1` through `65535` when connecting to an existing daemon. The daemon server also accepts port `0` for test and ephemeral-port binding. `daemon.idleTimeoutMs` must be an integer from `0` through `86400000` milliseconds; `0` disables the idle timer.
 
-Hook error fallback logs normally write to `~/.lossless-claude/logs/events.log`. `LCM_LOG_PATH` is intended for tests and must resolve under the lcm logs directory or the system temp directory.
+Hook error fallback logs write to `~/.lossless-claude/logs/events.log`.
 
 ## Model selection
 
