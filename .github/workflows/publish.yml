@@ -21,13 +21,13 @@ jobs:
     environment: npm-publish
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org/
@@ -115,5 +115,5 @@ ${CHANGELOG_BLOCK}
 
 ---
 
-🔖 [Full Changelog](https://github.com/lossless-claude/lcm/blob/stable/CHANGELOG.md)"
+🔖 [Full Changelog](https://github.com/donadiosolutions/lcm/blob/stable/CHANGELOG.md)"
           gh release edit "v${VERSION}" --notes "$FULL_NOTES"
