@@ -260,6 +260,7 @@ describe("importSessions", () => {
     expect((calls[0].body as { session_id: string }).session_id).toBe("session-abc");
     expect((calls[0].body as { cwd: string }).cwd).toBe(cwd);
     expect((calls[0].body as { transcript_path: string }).transcript_path).toContain("session-abc.jsonl");
+    expect((calls[0].body as { client: string }).client).toBe("claude");
 
     expect(result.imported).toBe(1);
     expect(result.totalMessages).toBe(5);
@@ -651,6 +652,7 @@ describe("importSessions — provider: codex", () => {
     expect((calls[0].body as { session_id: string }).session_id).toBe(sessionId);
     expect((calls[0].body as { cwd: string }).cwd).toBe(cwd);
     expect((calls[0].body as { transcript_path: string }).transcript_path).toContain(`${sessionId}.jsonl`);
+    expect((calls[0].body as { client: string }).client).toBe("codex");
     expect(result.imported).toBe(1);
     expect(result.totalMessages).toBe(2);
     expect(result.totalTokens).toBe(200);
@@ -712,6 +714,35 @@ describe("importSessions — provider: codex", () => {
 
     expect(client.post).not.toHaveBeenCalled();
     expect(result.imported).toBe(1);
+  });
+
+  it("passes client=codex to replay ingest and compact calls", async () => {
+    const codexDir = makeTmpDir();
+    const archivedDir = join(codexDir, "archived_sessions");
+    mkdirSync(archivedDir, { recursive: true });
+    writeFileSync(
+      join(archivedDir, "codex-replay.jsonl"),
+      [
+        makeCodexSessionMetaLine("codex-replay", "/workspace"),
+        makeCodexResponseItemLine("user", "Replay this"),
+      ].join("\n"),
+    );
+
+    const calls: { path: string; body: any }[] = [];
+    const client = makeMockClient(async (path, body) => {
+      calls.push({ path, body });
+      if (path === "/compact") return { summary: "ok", tokensBefore: 100, tokensAfter: 10 };
+      return { ingested: 1, totalTokens: 100 };
+    });
+
+    await importSessions(client, {
+      provider: "codex",
+      replay: true,
+      _codexDir: codexDir,
+    });
+
+    expect(calls.find(c => c.path === "/ingest")?.body.client).toBe("codex");
+    expect(calls.find(c => c.path === "/compact")?.body.client).toBe("codex");
   });
 
   it("provider all imports from both Claude and Codex", async () => {

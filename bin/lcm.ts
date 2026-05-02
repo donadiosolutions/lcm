@@ -935,8 +935,10 @@ async function main() {
   // ─── import ────────────────────────────────────────────────────────────────
   program
     .command("import")
-    .description("Import Claude Code session transcripts into lossless memory")
+    .description("Import Claude Code and Codex session transcripts into lossless memory")
     .option("--all", "Import all projects")
+    .option("--provider <provider>", "Transcript provider: claude, codex, or all", "claude")
+    .option("--codex", "Shorthand for --provider codex")
     .option("--verbose", "Show per-session import detail")
     .option("--dry-run", "Preview without importing")
     .option("--replay", "Replay compaction for each imported session")
@@ -961,6 +963,7 @@ async function main() {
       const { homedir } = await import("node:os");
       const { existsSync, readdirSync } = await import("node:fs");
       const { importSessions, cwdToProjectHash, findSessionFiles } = await import("../src/import.js");
+      const { findAllCodexTranscripts } = await import("../src/codex-transcript.js");
       type ImportProvider = import("../src/import.js").ImportProvider;
 
       // --codex is a shorthand for --provider codex
@@ -986,18 +989,23 @@ async function main() {
       // Pre-scan for session count (enables accurate live progress bar)
       const claudeProjectsDir = join(homedir(), ".claude", "projects");
       let sessionCount = 0;
-      if (all) {
-        if (existsSync(claudeProjectsDir)) {
-          for (const entry of readdirSync(claudeProjectsDir, { withFileTypes: true })) {
-            if (!entry.isDirectory()) continue;
-            sessionCount += findSessionFiles(join(claudeProjectsDir, entry.name)).length;
+      if (provider === "claude" || provider === "all") {
+        if (all) {
+          if (existsSync(claudeProjectsDir)) {
+            for (const entry of readdirSync(claudeProjectsDir, { withFileTypes: true })) {
+              if (!entry.isDirectory()) continue;
+              sessionCount += findSessionFiles(join(claudeProjectsDir, entry.name)).length;
+            }
           }
+        } else {
+          const cwd = process.cwd();
+          const hash = cwdToProjectHash(cwd);
+          const dir = join(claudeProjectsDir, hash);
+          if (existsSync(dir)) sessionCount = findSessionFiles(dir).length;
         }
-      } else {
-        const cwd = process.cwd();
-        const hash = cwdToProjectHash(cwd);
-        const dir = join(claudeProjectsDir, hash);
-        if (existsSync(dir)) sessionCount = findSessionFiles(dir).length;
+      }
+      if (provider === "codex" || provider === "all") {
+        sessionCount += findAllCodexTranscripts().length;
       }
 
       const isTTY = process.stdout.isTTY ?? false;
