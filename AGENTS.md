@@ -114,13 +114,13 @@ Reviewers (spec compliance + code quality) always use the most capable model ava
 
 ## Release Process
 
-The canonical release process is `.claude/skills/lcm-release/scripts/release.sh` — use it for all releases. `RELEASING.md` and `WORKFLOW.md` describe an older Changesets-based flow that is no longer in use.
+The canonical release process is `.agents/skills/lcm-release/scripts/release.sh` — use it for all releases. `RELEASING.md` and `WORKFLOW.md` describe an older Changesets-based flow that is no longer in use.
 
 See `SKILL.md` in the `lcm-release` skill for the full step table and failure modes.
 
 ## Git Gotchas
 
-- **`.claude/` is gitignored** — skill and script files under `.claude/` are tracked but require `git add -f` to stage them. If `git add .claude/...` silently does nothing, that's why.
+- **Agent-specific hidden directories may be gitignored** — skill and script files under ignored agent directories require `git add -f` to stage them. If `git add <agent-dir>/...` silently does nothing, that's why.
 - **`develop` has branch protection** — direct push is rejected. Always push to a feature branch and open a PR, even for trivial fixes.
 
 # context-mode — MANDATORY routing rules
