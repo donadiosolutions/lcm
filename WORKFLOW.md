@@ -23,7 +23,7 @@ feature/docs branches → develop (default, protected) → main (releases only, 
 ```
 
 - **`develop`** — Default branch. All PRs target develop. Protected: PRs required, linear history, no force push.
-- **`main`** — Releases only. Merging develop → main triggers the publish workflow.
+- **`main`** — Releases only. Merging develop → main prepares a release; pushing a matching `vX.Y.Z` tag triggers the publish workflow.
 - **Feature branches** — `feat/<topic>`, `docs/<topic>`, `fix/<topic>`. Always branch from develop.
 
 ### Release Flow
@@ -31,12 +31,13 @@ feature/docs branches → develop (default, protected) → main (releases only, 
 1. Changesets accumulate on PRs targeting `main` (`.changeset/*.md` files)
 2. Version PR is auto-created by `changesets/action` on each main push
 3. When ready to release: merge the version PR on `main` (bumps package.json)
-4. The `publish.yml` workflow runs automatically for the package.json version bump on `main`
-5. Let the publish workflow:
+4. Create and push the matching semver tag from the merged `main` commit, for example `vX.Y.Z`
+5. The `publish.yml` workflow runs automatically from that tag
+6. Let the publish workflow:
    - Type-check, test, build
    - Publish to npm (`@donadiosolutions/lcm`)
-   - Create git tag + GitHub release
-   - Update plugin manifest version
+   - Create or update the GitHub release
+   - Use the plugin manifest version already included in the version PR
 
 ### CI Triggers
 
@@ -44,7 +45,7 @@ feature/docs branches → develop (default, protected) → main (releases only, 
 |----------|---------|---------|
 | `ci.yml` | Push to develop/main + all PRs | Type-check, test, build |
 | `version-pr.yml` | Push to main | Auto-create version PR from changesets |
-| `publish.yml` | package.json changes on main + manual dispatch | Publish npm + marketplace + tag |
+| `publish.yml` | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag | Publish npm + create GitHub release |
 
 ## Defaults (predefined answers for brainstorming)
 

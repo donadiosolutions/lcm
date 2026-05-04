@@ -41,14 +41,15 @@ make sure a maintainer gets a `.changeset/*.md` file onto `main`.
 2. Let the `Version Packages` workflow open or update the release PR
 3. Review the generated version bump and `CHANGELOG.md`
 4. Merge the release PR to `main`
-5. Let the `Publish Package` workflow run automatically for the package.json version bump on `main`
-6. Approve the workflow if a protected GitHub Environment is configured
-7. Let the workflow:
+5. Create and push the matching semver release tag, for example `vX.Y.Z`, from
+   the merged `main` commit
+6. Let the `Publish Package` workflow run automatically from that tag
+7. Approve the workflow if a protected GitHub Environment is configured
+8. Let the workflow:
    - install dependencies
    - run tests
    - publish to npm
-   - create tag `vX.Y.Z`
-   - create the GitHub release
+   - create or update the GitHub release for the tag
 
 ## External setup required
 
@@ -75,4 +76,7 @@ Recommended external setup:
 
 When configuring npm trusted publishing, register the GitHub workflow using the exact workflow filename in this repo: `.github/workflows/publish.yml`.
 
-The publish workflow also supports manual dispatch for recovery or republishing from a specific ref.
+The publish workflow also supports manual dispatch for recovery from a specific
+`vX.Y.Z` tag. It will not publish from branch refs, and it fails if the tag
+version does not match `package.json` or the tagged commit is not reachable from
+`origin/main`.
