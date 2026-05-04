@@ -25,7 +25,7 @@ lcm doctor          # must show 0 failures
 npm test            # must pass
 ```
 
-Also sync the global plugin cache so Claude Code picks up updated hooks and commands:
+Also sync the global plugin cache so your Agent picks up updated hooks and commands:
 
 ```bash
 # Find the cached plugin directory (version and owner may vary)
@@ -38,7 +38,7 @@ if [ -n "$CACHE" ]; then
 fi
 ```
 
-Then run `/reload-plugins` inside Claude Code to apply the changes.
+Then run `/reload-plugins` inside your Agent to apply the changes.
 
 If anything fails, fix it before starting the next feature. A broken local env wastes time on every subsequent session (stale dist, wrong binary, hook errors, mismatched plugin cache).
 

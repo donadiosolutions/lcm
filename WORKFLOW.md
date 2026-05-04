@@ -166,7 +166,7 @@ gh api repos/{owner}/{repo}/pulls/{n}/comments \
    b. Push once
    c. Re-trigger review (DELETE + POST)
 5. **Max 3 rounds.** After round 3, if remaining comments are minor nits (1-2 editorial suggestions), merge. Do not chase zero comments indefinitely.
-6. Review is "clean" when: 0 new comments, or only context-specific nits that Copilot can't understand (e.g., Claude Code conventions)
+6. Review is "clean" when: 0 new comments, or only context-specific nits that Copilot can't understand (e.g., Agent conventions)
 
 ### Common Pitfalls
 
