@@ -57,6 +57,12 @@ jobs:
             exit 1
           fi
 
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::release tag $tag must point to a commit reachable from origin/main"
+            exit 1
+          fi
+
           {
             printf 'version=%s\n' "$version"
             printf 'tag=%s\n' "$tag"
@@ -138,7 +144,7 @@ jobs:
           🔖 [Full Changelog](https://github.com/donadiosolutions/lcm/blob/main/CHANGELOG.md)
           EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md --latest
+            gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md
           else
-            gh release create "$TAG" --title "$TAG" --notes-file release-notes.md --verify-tag --latest
+            gh release create "$TAG" --title "$TAG" --notes-file release-notes.md --verify-tag
           fi

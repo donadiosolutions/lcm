@@ -41,7 +41,8 @@ make sure a maintainer gets a `.changeset/*.md` file onto `main`.
 2. Let the `Version Packages` workflow open or update the release PR
 3. Review the generated version bump and `CHANGELOG.md`
 4. Merge the release PR to `main`
-5. Create and push the matching semver release tag, for example `vX.Y.Z`
+5. Create and push the matching semver release tag, for example `vX.Y.Z`, from
+   the merged `main` commit
 6. Let the `Publish Package` workflow run automatically from that tag
 7. Approve the workflow if a protected GitHub Environment is configured
 8. Let the workflow:
@@ -77,4 +78,5 @@ When configuring npm trusted publishing, register the GitHub workflow using the 
 
 The publish workflow also supports manual dispatch for recovery from a specific
 `vX.Y.Z` tag. It will not publish from branch refs, and it fails if the tag
-version does not match `package.json`.
+version does not match `package.json` or the tagged commit is not reachable from
+`origin/main`.

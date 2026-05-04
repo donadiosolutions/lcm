@@ -31,7 +31,7 @@ feature/docs branches → develop (default, protected) → main (releases only, 
 1. Changesets accumulate on PRs targeting `main` (`.changeset/*.md` files)
 2. Version PR is auto-created by `changesets/action` on each main push
 3. When ready to release: merge the version PR on `main` (bumps package.json)
-4. Create and push the matching semver tag, for example `vX.Y.Z`
+4. Create and push the matching semver tag from the merged `main` commit, for example `vX.Y.Z`
 5. The `publish.yml` workflow runs automatically from that tag
 6. Let the publish workflow:
    - Type-check, test, build
