@@ -56,8 +56,21 @@ The repo-side files are not enough by themselves. A maintainer still needs to co
 
 Recommended external setup:
 
-1. Configure npm trusted publishing for this repo and the `publish.yml` workflow
-2. Optionally create a GitHub Environment named `npm-publish` and add required reviewers
+1. Configure npm trusted publishing for this package:
+   - Package: `@donadiosolutions/lcm`
+   - Publisher: GitHub Actions
+   - Organization or user: `donadiosolutions`
+   - Repository: `lcm`
+   - Workflow filename: `publish.yml`
+   - Environment name: `npm-publish`
+   - CLI equivalent:
+     ```bash
+     npm trust github @donadiosolutions/lcm \
+       --repo donadiosolutions/lcm \
+       --file publish.yml \
+       --env npm-publish
+     ```
+2. Optionally add required reviewers to the GitHub Environment named `npm-publish`
 3. Confirm the repository label taxonomy used by `.github/release.yml`
 
 When configuring npm trusted publishing, register the GitHub workflow using the exact workflow filename in this repo: `.github/workflows/publish.yml`.
