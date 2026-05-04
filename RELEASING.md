@@ -41,7 +41,7 @@ make sure a maintainer gets a `.changeset/*.md` file onto `main`.
 2. Let the `Version Packages` workflow open or update the release PR
 3. Review the generated version bump and `CHANGELOG.md`
 4. Merge the release PR to `main`
-5. Manually trigger the `Publish Package` workflow on the merged release commit
+5. Let the `Publish Package` workflow run automatically for the package.json version bump on `main`
 6. Approve the workflow if a protected GitHub Environment is configured
 7. Let the workflow:
    - install dependencies
@@ -75,4 +75,4 @@ Recommended external setup:
 
 When configuring npm trusted publishing, register the GitHub workflow using the exact workflow filename in this repo: `.github/workflows/publish.yml`.
 
-The publish workflow is intentionally manual. Release issuance should stay deliberate even after trusted publishing is enabled.
+The publish workflow also supports manual dispatch for recovery or republishing from a specific ref.
