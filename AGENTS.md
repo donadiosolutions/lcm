@@ -16,7 +16,16 @@ See [WORKFLOW.md](./WORKFLOW.md) for the full development workflow.
 
 ## Local Environment Stability
 
-After merging a feature PR, always rebuild and verify the local environment before moving on:
+After merging a feature PR, follow exactly one of the workflows below before
+moving on. Choose the workflow for the agent you are currently running in.
+Do not run both paths unless the user explicitly asks you to verify both
+integrations.
+
+### Claude Workflow
+
+Use this path only when you are running inside Claude Code.
+
+Rebuild and verify the package:
 
 ```bash
 git checkout develop && git fetch origin develop && git reset --hard origin/develop
@@ -25,7 +34,8 @@ lcm doctor          # must show 0 failures
 npm test            # must pass
 ```
 
-Also sync the global plugin cache so your Agent picks up updated hooks and commands:
+Then sync the global Claude plugin cache so Claude Code picks up updated hooks
+and commands:
 
 ```bash
 # Find the cached plugin directory (version and owner may vary)
@@ -38,7 +48,28 @@ if [ -n "$CACHE" ]; then
 fi
 ```
 
-Then run `/reload-plugins` inside your Agent to apply the changes.
+Then run `/reload-plugins` inside Claude Code to apply the changes.
+
+### Codex Workflow
+
+Use this path only when you are running inside Codex.
+
+Rebuild and verify the package:
+
+```bash
+git checkout develop && git fetch origin develop && git reset --hard origin/develop
+npm run build && chmod +x dist/bin/lcm.js && npm link
+lcm doctor          # must show 0 failures
+npm test            # must pass
+```
+
+Then sync the Codex native hook connector so Codex picks up updated project
+hooks:
+
+```bash
+lcm connectors install codex
+lcm connectors doctor codex
+```
 
 If anything fails, fix it before starting the next feature. A broken local env wastes time on every subsequent session (stale dist, wrong binary, hook errors, mismatched plugin cache).
 
