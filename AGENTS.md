@@ -145,7 +145,9 @@ Reviewers (spec compliance + code quality) always use the most capable model ava
 
 ## Release Process
 
-The canonical release process is `.agents/skills/lcm-release/scripts/release.sh` — use it for all releases. `RELEASING.md` and `WORKFLOW.md` describe an older Changesets-based flow that is no longer in use.
+Release metadata uses Changesets; see `RELEASING.md` and `WORKFLOW.md` for the
+normal release-note and version PR flow. Use `.agents/skills/lcm-release/SKILL.md`
+when explicitly cutting or recovering a manual release.
 
 See `SKILL.md` in the `lcm-release` skill for the full step table and failure modes.
 

@@ -28,11 +28,11 @@ feature/docs branches → develop (default, protected) → main (releases only, 
 
 ### Release Flow
 
-1. Changesets accumulate on `develop` (`.changeset/*.md` files)
-2. Version PR is auto-created by `changesets/action` on each develop push
-3. When ready to release: merge the version PR on develop (bumps package.json)
-4. Create PR: `develop` → `main`
-5. Merge to main triggers publish workflow:
+1. Changesets accumulate on PRs targeting `main` (`.changeset/*.md` files)
+2. Version PR is auto-created by `changesets/action` on each main push
+3. When ready to release: merge the version PR on `main` (bumps package.json)
+4. Manually trigger `publish.yml` from the release commit on `main`
+5. Let the publish workflow:
    - Type-check, test, build
    - Publish to npm (`@donadiosolutions/lcm`)
    - Create git tag + GitHub release
@@ -43,7 +43,7 @@ feature/docs branches → develop (default, protected) → main (releases only, 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `ci.yml` | Push to develop/main + all PRs | Type-check, test, build |
-| `version-pr.yml` | Push to develop | Auto-create version PR from changesets |
+| `version-pr.yml` | Push to main | Auto-create version PR from changesets |
 | `publish.yml` | `workflow_dispatch` (manual from main) | Publish npm + marketplace + tag |
 
 ## Defaults (predefined answers for brainstorming)

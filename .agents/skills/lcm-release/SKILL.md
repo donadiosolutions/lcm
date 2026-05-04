@@ -7,7 +7,7 @@ description: "Use when the user says 'cut a release', 'release vX.Y.Z', 'publish
 
 Cut a versioned release of donadiosolutions/lcm. This is a **public npm package** — never delete or overwrite existing git tags.
 
-> **Note on release flow:** This script is the canonical release process for this repo. It replaces any earlier Changesets-based or `version-pr.yml` automation. `WORKFLOW.md` and `RELEASING.md` reflect the old flow and have not yet been updated.
+> **Note on release flow:** Changesets remains the normal release-note and version PR workflow. Use this script only when explicitly cutting or recovering a manual release.
 
 ## Normal flow — use the script
 
