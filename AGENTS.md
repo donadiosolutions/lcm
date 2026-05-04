@@ -16,7 +16,16 @@ See [WORKFLOW.md](./WORKFLOW.md) for the full development workflow.
 
 ## Local Environment Stability
 
-After merging a feature PR, always rebuild and verify the local environment before moving on:
+After merging a feature PR, follow exactly one of the workflows below before
+moving on. Choose the workflow for the agent you are currently running in.
+Do not run both paths unless the user explicitly asks you to verify both
+integrations.
+
+### Claude Workflow
+
+Use this path only when you are running inside Claude Code.
+
+Rebuild and verify the package:
 
 ```bash
 git checkout develop && git fetch origin develop && git reset --hard origin/develop
@@ -25,7 +34,8 @@ lcm doctor          # must show 0 failures
 npm test            # must pass
 ```
 
-Also sync the global plugin cache so Claude Code picks up updated hooks and commands:
+Then sync the global Claude plugin cache so Claude Code picks up updated hooks
+and commands:
 
 ```bash
 # Find the cached plugin directory (version and owner may vary)
@@ -39,6 +49,27 @@ fi
 ```
 
 Then run `/reload-plugins` inside Claude Code to apply the changes.
+
+### Codex Workflow
+
+Use this path only when you are running inside Codex.
+
+Rebuild and verify the package:
+
+```bash
+git checkout develop && git fetch origin develop && git reset --hard origin/develop
+npm run build && chmod +x dist/bin/lcm.js && npm link
+lcm doctor          # must show 0 failures
+npm test            # must pass
+```
+
+Then sync the Codex native hook connector so Codex picks up updated project
+hooks:
+
+```bash
+lcm connectors install codex
+lcm connectors doctor codex
+```
 
 If anything fails, fix it before starting the next feature. A broken local env wastes time on every subsequent session (stale dist, wrong binary, hook errors, mismatched plugin cache).
 
@@ -114,13 +145,15 @@ Reviewers (spec compliance + code quality) always use the most capable model ava
 
 ## Release Process
 
-The canonical release process is `.claude/skills/lcm-release/scripts/release.sh` — use it for all releases. `RELEASING.md` and `WORKFLOW.md` describe an older Changesets-based flow that is no longer in use.
+Release metadata uses Changesets; see `RELEASING.md` and `WORKFLOW.md` for the
+normal release-note and version PR flow. Use `.agents/skills/lcm-release/SKILL.md`
+when explicitly cutting or recovering a manual release.
 
 See `SKILL.md` in the `lcm-release` skill for the full step table and failure modes.
 
 ## Git Gotchas
 
-- **`.claude/` is gitignored** — skill and script files under `.claude/` are tracked but require `git add -f` to stage them. If `git add .claude/...` silently does nothing, that's why.
+- **Agent-specific hidden directories may be gitignored** — skill and script files under ignored agent directories require `git add -f` to stage them. If `git add <agent-dir>/...` silently does nothing, that's why.
 - **`develop` has branch protection** — direct push is rejected. Always push to a feature branch and open a PR, even for trivial fixes.
 
 # context-mode — MANDATORY routing rules

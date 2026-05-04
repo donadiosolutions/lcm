@@ -26,7 +26,7 @@ if ! command -v lcm &>/dev/null; then
   echo ""
   echo "  ERROR: lcm is not installed."
   echo ""
-  echo "    Install it with:  npm install -g @lossless-claude/lcm"
+  echo "    Install it with:  npm install -g @donadiosolutions/lcm"
   echo ""
   exit 1
 fi

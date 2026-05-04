@@ -1,4 +1,4 @@
-# Version Roadmap — @lossless-claude/lcm
+# Version Roadmap — @donadiosolutions/lcm
 
 ## Unreleased
 

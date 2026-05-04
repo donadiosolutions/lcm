@@ -1,6 +1,6 @@
 {
-  "name": "@lossless-claude/lcm",
-  "version": "0.9.0",
+  "name": "@donadiosolutions/lcm",
+  "version": "0.9.1",
   "description": "Never lose context again. lossless-claude compresses Claude Code sessions into searchable memory — every message preserved, every insight remembered.",
   "type": "module",
   "main": "dist/src/memory/index.js",
@@ -74,10 +74,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lossless-claude/lcm.git"
+    "url": "git+https://github.com/donadiosolutions/lcm.git"
   },
-  "homepage": "https://github.com/lossless-claude/lcm#readme",
+  "homepage": "https://github.com/donadiosolutions/lcm#readme",
   "bugs": {
-    "url": "https://github.com/lossless-claude/lcm/issues"
+    "url": "https://github.com/donadiosolutions/lcm/issues"
   }
 }

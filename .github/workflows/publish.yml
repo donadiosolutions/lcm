@@ -2,7 +2,7 @@ name: Publish Package
 
 on:
   push:
-    branches: [stable]
+    branches: [main]
     paths: [package.json]
   workflow_dispatch:
     inputs:
@@ -29,9 +29,8 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org/
-          cache: npm
 
       - name: Check if version already released
         id: check
@@ -50,6 +49,29 @@ jobs:
             printf 'skip=false\n' >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Verify trusted publishing prerequisites
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          node --version
+          npm --version
+          node - <<'NODE'
+          const cp = require('node:child_process');
+
+          function assertAtLeast(label, actual, expected) {
+            const actualParts = actual.replace(/^v/, '').split('.').map(Number);
+            const expectedParts = expected.split('.').map(Number);
+            for (let i = 0; i < expectedParts.length; i += 1) {
+              if (actualParts[i] > expectedParts[i]) return;
+              if (actualParts[i] < expectedParts[i]) {
+                throw new Error(`${label} ${actual} is below required ${expected}`);
+              }
+            }
+          }
+
+          assertAtLeast('Node', process.version, '22.14.0');
+          assertAtLeast('npm', cp.execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim(), '11.5.1');
+          NODE
+
       - name: Install dependencies
         if: steps.check.outputs.skip == 'false'
         run: npm ci
@@ -66,17 +88,9 @@ jobs:
         if: steps.check.outputs.skip == 'false'
         run: npm run build
 
-      - name: Verify npm identity
-        if: steps.check.outputs.skip == 'false'
-        run: npm whoami
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
       - name: Publish to npm
         if: steps.check.outputs.skip == 'false'
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create and push release tag
         if: steps.check.outputs.skip == 'false'
@@ -104,16 +118,18 @@ jobs:
           # Get the top version block from CHANGELOG.md
           CHANGELOG_BLOCK=$(awk "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
           # Build enriched notes
-          NPM_BADGE="📦 **npm:** \`npm install @lossless-claude/lcm@${VERSION}\`"
-          FULL_NOTES="${NPM_BADGE}
+          NPM_BADGE="📦 **npm:** \`npm install @donadiosolutions/lcm@${VERSION}\`"
+          cat > release-notes.md <<EOF
+          ${NPM_BADGE}
 
----
+          ---
 
-## Changelog
+          ## Changelog
 
-${CHANGELOG_BLOCK}
+          ${CHANGELOG_BLOCK}
 
----
+          ---
 
-🔖 [Full Changelog](https://github.com/donadiosolutions/lcm/blob/stable/CHANGELOG.md)"
-          gh release edit "v${VERSION}" --notes "$FULL_NOTES"
+          🔖 [Full Changelog](https://github.com/donadiosolutions/lcm/blob/main/CHANGELOG.md)
+          EOF
+          gh release edit "v${VERSION}" --notes-file release-notes.md

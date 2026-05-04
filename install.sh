@@ -14,7 +14,7 @@ if [ -d "$INSTALL_DIR/.git" ]; then
   git -C "$INSTALL_DIR" pull --ff-only
 else
   echo "  ▸ Cloning to ${INSTALL_DIR}"
-  git clone https://github.com/lossless-claude/lcm.git "$INSTALL_DIR"
+  git clone https://github.com/donadiosolutions/lcm.git "$INSTALL_DIR"
 fi
 
 # Build

@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import pkg from "../package.json";
 
 describe("package.json", () => {
-  it("has correct name", () => expect(pkg.name).toBe("@lossless-claude/lcm"));
+  it("has correct name", () => expect(pkg.name).toBe("@donadiosolutions/lcm"));
   it("has bin entry", () => expect(pkg.bin).toHaveProperty("lcm"));
   it("has anthropic sdk as optional peer dep", () => expect(pkg.peerDependencies).toHaveProperty("@anthropic-ai/sdk"));
   it("has mcp sdk", () => expect(pkg.dependencies).toHaveProperty("@modelcontextprotocol/sdk"));

@@ -21,7 +21,7 @@ if ! [[ "$VERSION" =~ $SEMVER_REGEX ]]; then
   exit 1
 fi
 
-REPO="lossless-claude/lcm"
+REPO="donadiosolutions/lcm"
 SYNC_BRANCH="chore/sync-develop-v$VERSION"
 
 err() { echo ""; echo "✗ ERROR: $*" >&2; exit 1; }

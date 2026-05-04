@@ -6,7 +6,7 @@ description: "You MUST use this before any work to recall project memory, and af
 # lcm Memory — Universal Agent Guide
 
 Use the `lcm` CLI to retrieve and store project memory across sessions.
-Install: `npm install -g @lossless-claude/lcm`
+Install: `npm install -g @donadiosolutions/lcm`
 
 Memory is stored in SQLite (FTS5) and accessed via CLI commands or MCP tools.
 
@@ -123,7 +123,7 @@ lcm expand <nodeId>      → full decompressed content
 
 | Error | What to tell the user |
 |---|---|
-| `lcm` command not found | Run `npm install -g @lossless-claude/lcm` |
+| `lcm` command not found | Run `npm install -g @donadiosolutions/lcm` |
 | Daemon won't start | Ask user to check `lcm doctor` output |
 | Database locked or corrupted | Ask user to run `lcm doctor` for diagnostics |
 

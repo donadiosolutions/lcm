@@ -5,31 +5,31 @@ description: "Use when the user says 'cut a release', 'release vX.Y.Z', 'publish
 
 # lcm-release
 
-Cut a versioned release of lossless-claude/lcm. This is a **public npm package** — never delete or overwrite existing git tags.
+Cut a versioned release of donadiosolutions/lcm. This is a **public npm package** — never delete or overwrite existing git tags.
 
-> **Note on release flow:** This script is the canonical release process for this repo. It replaces any earlier Changesets-based or `version-pr.yml` automation. `WORKFLOW.md` and `RELEASING.md` reflect the old flow and have not yet been updated.
+> **Note on release flow:** Changesets remains the normal release-note and version PR workflow. Use this script only when explicitly cutting or recovering a manual release.
 
 ## Normal flow — use the script
 
-Run `.claude/skills/lcm-release/scripts/release.sh` from the repo root:
+Run `.agents/skills/lcm-release/scripts/release.sh` from the repo root:
 
 ```bash
-bash .claude/skills/lcm-release/scripts/release.sh <version>
+bash .agents/skills/lcm-release/scripts/release.sh <version>
 # e.g.
-bash .claude/skills/lcm-release/scripts/release.sh 0.4.2
+bash .agents/skills/lcm-release/scripts/release.sh 0.4.2
 ```
 
 **Resuming after a failure** — pass `--from-step N` to skip already-completed steps:
 
 ```bash
-bash .claude/skills/lcm-release/scripts/release.sh 0.4.2 --from-step 8  # re-watch publish.yml
-bash .claude/skills/lcm-release/scripts/release.sh 0.4.2 --from-step 9  # just run develop sync
+bash .agents/skills/lcm-release/scripts/release.sh 0.4.2 --from-step 8  # re-watch publish.yml
+bash .agents/skills/lcm-release/scripts/release.sh 0.4.2 --from-step 9  # just run develop sync
 ```
 
 **Sync develop standalone** — when Step 9 needs to run independently:
 
 ```bash
-bash .claude/skills/lcm-release/scripts/sync-develop.sh 0.4.2
+bash .agents/skills/lcm-release/scripts/sync-develop.sh 0.4.2
 ```
 
 The script handles everything end-to-end:
@@ -74,6 +74,6 @@ The script handles everything end-to-end:
 ## Scripts
 
 ```
-.claude/skills/lcm-release/scripts/release.sh       ← full end-to-end, supports --from-step N
-.claude/skills/lcm-release/scripts/sync-develop.sh  ← standalone Step 9 (develop sync)
+.agents/skills/lcm-release/scripts/release.sh       ← full end-to-end, supports --from-step N
+.agents/skills/lcm-release/scripts/sync-develop.sh  ← standalone Step 9 (develop sync)
 ```

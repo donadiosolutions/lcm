@@ -28,13 +28,13 @@ feature/docs branches → develop (default, protected) → main (releases only, 
 
 ### Release Flow
 
-1. Changesets accumulate on `develop` (`.changeset/*.md` files)
-2. Version PR is auto-created by `changesets/action` on each develop push
-3. When ready to release: merge the version PR on develop (bumps package.json)
-4. Create PR: `develop` → `main`
-5. Merge to main triggers publish workflow:
+1. Changesets accumulate on PRs targeting `main` (`.changeset/*.md` files)
+2. Version PR is auto-created by `changesets/action` on each main push
+3. When ready to release: merge the version PR on `main` (bumps package.json)
+4. The `publish.yml` workflow runs automatically for the package.json version bump on `main`
+5. Let the publish workflow:
    - Type-check, test, build
-   - Publish to npm (`@lossless-claude/lcm`)
+   - Publish to npm (`@donadiosolutions/lcm`)
    - Create git tag + GitHub release
    - Update plugin manifest version
 
@@ -43,14 +43,14 @@ feature/docs branches → develop (default, protected) → main (releases only, 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `ci.yml` | Push to develop/main + all PRs | Type-check, test, build |
-| `version-pr.yml` | Push to develop | Auto-create version PR from changesets |
-| `publish.yml` | `workflow_dispatch` (manual from main) | Publish npm + marketplace + tag |
+| `version-pr.yml` | Push to main | Auto-create version PR from changesets |
+| `publish.yml` | package.json changes on main + manual dispatch | Publish npm + marketplace + tag |
 
 ## Defaults (predefined answers for brainstorming)
 
 | Question | Default Answer |
 |----------|---------------|
-| Spec location | `.xgh/specs/YYYY-MM-DD-<topic>-design.md` |
+| Spec location | PR or issue body unless the user asks for a tracked document |
 | Visual companion | No (CLI project, no visual questions) |
 | Implementation approach | Parallel tracks — breaking changes isolated from additive work |
 | Registry/config format | TypeScript (type-safe, compile-time checks) |
@@ -65,9 +65,9 @@ feature/docs branches → develop (default, protected) → main (releases only, 
 2. Ask clarifying questions only for genuinely ambiguous decisions — use defaults above for standard questions
 3. Propose 2-3 approaches with trade-offs, recommend one
 4. Present design sections incrementally, get user approval
-5. Write design spec to `.xgh/specs/`
+5. Write the design spec in the PR or issue body unless the user asks for a tracked document
 6. Run spec review loop (code-reviewer agent + user review)
-7. Write implementation plan to `.xgh/specs/`
+7. Write the implementation plan in the PR or issue body unless the user asks for a tracked document
 
 ## Phase 2: Spec Review via PR
 
@@ -166,7 +166,7 @@ gh api repos/{owner}/{repo}/pulls/{n}/comments \
    b. Push once
    c. Re-trigger review (DELETE + POST)
 5. **Max 3 rounds.** After round 3, if remaining comments are minor nits (1-2 editorial suggestions), merge. Do not chase zero comments indefinitely.
-6. Review is "clean" when: 0 new comments, or only context-specific nits that Copilot can't understand (e.g., Claude Code conventions)
+6. Review is "clean" when: 0 new comments, or only context-specific nits that Copilot can't understand (e.g., Agent conventions)
 
 ### Common Pitfalls
 
