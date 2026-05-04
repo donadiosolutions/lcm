@@ -5,7 +5,7 @@ description: "Use when the user says 'cut a release', 'release vX.Y.Z', 'publish
 
 # lcm-release
 
-Cut a versioned release of lossless-claude/lcm. This is a **public npm package** — never delete or overwrite existing git tags.
+Cut a versioned release of donadiosolutions/lcm. This is a **public npm package** — never delete or overwrite existing git tags.
 
 > **Note on release flow:** This script is the canonical release process for this repo. It replaces any earlier Changesets-based or `version-pr.yml` automation. `WORKFLOW.md` and `RELEASING.md` reflect the old flow and have not yet been updated.
 

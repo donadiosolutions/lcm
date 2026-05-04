@@ -104,7 +104,7 @@ jobs:
           # Get the top version block from CHANGELOG.md
           CHANGELOG_BLOCK=$(awk "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
           # Build enriched notes
-          NPM_BADGE="📦 **npm:** \`npm install @lossless-claude/lcm@${VERSION}\`"
+          NPM_BADGE="📦 **npm:** \`npm install @donadiosolutions/lcm@${VERSION}\`"
           FULL_NOTES="${NPM_BADGE}
 
 ---

@@ -1,4 +1,4 @@
-# @lossless-claude/lcm
+# @donadiosolutions/lcm
 
 ## [0.8.1] - 2026-03-30
 
@@ -30,4 +30,4 @@
 
 ## 0.1.0
 
-Initial release under `@lossless-claude/lcm`.
+Initial release under `@donadiosolutions/lcm`.

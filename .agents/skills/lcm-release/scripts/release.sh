@@ -74,7 +74,7 @@ REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || \
 cd "$REPO_ROOT"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
-REPO="lossless-claude/lcm"
+REPO="donadiosolutions/lcm"
 RELEASE_BRANCH="release/v$VERSION"
 PACKAGE_NAME=$(node -p "require('./package.json').name")
 

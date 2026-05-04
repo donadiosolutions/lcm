@@ -106,7 +106,7 @@ The core content (decision tree, guardrails, error tables) is identical across a
 | Workflow enforcement | None (hooks handle it) | Explicit (query before, store after) |
 | Hook-injected memory | "Don't re-query" note | Not mentioned |
 | Error: MCP disconnected | "Restart session" | N/A (no MCP) |
-| Error: command not found | N/A | "npm install -g @lossless-claude/lcm" |
+| Error: command not found | N/A | "npm install -g @donadiosolutions/lcm" |
 | File format | SKILL.md (frontmatter) | AGENTS.md / GEMINI.md / .mdc (platform-native) |
 
 ### Install Flow

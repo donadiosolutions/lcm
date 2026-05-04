@@ -7,8 +7,8 @@
 Install the `lcm` binary and add the plugin:
 
 ```bash
-npm install -g @lossless-claude/lcm  # provides the `lcm` command
-claude plugin add github:lossless-claude/lcm
+npm install -g @donadiosolutions/lcm  # provides the `lcm` command
+claude plugin add github:donadiosolutions/lcm
 lcm install
 ```
 
@@ -19,7 +19,7 @@ lcm install
 Install the repo-local connector:
 
 ```bash
-npm install -g @lossless-claude/lcm
+npm install -g @donadiosolutions/lcm
 lcm connectors install github-copilot
 lcm connectors doctor github-copilot
 ```
@@ -31,7 +31,7 @@ This writes `.github/skills/lcm-memory/SKILL.md` in the current repository.
 Install the Codex connector:
 
 ```bash
-npm install -g @lossless-claude/lcm
+npm install -g @donadiosolutions/lcm
 lcm connectors install codex
 lcm connectors doctor codex
 ```

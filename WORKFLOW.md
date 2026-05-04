@@ -34,7 +34,7 @@ feature/docs branches → develop (default, protected) → main (releases only, 
 4. Create PR: `develop` → `main`
 5. Merge to main triggers publish workflow:
    - Type-check, test, build
-   - Publish to npm (`@lossless-claude/lcm`)
+   - Publish to npm (`@donadiosolutions/lcm`)
    - Create git tag + GitHub release
    - Update plugin manifest version
 

@@ -688,8 +688,8 @@ Check the first argument passed to this command:
 Run this command to merge the `statusLine` config into `~/.claude/settings.json` without overwriting other settings:
 
 ```bash
-PLUGIN_ROOT=$(node -e "console.log(require.resolve('@lossless-claude/lcm/package.json').replace('/package.json',''))" 2>/dev/null || echo "")
-[ -z "$PLUGIN_ROOT" ] && echo "Error: @lossless-claude/lcm not found in node path" && exit 1
+PLUGIN_ROOT=$(node -e "console.log(require.resolve('@donadiosolutions/lcm/package.json').replace('/package.json',''))" 2>/dev/null || echo "")
+[ -z "$PLUGIN_ROOT" ] && echo "Error: @donadiosolutions/lcm not found in node path" && exit 1
 SETTINGS="$HOME/.claude/settings.json"
 [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
 node -e "

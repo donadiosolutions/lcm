@@ -1,7 +1,7 @@
 project:
   name: lossless-claude
   path: .
-  repo: lossless-claude/lcm
+  repo: donadiosolutions/lcm
 
 budget:
   max_experiments_per_session: 8

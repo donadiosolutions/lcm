@@ -8,9 +8,9 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@lossless-claude/lcm"><img src="https://img.shields.io/npm/v/@lossless-claude/lcm" alt="npm"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/lossless-claude/lcm" alt="License: MIT"></a>
-  <a href="package.json"><img src="https://img.shields.io/node/v/@lossless-claude/lcm" alt="Node"></a>
+  <a href="https://www.npmjs.com/package/@donadiosolutions/lcm"><img src="https://img.shields.io/npm/v/@donadiosolutions/lcm" alt="npm"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/donadiosolutions/lcm" alt="License: MIT"></a>
+  <a href="package.json"><img src="https://img.shields.io/node/v/@donadiosolutions/lcm" alt="Node"></a>
   <a href="https://github.com/anthropics/claude-code"><img src="https://img.shields.io/badge/Claude_Code-hooks%20%2B%20MCP-7c3aed" alt="Claude Code"></a>
 </p>
 
@@ -98,11 +98,11 @@ flowchart TD
 Install the `lcm` binary first:
 
 ```bash
-npm install -g @lossless-claude/lcm  # provides the `lcm` command
+npm install -g @donadiosolutions/lcm  # provides the `lcm` command
 ```
 
 ```bash
-claude plugin add github:lossless-claude/lcm
+claude plugin add github:donadiosolutions/lcm
 lcm install
 ```
 
@@ -113,7 +113,7 @@ lcm install
 Install the `lcm` binary first:
 
 ```bash
-npm install -g @lossless-claude/lcm
+npm install -g @donadiosolutions/lcm
 ```
 
 Then install the repo-local Copilot connector:
@@ -130,7 +130,7 @@ This creates a workspace skill under `.github/skills/lcm-memory/SKILL.md` so Cop
 Install the `lcm` binary first:
 
 ```bash
-npm install -g @lossless-claude/lcm
+npm install -g @donadiosolutions/lcm
 ```
 
 Then install the Codex connector:
