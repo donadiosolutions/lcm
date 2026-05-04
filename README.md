@@ -329,7 +329,7 @@ Add project-specific patterns with `lcm sensitive add "MY_PATTERN"`. See [docs/p
 
 ## Acknowledgments
 
-`lossless-claude` stands on the shoulders of [lossless-claw](https://github.com/Martian-Engineering/lossless-claude), the original implementation by [Martian Engineering](https://martian.engineering). The DAG-based compaction architecture, the LCM memory model, and the foundational design decisions all originate there.
+This project is a fork of `lossless-claude`, which itself stands on the shoulders of [lossless-claw](https://github.com/Martian-Engineering/lossless-claude), the original implementation by [Martian Engineering](https://martian.engineering). This fork keeps the DAG-based compaction architecture, the LCM memory model, and the foundational design decisions while emphasizing security hardening and broader agent support, explicitly including Codex alongside Claude Code.
 
 The underlying theory comes from the [LCM paper](https://papers.voltropy.com/LCM) by [Voltropy](https://x.com/Voltropy).
 
