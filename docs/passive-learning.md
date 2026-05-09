@@ -11,7 +11,7 @@ Two hooks capture events during your session:
 - **PostToolUse** — fires after every tool call. Extracts structured metadata (tool name, command, file path) from tool inputs. Never captures raw tool output.
 - **UserPromptSubmit** — fires on each user prompt. Detects decisions ("always use X"), role statements ("I'm a data scientist"), and intent patterns.
 
-Events are written to a **sidecar SQLite database** (`~/.lossless-claude/events/<project-hash>.db`) at <10ms cost. This is separate from the main LCM database — if the daemon is unavailable, events are safely queued.
+Events are written to a **sidecar SQLite database** (`~/.lcm/events/<project-hash>.db`) at <10ms cost. This is separate from the main LCM database — if the daemon is unavailable, events are safely queued.
 
 ### What Gets Captured
 
@@ -52,7 +52,7 @@ On SessionStart, recently promoted passive insights are surfaced in a `<learned-
 
 ## Configuration
 
-All thresholds are configurable in `~/.lossless-claude/config.json` under `compaction.promotionThresholds`:
+All thresholds are configurable in `~/.lcm/config.json` under `compaction.promotionThresholds`:
 
 ```json
 {
@@ -77,7 +77,7 @@ When a pattern crosses the reinforcement threshold, `reinforcementBoost` is adde
 
 ## Data Storage
 
-- **Sidecar DB**: `~/.lossless-claude/events/<sha256-of-project-path>.db`
+- **Sidecar DB**: `~/.lcm/events/<sha256-of-project-path>.db`
   - Per-project SQLite database in WAL mode
   - Processed events pruned after 7 days
   - Unprocessed events capped at 10,000 rows (oldest pruned first)
@@ -136,5 +136,5 @@ Events          1,234 captured (42 unprocessed, 3 errors (30d))
 All hooks use a three-layer error fence (`safeLogError`):
 
 1. **Layer 1**: Write to sidecar DB `error_log` table (queryable by doctor/stats)
-2. **Layer 2**: Append to `~/.lossless-claude/logs/events.log` (flat file fallback)
+2. **Layer 2**: Append to `~/.lcm/logs/events.log` (flat file fallback)
 3. **Layer 3**: Swallow silently — hooks must never crash or interfere with Claude Code

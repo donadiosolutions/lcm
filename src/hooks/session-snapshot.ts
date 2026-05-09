@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
 import { daemonJsonRequest, normalizeDaemonPort } from "../daemon/http-url.js";
+import { configPath as defaultConfigPath, daemonTokenPath, tmpDir as lcmTmpDir } from "../runtime-paths.js";
 
 export interface SnapshotDeps {
   statSync: (path: string) => { mtimeMs: number } | null;
@@ -32,7 +33,7 @@ export async function handleSessionSnapshot(
     const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
 
     const safeSessionId = session_id.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const cursorDir = join(homedir(), ".lossless-claude", "tmp");
+    const cursorDir = lcmTmpDir();
     mkdirSync(cursorDir, { recursive: true, mode: 0o700 });
     const cursorPath = join(cursorDir, `snap-${safeSessionId}.json`);
     const _statSync = deps?.statSync ?? defaultStatSync;
@@ -40,7 +41,7 @@ export async function handleSessionSnapshot(
     if (intervalSec === undefined) {
       const { loadDaemonConfig } = await import("../daemon/config.js");
       const { homedir } = await import("node:os");
-      const config = loadDaemonConfig(join(homedir(), ".lossless-claude", "config.json"));
+      const config = loadDaemonConfig(defaultConfigPath());
       intervalSec = config.hooks?.snapshotIntervalSec ?? 60;
     }
 
@@ -63,14 +64,13 @@ export async function handleSessionSnapshot(
     } else {
       const { loadDaemonConfig } = await import("../daemon/config.js");
       const { readFileSync: _readFileSync } = await import("node:fs");
-      const { homedir: _homedir } = await import("node:os");
-      const config = loadDaemonConfig(join(_homedir(), ".lossless-claude", "config.json"));
+      const config = loadDaemonConfig(defaultConfigPath());
       const port = normalizeDaemonPort(config.daemon?.port ?? 3737);
 
       // Read token from token file if available (silent fallback if not found)
       let token: string | null = null;
       try {
-        const tokenPath = join(_homedir(), ".lossless-claude", "daemon.token");
+        const tokenPath = daemonTokenPath();
         const raw = _readFileSync(tokenPath, "utf-8").trim();
         token = raw || null;
       } catch {
@@ -93,8 +93,7 @@ export async function handleSessionSnapshot(
     if (!_post && clientName === "codex" && typeof ingestResult?.totalTokens === "number") {
       try {
         const { loadDaemonConfig } = await import("../daemon/config.js");
-        const { homedir: _homedir3 } = await import("node:os");
-        const config = loadDaemonConfig(join(_homedir3(), ".lossless-claude", "config.json"));
+        const config = loadDaemonConfig(defaultConfigPath());
         const disableCompact = config.hooks?.disableAutoCompact ?? false;
         const minTokens = config.compaction.autoCompactMinTokens;
         if (!disableCompact && ingestResult.totalTokens >= minTokens) {
@@ -119,8 +118,7 @@ export async function handleSessionSnapshot(
     // Best-effort promote-events flush
     try {
       const { loadDaemonConfig: _loadConfig } = await import("../daemon/config.js");
-      const { homedir: _homedir2 } = await import("node:os");
-      const _config = _loadConfig(join(_homedir2(), ".lossless-claude", "config.json"));
+      const _config = _loadConfig(defaultConfigPath());
       const port = normalizeDaemonPort(_config.daemon?.port ?? 3737);
       const { firePromoteEventsRequest } = await import("./session-end.js");
       firePromoteEventsRequest(port, { cwd: input.cwd });

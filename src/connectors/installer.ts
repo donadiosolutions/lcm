@@ -6,11 +6,12 @@ import { requiresRestart } from "./types.js";
 import { LCM_MARKERS } from "./constants.js";
 import { generateContent } from "./template-service.js";
 import { findAgent, AGENTS } from "./registry.js";
-import { CODEX_CONFIG_PATH, hasCodexHooks, installCodexHooks, removeCodexHooks } from "./codex-hooks.js";
+import { CODEX_CONFIG_PATH, LEGACY_CODEX_HOOKS_PATHS, hasCodexHooks, installCodexHooks, removeCodexHooks } from "./codex-hooks.js";
 
 export interface InstallResult {
   success: boolean;
   path: string;
+  paths?: string[];
   requiresRestart: boolean;
   manual?: string;
 }
@@ -82,6 +83,18 @@ export function installConnector(agentIdOrName: string, type?: ConnectorType, cw
   const agent = findAgent(agentIdOrName);
   if (!agent) throw new Error(`Unknown agent: ${agentIdOrName}`);
 
+  if (!type && agent.defaultTypes && agent.defaultTypes.length > 0) {
+    const results = agent.defaultTypes.map((defaultType) => installConnector(agentIdOrName, defaultType, cwd));
+    const paths = results.map((result) => result.path).filter((path) => path.length > 0);
+    return {
+      success: results.every((result) => result.success),
+      path: paths.join(", "),
+      paths,
+      requiresRestart: results.some((result) => result.requiresRestart),
+      manual: results.map((result) => result.manual).filter((manual): manual is string => Boolean(manual)).join("\n\n") || undefined,
+    };
+  }
+
   const connectorType = type ?? agent.defaultType;
   if (!agent.supportedTypes.includes(connectorType)) {
     throw new Error(`Agent "${agent.name}" does not support connector type "${connectorType}". Supported: ${agent.supportedTypes.join(', ')}`);
@@ -92,6 +105,9 @@ export function installConnector(agentIdOrName: string, type?: ConnectorType, cw
       const hooksPath = resolveConfigPath(agent.configPaths.hook ?? '', cwd);
       const configPath = resolveConfigPath(CODEX_CONFIG_PATH, cwd);
       installCodexHooks(hooksPath, configPath);
+      for (const legacyPath of LEGACY_CODEX_HOOKS_PATHS.map((path) => resolveConfigPath(path, cwd))) {
+        if (legacyPath !== hooksPath) removeCodexHooks(legacyPath);
+      }
       return {
         success: true,
         path: hooksPath,
@@ -146,6 +162,14 @@ export function installConnector(agentIdOrName: string, type?: ConnectorType, cw
 export function removeConnector(agentIdOrName: string, type?: ConnectorType, cwd: string = process.cwd()): boolean {
   const agent = findAgent(agentIdOrName);
   if (!agent) throw new Error(`Unknown agent: ${agentIdOrName}`);
+
+  if (!type && agent.defaultTypes && agent.defaultTypes.length > 0) {
+    let removed = false;
+    for (const defaultType of agent.defaultTypes) {
+      removed = removeConnector(agentIdOrName, defaultType, cwd) || removed;
+    }
+    return removed;
+  }
 
   const connectorType = type ?? agent.defaultType;
   const configPath = agent.configPaths[connectorType];

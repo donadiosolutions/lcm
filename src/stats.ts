@@ -7,6 +7,7 @@ import { collectEventStats } from "./db/events-stats.js";
 import { RecallStore, type RecallStats } from "./db/recall.js";
 import { PromotedStore } from "./db/promoted.js";
 import { loadDaemonConfig } from "./daemon/config.js";
+import { configPath as defaultConfigPath, projectsDir as lcmProjectsDir } from "./runtime-paths.js";
 
 export type { RecallStats };
 
@@ -338,7 +339,7 @@ export function printStats(stats: OverallStats, verbose: boolean): void {
 }
 
 export function collectStats(): OverallStats {
-  const baseDir = join(homedir(), ".lossless-claude", "projects");
+  const baseDir = lcmProjectsDir();
 
   const emptyRecallStats: RecallStats = {
     memoriesSurfaced: 0, memoriesActedUpon: 0, recallPrecision: null, topRecalled: [],
@@ -375,7 +376,7 @@ export function collectStats(): OverallStats {
   // Load stale config once for all projects
   let staleCfg = { staleAfterDays: 90, staleSurfacingWithoutUseLimit: 5 };
   try {
-    const cfg = loadDaemonConfig(join(homedir(), ".lossless-claude", "config.json"));
+    const cfg = loadDaemonConfig(defaultConfigPath());
     staleCfg = {
       staleAfterDays: cfg.restoration.staleAfterDays,
       staleSurfacingWithoutUseLimit: cfg.restoration.staleSurfacingWithoutUseLimit,

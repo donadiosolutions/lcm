@@ -23,6 +23,7 @@ import { createPoolStatsHandler } from "./routes/pool-stats.js";
 import { createReviewStaleHandler } from "./routes/review-stale.js";
 import { PKG_VERSION } from "./version.js";
 import { normalizeDaemonPort, normalizeIdleTimeoutMs } from "./http-url.js";
+import { projectsDir as lcmProjectsDir } from "../runtime-paths.js";
 export { PKG_VERSION };
 
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse, body: string) => Promise<void>;
@@ -115,7 +116,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       const { join } = await import("node:path");
       const { homedir } = await import("node:os");
 
-      const projectsDir = join(homedir(), ".lossless-claude", "projects");
+      const projectsDir = lcmProjectsDir();
       if (!existsSync(projectsDir)) return;
 
       for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {

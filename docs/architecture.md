@@ -178,7 +178,7 @@ Files embedded in user messages (typically via `<file>` blocks from tool output)
 1. Parse file blocks from message content.
 2. For each block exceeding `largeFileTokenThreshold` (default 25k tokens):
    - Generate a unique file ID (`file_` prefix)
-   - Store the content to `~/.lossless-claude/projects/<project-hash>/files/<file_id>.<ext>`
+   - Store the content to `~/.lcm/projects/<project-hash>/files/<file_id>.<ext>`
    - Generate a ~200 token exploration summary (structural analysis, key sections, etc.)
    - Insert a `large_files` record with metadata
    - Replace the file block in the message with a compact reference

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { safeLogError } from "./hook-errors.js";
 import { buildMemoryContext } from "./memory-context.js";
+import { daemonPidPath } from "../runtime-paths.js";
 
 type PromptSearchResponse = {
   hints: string[];
@@ -33,7 +34,7 @@ export async function handleUserPromptSubmit(
   port?: number,
 ): Promise<{ exitCode: number; stdout: string }> {
   const daemonPort = port ?? 3737;
-  const pidFilePath = join(homedir(), ".lossless-claude", "daemon.pid");
+  const pidFilePath = daemonPidPath();
   const { connected } = await ensureDaemon({ port: daemonPort, pidFilePath, spawnTimeoutMs: 5000 });
   if (!connected) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
 

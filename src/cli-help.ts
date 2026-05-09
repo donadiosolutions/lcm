@@ -46,13 +46,13 @@ const HELP: Record<string, CommandHelp> = {
     summary: "Start the context daemon that stores and processes memory.",
     usage: "lcm daemon start [--detach]",
     options: [
-      ["--detach", "Run in the background; saves PID to ~/.lossless-claude/daemon.pid"],
+      ["--detach", "Run in the background; saves PID to ~/.lcm/daemon.pid"],
     ],
     examples: [
       ["lcm daemon start --detach", "Start daemon in background (recommended)"],
       ["lcm daemon start", "Start daemon in foreground (for debugging)"],
     ],
-    notes: "The daemon runs on port 3737 by default. Configure via ~/.lossless-claude/config.json.",
+    notes: "The daemon runs on port 3737 by default. Configure via ~/.lcm/config.json.",
   },
 
   status: {
@@ -239,10 +239,10 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm connectors list --global", "Show connectors from your global agent config"],
       ["lcm connectors list --format json", "Machine-readable connector list"],
       ["lcm connectors install github-copilot", "Install the GitHub Copilot workspace skill for VS Code"],
-      ["lcm connectors install codex", "Install native Codex hooks"],
+      ["lcm connectors install codex", "Install Codex hooks, skill, and rules"],
       ["lcm connectors install codex --global", "Install Codex into ~/.codex instead of the current project"],
-      ["lcm connectors install codex --type skill", "Install skill-only guidance for Codex"],
-      ["lcm connectors install codex --type rules", "Install rules-based connector for Codex"],
+      ["lcm connectors install codex --type skill", "Install only the Codex skill"],
+      ["lcm connectors install codex --type rules", "Install only the Codex rules"],
       ["lcm connectors remove codex", "Remove the Codex connector"],
       ["lcm connectors remove codex --global", "Remove Codex from your global config"],
       ["lcm connectors doctor", "Check health of all connectors"],
@@ -250,7 +250,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm connectors doctor github-copilot", "Check GitHub Copilot connector health"],
       ["lcm connectors doctor codex", "Check Codex connector health"],
     ],
-    notes: "Connector types: 'rules' (agent instruction file), 'hook' (native lifecycle hooks), 'mcp' (MCP server), 'skill' (skill file). GitHub Copilot uses a repo-local skill under .github/skills/. Codex defaults to native hooks in .codex/hooks.json and enables codex_hooks in .codex/config.toml.",
+    notes: "Connector types: 'rules' (agent instruction file), 'hook' (native lifecycle hooks), 'mcp' (MCP server), 'skill' (skill file). GitHub Copilot uses a repo-local skill under .github/skills/. Codex defaults to hooks in ~/.codex/hooks.json, a skill in .codex/skills/, and rules in ~/.codex/AGENTS.md.",
   },
 
   sensitive: {
@@ -272,7 +272,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm sensitive purge --yes", "IRREVERSIBLY delete all stored memory and patterns for current project"],
       ["lcm sensitive purge --all --yes", "IRREVERSIBLY delete all stored memory and patterns for ALL projects"],
     ],
-    notes: "Built-in patterns cover common secrets (API keys, tokens, passwords). Project patterns are stored in ~/.lossless-claude/projects/<id>/sensitive-patterns.txt; global patterns are stored in config.json. The 'purge' subcommand deletes the entire project data directory (including stored memory) and cannot be undone.",
+    notes: "Built-in patterns cover common secrets (API keys, tokens, passwords). Project patterns are stored in ~/.lcm/projects/<id>/sensitive-patterns.txt; global patterns are stored in config.json. The 'purge' subcommand deletes the entire project data directory (including stored memory) and cannot be undone.",
   },
 
   export: {

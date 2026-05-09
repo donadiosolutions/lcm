@@ -4,9 +4,9 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 
 describe("eventsDbPath", () => {
-  it("returns a path under ~/.lossless-claude/events/", () => {
+  it("returns a path under ~/.lcm/events/", () => {
     const result = eventsDbPath("/some/project");
-    expect(result).toMatch(/\.lossless-claude\/events\/.+\.db$/);
+    expect(result).toMatch(/\.lcm\/events\/.+\.db$/);
   });
 
   it("produces consistent paths for the same cwd", () => {
@@ -23,7 +23,7 @@ describe("eventsDbPath", () => {
 });
 
 describe("eventsDir", () => {
-  it("returns ~/.lossless-claude/events", () => {
-    expect(eventsDir()).toBe(join(homedir(), ".lossless-claude", "events"));
+  it("returns ~/.lcm/events", () => {
+    expect(eventsDir()).toBe(join(homedir(), ".lcm", "events"));
   });
 });

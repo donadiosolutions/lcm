@@ -24,6 +24,7 @@ import { runLcmMigrations } from "./db/migration.js";
 import { deduplicateAndInsert } from "./promotion/dedup.js";
 import { ScrubEngine } from "./scrub.js";
 import { getLcmConnection, closeLcmConnection } from "./db/connection.js";
+import { lcmHomeDir } from "./runtime-paths.js";
 
 export const EXPORT_VERSION = 1;
 
@@ -61,7 +62,7 @@ function resolveProjectDbPath(cwd: string, baseDir: string): string {
 }
 
 function defaultBaseDir(): string {
-  return join(homedir(), ".lossless-claude");
+  return lcmHomeDir();
 }
 
 // ─── Export ──────────────────────────────────────────────────────────────────
@@ -77,7 +78,7 @@ export interface ExportOptions {
   format?: "json";
   /** Skip scrubbing secrets (not recommended; useful for tests) */
   skipScrub?: boolean;
-  /** Override the ~/.lossless-claude base directory (for testing) */
+  /** Override the ~/.lcm base directory (for testing) */
   _lcmBaseDir?: string;
 }
 
@@ -165,7 +166,7 @@ export interface ImportOptions {
   dryRun?: boolean;
   /** Override confidence for all imported entries */
   confidence?: number;
-  /** Override the ~/.lossless-claude base directory (for testing) */
+  /** Override the ~/.lcm base directory (for testing) */
   _lcmBaseDir?: string;
 }
 

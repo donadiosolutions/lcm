@@ -43,7 +43,7 @@ lcm import --codex
 lcm import --provider all
 ```
 
-The default Codex connector writes native hooks to `.codex/hooks.json` and enables `codex_hooks` in `.codex/config.toml`. Use `lcm connectors install codex --type skill` only when you want instruction-based guidance without hooks.
+The default Codex connector writes native hooks to `~/.codex/hooks.json`, enables Codex's current `hooks` feature in `~/.codex/config.toml`, installs the LCM skill at `.codex/skills/lcm-memory/SKILL.md`, and ensures the LCM rules block is present in `~/.codex/AGENTS.md`. Use `lcm connectors install codex --type skill` or `lcm connectors install codex --type rules` only when you want one guidance surface without hooks.
 
 For current limitations and the manual MCP step for Codex TOML config, see [`docs/vscode-codex.md`](vscode-codex.md).
 
@@ -154,7 +154,7 @@ The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon 
 
 Daemon port values must be integers from `1` through `65535` when connecting to an existing daemon. The daemon server also accepts port `0` for test and ephemeral-port binding. `daemon.idleTimeoutMs` must be an integer from `0` through `86400000` milliseconds; `0` disables the idle timer.
 
-Hook error fallback logs write to `~/.lossless-claude/logs/events.log`.
+Hook error fallback logs write to `~/.lcm/logs/events.log`.
 
 ## Model selection
 
@@ -212,7 +212,7 @@ Run `lcm stats --verbose` to see a summary of stale memory candidates across all
 
 ## Database management
 
-Each project's SQLite database lives at `~/.lossless-claude/projects/<sha256-of-project-path>/db.sqlite`. The per-project path is derived automatically from the working directory.
+Each project's SQLite database lives at `~/.lcm/projects/<sha256-of-project-path>/db.sqlite`. The per-project path is derived automatically from the working directory.
 
 ### Inspecting the database
 
@@ -221,7 +221,7 @@ Each project's SQLite database lives at `~/.lossless-claude/projects/<sha256-of-
 lcm stats
 
 # Open the database (replace <hash> with your project hash)
-sqlite3 ~/.lossless-claude/projects/<hash>/db.sqlite
+sqlite3 ~/.lcm/projects/<hash>/db.sqlite
 
 # Count conversations
 SELECT COUNT(*) FROM conversations;
@@ -241,13 +241,13 @@ SELECT summary_id, depth, token_count FROM summaries ORDER BY token_count DESC L
 The database is a single file per project. Back it up with:
 
 ```bash
-cp ~/.lossless-claude/projects/<hash>/db.sqlite ~/.lossless-claude/projects/<hash>/db.sqlite.backup
+cp ~/.lcm/projects/<hash>/db.sqlite ~/.lcm/projects/<hash>/db.sqlite.backup
 ```
 
 Or use SQLite's online backup:
 
 ```bash
-sqlite3 ~/.lossless-claude/projects/<hash>/db.sqlite ".backup /tmp/lcm-backup.sqlite"
+sqlite3 ~/.lcm/projects/<hash>/db.sqlite ".backup /tmp/lcm-backup.sqlite"
 ```
 
 ## Per-agent configuration

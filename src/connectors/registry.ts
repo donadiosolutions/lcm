@@ -21,10 +21,11 @@ export const AGENTS: Agent[] = [
     name: 'Codex',
     category: 'cli',
     defaultType: 'hook',
+    defaultTypes: ['hook', 'skill', 'rules'],
     supportedTypes: ['rules', 'hook', 'mcp', 'skill'],
     configPaths: {
-      rules: 'AGENTS.md',
-      hook: '.codex/hooks.json',
+      rules: '~/.codex/AGENTS.md',
+      hook: '~/.codex/hooks.json',
       mcp: '.codex/config.toml',
       skill: '.codex/skills/',
     },

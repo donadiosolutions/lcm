@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INSTALL_DIR="${LOSSLESS_CLAUDE_DIR:-${HOME}/.lossless-claude/plugin}"
+INSTALL_DIR="${LCM_DIR:-${LOSSLESS_CLAUDE_DIR:-${HOME}/.lcm/plugin}}"
 NPM_PREFIX="${HOME}/.npm-global"
 
 echo ""

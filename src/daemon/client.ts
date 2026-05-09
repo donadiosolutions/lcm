@@ -2,6 +2,7 @@ import { readAuthToken } from "./auth.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { daemonJsonRequest, daemonPortFromLoopbackUrl, normalizeDaemonPath } from "./http-url.js";
+import { daemonTokenPath } from "../runtime-paths.js";
 
 export class DaemonClient {
   private token: string | null = null;
@@ -15,7 +16,7 @@ export class DaemonClient {
   private getToken(): string | null {
     if (!this.tokenLoaded) {
       this.token = readAuthToken(
-        this.tokenPath ?? join(homedir(), ".lossless-claude", "daemon.token"),
+        this.tokenPath ?? daemonTokenPath(),
       );
       this.tokenLoaded = true;
     }

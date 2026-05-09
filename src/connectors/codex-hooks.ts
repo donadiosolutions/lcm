@@ -1,8 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 
-export const CODEX_HOOKS_PATH = ".codex/hooks.json";
-export const CODEX_CONFIG_PATH = ".codex/config.toml";
+export const CODEX_HOOKS_PATH = "~/.codex/hooks.json";
+export const CODEX_CONFIG_PATH = "~/.codex/config.toml";
+export const LEGACY_CODEX_HOOKS_PATHS = [".codex/hooks.json"] as const;
 
 type CodexCommandHook = {
   type?: string;
@@ -160,34 +161,49 @@ export function enableCodexHooksFeature(configPath: string): void {
 export function setCodexHooksFeature(content: string): string {
   const normalized = content.replace(/\r\n/g, "\n").trimEnd();
   if (!normalized) {
-    return "[features]\ncodex_hooks = true\n";
+    return "[features]\nhooks = true\n";
   }
 
   const lines = normalized.split("\n");
   const sectionHeader = /^\s*\[features\]\s*(?:#.*)?$/;
   const anySectionHeader = /^\s*\[[^\]]+\]\s*(?:#.*)?$/;
-  const featureLine = /^(\s*codex_hooks\s*=\s*).*(\s*)$/;
+  const hooksFeatureLine = /^(\s*hooks\s*=\s*).*(\s*)$/;
+  const deprecatedFeatureLine = /^\s*codex_hooks\s*=.*$/;
 
   const featuresStart = lines.findIndex((line) => sectionHeader.test(line));
   if (featuresStart === -1) {
-    return `${normalized}\n\n[features]\ncodex_hooks = true\n`;
+    return `${normalized}\n\n[features]\nhooks = true\n`;
   }
 
   let insertAt = featuresStart + 1;
   let featuresEnd = lines.length;
+  let hooksLine = -1;
   for (let i = featuresStart + 1; i < lines.length; i++) {
     if (anySectionHeader.test(lines[i])) {
       featuresEnd = i;
       break;
     }
-    if (featureLine.test(lines[i])) {
-      lines[i] = lines[i].replace(featureLine, "$1true");
-      return `${lines.join("\n")}\n`;
+    if (hooksFeatureLine.test(lines[i])) {
+      hooksLine = i;
     }
     insertAt = i + 1;
   }
 
-  lines.splice(Math.min(insertAt, featuresEnd), 0, "codex_hooks = true");
+  for (let i = featuresEnd - 1; i > featuresStart; i--) {
+    if (deprecatedFeatureLine.test(lines[i])) {
+      lines.splice(i, 1);
+      if (hooksLine > i) hooksLine -= 1;
+      featuresEnd -= 1;
+      insertAt = Math.min(insertAt, featuresEnd);
+    }
+  }
+
+  if (hooksLine !== -1) {
+    lines[hooksLine] = lines[hooksLine].replace(hooksFeatureLine, "$1true");
+    return `${lines.join("\n")}\n`;
+  }
+
+  lines.splice(Math.min(insertAt, featuresEnd), 0, "hooks = true");
   return `${lines.join("\n")}\n`;
 }
 

@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { request } from "node:http";
 import { Buffer } from "node:buffer";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
+import { configPath as defaultConfigPath, daemonPidPath } from "../runtime-paths.js";
 
 /**
  * Fire a compact request to the daemon without blocking the hook process.
@@ -105,7 +106,7 @@ export async function handleSessionEnd(
   port?: number,
 ): Promise<{ exitCode: number; stdout: string }> {
   const daemonPort = port ?? 3737;
-  const pidFilePath = join(homedir(), ".lossless-claude", "daemon.pid");
+  const pidFilePath = daemonPidPath();
   const { connected } = await ensureDaemon({
     port: daemonPort,
     pidFilePath,
@@ -123,7 +124,7 @@ export async function handleSessionEnd(
       redactedCategories?: string[];
     }>("/ingest", { ...input, client: clientName });
 
-    const configPath = join(homedir(), ".lossless-claude", "config.json");
+    const configPath = defaultConfigPath();
     const config = loadDaemonConfig(configPath);
     const disableCompact = config.hooks?.disableAutoCompact ?? false;
 

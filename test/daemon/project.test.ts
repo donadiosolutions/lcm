@@ -8,8 +8,9 @@ describe("projectId", () => {
 });
 
 describe("projectDbPath", () => {
-  it("returns path under .lossless-claude/projects/<id>/db.sqlite", () => {
+  it("returns path under .lcm/projects/<id>/db.sqlite", () => {
     const p = projectDbPath("/foo/bar");
+    expect(p).toContain(".lcm");
     expect(p).toContain("projects");
     expect(p).toContain("db.sqlite");
   });

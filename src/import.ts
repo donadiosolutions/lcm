@@ -8,6 +8,7 @@ import { findAllCodexTranscripts, extractCodexSessionCwd } from "./codex-transcr
 import type { ProgressState } from "./cli/progress-state.js";
 import { projectDbPath, projectId } from "./daemon/project.js";
 import type { TranscriptClient } from "./transcript-provider.js";
+import { lcmHomeDir } from "./runtime-paths.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
 
@@ -23,7 +24,7 @@ interface ImportOptions {
   onProgress?: (patch: Partial<ProgressState>) => void;
   /** Override ~/.claude/projects path — used in tests only */
   _claudeProjectsDir?: string;
-  /** Override ~/.lossless-claude path — used in tests only */
+  /** Override ~/.lcm path — used in tests only */
   _lcmDir?: string;
   /** Override ~/.codex path — used in tests only */
   _codexDir?: string;
@@ -45,7 +46,7 @@ export function cwdToProjectHash(cwd: string): string {
 }
 
 function buildProjectMap(lcmDir?: string): Map<string, string> {
-  const lcmProjectsDir = join(lcmDir ?? join(homedir(), '.lossless-claude'), 'projects');
+  const lcmProjectsDir = join(lcmDir ?? lcmHomeDir(), 'projects');
   const map = new Map<string, string>();
   if (!existsSync(lcmProjectsDir)) return map;
   for (const entry of readdirSync(lcmProjectsDir, { withFileTypes: true })) {

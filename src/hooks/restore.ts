@@ -3,6 +3,7 @@ import { ensureDaemon } from "../daemon/lifecycle.js";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { writeFileSync, readFileSync } from "node:fs";
+import { daemonPidPath } from "../runtime-paths.js";
 
 /** Returns true if lock was acquired, false if another live process holds it. */
 function tryAcquireSessionLock(sessionId: string): boolean {
@@ -37,7 +38,7 @@ export async function handleSessionStart(stdin: string, client: DaemonClient, po
   }
 
   const daemonPort = port ?? 3737;
-  const pidFilePath = join(homedir(), ".lossless-claude", "daemon.pid");
+  const pidFilePath = daemonPidPath();
   const { connected } = await ensureDaemon({ port: daemonPort, pidFilePath, spawnTimeoutMs: 5000 });
   if (!connected) return { exitCode: 0, stdout: "" };
 

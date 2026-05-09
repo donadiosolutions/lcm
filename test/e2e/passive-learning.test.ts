@@ -4,7 +4,7 @@
  * Validates the full pipeline:
  *   event capture → sidecar DB → promotion → promoted store → restore surfacing
  *
- * Mocks only file paths to avoid writing to the real ~/.lossless-claude directory.
+ * Mocks only file paths to avoid writing to the real ~/.lcm directory.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";

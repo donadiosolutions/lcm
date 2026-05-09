@@ -106,20 +106,65 @@ describe('installConnector — skill', () => {
 });
 
 describe('installConnector — Codex native hooks', () => {
-  it('writes hooks.json and enables codex_hooks in config.toml by default', () => {
-    const result = installConnector('codex', undefined, tmpDir);
-    expect(result.success).toBe(true);
-    expect(result.path).toBe(join(tmpDir, '.codex', 'hooks.json'));
+  let originalHome: string | undefined;
 
-    const hooks = JSON.parse(readFileSync(result.path, 'utf-8'));
+  beforeEach(() => {
+    originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+  });
+
+  afterEach(() => {
+    process.env.HOME = originalHome;
+  });
+
+  it('installs hooks, skill, and global rules by default', () => {
+    const result = installConnector('codex', undefined, tmpDir);
+
+    expect(result.success).toBe(true);
+    expect(result.path).toContain(join(tmpDir, '.codex', 'hooks.json'));
+    expect(result.path).toContain(join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md'));
+    expect(result.path).toContain(join(tmpDir, '.codex', 'AGENTS.md'));
+
+    const hooksPath = join(tmpDir, '.codex', 'hooks.json');
+    const hooks = JSON.parse(readFileSync(hooksPath, 'utf-8'));
     expect(hooks.hooks.SessionStart[0].hooks[0].command).toBe('lcm restore --client codex');
     expect(hooks.hooks.UserPromptSubmit[0].hooks[0].command).toBe('lcm user-prompt --client codex');
     expect(hooks.hooks.PostToolUse[0].hooks[0].command).toBe('lcm post-tool --client codex');
     expect(hooks.hooks.Stop[0].hooks[0].command).toBe('lcm session-snapshot --client codex');
 
+    const skill = readFileSync(join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md'), 'utf-8');
+    expect(skill).toContain('lcm search');
+
+    const rules = readFileSync(join(tmpDir, '.codex', 'AGENTS.md'), 'utf-8');
+    expect(rules).toContain(LCM_MARKERS.START);
+    expect(rules).toContain('lcm search');
+
     const config = readFileSync(join(tmpDir, '.codex', 'config.toml'), 'utf-8');
     expect(config).toContain('[features]');
-    expect(config).toContain('codex_hooks = true');
+    expect(config).toContain('hooks = true');
+    expect(config).not.toContain('codex_hooks');
+  });
+
+  it('idempotently ensures Codex rules in ~/.codex/AGENTS.md', () => {
+    installConnector('codex', 'rules', tmpDir);
+    installConnector('codex', 'rules', tmpDir);
+
+    const rulesPath = join(tmpDir, '.codex', 'AGENTS.md');
+    const content = readFileSync(rulesPath, 'utf-8');
+    const startCount = (content.match(new RegExp(LCM_MARKERS.START.replace(/\\/g, '\\\\').replace(/[[\]]/g, '\\$&'), 'g')) ?? []).length;
+    expect(startCount).toBe(1);
+    expect(content).toContain('lcm search');
+  });
+
+  it('migrates the deprecated codex_hooks feature flag when installing hooks', () => {
+    const configPath = join(tmpDir, '.codex', 'config.toml');
+    mkdirSync(join(tmpDir, '.codex'), { recursive: true });
+    writeFileSync(configPath, '[features]\ncodex_hooks = true\n');
+
+    installConnector('codex', 'hook', tmpDir);
+
+    const config = readFileSync(configPath, 'utf-8');
+    expect(config).toBe('[features]\nhooks = true\n');
   });
 
   it('is idempotent and preserves existing Codex hooks', () => {
@@ -153,6 +198,28 @@ describe('installConnector — Codex native hooks', () => {
     expect(removeConnector('codex', 'hook', tmpDir)).toBe(true);
     expect(listConnectors(tmpDir).some(c => c.agentId === 'codex' && c.type === 'hook')).toBe(false);
     expect(existsSync(result.path)).toBe(false);
+  });
+
+  it('removes old LCM hooks from legacy cwd hooks.json when installing the user hook file', () => {
+    const projectDir = join(tmpDir, 'project');
+    const cwdHooksPath = join(projectDir, '.codex', 'hooks.json');
+    mkdirSync(join(projectDir, '.codex'), { recursive: true });
+    mkdirSync(join(tmpDir, '.codex'), { recursive: true });
+    writeFileSync(cwdHooksPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { hooks: [{ type: 'command', command: 'echo keep' }] },
+          { hooks: [{ type: 'command', command: 'lcm restore --client codex' }] },
+        ],
+      },
+    }, null, 2));
+
+    installConnector('codex', 'hook', projectDir);
+
+    expect(existsSync(join(tmpDir, '.codex', 'hooks.json'))).toBe(true);
+    const legacy = JSON.parse(readFileSync(cwdHooksPath, 'utf-8'));
+    const commands = legacy.hooks.SessionStart.flatMap((group: any) => group.hooks.map((hook: any) => hook.command));
+    expect(commands).toEqual(['echo keep']);
   });
 });
 
@@ -251,8 +318,14 @@ describe('listConnectors', () => {
   });
 
   it('returns empty when nothing installed', () => {
-    const list = listConnectors(tmpDir);
-    expect(list).toHaveLength(0);
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      const list = listConnectors(tmpDir);
+      expect(list).toHaveLength(0);
+    } finally {
+      process.env.HOME = originalHome;
+    }
   });
 
   it('does not list removed connectors', () => {

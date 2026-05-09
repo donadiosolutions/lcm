@@ -4,7 +4,7 @@ set -euo pipefail
 # lossless-claude setup script
 # Configures the LLM provider for compaction/summarization and installs hooks.
 
-CONFIG_DIR="$HOME/.lossless-claude"
+CONFIG_DIR="$HOME/.lcm"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 
 # ── Dry-run support (used by installer/dry-run-deps.ts) ──
@@ -13,7 +13,7 @@ if [ "${XGH_DRY_RUN:-}" = "1" ]; then
   echo ""
   echo "  [dry-run] lossless-claude setup would:"
   echo "    1. Prompt for LLM provider selection (auto / claude-process / codex-process / anthropic / openai / disabled)"
-  echo "    2. Write ~/.lossless-claude/config.json with the chosen llm block"
+  echo "    2. Write ~/.lcm/config.json with the chosen llm block"
   echo "    3. Run: lcm install"
   echo "    4. Run: lcm doctor"
   echo ""
