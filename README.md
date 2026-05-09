@@ -14,7 +14,6 @@
 </p>
 
 <p align="center">
-  <a href="https://lossless-claude.com">Website</a> &bull;
   <a href="#runtime-model">Runtime Model</a> &bull;
   <a href="#installation">Installation</a> &bull;
   <a href="#mcp-tools">MCP Tools</a> &bull;
@@ -145,7 +144,7 @@ lcm connectors doctor codex
 This installs the default Codex connector set:
 
 - Native hooks in `~/.codex/hooks.json` and Codex's current `hooks` feature in `~/.codex/config.toml`
-- The LCM skill in `.codex/skills/lcm-memory/SKILL.md`
+- The LCM skill in `~/.codex/skills/lcm-memory/SKILL.md`
 - User-level rules in `~/.codex/AGENTS.md`
 
 The native hooks use:
@@ -323,7 +322,7 @@ test/
 
 ## Privacy
 
-All conversation data is stored locally in `~/.lcm/`. On first startup after upgrading from older releases, lcm automatically migrates an existing `~/.lossless-claude/` directory to `~/.lcm/` when the new directory is absent or does not already contain LCM data. Nothing is sent to any lossless-claude server.
+All conversation data is stored locally in `~/.lcm/`. On first startup after upgrading from older releases, lcm automatically migrates an existing `~/.lossless-claude/` directory to `~/.lcm/` when the new directory is absent or does not already contain LCM data. Nothing is sent to any LCM server.
 
 If you configure an external summarizer (`claude-process`, `anthropic`, `openai`, etc.), messages are sent to that provider for summarization — after built-in secret redaction. lossless-claude scrubs common secret patterns (API keys, tokens, passwords) from message content before writing to SQLite and before sending to the summarizer.
 
@@ -340,6 +339,8 @@ Add project-specific patterns with `lcm sensitive add "MY_PATTERN"`. See [docs/p
 This project is a fork of [lossless-claude](https://github.com/lossless-claude), which itself stands on the shoulders of [lossless-claw](https://github.com/Martian-Engineering/lossless-claw), the original implementation by [Martian Engineering](https://martian.engineering). This fork keeps the DAG-based compaction architecture, the LCM memory model, and the foundational design decisions.
 
 The underlying theory comes from the [LCM paper](https://papers.voltropy.com/LCM) by [Voltropy](https://x.com/Voltropy).
+
+[Original website](https://lossless-claude.com)
 
 ## License
 
