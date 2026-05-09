@@ -6,10 +6,12 @@ lossless-claude stores your conversation history locally to enable memory across
 
 All storage is on your machine:
 
-- **`~/.lossless-claude/projects/{hash}/db.sqlite`** — Conversation messages, summaries, and promoted long-term memory for each project. The hash is a SHA-256 of the project directory path.
-- **`~/.lossless-claude/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
-- **`~/.lossless-claude/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
-- **`~/.lossless-claude/daemon.pid`** — Daemon process ID (transient).
+- **`~/.lcm/projects/{hash}/db.sqlite`** — Conversation messages, summaries, and promoted long-term memory for each project. The hash is a SHA-256 of the project directory path.
+- **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
+- **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
+- **`~/.lcm/daemon.pid`** — Daemon process ID (transient).
+
+On first startup after upgrading from older releases, lcm automatically migrates an existing `~/.lossless-claude/` directory to `~/.lcm/` when `~/.lcm/` is absent or does not already contain LCM data.
 
 No data is sent to any lossless-claude server. There is no telemetry.
 
@@ -52,7 +54,7 @@ These patterns are always active, regardless of configuration:
 Add patterns for secrets specific to your project:
 
 ```bash
-# Add a pattern (stored in ~/.lossless-claude/projects/{hash}/sensitive-patterns.txt)
+# Add a pattern (stored in ~/.lcm/projects/{hash}/sensitive-patterns.txt)
 lcm sensitive add "MY_APP_API_KEY_[A-Z0-9]+"
 
 # Add a global pattern (applies to all projects, stored in config.json)
@@ -82,7 +84,7 @@ lcm sensitive purge --yes
 lcm uninstall
 ```
 
-SQLite database files are stored in `~/.lossless-claude/projects/`. You can delete individual project directories manually to remove their history.
+SQLite database files are stored in `~/.lcm/projects/`. You can delete individual project directories manually to remove their history.
 
 ## Verifying your setup
 
@@ -96,8 +98,8 @@ The `Security` section of the doctor output shows:
 
 ## Summary
 
-- All data is local — SQLite in `~/.lossless-claude/`.
+- All data is local — SQLite in `~/.lcm/`.
 - External summarizer (optional) receives only the text to be summarized, after scrubbing.
 - Built-in patterns redact common secret formats automatically.
 - Add project-specific patterns with `lcm sensitive add`.
-- Delete your data with `lcm uninstall` or by removing `~/.lossless-claude/`.
+- Delete your data with `lcm uninstall` or by removing `~/.lcm/`.

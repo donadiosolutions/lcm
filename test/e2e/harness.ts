@@ -25,11 +25,12 @@ import { createDaemon } from "../../src/daemon/server.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { projectId, projectDir, projectDbPath } from "../../src/daemon/project.js";
+import { projectsDir } from "../../src/runtime-paths.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = join(__dirname, "..", "fixtures", "e2e");
 const FIXTURES_ROOT = join(__dirname, "..", "fixtures");
-const PROJECTS_DIR = join(homedir(), ".lossless-claude", "projects");
+const PROJECTS_DIR = projectsDir();
 
 // ─── Public types ────────────────────────────────────────────────────────────
 
@@ -186,7 +187,7 @@ export async function createHarness(mode: "mock" | "live"): Promise<HarnessHandl
         // Non-fatal
       }
 
-      // Remove the test project from ~/.lossless-claude/projects/<hash>/
+      // Remove the test project from ~/.lcm/projects/<hash>/
       const pDir = projectDir(tmpDir);
       if (existsSync(pDir)) {
         try {

@@ -54,7 +54,13 @@ describe("connectors CLI integration", () => {
 
   it("doctor reports no connectors for fresh workspace", () => {
     const tmp = tmps[tmps.push(mkdtempSync(join(tmpdir(), "lcm-cli-"))) - 1];
-    const installed = listConnectors(tmp);
-    expect(installed).toHaveLength(0);
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmp;
+    try {
+      const installed = listConnectors(tmp);
+      expect(installed).toHaveLength(0);
+    } finally {
+      process.env.HOME = originalHome;
+    }
   });
 });

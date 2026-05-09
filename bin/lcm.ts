@@ -6,6 +6,14 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command, Option } from "commander";
 import { DaemonClient } from "../src/daemon/client.js";
+import {
+  configPath as defaultConfigPath,
+  daemonPidPath,
+  daemonTokenPath,
+  lcmHomeDir,
+  migrateLegacyHomeIfNeeded,
+  projectsDir as lcmProjectsDir,
+} from "../src/runtime-paths.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -214,11 +222,11 @@ async function createDaemonClientOrExit(): Promise<DaemonClient> {
   const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
   const { loadDaemonConfig } = await import("../src/daemon/config.js");
 
-  const config = loadDaemonConfig(join(homedir(), ".lossless-claude", "config.json"));
+  migrateLegacyHomeIfNeeded();
+  const config = loadDaemonConfig(defaultConfigPath());
   const port = config.daemon?.port ?? 3737;
-  const lcDir = join(homedir(), ".lossless-claude");
-  const pidFilePath = join(lcDir, "daemon.pid");
-  const tokenPath = join(lcDir, "daemon.token");
+  const pidFilePath = daemonPidPath();
+  const tokenPath = daemonTokenPath();
   const { connected } = await ensureDaemon({ port, pidFilePath, spawnTimeoutMs: 5000 });
 
   if (!connected) {
@@ -230,6 +238,7 @@ async function createDaemonClientOrExit(): Promise<DaemonClient> {
 }
 
 async function main() {
+  migrateLegacyHomeIfNeeded();
   const { readFileSync } = await import("node:fs");
   const { join, dirname } = await import("node:path");
   const { fileURLToPath } = await import("node:url");
@@ -282,7 +291,7 @@ async function main() {
           const { writeFileSync, mkdirSync } = await import("node:fs");
           const { join } = await import("node:path");
           const { homedir } = await import("node:os");
-          const lcDir = join(homedir(), ".lossless-claude");
+          const lcDir = lcmHomeDir();
           mkdirSync(lcDir, { recursive: true });
           writeFileSync(join(lcDir, "daemon.pid"), String(child.pid));
           console.log(`lcm daemon started in background (PID ${child.pid})`);
@@ -294,7 +303,7 @@ async function main() {
       const { ensureAuthToken } = await import("../src/daemon/auth.js");
       const { join } = await import("node:path");
       const { homedir } = await import("node:os");
-      const lcDir = join(homedir(), ".lossless-claude");
+      const lcDir = lcmHomeDir();
       const tokenPath = join(lcDir, "daemon.token");
       ensureAuthToken(tokenPath);
       const config = loadDaemonConfig(join(lcDir, "config.json"));
@@ -338,9 +347,9 @@ async function main() {
         const { join } = await import("node:path");
         const { homedir } = await import("node:os");
         const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
-        const config = loadDaemonConfig(join(homedir(), ".lossless-claude", "config.json"));
+        const config = loadDaemonConfig(defaultConfigPath());
         const port = config.daemon?.port ?? 3737;
-        const pidFilePath = join(homedir(), ".lossless-claude", "daemon.pid");
+        const pidFilePath = daemonPidPath();
         const { connected } = await ensureDaemon({ port, pidFilePath, spawnTimeoutMs: 10000 });
         if (!connected) {
           console.error("Could not connect to daemon. Start it with: lcm daemon start --detach");
@@ -349,7 +358,7 @@ async function main() {
         const noPromote: boolean = !opts.promote;
         const minTokens = config.compaction.autoCompactMinTokens;
         const cwd = all ? undefined : process.cwd();
-        const tokenPath = join(homedir(), ".lossless-claude", "daemon.token");
+        const tokenPath = daemonTokenPath();
         const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
 
         const { NinjaRenderer } = await import("../src/cli/pipeline-runner.js");
@@ -381,7 +390,7 @@ async function main() {
           if (cwd) {
             promoteCwds.push(cwd);
           } else {
-            const projectsDir = join(homedir(), ".lossless-claude", "projects");
+            const projectsDir = lcmProjectsDir();
             if (existsSync(projectsDir)) {
               for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
                 if (!entry.isDirectory()) continue;
@@ -593,7 +602,7 @@ async function main() {
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
       const { join } = await import("node:path");
       const { homedir } = await import("node:os");
-      const config = loadDaemonConfig(join(homedir(), ".lossless-claude", "config.json"));
+      const config = loadDaemonConfig(defaultConfigPath());
       const jsonFlag: boolean = opts.json ?? false;
       const client = await createDaemonClientOrExit();
 
@@ -795,22 +804,30 @@ async function main() {
           id: a.id,
           name: a.name,
           category: a.category,
-          defaultType: a.defaultType,
+          defaultType: a.defaultTypes ?? a.defaultType,
           supportedTypes: a.supportedTypes,
           installed: installed.filter((c: any) => c.agentId === a.id).map((c: any) => c.type),
         }));
         stdout.write(JSON.stringify({ agents: result }, null, 2) + "\n");
       } else {
+        const rows = AGENTS.map((agent: any) => {
+          const agentInstalled = installed.filter((c: any) => c.agentId === agent.id);
+          return {
+            agent: agent.name,
+            installed: agentInstalled.length > 0 ? agentInstalled.map((c: any) => c.type).join(", ") : "-",
+            defaults: (agent.defaultTypes ?? [agent.defaultType]).join(", "),
+            supported: agent.supportedTypes.join(", "),
+          };
+        });
+        const agentWidth = Math.max("Agent".length, ...rows.map((row) => row.agent.length));
+        const installedWidth = Math.max("Installed".length, ...rows.map((row) => row.installed.length));
+        const defaultWidth = Math.max("Default".length, ...rows.map((row) => row.defaults.length));
+
         console.log("\n  Available agents:\n");
-        console.log("  %-20s %-15s %-15s %s", "Agent", "Installed", "Default", "Supported");
+        console.log(`  ${"Agent".padEnd(agentWidth)}  ${"Installed".padEnd(installedWidth)}  ${"Default".padEnd(defaultWidth)}  Supported`);
         console.log("  " + "─".repeat(70));
-        for (const agent of AGENTS) {
-          const agentInstalled = installed.filter((c: any) => c.agentId === (agent as any).id);
-          const installedStr = (agentInstalled as any[]).length > 0
-            ? (agentInstalled as any[]).map((c: any) => c.type).join(", ")
-            : "-";
-          console.log("  %-20s %-15s %-15s %s",
-            (agent as any).name, installedStr, (agent as any).defaultType, (agent as any).supportedTypes.join(", "));
+        for (const row of rows) {
+          console.log(`  ${row.agent.padEnd(agentWidth)}  ${row.installed.padEnd(installedWidth)}  ${row.defaults.padEnd(defaultWidth)}  ${row.supported}`);
         }
         console.log();
       }
@@ -837,7 +854,10 @@ async function main() {
           console.log(`\n  ${(result as any).manual}\n`);
         } else {
           console.log(`\n  ✓ Installed ${type ?? "default"} connector for ${agentName}`);
-          console.log(`    Path: ${(result as any).path}`);
+          const paths = Array.isArray((result as any).paths) ? (result as any).paths : [(result as any).path];
+          for (const path of paths.filter((path: string) => path.length > 0)) {
+            console.log(`    Path: ${path}`);
+          }
           if ((result as any).requiresRestart) console.log("    Restart the agent to activate.");
           console.log();
         }
@@ -926,7 +946,7 @@ async function main() {
       const { handleSensitive } = await import("../src/sensitive.js");
       const { join } = await import("node:path");
       const { homedir } = await import("node:os");
-      const configPath = join(homedir(), ".lossless-claude", "config.json");
+      const configPath = defaultConfigPath();
       const r = await handleSensitive(args, process.cwd(), configPath);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
@@ -980,9 +1000,9 @@ async function main() {
         }
       }
 
-      const config = loadDaemonConfig(join(homedir(), ".lossless-claude", "config.json"));
+      const config = loadDaemonConfig(defaultConfigPath());
       const port = config.daemon?.port ?? 3737;
-      const pidFilePath = join(homedir(), ".lossless-claude", "daemon.pid");
+      const pidFilePath = daemonPidPath();
       const { connected } = await ensureDaemon({ port, pidFilePath, spawnTimeoutMs: 5000 });
       if (!connected) { console.error("  Daemon not available"); exit(1); }
 
@@ -1069,9 +1089,9 @@ async function main() {
       const { join } = await import("node:path");
       const { homedir } = await import("node:os");
 
-      const config = loadDaemonConfig(join(homedir(), ".lossless-claude", "config.json"));
+      const config = loadDaemonConfig(defaultConfigPath());
       const port = config.daemon?.port ?? 3737;
-      const pidFilePath = join(homedir(), ".lossless-claude", "daemon.pid");
+      const pidFilePath = daemonPidPath();
       const { connected } = await ensureDaemon({ port, pidFilePath, spawnTimeoutMs: 5000 });
       if (!connected) {
         console.error("  Daemon not available. Start it with: lcm daemon start --detach");
@@ -1086,7 +1106,7 @@ async function main() {
       // Collect project cwds to promote
       const cwds: string[] = [];
       if (all) {
-        const projectsDir = join(homedir(), ".lossless-claude", "projects");
+        const projectsDir = lcmProjectsDir();
         if (existsSync(projectsDir)) {
           for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
             if (!entry.isDirectory()) continue;
@@ -1177,7 +1197,7 @@ async function main() {
 
       const cwds: string[] = [];
       if (all) {
-        const projectsDir = join(homedir(), ".lossless-claude", "projects");
+        const projectsDir = lcmProjectsDir();
         if (existsSync(projectsDir)) {
           for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
             if (!entry.isDirectory()) continue;

@@ -1,5 +1,5 @@
 <p align="center">
-  <strong>lossless-claude</strong><br>
+  <strong>Lossless Context Manager</strong><br>
   Shared memory infrastructure for coding agents
 </p>
 
@@ -11,7 +11,6 @@
   <a href="https://www.npmjs.com/package/@donadiosolutions/lcm"><img src="https://img.shields.io/npm/v/@donadiosolutions/lcm" alt="npm"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/donadiosolutions/lcm" alt="License: MIT"></a>
   <a href="package.json"><img src="https://img.shields.io/node/v/@donadiosolutions/lcm" alt="Node"></a>
-  <a href="https://github.com/anthropics/claude-code"><img src="https://img.shields.io/badge/Claude_Code-hooks%20%2B%20MCP-7c3aed" alt="Claude Code"></a>
 </p>
 
 <p align="center">
@@ -24,7 +23,7 @@
 
 ---
 
-`lossless-claude` replaces sliding-window forgetfulness with a persistent memory runtime for both humans and agents.
+`Lossless Context Manager` replaces sliding-window forgetfulness with a persistent memory runtime for both humans and agents.
 
 - Every message is stored in a project SQLite database.
 - Older context is compacted into a DAG of summaries instead of being dropped.
@@ -33,7 +32,9 @@
 
 Humans and agents use the same backend. The integration surface differs by client, but the memory model is shared.
 
-This repo started as a fork of [lossless-claw](https://github.com/Martian-Engineering/lossless-claude) by [Martian Engineering](https://martian.engineering), adapted for Claude Code. The LCM model and DAG architecture originate from the [Voltropy paper](https://papers.voltropy.com/LCM).
+This repo is a fork of [lossless-claude](https://github.com/lossless-claude), which in turn is a fork of [lossless-claw](https://github.com/Martian-Engineering/lossless-claw) by [Martian Engineering](https://martian.engineering). This fork's objective is to have first class support for Codex as well, but a number of other coding agents are also supported. Improvements to cover more harnesses are always welcome. Tigther security measures are a focus as well.
+
+The LCM model and DAG architecture originate from the [Voltropy paper](https://papers.voltropy.com/LCM).
 
 ## Runtime Model
 
@@ -41,10 +42,10 @@ This repo started as a fork of [lossless-claw](https://github.com/Martian-Engine
 flowchart LR
   subgraph Clients["Clients"]
     CC["Claude Code<br/>hooks + MCP"]
-    CX["Codex<br/>native hooks"]
+    CX["Codex<br/>hooks + MCP"]
   end
 
-  CC --> D["lossless-claude daemon"]
+  CC --> D["lcm daemon"]
   CX --> D
 
   D --> DB[("project SQLite DAG")]
@@ -57,8 +58,8 @@ flowchart LR
 | Path | Restore | Prompt hints | Turn writeback | Automatic compaction | Notes |
 |---|---|---|---|---|---|
 | Claude Code | Yes | Yes | Yes, via transcript/hooks | Yes | Primary hook-based integration |
-| GitHub Copilot (VS Code) | No | Yes, via skill/rules | No | No | Repo-local skill can teach Copilot to call `lcm`, but there is no automatic restore or turn capture yet |
-| Codex | Yes | Yes | Yes, via native hooks | Yes, thresholded | `lcm connectors install codex` writes native Codex hooks for restore, prompt hints, passive learning, rolling transcript snapshots, and thresholded compaction |
+| GitHub Copilot (VS Code) | No | Yes, via rules | No | No | Repo-local skill can teach Copilot to call `lcm`, but there is no automatic restore or turn capture yet |
+| Codex | Yes | Yes | Yes, via native hooks | Yes, thresholded | `lcm connectors install codex` writes native Codex hooks, the Codex skill, and user-level rules for restore, prompt hints, passive learning, rolling transcript snapshots, and thresholded compaction |
 
 ## LCM Model
 
@@ -89,9 +90,10 @@ flowchart TD
 ### Prerequisites
 
 - Node.js 22+
-- Claude Code if you want hook-based automation
-- GitHub Copilot in VS Code if you want VS Code integration
-- Codex CLI if you want Codex connector installation, summarization, or transcript import
+- For hook based automation, one of:
+  - Claude Code (native hooks)
+  - Codex CLI/VSCode integration/app (native hooks)
+  - VS Code with GitHub Copilot extension (connector-based)
 
 ### Claude Code
 
@@ -140,7 +142,13 @@ lcm connectors install codex
 lcm connectors doctor codex
 ```
 
-This writes `.codex/hooks.json` and enables `[features].codex_hooks = true` in `.codex/config.toml`. The native hooks use:
+This installs the default Codex connector set:
+
+- Native hooks in `~/.codex/hooks.json` and Codex's current `hooks` feature in `~/.codex/config.toml`
+- The LCM skill in `.codex/skills/lcm-memory/SKILL.md`
+- User-level rules in `~/.codex/AGENTS.md`
+
+The native hooks use:
 
 | Codex event | LCM command | Purpose |
 |---|---|---|
@@ -162,7 +170,7 @@ See [`docs/vscode-codex.md`](docs/vscode-codex.md) for the current VS Code/Codex
 
 ## Hooks
 
-Claude Code uses plugin-managed hooks. All Claude Code hooks auto-heal: each validates that all required entries remain registered and repairs missing entries before continuing. Codex uses native hooks from `.codex/hooks.json`.
+Claude Code uses plugin-managed hooks. All Claude Code hooks auto-heal: each validates that all required entries remain registered and repairs missing entries before continuing. Codex uses native hooks from `~/.codex/hooks.json`.
 
 | Hook | Command | Purpose |
 |---|---|---|
@@ -315,7 +323,7 @@ test/
 
 ## Privacy
 
-All conversation data is stored locally in `~/.lossless-claude/`. Nothing is sent to any lossless-claude server.
+All conversation data is stored locally in `~/.lcm/`. On first startup after upgrading from older releases, lcm automatically migrates an existing `~/.lossless-claude/` directory to `~/.lcm/` when the new directory is absent or does not already contain LCM data. Nothing is sent to any lossless-claude server.
 
 If you configure an external summarizer (`claude-process`, `anthropic`, `openai`, etc.), messages are sent to that provider for summarization — after built-in secret redaction. lossless-claude scrubs common secret patterns (API keys, tokens, passwords) from message content before writing to SQLite and before sending to the summarizer.
 
@@ -329,7 +337,7 @@ Add project-specific patterns with `lcm sensitive add "MY_PATTERN"`. See [docs/p
 
 ## Acknowledgments
 
-This project is a fork of `lossless-claude`, which itself stands on the shoulders of [lossless-claw](https://github.com/Martian-Engineering/lossless-claude), the original implementation by [Martian Engineering](https://martian.engineering). This fork keeps the DAG-based compaction architecture, the LCM memory model, and the foundational design decisions while emphasizing security hardening and broader agent support, explicitly including Codex alongside Claude Code.
+This project is a fork of [lossless-claude](https://github.com/lossless-claude), which itself stands on the shoulders of [lossless-claw](https://github.com/Martian-Engineering/lossless-claw), the original implementation by [Martian Engineering](https://martian.engineering). This fork keeps the DAG-based compaction architecture, the LCM memory model, and the foundational design decisions.
 
 The underlying theory comes from the [LCM paper](https://papers.voltropy.com/LCM) by [Voltropy](https://x.com/Voltropy).
 

@@ -3,6 +3,11 @@ import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { mergeClaudeSettings } from "./installer/settings.js";
 import { loadDaemonConfig } from "./daemon/config.js";
+import {
+  configPath as defaultConfigPath,
+  migrateLegacyHomeIfNeeded,
+  tmpDir as lcmTmpDir,
+} from "./runtime-paths.js";
 
 export interface EnsureCoreDeps {
   configPath: string;
@@ -16,8 +21,9 @@ export interface EnsureCoreDeps {
 }
 
 function defaultDeps(): EnsureCoreDeps {
+  migrateLegacyHomeIfNeeded();
   return {
-    configPath: join(homedir(), ".lossless-claude", "config.json"),
+    configPath: defaultConfigPath(),
     settingsPath: join(homedir(), ".claude", "settings.json"),
     existsSync,
     readFileSync: (p, enc) => readFileSync(p, enc as BufferEncoding),
@@ -32,6 +38,9 @@ function defaultDeps(): EnsureCoreDeps {
 }
 
 export async function ensureCore(deps: EnsureCoreDeps = defaultDeps()): Promise<void> {
+  if (deps.configPath === defaultConfigPath()) {
+    migrateLegacyHomeIfNeeded();
+  }
   // 1. Create config.json with defaults if missing
   if (!deps.existsSync(deps.configPath)) {
     deps.mkdirSync(dirname(deps.configPath), { recursive: true });
@@ -82,7 +91,7 @@ export async function ensureBootstrapped(
   deps: BootstrapDeps = defaultBootstrapDeps(),
 ): Promise<void> {
   const safeId = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
-  const flagDir = join(homedir(), ".lossless-claude", "tmp");
+  const flagDir = lcmTmpDir();
   mkdirSync(flagDir, { recursive: true });
   const flagPath = join(flagDir, `bootstrapped-${safeId}.flag`);
   try {

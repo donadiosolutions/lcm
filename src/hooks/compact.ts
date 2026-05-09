@@ -3,10 +3,11 @@ import { ensureDaemon } from "../daemon/lifecycle.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
+import { daemonPidPath } from "../runtime-paths.js";
 
 export async function handlePreCompact(stdin: string, client: DaemonClient, port?: number): Promise<{ exitCode: number; stdout: string }> {
   const daemonPort = port ?? 3737;
-  const pidFilePath = join(homedir(), ".lossless-claude", "daemon.pid");
+  const pidFilePath = daemonPidPath();
   const { connected } = await ensureDaemon({ port: daemonPort, pidFilePath, spawnTimeoutMs: 5000 });
   if (!connected) return { exitCode: 0, stdout: "" };
 

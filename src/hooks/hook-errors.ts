@@ -5,6 +5,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
+import { lcmPath } from "../runtime-paths.js";
 
 function isUnderDir(candidate: string, base: string): boolean {
   const resolvedCandidate = resolve(candidate);
@@ -21,12 +22,12 @@ export function _setLogPathForTesting(path: string | undefined): void {
 
 /** Returns the log path. */
 export function getLogPath(): string {
-  const defaultPath = join(homedir(), ".lossless-claude", "logs", "events.log");
+  const defaultPath = lcmPath("logs", "events.log");
   if (!testLogPath) return defaultPath;
 
   const resolved = resolve(testLogPath);
   const allowedBases = [
-    join(homedir(), ".lossless-claude", "logs"),
+    lcmPath("logs"),
     tmpdir(),
   ];
   if (!allowedBases.some((base) => isUnderDir(resolved, base))) {
@@ -45,7 +46,7 @@ export function _resetCircuitBreaker(): void {
 /**
  * Three-layer error fence for hook processes.
  * Layer 1: Sidecar DB error_log table (queryable by doctor/stats)
- * Layer 2: Flat file ~/.lossless-claude/logs/events.log
+ * Layer 2: Flat file ~/.lcm/logs/events.log
  * Layer 3: Swallow silently — hooks must never crash
  */
 export function safeLogError(

@@ -1,6 +1,6 @@
 # VS Code and Codex setup
 
-This repository has the shared memory backend needed for VS Code and Codex. Codex now has a native hook connector; GitHub Copilot in VS Code remains skill/rules based.
+This repository has the shared memory backend needed for VS Code and Codex. Codex now has native hooks plus skill and rules connectors; GitHub Copilot in VS Code remains rules based.
 
 ## Install from a repo checkout
 
@@ -35,10 +35,12 @@ lcm connectors install codex
 lcm connectors doctor codex
 ```
 
-This writes native Codex hook configuration:
+This writes the default Codex connector set:
 
-- `.codex/hooks.json`
-- `.codex/config.toml` with `[features].codex_hooks = true`
+- `~/.codex/hooks.json`
+- `~/.codex/config.toml` with `[features].hooks = true`
+- `.codex/skills/lcm-memory/SKILL.md`
+- `~/.codex/AGENTS.md`
 
 The hook connector installs these Codex events:
 
@@ -56,10 +58,11 @@ lcm connectors install codex --global
 lcm connectors doctor codex --global
 ```
 
-If you only want instruction-based guidance instead of native hooks:
+If you only want the Codex skill or rules instead of the default set:
 
 ```bash
 lcm connectors install codex --type skill
+lcm connectors install codex --type rules
 ```
 
 To import existing Codex sessions into LCM:
@@ -82,5 +85,5 @@ lcm import --provider all
 
 1. Add first-class `lcm setup vscode` and `lcm setup codex` commands instead of overloading `lcm install`.
 2. Add TOML read/write support so Codex MCP setup can be automated.
-3. Add a real VS Code runtime adapter for restore, writeback, and prompt-time recall instead of skill-only guidance.
-4. Expand connector diagnostics to validate Codex feature flags and hook event coverage.
+3. Add a real VS Code runtime adapter for restore, writeback, and prompt-time recall instead of rules-only guidance.
+4. Expand connector diagnostics to validate Codex hook event coverage.

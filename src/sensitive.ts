@@ -8,9 +8,10 @@ import { GITLEAKS_PATTERNS } from "./generated-patterns.js";
 import { projectDir } from "./daemon/project.js";
 import { loadDaemonConfig } from "./daemon/config.js";
 import { validateRegex } from "./store/regex-safety.js";
+import { configPath as runtimeConfigPath, projectsDir as runtimeProjectsDir } from "./runtime-paths.js";
 
 function defaultConfigPath(): string {
-  return join(homedir(), ".lossless-claude", "config.json");
+  return runtimeConfigPath();
 }
 
 export async function handleSensitive(
@@ -315,11 +316,8 @@ async function sensitivePurge(
     };
   }
 
-  const { join: pathJoin } = await import("node:path");
-  const { homedir: hd } = await import("node:os");
-
   if (purgeAll) {
-    const allProjectsDir = pathJoin(hd(), ".lossless-claude", "projects");
+    const allProjectsDir = runtimeProjectsDir();
     if (existsSync(allProjectsDir)) {
       rmSync(allProjectsDir, { recursive: true, force: true });
       return {

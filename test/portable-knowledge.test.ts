@@ -36,7 +36,7 @@ function toProjectId(cwd: string): string {
 }
 
 /**
- * Set up a fake ~/.lossless-claude project at `baseDir`
+ * Set up a fake ~/.lcm project at `baseDir`
  * seeded with the given entries, and return the project dir.
  */
 function seedProject(

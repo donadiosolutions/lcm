@@ -87,6 +87,7 @@ When you stumble across a bug while working on something else, **stop and file a
 
 ```bash
 gh issue create \
+  --repo donadiosolutions/lcm \
   --title "Short description of bug" \
   --body "**Observed:** what you saw\n**Expected:** what should happen\n**Root cause:** if known\n**Repro:** steps or code snippet" \
   --label bug

@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "./db/migration.js";
 import type { ProgressState } from "./cli/progress-state.js";
 import { DaemonClient } from "./daemon/client.js";
+import { projectsDir as lcmProjectsDir } from "./runtime-paths.js";
 
 export interface UncompactedConversation {
   projectDir: string;
@@ -17,7 +18,7 @@ export interface UncompactedConversation {
 
 /** Find conversations eligible for compaction, above the token threshold. */
 export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): UncompactedConversation[] {
-  const baseDir = join(homedir(), ".lossless-claude", "projects");
+  const baseDir = lcmProjectsDir();
   if (!existsSync(baseDir)) return [];
 
   const results: UncompactedConversation[] = [];

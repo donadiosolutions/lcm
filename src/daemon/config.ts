@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { lcmPath } from "../runtime-paths.js";
 
 export interface SecurityConfig {
   /** User-defined global regex patterns (plain strings, no /.../ delimiters). */
@@ -50,7 +49,7 @@ export type DaemonConfig = {
 
 const DEFAULTS: DaemonConfig = {
   version: 1,
-  daemon: { port: 3737, socketPath: join(homedir(), ".lossless-claude", "daemon.sock"), logLevel: "info", logMaxSizeMB: 10, logRetentionDays: 7, idleTimeoutMs: 1800000 },
+  daemon: { port: 3737, socketPath: lcmPath("daemon.sock"), logLevel: "info", logMaxSizeMB: 10, logRetentionDays: 7, idleTimeoutMs: 1800000 },
   compaction: {
     leafTokens: 1000, maxDepth: 5, autoCompactMinTokens: 10000,
     promotionThresholds: {

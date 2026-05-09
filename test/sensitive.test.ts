@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 
 // Mutable ref updated in beforeEach — lets the vi.mock factory redirect projectDir
-// into the per-test temp dir so no writes touch the real ~/.lossless-claude/.
+// into the per-test temp dir so no writes touch the real ~/.lcm/.
 const _projectBase = vi.hoisted(() => ({ current: "" }));
 
 vi.mock("../src/daemon/project.js", async () => {

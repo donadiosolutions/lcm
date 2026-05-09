@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { ensureCore } from "../src/bootstrap.js";
+import { lcmHomeDir } from "../src/runtime-paths.js";
 export { REQUIRED_HOOKS, mergeClaudeSettings } from "../src/installer/settings.js";
 
 export interface ServiceDeps {
@@ -176,7 +177,7 @@ export function ensureLcmMd(
 }
 
 export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
-  const lcDir = join(homedir(), ".lossless-claude");
+  const lcDir = lcmHomeDir();
   deps.mkdirSync(lcDir, { recursive: true });
 
   // Clear plugin cache entries for previous versions so stale/corrupted installs don't persist.

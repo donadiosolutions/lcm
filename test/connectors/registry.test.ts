@@ -15,6 +15,12 @@ describe("connector registry", () => {
       expect(CONNECTOR_TYPES).toContain(agent.defaultType);
       expect(agent.supportedTypes.length).toBeGreaterThan(0);
       expect(agent.supportedTypes).toContain(agent.defaultType);
+      if (agent.defaultTypes) {
+        for (const defaultType of agent.defaultTypes) {
+          expect(CONNECTOR_TYPES).toContain(defaultType);
+          expect(agent.supportedTypes).toContain(defaultType);
+        }
+      }
     }
   });
 
@@ -49,6 +55,10 @@ describe("connector registry", () => {
     expect(findAgent("claude-code")?.name).toBe("Claude Code");
     expect(findAgent("Claude Code")?.id).toBe("claude-code");
     expect(findAgent("nonexistent")).toBeUndefined();
+  });
+
+  it("Codex defaults to hooks, skill, and rules", () => {
+    expect(findAgent("codex")?.defaultTypes).toEqual(["hook", "skill", "rules"]);
   });
 
   it("requiresRestart returns false only for rules", () => {

@@ -8,6 +8,7 @@ export interface Agent {
   name: string;
   category: AgentCategory;
   defaultType: ConnectorType;
+  defaultTypes?: ConnectorType[];
   supportedTypes: ConnectorType[];
   configPaths: Partial<Record<ConnectorType, string>>;
   writeMode?: 'append' | 'overwrite'; // default: 'overwrite'

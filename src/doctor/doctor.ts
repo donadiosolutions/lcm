@@ -10,6 +10,7 @@ import { GITLEAKS_PATTERNS } from "../generated-patterns.js";
 import { projectDir } from "../daemon/project.js";
 import { collectEventStats, collectDetailedEventStats } from "../db/events-stats.js";
 import { validateRegex } from "../store/regex-safety.js";
+import { configPath, daemonPidPath } from "../runtime-paths.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -43,10 +44,10 @@ interface DoctorConfig {
 }
 
 function loadConfig(deps: DoctorDeps): DoctorConfig {
-  const configPath = join(deps.homedir, ".lossless-claude", "config.json");
+  const resolvedConfigPath = configPath(deps.homedir);
   let config: Record<string, unknown> = {};
   try {
-    config = JSON.parse(deps.readFileSync(configPath, "utf-8"));
+    config = JSON.parse(deps.readFileSync(resolvedConfigPath, "utf-8"));
   } catch {}
 
   const llm = config.llm as Record<string, string> | undefined;
@@ -143,9 +144,9 @@ function checkPassiveLearning(results: CheckResult[], hooksInstalled: boolean, v
 
   // Error check
   if (stats.errors >= 50) {
-    results.push({ name: "events-errors", category: "Passive Learning", status: "fail", message: `${stats.errors} hook errors (30d) — check ~/.lossless-claude/logs/events.log` });
+    results.push({ name: "events-errors", category: "Passive Learning", status: "fail", message: `${stats.errors} hook errors (30d) — check ~/.lcm/logs/events.log` });
   } else if (stats.errors > 0) {
-    results.push({ name: "events-errors", category: "Passive Learning", status: "warn", message: `${stats.errors} hook errors (30d) — check ~/.lossless-claude/logs/events.log` });
+    results.push({ name: "events-errors", category: "Passive Learning", status: "warn", message: `${stats.errors} hook errors (30d) — check ~/.lcm/logs/events.log` });
   } else {
     results.push({ name: "events-errors", category: "Passive Learning", status: "pass", message: "0 hook errors" });
   }
@@ -207,9 +208,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, verbose = false
   }
 
   // ── 2. config.json ──
-  const configPath = join(deps.homedir, ".lossless-claude", "config.json");
-  if (deps.existsSync(configPath)) {
-    results.push({ name: "config", category: "Stack", status: "pass", message: configPath });
+  const resolvedConfigPath = configPath(deps.homedir);
+  if (deps.existsSync(resolvedConfigPath)) {
+    results.push({ name: "config", category: "Stack", status: "pass", message: resolvedConfigPath });
   } else {
     results.push({ name: "config", category: "Stack", status: "fail", message: `Missing — run: lcm install` });
   }
@@ -227,7 +228,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, verbose = false
   } catch {}
 
   if (daemonHealthy) {
-    const pidFilePath = join(deps.homedir, ".lossless-claude", "daemon.pid");
+    const pidFilePath = daemonPidPath(deps.homedir);
     if (pkgVersion && daemonVersion && daemonVersion !== pkgVersion) {
       // Version mismatch — auto-restart with expectedVersion to kill stale daemon and spawn fresh
       try {
@@ -285,7 +286,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, verbose = false
       const { ensureDaemon } = await import("../daemon/lifecycle.js");
       const { connected } = await ensureDaemon({
         port: config.port,
-        pidFilePath: join(deps.homedir, ".lossless-claude", "daemon.pid"),
+        pidFilePath: daemonPidPath(deps.homedir),
         spawnTimeoutMs: 10000,
       });
       if (connected) {
@@ -460,7 +461,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, verbose = false
   let globalUserPatternCount = 0;
   try {
     const { loadDaemonConfig } = await import("../daemon/config.js");
-    const globalConfigPath = join(deps.homedir, ".lossless-claude", "config.json");
+    const globalConfigPath = configPath(deps.homedir);
     const config = loadDaemonConfig(globalConfigPath);
     globalUserPatternCount = config.security?.sensitivePatterns?.length ?? 0;
   } catch {
