@@ -156,6 +156,50 @@ describe('installConnector — Codex native hooks', () => {
     expect(content).toContain('lcm search');
   });
 
+  it('preserves existing user content when installing Codex rules', () => {
+    const rulesPath = join(tmpDir, '.codex', 'AGENTS.md');
+    mkdirSync(join(tmpDir, '.codex'), { recursive: true });
+    writeFileSync(rulesPath, '# Personal Codex rules\n\nNever overwrite this.\n');
+
+    installConnector('codex', 'rules', tmpDir);
+
+    const content = readFileSync(rulesPath, 'utf-8');
+    expect(content).toContain('# Personal Codex rules');
+    expect(content).toContain('Never overwrite this.');
+    expect(content).toContain(LCM_MARKERS.START);
+    expect(content).toContain(LCM_MARKERS.END);
+    expect(content).toContain('lcm search');
+  });
+
+  it('updates only the marked Codex rules block on reinstall', () => {
+    const rulesPath = join(tmpDir, '.codex', 'AGENTS.md');
+    mkdirSync(join(tmpDir, '.codex'), { recursive: true });
+    writeFileSync(
+      rulesPath,
+      [
+        '# Personal Codex rules',
+        '',
+        'Keep this before.',
+        LCM_MARKERS.START,
+        'old managed content',
+        LCM_MARKERS.END,
+        'Keep this after.',
+        '',
+      ].join('\n'),
+    );
+
+    installConnector('codex', 'rules', tmpDir);
+
+    const content = readFileSync(rulesPath, 'utf-8');
+    const startCount = (content.match(new RegExp(LCM_MARKERS.START.replace(/\\/g, '\\\\').replace(/[[\]]/g, '\\$&'), 'g')) ?? []).length;
+    expect(startCount).toBe(1);
+    expect(content).toContain('# Personal Codex rules');
+    expect(content).toContain('Keep this before.');
+    expect(content).toContain('Keep this after.');
+    expect(content).not.toContain('old managed content');
+    expect(content).toContain('lcm search');
+  });
+
   it('migrates the deprecated codex_hooks feature flag when installing hooks', () => {
     const configPath = join(tmpDir, '.codex', 'config.toml');
     mkdirSync(join(tmpDir, '.codex'), { recursive: true });

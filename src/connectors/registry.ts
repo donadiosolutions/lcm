@@ -29,6 +29,7 @@ export const AGENTS: Agent[] = [
       mcp: '.codex/config.toml',
       skill: '.codex/skills/',
     },
+    writeMode: 'append',
   },
   {
     id: 'gemini-cli',
