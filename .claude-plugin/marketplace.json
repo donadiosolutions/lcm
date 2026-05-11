@@ -12,7 +12,7 @@
         "repo": "donadiosolutions/lcm"
       },
       "description": "Lossless context management — DAG-based summarization that preserves every message",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "strict": true
     }
   ]
