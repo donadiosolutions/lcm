@@ -1,5 +1,11 @@
 # @donadiosolutions/lcm
 
+## 1.0.1
+
+### Patch Changes
+
+- e342a65: Preserve existing user content in Codex AGENTS.md while installing or updating the LCM rules block.
+
 ## 1.0.0
 
 ### Major Changes

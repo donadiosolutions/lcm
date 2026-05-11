@@ -1,6 +1,6 @@
 {
   "name": "lcm",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Lossless context management — DAG-based summarization that preserves every message",
   "author": {
     "name": "Pedro Almeida",
