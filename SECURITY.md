@@ -30,7 +30,11 @@ You may also send a GPG-encrypted report to:
 
 `security@donadio.solutions`
 
-Please encrypt the message to the following subkey:
+Please encrypt the message to the following encryption subkey fingerprint:
+
+`2F7D 25B7 EE28 BC68 3FB8 D106 17EE A4FE 9979 6826`
+
+For convenience, the subkey ID is:
 
 `rsa4096/0x17EEA4FE99796826` <!-- gitleaks:allow -->
 
