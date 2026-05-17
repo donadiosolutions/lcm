@@ -4,7 +4,8 @@ Donadio Solutions takes security reports seriously. If you believe you have foun
 service, package, infrastructure component, or other asset maintained by the Donadio Solutions organization
 (`@donadiosolutions`), please report it privately.
 
-Please **do not open a public GitHub issue** for security vulnerabilities. Humanity has enough unforced errors already.
+Please **do not open a public GitHub issue** for security vulnerabilities. Use one of the private reporting channels
+below instead.
 
 ## Reporting a Vulnerability
 
