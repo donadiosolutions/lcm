@@ -69,9 +69,13 @@ const HELP: Record<string, CommandHelp> = {
 
   doctor: {
     summary: "Run diagnostics — checks daemon health, hooks, MCP server, and summarizer.",
-    usage: "lcm doctor",
+    usage: "lcm doctor [--verbose]",
+    options: [
+      ["--verbose", "Show detailed passive-learning sidecar diagnostics"],
+    ],
     examples: [
       ["lcm doctor", "Run all diagnostic checks"],
+      ["lcm doctor --verbose", "Include per-sidecar passive-learning diagnostics"],
     ],
     notes: "Exits with code 1 if any check fails. Integrate into CI or shell startup for early detection.",
   },
@@ -206,6 +210,22 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm stats", "Summary view across all projects"],
       ["lcm stats -v", "Per-conversation detail"],
     ],
+  },
+
+  events: {
+    summary: "Manage passive-learning sidecar events.",
+    usage: "lcm events promote [--all] [--json]",
+    options: [
+      ["promote", "Promote queued passive-learning events for the current project"],
+      ["promote --all", "Promote queued events from all metadata-backed project sidecars"],
+      ["--json", "Output structured JSON"],
+    ],
+    examples: [
+      ["lcm events promote", "Drain queued passive events for the current project"],
+      ["lcm events promote --all", "Drain stale passive-event sidecars across all known projects"],
+      ["lcm events promote --all --json", "Show per-sidecar promotion results"],
+    ],
+    notes: "Sidecars without project metadata are reported but cannot be mapped back to a cwd automatically.",
   },
 
   diagnose: {
@@ -396,6 +416,7 @@ const GROUPS = [
       { name: "import [--provider ...] [--all] [--verbose] [--dry-run] [--replay]", summary: "Import Claude Code and Codex session transcripts" },
       { name: "promote [--all] [--verbose] [--dry-run]", summary: "Promote insights to long-term memory" },
       { name: "stats [-v]", summary: "Memory inventory and compression ratios" },
+      { name: "events promote [--all] [--json]", summary: "Drain queued passive-learning sidecar events" },
       { name: "diagnose [--all] [--days N] [--verbose] [--json]", summary: "Scan sessions for hook failures and issues" },
     ],
   },
@@ -406,13 +427,6 @@ const GROUPS = [
       { name: "connectors install <agent> [--type ...] [--global]", summary: "Install connector for a coding agent" },
       { name: "connectors remove <agent> [--type ...] [--global]", summary: "Remove connector for a coding agent" },
       { name: "connectors doctor [agent] [--global]", summary: "Check connector health" },
-    ],
-  },
-  {
-    label: "Portable Knowledge",
-    commands: [
-      { name: "export [--all] [--output <file>]", summary: "Export promoted knowledge to JSON (secrets scrubbed)" },
-      { name: "import-knowledge <file>", summary: "Import exported knowledge JSON, deduplicating on merge" },
     ],
   },
   {

@@ -1,27 +1,31 @@
 // src/db/events-stats.ts
-import { readdirSync } from "node:fs";
-import { join } from "node:path";
-import { eventsDir } from "./events-path.js";
-import { EventsDb } from "../hooks/events-db.js";
+import { collectEventSidecars } from "./event-sidecars.js";
 
 export interface EventStats {
   captured: number;
   unprocessed: number;
   errors: number;
+  scanErrors?: number;
   lastCapture: string | null;
+  sidecars?: number;
+  sidecarsWithUnprocessed?: number;
+  orphanedSidecarsWithUnprocessed?: number;
 }
 
 export interface DetailedEventStats extends EventStats {
   projects: Array<{
     file: string;
+    projectId: string;
+    cwd?: string;
+    metadataMissing: boolean;
     captured: number;
     unprocessed: number;
     lastCapture: string | null;
+    path: string;
+    scanError?: string;
   }>;
   recentErrors: Array<{ created_at: string; hook: string; error: string }>;
 }
-
-const MAX_DBS = 50;
 
 /**
  * Scan all sidecar DBs and aggregate event stats.
@@ -29,39 +33,34 @@ const MAX_DBS = 50;
  * @param timeoutMs Total time budget for the scan (default 2000ms)
  */
 export function collectEventStats(timeoutMs = 2000): EventStats {
-  const result: EventStats = { captured: 0, unprocessed: 0, errors: 0, lastCapture: null };
-  const dir = eventsDir();
+  const result: EventStats = {
+    captured: 0,
+    unprocessed: 0,
+    errors: 0,
+    scanErrors: 0,
+    lastCapture: null,
+    sidecars: 0,
+    sidecarsWithUnprocessed: 0,
+    orphanedSidecarsWithUnprocessed: 0,
+  };
 
-  let files: string[];
-  try {
-    files = readdirSync(dir).filter(f => f.endsWith(".db"));
-  } catch {
-    return result; // events dir doesn't exist
-  }
-
-  const deadline = Date.now() + timeoutMs;
-  let scanned = 0;
-
-  for (const file of files) {
-    if (scanned >= MAX_DBS || Date.now() >= deadline) break;
-    try {
-      const db = new EventsDb(join(dir, file));
-      // Override busy_timeout for scan connections (500ms instead of default 5000ms)
-      db.raw().exec("PRAGMA busy_timeout = 500");
-      try {
-        const stats = db.getHealthStats();
-        result.captured += stats.totalEvents;
-        result.unprocessed += stats.unprocessed;
-        result.errors += stats.errors;
-        if (stats.lastCapture && (!result.lastCapture || stats.lastCapture > result.lastCapture)) {
-          result.lastCapture = stats.lastCapture;
-        }
-      } finally {
-        db.close();
+  for (const sidecar of collectEventSidecars({ timeoutMs })) {
+    result.sidecars = (result.sidecars ?? 0) + 1;
+    result.captured += sidecar.captured;
+    result.unprocessed += sidecar.unprocessed;
+    if (sidecar.scanError) {
+      result.scanErrors = (result.scanErrors ?? 0) + 1;
+    } else {
+      result.errors += sidecar.errors;
+    }
+    if (sidecar.unprocessed > 0) {
+      result.sidecarsWithUnprocessed = (result.sidecarsWithUnprocessed ?? 0) + 1;
+      if (sidecar.metadataMissing) {
+        result.orphanedSidecarsWithUnprocessed = (result.orphanedSidecarsWithUnprocessed ?? 0) + 1;
       }
-      scanned++;
-    } catch {
-      scanned++;
+    }
+    if (sidecar.lastCapture && (!result.lastCapture || sidecar.lastCapture > result.lastCapture)) {
+      result.lastCapture = sidecar.lastCapture;
     }
   }
 
@@ -73,52 +72,41 @@ export function collectEventStats(timeoutMs = 2000): EventStats {
  */
 export function collectDetailedEventStats(timeoutMs = 2000): DetailedEventStats {
   const result: DetailedEventStats = {
-    captured: 0, unprocessed: 0, errors: 0, lastCapture: null,
+    captured: 0, unprocessed: 0, errors: 0, scanErrors: 0, lastCapture: null,
+    sidecars: 0, sidecarsWithUnprocessed: 0, orphanedSidecarsWithUnprocessed: 0,
     projects: [], recentErrors: [],
   };
-  const dir = eventsDir();
 
-  let files: string[];
-  try {
-    files = readdirSync(dir).filter(f => f.endsWith(".db"));
-  } catch {
-    return result;
-  }
-
-  const deadline = Date.now() + timeoutMs;
-  let scanned = 0;
-
-  for (const file of files) {
-    if (scanned >= MAX_DBS || Date.now() >= deadline) break;
-    try {
-      const db = new EventsDb(join(dir, file));
-      db.raw().exec("PRAGMA busy_timeout = 500");
-      try {
-        const stats = db.getHealthStats();
-        result.captured += stats.totalEvents;
-        result.unprocessed += stats.unprocessed;
-        result.errors += stats.errors;
-        if (stats.lastCapture && (!result.lastCapture || stats.lastCapture > result.lastCapture)) {
-          result.lastCapture = stats.lastCapture;
-        }
-        result.projects.push({
-          file,
-          captured: stats.totalEvents,
-          unprocessed: stats.unprocessed,
-          lastCapture: stats.lastCapture,
-        });
-        // Collect recent errors for verbose display (exclude maintenance/pruning entries)
-        const errors = db.raw().prepare(
-          "SELECT created_at, hook, error FROM error_log WHERE hook NOT LIKE 'maintenance:%' ORDER BY id DESC LIMIT 5"
-        ).all() as Array<{ created_at: string; hook: string; error: string }>;
-        result.recentErrors.push(...errors);
-      } finally {
-        db.close();
-      }
-      scanned++;
-    } catch {
-      scanned++;
+  for (const sidecar of collectEventSidecars({ timeoutMs, includeRecentErrors: true })) {
+    result.sidecars = (result.sidecars ?? 0) + 1;
+    result.captured += sidecar.captured;
+    result.unprocessed += sidecar.unprocessed;
+    if (sidecar.scanError) {
+      result.scanErrors = (result.scanErrors ?? 0) + 1;
+    } else {
+      result.errors += sidecar.errors;
     }
+    if (sidecar.unprocessed > 0) {
+      result.sidecarsWithUnprocessed = (result.sidecarsWithUnprocessed ?? 0) + 1;
+      if (sidecar.metadataMissing) {
+        result.orphanedSidecarsWithUnprocessed = (result.orphanedSidecarsWithUnprocessed ?? 0) + 1;
+      }
+    }
+    if (sidecar.lastCapture && (!result.lastCapture || sidecar.lastCapture > result.lastCapture)) {
+      result.lastCapture = sidecar.lastCapture;
+    }
+    result.projects.push({
+      file: sidecar.file,
+      projectId: sidecar.projectId,
+      cwd: sidecar.cwd,
+      metadataMissing: sidecar.metadataMissing,
+      captured: sidecar.captured,
+      unprocessed: sidecar.unprocessed,
+      lastCapture: sidecar.lastCapture,
+      path: sidecar.path,
+      scanError: sidecar.scanError,
+    });
+    result.recentErrors.push(...(sidecar.recentErrors ?? []));
   }
 
   // Sort and limit recent errors across all DBs

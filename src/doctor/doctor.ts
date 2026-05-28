@@ -128,7 +128,7 @@ function formatTimeAgo(date: Date): string {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-function checkPassiveLearning(results: CheckResult[], hooksInstalled: boolean, verbose: boolean): void {
+function checkPassiveLearning(results: CheckResult[], hooksInstalled: boolean, verbose: boolean, daemonHealthy: boolean): void {
   if (!hooksInstalled) return;
 
   const stats = verbose ? collectDetailedEventStats(2000) : collectEventStats(2000);
@@ -137,7 +137,25 @@ function checkPassiveLearning(results: CheckResult[], hooksInstalled: boolean, v
   if (stats.captured === 0) {
     results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: "No events captured — passive learning may not be active\n     Fix: run 'lcm install' to re-register hooks, then use a Bash or Edit tool to trigger the first event capture; re-run /lcm-doctor to verify" });
   } else if (stats.unprocessed > 1000) {
-    results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed) — daemon may be offline — run: lcm daemon start` });
+    const sidecarCount = stats.sidecarsWithUnprocessed ?? 0;
+    const orphanCount = stats.orphanedSidecarsWithUnprocessed ?? 0;
+    if (daemonHealthy) {
+      const scope = sidecarCount > 0
+        ? ` across ${sidecarCount} project sidecar${sidecarCount === 1 ? "" : "s"}`
+        : "";
+      const orphanNote = orphanCount > 0
+        ? `; ${orphanCount} sidecar${orphanCount === 1 ? "" : "s"} missing metadata`
+        : "";
+      if (orphanCount > 0 && orphanCount === sidecarCount) {
+        results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — project metadata is missing; lcm events promote --all can only report orphaned sidecars — remove stale orphan sidecars or trigger new activity after lcm install` });
+      } else if (orphanCount > 0) {
+        results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — daemon is up — run: lcm events promote --all for metadata-backed sidecars; orphaned sidecars need metadata repair or pruning` });
+      } else {
+        results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — daemon is up — run: lcm events promote --all` });
+      }
+    } else {
+      results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed) — daemon may be offline — run: lcm daemon start` });
+    }
   } else {
     results.push({ name: "events-capture", category: "Passive Learning", status: "pass", message: `${stats.captured} events captured (${stats.unprocessed} unprocessed)` });
   }
@@ -149,6 +167,10 @@ function checkPassiveLearning(results: CheckResult[], hooksInstalled: boolean, v
     results.push({ name: "events-errors", category: "Passive Learning", status: "warn", message: `${stats.errors} hook errors (30d) — check ~/.lcm/logs/events.log` });
   } else {
     results.push({ name: "events-errors", category: "Passive Learning", status: "pass", message: "0 hook errors" });
+  }
+
+  if ((stats.scanErrors ?? 0) > 0) {
+    results.push({ name: "events-sidecar-scan", category: "Passive Learning", status: "warn", message: `${stats.scanErrors} sidecar${stats.scanErrors === 1 ? "" : "s"} failed to scan — run lcm doctor --verbose to identify the affected .db file${stats.scanErrors === 1 ? "" : "s"}` });
   }
 
   // Staleness check
@@ -170,8 +192,13 @@ function checkPassiveLearning(results: CheckResult[], hooksInstalled: boolean, v
   if (verbose && "projects" in stats) {
     const detailed = stats as import("../db/events-stats.js").DetailedEventStats;
     for (const p of detailed.projects) {
+      if (p.scanError) {
+        results.push({ name: `events-project-${p.file}`, category: "Passive Learning", status: "warn", message: `${p.file.slice(0, 8)}… scan failed: ${p.scanError} — ${p.path}` });
+        continue;
+      }
       const ago = p.lastCapture ? formatTimeAgo(new Date(`${p.lastCapture.replace(" ", "T")}Z`)) : "never";
-      results.push({ name: `events-project-${p.file}`, category: "Passive Learning", status: "pass", message: `${p.file.slice(0, 8)}… ${p.captured} events (${p.unprocessed} unprocessed) last: ${ago}` });
+      const projectLabel = p.cwd ?? (p.metadataMissing ? "metadata missing" : p.projectId);
+      results.push({ name: `events-project-${p.file}`, category: "Passive Learning", status: "pass", message: `${p.file.slice(0, 8)}… ${p.captured} events (${p.unprocessed} unprocessed) last: ${ago} — ${projectLabel}` });
     }
     if (detailed.recentErrors.length > 0) {
       const errorLines = detailed.recentErrors.map(e => `  ${e.created_at} ${e.hook}: ${e.error}`).join("\n");
@@ -274,6 +301,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, verbose = false
           daemonHealthy = false;
         }
       } catch {
+        daemonHealthy = false;
         results.push({ name: "daemon", category: "Daemon", status: "warn",
           message: `localhost:${config.port} — version mismatch (v${daemonVersion} running, v${pkgVersion} installed)\n     Fix: lcm daemon restart` });
       }
@@ -291,6 +319,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, verbose = false
       });
       if (connected) {
         results.push({ name: "daemon", category: "Daemon", status: "warn", message: `localhost:${config.port} — started`, fixApplied: true });
+        daemonHealthy = true;
       } else {
         results.push({ name: "daemon", category: "Daemon", status: "fail", message: `localhost:${config.port} not responding\n     Fix: lcm daemon start` });
       }
@@ -502,7 +531,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, verbose = false
   const hooksInstalled = results.some(
     r => r.category === "Settings" && r.name === "hooks" && r.status !== "fail"
   );
-  checkPassiveLearning(results, hooksInstalled, verbose);
+  checkPassiveLearning(results, hooksInstalled, verbose, daemonHealthy);
 
   return results;
 }

@@ -11,6 +11,16 @@ type PromptSearchResponse = {
   ids?: string[];
 };
 
+function resolveHookCwd(inputCwd: unknown): string {
+  const cwd = typeof inputCwd === "string" ? inputCwd.trim() : "";
+  const envCwd = typeof process.env.CLAUDE_PROJECT_DIR === "string"
+    ? process.env.CLAUDE_PROJECT_DIR.trim()
+    : "";
+  if (cwd.length > 0) return cwd;
+  if (envCwd.length > 0) return envCwd;
+  return process.cwd();
+}
+
 const LEARNING_INSTRUCTION = `<learning-instruction>
 When you recognize a durable insight, call lcm_store immediately:
 - decision: architectural/design choice with trade-offs
@@ -43,18 +53,20 @@ export async function handleUserPromptSubmit(
     if (!input.prompt || typeof input.prompt !== "string" || !input.prompt.trim()) {
       return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
     }
+    const cwd = resolveHookCwd(input.cwd);
 
     // Sidecar event extraction — must happen before prompt-search, must never throw
     try {
       const { extractUserPromptEvents } = await import("./extractors.js");
       const { EventsDb } = await import("./events-db.js");
       const { eventsDbPath } = await import("../db/events-path.js");
+      const { ensureProjectDir } = await import("../daemon/project.js");
 
       const prompt = String(input.prompt ?? "");
       const events = extractUserPromptEvents(prompt);
 
       if (events.length > 0 && input.session_id && typeof input.session_id === "string") {
-        const cwd = input.cwd ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
+        ensureProjectDir(cwd);
         const db = new EventsDb(eventsDbPath(cwd));
         try {
           for (const event of events) {
@@ -73,7 +85,7 @@ export async function handleUserPromptSubmit(
 
     const result = await client.post<PromptSearchResponse>("/prompt-search", {
       query: input.prompt,
-      cwd: input.cwd,
+      cwd,
       session_id: input.session_id,
       learningInstructionBytes: Buffer.byteLength(LEARNING_INSTRUCTION, "utf8"),
     });

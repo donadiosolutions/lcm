@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { runDoctor } from "../../src/doctor/doctor.js";
 import { REQUIRED_HOOKS } from "../../installer/install.js";
 import { LCM_MD_CONTENT } from "../../src/daemon/orientation.js";
@@ -13,8 +13,16 @@ vi.mock("../../src/db/events-stats.js", () => ({
   collectDetailedEventStats: vi.fn().mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null, projects: [], recentErrors: [] }),
 }));
 
-import { collectEventStats } from "../../src/db/events-stats.js";
+import { collectDetailedEventStats, collectEventStats } from "../../src/db/events-stats.js";
 const mockCollectEventStats = vi.mocked(collectEventStats);
+const mockCollectDetailedEventStats = vi.mocked(collectDetailedEventStats);
+
+beforeEach(() => {
+  vi.mocked(ensureDaemon).mockReset();
+  vi.mocked(ensureDaemon).mockResolvedValue({ connected: false });
+  mockCollectEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null });
+  mockCollectDetailedEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null, projects: [], recentErrors: [] });
+});
 
 function buildSettingsJson(): string {
   const hooks: Record<string, unknown[]> = {};
@@ -158,6 +166,32 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.status).toBe("warn");
     expect(daemonResult?.message).toContain("did not fix mismatch");
   });
+
+  it("does not recommend event promotion when a stale daemon restart throws", async () => {
+    const pkgVersion = "0.6.0";
+    const daemonVersion = "0.5.0";
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(new Error("restart failed"));
+    mockCollectEventStats.mockReturnValue({ captured: 5000, unprocessed: 2000, errors: 0, lastCapture: "2026-03-26 10:00:00", sidecarsWithUnprocessed: 1 });
+
+    const deps = minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      readFileSync: (path: string) => {
+        if (path.endsWith("config.json")) return "{}";
+        if (path.endsWith("settings.json")) return buildSettingsJson();
+        if (path.endsWith("package.json")) return JSON.stringify({ version: pkgVersion });
+        if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
+        if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
+        return "{}";
+      },
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: daemonVersion }) }),
+    });
+
+    const results = await runDoctor(deps);
+    const capture = results.find((r) => r.name === "events-capture");
+
+    expect(capture?.message).toContain("daemon may be offline");
+    expect(capture?.message).not.toContain("lcm events promote --all");
+  });
 });
 
 describe("runDoctor summarizer modes", () => {
@@ -214,7 +248,10 @@ describe("Passive Learning checks", () => {
 
   it("warns when hooks installed but no events captured", async () => {
     mockCollectEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null });
-    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/test-proj",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    }));
     const capture = results.find(r => r.name === "events-capture");
     expect(capture?.status).toBe("warn");
     expect(capture?.message).toContain("No events captured");
@@ -222,17 +259,61 @@ describe("Passive Learning checks", () => {
 
   it("passes when events exist and unprocessed is low", async () => {
     mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, lastCapture: "2026-03-26 10:00:00" });
-    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/test-proj",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    }));
     const capture = results.find(r => r.name === "events-capture");
     expect(capture?.status).toBe("pass");
   });
 
   it("warns when unprocessed > 1000", async () => {
     mockCollectEventStats.mockReturnValue({ captured: 5000, unprocessed: 2000, errors: 0, lastCapture: "2026-03-26 10:00:00" });
-    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/test-proj",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    }));
     const capture = results.find(r => r.name === "events-capture");
     expect(capture?.status).toBe("warn");
     expect(capture?.message).toContain("unprocessed");
+  });
+
+  it("does not recommend global drain when every queued sidecar is orphaned", async () => {
+    mockCollectEventStats.mockReturnValue({
+      captured: 5000,
+      unprocessed: 2000,
+      errors: 0,
+      lastCapture: "2026-03-26 10:00:00",
+      sidecarsWithUnprocessed: 2,
+      orphanedSidecarsWithUnprocessed: 2,
+    });
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/test-proj",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    }));
+    const capture = results.find(r => r.name === "events-capture");
+    expect(capture?.status).toBe("warn");
+    expect(capture?.message).toContain("project metadata is missing");
+    expect(capture?.message).not.toContain("run: lcm events promote --all");
+  });
+
+  it("keeps global drain advice scoped when only some queued sidecars are orphaned", async () => {
+    mockCollectEventStats.mockReturnValue({
+      captured: 5000,
+      unprocessed: 2000,
+      errors: 0,
+      lastCapture: "2026-03-26 10:00:00",
+      sidecarsWithUnprocessed: 3,
+      orphanedSidecarsWithUnprocessed: 1,
+    });
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/test-proj",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    }));
+    const capture = results.find(r => r.name === "events-capture");
+    expect(capture?.status).toBe("warn");
+    expect(capture?.message).toContain("run: lcm events promote --all for metadata-backed sidecars");
+    expect(capture?.message).toContain("orphaned sidecars need metadata repair or pruning");
   });
 
   it("fails when errors >= 50", async () => {
@@ -247,6 +328,42 @@ describe("Passive Learning checks", () => {
     const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
     const errors = results.find(r => r.name === "events-errors");
     expect(errors?.status).toBe("pass");
+  });
+
+  it("warns separately for sidecar scan failures", async () => {
+    mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, scanErrors: 1, lastCapture: "2026-03-26 10:00:00" });
+    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
+    const hookErrors = results.find(r => r.name === "events-errors");
+    const scanErrors = results.find(r => r.name === "events-sidecar-scan");
+    expect(hookErrors?.status).toBe("pass");
+    expect(scanErrors?.status).toBe("warn");
+    expect(scanErrors?.message).toContain("run lcm doctor --verbose");
+  });
+
+  it("shows scan failure paths in verbose project output", async () => {
+    mockCollectDetailedEventStats.mockReturnValue({
+      captured: 0,
+      unprocessed: 0,
+      errors: 0,
+      scanErrors: 1,
+      lastCapture: null,
+      projects: [{
+        file: "corrupt.db",
+        projectId: "corrupt",
+        metadataMissing: true,
+        captured: 0,
+        unprocessed: 0,
+        lastCapture: null,
+        path: "/tmp/lcm-events/corrupt.db",
+        scanError: "database disk image is malformed",
+      }],
+      recentErrors: [],
+    });
+    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }), true);
+    const project = results.find(r => r.name === "events-project-corrupt.db");
+    expect(project?.status).toBe("warn");
+    expect(project?.message).toContain("database disk image is malformed");
+    expect(project?.message).toContain("/tmp/lcm-events/corrupt.db");
   });
 
   it("passes staleness when last capture is recent", async () => {

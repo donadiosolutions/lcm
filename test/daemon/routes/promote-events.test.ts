@@ -1,17 +1,22 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { EventsDb } from "../../../src/hooks/events-db.js";
-import { createPromoteEventsHandler } from "../../../src/daemon/routes/promote-events.js";
-import { projectDbPath } from "../../../src/daemon/project.js";
+import { createPromoteAllEventsHandler, createPromoteEventsHandler } from "../../../src/daemon/routes/promote-events.js";
+import { ensureProjectDir, projectDbPath, projectId } from "../../../src/daemon/project.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
+
+const eventPathMocks = vi.hoisted(() => ({
+  eventsDir: vi.fn(),
+}));
 
 // Mock eventsDbPath to point at our temp dir
 vi.mock("../../../src/db/events-path.js", () => ({
   eventsDbPath: vi.fn(),
+  eventsDir: eventPathMocks.eventsDir,
 }));
 
 // Mock deduplicateAndInsert to track calls without needing real FTS5
@@ -75,17 +80,34 @@ function setupProjectDb(cwd: string): DatabaseSync {
 
 describe("promote-events route", () => {
   let dir: string;
+  let homeDir: string;
   let sidecarPath: string;
+  let extraDirs: string[];
+  let originalHome: string | undefined;
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "promote-events-test-"));
+    homeDir = mkdtempSync(join(tmpdir(), "promote-events-home-"));
+    originalHome = process.env.HOME;
+    process.env.HOME = homeDir;
     sidecarPath = join(dir, "events.db");
+    extraDirs = [];
+    eventPathMocks.eventsDir.mockReturnValue(dir);
     vi.mocked(eventsDbPath).mockReturnValue(sidecarPath);
     vi.mocked(deduplicateAndInsert).mockClear();
   });
 
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(homeDir, { recursive: true, force: true });
+    for (const extraDir of extraDirs) {
+      rmSync(extraDir, { recursive: true, force: true });
+    }
+    if (originalHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
+    }
     vi.clearAllMocks();
   });
 
@@ -226,5 +248,160 @@ describe("promote-events route", () => {
 
     expect(res.writeHead).toHaveBeenCalledWith(400, expect.any(Object));
     expect(getBody().error).toBe("cwd is required");
+  });
+
+  it("promotes metadata-backed sidecars across all projects", async () => {
+    const projectCwd = mkdtempSync(join(tmpdir(), "promote-all-project-"));
+    extraDirs.push(projectCwd);
+    const projectSidecarPath = join(dir, `${projectId(projectCwd)}.db`);
+    ensureProjectDir(projectCwd);
+    vi.mocked(eventsDbPath).mockImplementation((cwd: string) =>
+      cwd === projectCwd ? projectSidecarPath : sidecarPath
+    );
+
+    const edb = new EventsDb(projectSidecarPath);
+    edb.insertEvent("s1", { type: "decision", category: "decision", data: "promote globally", priority: 1 }, "PostToolUse");
+    edb.close();
+
+    const db = setupProjectDb(projectCwd);
+    db.close();
+
+    const handler = createPromoteAllEventsHandler(makeConfig());
+    const { res, getBody } = mockRes();
+    await handler({} as any, res, "");
+
+    const result = getBody();
+    expect(result.scanned).toBe(1);
+    expect(result.sidecarsWithUnprocessed).toBe(1);
+    expect(result.promoted).toBe(1);
+    expect(result.processedProjects).toBe(1);
+    expect(result.orphanedProjects).toBe(0);
+    expect(result.projects[0].cwd).toBe(projectCwd);
+  });
+
+  it("drains the sidecar path found during the scan", async () => {
+    const projectCwd = mkdtempSync(join(tmpdir(), "promote-all-scanned-sidecar-"));
+    extraDirs.push(projectCwd);
+    const scannedSidecarPath = join(dir, `${projectId(projectCwd)}.db`);
+    const recomputedSidecarPath = join(dir, "recomputed.db");
+    ensureProjectDir(projectCwd);
+    vi.mocked(eventsDbPath).mockImplementation((cwd: string) =>
+      cwd === projectCwd ? recomputedSidecarPath : sidecarPath
+    );
+
+    const edb = new EventsDb(scannedSidecarPath);
+    edb.insertEvent("s1", { type: "decision", category: "decision", data: "use scanned sidecar", priority: 1 }, "PostToolUse");
+    edb.close();
+
+    const db = setupProjectDb(projectCwd);
+    db.close();
+
+    const handler = createPromoteAllEventsHandler(makeConfig());
+    const { res, getBody } = mockRes();
+    await handler({} as any, res, "");
+
+    const result = getBody();
+    expect(result.promoted).toBe(1);
+    const remainingDb = new EventsDb(scannedSidecarPath);
+    const remaining = remainingDb.getUnprocessed();
+    remainingDb.close();
+    expect(remaining).toHaveLength(0);
+    expect(existsSync(recomputedSidecarPath)).toBe(false);
+  });
+
+  it("drains every batch from metadata-backed sidecars during global promotion", async () => {
+    const projectCwd = mkdtempSync(join(tmpdir(), "promote-all-large-project-"));
+    extraDirs.push(projectCwd);
+    const projectSidecarPath = join(dir, `${projectId(projectCwd)}.db`);
+    ensureProjectDir(projectCwd);
+    vi.mocked(eventsDbPath).mockImplementation((cwd: string) =>
+      cwd === projectCwd ? projectSidecarPath : sidecarPath
+    );
+
+    const edb = new EventsDb(projectSidecarPath);
+    // 501 events exceeds the default 500-event sidecar fetch batch.
+    for (let i = 0; i < 501; i++) {
+      edb.insertEvent("s1", { type: "decision", category: "decision", data: `global backlog ${i}`, priority: 1 }, "PostToolUse");
+    }
+    edb.close();
+
+    const db = setupProjectDb(projectCwd);
+    db.close();
+
+    const handler = createPromoteAllEventsHandler(makeConfig());
+    const { res, getBody } = mockRes();
+    await handler({} as any, res, "");
+
+    const result = getBody();
+    expect(result.promoted).toBe(501);
+    expect(result.projects).toHaveLength(1);
+    expect(result.projects[0].batches).toBe(2);
+    expect(result.projects[0].message).toBe("drained all unprocessed events");
+    expect(deduplicateAndInsert).toHaveBeenCalledTimes(501);
+
+    const remainingDb = new EventsDb(projectSidecarPath);
+    const remaining = remainingDb.getUnprocessed();
+    remainingDb.close();
+    expect(remaining).toHaveLength(0);
+  });
+
+  it("drains every batch from the current project when requested", async () => {
+    const edb = new EventsDb(sidecarPath);
+    // 501 events exceeds the default 500-event sidecar fetch batch.
+    for (let i = 0; i < 501; i++) {
+      edb.insertEvent("s1", { type: "decision", category: "decision", data: `current backlog ${i}`, priority: 1 }, "PostToolUse");
+    }
+    edb.close();
+
+    const db = setupProjectDb(dir);
+    db.close();
+
+    const handler = createPromoteEventsHandler(makeConfig());
+    const { res, getBody } = mockRes();
+    await handler({} as any, res, JSON.stringify({ cwd: dir, drain: true }));
+
+    const result = getBody();
+    expect(result.promoted).toBe(501);
+    expect(result.batches).toBe(2);
+    expect(result.message).toBe("drained all unprocessed events");
+    expect(deduplicateAndInsert).toHaveBeenCalledTimes(501);
+
+    const remainingDb = new EventsDb(sidecarPath);
+    const remaining = remainingDb.getUnprocessed();
+    remainingDb.close();
+    expect(remaining).toHaveLength(0);
+  });
+
+  it("reports orphan sidecars during global promotion", async () => {
+    const orphanPath = join(dir, "orphan.db");
+    const edb = new EventsDb(orphanPath);
+    edb.insertEvent("s1", { type: "decision", category: "decision", data: "orphan", priority: 1 }, "PostToolUse");
+    edb.close();
+
+    const handler = createPromoteAllEventsHandler(makeConfig());
+    const { res, getBody } = mockRes();
+    await handler({} as any, res, "");
+
+    const result = getBody();
+    expect(result.promoted).toBe(0);
+    expect(result.orphanedProjects).toBe(1);
+    expect(result.projects).toHaveLength(1);
+    expect(result.projects[0].metadataMissing).toBe(true);
+    expect(result.projects[0].message).toBe("missing project metadata");
+  });
+
+  it("reports unreadable sidecars during global promotion", async () => {
+    writeFileSync(join(dir, "corrupt.db"), "not a sqlite database");
+
+    const handler = createPromoteAllEventsHandler(makeConfig());
+    const { res, getBody } = mockRes();
+    await handler({} as any, res, "");
+
+    const result = getBody();
+    expect(result.scanned).toBe(1);
+    expect(result.failedProjects).toBe(1);
+    expect(result.errors).toBe(1);
+    expect(result.projects).toHaveLength(1);
+    expect(result.projects[0].message).toBe("failed to scan sidecar");
   });
 });

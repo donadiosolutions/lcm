@@ -4,7 +4,18 @@ import { EventsDb } from "./events-db.js";
 import { eventsDbPath } from "../db/events-path.js";
 import { firePromoteEventsRequest } from "./session-end.js";
 import { safeLogError } from "./hook-errors.js";
+import { ensureProjectDir } from "../daemon/project.js";
 
+
+function resolveHookCwd(inputCwd: unknown): string {
+  const cwd = typeof inputCwd === "string" ? inputCwd.trim() : "";
+  const envCwd = typeof process.env.CLAUDE_PROJECT_DIR === "string"
+    ? process.env.CLAUDE_PROJECT_DIR.trim()
+    : "";
+  if (cwd.length > 0) return cwd;
+  if (envCwd.length > 0) return envCwd;
+  return process.cwd();
+}
 
 export async function handlePostToolUse(
   stdin: string,
@@ -19,8 +30,10 @@ export async function handlePostToolUse(
     const events = extractPostToolEvents({ tool_name, tool_input: tool_input ?? {}, tool_response, tool_output });
     if (events.length === 0) return { exitCode: 0, stdout: "" };
 
-    cwd = input.cwd ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
-    const dbPath = eventsDbPath(cwd as string);
+    const resolvedCwd = resolveHookCwd(input.cwd);
+    cwd = resolvedCwd;
+    ensureProjectDir(resolvedCwd);
+    const dbPath = eventsDbPath(resolvedCwd);
     const db = new EventsDb(dbPath);
 
     try {
@@ -35,7 +48,7 @@ export async function handlePostToolUse(
       const hasPriority1 = events.some(e => e.priority === 1);
       if (hasPriority1) {
         const port = input.daemon_port ?? 3737;
-        firePromoteEventsRequest(port, { cwd });
+        firePromoteEventsRequest(port, { cwd: resolvedCwd });
       }
     } finally {
       db.close();
