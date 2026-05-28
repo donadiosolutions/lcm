@@ -763,7 +763,7 @@ async function main() {
       const client = await createDaemonClientOrExit();
       const result = all
         ? await client.post<any>("/promote-events/all", {})
-        : await client.post<any>("/promote-events", { cwd: process.cwd() });
+        : await client.post<any>("/promote-events", { cwd: process.cwd(), drain: true });
 
       if (jsonFlag) {
         stdout.write(JSON.stringify(result, null, 2) + "\n");
@@ -777,6 +777,9 @@ async function main() {
         }
       } else {
         console.log(`Promoted ${result.promoted} passive event${result.promoted === 1 ? "" : "s"} (${result.skipped} skipped, ${result.errors} errors).`);
+        if (typeof result.batches === "number" && result.batches > 1) {
+          console.log(`Drained ${result.batches} batches.`);
+        }
         if (result.message) console.log(result.message);
       }
     });

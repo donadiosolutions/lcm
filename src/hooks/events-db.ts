@@ -42,6 +42,7 @@ export interface PatternReinforcementStats {
 }
 
 const SCHEMA_VERSION = 3;
+export const EVENTS_UNPROCESSED_BATCH_LIMIT = 500;
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -174,7 +175,7 @@ export class EventsDb {
     return Number(result.lastInsertRowid);
   }
 
-  getUnprocessed(limit = 500): EventRow[] {
+  getUnprocessed(limit = EVENTS_UNPROCESSED_BATCH_LIMIT): EventRow[] {
     return this.db.prepare(
       "SELECT * FROM events WHERE processed_at IS NULL ORDER BY session_id, seq LIMIT ?"
     ).all(limit) as unknown as EventRow[];

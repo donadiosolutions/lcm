@@ -14,11 +14,14 @@ export interface EventSidecarSummary {
   unprocessed: number;
   errors: number;
   lastCapture: string | null;
+  recentErrors?: Array<{ created_at: string; hook: string; error: string }>;
+  scanError?: string;
 }
 
 export interface EventSidecarScanOptions {
   timeoutMs?: number;
   maxDbs?: number;
+  includeRecentErrors?: boolean;
 }
 
 const DEFAULT_TIMEOUT_MS = 2000;
@@ -65,6 +68,11 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
       try {
         const stats = db.getHealthStats();
         const cwd = readCwdForProject(projectId);
+        const recentErrors = options.includeRecentErrors
+          ? db.raw().prepare(
+            "SELECT created_at, hook, error FROM error_log WHERE hook NOT LIKE 'maintenance:%' ORDER BY id DESC LIMIT 5"
+          ).all() as Array<{ created_at: string; hook: string; error: string }>
+          : undefined;
         sidecars.push({
           file,
           projectId,
@@ -75,12 +83,25 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
           unprocessed: stats.unprocessed,
           errors: stats.errors,
           lastCapture: stats.lastCapture,
+          recentErrors,
         });
       } finally {
         db.close();
       }
-    } catch {
-      // Corrupt or locked sidecars should not break global diagnostics.
+    } catch (error) {
+      const cwd = readCwdForProject(projectId);
+      sidecars.push({
+        file,
+        projectId,
+        path,
+        cwd,
+        metadataMissing: cwd === undefined,
+        captured: 0,
+        unprocessed: 0,
+        errors: 1,
+        lastCapture: null,
+        scanError: error instanceof Error ? error.message : "failed to scan sidecar",
+      });
     }
   }
 

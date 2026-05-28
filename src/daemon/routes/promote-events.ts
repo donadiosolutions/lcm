@@ -22,7 +22,6 @@ const AUTO_TAGS: Record<string, string> = {
 };
 
 const CORRELATION_WINDOW = 20;
-const PROMOTE_EVENTS_BATCH_SIZE = 500;
 const MAX_GLOBAL_PROMOTION_BATCHES = 10_000;
 const MIN_REINFORCED_PATTERN_OCCURRENCES = 3;
 const MIN_REINFORCED_PATTERN_SESSIONS = 2;
@@ -48,6 +47,7 @@ interface PromoteAllProjectResult extends PromoteResult {
 
 interface PromoteAllResult extends PromoteResult {
   scanned: number;
+  sidecarsWithUnprocessed: number;
   processedProjects: number;
   orphanedProjects: number;
   failedProjects: number;
@@ -119,7 +119,9 @@ export function createPromoteEventsHandler(config: DaemonConfig): RouteHandler {
     }
 
     try {
-      const result = await promoteEventsForCwd(config, cwd);
+      const result = input.drain === true
+        ? await drainEventsForCwd(config, cwd)
+        : await promoteEventsForCwd(config, cwd);
       sendJson(res, 200, result);
     } catch (error) {
       // Log detailed failure but avoid exposing internal error/stack info to the client
@@ -139,17 +141,38 @@ export function createPromoteAllEventsHandler(config: DaemonConfig): RouteHandle
         correlated: 0,
         errors: 0,
         scanned: 0,
+        sidecarsWithUnprocessed: 0,
         processedProjects: 0,
         orphanedProjects: 0,
         failedProjects: 0,
         projects: [],
       };
 
-      const sidecars = collectEventSidecars({ timeoutMs: 30_000, maxDbs: Number.MAX_SAFE_INTEGER })
-        .filter(sidecar => sidecar.unprocessed > 0);
+      const sidecars = collectEventSidecars({ timeoutMs: 30_000, maxDbs: Number.MAX_SAFE_INTEGER });
       result.scanned = sidecars.length;
+      result.sidecarsWithUnprocessed = sidecars.filter(sidecar => sidecar.unprocessed > 0).length;
 
       for (const sidecar of sidecars) {
+        if (sidecar.scanError) {
+          result.errors++;
+          result.failedProjects++;
+          result.projects.push({
+            projectId: sidecar.projectId,
+            cwd: sidecar.cwd,
+            unprocessedBefore: sidecar.unprocessed,
+            metadataMissing: sidecar.metadataMissing,
+            promoted: 0,
+            skipped: 0,
+            correlated: 0,
+            errors: 1,
+            batches: 0,
+            message: "failed to scan sidecar",
+          });
+          continue;
+        }
+
+        if (sidecar.unprocessed === 0) continue;
+
         if (!sidecar.cwd) {
           result.orphanedProjects++;
           result.projects.push({
@@ -234,11 +257,6 @@ async function drainEventsForCwd(config: DaemonConfig, cwd: string): Promise<Pro
     if (processed === 0) {
       result.incomplete = true;
       result.message = "stopped because remaining events failed to promote";
-      return result;
-    }
-
-    if (processed < PROMOTE_EVENTS_BATCH_SIZE && batchResult.errors === 0) {
-      result.message = "drained all unprocessed events";
       return result;
     }
   }

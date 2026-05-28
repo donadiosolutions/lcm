@@ -1,6 +1,5 @@
 // src/db/events-stats.ts
 import { collectEventSidecars } from "./event-sidecars.js";
-import { EventsDb } from "../hooks/events-db.js";
 
 export interface EventStats {
   captured: number;
@@ -70,7 +69,7 @@ export function collectDetailedEventStats(timeoutMs = 2000): DetailedEventStats 
     projects: [], recentErrors: [],
   };
 
-  for (const sidecar of collectEventSidecars({ timeoutMs })) {
+  for (const sidecar of collectEventSidecars({ timeoutMs, includeRecentErrors: true })) {
     result.sidecars = (result.sidecars ?? 0) + 1;
     result.captured += sidecar.captured;
     result.unprocessed += sidecar.unprocessed;
@@ -93,21 +92,7 @@ export function collectDetailedEventStats(timeoutMs = 2000): DetailedEventStats 
       unprocessed: sidecar.unprocessed,
       lastCapture: sidecar.lastCapture,
     });
-    try {
-      const db = new EventsDb(sidecar.path);
-      db.raw().exec("PRAGMA busy_timeout = 500");
-      try {
-        // Collect recent errors for verbose display (exclude maintenance/pruning entries)
-        const errors = db.raw().prepare(
-          "SELECT created_at, hook, error FROM error_log WHERE hook NOT LIKE 'maintenance:%' ORDER BY id DESC LIMIT 5"
-        ).all() as Array<{ created_at: string; hook: string; error: string }>;
-        result.recentErrors.push(...errors);
-      } finally {
-        db.close();
-      }
-    } catch {
-      // Ignore sidecars whose errors cannot be inspected.
-    }
+    result.recentErrors.push(...(sidecar.recentErrors ?? []));
   }
 
   // Sort and limit recent errors across all DBs

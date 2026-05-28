@@ -63,6 +63,7 @@ describe("collectEventStats", () => {
 
     const stats = collectEventStats();
     expect(stats.captured).toBe(0);
+    expect(stats.errors).toBe(1);
   });
 
   it("respects timeout budget", () => {
