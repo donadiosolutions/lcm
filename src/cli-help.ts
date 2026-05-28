@@ -208,6 +208,22 @@ const HELP: Record<string, CommandHelp> = {
     ],
   },
 
+  events: {
+    summary: "Manage passive-learning sidecar events.",
+    usage: "lcm events promote [--all] [--json]",
+    options: [
+      ["promote", "Promote queued passive-learning events for the current project"],
+      ["promote --all", "Promote queued events from all metadata-backed project sidecars"],
+      ["--json", "Output structured JSON"],
+    ],
+    examples: [
+      ["lcm events promote", "Drain queued passive events for the current project"],
+      ["lcm events promote --all", "Drain stale passive-event sidecars across all known projects"],
+      ["lcm events promote --all --json", "Show per-sidecar promotion results"],
+    ],
+    notes: "Sidecars without project metadata are reported but cannot be mapped back to a cwd automatically.",
+  },
+
   diagnose: {
     summary: "Scan recent sessions for hook failures, MCP disconnects, and stale state.",
     usage: "lcm diagnose [--all] [--days N] [--verbose] [--json]",
@@ -396,6 +412,7 @@ const GROUPS = [
       { name: "import [--provider ...] [--all] [--verbose] [--dry-run] [--replay]", summary: "Import Claude Code and Codex session transcripts" },
       { name: "promote [--all] [--verbose] [--dry-run]", summary: "Promote insights to long-term memory" },
       { name: "stats [-v]", summary: "Memory inventory and compression ratios" },
+      { name: "events promote [--all]", summary: "Drain queued passive-learning sidecar events" },
       { name: "diagnose [--all] [--days N] [--verbose] [--json]", summary: "Scan sessions for hook failures and issues" },
     ],
   },

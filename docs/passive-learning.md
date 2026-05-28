@@ -46,6 +46,16 @@ Events are promoted to cross-session memory at session boundaries (session-end, 
 
 When a tool error is followed by a successful command with a matching prefix (within 20 events), the system correlates them as an error→fix pair. These are tagged `category:solution` and promoted with higher priority.
 
+### Global Backlog Drain
+
+Normal hook promotion drains the active project's sidecar. If old sidecars from projects you have not opened recently still contain queued events, drain all metadata-backed sidecars:
+
+```bash
+lcm events promote --all
+```
+
+Sidecars that are missing project metadata are reported separately because their hash cannot be reversed back to a project path automatically.
+
 ### Learned Insights
 
 On SessionStart, recently promoted passive insights are surfaced in a `<learned-insights>` block. This closes the feedback loop — the system learns from your sessions and applies those learnings in future ones.
@@ -106,6 +116,7 @@ The UserPromptSubmit extractor includes guards against false-positive decisions.
 | Pre-compact | Events promoted before context is compacted |
 | Daemon unavailable | Events queued in sidecar, promoted next session |
 | Hard kill (SIGKILL) | Events survive in sidecar, scavenged on next SessionStart |
+| Stale sidecars in other projects | `lcm events promote --all` drains all metadata-backed sidecars |
 | Unprocessed cap exceeded | Oldest events pruned when > 10,000 rows or > 30 days |
 | Error log pruning | Entries older than 30 days removed on SessionStart |
 
@@ -122,6 +133,8 @@ When passive learning hooks are installed, `lcm doctor` includes a "Passive Lear
 | `events-staleness` | Time since last event capture |
 
 Run `lcm doctor` to see the per-project breakdown and recent error details.
+
+When the daemon is healthy but many queued events remain across old project sidecars, `lcm doctor` reports that the daemon is up and suggests `lcm events promote --all` instead of asking you to restart the daemon.
 
 ### `lcm stats`
 

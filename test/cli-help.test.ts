@@ -110,6 +110,15 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("Codex CLI sessions");
   });
 
+  it("prints events command help with global promotion", () => {
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    printHelp("events");
+    const text = out.mock.calls.map(c => c[0]).join("");
+    expect(text).toContain("lcm events");
+    expect(text).toContain("promote --all");
+    expect(text).toContain("metadata-backed");
+  });
+
   it("prints connector help with global scope option", () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     printHelp("connectors");

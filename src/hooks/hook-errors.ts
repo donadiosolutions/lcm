@@ -6,6 +6,7 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { lcmPath } from "../runtime-paths.js";
+import { ensureProjectDir } from "../daemon/project.js";
 
 function isUnderDir(candidate: string, base: string): boolean {
   const resolvedCandidate = resolve(candidate);
@@ -57,6 +58,7 @@ export function safeLogError(
   // Layer 1: Sidecar DB (skip if cwd missing or circuit open)
   if (opts.cwd && !dbCircuitOpen) {
     try {
+      ensureProjectDir(opts.cwd);
       const db = new EventsDb(eventsDbPath(opts.cwd));
       try {
         db.logHookError(hook, error, opts.sessionId);

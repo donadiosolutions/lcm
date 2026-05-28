@@ -49,12 +49,14 @@ export async function handleUserPromptSubmit(
       const { extractUserPromptEvents } = await import("./extractors.js");
       const { EventsDb } = await import("./events-db.js");
       const { eventsDbPath } = await import("../db/events-path.js");
+      const { ensureProjectDir } = await import("../daemon/project.js");
 
       const prompt = String(input.prompt ?? "");
       const events = extractUserPromptEvents(prompt);
 
       if (events.length > 0 && input.session_id && typeof input.session_id === "string") {
         const cwd = input.cwd ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
+        ensureProjectDir(cwd);
         const db = new EventsDb(eventsDbPath(cwd));
         try {
           for (const event of events) {

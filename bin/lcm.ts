@@ -733,6 +733,56 @@ async function main() {
       exit(failures.length > 0 ? 1 : 0);
     });
 
+  // ─── events ────────────────────────────────────────────────────────────────
+  const eventsCmd = new Command("events").description("Manage passive-learning sidecar events");
+  eventsCmd.helpOption(false).option("-h, --help", "Show help");
+  eventsCmd.action(async (opts) => {
+    if (opts.help || argv.includes("-h") || argv.includes("--help")) {
+      const { printHelp } = await import("../src/cli-help.js");
+      printHelp("events"); exit(0);
+    }
+    console.error("Usage: lcm events promote [--all] [--json]");
+    exit(1);
+  });
+
+  eventsCmd
+    .command("promote")
+    .description("Promote queued passive-learning events")
+    .option("--all", "Promote events from all metadata-backed sidecars")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (opts) => {
+      if (opts.help || argv.includes("-h") || argv.includes("--help")) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("events"); exit(0);
+      }
+
+      const all: boolean = opts.all ?? false;
+      const jsonFlag: boolean = opts.json ?? false;
+      const client = await createDaemonClientOrExit();
+      const result = all
+        ? await client.post<any>("/promote-events/all", {})
+        : await client.post<any>("/promote-events", { cwd: process.cwd() });
+
+      if (jsonFlag) {
+        stdout.write(JSON.stringify(result, null, 2) + "\n");
+        return;
+      }
+
+      if (all) {
+        console.log(`Promoted ${result.promoted} passive event${result.promoted === 1 ? "" : "s"} from ${result.processedProjects} project${result.processedProjects === 1 ? "" : "s"} (${result.skipped} skipped, ${result.errors} errors).`);
+        if (result.orphanedProjects > 0) {
+          console.log(`${result.orphanedProjects} sidecar${result.orphanedProjects === 1 ? "" : "s"} could not be promoted because project metadata is missing.`);
+        }
+      } else {
+        console.log(`Promoted ${result.promoted} passive event${result.promoted === 1 ? "" : "s"} (${result.skipped} skipped, ${result.errors} errors).`);
+        if (result.message) console.log(result.message);
+      }
+    });
+
+  program.addCommand(eventsCmd);
+
   registerMemoryCommands(program);
 
   // ─── diagnose ──────────────────────────────────────────────────────────────

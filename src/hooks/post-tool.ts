@@ -4,6 +4,7 @@ import { EventsDb } from "./events-db.js";
 import { eventsDbPath } from "../db/events-path.js";
 import { firePromoteEventsRequest } from "./session-end.js";
 import { safeLogError } from "./hook-errors.js";
+import { ensureProjectDir } from "../daemon/project.js";
 
 
 export async function handlePostToolUse(
@@ -19,8 +20,9 @@ export async function handlePostToolUse(
     const events = extractPostToolEvents({ tool_name, tool_input: tool_input ?? {}, tool_response, tool_output });
     if (events.length === 0) return { exitCode: 0, stdout: "" };
 
-    cwd = input.cwd ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
-    const dbPath = eventsDbPath(cwd as string);
+    cwd = String(input.cwd ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd());
+    ensureProjectDir(cwd);
+    const dbPath = eventsDbPath(cwd);
     const db = new EventsDb(dbPath);
 
     try {

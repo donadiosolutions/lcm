@@ -17,7 +17,7 @@ import { createIngestHandler } from "./routes/ingest.js";
 import { createPromptSearchHandler } from "./routes/prompt-search.js";
 import { createStatusHandler } from "./routes/status.js";
 import { createSessionCompleteHandler } from "./routes/session-complete.js";
-import { createPromoteEventsHandler } from "./routes/promote-events.js";
+import { createPromoteAllEventsHandler, createPromoteEventsHandler } from "./routes/promote-events.js";
 import { createStatsHandler } from "./routes/stats.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
 import { createReviewStaleHandler } from "./routes/review-stale.js";
@@ -101,6 +101,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   routes.set("POST /prompt-search", createPromptSearchHandler(config));
   routes.set("POST /session-complete", createSessionCompleteHandler());
   routes.set("POST /promote-events", createPromoteEventsHandler(config));
+  routes.set("POST /promote-events/all", createPromoteAllEventsHandler(config));
   routes.set("GET /stats", createStatsHandler());
   routes.set("GET /stats/pool", createPoolStatsHandler());
   routes.set("POST /review-stale", createReviewStaleHandler(config));
