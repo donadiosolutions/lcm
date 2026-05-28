@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -277,6 +277,36 @@ describe("promote-events route", () => {
     expect(result.processedProjects).toBe(1);
     expect(result.orphanedProjects).toBe(0);
     expect(result.projects[0].cwd).toBe(projectCwd);
+  });
+
+  it("drains the sidecar path found during the scan", async () => {
+    const projectCwd = mkdtempSync(join(tmpdir(), "promote-all-scanned-sidecar-"));
+    extraDirs.push(projectCwd);
+    const scannedSidecarPath = join(dir, `${projectId(projectCwd)}.db`);
+    const recomputedSidecarPath = join(dir, "recomputed.db");
+    ensureProjectDir(projectCwd);
+    vi.mocked(eventsDbPath).mockImplementation((cwd: string) =>
+      cwd === projectCwd ? recomputedSidecarPath : sidecarPath
+    );
+
+    const edb = new EventsDb(scannedSidecarPath);
+    edb.insertEvent("s1", { type: "decision", category: "decision", data: "use scanned sidecar", priority: 1 }, "PostToolUse");
+    edb.close();
+
+    const db = setupProjectDb(projectCwd);
+    db.close();
+
+    const handler = createPromoteAllEventsHandler(makeConfig());
+    const { res, getBody } = mockRes();
+    await handler({} as any, res, "");
+
+    const result = getBody();
+    expect(result.promoted).toBe(1);
+    const remainingDb = new EventsDb(scannedSidecarPath);
+    const remaining = remainingDb.getUnprocessed();
+    remainingDb.close();
+    expect(remaining).toHaveLength(0);
+    expect(existsSync(recomputedSidecarPath)).toBe(false);
   });
 
   it("drains every batch from metadata-backed sidecars during global promotion", async () => {

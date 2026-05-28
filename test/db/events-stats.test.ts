@@ -84,8 +84,8 @@ describe("collectEventStats", () => {
 
     const sidecars = collectEventSidecars({ maxDbs: 1 });
     expect(sidecars).toHaveLength(2);
-    expect(sidecars[0].scanError).toBeUndefined();
-    expect(sidecars[1].scanError).toContain("maxDbs");
+    expect(sidecars.some((sidecar) => sidecar.scanError === undefined)).toBe(true);
+    expect(sidecars.some((sidecar) => (sidecar.scanError ?? "").includes("maxDbs"))).toBe(true);
   });
 
   it("includes scan failures in detailed project stats", () => {

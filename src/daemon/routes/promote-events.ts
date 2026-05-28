@@ -190,7 +190,7 @@ export function createPromoteAllEventsHandler(config: DaemonConfig): RouteHandle
         }
 
         try {
-          const projectResult = await drainEventsForCwd(config, sidecar.cwd);
+          const projectResult = await drainEventsForCwd(config, sidecar.cwd, sidecar.path);
           result.promoted += projectResult.promoted;
           result.skipped += projectResult.skipped;
           result.correlated += projectResult.correlated;
@@ -229,7 +229,11 @@ export function createPromoteAllEventsHandler(config: DaemonConfig): RouteHandle
   };
 }
 
-async function drainEventsForCwd(config: DaemonConfig, cwd: string): Promise<PromoteResult & { batches: number; incomplete?: boolean }> {
+async function drainEventsForCwd(
+  config: DaemonConfig,
+  cwd: string,
+  sidecarPathOverride?: string,
+): Promise<PromoteResult & { batches: number; incomplete?: boolean }> {
   cwd = validateCwd(cwd);
   const result: PromoteResult & { batches: number; incomplete?: boolean } = {
     promoted: 0,
@@ -239,11 +243,13 @@ async function drainEventsForCwd(config: DaemonConfig, cwd: string): Promise<Pro
     batches: 0,
   };
 
-  const sidecarPath = eventsDbPath(cwd);
+  const sidecarPath = sidecarPathOverride ?? eventsDbPath(cwd);
   const edb = new EventsDb(sidecarPath);
   const dbPath = projectDbPath(cwd);
-  const db = getLcmConnection(dbPath);
+  let dbOpened = false;
   try {
+    const db = getLcmConnection(dbPath);
+    dbOpened = true;
     runLcmMigrations(db);
     const store = new PromotedStore(db);
 
@@ -270,8 +276,11 @@ async function drainEventsForCwd(config: DaemonConfig, cwd: string): Promise<Pro
       }
     }
   } finally {
-    closeLcmConnection(dbPath);
-    edb.close();
+    try {
+      if (dbOpened) closeLcmConnection(dbPath);
+    } finally {
+      edb.close();
+    }
   }
 
   result.incomplete = true;
@@ -284,14 +293,19 @@ export async function promoteEventsForCwd(config: DaemonConfig, cwd: string): Pr
   const sidecarPath = eventsDbPath(cwd);
   const edb = new EventsDb(sidecarPath);
   const dbPath = projectDbPath(cwd);
-  const db = getLcmConnection(dbPath);
+  let dbOpened = false;
   try {
+    const db = getLcmConnection(dbPath);
+    dbOpened = true;
     runLcmMigrations(db);
     const store = new PromotedStore(db);
     return await promoteEventsBatch(config, cwd, edb, store);
   } finally {
-    closeLcmConnection(dbPath);
-    edb.close();
+    try {
+      if (dbOpened) closeLcmConnection(dbPath);
+    } finally {
+      edb.close();
+    }
   }
 }
 

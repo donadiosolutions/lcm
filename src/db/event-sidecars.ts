@@ -39,15 +39,20 @@ function readCwdForProject(projectId: string): string | undefined {
   }
 }
 
-function failedSidecarSummary(file: string, path: string, scanError: string): EventSidecarSummary {
+function failedSidecarSummary(
+  file: string,
+  path: string,
+  scanError: string,
+  resolveMetadata = true,
+): EventSidecarSummary {
   const projectId = file.slice(0, -".db".length);
-  const cwd = readCwdForProject(projectId);
+  const cwd = resolveMetadata ? readCwdForProject(projectId) : undefined;
   return {
     file,
     projectId,
     path,
     cwd,
-    metadataMissing: cwd === undefined,
+    metadataMissing: resolveMetadata && cwd === undefined,
     captured: 0,
     unprocessed: 0,
     errors: 0,
@@ -81,7 +86,7 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
         ? "sidecar scan skipped after maxDbs limit"
         : "sidecar scan skipped after timeout";
       for (const skippedFile of files.slice(index)) {
-        sidecars.push(failedSidecarSummary(skippedFile, join(dir, skippedFile), scanError));
+        sidecars.push(failedSidecarSummary(skippedFile, join(dir, skippedFile), scanError, false));
       }
       break;
     }
