@@ -229,7 +229,37 @@ describe("handleUserPromptSubmit", () => {
 
     expect(mockEnsureProjectDir).toHaveBeenCalledWith("/env-project");
     expect(mockEventsDbPath).toHaveBeenCalledWith("/env-project");
+    expect(mockClient.post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({
+      cwd: "/env-project",
+    }));
     delete process.env.CLAUDE_PROJECT_DIR;
+  });
+
+  it("trims cwd before sidecar writes and prompt search", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const mockClose = vi.fn();
+    MockEventsDb.mockImplementation(() => ({
+      insertEvent: vi.fn(),
+      close: mockClose,
+    }) as any);
+    mockExtractUserPromptEvents.mockReturnValue([
+      { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
+    ]);
+    const mockClient = {
+      health: vi.fn(),
+      post: vi.fn().mockResolvedValue({ hints: [] }),
+    };
+
+    await handleUserPromptSubmit(
+      JSON.stringify({ prompt: "we decided to use SQLite", cwd: "  /trimmed-project  ", session_id: "s1" }),
+      mockClient as any,
+    );
+
+    expect(mockEnsureProjectDir).toHaveBeenCalledWith("/trimmed-project");
+    expect(mockEventsDbPath).toHaveBeenCalledWith("/trimmed-project");
+    expect(mockClient.post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({
+      cwd: "/trimmed-project",
+    }));
   });
 
   it("continues normally if sidecar extraction fails", async () => {

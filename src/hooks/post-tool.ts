@@ -7,6 +7,16 @@ import { safeLogError } from "./hook-errors.js";
 import { ensureProjectDir } from "../daemon/project.js";
 
 
+function resolveHookCwd(inputCwd: unknown): string {
+  const cwd = typeof inputCwd === "string" ? inputCwd.trim() : "";
+  const envCwd = typeof process.env.CLAUDE_PROJECT_DIR === "string"
+    ? process.env.CLAUDE_PROJECT_DIR.trim()
+    : "";
+  if (cwd.length > 0) return cwd;
+  if (envCwd.length > 0) return envCwd;
+  return process.cwd();
+}
+
 export async function handlePostToolUse(
   stdin: string,
 ): Promise<{ exitCode: number; stdout: string }> {
@@ -20,12 +30,7 @@ export async function handlePostToolUse(
     const events = extractPostToolEvents({ tool_name, tool_input: tool_input ?? {}, tool_response, tool_output });
     if (events.length === 0) return { exitCode: 0, stdout: "" };
 
-    const envCwd = process.env.CLAUDE_PROJECT_DIR;
-    const resolvedCwd = typeof input.cwd === "string" && input.cwd.trim().length > 0
-      ? input.cwd
-      : typeof envCwd === "string" && envCwd.trim().length > 0
-        ? envCwd
-        : process.cwd();
+    const resolvedCwd = resolveHookCwd(input.cwd);
     cwd = resolvedCwd;
     ensureProjectDir(resolvedCwd);
     const dbPath = eventsDbPath(resolvedCwd);

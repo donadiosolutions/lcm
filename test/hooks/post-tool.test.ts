@@ -97,4 +97,21 @@ describe("handlePostToolUse", () => {
     expect(existsSync(projectMetaPath(envCwd))).toBe(true);
     expect(JSON.parse(readFileSync(projectMetaPath(envCwd), "utf-8")).cwd).toBe(envCwd);
   });
+
+  it("trims the selected cwd before writing project metadata", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-input-cwd-"));
+    extraDirs.push(inputCwd);
+
+    const stdin = JSON.stringify({
+      session_id: "test-session",
+      tool_name: "Read",
+      cwd: `  ${inputCwd}  `,
+      tool_input: { file_path: join(inputCwd, "src/main.ts") },
+    });
+    const result = await handlePostToolUse(stdin);
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(projectMetaPath(inputCwd))).toBe(true);
+    expect(JSON.parse(readFileSync(projectMetaPath(inputCwd), "utf-8")).cwd).toBe(inputCwd);
+  });
 });

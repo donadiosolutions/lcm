@@ -11,6 +11,16 @@ type PromptSearchResponse = {
   ids?: string[];
 };
 
+function resolveHookCwd(inputCwd: unknown): string {
+  const cwd = typeof inputCwd === "string" ? inputCwd.trim() : "";
+  const envCwd = typeof process.env.CLAUDE_PROJECT_DIR === "string"
+    ? process.env.CLAUDE_PROJECT_DIR.trim()
+    : "";
+  if (cwd.length > 0) return cwd;
+  if (envCwd.length > 0) return envCwd;
+  return process.cwd();
+}
+
 const LEARNING_INSTRUCTION = `<learning-instruction>
 When you recognize a durable insight, call lcm_store immediately:
 - decision: architectural/design choice with trade-offs
@@ -43,6 +53,7 @@ export async function handleUserPromptSubmit(
     if (!input.prompt || typeof input.prompt !== "string" || !input.prompt.trim()) {
       return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
     }
+    const cwd = resolveHookCwd(input.cwd);
 
     // Sidecar event extraction — must happen before prompt-search, must never throw
     try {
@@ -55,12 +66,6 @@ export async function handleUserPromptSubmit(
       const events = extractUserPromptEvents(prompt);
 
       if (events.length > 0 && input.session_id && typeof input.session_id === "string") {
-        const envCwd = process.env.CLAUDE_PROJECT_DIR;
-        const cwd = typeof input.cwd === "string" && input.cwd.trim().length > 0
-          ? input.cwd
-          : typeof envCwd === "string" && envCwd.trim().length > 0
-            ? envCwd
-            : process.cwd();
         ensureProjectDir(cwd);
         const db = new EventsDb(eventsDbPath(cwd));
         try {
@@ -80,7 +85,7 @@ export async function handleUserPromptSubmit(
 
     const result = await client.post<PromptSearchResponse>("/prompt-search", {
       query: input.prompt,
-      cwd: input.cwd,
+      cwd,
       session_id: input.session_id,
       learningInstructionBytes: Buffer.byteLength(LEARNING_INSTRUCTION, "utf8"),
     });
