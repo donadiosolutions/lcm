@@ -146,7 +146,13 @@ function checkPassiveLearning(results: CheckResult[], hooksInstalled: boolean, v
       const orphanNote = orphanCount > 0
         ? `; ${orphanCount} sidecar${orphanCount === 1 ? "" : "s"} missing metadata`
         : "";
-      results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — daemon is up — run: lcm events promote --all` });
+      if (orphanCount > 0 && orphanCount === sidecarCount) {
+        results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — project metadata is missing; lcm events promote --all can only report orphaned sidecars — remove stale orphan sidecars or trigger new activity after lcm install` });
+      } else if (orphanCount > 0) {
+        results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — daemon is up — run: lcm events promote --all for metadata-backed sidecars; orphaned sidecars need metadata repair or pruning` });
+      } else {
+        results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — daemon is up — run: lcm events promote --all` });
+      }
     } else {
       results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed) — daemon may be offline — run: lcm daemon start` });
     }

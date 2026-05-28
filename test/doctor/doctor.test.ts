@@ -246,7 +246,10 @@ describe("Passive Learning checks", () => {
 
   it("warns when hooks installed but no events captured", async () => {
     mockCollectEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null });
-    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/test-proj",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    }));
     const capture = results.find(r => r.name === "events-capture");
     expect(capture?.status).toBe("warn");
     expect(capture?.message).toContain("No events captured");
@@ -254,17 +257,61 @@ describe("Passive Learning checks", () => {
 
   it("passes when events exist and unprocessed is low", async () => {
     mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, lastCapture: "2026-03-26 10:00:00" });
-    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/test-proj",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    }));
     const capture = results.find(r => r.name === "events-capture");
     expect(capture?.status).toBe("pass");
   });
 
   it("warns when unprocessed > 1000", async () => {
     mockCollectEventStats.mockReturnValue({ captured: 5000, unprocessed: 2000, errors: 0, lastCapture: "2026-03-26 10:00:00" });
-    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/test-proj",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    }));
     const capture = results.find(r => r.name === "events-capture");
     expect(capture?.status).toBe("warn");
     expect(capture?.message).toContain("unprocessed");
+  });
+
+  it("does not recommend global drain when every queued sidecar is orphaned", async () => {
+    mockCollectEventStats.mockReturnValue({
+      captured: 5000,
+      unprocessed: 2000,
+      errors: 0,
+      lastCapture: "2026-03-26 10:00:00",
+      sidecarsWithUnprocessed: 2,
+      orphanedSidecarsWithUnprocessed: 2,
+    });
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/test-proj",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    }));
+    const capture = results.find(r => r.name === "events-capture");
+    expect(capture?.status).toBe("warn");
+    expect(capture?.message).toContain("project metadata is missing");
+    expect(capture?.message).not.toContain("run: lcm events promote --all");
+  });
+
+  it("keeps global drain advice scoped when only some queued sidecars are orphaned", async () => {
+    mockCollectEventStats.mockReturnValue({
+      captured: 5000,
+      unprocessed: 2000,
+      errors: 0,
+      lastCapture: "2026-03-26 10:00:00",
+      sidecarsWithUnprocessed: 3,
+      orphanedSidecarsWithUnprocessed: 1,
+    });
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/test-proj",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    }));
+    const capture = results.find(r => r.name === "events-capture");
+    expect(capture?.status).toBe("warn");
+    expect(capture?.message).toContain("run: lcm events promote --all for metadata-backed sidecars");
+    expect(capture?.message).toContain("orphaned sidecars need metadata repair or pruning");
   });
 
   it("fails when errors >= 50", async () => {
