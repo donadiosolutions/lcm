@@ -55,7 +55,12 @@ export async function handleUserPromptSubmit(
       const events = extractUserPromptEvents(prompt);
 
       if (events.length > 0 && input.session_id && typeof input.session_id === "string") {
-        const cwd = input.cwd ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
+        const envCwd = process.env.CLAUDE_PROJECT_DIR;
+        const cwd = typeof input.cwd === "string" && input.cwd.trim().length > 0
+          ? input.cwd
+          : typeof envCwd === "string" && envCwd.trim().length > 0
+            ? envCwd
+            : process.cwd();
         ensureProjectDir(cwd);
         const db = new EventsDb(eventsDbPath(cwd));
         try {

@@ -17,17 +17,26 @@ vi.mock("../../src/db/events-path.js", () => ({
   eventsDbPath: vi.fn().mockReturnValue("/tmp/test-events.db"),
 }));
 
+vi.mock("../../src/daemon/project.js", () => ({
+  ensureProjectDir: vi.fn(),
+}));
+
 import { ensureDaemon } from "../../src/daemon/lifecycle.js";
+import { eventsDbPath } from "../../src/db/events-path.js";
+import { ensureProjectDir } from "../../src/daemon/project.js";
 import { extractUserPromptEvents } from "../../src/hooks/extractors.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
 
 const mockEnsureDaemon = vi.mocked(ensureDaemon);
+const mockEventsDbPath = vi.mocked(eventsDbPath);
+const mockEnsureProjectDir = vi.mocked(ensureProjectDir);
 const mockExtractUserPromptEvents = vi.mocked(extractUserPromptEvents);
 const MockEventsDb = vi.mocked(EventsDb);
 
 describe("handleUserPromptSubmit", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    delete process.env.CLAUDE_PROJECT_DIR;
   });
 
   it("returns hint when daemon returns matches", async () => {
@@ -194,6 +203,33 @@ describe("handleUserPromptSubmit", () => {
     expect(mockClose).toHaveBeenCalled();
     // prompt-search still called
     expect(mockClient.post).toHaveBeenCalledWith("/prompt-search", expect.any(Object));
+  });
+
+  it("falls back to CLAUDE_PROJECT_DIR when input cwd is blank for sidecar writes", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const mockInsertEvent = vi.fn();
+    const mockClose = vi.fn();
+    MockEventsDb.mockImplementation(() => ({
+      insertEvent: mockInsertEvent,
+      close: mockClose,
+    }) as any);
+    mockExtractUserPromptEvents.mockReturnValue([
+      { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
+    ]);
+    process.env.CLAUDE_PROJECT_DIR = "/env-project";
+    const mockClient = {
+      health: vi.fn(),
+      post: vi.fn().mockResolvedValue({ hints: [] }),
+    };
+
+    await handleUserPromptSubmit(
+      JSON.stringify({ prompt: "we decided to use SQLite", cwd: "   ", session_id: "s1" }),
+      mockClient as any,
+    );
+
+    expect(mockEnsureProjectDir).toHaveBeenCalledWith("/env-project");
+    expect(mockEventsDbPath).toHaveBeenCalledWith("/env-project");
+    delete process.env.CLAUDE_PROJECT_DIR;
   });
 
   it("continues normally if sidecar extraction fails", async () => {
