@@ -433,13 +433,6 @@ const GROUPS = [
     ],
   },
   {
-    label: "Portable Knowledge",
-    commands: [
-      { name: "export [--all] [--output <file>]", summary: "Export promoted knowledge to JSON (secrets scrubbed)" },
-      { name: "import-knowledge <file>", summary: "Import exported knowledge JSON, deduplicating on merge" },
-    ],
-  },
-  {
     label: "Sensitive",
     commands: [
       { name: "sensitive list", summary: "List active redaction patterns" },
