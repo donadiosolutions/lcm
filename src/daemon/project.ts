@@ -104,7 +104,11 @@ export const ensureProjectDir = (cwd: string): string => {
   const metaPath = join(dir, "meta.json");
   let meta: Record<string, unknown> = { cwd };
   if (existsSync(metaPath)) {
-    try { meta = { ...JSON.parse(readFileSync(metaPath, "utf-8")), cwd }; } catch { /* keep default */ }
+    try {
+      const existing = JSON.parse(readFileSync(metaPath, "utf-8")) as Record<string, unknown>;
+      if (existing.cwd === cwd) return dir;
+      meta = { ...existing, cwd };
+    } catch { /* keep default */ }
   }
   writeFileSync(metaPath, JSON.stringify(meta, null, 2));
   return dir;

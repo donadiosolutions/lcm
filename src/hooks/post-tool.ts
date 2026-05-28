@@ -20,12 +20,15 @@ export async function handlePostToolUse(
     const events = extractPostToolEvents({ tool_name, tool_input: tool_input ?? {}, tool_response, tool_output });
     if (events.length === 0) return { exitCode: 0, stdout: "" };
 
-    const rawCwd = input.cwd ?? process.env.CLAUDE_PROJECT_DIR;
-    cwd = typeof rawCwd === "string" && rawCwd.trim().length > 0
-      ? rawCwd
-      : process.cwd();
-    ensureProjectDir(cwd);
-    const dbPath = eventsDbPath(cwd);
+    const envCwd = process.env.CLAUDE_PROJECT_DIR;
+    const resolvedCwd = typeof input.cwd === "string" && input.cwd.trim().length > 0
+      ? input.cwd
+      : typeof envCwd === "string" && envCwd.trim().length > 0
+        ? envCwd
+        : process.cwd();
+    cwd = resolvedCwd;
+    ensureProjectDir(resolvedCwd);
+    const dbPath = eventsDbPath(resolvedCwd);
     const db = new EventsDb(dbPath);
 
     try {
@@ -40,7 +43,7 @@ export async function handlePostToolUse(
       const hasPriority1 = events.some(e => e.priority === 1);
       if (hasPriority1) {
         const port = input.daemon_port ?? 3737;
-        firePromoteEventsRequest(port, { cwd });
+        firePromoteEventsRequest(port, { cwd: resolvedCwd });
       }
     } finally {
       db.close();
