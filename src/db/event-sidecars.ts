@@ -50,7 +50,7 @@ function failedSidecarSummary(file: string, path: string, scanError: string): Ev
     metadataMissing: cwd === undefined,
     captured: 0,
     unprocessed: 0,
-    errors: 1,
+    errors: 0,
     lastCapture: null,
     scanError,
   };
