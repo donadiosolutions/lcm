@@ -39,6 +39,23 @@ function readCwdForProject(projectId: string): string | undefined {
   }
 }
 
+function failedSidecarSummary(file: string, path: string, scanError: string): EventSidecarSummary {
+  const projectId = file.slice(0, -".db".length);
+  const cwd = readCwdForProject(projectId);
+  return {
+    file,
+    projectId,
+    path,
+    cwd,
+    metadataMissing: cwd === undefined,
+    captured: 0,
+    unprocessed: 0,
+    errors: 1,
+    lastCapture: null,
+    scanError,
+  };
+}
+
 export function collectEventSidecars(options: EventSidecarScanOptions = {}): EventSidecarSummary[] {
   const dir = eventsDir();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -56,12 +73,21 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
 
   const sidecars: EventSidecarSummary[] = [];
   let scanned = 0;
-  for (const file of files) {
-    if (scanned >= maxDbs || Date.now() >= deadline) break;
+  for (let index = 0; index < files.length; index++) {
+    const file = files[index];
+    const path = join(dir, file);
+    if (scanned >= maxDbs || Date.now() >= deadline) {
+      const scanError = scanned >= maxDbs
+        ? "sidecar scan skipped after maxDbs limit"
+        : "sidecar scan skipped after timeout";
+      for (const skippedFile of files.slice(index)) {
+        sidecars.push(failedSidecarSummary(skippedFile, join(dir, skippedFile), scanError));
+      }
+      break;
+    }
     scanned++;
 
     const projectId = file.slice(0, -".db".length);
-    const path = join(dir, file);
     try {
       const db = new EventsDb(path);
       db.raw().exec("PRAGMA busy_timeout = 500");
@@ -89,19 +115,11 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
         db.close();
       }
     } catch (error) {
-      const cwd = readCwdForProject(projectId);
-      sidecars.push({
+      sidecars.push(failedSidecarSummary(
         file,
-        projectId,
         path,
-        cwd,
-        metadataMissing: cwd === undefined,
-        captured: 0,
-        unprocessed: 0,
-        errors: 1,
-        lastCapture: null,
-        scanError: error instanceof Error ? error.message : "failed to scan sidecar",
-      });
+        error instanceof Error ? error.message : "failed to scan sidecar",
+      ));
     }
   }
 

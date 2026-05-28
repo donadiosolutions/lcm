@@ -10,6 +10,7 @@ vi.mock("../../src/db/events-path.js", () => ({
 }));
 
 import { collectEventStats } from "../../src/db/events-stats.js";
+import { collectEventSidecars } from "../../src/db/event-sidecars.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
 
 describe("collectEventStats", () => {
@@ -69,5 +70,20 @@ describe("collectEventStats", () => {
   it("respects timeout budget", () => {
     const stats = collectEventStats(0);
     expect(stats.captured).toBe(0);
+  });
+
+  it("surfaces sidecars skipped by scan limits", () => {
+    const db1 = new EventsDb(join(tempDir, "project1.db"));
+    db1.insertEvent("s1", { type: "decision", category: "decision", data: "d1", priority: 1 }, "PostToolUse");
+    db1.close();
+
+    const db2 = new EventsDb(join(tempDir, "project2.db"));
+    db2.insertEvent("s2", { type: "decision", category: "decision", data: "d2", priority: 1 }, "PostToolUse");
+    db2.close();
+
+    const sidecars = collectEventSidecars({ maxDbs: 1 });
+    expect(sidecars).toHaveLength(2);
+    expect(sidecars[0].scanError).toBeUndefined();
+    expect(sidecars[1].scanError).toContain("maxDbs");
   });
 });
