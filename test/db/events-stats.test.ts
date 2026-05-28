@@ -9,7 +9,7 @@ vi.mock("../../src/db/events-path.js", () => ({
   eventsDir: () => mockEventsDir,
 }));
 
-import { collectEventStats } from "../../src/db/events-stats.js";
+import { collectDetailedEventStats, collectEventStats } from "../../src/db/events-stats.js";
 import { collectEventSidecars } from "../../src/db/event-sidecars.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
 
@@ -64,7 +64,8 @@ describe("collectEventStats", () => {
 
     const stats = collectEventStats();
     expect(stats.captured).toBe(0);
-    expect(stats.errors).toBe(1);
+    expect(stats.errors).toBe(0);
+    expect(stats.scanErrors).toBe(1);
   });
 
   it("respects timeout budget", () => {
@@ -85,5 +86,17 @@ describe("collectEventStats", () => {
     expect(sidecars).toHaveLength(2);
     expect(sidecars[0].scanError).toBeUndefined();
     expect(sidecars[1].scanError).toContain("maxDbs");
+  });
+
+  it("includes scan failures in detailed project stats", () => {
+    const { writeFileSync } = require("node:fs");
+    writeFileSync(join(tempDir, "corrupt.db"), "not a sqlite database");
+
+    const stats = collectDetailedEventStats();
+    expect(stats.errors).toBe(0);
+    expect(stats.scanErrors).toBe(1);
+    expect(stats.projects).toHaveLength(1);
+    expect(stats.projects[0].scanError).toBeTruthy();
+    expect(stats.projects[0].path).toContain("corrupt.db");
   });
 });

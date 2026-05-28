@@ -5,6 +5,7 @@ export interface EventStats {
   captured: number;
   unprocessed: number;
   errors: number;
+  scanErrors?: number;
   lastCapture: string | null;
   sidecars?: number;
   sidecarsWithUnprocessed?: number;
@@ -20,6 +21,8 @@ export interface DetailedEventStats extends EventStats {
     captured: number;
     unprocessed: number;
     lastCapture: string | null;
+    path: string;
+    scanError?: string;
   }>;
   recentErrors: Array<{ created_at: string; hook: string; error: string }>;
 }
@@ -34,6 +37,7 @@ export function collectEventStats(timeoutMs = 2000): EventStats {
     captured: 0,
     unprocessed: 0,
     errors: 0,
+    scanErrors: 0,
     lastCapture: null,
     sidecars: 0,
     sidecarsWithUnprocessed: 0,
@@ -44,7 +48,11 @@ export function collectEventStats(timeoutMs = 2000): EventStats {
     result.sidecars = (result.sidecars ?? 0) + 1;
     result.captured += sidecar.captured;
     result.unprocessed += sidecar.unprocessed;
-    result.errors += sidecar.errors;
+    if (sidecar.scanError) {
+      result.scanErrors = (result.scanErrors ?? 0) + 1;
+    } else {
+      result.errors += sidecar.errors;
+    }
     if (sidecar.unprocessed > 0) {
       result.sidecarsWithUnprocessed = (result.sidecarsWithUnprocessed ?? 0) + 1;
       if (sidecar.metadataMissing) {
@@ -64,7 +72,7 @@ export function collectEventStats(timeoutMs = 2000): EventStats {
  */
 export function collectDetailedEventStats(timeoutMs = 2000): DetailedEventStats {
   const result: DetailedEventStats = {
-    captured: 0, unprocessed: 0, errors: 0, lastCapture: null,
+    captured: 0, unprocessed: 0, errors: 0, scanErrors: 0, lastCapture: null,
     sidecars: 0, sidecarsWithUnprocessed: 0, orphanedSidecarsWithUnprocessed: 0,
     projects: [], recentErrors: [],
   };
@@ -73,7 +81,11 @@ export function collectDetailedEventStats(timeoutMs = 2000): DetailedEventStats 
     result.sidecars = (result.sidecars ?? 0) + 1;
     result.captured += sidecar.captured;
     result.unprocessed += sidecar.unprocessed;
-    result.errors += sidecar.errors;
+    if (sidecar.scanError) {
+      result.scanErrors = (result.scanErrors ?? 0) + 1;
+    } else {
+      result.errors += sidecar.errors;
+    }
     if (sidecar.unprocessed > 0) {
       result.sidecarsWithUnprocessed = (result.sidecarsWithUnprocessed ?? 0) + 1;
       if (sidecar.metadataMissing) {
@@ -91,6 +103,8 @@ export function collectDetailedEventStats(timeoutMs = 2000): DetailedEventStats 
       captured: sidecar.captured,
       unprocessed: sidecar.unprocessed,
       lastCapture: sidecar.lastCapture,
+      path: sidecar.path,
+      scanError: sidecar.scanError,
     });
     result.recentErrors.push(...(sidecar.recentErrors ?? []));
   }

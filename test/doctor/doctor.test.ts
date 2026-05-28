@@ -13,13 +13,15 @@ vi.mock("../../src/db/events-stats.js", () => ({
   collectDetailedEventStats: vi.fn().mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null, projects: [], recentErrors: [] }),
 }));
 
-import { collectEventStats } from "../../src/db/events-stats.js";
+import { collectDetailedEventStats, collectEventStats } from "../../src/db/events-stats.js";
 const mockCollectEventStats = vi.mocked(collectEventStats);
+const mockCollectDetailedEventStats = vi.mocked(collectDetailedEventStats);
 
 beforeEach(() => {
   vi.mocked(ensureDaemon).mockReset();
   vi.mocked(ensureDaemon).mockResolvedValue({ connected: false });
   mockCollectEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null });
+  mockCollectDetailedEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null, projects: [], recentErrors: [] });
 });
 
 function buildSettingsJson(): string {
@@ -326,6 +328,42 @@ describe("Passive Learning checks", () => {
     const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
     const errors = results.find(r => r.name === "events-errors");
     expect(errors?.status).toBe("pass");
+  });
+
+  it("warns separately for sidecar scan failures", async () => {
+    mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, scanErrors: 1, lastCapture: "2026-03-26 10:00:00" });
+    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
+    const hookErrors = results.find(r => r.name === "events-errors");
+    const scanErrors = results.find(r => r.name === "events-sidecar-scan");
+    expect(hookErrors?.status).toBe("pass");
+    expect(scanErrors?.status).toBe("warn");
+    expect(scanErrors?.message).toContain("run lcm doctor --verbose");
+  });
+
+  it("shows scan failure paths in verbose project output", async () => {
+    mockCollectDetailedEventStats.mockReturnValue({
+      captured: 0,
+      unprocessed: 0,
+      errors: 0,
+      scanErrors: 1,
+      lastCapture: null,
+      projects: [{
+        file: "corrupt.db",
+        projectId: "corrupt",
+        metadataMissing: true,
+        captured: 0,
+        unprocessed: 0,
+        lastCapture: null,
+        path: "/tmp/lcm-events/corrupt.db",
+        scanError: "database disk image is malformed",
+      }],
+      recentErrors: [],
+    });
+    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }), true);
+    const project = results.find(r => r.name === "events-project-corrupt.db");
+    expect(project?.status).toBe("warn");
+    expect(project?.message).toContain("database disk image is malformed");
+    expect(project?.message).toContain("/tmp/lcm-events/corrupt.db");
   });
 
   it("passes staleness when last capture is recent", async () => {

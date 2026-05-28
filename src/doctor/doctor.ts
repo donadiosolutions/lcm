@@ -169,6 +169,10 @@ function checkPassiveLearning(results: CheckResult[], hooksInstalled: boolean, v
     results.push({ name: "events-errors", category: "Passive Learning", status: "pass", message: "0 hook errors" });
   }
 
+  if ((stats.scanErrors ?? 0) > 0) {
+    results.push({ name: "events-sidecar-scan", category: "Passive Learning", status: "warn", message: `${stats.scanErrors} sidecar${stats.scanErrors === 1 ? "" : "s"} failed to scan — run lcm doctor --verbose to identify the affected .db file${stats.scanErrors === 1 ? "" : "s"}` });
+  }
+
   // Staleness check
   if (stats.lastCapture) {
     const isoLastCapture = `${stats.lastCapture.replace(" ", "T")}Z`;
@@ -188,6 +192,10 @@ function checkPassiveLearning(results: CheckResult[], hooksInstalled: boolean, v
   if (verbose && "projects" in stats) {
     const detailed = stats as import("../db/events-stats.js").DetailedEventStats;
     for (const p of detailed.projects) {
+      if (p.scanError) {
+        results.push({ name: `events-project-${p.file}`, category: "Passive Learning", status: "warn", message: `${p.file.slice(0, 8)}… scan failed: ${p.scanError} — ${p.path}` });
+        continue;
+      }
       const ago = p.lastCapture ? formatTimeAgo(new Date(`${p.lastCapture.replace(" ", "T")}Z`)) : "never";
       const projectLabel = p.cwd ?? (p.metadataMissing ? "metadata missing" : p.projectId);
       results.push({ name: `events-project-${p.file}`, category: "Passive Learning", status: "pass", message: `${p.file.slice(0, 8)}… ${p.captured} events (${p.unprocessed} unprocessed) last: ${ago} — ${projectLabel}` });
