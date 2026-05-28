@@ -764,9 +764,11 @@ async function main() {
       const result = all
         ? await client.post<any>("/promote-events/all", {})
         : await client.post<any>("/promote-events", { cwd: process.cwd(), drain: true });
+      const failed = all && ((result.errors ?? 0) > 0 || (result.failedProjects ?? 0) > 0);
 
       if (jsonFlag) {
         stdout.write(JSON.stringify(result, null, 2) + "\n");
+        if (failed) exit(1);
         return;
       }
 
@@ -782,6 +784,7 @@ async function main() {
         }
         if (result.message) console.log(result.message);
       }
+      if (failed) exit(1);
     });
 
   program.addCommand(eventsCmd);
