@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { EventsDb } from "../../../src/hooks/events-db.js";
 import { createPromoteAllEventsHandler, createPromoteEventsHandler } from "../../../src/daemon/routes/promote-events.js";
-import { ensureProjectDir, projectDbPath, projectDir, projectId } from "../../../src/daemon/project.js";
+import { ensureProjectDir, projectDbPath, projectId } from "../../../src/daemon/project.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
 
@@ -80,15 +80,18 @@ function setupProjectDb(cwd: string): DatabaseSync {
 
 describe("promote-events route", () => {
   let dir: string;
+  let homeDir: string;
   let sidecarPath: string;
   let extraDirs: string[];
-  let extraProjectDirs: string[];
+  let originalHome: string | undefined;
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "promote-events-test-"));
+    homeDir = mkdtempSync(join(tmpdir(), "promote-events-home-"));
+    originalHome = process.env.HOME;
+    process.env.HOME = homeDir;
     sidecarPath = join(dir, "events.db");
     extraDirs = [];
-    extraProjectDirs = [];
     eventPathMocks.eventsDir.mockReturnValue(dir);
     vi.mocked(eventsDbPath).mockReturnValue(sidecarPath);
     vi.mocked(deduplicateAndInsert).mockClear();
@@ -96,11 +99,14 @@ describe("promote-events route", () => {
 
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(homeDir, { recursive: true, force: true });
     for (const extraDir of extraDirs) {
       rmSync(extraDir, { recursive: true, force: true });
     }
-    for (const projectMetaDir of extraProjectDirs) {
-      rmSync(projectMetaDir, { recursive: true, force: true });
+    if (originalHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
     }
     vi.clearAllMocks();
   });
@@ -249,7 +255,6 @@ describe("promote-events route", () => {
     extraDirs.push(projectCwd);
     const projectSidecarPath = join(dir, `${projectId(projectCwd)}.db`);
     ensureProjectDir(projectCwd);
-    extraProjectDirs.push(projectDir(projectCwd));
     vi.mocked(eventsDbPath).mockImplementation((cwd: string) =>
       cwd === projectCwd ? projectSidecarPath : sidecarPath
     );
@@ -279,7 +284,6 @@ describe("promote-events route", () => {
     extraDirs.push(projectCwd);
     const projectSidecarPath = join(dir, `${projectId(projectCwd)}.db`);
     ensureProjectDir(projectCwd);
-    extraProjectDirs.push(projectDir(projectCwd));
     vi.mocked(eventsDbPath).mockImplementation((cwd: string) =>
       cwd === projectCwd ? projectSidecarPath : sidecarPath
     );

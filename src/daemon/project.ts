@@ -14,7 +14,7 @@ export const projectId = (cwd: string): string =>
   createHash("sha256").update(canonicalizeCwd(cwd)).digest("hex");
 
 export const projectDir = (cwd: string): string =>
-  join(BASE_DIR, "projects", projectId(cwd));
+  join(lcmHomeDir(), "projects", projectId(cwd));
 
 export const projectDbPath = (cwd: string): string =>
   join(projectDir(cwd), "db.sqlite");

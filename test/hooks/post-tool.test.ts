@@ -4,7 +4,7 @@ import { handlePostToolUse } from "../../src/hooks/post-tool.js";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { projectDir, projectMetaPath } from "../../src/daemon/project.js";
+import { projectMetaPath } from "../../src/daemon/project.js";
 
 // Mock eventsDbPath to use temp directory
 vi.mock("../../src/db/events-path.js", () => ({
@@ -14,18 +14,29 @@ vi.mock("../../src/db/events-path.js", () => ({
 
 describe("handlePostToolUse", () => {
   let dir: string;
+  let homeDir: string;
   let extraDirs: string[];
+  let originalHome: string | undefined;
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "post-tool-test-"));
+    homeDir = mkdtempSync(join(tmpdir(), "post-tool-home-"));
+    originalHome = process.env.HOME;
+    process.env.HOME = homeDir;
     extraDirs = [];
     process.env.TEST_EVENTS_DIR = dir;
   });
 
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(homeDir, { recursive: true, force: true });
     for (const extraDir of extraDirs) {
       rmSync(extraDir, { recursive: true, force: true });
+    }
+    if (originalHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
     }
     delete process.env.TEST_EVENTS_DIR;
     delete process.env.CLAUDE_PROJECT_DIR;
@@ -71,7 +82,7 @@ describe("handlePostToolUse", () => {
 
   it("falls back to CLAUDE_PROJECT_DIR when input cwd is empty", async () => {
     const envCwd = mkdtempSync(join(tmpdir(), "post-tool-env-cwd-"));
-    extraDirs.push(envCwd, projectDir(envCwd));
+    extraDirs.push(envCwd);
     process.env.CLAUDE_PROJECT_DIR = envCwd;
 
     const stdin = JSON.stringify({
