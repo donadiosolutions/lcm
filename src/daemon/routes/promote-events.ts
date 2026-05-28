@@ -230,6 +230,7 @@ export function createPromoteAllEventsHandler(config: DaemonConfig): RouteHandle
 }
 
 async function drainEventsForCwd(config: DaemonConfig, cwd: string): Promise<PromoteResult & { batches: number; incomplete?: boolean }> {
+  cwd = validateCwd(cwd);
   const result: PromoteResult & { batches: number; incomplete?: boolean } = {
     promoted: 0,
     skipped: 0,
@@ -238,27 +239,39 @@ async function drainEventsForCwd(config: DaemonConfig, cwd: string): Promise<Pro
     batches: 0,
   };
 
-  for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
-    const batchResult = await promoteEventsForCwd(config, cwd);
-    if (batchResult.message === "no unprocessed events") {
-      result.message = result.batches === 0
-        ? "no unprocessed events"
-        : "drained all unprocessed events";
-      return result;
-    }
+  const sidecarPath = eventsDbPath(cwd);
+  const edb = new EventsDb(sidecarPath);
+  const dbPath = projectDbPath(cwd);
+  const db = getLcmConnection(dbPath);
+  try {
+    runLcmMigrations(db);
+    const store = new PromotedStore(db);
 
-    result.promoted += batchResult.promoted;
-    result.skipped += batchResult.skipped;
-    result.correlated += batchResult.correlated;
-    result.errors += batchResult.errors;
-    result.batches++;
+    for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
+      const batchResult = await promoteEventsBatch(config, cwd, edb, store);
+      if (batchResult.message === "no unprocessed events") {
+        result.message = result.batches === 0
+          ? "no unprocessed events"
+          : "drained all unprocessed events";
+        return result;
+      }
 
-    const processed = batchResult.promoted + batchResult.skipped;
-    if (processed === 0) {
-      result.incomplete = true;
-      result.message = "stopped because remaining events failed to promote";
-      return result;
+      result.promoted += batchResult.promoted;
+      result.skipped += batchResult.skipped;
+      result.correlated += batchResult.correlated;
+      result.errors += batchResult.errors;
+      result.batches++;
+
+      const processed = batchResult.promoted + batchResult.skipped;
+      if (processed === 0) {
+        result.incomplete = true;
+        result.message = "stopped because remaining events failed to promote";
+        return result;
+      }
     }
+  } finally {
+    closeLcmConnection(dbPath);
+    edb.close();
   }
 
   result.incomplete = true;
@@ -268,26 +281,37 @@ async function drainEventsForCwd(config: DaemonConfig, cwd: string): Promise<Pro
 
 export async function promoteEventsForCwd(config: DaemonConfig, cwd: string): Promise<PromoteResult> {
   cwd = validateCwd(cwd);
-  const result: PromoteResult = { promoted: 0, skipped: 0, correlated: 0, errors: 0 };
   const sidecarPath = eventsDbPath(cwd);
   const edb = new EventsDb(sidecarPath);
-
+  const dbPath = projectDbPath(cwd);
+  const db = getLcmConnection(dbPath);
   try {
-    const events = edb.getUnprocessed();
-    if (events.length === 0) {
-      return { ...result, message: "no unprocessed events" };
-    }
+    runLcmMigrations(db);
+    const store = new PromotedStore(db);
+    return await promoteEventsBatch(config, cwd, edb, store);
+  } finally {
+    closeLcmConnection(dbPath);
+    edb.close();
+  }
+}
 
-    // Correlate error→fix pairs
-    correlateErrors(events);
+async function promoteEventsBatch(
+  config: DaemonConfig,
+  cwd: string,
+  edb: EventsDb,
+  store: PromotedStore,
+): Promise<PromoteResult> {
+  const result: PromoteResult = { promoted: 0, skipped: 0, correlated: 0, errors: 0 };
 
-    // Open main project DB for promotion
-    const pid = projectId(cwd);
-    const dbPath = projectDbPath(cwd);
-    const db = getLcmConnection(dbPath);
-    try {
-      runLcmMigrations(db);
-      const store = new PromotedStore(db);
+  const events = edb.getUnprocessed();
+  if (events.length === 0) {
+    return { ...result, message: "no unprocessed events" };
+  }
+
+  // Correlate error→fix pairs
+  correlateErrors(events);
+
+  const pid = projectId(cwd);
 
       const thresholds = config.compaction.promotionThresholds;
       const eventConf = thresholds.eventConfidence ?? {
@@ -400,12 +424,6 @@ export async function promoteEventsForCwd(config: DaemonConfig, cwd: string): Pr
       }
 
       edb.markProcessed(processedIds);
-    } finally {
-      closeLcmConnection(dbPath);
-    }
-  } finally {
-    edb.close();
-  }
 
   return result;
 }
