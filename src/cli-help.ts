@@ -69,9 +69,13 @@ const HELP: Record<string, CommandHelp> = {
 
   doctor: {
     summary: "Run diagnostics — checks daemon health, hooks, MCP server, and summarizer.",
-    usage: "lcm doctor",
+    usage: "lcm doctor [--verbose]",
+    options: [
+      ["--verbose", "Show detailed passive-learning sidecar diagnostics"],
+    ],
     examples: [
       ["lcm doctor", "Run all diagnostic checks"],
+      ["lcm doctor --verbose", "Include per-sidecar passive-learning diagnostics"],
     ],
     notes: "Exits with code 1 if any check fails. Integrate into CI or shell startup for early detection.",
   },

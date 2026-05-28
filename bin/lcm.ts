@@ -721,13 +721,15 @@ async function main() {
     .description("Run diagnostics: daemon, hooks, MCP, summarizer")
     .helpOption(false)
     .option("-h, --help", "Show help")
+    .option("--verbose", "Show detailed diagnostic output")
     .action(async (opts) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("doctor"); exit(0);
       }
+      const verbose: boolean = opts.verbose ?? false;
       const { runDoctor, printResults } = await import("../src/doctor/doctor.js");
-      const results = await runDoctor();
+      const results = await runDoctor(undefined, verbose);
       printResults(results);
       const failures = results.filter((r: { status: string }) => r.status === "fail");
       exit(failures.length > 0 ? 1 : 0);
@@ -764,11 +766,13 @@ async function main() {
       const result = all
         ? await client.post<any>("/promote-events/all", {})
         : await client.post<any>("/promote-events", { cwd: process.cwd(), drain: true });
-      const failed = all && ((result.errors ?? 0) > 0 || (result.failedProjects ?? 0) > 0);
+      const failed = all
+        ? ((result.errors ?? 0) > 0 || (result.failedProjects ?? 0) > 0)
+        : ((result.errors ?? 0) > 0 || result.incomplete === true);
 
       if (jsonFlag) {
         stdout.write(JSON.stringify(result, null, 2) + "\n");
-        if (failed) exit(1);
+        if (failed) process.exitCode = 1;
         return;
       }
 
