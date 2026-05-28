@@ -1,6 +1,6 @@
 {
   "name": "@donadiosolutions/lcm",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Never lose context again. lossless-claude compresses Claude Code sessions into searchable memory — every message preserved, every insight remembered.",
   "type": "module",
   "main": "dist/src/memory/index.js",
