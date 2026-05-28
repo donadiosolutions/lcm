@@ -1,5 +1,11 @@
 # @donadiosolutions/lcm
 
+## 1.0.2
+
+### Patch Changes
+
+- 1aee2a8: Add `lcm events promote --all` to drain queued passive-learning events from all metadata-backed sidecars, and update doctor messaging to recommend that command when the daemon is healthy but old sidecar backlogs remain.
+
 ## 1.0.1
 
 ### Patch Changes
