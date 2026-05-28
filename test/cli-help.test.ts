@@ -116,6 +116,7 @@ describe("printHelp — per-command detail", () => {
     const text = out.mock.calls.map(c => c[0]).join("");
     expect(text).toContain("lcm events");
     expect(text).toContain("promote --all");
+    expect(text).toContain("--json");
     expect(text).toContain("metadata-backed");
   });
 

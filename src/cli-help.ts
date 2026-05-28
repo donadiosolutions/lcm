@@ -412,7 +412,7 @@ const GROUPS = [
       { name: "import [--provider ...] [--all] [--verbose] [--dry-run] [--replay]", summary: "Import Claude Code and Codex session transcripts" },
       { name: "promote [--all] [--verbose] [--dry-run]", summary: "Promote insights to long-term memory" },
       { name: "stats [-v]", summary: "Memory inventory and compression ratios" },
-      { name: "events promote [--all]", summary: "Drain queued passive-learning sidecar events" },
+      { name: "events promote [--all] [--json]", summary: "Drain queued passive-learning sidecar events" },
       { name: "diagnose [--all] [--days N] [--verbose] [--json]", summary: "Scan sessions for hook failures and issues" },
     ],
   },

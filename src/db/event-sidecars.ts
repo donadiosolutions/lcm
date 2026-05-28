@@ -44,7 +44,9 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
 
   let files: string[];
   try {
-    files = readdirSync(dir).filter(f => f.endsWith(".db"));
+    files = readdirSync(dir)
+      .filter(f => f.endsWith(".db"))
+      .sort((a, b) => a.localeCompare(b));
   } catch {
     return [];
   }

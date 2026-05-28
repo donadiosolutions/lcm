@@ -22,6 +22,8 @@ const AUTO_TAGS: Record<string, string> = {
 };
 
 const CORRELATION_WINDOW = 20;
+const PROMOTE_EVENTS_BATCH_SIZE = 500;
+const MAX_GLOBAL_PROMOTION_BATCHES = 10_000;
 const MIN_REINFORCED_PATTERN_OCCURRENCES = 3;
 const MIN_REINFORCED_PATTERN_SESSIONS = 2;
 const AUTO_PROMOTABLE_PATTERN_CATEGORIES = new Set(["file", "mcp", "skill", "subagent"]);
@@ -39,7 +41,9 @@ interface PromoteAllProjectResult extends PromoteResult {
   projectId: string;
   cwd?: string;
   unprocessedBefore: number;
+  batches: number;
   metadataMissing?: boolean;
+  incomplete?: boolean;
 }
 
 interface PromoteAllResult extends PromoteResult {
@@ -128,70 +132,120 @@ export function createPromoteEventsHandler(config: DaemonConfig): RouteHandler {
 
 export function createPromoteAllEventsHandler(config: DaemonConfig): RouteHandler {
   return async (_req, res) => {
-    const result: PromoteAllResult = {
-      promoted: 0,
-      skipped: 0,
-      correlated: 0,
-      errors: 0,
-      scanned: 0,
-      processedProjects: 0,
-      orphanedProjects: 0,
-      failedProjects: 0,
-      projects: [],
-    };
+    try {
+      const result: PromoteAllResult = {
+        promoted: 0,
+        skipped: 0,
+        correlated: 0,
+        errors: 0,
+        scanned: 0,
+        processedProjects: 0,
+        orphanedProjects: 0,
+        failedProjects: 0,
+        projects: [],
+      };
 
-    const sidecars = collectEventSidecars({ timeoutMs: 30_000, maxDbs: Number.MAX_SAFE_INTEGER })
-      .filter(sidecar => sidecar.unprocessed > 0);
-    result.scanned = sidecars.length;
+      const sidecars = collectEventSidecars({ timeoutMs: 30_000, maxDbs: Number.MAX_SAFE_INTEGER })
+        .filter(sidecar => sidecar.unprocessed > 0);
+      result.scanned = sidecars.length;
 
-    for (const sidecar of sidecars) {
-      if (!sidecar.cwd) {
-        result.orphanedProjects++;
-        result.projects.push({
-          projectId: sidecar.projectId,
-          unprocessedBefore: sidecar.unprocessed,
-          metadataMissing: true,
-          promoted: 0,
-          skipped: 0,
-          correlated: 0,
-          errors: 0,
-          message: "missing project metadata",
-        });
-        continue;
+      for (const sidecar of sidecars) {
+        if (!sidecar.cwd) {
+          result.orphanedProjects++;
+          result.projects.push({
+            projectId: sidecar.projectId,
+            unprocessedBefore: sidecar.unprocessed,
+            metadataMissing: true,
+            promoted: 0,
+            skipped: 0,
+            correlated: 0,
+            errors: 0,
+            batches: 0,
+            message: "missing project metadata",
+          });
+          continue;
+        }
+
+        try {
+          const projectResult = await drainEventsForCwd(config, sidecar.cwd);
+          result.promoted += projectResult.promoted;
+          result.skipped += projectResult.skipped;
+          result.correlated += projectResult.correlated;
+          result.errors += projectResult.errors;
+          result.processedProjects++;
+          if (projectResult.incomplete) result.failedProjects++;
+          result.projects.push({
+            ...projectResult,
+            projectId: sidecar.projectId,
+            cwd: sidecar.cwd,
+            unprocessedBefore: sidecar.unprocessed,
+          });
+        } catch (error) {
+          result.errors++;
+          result.failedProjects++;
+          safeLogError("promote-events", error, { cwd: sidecar.cwd });
+          result.projects.push({
+            projectId: sidecar.projectId,
+            cwd: sidecar.cwd,
+            unprocessedBefore: sidecar.unprocessed,
+            promoted: 0,
+            skipped: 0,
+            correlated: 0,
+            errors: 1,
+            batches: 0,
+            message: "failed to promote events",
+          });
+        }
       }
 
-      try {
-        const projectResult = await promoteEventsForCwd(config, sidecar.cwd);
-        result.promoted += projectResult.promoted;
-        result.skipped += projectResult.skipped;
-        result.correlated += projectResult.correlated;
-        result.errors += projectResult.errors;
-        result.processedProjects++;
-        result.projects.push({
-          ...projectResult,
-          projectId: sidecar.projectId,
-          cwd: sidecar.cwd,
-          unprocessedBefore: sidecar.unprocessed,
-        });
-      } catch (error) {
-        result.errors++;
-        result.failedProjects++;
-        safeLogError("promote-events", error, { cwd: sidecar.cwd });
-        result.projects.push({
-          projectId: sidecar.projectId,
-          cwd: sidecar.cwd,
-          unprocessedBefore: sidecar.unprocessed,
-          promoted: 0,
-          skipped: 0,
-          correlated: 0,
-          errors: 1,
-          message: "failed to promote events",
-        });
-      }
+      sendJson(res, 200, result);
+    } catch (error) {
+      safeLogError("promote-events", error, {});
+      sendJson(res, 500, { error: "failed to promote events" });
+    }
+  };
+}
+
+async function drainEventsForCwd(config: DaemonConfig, cwd: string): Promise<PromoteResult & { batches: number; incomplete?: boolean }> {
+  const result: PromoteResult & { batches: number; incomplete?: boolean } = {
+    promoted: 0,
+    skipped: 0,
+    correlated: 0,
+    errors: 0,
+    batches: 0,
+  };
+
+  for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
+    const batchResult = await promoteEventsForCwd(config, cwd);
+    if (batchResult.message === "no unprocessed events") {
+      result.message = result.batches === 0
+        ? "no unprocessed events"
+        : "drained all unprocessed events";
+      return result;
     }
 
-    sendJson(res, 200, result);
-  };
+    result.promoted += batchResult.promoted;
+    result.skipped += batchResult.skipped;
+    result.correlated += batchResult.correlated;
+    result.errors += batchResult.errors;
+    result.batches++;
+
+    const processed = batchResult.promoted + batchResult.skipped;
+    if (processed === 0) {
+      result.incomplete = true;
+      result.message = "stopped because remaining events failed to promote";
+      return result;
+    }
+
+    if (processed < PROMOTE_EVENTS_BATCH_SIZE && batchResult.errors === 0) {
+      result.message = "drained all unprocessed events";
+      return result;
+    }
+  }
+
+  result.incomplete = true;
+  result.message = "stopped after maximum promotion batches";
+  return result;
 }
 
 export async function promoteEventsForCwd(config: DaemonConfig, cwd: string): Promise<PromoteResult> {

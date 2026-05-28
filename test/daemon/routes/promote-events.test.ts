@@ -266,6 +266,40 @@ describe("promote-events route", () => {
     expect(result.projects[0].cwd).toBe(projectCwd);
   });
 
+  it("drains every batch from metadata-backed sidecars during global promotion", async () => {
+    const projectCwd = mkdtempSync(join(tmpdir(), "promote-all-large-project-"));
+    extraDirs.push(projectCwd);
+    const projectSidecarPath = join(dir, `${projectId(projectCwd)}.db`);
+    ensureProjectDir(projectCwd);
+    vi.mocked(eventsDbPath).mockImplementation((cwd: string) =>
+      cwd === projectCwd ? projectSidecarPath : sidecarPath
+    );
+
+    const edb = new EventsDb(projectSidecarPath);
+    for (let i = 0; i < 501; i++) {
+      edb.insertEvent("s1", { type: "decision", category: "decision", data: `global backlog ${i}`, priority: 1 }, "PostToolUse");
+    }
+    edb.close();
+
+    const db = setupProjectDb(projectCwd);
+    db.close();
+
+    const handler = createPromoteAllEventsHandler(makeConfig());
+    const { res, getBody } = mockRes();
+    await handler({} as any, res, "");
+
+    const result = getBody();
+    expect(result.promoted).toBe(501);
+    expect(result.projects[0].batches).toBe(2);
+    expect(result.projects[0].message).toBe("drained all unprocessed events");
+    expect(deduplicateAndInsert).toHaveBeenCalledTimes(501);
+
+    const remainingDb = new EventsDb(projectSidecarPath);
+    const remaining = remainingDb.getUnprocessed();
+    remainingDb.close();
+    expect(remaining).toHaveLength(0);
+  });
+
   it("reports orphan sidecars during global promotion", async () => {
     const orphanPath = join(dir, "orphan.db");
     const edb = new EventsDb(orphanPath);

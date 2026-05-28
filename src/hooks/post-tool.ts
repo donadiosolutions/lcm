@@ -20,7 +20,10 @@ export async function handlePostToolUse(
     const events = extractPostToolEvents({ tool_name, tool_input: tool_input ?? {}, tool_response, tool_output });
     if (events.length === 0) return { exitCode: 0, stdout: "" };
 
-    cwd = String(input.cwd ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd());
+    const rawCwd = input.cwd ?? process.env.CLAUDE_PROJECT_DIR;
+    cwd = typeof rawCwd === "string" && rawCwd.trim().length > 0
+      ? rawCwd
+      : process.cwd();
     ensureProjectDir(cwd);
     const dbPath = eventsDbPath(cwd);
     const db = new EventsDb(dbPath);
