@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { runDoctor } from "../../src/doctor/doctor.js";
 import { REQUIRED_HOOKS } from "../../installer/install.js";
 import { LCM_MD_CONTENT } from "../../src/daemon/orientation.js";
@@ -15,6 +15,12 @@ vi.mock("../../src/db/events-stats.js", () => ({
 
 import { collectEventStats } from "../../src/db/events-stats.js";
 const mockCollectEventStats = vi.mocked(collectEventStats);
+
+beforeEach(() => {
+  vi.mocked(ensureDaemon).mockReset();
+  vi.mocked(ensureDaemon).mockResolvedValue({ connected: false });
+  mockCollectEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null });
+});
 
 function buildSettingsJson(): string {
   const hooks: Record<string, unknown[]> = {};
@@ -157,6 +163,32 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.fixApplied).toBe(false);
     expect(daemonResult?.status).toBe("warn");
     expect(daemonResult?.message).toContain("did not fix mismatch");
+  });
+
+  it("does not recommend event promotion when a stale daemon restart throws", async () => {
+    const pkgVersion = "0.6.0";
+    const daemonVersion = "0.5.0";
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(new Error("restart failed"));
+    mockCollectEventStats.mockReturnValue({ captured: 5000, unprocessed: 2000, errors: 0, lastCapture: "2026-03-26 10:00:00", sidecarsWithUnprocessed: 1 });
+
+    const deps = minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      readFileSync: (path: string) => {
+        if (path.endsWith("config.json")) return "{}";
+        if (path.endsWith("settings.json")) return buildSettingsJson();
+        if (path.endsWith("package.json")) return JSON.stringify({ version: pkgVersion });
+        if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
+        if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
+        return "{}";
+      },
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: daemonVersion }) }),
+    });
+
+    const results = await runDoctor(deps);
+    const capture = results.find((r) => r.name === "events-capture");
+
+    expect(capture?.message).toContain("daemon may be offline");
+    expect(capture?.message).not.toContain("lcm events promote --all");
   });
 });
 

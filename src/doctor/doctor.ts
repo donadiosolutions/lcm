@@ -287,6 +287,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, verbose = false
           daemonHealthy = false;
         }
       } catch {
+        daemonHealthy = false;
         results.push({ name: "daemon", category: "Daemon", status: "warn",
           message: `localhost:${config.port} — version mismatch (v${daemonVersion} running, v${pkgVersion} installed)\n     Fix: lcm daemon restart` });
       }
