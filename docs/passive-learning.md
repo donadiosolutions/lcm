@@ -124,17 +124,24 @@ The UserPromptSubmit extractor includes guards against false-positive decisions.
 
 ### `lcm doctor`
 
-When passive learning hooks are installed, `lcm doctor` includes a "Passive Learning" category with three checks:
+When passive learning hooks are installed, `lcm doctor` includes a "Passive Learning" category with sidecar health checks:
 
 | Check | What it monitors |
 |-------|-----------------|
 | `events-capture` | Total events captured, unprocessed count |
 | `events-errors` | Hook error count (last 30 days) |
+| `events-sidecar-prune` | Empty or stale orphan sidecars removed during the scan |
+| `events-sidecar-scan` | Sidecar DBs that failed to scan because of corruption or I/O errors |
+| `events-sidecar-scan-skipped` | Sidecar DBs intentionally skipped by the scan count or timeout budget |
 | `events-staleness` | Time since last event capture |
 
-Run `lcm doctor` to see the per-project breakdown and recent error details.
+Run `lcm doctor --verbose` to see the per-project breakdown and recent error details.
+
+By default, doctor scans up to 50 passive-learning sidecar DBs. Use `lcm doctor --events-max-dbs <n>` to set another count limit, or `lcm doctor --events-max-dbs all` / `lcm doctor --events-max-dbs unlimited` to remove the count limit. Sidecars skipped because of the count or timeout budget are reported as skipped, not warnings.
 
 When the daemon is healthy but many queued events remain across old project sidecars, `lcm doctor` reports that the daemon is up and suggests `lcm events promote --all` instead of asking you to restart the daemon.
+
+During the sidecar scan, lcm also prunes orphan sidecars that are safe to remove. A sidecar is pruned only when its project metadata is missing and it has no unprocessed events. Empty orphan sidecars are removed immediately; processed-only orphan sidecars are removed after the 30-day stale retention window.
 
 ### `lcm stats`
 

@@ -196,6 +196,11 @@ function parsePositiveInteger(value: string, optionName: string): number {
   return parsed;
 }
 
+function parsePositiveIntegerOrAll(value: string, optionName: string): number {
+  if (value === "all" || value === "unlimited") return Number.MAX_SAFE_INTEGER;
+  return parsePositiveInteger(value, optionName);
+}
+
 function ensureAllowedValues(values: string[] | undefined, allowed: readonly string[], optionName: string): void {
   if (!values) return;
   const invalid = values.filter((value) => !allowed.includes(value));
@@ -722,14 +727,16 @@ async function main() {
     .helpOption(false)
     .option("-h, --help", "Show help")
     .option("--verbose", "Show detailed diagnostic output")
+    .option("--events-max-dbs <n|all|unlimited>", "Maximum passive-learning sidecar DBs to scan", "50")
     .action(async (opts) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("doctor"); exit(0);
       }
       const verbose: boolean = opts.verbose ?? false;
+      const eventsMaxDbs = parsePositiveIntegerOrAll(String(opts.eventsMaxDbs ?? "50"), "--events-max-dbs");
       const { runDoctor, printResults } = await import("../src/doctor/doctor.js");
-      const results = await runDoctor(undefined, verbose);
+      const results = await runDoctor(undefined, { verbose, eventsMaxDbs });
       printResults(results);
       const failures = results.filter((r: { status: string }) => r.status === "fail");
       exit(failures.length > 0 ? 1 : 0);

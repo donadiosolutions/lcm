@@ -1,11 +1,13 @@
 // src/db/events-stats.ts
-import { collectEventSidecars } from "./event-sidecars.js";
+import { collectEventSidecars, type EventSidecarScanOptions } from "./event-sidecars.js";
 
 export interface EventStats {
   captured: number;
   unprocessed: number;
   errors: number;
   scanErrors?: number;
+  scanSkipped?: number;
+  prunedSidecars?: number;
   lastCapture: string | null;
   sidecars?: number;
   sidecarsWithUnprocessed?: number;
@@ -23,29 +25,50 @@ export interface DetailedEventStats extends EventStats {
     lastCapture: string | null;
     path: string;
     scanError?: string;
+    scanSkipped?: string;
+    pruned?: boolean;
+    pruneReason?: string;
   }>;
   recentErrors: Array<{ created_at: string; hook: string; error: string }>;
+}
+
+export type EventStatsOptions = number | EventSidecarScanOptions;
+
+function normalizeStatsOptions(options: EventStatsOptions = {}): EventSidecarScanOptions {
+  if (typeof options === "number") return { timeoutMs: options };
+  return options;
 }
 
 /**
  * Scan all sidecar DBs and aggregate event stats.
  * Used by both lcm doctor and lcm stats.
- * @param timeoutMs Total time budget for the scan (default 2000ms)
+ * @param options Total scan options, or timeout in milliseconds for backward compatibility.
  */
-export function collectEventStats(timeoutMs = 2000): EventStats {
+export function collectEventStats(options: EventStatsOptions = {}): EventStats {
+  const scanOptions = normalizeStatsOptions(options);
   const result: EventStats = {
     captured: 0,
     unprocessed: 0,
     errors: 0,
     scanErrors: 0,
+    scanSkipped: 0,
+    prunedSidecars: 0,
     lastCapture: null,
     sidecars: 0,
     sidecarsWithUnprocessed: 0,
     orphanedSidecarsWithUnprocessed: 0,
   };
 
-  for (const sidecar of collectEventSidecars({ timeoutMs })) {
+  for (const sidecar of collectEventSidecars(scanOptions)) {
     result.sidecars = (result.sidecars ?? 0) + 1;
+    if (sidecar.pruned) {
+      result.prunedSidecars = (result.prunedSidecars ?? 0) + 1;
+      continue;
+    }
+    if (sidecar.scanSkipped) {
+      result.scanSkipped = (result.scanSkipped ?? 0) + 1;
+      continue;
+    }
     result.captured += sidecar.captured;
     result.unprocessed += sidecar.unprocessed;
     if (sidecar.scanError) {
@@ -70,30 +93,37 @@ export function collectEventStats(timeoutMs = 2000): EventStats {
 /**
  * Detailed scan for verbose doctor output — returns per-project breakdown + recent errors.
  */
-export function collectDetailedEventStats(timeoutMs = 2000): DetailedEventStats {
+export function collectDetailedEventStats(options: EventStatsOptions = {}): DetailedEventStats {
+  const scanOptions = normalizeStatsOptions(options);
   const result: DetailedEventStats = {
-    captured: 0, unprocessed: 0, errors: 0, scanErrors: 0, lastCapture: null,
+    captured: 0, unprocessed: 0, errors: 0, scanErrors: 0, scanSkipped: 0, prunedSidecars: 0, lastCapture: null,
     sidecars: 0, sidecarsWithUnprocessed: 0, orphanedSidecarsWithUnprocessed: 0,
     projects: [], recentErrors: [],
   };
 
-  for (const sidecar of collectEventSidecars({ timeoutMs, includeRecentErrors: true })) {
+  for (const sidecar of collectEventSidecars({ ...scanOptions, includeRecentErrors: true })) {
     result.sidecars = (result.sidecars ?? 0) + 1;
-    result.captured += sidecar.captured;
-    result.unprocessed += sidecar.unprocessed;
-    if (sidecar.scanError) {
-      result.scanErrors = (result.scanErrors ?? 0) + 1;
+    if (sidecar.pruned) {
+      result.prunedSidecars = (result.prunedSidecars ?? 0) + 1;
+    } else if (sidecar.scanSkipped) {
+      result.scanSkipped = (result.scanSkipped ?? 0) + 1;
     } else {
-      result.errors += sidecar.errors;
-    }
-    if (sidecar.unprocessed > 0) {
-      result.sidecarsWithUnprocessed = (result.sidecarsWithUnprocessed ?? 0) + 1;
-      if (sidecar.metadataMissing) {
-        result.orphanedSidecarsWithUnprocessed = (result.orphanedSidecarsWithUnprocessed ?? 0) + 1;
+      result.captured += sidecar.captured;
+      result.unprocessed += sidecar.unprocessed;
+      if (sidecar.scanError) {
+        result.scanErrors = (result.scanErrors ?? 0) + 1;
+      } else {
+        result.errors += sidecar.errors;
       }
-    }
-    if (sidecar.lastCapture && (!result.lastCapture || sidecar.lastCapture > result.lastCapture)) {
-      result.lastCapture = sidecar.lastCapture;
+      if (sidecar.unprocessed > 0) {
+        result.sidecarsWithUnprocessed = (result.sidecarsWithUnprocessed ?? 0) + 1;
+        if (sidecar.metadataMissing) {
+          result.orphanedSidecarsWithUnprocessed = (result.orphanedSidecarsWithUnprocessed ?? 0) + 1;
+        }
+      }
+      if (sidecar.lastCapture && (!result.lastCapture || sidecar.lastCapture > result.lastCapture)) {
+        result.lastCapture = sidecar.lastCapture;
+      }
     }
     result.projects.push({
       file: sidecar.file,
@@ -105,6 +135,9 @@ export function collectDetailedEventStats(timeoutMs = 2000): DetailedEventStats 
       lastCapture: sidecar.lastCapture,
       path: sidecar.path,
       scanError: sidecar.scanError,
+      scanSkipped: sidecar.scanSkipped,
+      pruned: sidecar.pruned,
+      pruneReason: sidecar.pruneReason,
     });
     result.recentErrors.push(...(sidecar.recentErrors ?? []));
   }

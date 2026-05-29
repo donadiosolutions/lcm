@@ -309,6 +309,35 @@ describe("promote-events route", () => {
     expect(existsSync(recomputedSidecarPath)).toBe(false);
   });
 
+  it("reports sidecars skipped by the global scan budget", async () => {
+    const firstSidecarPath = join(dir, "a-project.db");
+    const secondSidecarPath = join(dir, "b-project.db");
+
+    const firstDb = new EventsDb(firstSidecarPath);
+    firstDb.close();
+    const secondDb = new EventsDb(secondSidecarPath);
+    secondDb.close();
+
+    const now = vi.spyOn(Date, "now");
+    now.mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValueOnce(30_001);
+
+    const handler = createPromoteAllEventsHandler(makeConfig());
+    const { res, getBody } = mockRes();
+    try {
+      await handler({} as any, res, "");
+    } finally {
+      now.mockRestore();
+    }
+
+    const result = getBody();
+    expect(result.scanned).toBe(2);
+    expect(result.failedProjects).toBe(1);
+    expect(result.projects).toHaveLength(1);
+    expect(result.projects[0].projectId).toBe("b-project");
+    expect(result.projects[0].incomplete).toBe(true);
+    expect(result.projects[0].message).toContain("sidecar scan skipped");
+  });
+
   it("drains every batch from metadata-backed sidecars during global promotion", async () => {
     const projectCwd = mkdtempSync(join(tmpdir(), "promote-all-large-project-"));
     extraDirs.push(projectCwd);

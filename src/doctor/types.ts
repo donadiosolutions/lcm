@@ -1,7 +1,7 @@
 export interface CheckResult {
   name: string;
   category: string;
-  status: "pass" | "warn" | "fail";
+  status: "pass" | "warn" | "fail" | "skip";
   message: string;
   fixApplied?: boolean;
 }
