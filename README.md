@@ -10,7 +10,10 @@
 <p align="center">
   <a href="https://www.npmjs.com/package/@donadiosolutions/lcm"><img src="https://img.shields.io/npm/v/@donadiosolutions/lcm" alt="npm"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/donadiosolutions/lcm" alt="License: MIT"></a>
-  <a href="package.json"><img src="https://img.shields.io/node/v/@donadiosolutions/lcm" alt="Node"></a>
+  <a href="https://github.com/donadiosolutions/lcm/actions/workflows/ci.yml"><img src="https://github.com/donadiosolutions/lcm/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://socket.dev/npm/package/@donadiosolutions/lcm"><img src="https://badge.socket.dev/npm/package/@donadiosolutions/lcm" alt="Socket"></a>
+  <a href="https://github.com/donadiosolutions/lcm/actions/workflows/github-code-scanning/codeql"><img src="https://github.com/donadiosolutions/lcm/actions/workflows/github-code-scanning/codeql/badge.svg" alt="CodeQL"></a>
+  <a href="https://codecov.io/gh/donadiosolutions/lcm"><img src="https://codecov.io/gh/donadiosolutions/lcm/graph/badge.svg?branch=main" alt="Codecov"></a>
 </p>
 
 <p align="center">
@@ -30,10 +33,6 @@
 - Claude Code and Codex have native hook integrations, while VS Code uses connector-based workflows on the same backend today.
 
 Humans and agents use the same backend. The integration surface differs by client, but the memory model is shared.
-
-This repo is a fork of [lossless-claude](https://github.com/lossless-claude), which in turn is a fork of [lossless-claw](https://github.com/Martian-Engineering/lossless-claw) by [Martian Engineering](https://martian.engineering). This fork's objective is to have first class support for Codex as well, but a number of other coding agents are also supported. Improvements to cover more harnesses are always welcome. Tigther security measures are a focus as well.
-
-The LCM model and DAG architecture originate from the [Voltropy paper](https://papers.voltropy.com/LCM).
 
 ## Runtime Model
 
