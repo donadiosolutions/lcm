@@ -10,6 +10,9 @@ export default defineConfig({
   test: {
     include: ["**/*.test.ts"],
     exclude: ["node_modules/**", ".claude/**"],
+    coverage: {
+      include: ["bin/**/*.ts", "installer/**/*.ts", "src/**/*.ts"],
+    },
     projects: [
       {
         test: {
