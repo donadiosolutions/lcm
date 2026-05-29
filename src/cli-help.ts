@@ -69,13 +69,15 @@ const HELP: Record<string, CommandHelp> = {
 
   doctor: {
     summary: "Run diagnostics — checks daemon health, hooks, MCP server, and summarizer.",
-    usage: "lcm doctor [--verbose]",
+    usage: "lcm doctor [--verbose] [--events-max-dbs <n|all>]",
     options: [
       ["--verbose", "Show detailed passive-learning sidecar diagnostics"],
+      ["--events-max-dbs <n|all>", "Limit passive-learning sidecar DB scans (default: 50; use all for no count limit)"],
     ],
     examples: [
       ["lcm doctor", "Run all diagnostic checks"],
       ["lcm doctor --verbose", "Include per-sidecar passive-learning diagnostics"],
+      ["lcm doctor --events-max-dbs all", "Scan every passive-learning sidecar DB"],
     ],
     notes: "Exits with code 1 if any check fails. Integrate into CI or shell startup for early detection.",
   },

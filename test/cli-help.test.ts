@@ -101,6 +101,15 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("--layer <name>");
   });
 
+  it("prints doctor command help with sidecar scan limit", () => {
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    printHelp("doctor");
+    const text = out.mock.calls.map(c => c[0]).join("");
+    expect(text).toContain("lcm doctor");
+    expect(text).toContain("--events-max-dbs <n|all>");
+    expect(text).toContain("lcm doctor --events-max-dbs all");
+  });
+
   it("prints import command help with Codex provider flags", () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     printHelp("import");

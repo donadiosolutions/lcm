@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { EventsDb } from "../hooks/events-db.js";
 import { eventsDir } from "./events-path.js";
@@ -16,16 +16,22 @@ export interface EventSidecarSummary {
   lastCapture: string | null;
   recentErrors?: Array<{ created_at: string; hook: string; error: string }>;
   scanError?: string;
+  scanSkipped?: string;
+  pruned?: boolean;
+  pruneReason?: string;
 }
 
 export interface EventSidecarScanOptions {
   timeoutMs?: number;
   maxDbs?: number;
   includeRecentErrors?: boolean;
+  pruneOrphanSidecars?: boolean;
+  pruneOrphanSidecarsOlderThanDays?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 2000;
 const DEFAULT_MAX_DBS = 50;
+const DEFAULT_PRUNE_ORPHAN_SIDECAR_AGE_DAYS = 30;
 
 function readCwdForProject(projectId: string): string | undefined {
   const metaPath = join(projectsDir(), projectId, "meta.json");
@@ -61,10 +67,60 @@ function failedSidecarSummary(
   };
 }
 
+function skippedSidecarSummary(file: string, path: string, scanSkipped: string): EventSidecarSummary {
+  const projectId = file.slice(0, -".db".length);
+  return {
+    file,
+    projectId,
+    path,
+    metadataMissing: false,
+    captured: 0,
+    unprocessed: 0,
+    errors: 0,
+    lastCapture: null,
+    scanSkipped,
+  };
+}
+
+function parseSqliteDate(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const parsed = Date.parse(`${value.replace(" ", "T")}Z`);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+function orphanPruneReason(summary: EventSidecarSummary, olderThanDays: number): string | undefined {
+  if (
+    !summary.metadataMissing
+    || summary.unprocessed > 0
+    || summary.errors > 0
+    || summary.scanError
+    || summary.scanSkipped
+  ) {
+    return undefined;
+  }
+  if (summary.captured === 0) return "empty orphan sidecar";
+
+  const lastCaptureMs = parseSqliteDate(summary.lastCapture);
+  if (lastCaptureMs === undefined) return undefined;
+  const ageMs = olderThanDays * 24 * 60 * 60 * 1000;
+  if (Date.now() - lastCaptureMs >= ageMs) {
+    return `stale orphan sidecar (${olderThanDays}d retention)`;
+  }
+  return undefined;
+}
+
+function pruneSidecarFiles(path: string): void {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    rmSync(`${path}${suffix}`, { force: true });
+  }
+}
+
 export function collectEventSidecars(options: EventSidecarScanOptions = {}): EventSidecarSummary[] {
   const dir = eventsDir();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxDbs = options.maxDbs ?? DEFAULT_MAX_DBS;
+  const pruneOrphans = options.pruneOrphanSidecars ?? true;
+  const pruneOlderThanDays = options.pruneOrphanSidecarsOlderThanDays ?? DEFAULT_PRUNE_ORPHAN_SIDECAR_AGE_DAYS;
   const deadline = Date.now() + timeoutMs;
 
   let files: string[];
@@ -82,11 +138,11 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
     const file = files[index];
     const path = join(dir, file);
     if (scanned >= maxDbs || Date.now() >= deadline) {
-      const scanError = scanned >= maxDbs
+      const scanSkipped = scanned >= maxDbs
         ? "sidecar scan skipped after maxDbs limit"
         : "sidecar scan skipped after timeout";
       for (const skippedFile of files.slice(index)) {
-        sidecars.push(failedSidecarSummary(skippedFile, join(dir, skippedFile), scanError, false));
+        sidecars.push(skippedSidecarSummary(skippedFile, join(dir, skippedFile), scanSkipped));
       }
       break;
     }
@@ -96,6 +152,7 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
     try {
       const db = new EventsDb(path);
       db.raw().exec("PRAGMA busy_timeout = 500");
+      let summary: EventSidecarSummary;
       try {
         const stats = db.getHealthStats();
         const cwd = readCwdForProject(projectId);
@@ -104,7 +161,7 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
             "SELECT created_at, hook, error FROM error_log WHERE hook NOT LIKE 'maintenance:%' ORDER BY id DESC LIMIT 5"
           ).all() as Array<{ created_at: string; hook: string; error: string }>
           : undefined;
-        sidecars.push({
+        summary = {
           file,
           projectId,
           path,
@@ -115,9 +172,16 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
           errors: stats.errors,
           lastCapture: stats.lastCapture,
           recentErrors,
-        });
+        };
       } finally {
         db.close();
+      }
+      const pruneReason = pruneOrphans ? orphanPruneReason(summary, pruneOlderThanDays) : undefined;
+      if (pruneReason) {
+        pruneSidecarFiles(path);
+        sidecars.push({ ...summary, pruned: true, pruneReason });
+      } else {
+        sidecars.push(summary);
       }
     } catch (error) {
       sidecars.push(failedSidecarSummary(

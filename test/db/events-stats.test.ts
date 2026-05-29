@@ -1,6 +1,6 @@
 // test/db/events-stats.test.ts
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -84,8 +84,65 @@ describe("collectEventStats", () => {
 
     const sidecars = collectEventSidecars({ maxDbs: 1 });
     expect(sidecars).toHaveLength(2);
-    expect(sidecars.some((sidecar) => sidecar.scanError === undefined)).toBe(true);
-    expect(sidecars.some((sidecar) => (sidecar.scanError ?? "").includes("maxDbs"))).toBe(true);
+    expect(sidecars.some((sidecar) => sidecar.scanSkipped === undefined)).toBe(true);
+    expect(sidecars.some((sidecar) => (sidecar.scanSkipped ?? "").includes("maxDbs"))).toBe(true);
+
+    const stats = collectEventStats({ maxDbs: 1 });
+    expect(stats.scanSkipped).toBe(1);
+    expect(stats.scanErrors).toBe(0);
+  });
+
+  it("prunes empty orphan sidecars during scans", () => {
+    const sidecarPath = join(tempDir, `orphan-empty-${Date.now()}.db`);
+    const db = new EventsDb(sidecarPath);
+    db.close();
+
+    const sidecars = collectEventSidecars();
+    const pruned = sidecars.find((sidecar) => sidecar.path === sidecarPath);
+
+    expect(pruned?.pruned).toBe(true);
+    expect(pruned?.pruneReason).toContain("empty orphan");
+    expect(existsSync(sidecarPath)).toBe(false);
+  });
+
+  it("prunes stale processed orphan sidecars but preserves queued orphan sidecars", () => {
+    const stalePath = join(tempDir, `orphan-stale-${Date.now()}.db`);
+    const staleDb = new EventsDb(stalePath);
+    staleDb.insertEvent("s1", { type: "decision", category: "decision", data: "old", priority: 1 }, "PostToolUse");
+    const staleEvents = staleDb.getUnprocessed();
+    staleDb.markProcessed(staleEvents.map((event) => event.event_id));
+    staleDb.raw().exec("UPDATE events SET created_at = datetime('now', '-31 days')");
+    staleDb.close();
+
+    const queuedPath = join(tempDir, `orphan-queued-${Date.now()}.db`);
+    const queuedDb = new EventsDb(queuedPath);
+    queuedDb.insertEvent("s1", { type: "decision", category: "decision", data: "queued", priority: 1 }, "PostToolUse");
+    queuedDb.close();
+
+    const sidecars = collectEventSidecars();
+    const pruned = sidecars.find((sidecar) => sidecar.path === stalePath);
+    const queued = sidecars.find((sidecar) => sidecar.path === queuedPath);
+
+    expect(pruned?.pruned).toBe(true);
+    expect(pruned?.pruneReason).toContain("stale orphan");
+    expect(existsSync(stalePath)).toBe(false);
+    expect(queued?.pruned).toBeUndefined();
+    expect(queued?.unprocessed).toBe(1);
+    expect(existsSync(queuedPath)).toBe(true);
+  });
+
+  it("preserves orphan sidecars with recent hook errors", () => {
+    const sidecarPath = join(tempDir, `orphan-errors-${Date.now()}.db`);
+    const db = new EventsDb(sidecarPath);
+    db.logHookError("PostToolUse", new Error("recent failure"));
+    db.close();
+
+    const sidecars = collectEventSidecars();
+    const preserved = sidecars.find((sidecar) => sidecar.path === sidecarPath);
+
+    expect(preserved?.pruned).toBeUndefined();
+    expect(preserved?.errors).toBe(1);
+    expect(existsSync(sidecarPath)).toBe(true);
   });
 
   it("includes scan failures in detailed project stats", () => {

@@ -43,6 +43,21 @@ interface DoctorConfig {
   summarizer: string;
 }
 
+export interface DoctorRunOptions {
+  verbose?: boolean;
+  eventsMaxDbs?: number;
+}
+
+function normalizeDoctorOptions(options: boolean | DoctorRunOptions = false): Required<DoctorRunOptions> {
+  if (typeof options === "boolean") {
+    return { verbose: options, eventsMaxDbs: 50 };
+  }
+  return {
+    verbose: options.verbose ?? false,
+    eventsMaxDbs: options.eventsMaxDbs ?? 50,
+  };
+}
+
 function loadConfig(deps: DoctorDeps): DoctorConfig {
   const resolvedConfigPath = configPath(deps.homedir);
   let config: Record<string, unknown> = {};
@@ -128,10 +143,26 @@ function formatTimeAgo(date: Date): string {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-function checkPassiveLearning(results: CheckResult[], hooksInstalled: boolean, verbose: boolean, daemonHealthy: boolean): void {
+function checkPassiveLearning(
+  results: CheckResult[],
+  hooksInstalled: boolean,
+  options: Required<DoctorRunOptions>,
+  daemonHealthy: boolean,
+): void {
   if (!hooksInstalled) return;
 
-  const stats = verbose ? collectDetailedEventStats(2000) : collectEventStats(2000);
+  const statsOptions = { timeoutMs: 2000, maxDbs: options.eventsMaxDbs };
+  const stats = options.verbose ? collectDetailedEventStats(statsOptions) : collectEventStats(statsOptions);
+
+  if ((stats.prunedSidecars ?? 0) > 0) {
+    results.push({
+      name: "events-sidecar-prune",
+      category: "Passive Learning",
+      status: "pass",
+      message: `pruned ${stats.prunedSidecars} empty/stale orphan sidecar${stats.prunedSidecars === 1 ? "" : "s"}`,
+      fixApplied: true,
+    });
+  }
 
   // Capture check
   if (stats.captured === 0) {
@@ -172,6 +203,14 @@ function checkPassiveLearning(results: CheckResult[], hooksInstalled: boolean, v
   if ((stats.scanErrors ?? 0) > 0) {
     results.push({ name: "events-sidecar-scan", category: "Passive Learning", status: "warn", message: `${stats.scanErrors} sidecar${stats.scanErrors === 1 ? "" : "s"} failed to scan — run lcm doctor --verbose to identify the affected .db file${stats.scanErrors === 1 ? "" : "s"}` });
   }
+  if ((stats.scanSkipped ?? 0) > 0) {
+    results.push({
+      name: "events-sidecar-scan-skipped",
+      category: "Passive Learning",
+      status: "skip",
+      message: `${stats.scanSkipped} sidecar${stats.scanSkipped === 1 ? "" : "s"} skipped by scan limit — run lcm doctor --events-max-dbs all to scan every sidecar`,
+    });
+  }
 
   // Staleness check
   if (stats.lastCapture) {
@@ -189,11 +228,19 @@ function checkPassiveLearning(results: CheckResult[], hooksInstalled: boolean, v
   }
 
   // Verbose: per-project breakdown
-  if (verbose && "projects" in stats) {
+  if (options.verbose && "projects" in stats) {
     const detailed = stats as import("../db/events-stats.js").DetailedEventStats;
     for (const p of detailed.projects) {
+      if (p.pruned) {
+        results.push({ name: `events-project-${p.file}`, category: "Passive Learning", status: "pass", message: `${p.file.slice(0, 8)}… pruned: ${p.pruneReason ?? "orphan sidecar"} — ${p.path}` });
+        continue;
+      }
       if (p.scanError) {
         results.push({ name: `events-project-${p.file}`, category: "Passive Learning", status: "warn", message: `${p.file.slice(0, 8)}… scan failed: ${p.scanError} — ${p.path}` });
+        continue;
+      }
+      if (p.scanSkipped) {
+        results.push({ name: `events-project-${p.file}`, category: "Passive Learning", status: "skip", message: `${p.file.slice(0, 8)}… scan skipped: ${p.scanSkipped} — ${p.path}` });
         continue;
       }
       const ago = p.lastCapture ? formatTimeAgo(new Date(`${p.lastCapture.replace(" ", "T")}Z`)) : "never";
@@ -207,8 +254,9 @@ function checkPassiveLearning(results: CheckResult[], hooksInstalled: boolean, v
   }
 }
 
-export async function runDoctor(overrides?: Partial<DoctorDeps>, verbose = false): Promise<CheckResult[]> {
+export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: boolean | DoctorRunOptions = false): Promise<CheckResult[]> {
   const deps = { ...defaultDeps(), ...overrides };
+  const options = normalizeDoctorOptions(doctorOptions);
   const results: CheckResult[] = [];
   const config = loadConfig(deps);
 
@@ -531,7 +579,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, verbose = false
   const hooksInstalled = results.some(
     r => r.category === "Settings" && r.name === "hooks" && r.status !== "fail"
   );
-  checkPassiveLearning(results, hooksInstalled, verbose, daemonHealthy);
+  checkPassiveLearning(results, hooksInstalled, options, daemonHealthy);
 
   return results;
 }
@@ -556,6 +604,7 @@ export function printResults(results: CheckResult[]): void {
     const icon =
       r.status === "pass" ? `${COLORS.green}✅${COLORS.nc}` :
       r.status === "warn" ? `${COLORS.yellow}⚠️ ${COLORS.nc}` :
+      r.status === "skip" ? `${COLORS.dim}⏭️ ${COLORS.nc}` :
                             `${COLORS.red}❌${COLORS.nc}`;
     const suffix = r.fixApplied ? ` ${COLORS.dim}(auto-fixed)${COLORS.nc}` : "";
     console.log(`    ${icon} ${COLORS.dim}${r.name}${COLORS.nc}  ${r.message}${suffix}`);
@@ -564,8 +613,9 @@ export function printResults(results: CheckResult[]): void {
   const pass = results.filter(r => r.status === "pass" && r.name !== "stack").length;
   const fail = results.filter(r => r.status === "fail").length;
   const warn = results.filter(r => r.status === "warn").length;
+  const skip = results.filter(r => r.status === "skip").length;
 
-  console.log(`\n  ${pass} passed · ${fail} failed · ${warn} warnings\n`);
+  console.log(`\n  ${pass} passed · ${fail} failed · ${warn} warnings · ${skip} skipped\n`);
 }
 
 export function formatResultsPlain(results: CheckResult[]): string {
@@ -594,7 +644,7 @@ export function formatResultsPlain(results: CheckResult[]): string {
       lines.push("| Check | Status |");
       lines.push("|---|---|");
       for (const r of tableItems) {
-        const icon = r.status === "pass" ? "✅" : r.status === "warn" ? "⚠️" : "❌";
+        const icon = r.status === "pass" ? "✅" : r.status === "warn" ? "⚠️" : r.status === "skip" ? "⏭️" : "❌";
         const suffix = r.fixApplied ? " (auto-fixed)" : "";
         lines.push(`| ${r.name} | ${icon} ${r.message}${suffix} |`);
       }
@@ -606,6 +656,7 @@ export function formatResultsPlain(results: CheckResult[]): string {
   const pass = results.filter(r => r.status === "pass" && r.name !== "stack").length;
   const fail = results.filter(r => r.status === "fail").length;
   const warn = results.filter(r => r.status === "warn").length;
-  lines.push(`${pass} passed · ${fail} failed · ${warn} warnings`);
+  const skip = results.filter(r => r.status === "skip").length;
+  lines.push(`${pass} passed · ${fail} failed · ${warn} warnings · ${skip} skipped`);
   return lines.join("\n");
 }

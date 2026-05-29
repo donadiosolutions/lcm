@@ -340,6 +340,30 @@ describe("Passive Learning checks", () => {
     expect(scanErrors?.message).toContain("run lcm doctor --verbose");
   });
 
+  it("reports scan-budget sidecars as skips instead of warnings", async () => {
+    mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, scanSkipped: 4, lastCapture: "2026-03-26 10:00:00" });
+    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
+    const scanSkipped = results.find(r => r.name === "events-sidecar-scan-skipped");
+    expect(scanSkipped?.status).toBe("skip");
+    expect(scanSkipped?.message).toContain("--events-max-dbs all");
+    expect(results.find(r => r.name === "events-sidecar-scan")).toBeUndefined();
+  });
+
+  it("reports pruned orphan sidecars as auto-fixed pass entries", async () => {
+    mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, prunedSidecars: 2, lastCapture: "2026-03-26 10:00:00" });
+    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
+    const pruned = results.find(r => r.name === "events-sidecar-prune");
+    expect(pruned?.status).toBe("pass");
+    expect(pruned?.fixApplied).toBe(true);
+    expect(pruned?.message).toContain("pruned 2");
+  });
+
+  it("passes doctor sidecar count limit through to passive learning stats", async () => {
+    mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, lastCapture: "2026-03-26 10:00:00" });
+    await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }), { eventsMaxDbs: 123 });
+    expect(mockCollectEventStats).toHaveBeenCalledWith({ timeoutMs: 2000, maxDbs: 123 });
+  });
+
   it("shows scan failure paths in verbose project output", async () => {
     mockCollectDetailedEventStats.mockReturnValue({
       captured: 0,
@@ -364,6 +388,32 @@ describe("Passive Learning checks", () => {
     expect(project?.status).toBe("warn");
     expect(project?.message).toContain("database disk image is malformed");
     expect(project?.message).toContain("/tmp/lcm-events/corrupt.db");
+  });
+
+  it("shows skipped scan paths in verbose project output", async () => {
+    mockCollectDetailedEventStats.mockReturnValue({
+      captured: 0,
+      unprocessed: 0,
+      errors: 0,
+      scanSkipped: 1,
+      lastCapture: null,
+      projects: [{
+        file: "skipped.db",
+        projectId: "skipped",
+        metadataMissing: false,
+        captured: 0,
+        unprocessed: 0,
+        lastCapture: null,
+        path: "/tmp/lcm-events/skipped.db",
+        scanSkipped: "sidecar scan skipped after maxDbs limit",
+      }],
+      recentErrors: [],
+    });
+    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }), true);
+    const project = results.find(r => r.name === "events-project-skipped.db");
+    expect(project?.status).toBe("skip");
+    expect(project?.message).toContain("scan skipped");
+    expect(project?.message).toContain("/tmp/lcm-events/skipped.db");
   });
 
   it("passes staleness when last capture is recent", async () => {
