@@ -250,6 +250,7 @@ lcm sensitive purge --yes  # remove all stored data for the current project
 
 # Daemon
 lcm daemon start --detach  # start daemon in background
+# If doctor reports a stale daemon version, stop the stale daemon process and rerun this command.
 
 # Hook handlers (internal — called by Claude Code hooks)
 lcm compact --hook         # PreCompact hook

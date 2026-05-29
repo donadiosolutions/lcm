@@ -165,6 +165,8 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.fixApplied).toBe(false);
     expect(daemonResult?.status).toBe("warn");
     expect(daemonResult?.message).toContain("did not fix mismatch");
+    expect(daemonResult?.message).toContain("lcm daemon start --detach");
+    expect(daemonResult?.message).not.toContain("lcm daemon restart");
   });
 
   it("does not recommend event promotion when a stale daemon restart throws", async () => {
@@ -188,7 +190,10 @@ describe("runDoctor daemon version mismatch", () => {
 
     const results = await runDoctor(deps);
     const capture = results.find((r) => r.name === "events-capture");
+    const daemonResult = results.find((r) => r.name === "daemon");
 
+    expect(daemonResult?.message).toContain("lcm daemon start --detach");
+    expect(daemonResult?.message).not.toContain("lcm daemon restart");
     expect(capture?.message).toContain("daemon may be offline");
     expect(capture?.message).not.toContain("lcm events promote --all");
   });

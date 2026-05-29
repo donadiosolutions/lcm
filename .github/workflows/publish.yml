@@ -99,6 +99,36 @@ jobs:
           assertAtLeast('npm', cp.execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim(), '11.5.1');
           NODE
 
+      - name: Prepare GitHub release notes
+        if: steps.check.outputs.valid_release == 'true'
+        run: |
+          VERSION="${{ steps.check.outputs.version }}"
+          # Get the top version block from CHANGELOG.md. Changesets may write
+          # headings as either "## 1.2.3" or "## [1.2.3]".
+          CHANGELOG_BLOCK=$(awk -v version="$VERSION" '
+            $0 == "## " version || $0 == "## [" version "]" ||
+            index($0, "## " version " ") == 1 || index($0, "## [" version "] ") == 1 {
+              found=1
+              next
+            }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md)
+          if [[ -z "$(printf '%s' "$CHANGELOG_BLOCK" | tr -d '[:space:]')" ]]; then
+            echo "::error::No changelog block found for version $VERSION in CHANGELOG.md"
+            exit 1
+          fi
+          # Build enriched notes before publishing so release-note failures stop the package publish.
+          NPM_BADGE="📦 **npm:** \`npm install @donadiosolutions/lcm@${VERSION}\`"
+          {
+            printf '%s\n\n' "$NPM_BADGE"
+            printf '%s\n\n' '---'
+            printf '%s\n\n' '## Changelog'
+            printf '%s\n\n' "$CHANGELOG_BLOCK"
+            printf '%s\n\n' '---'
+            printf '%s\n' '🔖 [Full Changelog](https://github.com/donadiosolutions/lcm/blob/main/CHANGELOG.md)'
+          } > release-notes.md
+
       - name: Install dependencies
         if: steps.check.outputs.valid_release == 'true'
         run: npm ci
@@ -124,25 +154,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${{ steps.check.outputs.version }}"
           TAG="${{ steps.check.outputs.tag }}"
-          # Get the top version block from CHANGELOG.md
-          CHANGELOG_BLOCK=$(awk "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
-          # Build enriched notes
-          NPM_BADGE="📦 **npm:** \`npm install @donadiosolutions/lcm@${VERSION}\`"
-          cat > release-notes.md <<EOF
-          ${NPM_BADGE}
-
-          ---
-
-          ## Changelog
-
-          ${CHANGELOG_BLOCK}
-
-          ---
-
-          🔖 [Full Changelog](https://github.com/donadiosolutions/lcm/blob/main/CHANGELOG.md)
-          EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md
           else
