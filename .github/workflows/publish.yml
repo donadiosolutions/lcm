@@ -126,8 +126,21 @@ jobs:
         run: |
           VERSION="${{ steps.check.outputs.version }}"
           TAG="${{ steps.check.outputs.tag }}"
-          # Get the top version block from CHANGELOG.md
-          CHANGELOG_BLOCK=$(awk "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
+          # Get the top version block from CHANGELOG.md. Changesets may write
+          # headings as either "## 1.2.3" or "## [1.2.3]".
+          CHANGELOG_BLOCK=$(awk -v version="$VERSION" '
+            $0 == "## " version || $0 == "## [" version "]" ||
+            index($0, "## " version " ") == 1 || index($0, "## [" version "] ") == 1 {
+              found=1
+              next
+            }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md)
+          if [[ -z "$(printf '%s' "$CHANGELOG_BLOCK" | tr -d '[:space:]')" ]]; then
+            echo "::error::No changelog block found for version $VERSION in CHANGELOG.md"
+            exit 1
+          fi
           # Build enriched notes
           NPM_BADGE="📦 **npm:** \`npm install @donadiosolutions/lcm@${VERSION}\`"
           cat > release-notes.md <<EOF
