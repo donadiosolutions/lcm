@@ -58,7 +58,7 @@
     "openai": "^6.32.0",
     "typescript": "^5.7.0",
     "typescript-eslint": "8.60.0",
-    "vitest": "^3.0.0"
+    "vitest": "^4.1.7"
   },
   "peerDependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
