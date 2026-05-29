@@ -56,39 +56,31 @@ jobs:
             echo "rule_count=$count" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Bump patch version
+      - name: Write changeset
         if: steps.diff.outputs.changed == 'true'
-        id: bump
         run: |
-          # Read current version and bump patch
-          current=$(node -p "require('./package.json').version")
-          # Increment patch: 0.7.0 -> 0.7.1
-          IFS='.' read -r major minor patch <<< "$current"
-          new_patch=$((patch + 1))
-          new_version="$major.$minor.$new_patch"
-          # Update package.json
-          node -e "
-            const fs = require('fs');
-            const p = 'package.json';
-            const s = fs.readFileSync(p, 'utf-8');
-            fs.writeFileSync(p, s.replace(/\"version\":\\s*\"[^\"]+\"/, '\"version\": \"$new_version\"'));
-          "
-          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
-          echo "Bumped version: $current -> $new_version"
+          mkdir -p .changeset
+          cat > ".changeset/gitleaks-patterns-${{ steps.diff.outputs.rule_count }}.md" <<EOF
+          ---
+          "@donadiosolutions/lcm": patch
+          ---
+
+          Update generated gitleaks redaction patterns to ${{ steps.diff.outputs.rule_count }} rules.
+          EOF
 
       - name: Commit and open PR
         if: steps.diff.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.PATTERNS_BOT_TOKEN }}
         run: |
-          BRANCH="chore/update-gitleaks-patterns-v${{ steps.bump.outputs.new_version }}"
+          BRANCH="chore/update-gitleaks-patterns-${{ steps.diff.outputs.rule_count }}-rules"
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           git config user.name "gitleaks-patterns-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin "$BRANCH:refs/remotes/origin/$BRANCH" || true
           git checkout -B "$BRANCH"
-          git add src/generated-patterns.ts package.json
-          git commit -s -m "chore(security): sync gitleaks patterns → ${{ steps.diff.outputs.rule_count }} rules (v${{ steps.bump.outputs.new_version }})"
+          git add src/generated-patterns.ts .changeset/gitleaks-patterns-${{ steps.diff.outputs.rule_count }}.md
+          git commit -s -m "chore(security): sync gitleaks patterns → ${{ steps.diff.outputs.rule_count }} rules"
           git push -u origin "$BRANCH" --force-with-lease
 
           PR_NUMBER=$(gh pr list \
@@ -105,7 +97,7 @@ jobs:
               --base main \
               --head "$BRANCH" \
               --title "chore(security): sync gitleaks patterns" \
-              --body "Updates generated gitleaks patterns to ${{ steps.diff.outputs.rule_count }} rules and bumps the package patch version to v${{ steps.bump.outputs.new_version }}.")
+              --body "Updates generated gitleaks patterns to ${{ steps.diff.outputs.rule_count }} rules and adds a patch changeset so the normal version PR owns release metadata.")
             PR_NUMBER="${PR_URL##*/}"
           fi
 
@@ -120,8 +112,7 @@ jobs:
           echo "### Gitleaks Patterns Updated" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Rules:** ${{ steps.diff.outputs.rule_count }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Version:** v${{ steps.bump.outputs.new_version }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Branch:** chore/update-gitleaks-patterns-v${{ steps.bump.outputs.new_version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branch:** chore/update-gitleaks-patterns-${{ steps.diff.outputs.rule_count }}-rules" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "> **Manual step required:** Review and merge the generated PR to main when ready." >> "$GITHUB_STEP_SUMMARY"
 
