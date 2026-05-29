@@ -71,7 +71,7 @@ feature/docs branches → main (default, protected)
 
 ## Phase 2: Spec Review via PR
 
-1. **Sync first:** `git push origin main` if there are unpushed local commits — stale diffs cause Copilot to review unrelated code
+1. **Sync first:** `git pull --ff-only origin main` before branching — stale local bases cause Copilot to review unrelated code
 2. Create `docs/<topic>` branch from main
 3. Ensure only documentation files are in the diff — specs, plans, workflow docs
 4. Push and open PR

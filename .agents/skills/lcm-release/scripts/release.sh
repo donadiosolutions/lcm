@@ -9,7 +9,7 @@
 #   0  Clean state + sync main
 #   1  Guard: verify tag and npm version are free
 #   2  Create release branch
-#   3  Bump all 3 version files + verify
+#   3  Bump version files + CHANGELOG.md + verify
 #   4  Commit and push
 #   5  Open PR targeting main
 #   6  Wait for CI
