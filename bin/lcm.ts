@@ -727,7 +727,7 @@ async function main() {
     .helpOption(false)
     .option("-h, --help", "Show help")
     .option("--verbose", "Show detailed diagnostic output")
-    .option("--events-max-dbs <n|all>", "Maximum passive-learning sidecar DBs to scan", "50")
+    .option("--events-max-dbs <n|all|unlimited>", "Maximum passive-learning sidecar DBs to scan", "50")
     .action(async (opts) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");

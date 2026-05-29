@@ -92,7 +92,7 @@ describe("collectEventStats", () => {
     expect(stats.scanErrors).toBe(0);
   });
 
-  it("prunes empty orphan sidecars during scans", () => {
+  it("prunes empty orphan sidecars by default", () => {
     const sidecarPath = join(tempDir, `orphan-empty-${Date.now()}.db`);
     const db = new EventsDb(sidecarPath);
     db.close();
@@ -119,7 +119,7 @@ describe("collectEventStats", () => {
     queuedDb.insertEvent("s1", { type: "decision", category: "decision", data: "queued", priority: 1 }, "PostToolUse");
     queuedDb.close();
 
-    const sidecars = collectEventSidecars();
+    const sidecars = collectEventSidecars({ pruneOrphanSidecars: true });
     const pruned = sidecars.find((sidecar) => sidecar.path === stalePath);
     const queued = sidecars.find((sidecar) => sidecar.path === queuedPath);
 
@@ -137,7 +137,7 @@ describe("collectEventStats", () => {
     db.logHookError("PostToolUse", new Error("recent failure"));
     db.close();
 
-    const sidecars = collectEventSidecars();
+    const sidecars = collectEventSidecars({ pruneOrphanSidecars: true });
     const preserved = sidecars.find((sidecar) => sidecar.path === sidecarPath);
 
     expect(preserved?.pruned).toBeUndefined();

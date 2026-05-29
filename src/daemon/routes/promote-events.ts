@@ -170,6 +170,23 @@ export function createPromoteAllEventsHandler(config: DaemonConfig): RouteHandle
           });
           continue;
         }
+        if (sidecar.scanSkipped) {
+          result.failedProjects++;
+          result.projects.push({
+            projectId: sidecar.projectId,
+            cwd: sidecar.cwd,
+            unprocessedBefore: 0,
+            metadataMissing: sidecar.metadataMissing,
+            promoted: 0,
+            skipped: 0,
+            correlated: 0,
+            errors: 0,
+            batches: 0,
+            incomplete: true,
+            message: `sidecar scan skipped: ${sidecar.scanSkipped}`,
+          });
+          continue;
+        }
 
         if (sidecar.unprocessed === 0) continue;
 

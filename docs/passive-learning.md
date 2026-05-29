@@ -137,7 +137,7 @@ When passive learning hooks are installed, `lcm doctor` includes a "Passive Lear
 
 Run `lcm doctor --verbose` to see the per-project breakdown and recent error details.
 
-By default, doctor scans up to 50 passive-learning sidecar DBs. Use `lcm doctor --events-max-dbs <n>` to set another count limit, or `lcm doctor --events-max-dbs all` to scan every sidecar. Sidecars skipped because of this limit are reported as skipped, not warnings.
+By default, doctor scans up to 50 passive-learning sidecar DBs. Use `lcm doctor --events-max-dbs <n>` to set another count limit, or `lcm doctor --events-max-dbs all` / `lcm doctor --events-max-dbs unlimited` to remove the count limit. Sidecars skipped because of the count or timeout budget are reported as skipped, not warnings.
 
 When the daemon is healthy but many queued events remain across old project sidecars, `lcm doctor` reports that the daemon is up and suggests `lcm events promote --all` instead of asking you to restart the daemon.
 

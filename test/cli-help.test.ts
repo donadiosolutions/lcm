@@ -106,7 +106,7 @@ describe("printHelp — per-command detail", () => {
     printHelp("doctor");
     const text = out.mock.calls.map(c => c[0]).join("");
     expect(text).toContain("lcm doctor");
-    expect(text).toContain("--events-max-dbs <n|all>");
+    expect(text).toContain("--events-max-dbs <n|all|unlimited>");
     expect(text).toContain("lcm doctor --events-max-dbs all");
   });
 

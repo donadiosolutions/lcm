@@ -361,7 +361,13 @@ describe("Passive Learning checks", () => {
   it("passes doctor sidecar count limit through to passive learning stats", async () => {
     mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, lastCapture: "2026-03-26 10:00:00" });
     await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }), { eventsMaxDbs: 123 });
-    expect(mockCollectEventStats).toHaveBeenCalledWith({ timeoutMs: 2000, maxDbs: 123 });
+    expect(mockCollectEventStats).toHaveBeenCalledWith({ timeoutMs: 2000, maxDbs: 123, pruneOrphanSidecars: true });
+  });
+
+  it("falls back to the default sidecar count limit for invalid runDoctor options", async () => {
+    mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, lastCapture: "2026-03-26 10:00:00" });
+    await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }), { eventsMaxDbs: 0 });
+    expect(mockCollectEventStats).toHaveBeenCalledWith({ timeoutMs: 2000, maxDbs: 50, pruneOrphanSidecars: true });
   });
 
   it("shows scan failure paths in verbose project output", async () => {

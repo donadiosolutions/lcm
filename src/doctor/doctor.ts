@@ -52,9 +52,16 @@ function normalizeDoctorOptions(options: boolean | DoctorRunOptions = false): Re
   if (typeof options === "boolean") {
     return { verbose: options, eventsMaxDbs: 50 };
   }
+  const requestedMaxDbs = options.eventsMaxDbs;
+  const eventsMaxDbs = typeof requestedMaxDbs === "number"
+    && Number.isInteger(requestedMaxDbs)
+    && Number.isFinite(requestedMaxDbs)
+    && requestedMaxDbs > 0
+    ? requestedMaxDbs
+    : 50;
   return {
     verbose: options.verbose ?? false,
-    eventsMaxDbs: options.eventsMaxDbs ?? 50,
+    eventsMaxDbs,
   };
 }
 
@@ -151,7 +158,7 @@ function checkPassiveLearning(
 ): void {
   if (!hooksInstalled) return;
 
-  const statsOptions = { timeoutMs: 2000, maxDbs: options.eventsMaxDbs };
+  const statsOptions = { timeoutMs: 2000, maxDbs: options.eventsMaxDbs, pruneOrphanSidecars: true };
   const stats = options.verbose ? collectDetailedEventStats(statsOptions) : collectEventStats(statsOptions);
 
   if ((stats.prunedSidecars ?? 0) > 0) {
@@ -208,7 +215,7 @@ function checkPassiveLearning(
       name: "events-sidecar-scan-skipped",
       category: "Passive Learning",
       status: "skip",
-      message: `${stats.scanSkipped} sidecar${stats.scanSkipped === 1 ? "" : "s"} skipped by scan limit — run lcm doctor --events-max-dbs all to scan every sidecar`,
+      message: `${stats.scanSkipped} sidecar${stats.scanSkipped === 1 ? "" : "s"} skipped by scan budget — run lcm doctor --events-max-dbs all to remove the count limit; timeout skips may still require retrying`,
     });
   }
 
