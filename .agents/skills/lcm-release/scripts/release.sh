@@ -96,7 +96,7 @@ if [[ "$FROM_STEP" -ge 6 && "$FROM_STEP" -le 7 ]]; then
   PR_NUMBER=$(gh pr list --repo "$REPO" --base main --head "$RELEASE_BRANCH" \
     --state open --json number --jq '.[0].number' 2>/dev/null || true)
   [[ -z "$PR_NUMBER" || "$PR_NUMBER" == "null" ]] && \
-    err "Resuming from step $FROM_STEP but no open PR found from $RELEASE_BRANCH → main. Has it already been merged? Use --from-step 8 or --from-step 9."
+    err "Resuming from step $FROM_STEP but no open PR found from $RELEASE_BRANCH → main. Has it already been merged? Use --from-step 8."
   echo "  Resuming: found PR #$PR_NUMBER"
 fi
 if [[ "$FROM_STEP" -eq 8 ]]; then
