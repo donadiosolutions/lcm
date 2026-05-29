@@ -62,6 +62,10 @@ jobs:
           version: v11.2.6
           fail_ci_if_error: true
 
+      - name: Clean Codecov uploader files
+        if: ${{ !cancelled() }}
+        run: rm -f codecov codecov.SHA256SUM codecov.SHA256SUM.sig
+
       - name: Build
         run: npm run build
 
