@@ -52,8 +52,21 @@ jobs:
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
             # Extract new rule count from updated file
-            count=$(grep -oP '(?<=// Rules: )\d+' src/generated-patterns.ts || echo "?")
+            count=$(sed -n 's/^\/\/ Rules: \([0-9][0-9]*\).*/\1/p' src/generated-patterns.ts | head -n 1)
+            if [[ -z "$count" ]]; then
+              echo "::error::Failed to extract numeric rule count from src/generated-patterns.ts"
+              exit 1
+            fi
             echo "rule_count=$count" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate rule count
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          RULE_COUNT="${{ steps.diff.outputs.rule_count }}"
+          if [[ ! "$RULE_COUNT" =~ ^[0-9]+$ ]]; then
+            echo "::error::Rule count must be numeric before it is used in branch or file names."
+            exit 1
           fi
 
       - name: Write changeset
