@@ -2,11 +2,11 @@
 # lcm-release — full end-to-end release script
 #
 # Usage:
-#   ./release.sh <version>               Run all steps (0-9)
+#   ./release.sh <version>               Run all steps (0-8)
 #   ./release.sh <version> --from-step N Resume from step N after a failure
 #
 # Steps:
-#   0  Clean state + sync develop←main
+#   0  Clean state + sync main
 #   1  Guard: verify tag and npm version are free
 #   2  Create release branch
 #   3  Bump all 3 version files + verify
@@ -15,7 +15,6 @@
 #   6  Wait for CI
 #   7  Merge release PR
 #   8  Wait for publish.yml
-#   9  Sync develop with main via PR
 set -euo pipefail
 
 # ─── Args ────────────────────────────────────────────────────────────────────
@@ -26,9 +25,9 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --from-step)
       FROM_STEP="${2:-}"
-      [[ -z "$FROM_STEP" ]] && { echo "--from-step requires a number (0-9)"; exit 1; }
-      if ! [[ "$FROM_STEP" =~ ^[0-9]$ ]]; then
-        echo "Invalid --from-step '$FROM_STEP'; must be an integer between 0 and 9."
+      [[ -z "$FROM_STEP" ]] && { echo "--from-step requires a number (0-8)"; exit 1; }
+      if ! [[ "$FROM_STEP" =~ ^[0-8]$ ]]; then
+        echo "Invalid --from-step '$FROM_STEP'; must be an integer between 0 and 8."
         echo "Usage: $0 <version> [--from-step N]"
         exit 1
       fi
@@ -36,8 +35,8 @@ while [[ $# -gt 0 ]]; do
       ;;
     --from-step=*)
       FROM_STEP="${1#*=}"
-      if ! [[ "$FROM_STEP" =~ ^[0-9]$ ]]; then
-        echo "Invalid --from-step '$FROM_STEP'; must be an integer between 0 and 9."
+      if ! [[ "$FROM_STEP" =~ ^[0-8]$ ]]; then
+        echo "Invalid --from-step '$FROM_STEP'; must be an integer between 0 and 8."
         echo "Usage: $0 <version> [--from-step N]"
         exit 1
       fi
@@ -108,7 +107,7 @@ if [[ "$FROM_STEP" -eq 8 ]]; then
   echo "  Resuming: found merge commit $MERGE_SHA"
 fi
 
-# ─── STEP 0: Clean state and develop sync ────────────────────────────────────
+# ─── STEP 0: Clean state and main sync ───────────────────────────────────────
 if run_step 0; then
   step "Step 0 — Clean state"
 
@@ -116,42 +115,9 @@ if run_step 0; then
     err "Working tree is dirty. Commit or stash changes first."
   ok "Working tree is clean."
 
-  [[ "$(git rev-parse --abbrev-ref HEAD)" != "develop" ]] && git checkout develop
-  git pull --ff-only origin develop || err "develop has diverged from origin/develop. Resolve manually before running the release."
-
-  git fetch origin
-  BEHIND=$(git rev-list --count develop..origin/main)
-  if [[ "$BEHIND" -gt 0 ]]; then
-    echo "  develop is $BEHIND commit(s) behind main — syncing before release..."
-
-    PRE_BRANCH="chore/sync-develop-pre-v$VERSION"
-    if git show-ref --verify --quiet "refs/heads/$PRE_BRANCH"; then
-      err "Local branch '$PRE_BRANCH' already exists. Delete it (git branch -D \"$PRE_BRANCH\") or choose a different version, then rerun."
-    fi
-    if git ls-remote --exit-code --heads origin "$PRE_BRANCH" >/dev/null 2>&1; then
-      err "Remote branch 'origin/$PRE_BRANCH' already exists. Delete it (git push origin --delete \"$PRE_BRANCH\") or choose a different version, then rerun."
-    fi
-
-    git checkout -b "$PRE_BRANCH"
-    git merge origin/main --no-edit 2>/dev/null || \
-      err "develop has conflicts with main. Resolve conflicts manually, then rerun."
-
-    git push -u origin "$PRE_BRANCH"
-    PRE_PR_URL=$(gh pr create \
-      --repo "$REPO" \
-      --base develop \
-      --title "chore: sync develop with main before v$VERSION release" \
-      --body "Pre-release sync: brings develop up to date with main.")
-    PRE_PR="${PRE_PR_URL##*/}"
-    [[ -z "$PRE_PR" || ! "$PRE_PR" =~ ^[0-9]+$ ]] && err "Failed to parse PR number from: $PRE_PR_URL"
-    echo "  Opened pre-release sync PR #$PRE_PR — merging..."
-    gh pr merge "$PRE_PR" --repo "$REPO" --merge --delete-branch
-    git checkout develop
-    git pull --ff-only origin develop || err "develop diverged after pre-release sync merge. Resolve manually."
-    ok "develop synced with main."
-  else
-    ok "develop is up to date with main."
-  fi
+  [[ "$(git rev-parse --abbrev-ref HEAD)" != "main" ]] && git checkout main
+  git pull --ff-only origin main || err "main has diverged from origin/main. Resolve manually before running the release."
+  ok "main is up to date."
 else
   step "Step 0 — Clean state"; skip
 fi
@@ -238,7 +204,7 @@ if run_step 4; then
   if git diff --cached --quiet; then
     ok "No staged changes to commit; skipping git commit."
   else
-    git commit -m "chore: bump version to $VERSION"
+    git commit -s -m "chore: bump version to $VERSION"
   fi
   git push -u origin "$RELEASE_BRANCH"
   ok "Pushed $RELEASE_BRANCH."
@@ -343,14 +309,6 @@ if run_step 8; then
   ok "$PACKAGE_NAME@$VERSION published to npm and tagged."
 else
   step "Step 8 — Wait for publish.yml"; skip
-fi
-
-# ─── STEP 9: Sync develop with main ──────────────────────────────────────────
-if run_step 9; then
-  step "Step 9 — Sync develop with main"
-  bash "$(dirname "$0")/sync-develop.sh" "$VERSION"
-else
-  step "Step 9 — Sync develop"; skip
 fi
 
 # ─── Done ────────────────────────────────────────────────────────────────────

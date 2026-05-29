@@ -14,17 +14,16 @@ This document is a living record. **Update it whenever you learn something:**
 
 **When to update:** At the end of every feature cycle (after the implementation PR merges), review this doc against what actually happened. If reality diverged from the doc, fix the doc — not reality.
 
-**How to update:** Create a `docs/<topic>` branch, push, get Copilot review, merge to develop. Same flow as any other docs change.
+**How to update:** Create a `docs/<topic>` branch, push, get Copilot review, merge to main. Same flow as any other docs change.
 
 ## Branch Strategy
 
 ```
-feature/docs branches → develop (default, protected) → main (releases only, protected)
+feature/docs branches → main (default, protected)
 ```
 
-- **`develop`** — Default branch. All PRs target develop. Protected: PRs required, linear history, no force push.
-- **`main`** — Releases only. Merging develop → main prepares a release; pushing a matching `vX.Y.Z` tag triggers the publish workflow.
-- **Feature branches** — `feat/<topic>`, `docs/<topic>`, `fix/<topic>`. Always branch from develop.
+- **`main`** — Default branch. All PRs target main. Protected: PRs required, no force push. Pushing a matching `vX.Y.Z` tag triggers the publish workflow.
+- **Feature branches** — `feat/<topic>`, `docs/<topic>`, `fix/<topic>`. Always branch from main.
 
 ### Release Flow
 
@@ -43,7 +42,7 @@ feature/docs branches → develop (default, protected) → main (releases only, 
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `ci.yml` | Push to develop/main + all PRs | Type-check, test, build |
+| `ci.yml` | Push to main + all PRs | Type-check, test, build |
 | `version-pr.yml` | Push to main | Auto-create version PR from changesets |
 | `publish.yml` | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag | Publish npm + create GitHub release |
 
@@ -73,7 +72,7 @@ feature/docs branches → develop (default, protected) → main (releases only, 
 ## Phase 2: Spec Review via PR
 
 1. **Sync first:** `git push origin main` if there are unpushed local commits — stale diffs cause Copilot to review unrelated code
-2. Create `docs/<topic>` branch from develop
+2. Create `docs/<topic>` branch from main
 3. Ensure only documentation files are in the diff — specs, plans, workflow docs
 4. Push and open PR
 5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
@@ -85,7 +84,7 @@ feature/docs branches → develop (default, protected) → main (releases only, 
 1. **Sync first:** `git pull origin main` to get latest (including merged specs)
 2. Dispatch `model: sonnet` subagents with `isolation: worktree` for each task in the plan
 3. **Independent tasks** → launch in parallel (e.g., PR A: delete files, PR D: add new module)
-4. **Sequential tasks** → launch one at a time; after merging upstream PR, rebase downstream branch: `git fetch origin main && git rebase origin/develop`
+4. **Sequential tasks** → launch one at a time; after merging upstream PR, rebase downstream branch: `git fetch origin main && git rebase origin/main`
 5. Each subagent: implement code + tests, run `npm test`, commit (do NOT push)
 6. After subagent completes: review the diff, push, open PR, request Copilot review
 
@@ -171,9 +170,9 @@ gh api repos/{owner}/{repo}/pulls/{n}/comments \
 
 ### Common Pitfalls
 
-- **Stale diff**: Always push develop before creating branches. If main has unpushed commits, the PR diff includes unrelated code and Copilot reviews the wrong things.
+- **Stale diff**: Always sync main before creating branches. If main has unpushed local commits, the PR diff includes unrelated code and Copilot reviews the wrong things.
 - **@copilot in comments**: Opens a new PR instead of triggering review. Always use the reviewers API.
 - **REST API 422 for Copilot bot**: The `requested_reviewers` REST endpoint rejects bot slugs. Use `gh pr edit --add-reviewer` instead.
 - **Empty commits don't trigger Copilot**: Copilot only reviews on substantive diffs. Use `gh pr edit` re-request instead.
-- **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Use `git checkout -B <clean-branch> origin/develop && git cherry-pick <docs-commits>`.
-- **Sequential PR chains**: After merging PR A, rebase PR B onto updated main before pushing: `git fetch origin main && git rebase origin/develop`.
+- **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Use `git checkout -B <clean-branch> origin/main && git cherry-pick <docs-commits>`.
+- **Sequential PR chains**: After merging PR A, rebase PR B onto updated main before pushing: `git fetch origin main && git rebase origin/main`.

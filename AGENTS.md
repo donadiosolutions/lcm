@@ -28,7 +28,7 @@ Use this path only when you are running inside Claude Code.
 Rebuild and verify the package:
 
 ```bash
-git checkout develop && git fetch origin develop && git reset --hard origin/develop
+git checkout main && git fetch origin main && git reset --hard origin/main
 npm run build && chmod +x dist/bin/lcm.js && npm link
 lcm doctor          # must show 0 failures
 npm test            # must pass
@@ -57,7 +57,7 @@ Use this path only when you are running inside Codex.
 Rebuild and verify the package:
 
 ```bash
-git checkout develop && git fetch origin develop && git reset --hard origin/develop
+git checkout main && git fetch origin main && git reset --hard origin/main
 npm run build && chmod +x dist/bin/lcm.js && npm link
 lcm doctor          # must show 0 failures
 npm test            # must pass
@@ -97,7 +97,7 @@ Then carry on with the original task. This ensures bugs are tracked and can be a
 
 ## Copilot Code Review Workflow
 
-Copilot reviews PRs targeting `main` and `develop` automatically. The ruleset has `review_on_push: true` — every push triggers a fresh review. No manual re-request needed.
+Copilot reviews PRs targeting `main` automatically. The ruleset has `review_on_push: true` — every push triggers a fresh review. No manual re-request needed.
 
 ### Custom instructions
 
@@ -120,7 +120,7 @@ Some flags that look reasonable don't exist in the installed version:
 
 - **`gh pr create` does not support `--json`/`--jq`** — it outputs a URL. Extract the PR number with `${url##*/}`:
   ```bash
-  PR_URL=$(gh pr create --repo "$REPO" --base develop --title "..." --body "...")
+  PR_URL=$(gh pr create --repo "$REPO" --base main --title "..." --body "...")
   PR_NUMBER="${PR_URL##*/}"
   [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "bad PR number: $PR_URL" >&2; exit 1; }
   ```
@@ -155,7 +155,7 @@ See `SKILL.md` in the `lcm-release` skill for the full step table and failure mo
 ## Git Gotchas
 
 - **Agent-specific hidden directories may be gitignored** — skill and script files under ignored agent directories require `git add -f` to stage them. If `git add <agent-dir>/...` silently does nothing, that's why.
-- **`develop` has branch protection** — direct push is rejected. Always push to a feature branch and open a PR, even for trivial fixes.
+- **`main` has branch protection** — direct push is rejected. Always push to a feature branch and open a PR, even for trivial fixes.
 
 # context-mode — MANDATORY routing rules
 
