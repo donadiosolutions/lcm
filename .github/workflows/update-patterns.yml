@@ -72,13 +72,14 @@ jobs:
       - name: Write changeset
         if: steps.diff.outputs.changed == 'true'
         run: |
+          RULE_COUNT="${{ steps.diff.outputs.rule_count }}"
           mkdir -p .changeset
-          cat > ".changeset/gitleaks-patterns-${{ steps.diff.outputs.rule_count }}.md" <<EOF
+          cat > ".changeset/gitleaks-patterns-${RULE_COUNT}.md" <<EOF
           ---
           "@donadiosolutions/lcm": patch
           ---
 
-          Update generated gitleaks redaction patterns to ${{ steps.diff.outputs.rule_count }} rules.
+          Update generated gitleaks redaction patterns to ${RULE_COUNT} rules.
           EOF
 
       - name: Commit and open PR
@@ -86,15 +87,23 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PATTERNS_BOT_TOKEN }}
         run: |
-          BRANCH="chore/update-gitleaks-patterns-${{ steps.diff.outputs.rule_count }}-rules"
+          RULE_COUNT="${{ steps.diff.outputs.rule_count }}"
+          BRANCH="chore/update-gitleaks-patterns-${RULE_COUNT}-rules"
+          CHANGESET=".changeset/gitleaks-patterns-${RULE_COUNT}.md"
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           git config user.name "gitleaks-patterns-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin "$BRANCH:refs/remotes/origin/$BRANCH" || true
-          git checkout -B "$BRANCH"
-          git add src/generated-patterns.ts .changeset/gitleaks-patterns-${{ steps.diff.outputs.rule_count }}.md
-          git commit -s -m "chore(security): sync gitleaks patterns → ${{ steps.diff.outputs.rule_count }} rules"
-          git push -u origin "$BRANCH" --force-with-lease
+
+          if git rev-parse --verify "refs/remotes/origin/$BRANCH" >/dev/null 2>&1 &&
+             git diff --quiet "origin/$BRANCH" -- src/generated-patterns.ts "$CHANGESET"; then
+            echo "Existing branch $BRANCH already contains the generated pattern update."
+          else
+            git checkout -B "$BRANCH"
+            git add src/generated-patterns.ts "$CHANGESET"
+            git commit -s -m "chore(security): sync gitleaks patterns → ${RULE_COUNT} rules"
+            git push -u origin "$BRANCH" --force-with-lease
+          fi
 
           PR_NUMBER=$(gh pr list \
             --repo "${{ github.repository }}" \
@@ -110,7 +119,7 @@ jobs:
               --base main \
               --head "$BRANCH" \
               --title "chore(security): sync gitleaks patterns" \
-              --body "Updates generated gitleaks patterns to ${{ steps.diff.outputs.rule_count }} rules and adds a patch changeset so the normal version PR owns release metadata.")
+              --body "Updates generated gitleaks patterns to ${RULE_COUNT} rules and adds a patch changeset so the normal version PR owns release metadata.")
             PR_NUMBER="${PR_URL##*/}"
           fi
 
@@ -122,10 +131,11 @@ jobs:
       - name: Summary
         if: steps.diff.outputs.changed == 'true'
         run: |
+          RULE_COUNT="${{ steps.diff.outputs.rule_count }}"
           echo "### Gitleaks Patterns Updated" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Rules:** ${{ steps.diff.outputs.rule_count }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Branch:** chore/update-gitleaks-patterns-${{ steps.diff.outputs.rule_count }}-rules" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Rules:** ${RULE_COUNT}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branch:** chore/update-gitleaks-patterns-${RULE_COUNT}-rules" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "> **Manual step required:** Review and merge the generated PR to main when ready." >> "$GITHUB_STEP_SUMMARY"
 
