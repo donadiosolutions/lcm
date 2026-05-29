@@ -194,7 +194,13 @@ if run_step 3; then
   const changelog = fs.readFileSync(p, 'utf8');
   const hasBlock = changelog
     .split(/\r?\n/)
-    .some((line) => line === `## ${version}` || line === `## [${version}]`);
+    .some(
+      (line) =>
+        line === `## ${version}` ||
+        line === `## [${version}]` ||
+        line.startsWith(`## ${version} `) ||
+        line.startsWith(`## [${version}] `)
+    );
 
   if (!hasBlock) {
     const eol = changelog.includes('\r\n') ? '\r\n' : '\n';
