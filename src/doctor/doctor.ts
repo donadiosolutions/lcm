@@ -43,6 +43,8 @@ interface DoctorConfig {
   summarizer: string;
 }
 
+const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start --detach";
+
 export interface DoctorRunOptions {
   verbose?: boolean;
   eventsMaxDbs?: number;
@@ -343,14 +345,14 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
           const runningVersion = postRestartVersion ?? daemonVersion;
           results.push({
             name: "daemon", category: "Daemon", status: "warn",
-            message: `localhost:${config.port} — version mismatch (v${runningVersion} running, v${pkgVersion} installed); restart did not fix mismatch\n     Fix: lcm daemon restart`,
+            message: `localhost:${config.port} — version mismatch (v${runningVersion} running, v${pkgVersion} installed); restart did not fix mismatch\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
             fixApplied: false,
           });
           daemonHealthy = false;
         } else {
           results.push({
             name: "daemon", category: "Daemon", status: "fail",
-            message: `localhost:${config.port} — version mismatch (v${daemonVersion} running, v${pkgVersion} installed); restart failed\n     Fix: lcm daemon restart`,
+            message: `localhost:${config.port} — version mismatch (v${daemonVersion} running, v${pkgVersion} installed); restart failed\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
             fixApplied: false,
           });
           daemonHealthy = false;
@@ -358,7 +360,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       } catch {
         daemonHealthy = false;
         results.push({ name: "daemon", category: "Daemon", status: "warn",
-          message: `localhost:${config.port} — version mismatch (v${daemonVersion} running, v${pkgVersion} installed)\n     Fix: lcm daemon restart` });
+          message: `localhost:${config.port} — version mismatch (v${daemonVersion} running, v${pkgVersion} installed)\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}` });
       }
     } else {
       results.push({ name: "daemon", category: "Daemon", status: "pass", message: `localhost:${config.port} (up)` });
