@@ -120,19 +120,14 @@ jobs:
           fi
           # Build enriched notes before publishing so release-note failures stop the package publish.
           NPM_BADGE="📦 **npm:** \`npm install @donadiosolutions/lcm@${VERSION}\`"
-          cat > release-notes.md <<EOF
-          ${NPM_BADGE}
-
-          ---
-
-          ## Changelog
-
-          ${CHANGELOG_BLOCK}
-
-          ---
-
-          🔖 [Full Changelog](https://github.com/donadiosolutions/lcm/blob/main/CHANGELOG.md)
-          EOF
+          {
+            printf '%s\n\n' "$NPM_BADGE"
+            printf '%s\n\n' '---'
+            printf '%s\n\n' '## Changelog'
+            printf '%s\n\n' "$CHANGELOG_BLOCK"
+            printf '%s\n\n' '---'
+            printf '%s\n' '🔖 [Full Changelog](https://github.com/donadiosolutions/lcm/blob/main/CHANGELOG.md)'
+          } > release-notes.md
 
       - name: Install dependencies
         if: steps.check.outputs.valid_release == 'true'

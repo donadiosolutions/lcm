@@ -164,9 +164,9 @@ else
   fi
 fi
 
-# ─── STEP 3: Bump all three version files ────────────────────────────────────
+# ─── STEP 3: Bump version files and changelog ────────────────────────────────
 if run_step 3; then
-  step "Step 3 — Bump all three version files to $VERSION"
+  step "Step 3 — Bump version files and CHANGELOG.md to $VERSION"
 
   npm version "$VERSION" --no-git-tag-version --silent
   ok "package.json → $VERSION"
@@ -187,6 +187,37 @@ if run_step 3; then
   "
   ok "marketplace.json → $VERSION"
 
+  VERSION="$VERSION" node <<'NODE'
+  const fs = require('fs');
+  const p = 'CHANGELOG.md';
+  const version = process.env.VERSION;
+  const changelog = fs.readFileSync(p, 'utf8');
+  const hasBlock = changelog
+    .split(/\r?\n/)
+    .some((line) => line === `## ${version}` || line === `## [${version}]`);
+
+  if (!hasBlock) {
+    const eol = changelog.includes('\r\n') ? '\r\n' : '\n';
+    const lines = changelog.split(/\r?\n/);
+    const headingIndex = lines.findIndex((line) => line.startsWith('# '));
+    if (headingIndex === -1) {
+      throw new Error('CHANGELOG.md top-level heading not found');
+    }
+    lines.splice(
+      headingIndex + 1,
+      0,
+      '',
+      `## ${version}`,
+      '',
+      '### Patch Changes',
+      '',
+      `- Manual release v${version}.`
+    );
+    fs.writeFileSync(p, lines.join(eol));
+  }
+NODE
+  ok "CHANGELOG.md includes $VERSION release block."
+
   V1=$(node -p "require('./package.json').version")
   V2=$(node -p "require('./.claude-plugin/plugin.json').version")
   V3=$(node -p "require('./.claude-plugin/marketplace.json').plugins[0].version")
@@ -194,13 +225,13 @@ if run_step 3; then
     err "Version mismatch after bump! package.json=$V1  plugin.json=$V2  marketplace.json=$V3"
   ok "All three files verified at $VERSION."
 else
-  step "Step 3 — Bump version files"; skip
+  step "Step 3 — Bump version files and changelog"; skip
 fi
 
 # ─── STEP 4: Commit and push ─────────────────────────────────────────────────
 if run_step 4; then
   step "Step 4 — Commit and push"
-  git add package.json package-lock.json .claude-plugin/plugin.json .claude-plugin/marketplace.json
+  git add package.json package-lock.json .claude-plugin/plugin.json .claude-plugin/marketplace.json CHANGELOG.md
   if git diff --cached --quiet; then
     ok "No staged changes to commit; skipping git commit."
   else

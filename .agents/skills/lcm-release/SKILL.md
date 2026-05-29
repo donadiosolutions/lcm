@@ -32,7 +32,7 @@ The script handles everything end-to-end:
 | 0 | Checkout main, pull, verify clean |
 | 1 | Guard: abort if tag or npm version already exists |
 | 2 | Create `release/vX.Y.Z` branch from main |
-| 3 | Bump all 3 version files, verify they all match |
+| 3 | Bump all 3 version files, add `CHANGELOG.md` entry, verify versions match |
 | 4 | Commit and push |
 | 5 | Open PR targeting `main` |
 | 6 | Wait for CI (skips gracefully if no CI configured) |
@@ -52,6 +52,7 @@ The script handles everything end-to-end:
 - **Use `--merge`** (not squash) so the version bump SHA is preserved on main
 - **All 3 version files must match**: `package.json`, `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`
   - Note: marketplace.json stores version at `.plugins[0].version`, not root
+- **CHANGELOG.md must include the release version block** before `publish.yml` publishes to npm
 
 ## Failure modes
 
