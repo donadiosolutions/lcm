@@ -31,11 +31,7 @@ export default defineConfig({
           sequence: {
             groupOrder: 1,
           },
-          poolOptions: {
-            forks: {
-              singleFork: true,
-            },
-          },
+          fileParallelism: false,
         },
       },
       {
@@ -48,11 +44,7 @@ export default defineConfig({
           sequence: {
             groupOrder: 2,
           },
-          poolOptions: {
-            forks: {
-              singleFork: true,
-            },
-          },
+          fileParallelism: false,
         },
       },
     ],

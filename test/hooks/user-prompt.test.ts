@@ -176,10 +176,12 @@ describe("handleUserPromptSubmit", () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const mockInsertEvent = vi.fn();
     const mockClose = vi.fn();
-    MockEventsDb.mockImplementation(() => ({
-      insertEvent: mockInsertEvent,
-      close: mockClose,
-    }) as any);
+    MockEventsDb.mockImplementation(function () {
+      return {
+        insertEvent: mockInsertEvent,
+        close: mockClose,
+      } as any;
+    });
     mockExtractUserPromptEvents.mockReturnValue([
       { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
     ]);
@@ -209,10 +211,12 @@ describe("handleUserPromptSubmit", () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const mockInsertEvent = vi.fn();
     const mockClose = vi.fn();
-    MockEventsDb.mockImplementation(() => ({
-      insertEvent: mockInsertEvent,
-      close: mockClose,
-    }) as any);
+    MockEventsDb.mockImplementation(function () {
+      return {
+        insertEvent: mockInsertEvent,
+        close: mockClose,
+      } as any;
+    });
     mockExtractUserPromptEvents.mockReturnValue([
       { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
     ]);
@@ -238,10 +242,12 @@ describe("handleUserPromptSubmit", () => {
   it("trims cwd before sidecar writes and prompt search", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const mockClose = vi.fn();
-    MockEventsDb.mockImplementation(() => ({
-      insertEvent: vi.fn(),
-      close: mockClose,
-    }) as any);
+    MockEventsDb.mockImplementation(function () {
+      return {
+        insertEvent: vi.fn(),
+        close: mockClose,
+      } as any;
+    });
     mockExtractUserPromptEvents.mockReturnValue([
       { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
     ]);
