@@ -32,9 +32,23 @@ Events are written to a **sidecar SQLite database** (`~/.lcm/events/<project-has
 - Sensitive file paths (`.env`, `.ssh/`, `credentials`, `.npmrc`)
 - LCM's own `lcm_store` calls (prevents feedback loops)
 
+### Automatic Queue Processing
+
+Captured events are normally processed by the daemon in the background. Hooks write to the sidecar database, notify the daemon that a project has queued work, and then return without waiting for promotion.
+
+The daemon uses bounded triggers so passive learning stays fresh without making hooks expensive:
+
+- Priority 1 events schedule processing after about 250 ms.
+- Normal events are debounced for about 3 seconds.
+- Active projects with 10 or more queued events use the near-immediate path.
+- A startup sweep and a 5-minute periodic sweep scan up to 20 metadata-backed sidecars per pass.
+- Active-project background processing promotes at most one batch per pass, then requeues remaining work.
+
+`lcm search` stays read-only: it searches already promoted memory and does not process queued sidecar events.
+
 ### Three-Tier Promotion
 
-Events are promoted to cross-session memory at session boundaries (session-end, pre-compact, or next session start):
+When the daemon processes queued events, it applies three promotion tiers:
 
 **Tier 1 — Immediate promotion** (priority 1): Decisions, plan approvals, and error→fix pairs are promoted directly with high confidence (0.4–0.7).
 
@@ -46,9 +60,9 @@ Events are promoted to cross-session memory at session boundaries (session-end, 
 
 When a tool error is followed by a successful command with a matching prefix (within 20 events), the system correlates them as an error→fix pair. These are tagged `category:solution` and promoted with higher priority.
 
-### Global Backlog Drain
+### Manual Backlog Drain
 
-Normal hook promotion drains the active project's sidecar. If old sidecars from projects you have not opened recently still contain queued events, drain all metadata-backed sidecars:
+Automatic processing should keep active projects near zero queued events. If `lcm doctor` reports a large backlog, or you are debugging daemon downtime or stale sidecars from projects you have not opened recently, drain all metadata-backed sidecars manually:
 
 ```bash
 lcm events promote --all
@@ -114,7 +128,8 @@ The UserPromptSubmit extractor includes guards against false-positive decisions.
 | Clean session end | Events promoted via `/promote-events` |
 | Ctrl+C (SIGINT) | Stop hook triggers best-effort promotion |
 | Pre-compact | Events promoted before context is compacted |
-| Daemon unavailable | Events queued in sidecar, promoted next session |
+| Daemon available during capture | Hooks notify `/promote-events/notify`; daemon processes queued events in the background |
+| Daemon unavailable | Events queued in sidecar, processed by startup/session lifecycle drains or manual remediation later |
 | Hard kill (SIGKILL) | Events survive in sidecar, scavenged on next SessionStart |
 | Stale sidecars in other projects | `lcm events promote --all` drains all metadata-backed sidecars |
 | Unprocessed cap exceeded | Oldest events pruned when > 10,000 rows or > 30 days |
@@ -139,7 +154,7 @@ Run `lcm doctor --verbose` to see the per-project breakdown and recent error det
 
 By default, doctor scans up to 50 passive-learning sidecar DBs. Use `lcm doctor --events-max-dbs <n>` to set another count limit, or `lcm doctor --events-max-dbs all` / `lcm doctor --events-max-dbs unlimited` to remove the count limit. Sidecars skipped because of the count or timeout budget are reported as skipped, not warnings.
 
-When the daemon is healthy but many queued events remain across old project sidecars, `lcm doctor` reports that the daemon is up and suggests `lcm events promote --all` instead of asking you to restart the daemon.
+Low nonzero backlog is reported as passing because the daemon processes queued events automatically. When the daemon is healthy but 200 or more queued events remain across project sidecars, `lcm doctor` warns and suggests `lcm events promote --all` instead of asking you to restart the daemon.
 
 During the sidecar scan, lcm also prunes orphan sidecars that are safe to remove. A sidecar is pruned only when its project metadata is missing and it has no unprocessed events. Empty orphan sidecars are removed immediately; processed-only orphan sidecars are removed after the 30-day stale retention window.
 

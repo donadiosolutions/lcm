@@ -44,6 +44,7 @@ interface DoctorConfig {
 }
 
 const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start --detach";
+const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
 
 export interface DoctorRunOptions {
   verbose?: boolean;
@@ -176,7 +177,7 @@ function checkPassiveLearning(
   // Capture check
   if (stats.captured === 0) {
     results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: "No events captured — passive learning may not be active\n     Fix: run 'lcm install' to re-register hooks, then use a Bash or Edit tool to trigger the first event capture; re-run /lcm-doctor to verify" });
-  } else if (stats.unprocessed > 1000) {
+  } else if (stats.unprocessed >= PASSIVE_BACKLOG_WARN_THRESHOLD) {
     const sidecarCount = stats.sidecarsWithUnprocessed ?? 0;
     const orphanCount = stats.orphanedSidecarsWithUnprocessed ?? 0;
     if (daemonHealthy) {
@@ -197,7 +198,10 @@ function checkPassiveLearning(
       results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed) — daemon may be offline — run: lcm daemon start` });
     }
   } else {
-    results.push({ name: "events-capture", category: "Passive Learning", status: "pass", message: `${stats.captured} events captured (${stats.unprocessed} unprocessed)` });
+    const pending = stats.unprocessed > 0
+      ? `; ${stats.unprocessed} queued for automatic daemon processing`
+      : "; queue empty";
+    results.push({ name: "events-capture", category: "Passive Learning", status: "pass", message: `${stats.captured} events captured${pending}` });
   }
 
   // Error check
