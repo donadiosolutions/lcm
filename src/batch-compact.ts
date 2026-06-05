@@ -1,8 +1,8 @@
 import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "./db/migration.js";
+import { closeLcmConnection, getLcmConnection } from "./db/connection.js";
 import type { ProgressState } from "./cli/progress-state.js";
 import { DaemonClient } from "./daemon/client.js";
 import { projectsDir as lcmProjectsDir } from "./runtime-paths.js";
@@ -51,7 +51,7 @@ export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?:
     if (!cwd) continue;
     if (!projectMatchesCwdFilter(entry.name, cwd, cwdFilter)) continue;
 
-    const db = new DatabaseSync(dbPath);
+    const db = getLcmConnection(dbPath);
     try {
       db.exec("PRAGMA busy_timeout = 5000");
       if (!readOnly) runLcmMigrations(db);
@@ -88,7 +88,7 @@ export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?:
         });
       }
     } catch { /* skip corrupt databases */ }
-    finally { db.close(); }
+    finally { closeLcmConnection(dbPath); }
   }
 
   return results;

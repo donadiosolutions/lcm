@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { findUncompacted } from "../src/batch-compact.js";
+import { getPoolStats } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { addProjectAlias, clearProjectMapCache } from "../src/project-map.js";
 import { ensureProjectDir, projectPaths } from "../src/daemon/project.js";
@@ -69,6 +70,7 @@ describe("batch compaction discovery", () => {
     expect(conversations).toHaveLength(1);
     expect(conversations[0].cwd).toBe(paths.canonical);
     expect(conversations[0].sessionId).toBe("session-1");
+    expect(getPoolStats().totalConnections).toBe(0);
   });
 
   it("does not match a current-project filter that is unrelated to the map entry", () => {
