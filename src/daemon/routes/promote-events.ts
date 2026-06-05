@@ -27,6 +27,7 @@ const MIN_REINFORCED_PATTERN_OCCURRENCES = 3;
 const MIN_REINFORCED_PATTERN_SESSIONS = 2;
 const AUTO_PROMOTABLE_PATTERN_CATEGORIES = new Set(["file", "mcp", "skill", "subagent"]);
 const EMPTY_REINFORCEMENT: PatternReinforcementStats = { totalCount: 0, distinctSessions: 0 };
+const sidecarPromotionLocks = new Map<string, Promise<void>>();
 
 export interface PromoteResult {
   promoted: number;
@@ -95,6 +96,24 @@ function correlateErrors(events: EventRow[]): void {
           break; // only correlate with closest match
         }
       }
+    }
+  }
+}
+
+async function withSidecarPromotionLock<T>(sidecarPath: string, fn: () => Promise<T>): Promise<T> {
+  const previous = sidecarPromotionLocks.get(sidecarPath) ?? Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>(resolve => { release = resolve; });
+  const chained = previous.catch(() => {}).then(() => next);
+  sidecarPromotionLocks.set(sidecarPath, chained);
+
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (sidecarPromotionLocks.get(sidecarPath) === chained) {
+      sidecarPromotionLocks.delete(sidecarPath);
     }
   }
 }
@@ -252,6 +271,15 @@ export async function drainEventsForCwd(
   sidecarPathOverride?: string,
 ): Promise<PromoteResult & { batches: number; incomplete?: boolean }> {
   cwd = validateCwd(cwd);
+  const sidecarPath = sidecarPathOverride ?? eventsDbPath(cwd);
+  return withSidecarPromotionLock(sidecarPath, () => drainEventsForCwdUnlocked(config, cwd, sidecarPath));
+}
+
+async function drainEventsForCwdUnlocked(
+  config: DaemonConfig,
+  cwd: string,
+  sidecarPath: string,
+): Promise<PromoteResult & { batches: number; incomplete?: boolean }> {
   const result: PromoteResult & { batches: number; incomplete?: boolean } = {
     promoted: 0,
     skipped: 0,
@@ -260,7 +288,6 @@ export async function drainEventsForCwd(
     batches: 0,
   };
 
-  const sidecarPath = sidecarPathOverride ?? eventsDbPath(cwd);
   const edb = new EventsDb(sidecarPath);
   const dbPath = projectDbPath(cwd);
   let dbOpened = false;
@@ -312,6 +339,14 @@ export async function promoteEventsForCwd(
 ): Promise<PromoteResult> {
   cwd = validateCwd(cwd);
   const sidecarPath = sidecarPathOverride ?? eventsDbPath(cwd);
+  return withSidecarPromotionLock(sidecarPath, () => promoteEventsForCwdUnlocked(config, cwd, sidecarPath));
+}
+
+async function promoteEventsForCwdUnlocked(
+  config: DaemonConfig,
+  cwd: string,
+  sidecarPath: string,
+): Promise<PromoteResult> {
   const edb = new EventsDb(sidecarPath);
   const dbPath = projectDbPath(cwd);
   let dbOpened = false;

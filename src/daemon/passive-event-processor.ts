@@ -124,7 +124,8 @@ export class PassiveEventProcessor {
         maxDbs: this.defaults.sweepMaxSidecars,
         startIndex: this.sweepStartIndex,
       });
-      this.sweepStartIndex += this.defaults.sweepMaxSidecars;
+      const attempted = sidecars.filter(sidecar => !sidecar.scanSkipped).length;
+      this.sweepStartIndex += Math.max(1, attempted);
 
       for (const sidecar of sidecars) {
         if (this.stopped) return;

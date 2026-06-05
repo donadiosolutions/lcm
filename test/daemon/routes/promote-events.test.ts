@@ -4,7 +4,7 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { EventsDb } from "../../../src/hooks/events-db.js";
-import { createPromoteAllEventsHandler, createPromoteEventsHandler } from "../../../src/daemon/routes/promote-events.js";
+import { createPromoteAllEventsHandler, createPromoteEventsHandler, promoteEventsForCwd } from "../../../src/daemon/routes/promote-events.js";
 import { ensureProjectDir, projectDbPath, projectId } from "../../../src/daemon/project.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
@@ -171,6 +171,26 @@ describe("promote-events route", () => {
     const edb2 = new EventsDb(sidecarPath);
     const remaining = edb2.getUnprocessed();
     edb2.close();
+    expect(remaining).toHaveLength(0);
+  });
+
+  it("serializes concurrent promotion attempts for the same sidecar", async () => {
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "decision", category: "decision", data: "serialize this event", priority: 1 }, "PostToolUse");
+    edb.close();
+
+    const db = setupProjectDb(dir);
+    db.close();
+
+    await Promise.all([
+      promoteEventsForCwd(makeConfig(), dir),
+      promoteEventsForCwd(makeConfig(), dir),
+    ]);
+
+    expect(deduplicateAndInsert).toHaveBeenCalledTimes(1);
+    const remainingDb = new EventsDb(sidecarPath);
+    const remaining = remainingDb.getUnprocessed();
+    remainingDb.close();
     expect(remaining).toHaveLength(0);
   });
 
