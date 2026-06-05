@@ -21,8 +21,25 @@ type SessionInstructionsRow = {
   updated_at: string;
 };
 
+const SESSION_INSTRUCTION_CACHE_TABLE = "session_instruction_cache";
+
 function sessionInstructionsId(client: TranscriptClient): number {
   return client === "codex" ? 2 : 1;
+}
+
+function readSessionInstructionsRow(
+  db: DatabaseSync,
+  instructionsId: number,
+  client: TranscriptClient,
+): SessionInstructionsRow | undefined {
+  const row = db
+    .prepare(`SELECT content, content_hash, updated_at FROM ${SESSION_INSTRUCTION_CACHE_TABLE} WHERE id = ?`)
+    .get(instructionsId) as SessionInstructionsRow | undefined;
+  if (row || client !== "claude") return row;
+
+  return db
+    .prepare(`SELECT content, content_hash, updated_at FROM session_instructions WHERE id = 1`)
+    .get() as SessionInstructionsRow | undefined;
 }
 
 function readSessionInstructionFiles(cwd: string, client: TranscriptClient): string {
@@ -84,9 +101,7 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
             const db = new DatabaseSync(dbPath);
             try {
               runLcmMigrations(db);
-              const row = db
-                .prepare(`SELECT content, content_hash, updated_at FROM session_instructions WHERE id = ?`)
-                .get(instructionsId) as SessionInstructionsRow | undefined;
+              const row = readSessionInstructionsRow(db, instructionsId, client);
               if (row) {
                 instructionsContext = `<project-instructions>\n${row.content}\n</project-instructions>`;
               }
@@ -156,12 +171,12 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
             if (instructionContent) {
               const hash = createHash("sha256").update(instructionContent).digest("hex");
               const existing = db
-                .prepare(`SELECT content_hash FROM session_instructions WHERE id = ?`)
+                .prepare(`SELECT content_hash FROM ${SESSION_INSTRUCTION_CACHE_TABLE} WHERE id = ?`)
                 .get(instructionsId) as { content_hash: string } | undefined;
 
               if (!existing || existing.content_hash !== hash) {
                 db.prepare(
-                  `INSERT INTO session_instructions (id, content, content_hash, updated_at)
+                  `INSERT INTO ${SESSION_INSTRUCTION_CACHE_TABLE} (id, content, content_hash, updated_at)
                    VALUES (?, ?, ?, datetime('now'))
                    ON CONFLICT(id) DO UPDATE SET
                      content = excluded.content,

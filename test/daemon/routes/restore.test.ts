@@ -94,10 +94,10 @@ describe("POST /restore", () => {
       const body = await res.json();
       expect(body.context).not.toContain("<memory-orientation>");
 
-      // Verify session_instructions was written to DB
+      // Verify session_instruction_cache was written to DB
       const dbPath = projectDbPath(tmpDir);
       const db = new DatabaseSync(dbPath);
-      const row = db.prepare(`SELECT content, content_hash FROM session_instructions WHERE id = 1`).get() as
+      const row = db.prepare(`SELECT content, content_hash FROM session_instruction_cache WHERE id = 1`).get() as
         | { content: string; content_hash: string }
         | undefined;
       db.close();
@@ -129,7 +129,7 @@ describe("POST /restore", () => {
 
       const dbPath = projectDbPath(tmpDir);
       const db = new DatabaseSync(dbPath);
-      const rows = db.prepare(`SELECT id, content FROM session_instructions ORDER BY id`).all() as Array<{
+      const rows = db.prepare(`SELECT id, content FROM session_instruction_cache ORDER BY id`).all() as Array<{
         id: number;
         content: string;
       }>;
@@ -161,7 +161,7 @@ describe("POST /restore", () => {
 
       const dbPath = projectDbPath(tmpDir);
       const db1 = new DatabaseSync(dbPath);
-      const row1 = db1.prepare(`SELECT updated_at FROM session_instructions WHERE id = 1`).get() as
+      const row1 = db1.prepare(`SELECT updated_at FROM session_instruction_cache WHERE id = 1`).get() as
         | { updated_at: string }
         | undefined;
       db1.close();
@@ -174,7 +174,7 @@ describe("POST /restore", () => {
       });
 
       const db2 = new DatabaseSync(dbPath);
-      const row2 = db2.prepare(`SELECT updated_at FROM session_instructions WHERE id = 1`).get() as
+      const row2 = db2.prepare(`SELECT updated_at FROM session_instruction_cache WHERE id = 1`).get() as
         | { updated_at: string }
         | undefined;
       db2.close();
