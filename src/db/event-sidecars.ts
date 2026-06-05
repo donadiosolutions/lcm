@@ -24,6 +24,7 @@ export interface EventSidecarSummary {
 export interface EventSidecarScanOptions {
   timeoutMs?: number;
   maxDbs?: number;
+  startIndex?: number;
   includeRecentErrors?: boolean;
   pruneOrphanSidecars?: boolean;
   pruneOrphanSidecarsOlderThanDays?: number;
@@ -130,6 +131,10 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
       .sort((a, b) => a.localeCompare(b));
   } catch {
     return [];
+  }
+  if (files.length > 0 && options.startIndex !== undefined) {
+    const start = Math.max(0, Math.trunc(options.startIndex)) % files.length;
+    files = [...files.slice(start), ...files.slice(0, start)];
   }
 
   const sidecars: EventSidecarSummary[] = [];

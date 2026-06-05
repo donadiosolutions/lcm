@@ -21,11 +21,16 @@ vi.mock("../../src/daemon/project.js", () => ({
   ensureProjectDir: vi.fn(),
 }));
 
+vi.mock("../../src/hooks/session-end.js", () => ({
+  firePromoteEventsNotifyRequest: vi.fn(),
+}));
+
 import { ensureDaemon } from "../../src/daemon/lifecycle.js";
 import { eventsDbPath } from "../../src/db/events-path.js";
 import { ensureProjectDir } from "../../src/daemon/project.js";
 import { extractUserPromptEvents } from "../../src/hooks/extractors.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
+import { firePromoteEventsNotifyRequest } from "../../src/hooks/session-end.js";
 
 const mockEnsureDaemon = vi.mocked(ensureDaemon);
 const mockEventsDbPath = vi.mocked(eventsDbPath);
@@ -36,6 +41,7 @@ const MockEventsDb = vi.mocked(EventsDb);
 describe("handleUserPromptSubmit", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(firePromoteEventsNotifyRequest).mockImplementation(() => {});
     delete process.env.CLAUDE_PROJECT_DIR;
   });
 
@@ -179,6 +185,7 @@ describe("handleUserPromptSubmit", () => {
     MockEventsDb.mockImplementation(function () {
       return {
         insertEvent: mockInsertEvent,
+        getHealthStats: vi.fn().mockReturnValue({ unprocessed: 1 }),
         close: mockClose,
       } as any;
     });
@@ -203,6 +210,12 @@ describe("handleUserPromptSubmit", () => {
       "UserPromptSubmit",
     );
     expect(mockClose).toHaveBeenCalled();
+    expect(firePromoteEventsNotifyRequest).toHaveBeenCalledWith(3737, {
+      cwd: "/proj",
+      priority: 1,
+      pendingCount: 1,
+      sourceHook: "UserPromptSubmit",
+    });
     // prompt-search still called
     expect(mockClient.post).toHaveBeenCalledWith("/prompt-search", expect.any(Object));
   });
@@ -214,6 +227,7 @@ describe("handleUserPromptSubmit", () => {
     MockEventsDb.mockImplementation(function () {
       return {
         insertEvent: mockInsertEvent,
+        getHealthStats: vi.fn().mockReturnValue({ unprocessed: 1 }),
         close: mockClose,
       } as any;
     });
@@ -245,6 +259,7 @@ describe("handleUserPromptSubmit", () => {
     MockEventsDb.mockImplementation(function () {
       return {
         insertEvent: vi.fn(),
+        getHealthStats: vi.fn().mockReturnValue({ unprocessed: 1 }),
         close: mockClose,
       } as any;
     });
@@ -266,6 +281,35 @@ describe("handleUserPromptSubmit", () => {
     expect(mockClient.post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({
       cwd: "/trimmed-project",
     }));
+  });
+
+  it("continues prompt search if daemon notify fails", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    MockEventsDb.mockImplementation(function () {
+      return {
+        insertEvent: vi.fn(),
+        getHealthStats: vi.fn().mockReturnValue({ unprocessed: 1 }),
+        close: vi.fn(),
+      } as any;
+    });
+    mockExtractUserPromptEvents.mockReturnValue([
+      { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
+    ]);
+    vi.mocked(firePromoteEventsNotifyRequest).mockImplementation(() => {
+      throw new Error("notify failed");
+    });
+    const mockClient = {
+      health: vi.fn(),
+      post: vi.fn().mockResolvedValue({ hints: ["recovered hint"] }),
+    };
+
+    const result = await handleUserPromptSubmit(
+      JSON.stringify({ prompt: "we decided to use SQLite", cwd: "/proj", session_id: "s1" }),
+      mockClient as any,
+    );
+
+    expect(result.stdout).toContain("recovered hint");
+    expect(mockClient.post).toHaveBeenCalledWith("/prompt-search", expect.any(Object));
   });
 
   it("continues normally if sidecar extraction fails", async () => {

@@ -18,6 +18,7 @@ import { createPromptSearchHandler } from "./routes/prompt-search.js";
 import { createStatusHandler } from "./routes/status.js";
 import { createSessionCompleteHandler } from "./routes/session-complete.js";
 import { createPromoteAllEventsHandler, createPromoteEventsHandler } from "./routes/promote-events.js";
+import { createPromoteEventsNotifyHandler, PassiveEventProcessor } from "./passive-event-processor.js";
 import { createStatsHandler } from "./routes/stats.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
 import { createReviewStaleHandler } from "./routes/review-stale.js";
@@ -100,8 +101,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   routes.set("POST /ingest", createIngestHandler(config));
   routes.set("POST /prompt-search", createPromptSearchHandler(config));
   routes.set("POST /session-complete", createSessionCompleteHandler());
+  const passiveEventProcessor = new PassiveEventProcessor(config);
   routes.set("POST /promote-events", createPromoteEventsHandler(config));
   routes.set("POST /promote-events/all", createPromoteAllEventsHandler(config));
+  routes.set("POST /promote-events/notify", createPromoteEventsNotifyHandler(passiveEventProcessor));
   routes.set("GET /stats", createStatsHandler());
   routes.set("GET /stats/pool", createPoolStatsHandler());
   routes.set("POST /review-stale", createReviewStaleHandler(config));
@@ -202,11 +205,13 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
 
       // Now that we know the actual port, register the status handler
       routes.set("POST /status", createStatusHandler(config, startTime, actualPort));
+      passiveEventProcessor.start();
 
       resolve({
         address: () => addr,
         stop: async () => {
           clearInterval(ingestInterval);
+          passiveEventProcessor.stop();
           if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
           if (proxyManager) {
             try { await proxyManager.stop(); } catch { /* non-fatal */ }

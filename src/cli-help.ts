@@ -215,19 +215,19 @@ const HELP: Record<string, CommandHelp> = {
   },
 
   events: {
-    summary: "Manage passive-learning sidecar events.",
+    summary: "Manually remediate passive-learning sidecar queues.",
     usage: "lcm events promote [--all] [--json]",
     options: [
-      ["promote", "Promote queued passive-learning events for the current project"],
-      ["promote --all", "Promote queued events from all metadata-backed project sidecars"],
+      ["promote", "Manually drain queued passive-learning events for the current project"],
+      ["promote --all", "Manually drain queued events from all metadata-backed project sidecars"],
       ["--json", "Output structured JSON"],
     ],
     examples: [
-      ["lcm events promote", "Drain queued passive events for the current project"],
-      ["lcm events promote --all", "Drain stale passive-event sidecars across all known projects"],
+      ["lcm events promote", "Remediate queued passive events for the current project"],
+      ["lcm events promote --all", "Remediate stale passive-event sidecars across all known projects"],
       ["lcm events promote --all --json", "Show per-sidecar promotion results"],
     ],
-    notes: "Sidecars without project metadata are reported but cannot be mapped back to a cwd automatically.",
+    notes: "Passive events are normally processed by the daemon automatically. Sidecars without project metadata are reported but cannot be mapped back to a cwd automatically.",
   },
 
   diagnose: {
@@ -418,7 +418,7 @@ const GROUPS = [
       { name: "import [--provider ...] [--all] [--verbose] [--dry-run] [--replay]", summary: "Import Claude Code and Codex session transcripts" },
       { name: "promote [--all] [--verbose] [--dry-run]", summary: "Promote insights to long-term memory" },
       { name: "stats [-v]", summary: "Memory inventory and compression ratios" },
-      { name: "events promote [--all] [--json]", summary: "Drain queued passive-learning sidecar events" },
+      { name: "events promote [--all] [--json]", summary: "Manually remediate passive-learning sidecar queues" },
       { name: "diagnose [--all] [--days N] [--verbose] [--json]", summary: "Scan sessions for hook failures and issues" },
     ],
   },

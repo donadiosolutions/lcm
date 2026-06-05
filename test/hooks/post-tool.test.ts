@@ -12,6 +12,12 @@ vi.mock("../../src/db/events-path.js", () => ({
   eventsDir: () => process.env.TEST_EVENTS_DIR!,
 }));
 
+vi.mock("../../src/hooks/session-end.js", () => ({
+  firePromoteEventsNotifyRequest: vi.fn(),
+}));
+
+import { firePromoteEventsNotifyRequest } from "../../src/hooks/session-end.js";
+
 describe("handlePostToolUse", () => {
   let dir: string;
   let homeDir: string;
@@ -25,6 +31,7 @@ describe("handlePostToolUse", () => {
     process.env.HOME = homeDir;
     extraDirs = [];
     process.env.TEST_EVENTS_DIR = dir;
+    vi.mocked(firePromoteEventsNotifyRequest).mockClear();
   });
 
   afterEach(() => {
@@ -113,5 +120,45 @@ describe("handlePostToolUse", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(projectMetaPath(inputCwd))).toBe(true);
     expect(JSON.parse(readFileSync(projectMetaPath(inputCwd), "utf-8")).cwd).toBe(inputCwd);
+  });
+
+  it("notifies daemon after captured passive events", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-notify-cwd-"));
+    extraDirs.push(inputCwd);
+
+    await handlePostToolUse(JSON.stringify({
+      session_id: "test-session",
+      tool_name: "AskUserQuestion",
+      cwd: inputCwd,
+      daemon_port: 4567,
+      tool_input: { question: "Use SQLite?" },
+      tool_response: "yes",
+    }));
+
+    expect(firePromoteEventsNotifyRequest).toHaveBeenCalledWith(4567, expect.objectContaining({
+      cwd: inputCwd,
+      priority: 1,
+      sourceHook: "PostToolUse",
+    }));
+  });
+
+  it("ignores invalid daemon_port values", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-invalid-port-cwd-"));
+    extraDirs.push(inputCwd);
+
+    await handlePostToolUse(JSON.stringify({
+      session_id: "test-session",
+      tool_name: "AskUserQuestion",
+      cwd: inputCwd,
+      daemon_port: "4567",
+      tool_input: { question: "Use SQLite?" },
+      tool_response: "yes",
+    }), 4568);
+
+    expect(firePromoteEventsNotifyRequest).toHaveBeenCalledWith(4568, expect.objectContaining({
+      cwd: inputCwd,
+      priority: 1,
+      sourceHook: "PostToolUse",
+    }));
   });
 });
