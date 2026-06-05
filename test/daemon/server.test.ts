@@ -3,9 +3,11 @@ import { createServer } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { claudeProjectDirName, createDaemon, projectTranscriptScanCwds, type DaemonInstance } from "../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
+import { projectDbPath } from "../../src/daemon/project.js";
 import { clearProjectMapCache, hashProjectPath, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
 
 describe("daemon server", () => {
@@ -23,6 +25,7 @@ describe("daemon server", () => {
 
   afterEach(async () => {
     if (daemon) { await daemon.stop(); daemon = undefined; }
+    vi.restoreAllMocks();
     clearProjectMapCache();
     if (tempHome) rmSync(tempHome, { recursive: true, force: true });
     tempHome = undefined;
@@ -144,6 +147,59 @@ describe("daemon server", () => {
       expect(projectTranscriptScanCwds("unknown-hash", canonical)).toEqual([canonical]);
     } finally {
       rmSync(canonical, { recursive: true, force: true });
+    }
+  });
+
+  it("scans alias Claude transcripts into the canonical project database", async () => {
+    let scanForTranscripts: (() => void | Promise<void>) | undefined;
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    const scanInterval = { unref: vi.fn() } as unknown as NodeJS.Timeout;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 10 * 60 * 1000 && typeof handler === "function") {
+        scanForTranscripts = () => handler(...args);
+        return scanInterval;
+      }
+      return realSetInterval(handler, timeout, ...args);
+    }) as typeof setInterval);
+    vi.spyOn(globalThis, "clearInterval").mockImplementation(((timer?: NodeJS.Timeout | number | string) => {
+      if (timer === scanInterval) return;
+      realClearInterval(timer as NodeJS.Timeout);
+    }) as typeof clearInterval);
+
+    const canonical = mkdtempSync(join(tmpdir(), "lcm-scan-canonical-"));
+    const alias = mkdtempSync(join(tmpdir(), "lcm-scan-alias-"));
+    const normalizedCanonical = normalizeProjectPath(canonical);
+    const normalizedAlias = normalizeProjectPath(alias);
+    const hash = hashProjectPath(normalizedCanonical);
+    mkdirSync(join(homedir(), ".lcm", "projects", hash), { recursive: true });
+    writeFileSync(join(homedir(), ".lcm", "projects", hash, "meta.json"), JSON.stringify({ cwd: normalizedCanonical }, null, 2) + "\n");
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [hash]: { canonical: normalizedCanonical, aliases: [normalizedAlias] },
+    }, null, 2) + "\n");
+    clearProjectMapCache();
+
+    const sessionsDir = join(homedir(), ".claude", "projects", claudeProjectDirName(normalizedAlias));
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "ignored.txt"), "not a transcript");
+    writeFileSync(join(sessionsDir, "alias-session.jsonl"), [
+      JSON.stringify({ message: { role: "user", content: [{ type: "text", text: "Alias scan question" }] } }),
+      JSON.stringify({ message: { role: "assistant", content: [{ type: "text", text: "Alias scan answer" }] } }),
+    ].join("\n") + "\n");
+
+    daemon = await createDaemon(loadDaemonConfig("/x", { daemon: { port: 0, idleTimeoutMs: 0 } }));
+    expect(scanForTranscripts).toBeDefined();
+
+    await scanForTranscripts?.();
+
+    const db = new DatabaseSync(projectDbPath(normalizedCanonical));
+    try {
+      const row = db.prepare("SELECT COUNT(*) AS count FROM messages").get() as { count: number };
+      expect(row.count).toBe(2);
+    } finally {
+      db.close();
+      rmSync(canonical, { recursive: true, force: true });
+      rmSync(alias, { recursive: true, force: true });
     }
   });
 });
