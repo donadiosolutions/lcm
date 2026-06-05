@@ -18,7 +18,7 @@ export function legacyLcmMcpServerName(): string {
 }
 
 export function legacyLaunchdPlistName(): string {
-  return ["com", LEGACY_PRODUCT_WORD, LEGACY_AGENT_WORD, "daemon", "plist"].join(".");
+  return ["com", legacyLcmSlug(), "daemon", "plist"].join(".");
 }
 
 export function legacySystemdServiceName(): string {

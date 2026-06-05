@@ -80,11 +80,17 @@ These three tools **chain** from broad to deep:
 If `lcm` is not on PATH, first try to install it by running:
 
 ```bash
-LCM_DIR=$(ls -d ~/.claude/plugins/cache/*/Long Context Manager (LCM)/*/ 2>/dev/null | sort -V | tail -1)
+LEGACY_SLUG="$(printf '%s-%s' lossless claude)"
+LCM_DIR=$(ls -d ~/.claude/plugins/cache/*/"$LEGACY_SLUG"/*/ ~/.claude/plugins/cache/"$LEGACY_SLUG"/lcm/*/ 2>/dev/null | sort -V | tail -1)
 node "${LCM_DIR}lcm.mjs" install
 ```
 
-If install succeeds, `lcm` should now be available on PATH. If it is still not available, use the bundled binary directly: `node "$(ls -d ~/.claude/plugins/cache/*/Long Context Manager (LCM)/*/ 2>/dev/null | sort -V | tail -1)lcm.mjs"`
+If install succeeds, `lcm` should now be available on PATH. If it is still not available, use the bundled binary directly:
+
+```bash
+LEGACY_SLUG="$(printf '%s-%s' lossless claude)"
+node "$(ls -d ~/.claude/plugins/cache/*/"$LEGACY_SLUG"/*/ ~/.claude/plugins/cache/"$LEGACY_SLUG"/lcm/*/ 2>/dev/null | sort -V | tail -1)lcm.mjs"
+```
 
 ## Error Self-Healing
 
