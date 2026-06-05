@@ -253,7 +253,7 @@ async function main() {
   const program = new Command();
   program
     .name("lcm")
-    .description("long context manager for coding agents")
+    .description("Long Context Manager for coding agents")
     .version(pkg.version, "-V, --version")
     .helpCommand(false)
     .addHelpCommand(false)

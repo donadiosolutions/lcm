@@ -42,6 +42,8 @@ function ensureClientKeyedSessionInstructions(db: DatabaseSync): void {
   const row = db
     .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_instructions'`)
     .get() as SqliteMasterRow | undefined;
+  // Legacy schema constrained session_instructions to CHECK(id = 1).
+  // Rebuild this tiny cache table transactionally so clients can use separate rows.
   if (!row?.sql || !/CREATE\s+TABLE\s+session_instructions\b[\s\S]*\bid\s+INTEGER\s+PRIMARY\s+KEY\s+CHECK\s*\(\s*id\s*=\s*1\s*\)/i.test(row.sql)) {
     return;
   }
