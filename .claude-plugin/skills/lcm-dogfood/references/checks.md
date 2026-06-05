@@ -230,7 +230,7 @@ Pass if: identical.
 ```bash
 ls -la ~/.lcm/projects/*/db.sqlite 2>/dev/null
 ```
-Pass if: at least one .db file exists.
+Pass if: at least one db.sqlite file exists.
 
 ### 10.4 DB integrity
 ```bash

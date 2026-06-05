@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { removeClaudeSettings, teardownDaemonService, uninstall, type TeardownDeps } from "../../installer/uninstall.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { legacyLaunchdPlistName, legacyLcmSlug, legacySystemdServiceName } from "../../src/legacy-names.js";
+import { legacyLaunchdPlistName, legacyLcmCommand, legacyLcmSlug, legacySystemdServiceName } from "../../src/legacy-names.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -91,6 +91,20 @@ describe("removeClaudeSettings", () => {
       mcpServers: {},
     });
     expect(r.hooks.PreCompact).toHaveLength(0);
+  });
+
+  it("removes pre-hook legacy compact commands", () => {
+    const r = removeClaudeSettings({
+      hooks: {
+        PreCompact: [
+          { matcher: "", hooks: [{ type: "command", command: legacyLcmCommand("lcm compact") }] },
+          { matcher: "", hooks: [{ type: "command", command: "other" }] },
+        ],
+      },
+      mcpServers: {},
+    });
+    expect(r.hooks.PreCompact).toHaveLength(1);
+    expect(r.hooks.PreCompact[0].hooks[0].command).toBe("other");
   });
 });
 

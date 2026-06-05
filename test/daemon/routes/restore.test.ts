@@ -132,6 +132,27 @@ describe("POST /restore", () => {
       expect(codexBody.context).toContain("Project Codex override.");
       expect(codexBody.context).not.toContain("Use Claude instructions.");
 
+      const codexCompactResponse = await fetch(`http://127.0.0.1:${port}/restore`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "codex-compact", cwd: tmpDir, source: "compact", client: "codex" }),
+      });
+      expect(codexCompactResponse.status).toBe(200);
+      const codexCompactBody = await codexCompactResponse.json() as { context: string };
+      expect(codexCompactBody.context).toContain("Use Codex instructions.");
+      expect(codexCompactBody.context).toContain("Project Codex override.");
+      expect(codexCompactBody.context).not.toContain("Use Claude instructions.");
+
+      const nestedDir = join(tmpDir, "packages", "worker");
+      mkdirSync(nestedDir, { recursive: true });
+      const codexNestedResponse = await fetch(`http://127.0.0.1:${port}/restore`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "codex-nested", cwd: nestedDir, source: "startup", client: "codex" }),
+      });
+      expect(codexNestedResponse.status).toBe(200);
+      const codexNestedBody = await codexNestedResponse.json() as { context: string };
+      expect(codexNestedBody.context).toContain("Use Codex instructions.");
+      expect(codexNestedBody.context).not.toContain("Use Claude instructions.");
+
       const dbPath = projectDbPath(tmpDir);
       const db = getLcmConnection(dbPath);
       const rows = db.prepare(`SELECT id, content FROM session_instruction_cache ORDER BY id`).all() as Array<{

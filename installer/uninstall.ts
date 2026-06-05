@@ -21,6 +21,7 @@ export function removeClaudeSettings(existing: any): any {
   for (const { command } of REQUIRED_HOOKS) {
     LC_COMMANDS.add(legacyLcmCommand(command));
   }
+  LC_COMMANDS.add(legacyLcmCommand("lcm compact"));
   for (const event of Object.keys(settings.hooks)) {
     if (!Array.isArray(settings.hooks[event])) continue;
     settings.hooks[event] = settings.hooks[event].filter(
