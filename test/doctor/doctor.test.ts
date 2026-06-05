@@ -262,7 +262,7 @@ describe("Passive Learning checks", () => {
     expect(capture?.message).toContain("No events captured");
   });
 
-  it("passes when events exist and unprocessed is low", async () => {
+  it("passes when events exist and low backlog awaits automatic processing", async () => {
     mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, lastCapture: "2026-03-26 10:00:00" });
     const results = await runDoctor(minimalDeps({
       cwd: "/tmp/test-proj",
@@ -270,10 +270,11 @@ describe("Passive Learning checks", () => {
     }));
     const capture = results.find(r => r.name === "events-capture");
     expect(capture?.status).toBe("pass");
+    expect(capture?.message).toContain("queued for automatic daemon processing");
   });
 
-  it("warns when unprocessed > 1000", async () => {
-    mockCollectEventStats.mockReturnValue({ captured: 5000, unprocessed: 2000, errors: 0, lastCapture: "2026-03-26 10:00:00" });
+  it("warns when unprocessed events reach the passive backlog threshold", async () => {
+    mockCollectEventStats.mockReturnValue({ captured: 5000, unprocessed: 200, errors: 0, lastCapture: "2026-03-26 10:00:00" });
     const results = await runDoctor(minimalDeps({
       cwd: "/tmp/test-proj",
       fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),

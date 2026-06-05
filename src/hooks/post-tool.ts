@@ -2,10 +2,19 @@
 import { extractPostToolEvents } from "./extractors.js";
 import { EventsDb } from "./events-db.js";
 import { eventsDbPath } from "../db/events-path.js";
-import { firePromoteEventsRequest } from "./session-end.js";
+import { firePromoteEventsNotifyRequest } from "./session-end.js";
 import { safeLogError } from "./hook-errors.js";
 import { ensureProjectDir } from "../daemon/project.js";
 
+interface PostToolHookInput {
+  session_id?: unknown;
+  tool_name?: unknown;
+  tool_input?: unknown;
+  tool_response?: unknown;
+  tool_output?: unknown;
+  cwd?: unknown;
+  daemon_port?: unknown;
+}
 
 function resolveHookCwd(inputCwd: unknown): string {
   const cwd = typeof inputCwd === "string" ? inputCwd.trim() : "";
@@ -17,17 +26,37 @@ function resolveHookCwd(inputCwd: unknown): string {
   return process.cwd();
 }
 
+function normalizeHookPort(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isInteger(value)) return undefined;
+  return value >= 1 && value <= 65535 ? value : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeToolOutput(value: unknown): { isError?: boolean } | undefined {
+  if (!isRecord(value)) return undefined;
+  return typeof value.isError === "boolean" ? { isError: value.isError } : {};
+}
+
 export async function handlePostToolUse(
   stdin: string,
+  port?: number,
 ): Promise<{ exitCode: number; stdout: string }> {
   let cwd: string | undefined;
   try {
-    const input = JSON.parse(stdin);
+    const input = JSON.parse(stdin) as PostToolHookInput;
     const { session_id, tool_name, tool_input, tool_response, tool_output } = input;
 
-    if (!tool_name || !session_id) return { exitCode: 0, stdout: "" };
+    if (typeof tool_name !== "string" || typeof session_id !== "string") return { exitCode: 0, stdout: "" };
 
-    const events = extractPostToolEvents({ tool_name, tool_input: tool_input ?? {}, tool_response, tool_output });
+    const events = extractPostToolEvents({
+      tool_name,
+      tool_input: isRecord(tool_input) ? tool_input : {},
+      tool_response,
+      tool_output: normalizeToolOutput(tool_output),
+    });
     if (events.length === 0) return { exitCode: 0, stdout: "" };
 
     const resolvedCwd = resolveHookCwd(input.cwd);
@@ -41,15 +70,13 @@ export async function handlePostToolUse(
         db.insertEvent(session_id, event, "PostToolUse");
       }
 
-      // Tier 1: fire-and-forget daemon promotion for high-priority events.
-      // The /promote-events route uses getUnprocessed() which reads processed_at IS NULL,
-      // so events already promoted by this call won't be re-promoted by the batch route
-      // at session-end. No additional de-duplication guard needed.
-      const hasPriority1 = events.some(e => e.priority === 1);
-      if (hasPriority1) {
-        const port = input.daemon_port ?? 3737;
-        firePromoteEventsRequest(port, { cwd: resolvedCwd });
-      }
+      const daemonPort = normalizeHookPort(input.daemon_port) ?? port ?? 3737;
+      const priority = Math.min(...events.map(e => e.priority));
+      firePromoteEventsNotifyRequest(daemonPort, {
+        cwd: resolvedCwd,
+        priority,
+        sourceHook: "PostToolUse",
+      });
     } finally {
       db.close();
     }

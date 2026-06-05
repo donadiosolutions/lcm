@@ -92,6 +92,20 @@ describe("collectEventStats", () => {
     expect(stats.scanErrors).toBe(0);
   });
 
+  it("can start scans from a rotated sidecar index", () => {
+    for (const file of ["a.db", "b.db", "c.db"]) {
+      const db = new EventsDb(join(tempDir, file));
+      db.insertEvent("s1", { type: "decision", category: "decision", data: file, priority: 1 }, "PostToolUse");
+      db.close();
+    }
+
+    const sidecars = collectEventSidecars({ maxDbs: 1, startIndex: 1, pruneOrphanSidecars: false });
+
+    expect(sidecars[0].file).toBe("b.db");
+    expect(sidecars[0].scanSkipped).toBeUndefined();
+    expect(sidecars.slice(1).every(sidecar => sidecar.scanSkipped)).toBe(true);
+  });
+
   it("prunes empty orphan sidecars by default", () => {
     const sidecarPath = join(tempDir, `orphan-empty-${Date.now()}.db`);
     const db = new EventsDb(sidecarPath);
