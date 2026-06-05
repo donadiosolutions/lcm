@@ -156,14 +156,6 @@ Daemon port values must be integers from `1` through `65535` when connecting to 
 
 Hook error fallback logs write to `~/.lcm/logs/events.log`.
 
-## Project path aliases
-
-LCM records canonical project paths and aliases in `~/.lcm/map.json`. All project database paths, passive-learning sidecars, metadata, sensitive-pattern files, and search/promotion routes resolve through that map before choosing a project hash.
-
-Use `lcm map list`, `lcm map show`, `lcm map add`, and `lcm map remove` to manage aliases. Manual edits are supported; the daemon reloads valid changes without restart, pretty-prints valid non-canonical JSON, and keeps the last valid in-memory map during transient invalid saves.
-
-See [Project path aliases](project-map.md) for the file format, backup behavior, ambiguity rules, and command reference.
-
 ## Model selection
 
 LCM defaults to `LCM_SUMMARY_PROVIDER=auto`.

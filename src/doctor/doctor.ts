@@ -11,7 +11,6 @@ import { projectDir } from "../daemon/project.js";
 import { collectEventStats, collectDetailedEventStats } from "../db/events-stats.js";
 import { validateRegex } from "../store/regex-safety.js";
 import { configPath, daemonPidPath } from "../runtime-paths.js";
-import { projectMapPath, validateProjectMap, type ProjectMapValidation } from "../project-map.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -81,56 +80,6 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
     port: (config.daemon as Record<string, number> | undefined)?.port ?? (config as Record<string, unknown>).port as number ?? 3737,
     summarizer: llm?.provider ?? "disabled",
   };
-}
-
-function checkProjectMap(results: CheckResult[], deps: DoctorDeps): void {
-  let validation: ProjectMapValidation;
-  try {
-    validation = validateProjectMap({ homeDir: deps.homedir, fix: true });
-  } catch (err) {
-    results.push({
-      name: "project-map",
-      category: "Project Map",
-      status: "fail",
-      message: `${projectMapPath(deps.homedir)}: ${err instanceof Error ? err.message : String(err)}`,
-    });
-    return;
-  }
-
-  if (!validation.ok) {
-    results.push({
-      name: "project-map",
-      category: "Project Map",
-      status: "fail",
-      message: `${validation.path}: ${validation.errors.join("; ")}`,
-    });
-    return;
-  }
-
-  if (validation.fixApplied) {
-    const detail = validation.warnings.length > 0
-      ? validation.warnings.join("; ")
-      : "formatted map.json";
-    const backup = validation.backupPath ? `; backup: ${validation.backupPath}` : "";
-    results.push({
-      name: "project-map",
-      category: "Project Map",
-      status: "warn",
-      message: `${detail}${backup}`,
-      fixApplied: true,
-    });
-    return;
-  }
-
-  const count = validation.map ? Object.keys(validation.map).length : 0;
-  results.push({
-    name: "project-map",
-    category: "Project Map",
-    status: "pass",
-    message: validation.warnings.includes("map.json does not exist yet")
-      ? "map.json not created yet"
-      : `${count} mapped project${count === 1 ? "" : "s"}`,
-  });
 }
 
 function checkBinary(deps: DoctorDeps, command: string): boolean {
@@ -353,9 +302,6 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   } else {
     results.push({ name: "config", category: "Stack", status: "fail", message: `Missing — run: lcm install` });
   }
-
-  // ── Project path aliases ──
-  checkProjectMap(results, deps);
 
   // ── Daemon ──
   let daemonHealthy = false;

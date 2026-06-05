@@ -1,37 +1,24 @@
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, realpathSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, normalize, join as pathJoin, dirname, basename } from "node:path";
 import { lcmHomeDir } from "../runtime-paths.js";
-import { resolveProjectIdentity, type ProjectIdentity } from "../project-map.js";
 
-export const projectIdentity = (cwd: string): ProjectIdentity =>
-  resolveProjectIdentity(cwd);
-
-export const projectId = (cwd: string): string =>
-  projectIdentity(cwd).id;
-
-export const projectCanonicalPath = (cwd: string): string =>
-  projectIdentity(cwd).canonical;
-
-export function projectPaths(cwd: string): ProjectIdentity & { dir: string; dbPath: string; metaPath: string } {
-  const identity = projectIdentity(cwd);
-  const dir = join(lcmHomeDir(), "projects", identity.id);
-  return {
-    ...identity,
-    dir,
-    dbPath: join(dir, "db.sqlite"),
-    metaPath: join(dir, "meta.json"),
-  };
+function canonicalizeCwd(cwd: string): string {
+  try { return realpathSync(cwd); } catch { return cwd; }
 }
 
+export const projectId = (cwd: string): string =>
+  createHash("sha256").update(canonicalizeCwd(cwd)).digest("hex");
+
 export const projectDir = (cwd: string): string =>
-  projectPaths(cwd).dir;
+  join(lcmHomeDir(), "projects", projectId(cwd));
 
 export const projectDbPath = (cwd: string): string =>
-  projectPaths(cwd).dbPath;
+  join(projectDir(cwd), "db.sqlite");
 
 export const projectMetaPath = (cwd: string): string =>
-  projectPaths(cwd).metaPath;
+  join(projectDir(cwd), "meta.json");
 
 function tryRealpath(p: string): string {
   try { return realpathSync(p); } catch { return p; }
@@ -110,18 +97,17 @@ export function isSafeTranscriptPath(transcriptPath: string, cwd: string): strin
 
 /** Ensures the project dir exists and writes cwd to meta.json. */
 export const ensureProjectDir = (cwd: string): string => {
-  const identity = resolveProjectIdentity(cwd);
-  const dir = join(lcmHomeDir(), "projects", identity.id);
+  const dir = projectDir(cwd);
   mkdirSync(dir, { recursive: true });
   const metaPath = join(dir, "meta.json");
-  let meta: Record<string, unknown> = { cwd: identity.canonical };
+  let meta: Record<string, unknown> = { cwd };
   if (existsSync(metaPath)) {
     try {
       const existing = JSON.parse(readFileSync(metaPath, "utf-8")) as Record<string, unknown>;
-      if (existing.cwd === identity.canonical) return dir;
-      meta = { ...existing, cwd: identity.canonical };
+      if (existing.cwd === cwd) return dir;
+      meta = { ...existing, cwd };
     } catch { /* keep default */ }
   }
-  writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
+  writeFileSync(metaPath, JSON.stringify(meta, null, 2));
   return dir;
 };

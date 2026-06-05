@@ -1,12 +1,10 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { createServer } from "node:http";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claudeProjectDirName, createDaemon, projectTranscriptScanCwds, type DaemonInstance } from "../../src/daemon/server.js";
+import { createDaemon, type DaemonInstance } from "../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
-import { clearProjectMapCache, hashProjectPath, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
 
 describe("daemon server", () => {
   let daemon: DaemonInstance | undefined;
@@ -53,59 +51,6 @@ describe("daemon server", () => {
       body: bigBody,
     });
     expect(res.status).toBe(413);
-  });
-
-  it("watches map.json and reformats valid user edits", async () => {
-    const project = mkdtempSync(join(tmpdir(), "lcm-map-watch-project-"));
-    const hash = hashProjectPath(normalizeProjectPath(project));
-    mkdirSync(join(homedir(), ".lcm"), { recursive: true });
-    const mapPath = projectMapPath();
-    writeFileSync(mapPath, JSON.stringify({ [hash]: { canonical: project, aliases: [] } }));
-
-    daemon = await createDaemon(loadDaemonConfig("/x", { daemon: { port: 0, idleTimeoutMs: 0 } }));
-
-    await new Promise<void>((resolve, reject) => {
-      const deadline = Date.now() + 2000;
-      const tick = () => {
-        if (!existsSync(mapPath)) {
-          reject(new Error("map.json missing"));
-          return;
-        }
-        const content = readFileSync(mapPath, "utf-8");
-        if (content === JSON.stringify({ [hash]: { canonical: project, aliases: [] } }, null, 2) + "\n") {
-          resolve();
-          return;
-        }
-        if (Date.now() > deadline) {
-          reject(new Error(`map.json was not reformatted: ${content}`));
-          return;
-        }
-        setTimeout(tick, 25);
-      };
-      tick();
-    });
-
-    rmSync(project, { recursive: true, force: true });
-  });
-
-  it("includes mapped aliases when deriving Claude transcript scan cwds", () => {
-    const canonical = mkdtempSync(join(tmpdir(), "lcm-scan-canonical-"));
-    const alias = mkdtempSync(join(tmpdir(), "lcm-scan-alias-"));
-    const hash = hashProjectPath(normalizeProjectPath(canonical));
-    mkdirSync(join(homedir(), ".lcm"), { recursive: true });
-    writeFileSync(projectMapPath(), JSON.stringify({
-      [hash]: { canonical: normalizeProjectPath(canonical), aliases: [normalizeProjectPath(alias)] },
-    }, null, 2) + "\n");
-    clearProjectMapCache();
-
-    const cwds = projectTranscriptScanCwds(hash, normalizeProjectPath(canonical));
-
-    expect(cwds).toContain(normalizeProjectPath(canonical));
-    expect(cwds).toContain(normalizeProjectPath(alias));
-    expect(claudeProjectDirName(normalizeProjectPath(alias))).toBe(normalizeProjectPath(alias).replace(/\//g, "-").replace(/^-/, ""));
-
-    rmSync(canonical, { recursive: true, force: true });
-    rmSync(alias, { recursive: true, force: true });
   });
 });
 
@@ -275,32 +220,5 @@ describe("daemon proxy integration", () => {
     const res = await fetch(`http://127.0.0.1:${daemon.address().port}/health`);
     expect(res.status).toBe(200);
     warnSpy.mockRestore();
-  });
-
-  it("cleans up startup resources when listen fails", async () => {
-    const blocker = createServer();
-    await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", () => resolve()));
-    const port = (blocker.address() as { port: number }).port;
-    const mockProxy = {
-      start: vi.fn().mockResolvedValue(undefined),
-      stop: vi.fn().mockResolvedValue(undefined),
-      isHealthy: vi.fn().mockResolvedValue(true),
-      port: 3456,
-      available: true,
-    };
-    const config = loadDaemonConfig("/x", {
-      daemon: { port, idleTimeoutMs: 0 },
-      llm: { provider: "disabled" },
-    });
-
-    try {
-      await expect(createDaemon(config, { proxyManager: mockProxy })).rejects.toThrow(/EADDRINUSE|listen/);
-      expect(mockProxy.start).toHaveBeenCalled();
-      expect(mockProxy.stop).toHaveBeenCalled();
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        blocker.close((err) => err ? reject(err) : resolve());
-      });
-    }
   });
 });

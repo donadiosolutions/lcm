@@ -110,15 +110,6 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("lcm doctor --events-max-dbs all");
   });
 
-  it("prints map command help", () => {
-    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-    printHelp("map");
-    const text = out.mock.calls.map(c => c[0]).join("");
-    expect(text).toContain("lcm map");
-    expect(text).toContain("add <alias>");
-    expect(text).toContain("--canonical");
-  });
-
   it("prints import command help with Codex provider flags", () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     printHelp("import");

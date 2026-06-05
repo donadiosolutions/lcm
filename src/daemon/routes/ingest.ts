@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { getLcmConnection, closeLcmConnection } from "../../db/connection.js";
 import type { DaemonConfig } from "../config.js";
-import { projectPaths, ensureProjectDir, isSafeTranscriptPath } from "../project.js";
+import { projectDbPath, projectDir, projectId, ensureProjectDir, projectMetaPath, isSafeTranscriptPath } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { runLcmMigrations } from "../../db/migration.js";
@@ -58,8 +58,7 @@ export function createIngestHandler(config: DaemonConfig): RouteHandler {
       return;
     }
 
-    const paths = projectPaths(cwd);
-    const dbPath = paths.dbPath;
+    const dbPath = projectDbPath(cwd);
 
     const parsed = resolveMessages(input, cwd);
     if (parsed.length === 0) {
@@ -71,7 +70,7 @@ export function createIngestHandler(config: DaemonConfig): RouteHandler {
 
     const scrubber = await ScrubEngine.forProject(
       config.security?.sensitivePatterns ?? [],
-      paths.dir,
+      projectDir(cwd),
     );
 
     const db = getLcmConnection(dbPath);
@@ -102,7 +101,7 @@ export function createIngestHandler(config: DaemonConfig): RouteHandler {
         return;
       }
 
-      const pid = paths.id;
+      const pid = projectId(cwd);
       const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
       const inputs = newMessages.map((m, i) => {
         const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project } = scrubber.scrubWithCounts(m.content);
@@ -127,14 +126,14 @@ export function createIngestHandler(config: DaemonConfig): RouteHandler {
 
       // Update meta.json with lastIngest timestamp
       try {
-        const metaPath = paths.metaPath;
+        const metaPath = projectMetaPath(cwd);
         let meta: Record<string, unknown> = {};
         if (existsSync(metaPath)) {
           meta = JSON.parse(readFileSync(metaPath, "utf-8"));
         }
-        meta.cwd = paths.canonical;
+        meta.cwd = cwd;
         meta.lastIngest = new Date().toISOString();
-        writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
+        writeFileSync(metaPath, JSON.stringify(meta, null, 2));
       } catch {
         // non-fatal: meta.json update failure shouldn't fail the ingest
       }

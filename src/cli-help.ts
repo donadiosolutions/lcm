@@ -82,24 +82,6 @@ const HELP: Record<string, CommandHelp> = {
     notes: "Exits with code 1 if any check fails. Integrate into CI or shell startup for early detection.",
   },
 
-  map: {
-    summary: "Manage project path aliases in ~/.lcm/map.json.",
-    usage: "lcm map <list|show|add|remove> [options]",
-    options: [
-      ["list [--json]", "List all canonical project paths and aliases"],
-      ["show [path-or-hash] [--json]", "Show one map entry; defaults to the current project"],
-      ["add <alias> [--canonical <path>|--hash <hash>] [--json]", "Add an alias to a project"],
-      ["remove <alias> [--canonical <path>|--hash <hash>] [--json]", "Remove an alias"],
-    ],
-    examples: [
-      ["lcm map show", "Show the current project's canonical path and aliases"],
-      ["lcm map add /work/project-alias", "Add an alias to the current project"],
-      ["lcm map add /work/project-alias --canonical /src/project", "Add an alias to a specific canonical project"],
-      ["lcm map list --json", "Output all entries as JSON"],
-    ],
-    notes: "Aliases may point to missing paths, but canonical targets must exist. Cross-project path ambiguity is refused.",
-  },
-
   search: {
     summary: "Search memory across episodic and promoted layers for the current project.",
     usage: "lcm search <query> [--limit N] [--layer episodic|promoted] [--tag <tag>]",
@@ -421,7 +403,6 @@ const GROUPS = [
       { name: "daemon start [--detach]", summary: "Start the context daemon" },
       { name: "status [--json]", summary: "Daemon status and project memory stats" },
       { name: "doctor", summary: "Diagnostics: daemon, hooks, MCP, summarizer" },
-      { name: "map <list|show|add|remove>", summary: "Manage project path aliases" },
       { name: "mcp", summary: "Start the MCP server (stdio transport)" },
     ],
   },
