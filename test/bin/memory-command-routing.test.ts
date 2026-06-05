@@ -141,6 +141,16 @@ describe("map command registration", () => {
 
       const removeText = await runMapCommand(["remove", alias, "--hash", hash]);
       expect(removeText.stdout).toEqual([`Removed alias from ${hash}`]);
+
+      const existingAlias = join(dir, "existing-alias");
+      mkdirSync(existingAlias);
+      const addExisting = await runMapCommand(["add", existingAlias, "--hash", hash]);
+      expect(addExisting.stderr).toEqual([]);
+      expect(addExisting.stdout).toEqual([`Added alias to ${hash}`]);
+
+      const absentAlias = join(dir, "absent-alias");
+      const removeAbsent = await runMapCommand(["remove", absentAlias, "--hash", hash]);
+      expect(removeAbsent.stdout).toEqual([`Alias was not present on ${hash}`]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

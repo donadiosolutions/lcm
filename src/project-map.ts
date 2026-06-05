@@ -392,6 +392,11 @@ export function addProjectAlias(alias: string, opts: { canonical?: string; hash?
   const normalizedAlias = normalizeProjectPath(alias);
   const warning = existsSync(normalizedAlias) ? undefined : `alias path does not exist: ${normalizedAlias}`;
   const target = resolveCliTarget(opts);
+  const canonical = normalizeProjectPath(target.entry.canonical);
+  if (normalizedAlias === canonical) {
+    throw new Error(`alias matches canonical path for ${target.hash}: ${normalizedAlias}`);
+  }
+
   const owners = collectPathOwners(target.map);
   const existingOwners = owners.get(normalizedAlias) ?? new Set<string>();
   if (existingOwners.has(target.hash)) {
@@ -413,11 +418,6 @@ export function addProjectAlias(alias: string, opts: { canonical?: string; hash?
     } else {
       throw new Error(`alias is already mapped to another hash: ${normalizedAlias} (${[...existingOwners].join(", ")})`);
     }
-  }
-
-  const canonical = normalizeProjectPath(target.entry.canonical);
-  if (normalizedAlias === canonical) {
-    throw new Error(`alias matches canonical path for ${target.hash}: ${normalizedAlias}`);
   }
 
   target.map[target.hash].aliases.push(normalizedAlias);

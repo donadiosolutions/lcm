@@ -305,6 +305,23 @@ describe("project map", () => {
     }
   });
 
+  it("shows the current unmapped project without writing map.json", () => {
+    const originalCwd = process.cwd();
+    const target = makeDir("show-current-unmapped");
+    process.chdir(target);
+
+    try {
+      const shown = showProjectMapEntry();
+
+      expect(shown.transient).toBe(true);
+      expect(shown.hash).toBe(hashProjectPath(normalizeProjectPath(target)));
+      expect(shown.entry).toEqual({ canonical: normalizeProjectPath(target), aliases: [] });
+      expect(existsSync(projectMapPath())).toBe(false);
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+
   it("adds an alias to the current project by default", () => {
     const originalCwd = process.cwd();
     const canonical = makeDir("default-add-canonical");
@@ -353,6 +370,28 @@ describe("project map", () => {
     addProjectAlias(alias, { canonical });
 
     expect(() => addProjectAlias(alias, { canonical })).toThrow(/already mapped/);
+  });
+
+  it("rejects aliases already owned by another non-adoptable hash", () => {
+    const first = makeDir("nonadopt-first");
+    const second = makeDir("nonadopt-second");
+    const alias = makeDir("nonadopt-alias");
+    const firstHash = hashProjectPath(normalizeProjectPath(first));
+    const secondHash = hashProjectPath(normalizeProjectPath(second));
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [firstHash]: { canonical: first, aliases: [alias] },
+      [secondHash]: { canonical: second, aliases: [] },
+    }, null, 2) + "\n");
+    clearProjectMapCache();
+
+    expect(() => addProjectAlias(alias, { hash: secondHash })).toThrow(/already mapped to another hash/);
+  });
+
+  it("rejects aliases equal to the target canonical path", () => {
+    const canonical = makeDir("same-canonical");
+    const hash = projectId(canonical);
+
+    expect(() => addProjectAlias(canonical, { hash })).toThrow(/matches canonical path/);
   });
 
   it("rejects ambiguous canonical targets when removing aliases", () => {
@@ -426,6 +465,14 @@ describe("project map", () => {
     expect(existsSync(projectMapPath())).toBe(false);
   });
 
+  it("rejects missing canonical and unknown hash remove targets", () => {
+    const missingCanonical = join(homedir(), "missing-remove-canonical");
+    const hash = "a".repeat(64);
+
+    expect(() => removeProjectAlias(makeDir("missing-remove-alias"), { canonical: missingCanonical })).toThrow(/canonical path does not exist/);
+    expect(() => removeProjectAlias(makeDir("unknown-hash-remove-alias"), { hash })).toThrow(/unknown project hash/);
+  });
+
   it("requires --canonical targets to be existing directories", () => {
     const canonicalFile = join(homedir(), "canonical-file");
     const alias = makeDir("file-target-alias");
@@ -433,6 +480,17 @@ describe("project map", () => {
 
     expect(() => addProjectAlias(alias, { canonical: canonicalFile })).toThrow(/existing directory/);
     expect(existsSync(projectMapPath())).toBe(false);
+  });
+
+  it("reports invalid map reloads without replacing the cache", () => {
+    const canonical = makeDir("reload-invalid-canonical");
+    const alias = makeDir("reload-invalid-alias");
+    const hash = projectId(canonical);
+    addProjectAlias(alias, { canonical });
+    writeFileSync(projectMapPath(), "{not-json");
+
+    expect(reloadProjectMapCache({ reformat: true })).toBe(false);
+    expect(projectId(alias)).toBe(hash);
   });
 
   it("refuses ambiguous alias removal without an explicit target", () => {
