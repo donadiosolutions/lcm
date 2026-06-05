@@ -403,6 +403,7 @@ describe("portable-knowledge — import", () => {
 
     const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
     expect(meta.cwd).toBe(cwd);
+    expect(readFileSync(metaPath, "utf-8").endsWith("\n")).toBe(true);
 
     // Verify the round-trip: export using the same project directory enumeration
     // that `lcm export --all` uses (scan projects/ for meta.json files).

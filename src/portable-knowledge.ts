@@ -258,7 +258,7 @@ export async function importKnowledge(
   const metaPath = join(projDir, "meta.json");
   if (!existsSync(metaPath)) {
     const tmpPath = metaPath + ".tmp";
-    writeFileSync(tmpPath, JSON.stringify({ cwd: project.canonical }, null, 2), "utf-8");
+    writeFileSync(tmpPath, JSON.stringify({ cwd: project.canonical }, null, 2) + "\n", "utf-8");
     renameSync(tmpPath, metaPath);
   }
 

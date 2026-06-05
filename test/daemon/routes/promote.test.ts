@@ -10,6 +10,7 @@ import { ConversationStore } from "../../../src/store/conversation-store.js";
 import { SummaryStore } from "../../../src/store/summary-store.js";
 import { createPromoteHandler } from "../../../src/daemon/routes/promote.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
+import * as dbConnection from "../../../src/db/connection.js";
 
 function makeConfig(): DaemonConfig {
   return {
@@ -56,6 +57,7 @@ describe("createPromoteHandler", () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+    vi.restoreAllMocks();
     for (const dir of tempDirs.splice(0)) {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -207,5 +209,28 @@ describe("createPromoteHandler", () => {
 
     expect(res.writeHead).toHaveBeenCalledWith(400, expect.any(Object));
     expect(getBody()).toHaveProperty("error");
+  });
+
+  it("returns 500 when the project database connection cannot be opened", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-promote-test-"));
+    tempDirs.push(tempDir);
+
+    const db = setupDb(tempDir);
+    db.close();
+
+    vi.spyOn(dbConnection, "getLcmConnection").mockImplementationOnce(() => {
+      throw new Error("connection refused");
+    });
+    const closeSpy = vi.spyOn(dbConnection, "closeLcmConnection");
+
+    const config = makeConfig();
+    const handler = createPromoteHandler(config);
+    const { res, getBody } = mockRes();
+
+    await handler({} as any, res, JSON.stringify({ cwd: tempDir }));
+
+    expect(res.writeHead).toHaveBeenCalledWith(500, expect.any(Object));
+    expect(getBody()).toEqual({ error: "connection refused" });
+    expect(closeSpy).not.toHaveBeenCalled();
   });
 });
