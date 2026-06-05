@@ -184,6 +184,9 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
                      updated_at = excluded.updated_at`,
                 ).run(instructionsId, instructionContent, hash);
               }
+              if (client === "codex") {
+                instructionsContext = `<project-instructions>\n${instructionContent}\n</project-instructions>`;
+              }
             }
           } catch { /* non-fatal */ }
 

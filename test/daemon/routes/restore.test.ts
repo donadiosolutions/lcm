@@ -126,6 +126,11 @@ describe("POST /restore", () => {
       });
       expect(claudeResponse.status).toBe(200);
       expect(codexResponse.status).toBe(200);
+      const codexBody = await codexResponse.json() as { context: string };
+      expect(codexBody.context).toContain("<project-instructions>");
+      expect(codexBody.context).toContain("Use Codex instructions.");
+      expect(codexBody.context).toContain("Project Codex override.");
+      expect(codexBody.context).not.toContain("Use Claude instructions.");
 
       const dbPath = projectDbPath(tmpDir);
       const db = getLcmConnection(dbPath);
