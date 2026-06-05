@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -64,12 +64,14 @@ describe("batch compaction discovery", () => {
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }, null, 2) + "\n");
     seedConversation(paths.dbPath);
     addProjectAlias(alias, { canonical });
+    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec");
 
     const conversations = findUncompacted(100, true, alias);
 
     expect(conversations).toHaveLength(1);
     expect(conversations[0].cwd).toBe(paths.canonical);
     expect(conversations[0].sessionId).toBe("session-1");
+    expect(execSpy.mock.calls.filter(([sql]) => sql === "PRAGMA busy_timeout = 5000")).toHaveLength(1);
     expect(getPoolStats().totalConnections).toBe(0);
   });
 

@@ -53,7 +53,6 @@ export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?:
 
     const db = getLcmConnection(dbPath);
     try {
-      db.exec("PRAGMA busy_timeout = 5000");
       if (!readOnly) runLcmMigrations(db);
       const rows = db.prepare(`
         SELECT
