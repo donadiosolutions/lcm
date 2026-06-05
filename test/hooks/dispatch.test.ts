@@ -133,6 +133,7 @@ describe("dispatchHook", () => {
   });
 
   it("routes post-tool without calling ensureBootstrapped", async () => {
+    vi.mocked(loadDaemonConfig).mockReturnValue({ daemon: { port: 4545 } } as any);
     vi.mocked(handlePostToolUse).mockClear();
     vi.mocked(ensureBootstrapped).mockClear();
     const result = await dispatchHook("post-tool", JSON.stringify({
@@ -142,7 +143,9 @@ describe("dispatchHook", () => {
     }));
     expect(result.exitCode).toBe(0);
     expect(handlePostToolUse).toHaveBeenCalledTimes(1);
+    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String), 4545);
     expect(ensureBootstrapped).not.toHaveBeenCalled();
+    vi.mocked(loadDaemonConfig).mockReturnValue({ daemon: { port: 3737 } } as any);
   });
 
   it("recognizes post-tool as a valid hook command", () => {

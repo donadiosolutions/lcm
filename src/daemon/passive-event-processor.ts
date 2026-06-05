@@ -2,8 +2,7 @@ import type { DaemonConfig } from "./config.js";
 import { sendJson, type RouteHandler } from "./server.js";
 import { validateCwd } from "./validate-cwd.js";
 import { safeLogError } from "../hooks/hook-errors.js";
-import { EventsDb } from "../hooks/events-db.js";
-import { eventsDbPath } from "../db/events-path.js";
+import { EVENTS_UNPROCESSED_BATCH_LIMIT } from "../hooks/events-db.js";
 import { collectEventSidecars } from "../db/event-sidecars.js";
 import { drainEventsForCwd, promoteEventsForCwd, type PromoteResult } from "./routes/promote-events.js";
 
@@ -28,7 +27,6 @@ interface PassiveEventProcessorDeps {
   promoteEventsForCwd?: typeof promoteEventsForCwd;
   drainEventsForCwd?: typeof drainEventsForCwd;
   collectEventSidecars?: typeof collectEventSidecars;
-  getPendingCount?: (cwd: string) => number;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
   setInterval?: typeof setInterval;
@@ -43,18 +41,19 @@ export class PassiveEventProcessor {
   private readonly promoteOneBatch: typeof promoteEventsForCwd;
   private readonly drainProject: typeof drainEventsForCwd;
   private readonly scanSidecars: typeof collectEventSidecars;
-  private readonly readPendingCount: (cwd: string) => number;
   private readonly setTimer: typeof setTimeout;
   private readonly clearTimer: typeof clearTimeout;
   private readonly setRepeating: typeof setInterval;
   private readonly clearRepeating: typeof clearInterval;
   private readonly logError: typeof safeLogError;
   private readonly debounceTimers = new Map<string, TimeoutHandle>();
+  private readonly debounceDeadlines = new Map<string, number>();
   private readonly queuedProjects = new Set<string>();
   private draining = false;
   private stopped = false;
   private sweepTimer: TimeoutHandle | null = null;
   private sweepInterval: IntervalHandle | null = null;
+  private sweepStartIndex = 0;
 
   constructor(
     private readonly config: DaemonConfig,
@@ -64,7 +63,6 @@ export class PassiveEventProcessor {
     this.promoteOneBatch = deps.promoteEventsForCwd ?? promoteEventsForCwd;
     this.drainProject = deps.drainEventsForCwd ?? drainEventsForCwd;
     this.scanSidecars = deps.collectEventSidecars ?? collectEventSidecars;
-    this.readPendingCount = deps.getPendingCount ?? getPendingCount;
     this.setTimer = deps.setTimeout ?? setTimeout;
     this.clearTimer = deps.clearTimeout ?? clearTimeout;
     this.setRepeating = deps.setInterval ?? setInterval;
@@ -87,6 +85,7 @@ export class PassiveEventProcessor {
       this.clearTimer(timer);
     }
     this.debounceTimers.clear();
+    this.debounceDeadlines.clear();
     this.queuedProjects.clear();
     if (this.sweepTimer) {
       this.clearTimer(this.sweepTimer);
@@ -102,7 +101,7 @@ export class PassiveEventProcessor {
     if (this.stopped) return;
     const cwd = validateCwd(input.cwd);
     const priority = normalizePriority(input.priority);
-    const pendingCount = input.pendingCount ?? this.safePendingCount(cwd);
+    const pendingCount = normalizePendingCount(input.pendingCount);
     const delay = priority === 1 || pendingCount >= this.defaults.activeProjectThreshold
       ? this.defaults.priorityDelayMs
       : this.defaults.debounceMs;
@@ -117,33 +116,55 @@ export class PassiveEventProcessor {
 
   async runSweep(): Promise<void> {
     if (this.stopped) return;
-    const sidecars = this.scanSidecars({
-      timeoutMs: this.defaults.sweepScanTimeoutMs,
-      maxDbs: this.defaults.sweepMaxSidecars,
-    });
+    if (this.draining) {
+      this.scheduleSweep(this.defaults.debounceMs);
+      return;
+    }
+    this.draining = true;
+    try {
+      const sidecars = this.scanSidecars({
+        timeoutMs: this.defaults.sweepScanTimeoutMs,
+        maxDbs: this.defaults.sweepMaxSidecars,
+        startIndex: this.sweepStartIndex,
+      });
+      this.sweepStartIndex += this.defaults.sweepMaxSidecars;
 
-    for (const sidecar of sidecars) {
-      if (this.stopped) return;
-      if (sidecar.scanError || sidecar.scanSkipped || sidecar.unprocessed === 0 || !sidecar.cwd) {
-        continue;
+      for (const sidecar of sidecars) {
+        if (this.stopped) return;
+        if (sidecar.scanError || sidecar.scanSkipped || sidecar.unprocessed === 0 || !sidecar.cwd) {
+          continue;
+        }
+        try {
+          await this.drainProject(this.config, sidecar.cwd, sidecar.path);
+        } catch (error) {
+          this.logError("passive-event-processor", error, { cwd: sidecar.cwd });
+        }
       }
-      try {
-        await this.drainProject(this.config, sidecar.cwd, sidecar.path);
-      } catch (error) {
-        this.logError("passive-event-processor", error, { cwd: sidecar.cwd });
+    } finally {
+      this.draining = false;
+      if (!this.stopped && this.queuedProjects.size > 0) {
+        for (const cwd of this.queuedProjects) {
+          this.scheduleProject(cwd, this.defaults.debounceMs);
+        }
       }
     }
   }
 
   private scheduleProject(cwd: string, delayMs: number): void {
+    const deadline = Date.now() + delayMs;
+    const existingDeadline = this.debounceDeadlines.get(cwd);
+    if (existingDeadline !== undefined && existingDeadline <= deadline) return;
+
     const existing = this.debounceTimers.get(cwd);
     if (existing) this.clearTimer(existing);
     const timer = this.setTimer(() => {
       this.debounceTimers.delete(cwd);
+      this.debounceDeadlines.delete(cwd);
       void this.drainQueuedProjects().catch(error => this.logError("passive-event-processor", error, { cwd }));
     }, delayMs);
     this.unref(timer);
     this.debounceTimers.set(cwd, timer);
+    this.debounceDeadlines.set(cwd, deadline);
   }
 
   private scheduleSweep(delayMs: number): void {
@@ -156,7 +177,13 @@ export class PassiveEventProcessor {
   }
 
   private async drainQueuedProjects(): Promise<void> {
-    if (this.stopped || this.draining) return;
+    if (this.stopped) return;
+    if (this.draining) {
+      for (const cwd of this.queuedProjects) {
+        this.scheduleProject(cwd, this.defaults.debounceMs);
+      }
+      return;
+    }
     this.draining = true;
     try {
       const projects = [...this.queuedProjects];
@@ -187,20 +214,11 @@ export class PassiveEventProcessor {
       if (result.message === "no unprocessed events") return;
       const processed = result.promoted + result.skipped;
       if (processed === 0) return;
-      remaining = this.safePendingCount(cwd) > 0;
+      remaining = result.promoted + result.skipped >= EVENTS_UNPROCESSED_BATCH_LIMIT;
       if (!remaining) return;
     }
     if (remaining && !this.stopped) {
       this.queuedProjects.add(cwd);
-    }
-  }
-
-  private safePendingCount(cwd: string): number {
-    try {
-      return this.readPendingCount(cwd);
-    } catch (error) {
-      this.logError("passive-event-processor", error, { cwd });
-      return 0;
     }
   }
 
@@ -214,13 +232,9 @@ function normalizePriority(value: unknown): number | undefined {
   return value >= 1 && value <= 3 ? value : undefined;
 }
 
-function getPendingCount(cwd: string): number {
-  const db = new EventsDb(eventsDbPath(cwd));
-  try {
-    return db.getHealthStats().unprocessed;
-  } finally {
-    db.close();
-  }
+function normalizePendingCount(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
+  return Math.trunc(value);
 }
 
 export function createPromoteEventsNotifyHandler(processor: PassiveEventProcessor): RouteHandler {
@@ -232,13 +246,14 @@ export function createPromoteEventsNotifyHandler(processor: PassiveEventProcesso
       sendJson(res, 400, { error: "invalid json" });
       return;
     }
-    if (typeof input.cwd !== "string" || input.cwd.trim().length === 0) {
+    const cwd = typeof input.cwd === "string" ? input.cwd.trim() : "";
+    if (cwd.length === 0) {
       sendJson(res, 400, { error: "cwd is required" });
       return;
     }
     try {
       processor.notify({
-        cwd: input.cwd,
+        cwd,
         priority: typeof input.priority === "number" ? input.priority : undefined,
         pendingCount: typeof input.pendingCount === "number" ? input.pendingCount : undefined,
         sourceHook: typeof input.sourceHook === "string" ? input.sourceHook : undefined,

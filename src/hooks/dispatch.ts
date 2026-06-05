@@ -15,7 +15,13 @@ export async function dispatchHook(
   // Early return for post-tool — runs on EVERY tool call, must skip bootstrap for performance
   if (command === "post-tool") {
     const { handlePostToolUse } = await import("./post-tool.js");
-    return handlePostToolUse(stdinText);
+    try {
+      const { loadDaemonConfig } = await import("../daemon/config.js");
+      const config = loadDaemonConfig(defaultConfigPath());
+      return handlePostToolUse(stdinText, config.daemon?.port ?? 3737);
+    } catch {
+      return handlePostToolUse(stdinText);
+    }
   }
 
   // Skip bootstrap for compact — the daemon is already running by the time

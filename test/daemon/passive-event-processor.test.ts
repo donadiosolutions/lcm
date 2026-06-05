@@ -50,28 +50,53 @@ describe("PassiveEventProcessor", () => {
     const { timers, deps } = timerDeps();
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
-      getPendingCount: vi.fn().mockReturnValue(0),
       promoteEventsForCwd: vi.fn(),
     });
 
     processor.notify({ cwd: "/tmp", priority: 1, pendingCount: 1 });
     processor.notify({ cwd: "/tmp", priority: 3, pendingCount: 10 });
 
-    expect(timers.map(timer => timer.ms)).toEqual([250, 250]);
+    expect(timers.map(timer => timer.ms)).toEqual([250]);
     expect(timers.every(timer => timer.unref.mock.calls.length === 1)).toBe(true);
+  });
+
+  it("schedules threshold notifications with near-immediate delay", () => {
+    const { timers, deps } = timerDeps();
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      promoteEventsForCwd: vi.fn(),
+    });
+
+    processor.notify({ cwd: "/tmp", priority: 3, pendingCount: 10 });
+
+    expect(timers.map(timer => timer.ms)).toEqual([250]);
   });
 
   it("debounces normal notifications", () => {
     const { timers, deps } = timerDeps();
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
-      getPendingCount: vi.fn().mockReturnValue(1),
       promoteEventsForCwd: vi.fn(),
     });
 
     processor.notify({ cwd: "/tmp", priority: 3, pendingCount: 1 });
 
     expect(timers[0].ms).toBe(3000);
+  });
+
+  it("does not delay an earlier priority timer after a later normal notification", () => {
+    const { timers, deps } = timerDeps();
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      promoteEventsForCwd: vi.fn(),
+    });
+
+    processor.notify({ cwd: "/tmp", priority: 1 });
+    processor.notify({ cwd: "/tmp", priority: 3 });
+
+    expect(timers).toHaveLength(1);
+    expect(timers[0].ms).toBe(250);
+    expect(deps.clearTimeout).not.toHaveBeenCalled();
   });
 
   it("runs startup and periodic sweeps with configured scan budget", async () => {
@@ -101,7 +126,7 @@ describe("PassiveEventProcessor", () => {
     timers[0].callback();
     await drained;
 
-    expect(collectEventSidecars).toHaveBeenCalledWith({ timeoutMs: 5000, maxDbs: 20 });
+    expect(collectEventSidecars).toHaveBeenCalledWith({ timeoutMs: 5000, maxDbs: 20, startIndex: 0 });
     expect(drainEventsForCwd).toHaveBeenCalledTimes(1);
     expect(drainEventsForCwd.mock.calls[0][1]).toBe("/tmp");
     expect(drainEventsForCwd.mock.calls[0][2]).toBe("/events/tmp.db");
@@ -115,13 +140,8 @@ describe("PassiveEventProcessor", () => {
         resolvePromotion = resolve;
       }))
       .mockResolvedValue({ promoted: 1, skipped: 0, correlated: 0, errors: 0 });
-    const getPendingCount = vi.fn()
-      .mockReturnValueOnce(1)
-      .mockReturnValueOnce(1)
-      .mockReturnValueOnce(1);
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
-      getPendingCount,
       promoteEventsForCwd: promoteEventsForCwd as any,
     });
 
@@ -131,7 +151,7 @@ describe("PassiveEventProcessor", () => {
     await second;
 
     expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
-    resolvePromotion?.({ promoted: 1, skipped: 0, correlated: 0, errors: 0 });
+    resolvePromotion?.({ promoted: 500, skipped: 0, correlated: 0, errors: 0 });
     await first;
 
     await processor.flushOnce();
@@ -142,7 +162,6 @@ describe("PassiveEventProcessor", () => {
     const { deps } = timerDeps();
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
-      getPendingCount: vi.fn().mockReturnValue(1),
       promoteEventsForCwd: vi.fn(),
     });
 
@@ -162,7 +181,7 @@ describe("createPromoteEventsNotifyHandler", () => {
     const { res, getBody } = mockRes();
 
     await handler({} as any, res, JSON.stringify({
-      cwd: "/tmp",
+      cwd: "  /tmp  ",
       priority: 1,
       pendingCount: 12,
       sourceHook: "PostToolUse",

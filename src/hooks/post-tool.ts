@@ -19,6 +19,7 @@ function resolveHookCwd(inputCwd: unknown): string {
 
 export async function handlePostToolUse(
   stdin: string,
+  port?: number,
 ): Promise<{ exitCode: number; stdout: string }> {
   let cwd: string | undefined;
   try {
@@ -41,9 +42,9 @@ export async function handlePostToolUse(
         db.insertEvent(session_id, event, "PostToolUse");
       }
 
-      const port = input.daemon_port ?? 3737;
+      const daemonPort = input.daemon_port ?? port ?? 3737;
       const priority = Math.min(...events.map(e => e.priority));
-      firePromoteEventsNotifyRequest(port, {
+      firePromoteEventsNotifyRequest(daemonPort, {
         cwd: resolvedCwd,
         priority,
         sourceHook: "PostToolUse",

@@ -6,19 +6,25 @@ import { homedir } from "node:os";
 import { request } from "node:http";
 import { Buffer } from "node:buffer";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
-import { configPath as defaultConfigPath, daemonPidPath } from "../runtime-paths.js";
+import { configPath as defaultConfigPath, daemonPidPath, daemonTokenPath } from "../runtime-paths.js";
+import { readAuthToken } from "../daemon/auth.js";
 
 function fireLocalPostRequest(port: number, path: string, body: Record<string, unknown>): void {
   const json = JSON.stringify(body);
+  const token = readAuthToken(daemonTokenPath());
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Content-Length": String(Buffer.byteLength(json)),
+  };
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
   const req = request({
     hostname: "127.0.0.1",
     port,
     path,
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(json),
-    },
+    headers,
   });
   req.on("socket", (socket) => {
     // Defer unref until after the request body is flushed so the daemon
