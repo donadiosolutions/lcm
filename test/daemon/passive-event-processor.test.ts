@@ -76,7 +76,12 @@ describe("PassiveEventProcessor", () => {
 
   it("runs startup and periodic sweeps with configured scan budget", async () => {
     const { timers, intervals, deps } = timerDeps();
-    const drainEventsForCwd = vi.fn().mockResolvedValue({ promoted: 1, skipped: 0, correlated: 0, errors: 0, batches: 1 });
+    let resolveDrained: (() => void) | undefined;
+    const drained = new Promise<void>(resolve => { resolveDrained = resolve; });
+    const drainEventsForCwd = vi.fn().mockImplementation(async () => {
+      resolveDrained?.();
+      return { promoted: 1, skipped: 0, correlated: 0, errors: 0, batches: 1 };
+    });
     const collectEventSidecars = vi.fn().mockReturnValue([
       // Covers one processable sidecar, one empty sidecar, and one orphan sidecar.
       { cwd: "/tmp", path: "/events/tmp.db", unprocessed: 1 },
@@ -94,8 +99,7 @@ describe("PassiveEventProcessor", () => {
     expect(intervals[0].ms).toBe(5 * 60 * 1000);
 
     timers[0].callback();
-    await Promise.resolve();
-    await Promise.resolve();
+    await drained;
 
     expect(collectEventSidecars).toHaveBeenCalledWith({ timeoutMs: 5000, maxDbs: 20 });
     expect(drainEventsForCwd).toHaveBeenCalledTimes(1);

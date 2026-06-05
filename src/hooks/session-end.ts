@@ -8,6 +8,28 @@ import { Buffer } from "node:buffer";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
 import { configPath as defaultConfigPath, daemonPidPath } from "../runtime-paths.js";
 
+function fireLocalPostRequest(port: number, path: string, body: Record<string, unknown>): void {
+  const json = JSON.stringify(body);
+  const req = request({
+    hostname: "127.0.0.1",
+    port,
+    path,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(json),
+    },
+  });
+  req.on("socket", (socket) => {
+    // Defer unref until after the request body is flushed so the daemon
+    // request reliably reaches the daemon before the process is allowed to exit.
+    req.on("finish", () => (socket as import("node:net").Socket).unref());
+  });
+  req.on("error", () => {}); // non-fatal
+  req.write(json);
+  req.end();
+}
+
 /**
  * Fire a compact request to the daemon without blocking the hook process.
  *
@@ -22,99 +44,23 @@ export function fireCompactRequest(
   port: number,
   body: Record<string, unknown>,
 ): void {
-  const json = JSON.stringify(body);
-  const req = request({
-    hostname: "127.0.0.1",
-    port,
-    path: "/compact",
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(json),
-    },
-  });
-  req.on("socket", (socket) => {
-    // Defer unref until after the request body is flushed so the /compact
-    // request reliably reaches the daemon before the process is allowed to exit.
-    req.on("finish", () => (socket as import("node:net").Socket).unref());
-  });
-  req.on("error", () => {}); // non-fatal
-  req.write(json);
-  req.end();
+  fireLocalPostRequest(port, "/compact", body);
 }
 
 export function firePromoteRequest(port: number, body: Record<string, unknown>): void {
-  const json = JSON.stringify(body);
-  const req = request({
-    hostname: "127.0.0.1",
-    port,
-    path: "/promote",
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(json),
-    },
-  });
-  req.on("socket", (socket) => {
-    req.on("finish", () => (socket as import("node:net").Socket).unref());
-  });
-  req.on("error", () => {});
-  req.write(json);
-  req.end();
+  fireLocalPostRequest(port, "/promote", body);
 }
 
 export function firePromoteEventsRequest(port: number, body: Record<string, unknown>): void {
-  const json = JSON.stringify(body);
-  const req = request({
-    hostname: "127.0.0.1",
-    port,
-    path: "/promote-events",
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(json) },
-  });
-  req.on("socket", (socket) => {
-    req.on("finish", () => (socket as import("node:net").Socket).unref());
-  });
-  req.on("error", () => {}); // non-fatal
-  req.write(json);
-  req.end();
+  fireLocalPostRequest(port, "/promote-events", body);
 }
 
 export function firePromoteEventsNotifyRequest(port: number, body: Record<string, unknown>): void {
-  const json = JSON.stringify(body);
-  const req = request({
-    hostname: "127.0.0.1",
-    port,
-    path: "/promote-events/notify",
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(json) },
-  });
-  req.on("socket", (socket) => {
-    req.on("finish", () => (socket as import("node:net").Socket).unref());
-  });
-  req.on("error", () => {}); // non-fatal
-  req.write(json);
-  req.end();
+  fireLocalPostRequest(port, "/promote-events/notify", body);
 }
 
 export function fireSessionCompleteRequest(port: number, body: Record<string, unknown>): void {
-  const json = JSON.stringify(body);
-  const req = request({
-    hostname: "127.0.0.1",
-    port,
-    path: "/session-complete",
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(json),
-    },
-  });
-  req.on("socket", (socket) => {
-    req.on("finish", () => (socket as import("node:net").Socket).unref());
-  });
-  req.on("error", () => {});
-  req.write(json);
-  req.end();
+  fireLocalPostRequest(port, "/session-complete", body);
 }
 
 export async function handleSessionEnd(
