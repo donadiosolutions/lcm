@@ -13,3 +13,5 @@ function replaceVersion(path, pattern) {
 
 replaceVersion(".claude-plugin/plugin.json", /("version":\s*")([^"]+)(")/);
 replaceVersion(".claude-plugin/marketplace.json", /("version":\s*")([^"]+)(")/);
+replaceVersion("package-lock.json", /("version":\s*")([^"]+)(")/);
+replaceVersion("package-lock.json", /("packages":\s*\{\s*"":\s*\{\s*"name":\s*"@donadiosolutions\/lcm",\s*"version":\s*")([^"]+)(")/);
