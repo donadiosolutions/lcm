@@ -1,5 +1,16 @@
 # @donadiosolutions/lcm
 
+## 1.1.0
+
+### Minor Changes
+
+- 4c7b46c: Process passive-learning sidecar events automatically in the daemon after hook capture, with bounded active-project drains, startup and periodic sidecar sweeps, and doctor messaging that treats small queued backlogs as pending automatic processing while warning at larger remediation-worthy backlogs.
+
+### Patch Changes
+
+- c5218fe: Fix release maintenance edge cases: publish release notes now extract Changesets changelog entries written as either `## 1.2.3` or `## [1.2.3]`, doctor no longer suggests the unsupported `lcm daemon restart` command, the manual release workflow now follows the repository's main-only branch layout and creates a changelog block before tagging, and automated release metadata stays on the Changesets path.
+- 7c419d7: Prune empty or stale orphan passive-learning sidecars during sidecar scans, and report doctor sidecars skipped by scan budgets as skipped instead of warnings. `lcm doctor` also now accepts `--events-max-dbs <n|all|unlimited>` to control the passive-learning sidecar scan count limit.
+
 ## 1.0.2
 
 ### Patch Changes
