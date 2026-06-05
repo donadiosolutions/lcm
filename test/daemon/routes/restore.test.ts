@@ -1,13 +1,13 @@
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { createDaemon, type DaemonInstance } from "../../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import { projectDbPath } from "../../../src/daemon/project.js";
 import { PromotedStore } from "../../../src/db/promoted.js";
+import { closeLcmConnection, getLcmConnection } from "../../../src/db/connection.js";
 
 describe("POST /restore", () => {
   let daemon: DaemonInstance | undefined;
@@ -60,13 +60,13 @@ describe("POST /restore", () => {
       // Pre-populate DB with session_instructions row
       const dbPath = projectDbPath(tmpDir);
       mkdirSync(dirname(dbPath), { recursive: true });
-      const db = new DatabaseSync(dbPath);
+      const db = getLcmConnection(dbPath);
       runLcmMigrations(db);
       db.prepare(
         `INSERT INTO session_instructions (id, content, content_hash, updated_at)
          VALUES (1, ?, ?, datetime('now'))`,
       ).run("# ~/.claude/CLAUDE.md\nDo not use emojis.", "abc123hash");
-      db.close();
+      closeLcmConnection(dbPath);
 
       daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
       const res = await fetch(`http://127.0.0.1:${daemon.address().port}/restore`, {
@@ -96,11 +96,11 @@ describe("POST /restore", () => {
 
       // Verify session_instruction_cache was written to DB
       const dbPath = projectDbPath(tmpDir);
-      const db = new DatabaseSync(dbPath);
+      const db = getLcmConnection(dbPath);
       const row = db.prepare(`SELECT content, content_hash FROM session_instruction_cache WHERE id = 1`).get() as
         | { content: string; content_hash: string }
         | undefined;
-      db.close();
+      closeLcmConnection(dbPath);
 
       expect(row).toBeDefined();
       expect(row!.content).toContain("Always write tests.");
@@ -128,12 +128,12 @@ describe("POST /restore", () => {
       expect(codexResponse.status).toBe(200);
 
       const dbPath = projectDbPath(tmpDir);
-      const db = new DatabaseSync(dbPath);
+      const db = getLcmConnection(dbPath);
       const rows = db.prepare(`SELECT id, content FROM session_instruction_cache ORDER BY id`).all() as Array<{
         id: number;
         content: string;
       }>;
-      db.close();
+      closeLcmConnection(dbPath);
 
       expect(rows).toHaveLength(2);
       expect(rows[0]).toEqual(expect.objectContaining({ id: 1 }));
@@ -160,11 +160,11 @@ describe("POST /restore", () => {
       });
 
       const dbPath = projectDbPath(tmpDir);
-      const db1 = new DatabaseSync(dbPath);
+      const db1 = getLcmConnection(dbPath);
       const row1 = db1.prepare(`SELECT updated_at FROM session_instruction_cache WHERE id = 1`).get() as
         | { updated_at: string }
         | undefined;
-      db1.close();
+      closeLcmConnection(dbPath);
       expect(row1).toBeDefined();
 
       // Second startup call with identical content — updated_at should not change
@@ -173,11 +173,11 @@ describe("POST /restore", () => {
         body: JSON.stringify({ session_id: "s-hash-2", cwd: tmpDir, source: "startup" }),
       });
 
-      const db2 = new DatabaseSync(dbPath);
+      const db2 = getLcmConnection(dbPath);
       const row2 = db2.prepare(`SELECT updated_at FROM session_instruction_cache WHERE id = 1`).get() as
         | { updated_at: string }
         | undefined;
-      db2.close();
+      closeLcmConnection(dbPath);
 
       expect(row2).toBeDefined();
       expect(row2!.updated_at).toBe(row1!.updated_at);
@@ -199,7 +199,7 @@ describe("POST /restore", () => {
       // Pre-populate DB with promoted entries tagged source:passive-capture
       const dbPath = projectDbPath(tmpDir);
       mkdirSync(dirname(dbPath), { recursive: true });
-      const db = new DatabaseSync(dbPath);
+      const db = getLcmConnection(dbPath);
       runLcmMigrations(db);
       const store = new PromotedStore(db);
       store.insert({
@@ -214,7 +214,7 @@ describe("POST /restore", () => {
         projectId: tmpDir,
         confidence: 0.5,
       });
-      db.close();
+      closeLcmConnection(dbPath);
 
       daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
       const res = await fetch(`http://127.0.0.1:${daemon.address().port}/restore`, {
@@ -248,7 +248,7 @@ describe("POST /restore", () => {
     it("filters out insights below confidence 0.3", async () => {
       const dbPath = projectDbPath(tmpDir);
       mkdirSync(dirname(dbPath), { recursive: true });
-      const db = new DatabaseSync(dbPath);
+      const db = getLcmConnection(dbPath);
       runLcmMigrations(db);
       const store = new PromotedStore(db);
       store.insert({
@@ -257,7 +257,7 @@ describe("POST /restore", () => {
         projectId: tmpDir,
         confidence: 0.1,
       });
-      db.close();
+      closeLcmConnection(dbPath);
 
       daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
       const res = await fetch(`http://127.0.0.1:${daemon.address().port}/restore`, {
@@ -284,7 +284,7 @@ describe("POST /restore", () => {
     it("excludes promoted memories older than restoreMaxPromotedAgeDays", async () => {
       const dbPath = projectDbPath(tmpDir);
       mkdirSync(dirname(dbPath), { recursive: true });
-      const db = new DatabaseSync(dbPath);
+      const db = getLcmConnection(dbPath);
       runLcmMigrations(db);
       const store = new PromotedStore(db);
 
@@ -309,7 +309,7 @@ describe("POST /restore", () => {
       db.prepare(
         `UPDATE promoted SET created_at = ? WHERE content LIKE '%Ancient%'`
       ).run(oldDate);
-      db.close();
+      closeLcmConnection(dbPath);
 
       // Use restoreMaxPromotedAgeDays = 180 (default)
       daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
