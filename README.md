@@ -220,6 +220,16 @@ lcm stats                  # memory and compression overview
 lcm stats -v               # per-conversation breakdown
 lcm stats --pool           # connection pool statistics
 
+# Project path aliases
+lcm map list               # list canonical project paths and aliases
+lcm map list --json        # output the project path map as JSON
+lcm map show               # show the current project's canonical path and aliases
+lcm map show [path-or-hash] # show a specific path or project hash
+lcm map add <alias>        # add an alias to the current project
+lcm map add <alias> --canonical <path> # add an alias to a specific canonical project
+lcm map add <alias> --hash <hash>      # add an alias to a specific project hash
+lcm map remove <alias>     # remove an alias from its unambiguous project
+
 # Compaction & promotion
 lcm compact                # compact the current project
 lcm compact --all          # compact all tracked projects
@@ -261,6 +271,8 @@ lcm post-tool              # PostToolUse hook (passive learning)
 # MCP server
 lcm mcp                    # start MCP server
 ```
+
+See [Project path aliases](docs/project-map.md) for `lcm map` ambiguity rules, manual `~/.lcm/map.json` edits, backups, and daemon reload behavior.
 
 ## Configuration
 
