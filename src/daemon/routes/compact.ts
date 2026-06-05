@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { getLcmConnection, closeLcmConnection } from "../../db/connection.js";
 import type { DaemonConfig } from "../config.js";
-import { projectId, projectDbPath, projectDir, projectMetaPath, ensureProjectDir, isSafeTranscriptPath } from "../project.js";
+import { projectPaths, ensureProjectDir, isSafeTranscriptPath } from "../project.js";
 import { enqueue } from "../project-queue.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
@@ -134,14 +134,15 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
         sendJson(res, 200, { summary: "Summarization disabled — no summarizer configured.", providerId: effectiveProvider, providerLabel });
         return;
       }
-      const pid = projectId(cwd);
+      const paths = projectPaths(cwd);
+      const pid = paths.id;
       const result = await enqueue(pid, async () => {
-        const dbPath = projectDbPath(cwd);
+        const dbPath = paths.dbPath;
         ensureProjectDir(cwd);
 
         const scrubber = await ScrubEngine.forProject(
           config.security?.sensitivePatterns ?? [],
-          projectDir(cwd),
+          paths.dir,
         );
 
         const db = getLcmConnection(dbPath);
@@ -220,14 +221,14 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
 
           // Update meta.json
           try {
-            const metaPath = projectMetaPath(cwd);
+            const metaPath = paths.metaPath;
             let meta: Record<string, unknown> = {};
             if (existsSync(metaPath)) {
               meta = JSON.parse(readFileSync(metaPath, "utf-8"));
             }
-            meta.cwd = cwd;
+            meta.cwd = paths.canonical;
             meta.lastCompact = new Date().toISOString();
-            writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+            writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
           } catch { /* non-fatal */ }
 
           // Set justCompacted flag
