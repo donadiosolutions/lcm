@@ -1,5 +1,11 @@
 # @donadiosolutions/lcm
 
+## 1.2.0
+
+### Minor Changes
+
+- a7dcf08: Add `~/.lcm/map.json` project path alias routing and the `lcm map` CLI for listing, showing, adding, and removing aliases.
+
 ## 1.1.1
 
 ### Patch Changes
