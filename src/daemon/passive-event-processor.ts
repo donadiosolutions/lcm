@@ -260,7 +260,7 @@ export function createPromoteEventsNotifyHandler(processor: PassiveEventProcesso
       });
       sendJson(res, 200, { queued: true });
     } catch (error) {
-      safeLogError("promote-events-notify", error, {});
+      safeLogError("promote-events-notify", error, { cwd });
       sendJson(res, 400, { error: "cwd is invalid" });
     }
   };
