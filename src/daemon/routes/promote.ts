@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { DaemonConfig } from "../config.js";
-import { projectId, projectDbPath, projectMetaPath } from "../project.js";
+import { projectPaths } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { runLcmMigrations } from "../../db/migration.js";
@@ -33,7 +33,8 @@ export function createPromoteHandler(
       return;
     }
 
-    const dbPath = projectDbPath(cwd);
+    const paths = projectPaths(cwd);
+    const dbPath = paths.dbPath;
     if (!existsSync(dbPath)) {
       sendJson(res, 200, { processed: 0, promoted: 0 });
       return;
@@ -51,7 +52,7 @@ export function createPromoteHandler(
 
       const convStore = new ConversationStore(db);
       const summStore = new SummaryStore(db);
-      const pid = projectId(cwd);
+      const pid = paths.id;
 
       // Get summary IDs that have already been promoted (to avoid re-promoting)
       const promotedStore = new PromotedStore(db);
@@ -110,14 +111,14 @@ export function createPromoteHandler(
       // Update meta.json unless dry_run
       if (!dry_run) {
         try {
-          const metaPath = projectMetaPath(cwd);
+          const metaPath = paths.metaPath;
           let meta: Record<string, unknown> = {};
           if (existsSync(metaPath)) {
             meta = JSON.parse(readFileSync(metaPath, "utf-8"));
           }
-          meta.cwd = cwd;
+          meta.cwd = paths.canonical;
           meta.lastPromote = new Date().toISOString();
-          writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+          writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
         } catch { /* non-fatal */ }
       }
     } catch (err) {
