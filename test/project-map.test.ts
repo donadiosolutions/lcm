@@ -262,6 +262,18 @@ describe("project map", () => {
     expect(listProjectMapEntries()[staleAliasId]).toBeDefined();
   });
 
+  it("refuses to adopt an already-seen alias project that has an event sidecar", () => {
+    const canonical = makeDir("events-canonical");
+    const alias = makeDir("events-alias");
+    projectId(canonical);
+    const staleAliasId = projectId(alias);
+    mkdirSync(join(homedir(), ".lcm", "events"), { recursive: true });
+    writeFileSync(join(homedir(), ".lcm", "events", `${staleAliasId}.db`), "");
+
+    expect(() => addProjectAlias(alias, { canonical })).toThrow(/stored data/);
+    expect(listProjectMapEntries()[staleAliasId]).toBeDefined();
+  });
+
   it("shows an unmapped path without creating or rewriting map.json", () => {
     const target = join(homedir(), "unmapped-show-target");
 

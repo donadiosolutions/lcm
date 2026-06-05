@@ -45,7 +45,7 @@ lcm map remove /alias/path
 
 LCM refuses to add an alias that already exists under the target hash or that would make a path resolve to more than one hash.
 
-If the alias path was already seen before as its own standalone map entry, where canonical equals the alias path and there are no aliases, `lcm map add` converts that entry into an alias for the target project. If that old project already has stored data, LCM refuses the conversion so existing project data is not hidden or stranded by a silent remap.
+If the alias path was already seen before as its own standalone map entry, where canonical equals the alias path and there are no aliases, `lcm map add` converts that entry into an alias for the target project. If that old project already has stored data, including its project database or event sidecar, LCM refuses the conversion so existing project data is not hidden or stranded by a silent remap.
 
 ## Manual edits and daemon reloads
 

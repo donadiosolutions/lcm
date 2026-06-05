@@ -288,8 +288,9 @@ function populateFromExistingProjectMetadata(map: ProjectMap, homeDir?: string):
   return { map: next, changed };
 }
 
-function existingProjectHasDatabase(hash: string): boolean {
-  return existsSync(join(projectsDir(), hash, "db.sqlite"));
+function existingProjectHasStoredData(hash: string): boolean {
+  return existsSync(join(projectsDir(), hash, "db.sqlite"))
+    || existsSync(join(lcmHomeDir(), "events", `${hash}.db`));
 }
 
 export function resolveProjectIdentity(cwd: string): ProjectIdentity {
@@ -394,7 +395,7 @@ export function addProjectAlias(alias: string, opts: { canonical?: string; hash?
         && entry.aliases.length === 0;
     });
     if (existingOwners.size === 1 && adoptableOwners.length === 1) {
-      if (existingProjectHasDatabase(adoptableOwners[0])) {
+      if (existingProjectHasStoredData(adoptableOwners[0])) {
         throw new Error(`alias is already a project with stored data: ${normalizedAlias} (${adoptableOwners[0]})`);
       }
       delete target.map[adoptableOwners[0]];
