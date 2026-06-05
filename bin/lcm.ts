@@ -177,6 +177,122 @@ export function registerMemoryCommands(program: Command): void {
     });
 }
 
+export function registerMapCommand(program: Command): void {
+  const mapCmd = new Command("map").description("Manage project path aliases");
+  mapCmd.helpOption(false).option("-h, --help", "Show help");
+  mapCmd.action(async (opts) => {
+    if (opts.help) {
+      const { printHelp } = await import("../src/cli-help.js");
+      printHelp("map"); exit(0);
+    }
+    console.error("Usage: lcm map <list|show|add|remove> [options]");
+    exit(1);
+  });
+
+  mapCmd
+    .command("list")
+    .description("List project path map entries")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (opts) => {
+      if (opts.help) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("map"); exit(0);
+      }
+      const { listProjectMapEntries } = await import("../src/project-map.js");
+      const map = listProjectMapEntries();
+      if (opts.json) {
+        printJson({ entries: map });
+        return;
+      }
+      for (const [hash, entry] of Object.entries(map)) {
+        console.log(`${hash}`);
+        console.log(`  canonical: ${entry.canonical}`);
+        for (const alias of entry.aliases) console.log(`  alias: ${alias}`);
+      }
+    });
+
+  mapCmd
+    .command("show [target]")
+    .description("Show one project path map entry")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (target: string | undefined, opts) => {
+      if (opts.help) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("map"); exit(0);
+      }
+      const { showProjectMapEntry } = await import("../src/project-map.js");
+      const shown = showProjectMapEntry(target);
+      if (opts.json) {
+        printJson(shown);
+        return;
+      }
+      console.log(shown.hash);
+      console.log(`  canonical: ${shown.entry.canonical}`);
+      for (const alias of shown.entry.aliases) console.log(`  alias: ${alias}`);
+    });
+
+  mapCmd
+    .command("add <alias>")
+    .description("Add an alias for a project path")
+    .option("--canonical <path>", "Target canonical project path")
+    .option("--hash <hash>", "Target project hash")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (alias: string, opts) => {
+      if (opts.help) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("map"); exit(0);
+      }
+      const { addProjectAlias } = await import("../src/project-map.js");
+      try {
+        const result = addProjectAlias(alias, { canonical: opts.canonical, hash: opts.hash });
+        if (opts.json) {
+          printJson({ added: true, ...result });
+          return;
+        }
+        if (result.warning) console.error(`Warning: ${result.warning}`);
+        console.log(`Added alias to ${result.hash}`);
+      } catch (err) {
+        console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+        exit(1);
+      }
+    });
+
+  mapCmd
+    .command("remove <alias>")
+    .description("Remove an alias from a project path")
+    .option("--canonical <path>", "Target canonical project path")
+    .option("--hash <hash>", "Target project hash")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (alias: string, opts) => {
+      if (opts.help) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("map"); exit(0);
+      }
+      const { removeProjectAlias } = await import("../src/project-map.js");
+      try {
+        const result = removeProjectAlias(alias, { canonical: opts.canonical, hash: opts.hash });
+        if (opts.json) {
+          printJson(result);
+          return;
+        }
+        console.log(result.removed ? `Removed alias from ${result.hash}` : `Alias was not present on ${result.hash}`);
+      } catch (err) {
+        console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+        exit(1);
+      }
+    });
+
+  program.addCommand(mapCmd);
+}
+
 function collectRepeatedOption(value: string, previous: string[] = []): string[] {
   return [...previous, value];
 }
@@ -800,6 +916,7 @@ async function main() {
 
   program.addCommand(eventsCmd);
 
+  registerMapCommand(program);
   registerMemoryCommands(program);
 
   // ─── diagnose ──────────────────────────────────────────────────────────────

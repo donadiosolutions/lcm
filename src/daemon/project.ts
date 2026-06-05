@@ -1,15 +1,14 @@
-import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, realpathSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, normalize, join as pathJoin, dirname, basename } from "node:path";
 import { lcmHomeDir } from "../runtime-paths.js";
-
-function canonicalizeCwd(cwd: string): string {
-  try { return realpathSync(cwd); } catch { return cwd; }
-}
+import { resolveProjectIdentity } from "../project-map.js";
 
 export const projectId = (cwd: string): string =>
-  createHash("sha256").update(canonicalizeCwd(cwd)).digest("hex");
+  resolveProjectIdentity(cwd).id;
+
+export const projectCanonicalPath = (cwd: string): string =>
+  resolveProjectIdentity(cwd).canonical;
 
 export const projectDir = (cwd: string): string =>
   join(lcmHomeDir(), "projects", projectId(cwd));
@@ -97,17 +96,18 @@ export function isSafeTranscriptPath(transcriptPath: string, cwd: string): strin
 
 /** Ensures the project dir exists and writes cwd to meta.json. */
 export const ensureProjectDir = (cwd: string): string => {
-  const dir = projectDir(cwd);
+  const identity = resolveProjectIdentity(cwd);
+  const dir = join(lcmHomeDir(), "projects", identity.id);
   mkdirSync(dir, { recursive: true });
   const metaPath = join(dir, "meta.json");
-  let meta: Record<string, unknown> = { cwd };
+  let meta: Record<string, unknown> = { cwd: identity.canonical };
   if (existsSync(metaPath)) {
     try {
       const existing = JSON.parse(readFileSync(metaPath, "utf-8")) as Record<string, unknown>;
-      if (existing.cwd === cwd) return dir;
-      meta = { ...existing, cwd };
+      if (existing.cwd === identity.canonical) return dir;
+      meta = { ...existing, cwd: identity.canonical };
     } catch { /* keep default */ }
   }
-  writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+  writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
   return dir;
 };

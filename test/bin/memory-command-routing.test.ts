@@ -3,7 +3,7 @@ import { Command } from "commander";
 import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { registerMemoryCommands, shouldRunMain } from "../../bin/lcm.js";
+import { registerMapCommand, registerMemoryCommands, shouldRunMain } from "../../bin/lcm.js";
 
 describe("memory command registration", () => {
   it("registers all daemon-backed memory commands", () => {
@@ -44,6 +44,17 @@ describe("memory command registration", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("map command registration", () => {
+  it("registers map subcommands", () => {
+    const program = new Command("lcm");
+    registerMapCommand(program);
+
+    const mapCommand = program.commands.find((command) => command.name() === "map");
+    expect(mapCommand).toBeDefined();
+    expect(mapCommand?.commands.map((command) => command.name()).sort()).toEqual(["add", "list", "remove", "show"]);
   });
 });
 

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { getLcmConnection, closeLcmConnection } from "../../db/connection.js";
 import type { DaemonConfig } from "../config.js";
-import { projectDbPath, projectDir, projectId, ensureProjectDir, projectMetaPath, isSafeTranscriptPath } from "../project.js";
+import { projectDbPath, projectDir, projectId, ensureProjectDir, projectMetaPath, projectCanonicalPath, isSafeTranscriptPath } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { runLcmMigrations } from "../../db/migration.js";
@@ -131,9 +131,9 @@ export function createIngestHandler(config: DaemonConfig): RouteHandler {
         if (existsSync(metaPath)) {
           meta = JSON.parse(readFileSync(metaPath, "utf-8"));
         }
-        meta.cwd = cwd;
+        meta.cwd = projectCanonicalPath(cwd);
         meta.lastIngest = new Date().toISOString();
-        writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+        writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
       } catch {
         // non-fatal: meta.json update failure shouldn't fail the ingest
       }

@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { getLcmConnection, closeLcmConnection } from "../../db/connection.js";
 import type { DaemonConfig } from "../config.js";
-import { projectId, projectDbPath, projectDir, projectMetaPath, ensureProjectDir, isSafeTranscriptPath } from "../project.js";
+import { projectId, projectDbPath, projectDir, projectMetaPath, projectCanonicalPath, ensureProjectDir, isSafeTranscriptPath } from "../project.js";
 import { enqueue } from "../project-queue.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
@@ -225,9 +225,9 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
             if (existsSync(metaPath)) {
               meta = JSON.parse(readFileSync(metaPath, "utf-8"));
             }
-            meta.cwd = cwd;
+            meta.cwd = projectCanonicalPath(cwd);
             meta.lastCompact = new Date().toISOString();
-            writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+            writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
           } catch { /* non-fatal */ }
 
           // Set justCompacted flag

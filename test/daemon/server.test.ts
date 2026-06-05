@@ -1,10 +1,11 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDaemon, type DaemonInstance } from "../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
+import { hashProjectPath, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
 
 describe("daemon server", () => {
   let daemon: DaemonInstance | undefined;
@@ -51,6 +52,39 @@ describe("daemon server", () => {
       body: bigBody,
     });
     expect(res.status).toBe(413);
+  });
+
+  it("watches map.json and reformats valid user edits", async () => {
+    const project = mkdtempSync(join(tmpdir(), "lcm-map-watch-project-"));
+    const hash = hashProjectPath(normalizeProjectPath(project));
+    mkdirSync(join(homedir(), ".lcm"), { recursive: true });
+    const mapPath = projectMapPath();
+    writeFileSync(mapPath, JSON.stringify({ [hash]: { canonical: project, aliases: [] } }));
+
+    daemon = await createDaemon(loadDaemonConfig("/x", { daemon: { port: 0, idleTimeoutMs: 0 } }));
+
+    await new Promise<void>((resolve, reject) => {
+      const deadline = Date.now() + 2000;
+      const tick = () => {
+        if (!existsSync(mapPath)) {
+          reject(new Error("map.json missing"));
+          return;
+        }
+        const content = readFileSync(mapPath, "utf-8");
+        if (content === JSON.stringify({ [hash]: { canonical: project, aliases: [] } }, null, 2) + "\n") {
+          resolve();
+          return;
+        }
+        if (Date.now() > deadline) {
+          reject(new Error(`map.json was not reformatted: ${content}`));
+          return;
+        }
+        setTimeout(tick, 25);
+      };
+      tick();
+    });
+
+    rmSync(project, { recursive: true, force: true });
   });
 });
 

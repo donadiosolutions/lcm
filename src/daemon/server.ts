@@ -25,6 +25,7 @@ import { createReviewStaleHandler } from "./routes/review-stale.js";
 import { PKG_VERSION } from "./version.js";
 import { normalizeDaemonPort, normalizeIdleTimeoutMs } from "./http-url.js";
 import { projectsDir as lcmProjectsDir } from "../runtime-paths.js";
+import { watchProjectMap } from "../project-map.js";
 export { PKG_VERSION };
 
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse, body: string) => Promise<void>;
@@ -109,6 +110,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   routes.set("GET /stats/pool", createPoolStatsHandler());
   routes.set("POST /review-stale", createReviewStaleHandler(config));
   // Status handler is registered after listen() when we know the actual port
+  const projectMapWatcher = watchProjectMap();
 
   // Periodic transcript ingestion scan
   const INGEST_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
@@ -211,6 +213,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         address: () => addr,
         stop: async () => {
           clearInterval(ingestInterval);
+          projectMapWatcher.close();
           passiveEventProcessor.stop();
           if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
           if (proxyManager) {

@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { DaemonConfig } from "../config.js";
-import { projectId, projectDbPath, projectMetaPath } from "../project.js";
+import { projectId, projectDbPath, projectMetaPath, projectCanonicalPath } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { runLcmMigrations } from "../../db/migration.js";
@@ -115,9 +115,9 @@ export function createPromoteHandler(
           if (existsSync(metaPath)) {
             meta = JSON.parse(readFileSync(metaPath, "utf-8"));
           }
-          meta.cwd = cwd;
+          meta.cwd = projectCanonicalPath(cwd);
           meta.lastPromote = new Date().toISOString();
-          writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+          writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
         } catch { /* non-fatal */ }
       }
     } catch (err) {
