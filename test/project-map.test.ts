@@ -9,6 +9,7 @@ import {
   listProjectMapEntries,
   normalizeProjectPath,
   projectMapPath,
+  reloadProjectMapCache,
   removeProjectAlias,
   resolveProjectIdentity,
   showProjectMapEntry,
@@ -164,6 +165,24 @@ describe("project map", () => {
     expect(map[canonicalId].aliases).toContain(normalizeProjectPath(alias));
     expect(map[unseenId].canonical).toBe(normalizeProjectPath(unseen));
     expect(readFileSync(projectMapPath(), "utf-8")).toBe(JSON.stringify(map, null, 2) + "\n");
+  });
+
+  it("keeps cached aliases when a map reload sees a transient missing file", () => {
+    const canonical = makeDir("reload-missing-canonical");
+    const alias = makeDir("reload-missing-alias");
+    const unseen = makeDir("reload-missing-unseen");
+    const canonicalId = projectId(canonical);
+    addProjectAlias(alias, { canonical });
+    rmSync(projectMapPath());
+
+    expect(reloadProjectMapCache({ reformat: true })).toBe(true);
+    expect(existsSync(projectMapPath())).toBe(false);
+
+    const unseenId = projectId(unseen);
+    const map = listProjectMapEntries();
+
+    expect(map[canonicalId].aliases).toContain(normalizeProjectPath(alias));
+    expect(map[unseenId].canonical).toBe(normalizeProjectPath(unseen));
   });
 
   it("rejects relative canonical paths in manually edited maps", () => {

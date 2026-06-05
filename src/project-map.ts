@@ -523,6 +523,9 @@ export function reloadProjectMapCache(opts: { reformat?: boolean } = {}): boolea
   const path = projectMapPath();
   const file = readMapFile(path);
   if (!file) {
+    if (cache?.path === path) {
+      return true;
+    }
     cache = { path, mtimeMs: null, map: emptyMap(), metadataPopulated: false };
     return true;
   }
