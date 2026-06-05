@@ -179,6 +179,9 @@ function loadProjectMap(opts: { strict?: boolean; reload?: boolean; homeDir?: st
   const path = projectMapPath(opts.homeDir);
   const file = readMapFile(path);
   if (!file) {
+    if (!opts.strict && cache?.path === path) {
+      return cloneMap(cache.map);
+    }
     const map = emptyMap();
     cache = { path, mtimeMs: null, map, metadataPopulated: false };
     return cloneMap(map);

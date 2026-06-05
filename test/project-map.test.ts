@@ -150,6 +150,22 @@ describe("project map", () => {
     expect(readFileSync(projectMapPath(), "utf-8")).toBe("{not-json");
   });
 
+  it("keeps cached aliases when map.json temporarily disappears", () => {
+    const canonical = makeDir("cached-missing-canonical");
+    const alias = makeDir("cached-missing-alias");
+    const unseen = makeDir("cached-missing-unseen");
+    const canonicalId = projectId(canonical);
+    addProjectAlias(alias, { canonical });
+    rmSync(projectMapPath());
+
+    const unseenId = projectId(unseen);
+    const map = listProjectMapEntries();
+
+    expect(map[canonicalId].aliases).toContain(normalizeProjectPath(alias));
+    expect(map[unseenId].canonical).toBe(normalizeProjectPath(unseen));
+    expect(readFileSync(projectMapPath(), "utf-8")).toBe(JSON.stringify(map, null, 2) + "\n");
+  });
+
   it("rejects relative canonical paths in manually edited maps", () => {
     const hash = hashProjectPath("/absolute-project");
     writeFileSync(projectMapPath(), JSON.stringify({
