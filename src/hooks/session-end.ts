@@ -80,6 +80,23 @@ export function firePromoteEventsRequest(port: number, body: Record<string, unkn
   req.end();
 }
 
+export function firePromoteEventsNotifyRequest(port: number, body: Record<string, unknown>): void {
+  const json = JSON.stringify(body);
+  const req = request({
+    hostname: "127.0.0.1",
+    port,
+    path: "/promote-events/notify",
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(json) },
+  });
+  req.on("socket", (socket) => {
+    req.on("finish", () => (socket as import("node:net").Socket).unref());
+  });
+  req.on("error", () => {}); // non-fatal
+  req.write(json);
+  req.end();
+}
+
 export function fireSessionCompleteRequest(port: number, body: Record<string, unknown>): void {
   const json = JSON.stringify(body);
   const req = request({

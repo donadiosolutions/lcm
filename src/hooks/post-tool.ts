@@ -2,7 +2,7 @@
 import { extractPostToolEvents } from "./extractors.js";
 import { EventsDb } from "./events-db.js";
 import { eventsDbPath } from "../db/events-path.js";
-import { firePromoteEventsRequest } from "./session-end.js";
+import { firePromoteEventsNotifyRequest } from "./session-end.js";
 import { safeLogError } from "./hook-errors.js";
 import { ensureProjectDir } from "../daemon/project.js";
 
@@ -41,15 +41,15 @@ export async function handlePostToolUse(
         db.insertEvent(session_id, event, "PostToolUse");
       }
 
-      // Tier 1: fire-and-forget daemon promotion for high-priority events.
-      // The /promote-events route uses getUnprocessed() which reads processed_at IS NULL,
-      // so events already promoted by this call won't be re-promoted by the batch route
-      // at session-end. No additional de-duplication guard needed.
-      const hasPriority1 = events.some(e => e.priority === 1);
-      if (hasPriority1) {
-        const port = input.daemon_port ?? 3737;
-        firePromoteEventsRequest(port, { cwd: resolvedCwd });
-      }
+      const port = input.daemon_port ?? 3737;
+      const priority = Math.min(...events.map(e => e.priority));
+      const pendingCount = db.getHealthStats().unprocessed;
+      firePromoteEventsNotifyRequest(port, {
+        cwd: resolvedCwd,
+        priority,
+        pendingCount,
+        sourceHook: "PostToolUse",
+      });
     } finally {
       db.close();
     }

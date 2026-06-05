@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { safeLogError } from "./hook-errors.js";
 import { buildMemoryContext } from "./memory-context.js";
 import { daemonPidPath } from "../runtime-paths.js";
+import { firePromoteEventsNotifyRequest } from "./session-end.js";
 
 type PromptSearchResponse = {
   hints: string[];
@@ -72,6 +73,14 @@ export async function handleUserPromptSubmit(
           for (const event of events) {
             db.insertEvent(input.session_id, event, "UserPromptSubmit");
           }
+          const priority = Math.min(...events.map(event => event.priority));
+          const pendingCount = db.getHealthStats().unprocessed;
+          firePromoteEventsNotifyRequest(daemonPort, {
+            cwd,
+            priority,
+            pendingCount,
+            sourceHook: "UserPromptSubmit",
+          });
         } finally {
           db.close();
         }
