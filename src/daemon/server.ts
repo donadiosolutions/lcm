@@ -163,12 +163,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
             const transcriptPath = join(sessionsDir, file);
 
             // Use the ingest route logic directly
-            const mockReq = {} as any;
+            const mockReq = {} as unknown as IncomingMessage;
             const response = { statusCode: 200, body: "" };
             const mockRes = {
               writeHead: (code: number) => { response.statusCode = code; },
               end: (data: string) => { response.body = data; },
-            } as any;
+            } as unknown as ServerResponse;
 
             await ingestHandler(mockReq, mockRes, JSON.stringify({
               session_id: sessionId,
