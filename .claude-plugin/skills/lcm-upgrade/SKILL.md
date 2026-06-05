@@ -3,7 +3,7 @@ name: lcm-upgrade
 description: |
   Rebuild, reinstall, and restart Long Context Manager (LCM) from source.
   Fixes hooks, restarts daemon, runs diagnostics.
-  Trigger: /Long Context Manager (LCM):upgrade
+  Trigger: /lcm:upgrade
 user-invocable: true
 ---
 
