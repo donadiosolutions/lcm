@@ -69,6 +69,7 @@ describe("createPromoteHandler", () => {
 
     const db = setupDb(tempDir);
     db.close();
+    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec");
 
     const config = makeConfig();
     const handler = createPromoteHandler(config);
@@ -78,6 +79,7 @@ describe("createPromoteHandler", () => {
 
     const body = getBody();
     expect(body).toMatchObject({ processed: 0, promoted: 0 });
+    expect(execSpy.mock.calls.filter(([sql]) => sql === "PRAGMA busy_timeout = 5000")).toHaveLength(1);
   });
 
   it("promotes a summary that matches keyword signals", async () => {

@@ -47,7 +47,6 @@ export function createPromoteHandler(
     try {
       const db = getLcmConnection(dbPath);
       try {
-        db.exec("PRAGMA busy_timeout = 5000");
         runLcmMigrations(db);
         mkdirSync(dirname(dbPath), { recursive: true });
 

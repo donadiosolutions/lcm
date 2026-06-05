@@ -77,12 +77,20 @@ function cloneMap(map: ProjectMap): ProjectMap {
   );
 }
 
+function isEnoent(err: unknown): boolean {
+  return Boolean(err && typeof err === "object" && "code" in err && err.code === "ENOENT");
+}
+
 function readMapFile(path: string): { content: string; mtimeMs: number | null } | null {
-  if (!existsSync(path)) return null;
-  return {
-    content: readFileSync(path, "utf-8"),
-    mtimeMs: statSync(path).mtimeMs,
-  };
+  try {
+    return {
+      content: readFileSync(path, "utf-8"),
+      mtimeMs: statSync(path).mtimeMs,
+    };
+  } catch (err) {
+    if (isEnoent(err)) return null;
+    throw err;
+  }
 }
 
 function parseProjectMap(content: string): ProjectMap {

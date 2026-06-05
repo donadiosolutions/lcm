@@ -181,7 +181,7 @@ describe("project map", () => {
     ["non-object entry", { ["a".repeat(64)]: null }],
     ["empty canonical", { ["a".repeat(64)]: { canonical: "", aliases: [] } }],
     ["bad aliases", { ["a".repeat(64)]: { canonical: "/tmp/project", aliases: [""] } }],
-  ])("rejects invalid map schema: %s", (_label, map) => {
+  ])("rejects invalid map schema: %s", (_label: string, map: unknown) => {
     writeFileSync(projectMapPath(), JSON.stringify(map));
 
     const validation = validateProjectMap({ fix: true });
