@@ -9,15 +9,8 @@ import { normalizeTranscriptClient } from "../transcript-provider.js";
 import { configPath as defaultConfigPath, daemonPidPath, daemonTokenPath } from "../runtime-paths.js";
 import { readAuthToken } from "../daemon/auth.js";
 
-let cachedDaemonToken: string | null = null;
-let daemonTokenLoaded = false;
-
 function getDaemonToken(): string | null {
-  if (!daemonTokenLoaded) {
-    cachedDaemonToken = readAuthToken(daemonTokenPath());
-    daemonTokenLoaded = true;
-  }
-  return cachedDaemonToken;
+  return readAuthToken(daemonTokenPath());
 }
 
 function fireLocalPostRequest(port: number, path: string, body: Record<string, unknown>): void {
