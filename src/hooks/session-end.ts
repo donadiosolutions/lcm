@@ -55,6 +55,16 @@ export function firePromoteEventsRequest(port: number, body: Record<string, unkn
   fireLocalPostRequest(port, "/promote-events", body);
 }
 
+/**
+ * Fire a promote-events notification to the daemon without blocking the hook process.
+ *
+ * Uses a raw http.request with socket.unref() so the Node.js event loop does not
+ * wait for a response. The daemon receives and processes the notification
+ * independently.
+ *
+ * This is intentionally separate from DaemonClient.post(), which is a full
+ * request/response client.
+ */
 export function firePromoteEventsNotifyRequest(port: number, body: Record<string, unknown>): void {
   fireLocalPostRequest(port, "/promote-events/notify", body);
 }
