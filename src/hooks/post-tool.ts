@@ -43,11 +43,9 @@ export async function handlePostToolUse(
 
       const port = input.daemon_port ?? 3737;
       const priority = Math.min(...events.map(e => e.priority));
-      const pendingCount = db.getHealthStats().unprocessed;
       firePromoteEventsNotifyRequest(port, {
         cwd: resolvedCwd,
         priority,
-        pendingCount,
         sourceHook: "PostToolUse",
       });
     } finally {

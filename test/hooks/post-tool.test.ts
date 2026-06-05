@@ -138,7 +138,6 @@ describe("handlePostToolUse", () => {
     expect(firePromoteEventsNotifyRequest).toHaveBeenCalledWith(4567, expect.objectContaining({
       cwd: inputCwd,
       priority: 1,
-      pendingCount: 1,
       sourceHook: "PostToolUse",
     }));
   });

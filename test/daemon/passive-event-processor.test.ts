@@ -78,6 +78,7 @@ describe("PassiveEventProcessor", () => {
     const { timers, intervals, deps } = timerDeps();
     const drainEventsForCwd = vi.fn().mockResolvedValue({ promoted: 1, skipped: 0, correlated: 0, errors: 0, batches: 1 });
     const collectEventSidecars = vi.fn().mockReturnValue([
+      // Covers one processable sidecar, one empty sidecar, and one orphan sidecar.
       { cwd: "/tmp", path: "/events/tmp.db", unprocessed: 1 },
       { cwd: "/tmp", path: "/events/tmp.db", unprocessed: 0 },
       { path: "/events/orphan.db", unprocessed: 1 },
