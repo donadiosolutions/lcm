@@ -25,7 +25,7 @@ import { createReviewStaleHandler } from "./routes/review-stale.js";
 import { PKG_VERSION } from "./version.js";
 import { normalizeDaemonPort, normalizeIdleTimeoutMs } from "./http-url.js";
 import { projectsDir as lcmProjectsDir } from "../runtime-paths.js";
-import { watchProjectMap } from "../project-map.js";
+import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
 export { PKG_VERSION };
 
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse, body: string) => Promise<void>;
@@ -33,6 +33,22 @@ export type DaemonInstance = { address: () => AddressInfo; stop: () => Promise<v
 export type DaemonOptions = { proxyManager?: ProxyManager; onIdle?: () => void; tokenPath?: string };
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
+
+export function claudeProjectDirName(cwd: string): string {
+  return cwd.replace(/\//g, "-").replace(/^-/, "");
+}
+
+export function projectTranscriptScanCwds(projectHash: string, metaCwd: string): string[] {
+  const candidates = new Set<string>([metaCwd]);
+  try {
+    for (const mappedPath of projectMapPathsForHash(projectHash)) {
+      candidates.add(mappedPath);
+    }
+  } catch {
+    // Fall back to meta.cwd if the user is in the middle of editing map.json.
+  }
+  return [...candidates];
+}
 
 export async function readBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
@@ -134,29 +150,32 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         try { meta = JSON.parse(readFileSync(metaPath, "utf-8")); } catch { continue; }
         if (!meta.cwd) continue;
 
-        // Find Claude Code session files for this project's cwd
-        const cwdDashed = meta.cwd.replace(/\//g, "-").replace(/^-/, "");
-        const sessionsDir = join(homedir(), ".claude", "projects", cwdDashed);
-        if (!existsSync(sessionsDir)) continue;
+        // Find Claude Code session files for this project's canonical cwd and aliases.
+        const scanCwds = projectTranscriptScanCwds(entry.name, meta.cwd);
 
-        for (const file of readdirSync(sessionsDir)) {
-          if (!file.endsWith(".jsonl")) continue;
-          const sessionId = file.replace(".jsonl", "");
-          const transcriptPath = join(sessionsDir, file);
+        for (const scanCwd of scanCwds) {
+          const sessionsDir = join(homedir(), ".claude", "projects", claudeProjectDirName(scanCwd));
+          if (!existsSync(sessionsDir)) continue;
 
-          // Use the ingest route logic directly
-          const mockReq = {} as any;
-          const response = { statusCode: 200, body: "" };
-          const mockRes = {
-            writeHead: (code: number) => { response.statusCode = code; },
-            end: (data: string) => { response.body = data; },
-          } as any;
+          for (const file of readdirSync(sessionsDir)) {
+            if (!file.endsWith(".jsonl")) continue;
+            const sessionId = file.replace(".jsonl", "");
+            const transcriptPath = join(sessionsDir, file);
 
-          await ingestHandler(mockReq, mockRes, JSON.stringify({
-            session_id: sessionId,
-            cwd: meta.cwd,
-            transcript_path: transcriptPath,
-          }));
+            // Use the ingest route logic directly
+            const mockReq = {} as any;
+            const response = { statusCode: 200, body: "" };
+            const mockRes = {
+              writeHead: (code: number) => { response.statusCode = code; },
+              end: (data: string) => { response.body = data; },
+            } as any;
+
+            await ingestHandler(mockReq, mockRes, JSON.stringify({
+              session_id: sessionId,
+              cwd: scanCwd,
+              transcript_path: transcriptPath,
+            }));
+          }
         }
       }
     } catch {

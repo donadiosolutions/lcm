@@ -2,10 +2,10 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDaemon, type DaemonInstance } from "../../src/daemon/server.js";
+import { claudeProjectDirName, createDaemon, projectTranscriptScanCwds, type DaemonInstance } from "../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
-import { hashProjectPath, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
+import { clearProjectMapCache, hashProjectPath, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
 
 describe("daemon server", () => {
   let daemon: DaemonInstance | undefined;
@@ -85,6 +85,26 @@ describe("daemon server", () => {
     });
 
     rmSync(project, { recursive: true, force: true });
+  });
+
+  it("includes mapped aliases when deriving Claude transcript scan cwds", () => {
+    const canonical = mkdtempSync(join(tmpdir(), "lcm-scan-canonical-"));
+    const alias = mkdtempSync(join(tmpdir(), "lcm-scan-alias-"));
+    const hash = hashProjectPath(normalizeProjectPath(canonical));
+    mkdirSync(join(homedir(), ".lcm"), { recursive: true });
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [hash]: { canonical: normalizeProjectPath(canonical), aliases: [normalizeProjectPath(alias)] },
+    }, null, 2) + "\n");
+    clearProjectMapCache();
+
+    const cwds = projectTranscriptScanCwds(hash, normalizeProjectPath(canonical));
+
+    expect(cwds).toContain(normalizeProjectPath(canonical));
+    expect(cwds).toContain(normalizeProjectPath(alias));
+    expect(claudeProjectDirName(normalizeProjectPath(alias))).toBe(normalizeProjectPath(alias).replace(/\//g, "-").replace(/^-/, ""));
+
+    rmSync(canonical, { recursive: true, force: true });
+    rmSync(alias, { recursive: true, force: true });
   });
 });
 

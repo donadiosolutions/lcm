@@ -2,22 +2,36 @@ import { existsSync, lstatSync, mkdirSync, realpathSync, readFileSync, writeFile
 import { homedir } from "node:os";
 import { join, resolve, normalize, join as pathJoin, dirname, basename } from "node:path";
 import { lcmHomeDir } from "../runtime-paths.js";
-import { resolveProjectIdentity } from "../project-map.js";
+import { resolveProjectIdentity, type ProjectIdentity } from "../project-map.js";
+
+export const projectIdentity = (cwd: string): ProjectIdentity =>
+  resolveProjectIdentity(cwd);
 
 export const projectId = (cwd: string): string =>
-  resolveProjectIdentity(cwd).id;
+  projectIdentity(cwd).id;
 
 export const projectCanonicalPath = (cwd: string): string =>
-  resolveProjectIdentity(cwd).canonical;
+  projectIdentity(cwd).canonical;
+
+export function projectPaths(cwd: string): ProjectIdentity & { dir: string; dbPath: string; metaPath: string } {
+  const identity = projectIdentity(cwd);
+  const dir = join(lcmHomeDir(), "projects", identity.id);
+  return {
+    ...identity,
+    dir,
+    dbPath: join(dir, "db.sqlite"),
+    metaPath: join(dir, "meta.json"),
+  };
+}
 
 export const projectDir = (cwd: string): string =>
-  join(lcmHomeDir(), "projects", projectId(cwd));
+  projectPaths(cwd).dir;
 
 export const projectDbPath = (cwd: string): string =>
-  join(projectDir(cwd), "db.sqlite");
+  projectPaths(cwd).dbPath;
 
 export const projectMetaPath = (cwd: string): string =>
-  join(projectDir(cwd), "meta.json");
+  projectPaths(cwd).metaPath;
 
 function tryRealpath(p: string): string {
   try { return realpathSync(p); } catch { return p; }

@@ -91,6 +91,31 @@ describe("project map", () => {
     expect(readFileSync(projectMapPath(), "utf-8")).toBe("{not-json");
   });
 
+  it("rejects relative canonical paths in manually edited maps", () => {
+    const hash = hashProjectPath("/absolute-project");
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [hash]: { canonical: "relative-project", aliases: [] },
+    }));
+
+    const validation = validateProjectMap({ fix: true });
+
+    expect(validation.ok).toBe(false);
+    expect(validation.errors.join("\n")).toContain("canonical must be an absolute path");
+  });
+
+  it("rejects relative aliases in manually edited maps", () => {
+    const canonical = makeDir("absolute-canonical");
+    const hash = hashProjectPath(normalizeProjectPath(canonical));
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [hash]: { canonical, aliases: ["relative-alias"] },
+    }));
+
+    const validation = validateProjectMap({ fix: true });
+
+    expect(validation.ok).toBe(false);
+    expect(validation.errors.join("\n")).toContain("aliases must contain only absolute paths");
+  });
+
   it("reformats valid compact JSON and creates a backup", () => {
     const canonical = makeDir("compact");
     const hash = hashProjectPath(normalizeProjectPath(canonical));
@@ -149,6 +174,26 @@ describe("project map", () => {
     expect(shown.entry.aliases).toContain(normalizeProjectPath(alias));
     expect(removed.removed).toBe(true);
     expect(listProjectMapEntries()[added.hash].aliases).toEqual([]);
+  });
+
+  it("shows an unmapped path without creating or rewriting map.json", () => {
+    const target = join(homedir(), "unmapped-show-target");
+
+    const shown = showProjectMapEntry(target);
+
+    expect(shown.transient).toBe(true);
+    expect(shown.hash).toBe(hashProjectPath(normalizeProjectPath(target)));
+    expect(shown.entry).toEqual({ canonical: normalizeProjectPath(target), aliases: [] });
+    expect(existsSync(projectMapPath())).toBe(false);
+  });
+
+  it("requires --canonical targets to be existing directories", () => {
+    const canonicalFile = join(homedir(), "canonical-file");
+    const alias = makeDir("file-target-alias");
+    writeFileSync(canonicalFile, "not a directory");
+
+    expect(() => addProjectAlias(alias, { canonical: canonicalFile })).toThrow(/existing directory/);
+    expect(existsSync(projectMapPath())).toBe(false);
   });
 
   it("refuses ambiguous alias removal without an explicit target", () => {

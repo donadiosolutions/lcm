@@ -11,7 +11,7 @@ import {
   copyFileSync,
   type FSWatcher,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { lcmHomeDir, projectsDir } from "./runtime-paths.js";
 
 export type ProjectMapEntry = {
@@ -37,7 +37,7 @@ export type ProjectMapValidation = {
 };
 
 const HASH_RE = /^[a-f0-9]{64}$/;
-let cache: { path: string; mtimeMs: number | null; map: ProjectMap } | null = null;
+let cache: { path: string; mtimeMs: number | null; map: ProjectMap; metadataPopulated: boolean } | null = null;
 
 export function projectMapPath(homeDir?: string): string {
   return join(lcmHomeDir(homeDir), "map.json");
@@ -103,8 +103,16 @@ function parseProjectMap(content: string): ProjectMap {
     if (typeof entry.canonical !== "string" || entry.canonical.length === 0) {
       throw new Error(`map entry ${hash}.canonical must be a non-empty string`);
     }
+    if (!isAbsolute(entry.canonical)) {
+      throw new Error(`map entry ${hash}.canonical must be an absolute path`);
+    }
     if (!Array.isArray(entry.aliases) || !entry.aliases.every((alias) => typeof alias === "string" && alias.length > 0)) {
       throw new Error(`map entry ${hash}.aliases must be an array of non-empty strings`);
+    }
+    for (const alias of entry.aliases) {
+      if (!isAbsolute(alias)) {
+        throw new Error(`map entry ${hash}.aliases must contain only absolute paths: ${alias}`);
+      }
     }
     map[hash] = {
       canonical: entry.canonical,
@@ -129,12 +137,21 @@ function createBackupIfNeeded(path: string, homeDir?: string): string | undefine
   return backupPath;
 }
 
-export function writeProjectMap(map: ProjectMap, homeDir?: string): { path: string; backupPath?: string } {
+export function writeProjectMap(
+  map: ProjectMap,
+  homeDir?: string,
+  opts: { metadataPopulated?: boolean } = {},
+): { path: string; backupPath?: string } {
   const path = projectMapPath(homeDir);
   mkdirSync(dirname(path), { recursive: true });
   const backupPath = createBackupIfNeeded(path, homeDir);
   writeFileSync(path, prettyMap(map));
-  cache = { path, mtimeMs: statSync(path).mtimeMs, map: cloneMap(map) };
+  cache = {
+    path,
+    mtimeMs: statSync(path).mtimeMs,
+    map: cloneMap(map),
+    metadataPopulated: opts.metadataPopulated ?? cache?.metadataPopulated ?? false,
+  };
   return { path, backupPath };
 }
 
@@ -143,7 +160,7 @@ function loadProjectMap(opts: { strict?: boolean; reload?: boolean; homeDir?: st
   const file = readMapFile(path);
   if (!file) {
     const map = emptyMap();
-    cache = { path, mtimeMs: null, map };
+    cache = { path, mtimeMs: null, map, metadataPopulated: false };
     return cloneMap(map);
   }
 
@@ -153,7 +170,7 @@ function loadProjectMap(opts: { strict?: boolean; reload?: boolean; homeDir?: st
 
   try {
     const map = parseProjectMap(file.content);
-    cache = { path, mtimeMs: file.mtimeMs, map: cloneMap(map) };
+    cache = { path, mtimeMs: file.mtimeMs, map: cloneMap(map), metadataPopulated: false };
     return map;
   } catch (err) {
     if (opts.strict || !cache || cache.path !== path) {
@@ -161,6 +178,25 @@ function loadProjectMap(opts: { strict?: boolean; reload?: boolean; homeDir?: st
     }
     return cloneMap(cache.map);
   }
+}
+
+function loadProjectMapWithMetadata(opts: { strict?: boolean; reload?: boolean; homeDir?: string } = {}): ProjectMap {
+  const path = projectMapPath(opts.homeDir);
+  const map = loadProjectMap(opts);
+  if (!opts.reload && cache?.path === path && cache.metadataPopulated) {
+    return map;
+  }
+
+  const populated = populateFromExistingProjectMetadata(map, opts.homeDir);
+  if (populated.changed) {
+    writeProjectMap(populated.map, opts.homeDir, { metadataPopulated: true });
+    return populated.map;
+  }
+
+  if (cache?.path === path) {
+    cache = { ...cache, map: cloneMap(map), metadataPopulated: true };
+  }
+  return map;
 }
 
 function collectPathOwners(map: ProjectMap): Map<string, Set<string>> {
@@ -239,9 +275,7 @@ function populateFromExistingProjectMetadata(map: ProjectMap, homeDir?: string):
 }
 
 export function resolveProjectIdentity(cwd: string): ProjectIdentity {
-  let map = loadProjectMap();
-  const populated = populateFromExistingProjectMetadata(map);
-  map = populated.map;
+  const map = loadProjectMapWithMetadata();
 
   const normalized = normalizeProjectPath(cwd);
   const matches = findPathMatches(map, normalized);
@@ -249,7 +283,6 @@ export function resolveProjectIdentity(cwd: string): ProjectIdentity {
     throw new Error(`project path maps to multiple hashes: ${normalized} (${[...matches].join(", ")})`);
   }
   if (matches.size === 1) {
-    if (populated.changed) writeProjectMap(map);
     const id = [...matches][0];
     return { id, canonical: normalizeProjectPath(map[id].canonical) };
   }
@@ -257,25 +290,27 @@ export function resolveProjectIdentity(cwd: string): ProjectIdentity {
   const id = hashProjectPath(normalized);
   if (!map[id]) {
     map[id] = { canonical: normalized, aliases: [] };
-    writeProjectMap(map);
-  } else if (populated.changed) {
-    writeProjectMap(map);
+    writeProjectMap(map, undefined, { metadataPopulated: true });
   }
   return { id, canonical: normalizeProjectPath(map[id].canonical) };
 }
 
 export function listProjectMapEntries(): ProjectMap {
-  const loaded = loadProjectMap({ strict: true, reload: true });
-  const populated = populateFromExistingProjectMetadata(loaded);
-  if (populated.changed) writeProjectMap(populated.map);
-  return populated.map;
+  return loadProjectMapWithMetadata({ strict: true, reload: true });
 }
 
-export function showProjectMapEntry(target?: string): { hash: string; entry: ProjectMapEntry } {
-  const map = listProjectMapEntries();
+export function showProjectMapEntry(target?: string): { hash: string; entry: ProjectMapEntry; transient?: boolean } {
+  const map = loadProjectMap({ strict: true, reload: true });
+  const targetPath = target ?? process.cwd();
   if (!target) {
-    const identity = resolveProjectIdentity(process.cwd());
-    return { hash: identity.id, entry: map[identity.id] ?? { canonical: identity.canonical, aliases: [] } };
+    const matches = findPathMatches(map, targetPath);
+    if (matches.size > 1) throw new Error(`project path maps to multiple hashes: ${targetPath} (${[...matches].join(", ")})`);
+    if (matches.size === 1) {
+      const hash = [...matches][0];
+      return { hash, entry: map[hash] };
+    }
+    const canonical = normalizeProjectPath(targetPath);
+    return { hash: hashProjectPath(canonical), entry: { canonical, aliases: [] }, transient: true };
   }
   if (HASH_RE.test(target)) {
     const entry = map[target];
@@ -288,8 +323,8 @@ export function showProjectMapEntry(target?: string): { hash: string; entry: Pro
     const hash = [...matches][0];
     return { hash, entry: map[hash] };
   }
-  const identity = resolveProjectIdentity(target);
-  return { hash: identity.id, entry: listProjectMapEntries()[identity.id] };
+  const canonical = normalizeProjectPath(target);
+  return { hash: hashProjectPath(canonical), entry: { canonical, aliases: [] }, transient: true };
 }
 
 function resolveCliTarget(opts: { canonical?: string; hash?: string }): { hash: string; entry: ProjectMapEntry; map: ProjectMap } {
@@ -297,8 +332,10 @@ function resolveCliTarget(opts: { canonical?: string; hash?: string }): { hash: 
     throw new Error("--canonical and --hash are mutually exclusive");
   }
   if (opts.canonical) {
-    if (!existsSync(opts.canonical)) throw new Error(`canonical path does not exist: ${opts.canonical}`);
-    const identity = resolveProjectIdentity(opts.canonical);
+    const canonical = normalizeProjectPath(opts.canonical);
+    if (!existsSync(canonical)) throw new Error(`canonical path does not exist: ${canonical}`);
+    if (!statSync(canonical).isDirectory()) throw new Error(`canonical path must be an existing directory: ${canonical}`);
+    const identity = resolveProjectIdentity(canonical);
     const map = listProjectMapEntries();
     return { hash: identity.id, entry: map[identity.id], map };
   }
@@ -312,6 +349,13 @@ function resolveCliTarget(opts: { canonical?: string; hash?: string }): { hash: 
   const identity = resolveProjectIdentity(process.cwd());
   const refreshed = listProjectMapEntries();
   return { hash: identity.id, entry: refreshed[identity.id], map: refreshed };
+}
+
+export function projectMapPathsForHash(hash: string): string[] {
+  const map = loadProjectMapWithMetadata();
+  const entry = map[hash];
+  if (!entry) return [];
+  return [...new Set([entry.canonical, ...entry.aliases].map(normalizeProjectPath))];
 }
 
 export function addProjectAlias(alias: string, opts: { canonical?: string; hash?: string } = {}): { hash: string; entry: ProjectMapEntry; warning?: string; backupPath?: string } {
@@ -421,12 +465,12 @@ export function reloadProjectMapCache(opts: { reformat?: boolean } = {}): boolea
   const path = projectMapPath();
   const file = readMapFile(path);
   if (!file) {
-    cache = { path, mtimeMs: null, map: emptyMap() };
+    cache = { path, mtimeMs: null, map: emptyMap(), metadataPopulated: false };
     return true;
   }
   try {
     const map = parseProjectMap(file.content);
-    cache = { path, mtimeMs: file.mtimeMs, map: cloneMap(map) };
+    cache = { path, mtimeMs: file.mtimeMs, map: cloneMap(map), metadataPopulated: false };
     if (opts.reformat && file.content !== prettyMap(map)) {
       writeProjectMap(map);
     }
