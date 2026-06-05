@@ -1,6 +1,6 @@
 {
   "name": "lcm",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Long Context Manager (LCM) — DAG-based summarization that preserves every message",
   "author": {
     "name": "Pedro Almeida",
