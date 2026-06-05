@@ -6,6 +6,7 @@ import { runLcmMigrations } from "./db/migration.js";
 import type { ProgressState } from "./cli/progress-state.js";
 import { DaemonClient } from "./daemon/client.js";
 import { projectsDir as lcmProjectsDir } from "./runtime-paths.js";
+import { normalizeProjectPath, projectMapPathsForHash } from "./project-map.js";
 
 export interface UncompactedConversation {
   projectDir: string;
@@ -17,6 +18,17 @@ export interface UncompactedConversation {
 }
 
 /** Find conversations eligible for compaction, above the token threshold. */
+function projectMatchesCwdFilter(projectHash: string, cwd: string, cwdFilter?: string): boolean {
+  if (!cwdFilter) return true;
+  const normalizedFilter = normalizeProjectPath(cwdFilter);
+  if (normalizeProjectPath(cwd) === normalizedFilter) return true;
+  try {
+    return projectMapPathsForHash(projectHash).includes(normalizedFilter);
+  } catch {
+    return false;
+  }
+}
+
 export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): UncompactedConversation[] {
   const baseDir = lcmProjectsDir();
   if (!existsSync(baseDir)) return [];
@@ -37,7 +49,7 @@ export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?:
       } catch { /* skip corrupt meta */ }
     }
     if (!cwd) continue;
-    if (cwdFilter && cwd !== cwdFilter) continue;
+    if (!projectMatchesCwdFilter(entry.name, cwd, cwdFilter)) continue;
 
     const db = new DatabaseSync(dbPath);
     try {

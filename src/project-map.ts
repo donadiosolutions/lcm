@@ -137,6 +137,17 @@ function createBackupIfNeeded(path: string, homeDir?: string): string | undefine
   return backupPath;
 }
 
+function assertCurrentMapIsWritable(path: string): void {
+  const file = readMapFile(path);
+  if (!file) return;
+  try {
+    parseProjectMap(file.content);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : "map.json is invalid";
+    throw new Error(`refusing to overwrite invalid map.json: ${detail}`);
+  }
+}
+
 export function writeProjectMap(
   map: ProjectMap,
   homeDir?: string,
@@ -144,6 +155,7 @@ export function writeProjectMap(
 ): { path: string; backupPath?: string } {
   const path = projectMapPath(homeDir);
   mkdirSync(dirname(path), { recursive: true });
+  assertCurrentMapIsWritable(path);
   const backupPath = createBackupIfNeeded(path, homeDir);
   writeFileSync(path, prettyMap(map));
   cache = {
@@ -368,7 +380,18 @@ export function addProjectAlias(alias: string, opts: { canonical?: string; hash?
     throw new Error(`alias is already mapped to ${target.hash}: ${normalizedAlias}`);
   }
   if (existingOwners.size > 0) {
-    throw new Error(`alias is already mapped to another hash: ${normalizedAlias} (${[...existingOwners].join(", ")})`);
+    const adoptableOwners = [...existingOwners].filter((ownerHash) => {
+      const entry = target.map[ownerHash];
+      return entry
+        && ownerHash === hashProjectPath(normalizedAlias)
+        && normalizeProjectPath(entry.canonical) === normalizedAlias
+        && entry.aliases.length === 0;
+    });
+    if (existingOwners.size === 1 && adoptableOwners.length === 1) {
+      delete target.map[adoptableOwners[0]];
+    } else {
+      throw new Error(`alias is already mapped to another hash: ${normalizedAlias} (${[...existingOwners].join(", ")})`);
+    }
   }
 
   const canonical = normalizeProjectPath(target.entry.canonical);

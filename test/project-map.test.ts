@@ -91,6 +91,17 @@ describe("project map", () => {
     expect(readFileSync(projectMapPath(), "utf-8")).toBe("{not-json");
   });
 
+  it("does not overwrite invalid map edits from a stale cache", () => {
+    const canonical = makeDir("cached-canonical");
+    resolveProjectIdentity(canonical);
+    writeFileSync(projectMapPath(), "{not-json");
+
+    const unseen = makeDir("unseen-while-invalid");
+
+    expect(() => resolveProjectIdentity(unseen)).toThrow(/refusing to overwrite invalid map\.json/);
+    expect(readFileSync(projectMapPath(), "utf-8")).toBe("{not-json");
+  });
+
   it("rejects relative canonical paths in manually edited maps", () => {
     const hash = hashProjectPath("/absolute-project");
     writeFileSync(projectMapPath(), JSON.stringify({
@@ -174,6 +185,21 @@ describe("project map", () => {
     expect(shown.entry.aliases).toContain(normalizeProjectPath(alias));
     expect(removed.removed).toBe(true);
     expect(listProjectMapEntries()[added.hash].aliases).toEqual([]);
+  });
+
+  it("converts an already-seen canonical-only path into an alias", () => {
+    const canonical = makeDir("adopt-canonical");
+    const alias = makeDir("adopt-alias");
+    const canonicalId = projectId(canonical);
+    const staleAliasId = projectId(alias);
+
+    const added = addProjectAlias(alias, { canonical });
+    const map = listProjectMapEntries();
+
+    expect(added.hash).toBe(canonicalId);
+    expect(map[canonicalId].aliases).toContain(normalizeProjectPath(alias));
+    expect(map[staleAliasId]).toBeUndefined();
+    expect(projectId(alias)).toBe(canonicalId);
   });
 
   it("shows an unmapped path without creating or rewriting map.json", () => {
