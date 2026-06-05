@@ -95,7 +95,7 @@ export async function exportKnowledge(
   const dbPath = resolveProjectDbPath(cwd, baseDir);
 
   if (!existsSync(dbPath)) {
-    throw new Error(`No lossless-claude database found for project: ${cwd}`);
+    throw new Error(`No Long Context Manager (LCM) database found for project: ${cwd}`);
   }
 
   const db = getLcmConnection(dbPath);

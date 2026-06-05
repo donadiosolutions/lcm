@@ -81,6 +81,20 @@ describe("dispatchHook", () => {
     expect(callOrder).toEqual(["heal", "handler"]);
   });
 
+  it("skips validateAndFixHooks for Codex hook payloads", async () => {
+    vi.mocked(validateAndFixHooks).mockClear();
+    vi.mocked(handlePreCompact).mockResolvedValue({ exitCode: 0, stdout: "" });
+
+    await dispatchHook("compact", JSON.stringify({ client: "codex" }));
+
+    expect(validateAndFixHooks).not.toHaveBeenCalled();
+    expect(handlePreCompact).toHaveBeenCalledWith(
+      JSON.stringify({ client: "codex" }),
+      expect.anything(),
+      expect.any(Number),
+    );
+  });
+
   it("dispatches each command to its correct handler", async () => {
     const mapping: [typeof HOOK_COMMANDS[number], any][] = [
       ["compact", handlePreCompact],

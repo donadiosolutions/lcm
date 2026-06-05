@@ -21,6 +21,18 @@ const mockAgentWithHeader: Agent = {
   header: '---\ntrigger: always_on\n---',
 };
 
+const codexAgent: Agent = {
+  ...mockAgent,
+  id: 'codex',
+  name: 'Codex',
+  configPaths: {
+    rules: '~/.codex/AGENTS.md',
+    hook: '~/.codex/hooks.json',
+    mcp: '.codex/config.toml',
+    skill: '.codex/skills/',
+  },
+};
+
 describe('generateRulesContent', () => {
   it('contains lcm search command', () => {
     const content = generateRulesContent(mockAgent);
@@ -62,6 +74,11 @@ describe('generateRulesContent', () => {
     expect(content).toContain('lcm store');
     expect(content).toContain('lcm doctor');
   });
+
+  it('keeps Codex generated rules free of Claude-specific text', () => {
+    const content = generateRulesContent(codexAgent);
+    expect(content).not.toMatch(/claude/i);
+  });
 });
 
 describe('generateMcpContent', () => {
@@ -88,6 +105,11 @@ describe('generateMcpContent', () => {
   it('contains lcm_store tool', () => {
     const content = generateMcpContent(mockAgent);
     expect(content).toContain('lcm_store');
+  });
+
+  it('keeps Codex generated MCP guidance free of Claude-specific text', () => {
+    const content = generateMcpContent(codexAgent);
+    expect(content).not.toMatch(/claude/i);
   });
 });
 
@@ -125,6 +147,11 @@ describe('generateSkillContent', () => {
   it('contains YAML frontmatter', () => {
     const content = generateSkillContent(mockAgent);
     expect(content).toContain('name: lcm-memory');
+  });
+
+  it('keeps generated Codex skill content free of Claude-specific text', () => {
+    const content = generateSkillContent(codexAgent);
+    expect(content).not.toMatch(/claude/i);
   });
 });
 

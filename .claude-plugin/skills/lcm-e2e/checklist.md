@@ -231,8 +231,8 @@ FIXTURE
 | Step | Command | Expected |
 |------|---------|----------|
 | 13.1 | `PROJECT_HASH=$(lcm status --json --cwd $LCME2E_DIR \| jq -r '.projectHash // empty')` | Hash extracted or empty |
-| 13.2 | `rm -rf $LCME2E_DIR` | Temp dir removed |
-| 13.3 | `[ -n "$PROJECT_HASH" ] && rm -rf ~/.lossless-claude/projects/$PROJECT_HASH` | Project data removed (if hash known) |
+| 13.2 | `rm -rf "$LCME2E_DIR"` | Temp dir removed |
+| 13.3 | `[ -n "$PROJECT_HASH" ] && rm -rf "$HOME/.lcm/projects/$PROJECT_HASH"` | Project data removed (if hash known) |
 | 13.4 | `ls /tmp/lcm-e2e-test-* 2>/dev/null` | No lcm-e2e-test dirs remain |
 
 **Pass criteria:** Temp dir gone, project data cleaned up.

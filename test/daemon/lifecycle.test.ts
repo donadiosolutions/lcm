@@ -22,7 +22,7 @@ describe("ensureDaemon", () => {
     const daemon = await createDaemon(config);
     const port = daemon.address().port;
 
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-lifecycle-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
 
@@ -42,7 +42,7 @@ describe("ensureDaemon", () => {
   });
 
   it("returns connected=false when daemon is not running and spawn is skipped", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-lifecycle-no-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-no-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
 
@@ -56,7 +56,7 @@ describe("ensureDaemon", () => {
   });
 
   it("cleans up stale PID file", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-lifecycle-stale-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-stale-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
     writeFileSync(pidFile, "99999999");
@@ -81,7 +81,7 @@ describe("ensureDaemon", () => {
     const daemon = await createDaemon(config);
     const port = daemon.address().port;
 
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-lifecycle-ver-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-ver-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
 
@@ -102,7 +102,7 @@ describe("ensureDaemon", () => {
   });
 
   it("does not connect when health wait returns a daemon with mismatched version", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-lifecycle-healthver-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-healthver-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
     // Stale PID — process.kill will fail silently
@@ -131,7 +131,7 @@ describe("ensureDaemon", () => {
   });
 
   it("spawns a caller-specified command instead of process.argv[1] when provided", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-lifecycle-spawn-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-spawn-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
     const spawnMock = vi.fn().mockReturnValue({ pid: 12345, unref: vi.fn() });

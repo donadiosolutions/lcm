@@ -4,8 +4,6 @@ import { homedir } from "node:os";
 import { join, resolve, normalize, join as pathJoin, dirname, basename } from "node:path";
 import { lcmHomeDir } from "../runtime-paths.js";
 
-export const BASE_DIR = lcmHomeDir();
-
 function canonicalizeCwd(cwd: string): string {
   try { return realpathSync(cwd); } catch { return cwd; }
 }

@@ -1,6 +1,6 @@
 # Privacy & Data Handling
 
-lossless-claude stores your conversation history locally to enable memory across sessions. This document explains exactly what is stored, what leaves your machine, and how to control sensitive data.
+Long Context Manager (LCM) stores your conversation history locally to enable memory across sessions. This document explains exactly what is stored, what leaves your machine, and how to control sensitive data.
 
 ## What is stored locally
 
@@ -11,13 +11,13 @@ All storage is on your machine:
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
 - **`~/.lcm/daemon.pid`** — Daemon process ID (transient).
 
-On first startup after upgrading from older releases, lcm automatically migrates an existing `~/.lossless-claude/` directory to `~/.lcm/` when `~/.lcm/` is absent or does not already contain LCM data.
+On first startup after upgrading from older releases, lcm automatically migrates an existing legacy runtime directory to `~/.lcm/` when `~/.lcm/` is absent or does not already contain LCM data.
 
-No data is sent to any lossless-claude server. There is no telemetry.
+No data is sent to any Long Context Manager (LCM) server. There is no telemetry.
 
 ## What leaves your machine
 
-lossless-claude is a local runtime. By default, **nothing leaves your machine**.
+Long Context Manager (LCM) is a local runtime. By default, **nothing leaves your machine**.
 
 The exception is the summarizer, which you configure explicitly:
 
@@ -33,7 +33,7 @@ When using an external summarizer, only the text being summarized is sent — no
 
 ## Secret redaction
 
-lossless-claude scrubs secrets from message content **before writing to SQLite** and **before sending to the summarizer**. Redaction happens at both write points to ensure secrets are never persisted or transmitted.
+Long Context Manager (LCM) scrubs secrets from message content **before writing to SQLite** and **before sending to the summarizer**. Redaction happens at both write points to ensure secrets are never persisted or transmitted.
 
 ### Built-in patterns
 
@@ -80,7 +80,7 @@ Messages and summaries persist until you explicitly remove them:
 # Remove data for the current project
 lcm sensitive purge --yes
 
-# Remove all lossless-claude data
+# Remove all Long Context Manager (LCM) data
 lcm uninstall
 ```
 

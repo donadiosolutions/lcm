@@ -5,14 +5,14 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-const projectsDir = path.join(os.homedir(), ".lossless-claude", "projects");
+const projectsDir = path.join(os.homedir(), ".lcm", "projects");
 if (!fs.existsSync(projectsDir)) {
   console.log("No projects directory found");
   process.exit(0);
 }
 
 const dirs = fs.readdirSync(projectsDir).filter((d) => {
-  const dbPath = path.join(projectsDir, d, "lcm.db");
+  const dbPath = path.join(projectsDir, d, "db.sqlite");
   return fs.existsSync(dbPath);
 });
 
@@ -23,17 +23,19 @@ if (dirs.length === 0) {
 
 let allOk = true;
 for (const d of dirs) {
-  const dbPath = path.join(projectsDir, d, "lcm.db");
+  const dbPath = path.join(projectsDir, d, "db.sqlite");
+  let db;
   try {
-    const db = new DatabaseSync(dbPath);
+    db = new DatabaseSync(dbPath);
     const result = db.prepare("PRAGMA integrity_check").get();
     const status = result.integrity_check === "ok" ? "ok" : "FAIL";
     if (status !== "ok") allOk = false;
     console.log(`${d.slice(0, 16)}...  ${status}`);
-    db.close();
   } catch (e) {
     console.log(`${d.slice(0, 16)}...  ERROR: ${e.message}`);
     allOk = false;
+  } finally {
+    db?.close();
   }
 }
 

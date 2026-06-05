@@ -1,3 +1,5 @@
+import { legacyLcmCommand, legacyLcmMcpServerName } from "../legacy-names.js";
+
 export const REQUIRED_HOOKS: { event: string; command: string }[] = [
   { event: "PostToolUse", command: "lcm post-tool" },
   { event: "PreCompact", command: "lcm compact --hook" },
@@ -12,12 +14,12 @@ export function mergeClaudeSettings(existing: any): any {
   settings.hooks = (settings.hooks && typeof settings.hooks === "object" && !Array.isArray(settings.hooks)) ? settings.hooks : {};
   settings.mcpServers = (settings.mcpServers && typeof settings.mcpServers === "object" && !Array.isArray(settings.mcpServers)) ? settings.mcpServers : {};
 
-  // Migrate old hook commands to current form
+  // Migrate old hook commands to current form.
   const OLD_TO_NEW: Record<string, string> = {
-    "lossless-claude compact": "lcm compact --hook",
-    "lossless-claude restore": "lcm restore",
-    "lossless-claude session-end": "lcm session-end",
-    "lossless-claude user-prompt": "lcm user-prompt",
+    [legacyLcmCommand("lcm compact")]: "lcm compact --hook",
+    [legacyLcmCommand("lcm restore")]: "lcm restore",
+    [legacyLcmCommand("lcm session-end")]: "lcm session-end",
+    [legacyLcmCommand("lcm user-prompt")]: "lcm user-prompt",
     // Migrate pre-#90 direct installs that registered without --hook
     "lcm compact": "lcm compact --hook",
   };
@@ -41,7 +43,7 @@ export function mergeClaudeSettings(existing: any): any {
     }
   }
   // Remove legacy MCP server entries
-  delete settings.mcpServers["lossless-claude"];
+  delete settings.mcpServers[legacyLcmMcpServerName()];
 
   // Remove lcm hooks from settings.json — plugin.json owns them.
   // Having hooks in both causes double-firing.

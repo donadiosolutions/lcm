@@ -17,7 +17,7 @@ afterEach(async () => {
 
 describe("POST /store", () => {
   it("stores to SQLite promoted table", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-store-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-store-"));
     tempDirs.push(tempDir);
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
@@ -44,7 +44,7 @@ describe("POST /store", () => {
   });
 
   it("returns 400 when text is missing", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-store-err-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-store-err-"));
     tempDirs.push(tempDir);
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
@@ -82,7 +82,7 @@ describe("POST /store", () => {
   });
 
   it("scrubs secrets before inserting into the promoted table", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-store-scrub-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-store-scrub-"));
     tempDirs.push(tempDir);
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;

@@ -2,17 +2,19 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 import type { DaemonConfig } from "../config.js";
 import { projectDbPath } from "../project.js";
 import { buildOrientationPrompt } from "../orientation.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { runLcmMigrations } from "../../db/migration.js";
+import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
 import { PromotedStore } from "../../db/promoted.js";
 import { justCompactedMap, JUST_COMPACTED_TTL_MS } from "./compact.js";
 import { fenceContent } from "../content-fence.js";
 import { validateCwd } from "../validate-cwd.js";
+import { normalizeTranscriptClient, type TranscriptClient } from "../../transcript-provider.js";
 
 type SessionInstructionsRow = {
   content: string;
@@ -20,12 +22,51 @@ type SessionInstructionsRow = {
   updated_at: string;
 };
 
-function readClaudeMdFiles(cwd: string): string {
-  const paths = [
-    { label: "~/.claude/CLAUDE.md", path: join(homedir(), ".claude", "CLAUDE.md") },
-    { label: `${cwd}/CLAUDE.md`, path: join(cwd, "CLAUDE.md") },
-    { label: `${cwd}/.claude/CLAUDE.md`, path: join(cwd, ".claude", "CLAUDE.md") },
+const SESSION_INSTRUCTION_CACHE_TABLE = "session_instruction_cache";
+
+function sessionInstructionsId(client: TranscriptClient): number {
+  return client === "codex" ? 2 : 1;
+}
+
+function codexInstructionPaths(cwd: string): Array<{ label: string; path: string }> {
+  const dirs: string[] = [];
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    dirs.push(dir);
+    const parent = dirname(dir);
+    if (parent === dir) break;
+  }
+
+  return [
+    { label: "~/.codex/AGENTS.md", path: join(homedir(), ".codex", "AGENTS.md") },
+    ...dirs.reverse().map((dir) => ({ label: `${dir}/AGENTS.md`, path: join(dir, "AGENTS.md") })),
+    { label: `${cwd}/.codex/AGENTS.md`, path: join(cwd, ".codex", "AGENTS.md") },
   ];
+}
+
+function readSessionInstructionsRow(
+  db: DatabaseSync,
+  instructionsId: number,
+  client: TranscriptClient,
+): SessionInstructionsRow | undefined {
+  const row = db
+    .prepare(`SELECT content, content_hash, updated_at FROM ${SESSION_INSTRUCTION_CACHE_TABLE} WHERE id = ?`)
+    .get(instructionsId) as SessionInstructionsRow | undefined;
+  if (row || client !== "claude") return row;
+
+  return db
+    .prepare(`SELECT content, content_hash, updated_at FROM session_instructions WHERE id = 1`)
+    .get() as SessionInstructionsRow | undefined;
+}
+
+function readSessionInstructionFiles(cwd: string, client: TranscriptClient): string {
+  const isCodex = client === "codex";
+  const paths = isCodex
+    ? codexInstructionPaths(cwd)
+    : [
+      { label: "~/.claude/CLAUDE.md", path: join(homedir(), ".claude", "CLAUDE.md") },
+      { label: `${cwd}/CLAUDE.md`, path: join(cwd, "CLAUDE.md") },
+      { label: `${cwd}/.claude/CLAUDE.md`, path: join(cwd, ".claude", "CLAUDE.md") },
+    ];
 
   const parts: string[] = [];
   for (const { label, path } of paths) {
@@ -45,6 +86,8 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
     try {
       const input = JSON.parse(body || "{}");
       const { session_id, source } = input;
+      const client = normalizeTranscriptClient(input.client);
+      const instructionsId = sessionInstructionsId(client);
       let cwd: string | undefined;
       if (input.cwd) {
         try {
@@ -67,17 +110,15 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
         const dbPath = projectDbPath(cwd);
         if (existsSync(dbPath)) {
           try {
-            const db = new DatabaseSync(dbPath);
+            const db = getLcmConnection(dbPath);
             try {
               runLcmMigrations(db);
-              const row = db
-                .prepare(`SELECT content, content_hash, updated_at FROM session_instructions WHERE id = 1`)
-                .get() as SessionInstructionsRow | undefined;
+              const row = readSessionInstructionsRow(db, instructionsId, client);
               if (row) {
                 instructionsContext = `<project-instructions>\n${row.content}\n</project-instructions>`;
               }
             } finally {
-              db.close();
+              closeLcmConnection(dbPath);
             }
           } catch { /* non-fatal */ }
         }
@@ -92,73 +133,79 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
       let episodicContext = "";
       let promotedContext = "";
 
-      // Episodic: query recent summaries from project SQLite DB
-      // Also capture CLAUDE.md files on startup
+      // Episodic: query recent summaries from project SQLite DB.
+      // Also capture client-specific instruction files on startup.
       if (cwd) {
         const dbPath = projectDbPath(cwd);
         mkdirSync(dirname(dbPath), { recursive: true });
-        const db = new DatabaseSync(dbPath);
         try {
-          runLcmMigrations(db);
-
-          const rows = db.prepare(
-            `SELECT s.content FROM summaries s
-             JOIN conversations c ON s.conversation_id = c.conversation_id
-             WHERE c.session_id = ?
-             ORDER BY s.depth DESC, s.created_at DESC
-             LIMIT ?`,
-          ).all(session_id, config.restoration.recentSummaries) as Array<{ content: string }>;
-
-          if (rows.length > 0) {
-            episodicContext = fenceContent(
-              rows.map((r) => r.content).join("\n\n"),
-              "recent-session-context",
-            );
-          }
-
-          // Promoted: cross-session knowledge from SQLite
+          const db = getLcmConnection(dbPath);
           try {
-            const promotedStore = new PromotedStore(db);
-            const maxAgeDays = config.restoration.restoreMaxPromotedAgeDays;
-            const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-            // Fetch more candidates than needed, then filter by age before capping.
-            // This prevents old memories from consuming the top-5 slots and leaving
-            // fewer results than available when newer memories exist.
-            const results = promotedStore
-              .search(`project context ${cwd}`, 20)
-              .filter((r) => !r.createdAt || Date.parse(r.createdAt) >= cutoffMs)
-              .slice(0, 5);
-            if (results.length > 0) {
-              promotedContext = fenceContent(
-                results.map((r) => r.content).join("\n\n"),
-                "project-knowledge",
+            runLcmMigrations(db);
+
+            const rows = db.prepare(
+              `SELECT s.content FROM summaries s
+               JOIN conversations c ON s.conversation_id = c.conversation_id
+               WHERE c.session_id = ?
+               ORDER BY s.depth DESC, s.created_at DESC
+               LIMIT ?`,
+            ).all(session_id, config.restoration.recentSummaries) as Array<{ content: string }>;
+
+            if (rows.length > 0) {
+              episodicContext = fenceContent(
+                rows.map((r) => r.content).join("\n\n"),
+                "recent-session-context",
               );
             }
-          } catch { /* non-fatal */ }
 
-          // Capture CLAUDE.md files and upsert into session_instructions if changed
-          try {
-            const claudeMdContent = readClaudeMdFiles(cwd);
-            if (claudeMdContent) {
-              const hash = createHash("sha256").update(claudeMdContent).digest("hex");
-              const existing = db
-                .prepare(`SELECT content_hash FROM session_instructions WHERE id = 1`)
-                .get() as { content_hash: string } | undefined;
-
-              if (!existing || existing.content_hash !== hash) {
-                db.prepare(
-                  `INSERT INTO session_instructions (id, content, content_hash, updated_at)
-                   VALUES (1, ?, ?, datetime('now'))
-                   ON CONFLICT(id) DO UPDATE SET
-                     content = excluded.content,
-                     content_hash = excluded.content_hash,
-                     updated_at = excluded.updated_at`,
-                ).run(claudeMdContent, hash);
+            // Promoted: cross-session knowledge from SQLite
+            try {
+              const promotedStore = new PromotedStore(db);
+              const maxAgeDays = config.restoration.restoreMaxPromotedAgeDays;
+              const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+              // Fetch more candidates than needed, then filter by age before capping.
+              // This prevents old memories from consuming the top-5 slots and leaving
+              // fewer results than available when newer memories exist.
+              const results = promotedStore
+                .search(`project context ${cwd}`, 20)
+                .filter((r) => !r.createdAt || Date.parse(r.createdAt) >= cutoffMs)
+                .slice(0, 5);
+              if (results.length > 0) {
+                promotedContext = fenceContent(
+                  results.map((r) => r.content).join("\n\n"),
+                  "project-knowledge",
+                );
               }
-            }
-          } catch { /* non-fatal */ }
+            } catch { /* non-fatal */ }
 
-          db.close();
+            // Capture instruction files and upsert into the client-specific row if changed.
+            try {
+              const instructionContent = readSessionInstructionFiles(cwd, client);
+              if (instructionContent) {
+                const hash = createHash("sha256").update(instructionContent).digest("hex");
+                const existing = db
+                  .prepare(`SELECT content_hash FROM ${SESSION_INSTRUCTION_CACHE_TABLE} WHERE id = ?`)
+                  .get(instructionsId) as { content_hash: string } | undefined;
+
+                if (!existing || existing.content_hash !== hash) {
+                  db.prepare(
+                    `INSERT INTO ${SESSION_INSTRUCTION_CACHE_TABLE} (id, content, content_hash, updated_at)
+                     VALUES (?, ?, ?, datetime('now'))
+                     ON CONFLICT(id) DO UPDATE SET
+                       content = excluded.content,
+                       content_hash = excluded.content_hash,
+                       updated_at = excluded.updated_at`,
+                  ).run(instructionsId, instructionContent, hash);
+                }
+                instructionsContext = `<project-instructions>\n${instructionContent}\n</project-instructions>`;
+              } else {
+                db.prepare(`DELETE FROM ${SESSION_INSTRUCTION_CACHE_TABLE} WHERE id = ?`).run(instructionsId);
+                instructionsContext = "";
+              }
+            } catch { /* non-fatal */ }
+          } finally {
+            closeLcmConnection(dbPath);
+          }
         } catch { /* non-fatal */ }
       }
 
@@ -168,7 +215,7 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
         try {
           const dbPath = projectDbPath(cwd);
           if (existsSync(dbPath)) {
-            const insightsDb = new DatabaseSync(dbPath);
+            const insightsDb = getLcmConnection(dbPath);
             try {
               runLcmMigrations(insightsDb);
               const insightsStore = new PromotedStore(insightsDb);
@@ -182,7 +229,7 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
                 .slice(0, 5)
                 .map((r) => ({ content: r.content, confidence: r.confidence, tags: r.tags }));
             } finally {
-              insightsDb.close();
+              closeLcmConnection(dbPath);
             }
           }
         } catch { /* non-fatal */ }

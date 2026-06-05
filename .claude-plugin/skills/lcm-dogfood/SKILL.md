@@ -17,7 +17,7 @@ Execute each phase in order (or just the requested phase). For each check:
 
 1. Run the command or verify the condition
 2. Record: ✅ PASS, ❌ FAIL, or ⚠️ SKIP (with reason)
-3. On FAIL: capture error, check daemon logs (`~/.lossless-claude/daemon.log`), continue
+3. On FAIL: capture error, check daemon logs (`~/.lcm/daemon.log`), continue
 4. Produce the **Scorecard** at the end
 5. Write failures to `.xgh/reviews/dogfood-YYYY-MM-DD.md`
 

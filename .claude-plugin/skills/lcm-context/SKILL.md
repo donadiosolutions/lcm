@@ -5,7 +5,7 @@ description: "Use when deciding which lcm MCP tool to call — lcm_search, lcm_g
 
 # lcm Memory Tool Guide
 
-Lossless-claude provides 7 MCP tools. This skill helps you pick the right one and recover from errors.
+Long Context Manager (LCM) provides 7 MCP tools. This skill helps you pick the right one and recover from errors.
 
 > **Hooks already inject memory at session start.** Do NOT re-query what was already injected. This skill is for active retrieval, storage, and error recovery — not session initialization.
 
@@ -80,11 +80,19 @@ These three tools **chain** from broad to deep:
 If `lcm` is not on PATH, first try to install it by running:
 
 ```bash
-LCM_DIR=$(ls -d ~/.claude/plugins/cache/*/lossless-claude/*/ 2>/dev/null | sort -V | tail -1)
+LEGACY_SLUG="$(printf '%s-%s' lossless claude)"
+LCM_PLUGIN_SLUG="lcm"
+LCM_DIR=$(ls -d ~/.claude/plugins/cache/*/"$LCM_PLUGIN_SLUG"/*/ ~/.claude/plugins/cache/"$LCM_PLUGIN_SLUG"/lcm/*/ ~/.claude/plugins/cache/*/"$LEGACY_SLUG"/*/ ~/.claude/plugins/cache/"$LEGACY_SLUG"/lcm/*/ 2>/dev/null | sort -V | tail -1)
 node "${LCM_DIR}lcm.mjs" install
 ```
 
-If install succeeds, `lcm` should now be available on PATH. If it is still not available, use the bundled binary directly: `node "$(ls -d ~/.claude/plugins/cache/*/lossless-claude/*/ 2>/dev/null | sort -V | tail -1)lcm.mjs"`
+If install succeeds, `lcm` should now be available on PATH. If it is still not available, use the bundled binary directly:
+
+```bash
+LEGACY_SLUG="$(printf '%s-%s' lossless claude)"
+LCM_PLUGIN_SLUG="lcm"
+node "$(ls -d ~/.claude/plugins/cache/*/"$LCM_PLUGIN_SLUG"/*/ ~/.claude/plugins/cache/"$LCM_PLUGIN_SLUG"/lcm/*/ ~/.claude/plugins/cache/*/"$LEGACY_SLUG"/*/ ~/.claude/plugins/cache/"$LEGACY_SLUG"/lcm/*/ 2>/dev/null | sort -V | tail -1)lcm.mjs"
+```
 
 ## Error Self-Healing
 

@@ -528,6 +528,16 @@ export function runLcmMigrations(
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_instruction_cache (
+      id INTEGER PRIMARY KEY,
+      content TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT OR IGNORE INTO session_instruction_cache (id, content, content_hash, updated_at)
+      SELECT id, content, content_hash, updated_at FROM session_instructions WHERE id = 1;
+  `);
 
   // Promoted memories (cross-session, agent-stored)
   db.exec(`

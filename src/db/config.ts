@@ -56,7 +56,7 @@ function toStr(value: unknown): string | undefined {
 /**
  * Resolve LCM configuration with three-tier precedence:
  *   1. Environment variables (highest — backward compat)
- *   2. Plugin config object (from plugins.entries.lossless-claude.config)
+ *   2. Plugin config object (from plugins.entries.lcm.config)
  *   3. Hardcoded defaults (lowest)
  */
 export function resolveLcmConfig(

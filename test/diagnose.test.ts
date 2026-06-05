@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cwdToProjectHash } from "../src/import.js";
 import { diagnose, scanSession } from "../src/diagnose.js";
+import { legacyLcmCommand, legacyLcmSlug } from "../src/legacy-names.js";
 
 function writeJsonl(filePath: string, entries: unknown[]) {
   writeFileSync(filePath, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
@@ -110,7 +111,7 @@ describe("diagnose", () => {
     );
   });
 
-  it("detects old binary hook commands and ignores path-only lossless-claude mentions", async () => {
+  it("detects old binary hook commands and ignores path-only legacy slug mentions", async () => {
     const root = makeTmpDir();
     const cwd = "/tmp/project-old-binary";
     const projectDir = makeProjectDir(root, cwd);
@@ -122,7 +123,7 @@ describe("diagnose", () => {
         data: {
           type: "hook_progress",
           hookEvent: "SessionStart",
-          command: "lossless-claude restore",
+          command: legacyLcmCommand("lcm restore"),
         },
         parentToolUseID: "tool-legacy",
         toolUseID: "tool-legacy",
@@ -133,7 +134,7 @@ describe("diagnose", () => {
         data: {
           type: "hook_progress",
           hookEvent: "PostToolUse",
-          command: "node \"/Users/pedro/Developer/lossless-claude/scripts/helper.mjs\"",
+          command: `node "/Users/pedro/Developer/${legacyLcmSlug()}/scripts/helper.mjs"`,
         },
         parentToolUseID: "tool-path",
         toolUseID: "tool-path",
@@ -147,7 +148,7 @@ describe("diagnose", () => {
     expect(warnings[0]).toEqual(
       expect.objectContaining({
         type: "old-binary",
-        command: "lossless-claude restore",
+        command: legacyLcmCommand("lcm restore"),
         count: 1,
       })
     );
@@ -219,7 +220,7 @@ describe("diagnose", () => {
         data: {
           type: "hook_progress",
           hookEvent: "UserPromptSubmit",
-          command: "lossless-claude user-prompt",
+          command: legacyLcmCommand("lcm user-prompt"),
         },
         parentToolUseID: "recent-tool",
         toolUseID: "recent-tool",
@@ -232,7 +233,7 @@ describe("diagnose", () => {
         data: {
           type: "hook_progress",
           hookEvent: "UserPromptSubmit",
-          command: "lossless-claude user-prompt",
+          command: legacyLcmCommand("lcm user-prompt"),
         },
         parentToolUseID: "old-tool",
         toolUseID: "old-tool",
@@ -271,7 +272,7 @@ describe("diagnose", () => {
         data: {
           type: "hook_progress",
           hookEvent: "SessionStart",
-          command: "lossless-claude restore",
+          command: legacyLcmCommand("lcm restore"),
         },
         parentToolUseID: "tool-title",
         toolUseID: "tool-title",

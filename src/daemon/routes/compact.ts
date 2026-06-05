@@ -54,7 +54,7 @@ export function buildCompactionMessage(p: {
   ];
   return [
     border,
-    `  🧠  lossless-claude · compaction complete`,
+    `  🧠  lcm · compaction complete`,
     border,
     ``,
     `  ${fmtN(p.tokensBefore)} ──────────────────────→ ${fmtN(p.tokensAfter)}`,

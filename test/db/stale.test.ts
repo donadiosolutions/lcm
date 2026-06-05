@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 function makeDb() {
-  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-stale-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lcm-stale-"));
   tempDirs.push(tempDir);
   const dbPath = join(tempDir, "test.db");
   const db = getLcmConnection(dbPath);

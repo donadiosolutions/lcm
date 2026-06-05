@@ -9,6 +9,7 @@ import {
   lcmHomeDir,
   migrateLegacyHomeIfNeeded,
 } from "../src/runtime-paths.js";
+import { legacyLcmHomeDirname } from "../src/legacy-names.js";
 
 describe("runtime paths", () => {
   it("uses ~/.lcm as the default LCM home", () => {
@@ -17,7 +18,7 @@ describe("runtime paths", () => {
   });
 
   it("keeps the legacy home path available for migration only", () => {
-    expect(legacyLcmHomeDir("/home/alice")).toBe("/home/alice/.lossless-claude");
+    expect(legacyLcmHomeDir("/home/alice")).toBe(join("/home/alice", legacyLcmHomeDirname()));
   });
 
   it("migrates an existing legacy home when the new home is absent", () => {

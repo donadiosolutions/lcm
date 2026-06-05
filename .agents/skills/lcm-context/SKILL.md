@@ -1,6 +1,6 @@
 ---
 name: lcm-context
-description: "You MUST use this before any work to recall project memory, and after implementing to store decisions. Lossless-claude (lcm) provides persistent cross-session memory via CLI commands."
+description: "You MUST use this before any work to recall project memory, and after implementing to store decisions. Long Context Manager (LCM) (lcm) provides persistent cross-session memory via CLI commands."
 ---
 
 # lcm Memory — Universal Agent Guide

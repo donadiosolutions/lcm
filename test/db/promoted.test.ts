@@ -16,7 +16,7 @@ afterEach(() => {
 });
 
 function makeDb() {
-  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-promoted-store-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lcm-promoted-store-"));
   tempDirs.push(tempDir);
   const dbPath = join(tempDir, "test.db");
   const db = getLcmConnection(dbPath);

@@ -1,26 +1,26 @@
 ---
-name: lossless-claude-upgrade
+name: lcm-upgrade
 description: |
-  Rebuild, reinstall, and restart lossless-claude from source.
+  Rebuild, reinstall, and restart Long Context Manager (LCM) from source.
   Fixes hooks, restarts daemon, runs diagnostics.
-  Trigger: /lossless-claude:upgrade
+  Trigger: /lcm:upgrade
 user-invocable: true
 ---
 
-# lossless-claude Upgrade (lcm)
+# Long Context Manager (LCM) Upgrade (lcm)
 
 Rebuild from source, restart daemon, and verify installation.
 
 ## Instructions
 
-1. Derive the **repo root** from this skill's base directory (go up 3 levels — remove `/skills/lossless-claude-upgrade` from the path, then remove `.claude-plugin`).
+1. Derive the **repo root** from this skill's base directory (go up 3 levels — remove `/skills/lcm-upgrade` from the path, then remove `.claude-plugin`).
 2. Run with Bash:
-   ```
+   ```bash
    cd <REPO_ROOT> && npm run build && npm link
    ```
 3. Restart daemon with Bash:
-   ```
-   PID_FILE="$HOME/.lossless-claude/daemon.pid"
+   ```bash
+   PID_FILE="$HOME/.lcm/daemon.pid"
    if [ -f "$PID_FILE" ]; then
      PID=$(cat "$PID_FILE")
      if ps -p "$PID" -o args= 2>/dev/null | grep -q 'lcm.*daemon'; then
@@ -31,12 +31,12 @@ Rebuild from source, restart daemon, and verify installation.
    lcm daemon start --detach
    ```
 4. Run doctor with Bash:
-   ```
+   ```bash
    lcm doctor
    ```
 5. **IMPORTANT**: After all Bash commands complete, re-display key results as markdown text directly in the conversation. Format as:
-   ```
-   ## lossless-claude upgrade
+   ```bash
+   ## Long Context Manager (LCM) upgrade
    - [x] Built from source
    - [x] npm linked globally
    - [x] Daemon restarted (PID XXXX)

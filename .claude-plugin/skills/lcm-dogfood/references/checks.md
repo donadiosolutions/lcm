@@ -216,7 +216,7 @@ Pass if: returns within 10s, no crash. Restart daemon after.
 
 ### 10.1 Daemon logs
 ```bash
-tail -50 ~/.lossless-claude/daemon.log
+tail -50 ~/.lcm/daemon.log
 ```
 Pass if: no ERROR entries.
 
@@ -228,9 +228,9 @@ Pass if: identical.
 
 ### 10.3 Project DB exists
 ```bash
-ls -la ~/.lossless-claude/projects/*/lcm.db 2>/dev/null
+ls -la ~/.lcm/projects/*/db.sqlite 2>/dev/null
 ```
-Pass if: at least one .db file exists.
+Pass if: at least one db.sqlite file exists.
 
 ### 10.4 DB integrity
 ```bash

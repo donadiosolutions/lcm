@@ -472,7 +472,7 @@ export function printHelp(command?: string): void {
 
   const lines: string[] = [
     "",
-    "  lcm — lossless context management for coding agents",
+    "  lcm — Long Context Manager for coding agents",
     "",
     "  Usage: lcm <command> [options]",
     "",

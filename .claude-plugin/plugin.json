@@ -1,12 +1,12 @@
 {
   "name": "lcm",
   "version": "1.1.0",
-  "description": "Lossless context management — DAG-based summarization that preserves every message",
+  "description": "Long Context Manager (LCM) — DAG-based summarization that preserves every message",
   "author": {
     "name": "Pedro Almeida",
     "url": "https://github.com/ipedro"
   },
-  "homepage": "https://lossless-claude.com",
+  "homepage": "https://github.com/donadiosolutions/lcm",
   "repository": "https://github.com/donadiosolutions/lcm",
   "license": "MIT",
   "keywords": ["context", "memory", "compaction", "summarization", "lcm"],

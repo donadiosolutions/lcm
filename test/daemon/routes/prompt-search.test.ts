@@ -158,7 +158,7 @@ afterEach(async () => {
 
 describe("POST /prompt-search", () => {
   it("returns hints for matching promoted entries", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-"));
     tempDirs.push(tempDir);
 
     // Pre-populate promoted table
@@ -199,7 +199,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("logs surfacing events to recall_surfacing table", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-recall-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-recall-"));
     tempDirs.push(tempDir);
 
     const dbPath = projectDbPath(tempDir);
@@ -239,7 +239,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("returns empty hints when no entries match", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-nomatch-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-nomatch-"));
     tempDirs.push(tempDir);
 
     // Pre-populate with unrelated content
@@ -273,7 +273,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("returns empty hints when no db exists", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-nodb-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-nodb-"));
     tempDirs.push(tempDir);
 
     const config = loadDaemonConfig("/nonexistent");
@@ -327,7 +327,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("returns hints for same-session entries and filters via minScore when session_id provided", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-session-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-session-"));
     tempDirs.push(tempDir);
 
     const dbPath = projectDbPath(tempDir);
@@ -361,7 +361,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("truncates long content to snippetLength", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-truncate-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-truncate-"));
     tempDirs.push(tempDir);
 
     const longContent = "React " + "x".repeat(300);
@@ -397,7 +397,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("reranks acted-upon memories above otherwise similar unused memories", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-usage-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-usage-"));
     tempDirs.push(tempDir);
 
     const dbPath = projectDbPath(tempDir);
@@ -443,7 +443,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("suppresses recently surfaced memories unless they clear the resurface margin", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-cooldown-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-cooldown-"));
     tempDirs.push(tempDir);
 
     const dbPath = projectDbPath(tempDir);
@@ -494,7 +494,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("falls back to the best cooled candidate when every eligible result is in cooldown", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-all-cooled-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-all-cooled-"));
     tempDirs.push(tempDir);
 
     const dbPath = projectDbPath(tempDir);
@@ -544,7 +544,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("penalizes repeatedly surfaced memories that were never acted upon", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-unused-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-unused-"));
     tempDirs.push(tempDir);
 
     const dbPath = projectDbPath(tempDir);
@@ -594,7 +594,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("falls back to baseline ordering when no recall feedback exists", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-fallback-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-fallback-"));
     tempDirs.push(tempDir);
 
     const dbPath = projectDbPath(tempDir);
@@ -638,7 +638,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("treats invalid created_at values as neutral recency instead of dropping results", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-invalid-created-at-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-invalid-created-at-"));
     tempDirs.push(tempDir);
 
     const dbPath = projectDbPath(tempDir);
@@ -679,7 +679,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("dedupes near-identical emitted hints before surfacing", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-dedupe-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-dedupe-"));
     tempDirs.push(tempDir);
 
     const dbPath = projectDbPath(tempDir);
@@ -728,7 +728,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("drops lower-ranked hints when the final memory-context budget is exhausted", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-budget-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-budget-"));
     tempDirs.push(tempDir);
 
     const dbPath = projectDbPath(tempDir);
@@ -781,7 +781,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("skips surfacing logs when the caller defers tracking to final emission", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-deferred-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-deferred-"));
     tempDirs.push(tempDir);
 
     const dbPath = projectDbPath(tempDir);
@@ -823,7 +823,7 @@ describe("POST /prompt-search", () => {
   });
 
   it("logs surfacing events when logSurfacing is enabled (default)", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-prompt-search-log-enabled-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-log-enabled-"));
     tempDirs.push(tempDir);
 
     const dbPath = projectDbPath(tempDir);

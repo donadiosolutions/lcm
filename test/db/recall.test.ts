@@ -16,7 +16,7 @@ afterEach(() => {
 });
 
 function makeDb(): DatabaseSync {
-  const tempDir = mkdtempSync(join(tmpdir(), "lossless-recall-test-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lcm-recall-test-"));
   tempDirs.push(tempDir);
   const dbPath = join(tempDir, "test.db");
   const db = new DatabaseSync(dbPath);
