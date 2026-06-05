@@ -13,6 +13,7 @@ const DAEMON_PATHS = new Set([
   "/promote",
   "/promote-events",
   "/promote-events/all",
+  "/promote-events/notify",
   "/prompt-search",
   "/recent",
   "/restore",

@@ -28,7 +28,7 @@ const MIN_REINFORCED_PATTERN_SESSIONS = 2;
 const AUTO_PROMOTABLE_PATTERN_CATEGORIES = new Set(["file", "mcp", "skill", "subagent"]);
 const EMPTY_REINFORCEMENT: PatternReinforcementStats = { totalCount: 0, distinctSessions: 0 };
 
-interface PromoteResult {
+export interface PromoteResult {
   promoted: number;
   skipped: number;
   correlated: number;
@@ -36,7 +36,7 @@ interface PromoteResult {
   message?: string;
 }
 
-interface PromoteAllProjectResult extends PromoteResult {
+export interface PromoteAllProjectResult extends PromoteResult {
   projectId: string;
   cwd?: string;
   unprocessedBefore: number;
@@ -45,7 +45,7 @@ interface PromoteAllProjectResult extends PromoteResult {
   incomplete?: boolean;
 }
 
-interface PromoteAllResult extends PromoteResult {
+export interface PromoteAllResult extends PromoteResult {
   scanned: number;
   sidecarsWithUnprocessed: number;
   processedProjects: number;
@@ -246,7 +246,7 @@ export function createPromoteAllEventsHandler(config: DaemonConfig): RouteHandle
   };
 }
 
-async function drainEventsForCwd(
+export async function drainEventsForCwd(
   config: DaemonConfig,
   cwd: string,
   sidecarPathOverride?: string,
