@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,12 +10,28 @@ import { projectDbPath, projectId } from "../../../src/daemon/project.js";
 import { eventsDbPath } from "../../../src/db/events-path.js";
 
 const tempDirs: string[] = [];
+const originalHome = process.env.HOME;
+const originalUserProfile = process.env.USERPROFILE;
+let tempHome: string | undefined;
+
+beforeEach(() => {
+  tempHome = mkdtempSync(join(tmpdir(), "lcm-route-home-"));
+  process.env.HOME = tempHome;
+  process.env.USERPROFILE = tempHome;
+  clearProjectMapCache();
+});
 
 afterEach(() => {
   clearProjectMapCache();
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
+  if (tempHome) rmSync(tempHome, { recursive: true, force: true });
+  tempHome = undefined;
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = originalUserProfile;
 });
 
 function makeProject(prefix: string): string {

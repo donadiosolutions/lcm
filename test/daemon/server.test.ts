@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { createServer } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -9,8 +9,28 @@ import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
 import { clearProjectMapCache, hashProjectPath, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
 
 describe("daemon server", () => {
+  const originalHome = process.env.HOME;
+  const originalUserProfile = process.env.USERPROFILE;
+  let tempHome: string | undefined;
   let daemon: DaemonInstance | undefined;
-  afterEach(async () => { if (daemon) { await daemon.stop(); daemon = undefined; } });
+
+  beforeEach(() => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-daemon-home-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    clearProjectMapCache();
+  });
+
+  afterEach(async () => {
+    if (daemon) { await daemon.stop(); daemon = undefined; }
+    clearProjectMapCache();
+    if (tempHome) rmSync(tempHome, { recursive: true, force: true });
+    tempHome = undefined;
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
+  });
 
   it("starts and responds to /health", async () => {
     daemon = await createDaemon(loadDaemonConfig("/x", { daemon: { port: 0 } }));
@@ -111,6 +131,20 @@ describe("daemon server", () => {
   it("turns Windows paths into relative Claude project directory names", () => {
     expect(claudeProjectDirName("C:\\work\\repo")).toBe("work-repo");
     expect(claudeProjectDirName("\\\\server\\share\\repo")).toBe("server-share-repo");
+    expect(claudeProjectDirName("/")).toBe("root");
+  });
+
+  it("falls back to meta cwd while map.json is temporarily invalid", () => {
+    const canonical = mkdtempSync(join(tmpdir(), "lcm-scan-invalid-map-"));
+    mkdirSync(join(homedir(), ".lcm"), { recursive: true });
+    writeFileSync(projectMapPath(), "{not-json");
+    clearProjectMapCache();
+
+    try {
+      expect(projectTranscriptScanCwds("unknown-hash", canonical)).toEqual([canonical]);
+    } finally {
+      rmSync(canonical, { recursive: true, force: true });
+    }
   });
 });
 

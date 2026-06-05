@@ -318,7 +318,7 @@ export function listProjectMapEntries(): ProjectMap {
 }
 
 export function showProjectMapEntry(target?: string): { hash: string; entry: ProjectMapEntry; transient?: boolean } {
-  const map = loadProjectMap({ strict: true, reload: true });
+  const map = loadProjectMapWithMetadata({ strict: true, reload: true });
   const targetPath = target ?? process.cwd();
   if (!target) {
     const matches = findPathMatches(map, targetPath);

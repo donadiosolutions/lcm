@@ -7,11 +7,20 @@ import { registerMapCommand, registerMemoryCommands, shouldRunMain } from "../..
 import { clearProjectMapCache, hashProjectPath, normalizeProjectPath } from "../../src/project-map.js";
 
 const originalCwd = process.cwd();
+const originalHome = process.env.HOME;
+const originalUserProfile = process.env.USERPROFILE;
+let tempHome: string | undefined;
 
 afterEach(() => {
   process.chdir(originalCwd);
   clearProjectMapCache();
   vi.restoreAllMocks();
+  if (tempHome) rmSync(tempHome, { recursive: true, force: true });
+  tempHome = undefined;
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = originalUserProfile;
 });
 
 async function runMapCommand(args: string[]): Promise<{ stdout: string[]; stderr: string[] }> {
@@ -85,6 +94,10 @@ describe("map command registration", () => {
   });
 
   it("adds, lists, shows, and removes aliases through CLI actions", async () => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-map-cli-home-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    clearProjectMapCache();
     const dir = mkdtempSync(join(tmpdir(), "lcm-map-cli-"));
     const canonical = join(dir, "canonical");
     const alias = join(dir, "missing-alias");

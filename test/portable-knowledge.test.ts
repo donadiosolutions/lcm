@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { PromotedStore } from "../src/db/promoted.js";
@@ -17,6 +17,9 @@ import { addProjectAlias, clearProjectMapCache } from "../src/project-map.js";
 import { lcmHomeDir } from "../src/runtime-paths.js";
 
 const tempDirs: string[] = [];
+const originalHome = process.env.HOME;
+const originalUserProfile = process.env.USERPROFILE;
+let tempHome: string | undefined;
 
 function makeTempDir() {
   const d = mkdtempSync(join(tmpdir(), "lcm-portable-knowledge-"));
@@ -24,10 +27,22 @@ function makeTempDir() {
   return d;
 }
 
+beforeEach(() => {
+  tempHome = mkdtempSync(join(tmpdir(), "lcm-portable-home-"));
+  process.env.HOME = tempHome;
+  process.env.USERPROFILE = tempHome;
+  clearProjectMapCache();
+});
+
 afterEach(() => {
   for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true });
-  rmSync(lcmHomeDir(), { recursive: true, force: true });
   clearProjectMapCache();
+  if (tempHome) rmSync(tempHome, { recursive: true, force: true });
+  tempHome = undefined;
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = originalUserProfile;
 });
 
 /**

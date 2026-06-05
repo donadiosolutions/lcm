@@ -1,10 +1,10 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import type { DaemonConfig } from "../config.js";
 import { projectPaths } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
+import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
 import { runLcmMigrations } from "../../db/migration.js";
 import { ConversationStore } from "../../store/conversation-store.js";
 import { SummaryStore } from "../../store/summary-store.js";
@@ -40,7 +40,7 @@ export function createPromoteHandler(
       return;
     }
 
-    const db = new DatabaseSync(dbPath);
+    const db = getLcmConnection(dbPath);
     let processed = 0;
     let promoted = 0;
     let totalConversations = 0;
@@ -125,7 +125,7 @@ export function createPromoteHandler(
       sendJson(res, 500, { error: err instanceof Error ? err.message : "promote failed" });
       return;
     } finally {
-      db.close();
+      closeLcmConnection(dbPath);
     }
 
     sendJson(res, 200, { processed, promoted, conversations: totalConversations });

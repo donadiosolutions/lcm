@@ -1,6 +1,6 @@
-import { beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   addProjectAlias,
@@ -30,8 +30,25 @@ function makeDir(name: string): string {
 }
 
 describe("project map", () => {
+  const originalHome = process.env.HOME;
+  const originalUserProfile = process.env.USERPROFILE;
+  let tempHome: string | undefined;
+
   beforeEach(() => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-project-map-home-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
     resetLcmHome();
+  });
+
+  afterEach(() => {
+    clearProjectMapCache();
+    if (tempHome) rmSync(tempHome, { recursive: true, force: true });
+    tempHome = undefined;
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
   });
 
   it("auto-creates a formatted canonical entry for a newly seen project path", () => {
@@ -79,6 +96,21 @@ describe("project map", () => {
     const map = listProjectMapEntries();
 
     expect(map[hash]?.canonical).toBe(normalizeProjectPath(canonical));
+  });
+
+  it("shows metadata-backed map entries by hash and path", () => {
+    const canonical = makeDir("show-from-meta");
+    const hash = hashProjectPath(normalizeProjectPath(canonical));
+    mkdirSync(join(homedir(), ".lcm", "projects", hash), { recursive: true });
+    writeFileSync(join(homedir(), ".lcm", "projects", hash, "meta.json"), JSON.stringify({ cwd: canonical }));
+
+    const byHash = showProjectMapEntry(hash);
+    const byPath = showProjectMapEntry(canonical);
+
+    expect(byHash.transient).toBeUndefined();
+    expect(byHash.entry.canonical).toBe(normalizeProjectPath(canonical));
+    expect(byPath.hash).toBe(hash);
+    expect(byPath.entry.canonical).toBe(normalizeProjectPath(canonical));
   });
 
   it("skips metadata backfill entries that would create path ambiguity", () => {
