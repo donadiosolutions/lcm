@@ -81,6 +81,22 @@ describe("project map", () => {
     expect(map[hash]?.canonical).toBe(normalizeProjectPath(canonical));
   });
 
+  it("skips metadata backfill entries that would create path ambiguity", () => {
+    const shared = makeDir("shared-meta");
+    const firstHash = hashProjectPath(`${normalizeProjectPath(shared)}-first`);
+    const secondHash = hashProjectPath(`${normalizeProjectPath(shared)}-second`);
+    mkdirSync(join(homedir(), ".lcm", "projects", firstHash), { recursive: true });
+    mkdirSync(join(homedir(), ".lcm", "projects", secondHash), { recursive: true });
+    writeFileSync(join(homedir(), ".lcm", "projects", firstHash, "meta.json"), JSON.stringify({ cwd: shared }));
+    writeFileSync(join(homedir(), ".lcm", "projects", secondHash, "meta.json"), JSON.stringify({ cwd: shared }));
+
+    const map = listProjectMapEntries();
+    const validation = validateProjectMap({ fix: true });
+
+    expect(Object.keys(map)).toHaveLength(1);
+    expect(validation.ok).toBe(true);
+  });
+
   it("reports invalid JSON without rewriting the map", () => {
     writeFileSync(projectMapPath(), "{not-json");
 
@@ -200,6 +216,18 @@ describe("project map", () => {
     expect(map[canonicalId].aliases).toContain(normalizeProjectPath(alias));
     expect(map[staleAliasId]).toBeUndefined();
     expect(projectId(alias)).toBe(canonicalId);
+  });
+
+  it("refuses to adopt an already-seen alias project that has stored data", () => {
+    const canonical = makeDir("data-canonical");
+    const alias = makeDir("data-alias");
+    projectId(canonical);
+    const staleAliasId = projectId(alias);
+    mkdirSync(join(homedir(), ".lcm", "projects", staleAliasId), { recursive: true });
+    writeFileSync(join(homedir(), ".lcm", "projects", staleAliasId, "db.sqlite"), "");
+
+    expect(() => addProjectAlias(alias, { canonical })).toThrow(/stored data/);
+    expect(listProjectMapEntries()[staleAliasId]).toBeDefined();
   });
 
   it("shows an unmapped path without creating or rewriting map.json", () => {

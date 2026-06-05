@@ -144,6 +144,21 @@ describe("runDoctor project map checks", () => {
     }
   });
 
+  it("reports a missing project map without depending on validation warning text", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-missing-"));
+    try {
+      mkdirSync(join(home, ".lcm"), { recursive: true });
+
+      const results = await runDoctor(minimalDeps({ homedir: home, cwd: "/tmp/nonexistent-project-xyz" }));
+      const check = results.find((r) => r.name === "project-map");
+
+      expect(check?.status).toBe("pass");
+      expect(check?.message).toBe("map.json not created yet");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("reports project map auto-fix write failures without aborting doctor", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-write-fail-"));
     try {

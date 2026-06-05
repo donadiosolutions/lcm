@@ -107,6 +107,11 @@ describe("daemon server", () => {
     rmSync(canonical, { recursive: true, force: true });
     rmSync(alias, { recursive: true, force: true });
   });
+
+  it("turns Windows paths into relative Claude project directory names", () => {
+    expect(claudeProjectDirName("C:\\work\\repo")).toBe("work-repo");
+    expect(claudeProjectDirName("\\\\server\\share\\repo")).toBe("server-share-repo");
+  });
 });
 
 describe("daemon idle timeout", () => {

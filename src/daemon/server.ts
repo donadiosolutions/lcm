@@ -35,7 +35,13 @@ export type DaemonOptions = { proxyManager?: ProxyManager; onIdle?: () => void; 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
 
 export function claudeProjectDirName(cwd: string): string {
-  return cwd.replace(/\//g, "-").replace(/^-/, "");
+  const sanitized = cwd
+    .replace(/^[A-Za-z]:/, "")
+    .replace(/^[\\/]+/, "")
+    .replace(/[\\/]+/g, "-")
+    .replace(/:/g, "-")
+    .replace(/^-+/, "");
+  return sanitized || "root";
 }
 
 export function projectTranscriptScanCwds(projectHash: string, metaCwd: string): string[] {

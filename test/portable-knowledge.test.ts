@@ -13,6 +13,8 @@ import {
   importKnowledge,
   type ExportDocument,
 } from "../src/portable-knowledge.js";
+import { addProjectAlias, clearProjectMapCache } from "../src/project-map.js";
+import { lcmHomeDir } from "../src/runtime-paths.js";
 
 const tempDirs: string[] = [];
 
@@ -24,6 +26,8 @@ function makeTempDir() {
 
 afterEach(() => {
   for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  rmSync(lcmHomeDir(), { recursive: true, force: true });
+  clearProjectMapCache();
 });
 
 /**
@@ -117,6 +121,20 @@ describe("portable-knowledge — export", () => {
     const doc: ExportDocument = JSON.parse(readFileSync(outFile, "utf-8"));
     expect(doc.entries).toHaveLength(1);
     expect(doc.entries[0].content).toBe("Entry one");
+  });
+
+  it("exports canonical project knowledge when invoked from an alias", async () => {
+    const baseDir = lcmHomeDir();
+    const canonical = makeTempDir();
+    const alias = makeTempDir();
+    const outFile = join(makeTempDir(), "alias-export.json");
+    seedProject(baseDir, canonical, [{ content: "Canonical memory", tags: ["decision"] }]);
+    addProjectAlias(alias, { canonical });
+
+    const result = await exportKnowledge(alias, { output: outFile, skipScrub: true });
+
+    expect(result.exported).toBe(1);
+    expect(result.projectCwd).toBe(realpathSync(canonical));
   });
 
   it("filters by tags", async () => {
@@ -234,6 +252,31 @@ describe("portable-knowledge — import", () => {
     const rows = store.getAll({ projectId: projId });
     expect(rows.length).toBeGreaterThanOrEqual(1);
     db.close();
+  });
+
+  it("imports alias-invoked knowledge into the canonical project", async () => {
+    const canonical = makeTempDir();
+    const alias = makeTempDir();
+    addProjectAlias(alias, { canonical });
+    const canonicalId = toProjectId(canonical);
+
+    const doc = makeDoc([
+      {
+        content: "Imported through alias",
+        tags: ["decision"],
+        confidence: 0.9,
+        createdAt: new Date().toISOString(),
+        sessionId: null,
+      },
+    ]);
+
+    const result = await importKnowledge(alias, doc);
+    const canonicalDbPath = join(lcmHomeDir(), "projects", canonicalId, "db.sqlite");
+    const aliasDbPath = join(lcmHomeDir(), "projects", toProjectId(alias), "db.sqlite");
+
+    expect(result.imported).toBe(1);
+    expect(existsSync(canonicalDbPath)).toBe(true);
+    expect(existsSync(aliasDbPath)).toBe(false);
   });
 
   it("dry-run returns expected counts without writing", async () => {

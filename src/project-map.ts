@@ -277,13 +277,19 @@ function populateFromExistingProjectMetadata(map: ProjectMap, homeDir?: string):
     try {
       const meta = JSON.parse(readFileSync(metaPath, "utf-8")) as { cwd?: unknown };
       if (typeof meta.cwd !== "string" || meta.cwd.length === 0) continue;
-      next[entry.name] = { canonical: normalizeProjectPath(meta.cwd), aliases: [] };
+      const canonical = normalizeProjectPath(meta.cwd);
+      if (findPathMatches(next, canonical).size > 0) continue;
+      next[entry.name] = { canonical, aliases: [] };
       changed = true;
     } catch {
       // Ignore corrupt project metadata; doctor handles project health separately.
     }
   }
   return { map: next, changed };
+}
+
+function existingProjectHasDatabase(hash: string): boolean {
+  return existsSync(join(projectsDir(), hash, "db.sqlite"));
 }
 
 export function resolveProjectIdentity(cwd: string): ProjectIdentity {
@@ -388,6 +394,9 @@ export function addProjectAlias(alias: string, opts: { canonical?: string; hash?
         && entry.aliases.length === 0;
     });
     if (existingOwners.size === 1 && adoptableOwners.length === 1) {
+      if (existingProjectHasDatabase(adoptableOwners[0])) {
+        throw new Error(`alias is already a project with stored data: ${normalizedAlias} (${adoptableOwners[0]})`);
+      }
       delete target.map[adoptableOwners[0]];
     } else {
       throw new Error(`alias is already mapped to another hash: ${normalizedAlias} (${[...existingOwners].join(", ")})`);

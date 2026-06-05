@@ -45,6 +45,8 @@ lcm map remove /alias/path
 
 LCM refuses to add an alias that already exists under the target hash or that would make a path resolve to more than one hash.
 
+If the alias path was already seen before and only has an empty canonical map entry, `lcm map add` converts that entry into an alias for the target project. If the old alias project already has a `db.sqlite`, LCM refuses the conversion so existing project data is not hidden or stranded by a silent remap.
+
 ## Manual edits and daemon reloads
 
 You can edit `~/.lcm/map.json` by hand. The daemon watches the file and reloads valid changes without restart. If an editor briefly saves invalid JSON, the daemon keeps the last valid in-memory map and tries again on the next file change.

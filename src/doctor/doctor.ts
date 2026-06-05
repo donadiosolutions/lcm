@@ -123,11 +123,12 @@ function checkProjectMap(results: CheckResult[], deps: DoctorDeps): void {
   }
 
   const count = validation.map ? Object.keys(validation.map).length : 0;
+  const mapExists = existsSync(validation.path);
   results.push({
     name: "project-map",
     category: "Project Map",
     status: "pass",
-    message: validation.warnings.includes("map.json does not exist yet")
+    message: !mapExists
       ? "map.json not created yet"
       : `${count} mapped project${count === 1 ? "" : "s"}`,
   });
