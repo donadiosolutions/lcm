@@ -1,5 +1,11 @@
 # @donadiosolutions/lcm
 
+## 1.1.1
+
+### Patch Changes
+
+- 7f527b6: Normalize product naming to Long Context Manager (LCM), keep Codex connector prompts free of Claude-specific wording, and preserve legacy install migration and cleanup through generated compatibility identifiers.
+
 ## 1.1.0
 
 ### Minor Changes
