@@ -305,9 +305,13 @@ export async function drainEventsForCwd(
   return result;
 }
 
-export async function promoteEventsForCwd(config: DaemonConfig, cwd: string): Promise<PromoteResult> {
+export async function promoteEventsForCwd(
+  config: DaemonConfig,
+  cwd: string,
+  sidecarPathOverride?: string,
+): Promise<PromoteResult> {
   cwd = validateCwd(cwd);
-  const sidecarPath = eventsDbPath(cwd);
+  const sidecarPath = sidecarPathOverride ?? eventsDbPath(cwd);
   const edb = new EventsDb(sidecarPath);
   const dbPath = projectDbPath(cwd);
   let dbOpened = false;

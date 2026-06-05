@@ -4,7 +4,7 @@ import { validateCwd } from "./validate-cwd.js";
 import { safeLogError } from "../hooks/hook-errors.js";
 import { EVENTS_UNPROCESSED_BATCH_LIMIT } from "../hooks/events-db.js";
 import { collectEventSidecars } from "../db/event-sidecars.js";
-import { drainEventsForCwd, promoteEventsForCwd, type PromoteResult } from "./routes/promote-events.js";
+import { promoteEventsForCwd, type PromoteResult } from "./routes/promote-events.js";
 
 export const PASSIVE_EVENT_PROCESSOR_DEFAULTS = {
   priorityDelayMs: 250,
@@ -25,7 +25,6 @@ export interface PassiveEventNotification {
 
 interface PassiveEventProcessorDeps {
   promoteEventsForCwd?: typeof promoteEventsForCwd;
-  drainEventsForCwd?: typeof drainEventsForCwd;
   collectEventSidecars?: typeof collectEventSidecars;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
@@ -39,7 +38,6 @@ type IntervalHandle = ReturnType<typeof setInterval>;
 
 export class PassiveEventProcessor {
   private readonly promoteOneBatch: typeof promoteEventsForCwd;
-  private readonly drainProject: typeof drainEventsForCwd;
   private readonly scanSidecars: typeof collectEventSidecars;
   private readonly setTimer: typeof setTimeout;
   private readonly clearTimer: typeof clearTimeout;
@@ -61,7 +59,6 @@ export class PassiveEventProcessor {
     deps: PassiveEventProcessorDeps = {},
   ) {
     this.promoteOneBatch = deps.promoteEventsForCwd ?? promoteEventsForCwd;
-    this.drainProject = deps.drainEventsForCwd ?? drainEventsForCwd;
     this.scanSidecars = deps.collectEventSidecars ?? collectEventSidecars;
     this.setTimer = deps.setTimeout ?? setTimeout;
     this.clearTimer = deps.clearTimeout ?? clearTimeout;
@@ -135,7 +132,7 @@ export class PassiveEventProcessor {
           continue;
         }
         try {
-          await this.drainProject(this.config, sidecar.cwd, sidecar.path);
+          await this.promoteOneBatch(this.config, sidecar.cwd, sidecar.path);
         } catch (error) {
           this.logError("passive-event-processor", error, { cwd: sidecar.cwd });
         }
@@ -214,7 +211,7 @@ export class PassiveEventProcessor {
       if (result.message === "no unprocessed events") return;
       const processed = result.promoted + result.skipped;
       if (processed === 0) return;
-      remaining = result.promoted + result.skipped >= EVENTS_UNPROCESSED_BATCH_LIMIT;
+      remaining = processed >= EVENTS_UNPROCESSED_BATCH_LIMIT || result.errors > 0;
       if (!remaining) return;
     }
     if (remaining && !this.stopped) {

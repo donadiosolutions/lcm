@@ -103,7 +103,7 @@ describe("PassiveEventProcessor", () => {
     const { timers, intervals, deps } = timerDeps();
     let resolveDrained: (() => void) | undefined;
     const drained = new Promise<void>(resolve => { resolveDrained = resolve; });
-    const drainEventsForCwd = vi.fn().mockImplementation(async () => {
+    const promoteEventsForCwd = vi.fn().mockImplementation(async () => {
       resolveDrained?.();
       return { promoted: 1, skipped: 0, correlated: 0, errors: 0, batches: 1 };
     });
@@ -116,7 +116,7 @@ describe("PassiveEventProcessor", () => {
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
       collectEventSidecars: collectEventSidecars as any,
-      drainEventsForCwd: drainEventsForCwd as any,
+      promoteEventsForCwd: promoteEventsForCwd as any,
     });
 
     processor.start();
@@ -127,9 +127,9 @@ describe("PassiveEventProcessor", () => {
     await drained;
 
     expect(collectEventSidecars).toHaveBeenCalledWith({ timeoutMs: 5000, maxDbs: 20, startIndex: 0 });
-    expect(drainEventsForCwd).toHaveBeenCalledTimes(1);
-    expect(drainEventsForCwd.mock.calls[0][1]).toBe("/tmp");
-    expect(drainEventsForCwd.mock.calls[0][2]).toBe("/events/tmp.db");
+    expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+    expect(promoteEventsForCwd.mock.calls[0][1]).toBe("/tmp");
+    expect(promoteEventsForCwd.mock.calls[0][2]).toBe("/events/tmp.db");
   });
 
   it("prevents concurrent active drains and requeues remaining work after the batch limit", async () => {
@@ -155,6 +155,23 @@ describe("PassiveEventProcessor", () => {
     await first;
 
     await processor.flushOnce();
+    expect(promoteEventsForCwd).toHaveBeenCalledTimes(2);
+  });
+
+  it("requeues active work when a batch reports promotion errors", async () => {
+    const { deps } = timerDeps();
+    const promoteEventsForCwd = vi.fn()
+      .mockResolvedValueOnce({ promoted: 2, skipped: 0, correlated: 0, errors: 1 })
+      .mockResolvedValueOnce({ promoted: 0, skipped: 0, correlated: 0, errors: 0, message: "no unprocessed events" });
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      promoteEventsForCwd: promoteEventsForCwd as any,
+    });
+
+    processor.notify({ cwd: "/tmp", priority: 1, pendingCount: 1 });
+    await processor.flushOnce();
+    await processor.flushOnce();
+
     expect(promoteEventsForCwd).toHaveBeenCalledTimes(2);
   });
 

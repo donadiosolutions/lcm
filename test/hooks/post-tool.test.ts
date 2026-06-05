@@ -141,4 +141,24 @@ describe("handlePostToolUse", () => {
       sourceHook: "PostToolUse",
     }));
   });
+
+  it("ignores invalid daemon_port values", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-invalid-port-cwd-"));
+    extraDirs.push(inputCwd);
+
+    await handlePostToolUse(JSON.stringify({
+      session_id: "test-session",
+      tool_name: "AskUserQuestion",
+      cwd: inputCwd,
+      daemon_port: "4567",
+      tool_input: { question: "Use SQLite?" },
+      tool_response: "yes",
+    }), 4568);
+
+    expect(firePromoteEventsNotifyRequest).toHaveBeenCalledWith(4568, expect.objectContaining({
+      cwd: inputCwd,
+      priority: 1,
+      sourceHook: "PostToolUse",
+    }));
+  });
 });
