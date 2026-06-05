@@ -11,7 +11,7 @@ import { projectDir } from "../daemon/project.js";
 import { collectEventStats, collectDetailedEventStats } from "../db/events-stats.js";
 import { validateRegex } from "../store/regex-safety.js";
 import { configPath, daemonPidPath } from "../runtime-paths.js";
-import { validateProjectMap } from "../project-map.js";
+import { projectMapPath, validateProjectMap, type ProjectMapValidation } from "../project-map.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -84,7 +84,19 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
 }
 
 function checkProjectMap(results: CheckResult[], deps: DoctorDeps): void {
-  const validation = validateProjectMap({ homeDir: deps.homedir, fix: true });
+  let validation: ProjectMapValidation;
+  try {
+    validation = validateProjectMap({ homeDir: deps.homedir, fix: true });
+  } catch (err) {
+    results.push({
+      name: "project-map",
+      category: "Project Map",
+      status: "fail",
+      message: `${projectMapPath(deps.homedir)}: ${err instanceof Error ? err.message : String(err)}`,
+    });
+    return;
+  }
+
   if (!validation.ok) {
     results.push({
       name: "project-map",

@@ -187,6 +187,14 @@ describe("project map", () => {
     expect(existsSync(projectMapPath())).toBe(false);
   });
 
+  it("does not create a map entry when removing from an unmapped canonical target", () => {
+    const canonical = makeDir("remove-unmapped-canonical");
+    const alias = join(homedir(), "remove-unmapped-alias");
+
+    expect(() => removeProjectAlias(alias, { canonical })).toThrow(/unknown canonical project path/);
+    expect(existsSync(projectMapPath())).toBe(false);
+  });
+
   it("requires --canonical targets to be existing directories", () => {
     const canonicalFile = join(homedir(), "canonical-file");
     const alias = makeDir("file-target-alias");

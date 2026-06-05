@@ -144,6 +144,26 @@ describe("runDoctor project map checks", () => {
     }
   });
 
+  it("reports project map auto-fix write failures without aborting doctor", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-write-fail-"));
+    try {
+      const canonical = join(home, "project");
+      mkdirSync(join(home, ".lcm"), { recursive: true });
+      mkdirSync(canonical, { recursive: true });
+      writeFileSync(join(home, ".lcm", "oldmaps"), "not a directory");
+      const hash = hashProjectPath(normalizeProjectPath(canonical));
+      writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({ [hash]: { canonical, aliases: [] } }));
+
+      const results = await runDoctor(minimalDeps({ homedir: home, cwd: "/tmp/nonexistent-project-xyz" }));
+      const check = results.find((r) => r.name === "project-map");
+
+      expect(check?.status).toBe("fail");
+      expect(check?.message).toContain("map.json");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("fails on cross-hash path ambiguity", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-ambiguous-"));
     try {

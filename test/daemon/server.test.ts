@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
+import { createServer } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -274,5 +275,32 @@ describe("daemon proxy integration", () => {
     const res = await fetch(`http://127.0.0.1:${daemon.address().port}/health`);
     expect(res.status).toBe(200);
     warnSpy.mockRestore();
+  });
+
+  it("cleans up startup resources when listen fails", async () => {
+    const blocker = createServer();
+    await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", () => resolve()));
+    const port = (blocker.address() as { port: number }).port;
+    const mockProxy = {
+      start: vi.fn().mockResolvedValue(undefined),
+      stop: vi.fn().mockResolvedValue(undefined),
+      isHealthy: vi.fn().mockResolvedValue(true),
+      port: 3456,
+      available: true,
+    };
+    const config = loadDaemonConfig("/x", {
+      daemon: { port, idleTimeoutMs: 0 },
+      llm: { provider: "disabled" },
+    });
+
+    try {
+      await expect(createDaemon(config, { proxyManager: mockProxy })).rejects.toThrow(/EADDRINUSE|listen/);
+      expect(mockProxy.start).toHaveBeenCalled();
+      expect(mockProxy.stop).toHaveBeenCalled();
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        blocker.close((err) => err ? reject(err) : resolve());
+      });
+    }
   });
 });

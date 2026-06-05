@@ -383,13 +383,27 @@ export function addProjectAlias(alias: string, opts: { canonical?: string; hash?
 
 export function removeProjectAlias(alias: string, opts: { canonical?: string; hash?: string } = {}): { hash: string; entry: ProjectMapEntry; removed: boolean; backupPath?: string } {
   const normalizedAlias = normalizeProjectPath(alias);
-  let map = listProjectMapEntries();
+  let map = loadProjectMap({ strict: true, reload: true });
   let hash: string;
 
-  if (opts.canonical || opts.hash) {
-    const target = resolveCliTarget(opts);
-    map = target.map;
-    hash = target.hash;
+  if (opts.canonical && opts.hash) {
+    throw new Error("--canonical and --hash are mutually exclusive");
+  }
+
+  if (opts.canonical) {
+    const canonical = normalizeProjectPath(opts.canonical);
+    if (!existsSync(canonical)) throw new Error(`canonical path does not exist: ${canonical}`);
+    if (!statSync(canonical).isDirectory()) throw new Error(`canonical path must be an existing directory: ${canonical}`);
+    const owners = Object.entries(map)
+      .filter(([, entry]) => normalizeProjectPath(entry.canonical) === canonical)
+      .map(([ownerHash]) => ownerHash);
+    if (owners.length === 0) throw new Error(`unknown canonical project path: ${canonical}`);
+    if (owners.length > 1) throw new Error(`canonical path maps to multiple hashes: ${canonical} (${owners.join(", ")})`);
+    hash = owners[0];
+  } else if (opts.hash) {
+    if (!HASH_RE.test(opts.hash)) throw new Error(`invalid project hash: ${opts.hash}`);
+    if (!map[opts.hash]) throw new Error(`unknown project hash: ${opts.hash}`);
+    hash = opts.hash;
   } else {
     const owners = Object.entries(map)
       .filter(([, entry]) => entry.aliases.map(normalizeProjectPath).includes(normalizedAlias))

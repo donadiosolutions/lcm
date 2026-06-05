@@ -218,8 +218,31 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }
   }
 
-  return new Promise((resolve) => {
+  const cleanupStartupFailure = async (): Promise<void> => {
+    clearInterval(ingestInterval);
+    projectMapWatcher.close();
+    passiveEventProcessor.stop();
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    if (proxyManager) {
+      try { await proxyManager.stop(); } catch { /* non-fatal */ }
+    }
+  };
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const rejectStartup = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanupStartupFailure()
+        .then(() => reject(err))
+        .catch(() => reject(err));
+    };
+
+    server.once("error", rejectStartup);
     server.listen(listenPort, "127.0.0.1", () => {
+      if (settled) return;
+      settled = true;
+      server.off("error", rejectStartup);
       resetIdleTimer();
       const addr = server.address() as AddressInfo;
       const actualPort = addr.port;

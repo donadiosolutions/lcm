@@ -178,9 +178,24 @@ export function registerMemoryCommands(program: Command): void {
 }
 
 export function registerMapCommand(program: Command): void {
+  type MapRootOptions = { help?: boolean };
+  type MapListOptions = { help?: boolean; json?: boolean };
+  type MapShowOptions = MapListOptions;
+  type MapMutateOptions = { help?: boolean; canonical?: string; hash?: string; json?: boolean };
+
+  const mapError = (err: unknown, opts: { json?: boolean } = {}): never => {
+    const message = err instanceof Error ? err.message : String(err);
+    if (opts.json) {
+      printJson({ error: message });
+    } else {
+      console.error(`Error: ${message}`);
+    }
+    exit(1);
+  };
+
   const mapCmd = new Command("map").description("Manage project path aliases");
   mapCmd.helpOption(false).option("-h, --help", "Show help");
-  mapCmd.action(async (opts) => {
+  mapCmd.action(async (opts: MapRootOptions) => {
     if (opts.help) {
       const { printHelp } = await import("../src/cli-help.js");
       printHelp("map"); exit(0);
@@ -195,21 +210,25 @@ export function registerMapCommand(program: Command): void {
     .option("--json", "Output structured JSON")
     .helpOption(false)
     .option("-h, --help", "Show help")
-    .action(async (opts) => {
+    .action(async (opts: MapListOptions) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("map"); exit(0);
       }
       const { listProjectMapEntries } = await import("../src/project-map.js");
-      const map = listProjectMapEntries();
-      if (opts.json) {
-        printJson({ entries: map });
-        return;
-      }
-      for (const [hash, entry] of Object.entries(map)) {
-        console.log(`${hash}`);
-        console.log(`  canonical: ${entry.canonical}`);
-        for (const alias of entry.aliases) console.log(`  alias: ${alias}`);
+      try {
+        const map = listProjectMapEntries();
+        if (opts.json) {
+          printJson({ entries: map });
+          return;
+        }
+        for (const [hash, entry] of Object.entries(map)) {
+          console.log(`${hash}`);
+          console.log(`  canonical: ${entry.canonical}`);
+          for (const alias of entry.aliases) console.log(`  alias: ${alias}`);
+        }
+      } catch (err) {
+        mapError(err, opts);
       }
     });
 
@@ -219,20 +238,24 @@ export function registerMapCommand(program: Command): void {
     .option("--json", "Output structured JSON")
     .helpOption(false)
     .option("-h, --help", "Show help")
-    .action(async (target: string | undefined, opts) => {
+    .action(async (target: string | undefined, opts: MapShowOptions) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("map"); exit(0);
       }
       const { showProjectMapEntry } = await import("../src/project-map.js");
-      const shown = showProjectMapEntry(target);
-      if (opts.json) {
-        printJson(shown);
-        return;
+      try {
+        const shown = showProjectMapEntry(target);
+        if (opts.json) {
+          printJson(shown);
+          return;
+        }
+        console.log(shown.hash);
+        console.log(`  canonical: ${shown.entry.canonical}`);
+        for (const alias of shown.entry.aliases) console.log(`  alias: ${alias}`);
+      } catch (err) {
+        mapError(err, opts);
       }
-      console.log(shown.hash);
-      console.log(`  canonical: ${shown.entry.canonical}`);
-      for (const alias of shown.entry.aliases) console.log(`  alias: ${alias}`);
     });
 
   mapCmd
@@ -243,7 +266,7 @@ export function registerMapCommand(program: Command): void {
     .option("--json", "Output structured JSON")
     .helpOption(false)
     .option("-h, --help", "Show help")
-    .action(async (alias: string, opts) => {
+    .action(async (alias: string, opts: MapMutateOptions) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("map"); exit(0);
@@ -258,8 +281,7 @@ export function registerMapCommand(program: Command): void {
         if (result.warning) console.error(`Warning: ${result.warning}`);
         console.log(`Added alias to ${result.hash}`);
       } catch (err) {
-        console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
-        exit(1);
+        mapError(err, opts);
       }
     });
 
@@ -271,7 +293,7 @@ export function registerMapCommand(program: Command): void {
     .option("--json", "Output structured JSON")
     .helpOption(false)
     .option("-h, --help", "Show help")
-    .action(async (alias: string, opts) => {
+    .action(async (alias: string, opts: MapMutateOptions) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("map"); exit(0);
@@ -285,8 +307,7 @@ export function registerMapCommand(program: Command): void {
         }
         console.log(result.removed ? `Removed alias from ${result.hash}` : `Alias was not present on ${result.hash}`);
       } catch (err) {
-        console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
-        exit(1);
+        mapError(err, opts);
       }
     });
 
