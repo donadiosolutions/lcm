@@ -224,7 +224,7 @@ lcm stats --pool           # connection pool statistics
 lcm map list               # list canonical project paths and aliases
 lcm map list --json        # output the project path map as JSON
 lcm map show               # show the current project's canonical path and aliases
-lcm map show <path|hash>   # show a specific path or project hash
+lcm map show [path-or-hash] # show a specific path or project hash
 lcm map add <alias>        # add an alias to the current project
 lcm map add <alias> --canonical <path> # add an alias to a specific canonical project
 lcm map add <alias> --hash <hash>      # add an alias to a specific project hash
