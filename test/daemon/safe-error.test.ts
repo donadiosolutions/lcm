@@ -3,7 +3,7 @@ import { sanitizeError } from "../../src/daemon/safe-error.js";
 
 describe("sanitizeError", () => {
   it("strips absolute file paths from error messages", () => {
-    const result = sanitizeError("ENOENT: no such file /Users/pedro/.lossless-claude/x");
+    const result = sanitizeError("ENOENT: no such file /Users/pedro/.lcm/x");
     expect(result).not.toContain("/Users/pedro");
   });
 

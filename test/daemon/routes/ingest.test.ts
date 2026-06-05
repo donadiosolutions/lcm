@@ -23,7 +23,7 @@ describe("POST /ingest", () => {
   });
 
   it("accepts messages[] as an alternative to transcript_path", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-ingest-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-"));
     tempDirs.push(tempDir);
 
     daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
@@ -45,7 +45,7 @@ describe("POST /ingest", () => {
   });
 
   it("accepts tool messages in structured ingestion mode", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-ingest-tool-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-tool-"));
     tempDirs.push(tempDir);
 
     daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
@@ -69,7 +69,7 @@ describe("POST /ingest", () => {
   });
 
   it("prefers messages[] over transcript_path when both are present", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-ingest-both-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-both-"));
     tempDirs.push(tempDir);
 
     daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
@@ -92,7 +92,7 @@ describe("POST /ingest", () => {
   });
 
   it("parses Codex transcript_path when client is codex", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-ingest-codex-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-codex-"));
     tempDirs.push(tempDir);
     const transcriptPath = join(tempDir, "codex-session.jsonl");
     writeFileSync(
@@ -138,7 +138,7 @@ describe("POST /ingest", () => {
   });
 
   it("scrubs secrets from message content before SQLite write", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-ingest-scrub-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-scrub-"));
     tempDirs.push(tempDir);
 
     daemon = await createDaemon(
@@ -174,7 +174,7 @@ describe("POST /ingest", () => {
   });
 
   it("increments redaction_stats per category when content contains secrets", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-ingest-redact-stats-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-redact-stats-"));
     tempDirs.push(tempDir);
 
     daemon = await createDaemon(
@@ -218,7 +218,7 @@ describe("POST /ingest", () => {
   });
 
   it("returns ingested=0 when transcript_path is missing and messages[] is absent", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-ingest-missing-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-missing-"));
     tempDirs.push(tempDir);
 
     daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));

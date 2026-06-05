@@ -5,6 +5,10 @@ type SummaryColumnInfo = {
   name?: string;
 };
 
+type SqliteMasterRow = {
+  sql?: string;
+};
+
 type SummaryDepthRow = {
   summary_id: string;
   conversation_id: number;
@@ -31,6 +35,40 @@ function ensureSummaryDepthColumn(db: DatabaseSync): void {
   const hasDepth = summaryColumns.some((col) => col.name === "depth");
   if (!hasDepth) {
     db.exec(`ALTER TABLE summaries ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`);
+  }
+}
+
+function ensureClientKeyedSessionInstructions(db: DatabaseSync): void {
+  const row = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_instructions'`)
+    .get() as SqliteMasterRow | undefined;
+  if (!row?.sql || !/CREATE\s+TABLE\s+session_instructions\b[\s\S]*\bid\s+INTEGER\s+PRIMARY\s+KEY\s+CHECK\s*\(\s*id\s*=\s*1\s*\)/i.test(row.sql)) {
+    return;
+  }
+
+  try {
+    db.exec(`
+      BEGIN;
+      DROP TABLE IF EXISTS session_instructions_next;
+      CREATE TABLE session_instructions_next (
+        id INTEGER PRIMARY KEY,
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO session_instructions_next (id, content, content_hash, updated_at)
+        SELECT id, content, content_hash, updated_at FROM session_instructions;
+      DROP TABLE session_instructions;
+      ALTER TABLE session_instructions_next RENAME TO session_instructions;
+      COMMIT;
+    `);
+  } catch (err) {
+    try {
+      db.exec(`ROLLBACK; DROP TABLE IF EXISTS session_instructions_next;`);
+    } catch {
+      // Preserve the original migration error.
+    }
+    throw err;
   }
 }
 
@@ -522,12 +560,13 @@ export function runLcmMigrations(
   // Session instructions (CLAUDE.md captured on startup)
   db.exec(`
     CREATE TABLE IF NOT EXISTS session_instructions (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
+      id INTEGER PRIMARY KEY,
       content TEXT NOT NULL,
       content_hash TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+  ensureClientKeyedSessionInstructions(db);
 
   // Promoted memories (cross-session, agent-stored)
   db.exec(`

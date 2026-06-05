@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { removeClaudeSettings, teardownDaemonService, uninstall, type TeardownDeps } from "../../installer/uninstall.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { legacyLaunchdPlistName, legacyLcmSlug, legacySystemdServiceName } from "../../src/legacy-names.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -110,7 +111,7 @@ describe("teardownDaemonService", () => {
     const cmds = deps.spawnSync.mock.calls.map((c: any[]) => `${c[0]} ${(c[1] as string[]).join(" ")}`);
     expect(cmds.some((c: string) => c.includes("launchctl unload"))).toBe(true);
     expect(deps.rmSync).toHaveBeenCalledWith(
-      expect.stringContaining("com.lossless-claude.daemon.plist")
+      expect.stringContaining(legacyLaunchdPlistName())
     );
   });
 
@@ -131,11 +132,11 @@ describe("teardownDaemonService", () => {
     teardownDaemonService(deps);
 
     const cmds = deps.spawnSync.mock.calls.map((c: any[]) => `${c[0]} ${(c[1] as string[]).join(" ")}`);
-    expect(cmds.some((c: string) => c.includes("systemctl --user stop lossless-claude"))).toBe(true);
-    expect(cmds.some((c: string) => c.includes("systemctl --user disable lossless-claude"))).toBe(true);
+    expect(cmds.some((c: string) => c.includes(`systemctl --user stop ${legacyLcmSlug()}`))).toBe(true);
+    expect(cmds.some((c: string) => c.includes(`systemctl --user disable ${legacyLcmSlug()}`))).toBe(true);
     expect(cmds.some((c: string) => c.includes("systemctl --user daemon-reload"))).toBe(true);
     expect(deps.rmSync).toHaveBeenCalledWith(
-      expect.stringContaining("lossless-claude.service")
+      expect.stringContaining(legacySystemdServiceName())
     );
   });
 
@@ -147,7 +148,7 @@ describe("teardownDaemonService", () => {
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("unit file not found"));
     expect(deps.rmSync).not.toHaveBeenCalled();
     const cmds = deps.spawnSync.mock.calls.map((c: any[]) => `${c[0]} ${(c[1] as string[]).join(" ")}`);
-    expect(cmds.some((c: string) => c.includes("systemctl --user stop lossless-claude"))).toBe(true);
+    expect(cmds.some((c: string) => c.includes(`systemctl --user stop ${legacyLcmSlug()}`))).toBe(true);
     warnSpy.mockRestore();
   });
 

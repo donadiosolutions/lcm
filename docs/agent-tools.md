@@ -119,7 +119,7 @@ lcm_expand(nodeId: "sum_def456", depth: 2)
 
 ### lcm_store
 
-Store a memory into lossless-claude's semantic layer. Use to persist decisions, findings, reasoning outcomes, or any knowledge worth retrieving in future sessions.
+Store a memory into Long Context Manager (LCM)'s semantic layer. Use to persist decisions, findings, reasoning outcomes, or any knowledge worth retrieving in future sessions.
 
 **Parameters:**
 
@@ -147,7 +147,7 @@ lcm_store(
 
 ### lcm_stats
 
-Show token savings, compression ratios, and usage statistics across all lossless-claude projects.
+Show token savings, compression ratios, and usage statistics across all Long Context Manager (LCM) projects.
 
 **Parameters:**
 
@@ -157,7 +157,7 @@ Show token savings, compression ratios, and usage statistics across all lossless
 
 ### lcm_doctor
 
-Run diagnostics on the lossless-claude installation. Checks daemon, hooks, MCP config, and summarizer health.
+Run diagnostics on the Long Context Manager (LCM) installation. Checks daemon, hooks, MCP config, and summarizer health.
 
 **Parameters:** none.
 

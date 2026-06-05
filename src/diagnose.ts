@@ -3,9 +3,11 @@ import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 import { cwdToProjectHash, findSessionFiles } from "./import.js";
+import { legacyLcmSlug } from "./legacy-names.js";
 
-const RELEVANT_COMMAND_RE = /(^|[\s"'`])(?:[^"'`\s]+\/)?(?:lcm|lossless-claude)(?=$|[\s"'`])/;
-const OLD_BINARY_RE = /(^|[\s"'`])(?:[^"'`\s]+\/)?lossless-claude(?=$|[\s"'`])/;
+const LEGACY_SLUG_PATTERN = legacyLcmSlug().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const RELEVANT_COMMAND_RE = new RegExp(`(^|[\\s"'\\\`])(?:[^"'\\\`\\s]+/)?(?:lcm|${LEGACY_SLUG_PATTERN})(?=$|[\\s"'\\\`])`);
+const OLD_BINARY_RE = new RegExp(`(^|[\\s"'\\\`])(?:[^"'\\\`\\s]+/)?${LEGACY_SLUG_PATTERN}(?=$|[\\s"'\\\`])`);
 const ERROR_WINDOW_LINES = 5;
 
 export interface DiagnosticError {
@@ -219,7 +221,7 @@ function getMcpDisconnect(entry: Record<string, unknown>): string | undefined {
   if (!content) return undefined;
   const lower = content.toLowerCase();
   if (!lower.includes("disconnect")) return undefined;
-  if (!lower.includes("lcm") && !lower.includes("lossless-claude")) return undefined;
+  if (!lower.includes("lcm") && !lower.includes(legacyLcmSlug())) return undefined;
   return truncate(content);
 }
 
@@ -490,7 +492,7 @@ function formatErrorLine(error: DiagnosticError): string {
     case "mcp-disconnect":
       return `MCP server disconnect${error.count > 1 ? ` (${error.count}x)` : ""}`;
     case "old-binary":
-      return `Hook uses old binary: ${error.command ?? "lossless-claude"}${error.count > 1 ? ` (${error.count}x)` : ""}`;
+      return `Hook uses old binary: ${error.command ?? legacyLcmSlug()}${error.count > 1 ? ` (${error.count}x)` : ""}`;
     case "duplicate-hook":
       return `Duplicate hook firing: ${error.hookEvent ?? "hook"}${error.command ? ` (${error.command})` : ""}${error.count > 1 ? ` (${error.count}x)` : ""}`;
   }

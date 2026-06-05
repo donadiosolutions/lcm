@@ -1,9 +1,10 @@
 import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { legacyLcmHomeDirname } from "./legacy-names.js";
 
 export const LCM_HOME_DIRNAME = ".lcm";
-export const LEGACY_LCM_HOME_DIRNAME = ".lossless-claude";
+export const LEGACY_LCM_HOME_DIRNAME = legacyLcmHomeDirname();
 
 export type RuntimeHomeMigration = {
   migrated: boolean;

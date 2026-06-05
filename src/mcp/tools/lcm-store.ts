@@ -1,6 +1,6 @@
 export const lcmStoreTool = {
   name: "lcm_store",
-  description: "Store a memory into lossless-claude's semantic layer. Use to persist decisions, findings, reasoning outcomes, or any knowledge worth retrieving in future sessions. Stored memories are searchable via lcm_search.",
+  description: "Store a memory into Long Context Manager (LCM)'s semantic layer. Use to persist decisions, findings, reasoning outcomes, or any knowledge worth retrieving in future sessions. Stored memories are searchable via lcm_search.",
   inputSchema: {
     type: "object" as const,
     properties: {

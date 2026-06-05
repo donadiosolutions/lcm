@@ -40,7 +40,7 @@ describe("createCodexProcessSummarizer", () => {
       stdin += chunk.toString();
     });
     const mkdtempSyncMock = vi.fn(() => {
-      const dir = mkdtempSync(join(tmpdir(), "lossless-codex-"));
+      const dir = mkdtempSync(join(tmpdir(), "lcm-codex-"));
       tempDirs.push(dir);
       return dir;
     });
@@ -76,7 +76,7 @@ describe("createCodexProcessSummarizer", () => {
       model: "gpt-5.4",
       spawn: spawn as any,
       mkdtempSync: vi.fn(() => {
-        const dir = mkdtempSync(join(tmpdir(), "lossless-codex-"));
+        const dir = mkdtempSync(join(tmpdir(), "lcm-codex-"));
         tempDirs.push(dir);
         return dir;
       }) as any,
@@ -98,7 +98,7 @@ describe("createCodexProcessSummarizer", () => {
         err.code = "ENOENT";
         throw err;
       }) as any,
-      mkdtempSync: vi.fn(() => mkdtempSync(join(tmpdir(), "lossless-codex-"))) as any,
+      mkdtempSync: vi.fn(() => mkdtempSync(join(tmpdir(), "lcm-codex-"))) as any,
       readFileSync: vi.fn() as any,
       rmSync: vi.fn() as any,
       tmpdir: () => tmpdir(),
@@ -118,7 +118,7 @@ describe("createCodexProcessSummarizer", () => {
     const summarizer = createCodexProcessSummarizer({
       spawn: spawn as any,
       mkdtempSync: vi.fn(() => {
-        const dir = mkdtempSync(join(tmpdir(), "lossless-codex-"));
+        const dir = mkdtempSync(join(tmpdir(), "lcm-codex-"));
         tempDirs.push(dir);
         return dir;
       }) as any,
@@ -137,7 +137,7 @@ describe("createCodexProcessSummarizer", () => {
     const summarizer = createCodexProcessSummarizer({
       spawn: spawn as any,
       mkdtempSync: vi.fn(() => {
-        const dir = mkdtempSync(join(tmpdir(), "lossless-codex-"));
+        const dir = mkdtempSync(join(tmpdir(), "lcm-codex-"));
         tempDirs.push(dir);
         return dir;
       }) as any,

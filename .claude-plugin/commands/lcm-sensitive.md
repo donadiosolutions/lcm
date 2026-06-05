@@ -1,12 +1,12 @@
 ---
 name: lcm-sensitive
-description: Manage sensitive patterns for lossless-claude secret redaction — list, add, remove, test, or purge patterns.
+description: Manage sensitive patterns for Long Context Manager (LCM) secret redaction — list, add, remove, test, or purge patterns.
 user_invocable: true
 ---
 
 # /lcm-sensitive
 
-Manage the sensitive patterns used by lossless-claude to redact secrets before storing conversation messages.
+Manage the sensitive patterns used by Long Context Manager (LCM) to redact secrets before storing conversation messages.
 
 ## Usage
 
@@ -40,8 +40,8 @@ lcm sensitive purge --all --yes
 - **add --global `<pattern>`** — Add a pattern to the global config (applies to all projects)
 - **remove `<pattern>`** — Remove a pattern from the project's sensitive patterns file
 - **test `<text>`** — Test what gets redacted from the given text (shows `[REDACTED]` substitutions)
-- **purge** — Delete the current project's data directory (`~/.lossless-claude/projects/{hash}/`) (requires `--yes`)
-- **purge --all** — Delete all project data directories under `~/.lossless-claude/projects/` (requires `--yes`)
+- **purge** — Delete the current project's data directory (`~/.lcm/projects/{hash}/`) (requires `--yes`)
+- **purge --all** — Delete all project data directories under `~/.lcm/projects/` (requires `--yes`)
 
 All `purge` variants require `--yes` to confirm the destructive action.
 

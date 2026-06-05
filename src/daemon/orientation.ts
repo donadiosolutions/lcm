@@ -1,6 +1,6 @@
 // Content written to ~/.claude/lcm.md during install/doctor — loaded via CLAUDE.md @include.
 // Kept here as the single source of truth for the guidance text.
-export const LCM_MD_CONTENT = `# lossless-claude memory — MANDATORY routing rules
+export const LCM_MD_CONTENT = `# Long Context Manager (LCM) memory — MANDATORY routing rules
 
 Memory is captured automatically by hooks. Do NOT store manually.
 

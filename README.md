@@ -322,9 +322,9 @@ test/
 
 ## Privacy
 
-All conversation data is stored locally in `~/.lcm/`. On first startup after upgrading from older releases, lcm automatically migrates an existing `~/.lossless-claude/` directory to `~/.lcm/` when the new directory is absent or does not already contain LCM data. Nothing is sent to any LCM server.
+All conversation data is stored locally in `~/.lcm/`. On first startup after upgrading from older releases, lcm automatically migrates an existing legacy runtime directory to `~/.lcm/` when the new directory is absent or does not already contain LCM data. Nothing is sent to any LCM server.
 
-If you configure an external summarizer (`claude-process`, `anthropic`, `openai`, etc.), messages are sent to that provider for summarization — after built-in secret redaction. lossless-claude scrubs common secret patterns (API keys, tokens, passwords) from message content before writing to SQLite and before sending to the summarizer.
+If you configure an external summarizer (`claude-process`, `anthropic`, `openai`, etc.), messages are sent to that provider for summarization — after built-in secret redaction. Long Context Manager (LCM) scrubs common secret patterns (API keys, tokens, passwords) from message content before writing to SQLite and before sending to the summarizer.
 
 Add project-specific patterns with `lcm sensitive add "MY_PATTERN"`. See [docs/privacy.md](docs/privacy.md) for full details.
 
@@ -336,11 +336,9 @@ Add project-specific patterns with `lcm sensitive add "MY_PATTERN"`. See [docs/p
 
 ## Acknowledgments
 
-This project is a fork of [lossless-claude](https://github.com/lossless-claude), which itself stands on the shoulders of [lossless-claw](https://github.com/Martian-Engineering/lossless-claw), the original implementation by [Martian Engineering](https://martian.engineering). This fork keeps the DAG-based compaction architecture, the LCM memory model, and the foundational design decisions.
+This project is a maintained fork in the original LCM lineage, which itself stands on the shoulders of [lossless-claw](https://github.com/Martian-Engineering/lossless-claw), the original implementation by [Martian Engineering](https://martian.engineering). This fork keeps the DAG-based compaction architecture, the LCM memory model, and the foundational design decisions.
 
 The underlying theory comes from the [LCM paper](https://papers.voltropy.com/LCM) by [Voltropy](https://x.com/Voltropy).
-
-[Original website](https://lossless-claude.com)
 
 ## License
 

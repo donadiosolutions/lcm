@@ -9,6 +9,7 @@ import {
 } from "../../installer/install.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { legacyLcmCommand, legacyLcmMcpServerName } from "../../src/legacy-names.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -106,15 +107,16 @@ describe("mergeClaudeSettings", () => {
     }]);
   });
 
-  it("migrates legacy lossless-claude hooks to lcm before removing them", () => {
+  it("migrates legacy hooks to lcm before removing them", () => {
+    const legacyServerName = legacyLcmMcpServerName();
     const existing = {
       hooks: {
-        PreCompact: [{ matcher: "", hooks: [{ type: "command", command: "lossless-claude compact" }] }],
-        SessionStart: [{ matcher: "", hooks: [{ type: "command", command: "lossless-claude restore" }] }],
+        PreCompact: [{ matcher: "", hooks: [{ type: "command", command: legacyLcmCommand("lcm compact") }] }],
+        SessionStart: [{ matcher: "", hooks: [{ type: "command", command: legacyLcmCommand("lcm restore") }] }],
         PostToolUse: [{ matcher: "", hooks: [{ type: "command", command: "other" }] }],
       },
       mcpServers: {
-        "lossless-claude": { command: "lossless-claude", args: ["mcp"] },
+        [legacyServerName]: { command: legacyServerName, args: ["mcp"] },
         other: { command: "other", args: ["mcp"] },
       }
     };
@@ -123,10 +125,10 @@ describe("mergeClaudeSettings", () => {
       const entries = result.hooks?.[event] ?? [];
       const commands = entries.flatMap((e: any) => e.hooks.map((h: any) => h.command));
       expect(commands).not.toContain(command);
-      expect(commands).not.toContain(command.replace(/^lcm /, "lossless-claude "));
+      expect(commands).not.toContain(legacyLcmCommand(command));
     }
     expect(result.hooks?.PostToolUse).toEqual([{ matcher: "", hooks: [{ type: "command", command: "other" }] }]);
-    expect(result.mcpServers["lossless-claude"]).toBeUndefined();
+    expect(result.mcpServers[legacyServerName]).toBeUndefined();
     expect(result.mcpServers["lcm"]).toBeUndefined();
     expect(result.mcpServers.other).toEqual({ command: "other", args: ["mcp"] });
   });

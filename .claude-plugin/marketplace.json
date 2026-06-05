@@ -1,5 +1,5 @@
 {
-  "name": "lossless-claude",
+  "name": "lcm",
   "owner": {
     "name": "Pedro",
     "url": "https://github.com/ipedro"
@@ -11,7 +11,7 @@
         "source": "github",
         "repo": "donadiosolutions/lcm"
       },
-      "description": "Lossless context management — DAG-based summarization that preserves every message",
+      "description": "Long Context Manager (LCM) — DAG-based summarization that preserves every message",
       "version": "1.1.0",
       "strict": true
     }

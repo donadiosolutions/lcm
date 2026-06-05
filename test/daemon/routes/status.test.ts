@@ -30,7 +30,7 @@ describe("POST /status", () => {
   });
 
   it("returns correct stats for project with data", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-status-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-status-"));
     tempDirs.push(tempDir);
 
     // Pre-populate database with messages, summaries, and promoted
@@ -124,7 +124,7 @@ describe("POST /status", () => {
   });
 
   it("returns zeros for empty project", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-status-empty-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-status-empty-"));
     tempDirs.push(tempDir);
 
     daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
@@ -153,7 +153,7 @@ describe("POST /status", () => {
   });
 
   it("includes daemon version and uptime", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-status-version-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-status-version-"));
     tempDirs.push(tempDir);
 
     daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));

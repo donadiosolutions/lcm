@@ -39,7 +39,8 @@ and commands:
 
 ```bash
 # Find the cached plugin directory (version and owner may vary)
-CACHE=$(ls -d ~/.claude/plugins/cache/*/lossless-claude/*/ 2>/dev/null | sort -V | tail -1)
+LEGACY_SLUG="$(printf '%s-%s' lossless claude)"
+CACHE=$(ls -d ~/.claude/plugins/cache/*/"$LEGACY_SLUG"/*/ ~/.claude/plugins/cache/"$LEGACY_SLUG"/lcm/*/ 2>/dev/null | sort -V | tail -1)
 if [ -n "$CACHE" ]; then
   rm -rf "$CACHE" && mkdir -p "$CACHE"
   cp .claude-plugin/plugin.json "$CACHE/"

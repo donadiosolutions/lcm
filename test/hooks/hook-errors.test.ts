@@ -22,6 +22,7 @@ vi.mock("../../src/db/events-path.js", async () => {
 import { safeLogError, _resetCircuitBreaker, _setLogPathForTesting } from "../../src/hooks/hook-errors.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
 import { eventsDbPath } from "../../src/db/events-path.js";
+import { lcmPath } from "../../src/runtime-paths.js";
 
 describe("safeLogError", () => {
   let tempDir: string;
@@ -102,6 +103,23 @@ describe("safeLogError", () => {
       safeLogError("PostToolUse", new Error("unsafe path"), {});
     }).not.toThrow();
     expect(existsSync("/etc/lcm-events.log")).toBe(false);
+  });
+
+  it("writes fallback events.log under the isolated test home by default", () => {
+    _setLogPathForTesting(undefined);
+    _resetCircuitBreaker();
+    try {
+      safeLogError("PostToolUse", new Error("sandbox fallback"), {});
+
+      const logPath = lcmPath("logs", "events.log");
+      expect(existsSync(logPath)).toBe(true);
+      expect(readFileSync(logPath, "utf-8")).toContain("sandbox fallback");
+      if (process.env.LCM_TEST_REAL_HOME) {
+        expect(logPath.startsWith(process.env.LCM_TEST_REAL_HOME)).toBe(false);
+      }
+    } finally {
+      _setLogPathForTesting(join(tempDir, "events.log"));
+    }
   });
 
 });

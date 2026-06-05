@@ -1,9 +1,9 @@
 ---
 name: lcm-memory
-description: Lossless context management — search and store persistent memory across sessions
+description: Long Context Manager (LCM) — search and store persistent memory across sessions
 ---
 
-# Lossless Context Management
+# Long Context Manager (LCM)
 
 > **Before responding to code tasks, check memory first.**
 > Code task? → `lcm search` FIRST. Completed work? → `lcm store` BEFORE done.

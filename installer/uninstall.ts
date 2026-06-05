@@ -3,6 +3,13 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { REQUIRED_HOOKS } from "./install.js";
+import {
+  legacyLaunchdPlistName,
+  legacyLcmCommand,
+  legacyLcmMcpServerName,
+  legacyLcmSlug,
+  legacySystemdServiceName,
+} from "../src/legacy-names.js";
 
 export function removeClaudeSettings(existing: any): any {
   const settings = JSON.parse(JSON.stringify(existing));
@@ -10,9 +17,9 @@ export function removeClaudeSettings(existing: any): any {
   settings.mcpServers = (settings.mcpServers && typeof settings.mcpServers === "object" && !Array.isArray(settings.mcpServers)) ? settings.mcpServers : {};
 
   const LC_COMMANDS = new Set(REQUIRED_HOOKS.map(h => h.command));
-  // Also remove legacy lossless-claude commands
+  // Also remove legacy command names.
   for (const { command } of REQUIRED_HOOKS) {
-    LC_COMMANDS.add(command.replace(/^lcm /, 'lossless-claude '));
+    LC_COMMANDS.add(legacyLcmCommand(command));
   }
   for (const event of Object.keys(settings.hooks)) {
     if (!Array.isArray(settings.hooks[event])) continue;
@@ -21,7 +28,7 @@ export function removeClaudeSettings(existing: any): any {
     );
   }
   delete settings.mcpServers["lcm"];
-  delete settings.mcpServers["lossless-claude"]; // legacy cleanup
+  delete settings.mcpServers[legacyLcmMcpServerName()];
   return settings;
 }
 
@@ -49,7 +56,7 @@ export function teardownDaemonService(deps: TeardownDeps = defaultDeps): void {
       homedir(),
       "Library",
       "LaunchAgents",
-      "com.lossless-claude.daemon.plist"
+      legacyLaunchdPlistName()
     );
     if (deps.existsSync(plistPath)) {
       console.log("Stopping daemon service (launchd)...");
@@ -65,11 +72,12 @@ export function teardownDaemonService(deps: TeardownDeps = defaultDeps): void {
       ".config",
       "systemd",
       "user",
-      "lossless-claude.service"
+      legacySystemdServiceName()
     );
     console.log("Stopping daemon service (systemd)...");
-    deps.spawnSync("systemctl", ["--user", "stop", "lossless-claude"], { stdio: "inherit" });
-    deps.spawnSync("systemctl", ["--user", "disable", "lossless-claude"], { stdio: "inherit" });
+    const legacyServiceName = legacyLcmSlug();
+    deps.spawnSync("systemctl", ["--user", "stop", legacyServiceName], { stdio: "inherit" });
+    deps.spawnSync("systemctl", ["--user", "disable", legacyServiceName], { stdio: "inherit" });
     if (deps.existsSync(unitPath)) {
       deps.rmSync(unitPath);
       console.log(`Removed ${unitPath}`);
@@ -86,7 +94,7 @@ export async function uninstall(deps: TeardownDeps = defaultDeps): Promise<void>
   // 1. Stop and remove the daemon service
   teardownDaemonService(deps);
 
-  // 2. Remove lcm and legacy lossless-claude entries from ~/.claude/settings.json
+  // 2. Remove lcm and legacy entries from ~/.claude/settings.json
   const settingsPath = join(homedir(), ".claude", "settings.json");
   if (deps.existsSync(settingsPath)) {
     try {

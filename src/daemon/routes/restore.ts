@@ -13,6 +13,7 @@ import { PromotedStore } from "../../db/promoted.js";
 import { justCompactedMap, JUST_COMPACTED_TTL_MS } from "./compact.js";
 import { fenceContent } from "../content-fence.js";
 import { validateCwd } from "../validate-cwd.js";
+import { normalizeTranscriptClient, type TranscriptClient } from "../../transcript-provider.js";
 
 type SessionInstructionsRow = {
   content: string;
@@ -20,11 +21,22 @@ type SessionInstructionsRow = {
   updated_at: string;
 };
 
-function readClaudeMdFiles(cwd: string): string {
+function sessionInstructionsId(client: TranscriptClient): number {
+  return client === "codex" ? 2 : 1;
+}
+
+function readSessionInstructionFiles(cwd: string, client: TranscriptClient): string {
+  const isCodex = client === "codex";
   const paths = [
-    { label: "~/.claude/CLAUDE.md", path: join(homedir(), ".claude", "CLAUDE.md") },
-    { label: `${cwd}/CLAUDE.md`, path: join(cwd, "CLAUDE.md") },
-    { label: `${cwd}/.claude/CLAUDE.md`, path: join(cwd, ".claude", "CLAUDE.md") },
+    isCodex
+      ? { label: "~/.codex/AGENTS.md", path: join(homedir(), ".codex", "AGENTS.md") }
+      : { label: "~/.claude/CLAUDE.md", path: join(homedir(), ".claude", "CLAUDE.md") },
+    isCodex
+      ? { label: `${cwd}/AGENTS.md`, path: join(cwd, "AGENTS.md") }
+      : { label: `${cwd}/CLAUDE.md`, path: join(cwd, "CLAUDE.md") },
+    isCodex
+      ? { label: `${cwd}/.codex/AGENTS.md`, path: join(cwd, ".codex", "AGENTS.md") }
+      : { label: `${cwd}/.claude/CLAUDE.md`, path: join(cwd, ".claude", "CLAUDE.md") },
   ];
 
   const parts: string[] = [];
@@ -45,6 +57,8 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
     try {
       const input = JSON.parse(body || "{}");
       const { session_id, source } = input;
+      const client = normalizeTranscriptClient(input.client);
+      const instructionsId = sessionInstructionsId(client);
       let cwd: string | undefined;
       if (input.cwd) {
         try {
@@ -71,8 +85,8 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
             try {
               runLcmMigrations(db);
               const row = db
-                .prepare(`SELECT content, content_hash, updated_at FROM session_instructions WHERE id = 1`)
-                .get() as SessionInstructionsRow | undefined;
+                .prepare(`SELECT content, content_hash, updated_at FROM session_instructions WHERE id = ?`)
+                .get(instructionsId) as SessionInstructionsRow | undefined;
               if (row) {
                 instructionsContext = `<project-instructions>\n${row.content}\n</project-instructions>`;
               }
@@ -92,8 +106,8 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
       let episodicContext = "";
       let promotedContext = "";
 
-      // Episodic: query recent summaries from project SQLite DB
-      // Also capture CLAUDE.md files on startup
+      // Episodic: query recent summaries from project SQLite DB.
+      // Also capture client-specific instruction files on startup.
       if (cwd) {
         const dbPath = projectDbPath(cwd);
         mkdirSync(dirname(dbPath), { recursive: true });
@@ -136,24 +150,24 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
             }
           } catch { /* non-fatal */ }
 
-          // Capture CLAUDE.md files and upsert into session_instructions if changed
+          // Capture instruction files and upsert into the client-specific row if changed.
           try {
-            const claudeMdContent = readClaudeMdFiles(cwd);
-            if (claudeMdContent) {
-              const hash = createHash("sha256").update(claudeMdContent).digest("hex");
+            const instructionContent = readSessionInstructionFiles(cwd, client);
+            if (instructionContent) {
+              const hash = createHash("sha256").update(instructionContent).digest("hex");
               const existing = db
-                .prepare(`SELECT content_hash FROM session_instructions WHERE id = 1`)
-                .get() as { content_hash: string } | undefined;
+                .prepare(`SELECT content_hash FROM session_instructions WHERE id = ?`)
+                .get(instructionsId) as { content_hash: string } | undefined;
 
               if (!existing || existing.content_hash !== hash) {
                 db.prepare(
                   `INSERT INTO session_instructions (id, content, content_hash, updated_at)
-                   VALUES (1, ?, ?, datetime('now'))
+                   VALUES (?, ?, ?, datetime('now'))
                    ON CONFLICT(id) DO UPDATE SET
                      content = excluded.content,
                      content_hash = excluded.content_hash,
                      updated_at = excluded.updated_at`,
-                ).run(claudeMdContent, hash);
+                ).run(instructionsId, instructionContent, hash);
               }
             }
           } catch { /* non-fatal */ }

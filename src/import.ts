@@ -41,7 +41,7 @@ export interface ImportResult {
 
 export function cwdToProjectHash(cwd: string): string {
   // Claude Code uses the cwd with slashes replaced by dashes, keeping the leading dash
-  // e.g. /Users/pedro/Developer/lossless-claude → -Users-pedro-Developer-lossless-claude
+  // e.g. /Users/pedro/Developer/Long Context Manager (LCM) → -Users-pedro-Developer-Long Context Manager (LCM)
   return cwd.replace(/\//g, '-');
 }
 

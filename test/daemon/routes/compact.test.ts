@@ -94,7 +94,7 @@ describe("buildCompactionMessage", () => {
 
   it("contains the header and closing motto", () => {
     const msg = buildCompactionMessage(base);
-    expect(msg).toContain("lossless-claude · compaction complete");
+    expect(msg).toContain("lcm · compaction complete");
     expect(msg).toContain("Nothing was lost. Everything is remembered.");
   });
 
@@ -280,7 +280,7 @@ describe("POST /compact", () => {
     const res = await fetch(`http://127.0.0.1:${daemon.address().port}/compact`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: "test-sess", cwd: mkdtempSync(join(tmpdir(), "lossless-compact-proj-")), hook_event_name: "PreCompact" }),
+      body: JSON.stringify({ session_id: "test-sess", cwd: mkdtempSync(join(tmpdir(), "lcm-compact-proj-")), hook_event_name: "PreCompact" }),
     });
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -289,7 +289,7 @@ describe("POST /compact", () => {
   });
 
   it("skips transcript ingestion when skip_ingest is true", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-compact-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-compact-"));
     tempDirs.push(tempDir);
 
     const transcriptPath = join(tempDir, "session.jsonl");
@@ -348,7 +348,7 @@ describe("POST /compact", () => {
   });
 
   it("accepts previous_summary and returns latestSummaryContent", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-compact-prev-summary-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-compact-prev-summary-"));
     tempDirs.push(tempDir);
 
     // Use mock summarizer so compact actually produces a summary
@@ -393,7 +393,7 @@ describe("POST /compact", () => {
 
   it("returns latestSummaryContent when summary is created", async () => {
     // Setup: create a real daemon with mock summarizer so compact produces a real summary
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-compact-latest-content-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-compact-latest-content-"));
     tempDirs.push(tempDir);
 
     daemon = await createDaemon(loadDaemonConfig("/x", {
@@ -441,7 +441,7 @@ describe("POST /compact", () => {
   });
 
   it("updates redaction_stats when transcript ingestion contains secrets", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-compact-redact-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-compact-redact-"));
     tempDirs.push(tempDir);
 
     const transcriptPath = join(tempDir, "session.jsonl");
@@ -500,7 +500,7 @@ describe("POST /compact with disabled provider", () => {
     const res = await fetch(`http://127.0.0.1:${daemon.address().port}/compact`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: "test-sess", cwd: mkdtempSync(join(tmpdir(), "lossless-disabled-proj-")) }),
+      body: JSON.stringify({ session_id: "test-sess", cwd: mkdtempSync(join(tmpdir(), "lcm-disabled-proj-")) }),
     });
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -523,7 +523,7 @@ describe("POST /compact — scrub redaction during transcript ingestion", () => 
   });
 
   it("redacts sensitive patterns from transcript messages during compaction", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-compact-scrub-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-compact-scrub-"));
     tempDirs.push(tempDir);
 
     const secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";

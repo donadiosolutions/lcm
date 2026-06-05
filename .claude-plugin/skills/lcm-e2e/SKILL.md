@@ -48,9 +48,9 @@ Run the E2E validation checklist from `.claude-plugin/skills/lcm-e2e/checklist.m
 
 All operations use an isolated temp directory as `cwd`:
 - Create: `mktemp -d /tmp/lcm-e2e-test-XXXXXX`
-- This temp cwd creates a separate project database under `~/.lossless-claude/projects/<hash>/`
+- This temp cwd creates a separate project database under `~/.lcm/projects/<hash>/`
 - The user's real project data is never accessed
-- Cleanup removes both the temp dir AND the project under `~/.lossless-claude/projects/`
+- Cleanup removes both the temp dir AND the project under `~/.lcm/projects/`
 
 ## Important notes
 

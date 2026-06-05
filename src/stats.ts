@@ -182,7 +182,7 @@ export function printStats(stats: OverallStats, verbose: boolean): void {
   const reset = "\x1b[0m";
 
   console.log();
-  console.log(`    ${bold}${cyan}🧠 lossless-claude${reset}`);
+  console.log(`    ${bold}${cyan}🧠 Long Context Manager (LCM)${reset}`);
   console.log();
 
   // Memory section

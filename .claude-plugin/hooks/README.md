@@ -1,6 +1,6 @@
-# lossless-claude — Hooks
+# Long Context Manager (LCM) — Hooks
 
-**Usage**: Lossless context management — every conversation is captured, compressed, and restored across sessions.
+**Usage**: Long Context Manager (LCM) — every conversation is captured, compressed, and restored across sessions.
 
 ## Hooks
 
@@ -25,7 +25,7 @@ SessionStart ──→ conversation ──→ UserPromptSubmit (each turn)
 
 1. **SessionStart**: daemon wakes, orientation + episodic + promoted context injected
 2. **UserPromptSubmit**: each user message triggers a background memory search — relevant context appears as hints
-3. **PreCompact**: when Claude's context window fills, lossless-claude intercepts and produces a DAG-based summary (nothing lost)
+3. **PreCompact**: when Claude's context window fills, Long Context Manager (LCM) intercepts and produces a DAG-based summary (nothing lost)
 4. **SessionEnd**: full transcript ingested into SQLite for future sessions
 
 ## MCP Tools
@@ -44,4 +44,4 @@ lcm_doctor    # Diagnostics — daemon, hooks, MCP, summarizer
 
 ## Why
 
-Without lossless-claude, conversation history is lost when Claude compacts or when a session ends. With it, every message is preserved in a SQLite DAG, summaries are hierarchical (leaf → condensed → session → durable), and relevant context from past sessions surfaces automatically on each prompt.
+Without Long Context Manager (LCM), conversation history is lost when Claude compacts or when a session ends. With it, every message is preserved in a SQLite DAG, summaries are hierarchical (leaf → condensed → session → durable), and relevant context from past sessions surfaces automatically on each prompt.

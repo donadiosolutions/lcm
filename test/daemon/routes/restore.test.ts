@@ -107,6 +107,44 @@ describe("POST /restore", () => {
       expect(row!.content_hash).toMatch(/^[a-f0-9]{64}$/);
     });
 
+    it("captures Codex AGENTS.md separately from Claude instructions", async () => {
+      writeFileSync(join(tmpDir, "CLAUDE.md"), "# Claude Rules\nUse Claude instructions.", "utf8");
+      writeFileSync(join(tmpDir, "AGENTS.md"), "# Codex Rules\nUse Codex instructions.", "utf8");
+      mkdirSync(join(tmpDir, ".codex"), { recursive: true });
+      writeFileSync(join(tmpDir, ".codex", "AGENTS.md"), "Project Codex override.", "utf8");
+
+      daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+      const port = daemon.address().port;
+
+      const claudeResponse = await fetch(`http://127.0.0.1:${port}/restore`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "claude-startup", cwd: tmpDir, source: "startup", client: "claude" }),
+      });
+      const codexResponse = await fetch(`http://127.0.0.1:${port}/restore`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "codex-startup", cwd: tmpDir, source: "startup", client: "codex" }),
+      });
+      expect(claudeResponse.status).toBe(200);
+      expect(codexResponse.status).toBe(200);
+
+      const dbPath = projectDbPath(tmpDir);
+      const db = new DatabaseSync(dbPath);
+      const rows = db.prepare(`SELECT id, content FROM session_instructions ORDER BY id`).all() as Array<{
+        id: number;
+        content: string;
+      }>;
+      db.close();
+
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toEqual(expect.objectContaining({ id: 1 }));
+      expect(rows[0].content).toContain("Use Claude instructions.");
+      expect(rows[0].content).not.toContain("Use Codex instructions.");
+      expect(rows[1]).toEqual(expect.objectContaining({ id: 2 }));
+      expect(rows[1].content).toContain("Use Codex instructions.");
+      expect(rows[1].content).toContain("Project Codex override.");
+      expect(rows[1].content).not.toContain("Use Claude instructions.");
+    });
+
     it("does not re-upsert session_instructions when content hash unchanged", async () => {
       // Write CLAUDE.md
       writeFileSync(join(tmpDir, "CLAUDE.md"), "Stable content.", "utf8");

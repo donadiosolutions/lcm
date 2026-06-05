@@ -76,9 +76,9 @@ describe("printStats", () => {
     recallStats: { memoriesSurfaced: 0, memoriesActedUpon: 0, recallPrecision: null, topRecalled: [] },
   };
 
-  it("prints the lossless-claude header", () => {
+  it("prints the Long Context Manager (LCM) header", () => {
     const out = captureLog(() => printStats(baseStats, false));
-    expect(out).toContain("lossless-claude");
+    expect(out).toContain("Long Context Manager (LCM)");
   });
 
   it("prints Memory section with project and message counts", () => {

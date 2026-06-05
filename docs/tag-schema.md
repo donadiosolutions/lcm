@@ -36,7 +36,7 @@ All tags follow the `<prefix>:<value>` format. Free-text tags (no colon) are all
 | `scope:process` | Team workflow, governance, sprint cadence |
 | `scope:xgh` | Anything in or about the xgh repo |
 | `scope:autoimprove` | Anything in or about the autoimprove repo |
-| `scope:lcm` | Anything in or about lossless-claude itself |
+| `scope:lcm` | Anything in or about Long Context Manager (LCM) itself |
 | `scope:security` | Secret scanning, auth, access control |
 | `scope:testing` | Test strategy, test infrastructure, test failures |
 | `scope:ci` | CI/CD pipelines, GitHub Actions, release automation |

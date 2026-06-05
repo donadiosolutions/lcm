@@ -5,6 +5,7 @@ import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { ensureCore } from "../src/bootstrap.js";
 import { lcmHomeDir } from "../src/runtime-paths.js";
+import { legacyLcmSlug } from "../src/legacy-names.js";
 export { REQUIRED_HOOKS, mergeClaudeSettings } from "../src/installer/settings.js";
 
 export interface ServiceDeps {
@@ -184,7 +185,7 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   try {
     const pkgJsonPath = join(dirname(fileURLToPath(import.meta.url)), "../..", "package.json");
     const pkgVersion = (JSON.parse(deps.readFileSync(pkgJsonPath, "utf-8")) as { version: string }).version;
-    const cacheDir = join(homedir(), ".claude", "plugins", "cache", "lossless-claude", "lcm");
+    const cacheDir = join(homedir(), ".claude", "plugins", "cache", legacyLcmSlug(), "lcm");
     if (deps.existsSync(cacheDir)) {
       for (const entry of readdirSync(cacheDir, { withFileTypes: true })) {
         if (entry.isDirectory() && entry.name !== pkgVersion) {

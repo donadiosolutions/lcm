@@ -1,4 +1,4 @@
-# Copilot Review Instructions — lossless-claude (lcm)
+# Copilot Review Instructions — Long Context Manager (LCM) (lcm)
 
 This repo is a TypeScript SQLite daemon that persists Agent session memories across context resets. It uses Node.js `DatabaseSync` (synchronous SQLite API) and exposes an HTTP daemon with REST routes.
 

@@ -19,6 +19,15 @@ function daemonPortFromHookPayload(stdinText: string): number | undefined {
   }
 }
 
+function hookClientFromPayload(stdinText: string): string | undefined {
+  try {
+    const parsed = JSON.parse(stdinText || "{}") as { client?: unknown };
+    return typeof parsed.client === "string" ? parsed.client : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function dispatchHook(
   command: HookCommand,
   stdinText: string,
@@ -53,7 +62,10 @@ export async function dispatchHook(
     } catch {} // bootstrap failure must not block hooks
   }
 
-  validateAndFixHooks();
+  const hookClient = hookClientFromPayload(stdinText) ?? process.env.LCM_CLIENT;
+  if (hookClient !== "codex") {
+    validateAndFixHooks();
+  }
 
   const { DaemonClient } = await import("../daemon/client.js");
   const { loadDaemonConfig } = await import("../daemon/config.js");

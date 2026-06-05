@@ -42,7 +42,7 @@ function friendlyMissingCodexError(): Error {
   return new Error([
     "Codex CLI is not installed or not on PATH.",
     "Install it first, for example: npm install -g @openai/codex",
-    "Then run lossless-codex again.",
+    "Then run lcm again.",
   ].join("\n"));
 }
 
@@ -85,7 +85,7 @@ function runCodexSummarizer(
     model?: string;
   },
 ): Promise<string> {
-  const tempDir = deps.mkdtempSync(join(deps.tmpdir(), "lossless-codex-"));
+  const tempDir = deps.mkdtempSync(join(deps.tmpdir(), "lcm-codex-"));
   const outputPath = join(tempDir, "last-message.txt");
 
   return new Promise((resolve, reject) => {

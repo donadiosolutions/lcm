@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes how lossless-claude works internally — the data model, compaction lifecycle, context assembly, and expansion system.
+This document describes how Long Context Manager (LCM) works internally — the data model, compaction lifecycle, context assembly, and expansion system.
 
 ## Data model
 

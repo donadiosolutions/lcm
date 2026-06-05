@@ -131,18 +131,22 @@ describe('installConnector — Codex native hooks', () => {
     expect(hooks.hooks.UserPromptSubmit[0].hooks[0].command).toBe('lcm user-prompt --client codex');
     expect(hooks.hooks.PostToolUse[0].hooks[0].command).toBe('lcm post-tool --client codex');
     expect(hooks.hooks.Stop[0].hooks[0].command).toBe('lcm session-snapshot --client codex');
+    expect(JSON.stringify(hooks)).not.toMatch(/claude/i);
 
     const skill = readFileSync(join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md'), 'utf-8');
     expect(skill).toContain('lcm search');
+    expect(skill).not.toMatch(/claude/i);
 
     const rules = readFileSync(join(tmpDir, '.codex', 'AGENTS.md'), 'utf-8');
     expect(rules).toContain(LCM_MARKERS.START);
     expect(rules).toContain('lcm search');
+    expect(rules).not.toMatch(/claude/i);
 
     const config = readFileSync(join(tmpDir, '.codex', 'config.toml'), 'utf-8');
     expect(config).toContain('[features]');
     expect(config).toContain('hooks = true');
     expect(config).not.toContain('codex_hooks');
+    expect(config).not.toMatch(/claude/i);
   });
 
   it('idempotently ensures Codex rules in ~/.codex/AGENTS.md', () => {

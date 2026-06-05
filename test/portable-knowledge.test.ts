@@ -165,7 +165,7 @@ describe("portable-knowledge — export", () => {
     const cwd = makeTempDir();
     await expect(
       exportKnowledge(cwd, { skipScrub: true, _lcmBaseDir: baseDir }),
-    ).rejects.toThrow(/No lossless-claude database found/);
+    ).rejects.toThrow("No Long Context Manager (LCM) database found");
   });
 
   it("export document has the correct shape", async () => {

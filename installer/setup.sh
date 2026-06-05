@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# lossless-claude setup script
+# lcm setup script
 # Configures the LLM provider for compaction/summarization and installs hooks.
 
 CONFIG_DIR="$HOME/.lcm"
@@ -11,7 +11,7 @@ CONFIG_FILE="$CONFIG_DIR/config.json"
 
 if [ "${XGH_DRY_RUN:-}" = "1" ]; then
   echo ""
-  echo "  [dry-run] lossless-claude setup would:"
+  echo "  [dry-run] lcm setup would:"
   echo "    1. Prompt for LLM provider selection (auto / claude-process / codex-process / anthropic / openai / disabled)"
   echo "    2. Write ~/.lcm/config.json with the chosen llm block"
   echo "    3. Run: lcm install"
@@ -43,7 +43,7 @@ if [ ! -t 0 ]; then
   true
 else
   echo ""
-  echo "  lossless-claude setup"
+  echo "  lcm setup"
   echo ""
   echo "  Which LLM provider should lcm use for compaction/summarization?"
   echo ""

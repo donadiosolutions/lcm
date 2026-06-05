@@ -29,7 +29,7 @@
 
 - 9632840: Update Codex hook setup to use the current `hooks` feature flag and migrate existing `codex_hooks` entries when installing the connector.
 - 9632840: Install Codex hooks, skill, and rules by default, write Codex hooks to `~/.codex/hooks.json`, and make the Codex rules connector idempotently maintain `~/.codex/AGENTS.md`.
-- 9632840: Move LCM runtime storage from `~/.lossless-claude` to `~/.lcm` and migrate legacy runtime data automatically on startup.
+- 9632840: Move LCM runtime storage from the legacy runtime directory to `~/.lcm` and migrate legacy runtime data automatically on startup.
 
 ## 0.9.1
 

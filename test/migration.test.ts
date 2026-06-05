@@ -16,7 +16,7 @@ afterEach(() => {
 
 describe("runLcmMigrations summary depth backfill", () => {
   it("adds depth and metadata from summary lineage", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-migration-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-migration-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "legacy.db");
     const db = getLcmConnection(dbPath);
@@ -211,7 +211,7 @@ describe("runLcmMigrations summary depth backfill", () => {
   });
 
   it("skips FTS tables when fts5 is unavailable", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-migration-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-migration-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "no-fts.db");
     const db = getLcmConnection(dbPath);
@@ -228,7 +228,7 @@ describe("runLcmMigrations summary depth backfill", () => {
 
 describe("promoted table migration", () => {
   it("creates promoted table and FTS5 index", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-promoted-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-promoted-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "test.db");
     const db = getLcmConnection(dbPath);
@@ -264,7 +264,7 @@ describe("promoted table migration", () => {
   });
 
   it("is idempotent — running migration twice does not error", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-promoted-idem-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-promoted-idem-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "test.db");
     const db = getLcmConnection(dbPath);
@@ -283,7 +283,7 @@ describe("promoted table migration", () => {
 
 describe("redaction_stats table migration", () => {
   it("creates redaction_stats table with correct schema", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-redaction-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-redaction-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "test.db");
     const db = getLcmConnection(dbPath);
@@ -323,7 +323,7 @@ describe("redaction_stats table migration", () => {
   });
 
   it("is idempotent — running migration twice does not error", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-redaction-idem-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-redaction-idem-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "test.db");
     const db = getLcmConnection(dbPath);
@@ -342,7 +342,7 @@ describe("redaction_stats table migration", () => {
 
 describe("session_ingest_log table migration", () => {
   it("creates session_ingest_log table", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-session-ingest-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-session-ingest-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "test.db");
     const db = getLcmConnection(dbPath);
@@ -359,7 +359,7 @@ describe("session_ingest_log table migration", () => {
   });
 
   it("session_ingest_log is idempotent", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-session-ingest-idem-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-session-ingest-idem-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "test.db");
     const db = getLcmConnection(dbPath);

@@ -19,7 +19,7 @@ afterEach(async () => {
 
 describe("POST /search", () => {
   it("finds promoted memories via FTS5", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-search-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-search-"));
     tempDirs.push(tempDir);
 
     // Pre-populate promoted table
@@ -52,7 +52,7 @@ describe("POST /search", () => {
   });
 
   it("returns all three layers in response", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-search-layers-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-search-layers-"));
     tempDirs.push(tempDir);
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;

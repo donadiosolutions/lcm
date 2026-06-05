@@ -2,10 +2,8 @@ import { join } from "node:path";
 import { projectId } from "../daemon/project.js";
 import { lcmHomeDir } from "../runtime-paths.js";
 
-const BASE = lcmHomeDir();
-
 export function eventsDir(): string {
-  return join(BASE, "events");
+  return join(lcmHomeDir(), "events");
 }
 
 export function eventsDbPath(cwd: string): string {

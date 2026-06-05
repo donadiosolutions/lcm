@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { isSafeTranscriptPath } from "../../src/daemon/project.js";
 
 describe("isSafeTranscriptPath", () => {
-  const cwd = "/tmp";
+  const cwd = "/tmp/lcm-project-path-safety-cwd";
 
   it("allows paths under ~/.claude/projects/", () => {
     const p = join(homedir(), ".claude", "projects", "test-project", "abc.jsonl");
