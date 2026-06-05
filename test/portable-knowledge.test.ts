@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { PromotedStore } from "../src/db/promoted.js";
@@ -13,8 +13,13 @@ import {
   importKnowledge,
   type ExportDocument,
 } from "../src/portable-knowledge.js";
+import { addProjectAlias, clearProjectMapCache } from "../src/project-map.js";
+import { lcmHomeDir } from "../src/runtime-paths.js";
 
 const tempDirs: string[] = [];
+const originalHome = process.env.HOME;
+const originalUserProfile = process.env.USERPROFILE;
+let tempHome: string | undefined;
 
 function makeTempDir() {
   const d = mkdtempSync(join(tmpdir(), "lcm-portable-knowledge-"));
@@ -22,8 +27,22 @@ function makeTempDir() {
   return d;
 }
 
+beforeEach(() => {
+  tempHome = mkdtempSync(join(tmpdir(), "lcm-portable-home-"));
+  process.env.HOME = tempHome;
+  process.env.USERPROFILE = tempHome;
+  clearProjectMapCache();
+});
+
 afterEach(() => {
   for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  clearProjectMapCache();
+  if (tempHome) rmSync(tempHome, { recursive: true, force: true });
+  tempHome = undefined;
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = originalUserProfile;
 });
 
 /**
@@ -117,6 +136,20 @@ describe("portable-knowledge — export", () => {
     const doc: ExportDocument = JSON.parse(readFileSync(outFile, "utf-8"));
     expect(doc.entries).toHaveLength(1);
     expect(doc.entries[0].content).toBe("Entry one");
+  });
+
+  it("exports canonical project knowledge when invoked from an alias", async () => {
+    const baseDir = lcmHomeDir();
+    const canonical = makeTempDir();
+    const alias = makeTempDir();
+    const outFile = join(makeTempDir(), "alias-export.json");
+    seedProject(baseDir, canonical, [{ content: "Canonical memory", tags: ["decision"] }]);
+    addProjectAlias(alias, { canonical });
+
+    const result = await exportKnowledge(alias, { output: outFile, skipScrub: true });
+
+    expect(result.exported).toBe(1);
+    expect(result.projectCwd).toBe(realpathSync(canonical));
   });
 
   it("filters by tags", async () => {
@@ -236,6 +269,31 @@ describe("portable-knowledge — import", () => {
     db.close();
   });
 
+  it("imports alias-invoked knowledge into the canonical project", async () => {
+    const canonical = makeTempDir();
+    const alias = makeTempDir();
+    addProjectAlias(alias, { canonical });
+    const canonicalId = toProjectId(canonical);
+
+    const doc = makeDoc([
+      {
+        content: "Imported through alias",
+        tags: ["decision"],
+        confidence: 0.9,
+        createdAt: new Date().toISOString(),
+        sessionId: null,
+      },
+    ]);
+
+    const result = await importKnowledge(alias, doc);
+    const canonicalDbPath = join(lcmHomeDir(), "projects", canonicalId, "db.sqlite");
+    const aliasDbPath = join(lcmHomeDir(), "projects", toProjectId(alias), "db.sqlite");
+
+    expect(result.imported).toBe(1);
+    expect(existsSync(canonicalDbPath)).toBe(true);
+    expect(existsSync(aliasDbPath)).toBe(false);
+  });
+
   it("dry-run returns expected counts without writing", async () => {
     const baseDir = makeTempDir();
     const cwd = makeTempDir();
@@ -345,6 +403,7 @@ describe("portable-knowledge — import", () => {
 
     const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
     expect(meta.cwd).toBe(cwd);
+    expect(readFileSync(metaPath, "utf-8").endsWith("\n")).toBe(true);
 
     // Verify the round-trip: export using the same project directory enumeration
     // that `lcm export --all` uses (scan projects/ for meta.json files).

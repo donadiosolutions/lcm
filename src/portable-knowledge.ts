@@ -25,6 +25,7 @@ import { deduplicateAndInsert } from "./promotion/dedup.js";
 import { ScrubEngine } from "./scrub.js";
 import { getLcmConnection, closeLcmConnection } from "./db/connection.js";
 import { lcmHomeDir } from "./runtime-paths.js";
+import { resolveProjectIdentity } from "./project-map.js";
 
 export const EXPORT_VERSION = 1;
 
@@ -57,12 +58,20 @@ function resolveProjectDir(cwd: string, baseDir: string): string {
   return join(baseDir, "projects", resolveProjectId(cwd));
 }
 
-function resolveProjectDbPath(cwd: string, baseDir: string): string {
-  return join(resolveProjectDir(cwd, baseDir), "db.sqlite");
-}
-
 function defaultBaseDir(): string {
   return lcmHomeDir();
+}
+
+function resolvePortableProject(cwd: string, baseDir: string): { id: string; canonical: string; dir: string; dbPath: string } {
+  if (baseDir === defaultBaseDir()) {
+    const identity = resolveProjectIdentity(cwd);
+    const dir = join(baseDir, "projects", identity.id);
+    return { id: identity.id, canonical: identity.canonical, dir, dbPath: join(dir, "db.sqlite") };
+  }
+  const canonical = canonicalizeCwd(cwd);
+  const id = resolveProjectId(cwd);
+  const dir = resolveProjectDir(cwd, baseDir);
+  return { id, canonical, dir, dbPath: join(dir, "db.sqlite") };
 }
 
 // ─── Export ──────────────────────────────────────────────────────────────────
@@ -92,7 +101,8 @@ export async function exportKnowledge(
   opts: ExportOptions = {},
 ): Promise<ExportResult> {
   const baseDir = opts._lcmBaseDir ?? defaultBaseDir();
-  const dbPath = resolveProjectDbPath(cwd, baseDir);
+  const project = resolvePortableProject(cwd, baseDir);
+  const dbPath = project.dbPath;
 
   if (!existsSync(dbPath)) {
     throw new Error(`No Long Context Manager (LCM) database found for project: ${cwd}`);
@@ -104,10 +114,9 @@ export async function exportKnowledge(
     runLcmMigrations(db);
 
     const store = new PromotedStore(db);
-    const projId = resolveProjectId(cwd);
 
     const rows = store.getAll({
-      projectId: projId,
+      projectId: project.id,
       since: opts.since,
       tags: opts.tags,
     });
@@ -115,8 +124,7 @@ export async function exportKnowledge(
     // Build scrubber for secret redaction
     let scrubber: ScrubEngine | null = null;
     if (!opts.skipScrub) {
-      const projDir = resolveProjectDir(cwd, baseDir);
-      scrubber = await ScrubEngine.forProject([], projDir);
+      scrubber = await ScrubEngine.forProject([], project.dir);
     }
 
     entries = rows.map((r) => {
@@ -142,7 +150,7 @@ export async function exportKnowledge(
   const doc: ExportDocument = {
     version: EXPORT_VERSION,
     exportedAt: new Date().toISOString(),
-    projectCwd: cwd,
+    projectCwd: project.canonical,
     entries,
   };
 
@@ -154,7 +162,7 @@ export async function exportKnowledge(
     process.stdout.write(json + "\n");
   }
 
-  return { exported: entries.length, projectCwd: cwd };
+  return { exported: entries.length, projectCwd: project.canonical };
 }
 
 // ─── Import ──────────────────────────────────────────────────────────────────
@@ -203,8 +211,9 @@ export async function importKnowledge(
   }
 
   const baseDir = opts._lcmBaseDir ?? defaultBaseDir();
-  const projDir = resolveProjectDir(cwd, baseDir);
-  const dbPath = resolveProjectDbPath(cwd, baseDir);
+  const project = resolvePortableProject(cwd, baseDir);
+  const projDir = project.dir;
+  const dbPath = project.dbPath;
 
   // Ensure project dir + DB exist
   mkdirSync(projDir, { recursive: true });
@@ -219,7 +228,6 @@ export async function importKnowledge(
     runLcmMigrations(db);
 
     const store = new PromotedStore(db);
-    const projId = resolveProjectId(cwd);
 
     for (const entry of doc.entries) {
       const confidence = opts.confidence !== undefined ? opts.confidence : entry.confidence;
@@ -228,7 +236,7 @@ export async function importKnowledge(
           store,
           content: entry.content,
           tags: entry.tags,
-          projectId: projId,
+          projectId: project.id,
           sessionId: entry.sessionId ?? undefined,
           depth: 0,
           confidence,
@@ -250,7 +258,7 @@ export async function importKnowledge(
   const metaPath = join(projDir, "meta.json");
   if (!existsSync(metaPath)) {
     const tmpPath = metaPath + ".tmp";
-    writeFileSync(tmpPath, JSON.stringify({ cwd }, null, 2), "utf-8");
+    writeFileSync(tmpPath, JSON.stringify({ cwd: project.canonical }, null, 2) + "\n", "utf-8");
     renameSync(tmpPath, metaPath);
   }
 

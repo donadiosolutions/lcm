@@ -1,8 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
 import { REQUIRED_HOOKS } from "../../installer/install.js";
 import { LCM_MD_CONTENT } from "../../src/daemon/orientation.js";
 import { ensureDaemon } from "../../src/daemon/lifecycle.js";
+import { hashProjectPath, normalizeProjectPath } from "../../src/project-map.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn().mockResolvedValue({ connected: false }),
@@ -98,6 +102,108 @@ describe("runDoctor lcm-md check", () => {
     expect(check?.status).toBe("warn");
     expect(check?.fixApplied).toBe(true);
     expect(written["/tmp/test-home/.claude/lcm.md"]).toBeDefined();
+  });
+});
+
+describe("runDoctor project map checks", () => {
+  it("fails on invalid map JSON", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-invalid-"));
+    try {
+      mkdirSync(join(home, ".lcm"), { recursive: true });
+      writeFileSync(join(home, ".lcm", "map.json"), "{bad-json");
+
+      const results = await runDoctor(minimalDeps({ homedir: home, cwd: "/tmp/nonexistent-project-xyz" }));
+      const check = results.find((r) => r.name === "project-map");
+
+      expect(check?.status).toBe("fail");
+      expect(check?.message).toContain("map.json");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("auto-formats valid compact map JSON", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-format-"));
+    try {
+      const canonical = join(home, "project");
+      mkdirSync(join(home, ".lcm"), { recursive: true });
+      mkdirSync(canonical, { recursive: true });
+      const hash = hashProjectPath(normalizeProjectPath(canonical));
+      const mapPath = join(home, ".lcm", "map.json");
+      writeFileSync(mapPath, JSON.stringify({ [hash]: { canonical, aliases: [] } }));
+
+      const results = await runDoctor(minimalDeps({ homedir: home, cwd: "/tmp/nonexistent-project-xyz" }));
+      const check = results.find((r) => r.name === "project-map");
+
+      expect(check?.status).toBe("warn");
+      expect(check?.fixApplied).toBe(true);
+      expect(check?.message).toContain("backup:");
+      expect(readFileSync(mapPath, "utf-8")).toBe(JSON.stringify({ [hash]: { canonical, aliases: [] } }, null, 2) + "\n");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a missing project map without depending on validation warning text", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-missing-"));
+    try {
+      mkdirSync(join(home, ".lcm"), { recursive: true });
+
+      const results = await runDoctor(minimalDeps({ homedir: home, cwd: "/tmp/nonexistent-project-xyz" }));
+      const check = results.find((r) => r.name === "project-map");
+
+      expect(check?.status).toBe("pass");
+      expect(check?.message).toBe("map.json not created yet");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reports project map auto-fix write failures without aborting doctor", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-write-fail-"));
+    try {
+      const canonical = join(home, "project");
+      mkdirSync(join(home, ".lcm"), { recursive: true });
+      mkdirSync(canonical, { recursive: true });
+      writeFileSync(join(home, ".lcm", "oldmaps"), "not a directory");
+      const hash = hashProjectPath(normalizeProjectPath(canonical));
+      writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({ [hash]: { canonical, aliases: [] } }));
+
+      const results = await runDoctor(minimalDeps({ homedir: home, cwd: "/tmp/nonexistent-project-xyz" }));
+      const check = results.find((r) => r.name === "project-map");
+
+      expect(check?.status).toBe("fail");
+      expect(check?.message).toContain("map.json");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("fails on cross-hash path ambiguity", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-ambiguous-"));
+    try {
+      const first = join(home, "first");
+      const second = join(home, "second");
+      const shared = join(home, "shared");
+      mkdirSync(join(home, ".lcm"), { recursive: true });
+      mkdirSync(first, { recursive: true });
+      mkdirSync(second, { recursive: true });
+      mkdirSync(shared, { recursive: true });
+      const firstHash = hashProjectPath(normalizeProjectPath(first));
+      const secondHash = hashProjectPath(normalizeProjectPath(second));
+      writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({
+        [firstHash]: { canonical: first, aliases: [shared] },
+        [secondHash]: { canonical: second, aliases: [shared] },
+      }, null, 2) + "\n");
+
+      const results = await runDoctor(minimalDeps({ homedir: home, cwd: "/tmp/nonexistent-project-xyz" }));
+      const check = results.find((r) => r.name === "project-map");
+
+      expect(check?.status).toBe("fail");
+      expect(check?.message).toContain("multiple hashes");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 
