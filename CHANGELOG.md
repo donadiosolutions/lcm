@@ -1,5 +1,11 @@
 # @donadiosolutions/lcm
 
+## 1.2.1
+
+### Patch Changes
+
+- Manual release v1.2.1.
+
 ## 1.2.0
 
 ### Minor Changes
