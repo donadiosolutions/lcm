@@ -30,9 +30,10 @@ function wrapWithMarkers(content: string, header?: string): string {
 
 export function generateRulesContent(agent: Agent): string {
   const workflow = loadFile("sections/workflow.md");
+  const commandRef = loadFile("sections/command-reference.md");
   const base = loadFile("base.md");
   const content = substituteVariables(base, {
-    workflow,
+    workflow: substituteVariables(workflow, { command_reference: commandRef }),
   });
   return wrapWithMarkers(content, agent.header);
 }

@@ -26,4 +26,4 @@ Use the lcm CLI to manage persistent memory across sessions.
 - Meta tasks: run tests, build, commit, create PR
 - Simple clarifications about a previous response
 
-Run `lcm --help` for all options.
+{{command_reference}}
