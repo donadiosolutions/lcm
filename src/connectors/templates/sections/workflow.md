@@ -1,6 +1,6 @@
 # Workflow Instruction
 
-You are a coding agent. Use the lcm CLI to manage persistent memory across sessions.
+Use the lcm CLI to manage persistent memory across sessions.
 
 ## Core Rules
 
@@ -26,4 +26,4 @@ You are a coding agent. Use the lcm CLI to manage persistent memory across sessi
 - Meta tasks: run tests, build, commit, create PR
 - Simple clarifications about a previous response
 
-{{command_reference}}
+Run `lcm --help` for all options.

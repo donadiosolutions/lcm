@@ -30,14 +30,75 @@ function resolveConfigPath(configPath: string, cwd: string): string {
   return join(cwd, configPath);
 }
 
+const MANAGED_MARKER_PAIRS = [
+  LCM_MARKERS,
+  {
+    START: '<!-- [LCM_CONNECTOR_START] -->',
+    END: '<!-- [LCM_CONNECTOR_END] -->',
+  },
+] as const;
+
+type MarkerLine = {
+  lineStart: number;
+  lineEnd: number;
+};
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function findStandaloneMarkerLines(content: string, marker: string): MarkerLine[] {
+  const lines: MarkerLine[] = [];
+  const pattern = new RegExp(`(^|\\r?\\n)[ \\t]*${escapeRegExp(marker)}[ \\t]*(?:\\r?\\n|$)`, 'g');
+  for (let match = pattern.exec(content); match; match = pattern.exec(content)) {
+    const lineStart = match.index + match[1].length;
+    lines.push({
+      lineStart,
+      lineEnd: match.index + match[0].length,
+    });
+  }
+  return lines;
+}
+
+function isGeneratedLcmBlock(content: string, start: MarkerLine, end: MarkerLine): boolean {
+  return content.slice(start.lineEnd, end.lineStart).trimStart().startsWith('# Workflow Instruction');
+}
+
+function findManagedBlock(content: string): { startIdx: number; endIdx: number; endLength: number } | undefined {
+  let found: { startIdx: number; endIdx: number; endLength: number } | undefined;
+  for (const markers of MANAGED_MARKER_PAIRS) {
+    const starts = findStandaloneMarkerLines(content, markers.START);
+    const ends = markers.START === markers.END ? starts : findStandaloneMarkerLines(content, markers.END);
+    for (const start of starts) {
+      for (const end of ends) {
+        if (end.lineStart <= start.lineStart) continue;
+        if (markers.START === markers.END && !isGeneratedLcmBlock(content, start, end)) continue;
+        if (!found || start.lineStart < found.startIdx) {
+          found = {
+            startIdx: start.lineStart,
+            endIdx: end.lineStart,
+            endLength: end.lineEnd - end.lineStart,
+          };
+        }
+        break;
+      }
+    }
+  }
+  return found;
+}
+
+function hasManagedBlock(content: string): boolean {
+  return findManagedBlock(content) !== undefined;
+}
+
 function removeMarkers(content: string): string {
-  const startIdx = content.indexOf(LCM_MARKERS.START);
-  if (startIdx === -1) return content;
-  const endIdx = content.indexOf(LCM_MARKERS.END);
-  if (endIdx === -1) return content;
-  const before = content.slice(0, startIdx);
-  const after = content.slice(endIdx + LCM_MARKERS.END.length);
-  return (before.trimEnd() + after.trimStart()).trim();
+  const block = findManagedBlock(content);
+  if (!block) return content;
+  const before = content.slice(0, block.startIdx).trimEnd();
+  const after = content.slice(block.endIdx + block.endLength).trimStart();
+  if (!before) return after.trim();
+  if (!after) return before.trim();
+  return `${before}\n${after}`.trim();
 }
 
 // Strategy 1: Markdown targets (rules, skill)
@@ -197,7 +258,7 @@ export function removeConnector(agentIdOrName: string, type?: ConnectorType, cwd
   // rules: remove markers from file
   if (!existsSync(resolvedPath)) return false;
   const content = readFileSync(resolvedPath, 'utf-8');
-  if (!content.includes(LCM_MARKERS.START)) return false;
+  if (!hasManagedBlock(content)) return false;
   const cleaned = removeMarkers(content);
   if (cleaned.trim() === '') {
     unlinkSync(resolvedPath);
@@ -242,7 +303,7 @@ export function listConnectors(cwd: string = process.cwd()): InstalledConnector[
         // rules / hook
         if (existsSync(resolvedPath)) {
           const content = readFileSync(resolvedPath, 'utf-8');
-          if (content.includes(LCM_MARKERS.START)) {
+          if (hasManagedBlock(content)) {
             installed.push({ agentId: agent.id, agentName: agent.name, type, path: resolvedPath });
           }
         }
