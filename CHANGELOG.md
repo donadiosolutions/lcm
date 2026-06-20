@@ -1,5 +1,12 @@
 # @donadiosolutions/lcm
 
+## 1.2.1
+
+### Patch Changes
+
+- b6a3aeb: Document the `lcm map` command in the README CLI reference.
+- 8918eef: Reduce generated connector rules context while preserving `lcm --help` guidance.
+
 ## 1.2.0
 
 ### Minor Changes
