@@ -94,9 +94,11 @@ function hasManagedBlock(content: string): boolean {
 function removeMarkers(content: string): string {
   const block = findManagedBlock(content);
   if (!block) return content;
-  const before = content.slice(0, block.startIdx);
-  const after = content.slice(block.endIdx + block.endLength);
-  return (before.trimEnd() + after.trimStart()).trim();
+  const before = content.slice(0, block.startIdx).trimEnd();
+  const after = content.slice(block.endIdx + block.endLength).trimStart();
+  if (!before) return after.trim();
+  if (!after) return before.trim();
+  return `${before}\n${after}`.trim();
 }
 
 // Strategy 1: Markdown targets (rules, skill)

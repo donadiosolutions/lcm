@@ -235,6 +235,7 @@ describe('installConnector — Codex native hooks', () => {
     expect(content).toContain('# Personal Codex rules');
     expect(content).toContain('Keep this before.');
     expect(content).toContain('Keep this after.');
+    expect(content).toContain('Keep this before.\nKeep this after.');
     expect(content).not.toContain('old managed content');
     expect(content).toContain('lcm search');
   });
@@ -265,6 +266,7 @@ describe('installConnector — Codex native hooks', () => {
     expect(content).toContain('# Personal Codex rules');
     expect(content).toContain('Keep this before.');
     expect(content).toContain('Keep this after.');
+    expect(content).toContain('Keep this before.\nKeep this after.');
     expect(content).not.toContain(LEGACY_LCM_MARKERS.START);
     expect(content).not.toContain(LEGACY_LCM_MARKERS.END);
     expect(content).not.toContain('old managed content');
@@ -387,6 +389,7 @@ describe('removeConnector — rules', () => {
     const content = readFileSync(rulesPath, 'utf-8');
     expect(content).toContain('Keep this before.');
     expect(content).toContain('Keep this after.');
+    expect(content).toContain('Keep this before.\nKeep this after.');
     expect(content).not.toContain(LEGACY_LCM_MARKERS.START);
     expect(content).not.toContain('old managed content');
   });
