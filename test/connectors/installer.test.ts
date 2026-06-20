@@ -7,6 +7,15 @@ import { LCM_MARKERS } from '../../src/connectors/constants.js';
 
 let tmpDir: string;
 
+const LEGACY_LCM_MARKERS = {
+  START: '<!-- [LCM_CONNECTOR_START] -->',
+  END: '<!-- [LCM_CONNECTOR_END] -->',
+} as const;
+
+function countOccurrences(value: string, needle: string): number {
+  return value.split(needle).length - 1;
+}
+
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), 'lcm-installer-test-'));
 });
@@ -40,8 +49,7 @@ describe('installConnector — rules (markdown append)', () => {
     installConnector('claude-code', 'rules', tmpDir);
     const rulesPath = join(tmpDir, 'CLAUDE.md');
     const content = readFileSync(rulesPath, 'utf-8');
-    const startCount = (content.match(new RegExp(LCM_MARKERS.START.replace(/\\/g, '\\\\').replace(/[[\]]/g, '\\$&'), 'g')) ?? []).length;
-    expect(startCount).toBe(1);
+    expect(countOccurrences(content, LCM_MARKERS.START)).toBe(2);
   });
 
   it('returns requiresRestart: false for rules', () => {
@@ -139,7 +147,11 @@ describe('installConnector — Codex native hooks', () => {
 
     const rules = readFileSync(join(tmpDir, '.codex', 'AGENTS.md'), 'utf-8');
     expect(rules).toContain(LCM_MARKERS.START);
+    expect(countOccurrences(rules, LCM_MARKERS.START)).toBe(2);
     expect(rules).toContain('lcm search');
+    expect(rules).toContain('lcm --help');
+    expect(rules).not.toContain('@lcm');
+    expect(rules).not.toContain('LCM_CONNECTOR_START');
     expect(rules).not.toMatch(/claude/i);
 
     const config = readFileSync(join(tmpDir, '.codex', 'config.toml'), 'utf-8');
@@ -155,8 +167,7 @@ describe('installConnector — Codex native hooks', () => {
 
     const rulesPath = join(tmpDir, '.codex', 'AGENTS.md');
     const content = readFileSync(rulesPath, 'utf-8');
-    const startCount = (content.match(new RegExp(LCM_MARKERS.START.replace(/\\/g, '\\\\').replace(/[[\]]/g, '\\$&'), 'g')) ?? []).length;
-    expect(startCount).toBe(1);
+    expect(countOccurrences(content, LCM_MARKERS.START)).toBe(2);
     expect(content).toContain('lcm search');
   });
 
@@ -172,6 +183,7 @@ describe('installConnector — Codex native hooks', () => {
     expect(content).toContain('Never overwrite this.');
     expect(content).toContain(LCM_MARKERS.START);
     expect(content).toContain(LCM_MARKERS.END);
+    expect(countOccurrences(content, LCM_MARKERS.START)).toBe(2);
     expect(content).toContain('lcm search');
   });
 
@@ -195,13 +207,45 @@ describe('installConnector — Codex native hooks', () => {
     installConnector('codex', 'rules', tmpDir);
 
     const content = readFileSync(rulesPath, 'utf-8');
-    const startCount = (content.match(new RegExp(LCM_MARKERS.START.replace(/\\/g, '\\\\').replace(/[[\]]/g, '\\$&'), 'g')) ?? []).length;
-    expect(startCount).toBe(1);
+    expect(countOccurrences(content, LCM_MARKERS.START)).toBe(2);
     expect(content).toContain('# Personal Codex rules');
     expect(content).toContain('Keep this before.');
     expect(content).toContain('Keep this after.');
     expect(content).not.toContain('old managed content');
     expect(content).toContain('lcm search');
+  });
+
+  it('migrates legacy bracketed Codex rules markers on reinstall', () => {
+    const rulesPath = join(tmpDir, '.codex', 'AGENTS.md');
+    mkdirSync(join(tmpDir, '.codex'), { recursive: true });
+    writeFileSync(
+      rulesPath,
+      [
+        '# Personal Codex rules',
+        '',
+        'Keep this before.',
+        LEGACY_LCM_MARKERS.START,
+        'old managed content',
+        '---',
+        '@lcm Codex',
+        LEGACY_LCM_MARKERS.END,
+        'Keep this after.',
+        '',
+      ].join('\n'),
+    );
+
+    installConnector('codex', 'rules', tmpDir);
+
+    const content = readFileSync(rulesPath, 'utf-8');
+    expect(countOccurrences(content, LCM_MARKERS.START)).toBe(2);
+    expect(content).toContain('# Personal Codex rules');
+    expect(content).toContain('Keep this before.');
+    expect(content).toContain('Keep this after.');
+    expect(content).not.toContain(LEGACY_LCM_MARKERS.START);
+    expect(content).not.toContain(LEGACY_LCM_MARKERS.END);
+    expect(content).not.toContain('old managed content');
+    expect(content).not.toContain('@lcm Codex');
+    expect(content).toContain('lcm --help');
   });
 
   it('migrates the deprecated codex_hooks feature flag when installing hooks', () => {
@@ -281,6 +325,7 @@ describe('removeConnector — rules', () => {
     try {
       const content = readFileSync(rulesPath, 'utf-8');
       expect(content).not.toContain(LCM_MARKERS.START);
+      expect(content).not.toContain(LEGACY_LCM_MARKERS.START);
     } catch {
       // File was deleted — also acceptable
     }
@@ -294,6 +339,32 @@ describe('removeConnector — rules', () => {
     const content = readFileSync(rulesPath, 'utf-8');
     expect(content).toContain('Keep this');
     expect(content).not.toContain(LCM_MARKERS.START);
+    expect(content).not.toContain(LEGACY_LCM_MARKERS.START);
+  });
+
+  it('removes legacy bracketed marker blocks', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        '# My Rules',
+        '',
+        'Keep this before.',
+        LEGACY_LCM_MARKERS.START,
+        'old managed content',
+        LEGACY_LCM_MARKERS.END,
+        'Keep this after.',
+        '',
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+
+    const content = readFileSync(rulesPath, 'utf-8');
+    expect(content).toContain('Keep this before.');
+    expect(content).toContain('Keep this after.');
+    expect(content).not.toContain(LEGACY_LCM_MARKERS.START);
+    expect(content).not.toContain('old managed content');
   });
 
   it('returns false when file does not exist', () => {
@@ -346,6 +417,23 @@ describe('removeConnector — skill', () => {
 describe('listConnectors', () => {
   it('finds installed rules connector', () => {
     installConnector('claude-code', 'rules', tmpDir);
+    const list = listConnectors(tmpDir);
+    const found = list.find(c => c.agentId === 'claude-code' && c.type === 'rules');
+    expect(found).toBeDefined();
+  });
+
+  it('finds legacy bracketed rules connector', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        LEGACY_LCM_MARKERS.START,
+        'old managed content',
+        LEGACY_LCM_MARKERS.END,
+        '',
+      ].join('\n'),
+    );
+
     const list = listConnectors(tmpDir);
     const found = list.find(c => c.agentId === 'claude-code' && c.type === 'rules');
     expect(found).toBeDefined();

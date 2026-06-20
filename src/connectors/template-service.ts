@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Agent, ConnectorType } from "./types.js";
-import { LCM_MARKERS, LCM_TAG } from "./constants.js";
+import { LCM_MARKERS } from "./constants.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = join(__dirname, "templates");
@@ -19,32 +19,29 @@ function substituteVariables(template: string, context: Record<string, string>):
   return result;
 }
 
-function wrapWithMarkers(content: string, agentName: string, header?: string): string {
+function wrapWithMarkers(content: string, header?: string): string {
   const parts: string[] = [];
   if (header) parts.push(header);
   parts.push(LCM_MARKERS.START);
-  parts.push(content);
-  parts.push('---');
-  parts.push(`${LCM_TAG} ${agentName}`);
+  parts.push(content.trim());
   parts.push(LCM_MARKERS.END);
   return parts.join('\n');
 }
 
 export function generateRulesContent(agent: Agent): string {
   const workflow = loadFile("sections/workflow.md");
-  const commandRef = loadFile("sections/command-reference.md");
   const base = loadFile("base.md");
   const content = substituteVariables(base, {
-    workflow: substituteVariables(workflow, { command_reference: commandRef }),
+    workflow,
   });
-  return wrapWithMarkers(content, agent.name, agent.header);
+  return wrapWithMarkers(content, agent.header);
 }
 
 export function generateMcpContent(agent: Agent): string {
   const mcpWorkflow = loadFile("sections/mcp-workflow.md");
   const base = loadFile("mcp-base.md");
   const content = substituteVariables(base, { mcp_workflow: mcpWorkflow });
-  return wrapWithMarkers(content, agent.name, agent.header);
+  return wrapWithMarkers(content, agent.header);
 }
 
 export function generateSkillContent(_agent: Agent): string {

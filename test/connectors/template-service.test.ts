@@ -33,6 +33,10 @@ const codexAgent: Agent = {
   },
 };
 
+function countOccurrences(value: string, needle: string): number {
+  return value.split(needle).length - 1;
+}
+
 describe('generateRulesContent', () => {
   it('contains lcm search command', () => {
     const content = generateRulesContent(mockAgent);
@@ -49,9 +53,9 @@ describe('generateRulesContent', () => {
     expect(content).toContain(LCM_MARKERS.END);
   });
 
-  it('contains agent name tag', () => {
+  it('contains exactly one managed lcm block', () => {
     const content = generateRulesContent(mockAgent);
-    expect(content).toContain('Test Agent');
+    expect(countOccurrences(content, LCM_MARKERS.START)).toBe(2);
   });
 
   it('substitutes all template variables (no {{}} placeholders remain)', () => {
@@ -69,10 +73,25 @@ describe('generateRulesContent', () => {
     expect(content).not.toContain('trigger:');
   });
 
-  it('contains command reference section', () => {
+  it('keeps only the short help command pointer', () => {
     const content = generateRulesContent(mockAgent);
     expect(content).toContain('lcm store');
-    expect(content).toContain('lcm doctor');
+    expect(content).toContain('Run `lcm --help` for all options.');
+    expect(content).not.toContain('## Available Commands');
+    expect(content).not.toContain('lcm stats');
+    expect(content).not.toContain('lcm import --codex');
+    expect(content).not.toContain('lcm import --provider all');
+    expect(content).not.toContain('lcm compact --all');
+  });
+
+  it('omits legacy markers, footer tag, and extra separator', () => {
+    const content = generateRulesContent(mockAgent);
+    expect(content).not.toContain('LCM_CONNECTOR_START');
+    expect(content).not.toContain('LCM_CONNECTOR_END');
+    expect(content).not.toContain('@lcm');
+    expect(content).not.toContain('Test Agent');
+    expect(content).not.toContain('\n---\n');
+    expect(content).not.toContain('You are a coding agent.');
   });
 
   it('keeps Codex generated rules free of Claude-specific text', () => {
@@ -97,6 +116,11 @@ describe('generateMcpContent', () => {
     expect(content).toContain(LCM_MARKERS.END);
   });
 
+  it('contains exactly one managed lcm block', () => {
+    const content = generateMcpContent(mockAgent);
+    expect(countOccurrences(content, LCM_MARKERS.START)).toBe(2);
+  });
+
   it('substitutes all template variables', () => {
     const content = generateMcpContent(mockAgent);
     expect(content).not.toMatch(/\{\{[^}]+\}\}/);
@@ -105,6 +129,13 @@ describe('generateMcpContent', () => {
   it('contains lcm_store tool', () => {
     const content = generateMcpContent(mockAgent);
     expect(content).toContain('lcm_store');
+  });
+
+  it('omits footer tag and extra separator', () => {
+    const content = generateMcpContent(mockAgent);
+    expect(content).not.toContain('@lcm');
+    expect(content).not.toContain('Test Agent');
+    expect(content).not.toContain('\n---\n');
   });
 
   it('keeps Codex generated MCP guidance free of Claude-specific text', () => {
@@ -160,6 +191,7 @@ describe('generateContent dispatch', () => {
     const content = generateContent(mockAgent, 'rules');
     expect(content).toContain(LCM_MARKERS.START);
     expect(content).toContain('lcm search');
+    expect(content).toContain('lcm --help');
   });
 
   it('delegates mcp to generateMcpContent', () => {

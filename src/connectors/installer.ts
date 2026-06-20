@@ -30,13 +30,37 @@ function resolveConfigPath(configPath: string, cwd: string): string {
   return join(cwd, configPath);
 }
 
+const MANAGED_MARKER_PAIRS = [
+  LCM_MARKERS,
+  {
+    START: '<!-- [LCM_CONNECTOR_START] -->',
+    END: '<!-- [LCM_CONNECTOR_END] -->',
+  },
+] as const;
+
+function findManagedBlock(content: string): { startIdx: number; endIdx: number; endLength: number } | undefined {
+  let found: { startIdx: number; endIdx: number; endLength: number } | undefined;
+  for (const markers of MANAGED_MARKER_PAIRS) {
+    const startIdx = content.indexOf(markers.START);
+    if (startIdx === -1) continue;
+    const endIdx = content.indexOf(markers.END, startIdx + markers.START.length);
+    if (endIdx === -1) continue;
+    if (!found || startIdx < found.startIdx) {
+      found = { startIdx, endIdx, endLength: markers.END.length };
+    }
+  }
+  return found;
+}
+
+function hasManagedBlock(content: string): boolean {
+  return findManagedBlock(content) !== undefined;
+}
+
 function removeMarkers(content: string): string {
-  const startIdx = content.indexOf(LCM_MARKERS.START);
-  if (startIdx === -1) return content;
-  const endIdx = content.indexOf(LCM_MARKERS.END);
-  if (endIdx === -1) return content;
-  const before = content.slice(0, startIdx);
-  const after = content.slice(endIdx + LCM_MARKERS.END.length);
+  const block = findManagedBlock(content);
+  if (!block) return content;
+  const before = content.slice(0, block.startIdx);
+  const after = content.slice(block.endIdx + block.endLength);
   return (before.trimEnd() + after.trimStart()).trim();
 }
 
@@ -197,7 +221,7 @@ export function removeConnector(agentIdOrName: string, type?: ConnectorType, cwd
   // rules: remove markers from file
   if (!existsSync(resolvedPath)) return false;
   const content = readFileSync(resolvedPath, 'utf-8');
-  if (!content.includes(LCM_MARKERS.START)) return false;
+  if (!hasManagedBlock(content)) return false;
   const cleaned = removeMarkers(content);
   if (cleaned.trim() === '') {
     unlinkSync(resolvedPath);
@@ -242,7 +266,7 @@ export function listConnectors(cwd: string = process.cwd()): InstalledConnector[
         // rules / hook
         if (existsSync(resolvedPath)) {
           const content = readFileSync(resolvedPath, 'utf-8');
-          if (content.includes(LCM_MARKERS.START)) {
+          if (hasManagedBlock(content)) {
             installed.push({ agentId: agent.id, agentName: agent.name, type, path: resolvedPath });
           }
         }
