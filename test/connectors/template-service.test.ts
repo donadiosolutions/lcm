@@ -73,11 +73,19 @@ describe('generateRulesContent', () => {
     expect(content).not.toContain('trigger:');
   });
 
-  it('keeps only the short help command pointer', () => {
+  it('contains available commands without the removed directives', () => {
     const content = generateRulesContent(mockAgent);
+    expect(content).toContain('## Available Commands');
+    expect(content).toContain('lcm search "query"');
+    expect(content).toContain('lcm grep "pattern" --mode regex');
+    expect(content).toContain('lcm describe <nodeId>');
+    expect(content).toContain('lcm expand <nodeId> --depth N');
     expect(content).toContain('lcm store');
+    expect(content).toContain('lcm doctor');
+    expect(content).toContain('lcm diagnose');
+    expect(content).toContain('`lcm import`');
+    expect(content).toContain('lcm import --all');
     expect(content).toContain('Run `lcm --help` for all options.');
-    expect(content).not.toContain('## Available Commands');
     expect(content).not.toContain('lcm stats');
     expect(content).not.toContain('lcm import --codex');
     expect(content).not.toContain('lcm import --provider all');
