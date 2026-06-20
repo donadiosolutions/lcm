@@ -4,7 +4,8 @@
 
 ### Patch Changes
 
-- Manual release v1.2.1.
+- b6a3aeb: Document the `lcm map` command in the README CLI reference.
+- 1b465d3: Restore generated connector command guidance while keeping rarely used directives removed from always-loaded agent rules.
 
 ## 1.2.0
 
