@@ -52,6 +52,28 @@ describe('installConnector — rules (markdown append)', () => {
     expect(countOccurrences(content, LCM_MARKERS.START)).toBe(2);
   });
 
+  it('does not replace ordinary lcm comments when appending rules', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        '# My existing rules',
+        '',
+        '<!-- lcm -->',
+        'Keep this user-authored block.',
+        '<!-- lcm -->',
+        '',
+      ].join('\n'),
+    );
+
+    installConnector('claude-code', 'rules', tmpDir);
+
+    const content = readFileSync(rulesPath, 'utf-8');
+    expect(content).toContain('Keep this user-authored block.');
+    expect(countOccurrences(content, LCM_MARKERS.START)).toBe(4);
+    expect(content).toContain('# Workflow Instruction');
+  });
+
   it('returns requiresRestart: false for rules', () => {
     const result = installConnector('claude-code', 'rules', tmpDir);
     expect(result.requiresRestart).toBe(false);
@@ -197,6 +219,8 @@ describe('installConnector — Codex native hooks', () => {
         '',
         'Keep this before.',
         LCM_MARKERS.START,
+        '# Workflow Instruction',
+        '',
         'old managed content',
         LCM_MARKERS.END,
         'Keep this after.',
@@ -378,6 +402,22 @@ describe('removeConnector — rules', () => {
     const removed = removeConnector('claude-code', 'rules', tmpDir);
     expect(removed).toBe(false);
   });
+
+  it('returns false for ordinary lcm comments and preserves user content', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const original = [
+      '# My Rules',
+      '',
+      '<!-- lcm -->',
+      'Keep this user-authored block.',
+      '<!-- lcm -->',
+      '',
+    ].join('\n');
+    writeFileSync(rulesPath, original);
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(false);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(original);
+  });
 });
 
 describe('removeConnector — MCP JSON', () => {
@@ -437,6 +477,23 @@ describe('listConnectors', () => {
     const list = listConnectors(tmpDir);
     const found = list.find(c => c.agentId === 'claude-code' && c.type === 'rules');
     expect(found).toBeDefined();
+  });
+
+  it('does not list ordinary lcm comments as a rules connector', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        '<!-- lcm -->',
+        'Keep this user-authored block.',
+        '<!-- lcm -->',
+        '',
+      ].join('\n'),
+    );
+
+    const list = listConnectors(tmpDir);
+    const found = list.find(c => c.agentId === 'claude-code' && c.type === 'rules');
+    expect(found).toBeUndefined();
   });
 
   it('finds installed MCP connector', () => {

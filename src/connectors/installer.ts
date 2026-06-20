@@ -38,15 +38,50 @@ const MANAGED_MARKER_PAIRS = [
   },
 ] as const;
 
+type MarkerLine = {
+  lineStart: number;
+  lineEnd: number;
+};
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function findStandaloneMarkerLines(content: string, marker: string): MarkerLine[] {
+  const lines: MarkerLine[] = [];
+  const pattern = new RegExp(`(^|\\r?\\n)[ \\t]*${escapeRegExp(marker)}[ \\t]*(?:\\r?\\n|$)`, 'g');
+  for (let match = pattern.exec(content); match; match = pattern.exec(content)) {
+    const lineStart = match.index + match[1].length;
+    lines.push({
+      lineStart,
+      lineEnd: match.index + match[0].length,
+    });
+  }
+  return lines;
+}
+
+function isGeneratedLcmBlock(content: string, start: MarkerLine, end: MarkerLine): boolean {
+  return content.slice(start.lineEnd, end.lineStart).trimStart().startsWith('# Workflow Instruction');
+}
+
 function findManagedBlock(content: string): { startIdx: number; endIdx: number; endLength: number } | undefined {
   let found: { startIdx: number; endIdx: number; endLength: number } | undefined;
   for (const markers of MANAGED_MARKER_PAIRS) {
-    const startIdx = content.indexOf(markers.START);
-    if (startIdx === -1) continue;
-    const endIdx = content.indexOf(markers.END, startIdx + markers.START.length);
-    if (endIdx === -1) continue;
-    if (!found || startIdx < found.startIdx) {
-      found = { startIdx, endIdx, endLength: markers.END.length };
+    const starts = findStandaloneMarkerLines(content, markers.START);
+    const ends = markers.START === markers.END ? starts : findStandaloneMarkerLines(content, markers.END);
+    for (const start of starts) {
+      for (const end of ends) {
+        if (end.lineStart <= start.lineStart) continue;
+        if (markers.START === markers.END && !isGeneratedLcmBlock(content, start, end)) continue;
+        if (!found || start.lineStart < found.startIdx) {
+          found = {
+            startIdx: start.lineStart,
+            endIdx: end.lineStart,
+            endLength: end.lineEnd - end.lineStart,
+          };
+        }
+        break;
+      }
     }
   }
   return found;
