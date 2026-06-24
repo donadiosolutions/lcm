@@ -44,7 +44,7 @@ interface DoctorConfig {
   summarizer: string;
 }
 
-const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start --detach";
+const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start";
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
 
 export interface DoctorRunOptions {
