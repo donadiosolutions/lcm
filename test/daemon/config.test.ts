@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, expect } from "vitest";
 import { loadDaemonConfig, deepMerge } from "../../src/daemon/config.js";
 
@@ -33,6 +36,36 @@ describe("loadDaemonConfig", () => {
   it("falls back to env var when apiKey not set and provider is anthropic", () => {
     const c = loadDaemonConfig("/nonexistent", { llm: { provider: "anthropic" } }, { ANTHROPIC_API_KEY: "sk-env" });
     expect(c.llm.apiKey).toBe("sk-env");
+  });
+
+  it("falls back to systemd credentials when provider API key env vars are not set", () => {
+    const credentialsDir = mkdtempSync(join(tmpdir(), "lcm-config-credentials-"));
+    try {
+      writeFileSync(join(credentialsDir, "ANTHROPIC_API_KEY"), "sk-credential", { mode: 0o600 });
+      const c = loadDaemonConfig(
+        "/nonexistent",
+        { llm: { provider: "anthropic" } },
+        { CREDENTIALS_DIRECTORY: credentialsDir },
+      );
+      expect(c.llm.apiKey).toBe("sk-credential");
+    } finally {
+      rmSync(credentialsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("interpolates API keys from systemd credentials", () => {
+    const credentialsDir = mkdtempSync(join(tmpdir(), "lcm-config-credentials-"));
+    try {
+      writeFileSync(join(credentialsDir, "OPENAI_API_KEY"), "sk-openai-credential", { mode: 0o600 });
+      const c = loadDaemonConfig(
+        "/nonexistent",
+        { llm: { provider: "openai", apiKey: "${OPENAI_API_KEY}" } },
+        { CREDENTIALS_DIRECTORY: credentialsDir },
+      );
+      expect(c.llm.apiKey).toBe("sk-openai-credential");
+    } finally {
+      rmSync(credentialsDir, { recursive: true, force: true });
+    }
   });
 
   it("merges provider and baseURL from file config", () => {

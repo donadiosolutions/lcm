@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, unlinkSync, readdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync, unlinkSync, readdirSync } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
 import { join, dirname } from "node:path";
@@ -304,13 +304,37 @@ function startViaDetachedSpawn(
   };
 }
 
-const SYSTEMD_DAEMON_ENV_NAMES = new Set(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
+const SYSTEMD_PROVIDER_SECRET_ENV_NAMES = new Set(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
+const SYSTEMD_SECRET_ENV_PATTERN = /(?:API_)?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/;
+
+function shouldPropagateDaemonEnv(name: string, value: string | undefined): value is string {
+  return value !== undefined && (name.startsWith("LCM_") || SYSTEMD_PROVIDER_SECRET_ENV_NAMES.has(name));
+}
+
+function isSecretDaemonEnvName(name: string): boolean {
+  return SYSTEMD_PROVIDER_SECRET_ENV_NAMES.has(name) || (name.startsWith("LCM_") && SYSTEMD_SECRET_ENV_PATTERN.test(name));
+}
 
 function systemdDaemonSetenvArgs(env: NodeJS.ProcessEnv): string[] {
   return Object.entries(env)
-    .filter(([name, value]) => value !== undefined && (name.startsWith("LCM_") || SYSTEMD_DAEMON_ENV_NAMES.has(name)))
+    .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && !isSecretDaemonEnvName(name))
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, value]) => `--setenv=${name}=${value ?? ""}`);
+}
+
+function systemdDaemonCredentialArgs(env: NodeJS.ProcessEnv, pidFilePath: string): string[] {
+  const secrets = Object.entries(env)
+    .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && isSecretDaemonEnvName(name))
+    .sort(([left], [right]) => left.localeCompare(right));
+  if (secrets.length === 0) return [];
+  const baseDir = process.env.XDG_RUNTIME_DIR ?? dirname(pidFilePath);
+  const credentialDir = mkdtempSync(join(baseDir, "lcm-systemd-credentials-"));
+  chmodSync(credentialDir, 0o700);
+  return secrets.map(([name, value]) => {
+    const credentialPath = join(credentialDir, name);
+    writeFileSync(credentialPath, value ?? "", { mode: 0o600 });
+    return `--property=LoadCredential=${name}:${credentialPath}`;
+  });
 }
 
 function startViaUserSystemd(
@@ -320,6 +344,16 @@ function startViaUserSystemd(
 ): { ok: boolean; warning?: string } {
   const spawnSyncImpl = opts._spawnSyncOverride ?? spawnSync;
   const unit = `lcm-daemon-${process.pid}-${Date.now()}`;
+  let credentialArgs: string[];
+  try {
+    credentialArgs = systemdDaemonCredentialArgs(process.env, opts.pidFilePath);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      warning: `user systemd credential setup failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
+    };
+  }
   const result = spawnSyncImpl("systemd-run", [
     "--user",
     "--collect",
@@ -327,6 +361,7 @@ function startViaUserSystemd(
     "--quiet",
     `--unit=${unit}`,
     ...systemdDaemonSetenvArgs(process.env),
+    ...credentialArgs,
     spawnCommand,
     ...spawnArgs,
   ], { encoding: "utf-8", env: { ...process.env }, timeout: Math.max(1, opts.spawnTimeoutMs) });

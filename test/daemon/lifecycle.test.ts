@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -191,10 +191,16 @@ describe("ensureDaemon", () => {
     const spawnSyncMock = vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" });
     const spawnMock = vi.fn();
     const originalProvider = process.env.LCM_SUMMARY_PROVIDER;
+    const originalSummaryApiKey = process.env.LCM_SUMMARY_API_KEY;
     const originalApiKey = process.env.ANTHROPIC_API_KEY;
+    const originalOpenAiApiKey = process.env.OPENAI_API_KEY;
     const originalUnrelated = process.env.UNRELATED_DAEMON_VALUE;
+    const originalRuntimeDir = process.env.XDG_RUNTIME_DIR;
+    process.env.XDG_RUNTIME_DIR = tempDir;
     process.env.LCM_SUMMARY_PROVIDER = "anthropic";
+    process.env.LCM_SUMMARY_API_KEY = "sk-lcm-test";
     process.env.ANTHROPIC_API_KEY = "sk-test";
+    delete process.env.OPENAI_API_KEY;
     process.env.UNRELATED_DAEMON_VALUE = "ignored";
 
     try {
@@ -219,7 +225,6 @@ describe("ensureDaemon", () => {
           "--user",
           "--collect",
           "--no-block",
-          "--setenv=ANTHROPIC_API_KEY=sk-test",
           "--setenv=LCM_SUMMARY_PROVIDER=anthropic",
           "node",
           "/path/lcm.js",
@@ -229,14 +234,34 @@ describe("ensureDaemon", () => {
         ]),
         expect.objectContaining({ encoding: "utf-8", timeout: 100 }),
       );
-      expect(spawnSyncMock.mock.calls[0][1]).not.toContain("--setenv=UNRELATED_DAEMON_VALUE=ignored");
+      const systemdArgs = spawnSyncMock.mock.calls[0][1] as string[];
+      const joinedArgs = systemdArgs.join("\n");
+      expect(joinedArgs).not.toContain("sk-test");
+      expect(joinedArgs).not.toContain("sk-lcm-test");
+      expect(systemdArgs).not.toContain("--setenv=UNRELATED_DAEMON_VALUE=ignored");
+      const credentialArgs = systemdArgs.filter((arg) => arg.startsWith("--property=LoadCredential="));
+      expect(credentialArgs).toEqual([
+        expect.stringContaining("ANTHROPIC_API_KEY:"),
+        expect.stringContaining("LCM_SUMMARY_API_KEY:"),
+      ]);
+      for (const arg of credentialArgs) {
+        const [, credentialPath] = arg.split(":", 2);
+        const expectedValue = arg.includes("ANTHROPIC_API_KEY:") ? "sk-test" : "sk-lcm-test";
+        expect(readFileSync(credentialPath, "utf-8")).toBe(expectedValue);
+      }
     } finally {
       if (originalProvider === undefined) delete process.env.LCM_SUMMARY_PROVIDER;
       else process.env.LCM_SUMMARY_PROVIDER = originalProvider;
+      if (originalSummaryApiKey === undefined) delete process.env.LCM_SUMMARY_API_KEY;
+      else process.env.LCM_SUMMARY_API_KEY = originalSummaryApiKey;
       if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = originalApiKey;
+      if (originalOpenAiApiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = originalOpenAiApiKey;
       if (originalUnrelated === undefined) delete process.env.UNRELATED_DAEMON_VALUE;
       else process.env.UNRELATED_DAEMON_VALUE = originalUnrelated;
+      if (originalRuntimeDir === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = originalRuntimeDir;
     }
   });
 

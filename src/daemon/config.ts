@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
 
 export interface SecurityConfig {
@@ -101,6 +102,22 @@ const DEFAULTS: DaemonConfig = {
 };
 
 const DENIED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const CREDENTIAL_ENV_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
+
+function readSystemdCredentialEnv(env: Record<string, string | undefined>): Record<string, string> {
+  const credentialsDir = env.CREDENTIALS_DIRECTORY;
+  if (!credentialsDir) return {};
+  const credentialEnv: Record<string, string> = {};
+  try {
+    for (const name of readdirSync(credentialsDir)) {
+      if (!CREDENTIAL_ENV_NAME_RE.test(name)) continue;
+      credentialEnv[name] = readFileSync(join(credentialsDir, name), "utf-8");
+    }
+  } catch {
+    return {};
+  }
+  return credentialEnv;
+}
 
 export function deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
   if (!source || typeof source !== "object") return target;
@@ -124,7 +141,8 @@ export function deepMerge(target: Record<string, unknown>, source: Record<string
 }
 
 export function loadDaemonConfig(configPath: string, overrides?: any, env?: Record<string, string | undefined>): DaemonConfig {
-  const e = env ?? process.env;
+  const rawEnv = env ?? process.env;
+  const e = { ...readSystemdCredentialEnv(rawEnv), ...rawEnv };
   let fileConfig: any = {};
   try { fileConfig = JSON.parse(readFileSync(configPath, "utf-8")); } catch {}
   // Always merge untrusted sources (fileConfig, overrides) into a trusted target so that
