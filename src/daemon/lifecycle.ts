@@ -202,6 +202,23 @@ function inspectDaemonParent(
   };
 }
 
+function parentInvariantWarning(parent: ParentInspection): string {
+  switch (parent.reason) {
+    case "missing-pid":
+      return "daemon PID file missing; daemon parent invariant is not verified";
+    case "dead-pid":
+      return `daemon PID ${parent.pid} is not running; daemon parent invariant is not verified`;
+    case "pid-not-lcm-daemon":
+      return `daemon PID ${parent.pid} is not an LCM daemon; daemon parent invariant is not verified`;
+    case "parent-unknown":
+      return `daemon PID ${parent.pid} parent could not be read; daemon parent invariant is not verified`;
+    case "user-systemd-unavailable":
+      return "user systemd manager unavailable; daemon parent invariant is not verified";
+    default:
+      return "daemon parent invariant is not verified";
+  }
+}
+
 async function terminatePid(
   pid: number,
   options: {
@@ -384,7 +401,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
             userSystemdPid: parent.userSystemdPid,
             restartedForParent,
             startMethod,
-            warning: warning ?? "user systemd manager unavailable; daemon parent invariant is not verified",
+            warning: warning ?? parentInvariantWarning(parent),
           };
         }
         return null;

@@ -403,7 +403,7 @@ describe("ensureDaemon", () => {
     });
 
     expect(result.connected).toBe(true);
-    expect(result.warning).toContain("daemon parent invariant is not verified");
+    expect(result.warning).toContain("daemon PID file missing");
     expect(spawnSyncMock).not.toHaveBeenCalled();
   });
 
@@ -490,7 +490,7 @@ describe("ensureDaemon", () => {
     expect(result.connected).toBe(true);
     expect(result.restartedForParent).toBe(false);
     expect(result.startMethod).toBe("existing");
-    expect(result.warning).toContain("daemon parent invariant is not verified");
+    expect(result.warning).toContain("daemon PID 200 is not an LCM daemon");
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnSyncMock).not.toHaveBeenCalled();
     expect(existsSync(pidFile)).toBe(false);
