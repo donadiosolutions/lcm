@@ -146,7 +146,7 @@ describe("ensureDaemon", () => {
     const tokenFile = join(tempDir, "daemon.token");
     writeFileSync(tokenFile, "local-token");
 
-    const mockFetch = vi.fn().mockImplementation(async (url: string) => {
+    const mockFetch = vi.fn().mockImplementation(async (url: string): Promise<Response> => {
       if (url.endsWith("/health")) {
         return { ok: true, json: async () => ({ status: "ok", version: "1.2.3", uptime: 100 }) } as Response;
       }
@@ -166,7 +166,50 @@ describe("ensureDaemon", () => {
     });
 
     expect(result.connected).toBe(true);
-    expect(mockFetch.mock.calls.filter(([url]) => String(url).endsWith("/stats/pool"))).toHaveLength(1);
+    expect(mockFetch.mock.calls.filter(([url]: [unknown, ...unknown[]]): boolean => String(url).endsWith("/stats/pool"))).toHaveLength(1);
+  });
+
+  it("terminates a PID-file daemon when retry health reports the wrong version", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-retry-version-"));
+    tempDirs.push(tempDir);
+    const procRoot = join(tempDir, "proc");
+    mkdirSync(procRoot);
+    const pidFile = join(tempDir, "daemon.pid");
+    const tokenFile = join(tempDir, "daemon.token");
+    writeFileSync(pidFile, "200");
+    writeFileSync(tokenFile, "local-token");
+    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+
+    let healthCalls = 0;
+    const mockFetch = vi.fn().mockImplementation(async (url: string): Promise<Response> => {
+      if (url.endsWith("/health")) {
+        healthCalls += 1;
+        if (healthCalls === 1) return { ok: false, json: async () => ({ error: "not ready" }) } as Response;
+        return { ok: true, json: async () => ({ status: "ok", version: "0.0.0", uptime: 100 }) } as Response;
+      }
+      if (url.endsWith("/stats/pool")) {
+        return { ok: true, json: async () => ({}) } as Response;
+      }
+      return { ok: false, json: async () => ({ error: "unexpected" }) } as Response;
+    });
+    const killMock = vi.fn();
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      _skipSpawn: true,
+      _fetchOverride: mockFetch as FetchOverride,
+      _killOverride: killMock,
+      _sleepOverride: async (): Promise<void> => {},
+      _isProcessAliveOverride: (): boolean => true,
+      _procRoot: procRoot,
+    });
+
+    expect(result.connected).toBe(false);
+    expect(killMock).toHaveBeenCalledWith(200, "SIGTERM");
+    expect(killMock).toHaveBeenCalledWith(200, "SIGKILL");
   });
 
   it("does not assume access when the local token file is missing", async () => {

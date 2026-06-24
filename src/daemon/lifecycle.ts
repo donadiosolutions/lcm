@@ -564,9 +564,16 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       if (!isNaN(pid) && isAlive(pid)) {
         await sleepFn(1000);
         const retry = await checkDaemonHealth(opts.port, fetchFn);
-        const accepted = await daemonResult(retry, false, "existing");
-        if (accepted) {
-          return accepted;
+        if (retry?.status === "ok") {
+          const retryHasAccess = await checkDaemonAccess(opts.port, tokenPath, fetchFn);
+          if (retryHasAccess && opts.expectedVersion && retry.version !== opts.expectedVersion) {
+            await terminatePidFileProcess();
+          } else if (retryHasAccess) {
+            const accepted = await daemonResult(retry, false, "existing", undefined, false, retryHasAccess);
+            if (accepted) {
+              return accepted;
+            }
+          }
         }
         if (enforceParent) {
           const parent = inspectParent();
