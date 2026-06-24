@@ -380,21 +380,28 @@ function systemdDaemonCredentialArgs(env: NodeJS.ProcessEnv): { args: string[]; 
   if (!baseStats.isDirectory()) {
     throw new Error(`${baseDir} is not a directory`);
   }
-  cleanupOldSystemdCredentialDirs(baseDir);
-  const credentialDir = mkdtempSync(join(baseDir, SYSTEMD_CREDENTIAL_DIR_PREFIX));
-  chmodSync(credentialDir, 0o700);
-  const names: string[] = [];
-  const args = secrets.map(([name, value]) => {
-    const credentialPath = join(credentialDir, name);
-    writeFileSync(credentialPath, value ?? "", { mode: 0o600 });
-    names.push(name);
-    return `--property=LoadCredential=${name}:${credentialPath}`;
-  });
-  return {
-    args,
-    names,
-    cleanup: systemdCredentialCleanup(credentialDir),
-  };
+  let credentialDir: string | undefined;
+  try {
+    cleanupOldSystemdCredentialDirs(baseDir);
+    credentialDir = mkdtempSync(join(baseDir, SYSTEMD_CREDENTIAL_DIR_PREFIX));
+    chmodSync(credentialDir, 0o700);
+    const createdCredentialDir = credentialDir;
+    const names: string[] = [];
+    const args = secrets.map(([name, value]) => {
+      const credentialPath = join(createdCredentialDir, name);
+      writeFileSync(credentialPath, value ?? "", { mode: 0o600 });
+      names.push(name);
+      return `--property=LoadCredential=${name}:${credentialPath}`;
+    });
+    return {
+      args,
+      names,
+      cleanup: systemdCredentialCleanup(createdCredentialDir),
+    };
+  } catch (err) {
+    if (credentialDir) systemdCredentialCleanup(credentialDir)();
+    throw err;
+  }
 }
 
 function startViaUserSystemd(
@@ -414,17 +421,27 @@ function startViaUserSystemd(
       warning: `user systemd credential setup failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
     };
   }
-  const result = spawnSyncImpl("systemd-run", [
-    "--user",
-    "--collect",
-    "--no-block",
-    "--quiet",
-    `--unit=${unit}`,
-    ...systemdDaemonSetenvArgs(process.env, credentials.names),
-    ...credentials.args,
-    spawnCommand,
-    ...spawnArgs,
-  ], { encoding: "utf-8", env: systemdRunProcessEnv(process.env), timeout: Math.max(1, opts.spawnTimeoutMs) });
+  let result: ReturnType<typeof spawnSyncImpl>;
+  try {
+    result = spawnSyncImpl("systemd-run", [
+      "--user",
+      "--collect",
+      "--no-block",
+      "--quiet",
+      `--unit=${unit}`,
+      ...systemdDaemonSetenvArgs(process.env, credentials.names),
+      ...credentials.args,
+      spawnCommand,
+      ...spawnArgs,
+    ], { encoding: "utf-8", env: systemdRunProcessEnv(process.env), timeout: Math.max(1, opts.spawnTimeoutMs) });
+  } catch (err) {
+    credentials.cleanup?.();
+    const detail = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      warning: `user systemd start failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
+    };
+  }
 
   if (result.status === 0) return { ok: true, cleanup: credentials.cleanup };
   const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
@@ -475,10 +492,11 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     startMethod: EnsureDaemonResult["startMethod"],
     warning?: string,
     allowParentWarning = false,
+    accessAlreadyVerified = false,
   ): Promise<EnsureDaemonResult | null> {
     if (health?.status !== "ok") return null;
     if (opts.expectedVersion && health.version !== opts.expectedVersion) return null;
-    if (!await checkDaemonAccess(opts.port, tokenPath, fetchFn)) return null;
+    if (!accessAlreadyVerified && !await checkDaemonAccess(opts.port, tokenPath, fetchFn)) return null;
 
     let parent: ParentInspection | undefined;
     if (enforceParent) {
@@ -524,7 +542,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (hasAccess && opts.expectedVersion && health.version !== opts.expectedVersion) {
       await terminatePidFileProcess();
     } else if (hasAccess) {
-      const accepted = await daemonResult(health, false, "existing");
+      const accepted = await daemonResult(health, false, "existing", undefined, false, true);
       if (accepted) return accepted;
       if (enforceParent) {
         const parent = inspectParent();

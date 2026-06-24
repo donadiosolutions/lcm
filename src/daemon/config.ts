@@ -156,7 +156,13 @@ function readSystemdCredentialEnv(env: Record<string, string | undefined>): Reco
   if (!credentialsDir) return {};
   const credentialEnv: Record<string, string> = {};
   for (const name of credentialNamesFromEnv(env)) {
-    const credentialFile = resolve(credentialsDir, credentialFileName(name));
+    let credentialFile: string;
+    try {
+      credentialFile = realpathSync(resolve(credentialsDir, credentialFileName(name)));
+    } catch {
+      // Ignore missing credentials; normal env/config validation will report required keys.
+      continue;
+    }
     if (!hasTrustedSystemdCredentialPrefix(credentialFile)) continue;
     if (!credentialFile.startsWith(`${credentialsDir}/`)) continue;
     try {

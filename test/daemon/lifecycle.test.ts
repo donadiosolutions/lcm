@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi, type TestContext } from "vitest";
 import { ensureDaemon, findUserSystemdPid, readProcessParentPid } from "../../src/daemon/lifecycle.js";
 
 const tempDirs: string[] = [];
@@ -29,7 +29,7 @@ function userRuntimeBaseDir(): string | undefined {
   if (typeof process.getuid !== "function") return undefined;
   const baseDir = `/run/user/${process.getuid()}`;
   try {
-    mkdirSync(baseDir, { recursive: true, mode: 0o700 });
+    if (!existsSync(baseDir)) return undefined;
     const probeDir = mkdtempSync(join(baseDir, "lcm-lifecycle-probe-"));
     rmSync(probeDir, { recursive: true, force: true });
     return baseDir;
@@ -37,8 +37,6 @@ function userRuntimeBaseDir(): string | undefined {
     return undefined;
   }
 }
-
-const userSystemdRuntimeIt = userRuntimeBaseDir() === undefined ? it.skip : it;
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
@@ -141,6 +139,36 @@ describe("ensureDaemon", () => {
     });
   });
 
+  it("reuses the healthy daemon access probe on the existing-daemon fast path", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-access-probe-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const tokenFile = join(tempDir, "daemon.token");
+    writeFileSync(tokenFile, "local-token");
+
+    const mockFetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.endsWith("/health")) {
+        return { ok: true, json: async () => ({ status: "ok", version: "1.2.3", uptime: 100 }) } as Response;
+      }
+      if (url.endsWith("/stats/pool")) {
+        return { ok: true, json: async () => ({}) } as Response;
+      }
+      return { ok: false, json: async () => ({ error: "unexpected" }) } as Response;
+    });
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      _skipSpawn: true,
+      _fetchOverride: mockFetch as FetchOverride,
+    });
+
+    expect(result.connected).toBe(true);
+    expect(mockFetch.mock.calls.filter(([url]) => String(url).endsWith("/stats/pool"))).toHaveLength(1);
+  });
+
   it("does not assume access when the local token file is missing", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-missing-token-"));
     tempDirs.push(tempDir);
@@ -199,11 +227,15 @@ describe("ensureDaemon", () => {
     expect(spawnMock).toHaveBeenCalled();
   });
 
-  userSystemdRuntimeIt("starts via user systemd when parent enforcement is requested on Linux", async (): Promise<void> => {
+  it("starts via user systemd when parent enforcement is requested on Linux", async (context: TestContext): Promise<void> => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-systemd-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
-    const runtimeBaseDir = userRuntimeBaseDir()!;
+    const runtimeBaseDir = userRuntimeBaseDir();
+    if (runtimeBaseDir === undefined) {
+      context.skip();
+      return;
+    }
     const oldCredentialDir = mkdtempSync(join(runtimeBaseDir, "lcm-systemd-credentials-old-"));
     tempDirs.push(oldCredentialDir);
     writeFileSync(join(oldCredentialDir, "ANTHROPIC_API_KEY"), "old");

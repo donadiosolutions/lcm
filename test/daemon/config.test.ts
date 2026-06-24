@@ -1,20 +1,30 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, type TestContext } from "vitest";
 import { loadDaemonConfig, deepMerge } from "../../src/daemon/config.js";
 
 function trustedCredentialBaseDir(): string | undefined {
   if (typeof process.getuid !== "function") return undefined;
   const baseDir = `/run/user/${process.getuid()}/credentials`;
   try {
-    mkdirSync(baseDir, { recursive: true, mode: 0o700 });
+    if (!existsSync(baseDir)) return undefined;
+    const probeDir = mkdtempSync(join(baseDir, "lcm-config-probe-"));
+    rmSync(probeDir, { recursive: true, force: true });
     return baseDir;
   } catch {
     return undefined;
   }
 }
 
-const trustedCredentialIt = trustedCredentialBaseDir() === undefined ? it.skip : it;
+function makeTrustedCredentialDir(context: TestContext): string | undefined {
+  const baseDir = trustedCredentialBaseDir();
+  if (baseDir === undefined) {
+    context.skip();
+    return undefined;
+  }
+  return mkdtempSync(join(baseDir, "lcm-config-credentials-"));
+}
 
 describe("loadDaemonConfig", () => {
   it("returns defaults when no config file exists", () => {
@@ -50,8 +60,9 @@ describe("loadDaemonConfig", () => {
     expect(c.llm.apiKey).toBe("sk-env");
   });
 
-  trustedCredentialIt("falls back to systemd credentials when provider API key env vars are not set", (): void => {
-    const credentialsDir = mkdtempSync(join(trustedCredentialBaseDir()!, "lcm-config-credentials-"));
+  it("falls back to systemd credentials when provider API key env vars are not set", (context: TestContext): void => {
+    const credentialsDir = makeTrustedCredentialDir(context);
+    if (credentialsDir === undefined) return;
     try {
       writeFileSync(join(credentialsDir, "ANTHROPIC_API_KEY"), "sk-credential", { mode: 0o600 });
       const c = loadDaemonConfig(
@@ -68,8 +79,9 @@ describe("loadDaemonConfig", () => {
     }
   });
 
-  trustedCredentialIt("interpolates API keys from systemd credentials", (): void => {
-    const credentialsDir = mkdtempSync(join(trustedCredentialBaseDir()!, "lcm-config-credentials-"));
+  it("interpolates API keys from systemd credentials", (context: TestContext): void => {
+    const credentialsDir = makeTrustedCredentialDir(context);
+    if (credentialsDir === undefined) return;
     try {
       writeFileSync(join(credentialsDir, "OPENAI_API_KEY"), "sk-openai-credential", { mode: 0o600 });
       const c = loadDaemonConfig(
@@ -83,6 +95,29 @@ describe("loadDaemonConfig", () => {
       expect(c.llm.apiKey).toBe("sk-openai-credential");
     } finally {
       rmSync(credentialsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not follow systemd credential symlinks outside the trusted directory", (context: TestContext): void => {
+    const credentialsDir = makeTrustedCredentialDir(context);
+    if (credentialsDir === undefined) return;
+    const outsideDir = mkdtempSync(join(tmpdir(), "lcm-config-credential-outside-"));
+    try {
+      const outsideCredential = join(outsideDir, "OPENAI_API_KEY");
+      writeFileSync(outsideCredential, "sk-outside", { mode: 0o600 });
+      symlinkSync(outsideCredential, join(credentialsDir, "OPENAI_API_KEY"));
+      const c = loadDaemonConfig(
+        "/nonexistent",
+        { llm: { provider: "openai", apiKey: "${OPENAI_API_KEY}" } },
+        {
+          CREDENTIALS_DIRECTORY: credentialsDir,
+          LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
+        },
+      );
+      expect(c.llm.apiKey).toBe("");
+    } finally {
+      rmSync(credentialsDir, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
     }
   });
 
