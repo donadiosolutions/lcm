@@ -152,6 +152,10 @@ In practice, the hook asks the daemon for ranked candidates, the daemon dedupes 
 
 The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon requests to loopback HTTP origins and known daemon routes, so a malformed config or caller cannot redirect daemon traffic to another host.
 
+Use `lcm daemon start` to start or validate the managed background daemon. On Linux, lcm prefers the current user's `systemd --user` manager so the daemon remains a direct child of the user manager instead of being orphaned under PID 1. `lcm daemon start --detach` is kept as a compatibility alias for the same managed start behavior. Use `lcm daemon start --foreground` only when you want the daemon to stay attached to the current terminal for debugging.
+
+`lcm doctor` verifies daemon health and, on Linux, repairs a healthy daemon that is not parented by the current user's systemd manager by restarting it through the managed start path. If the user systemd manager is unavailable, lcm falls back to the older detached spawn behavior and reports that the parent invariant is not satisfied.
+
 Daemon port values must be integers from `1` through `65535` when connecting to an existing daemon. The daemon server also accepts port `0` for test and ephemeral-port binding. `daemon.idleTimeoutMs` must be an integer from `0` through `86400000` milliseconds; `0` disables the idle timer.
 
 Hook error fallback logs write to `~/.lcm/logs/events.log`.

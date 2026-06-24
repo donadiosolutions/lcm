@@ -1,8 +1,8 @@
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ensureDaemon } from "../../src/daemon/lifecycle.js";
+import { ensureDaemon, findUserSystemdPid, readProcessParentPid } from "../../src/daemon/lifecycle.js";
 
 const tempDirs: string[] = [];
 
@@ -12,7 +12,26 @@ afterEach(() => {
   }
 });
 
+function writeProcEntry(procRoot: string, pid: number, status: string, cmdline: string): void {
+  const dir = join(procRoot, String(pid));
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "status"), status);
+  writeFileSync(join(dir, "cmdline"), cmdline.replaceAll(" ", "\0"));
+}
+
 describe("ensureDaemon", () => {
+  it("finds the current user systemd manager and process parent from procfs", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-proc-"));
+    tempDirs.push(tempDir);
+
+    writeProcEntry(tempDir, 100, "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "/usr/lib/systemd/systemd --user --deserialize=10");
+    writeProcEntry(tempDir, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t100\n", "node lcm daemon start --foreground");
+    writeProcEntry(tempDir, 300, "Name:\tsystemd\nUid:\t1001\t1001\t1001\t1001\nPPid:\t1\n", "/usr/lib/systemd/systemd --user");
+
+    expect(findUserSystemdPid({ procRoot: tempDir, uid: 1000 })).toBe(100);
+    expect(readProcessParentPid(200, tempDir)).toBe(100);
+  });
+
   it("connects to existing healthy daemon", async () => {
     const { createDaemon } = await import("../../src/daemon/server.js");
     const { loadDaemonConfig } = await import("../../src/daemon/config.js");
@@ -39,6 +58,164 @@ describe("ensureDaemon", () => {
     } finally {
       await daemon.stop();
     }
+  });
+
+  it("does not connect when health passes but authenticated routes reject the local token", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-auth-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const tokenFile = join(tempDir, "daemon.token");
+    writeFileSync(tokenFile, "local-token");
+
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ status: "ok", version: "1.2.3", uptime: 100 }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        json: async () => ({ error: "unauthorized" }),
+      } as Response);
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      _skipSpawn: true,
+      _fetchOverride: mockFetch as any,
+    });
+
+    expect(result.connected).toBe(false);
+    expect(mockFetch).toHaveBeenNthCalledWith(2, "http://127.0.0.1:19999/stats/pool", {
+      headers: { Authorization: "Bearer local-token" },
+    });
+  });
+
+  it("does not report spawned daemon connected when an occupied port still rejects the local token", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-auth-spawn-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const tokenFile = join(tempDir, "daemon.token");
+    writeFileSync(tokenFile, "local-token");
+
+    const mockFetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.endsWith("/stats/pool")) {
+        return { ok: false, status: 401, json: async () => ({ error: "unauthorized" }) } as Response;
+      }
+      return { ok: true, json: async () => ({ status: "ok", version: "1.2.3", uptime: 100 }) } as Response;
+    });
+    const spawnMock = vi.fn().mockReturnValue({ pid: 12345, unref: vi.fn() });
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      _fetchOverride: mockFetch as any,
+      _spawnOverride: spawnMock as any,
+    });
+
+    expect(result.connected).toBe(false);
+    expect(result.spawned).toBe(true);
+    expect(spawnMock).toHaveBeenCalled();
+  });
+
+  it("starts via user systemd when parent enforcement is requested on Linux", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-systemd-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const spawnSyncMock = vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" });
+    const spawnMock = vi.fn();
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      spawnCommand: "node",
+      spawnArgs: ["/path/lcm.js", "daemon", "start", "--foreground"],
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _skipHealthWait: true,
+      _spawnSyncOverride: spawnSyncMock as any,
+      _spawnOverride: spawnMock as any,
+    });
+
+    expect(result.startMethod).toBe("systemd-user");
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(spawnSyncMock).toHaveBeenCalledWith(
+      "systemd-run",
+      expect.arrayContaining(["--user", "--collect", "--no-block", "node", "/path/lcm.js", "daemon", "start", "--foreground"]),
+      expect.objectContaining({ encoding: "utf-8" }),
+    );
+  });
+
+  it("falls back to detached spawn with a Linux parent-invariant warning when systemd-run fails", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-systemd-fallback-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const spawnSyncMock = vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "No medium found" });
+    const spawnMock = vi.fn().mockReturnValue({ pid: 12345, unref: vi.fn() });
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      spawnCommand: "node",
+      spawnArgs: ["/path/lcm.js", "daemon", "start", "--foreground"],
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _skipHealthWait: true,
+      _spawnSyncOverride: spawnSyncMock as any,
+      _spawnOverride: spawnMock as any,
+    });
+
+    expect(result.startMethod).toBe("detached-spawn");
+    expect(result.warning).toContain("daemon parent invariant is not satisfied");
+    expect(spawnMock).toHaveBeenCalled();
+  });
+
+  it("kills and restarts an authenticated daemon with the wrong Linux parent", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-wrong-parent-"));
+    tempDirs.push(tempDir);
+    const procRoot = join(tempDir, "proc");
+    mkdirSync(procRoot);
+    const pidFile = join(tempDir, "daemon.pid");
+    const tokenFile = join(tempDir, "daemon.token");
+    writeFileSync(tokenFile, "local-token");
+    writeFileSync(pidFile, "200");
+    writeProcEntry(procRoot, 100, "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "/usr/lib/systemd/systemd --user");
+    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response);
+    const killMock = vi.fn();
+    const spawnSyncMock = vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" });
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _procRoot: procRoot,
+      _uid: 1000,
+      _fetchOverride: fetchMock as any,
+      _killOverride: killMock,
+      _sleepOverride: async () => {},
+      _isProcessAliveOverride: () => true,
+      _spawnSyncOverride: spawnSyncMock as any,
+      _skipHealthWait: true,
+    });
+
+    expect(result.restartedForParent).toBe(true);
+    expect(result.startMethod).toBe("systemd-user");
+    expect(killMock).toHaveBeenCalledWith(200, "SIGTERM");
+    expect(killMock).toHaveBeenCalledWith(200, "SIGKILL");
   });
 
   it("returns connected=false when daemon is not running and spawn is skipped", async () => {

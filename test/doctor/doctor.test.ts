@@ -208,6 +208,57 @@ describe("runDoctor project map checks", () => {
 });
 
 describe("runDoctor daemon version mismatch", () => {
+  it("restarts a healthy daemon that is not parented by user systemd", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 7865,
+      spawned: true,
+      restartedForParent: true,
+      startMethod: "systemd-user",
+    });
+
+    const deps = minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch: vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    });
+
+    const results = await runDoctor(deps);
+    const daemonResult = results.find((r) => r.name === "daemon");
+
+    expect(vi.mocked(ensureDaemon)).toHaveBeenCalledWith(
+      expect.objectContaining({ enforceUserManagerParent: true }),
+    );
+    expect(daemonResult?.status).toBe("warn");
+    expect(daemonResult?.fixApplied).toBe(true);
+    expect(daemonResult?.message).toContain("restarted under user systemd");
+  });
+
+  it("warns when Linux fallback starts a daemon without satisfying the parent invariant", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 7865,
+      spawned: true,
+      startMethod: "detached-spawn",
+      warning: "user systemd start failed (No medium found); used detached spawn fallback; daemon parent invariant is not satisfied",
+    });
+
+    const deps = minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch: vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    });
+
+    const results = await runDoctor(deps);
+    const daemonResult = results.find((r) => r.name === "daemon");
+
+    expect(daemonResult?.status).toBe("warn");
+    expect(daemonResult?.fixApplied).toBe(false);
+    expect(daemonResult?.message).toContain("daemon parent invariant is not satisfied");
+  });
+
   it("auto-restarts daemon on version mismatch and reports fixApplied when post-restart version matches", async () => {
     const pkgVersion = "0.6.0";
     const daemonVersion = "0.5.0";
@@ -391,6 +442,7 @@ describe("Passive Learning checks", () => {
   });
 
   it("does not recommend global drain when every queued sidecar is orphaned", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({ connected: true, port: 3737, spawned: false });
     mockCollectEventStats.mockReturnValue({
       captured: 5000,
       unprocessed: 2000,
@@ -410,6 +462,7 @@ describe("Passive Learning checks", () => {
   });
 
   it("keeps global drain advice scoped when only some queued sidecars are orphaned", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({ connected: true, port: 3737, spawned: false });
     mockCollectEventStats.mockReturnValue({
       captured: 5000,
       unprocessed: 2000,
