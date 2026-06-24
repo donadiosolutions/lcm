@@ -170,11 +170,12 @@ export async function handleDaemonRequest(
     const ensure = opts._ensureDaemon ?? ensureDaemon;
     if (!restartInFlight.has(opts.port)) {
       const p = ensure({
-          port: opts.port, pidFilePath: opts.pidFilePath, spawnTimeoutMs: 10000,
-          expectedVersion: opts.expectedVersion,
-          spawnCommand: opts.spawnCommand,
-          spawnArgs: opts.spawnArgs,
-        })
+        port: opts.port, pidFilePath: opts.pidFilePath, spawnTimeoutMs: 10000,
+        expectedVersion: opts.expectedVersion,
+        spawnCommand: opts.spawnCommand,
+        spawnArgs: opts.spawnArgs,
+        enforceUserManagerParent: true,
+      })
         .catch(() => { /* non-fatal */ })
         .finally(() => { restartInFlight.delete(opts.port); });
       restartInFlight.set(opts.port, p);
@@ -201,6 +202,7 @@ export async function startMcpServer(): Promise<void> {
     expectedVersion: PKG_VERSION,
     spawnCommand: process.execPath,
     spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
+    enforceUserManagerParent: true,
   });
 
   const client = new DaemonClient(`http://127.0.0.1:${port}`);

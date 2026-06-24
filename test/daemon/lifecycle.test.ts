@@ -102,6 +102,37 @@ describe("ensureDaemon", () => {
     });
   });
 
+  it("does not assume access when the local token file is missing", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-missing-token-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ status: "ok", version: "1.2.3", uptime: 100 }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        json: async () => ({ error: "unauthorized" }),
+      } as Response);
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      _skipSpawn: true,
+      _fetchOverride: mockFetch as any,
+    });
+
+    expect(result.connected).toBe(false);
+    expect(mockFetch).toHaveBeenNthCalledWith(2, "http://127.0.0.1:19999/stats/pool", {
+      headers: undefined,
+    });
+  });
+
   it("does not report spawned daemon connected when an occupied port still rejects the local token", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-auth-spawn-"));
     tempDirs.push(tempDir);
@@ -262,6 +293,41 @@ describe("ensureDaemon", () => {
     expect(result.pid).toBe(200);
   });
 
+  it("accepts an authenticated daemon with a warning when the PID file is missing", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-no-pid-"));
+    tempDirs.push(tempDir);
+    const procRoot = join(tempDir, "proc");
+    mkdirSync(procRoot);
+    const pidFile = join(tempDir, "daemon.pid");
+    const tokenFile = join(tempDir, "daemon.token");
+    writeFileSync(tokenFile, "local-token");
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response);
+    const spawnSyncMock = vi.fn();
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _procRoot: procRoot,
+      _uid: 1000,
+      _fetchOverride: fetchMock as any,
+      _isProcessAliveOverride: () => true,
+      _spawnSyncOverride: spawnSyncMock as any,
+      _skipSpawn: true,
+    });
+
+    expect(result.connected).toBe(true);
+    expect(result.warning).toContain("daemon parent invariant is not verified");
+    expect(spawnSyncMock).not.toHaveBeenCalled();
+  });
+
   it("retries a live PID file process and restarts it when the parent is wrong", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-pid-retry-"));
     tempDirs.push(tempDir);
@@ -303,6 +369,49 @@ describe("ensureDaemon", () => {
     expect(result.startMethod).toBe("systemd-user");
     expect(killMock).toHaveBeenCalledWith(200, "SIGTERM");
     expect(killMock).toHaveBeenCalledWith(200, "SIGKILL");
+  });
+
+  it("does not kill an unrelated live process from a stale PID file", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-stale-unrelated-"));
+    tempDirs.push(tempDir);
+    const procRoot = join(tempDir, "proc");
+    mkdirSync(procRoot);
+    const pidFile = join(tempDir, "daemon.pid");
+    const tokenFile = join(tempDir, "daemon.token");
+    writeFileSync(tokenFile, "local-token");
+    writeFileSync(pidFile, "200");
+    writeProcEntry(procRoot, 100, "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "/usr/lib/systemd/systemd --user");
+    writeProcEntry(procRoot, 200, "Name:\tsleep\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "sleep 1000");
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, json: async () => ({}) } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response);
+    const killMock = vi.fn();
+    const spawnSyncMock = vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" });
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _procRoot: procRoot,
+      _uid: 1000,
+      _fetchOverride: fetchMock as any,
+      _killOverride: killMock,
+      _sleepOverride: async () => {},
+      _isProcessAliveOverride: () => true,
+      _spawnSyncOverride: spawnSyncMock as any,
+      _skipHealthWait: true,
+    });
+
+    expect(result.restartedForParent).toBe(false);
+    expect(result.startMethod).toBe("systemd-user");
+    expect(killMock).not.toHaveBeenCalled();
+    expect(existsSync(pidFile)).toBe(false);
   });
 
   it("treats access check failures as unavailable", async () => {

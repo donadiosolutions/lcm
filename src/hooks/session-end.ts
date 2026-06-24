@@ -94,6 +94,7 @@ export async function handleSessionEnd(
     port: daemonPort,
     pidFilePath,
     spawnTimeoutMs: 5000,
+    enforceUserManagerParent: true,
   });
   if (!connected) return { exitCode: 0, stdout: "" };
 

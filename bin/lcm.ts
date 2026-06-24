@@ -369,7 +369,12 @@ async function createDaemonClientOrExit(): Promise<DaemonClient> {
   const port = config.daemon?.port ?? 3737;
   const pidFilePath = daemonPidPath();
   const tokenPath = daemonTokenPath();
-  const { connected } = await ensureDaemon({ port, pidFilePath, spawnTimeoutMs: 5000 });
+  const { connected } = await ensureDaemon({
+    port,
+    pidFilePath,
+    spawnTimeoutMs: 5000,
+    enforceUserManagerParent: true,
+  });
 
   if (!connected) {
     console.error("  Daemon not available. Start it with: lcm daemon start --detach");
@@ -458,8 +463,6 @@ async function main() {
       ensureAuthToken(tokenPath);
       const config = loadDaemonConfig(join(lcDir, "config.json"));
       const pidFilePath = daemonPidPath();
-      mkdirSync(lcDir, { recursive: true });
-      writeFileSync(pidFilePath, String(process.pid));
       const cleanupPidFile = () => {
         try {
           if (readFileSync(pidFilePath, "utf-8").trim() === String(process.pid)) {
@@ -469,8 +472,10 @@ async function main() {
           // Best-effort cleanup; stale PID files are handled by ensureDaemon.
         }
       };
-      process.on("exit", cleanupPidFile);
       const daemon = await createDaemon(config, { tokenPath });
+      mkdirSync(lcDir, { recursive: true });
+      writeFileSync(pidFilePath, String(process.pid));
+      process.on("exit", cleanupPidFile);
       console.log(`lcm daemon started on port ${daemon.address().port}`);
       process.on("SIGTERM", () => exit(0));
       process.on("SIGINT", () => exit(0));
@@ -513,7 +518,12 @@ async function main() {
         const config = loadDaemonConfig(defaultConfigPath());
         const port = config.daemon?.port ?? 3737;
         const pidFilePath = daemonPidPath();
-        const { connected } = await ensureDaemon({ port, pidFilePath, spawnTimeoutMs: 10000 });
+        const { connected } = await ensureDaemon({
+          port,
+          pidFilePath,
+          spawnTimeoutMs: 10000,
+          enforceUserManagerParent: true,
+        });
         if (!connected) {
           console.error("Could not connect to daemon. Start it with: lcm daemon start --detach");
           exit(1);
@@ -1229,7 +1239,12 @@ async function main() {
       const config = loadDaemonConfig(defaultConfigPath());
       const port = config.daemon?.port ?? 3737;
       const pidFilePath = daemonPidPath();
-      const { connected } = await ensureDaemon({ port, pidFilePath, spawnTimeoutMs: 5000 });
+      const { connected } = await ensureDaemon({
+        port,
+        pidFilePath,
+        spawnTimeoutMs: 5000,
+        enforceUserManagerParent: true,
+      });
       if (!connected) { console.error("  Daemon not available"); exit(1); }
 
       // Pre-scan for session count (enables accurate live progress bar)
@@ -1318,7 +1333,12 @@ async function main() {
       const config = loadDaemonConfig(defaultConfigPath());
       const port = config.daemon?.port ?? 3737;
       const pidFilePath = daemonPidPath();
-      const { connected } = await ensureDaemon({ port, pidFilePath, spawnTimeoutMs: 5000 });
+      const { connected } = await ensureDaemon({
+        port,
+        pidFilePath,
+        spawnTimeoutMs: 5000,
+        enforceUserManagerParent: true,
+      });
       if (!connected) {
         console.error("  Daemon not available. Start it with: lcm daemon start --detach");
         exit(1);

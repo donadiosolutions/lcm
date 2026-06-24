@@ -39,7 +39,12 @@ export async function handleSessionStart(stdin: string, client: DaemonClient, po
 
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
-  const { connected } = await ensureDaemon({ port: daemonPort, pidFilePath, spawnTimeoutMs: 5000 });
+  const { connected } = await ensureDaemon({
+    port: daemonPort,
+    pidFilePath,
+    spawnTimeoutMs: 5000,
+    enforceUserManagerParent: true,
+  });
   if (!connected) return { exitCode: 0, stdout: "" };
 
   try {

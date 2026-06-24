@@ -97,6 +97,21 @@ export function readProcessParentPid(pid: number, procRoot = "/proc"): number | 
   }
 }
 
+function readProcessCommand(pid: number, procRoot = "/proc"): string | null {
+  try {
+    return readFileSync(join(procRoot, String(pid), "cmdline"), "utf-8").replace(/\0/g, " ").trim();
+  } catch {
+    return null;
+  }
+}
+
+function isLikelyLcmDaemonProcess(pid: number, procRoot = "/proc"): boolean {
+  const command = readProcessCommand(pid, procRoot);
+  if (!command) return false;
+  const parts = command.split(/\s+/);
+  return command.includes("lcm") && parts.includes("daemon") && parts.includes("start");
+}
+
 export function findUserSystemdPid(options: { procRoot?: string; uid?: number } = {}): number | null {
   const procRoot = options.procRoot ?? "/proc";
   const uid = options.uid ?? (typeof process.getuid === "function" ? process.getuid() : undefined);
@@ -149,8 +164,8 @@ function inspectDaemonParent(
   }
 
   const pid = readPidFile(pidFilePath);
-  if (pid === null) return { satisfies: false, available: true, reason: "missing-pid" };
-  if (!options.isAlive(pid)) return { satisfies: false, available: true, pid, reason: "dead-pid" };
+  if (pid === null) return { satisfies: false, available: false, reason: "missing-pid" };
+  if (!options.isAlive(pid)) return { satisfies: false, available: false, pid, reason: "dead-pid" };
 
   const userSystemdPid = findUserSystemdPid({ procRoot: options.procRoot, uid: options.uid });
   if (userSystemdPid === null) {
@@ -159,7 +174,7 @@ function inspectDaemonParent(
 
   const parentPid = readProcessParentPid(pid, options.procRoot);
   if (parentPid === null) {
-    return { satisfies: false, available: true, pid, userSystemdPid, reason: "parent-unknown" };
+    return { satisfies: false, available: false, pid, userSystemdPid, reason: "parent-unknown" };
   }
 
   return {
@@ -215,10 +230,9 @@ async function checkDaemonAccess(
   fetchFn: typeof globalThis.fetch,
 ): Promise<boolean> {
   const token = readAuthToken(tokenPath);
-  if (!token) return true;
   try {
     const res = await fetchFn(`http://127.0.0.1:${port}/stats/pool`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
     });
     return res.ok;
   } catch {
@@ -382,8 +396,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         if (enforceParent) {
           const parent = inspectParent();
           if (parent.available && parent.pid !== undefined) {
-            await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
-            restartedForParent = true;
+            if (isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
+              await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
+              restartedForParent = true;
+            }
           }
         }
       }

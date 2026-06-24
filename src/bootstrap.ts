@@ -17,7 +17,12 @@ export interface EnsureCoreDeps {
   writeFileSync: (path: string, data: string) => void;
   mkdirSync: (path: string, opts?: { recursive: boolean }) => void;
   chmodSync?: (path: string, mode: number) => void;
-  ensureDaemon: (opts: { port: number; pidFilePath: string; spawnTimeoutMs: number }) => Promise<{ connected: boolean }>;
+  ensureDaemon: (opts: {
+    port: number;
+    pidFilePath: string;
+    spawnTimeoutMs: number;
+    enforceUserManagerParent?: boolean;
+  }) => Promise<{ connected: boolean }>;
 }
 
 function defaultDeps(): EnsureCoreDeps {
@@ -70,6 +75,7 @@ export async function ensureCore(deps: EnsureCoreDeps = defaultDeps()): Promise<
     port: config.daemon?.port ?? 3737,
     pidFilePath: join(dirname(deps.configPath), "daemon.pid"),
     spawnTimeoutMs: 5000,
+    enforceUserManagerParent: true,
   });
 }
 
