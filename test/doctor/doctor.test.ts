@@ -354,6 +354,45 @@ describe("runDoctor daemon version mismatch", () => {
     expect(capture?.message).toContain("daemon may be offline");
     expect(capture?.message).not.toContain("lcm events promote --all");
   });
+
+  it("reports daemon validation failure when restart throws without version mismatch", async () => {
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(new Error("restart failed"));
+
+    const deps = minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    });
+
+    const results = await runDoctor(deps);
+    const daemonResult = results.find((r) => r.name === "daemon");
+
+    expect(daemonResult?.status).toBe("warn");
+    expect(daemonResult?.message).toContain("daemon validation failed");
+    expect(daemonResult?.message).toContain("lcm daemon start --detach");
+  });
+
+  it("reports daemon auto-start warnings when starting an offline daemon", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 7865,
+      spawned: true,
+      startMethod: "detached-spawn",
+      warning: "user systemd manager unavailable; daemon parent invariant is not verified",
+    });
+
+    const deps = minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: false }),
+    });
+
+    const results = await runDoctor(deps);
+    const daemonResult = results.find((r) => r.name === "daemon");
+
+    expect(daemonResult?.status).toBe("warn");
+    expect(daemonResult?.fixApplied).toBe(true);
+    expect(daemonResult?.message).toContain("localhost:3737");
+    expect(daemonResult?.message).toContain("daemon parent invariant is not verified");
+  });
 });
 
 describe("runDoctor summarizer modes", () => {
