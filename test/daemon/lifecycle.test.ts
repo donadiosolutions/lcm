@@ -216,11 +216,13 @@ describe("ensureDaemon", () => {
     const originalApiKey = process.env.ANTHROPIC_API_KEY;
     const originalOpenAiApiKey = process.env.OPENAI_API_KEY;
     const originalUnrelated = process.env.UNRELATED_DAEMON_VALUE;
+    const originalPath = process.env.PATH;
     process.env.LCM_SUMMARY_PROVIDER = "anthropic";
     process.env.LCM_SUMMARY_API_KEY = "sk-lcm-test";
     process.env.ANTHROPIC_API_KEY = "sk-test";
     delete process.env.OPENAI_API_KEY;
     process.env.UNRELATED_DAEMON_VALUE = "ignored";
+    process.env.PATH = "/opt/lcm-test/bin:/usr/bin";
 
     try {
       const result = await ensureDaemon({
@@ -244,6 +246,7 @@ describe("ensureDaemon", () => {
           "--user",
           "--collect",
           "--no-block",
+          "--setenv=PATH=/opt/lcm-test/bin:/usr/bin",
           "--setenv=LCM_SUMMARY_PROVIDER=anthropic",
           "--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_SUMMARY_API_KEY",
           "node",
@@ -281,6 +284,8 @@ describe("ensureDaemon", () => {
       else process.env.OPENAI_API_KEY = originalOpenAiApiKey;
       if (originalUnrelated === undefined) delete process.env.UNRELATED_DAEMON_VALUE;
       else process.env.UNRELATED_DAEMON_VALUE = originalUnrelated;
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
     }
   });
 

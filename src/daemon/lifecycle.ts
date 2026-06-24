@@ -311,7 +311,7 @@ const SYSTEMD_CREDENTIAL_DIR_PREFIX = "lcm-systemd-credentials-";
 const SYSTEMD_CREDENTIAL_SOURCE_MAX_AGE_MS = 10 * 60 * 1000;
 
 function shouldPropagateDaemonEnv(name: string, value: string | undefined): value is string {
-  return value !== undefined && (name.startsWith("LCM_") || SYSTEMD_PROVIDER_SECRET_ENV_NAMES.has(name));
+  return value !== undefined && (name === "PATH" || name.startsWith("LCM_") || SYSTEMD_PROVIDER_SECRET_ENV_NAMES.has(name));
 }
 
 function isSecretDaemonEnvName(name: string): boolean {
