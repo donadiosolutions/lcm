@@ -356,7 +356,17 @@ function systemdRunProcessEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return result;
 }
 
-function systemdDaemonCredentialArgs(env: NodeJS.ProcessEnv): { args: string[]; names: string[] } {
+function systemdCredentialCleanup(credentialDir: string): () => void {
+  return () => {
+    try {
+      rmSync(credentialDir, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup only; the age-based cleanup handles leftovers.
+    }
+  };
+}
+
+function systemdDaemonCredentialArgs(env: NodeJS.ProcessEnv): { args: string[]; names: string[]; cleanup?: () => void } {
   const secrets = Object.entries(env)
     .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && isSecretDaemonEnvName(name))
     .sort(([left], [right]) => left.localeCompare(right));
@@ -380,17 +390,21 @@ function systemdDaemonCredentialArgs(env: NodeJS.ProcessEnv): { args: string[]; 
     names.push(name);
     return `--property=LoadCredential=${name}:${credentialPath}`;
   });
-  return { args, names };
+  return {
+    args,
+    names,
+    cleanup: systemdCredentialCleanup(credentialDir),
+  };
 }
 
 function startViaUserSystemd(
   opts: EnsureDaemonOptions,
   spawnCommand: string,
   spawnArgs: string[],
-): { ok: boolean; warning?: string } {
+): { ok: boolean; warning?: string; cleanup?: () => void } {
   const spawnSyncImpl = opts._spawnSyncOverride ?? spawnSync;
   const unit = `lcm-daemon-${process.pid}-${Date.now()}`;
-  let credentials: { args: string[]; names: string[] };
+  let credentials: { args: string[]; names: string[]; cleanup?: () => void };
   try {
     credentials = systemdDaemonCredentialArgs(process.env);
   } catch (err) {
@@ -412,7 +426,7 @@ function startViaUserSystemd(
     ...spawnArgs,
   ], { encoding: "utf-8", env: systemdRunProcessEnv(process.env), timeout: Math.max(1, opts.spawnTimeoutMs) });
 
-  if (result.status === 0) return { ok: true };
+  if (result.status === 0) return { ok: true, cleanup: credentials.cleanup };
   const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
   const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
   const error = result.error instanceof Error ? result.error.message : "";
@@ -421,6 +435,7 @@ function startViaUserSystemd(
   return {
     ok: false,
     warning: `user systemd start failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
+    cleanup: credentials.cleanup,
   };
 }
 
@@ -562,9 +577,11 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   let startMethod: EnsureDaemonResult["startMethod"] = "detached-spawn";
   let warning: string | undefined;
   let detachedStart: { getWarning: () => string | undefined } | undefined;
+  let cleanupSystemdCredentials: (() => void) | undefined;
 
   if (enforceParent) {
     const systemdStart = startViaUserSystemd(opts, spawnCommand, spawnArgs);
+    cleanupSystemdCredentials = systemdStart.cleanup;
     if (systemdStart.ok) {
       startMethod = "systemd-user";
     } else {
@@ -578,6 +595,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   if (opts._skipHealthWait) {
     const detachedWarning = detachedStart?.getWarning();
     const combinedWarning = warning && detachedWarning ? `${warning}; ${detachedWarning}` : warning ?? detachedWarning;
+    cleanupSystemdCredentials?.();
     return { connected: false, port: opts.port, spawned: true, startMethod, warning: combinedWarning, restartedForParent };
   }
 
@@ -586,11 +604,15 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   while (Date.now() < deadline) {
     const h = await checkDaemonHealth(opts.port, fetchFn);
     const accepted = await daemonResult(h, true, startMethod, warning, warning !== undefined);
-    if (accepted) return accepted;
+    if (accepted) {
+      cleanupSystemdCredentials?.();
+      return accepted;
+    }
     await sleepFn(300);
   }
 
   const detachedWarning = detachedStart?.getWarning();
   const combinedWarning = warning && detachedWarning ? `${warning}; ${detachedWarning}` : warning ?? detachedWarning;
+  cleanupSystemdCredentials?.();
   return { connected: false, port: opts.port, spawned: true, startMethod, warning: combinedWarning, restartedForParent };
 }

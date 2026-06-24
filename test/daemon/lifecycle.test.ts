@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -199,7 +199,7 @@ describe("ensureDaemon", () => {
     expect(spawnMock).toHaveBeenCalled();
   });
 
-  userSystemdRuntimeIt("starts via user systemd when parent enforcement is requested on Linux", async () => {
+  userSystemdRuntimeIt("starts via user systemd when parent enforcement is requested on Linux", async (): Promise<void> => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-systemd-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
@@ -266,9 +266,8 @@ describe("ensureDaemon", () => {
       ]);
       for (const arg of credentialArgs) {
         const [, credentialPath] = arg.split(":", 2);
-        tempDirs.push(dirname(credentialPath));
-        const expectedValue = arg.includes("ANTHROPIC_API_KEY:") ? "sk-test" : "sk-lcm-test";
-        expect(readFileSync(credentialPath, "utf-8")).toBe(expectedValue);
+        expect(existsSync(credentialPath)).toBe(false);
+        expect(existsSync(dirname(credentialPath))).toBe(false);
       }
       expect(existsSync(oldCredentialDir)).toBe(false);
     } finally {

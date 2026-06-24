@@ -50,7 +50,7 @@ describe("loadDaemonConfig", () => {
     expect(c.llm.apiKey).toBe("sk-env");
   });
 
-  trustedCredentialIt("falls back to systemd credentials when provider API key env vars are not set", () => {
+  trustedCredentialIt("falls back to systemd credentials when provider API key env vars are not set", (): void => {
     const credentialsDir = mkdtempSync(join(trustedCredentialBaseDir()!, "lcm-config-credentials-"));
     try {
       writeFileSync(join(credentialsDir, "ANTHROPIC_API_KEY"), "sk-credential", { mode: 0o600 });
@@ -68,7 +68,7 @@ describe("loadDaemonConfig", () => {
     }
   });
 
-  trustedCredentialIt("interpolates API keys from systemd credentials", () => {
+  trustedCredentialIt("interpolates API keys from systemd credentials", (): void => {
     const credentialsDir = mkdtempSync(join(trustedCredentialBaseDir()!, "lcm-config-credentials-"));
     try {
       writeFileSync(join(credentialsDir, "OPENAI_API_KEY"), "sk-openai-credential", { mode: 0o600 });
