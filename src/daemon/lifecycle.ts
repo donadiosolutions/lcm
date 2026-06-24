@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync, unlinkSync, readdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
 import { join, dirname } from "node:path";
@@ -305,19 +305,41 @@ function startViaDetachedSpawn(
 }
 
 const SYSTEMD_PROVIDER_SECRET_ENV_NAMES = new Set(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
+const SYSTEMD_LCM_SECRET_ENV_NAMES = new Set(["LCM_SUMMARY_API_KEY"]);
 const SYSTEMD_SECRET_ENV_PATTERN = /(?:API_)?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/;
+const SYSTEMD_CREDENTIAL_DIR_PREFIX = "lcm-systemd-credentials-";
+const SYSTEMD_CREDENTIAL_SOURCE_MAX_AGE_MS = 10 * 60 * 1000;
 
 function shouldPropagateDaemonEnv(name: string, value: string | undefined): value is string {
   return value !== undefined && (name.startsWith("LCM_") || SYSTEMD_PROVIDER_SECRET_ENV_NAMES.has(name));
 }
 
 function isSecretDaemonEnvName(name: string): boolean {
-  return SYSTEMD_PROVIDER_SECRET_ENV_NAMES.has(name) || (name.startsWith("LCM_") && SYSTEMD_SECRET_ENV_PATTERN.test(name));
+  return SYSTEMD_PROVIDER_SECRET_ENV_NAMES.has(name) || SYSTEMD_LCM_SECRET_ENV_NAMES.has(name);
+}
+
+function cleanupOldSystemdCredentialDirs(baseDir: string): void {
+  const cutoff = Date.now() - SYSTEMD_CREDENTIAL_SOURCE_MAX_AGE_MS;
+  try {
+    for (const entry of readdirSync(baseDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !entry.name.startsWith(SYSTEMD_CREDENTIAL_DIR_PREFIX)) continue;
+      const entryPath = join(baseDir, entry.name);
+      try {
+        if (statSync(entryPath).mtimeMs < cutoff) {
+          rmSync(entryPath, { recursive: true, force: true });
+        }
+      } catch {
+        // Best-effort cleanup only.
+      }
+    }
+  } catch {
+    // Best-effort cleanup only.
+  }
 }
 
 function systemdDaemonSetenvArgs(env: NodeJS.ProcessEnv, credentialNames: string[]): string[] {
   const args = Object.entries(env)
-    .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && !isSecretDaemonEnvName(name))
+    .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && !SYSTEMD_SECRET_ENV_PATTERN.test(name))
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, value]) => `--setenv=${name}=${value ?? ""}`);
   if (credentialNames.length > 0) {
@@ -332,7 +354,8 @@ function systemdDaemonCredentialArgs(env: NodeJS.ProcessEnv, pidFilePath: string
     .sort(([left], [right]) => left.localeCompare(right));
   if (secrets.length === 0) return { args: [], names: [] };
   const baseDir = process.env.XDG_RUNTIME_DIR ?? dirname(pidFilePath);
-  const credentialDir = mkdtempSync(join(baseDir, "lcm-systemd-credentials-"));
+  cleanupOldSystemdCredentialDirs(baseDir);
+  const credentialDir = mkdtempSync(join(baseDir, SYSTEMD_CREDENTIAL_DIR_PREFIX));
   chmodSync(credentialDir, 0o700);
   const names: string[] = [];
   const args = secrets.map(([name, value]) => {

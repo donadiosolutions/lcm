@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -188,6 +188,11 @@ describe("ensureDaemon", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-systemd-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
+    const oldCredentialDir = join(tempDir, "lcm-systemd-credentials-old");
+    mkdirSync(oldCredentialDir);
+    writeFileSync(join(oldCredentialDir, "ANTHROPIC_API_KEY"), "old");
+    const oldDate = new Date(Date.now() - 20 * 60 * 1000);
+    utimesSync(oldCredentialDir, oldDate, oldDate);
     const spawnSyncMock = vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" });
     const spawnMock = vi.fn();
     const originalProvider = process.env.LCM_SUMMARY_PROVIDER;
@@ -250,6 +255,7 @@ describe("ensureDaemon", () => {
         const expectedValue = arg.includes("ANTHROPIC_API_KEY:") ? "sk-test" : "sk-lcm-test";
         expect(readFileSync(credentialPath, "utf-8")).toBe(expectedValue);
       }
+      expect(existsSync(oldCredentialDir)).toBe(false);
     } finally {
       if (originalProvider === undefined) delete process.env.LCM_SUMMARY_PROVIDER;
       else process.env.LCM_SUMMARY_PROVIDER = originalProvider;

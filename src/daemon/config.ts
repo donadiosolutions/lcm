@@ -102,7 +102,9 @@ const DEFAULTS: DaemonConfig = {
 };
 
 const DENIED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-const CREDENTIAL_ENV_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
+const SYSTEMD_CREDENTIAL_ENV_NAMES = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "LCM_SUMMARY_API_KEY"] as const;
+type SystemdCredentialEnvName = typeof SYSTEMD_CREDENTIAL_ENV_NAMES[number];
+const SYSTEMD_CREDENTIAL_ENV_NAME_SET = new Set<string>(SYSTEMD_CREDENTIAL_ENV_NAMES);
 
 function trustedSystemdCredentialsDir(
   credentialsDir: string | undefined,
@@ -129,7 +131,18 @@ function credentialNamesFromEnv(env: Record<string, string | undefined>): string
   return (env.LCM_SYSTEMD_CRED_IDS ?? "")
     .split(",")
     .map((name) => name.trim())
-    .filter((name) => CREDENTIAL_ENV_NAME_RE.test(name));
+    .filter((name) => SYSTEMD_CREDENTIAL_ENV_NAME_SET.has(name));
+}
+
+function credentialPath(credentialsDir: string, name: SystemdCredentialEnvName): string {
+  switch (name) {
+    case "ANTHROPIC_API_KEY":
+      return join(credentialsDir, "ANTHROPIC_API_KEY");
+    case "OPENAI_API_KEY":
+      return join(credentialsDir, "OPENAI_API_KEY");
+    case "LCM_SUMMARY_API_KEY":
+      return join(credentialsDir, "LCM_SUMMARY_API_KEY");
+  }
 }
 
 function readSystemdCredentialEnv(env: Record<string, string | undefined>): Record<string, string> {
@@ -138,7 +151,7 @@ function readSystemdCredentialEnv(env: Record<string, string | undefined>): Reco
   const credentialEnv: Record<string, string> = {};
   for (const name of credentialNamesFromEnv(env)) {
     try {
-      credentialEnv[name] = readFileSync(join(credentialsDir, name), "utf-8");
+      credentialEnv[name] = readFileSync(credentialPath(credentialsDir, name as SystemdCredentialEnvName), "utf-8").replace(/\n+$/, "");
     } catch {
       // Ignore missing credentials; normal env/config validation will report required keys.
     }
