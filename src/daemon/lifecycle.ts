@@ -166,6 +166,9 @@ function inspectDaemonParent(
   const pid = readPidFile(pidFilePath);
   if (pid === null) return { satisfies: false, available: false, reason: "missing-pid" };
   if (!options.isAlive(pid)) return { satisfies: false, available: false, pid, reason: "dead-pid" };
+  if (!isLikelyLcmDaemonProcess(pid, options.procRoot)) {
+    return { satisfies: false, available: false, pid, reason: "pid-not-lcm-daemon" };
+  }
 
   const userSystemdPid = findUserSystemdPid({ procRoot: options.procRoot, uid: options.uid });
   if (userSystemdPid === null) {
@@ -230,9 +233,10 @@ async function checkDaemonAccess(
   fetchFn: typeof globalThis.fetch,
 ): Promise<boolean> {
   const token = readAuthToken(tokenPath);
+  if (!token) return false;
   try {
     const res = await fetchFn(`http://127.0.0.1:${port}/stats/pool`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      headers: { Authorization: `Bearer ${token}` },
     });
     return res.ok;
   } catch {
@@ -244,18 +248,31 @@ function startViaDetachedSpawn(
   opts: EnsureDaemonOptions,
   spawnCommand: string,
   spawnArgs: string[],
-): void {
+): { getWarning: () => string | undefined } {
   const spawnImpl = opts._spawnOverride ?? spawn;
-  const child = spawnImpl(spawnCommand, spawnArgs, {
-    detached: true,
-    stdio: "ignore",
-    env: { ...process.env },
-  }) as ChildProcess;
+  let errorMessage: string | undefined;
+  let child: ChildProcess;
+  try {
+    child = spawnImpl(spawnCommand, spawnArgs, {
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env },
+    }) as ChildProcess;
+  } catch (err) {
+    errorMessage = err instanceof Error ? err.message : String(err);
+    return { getWarning: () => `detached spawn failed (${errorMessage})` };
+  }
+  child.once("error", (err) => {
+    errorMessage = err.message;
+  });
   child.unref();
 
   if (child.pid) {
     writeFileSync(opts.pidFilePath, String(child.pid));
   }
+  return {
+    getWarning: () => errorMessage ? `detached spawn failed (${errorMessage})` : undefined,
+  };
 }
 
 function startViaUserSystemd(
@@ -273,12 +290,14 @@ function startViaUserSystemd(
     `--unit=${unit}`,
     spawnCommand,
     ...spawnArgs,
-  ], { encoding: "utf-8", env: { ...process.env } });
+  ], { encoding: "utf-8", env: { ...process.env }, timeout: Math.max(1, opts.spawnTimeoutMs) });
 
   if (result.status === 0) return { ok: true };
   const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
   const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
-  const detail = stderr || stdout || `exit status ${result.status ?? "unknown"}`;
+  const error = result.error instanceof Error ? result.error.message : "";
+  const signal = result.signal ? `signal ${result.signal}` : "";
+  const detail = stderr || stdout || error || signal || `exit status ${result.status ?? "unknown"}`;
   return {
     ok: false,
     warning: `user systemd start failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
@@ -323,7 +342,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     allowParentWarning = false,
   ): Promise<EnsureDaemonResult | null> {
     if (health?.status !== "ok") return null;
-    if (opts.expectedVersion && health.version && health.version !== opts.expectedVersion) return null;
+    if (opts.expectedVersion && health.version !== opts.expectedVersion) return null;
     if (!await checkDaemonAccess(opts.port, tokenPath, fetchFn)) return null;
 
     let parent: ParentInspection | undefined;
@@ -331,6 +350,9 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       parent = inspectParent();
       if (!parent.satisfies) {
         if (!parent.available || allowParentWarning) {
+          if (parent.reason === "dead-pid" || parent.reason === "pid-not-lcm-daemon") {
+            cleanStalePid(opts.pidFilePath);
+          }
           return {
             connected: true,
             port: opts.port,
@@ -364,7 +386,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const health = await checkDaemonHealth(opts.port, fetchFn);
   if (health?.status === "ok") {
     const hasAccess = await checkDaemonAccess(opts.port, tokenPath, fetchFn);
-    if (hasAccess && opts.expectedVersion && health.version && health.version !== opts.expectedVersion) {
+    if (hasAccess && opts.expectedVersion && health.version !== opts.expectedVersion) {
       await terminatePidFileProcess();
     } else if (hasAccess) {
       const accepted = await daemonResult(health, false, "existing");
@@ -419,6 +441,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const spawnArgs = opts.spawnArgs ?? [process.argv[1], "daemon", "start", "--foreground"];
   let startMethod: EnsureDaemonResult["startMethod"] = "detached-spawn";
   let warning: string | undefined;
+  let detachedStart: { getWarning: () => string | undefined } | undefined;
 
   if (enforceParent) {
     const systemdStart = startViaUserSystemd(opts, spawnCommand, spawnArgs);
@@ -426,14 +449,16 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       startMethod = "systemd-user";
     } else {
       warning = systemdStart.warning;
-      startViaDetachedSpawn(opts, spawnCommand, spawnArgs);
+      detachedStart = startViaDetachedSpawn(opts, spawnCommand, spawnArgs);
     }
   } else {
-    startViaDetachedSpawn(opts, spawnCommand, spawnArgs);
+    detachedStart = startViaDetachedSpawn(opts, spawnCommand, spawnArgs);
   }
 
   if (opts._skipHealthWait) {
-    return { connected: false, port: opts.port, spawned: true, startMethod, warning, restartedForParent };
+    const detachedWarning = detachedStart?.getWarning();
+    const combinedWarning = warning && detachedWarning ? `${warning}; ${detachedWarning}` : warning ?? detachedWarning;
+    return { connected: false, port: opts.port, spawned: true, startMethod, warning: combinedWarning, restartedForParent };
   }
 
   // Step 4: Wait for health — only connect if version matches (if expected)
@@ -445,5 +470,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     await sleepFn(300);
   }
 
-  return { connected: false, port: opts.port, spawned: true, startMethod, warning, restartedForParent };
+  const detachedWarning = detachedStart?.getWarning();
+  const combinedWarning = warning && detachedWarning ? `${warning}; ${detachedWarning}` : warning ?? detachedWarning;
+  return { connected: false, port: opts.port, spawned: true, startMethod, warning: combinedWarning, restartedForParent };
 }

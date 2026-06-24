@@ -5,6 +5,20 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureDaemon, findUserSystemdPid, readProcessParentPid } from "../../src/daemon/lifecycle.js";
 
 const tempDirs: string[] = [];
+type EnsureDaemonOptions = Parameters<typeof ensureDaemon>[0];
+type FetchOverride = NonNullable<EnsureDaemonOptions["_fetchOverride"]>;
+type SpawnOverride = NonNullable<EnsureDaemonOptions["_spawnOverride"]>;
+type SpawnSyncOverride = NonNullable<EnsureDaemonOptions["_spawnSyncOverride"]>;
+
+function makeSpawnChild(pid: number | undefined) {
+  const child = {
+    pid,
+    unref: vi.fn(),
+    once: vi.fn(),
+  };
+  child.once.mockReturnValue(child);
+  return child;
+}
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
@@ -44,15 +58,17 @@ describe("ensureDaemon", () => {
   it("connects to existing healthy daemon", async () => {
     const { createDaemon } = await import("../../src/daemon/server.js");
     const { loadDaemonConfig } = await import("../../src/daemon/config.js");
-    const config = loadDaemonConfig("/nonexistent");
-    config.daemon.port = 0;
-    config.daemon.idleTimeoutMs = 0;
-    const daemon = await createDaemon(config);
-    const port = daemon.address().port;
-
+    const { ensureAuthToken } = await import("../../src/daemon/auth.js");
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
+    const tokenFile = join(tempDir, "daemon.token");
+    ensureAuthToken(tokenFile);
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    config.daemon.idleTimeoutMs = 0;
+    const daemon = await createDaemon(config, { tokenPath: tokenFile });
+    const port = daemon.address().port;
 
     try {
       const result = await ensureDaemon({
@@ -93,7 +109,7 @@ describe("ensureDaemon", () => {
       spawnTimeoutMs: 100,
       expectedVersion: "1.2.3",
       _skipSpawn: true,
-      _fetchOverride: mockFetch as any,
+      _fetchOverride: mockFetch as FetchOverride,
     });
 
     expect(result.connected).toBe(false);
@@ -124,13 +140,11 @@ describe("ensureDaemon", () => {
       spawnTimeoutMs: 100,
       expectedVersion: "1.2.3",
       _skipSpawn: true,
-      _fetchOverride: mockFetch as any,
+      _fetchOverride: mockFetch as FetchOverride,
     });
 
     expect(result.connected).toBe(false);
-    expect(mockFetch).toHaveBeenNthCalledWith(2, "http://127.0.0.1:19999/stats/pool", {
-      headers: undefined,
-    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
   it("does not report spawned daemon connected when an occupied port still rejects the local token", async () => {
@@ -146,15 +160,15 @@ describe("ensureDaemon", () => {
       }
       return { ok: true, json: async () => ({ status: "ok", version: "1.2.3", uptime: 100 }) } as Response;
     });
-    const spawnMock = vi.fn().mockReturnValue({ pid: 12345, unref: vi.fn() });
+    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(12345));
 
     const result = await ensureDaemon({
       port: 19999,
       pidFilePath: pidFile,
       spawnTimeoutMs: 100,
       expectedVersion: "1.2.3",
-      _fetchOverride: mockFetch as any,
-      _spawnOverride: spawnMock as any,
+      _fetchOverride: mockFetch as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
     });
 
     expect(result.connected).toBe(false);
@@ -178,8 +192,8 @@ describe("ensureDaemon", () => {
       enforceUserManagerParent: true,
       _platform: "linux",
       _skipHealthWait: true,
-      _spawnSyncOverride: spawnSyncMock as any,
-      _spawnOverride: spawnMock as any,
+      _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
     });
 
     expect(result.startMethod).toBe("systemd-user");
@@ -187,7 +201,7 @@ describe("ensureDaemon", () => {
     expect(spawnSyncMock).toHaveBeenCalledWith(
       "systemd-run",
       expect.arrayContaining(["--user", "--collect", "--no-block", "node", "/path/lcm.js", "daemon", "start", "--foreground"]),
-      expect.objectContaining({ encoding: "utf-8" }),
+      expect.objectContaining({ encoding: "utf-8", timeout: 100 }),
     );
   });
 
@@ -196,7 +210,7 @@ describe("ensureDaemon", () => {
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
     const spawnSyncMock = vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "No medium found" });
-    const spawnMock = vi.fn().mockReturnValue({ pid: 12345, unref: vi.fn() });
+    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(12345));
 
     const result = await ensureDaemon({
       port: 19999,
@@ -207,13 +221,43 @@ describe("ensureDaemon", () => {
       enforceUserManagerParent: true,
       _platform: "linux",
       _skipHealthWait: true,
-      _spawnSyncOverride: spawnSyncMock as any,
-      _spawnOverride: spawnMock as any,
+      _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
     });
 
     expect(result.startMethod).toBe("detached-spawn");
     expect(result.warning).toContain("daemon parent invariant is not satisfied");
     expect(spawnMock).toHaveBeenCalled();
+  });
+
+  it("surfaces detached spawn errors without throwing", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-spawn-error-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const child = {
+      pid: undefined,
+      unref: vi.fn(),
+      once: vi.fn((_event: string, handler: (err: Error) => void) => {
+        handler(new Error("spawn ENOENT"));
+        return child;
+      }),
+    };
+    const spawnMock = vi.fn().mockReturnValue(child);
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      spawnCommand: "missing-lcm",
+      spawnArgs: ["daemon", "start"],
+      _skipHealthWait: true,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+    });
+
+    expect(result.connected).toBe(false);
+    expect(result.warning).toContain("detached spawn failed (spawn ENOENT)");
+    expect(child.once).toHaveBeenCalledWith("error", expect.any(Function));
+    expect(child.unref).toHaveBeenCalled();
   });
 
   it("kills and restarts an authenticated daemon with the wrong Linux parent", async () => {
@@ -244,11 +288,11 @@ describe("ensureDaemon", () => {
       _platform: "linux",
       _procRoot: procRoot,
       _uid: 1000,
-      _fetchOverride: fetchMock as any,
+      _fetchOverride: fetchMock as FetchOverride,
       _killOverride: killMock,
       _sleepOverride: async () => {},
       _isProcessAliveOverride: () => true,
-      _spawnSyncOverride: spawnSyncMock as any,
+      _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
       _skipHealthWait: true,
     });
 
@@ -283,7 +327,7 @@ describe("ensureDaemon", () => {
       _platform: "linux",
       _procRoot: procRoot,
       _uid: 1000,
-      _fetchOverride: fetchMock as any,
+      _fetchOverride: fetchMock as FetchOverride,
       _isProcessAliveOverride: () => true,
       _skipSpawn: true,
     });
@@ -317,9 +361,9 @@ describe("ensureDaemon", () => {
       _platform: "linux",
       _procRoot: procRoot,
       _uid: 1000,
-      _fetchOverride: fetchMock as any,
+      _fetchOverride: fetchMock as FetchOverride,
       _isProcessAliveOverride: () => true,
-      _spawnSyncOverride: spawnSyncMock as any,
+      _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
       _skipSpawn: true,
     });
 
@@ -357,11 +401,11 @@ describe("ensureDaemon", () => {
       _platform: "linux",
       _procRoot: procRoot,
       _uid: 1000,
-      _fetchOverride: fetchMock as any,
+      _fetchOverride: fetchMock as FetchOverride,
       _killOverride: killMock,
       _sleepOverride: async () => {},
       _isProcessAliveOverride: () => true,
-      _spawnSyncOverride: spawnSyncMock as any,
+      _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
       _skipHealthWait: true,
     });
 
@@ -400,17 +444,20 @@ describe("ensureDaemon", () => {
       _platform: "linux",
       _procRoot: procRoot,
       _uid: 1000,
-      _fetchOverride: fetchMock as any,
+      _fetchOverride: fetchMock as FetchOverride,
       _killOverride: killMock,
       _sleepOverride: async () => {},
       _isProcessAliveOverride: () => true,
-      _spawnSyncOverride: spawnSyncMock as any,
+      _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
       _skipHealthWait: true,
     });
 
+    expect(result.connected).toBe(true);
     expect(result.restartedForParent).toBe(false);
-    expect(result.startMethod).toBe("systemd-user");
+    expect(result.startMethod).toBe("existing");
+    expect(result.warning).toContain("daemon parent invariant is not verified");
     expect(killMock).not.toHaveBeenCalled();
+    expect(spawnSyncMock).not.toHaveBeenCalled();
     expect(existsSync(pidFile)).toBe(false);
   });
 
@@ -431,7 +478,30 @@ describe("ensureDaemon", () => {
       spawnTimeoutMs: 100,
       expectedVersion: "1.2.3",
       _skipSpawn: true,
-      _fetchOverride: fetchMock as any,
+      _fetchOverride: fetchMock as FetchOverride,
+    });
+
+    expect(result.connected).toBe(false);
+  });
+
+  it("does not accept an unversioned daemon when an expected version is required", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-missing-version-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const tokenFile = join(tempDir, "daemon.token");
+    writeFileSync(tokenFile, "local-token");
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok" }) } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response);
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      _skipSpawn: true,
+      _fetchOverride: fetchMock as FetchOverride,
     });
 
     expect(result.connected).toBe(false);
@@ -511,15 +581,15 @@ describe("ensureDaemon", () => {
     } as Response);
 
     // Spawn override does nothing (simulates new process failing to bind occupied port)
-    const spawnMock = vi.fn().mockReturnValue({ pid: undefined, unref: vi.fn() });
+    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(undefined));
 
     const result = await ensureDaemon({
       port: 19999,
       pidFilePath: pidFile,
       spawnTimeoutMs: 600,
       expectedVersion: "99.99.99",
-      _fetchOverride: mockFetch as any,
-      _spawnOverride: spawnMock as any,
+      _fetchOverride: mockFetch as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
     });
 
     // Must NOT connect to the daemon that answered with wrong version
@@ -530,7 +600,7 @@ describe("ensureDaemon", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-spawn-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
-    const spawnMock = vi.fn().mockReturnValue({ pid: 12345, unref: vi.fn() });
+    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(12345));
 
     const result = await ensureDaemon({
       port: 19999,
@@ -539,7 +609,7 @@ describe("ensureDaemon", () => {
       spawnCommand: "lcm",
       spawnArgs: ["daemon", "start"],
       _skipHealthWait: true,
-      _spawnOverride: spawnMock as any,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
     });
 
     expect(result.connected).toBe(false);

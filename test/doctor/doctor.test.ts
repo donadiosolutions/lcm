@@ -326,6 +326,35 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.message).not.toContain("lcm daemon restart");
   });
 
+  it("treats missing daemon version as a mismatch when package version is known", async () => {
+    const pkgVersion = "0.6.0";
+
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: true });
+
+    const deps = minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      readFileSync: (path: string) => {
+        if (path.endsWith("config.json")) return "{}";
+        if (path.endsWith("settings.json")) return buildSettingsJson();
+        if (path.endsWith("package.json")) return JSON.stringify({ version: pkgVersion });
+        if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
+        if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
+        return "{}";
+      },
+      fetch: vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok" }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok" }) }),
+    });
+
+    const results = await runDoctor(deps);
+    const daemonResult = results.find((r) => r.name === "daemon");
+
+    expect(daemonResult?.status).toBe("warn");
+    expect(daemonResult?.fixApplied).toBe(false);
+    expect(daemonResult?.message).toContain("unknown version running");
+    expect(daemonResult?.message).toContain(`v${pkgVersion} installed`);
+  });
+
   it("does not recommend event promotion when a stale daemon restart throws", async () => {
     const pkgVersion = "0.6.0";
     const daemonVersion = "0.5.0";

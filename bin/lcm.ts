@@ -47,6 +47,16 @@ async function withCustomHelp(cmd: Command, commandName: string): Promise<void> 
   exit(0);
 }
 
+type DaemonStartOptions = {
+  help?: boolean;
+  detach?: boolean;
+  foreground?: boolean;
+};
+
+type DaemonRootOptions = {
+  help?: boolean;
+};
+
 export function shouldRunMain(invokedPath: string | undefined, currentFilePath: string): boolean {
   if (!invokedPath) return false;
 
@@ -425,7 +435,7 @@ async function main() {
     .option("--detach", "Run in the background (compatibility alias)")
     .option("--foreground", "Run in the foreground for debugging")
     .option("-h, --help", "Show help")
-    .action(async (opts) => {
+    .action(async (opts: DaemonStartOptions) => {
       if (opts.help) { await withCustomHelp(daemonCmd, "daemon"); return; }
       if (!opts.foreground) {
         const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
@@ -463,7 +473,7 @@ async function main() {
       ensureAuthToken(tokenPath);
       const config = loadDaemonConfig(join(lcDir, "config.json"));
       const pidFilePath = daemonPidPath();
-      const cleanupPidFile = () => {
+      const cleanupPidFile = (): void => {
         try {
           if (readFileSync(pidFilePath, "utf-8").trim() === String(process.pid)) {
             unlinkSync(pidFilePath);
@@ -480,7 +490,7 @@ async function main() {
       process.on("SIGTERM", () => exit(0));
       process.on("SIGINT", () => exit(0));
     });
-  daemonCmd.action(async (opts) => {
+  daemonCmd.action(async (opts: DaemonRootOptions) => {
     if (opts.help) { await withCustomHelp(daemonCmd, "daemon"); return; }
   });
   program.addCommand(daemonCmd);

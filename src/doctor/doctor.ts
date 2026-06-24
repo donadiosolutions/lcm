@@ -372,7 +372,8 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
 
   if (daemonHealthy) {
     const pidFilePath = daemonPidPath(deps.homedir);
-    const versionMismatch = Boolean(pkgVersion && daemonVersion && daemonVersion !== pkgVersion);
+    const versionMismatch = Boolean(pkgVersion && daemonVersion !== pkgVersion);
+    const daemonVersionLabel = daemonVersion ? `v${daemonVersion}` : "unknown version";
     try {
       const { ensureDaemon } = await import("../daemon/lifecycle.js");
       const ensureResult = await ensureDaemon({
@@ -402,22 +403,22 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
           const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
           results.push({
             name: "daemon", category: "Daemon", status: "warn",
-            message: `localhost:${config.port} — restarted (v${daemonVersion} → v${pkgVersion})${warning}`,
+            message: `localhost:${config.port} — restarted (${daemonVersionLabel} → v${pkgVersion})${warning}`,
             fixApplied: true,
           });
           daemonHealthy = true;
         } else if (ensureResult.connected) {
-          const runningVersion = postRestartVersion ?? daemonVersion;
+          const runningVersionLabel = postRestartVersion ? `v${postRestartVersion}` : daemonVersionLabel;
           results.push({
             name: "daemon", category: "Daemon", status: "warn",
-            message: `localhost:${config.port} — version mismatch (v${runningVersion} running, v${pkgVersion} installed); restart did not fix mismatch\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
+            message: `localhost:${config.port} — version mismatch (${runningVersionLabel} running, v${pkgVersion} installed); restart did not fix mismatch\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
             fixApplied: false,
           });
           daemonHealthy = false;
         } else {
           results.push({
             name: "daemon", category: "Daemon", status: "fail",
-            message: `localhost:${config.port} — version mismatch (v${daemonVersion} running, v${pkgVersion} installed); restart failed\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
+            message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed); restart failed\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
             fixApplied: false,
           });
           daemonHealthy = false;
@@ -452,7 +453,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       daemonHealthy = false;
       if (versionMismatch) {
         results.push({ name: "daemon", category: "Daemon", status: "warn",
-          message: `localhost:${config.port} — version mismatch (v${daemonVersion} running, v${pkgVersion} installed)\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}` });
+          message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed)\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}` });
       } else {
         results.push({ name: "daemon", category: "Daemon", status: "warn",
           message: `localhost:${config.port} — daemon validation failed\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}` });
