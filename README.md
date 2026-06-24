@@ -258,7 +258,9 @@ lcm sensitive test <str>   # test what gets redacted
 lcm sensitive purge --yes  # remove all stored data for the current project
 
 # Daemon
-lcm daemon start --detach  # start daemon in background
+lcm daemon start           # start managed daemon in background
+lcm daemon start --detach  # compatibility alias for managed background start
+lcm daemon start --foreground  # start daemon in current terminal for debugging
 # If doctor reports a stale daemon version, stop the stale daemon process and rerun this command.
 
 # Hook handlers (internal — called by Claude Code hooks)

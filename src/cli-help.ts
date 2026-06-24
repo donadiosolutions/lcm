@@ -44,15 +44,17 @@ const HELP: Record<string, CommandHelp> = {
 
   daemon: {
     summary: "Start the context daemon that stores and processes memory.",
-    usage: "lcm daemon start [--detach]",
+    usage: "lcm daemon start [--detach] [--foreground]",
     options: [
-      ["--detach", "Run in the background; saves PID to ~/.lcm/daemon.pid"],
+      ["--detach", "Compatibility alias for the default managed background start"],
+      ["--foreground", "Run in the current terminal for debugging"],
     ],
     examples: [
-      ["lcm daemon start --detach", "Start daemon in background (recommended)"],
-      ["lcm daemon start", "Start daemon in foreground (for debugging)"],
+      ["lcm daemon start", "Start managed daemon in background (recommended)"],
+      ["lcm daemon start --detach", "Start managed daemon in background (compatibility alias)"],
+      ["lcm daemon start --foreground", "Start daemon in foreground (for debugging)"],
     ],
-    notes: "The daemon runs on port 3737 by default. Configure via ~/.lcm/config.json.",
+    notes: "On Linux, background starts prefer the user's systemd manager. The daemon runs on port 3737 by default. Configure via ~/.lcm/config.json.",
   },
 
   status: {
@@ -418,7 +420,7 @@ const GROUPS = [
   {
     label: "Runtime",
     commands: [
-      { name: "daemon start [--detach]", summary: "Start the context daemon" },
+      { name: "daemon start [--detach] [--foreground]", summary: "Start the context daemon" },
       { name: "status [--json]", summary: "Daemon status and project memory stats" },
       { name: "doctor", summary: "Diagnostics: daemon, hooks, MCP, summarizer" },
       { name: "map <list|show|add|remove>", summary: "Manage project path aliases" },

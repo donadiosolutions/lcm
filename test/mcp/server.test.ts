@@ -128,7 +128,10 @@ describe("startMcpServer", () => {
 
     // PKG_VERSION is mocked to "9.9.9-test" via vi.mock("../../src/daemon/version.js")
     expect(ensureDaemonMcpMock).toHaveBeenCalledWith(
-      expect.objectContaining({ expectedVersion: "9.9.9-test" }),
+      expect.objectContaining({
+        expectedVersion: "9.9.9-test",
+        enforceUserManagerParent: true,
+      }),
     );
   });
 
@@ -145,7 +148,9 @@ describe("startMcpServer", () => {
           expect.stringContaining("lcm.mjs"),
           "daemon",
           "start",
+          "--foreground",
         ]),
+        enforceUserManagerParent: true,
       }),
     );
   });
@@ -174,8 +179,9 @@ describe("handleDaemonRequest spawn opts propagation", () => {
     expect(ensureDaemonSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         spawnCommand: "/usr/local/bin/node",
-        spawnArgs: ["/path/to/lcm.mjs", "daemon", "start"],
+        spawnArgs: ["/path/to/lcm.mjs", "daemon", "start", "--foreground"],
         expectedVersion: "1.2.3",
+        enforceUserManagerParent: true,
       }),
     );
   });
@@ -199,5 +205,6 @@ describe("handleDaemonRequest spawn opts propagation", () => {
     const callArgs = ensureDaemonSpy.mock.calls[0][0];
     expect(callArgs.spawnCommand).toBeUndefined();
     expect(callArgs.spawnArgs).toBeUndefined();
+    expect(callArgs.enforceUserManagerParent).toBe(true);
   });
 });

@@ -8,7 +8,12 @@ import { daemonPidPath } from "../runtime-paths.js";
 export async function handlePreCompact(stdin: string, client: DaemonClient, port?: number): Promise<{ exitCode: number; stdout: string }> {
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
-  const { connected } = await ensureDaemon({ port: daemonPort, pidFilePath, spawnTimeoutMs: 5000 });
+  const { connected } = await ensureDaemon({
+    port: daemonPort,
+    pidFilePath,
+    spawnTimeoutMs: 5000,
+    enforceUserManagerParent: true,
+  });
   if (!connected) return { exitCode: 0, stdout: "" };
 
   try {

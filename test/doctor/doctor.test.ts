@@ -208,7 +208,58 @@ describe("runDoctor project map checks", () => {
 });
 
 describe("runDoctor daemon version mismatch", () => {
-  it("auto-restarts daemon on version mismatch and reports fixApplied when post-restart version matches", async () => {
+  it("restarts a healthy daemon that is not parented by user systemd", async (): Promise<void> => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 7865,
+      spawned: true,
+      restartedForParent: true,
+      startMethod: "systemd-user",
+    });
+
+    const deps = minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch: vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    });
+
+    const results = await runDoctor(deps);
+    const daemonResult = results.find((r) => r.name === "daemon");
+
+    expect(vi.mocked(ensureDaemon)).toHaveBeenCalledWith(
+      expect.objectContaining({ enforceUserManagerParent: true }),
+    );
+    expect(daemonResult?.status).toBe("warn");
+    expect(daemonResult?.fixApplied).toBe(true);
+    expect(daemonResult?.message).toContain("restarted under user systemd");
+  });
+
+  it("warns when Linux fallback starts a daemon without satisfying the parent invariant", async (): Promise<void> => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 7865,
+      spawned: true,
+      startMethod: "detached-spawn",
+      warning: "user systemd start failed (No medium found); used detached spawn fallback; daemon parent invariant is not satisfied",
+    });
+
+    const deps = minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch: vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    });
+
+    const results = await runDoctor(deps);
+    const daemonResult = results.find((r) => r.name === "daemon");
+
+    expect(daemonResult?.status).toBe("warn");
+    expect(daemonResult?.fixApplied).toBe(false);
+    expect(daemonResult?.message).toContain("daemon parent invariant is not satisfied");
+  });
+
+  it("auto-restarts daemon on version mismatch and reports fixApplied when post-restart version matches", async (): Promise<void> => {
     const pkgVersion = "0.6.0";
     const daemonVersion = "0.5.0";
 
@@ -243,7 +294,7 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.message).toContain(pkgVersion);
   });
 
-  it("reports warn with fixApplied:false when restart does not fix version mismatch", async () => {
+  it("reports warn with fixApplied:false when restart does not fix version mismatch", async (): Promise<void> => {
     const pkgVersion = "0.6.0";
     const daemonVersion = "0.5.0";
 
@@ -271,11 +322,41 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.fixApplied).toBe(false);
     expect(daemonResult?.status).toBe("warn");
     expect(daemonResult?.message).toContain("did not fix mismatch");
-    expect(daemonResult?.message).toContain("lcm daemon start --detach");
+    expect(daemonResult?.message).toContain("lcm daemon start");
+    expect(daemonResult?.message).not.toContain("lcm daemon start --detach");
     expect(daemonResult?.message).not.toContain("lcm daemon restart");
   });
 
-  it("does not recommend event promotion when a stale daemon restart throws", async () => {
+  it("treats missing daemon version as a mismatch when package version is known", async (): Promise<void> => {
+    const pkgVersion = "0.6.0";
+
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: true });
+
+    const deps = minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      readFileSync: (path: string) => {
+        if (path.endsWith("config.json")) return "{}";
+        if (path.endsWith("settings.json")) return buildSettingsJson();
+        if (path.endsWith("package.json")) return JSON.stringify({ version: pkgVersion });
+        if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
+        if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
+        return "{}";
+      },
+      fetch: vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok" }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok" }) }),
+    });
+
+    const results = await runDoctor(deps);
+    const daemonResult = results.find((r) => r.name === "daemon");
+
+    expect(daemonResult?.status).toBe("warn");
+    expect(daemonResult?.fixApplied).toBe(false);
+    expect(daemonResult?.message).toContain("unknown version running");
+    expect(daemonResult?.message).toContain(`v${pkgVersion} installed`);
+  });
+
+  it("does not recommend event promotion when a stale daemon restart throws", async (): Promise<void> => {
     const pkgVersion = "0.6.0";
     const daemonVersion = "0.5.0";
     vi.mocked(ensureDaemon).mockRejectedValueOnce(new Error("restart failed"));
@@ -298,10 +379,51 @@ describe("runDoctor daemon version mismatch", () => {
     const capture = results.find((r) => r.name === "events-capture");
     const daemonResult = results.find((r) => r.name === "daemon");
 
-    expect(daemonResult?.message).toContain("lcm daemon start --detach");
+    expect(daemonResult?.message).toContain("lcm daemon start");
+    expect(daemonResult?.message).not.toContain("lcm daemon start --detach");
     expect(daemonResult?.message).not.toContain("lcm daemon restart");
     expect(capture?.message).toContain("daemon may be offline");
     expect(capture?.message).not.toContain("lcm events promote --all");
+  });
+
+  it("reports daemon validation failure when restart throws without version mismatch", async (): Promise<void> => {
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(new Error("restart failed"));
+
+    const deps = minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    });
+
+    const results = await runDoctor(deps);
+    const daemonResult = results.find((r) => r.name === "daemon");
+
+    expect(daemonResult?.status).toBe("warn");
+    expect(daemonResult?.message).toContain("daemon validation failed");
+    expect(daemonResult?.message).toContain("lcm daemon start");
+    expect(daemonResult?.message).not.toContain("lcm daemon start --detach");
+  });
+
+  it("reports daemon auto-start warnings when starting an offline daemon", async (): Promise<void> => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 7865,
+      spawned: true,
+      startMethod: "detached-spawn",
+      warning: "user systemd manager unavailable; daemon parent invariant is not verified",
+    });
+
+    const deps = minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch: vi.fn().mockResolvedValueOnce({ ok: false }),
+    });
+
+    const results = await runDoctor(deps);
+    const daemonResult = results.find((r) => r.name === "daemon");
+
+    expect(daemonResult?.status).toBe("warn");
+    expect(daemonResult?.fixApplied).toBe(true);
+    expect(daemonResult?.message).toContain("localhost:3737");
+    expect(daemonResult?.message).toContain("daemon parent invariant is not verified");
   });
 });
 
@@ -391,6 +513,7 @@ describe("Passive Learning checks", () => {
   });
 
   it("does not recommend global drain when every queued sidecar is orphaned", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({ connected: true, port: 3737, spawned: false });
     mockCollectEventStats.mockReturnValue({
       captured: 5000,
       unprocessed: 2000,
@@ -410,6 +533,7 @@ describe("Passive Learning checks", () => {
   });
 
   it("keeps global drain advice scoped when only some queued sidecars are orphaned", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({ connected: true, port: 3737, spawned: false });
     mockCollectEventStats.mockReturnValue({
       captured: 5000,
       unprocessed: 2000,

@@ -149,6 +149,14 @@ function isNetworkError(err: unknown): boolean {
  */
 const restartInFlight = new Map<number, Promise<unknown>>();
 
+function foregroundDaemonStartArgs(spawnArgs: string[] | undefined): string[] | undefined {
+  if (!spawnArgs) return undefined;
+  if (spawnArgs.includes("--foreground")) return spawnArgs;
+  const daemonStartIndex = spawnArgs.findIndex((arg, index) => arg === "daemon" && spawnArgs[index + 1] === "start");
+  if (daemonStartIndex === -1) return spawnArgs;
+  return [...spawnArgs, "--foreground"];
+}
+
 /** Exported for testing. Calls a daemon route with auto-restart + retry on network failure. */
 export async function handleDaemonRequest(
   client: Pick<DaemonClient, "post">,
@@ -170,11 +178,12 @@ export async function handleDaemonRequest(
     const ensure = opts._ensureDaemon ?? ensureDaemon;
     if (!restartInFlight.has(opts.port)) {
       const p = ensure({
-          port: opts.port, pidFilePath: opts.pidFilePath, spawnTimeoutMs: 10000,
-          expectedVersion: opts.expectedVersion,
-          spawnCommand: opts.spawnCommand,
-          spawnArgs: opts.spawnArgs,
-        })
+        port: opts.port, pidFilePath: opts.pidFilePath, spawnTimeoutMs: 10000,
+        expectedVersion: opts.expectedVersion,
+        spawnCommand: opts.spawnCommand,
+        spawnArgs: foregroundDaemonStartArgs(opts.spawnArgs),
+        enforceUserManagerParent: true,
+      })
         .catch(() => { /* non-fatal */ })
         .finally(() => { restartInFlight.delete(opts.port); });
       restartInFlight.set(opts.port, p);
@@ -200,7 +209,8 @@ export async function startMcpServer(): Promise<void> {
     port, pidFilePath, spawnTimeoutMs: 10000,
     expectedVersion: PKG_VERSION,
     spawnCommand: process.execPath,
-    spawnArgs: [lcmBin, "daemon", "start"],
+    spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
+    enforceUserManagerParent: true,
   });
 
   const client = new DaemonClient(`http://127.0.0.1:${port}`);
@@ -243,7 +253,7 @@ export async function startMcpServer(): Promise<void> {
     return handleDaemonRequest(client, route, body, {
       port, pidFilePath,
       spawnCommand: process.execPath,
-      spawnArgs: [lcmBin, "daemon", "start"],
+      spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
       expectedVersion: PKG_VERSION,
     });
   });

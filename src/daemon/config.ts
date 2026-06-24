@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
 
 export interface SecurityConfig {
@@ -101,6 +102,77 @@ const DEFAULTS: DaemonConfig = {
 };
 
 const DENIED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const SYSTEMD_CREDENTIAL_ENV_NAMES = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "LCM_SUMMARY_API_KEY"] as const;
+type SystemdCredentialEnvName = typeof SYSTEMD_CREDENTIAL_ENV_NAMES[number];
+const SYSTEMD_CREDENTIAL_ENV_NAME_SET = new Set<SystemdCredentialEnvName>(SYSTEMD_CREDENTIAL_ENV_NAMES);
+
+function systemdCredentialDirPrefixes(): string[] {
+  const prefixes = ["/run/credentials/"];
+  if (typeof process.getuid === "function") {
+    prefixes.push(`/run/user/${process.getuid()}/credentials/`);
+  }
+  return prefixes;
+}
+
+function hasTrustedSystemdCredentialPrefix(path: string): boolean {
+  return systemdCredentialDirPrefixes().some((prefix) => path.startsWith(prefix));
+}
+
+function trustedSystemdCredentialsDir(credentialsDir: string | undefined): string | undefined {
+  if (!credentialsDir || !isAbsolute(credentialsDir)) return undefined;
+  let realDir: string;
+  try {
+    realDir = realpathSync(resolve(credentialsDir));
+  } catch {
+    return undefined;
+  }
+  return hasTrustedSystemdCredentialPrefix(`${realDir}/`) ? realDir : undefined;
+}
+
+function isSystemdCredentialEnvName(name: string): name is SystemdCredentialEnvName {
+  return SYSTEMD_CREDENTIAL_ENV_NAME_SET.has(name as SystemdCredentialEnvName);
+}
+
+function credentialNamesFromEnv(env: Record<string, string | undefined>): SystemdCredentialEnvName[] {
+  return (env.LCM_SYSTEMD_CRED_IDS ?? "")
+    .split(",")
+    .map((name) => name.trim())
+    .filter(isSystemdCredentialEnvName);
+}
+
+function credentialFileName(name: SystemdCredentialEnvName): string {
+  switch (name) {
+    case "ANTHROPIC_API_KEY":
+      return "ANTHROPIC_API_KEY";
+    case "OPENAI_API_KEY":
+      return "OPENAI_API_KEY";
+    case "LCM_SUMMARY_API_KEY":
+      return "LCM_SUMMARY_API_KEY";
+  }
+}
+
+function readSystemdCredentialEnv(env: Record<string, string | undefined>): Record<string, string> {
+  const credentialsDir = trustedSystemdCredentialsDir(env.CREDENTIALS_DIRECTORY);
+  if (!credentialsDir) return {};
+  const credentialEnv: Record<string, string> = {};
+  for (const name of credentialNamesFromEnv(env)) {
+    let credentialFile: string;
+    try {
+      credentialFile = realpathSync(resolve(credentialsDir, credentialFileName(name)));
+    } catch {
+      // Ignore missing credentials; normal env/config validation will report required keys.
+      continue;
+    }
+    if (!hasTrustedSystemdCredentialPrefix(credentialFile)) continue;
+    if (!credentialFile.startsWith(`${credentialsDir}/`)) continue;
+    try {
+      credentialEnv[name] = readFileSync(credentialFile, "utf-8").replace(/\n+$/, "");
+    } catch {
+      // Ignore missing credentials; normal env/config validation will report required keys.
+    }
+  }
+  return credentialEnv;
+}
 
 export function deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
   if (!source || typeof source !== "object") return target;
@@ -124,7 +196,8 @@ export function deepMerge(target: Record<string, unknown>, source: Record<string
 }
 
 export function loadDaemonConfig(configPath: string, overrides?: any, env?: Record<string, string | undefined>): DaemonConfig {
-  const e = env ?? process.env;
+  const rawEnv = env ?? process.env;
+  const e = { ...readSystemdCredentialEnv(rawEnv), ...rawEnv };
   let fileConfig: any = {};
   try { fileConfig = JSON.parse(readFileSync(configPath, "utf-8")); } catch {}
   // Always merge untrusted sources (fileConfig, overrides) into a trusted target so that

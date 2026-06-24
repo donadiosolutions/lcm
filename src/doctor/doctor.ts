@@ -44,7 +44,7 @@ interface DoctorConfig {
   summarizer: string;
 }
 
-const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start --detach";
+const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start";
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
 
 export interface DoctorRunOptions {
@@ -372,69 +372,107 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
 
   if (daemonHealthy) {
     const pidFilePath = daemonPidPath(deps.homedir);
-    if (pkgVersion && daemonVersion && daemonVersion !== pkgVersion) {
-      // Version mismatch — auto-restart with expectedVersion to kill stale daemon and spawn fresh
-      try {
-        const { ensureDaemon } = await import("../daemon/lifecycle.js");
-        const { connected } = await ensureDaemon({ port: config.port, pidFilePath, spawnTimeoutMs: 10000, expectedVersion: pkgVersion });
+    const versionMismatch = Boolean(pkgVersion && daemonVersion !== pkgVersion);
+    const daemonVersionLabel = daemonVersion ? `v${daemonVersion}` : "unknown version";
+    try {
+      const { ensureDaemon } = await import("../daemon/lifecycle.js");
+      const ensureResult = await ensureDaemon({
+        port: config.port,
+        pidFilePath,
+        spawnTimeoutMs: 10000,
+        expectedVersion: pkgVersion,
+        enforceUserManagerParent: true,
+      });
 
-        // Re-fetch health to verify restart actually fixed the version
-        let postRestartVersion: string | undefined;
-        let postRestartOk = false;
-        if (connected) {
-          try {
-            const res = await deps.fetch(`http://127.0.0.1:${config.port}/health`);
-            if (res.ok) {
-              const h = (await res.json()) as { status?: string; version?: string };
-              postRestartOk = h.status === "ok";
-              postRestartVersion = h.version;
-            }
-          } catch { /* non-fatal */ }
-        }
+      let postRestartVersion: string | undefined;
+      let postRestartOk = false;
+      if (ensureResult.connected) {
+        try {
+          const res = await deps.fetch(`http://127.0.0.1:${config.port}/health`);
+          if (res.ok) {
+            const h = (await res.json()) as { status?: string; version?: string };
+            postRestartOk = h.status === "ok";
+            postRestartVersion = h.version;
+          }
+        } catch { /* non-fatal */ }
+      }
 
-        const fixApplied = connected && postRestartOk && postRestartVersion === pkgVersion;
+      if (versionMismatch) {
+        const fixApplied = ensureResult.connected && postRestartOk && postRestartVersion === pkgVersion;
         if (fixApplied) {
+          const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
           results.push({
             name: "daemon", category: "Daemon", status: "warn",
-            message: `localhost:${config.port} — restarted (v${daemonVersion} → v${pkgVersion})`,
+            message: `localhost:${config.port} — restarted (${daemonVersionLabel} → v${pkgVersion})${warning}`,
             fixApplied: true,
           });
           daemonHealthy = true;
-        } else if (connected) {
-          const runningVersion = postRestartVersion ?? daemonVersion;
+        } else if (ensureResult.connected) {
+          const runningVersionLabel = postRestartVersion ? `v${postRestartVersion}` : daemonVersionLabel;
           results.push({
             name: "daemon", category: "Daemon", status: "warn",
-            message: `localhost:${config.port} — version mismatch (v${runningVersion} running, v${pkgVersion} installed); restart did not fix mismatch\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
+            message: `localhost:${config.port} — version mismatch (${runningVersionLabel} running, v${pkgVersion} installed); restart did not fix mismatch\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
             fixApplied: false,
           });
           daemonHealthy = false;
         } else {
           results.push({
             name: "daemon", category: "Daemon", status: "fail",
-            message: `localhost:${config.port} — version mismatch (v${daemonVersion} running, v${pkgVersion} installed); restart failed\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
+            message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed); restart failed\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
             fixApplied: false,
           });
           daemonHealthy = false;
         }
-      } catch {
+      } else if (!ensureResult.connected) {
+        results.push({
+          name: "daemon", category: "Daemon", status: "fail",
+          message: `localhost:${config.port} — running daemon could not be validated or restarted\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
+          fixApplied: false,
+        });
         daemonHealthy = false;
-        results.push({ name: "daemon", category: "Daemon", status: "warn",
-          message: `localhost:${config.port} — version mismatch (v${daemonVersion} running, v${pkgVersion} installed)\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}` });
+      } else if (ensureResult.restartedForParent) {
+        const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
+        results.push({
+          name: "daemon", category: "Daemon", status: "warn",
+          message: `localhost:${config.port} — restarted under user systemd${warning}`,
+          fixApplied: true,
+        });
+        daemonHealthy = true;
+      } else if (ensureResult.warning) {
+        results.push({
+          name: "daemon", category: "Daemon", status: "warn",
+          message: `localhost:${config.port} (up)\n     Warning: ${ensureResult.warning}`,
+          fixApplied: false,
+        });
+        daemonHealthy = true;
+      } else {
+        results.push({ name: "daemon", category: "Daemon", status: "pass", message: `localhost:${config.port} (up)` });
+        daemonHealthy = true;
       }
-    } else {
-      results.push({ name: "daemon", category: "Daemon", status: "pass", message: `localhost:${config.port} (up)` });
+    } catch {
+      daemonHealthy = false;
+      if (versionMismatch) {
+        results.push({ name: "daemon", category: "Daemon", status: "warn",
+          message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed)\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}` });
+      } else {
+        results.push({ name: "daemon", category: "Daemon", status: "warn",
+          message: `localhost:${config.port} — daemon validation failed\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}` });
+      }
     }
   } else {
     // Auto-fix: try ensureDaemon
     try {
       const { ensureDaemon } = await import("../daemon/lifecycle.js");
-      const { connected } = await ensureDaemon({
+      const ensureResult = await ensureDaemon({
         port: config.port,
         pidFilePath: daemonPidPath(deps.homedir),
         spawnTimeoutMs: 10000,
+        expectedVersion: pkgVersion,
+        enforceUserManagerParent: true,
       });
-      if (connected) {
-        results.push({ name: "daemon", category: "Daemon", status: "warn", message: `localhost:${config.port} — started`, fixApplied: true });
+      if (ensureResult.connected) {
+        const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
+        results.push({ name: "daemon", category: "Daemon", status: "warn", message: `localhost:${config.port} — started${warning}`, fixApplied: true });
         daemonHealthy = true;
       } else {
         results.push({ name: "daemon", category: "Daemon", status: "fail", message: `localhost:${config.port} not responding\n     Fix: lcm daemon start` });

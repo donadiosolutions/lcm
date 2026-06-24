@@ -60,7 +60,9 @@ describe("ensureCore", () => {
     const deps = makeDeps();
     const { ensureCore } = await import("../src/bootstrap.js");
     await ensureCore(deps);
-    expect(deps.ensureDaemon).toHaveBeenCalled();
+    expect(deps.ensureDaemon).toHaveBeenCalledWith(
+      expect.objectContaining({ enforceUserManagerParent: true }),
+    );
   });
 
   it("calls chmodSync(0o600) on config.json after creation", async () => {
@@ -96,7 +98,9 @@ describe("ensureBootstrapped", () => {
       flagExists: vi.fn().mockReturnValue(false),
       writeFlag,
     });
-    expect(coreDeps.ensureDaemon).toHaveBeenCalled();
+    expect(coreDeps.ensureDaemon).toHaveBeenCalledWith(
+      expect.objectContaining({ enforceUserManagerParent: true }),
+    );
     expect(writeFlag).toHaveBeenCalled();
   });
 });
