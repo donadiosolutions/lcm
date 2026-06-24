@@ -287,6 +287,15 @@ function startViaDetachedSpawn(
   };
 }
 
+const SYSTEMD_DAEMON_ENV_NAMES = new Set(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
+
+function systemdDaemonSetenvArgs(env: NodeJS.ProcessEnv): string[] {
+  return Object.entries(env)
+    .filter(([name, value]) => value !== undefined && (name.startsWith("LCM_") || SYSTEMD_DAEMON_ENV_NAMES.has(name)))
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, value]) => `--setenv=${name}=${value ?? ""}`);
+}
+
 function startViaUserSystemd(
   opts: EnsureDaemonOptions,
   spawnCommand: string,
@@ -300,6 +309,7 @@ function startViaUserSystemd(
     "--no-block",
     "--quiet",
     `--unit=${unit}`,
+    ...systemdDaemonSetenvArgs(process.env),
     spawnCommand,
     ...spawnArgs,
   ], { encoding: "utf-8", env: { ...process.env }, timeout: Math.max(1, opts.spawnTimeoutMs) });

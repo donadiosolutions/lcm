@@ -190,27 +190,54 @@ describe("ensureDaemon", () => {
     const pidFile = join(tempDir, "daemon.pid");
     const spawnSyncMock = vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" });
     const spawnMock = vi.fn();
+    const originalProvider = process.env.LCM_SUMMARY_PROVIDER;
+    const originalApiKey = process.env.ANTHROPIC_API_KEY;
+    const originalUnrelated = process.env.UNRELATED_DAEMON_VALUE;
+    process.env.LCM_SUMMARY_PROVIDER = "anthropic";
+    process.env.ANTHROPIC_API_KEY = "sk-test";
+    process.env.UNRELATED_DAEMON_VALUE = "ignored";
 
-    const result = await ensureDaemon({
-      port: 19999,
-      pidFilePath: pidFile,
-      spawnTimeoutMs: 100,
-      spawnCommand: "node",
-      spawnArgs: ["/path/lcm.js", "daemon", "start", "--foreground"],
-      enforceUserManagerParent: true,
-      _platform: "linux",
-      _skipHealthWait: true,
-      _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
-      _spawnOverride: spawnMock as unknown as SpawnOverride,
-    });
+    try {
+      const result = await ensureDaemon({
+        port: 19999,
+        pidFilePath: pidFile,
+        spawnTimeoutMs: 100,
+        spawnCommand: "node",
+        spawnArgs: ["/path/lcm.js", "daemon", "start", "--foreground"],
+        enforceUserManagerParent: true,
+        _platform: "linux",
+        _skipHealthWait: true,
+        _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
+        _spawnOverride: spawnMock as unknown as SpawnOverride,
+      });
 
-    expect(result.startMethod).toBe("systemd-user");
-    expect(spawnMock).not.toHaveBeenCalled();
-    expect(spawnSyncMock).toHaveBeenCalledWith(
-      "systemd-run",
-      expect.arrayContaining(["--user", "--collect", "--no-block", "node", "/path/lcm.js", "daemon", "start", "--foreground"]),
-      expect.objectContaining({ encoding: "utf-8", timeout: 100 }),
-    );
+      expect(result.startMethod).toBe("systemd-user");
+      expect(spawnMock).not.toHaveBeenCalled();
+      expect(spawnSyncMock).toHaveBeenCalledWith(
+        "systemd-run",
+        expect.arrayContaining([
+          "--user",
+          "--collect",
+          "--no-block",
+          "--setenv=ANTHROPIC_API_KEY=sk-test",
+          "--setenv=LCM_SUMMARY_PROVIDER=anthropic",
+          "node",
+          "/path/lcm.js",
+          "daemon",
+          "start",
+          "--foreground",
+        ]),
+        expect.objectContaining({ encoding: "utf-8", timeout: 100 }),
+      );
+      expect(spawnSyncMock.mock.calls[0][1]).not.toContain("--setenv=UNRELATED_DAEMON_VALUE=ignored");
+    } finally {
+      if (originalProvider === undefined) delete process.env.LCM_SUMMARY_PROVIDER;
+      else process.env.LCM_SUMMARY_PROVIDER = originalProvider;
+      if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = originalApiKey;
+      if (originalUnrelated === undefined) delete process.env.UNRELATED_DAEMON_VALUE;
+      else process.env.UNRELATED_DAEMON_VALUE = originalUnrelated;
+    }
   });
 
   it("falls back to detached spawn with a Linux parent-invariant warning when systemd-run fails", async () => {
