@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureDaemon, findUserSystemdPid, readProcessParentPid } from "../../src/daemon/lifecycle.js";
 
@@ -24,6 +24,21 @@ function makeSpawnChild(pid: number | undefined): SpawnChildMock {
   child.once.mockReturnValue(child);
   return child;
 }
+
+function userRuntimeBaseDir(): string | undefined {
+  if (typeof process.getuid !== "function") return undefined;
+  const baseDir = `/run/user/${process.getuid()}`;
+  try {
+    mkdirSync(baseDir, { recursive: true, mode: 0o700 });
+    const probeDir = mkdtempSync(join(baseDir, "lcm-lifecycle-probe-"));
+    rmSync(probeDir, { recursive: true, force: true });
+    return baseDir;
+  } catch {
+    return undefined;
+  }
+}
+
+const userSystemdRuntimeIt = userRuntimeBaseDir() === undefined ? it.skip : it;
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
@@ -184,12 +199,13 @@ describe("ensureDaemon", () => {
     expect(spawnMock).toHaveBeenCalled();
   });
 
-  it("starts via user systemd when parent enforcement is requested on Linux", async () => {
+  userSystemdRuntimeIt("starts via user systemd when parent enforcement is requested on Linux", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-systemd-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
-    const oldCredentialDir = join(tempDir, "lcm-systemd-credentials-old");
-    mkdirSync(oldCredentialDir);
+    const runtimeBaseDir = userRuntimeBaseDir()!;
+    const oldCredentialDir = mkdtempSync(join(runtimeBaseDir, "lcm-systemd-credentials-old-"));
+    tempDirs.push(oldCredentialDir);
     writeFileSync(join(oldCredentialDir, "ANTHROPIC_API_KEY"), "old");
     const oldDate = new Date(Date.now() - 20 * 60 * 1000);
     utimesSync(oldCredentialDir, oldDate, oldDate);
@@ -200,8 +216,6 @@ describe("ensureDaemon", () => {
     const originalApiKey = process.env.ANTHROPIC_API_KEY;
     const originalOpenAiApiKey = process.env.OPENAI_API_KEY;
     const originalUnrelated = process.env.UNRELATED_DAEMON_VALUE;
-    const originalRuntimeDir = process.env.XDG_RUNTIME_DIR;
-    process.env.XDG_RUNTIME_DIR = tempDir;
     process.env.LCM_SUMMARY_PROVIDER = "anthropic";
     process.env.LCM_SUMMARY_API_KEY = "sk-lcm-test";
     process.env.ANTHROPIC_API_KEY = "sk-test";
@@ -252,6 +266,7 @@ describe("ensureDaemon", () => {
       ]);
       for (const arg of credentialArgs) {
         const [, credentialPath] = arg.split(":", 2);
+        tempDirs.push(dirname(credentialPath));
         const expectedValue = arg.includes("ANTHROPIC_API_KEY:") ? "sk-test" : "sk-lcm-test";
         expect(readFileSync(credentialPath, "utf-8")).toBe(expectedValue);
       }
@@ -267,8 +282,6 @@ describe("ensureDaemon", () => {
       else process.env.OPENAI_API_KEY = originalOpenAiApiKey;
       if (originalUnrelated === undefined) delete process.env.UNRELATED_DAEMON_VALUE;
       else process.env.UNRELATED_DAEMON_VALUE = originalUnrelated;
-      if (originalRuntimeDir === undefined) delete process.env.XDG_RUNTIME_DIR;
-      else process.env.XDG_RUNTIME_DIR = originalRuntimeDir;
     }
   });
 

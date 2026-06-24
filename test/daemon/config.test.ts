@@ -1,8 +1,20 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it, expect } from "vitest";
 import { loadDaemonConfig, deepMerge } from "../../src/daemon/config.js";
+
+function trustedCredentialBaseDir(): string | undefined {
+  if (typeof process.getuid !== "function") return undefined;
+  const baseDir = `/run/user/${process.getuid()}/credentials`;
+  try {
+    mkdirSync(baseDir, { recursive: true, mode: 0o700 });
+    return baseDir;
+  } catch {
+    return undefined;
+  }
+}
+
+const trustedCredentialIt = trustedCredentialBaseDir() === undefined ? it.skip : it;
 
 describe("loadDaemonConfig", () => {
   it("returns defaults when no config file exists", () => {
@@ -38,8 +50,8 @@ describe("loadDaemonConfig", () => {
     expect(c.llm.apiKey).toBe("sk-env");
   });
 
-  it("falls back to systemd credentials when provider API key env vars are not set", () => {
-    const credentialsDir = mkdtempSync(join(tmpdir(), "lcm-config-credentials-"));
+  trustedCredentialIt("falls back to systemd credentials when provider API key env vars are not set", () => {
+    const credentialsDir = mkdtempSync(join(trustedCredentialBaseDir()!, "lcm-config-credentials-"));
     try {
       writeFileSync(join(credentialsDir, "ANTHROPIC_API_KEY"), "sk-credential", { mode: 0o600 });
       const c = loadDaemonConfig(
@@ -48,7 +60,6 @@ describe("loadDaemonConfig", () => {
         {
           CREDENTIALS_DIRECTORY: credentialsDir,
           LCM_SYSTEMD_CRED_IDS: "ANTHROPIC_API_KEY",
-          LCM_TEST_TRUST_CREDENTIALS_DIRECTORY: "true",
         },
       );
       expect(c.llm.apiKey).toBe("sk-credential");
@@ -57,8 +68,8 @@ describe("loadDaemonConfig", () => {
     }
   });
 
-  it("interpolates API keys from systemd credentials", () => {
-    const credentialsDir = mkdtempSync(join(tmpdir(), "lcm-config-credentials-"));
+  trustedCredentialIt("interpolates API keys from systemd credentials", () => {
+    const credentialsDir = mkdtempSync(join(trustedCredentialBaseDir()!, "lcm-config-credentials-"));
     try {
       writeFileSync(join(credentialsDir, "OPENAI_API_KEY"), "sk-openai-credential", { mode: 0o600 });
       const c = loadDaemonConfig(
@@ -67,7 +78,6 @@ describe("loadDaemonConfig", () => {
         {
           CREDENTIALS_DIRECTORY: credentialsDir,
           LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
-          LCM_TEST_TRUST_CREDENTIALS_DIRECTORY: "true",
         },
       );
       expect(c.llm.apiKey).toBe("sk-openai-credential");

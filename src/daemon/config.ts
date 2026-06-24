@@ -1,5 +1,5 @@
 import { readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
 
 export interface SecurityConfig {
@@ -104,54 +104,63 @@ const DEFAULTS: DaemonConfig = {
 const DENIED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const SYSTEMD_CREDENTIAL_ENV_NAMES = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "LCM_SUMMARY_API_KEY"] as const;
 type SystemdCredentialEnvName = typeof SYSTEMD_CREDENTIAL_ENV_NAMES[number];
-const SYSTEMD_CREDENTIAL_ENV_NAME_SET = new Set<string>(SYSTEMD_CREDENTIAL_ENV_NAMES);
+const SYSTEMD_CREDENTIAL_ENV_NAME_SET = new Set<SystemdCredentialEnvName>(SYSTEMD_CREDENTIAL_ENV_NAMES);
 
-function trustedSystemdCredentialsDir(
-  credentialsDir: string | undefined,
-  env: Record<string, string | undefined>,
-): string | undefined {
-  if (!credentialsDir || !isAbsolute(credentialsDir)) return undefined;
-  if (process.env.NODE_ENV === "test" && env.LCM_TEST_TRUST_CREDENTIALS_DIRECTORY === "true") {
-    return resolve(credentialsDir);
+function systemdCredentialDirPrefixes(): string[] {
+  const prefixes = ["/run/credentials/"];
+  if (typeof process.getuid === "function") {
+    prefixes.push(`/run/user/${process.getuid()}/credentials/`);
   }
+  return prefixes;
+}
+
+function hasTrustedSystemdCredentialPrefix(path: string): boolean {
+  return systemdCredentialDirPrefixes().some((prefix) => path.startsWith(prefix));
+}
+
+function trustedSystemdCredentialsDir(credentialsDir: string | undefined): string | undefined {
+  if (!credentialsDir || !isAbsolute(credentialsDir)) return undefined;
   let realDir: string;
   try {
-    realDir = realpathSync(credentialsDir);
+    realDir = realpathSync(resolve(credentialsDir));
   } catch {
     return undefined;
   }
-  const allowedPrefixes = ["/run/credentials/"];
-  if (typeof process.getuid === "function") {
-    allowedPrefixes.push(`/run/user/${process.getuid()}/credentials/`);
-  }
-  return allowedPrefixes.some((prefix) => realDir.startsWith(prefix)) ? realDir : undefined;
+  return hasTrustedSystemdCredentialPrefix(`${realDir}/`) ? realDir : undefined;
 }
 
-function credentialNamesFromEnv(env: Record<string, string | undefined>): string[] {
+function isSystemdCredentialEnvName(name: string): name is SystemdCredentialEnvName {
+  return SYSTEMD_CREDENTIAL_ENV_NAME_SET.has(name as SystemdCredentialEnvName);
+}
+
+function credentialNamesFromEnv(env: Record<string, string | undefined>): SystemdCredentialEnvName[] {
   return (env.LCM_SYSTEMD_CRED_IDS ?? "")
     .split(",")
     .map((name) => name.trim())
-    .filter((name) => SYSTEMD_CREDENTIAL_ENV_NAME_SET.has(name));
+    .filter(isSystemdCredentialEnvName);
 }
 
-function credentialPath(credentialsDir: string, name: SystemdCredentialEnvName): string {
+function credentialFileName(name: SystemdCredentialEnvName): string {
   switch (name) {
     case "ANTHROPIC_API_KEY":
-      return join(credentialsDir, "ANTHROPIC_API_KEY");
+      return "ANTHROPIC_API_KEY";
     case "OPENAI_API_KEY":
-      return join(credentialsDir, "OPENAI_API_KEY");
+      return "OPENAI_API_KEY";
     case "LCM_SUMMARY_API_KEY":
-      return join(credentialsDir, "LCM_SUMMARY_API_KEY");
+      return "LCM_SUMMARY_API_KEY";
   }
 }
 
 function readSystemdCredentialEnv(env: Record<string, string | undefined>): Record<string, string> {
-  const credentialsDir = trustedSystemdCredentialsDir(env.CREDENTIALS_DIRECTORY, env);
+  const credentialsDir = trustedSystemdCredentialsDir(env.CREDENTIALS_DIRECTORY);
   if (!credentialsDir) return {};
   const credentialEnv: Record<string, string> = {};
   for (const name of credentialNamesFromEnv(env)) {
+    const credentialFile = resolve(credentialsDir, credentialFileName(name));
+    if (!hasTrustedSystemdCredentialPrefix(credentialFile)) continue;
+    if (!credentialFile.startsWith(`${credentialsDir}/`)) continue;
     try {
-      credentialEnv[name] = readFileSync(credentialPath(credentialsDir, name as SystemdCredentialEnvName), "utf-8").replace(/\n+$/, "");
+      credentialEnv[name] = readFileSync(credentialFile, "utf-8").replace(/\n+$/, "");
     } catch {
       // Ignore missing credentials; normal env/config validation will report required keys.
     }

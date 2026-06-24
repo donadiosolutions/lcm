@@ -348,12 +348,28 @@ function systemdDaemonSetenvArgs(env: NodeJS.ProcessEnv, credentialNames: string
   return args;
 }
 
-function systemdDaemonCredentialArgs(env: NodeJS.ProcessEnv, pidFilePath: string): { args: string[]; names: string[] } {
+function systemdRunProcessEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = { ...env };
+  for (const name of Object.keys(result)) {
+    if (SYSTEMD_SECRET_ENV_PATTERN.test(name)) delete result[name];
+  }
+  return result;
+}
+
+function systemdDaemonCredentialArgs(env: NodeJS.ProcessEnv): { args: string[]; names: string[] } {
   const secrets = Object.entries(env)
     .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && isSecretDaemonEnvName(name))
     .sort(([left], [right]) => left.localeCompare(right));
   if (secrets.length === 0) return { args: [], names: [] };
-  const baseDir = process.env.XDG_RUNTIME_DIR ?? dirname(pidFilePath);
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (uid === undefined) {
+    throw new Error("current user id is unavailable");
+  }
+  const baseDir = `/run/user/${uid}`;
+  const baseStats = statSync(baseDir);
+  if (!baseStats.isDirectory()) {
+    throw new Error(`${baseDir} is not a directory`);
+  }
   cleanupOldSystemdCredentialDirs(baseDir);
   const credentialDir = mkdtempSync(join(baseDir, SYSTEMD_CREDENTIAL_DIR_PREFIX));
   chmodSync(credentialDir, 0o700);
@@ -376,7 +392,7 @@ function startViaUserSystemd(
   const unit = `lcm-daemon-${process.pid}-${Date.now()}`;
   let credentials: { args: string[]; names: string[] };
   try {
-    credentials = systemdDaemonCredentialArgs(process.env, opts.pidFilePath);
+    credentials = systemdDaemonCredentialArgs(process.env);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     return {
@@ -394,7 +410,7 @@ function startViaUserSystemd(
     ...credentials.args,
     spawnCommand,
     ...spawnArgs,
-  ], { encoding: "utf-8", env: { ...process.env }, timeout: Math.max(1, opts.spawnTimeoutMs) });
+  ], { encoding: "utf-8", env: systemdRunProcessEnv(process.env), timeout: Math.max(1, opts.spawnTimeoutMs) });
 
   if (result.status === 0) return { ok: true };
   const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
