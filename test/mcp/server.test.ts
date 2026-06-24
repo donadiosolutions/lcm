@@ -148,6 +148,7 @@ describe("startMcpServer", () => {
           expect.stringContaining("lcm.mjs"),
           "daemon",
           "start",
+          "--foreground",
         ]),
         enforceUserManagerParent: true,
       }),
@@ -178,7 +179,7 @@ describe("handleDaemonRequest spawn opts propagation", () => {
     expect(ensureDaemonSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         spawnCommand: "/usr/local/bin/node",
-        spawnArgs: ["/path/to/lcm.mjs", "daemon", "start"],
+        spawnArgs: ["/path/to/lcm.mjs", "daemon", "start", "--foreground"],
         expectedVersion: "1.2.3",
         enforceUserManagerParent: true,
       }),

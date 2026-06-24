@@ -9,9 +9,14 @@ type EnsureDaemonOptions = Parameters<typeof ensureDaemon>[0];
 type FetchOverride = NonNullable<EnsureDaemonOptions["_fetchOverride"]>;
 type SpawnOverride = NonNullable<EnsureDaemonOptions["_spawnOverride"]>;
 type SpawnSyncOverride = NonNullable<EnsureDaemonOptions["_spawnSyncOverride"]>;
+type SpawnChildMock = {
+  pid: number | undefined;
+  unref: ReturnType<typeof vi.fn>;
+  once: ReturnType<typeof vi.fn>;
+};
 
-function makeSpawnChild(pid: number | undefined) {
-  const child = {
+function makeSpawnChild(pid: number | undefined): SpawnChildMock {
+  const child: SpawnChildMock = {
     pid,
     unref: vi.fn(),
     once: vi.fn(),
@@ -237,7 +242,7 @@ describe("ensureDaemon", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-spawn-error-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
-    const child = {
+    const child: SpawnChildMock = {
       pid: undefined,
       unref: vi.fn(),
       once: vi.fn((_event: string, handler: (err: Error) => void) => {

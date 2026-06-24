@@ -149,6 +149,14 @@ function isNetworkError(err: unknown): boolean {
  */
 const restartInFlight = new Map<number, Promise<unknown>>();
 
+function foregroundDaemonStartArgs(spawnArgs: string[] | undefined): string[] | undefined {
+  if (!spawnArgs) return undefined;
+  if (spawnArgs.includes("--foreground")) return spawnArgs;
+  const daemonStartIndex = spawnArgs.findIndex((arg, index) => arg === "daemon" && spawnArgs[index + 1] === "start");
+  if (daemonStartIndex === -1) return spawnArgs;
+  return [...spawnArgs, "--foreground"];
+}
+
 /** Exported for testing. Calls a daemon route with auto-restart + retry on network failure. */
 export async function handleDaemonRequest(
   client: Pick<DaemonClient, "post">,
@@ -173,7 +181,7 @@ export async function handleDaemonRequest(
         port: opts.port, pidFilePath: opts.pidFilePath, spawnTimeoutMs: 10000,
         expectedVersion: opts.expectedVersion,
         spawnCommand: opts.spawnCommand,
-        spawnArgs: opts.spawnArgs,
+        spawnArgs: foregroundDaemonStartArgs(opts.spawnArgs),
         enforceUserManagerParent: true,
       })
         .catch(() => { /* non-fatal */ })
