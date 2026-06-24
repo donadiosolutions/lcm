@@ -45,7 +45,11 @@ describe("loadDaemonConfig", () => {
       const c = loadDaemonConfig(
         "/nonexistent",
         { llm: { provider: "anthropic" } },
-        { CREDENTIALS_DIRECTORY: credentialsDir },
+        {
+          CREDENTIALS_DIRECTORY: credentialsDir,
+          LCM_SYSTEMD_CRED_IDS: "ANTHROPIC_API_KEY",
+          LCM_TEST_TRUST_CREDENTIALS_DIRECTORY: "true",
+        },
       );
       expect(c.llm.apiKey).toBe("sk-credential");
     } finally {
@@ -60,7 +64,11 @@ describe("loadDaemonConfig", () => {
       const c = loadDaemonConfig(
         "/nonexistent",
         { llm: { provider: "openai", apiKey: "${OPENAI_API_KEY}" } },
-        { CREDENTIALS_DIRECTORY: credentialsDir },
+        {
+          CREDENTIALS_DIRECTORY: credentialsDir,
+          LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
+          LCM_TEST_TRUST_CREDENTIALS_DIRECTORY: "true",
+        },
       );
       expect(c.llm.apiKey).toBe("sk-openai-credential");
     } finally {

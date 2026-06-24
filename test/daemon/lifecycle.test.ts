@@ -226,6 +226,7 @@ describe("ensureDaemon", () => {
           "--collect",
           "--no-block",
           "--setenv=LCM_SUMMARY_PROVIDER=anthropic",
+          "--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_SUMMARY_API_KEY",
           "node",
           "/path/lcm.js",
           "daemon",

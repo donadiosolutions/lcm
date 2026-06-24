@@ -315,26 +315,33 @@ function isSecretDaemonEnvName(name: string): boolean {
   return SYSTEMD_PROVIDER_SECRET_ENV_NAMES.has(name) || (name.startsWith("LCM_") && SYSTEMD_SECRET_ENV_PATTERN.test(name));
 }
 
-function systemdDaemonSetenvArgs(env: NodeJS.ProcessEnv): string[] {
-  return Object.entries(env)
+function systemdDaemonSetenvArgs(env: NodeJS.ProcessEnv, credentialNames: string[]): string[] {
+  const args = Object.entries(env)
     .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && !isSecretDaemonEnvName(name))
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, value]) => `--setenv=${name}=${value ?? ""}`);
+  if (credentialNames.length > 0) {
+    args.push(`--setenv=LCM_SYSTEMD_CRED_IDS=${credentialNames.join(",")}`);
+  }
+  return args;
 }
 
-function systemdDaemonCredentialArgs(env: NodeJS.ProcessEnv, pidFilePath: string): string[] {
+function systemdDaemonCredentialArgs(env: NodeJS.ProcessEnv, pidFilePath: string): { args: string[]; names: string[] } {
   const secrets = Object.entries(env)
     .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && isSecretDaemonEnvName(name))
     .sort(([left], [right]) => left.localeCompare(right));
-  if (secrets.length === 0) return [];
+  if (secrets.length === 0) return { args: [], names: [] };
   const baseDir = process.env.XDG_RUNTIME_DIR ?? dirname(pidFilePath);
   const credentialDir = mkdtempSync(join(baseDir, "lcm-systemd-credentials-"));
   chmodSync(credentialDir, 0o700);
-  return secrets.map(([name, value]) => {
+  const names: string[] = [];
+  const args = secrets.map(([name, value]) => {
     const credentialPath = join(credentialDir, name);
     writeFileSync(credentialPath, value ?? "", { mode: 0o600 });
+    names.push(name);
     return `--property=LoadCredential=${name}:${credentialPath}`;
   });
+  return { args, names };
 }
 
 function startViaUserSystemd(
@@ -344,9 +351,9 @@ function startViaUserSystemd(
 ): { ok: boolean; warning?: string } {
   const spawnSyncImpl = opts._spawnSyncOverride ?? spawnSync;
   const unit = `lcm-daemon-${process.pid}-${Date.now()}`;
-  let credentialArgs: string[];
+  let credentials: { args: string[]; names: string[] };
   try {
-    credentialArgs = systemdDaemonCredentialArgs(process.env, opts.pidFilePath);
+    credentials = systemdDaemonCredentialArgs(process.env, opts.pidFilePath);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     return {
@@ -360,8 +367,8 @@ function startViaUserSystemd(
     "--no-block",
     "--quiet",
     `--unit=${unit}`,
-    ...systemdDaemonSetenvArgs(process.env),
-    ...credentialArgs,
+    ...systemdDaemonSetenvArgs(process.env, credentials.names),
+    ...credentials.args,
     spawnCommand,
     ...spawnArgs,
   ], { encoding: "utf-8", env: { ...process.env }, timeout: Math.max(1, opts.spawnTimeoutMs) });

@@ -1,5 +1,5 @@
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
 
 export interface SecurityConfig {
@@ -104,17 +104,44 @@ const DEFAULTS: DaemonConfig = {
 const DENIED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const CREDENTIAL_ENV_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
 
+function trustedSystemdCredentialsDir(
+  credentialsDir: string | undefined,
+  env: Record<string, string | undefined>,
+): string | undefined {
+  if (!credentialsDir || !isAbsolute(credentialsDir)) return undefined;
+  if (process.env.NODE_ENV === "test" && env.LCM_TEST_TRUST_CREDENTIALS_DIRECTORY === "true") {
+    return resolve(credentialsDir);
+  }
+  let realDir: string;
+  try {
+    realDir = realpathSync(credentialsDir);
+  } catch {
+    return undefined;
+  }
+  const allowedPrefixes = ["/run/credentials/"];
+  if (typeof process.getuid === "function") {
+    allowedPrefixes.push(`/run/user/${process.getuid()}/credentials/`);
+  }
+  return allowedPrefixes.some((prefix) => realDir.startsWith(prefix)) ? realDir : undefined;
+}
+
+function credentialNamesFromEnv(env: Record<string, string | undefined>): string[] {
+  return (env.LCM_SYSTEMD_CRED_IDS ?? "")
+    .split(",")
+    .map((name) => name.trim())
+    .filter((name) => CREDENTIAL_ENV_NAME_RE.test(name));
+}
+
 function readSystemdCredentialEnv(env: Record<string, string | undefined>): Record<string, string> {
-  const credentialsDir = env.CREDENTIALS_DIRECTORY;
+  const credentialsDir = trustedSystemdCredentialsDir(env.CREDENTIALS_DIRECTORY, env);
   if (!credentialsDir) return {};
   const credentialEnv: Record<string, string> = {};
-  try {
-    for (const name of readdirSync(credentialsDir)) {
-      if (!CREDENTIAL_ENV_NAME_RE.test(name)) continue;
+  for (const name of credentialNamesFromEnv(env)) {
+    try {
       credentialEnv[name] = readFileSync(join(credentialsDir, name), "utf-8");
+    } catch {
+      // Ignore missing credentials; normal env/config validation will report required keys.
     }
-  } catch {
-    return {};
   }
   return credentialEnv;
 }
