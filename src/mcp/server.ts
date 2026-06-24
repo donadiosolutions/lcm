@@ -245,7 +245,7 @@ export async function startMcpServer(): Promise<void> {
     return handleDaemonRequest(client, route, body, {
       port, pidFilePath,
       spawnCommand: process.execPath,
-      spawnArgs: [lcmBin, "daemon", "start"],
+      spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
       expectedVersion: PKG_VERSION,
     });
   });

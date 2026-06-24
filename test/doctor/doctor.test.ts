@@ -208,7 +208,7 @@ describe("runDoctor project map checks", () => {
 });
 
 describe("runDoctor daemon version mismatch", () => {
-  it("restarts a healthy daemon that is not parented by user systemd", async () => {
+  it("restarts a healthy daemon that is not parented by user systemd", async (): Promise<void> => {
     vi.mocked(ensureDaemon).mockResolvedValueOnce({
       connected: true,
       port: 7865,
@@ -235,7 +235,7 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.message).toContain("restarted under user systemd");
   });
 
-  it("warns when Linux fallback starts a daemon without satisfying the parent invariant", async () => {
+  it("warns when Linux fallback starts a daemon without satisfying the parent invariant", async (): Promise<void> => {
     vi.mocked(ensureDaemon).mockResolvedValueOnce({
       connected: true,
       port: 7865,
@@ -259,7 +259,7 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.message).toContain("daemon parent invariant is not satisfied");
   });
 
-  it("auto-restarts daemon on version mismatch and reports fixApplied when post-restart version matches", async () => {
+  it("auto-restarts daemon on version mismatch and reports fixApplied when post-restart version matches", async (): Promise<void> => {
     const pkgVersion = "0.6.0";
     const daemonVersion = "0.5.0";
 
@@ -294,7 +294,7 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.message).toContain(pkgVersion);
   });
 
-  it("reports warn with fixApplied:false when restart does not fix version mismatch", async () => {
+  it("reports warn with fixApplied:false when restart does not fix version mismatch", async (): Promise<void> => {
     const pkgVersion = "0.6.0";
     const daemonVersion = "0.5.0";
 
@@ -326,7 +326,7 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.message).not.toContain("lcm daemon restart");
   });
 
-  it("treats missing daemon version as a mismatch when package version is known", async () => {
+  it("treats missing daemon version as a mismatch when package version is known", async (): Promise<void> => {
     const pkgVersion = "0.6.0";
 
     vi.mocked(ensureDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: true });
@@ -355,7 +355,7 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.message).toContain(`v${pkgVersion} installed`);
   });
 
-  it("does not recommend event promotion when a stale daemon restart throws", async () => {
+  it("does not recommend event promotion when a stale daemon restart throws", async (): Promise<void> => {
     const pkgVersion = "0.6.0";
     const daemonVersion = "0.5.0";
     vi.mocked(ensureDaemon).mockRejectedValueOnce(new Error("restart failed"));
@@ -384,7 +384,7 @@ describe("runDoctor daemon version mismatch", () => {
     expect(capture?.message).not.toContain("lcm events promote --all");
   });
 
-  it("reports daemon validation failure when restart throws without version mismatch", async () => {
+  it("reports daemon validation failure when restart throws without version mismatch", async (): Promise<void> => {
     vi.mocked(ensureDaemon).mockRejectedValueOnce(new Error("restart failed"));
 
     const deps = minimalDeps({
@@ -400,7 +400,7 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.message).toContain("lcm daemon start --detach");
   });
 
-  it("reports daemon auto-start warnings when starting an offline daemon", async () => {
+  it("reports daemon auto-start warnings when starting an offline daemon", async (): Promise<void> => {
     vi.mocked(ensureDaemon).mockResolvedValueOnce({
       connected: true,
       port: 7865,
