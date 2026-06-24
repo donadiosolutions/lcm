@@ -46,6 +46,9 @@ type HealthResponse = {
   uptime?: number;
 };
 
+const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
+const userSystemdPidCache = new Map<string, { pid: number | null; expiresAt: number }>();
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -117,6 +120,15 @@ export function findUserSystemdPid(options: { procRoot?: string; uid?: number } 
   const uid = options.uid ?? (typeof process.getuid === "function" ? process.getuid() : undefined);
   if (uid === undefined) return null;
 
+  const cacheKey = `${procRoot}:${uid}`;
+  const cached = userSystemdPidCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) return cached.pid;
+  const cache = (pid: number | null): number | null => {
+    userSystemdPidCache.set(cacheKey, { pid, expiresAt: now + USER_SYSTEMD_PID_CACHE_TTL_MS });
+    return pid;
+  };
+
   try {
     for (const entry of readdirSync(procRoot, { withFileTypes: true })) {
       if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
@@ -128,17 +140,17 @@ export function findUserSystemdPid(options: { procRoot?: string; uid?: number } 
 
         const command = readFileSync(join(dir, "cmdline"), "utf-8").replace(/\0/g, " ").trim();
         if (command.includes("systemd") && command.split(/\s+/).includes("--user")) {
-          return pid;
+          return cache(pid);
         }
       } catch {
         // Process may exit while scanning /proc; ignore and continue.
       }
     }
   } catch {
-    return null;
+    return cache(null);
   }
 
-  return null;
+  return cache(null);
 }
 
 type ParentInspection = {
@@ -328,7 +340,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
 
   async function terminatePidFileProcess(): Promise<void> {
     const pid = readPidFile(opts.pidFilePath);
-    if (pid !== null) {
+    if (pid !== null && isLikelyLcmDaemonProcess(pid, procRoot)) {
       await terminatePid(pid, { isAlive, killProcess, sleepFn });
     }
     cleanStalePid(opts.pidFilePath);
@@ -393,7 +405,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       if (accepted) return accepted;
       if (enforceParent) {
         const parent = inspectParent();
-        if (parent.available && parent.pid !== undefined) {
+        if (parent.available && parent.pid !== undefined && isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
           await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
           restartedForParent = true;
         }

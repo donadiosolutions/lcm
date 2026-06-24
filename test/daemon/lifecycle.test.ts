@@ -44,6 +44,9 @@ describe("ensureDaemon", () => {
 
     expect(findUserSystemdPid({ procRoot: tempDir, uid: 1000 })).toBe(100);
     expect(readProcessParentPid(200, tempDir)).toBe(100);
+
+    rmSync(join(tempDir, "100"), { recursive: true, force: true });
+    expect(findUserSystemdPid({ procRoot: tempDir, uid: 1000 })).toBe(100);
   });
 
   it("returns null when procfs status data is unavailable", () => {
@@ -458,6 +461,43 @@ describe("ensureDaemon", () => {
     expect(result.warning).toContain("daemon parent invariant is not verified");
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnSyncMock).not.toHaveBeenCalled();
+    expect(existsSync(pidFile)).toBe(false);
+  });
+
+  it("does not kill an unrelated PID-file process during version mismatch repair", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-version-stale-pid-"));
+    tempDirs.push(tempDir);
+    const procRoot = join(tempDir, "proc");
+    mkdirSync(procRoot);
+    const pidFile = join(tempDir, "daemon.pid");
+    const tokenFile = join(tempDir, "daemon.token");
+    writeFileSync(tokenFile, "local-token");
+    writeFileSync(pidFile, "200");
+    writeProcEntry(procRoot, 200, "Name:\tsleep\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "sleep 1000");
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.0.1" }) } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response);
+    const killMock = vi.fn();
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _procRoot: procRoot,
+      _uid: 1000,
+      _fetchOverride: fetchMock as FetchOverride,
+      _killOverride: killMock,
+      _sleepOverride: async () => {},
+      _isProcessAliveOverride: () => true,
+      _skipSpawn: true,
+    });
+
+    expect(result.connected).toBe(false);
+    expect(killMock).not.toHaveBeenCalled();
     expect(existsSync(pidFile)).toBe(false);
   });
 
