@@ -44,15 +44,17 @@ export async function handleSessionSnapshot(
       const config = loadDaemonConfig(defaultConfigPath());
       intervalSec = config.hooks?.snapshotIntervalSec ?? 60;
     }
+    const forceSnapshot = input.hook_event_name === "PreCompact";
 
-    // Throttle: stat cursor mtime, skip if within interval
+    // Throttle: stat cursor mtime, skip if within interval. PreCompact is a
+    // boundary event, so force a final ingest attempt before Codex compacts.
     let stat: { mtimeMs: number } | null = null;
     try {
       stat = _statSync(cursorPath);
     } catch {
       // No cursor file — treat as expired
     }
-    if (stat && (Date.now() - stat.mtimeMs) < intervalSec * 1000) {
+    if (!forceSnapshot && stat && (Date.now() - stat.mtimeMs) < intervalSec * 1000) {
       return { exitCode: 0, stdout: "" };
     }
 
@@ -110,10 +112,13 @@ export async function handleSessionSnapshot(
       }
     }
 
-    // Touch cursor file
-    const _writeFileSync = deps?.writeFileSync ?? writeFileSync;
-    _writeFileSync(cursorPath, JSON.stringify({ ts: Date.now() }));
-    try { chmodSync(cursorPath, 0o600); } catch { /* non-fatal */ }
+    // Touch cursor file for normal snapshots only. PreCompact is forced and
+    // must not refresh the throttle cursor used by regular Stop snapshots.
+    if (!forceSnapshot) {
+      const _writeFileSync = deps?.writeFileSync ?? writeFileSync;
+      _writeFileSync(cursorPath, JSON.stringify({ ts: Date.now() }));
+      try { chmodSync(cursorPath, 0o600); } catch { /* non-fatal */ }
+    }
 
     // Best-effort promote-events flush
     try {

@@ -43,7 +43,7 @@ lcm import --codex
 lcm import --provider all
 ```
 
-The default Codex connector writes native hooks to `~/.codex/hooks.json`, enables Codex's current `hooks` feature in `~/.codex/config.toml`, installs the LCM skill at `.codex/skills/lcm-memory/SKILL.md`, and ensures the LCM rules block is present in `~/.codex/AGENTS.md`. Use `lcm connectors install codex --type skill` or `lcm connectors install codex --type rules` only when you want one guidance surface without hooks.
+The default Codex connector writes native hooks to `~/.codex/hooks.json`, enables Codex's current `hooks` feature in `~/.codex/config.toml`, installs the LCM skill at `.codex/skills/lcm-memory/SKILL.md`, and ensures the LCM rules block is present in `~/.codex/AGENTS.md`. Its hook set restores memory at session start, searches memory before prompts, captures passive tool-use signals, snapshots transcript deltas on `Stop`, and force-snapshots transcript deltas on `PreCompact` before manual or automatic Codex compaction. Use `lcm connectors install codex --type skill` or `lcm connectors install codex --type rules` only when you want one guidance surface without hooks.
 
 For current limitations and the manual MCP step for Codex TOML config, see [`docs/vscode-codex.md`](vscode-codex.md).
 
