@@ -97,7 +97,7 @@ Invoked after every tool call. lcm extracts structured events (decisions, errors
 
 **Command:** `lcm session-snapshot`
 
-An optional periodic hook that incrementally ingests the live session transcript between `SessionEnd` events. This is used for long-running sessions where you want memory to be updated without waiting for the session to end.
+An optional periodic hook that incrementally ingests the live session transcript between `SessionEnd` events. This is used for long-running sessions where you want memory to be updated without waiting for the session to end. Codex uses this command on `Stop` for rolling snapshots and on `PreCompact` to force-ingest deltas immediately before manual or automatic compaction.
 
 **Stdin fields:**
 
@@ -106,7 +106,7 @@ An optional periodic hook that incrementally ingests the live session transcript
 | `session_id` | string | Session identifier |
 | `cwd` | string | Working directory |
 | `transcript_path` | string | Path to the live JSONL session transcript |
-| `hook_event_name` | string | `"SessionSnapshot"` (if provided) |
+| `hook_event_name` | string | `"SessionSnapshot"` or `"PreCompact"` (if provided) |
 
 **Response:** Exit code `0`.
 

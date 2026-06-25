@@ -49,6 +49,7 @@ The hook connector installs these Codex events:
 | `SessionStart` | `lcm restore --client codex` | Restores project context when Codex starts, resumes, or clears a session |
 | `UserPromptSubmit` | `lcm user-prompt --client codex` | Searches memory and injects prompt-time hints |
 | `PostToolUse` | `lcm post-tool --client codex` | Captures passive learning signals from supported tool calls |
+| `PreCompact` | `lcm session-snapshot --client codex` | Force-ingests transcript deltas before manual or automatic Codex compaction |
 | `Stop` | `lcm session-snapshot --client codex` | Ingests transcript deltas and triggers compaction once the configured token threshold is reached |
 
 Codex must trust the project `.codex/` layer for project-local hooks to load. For a global setup, run:
@@ -78,7 +79,7 @@ lcm import --provider all
 2. GitHub Copilot in VS Code is skill-based today. There is no automatic session restore, turn ingestion, prompt-time search injection, or compaction hook.
 3. The GitHub Copilot connector does not register MCP automatically. The current supported path is instructions/skill guidance plus the `lcm` CLI.
 4. Codex MCP config lives in `.codex/config.toml`, but the connector installer does not edit TOML yet. `lcm connectors install codex --type mcp` only prints manual instructions.
-5. Codex `Stop` hooks are turn-scoped, not final-session hooks. LCM therefore uses rolling snapshots and thresholded compaction instead of marking Codex sessions complete on each `Stop`.
+5. Codex `Stop` hooks are turn-scoped, not final-session hooks. LCM therefore uses rolling snapshots and thresholded compaction instead of marking Codex sessions complete on each `Stop`; the `PreCompact` snapshot hook fills the pre-compaction gap.
 6. The top-level branding and install flow were originally Claude-first, so documentation drift is still a risk whenever new clients are added.
 
 ## Improvement candidates

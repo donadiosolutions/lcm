@@ -44,15 +44,17 @@ export async function handleSessionSnapshot(
       const config = loadDaemonConfig(defaultConfigPath());
       intervalSec = config.hooks?.snapshotIntervalSec ?? 60;
     }
+    const forceSnapshot = input.hook_event_name === "PreCompact";
 
-    // Throttle: stat cursor mtime, skip if within interval
+    // Throttle: stat cursor mtime, skip if within interval. PreCompact is a
+    // boundary event, so force a final ingest attempt before Codex compacts.
     let stat: { mtimeMs: number } | null = null;
     try {
       stat = _statSync(cursorPath);
     } catch {
       // No cursor file — treat as expired
     }
-    if (stat && (Date.now() - stat.mtimeMs) < intervalSec * 1000) {
+    if (!forceSnapshot && stat && (Date.now() - stat.mtimeMs) < intervalSec * 1000) {
       return { exitCode: 0, stdout: "" };
     }
 

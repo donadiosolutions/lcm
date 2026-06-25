@@ -160,6 +160,13 @@ describe('installConnector — Codex native hooks', () => {
     expect(hooks.hooks.SessionStart[0].hooks[0].command).toBe('lcm restore --client codex');
     expect(hooks.hooks.UserPromptSubmit[0].hooks[0].command).toBe('lcm user-prompt --client codex');
     expect(hooks.hooks.PostToolUse[0].hooks[0].command).toBe('lcm post-tool --client codex');
+    expect(hooks.hooks.PreCompact[0].matcher).toBe('manual|auto');
+    expect(hooks.hooks.PreCompact[0].hooks[0]).toEqual({
+      type: 'command',
+      command: 'lcm session-snapshot --client codex',
+      timeout: 30,
+      statusMessage: 'Saving LCM memory before compaction',
+    });
     expect(hooks.hooks.Stop[0].hooks[0].command).toBe('lcm session-snapshot --client codex');
     expect(JSON.stringify(hooks)).not.toMatch(/claude/i);
 
@@ -296,6 +303,12 @@ describe('installConnector — Codex native hooks', () => {
             hooks: [{ type: 'command', command: 'echo existing' }],
           },
         ],
+        PreCompact: [
+          {
+            matcher: 'manual|auto',
+            hooks: [{ type: 'command', command: 'node "/tmp/honcho.mjs" writeback' }],
+          },
+        ],
       },
     }, null, 2));
 
@@ -306,6 +319,15 @@ describe('installConnector — Codex native hooks', () => {
     const commands = hooks.hooks.SessionStart.flatMap((group: any) => group.hooks.map((hook: any) => hook.command));
     expect(commands).toContain('echo existing');
     expect(commands.filter((command: string) => command === 'lcm restore --client codex')).toHaveLength(1);
+
+    const preCompactCommands = hooks.hooks.PreCompact.flatMap((group: any) => group.hooks.map((hook: any) => hook.command));
+    expect(preCompactCommands).toContain('node "/tmp/honcho.mjs" writeback');
+    expect(preCompactCommands.filter((command: string) => command === 'lcm session-snapshot --client codex')).toHaveLength(1);
+    const lcmPreCompactGroup = hooks.hooks.PreCompact.find((group: any) =>
+      group.hooks.some((hook: any) => hook.command === 'lcm session-snapshot --client codex'),
+    );
+    expect(lcmPreCompactGroup).toBeDefined();
+    expect(lcmPreCompactGroup?.matcher).toBe('manual|auto');
   });
 
   it('lists and removes Codex hooks', () => {

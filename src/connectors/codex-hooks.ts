@@ -68,6 +68,19 @@ function codexLcmHooks(): Record<string, CodexHookGroup[]> {
         ],
       },
     ],
+    PreCompact: [
+      {
+        matcher: "manual|auto",
+        hooks: [
+          {
+            type: "command",
+            command: lcmCommand("session-snapshot"),
+            timeout: 30,
+            statusMessage: "Saving LCM memory before compaction",
+          },
+        ],
+      },
+    ],
     Stop: [
       {
         hooks: [

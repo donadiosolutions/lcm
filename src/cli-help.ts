@@ -403,9 +403,9 @@ const HELP: Record<string, CommandHelp> = {
     summary: "Dispatch the rolling session snapshot hook.",
     usage: "lcm session-snapshot",
     examples: [
-      ["lcm session-snapshot", "Ingest transcript deltas (called by Stop hook)"],
+      ["lcm session-snapshot", "Ingest transcript deltas (called by Stop and PreCompact hooks)"],
     ],
-    notes: "Used by Codex Stop hooks for rolling writeback, and by Claude Code Stop hooks for best-effort snapshots. Not intended for direct use.",
+    notes: "Used by Codex Stop hooks for rolling writeback and Codex PreCompact hooks for forced pre-compaction snapshots. Also used by Claude Code Stop hooks for best-effort snapshots. Not intended for direct use.",
   },
 };
 

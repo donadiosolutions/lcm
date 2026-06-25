@@ -44,6 +44,30 @@ describe("handleSessionSnapshot", () => {
     expect(deps.post).not.toHaveBeenCalled();
   });
 
+  it("ingests PreCompact snapshots even when cursor mtime is within interval", async () => {
+    const deps = makeDeps({
+      statSync: vi.fn().mockReturnValue({ mtimeMs: Date.now() - 10_000 }),
+    });
+    const { handleSessionSnapshot } = await import("../../src/hooks/session-snapshot.js");
+    const result = await handleSessionSnapshot(
+      JSON.stringify({
+        session_id: "abc-123",
+        cwd: "/tmp/test",
+        transcript_path: "/tmp/session.jsonl",
+        hook_event_name: "PreCompact",
+        client: "codex",
+      }),
+      deps,
+    );
+    expect(result.exitCode).toBe(0);
+    expect(deps.post).toHaveBeenCalledWith("/ingest", {
+      session_id: "abc-123",
+      cwd: "/tmp/test",
+      transcript_path: "/tmp/session.jsonl",
+      client: "codex",
+    });
+  });
+
   it("ingests when cursor mtime exceeds interval", async () => {
     const deps = makeDeps({
       statSync: vi.fn().mockReturnValue({ mtimeMs: Date.now() - 120_000 }),
@@ -55,6 +79,17 @@ describe("handleSessionSnapshot", () => {
     );
     expect(result.exitCode).toBe(0);
     expect(deps.post).toHaveBeenCalled();
+  });
+
+  it("no-ops incomplete PreCompact payloads", async () => {
+    const deps = makeDeps();
+    const { handleSessionSnapshot } = await import("../../src/hooks/session-snapshot.js");
+    const result = await handleSessionSnapshot(
+      JSON.stringify({ session_id: "abc-123", cwd: "/tmp/test", hook_event_name: "PreCompact", client: "codex" }),
+      deps,
+    );
+    expect(result.exitCode).toBe(0);
+    expect(deps.post).not.toHaveBeenCalled();
   });
 
   it("passes Codex client through when invoked by Codex hooks", async () => {
