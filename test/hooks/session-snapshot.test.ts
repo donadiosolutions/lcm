@@ -12,7 +12,7 @@ function makeDeps(overrides: Partial<SnapshotDeps> = {}): SnapshotDeps {
 }
 
 describe("handleSessionSnapshot", () => {
-  it("ingests when no cursor file exists", async () => {
+  it("ingests and writes the normal cursor when no cursor file exists", async () => {
     const deps = makeDeps({
       statSync: vi.fn().mockImplementation(() => { throw new Error("ENOENT"); }),
     });
@@ -28,7 +28,10 @@ describe("handleSessionSnapshot", () => {
       transcript_path: "/tmp/session.jsonl",
       client: "claude",
     });
-    expect(deps.writeFileSync).toHaveBeenCalled();
+    expect(deps.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining("snap-abc-123.json"),
+      expect.stringContaining("\"ts\":"),
+    );
   });
 
   it("skips when throttled (cursor mtime < interval)", async () => {
@@ -42,6 +45,7 @@ describe("handleSessionSnapshot", () => {
     );
     expect(result.exitCode).toBe(0);
     expect(deps.post).not.toHaveBeenCalled();
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
   });
 
   it("ingests PreCompact snapshots even when cursor mtime is within interval", async () => {
@@ -66,6 +70,7 @@ describe("handleSessionSnapshot", () => {
       transcript_path: "/tmp/session.jsonl",
       client: "codex",
     });
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
   });
 
   it("ingests when cursor mtime exceeds interval", async () => {
@@ -79,6 +84,10 @@ describe("handleSessionSnapshot", () => {
     );
     expect(result.exitCode).toBe(0);
     expect(deps.post).toHaveBeenCalled();
+    expect(deps.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining("snap-abc-123.json"),
+      expect.stringContaining("\"ts\":"),
+    );
   });
 
   it("no-ops incomplete PreCompact payloads", async () => {

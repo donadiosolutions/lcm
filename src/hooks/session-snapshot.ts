@@ -112,10 +112,13 @@ export async function handleSessionSnapshot(
       }
     }
 
-    // Touch cursor file
-    const _writeFileSync = deps?.writeFileSync ?? writeFileSync;
-    _writeFileSync(cursorPath, JSON.stringify({ ts: Date.now() }));
-    try { chmodSync(cursorPath, 0o600); } catch { /* non-fatal */ }
+    // Touch cursor file for normal snapshots only. PreCompact is forced and
+    // must not refresh the throttle cursor used by regular Stop snapshots.
+    if (!forceSnapshot) {
+      const _writeFileSync = deps?.writeFileSync ?? writeFileSync;
+      _writeFileSync(cursorPath, JSON.stringify({ ts: Date.now() }));
+      try { chmodSync(cursorPath, 0o600); } catch { /* non-fatal */ }
+    }
 
     // Best-effort promote-events flush
     try {
