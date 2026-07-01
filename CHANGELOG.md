@@ -1,5 +1,12 @@
 # @donadiosolutions/lcm
 
+## 1.3.0
+
+### Minor Changes
+
+- cb5228d: Install a Codex PreCompact hook that snapshots transcript deltas before manual or automatic compaction.
+- 4f183a6: Start background daemons through the user systemd manager on Linux and have doctor repair daemons running under the wrong parent process.
+
 ## 1.2.1
 
 ### Patch Changes
