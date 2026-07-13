@@ -191,6 +191,29 @@ describe("createCompactHandler — summarizer branching", () => {
     },
   );
 
+  it.each([
+    [{ cwd: testCwd }, "session_id must be a non-empty string"],
+    [{ session_id: 42, cwd: testCwd }, "session_id must be a non-empty string"],
+    [{ session_id: "", cwd: testCwd }, "session_id must be a non-empty string"],
+    [{ session_id: "s1" }, "cwd must be a non-empty string"],
+    [{ session_id: "s1", cwd: false }, "cwd must be a non-empty string"],
+    [{ session_id: "s1", cwd: testCwd, transcript_path: 42 }, "transcript_path must be a string"],
+    [{ session_id: "s1", cwd: testCwd, skip_ingest: "false" }, "skip_ingest must be a boolean"],
+    [{ session_id: "s1", cwd: testCwd, client: "other" }, "client must be one of: claude, codex"],
+    [{ session_id: "s1", cwd: testCwd, previous_summary: {} }, "previous_summary must be a string"],
+    [{ session_id: "s1", cwd: testCwd, reasoning_effort: true }, "reasoning_effort must be a string"],
+  ])("rejects invalid compact request fields: %j", async (request, error) => {
+    vi.clearAllMocks();
+    const handler = createCompactHandler(makeConfig("openai"));
+    const { res, getBody } = mockRes();
+
+    await handler({} as any, res, JSON.stringify(request));
+
+    expect(res.writeHead).toHaveBeenCalledWith(400, { "Content-Type": "application/json" });
+    expect(getBody()).toEqual({ error });
+    expect(createOpenAISummarizer).not.toHaveBeenCalled();
+  });
+
   it("uses createClaudeProcessSummarizer when provider is claude-process", async () => {
     vi.clearAllMocks();
     const handler = createCompactHandler(makeConfig("claude-process"));

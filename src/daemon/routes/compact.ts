@@ -17,13 +17,43 @@ import { resolveEffectiveProvider, createSummarizer, type CompactClient, type Ef
 import { validateCwd } from "../validate-cwd.js";
 
 interface CompactRequestBody {
-  session_id?: string;
-  cwd?: string;
+  session_id: string;
+  cwd: string;
   transcript_path?: string;
   skip_ingest?: boolean;
   client?: CompactClient;
   previous_summary?: string;
   reasoning_effort?: unknown;
+}
+
+const COMPACT_CLIENTS: readonly CompactClient[] = ["claude", "codex"];
+
+function validateCompactRequestBody(input: Record<string, unknown>): string | undefined {
+  if (typeof input.session_id !== "string" || input.session_id.length === 0) {
+    return "session_id must be a non-empty string";
+  }
+  if (typeof input.cwd !== "string" || input.cwd.length === 0) {
+    return "cwd must be a non-empty string";
+  }
+  if (input.transcript_path !== undefined && typeof input.transcript_path !== "string") {
+    return "transcript_path must be a string";
+  }
+  if (input.skip_ingest !== undefined && typeof input.skip_ingest !== "boolean") {
+    return "skip_ingest must be a boolean";
+  }
+  if (
+    input.client !== undefined
+    && (typeof input.client !== "string" || !COMPACT_CLIENTS.includes(input.client as CompactClient))
+  ) {
+    return `client must be one of: ${COMPACT_CLIENTS.join(", ")}`;
+  }
+  if (input.previous_summary !== undefined && typeof input.previous_summary !== "string") {
+    return "previous_summary must be a string";
+  }
+  if (input.reasoning_effort !== undefined && typeof input.reasoning_effort !== "string") {
+    return "reasoning_effort must be a string";
+  }
+  return undefined;
 }
 
 function fmtN(n: number): string {
@@ -112,17 +142,17 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
       sendJson(res, 400, { error: "Invalid JSON body" });
       return;
     }
+    const validationError = validateCompactRequestBody(parsed as Record<string, unknown>);
+    if (validationError) {
+      sendJson(res, 400, { error: validationError });
+      return;
+    }
     const input = parsed as CompactRequestBody;
     const { session_id, transcript_path, skip_ingest, client, previous_summary } = input;
     const MAX_PREVIOUS_SUMMARY_LENGTH = 50_000;
     const validatedPreviousSummary = typeof previous_summary === "string"
       ? previous_summary.slice(0, MAX_PREVIOUS_SUMMARY_LENGTH)
       : undefined;
-
-    if (!session_id || !input.cwd) {
-      sendJson(res, 400, { error: "session_id and cwd are required" });
-      return;
-    }
 
     let cwd: string;
     try {
