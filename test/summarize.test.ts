@@ -501,6 +501,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
                 opaqueEndpoint: `user:${secrets[4]}@example.com`,
                 protocolRelativeEndpoint: `//user:${secrets[5]}@example.com/v1?token=${secrets[2]}`,
                 message: "Error: provider failed",
+                embeddedMessage: `request failed: https://${secrets[0]}:${secrets[1]}@example.com/v1?api_key=${secrets[2]}#${secrets[3]}; retrying`,
               },
             }],
           })),
@@ -513,12 +514,15 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         await summarize!("F".repeat(8_000), false);
 
         const diagnostics = consoleError.mock.calls
-          .flatMap((call) => call.map((entry) => String(entry)))
+          .flatMap((call: unknown[]) => call.map((entry: unknown) => String(entry)))
           .join(" ");
         expect(diagnostics).toContain("content_preview=");
         expect(diagnostics).toContain('"opaqueEndpoint":"[REDACTED]"');
         expect(diagnostics).toContain('"protocolRelativeEndpoint":"[REDACTED]"');
         expect(diagnostics).toContain('"message":"Error: provider failed"');
+        expect(diagnostics).toContain(
+          '"embeddedMessage":"request failed: https://example.com/v1?[REDACTED]#[REDACTED]; retrying"',
+        );
         for (const secret of secrets) expect(diagnostics).not.toContain(secret);
       } finally {
         consoleError.mockRestore();

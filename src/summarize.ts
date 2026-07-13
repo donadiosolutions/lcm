@@ -32,8 +32,9 @@ const DIAGNOSTIC_MAX_DEPTH = 4;
 const DIAGNOSTIC_MAX_ARRAY_ITEMS = 8;
 const DIAGNOSTIC_MAX_OBJECT_KEYS = 16;
 const DIAGNOSTIC_MAX_CHARS = 1200;
-const HTTP_URL_PATTERN = /^\s*https?:\/\//i;
 const PROTOCOL_RELATIVE_URL_PATTERN = /^\s*\/\//;
+const EMBEDDED_HTTP_URL_PATTERN = /https?:\/\/[^\s<>"'`\])}]+/gi;
+const TRAILING_URL_PUNCTUATION_PATTERN = /[.,;!?]+$/;
 
 /** Normalize provider ids for stable config/profile lookup. */
 function normalizeProviderId(provider: string): string {
@@ -218,18 +219,25 @@ function isUrlLikeKey(key: string | undefined): boolean {
     .some((suffix) => normalized.endsWith(suffix));
 }
 
+function sanitizeEmbeddedHttpUrls(value: string): string {
+  return value.replace(EMBEDDED_HTTP_URL_PATTERN, (match) => {
+    const trailing = match.match(TRAILING_URL_PUNCTUATION_PATTERN)?.[0] ?? "";
+    const url = trailing.length > 0 ? match.slice(0, -trailing.length) : match;
+    return `${sanitizeUrlForDisplay(url)}${trailing}`;
+  });
+}
+
 /** Build a JSON-safe, redacted, depth-limited clone for diagnostic logging. */
 function sanitizeForDiagnostics(value: unknown, depth = 0, key?: string): unknown {
   if (depth >= DIAGNOSTIC_MAX_DEPTH) {
     return "[max-depth]";
   }
   if (typeof value === "string") {
-    const safeValue = HTTP_URL_PATTERN.test(value)
-      || PROTOCOL_RELATIVE_URL_PATTERN.test(value)
-      || isUrlLikeKey(key)
-      ? sanitizeUrlForDisplay(value)
-      : value;
-    return truncateDiagnosticText(safeValue);
+    const boundedValue = truncateDiagnosticText(value);
+    if (PROTOCOL_RELATIVE_URL_PATTERN.test(boundedValue) || isUrlLikeKey(key)) {
+      return sanitizeUrlForDisplay(boundedValue);
+    }
+    return sanitizeEmbeddedHttpUrls(boundedValue);
   }
   if (
     value === null ||
