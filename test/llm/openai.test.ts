@@ -206,6 +206,7 @@ describe("createOpenAISummarizer", () => {
 
     expect(thrown?.message).toContain("OpenAI Chat Completions request failed after retries");
     expect(thrown?.message).toContain('model "test-model"');
+    expect(thrown?.message).toContain("initialDelayMs=0, maxDelayMs=0, multiplier=2");
     expect(thrown?.message).not.toContain(secretProviderMessage);
     expect(thrown?.message).not.toContain("PRIVATE PROMPT");
     expect(thrown?.message).not.toContain("sk-secret");

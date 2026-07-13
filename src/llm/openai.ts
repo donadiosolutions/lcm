@@ -39,6 +39,11 @@ type OpenAIErrorMetadata = {
   code?: unknown;
 };
 
+type EffectiveOpenAIRequestPolicy = {
+  requestTimeoutMs: number;
+  retry: LlmRetryPolicy;
+};
+
 function getErrorMetadata(err: unknown): OpenAIErrorMetadata {
   if (typeof err !== "object" || err === null) return {};
   const candidate = err as Record<string, unknown>;
@@ -63,10 +68,9 @@ function safeMetadata(err: unknown): string {
   return safeCode ? `${status}, code ${safeCode}` : status;
 }
 
-function policyDescription(opts: OpenAISummarizerOptions, attempts: number): string {
-  const retry = opts.retry ?? DEFAULT_LLM_RETRY_POLICY;
-  const timeout = opts.requestTimeoutMs ?? DEFAULT_LLM_REQUEST_TIMEOUT_MS;
-  return `attempts ${attempts}/${retry.maxAttempts}; timeout ${timeout}ms; retry policy ` +
+function policyDescription(policy: EffectiveOpenAIRequestPolicy, attempts: number): string {
+  const { retry, requestTimeoutMs } = policy;
+  return `attempts ${attempts}/${retry.maxAttempts}; timeout ${requestTimeoutMs}ms; retry policy ` +
     `initialDelayMs=${retry.initialDelayMs}, maxDelayMs=${retry.maxDelayMs}, multiplier=${retry.multiplier}`;
 }
 
@@ -74,14 +78,15 @@ function terminalRequestError(
   err: unknown,
   opts: OpenAISummarizerOptions,
   attempts: number,
+  policy: EffectiveOpenAIRequestPolicy,
 ): Error {
   const apiMode = opts.apiMode === "responses" ? "responses" : "chat-completions";
   const metadata = safeMetadata(err);
-  const policy = policyDescription(opts, attempts);
+  const policyDetails = policyDescription(policy, attempts);
 
   if (apiMode === "chat-completions") {
     return new Error(
-      `OpenAI Chat Completions request rejected (${metadata}; ${policy}): api mode chat-completions, ` +
+      `OpenAI Chat Completions request rejected (${metadata}; ${policyDetails}): api mode chat-completions, ` +
         `model ${JSON.stringify(opts.model)}. Verify that the selected model supports the Chat Completions API ` +
         "and that the request configuration is valid.",
     );
@@ -89,17 +94,22 @@ function terminalRequestError(
 
   const reasoningEffort = opts.reasoningEffort ?? "default/omitted";
   return new Error(
-    `OpenAI Responses request rejected (${metadata}; ${policy}): api mode responses, model ${JSON.stringify(opts.model)}, ` +
+    `OpenAI Responses request rejected (${metadata}; ${policyDetails}): api mode responses, model ${JSON.stringify(opts.model)}, ` +
       `reasoning effort ${JSON.stringify(reasoningEffort)}. Verify that the selected model supports the Responses API ` +
       "and requested reasoning configuration; choose a supported effort or omit reasoningEffort.",
   );
 }
 
-function requestFailureError(err: unknown, opts: OpenAISummarizerOptions, attempts: number): Error {
+function requestFailureError(
+  err: unknown,
+  opts: OpenAISummarizerOptions,
+  attempts: number,
+  policy: EffectiveOpenAIRequestPolicy,
+): Error {
   const apiMode = opts.apiMode === "responses" ? "responses" : "chat-completions";
   const apiName = apiMode === "responses" ? "Responses" : "Chat Completions";
   return new Error(
-    `OpenAI ${apiName} request failed after retries (${safeMetadata(err)}; ${policyDescription(opts, attempts)}): ` +
+    `OpenAI ${apiName} request failed after retries (${safeMetadata(err)}; ${policyDescription(policy, attempts)}): ` +
       `api mode ${apiMode}, model ${JSON.stringify(opts.model)}. ` +
       "Verify endpoint availability and the provider configuration.",
   );
@@ -113,12 +123,16 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
   const retry = opts._retryDelayMs === undefined
     ? opts.retry ?? { ...DEFAULT_LLM_RETRY_POLICY }
     : { ...(opts.retry ?? DEFAULT_LLM_RETRY_POLICY), initialDelayMs: opts._retryDelayMs, maxDelayMs: opts._retryDelayMs };
+  const effectiveRequestPolicy: EffectiveOpenAIRequestPolicy = {
+    requestTimeoutMs: opts.requestTimeoutMs ?? DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+    retry,
+  };
   const client =
     opts._clientOverride ??
     new OpenAI({
       baseURL: opts.baseUrl,
       apiKey: opts.apiKey || "local", // many local servers require a non-empty key
-      timeout: opts.requestTimeoutMs ?? DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+      timeout: effectiveRequestPolicy.requestTimeoutMs,
       maxRetries: 0,
     });
   const wait = opts._sleep ?? sleep;
@@ -181,13 +195,13 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
       } catch (err: unknown) {
         lastError = err;
         const attempts = attempt + 1;
-        if (!isRetryableError(err)) throw terminalRequestError(err, opts, attempts);
+        if (!isRetryableError(err)) throw terminalRequestError(err, opts, attempts, effectiveRequestPolicy);
         if (attempts < retry.maxAttempts) {
           const delay = Math.min(retry.maxDelayMs, retry.initialDelayMs * Math.pow(retry.multiplier, attempt));
           await wait(delay);
         }
       }
     }
-    throw requestFailureError(lastError, opts, retry.maxAttempts);
+    throw requestFailureError(lastError, opts, retry.maxAttempts, effectiveRequestPolicy);
   };
 }

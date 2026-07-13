@@ -452,6 +452,26 @@ describe("createCompactHandler — summarizer branching", () => {
     expect(createClaudeProcessSummarizer).not.toHaveBeenCalled();
   });
 
+  it.each(["__proto__", "constructor", "prototype"])(
+    "rejects prototype-sensitive retry key %s without resolving inherited mappings",
+    async (key) => {
+      vi.clearAllMocks();
+      const handler = createCompactHandler(makeConfig("openai"));
+      const { res, getBody } = mockRes();
+      const retry = JSON.parse(`{${JSON.stringify(key)}:1}`) as Record<string, unknown>;
+      await handler({} as any, res, JSON.stringify({
+        session_id: `policy-${key}`,
+        cwd: testCwd,
+        retry,
+      }));
+
+      expect(res.writeHead).toHaveBeenCalledWith(400, expect.anything());
+      expect(getBody().error).toContain(`retry.${key}`);
+      expect(getBody().error).toContain("unknown retry policy key");
+      expect(createOpenAISummarizer).not.toHaveBeenCalled();
+    },
+  );
+
   it("isolates cached OpenAI summarizers by effective request policy", async () => {
     vi.clearAllMocks();
     const handler = createCompactHandler(makeConfig("openai"));

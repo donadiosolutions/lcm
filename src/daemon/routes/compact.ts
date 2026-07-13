@@ -79,15 +79,15 @@ function resolveCompactRequestPolicy(config: DaemonConfig, input: CompactRequest
   const retryInput = input.retry as Record<string, unknown> | undefined;
   let retry: Record<string, unknown> | undefined;
   if (retryInput !== undefined) {
-    const keyMap: Readonly<Record<string, string>> = {
-      max_attempts: "maxAttempts",
-      initial_delay_ms: "initialDelayMs",
-      max_delay_ms: "maxDelayMs",
-      multiplier: "multiplier",
-    };
-    retry = {};
+    const keyMap = new Map<string, string>([
+      ["max_attempts", "maxAttempts"],
+      ["initial_delay_ms", "initialDelayMs"],
+      ["max_delay_ms", "maxDelayMs"],
+      ["multiplier", "multiplier"],
+    ]);
+    retry = Object.create(null) as Record<string, unknown>;
     for (const [key, value] of Object.entries(retryInput)) {
-      const canonical = keyMap[key];
+      const canonical = keyMap.get(key);
       if (!canonical) throw new ConfigValidationError(`retry.${key}`, `unknown retry policy key ${JSON.stringify(key)}`);
       retry[canonical] = value;
     }
