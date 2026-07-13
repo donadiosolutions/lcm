@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { batchCompact, findUncompacted, formatLlmDiagnostic } from "../src/batch-compact.js";
 import { DaemonClient } from "../src/daemon/client.js";
-import { getPoolStats } from "../src/db/connection.js";
+import { closeLcmConnection, getLcmConnection, getPoolStats } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { addProjectAlias, clearProjectMapCache } from "../src/project-map.js";
 import { ensureProjectDir, projectPaths } from "../src/daemon/project.js";
@@ -36,7 +36,7 @@ function seedConversation(dbPath: string): void {
 }
 
 function seedConversations(dbPath: string): void {
-  const db = new DatabaseSync(dbPath);
+  const db = getLcmConnection(dbPath);
   try {
     runLcmMigrations(db);
     for (const id of [1, 2]) {
@@ -46,7 +46,7 @@ function seedConversations(dbPath: string): void {
       ).run(id, 1, "user", `hello ${id}`, 250);
     }
   } finally {
-    db.close();
+    closeLcmConnection(dbPath);
   }
 }
 
