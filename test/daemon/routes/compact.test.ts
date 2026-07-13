@@ -1,4 +1,6 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { IncomingMessage } from "node:http";
+import { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -163,9 +165,10 @@ describe("createCompactHandler — summarizer branching", () => {
   it("returns 400 for a malformed JSON body", async () => {
     vi.clearAllMocks();
     const handler = createCompactHandler(makeConfig("openai"));
+    const req = new IncomingMessage(new Socket());
     const { res, getBody } = mockRes();
 
-    await handler({} as any, res, '{"session_id":');
+    await handler(req, res, '{"session_id":');
 
     expect(res.writeHead).toHaveBeenCalledWith(400, { "Content-Type": "application/json" });
     expect(getBody()).toEqual({ error: "Invalid JSON body" });
@@ -177,9 +180,10 @@ describe("createCompactHandler — summarizer branching", () => {
     async (body) => {
       vi.clearAllMocks();
       const handler = createCompactHandler(makeConfig("openai"));
+      const req = new IncomingMessage(new Socket());
       const { res, getBody } = mockRes();
 
-      await handler({} as any, res, body);
+      await handler(req, res, body);
 
       expect(res.writeHead).toHaveBeenCalledWith(400, { "Content-Type": "application/json" });
       expect(getBody()).toEqual({ error: "Invalid JSON body" });
