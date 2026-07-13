@@ -11,9 +11,13 @@ import { ConversationStore } from "../../store/conversation-store.js";
 import { SummaryStore } from "../../store/summary-store.js";
 import { CompactionEngine } from "../../compaction.js";
 import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
-import type { LcmSummarizeFn } from "../../llm/types.js";
 import { ScrubEngine } from "../../scrub.js";
-import { resolveEffectiveProvider, createSummarizer, type CompactClient, type EffectiveProvider } from "../summarizer.js";
+import {
+  makeSummarizerCache,
+  resolveEffectiveProvider,
+  type CompactClient,
+  type EffectiveProvider,
+} from "../summarizer.js";
 import { validateCwd } from "../validate-cwd.js";
 
 interface CompactRequestBody {
@@ -118,17 +122,7 @@ const compactingNow = new Set<string>();
 
 
 export function createCompactHandler(config: DaemonConfig): RouteHandler {
-  const summarizerCache = new Map<string, Promise<LcmSummarizeFn | null>>();
-
-  const getSummarizer = (provider: EffectiveProvider, reasoningEffort?: LlmReasoningEffort): Promise<LcmSummarizeFn | null> => {
-    const cacheKey = `${provider}:${config.llm.apiMode ?? ""}:${reasoningEffort ?? config.llm.reasoningEffort ?? ""}`;
-    let cached = summarizerCache.get(cacheKey);
-    if (!cached) {
-      cached = createSummarizer(provider, config, { reasoningEffort });
-      summarizerCache.set(cacheKey, cached);
-    }
-    return cached;
-  };
+  const getSummarizer = makeSummarizerCache(config);
 
   return async (_req, res, body) => {
     let parsed: unknown;
