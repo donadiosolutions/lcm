@@ -1,3 +1,7 @@
+const LOWER_TO_UPPER_BOUNDARY_PATTERN = /([a-z\d])([A-Z])/g;
+const ACRONYM_TO_WORD_BOUNDARY_PATTERN = /([A-Z]+)([A-Z][a-z])/g;
+const KEY_SEGMENT_DELIMITER_PATTERN = /[^A-Za-z\d]+/;
+
 const ALWAYS_SENSITIVE_SEGMENTS = new Set([
   "authorization",
   "bearer",
@@ -25,9 +29,9 @@ const TOKEN_MEASUREMENT_SEGMENTS = new Set([
 
 function keySegments(key: string): string[] {
   return key
-    .replace(/([a-z\d])([A-Z])/g, "$1 $2")
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
-    .split(/[^A-Za-z\d]+/)
+    .replace(LOWER_TO_UPPER_BOUNDARY_PATTERN, "$1 $2")
+    .replace(ACRONYM_TO_WORD_BOUNDARY_PATTERN, "$1 $2")
+    .split(KEY_SEGMENT_DELIMITER_PATTERN)
     .filter(Boolean)
     .map((segment) => segment.toLowerCase());
 }
