@@ -55,6 +55,11 @@ export function parseConfigPath(path: string): string[] {
     throw new ConfigManagerError("Configuration paths must contain non-empty dotted segments.");
   }
   for (const segment of segments) {
+    if (segment.trim() !== segment) {
+      throw new ConfigManagerError(
+        "Configuration path segments must not contain leading or trailing whitespace.",
+      );
+    }
     if (DENIED_PATH_SEGMENTS.has(segment)) {
       throw new ConfigManagerError(`Configuration path contains forbidden segment ${JSON.stringify(segment)}.`);
     }

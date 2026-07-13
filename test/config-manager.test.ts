@@ -33,7 +33,19 @@ describe("config manager paths and values", () => {
   it("canonicalizes the legacy baseURL path and rejects unsafe paths", () => {
     expect(parseConfigPath("llm.baseURL")).toEqual(["llm", "baseUrl"]);
     expect(normalizeConfigPath("llm.baseURL")).toBe("llm.baseUrl");
-    for (const path of ["", ".llm", "llm.", "llm..model", "__proto__.polluted", "llm.constructor.value", "prototype.x"]) {
+    for (const path of [
+      "",
+      ".llm",
+      "llm.",
+      "llm..model",
+      " llm.provider",
+      "llm.provider ",
+      "llm. provider",
+      "llm.   .provider",
+      "__proto__.polluted",
+      "llm.constructor.value",
+      "prototype.x",
+    ]) {
       expect(() => parseConfigPath(path)).toThrow(ConfigManagerError);
     }
   });
@@ -138,6 +150,14 @@ describe("getConfigValue", () => {
     expect(getConfigValue({ configPath, path: "llm.apiKey" })).toBe("[REDACTED]");
     expect(() => getConfigValue({ configPath, path: "daemon.port" })).toThrow("does not exist");
   });
+
+  it.each([" llm.provider", "llm. provider"])(
+    "rejects whitespace-padded path %j before reading a value",
+    (path) => {
+      const { configPath } = makeConfig({ llm: { provider: "disabled" } });
+      expect(() => getConfigValue({ configPath, path })).toThrow("whitespace");
+    },
+  );
 
   it("sanitizes baseUrl secrets for scalar and whole-object stored reads", () => {
     const secrets = ["stored-user", "stored-password", "stored-query", "stored-fragment"];
@@ -281,6 +301,22 @@ describe("setConfigValue", () => {
     expect(statSync(configPath).mode & 0o777).toBe(0o600);
     expect(readdirSync(directory).filter((name) => name.startsWith(".lcm-config-"))).toEqual([]);
   });
+
+  it.each([" llm.provider", "llm. provider", "llm.provider "])(
+    "rejects whitespace-padded path %j without changing the file",
+    (path) => {
+      const { configPath } = makeConfig({ version: 1, llm: { provider: "disabled" } });
+      const before = readFileSync(configPath, "utf-8");
+
+      expect(() => setConfigValue({
+        configPath,
+        path,
+        value: "codex-process",
+        env: {},
+      })).toThrow("whitespace");
+      expect(readFileSync(configPath, "utf-8")).toBe(before);
+    },
+  );
 
   it("writes only the canonical baseUrl spelling", () => {
     const { configPath } = makeConfig({ llm: { baseURL: "http://old.example/v1" } });
