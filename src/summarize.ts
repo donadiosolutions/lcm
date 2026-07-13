@@ -1,6 +1,7 @@
 import type { LcmDependencies } from "./types.js";
 import { loadTemplate, renderTemplate } from "./prompts/loader.js";
 import { isSensitiveKey } from "./secret-key.js";
+import { sanitizeUrlForDisplay } from "./url-display.js";
 
 export type LcmSummarizeOptions = {
   previousSummary?: string;
@@ -31,6 +32,8 @@ const DIAGNOSTIC_MAX_DEPTH = 4;
 const DIAGNOSTIC_MAX_ARRAY_ITEMS = 8;
 const DIAGNOSTIC_MAX_OBJECT_KEYS = 16;
 const DIAGNOSTIC_MAX_CHARS = 1200;
+const HTTP_URL_PATTERN = /^\s*https?:\/\//i;
+const PROTOCOL_RELATIVE_URL_PATTERN = /^\s*\/\//;
 
 /** Normalize provider ids for stable config/profile lookup. */
 function normalizeProviderId(provider: string): string {
@@ -208,13 +211,25 @@ function truncateDiagnosticText(value: string, maxChars = DIAGNOSTIC_MAX_CHARS):
   return `${value.slice(0, maxChars)}...[truncated:${value.length - maxChars} chars]`;
 }
 
+function isUrlLikeKey(key: string | undefined): boolean {
+  if (!key) return false;
+  const normalized = key.replace(/[-_]/g, "").toLowerCase();
+  return ["url", "urls", "uri", "uris", "endpoint", "endpoints"]
+    .some((suffix) => normalized.endsWith(suffix));
+}
+
 /** Build a JSON-safe, redacted, depth-limited clone for diagnostic logging. */
-function sanitizeForDiagnostics(value: unknown, depth = 0): unknown {
+function sanitizeForDiagnostics(value: unknown, depth = 0, key?: string): unknown {
   if (depth >= DIAGNOSTIC_MAX_DEPTH) {
     return "[max-depth]";
   }
   if (typeof value === "string") {
-    return truncateDiagnosticText(value);
+    const safeValue = HTTP_URL_PATTERN.test(value)
+      || PROTOCOL_RELATIVE_URL_PATTERN.test(value)
+      || isUrlLikeKey(key)
+      ? sanitizeUrlForDisplay(value)
+      : value;
+    return truncateDiagnosticText(safeValue);
   }
   if (
     value === null ||
@@ -236,7 +251,7 @@ function sanitizeForDiagnostics(value: unknown, depth = 0): unknown {
   if (Array.isArray(value)) {
     const head = value
       .slice(0, DIAGNOSTIC_MAX_ARRAY_ITEMS)
-      .map((entry) => sanitizeForDiagnostics(entry, depth + 1));
+      .map((entry) => sanitizeForDiagnostics(entry, depth + 1, key));
     if (value.length > DIAGNOSTIC_MAX_ARRAY_ITEMS) {
       head.push(`[+${value.length - DIAGNOSTIC_MAX_ARRAY_ITEMS} more items]`);
     }
@@ -251,7 +266,7 @@ function sanitizeForDiagnostics(value: unknown, depth = 0): unknown {
   for (const [key, entry] of entries.slice(0, DIAGNOSTIC_MAX_OBJECT_KEYS)) {
     out[key] = isSensitiveKey(key)
       ? "[redacted]"
-      : sanitizeForDiagnostics(entry, depth + 1);
+      : sanitizeForDiagnostics(entry, depth + 1, key);
   }
   if (entries.length > DIAGNOSTIC_MAX_OBJECT_KEYS) {
     out.__truncated_keys__ = entries.length - DIAGNOSTIC_MAX_OBJECT_KEYS;

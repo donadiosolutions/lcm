@@ -3,12 +3,16 @@ const ACRONYM_TO_WORD_BOUNDARY_PATTERN = /([A-Z]+)([A-Z][a-z])/g;
 const KEY_SEGMENT_DELIMITER_PATTERN = /[^A-Za-z\d]+/;
 
 const ALWAYS_SENSITIVE_SEGMENTS = new Set([
+  "apikey",
+  "apikeys",
   "authorization",
   "bearer",
   "cookie",
   "credential",
   "credentials",
   "password",
+  "privatekey",
+  "privatekeys",
   "secret",
 ]);
 

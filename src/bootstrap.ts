@@ -2,7 +2,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "n
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { mergeClaudeSettings } from "./installer/settings.js";
-import { loadDaemonConfig } from "./daemon/config.js";
+import { daemonConfigForPersistence, loadDaemonConfig } from "./daemon/config.js";
 import {
   configPath as defaultConfigPath,
   migrateLegacyHomeIfNeeded,
@@ -50,7 +50,7 @@ export async function ensureCore(deps: EnsureCoreDeps = defaultDeps()): Promise<
   if (!deps.existsSync(deps.configPath)) {
     deps.mkdirSync(dirname(deps.configPath), { recursive: true });
     const defaults = loadDaemonConfig("/nonexistent");
-    deps.writeFileSync(deps.configPath, JSON.stringify(defaults, null, 2));
+    deps.writeFileSync(deps.configPath, JSON.stringify(daemonConfigForPersistence(defaults), null, 2));
     try {
       deps.chmodSync?.(deps.configPath, 0o600);
     } catch {}

@@ -206,11 +206,11 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   // For install, we inject summarizer config into the default config if creating fresh
   if (!deps.existsSync(configPath)) {
     const summarizerConfig = await pickSummarizer(deps);
-    const { loadDaemonConfig } = await import("../src/daemon/config.js");
+    const { daemonConfigForPersistence, loadDaemonConfig } = await import("../src/daemon/config.js");
     const defaults = loadDaemonConfig("/nonexistent");
     defaults.llm = { ...defaults.llm, ...summarizerConfig };
     deps.mkdirSync(dirname(configPath), { recursive: true });
-    deps.writeFileSync(configPath, JSON.stringify(defaults, null, 2));
+    deps.writeFileSync(configPath, JSON.stringify(daemonConfigForPersistence(defaults), null, 2));
     try { deps.chmodSync?.(configPath, 0o600); } catch { /* best-effort */ }
     console.log(`Created ${configPath}`);
   }

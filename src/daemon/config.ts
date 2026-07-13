@@ -1,6 +1,9 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
+import { sanitizeUrlForDisplay } from "../url-display.js";
+
+export { sanitizeUrlForDisplay } from "../url-display.js";
 
 export const CANONICAL_LLM_PROVIDERS = [
   "auto",
@@ -299,23 +302,6 @@ function valueType(value: unknown): string {
 function isCredentialPath(path: string): boolean {
   const key = path.split(".").at(-1) ?? path;
   return /(?:api[-_]?key|token|secret|password|credential)/i.test(key);
-}
-
-/** Remove URL userinfo, query values, and fragments before displaying configuration. */
-export function sanitizeUrlForDisplay(value: string): string {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "http:" && url.protocol !== "https:") return "[REDACTED]";
-    if (url.username || url.password) {
-      url.username = "[REDACTED]";
-      url.password = "";
-    }
-    if (url.search) url.search = "?[REDACTED]";
-    if (url.hash) url.hash = "#[REDACTED]";
-    return url.toString();
-  } catch {
-    return "[REDACTED]";
-  }
 }
 
 function displayValue(path: string, value: unknown): string {
@@ -677,6 +663,21 @@ function parseConfigRoot(content: string, providerOverride?: LlmProvider): Recor
 /** Parse and normalize stored configuration without applying defaults or environment values. */
 export function parseStoredConfig(content: string): Record<string, unknown> {
   return parseConfigRoot(content);
+}
+
+/**
+ * Convert effective daemon configuration back to a safe persisted document.
+ * OpenAI request policy defaults remain effective at runtime but are explicit
+ * configuration only when the persisted provider is OpenAI-compatible.
+ */
+export function daemonConfigForPersistence(config: DaemonConfig): Record<string, unknown> {
+  const stored = structuredClone(config) as unknown as Record<string, unknown>;
+  const llm = stored.llm as Record<string, unknown>;
+  if (llm.provider !== "openai") {
+    delete llm.requestTimeoutMs;
+    delete llm.retry;
+  }
+  return stored;
 }
 
 function requireNonEmpty(value: string, path: string, provider: LlmProvider): void {

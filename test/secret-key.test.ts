@@ -4,6 +4,8 @@ import { isSensitiveKey } from "../src/secret-key.js";
 describe("isSensitiveKey", () => {
   it.each([
     "apiKey",
+    "apikey",
+    "apikeys",
     "api_key",
     "x-api-key",
     "apiKeys",
@@ -20,6 +22,8 @@ describe("isSensitiveKey", () => {
     "Set-Cookie",
     "sessionCookie",
     "privateKey",
+    "privatekey",
+    "privatekeys",
     "private_key",
     "private-key",
     "credential",

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import type { EnsureCoreDeps } from "../src/bootstrap.js";
+import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../src/daemon/config.js";
 
 function makeDeps(overrides: Partial<EnsureCoreDeps> = {}): EnsureCoreDeps {
   return {
@@ -23,6 +24,16 @@ describe("ensureCore", () => {
       deps.configPath,
       expect.stringContaining('"version"'),
     );
+    const configWrite = vi.mocked(deps.writeFileSync).mock.calls.find(([path]) => path === deps.configPath);
+    expect(configWrite).toBeDefined();
+    const stored = JSON.parse(configWrite![1]) as { llm: Record<string, unknown> };
+    expect(stored.llm.provider).toBe("auto");
+    expect(stored.llm).not.toHaveProperty("requestTimeoutMs");
+    expect(stored.llm).not.toHaveProperty("retry");
+
+    const effective = parseDaemonConfig(configWrite![1], {}, {});
+    expect(effective.llm.requestTimeoutMs).toBe(DEFAULT_LLM_REQUEST_TIMEOUT_MS);
+    expect(effective.llm.retry).toEqual(DEFAULT_LLM_RETRY_POLICY);
   });
 
   it("skips config.json creation when it already exists", async () => {

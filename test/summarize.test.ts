@@ -479,6 +479,52 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       }
     });
 
+    it("sanitizes credential-bearing and opaque URL values in diagnostic previews", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      const secrets = [
+        "url-user",
+        "url-password",
+        "query-secret",
+        "fragment-secret",
+        "opaque-secret",
+        "protocol-secret",
+      ];
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({ provider: "openai", model: "gpt-5.3-codex" })),
+          complete: vi.fn(async () => ({
+            content: [{
+              type: "tool_use",
+              name: "http",
+              input: {
+                endpoint: `https://${secrets[0]}:${secrets[1]}@example.com/v1?token=${secrets[2]}#${secrets[3]}`,
+                opaqueEndpoint: `user:${secrets[4]}@example.com`,
+                protocolRelativeEndpoint: `//user:${secrets[5]}@example.com/v1?token=${secrets[2]}`,
+                message: "Error: provider failed",
+              },
+            }],
+          })),
+        });
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+        });
+
+        await summarize!("F".repeat(8_000), false);
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((call) => call.map((entry) => String(entry)))
+          .join(" ");
+        expect(diagnostics).toContain("content_preview=");
+        expect(diagnostics).toContain('"opaqueEndpoint":"[REDACTED]"');
+        expect(diagnostics).toContain('"protocolRelativeEndpoint":"[REDACTED]"');
+        expect(diagnostics).toContain('"message":"Error: provider failed"');
+        for (const secret of secrets) expect(diagnostics).not.toContain(secret);
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
     it("does not retry when Anthropic provider returns a valid summary", async () => {
       const deps = makeDeps({
         // Default makeDeps uses anthropic + returns valid text — no retry expected.
