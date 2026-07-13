@@ -382,6 +382,14 @@ function requireNonEmpty(value: string, path: string, provider: LlmProvider): vo
   }
 }
 
+function isPublicOpenAIBaseURL(baseURL: string): boolean {
+  try {
+    return new URL(baseURL).hostname.toLowerCase().replace(/\.+$/, "") === "api.openai.com";
+  } catch {
+    return false;
+  }
+}
+
 function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: ReadonlySet<string>): void {
   const { llm } = merged;
   if (llm.provider === "anthropic") {
@@ -401,8 +409,7 @@ function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: Readonl
     if (!(["http:", "https:"] as const).includes(baseURL.protocol as "http:" | "https:")) {
       throw new ConfigValidationError("llm.baseURL", `expected an absolute HTTP(S) URL, received string ${displayValue("llm.baseURL", llm.baseURL)}`);
     }
-    const normalizedHostname = baseURL.hostname.toLowerCase().replace(/\.+$/, "");
-    if (normalizedHostname === "api.openai.com") {
+    if (isPublicOpenAIBaseURL(llm.baseURL)) {
       requireNonEmpty(llm.apiKey ?? "", "llm.apiKey", llm.provider);
     }
     llm.apiMode ??= "chat-completions";
@@ -502,7 +509,7 @@ export function parseDaemonConfig(
   if (!merged.llm.apiKey && merged.llm.provider === "anthropic") {
     merged.llm.apiKey = env.LCM_SUMMARY_API_KEY || env.ANTHROPIC_API_KEY || "";
   }
-  if (!merged.llm.apiKey && merged.llm.provider === "openai") {
+  if (!merged.llm.apiKey && merged.llm.provider === "openai" && isPublicOpenAIBaseURL(merged.llm.baseURL)) {
     merged.llm.apiKey = env.LCM_SUMMARY_API_KEY || env.OPENAI_API_KEY || "";
   }
 

@@ -107,6 +107,25 @@ describe("loadDaemonConfig", () => {
     }
   });
 
+  it("does not automatically inject a systemd OpenAI credential into a custom endpoint", (context: TestContext): void => {
+    const credentialsDir = makeTrustedCredentialDir(context);
+    if (credentialsDir === undefined) return;
+    try {
+      writeFileSync(join(credentialsDir, "OPENAI_API_KEY"), "sk-openai-credential", { mode: 0o600 });
+      const c = loadDaemonConfig(
+        "/nonexistent",
+        { llm: { provider: "openai", model: "test-model", baseURL: "https://compatible.example/v1" } },
+        {
+          CREDENTIALS_DIRECTORY: credentialsDir,
+          LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
+        },
+      );
+      expect(c.llm.apiKey).toBe("");
+    } finally {
+      rmSync(credentialsDir, { recursive: true, force: true });
+    }
+  });
+
   it("does not follow systemd credential symlinks outside the trusted directory", (context: TestContext): void => {
     const credentialsDir = makeTrustedCredentialDir(context);
     if (credentialsDir === undefined) return;
@@ -149,6 +168,47 @@ describe("loadDaemonConfig", () => {
   it("does NOT inject ANTHROPIC_API_KEY when provider is openai", () => {
     const c = loadDaemonConfig("/nonexistent", { llm: { provider: "openai", model: "test-model", baseURL: "http://localhost:11435/v1" } }, { ANTHROPIC_API_KEY: "sk-leaked" });
     expect(c.llm.apiKey).toBe("");
+  });
+
+  it.each(["OPENAI_API_KEY", "LCM_SUMMARY_API_KEY"] as const)(
+    "does not automatically inject %s into a custom OpenAI-compatible endpoint",
+    (envName) => {
+      const c = loadDaemonConfig(
+        "/nonexistent",
+        { llm: { provider: "openai", model: "test-model", baseURL: "https://compatible.example/v1" } },
+        { [envName]: "sk-public-secret" },
+      );
+      expect(c.llm.apiKey).toBe("");
+    },
+  );
+
+  it.each([
+    "https://api.openai.com/v1",
+    "https://API.OPENAI.COM/alternate/path",
+    "https://api.openai.com./v1",
+  ])("automatically injects the OpenAI env credential for the normalized public endpoint: %s", (baseURL) => {
+    const c = loadDaemonConfig(
+      "/nonexistent",
+      { llm: { provider: "openai", model: "test-model", baseURL } },
+      { OPENAI_API_KEY: "sk-openai-env" },
+    );
+    expect(c.llm.apiKey).toBe("sk-openai-env");
+  });
+
+  it("prefers an explicit custom-endpoint API key over public-provider env credentials", () => {
+    const c = loadDaemonConfig(
+      "/nonexistent",
+      {
+        llm: {
+          provider: "openai",
+          model: "test-model",
+          baseURL: "https://compatible.example/v1",
+          apiKey: "custom-endpoint-key",
+        },
+      },
+      { LCM_SUMMARY_API_KEY: "sk-summary-env", OPENAI_API_KEY: "sk-openai-env" },
+    );
+    expect(c.llm.apiKey).toBe("custom-endpoint-key");
   });
 
   it("still injects ANTHROPIC_API_KEY when provider is anthropic", () => {
