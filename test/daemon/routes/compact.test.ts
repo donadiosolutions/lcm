@@ -172,6 +172,21 @@ describe("createCompactHandler — summarizer branching", () => {
     expect(createOpenAISummarizer).not.toHaveBeenCalled();
   });
 
+  it.each(["null", "[]", "42", "true", '"string"'])(
+    "returns 400 when the JSON body is not an object: %s",
+    async (body) => {
+      vi.clearAllMocks();
+      const handler = createCompactHandler(makeConfig("openai"));
+      const { res, getBody } = mockRes();
+
+      await handler({} as any, res, body);
+
+      expect(res.writeHead).toHaveBeenCalledWith(400, { "Content-Type": "application/json" });
+      expect(getBody()).toEqual({ error: "Invalid JSON body" });
+      expect(createOpenAISummarizer).not.toHaveBeenCalled();
+    },
+  );
+
   it("uses createClaudeProcessSummarizer when provider is claude-process", async () => {
     vi.clearAllMocks();
     const handler = createCompactHandler(makeConfig("claude-process"));

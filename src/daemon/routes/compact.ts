@@ -13,8 +13,18 @@ import { CompactionEngine } from "../../compaction.js";
 import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
 import type { LcmSummarizeFn } from "../../llm/types.js";
 import { ScrubEngine } from "../../scrub.js";
-import { resolveEffectiveProvider, createSummarizer, type EffectiveProvider } from "../summarizer.js";
+import { resolveEffectiveProvider, createSummarizer, type CompactClient, type EffectiveProvider } from "../summarizer.js";
 import { validateCwd } from "../validate-cwd.js";
+
+interface CompactRequestBody {
+  session_id?: string;
+  cwd?: string;
+  transcript_path?: string;
+  skip_ingest?: boolean;
+  client?: CompactClient;
+  previous_summary?: string;
+  reasoning_effort?: unknown;
+}
 
 function fmtN(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -91,13 +101,18 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
   };
 
   return async (_req, res, body) => {
-    let input;
+    let parsed: unknown;
     try {
-      input = JSON.parse(body || "{}");
+      parsed = JSON.parse(body || "{}");
     } catch {
       sendJson(res, 400, { error: "Invalid JSON body" });
       return;
     }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      sendJson(res, 400, { error: "Invalid JSON body" });
+      return;
+    }
+    const input = parsed as CompactRequestBody;
     const { session_id, transcript_path, skip_ingest, client, previous_summary } = input;
     const MAX_PREVIOUS_SUMMARY_LENGTH = 50_000;
     const validatedPreviousSummary = typeof previous_summary === "string"
