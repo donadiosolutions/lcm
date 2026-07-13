@@ -502,6 +502,19 @@ describe("runDoctor summarizer modes", () => {
 });
 
 describe("runDoctor configuration validation", () => {
+  it("keeps the summarizer disabled when config.json is missing", async () => {
+    const results = await runDoctor(minimalDeps({
+      existsSync: (path: string) => !path.endsWith("config.json"),
+    }));
+
+    expect(results.find((result) => result.name === "stack")?.message).toContain("Summarizer: disabled");
+    expect(results.find((result) => result.name === "stack")?.message).not.toContain("Summarizer: auto");
+    expect(results.find((result) => result.name === "config")).toMatchObject({
+      status: "fail",
+      message: "Missing — run: lcm install",
+    });
+  });
+
   it("resolves provider API keys from the daemon's systemd credential environment", async (context: TestContext) => {
     const credentialsDir = makeTrustedCredentialDir(context);
     if (credentialsDir === undefined) return;

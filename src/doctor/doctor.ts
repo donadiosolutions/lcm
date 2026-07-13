@@ -75,10 +75,12 @@ function normalizeDoctorOptions(options: boolean | DoctorRunOptions = false): Re
 
 function loadConfig(deps: DoctorDeps): DoctorConfig {
   const resolvedConfigPath = configPath(deps.homedir);
+  if (!deps.existsSync(resolvedConfigPath)) {
+    return { port: 3737, summarizer: "disabled" };
+  }
+
   try {
-    const content = deps.existsSync(resolvedConfigPath)
-      ? deps.readFileSync(resolvedConfigPath, "utf-8")
-      : "{}";
+    const content = deps.readFileSync(resolvedConfigPath, "utf-8");
     const config = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
     return {
       port: config.daemon.port,
