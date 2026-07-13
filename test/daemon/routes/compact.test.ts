@@ -160,6 +160,18 @@ describe("createCompactHandler — summarizer branching", () => {
   // Use tmpdir() which always exists; these tests mock all summarizers and don't need unique project dirs
   const testCwd = tmpdir();
 
+  it("returns 400 for a malformed JSON body", async () => {
+    vi.clearAllMocks();
+    const handler = createCompactHandler(makeConfig("openai"));
+    const { res, getBody } = mockRes();
+
+    await handler({} as any, res, '{"session_id":');
+
+    expect(res.writeHead).toHaveBeenCalledWith(400, { "Content-Type": "application/json" });
+    expect(getBody()).toEqual({ error: "Invalid JSON body" });
+    expect(createOpenAISummarizer).not.toHaveBeenCalled();
+  });
+
   it("uses createClaudeProcessSummarizer when provider is claude-process", async () => {
     vi.clearAllMocks();
     const handler = createCompactHandler(makeConfig("claude-process"));

@@ -91,7 +91,13 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
   };
 
   return async (_req, res, body) => {
-    const input = JSON.parse(body || "{}");
+    let input;
+    try {
+      input = JSON.parse(body || "{}");
+    } catch {
+      sendJson(res, 400, { error: "Invalid JSON body" });
+      return;
+    }
     const { session_id, transcript_path, skip_ingest, client, previous_summary } = input;
     const MAX_PREVIOUS_SUMMARY_LENGTH = 50_000;
     const validatedPreviousSummary = typeof previous_summary === "string"
