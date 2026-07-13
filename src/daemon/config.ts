@@ -420,8 +420,47 @@ function validateOptionalStringArray(object: Record<string, unknown>, key: strin
   if (object[key] !== undefined) validateStringArray(`${path}.${key}`, object[key]);
 }
 
+function rejectUnknownKeys(
+  object: Record<string, unknown>,
+  path: string,
+  allowedKeys: ReadonlySet<string>,
+): void {
+  for (const key of Object.keys(object)) {
+    if (!allowedKeys.has(key)) {
+      throw new ConfigValidationError(
+        `${path}.${key}`,
+        `unknown key ${JSON.stringify(key)}; valid keys: ${[...allowedKeys].join(", ")}`,
+      );
+    }
+  }
+}
+
+const DAEMON_KEYS = new Set(["port", "socketPath", "logLevel", "logMaxSizeMB", "logRetentionDays", "idleTimeoutMs"]);
+const COMPACTION_KEYS = new Set(["leafTokens", "maxDepth", "autoCompactMinTokens", "promotionThresholds"]);
+const PROMOTION_THRESHOLD_KEYS = new Set([
+  "minDepth", "compressionRatio", "keywords", "architecturePatterns", "dedupBm25Threshold",
+  "dedupCandidateLimit", "eventConfidence", "reinforcementBoost", "maxConfidence", "insightsMaxAgeDays",
+  // Supported legacy fields removed by the post-merge migration.
+  "mergeMaxEntries", "confidenceDecayRate",
+]);
+const EVENT_CONFIDENCE_KEYS = new Set(["decision", "plan", "errorFix", "batch", "pattern"]);
+const RESTORATION_KEYS = new Set([
+  "recentSummaries", "promptSearchMinScore", "promptSearchMaxResults", "promptSnippetLength",
+  "maxInjectedMemoryBytes", "reservedForLearningInstruction", "maxInjectedMemoryItems", "dedupMinPrefix",
+  "recencyHalfLifeHours", "crossSessionAffinity", "recallUsageBoost", "recallUsageSmoothing",
+  "surfacingCooldownWindow", "resurfaceMargin", "unusedSurfacingPenalty", "staleAfterDays",
+  "staleSurfacingWithoutUseLimit", "restoreMaxPromotedAgeDays", "stalePenalty", "allowStaleOnStrongMatch",
+  // Supported legacy names migrated after defaults are merged.
+  "promptHintsByteBudget", "promptHintsReservedForLearningInstruction", "promptHintsMaxEmitted",
+  "promptHintsDedupMinPrefix",
+]);
+const SUMMARIZER_KEYS = new Set(["mock"]);
+const SECURITY_KEYS = new Set(["sensitivePatterns", "notify_on_filter"]);
+const HOOK_KEYS = new Set(["snapshotIntervalSec", "disableAutoCompact"]);
+
 function validateDaemonSection(value: unknown, allowEphemeralPort: boolean): void {
   const daemon = validateObject("daemon", value);
+  rejectUnknownKeys(daemon, "daemon", DAEMON_KEYS);
   validateOptionalInteger(daemon, "port", "daemon", allowEphemeralPort ? 0 : 1, 65_535);
   validateOptionalString(daemon, "socketPath", "daemon");
   validateOptionalString(daemon, "logLevel", "daemon");
@@ -433,6 +472,7 @@ function validateDaemonSection(value: unknown, allowEphemeralPort: boolean): voi
 function validatePromotionThresholds(value: unknown): void {
   const thresholds = validateObject("compaction.promotionThresholds", value);
   const path = "compaction.promotionThresholds";
+  rejectUnknownKeys(thresholds, path, PROMOTION_THRESHOLD_KEYS);
   validateOptionalInteger(thresholds, "minDepth", path);
   validateOptionalNumber(thresholds, "compressionRatio", path, 0, 1);
   validateOptionalNumber(thresholds, "dedupBm25Threshold", path);
@@ -453,6 +493,7 @@ function validatePromotionThresholds(value: unknown): void {
   }
   if (thresholds.eventConfidence !== undefined) {
     const confidence = validateObject(`${path}.eventConfidence`, thresholds.eventConfidence);
+    rejectUnknownKeys(confidence, `${path}.eventConfidence`, EVENT_CONFIDENCE_KEYS);
     for (const key of ["decision", "plan", "errorFix", "batch", "pattern"]) {
       validateOptionalNumber(confidence, key, `${path}.eventConfidence`, 0, 1);
     }
@@ -461,6 +502,7 @@ function validatePromotionThresholds(value: unknown): void {
 
 function validateCompactionSection(value: unknown): void {
   const compaction = validateObject("compaction", value);
+  rejectUnknownKeys(compaction, "compaction", COMPACTION_KEYS);
   validateOptionalInteger(compaction, "leafTokens", "compaction", 1);
   validateOptionalInteger(compaction, "maxDepth", "compaction", 1);
   validateOptionalInteger(compaction, "autoCompactMinTokens", "compaction");
@@ -470,6 +512,7 @@ function validateCompactionSection(value: unknown): void {
 function validateRestorationSection(value: unknown): void {
   const restoration = validateObject("restoration", value);
   const path = "restoration";
+  rejectUnknownKeys(restoration, path, RESTORATION_KEYS);
   for (const key of [
     "recentSummaries", "promptSearchMaxResults", "promptSnippetLength", "maxInjectedMemoryBytes",
     "reservedForLearningInstruction", "maxInjectedMemoryItems", "dedupMinPrefix",
@@ -511,15 +554,18 @@ function validateKnownConfigSections(
   if (config.restoration !== undefined) validateRestorationSection(config.restoration);
   if (config.summarizer !== undefined) {
     const summarizer = validateObject("summarizer", config.summarizer);
+    rejectUnknownKeys(summarizer, "summarizer", SUMMARIZER_KEYS);
     validateOptionalBoolean(summarizer, "mock", "summarizer");
   }
   if (config.security !== undefined) {
     const security = validateObject("security", config.security);
+    rejectUnknownKeys(security, "security", SECURITY_KEYS);
     validateOptionalStringArray(security, "sensitivePatterns", "security");
     validateOptionalBoolean(security, "notify_on_filter", "security");
   }
   if (config.hooks !== undefined) {
     const hooks = validateObject("hooks", config.hooks);
+    rejectUnknownKeys(hooks, "hooks", HOOK_KEYS);
     validateOptionalInteger(hooks, "snapshotIntervalSec", "hooks");
     validateOptionalBoolean(hooks, "disableAutoCompact", "hooks");
   }

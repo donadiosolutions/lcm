@@ -4,7 +4,7 @@ export function sanitizeUrlForDisplay(value: string): string {
     const url = new URL(value);
     if (url.protocol !== "http:" && url.protocol !== "https:") return "[REDACTED]";
     if (url.username || url.password) {
-      url.username = "[REDACTED]";
+      url.username = "";
       url.password = "";
     }
     if (url.search) url.search = "?[REDACTED]";

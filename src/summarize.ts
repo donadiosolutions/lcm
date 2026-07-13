@@ -265,7 +265,7 @@ function sanitizeForDiagnostics(value: unknown, depth = 0, key?: string): unknow
   const entries = Object.entries(value);
   for (const [key, entry] of entries.slice(0, DIAGNOSTIC_MAX_OBJECT_KEYS)) {
     out[key] = isSensitiveKey(key)
-      ? "[redacted]"
+      ? "[REDACTED]"
       : sanitizeForDiagnostics(entry, depth + 1, key);
   }
   if (entries.length > DIAGNOSTIC_MAX_OBJECT_KEYS) {

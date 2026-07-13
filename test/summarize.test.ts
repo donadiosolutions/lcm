@@ -471,7 +471,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           .flatMap((call) => call.map((entry) => String(entry)))
           .join(" ");
         expect(diagnostics).toContain("content_preview=");
-        expect(diagnostics).toContain('"authorization":"[redacted]"');
+        expect(diagnostics).toContain('"authorization":"[REDACTED]"');
         expect(diagnostics).not.toContain("super-secret-token");
         expect(diagnostics).toContain("[truncated:");
       } finally {

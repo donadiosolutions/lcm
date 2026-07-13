@@ -64,6 +64,10 @@ describe("config manager paths and values", () => {
     const unsafeUrl = "https://private-user:private-password@example.com/v1?token=private-query#private-fragment";
     const direct = maskConfigSecrets(unsafeUrl, ["llm", "baseUrl"]);
     const nested = maskConfigSecrets({ llm: { baseURL: unsafeUrl } });
+    expect(direct).toBe("https://example.com/v1?[REDACTED]#[REDACTED]");
+    expect(String(direct)).toContain("example.com/v1");
+    expect(String(direct)).not.toContain("@");
+    expect(JSON.stringify(nested)).not.toContain("@");
     for (const output of [String(direct), JSON.stringify(nested)]) {
       expect(output).not.toContain("private-user");
       expect(output).not.toContain("private-password");
@@ -264,6 +268,8 @@ describe("setConfigValue", () => {
     ["daemon.port", "not-a-port", false, "daemon.port"],
     ["daemon.port", "0", true, "daemon.port"],
     ["daemon.port", "70000", true, "daemon.port"],
+    ["daemon.prt", "3737", true, "daemon.prt"],
+    ["compaction.promotionThresholds.eventConfidence.decison", "0.5", true, "compaction.promotionThresholds.eventConfidence.decison"],
     ["hooks.disableAutoCompact", "false", false, "hooks.disableAutoCompact"],
   ] as const)("validates the full result before replacing the file when setting %s", (path, value, json, expectedPath) => {
     const { configPath } = makeConfig({ version: 1 });

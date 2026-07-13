@@ -40,20 +40,35 @@ describe("known configuration schema validation", () => {
     expect(() => parseDaemonConfig("{}", config)).toThrow(expectedPath);
   });
 
+  it.each([
+    [{ daemon: { prt: 3737 } }, "daemon.prt"],
+    [{ compaction: { leafToken: 1000 } }, "compaction.leafToken"],
+    [{ compaction: { promotionThresholds: { compressionRato: 0.3 } } }, "compaction.promotionThresholds.compressionRato"],
+    [{ compaction: { promotionThresholds: { eventConfidence: { decison: 0.5 } } } }, "compaction.promotionThresholds.eventConfidence.decison"],
+    [{ restoration: { recentSummary: 3 } }, "restoration.recentSummary"],
+    [{ summarizer: { mok: false } }, "summarizer.mok"],
+    [{ security: { sensitivePattern: [] } }, "security.sensitivePattern"],
+    [{ hooks: { snapshotIntervalSeconds: 60 } }, "hooks.snapshotIntervalSeconds"],
+  ] as const)("rejects unknown keys inside fixed-schema sections %#", (config, expectedPath) => {
+    expect(() => parseStoredConfig(JSON.stringify(config))).toThrow(expectedPath);
+    expect(() => parseDaemonConfig("{}", config)).toThrow(expectedPath);
+  });
+
   it("rejects stored port 0 while preserving the internal ephemeral runtime override", () => {
     expect(() => parseStoredConfig(JSON.stringify({ daemon: { port: 0 } }))).toThrow("daemon.port");
     expect(() => parseDaemonConfig(JSON.stringify({ daemon: { port: 0 } }))).toThrow("daemon.port");
     expect(parseDaemonConfig("{}", { daemon: { port: 0 } }).daemon.port).toBe(0);
   });
 
-  it("preserves extension keys and accepts supported legacy migration fields", () => {
+  it("preserves root extensions and dynamic keyword categories while accepting legacy fields", () => {
     const stored = parseStoredConfig(JSON.stringify({
       extension: { enabled: true },
-      daemon: { extensionPortStrategy: "external" },
-      hooks: { extensionHook: { enabled: true } },
       compaction: {
-        extensionCompactor: true,
-        promotionThresholds: { mergeMaxEntries: 25, confidenceDecayRate: 0.25 },
+        promotionThresholds: {
+          mergeMaxEntries: 25,
+          confidenceDecayRate: 0.25,
+          keywords: { customCategory: ["custom phrase"] },
+        },
       },
       restoration: {
         promptHintsByteBudget: 4096,
@@ -65,9 +80,9 @@ describe("known configuration schema validation", () => {
 
     expect(stored).toMatchObject({
       extension: { enabled: true },
-      daemon: { extensionPortStrategy: "external" },
-      hooks: { extensionHook: { enabled: true } },
-      compaction: { extensionCompactor: true },
+      compaction: {
+        promotionThresholds: { keywords: { customCategory: ["custom phrase"] } },
+      },
     });
     expect(() => parseDaemonConfig(JSON.stringify(stored))).not.toThrow();
   });
