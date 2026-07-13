@@ -383,6 +383,62 @@ describe("loadDaemonConfig", () => {
     expect(c.llm.model).toBe("");
   });
 
+  it.each(["claude-process", "claude"])(
+    "clears a file model when the runtime-only provider switches to %s",
+    (provider) => {
+      const c = parseDaemonConfig(
+        JSON.stringify({
+          llm: {
+            provider: "openai",
+            model: "remote-openai-model",
+            baseUrl: "http://localhost:11435/v1",
+          },
+        }),
+        { llm: { provider } },
+      );
+
+      expect(c.llm.provider).toBe("claude-process");
+      expect(c.llm.model).toBe("");
+    },
+  );
+
+  it("does not let a runtime-only remote provider inherit another provider's file model", () => {
+    expect(() => parseDaemonConfig(
+      JSON.stringify({
+        llm: {
+          provider: "openai",
+          model: "remote-openai-model",
+          baseUrl: "http://localhost:11435/v1",
+        },
+      }),
+      { llm: { provider: "anthropic", apiKey: "sk-anthropic" } },
+    )).toThrow("llm.model");
+  });
+
+  it("preserves an explicit runtime model during a runtime-only provider switch", () => {
+    const c = parseDaemonConfig(
+      JSON.stringify({
+        llm: {
+          provider: "openai",
+          model: "remote-openai-model",
+          baseUrl: "http://localhost:11435/v1",
+        },
+      }),
+      { llm: { provider: "claude-process", model: "claude-sonnet-4-20250514" } },
+    );
+
+    expect(c.llm.model).toBe("claude-sonnet-4-20250514");
+  });
+
+  it("preserves a provider-less file model during a runtime-only provider switch", () => {
+    const c = parseDaemonConfig(
+      JSON.stringify({ llm: { model: "claude-sonnet-4-20250514" } }),
+      { llm: { provider: "claude-process" } },
+    );
+
+    expect(c.llm.model).toBe("claude-sonnet-4-20250514");
+  });
+
   it("preserves an explicit runtime model for the environment-selected provider", () => {
     const c = parseDaemonConfig(
       JSON.stringify({

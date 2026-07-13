@@ -69,6 +69,7 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("--effective");
     expect(text).toContain("--json");
     expect(text).toContain("always masked");
+    expect(text).toContain("custom and openai-compatible normalize to OpenAI and retain those settings");
     expect(text).toContain("lcm daemon restart");
   });
 

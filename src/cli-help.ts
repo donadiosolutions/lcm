@@ -71,7 +71,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm config set llm.provider codex-process", "Store a validated string value"],
       ["lcm config set hooks.disableAutoCompact true --json", "Store a typed boolean value"],
     ],
-    notes: "Stored reads normalize compatibility aliases without rewriting the file. Secret-like values are always masked, including with --effective. Setting llm.provider away from OpenAI removes OpenAI-only API mode, reasoning, timeout, and retry settings. Successful writes are atomic, preserve unrelated keys, and require `lcm daemon restart` before a running daemon uses the new configuration.",
+    notes: "Stored reads normalize compatibility aliases without rewriting the file. Secret-like values are always masked, including with --effective. Setting llm.provider away from OpenAI removes OpenAI-only API mode, reasoning, timeout, and retry settings; custom and openai-compatible normalize to OpenAI and retain those settings. Successful writes are atomic, preserve unrelated keys, and require `lcm daemon restart` before a running daemon uses the new configuration.",
   },
 
   status: {

@@ -824,6 +824,11 @@ export function parseDaemonConfig(
     : undefined;
   const hasExplicitFileModel = typeof fileLlm?.model === "string";
   const hasExplicitRuntimeModel = typeof overrideLlm?.model === "string";
+  const selectedProvider = providerOverride ?? (
+    typeof overrideLlm?.provider === "string"
+      ? normalizeLlmProvider(overrideLlm.provider)
+      : undefined
+  );
   const explicitLlmKeys = new Set([
     ...Object.keys(fileLlm ?? {}),
     ...Object.keys(overrideLlm ?? {}),
@@ -848,21 +853,23 @@ export function parseDaemonConfig(
   delete thresholds["confidenceDecayRate"];
   if (merged.llm.apiKey) merged.llm.apiKey = merged.llm.apiKey.replace(/\$\{(\w+)\}/g, (_: string, k: string) => env[k] ?? "");
 
+  // Runtime models belong to the runtime/environment selection. Only discard
+  // a model inherited from a file that explicitly paired it with another
+  // selected provider; provider-less file models remain intentionally portable.
+  if (
+    selectedProvider !== undefined
+    && hasExplicitFileModel
+    && !hasExplicitRuntimeModel
+    && fileModelProvider !== undefined
+    && fileModelProvider !== selectedProvider
+    && env.LCM_SUMMARY_MODEL === undefined
+  ) {
+    merged.llm.model = "";
+  }
+
   // Env var override: LCM_SUMMARY_PROVIDER takes precedence over config
   if (providerOverride !== undefined) {
     merged.llm.provider = providerOverride;
-    // Runtime models belong to the runtime/environment selection. Only discard
-    // a model inherited from a file that explicitly paired it with another
-    // provider; provider-less file models remain intentionally portable.
-    if (
-      hasExplicitFileModel
-      && !hasExplicitRuntimeModel
-      && fileModelProvider !== undefined
-      && fileModelProvider !== providerOverride
-      && env.LCM_SUMMARY_MODEL === undefined
-    ) {
-      merged.llm.model = "";
-    }
     if (providerOverride !== "openai") {
       delete merged.llm.apiMode;
       delete merged.llm.reasoningEffort;

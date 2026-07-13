@@ -314,7 +314,11 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(config);
     const { res } = mockRes();
 
-    await handler({}, res, JSON.stringify({ session_id: `s1-${client}-default-model`, cwd: testCwd, client }));
+    await handler(
+      new IncomingMessage(new Socket()),
+      res,
+      JSON.stringify({ session_id: `s1-${client}-default-model`, cwd: testCwd, client }),
+    );
 
     expect(factory).toHaveBeenCalledWith({ model: "" });
   });
