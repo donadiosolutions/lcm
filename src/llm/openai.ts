@@ -11,9 +11,34 @@ type OpenAISummarizerOptions = {
   model: string;
   baseURL: string;
   apiKey?: string;
+  apiMode?: "chat-completions" | "responses";
+  reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
   _clientOverride?: any;
   _retryDelayMs?: number;
 };
+
+const CONFIGURATION_ERROR_STATUSES = new Set([400, 403, 404, 409, 422]);
+
+function isConfigurationError(err: any): boolean {
+  return CONFIGURATION_ERROR_STATUSES.has(err?.status);
+}
+
+function responsesConfigurationError(
+  err: any,
+  opts: OpenAISummarizerOptions,
+): Error {
+  const status = typeof err?.status === "number" ? `status ${err.status}` : "unknown status";
+  const rawCode =
+    typeof err?.code === "string" || typeof err?.code === "number" ? String(err.code) : "";
+  const safeCode = rawCode.replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 80);
+  const code = safeCode ? `, code ${safeCode}` : "";
+
+  return new Error(
+    `OpenAI Responses request rejected (${status}${code}): api mode responses, model ${opts.model}, ` +
+      `reasoning effort ${opts.reasoningEffort}. Verify that the selected model supports this reasoning ` +
+      "effort, choose a supported effort, or remove reasoningEffort.",
+  );
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -48,6 +73,26 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
+        if (opts.apiMode === "responses") {
+          const input = `${LCM_SUMMARIZER_SYSTEM_PROMPT}\n\n${prompt}`;
+          const request: {
+            model: string;
+            max_output_tokens: number;
+            input: string;
+            reasoning?: { effort: NonNullable<OpenAISummarizerOptions["reasoningEffort"]> };
+          } = {
+            model: opts.model,
+            max_output_tokens: 1024,
+            input,
+          };
+          if (opts.reasoningEffort !== undefined) {
+            request.reasoning = { effort: opts.reasoningEffort };
+          }
+
+          const response = await client.responses.create(request);
+          return response.output_text || text.slice(0, 500);
+        }
+
         const response = await client.chat.completions.create({
           model: opts.model,
           max_tokens: 1024,
@@ -62,6 +107,12 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
         return textContent || text.slice(0, 500);
       } catch (err: any) {
         if (err?.status === 401) throw err; // auth error: no retry
+        if (isConfigurationError(err)) {
+          if (opts.apiMode === "responses" && opts.reasoningEffort !== undefined) {
+            throw responsesConfigurationError(err, opts);
+          }
+          throw err;
+        }
         lastError = err;
         if (attempt < MAX_RETRIES - 1) await sleep(retryDelayMs * Math.pow(2, attempt));
       }
