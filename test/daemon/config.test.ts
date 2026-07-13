@@ -488,7 +488,9 @@ describe("strict LLM configuration validation", () => {
       },
     });
     expect(parseDaemonConfig(content).llm.reasoningEffort).toBe("high");
-    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "codex", reasoningEffort: "high" } }))).toThrow("only valid");
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "codex", reasoningEffort: "high" } }))).toThrow(
+      'Invalid configuration at llm.reasoningEffort: is only valid when llm.provider is "openai" and llm.apiMode is "responses"',
+    );
     expect(() => parseDaemonConfig(JSON.stringify({
       llm: {
         provider: "openai",
@@ -497,7 +499,17 @@ describe("strict LLM configuration validation", () => {
         reasoningEffort: "high",
       },
     }))).toThrow('apiMode "responses"');
-    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "disabled", apiMode: "responses" } }))).toThrow("only valid");
+    expect(parseDaemonConfig(JSON.stringify({
+      llm: {
+        provider: "openai",
+        model: "gpt-test",
+        baseURL: "http://localhost:11435/v1",
+        apiMode: "chat-completions",
+      },
+    })).llm.apiMode).toBe("chat-completions");
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "disabled", apiMode: "chat-completions" } }))).toThrow(
+      'Invalid configuration at llm.apiMode: is only valid when llm.provider is "openai"',
+    );
   });
 });
 

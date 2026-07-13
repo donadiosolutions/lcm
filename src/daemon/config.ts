@@ -405,13 +405,17 @@ function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: Readonl
     }
     llm.apiMode ??= "chat-completions";
   } else {
-    for (const key of ["apiMode", "reasoningEffort"] as const) {
-      if (explicitlyConfigured.has(key)) {
-        throw new ConfigValidationError(
-          `llm.${key}`,
-          `is only valid when llm.provider is "openai" and llm.apiMode is "responses"`,
-        );
-      }
+    if (explicitlyConfigured.has("apiMode")) {
+      throw new ConfigValidationError(
+        "llm.apiMode",
+        `is only valid when llm.provider is "openai"`,
+      );
+    }
+    if (explicitlyConfigured.has("reasoningEffort")) {
+      throw new ConfigValidationError(
+        "llm.reasoningEffort",
+        `is only valid when llm.provider is "openai" and llm.apiMode is "responses"`,
+      );
     }
   }
 
