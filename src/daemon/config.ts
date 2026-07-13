@@ -197,6 +197,13 @@ function readSystemdCredentialEnv(env: Record<string, string | undefined>): Reco
   return credentialEnv;
 }
 
+/** Resolve the environment used for daemon configuration, including trusted systemd credentials. */
+export function resolveDaemonConfigEnv(
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string | undefined> {
+  return { ...readSystemdCredentialEnv(env), ...env };
+}
+
 export function deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
   if (!source || typeof source !== "object") return target;
   const result: Record<string, unknown> = { ...target };
@@ -493,7 +500,7 @@ export function parseDaemonConfig(
 
 export function loadDaemonConfig(configPath: string, overrides?: unknown, env?: Record<string, string | undefined>): DaemonConfig {
   const rawEnv = env ?? process.env;
-  const resolvedEnv = { ...readSystemdCredentialEnv(rawEnv), ...rawEnv };
+  const resolvedEnv = resolveDaemonConfigEnv(rawEnv);
   let content: string;
   try {
     content = readFileSync(configPath, "utf-8");

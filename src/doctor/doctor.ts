@@ -12,7 +12,7 @@ import { collectEventStats, collectDetailedEventStats } from "../db/events-stats
 import { validateRegex } from "../store/regex-safety.js";
 import { configPath, daemonPidPath } from "../runtime-paths.js";
 import { projectMapPath, validateProjectMap, type ProjectMapValidation } from "../project-map.js";
-import { ConfigValidationError, parseDaemonConfig } from "../daemon/config.js";
+import { ConfigValidationError, parseDaemonConfig, resolveDaemonConfigEnv } from "../daemon/config.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -79,7 +79,7 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
     const content = deps.existsSync(resolvedConfigPath)
       ? deps.readFileSync(resolvedConfigPath, "utf-8")
       : "{}";
-    const config = parseDaemonConfig(content, {}, process.env);
+    const config = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
     return {
       port: config.daemon.port,
       summarizer: config.llm.provider,

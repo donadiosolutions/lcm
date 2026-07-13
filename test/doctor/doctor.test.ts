@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -61,6 +61,24 @@ function minimalDeps(overrides: Partial<Parameters<typeof runDoctor>[0]> = {}) {
     platform: "darwin",
     ...overrides,
   };
+}
+
+function makeTrustedCredentialDir(context: TestContext): string | undefined {
+  if (typeof process.getuid !== "function") {
+    context.skip();
+    return undefined;
+  }
+  const baseDir = `/run/user/${process.getuid()}/credentials`;
+  try {
+    if (!existsSync(baseDir)) {
+      context.skip();
+      return undefined;
+    }
+    return mkdtempSync(join(baseDir, "lcm-doctor-credentials-"));
+  } catch {
+    context.skip();
+    return undefined;
+  }
 }
 
 describe("runDoctor security section", () => {
@@ -484,6 +502,44 @@ describe("runDoctor summarizer modes", () => {
 });
 
 describe("runDoctor configuration validation", () => {
+  it("resolves provider API keys from the daemon's systemd credential environment", async (context: TestContext) => {
+    const credentialsDir = makeTrustedCredentialDir(context);
+    if (credentialsDir === undefined) return;
+    const previousCredentialsDirectory = process.env.CREDENTIALS_DIRECTORY;
+    const previousCredentialIds = process.env.LCM_SYSTEMD_CRED_IDS;
+    const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    const previousSummaryKey = process.env.LCM_SUMMARY_API_KEY;
+    try {
+      writeFileSync(join(credentialsDir, "ANTHROPIC_API_KEY"), "sk-doctor-credential\n", { mode: 0o600 });
+      process.env.CREDENTIALS_DIRECTORY = credentialsDir;
+      process.env.LCM_SYSTEMD_CRED_IDS = "ANTHROPIC_API_KEY";
+      delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.LCM_SUMMARY_API_KEY;
+
+      const results = await runDoctor(minimalDeps({
+        readFileSync: (path: string) => {
+          if (path.endsWith("config.json")) {
+            return JSON.stringify({ llm: { provider: "anthropic", model: "claude-sonnet" } });
+          }
+          return minimalDeps().readFileSync(path, "utf-8");
+        },
+      }));
+
+      expect(results.find((result) => result.name === "config")).toMatchObject({ status: "pass" });
+      expect(results.find((result) => result.name === "stack")?.message).toContain("Summarizer: anthropic");
+    } finally {
+      rmSync(credentialsDir, { recursive: true, force: true });
+      if (previousCredentialsDirectory === undefined) delete process.env.CREDENTIALS_DIRECTORY;
+      else process.env.CREDENTIALS_DIRECTORY = previousCredentialsDirectory;
+      if (previousCredentialIds === undefined) delete process.env.LCM_SYSTEMD_CRED_IDS;
+      else process.env.LCM_SYSTEMD_CRED_IDS = previousCredentialIds;
+      if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
+      if (previousSummaryKey === undefined) delete process.env.LCM_SUMMARY_API_KEY;
+      else process.env.LCM_SUMMARY_API_KEY = previousSummaryKey;
+    }
+  });
+
   it("fails the config check, redacts secrets, and continues diagnostics", async () => {
     const secret = "sk-do-not-print";
     const results = await runDoctor(minimalDeps({
