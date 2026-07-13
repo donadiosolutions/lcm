@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { getLcmConnection, closeLcmConnection } from "../../db/connection.js";
-import type { DaemonConfig } from "../config.js";
+import { LLM_REASONING_EFFORTS, type DaemonConfig, type LlmReasoningEffort } from "../config.js";
 import { projectPaths, ensureProjectDir, isSafeTranscriptPath } from "../project.js";
 import { enqueue } from "../project-queue.js";
 import { sendJson } from "../server.js";
@@ -11,10 +11,54 @@ import { ConversationStore } from "../../store/conversation-store.js";
 import { SummaryStore } from "../../store/summary-store.js";
 import { CompactionEngine } from "../../compaction.js";
 import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
-import type { LcmSummarizeFn } from "../../llm/types.js";
 import { ScrubEngine } from "../../scrub.js";
-import { resolveEffectiveProvider, createSummarizer, type EffectiveProvider } from "../summarizer.js";
+import {
+  makeSummarizerCache,
+  resolveEffectiveProvider,
+  type CompactClient,
+  type EffectiveProvider,
+} from "../summarizer.js";
 import { validateCwd } from "../validate-cwd.js";
+
+interface CompactRequestBody {
+  session_id: string;
+  cwd: string;
+  transcript_path?: string;
+  skip_ingest?: boolean;
+  client?: CompactClient;
+  previous_summary?: string;
+  reasoning_effort?: unknown;
+}
+
+const COMPACT_CLIENTS: readonly CompactClient[] = ["claude", "codex"];
+
+function validateCompactRequestBody(input: Record<string, unknown>): string | undefined {
+  if (typeof input.session_id !== "string" || input.session_id.length === 0) {
+    return "session_id must be a non-empty string";
+  }
+  if (typeof input.cwd !== "string" || input.cwd.length === 0) {
+    return "cwd must be a non-empty string";
+  }
+  if (input.transcript_path !== undefined && typeof input.transcript_path !== "string") {
+    return "transcript_path must be a string";
+  }
+  if (input.skip_ingest !== undefined && typeof input.skip_ingest !== "boolean") {
+    return "skip_ingest must be a boolean";
+  }
+  if (
+    input.client !== undefined
+    && (typeof input.client !== "string" || !COMPACT_CLIENTS.includes(input.client as CompactClient))
+  ) {
+    return `client must be one of: ${COMPACT_CLIENTS.join(", ")}`;
+  }
+  if (input.previous_summary !== undefined && typeof input.previous_summary !== "string") {
+    return "previous_summary must be a string";
+  }
+  if (input.reasoning_effort !== undefined && typeof input.reasoning_effort !== "string") {
+    return "reasoning_effort must be a string";
+  }
+  return undefined;
+}
 
 function fmtN(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -78,29 +122,31 @@ const compactingNow = new Set<string>();
 
 
 export function createCompactHandler(config: DaemonConfig): RouteHandler {
-  const summarizerCache = new Map<EffectiveProvider, Promise<LcmSummarizeFn | null>>();
-
-  const getSummarizer = (provider: EffectiveProvider): Promise<LcmSummarizeFn | null> => {
-    let cached = summarizerCache.get(provider);
-    if (!cached) {
-      cached = createSummarizer(provider, config);
-      summarizerCache.set(provider, cached);
-    }
-    return cached;
-  };
+  const getSummarizer = makeSummarizerCache(config);
 
   return async (_req, res, body) => {
-    const input = JSON.parse(body || "{}");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body || "{}");
+    } catch {
+      sendJson(res, 400, { error: "Invalid JSON body" });
+      return;
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      sendJson(res, 400, { error: "Invalid JSON body" });
+      return;
+    }
+    const validationError = validateCompactRequestBody(parsed as Record<string, unknown>);
+    if (validationError) {
+      sendJson(res, 400, { error: validationError });
+      return;
+    }
+    const input = parsed as CompactRequestBody;
     const { session_id, transcript_path, skip_ingest, client, previous_summary } = input;
     const MAX_PREVIOUS_SUMMARY_LENGTH = 50_000;
     const validatedPreviousSummary = typeof previous_summary === "string"
       ? previous_summary.slice(0, MAX_PREVIOUS_SUMMARY_LENGTH)
       : undefined;
-
-    if (!session_id || !input.cwd) {
-      sendJson(res, 400, { error: "session_id and cwd are required" });
-      return;
-    }
 
     let cwd: string;
     try {
@@ -110,6 +156,33 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
       return;
     }
 
+    const effectiveProvider = resolveEffectiveProvider(config, client);
+    const apiMode = effectiveProvider === "openai"
+      ? config.llm.apiMode ?? "chat-completions"
+      : undefined;
+    let reasoningEffortOverride: LlmReasoningEffort | undefined;
+    if (input.reasoning_effort !== undefined) {
+      if (
+        typeof input.reasoning_effort !== "string"
+        || !LLM_REASONING_EFFORTS.includes(input.reasoning_effort as LlmReasoningEffort)
+      ) {
+        sendJson(res, 400, {
+          error: `Invalid reasoning_effort=${JSON.stringify(input.reasoning_effort)}. Valid values: ${LLM_REASONING_EFFORTS.join(", ")}`,
+        });
+        return;
+      }
+      if (effectiveProvider !== "openai" || apiMode !== "responses") {
+        sendJson(res, 400, {
+          error: "reasoning_effort requires llm.provider=\"openai\" and llm.apiMode=\"responses\"",
+        });
+        return;
+      }
+      reasoningEffortOverride = input.reasoning_effort as LlmReasoningEffort;
+    }
+    const effectiveReasoningEffort = effectiveProvider === "openai" && apiMode === "responses"
+      ? reasoningEffortOverride ?? config.llm.reasoningEffort
+      : undefined;
+
     // Guard must be checked and set synchronously (before any await) to prevent
     // concurrent requests from racing through the has() check before add() runs.
     if (compactingNow.has(session_id)) {
@@ -118,7 +191,6 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
     }
     compactingNow.add(session_id);
 
-    const effectiveProvider = resolveEffectiveProvider(config, client);
     const providerLabels: Record<EffectiveProvider, string> = {
       "claude-process": "Claude (process)",
       "codex-process": "Codex (process)",
@@ -129,9 +201,15 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
     const providerLabel = providerLabels[effectiveProvider] ?? effectiveProvider;
 
     try {
-      const summarize = await getSummarizer(effectiveProvider);
+      const summarize = await getSummarizer(effectiveProvider, effectiveReasoningEffort);
       if (!summarize) {
-        sendJson(res, 200, { summary: "Summarization disabled — no summarizer configured.", providerId: effectiveProvider, providerLabel });
+        sendJson(res, 200, {
+          summary: "Summarization disabled — no summarizer configured.",
+          providerId: effectiveProvider,
+          providerLabel,
+          apiMode,
+          reasoningEffort: effectiveReasoningEffort ?? null,
+        });
         return;
       }
       const paths = projectPaths(cwd);
@@ -187,7 +265,13 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
           const tokenCount = await summaryStore.getContextTokenCount(conversation.conversationId);
 
           if (tokenCount === 0) {
-            return { summary: "No messages to compact.", providerId: effectiveProvider, providerLabel };
+            return {
+              summary: "No messages to compact.",
+              providerId: effectiveProvider,
+              providerLabel,
+              apiMode,
+              reasoningEffort: effectiveReasoningEffort ?? null,
+            };
           }
 
           const engine = new CompactionEngine(conversationStore, summaryStore, {
@@ -261,6 +345,8 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
             tokensAfter: compactResult.tokensAfter,
             providerId: effectiveProvider,
             providerLabel,
+            apiMode,
+            reasoningEffort: effectiveReasoningEffort ?? null,
           };
         } finally {
           closeLcmConnection(dbPath);

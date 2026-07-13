@@ -47,6 +47,11 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("--all");
     expect(text).toContain("--dry-run");
     expect(text).toContain("--replay");
+    expect(text).toContain("--reasoning-effort <level>");
+    expect(text).toContain("none, minimal, low, medium, high, or xhigh");
+    expect(text).toContain("overrides llm.reasoningEffort for this invocation without rewriting ~/.lcm/config.json");
+    expect(text).toContain("llm.provider=openai with llm.apiMode=responses");
+    expect(text).toContain("lcm compact --reasoning-effort high");
     expect(text).toContain("Examples:");
   });
 

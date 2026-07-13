@@ -12,6 +12,7 @@ import { collectEventStats, collectDetailedEventStats } from "../db/events-stats
 import { validateRegex } from "../store/regex-safety.js";
 import { configPath, daemonPidPath } from "../runtime-paths.js";
 import { projectMapPath, validateProjectMap, type ProjectMapValidation } from "../project-map.js";
+import { ConfigValidationError, DEFAULT_DAEMON_PORT, parseDaemonConfig, resolveDaemonConfigEnv } from "../daemon/config.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -42,6 +43,9 @@ function defaultDeps(): DoctorDeps {
 interface DoctorConfig {
   port: number;
   summarizer: string;
+  apiMode?: string;
+  reasoningEffort?: string;
+  validationError?: ConfigValidationError;
 }
 
 const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start";
@@ -69,18 +73,50 @@ function normalizeDoctorOptions(options: boolean | DoctorRunOptions = false): Re
   };
 }
 
+function recoverConfiguredPort(content: string): number {
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return DEFAULT_DAEMON_PORT;
+    const daemon = (parsed as Record<string, unknown>).daemon;
+    if (daemon === null || typeof daemon !== "object" || Array.isArray(daemon)) return DEFAULT_DAEMON_PORT;
+    const port = (daemon as Record<string, unknown>).port;
+    return typeof port === "number"
+      && Number.isInteger(port)
+      && port >= 1
+      && port <= 65535
+      ? port
+      : DEFAULT_DAEMON_PORT;
+  } catch {
+    return DEFAULT_DAEMON_PORT;
+  }
+}
+
 function loadConfig(deps: DoctorDeps): DoctorConfig {
   const resolvedConfigPath = configPath(deps.homedir);
-  let config: Record<string, unknown> = {};
-  try {
-    config = JSON.parse(deps.readFileSync(resolvedConfigPath, "utf-8"));
-  } catch {}
+  if (!deps.existsSync(resolvedConfigPath)) {
+    return { port: DEFAULT_DAEMON_PORT, summarizer: "disabled" };
+  }
 
-  const llm = config.llm as Record<string, string> | undefined;
-  return {
-    port: (config.daemon as Record<string, number> | undefined)?.port ?? (config as Record<string, unknown>).port as number ?? 3737,
-    summarizer: llm?.provider ?? "disabled",
-  };
+  let content: string | undefined;
+  try {
+    content = deps.readFileSync(resolvedConfigPath, "utf-8");
+    const config = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
+    return {
+      port: config.daemon.port,
+      summarizer: config.llm.provider,
+      apiMode: config.llm.apiMode,
+      reasoningEffort: config.llm.reasoningEffort,
+    };
+  } catch (error) {
+    const validationError = error instanceof ConfigValidationError
+      ? error
+      : new ConfigValidationError("$", error instanceof Error ? error.message : String(error));
+    return {
+      port: typeof content === "string" ? recoverConfiguredPort(content) : DEFAULT_DAEMON_PORT,
+      summarizer: "disabled",
+      validationError,
+    };
+  }
 }
 
 function checkProjectMap(results: CheckResult[], deps: DoctorDeps): void {
@@ -330,9 +366,11 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     name: "stack",
     category: "Stack",
     status: "pass",
-    message: config.summarizer === "auto"
+    message: config.validationError
+      ? `Summarizer: unavailable (${config.validationError.name}: ${config.validationError.message})`
+      : config.summarizer === "auto"
       ? "Summarizer: auto (Claude->claude-process, Codex->codex-process)"
-      : `Summarizer: ${config.summarizer}`,
+      : `Summarizer: ${config.summarizer}${config.apiMode ? `; API mode: ${config.apiMode}` : ""}${config.reasoningEffort ? `; reasoning effort: ${config.reasoningEffort}` : ""}`,
   });
 
   // ── 1. Binary version ──
@@ -350,7 +388,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   // ── 2. config.json ──
   const resolvedConfigPath = configPath(deps.homedir);
   if (deps.existsSync(resolvedConfigPath)) {
-    results.push({ name: "config", category: "Stack", status: "pass", message: resolvedConfigPath });
+    results.push(config.validationError
+      ? { name: "config", category: "Stack", status: "fail", message: `${resolvedConfigPath}: ${config.validationError.name}: ${config.validationError.message}` }
+      : { name: "config", category: "Stack", status: "pass", message: resolvedConfigPath });
   } else {
     results.push({ name: "config", category: "Stack", status: "fail", message: `Missing — run: lcm install` });
   }

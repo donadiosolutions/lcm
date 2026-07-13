@@ -7,6 +7,11 @@ import { fileURLToPath } from "node:url";
 import { Command, Option } from "commander";
 import { DaemonClient } from "../src/daemon/client.js";
 import {
+  ConfigValidationError,
+  LLM_REASONING_EFFORTS,
+  type LlmReasoningEffort,
+} from "../src/daemon/config.js";
+import {
   configPath as defaultConfigPath,
   daemonPidPath,
   daemonTokenPath,
@@ -30,15 +35,30 @@ function readStdin(): Promise<string> {
   });
 }
 
-function withHookClient(stdinText: string, client: unknown): string {
-  if (client !== "claude" && client !== "codex") return stdinText;
+export function withHookOverrides(
+  stdinText: string,
+  client: unknown,
+  reasoningEffort: LlmReasoningEffort | undefined,
+): string {
   try {
     const parsed = JSON.parse(stdinText || "{}");
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return stdinText;
-    return JSON.stringify({ ...parsed, client });
+    return JSON.stringify({
+      ...parsed,
+      ...(client === "claude" || client === "codex" ? { client } : {}),
+      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+    });
   } catch {
     return stdinText;
   }
+}
+
+export function compactFailureExitCode(failures: number): 1 | undefined {
+  return failures > 0 ? 1 : undefined;
+}
+
+function withHookClient(stdinText: string, client: unknown): string {
+  return withHookOverrides(stdinText, client, undefined);
 }
 
 async function withCustomHelp(cmd: Command, commandName: string): Promise<void> {
@@ -503,6 +523,8 @@ async function main() {
     .option("--dry-run", "Show what would be compacted without writing")
     .option("--replay", "Compact sequentially with threaded context")
     .option("--no-promote", "Skip the automatic promote step")
+    .addOption(new Option("--reasoning-effort <value>", "Override OpenAI Responses reasoning effort for this invocation")
+      .choices([...LLM_REASONING_EFFORTS]))
     .option("-v, --verbose", "Show per-session token details")
     .addOption(new Option("--hook", "Hook dispatch mode (internal)").hideHelp())
     .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
@@ -517,6 +539,7 @@ async function main() {
       const dryRun: boolean = opts.dryRun ?? false;
       const verbose: boolean = opts.verbose ?? false;
       const replay: boolean = opts.replay ?? false;
+      const reasoningEffort = opts.reasoningEffort as LlmReasoningEffort | undefined;
       // Hook dispatch only when --hook is explicit; all other invocations go to batch.
       const hook: boolean = opts.hook ?? false;
       if (!hook) {
@@ -526,6 +549,13 @@ async function main() {
         const { homedir } = await import("node:os");
         const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
         const config = loadDaemonConfig(defaultConfigPath());
+        if (
+          reasoningEffort
+          && (config.llm.provider !== "openai" || config.llm.apiMode !== "responses")
+        ) {
+          console.error('  --reasoning-effort requires llm.provider="openai" and llm.apiMode="responses"');
+          exit(1);
+        }
         const port = config.daemon?.port ?? 3737;
         const pidFilePath = daemonPidPath();
         const { connected } = await ensureDaemon({
@@ -552,8 +582,8 @@ async function main() {
         const compactRenderer = new NinjaRenderer({ state: compactState, renderOpts });
         compactRenderer.start();
 
-        const { compacted } = await batchCompact({
-          minTokens, dryRun, port, cwd, replay, verbose, tokenPath,
+        const { compacted, failures } = await batchCompact({
+          minTokens, dryRun, port, cwd, replay, verbose, tokenPath, reasoningEffort,
           onProgress: (patch) => {
             Object.assign(compactState, patch);
             if (patch.lastResult) compactRenderer.sessionDone();
@@ -565,6 +595,7 @@ async function main() {
           compactState.phases[0].status = "done";
           compactRenderer.printSummary();
         }
+        process.exitCode = compactFailureExitCode(failures);
 
         // Auto-promote after a successful compact: new summaries are prime promotion candidates.
         if (compacted > 0 && !noPromote) {
@@ -606,7 +637,7 @@ async function main() {
       }
       // Piped stdin — hook dispatch (PreCompact hook invocation)
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = withHookClient(await readStdin(), opts.client);
+      const input = withHookOverrides(await readStdin(), opts.client, reasoningEffort);
       const r = await dispatchHook("compact", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
@@ -1584,5 +1615,8 @@ async function main() {
 }
 
 if (shouldRunMain(argv[1], fileURLToPath(import.meta.url))) {
-  main().catch((err) => { console.error(err); exit(1); });
+  main().catch((err) => {
+    console.error(err instanceof ConfigValidationError ? err.message : err);
+    exit(1);
+  });
 }

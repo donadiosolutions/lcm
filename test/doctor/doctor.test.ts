@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
@@ -61,6 +61,24 @@ function minimalDeps(overrides: Partial<Parameters<typeof runDoctor>[0]> = {}) {
     platform: "darwin",
     ...overrides,
   };
+}
+
+function makeTrustedCredentialDir(context: TestContext): string | undefined {
+  if (typeof process.getuid !== "function") {
+    context.skip();
+    return undefined;
+  }
+  const baseDir = `/run/user/${process.getuid()}/credentials`;
+  try {
+    if (!existsSync(baseDir)) {
+      context.skip();
+      return undefined;
+    }
+    return mkdtempSync(join(baseDir, "lcm-doctor-credentials-"));
+  } catch {
+    context.skip();
+    return undefined;
+  }
 }
 
 describe("runDoctor security section", () => {
@@ -456,6 +474,171 @@ describe("runDoctor summarizer modes", () => {
     expect(results.find((result) => result.name === "stack")?.message).toContain("Summarizer: auto");
     expect(results.some((result) => result.name === "claude-process")).toBe(true);
     expect(results.some((result) => result.name === "codex-process")).toBe(true);
+  });
+
+  it("reports effective OpenAI API mode and reasoning effort", async () => {
+    const results = await runDoctor(minimalDeps({
+      readFileSync: (path: string) => {
+        if (path.endsWith("config.json")) return JSON.stringify({
+          llm: {
+            provider: "openai",
+            model: "gpt-test",
+            baseURL: "http://localhost:11435/v1",
+            apiMode: "responses",
+            reasoningEffort: "medium",
+          },
+        });
+        if (path.endsWith("settings.json")) return buildCleanSettingsJson();
+        if (path.endsWith("package.json")) return JSON.stringify({ version: "0.5.0" });
+        if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
+        if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
+        return "{}";
+      },
+    }));
+    const stack = results.find((result) => result.name === "stack");
+    expect(stack?.message).toContain("API mode: responses");
+    expect(stack?.message).toContain("reasoning effort: medium");
+  });
+});
+
+describe("runDoctor configuration validation", () => {
+  it("keeps the summarizer disabled when config.json is missing", async () => {
+    const results = await runDoctor(minimalDeps({
+      existsSync: (path: string) => !path.endsWith("config.json"),
+    }));
+
+    expect(results.find((result) => result.name === "stack")?.message).toContain("Summarizer: disabled");
+    expect(results.find((result) => result.name === "stack")?.message).not.toContain("Summarizer: auto");
+    expect(results.find((result) => result.name === "config")).toMatchObject({
+      status: "fail",
+      message: "Missing — run: lcm install",
+    });
+  });
+
+  it("resolves provider API keys from the daemon's systemd credential environment", async (context: TestContext) => {
+    const credentialsDir = makeTrustedCredentialDir(context);
+    if (credentialsDir === undefined) return;
+    const previousCredentialsDirectory = process.env.CREDENTIALS_DIRECTORY;
+    const previousCredentialIds = process.env.LCM_SYSTEMD_CRED_IDS;
+    const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    const previousSummaryKey = process.env.LCM_SUMMARY_API_KEY;
+    try {
+      writeFileSync(join(credentialsDir, "ANTHROPIC_API_KEY"), "sk-doctor-credential\n", { mode: 0o600 });
+      process.env.CREDENTIALS_DIRECTORY = credentialsDir;
+      process.env.LCM_SYSTEMD_CRED_IDS = "ANTHROPIC_API_KEY";
+      delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.LCM_SUMMARY_API_KEY;
+
+      const results = await runDoctor(minimalDeps({
+        readFileSync: (path: string) => {
+          if (path.endsWith("config.json")) {
+            return JSON.stringify({ llm: { provider: "anthropic", model: "claude-sonnet" } });
+          }
+          return minimalDeps().readFileSync(path, "utf-8");
+        },
+      }));
+
+      expect(results.find((result) => result.name === "config")).toMatchObject({ status: "pass" });
+      expect(results.find((result) => result.name === "stack")?.message).toContain("Summarizer: anthropic");
+    } finally {
+      rmSync(credentialsDir, { recursive: true, force: true });
+      if (previousCredentialsDirectory === undefined) delete process.env.CREDENTIALS_DIRECTORY;
+      else process.env.CREDENTIALS_DIRECTORY = previousCredentialsDirectory;
+      if (previousCredentialIds === undefined) delete process.env.LCM_SYSTEMD_CRED_IDS;
+      else process.env.LCM_SYSTEMD_CRED_IDS = previousCredentialIds;
+      if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
+      if (previousSummaryKey === undefined) delete process.env.LCM_SUMMARY_API_KEY;
+      else process.env.LCM_SUMMARY_API_KEY = previousSummaryKey;
+    }
+  });
+
+  it("fails the config check, redacts secrets, and continues diagnostics", async () => {
+    const secrets = [
+      "Bearer doctor-authorization-secret",
+      "Basic doctor-proxy-secret",
+      "doctor-cookie-secret",
+      "doctor-custom-auth-secret",
+    ];
+    const results = await runDoctor(minimalDeps({
+      readFileSync: (path: string) => {
+        if (path.endsWith("config.json")) {
+          return JSON.stringify({
+            llm: {
+              baseURL: {
+                headers: {
+                  Authorization: secrets[0],
+                  "Proxy-Authorization": secrets[1],
+                  Cookie: secrets[2],
+                  "X-Custom-Auth": secrets[3],
+                },
+              },
+            },
+          });
+        }
+        if (path.endsWith("settings.json")) return buildCleanSettingsJson();
+        if (path.endsWith("package.json")) return JSON.stringify({ version: "0.5.0" });
+        if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
+        if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
+        return "{}";
+      },
+    }));
+    const config = results.find((result) => result.name === "config");
+    const stack = results.find((result) => result.name === "stack");
+    expect(config?.status).toBe("fail");
+    expect(config?.message).toContain("ConfigValidationError");
+    expect(config?.message).toContain("llm.baseURL");
+    expect(config?.message).toContain("[REDACTED]");
+    for (const secret of secrets) expect(JSON.stringify(results)).not.toContain(secret);
+    expect(stack?.status).toBe("pass");
+    expect(stack?.message).toContain("Summarizer: unavailable");
+    expect(results.some((result) => result.name === "secret-detection")).toBe(true);
+  });
+
+  it("uses a valid configured daemon port when another config field is invalid", async () => {
+    const fetch = vi.fn().mockResolvedValue({ ok: false });
+    const results = await runDoctor(minimalDeps({
+      fetch,
+      readFileSync: (path: string) => {
+        if (path.endsWith("config.json")) {
+          return JSON.stringify({ daemon: { port: 4545 }, llm: { provider: "invalid" } });
+        }
+        return minimalDeps().readFileSync(path);
+      },
+    }));
+
+    expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
+    expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:4545/health");
+    expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({ port: 4545 }));
+    expect(results.find((result) => result.name === "daemon")?.message).toContain("localhost:4545");
+  });
+
+  it.each([0, 65536, 4545.5, "4545"])(
+    "does not use invalid daemon port %j while reporting config errors",
+    async (port) => {
+      const fetch = vi.fn().mockResolvedValue({ ok: false });
+      await runDoctor(minimalDeps({
+        fetch,
+        readFileSync: (path: string) => {
+          if (path.endsWith("config.json")) {
+            return JSON.stringify({ daemon: { port }, llm: { provider: "invalid" } });
+          }
+          return minimalDeps().readFileSync(path);
+        },
+      }));
+
+      expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3737/health");
+      expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({ port: 3737 }));
+    },
+  );
+
+  it("reports malformed JSON without aborting doctor", async () => {
+    const results = await runDoctor(minimalDeps({
+      readFileSync: (path: string) => path.endsWith("config.json") ? "{" : minimalDeps().readFileSync(path),
+    }));
+    expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
+    expect(results.find((result) => result.name === "config")?.message).toContain("malformed JSON");
+    expect(results.some((result) => result.name === "project-map")).toBe(true);
   });
 });
 

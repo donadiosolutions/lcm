@@ -2,6 +2,24 @@ import { readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
 
+export const CANONICAL_LLM_PROVIDERS = [
+  "auto",
+  "claude-process",
+  "codex-process",
+  "anthropic",
+  "openai",
+  "disabled",
+] as const;
+export type LlmProvider = typeof CANONICAL_LLM_PROVIDERS[number];
+
+export const LLM_API_MODES = ["chat-completions", "responses"] as const;
+export type LlmApiMode = typeof LLM_API_MODES[number];
+
+export const LLM_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
+export type LlmReasoningEffort = typeof LLM_REASONING_EFFORTS[number];
+
+export const DEFAULT_DAEMON_PORT = 3737;
+
 export interface SecurityConfig {
   /** User-defined global regex patterns (plain strings, no /.../ delimiters). */
   sensitivePatterns: string[];
@@ -42,7 +60,14 @@ export type DaemonConfig = {
     stalePenalty: number;
     allowStaleOnStrongMatch: boolean;
   };
-  llm: { provider: "auto" | "claude-process" | "codex-process" | "anthropic" | "openai" | "disabled"; model: string; apiKey?: string; baseURL: string };
+  llm: {
+    provider: LlmProvider;
+    model: string;
+    apiKey?: string;
+    baseURL: string;
+    apiMode?: LlmApiMode;
+    reasoningEffort?: LlmReasoningEffort;
+  };
   summarizer: { mock: boolean };
   security: SecurityConfig;
   hooks: { snapshotIntervalSec: number; disableAutoCompact: boolean };
@@ -50,7 +75,7 @@ export type DaemonConfig = {
 
 const DEFAULTS: DaemonConfig = {
   version: 1,
-  daemon: { port: 3737, socketPath: lcmPath("daemon.sock"), logLevel: "info", logMaxSizeMB: 10, logRetentionDays: 7, idleTimeoutMs: 1800000 },
+  daemon: { port: DEFAULT_DAEMON_PORT, socketPath: lcmPath("daemon.sock"), logLevel: "info", logMaxSizeMB: 10, logRetentionDays: 7, idleTimeoutMs: 1800000 },
   compaction: {
     leafTokens: 1000, maxDepth: 5, autoCompactMinTokens: 10000,
     promotionThresholds: {
@@ -174,6 +199,13 @@ function readSystemdCredentialEnv(env: Record<string, string | undefined>): Reco
   return credentialEnv;
 }
 
+/** Resolve the environment used for daemon configuration, including trusted systemd credentials. */
+export function resolveDaemonConfigEnv(
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string | undefined> {
+  return { ...readSystemdCredentialEnv(env), ...env };
+}
+
 export function deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
   if (!source || typeof source !== "object") return target;
   const result: Record<string, unknown> = { ...target };
@@ -195,18 +227,254 @@ export function deepMerge(target: Record<string, unknown>, source: Record<string
   return result;
 }
 
-export function loadDaemonConfig(configPath: string, overrides?: any, env?: Record<string, string | undefined>): DaemonConfig {
-  const rawEnv = env ?? process.env;
-  const e = { ...readSystemdCredentialEnv(rawEnv), ...rawEnv };
-  let fileConfig: any = {};
-  try { fileConfig = JSON.parse(readFileSync(configPath, "utf-8")); } catch {}
-  // Always merge untrusted sources (fileConfig, overrides) into a trusted target so that
-  // DENIED_KEYS filtering applies before any untrusted key reaches the result object.
-  // Precedence: DEFAULTS < fileConfig < overrides.
+const LLM_PROVIDER_ALIASES: Readonly<Record<string, LlmProvider>> = {
+  claude: "claude-process",
+  "claude-cli": "claude-process",
+  codex: "codex-process",
+};
+const LLM_KEYS = new Set(["provider", "model", "apiKey", "baseURL", "apiMode", "reasoningEffort"]);
+const CONFIG_EXAMPLE = JSON.stringify({
+  llm: {
+    provider: "openai",
+    model: "gpt-5",
+    apiKey: "${OPENAI_API_KEY}",
+    baseURL: "https://api.openai.com/v1",
+    apiMode: "responses",
+    reasoningEffort: "medium",
+  },
+}, null, 2);
+
+export class ConfigValidationError extends Error {
+  constructor(path: string, detail: string) {
+    super(`[lcm] Invalid configuration at ${path}: ${detail}\nExample:\n${CONFIG_EXAMPLE}`);
+    this.name = "ConfigValidationError";
+  }
+}
+
+function valueType(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+function isCredentialPath(path: string): boolean {
+  const key = path.split(".").at(-1) ?? path;
+  return /(?:api[-_]?key|token|secret|password|credential)/i.test(key);
+}
+
+function sanitizeUrlForDisplay(value: string): string {
+  try {
+    const url = new URL(value);
+    if (url.username || url.password) {
+      url.username = "[REDACTED]";
+      url.password = "";
+    }
+    if (url.search) url.search = "?[REDACTED]";
+    if (url.hash) url.hash = "#[REDACTED]";
+    return url.toString();
+  } catch {
+    return value
+      .replace(/\/\/[^/@\s]+@/, "//[REDACTED]@")
+      .replace(/[?#].*$/, "?[REDACTED]");
+  }
+}
+
+function displayValue(path: string, value: unknown): string {
+  if (isCredentialPath(path)) return '"[REDACTED]"';
+  // Structured values are only displayed for type errors, where their contents
+  // are not useful and may contain credentials under arbitrary header names.
+  if (value !== null && typeof value === "object") return '"[REDACTED]"';
+  if (path === "llm.baseURL" && typeof value === "string") {
+    return JSON.stringify(sanitizeUrlForDisplay(value));
+  }
+  const serialized = JSON.stringify(value, (key, nestedValue) => {
+    if (key && isCredentialPath(key)) return "[REDACTED]";
+    if (typeof nestedValue === "string" && /^[a-z][a-z\d+.-]*:\/\//i.test(nestedValue)) {
+      return sanitizeUrlForDisplay(nestedValue);
+    }
+    return nestedValue;
+  });
+  return serialized === undefined ? String(value) : serialized;
+}
+
+function invalidType(path: string, value: unknown, expected: string): never {
+  throw new ConfigValidationError(
+    path,
+    `expected ${expected}, received ${valueType(value)} ${displayValue(path, value)}`,
+  );
+}
+
+function normalizeProvider(value: string): string {
+  return LLM_PROVIDER_ALIASES[value] ?? value;
+}
+
+function validateProviderChoice(path: string, value: string): LlmProvider {
+  const provider = normalizeProvider(value);
+  if (!(CANONICAL_LLM_PROVIDERS as readonly string[]).includes(provider)) {
+    throw new ConfigValidationError(
+      path,
+      `received ${displayValue(path, value)}; valid choices: ${CANONICAL_LLM_PROVIDERS.join(", ")}`,
+    );
+  }
+  return provider as LlmProvider;
+}
+
+function validateStringField(llm: Record<string, unknown>, key: string): void {
+  if (llm[key] !== undefined && typeof llm[key] !== "string") {
+    invalidType(`llm.${key}`, llm[key], "a string");
+  }
+}
+
+function validateLlmObject(
+  value: unknown,
+  providerOverride?: LlmProvider,
+): Record<string, unknown> | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    invalidType("llm", value, "an object");
+  }
+
+  const llm = { ...(value as Record<string, unknown>) };
+  for (const key of Object.keys(llm)) {
+    if (!LLM_KEYS.has(key)) {
+      throw new ConfigValidationError(
+        `llm.${key}`,
+        `unknown key ${JSON.stringify(key)} with ${valueType(llm[key])} value; valid keys: ${[...LLM_KEYS].join(", ")}`,
+      );
+    }
+  }
+
+  for (const key of ["provider", "model", "apiKey", "baseURL", "apiMode", "reasoningEffort"]) {
+    validateStringField(llm, key);
+  }
+
+  if (providerOverride !== undefined) {
+    llm.provider = providerOverride;
+  } else if (typeof llm.provider === "string") {
+    llm.provider = validateProviderChoice("llm.provider", llm.provider);
+  }
+  if (typeof llm.apiMode === "string" && !(LLM_API_MODES as readonly string[]).includes(llm.apiMode)) {
+    throw new ConfigValidationError(
+      "llm.apiMode",
+      `received ${displayValue("llm.apiMode", llm.apiMode)}; valid choices: ${LLM_API_MODES.join(", ")}`,
+    );
+  }
+  if (typeof llm.reasoningEffort === "string" && !(LLM_REASONING_EFFORTS as readonly string[]).includes(llm.reasoningEffort)) {
+    throw new ConfigValidationError(
+      "llm.reasoningEffort",
+      `received ${displayValue("llm.reasoningEffort", llm.reasoningEffort)}; valid choices: ${LLM_REASONING_EFFORTS.join(", ")}`,
+    );
+  }
+  return llm;
+}
+
+function parseConfigRoot(content: string, providerOverride?: LlmProvider): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new ConfigValidationError("$", `malformed JSON (${detail})`);
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    invalidType("$", parsed, "a JSON object");
+  }
+  const root = { ...(parsed as Record<string, unknown>) };
+  const llm = validateLlmObject(root.llm, providerOverride);
+  if (llm !== undefined) root.llm = llm;
+  return root;
+}
+
+function requireNonEmpty(value: string, path: string, provider: LlmProvider): void {
+  if (value.trim() === "") {
+    throw new ConfigValidationError(
+      path,
+      `expected a non-empty string when llm.provider is ${JSON.stringify(provider)}, received string ${displayValue(path, value)}`,
+    );
+  }
+}
+
+function isPublicOpenAIBaseURL(baseURL: string): boolean {
+  try {
+    return new URL(baseURL).hostname.toLowerCase().replace(/\.+$/, "") === "api.openai.com";
+  } catch {
+    return false;
+  }
+}
+
+function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: ReadonlySet<string>): void {
+  const { llm } = merged;
+  if (llm.provider === "anthropic") {
+    requireNonEmpty(llm.model, "llm.model", llm.provider);
+    requireNonEmpty(llm.apiKey ?? "", "llm.apiKey", llm.provider);
+  }
+
+  if (llm.provider === "openai") {
+    requireNonEmpty(llm.model, "llm.model", llm.provider);
+    requireNonEmpty(llm.baseURL, "llm.baseURL", llm.provider);
+    let baseURL: URL;
+    try {
+      baseURL = new URL(llm.baseURL);
+    } catch {
+      throw new ConfigValidationError("llm.baseURL", `expected an absolute HTTP(S) URL, received string ${displayValue("llm.baseURL", llm.baseURL)}`);
+    }
+    if (!(["http:", "https:"] as const).includes(baseURL.protocol as "http:" | "https:")) {
+      throw new ConfigValidationError("llm.baseURL", `expected an absolute HTTP(S) URL, received string ${displayValue("llm.baseURL", llm.baseURL)}`);
+    }
+    if (isPublicOpenAIBaseURL(llm.baseURL)) {
+      requireNonEmpty(llm.apiKey ?? "", "llm.apiKey", llm.provider);
+    }
+    llm.apiMode ??= "chat-completions";
+  } else {
+    if (explicitlyConfigured.has("apiMode")) {
+      throw new ConfigValidationError(
+        "llm.apiMode",
+        `is only valid when llm.provider is "openai"`,
+      );
+    }
+    if (explicitlyConfigured.has("reasoningEffort")) {
+      throw new ConfigValidationError(
+        "llm.reasoningEffort",
+        `is only valid when llm.provider is "openai" and llm.apiMode is "responses"`,
+      );
+    }
+  }
+
+  if (llm.reasoningEffort !== undefined && llm.apiMode !== "responses") {
+    throw new ConfigValidationError(
+      "llm.reasoningEffort",
+      `requires llm.provider "openai" and llm.apiMode "responses"; current apiMode is ${JSON.stringify(llm.apiMode)}`,
+    );
+  }
+}
+
+/** Parse, merge, resolve, and validate daemon configuration without filesystem access. */
+export function parseDaemonConfig(
+  content: string,
+  overrides: unknown = {},
+  env: Record<string, string | undefined> = {},
+): DaemonConfig {
+  const providerOverride = env.LCM_SUMMARY_PROVIDER
+    ? validateProviderChoice("LCM_SUMMARY_PROVIDER", env.LCM_SUMMARY_PROVIDER)
+    : undefined;
+  const fileConfig = parseConfigRoot(content, providerOverride);
+  if (overrides === null || typeof overrides !== "object" || Array.isArray(overrides)) {
+    invalidType("overrides", overrides, "an object");
+  }
+  const normalizedOverrides = { ...(overrides as Record<string, unknown>) };
+  const overrideLlm = validateLlmObject(normalizedOverrides.llm, providerOverride);
+  if (overrideLlm !== undefined) normalizedOverrides.llm = overrideLlm;
+
+  const fileLlm = fileConfig.llm as Record<string, unknown> | undefined;
+  const explicitLlmKeys = new Set([
+    ...Object.keys(fileLlm ?? {}),
+    ...Object.keys(overrideLlm ?? {}),
+  ]);
+
+  // Always merge untrusted sources into a trusted target so DENIED_KEYS filtering
+  // applies before any untrusted key reaches the result object.
   const withFile = deepMerge(structuredClone(DEFAULTS) as Record<string, unknown>, fileConfig);
-  const merged = deepMerge(withFile, overrides ?? {}) as DaemonConfig;
-  // Migrate legacy provider names from v0.3.0
-  if ((merged.llm.provider as string) === "claude-cli") merged.llm.provider = "claude-process";
+  const merged = deepMerge(withFile, normalizedOverrides) as DaemonConfig;
   // Migrate legacy mergeMaxEntries (renamed to dedupCandidateLimit)
   const thresholds = merged.compaction.promotionThresholds as Record<string, unknown>;
   if (thresholds["mergeMaxEntries"] !== undefined && thresholds["dedupCandidateLimit"] === undefined) {
@@ -214,18 +482,17 @@ export function loadDaemonConfig(configPath: string, overrides?: any, env?: Reco
   }
   delete thresholds["mergeMaxEntries"];
   delete thresholds["confidenceDecayRate"];
-  if (merged.llm.apiKey) merged.llm.apiKey = merged.llm.apiKey.replace(/\$\{(\w+)\}/g, (_: string, k: string) => e[k] ?? "");
+  if (merged.llm.apiKey) merged.llm.apiKey = merged.llm.apiKey.replace(/\$\{(\w+)\}/g, (_: string, k: string) => env[k] ?? "");
 
   // Env var override: LCM_SUMMARY_PROVIDER takes precedence over config
-  const VALID_PROVIDERS = new Set(["auto", "claude-process", "codex-process", "anthropic", "openai", "disabled"]);
-  if (e.LCM_SUMMARY_PROVIDER) {
-    if (!VALID_PROVIDERS.has(e.LCM_SUMMARY_PROVIDER)) {
-      throw new Error(
-        `[lcm] Invalid LCM_SUMMARY_PROVIDER="${e.LCM_SUMMARY_PROVIDER}". ` +
-        `Valid values: ${[...VALID_PROVIDERS].join(", ")}`
-      );
+  if (providerOverride !== undefined) {
+    merged.llm.provider = providerOverride;
+    if (providerOverride !== "openai") {
+      delete merged.llm.apiMode;
+      delete merged.llm.reasoningEffort;
+      explicitLlmKeys.delete("apiMode");
+      explicitLlmKeys.delete("reasoningEffort");
     }
-    merged.llm.provider = e.LCM_SUMMARY_PROVIDER as DaemonConfig["llm"]["provider"];
   }
 
   // Migrate old config names to new names for backward compatibility
@@ -247,17 +514,26 @@ export function loadDaemonConfig(configPath: string, overrides?: any, env?: Reco
   }
 
   // Anthropic API key fallback from env
-  if (!merged.llm.apiKey && merged.llm.provider === "anthropic" && e.ANTHROPIC_API_KEY) {
-    merged.llm.apiKey = e.ANTHROPIC_API_KEY;
+  if (!merged.llm.apiKey && merged.llm.provider === "anthropic") {
+    merged.llm.apiKey = env.LCM_SUMMARY_API_KEY || env.ANTHROPIC_API_KEY || "";
+  }
+  if (!merged.llm.apiKey && merged.llm.provider === "openai" && isPublicOpenAIBaseURL(merged.llm.baseURL)) {
+    merged.llm.apiKey = env.LCM_SUMMARY_API_KEY || env.OPENAI_API_KEY || "";
   }
 
-  // Validate: anthropic provider requires an API key
-  if (merged.llm.provider === "anthropic" && !merged.llm.apiKey) {
-    throw new Error(
-      "[lcm] LCM_SUMMARY_API_KEY is required when using the Anthropic provider. " +
-      "Set it in your environment or switch to 'auto', 'claude-process', or another provider."
-    );
-  }
-
+  validateResolvedLlm(merged, explicitLlmKeys);
   return merged;
+}
+
+export function loadDaemonConfig(configPath: string, overrides?: unknown, env?: Record<string, string | undefined>): DaemonConfig {
+  const rawEnv = env ?? process.env;
+  const resolvedEnv = resolveDaemonConfigEnv(rawEnv);
+  let content: string;
+  try {
+    content = readFileSync(configPath, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    content = "{}";
+  }
+  return parseDaemonConfig(content, overrides, resolvedEnv);
 }

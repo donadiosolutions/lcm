@@ -2,7 +2,16 @@ import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, type TestContext } from "vitest";
-import { loadDaemonConfig, deepMerge } from "../../src/daemon/config.js";
+import {
+  CANONICAL_LLM_PROVIDERS,
+  ConfigValidationError,
+  DEFAULT_DAEMON_PORT,
+  LLM_API_MODES,
+  LLM_REASONING_EFFORTS,
+  loadDaemonConfig,
+  parseDaemonConfig,
+  deepMerge,
+} from "../../src/daemon/config.js";
 
 function trustedCredentialBaseDir(): string | undefined {
   if (typeof process.getuid !== "function") return undefined;
@@ -29,7 +38,8 @@ function makeTrustedCredentialDir(context: TestContext): string | undefined {
 describe("loadDaemonConfig", () => {
   it("returns defaults when no config file exists", () => {
     const c = loadDaemonConfig("/nonexistent/config.json");
-    expect(c.daemon.port).toBe(3737);
+    expect(DEFAULT_DAEMON_PORT).toBe(3737);
+    expect(c.daemon.port).toBe(DEFAULT_DAEMON_PORT);
     expect(c.daemon.socketPath).toContain("daemon.sock");
     expect(c.llm.provider).toBe("auto");
     expect(c.llm.model).toBe("");
@@ -56,7 +66,7 @@ describe("loadDaemonConfig", () => {
   });
 
   it("falls back to env var when apiKey not set and provider is anthropic", () => {
-    const c = loadDaemonConfig("/nonexistent", { llm: { provider: "anthropic" } }, { ANTHROPIC_API_KEY: "sk-env" });
+    const c = loadDaemonConfig("/nonexistent", { llm: { provider: "anthropic", model: "claude-sonnet" } }, { ANTHROPIC_API_KEY: "sk-env" });
     expect(c.llm.apiKey).toBe("sk-env");
   });
 
@@ -67,7 +77,7 @@ describe("loadDaemonConfig", () => {
       writeFileSync(join(credentialsDir, "ANTHROPIC_API_KEY"), "sk-credential", { mode: 0o600 });
       const c = loadDaemonConfig(
         "/nonexistent",
-        { llm: { provider: "anthropic" } },
+        { llm: { provider: "anthropic", model: "claude-sonnet" } },
         {
           CREDENTIALS_DIRECTORY: credentialsDir,
           LCM_SYSTEMD_CRED_IDS: "ANTHROPIC_API_KEY",
@@ -86,13 +96,32 @@ describe("loadDaemonConfig", () => {
       writeFileSync(join(credentialsDir, "OPENAI_API_KEY"), "sk-openai-credential", { mode: 0o600 });
       const c = loadDaemonConfig(
         "/nonexistent",
-        { llm: { provider: "openai", apiKey: "${OPENAI_API_KEY}" } },
+        { llm: { provider: "openai", model: "test-model", baseURL: "http://localhost:11435/v1", apiKey: "${OPENAI_API_KEY}" } },
         {
           CREDENTIALS_DIRECTORY: credentialsDir,
           LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
         },
       );
       expect(c.llm.apiKey).toBe("sk-openai-credential");
+    } finally {
+      rmSync(credentialsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not automatically inject a systemd OpenAI credential into a custom endpoint", (context: TestContext): void => {
+    const credentialsDir = makeTrustedCredentialDir(context);
+    if (credentialsDir === undefined) return;
+    try {
+      writeFileSync(join(credentialsDir, "OPENAI_API_KEY"), "sk-openai-credential", { mode: 0o600 });
+      const c = loadDaemonConfig(
+        "/nonexistent",
+        { llm: { provider: "openai", model: "test-model", baseURL: "https://compatible.example/v1" } },
+        {
+          CREDENTIALS_DIRECTORY: credentialsDir,
+          LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
+        },
+      );
+      expect(c.llm.apiKey).toBe("");
     } finally {
       rmSync(credentialsDir, { recursive: true, force: true });
     }
@@ -108,7 +137,7 @@ describe("loadDaemonConfig", () => {
       symlinkSync(outsideCredential, join(credentialsDir, "OPENAI_API_KEY"));
       const c = loadDaemonConfig(
         "/nonexistent",
-        { llm: { provider: "openai", apiKey: "${OPENAI_API_KEY}" } },
+        { llm: { provider: "openai", model: "test-model", baseURL: "http://localhost:11435/v1", apiKey: "${OPENAI_API_KEY}" } },
         {
           CREDENTIALS_DIRECTORY: credentialsDir,
           LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
@@ -138,40 +167,99 @@ describe("loadDaemonConfig", () => {
   });
 
   it("does NOT inject ANTHROPIC_API_KEY when provider is openai", () => {
-    const c = loadDaemonConfig("/nonexistent", { llm: { provider: "openai" } }, { ANTHROPIC_API_KEY: "sk-leaked" });
+    const c = loadDaemonConfig("/nonexistent", { llm: { provider: "openai", model: "test-model", baseURL: "http://localhost:11435/v1" } }, { ANTHROPIC_API_KEY: "sk-leaked" });
     expect(c.llm.apiKey).toBe("");
   });
 
+  it.each(["OPENAI_API_KEY", "LCM_SUMMARY_API_KEY"] as const)(
+    "does not automatically inject %s into a custom OpenAI-compatible endpoint",
+    (envName) => {
+      const c = loadDaemonConfig(
+        "/nonexistent",
+        { llm: { provider: "openai", model: "test-model", baseURL: "https://compatible.example/v1" } },
+        { [envName]: "sk-public-secret" },
+      );
+      expect(c.llm.apiKey).toBe("");
+    },
+  );
+
+  it.each([
+    "https://api.openai.com/v1",
+    "https://API.OPENAI.COM/alternate/path",
+    "https://api.openai.com./v1",
+  ])("automatically injects the OpenAI env credential for the normalized public endpoint: %s", (baseURL) => {
+    const c = loadDaemonConfig(
+      "/nonexistent",
+      { llm: { provider: "openai", model: "test-model", baseURL } },
+      { OPENAI_API_KEY: "sk-openai-env" },
+    );
+    expect(c.llm.apiKey).toBe("sk-openai-env");
+  });
+
+  it("prefers an explicit custom-endpoint API key over public-provider env credentials", () => {
+    const c = loadDaemonConfig(
+      "/nonexistent",
+      {
+        llm: {
+          provider: "openai",
+          model: "test-model",
+          baseURL: "https://compatible.example/v1",
+          apiKey: "custom-endpoint-key",
+        },
+      },
+      { LCM_SUMMARY_API_KEY: "sk-summary-env", OPENAI_API_KEY: "sk-openai-env" },
+    );
+    expect(c.llm.apiKey).toBe("custom-endpoint-key");
+  });
+
   it("still injects ANTHROPIC_API_KEY when provider is anthropic", () => {
-    const c = loadDaemonConfig("/nonexistent", { llm: { provider: "anthropic" } }, { ANTHROPIC_API_KEY: "sk-env" });
+    const c = loadDaemonConfig("/nonexistent", { llm: { provider: "anthropic", model: "claude-sonnet" } }, { ANTHROPIC_API_KEY: "sk-env" });
     expect(c.llm.apiKey).toBe("sk-env");
   });
 
   it("throws when provider resolves to 'anthropic' and apiKey is missing", () => {
     expect(() =>
-      loadDaemonConfig("/nonexistent", { llm: { provider: "anthropic", apiKey: "" } }, {})
-    ).toThrow("LCM_SUMMARY_API_KEY is required");
+      loadDaemonConfig("/nonexistent", { llm: { provider: "anthropic", model: "claude-sonnet", apiKey: "" } }, {})
+    ).toThrow("llm.apiKey");
   });
 
   it("does not throw for 'anthropic' when apiKey is provided", () => {
     expect(() =>
-      loadDaemonConfig("/nonexistent", { llm: { provider: "anthropic", apiKey: "sk-test" } }, {})
+      loadDaemonConfig("/nonexistent", { llm: { provider: "anthropic", model: "claude-sonnet", apiKey: "sk-test" } }, {})
     ).not.toThrow();
   });
 
   it("does not throw for 'anthropic' when ANTHROPIC_API_KEY env var is set", () => {
     expect(() =>
-      loadDaemonConfig("/nonexistent", { llm: { provider: "anthropic" } }, { ANTHROPIC_API_KEY: "sk-env" })
+      loadDaemonConfig("/nonexistent", { llm: { provider: "anthropic", model: "claude-sonnet" } }, { ANTHROPIC_API_KEY: "sk-env" })
     ).not.toThrow();
   });
 
   it("LCM_SUMMARY_PROVIDER env var overrides config provider", () => {
     const c = loadDaemonConfig(
       "/nonexistent",
-      { llm: { provider: "claude-process" } },
+      { llm: { provider: "claude-process", model: "gpt-test", baseURL: "http://localhost:11435/v1" } },
       { LCM_SUMMARY_PROVIDER: "openai" }
     );
     expect(c.llm.provider).toBe("openai");
+  });
+
+  it("LCM_SUMMARY_PROVIDER recovers from a stale file provider", () => {
+    const c = parseDaemonConfig(
+      JSON.stringify({ llm: { provider: "ollama" } }),
+      {},
+      { LCM_SUMMARY_PROVIDER: "disabled" },
+    );
+    expect(c.llm.provider).toBe("disabled");
+  });
+
+  it("LCM_SUMMARY_PROVIDER recovers from a stale runtime provider", () => {
+    const c = parseDaemonConfig(
+      "{}",
+      { llm: { provider: "ollama" } },
+      { LCM_SUMMARY_PROVIDER: "claude" },
+    );
+    expect(c.llm.provider).toBe("claude-process");
   });
 
   it("accepts LCM_SUMMARY_PROVIDER=auto", () => {
@@ -187,16 +275,62 @@ describe("loadDaemonConfig", () => {
   it("LCM_SUMMARY_PROVIDER=anthropic overrides provider with apiKey", () => {
     const c = loadDaemonConfig(
       "/nonexistent",
-      { llm: { apiKey: "sk-test" } },
+      { llm: { model: "claude-sonnet", apiKey: "sk-test" } },
       { LCM_SUMMARY_PROVIDER: "anthropic" }
     );
     expect(c.llm.provider).toBe("anthropic");
   });
 
+  it("clears OpenAI-only file settings when LCM_SUMMARY_PROVIDER selects another provider", () => {
+    const c = parseDaemonConfig(
+      JSON.stringify({
+        llm: {
+          provider: "openai",
+          model: "gpt-test",
+          baseURL: "http://localhost:11435/v1",
+          apiMode: "responses",
+          reasoningEffort: "high",
+        },
+      }),
+      {},
+      { LCM_SUMMARY_PROVIDER: "auto" },
+    );
+
+    expect(c.llm.provider).toBe("auto");
+    expect(c.llm.apiMode).toBeUndefined();
+    expect(c.llm.reasoningEffort).toBeUndefined();
+  });
+
+  it("clears OpenAI-only runtime overrides when LCM_SUMMARY_PROVIDER selects another provider", () => {
+    const c = parseDaemonConfig(
+      "{}",
+      { llm: { apiMode: "responses", reasoningEffort: "medium" } },
+      { LCM_SUMMARY_PROVIDER: "disabled" },
+    );
+
+    expect(c.llm.provider).toBe("disabled");
+    expect(c.llm.apiMode).toBeUndefined();
+    expect(c.llm.reasoningEffort).toBeUndefined();
+  });
+
+  it("still rejects invalid OpenAI settings when the effective provider is OpenAI", () => {
+    expect(() => parseDaemonConfig(
+      JSON.stringify({
+        llm: {
+          model: "gpt-test",
+          baseURL: "http://localhost:11435/v1",
+          reasoningEffort: "high",
+        },
+      }),
+      {},
+      { LCM_SUMMARY_PROVIDER: "openai" },
+    )).toThrow('apiMode "responses"');
+  });
+
   it("throws when LCM_SUMMARY_PROVIDER is set to an invalid value", () => {
     expect(() =>
       loadDaemonConfig("/nonexistent", {}, { LCM_SUMMARY_PROVIDER: "ollama" })
-    ).toThrow('Invalid LCM_SUMMARY_PROVIDER="ollama"');
+    ).toThrow("Invalid configuration at LCM_SUMMARY_PROVIDER");
   });
 
   it("includes autoCompactMinTokens default of 10000", () => {
@@ -269,6 +403,249 @@ describe("loadDaemonConfig", () => {
       },
     });
     expect(config.restoration.maxInjectedMemoryBytes).toBe(4096);
+  });
+});
+
+describe("strict LLM configuration validation", () => {
+  it("exports the canonical provider, API mode, and reasoning effort contracts", () => {
+    expect(CANONICAL_LLM_PROVIDERS).toEqual(["auto", "claude-process", "codex-process", "anthropic", "openai", "disabled"]);
+    expect(LLM_API_MODES).toEqual(["chat-completions", "responses"]);
+    expect(LLM_REASONING_EFFORTS).toEqual(["none", "minimal", "low", "medium", "high", "xhigh"]);
+  });
+
+  it.each([
+    ["claude", "claude-process"],
+    ["claude-cli", "claude-process"],
+    ["codex", "codex-process"],
+  ])("normalizes file provider alias %s", (alias, expected) => {
+    expect(parseDaemonConfig(JSON.stringify({ llm: { provider: alias } })).llm.provider).toBe(expected);
+  });
+
+  it.each([
+    ["claude", "claude-process"],
+    ["claude-cli", "claude-process"],
+    ["codex", "codex-process"],
+  ])("normalizes LCM_SUMMARY_PROVIDER alias %s", (alias, expected) => {
+    expect(parseDaemonConfig("{}", {}, { LCM_SUMMARY_PROVIDER: alias }).llm.provider).toBe(expected);
+  });
+
+  it("rejects malformed JSON instead of silently using defaults", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-invalid-config-"));
+    const path = join(dir, "config.json");
+    try {
+      writeFileSync(path, '{"llm":');
+      expect(() => loadDaemonConfig(path)).toThrowError(ConfigValidationError);
+      expect(() => loadDaemonConfig(path)).toThrow("malformed JSON");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["null", "$"],
+    [JSON.stringify({ llm: [] }), "llm"],
+    [JSON.stringify({ llm: { model: 42 } }), "llm.model"],
+    [JSON.stringify({ llm: { provider: "ollama" } }), "llm.provider"],
+    [JSON.stringify({ llm: { apiMode: "legacy" } }), "llm.apiMode"],
+    [JSON.stringify({ llm: { reasoningEffort: "extreme" } }), "llm.reasoningEffort"],
+    [JSON.stringify({ llm: { timeout: 1000 } }), "llm.timeout"],
+  ])("rejects invalid configuration %s at %s", (content, path) => {
+    expect(() => parseDaemonConfig(content)).toThrow(`Invalid configuration at ${path}`);
+  });
+
+  it("redacts an invalid apiKey value from errors", () => {
+    const secret = "sk-super-secret";
+    let message = "";
+    try {
+      parseDaemonConfig(JSON.stringify({ llm: { apiKey: { secret } } }));
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain("llm.apiKey");
+    expect(message).toContain("[REDACTED]");
+    expect(message).not.toContain(secret);
+  });
+
+  it("does not expose structured authorization credentials in startup errors", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-invalid-llm-credentials-"));
+    const path = join(dir, "config.json");
+    const secrets = [
+      "Bearer startup-authorization-secret",
+      "Basic startup-proxy-secret",
+      "startup-cookie-secret",
+      "startup-custom-auth-secret",
+    ];
+    try {
+      writeFileSync(path, JSON.stringify({
+        llm: {
+          baseURL: {
+            headers: {
+              Authorization: secrets[0],
+              "Proxy-Authorization": secrets[1],
+              Cookie: secrets[2],
+              "X-Custom-Auth": secrets[3],
+            },
+          },
+        },
+      }));
+
+      let message = "";
+      try {
+        loadDaemonConfig(path);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("llm.baseURL");
+      expect(message).toContain("[REDACTED]");
+      for (const secret of secrets) expect(message).not.toContain(secret);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports unknown-key types without reflecting their values", () => {
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { timeout: 1000 } })))
+      .toThrow('unknown key "timeout" with number value; valid keys:');
+
+    const secret = "sk-unknown-key-secret";
+    let message = "";
+    try {
+      parseDaemonConfig(JSON.stringify({
+        llm: {
+          options: { apiKey: secret, label: "visible" },
+        },
+      }));
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain('unknown key "options" with object value');
+    expect(message).not.toContain("visible");
+    expect(message).not.toContain(secret);
+  });
+
+  it("redacts credential-like unknown keys", () => {
+    const secret = "private-token-value";
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { accessToken: secret } })))
+      .toThrow('unknown key "accessToken" with string value; valid keys:');
+    try {
+      parseDaemonConfig(JSON.stringify({ llm: { accessToken: secret } }));
+    } catch (error) {
+      expect(error instanceof Error ? error.message : String(error)).not.toContain(secret);
+    }
+  });
+
+  it.each([
+    ["direct Authorization value", { Authorization: "Bearer direct-secret" }, ["Bearer direct-secret"]],
+    [
+      "nested header values",
+      { headers: { Authorization: "Bearer nested-secret", "X-Api-Key": "header-secret" } },
+      ["Bearer nested-secret", "header-secret"],
+    ],
+  ])("does not reflect %s from unknown llm keys", (_name, llm, secrets) => {
+    let message = "";
+    try {
+      parseDaemonConfig(JSON.stringify({ llm }));
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).toContain("unknown key");
+    for (const secret of secrets) expect(message).not.toContain(secret);
+  });
+
+  it("requires an Anthropic model and a resolved API key", () => {
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "anthropic", apiKey: "sk-test" } }))).toThrow("llm.model");
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "anthropic", model: "claude-sonnet" } }))).toThrow("llm.apiKey");
+    expect(parseDaemonConfig(
+      JSON.stringify({ llm: { provider: "anthropic", model: "claude-sonnet" } }),
+      {},
+      { LCM_SUMMARY_API_KEY: "sk-env" },
+    ).llm.apiKey).toBe("sk-env");
+  });
+
+  it("validates OpenAI model, URL, and public endpoint credentials", () => {
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "openai", baseURL: "http://localhost/v1" } }))).toThrow("llm.model");
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "openai", model: "gpt-test", baseURL: "localhost/v1" } }))).toThrow("absolute HTTP(S) URL");
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "openai", model: "gpt-test", baseURL: "ftp://localhost/v1" } }))).toThrow("absolute HTTP(S) URL");
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "openai", model: "gpt-test", baseURL: "https://api.openai.com/v1" } }))).toThrow("llm.apiKey");
+  });
+
+  it.each([
+    "https://api.openai.com",
+    "https://API.OPENAI.COM/alternate/path",
+    "https://api.openai.com./alternate/path",
+    "https://api.openai.com/not-v1?feature=preview",
+  ])("requires credentials for the public OpenAI hostname regardless of path: %s", (baseURL) => {
+    expect(() => parseDaemonConfig(JSON.stringify({
+      llm: { provider: "openai", model: "gpt-test", baseURL },
+    }))).toThrow("llm.apiKey");
+  });
+
+  it("redacts URL credentials and query data from baseURL errors", () => {
+    const username = "private-user";
+    const password = "private-password";
+    const querySecret = "private-query-secret";
+    let message = "";
+    try {
+      parseDaemonConfig(JSON.stringify({
+        llm: {
+          provider: "openai",
+          model: "gpt-test",
+          baseURL: `ftp://${username}:${password}@localhost/v1?token=${querySecret}#fragment-secret`,
+        },
+      }));
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain("llm.baseURL");
+    expect(message).toContain("[REDACTED]");
+    expect(message).not.toContain(username);
+    expect(message).not.toContain(password);
+    expect(message).not.toContain(querySecret);
+    expect(message).not.toContain("fragment-secret");
+  });
+
+  it("defaults OpenAI-compatible endpoints to Chat Completions without requiring local credentials", () => {
+    const config = parseDaemonConfig(JSON.stringify({
+      llm: { provider: "openai", model: "local-model", baseURL: "http://localhost:11435/v1" },
+    }));
+    expect(config.llm.apiMode).toBe("chat-completions");
+    expect(config.llm.apiKey).toBe("");
+  });
+
+  it("accepts reasoning effort only for OpenAI Responses mode", () => {
+    const content = JSON.stringify({
+      llm: {
+        provider: "openai",
+        model: "gpt-test",
+        baseURL: "http://localhost:11435/v1",
+        apiMode: "responses",
+        reasoningEffort: "high",
+      },
+    });
+    expect(parseDaemonConfig(content).llm.reasoningEffort).toBe("high");
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "codex", reasoningEffort: "high" } }))).toThrow(
+      'Invalid configuration at llm.reasoningEffort: is only valid when llm.provider is "openai" and llm.apiMode is "responses"',
+    );
+    expect(() => parseDaemonConfig(JSON.stringify({
+      llm: {
+        provider: "openai",
+        model: "gpt-test",
+        baseURL: "http://localhost:11435/v1",
+        reasoningEffort: "high",
+      },
+    }))).toThrow('apiMode "responses"');
+    expect(parseDaemonConfig(JSON.stringify({
+      llm: {
+        provider: "openai",
+        model: "gpt-test",
+        baseURL: "http://localhost:11435/v1",
+        apiMode: "chat-completions",
+      },
+    })).llm.apiMode).toBe("chat-completions");
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "disabled", apiMode: "chat-completions" } }))).toThrow(
+      'Invalid configuration at llm.apiMode: is only valid when llm.provider is "openai"',
+    );
   });
 });
 
