@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { createDaemon, type DaemonInstance } from "../../../src/daemon/server.js";
-import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { loadDaemonConfig, parseDaemonConfig } from "../../../src/daemon/config.js";
 import { projectDbPath, projectId } from "../../../src/daemon/project.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import { ConversationStore } from "../../../src/store/conversation-store.js";
@@ -297,6 +297,26 @@ describe("createCompactHandler — summarizer branching", () => {
     await handler({} as any, res, JSON.stringify({ session_id: "s1-env-model", cwd: testCwd, client: "claude" }));
 
     expect(createClaudeProcessSummarizer).toHaveBeenCalledWith({ model: "claude-opus-4-1" });
+  });
+
+  it.each([
+    ["claude", createClaudeProcessSummarizer],
+    ["codex", createCodexProcessSummarizer],
+  ] as const)("does not forward a persisted remote model through auto + %s resolution", async (client, factory) => {
+    vi.clearAllMocks();
+    const config = parseDaemonConfig(JSON.stringify({
+      llm: {
+        provider: "openai",
+        model: "remote-openai-model",
+        baseUrl: "http://localhost:11435/v1",
+      },
+    }), {}, { LCM_SUMMARY_PROVIDER: "auto" });
+    const handler = createCompactHandler(config);
+    const { res } = mockRes();
+
+    await handler({}, res, JSON.stringify({ session_id: `s1-${client}-default-model`, cwd: testCwd, client }));
+
+    expect(factory).toHaveBeenCalledWith({ model: "" });
   });
 
   it("auto + client=codex resolves to codex-process", async () => {

@@ -314,9 +314,118 @@ describe("loadDaemonConfig", () => {
     const c = loadDaemonConfig(
       "/nonexistent",
       { llm: { provider: "claude-process", model: "gpt-test", baseURL: "http://localhost:11435/v1" } },
-      { LCM_SUMMARY_PROVIDER: "openai" }
+      { LCM_SUMMARY_PROVIDER: "openai", LCM_SUMMARY_MODEL: "gpt-test" }
     );
     expect(c.llm.provider).toBe("openai");
+  });
+
+  it.each(["auto", "claude-process", "codex-process", "disabled"] as const)(
+    "clears a persisted provider-specific model when LCM_SUMMARY_PROVIDER switches to %s",
+    (provider) => {
+      const c = parseDaemonConfig(
+        JSON.stringify({
+          llm: {
+            provider: "openai",
+            model: "remote-openai-model",
+            baseUrl: "http://localhost:11435/v1",
+          },
+        }),
+        {},
+        { LCM_SUMMARY_PROVIDER: provider },
+      );
+
+      expect(c.llm.provider).toBe(provider);
+      expect(c.llm.model).toBe("");
+    },
+  );
+
+  it("preserves an explicit environment model when the provider changes", () => {
+    const c = parseDaemonConfig(
+      JSON.stringify({
+        llm: {
+          provider: "openai",
+          model: "remote-openai-model",
+          baseUrl: "http://localhost:11435/v1",
+        },
+      }),
+      {},
+      { LCM_SUMMARY_PROVIDER: "claude-process", LCM_SUMMARY_MODEL: "claude-sonnet-4-20250514" },
+    );
+
+    expect(c.llm.model).toBe("claude-sonnet-4-20250514");
+  });
+
+  it("preserves a configured model when the environment selects the same provider alias", () => {
+    const c = parseDaemonConfig(
+      JSON.stringify({ llm: { provider: "claude-process", model: "claude-sonnet-4-20250514" } }),
+      {},
+      { LCM_SUMMARY_PROVIDER: "claude" },
+    );
+
+    expect(c.llm.provider).toBe("claude-process");
+    expect(c.llm.model).toBe("claude-sonnet-4-20250514");
+  });
+
+  it("clears a file model based on its file provider when a runtime provider matches the environment", () => {
+    const c = parseDaemonConfig(
+      JSON.stringify({
+        llm: {
+          provider: "openai",
+          model: "remote-openai-model",
+          baseUrl: "http://localhost:11435/v1",
+        },
+      }),
+      { llm: { provider: "claude-process" } },
+      { LCM_SUMMARY_PROVIDER: "claude" },
+    );
+
+    expect(c.llm.provider).toBe("claude-process");
+    expect(c.llm.model).toBe("");
+  });
+
+  it("preserves an explicit runtime model for the environment-selected provider", () => {
+    const c = parseDaemonConfig(
+      JSON.stringify({
+        llm: {
+          provider: "openai",
+          model: "remote-openai-model",
+          baseUrl: "http://localhost:11435/v1",
+        },
+      }),
+      { llm: { model: "claude-sonnet-4-20250514" } },
+      { LCM_SUMMARY_PROVIDER: "claude" },
+    );
+
+    expect(c.llm.provider).toBe("claude-process");
+    expect(c.llm.model).toBe("claude-sonnet-4-20250514");
+  });
+
+  it("normalizes the file provider before comparing it with the environment provider", () => {
+    const c = parseDaemonConfig(
+      JSON.stringify({
+        llm: {
+          provider: "custom",
+          model: "remote-openai-model",
+          baseUrl: "http://localhost:11435/v1",
+        },
+      }),
+      {},
+      { LCM_SUMMARY_PROVIDER: "openai-compatible" },
+    );
+
+    expect(c.llm.provider).toBe("openai");
+    expect(c.llm.model).toBe("remote-openai-model");
+  });
+
+  it("preserves a file model that has no explicit file provider", () => {
+    const c = parseDaemonConfig(
+      JSON.stringify({ llm: { model: "claude-sonnet-4-20250514" } }),
+      {},
+      { LCM_SUMMARY_PROVIDER: "claude-process" },
+    );
+
+    expect(c.llm.provider).toBe("claude-process");
+    expect(c.llm.model).toBe("claude-sonnet-4-20250514");
   });
 
   it("LCM_SUMMARY_PROVIDER recovers from a stale file provider", () => {

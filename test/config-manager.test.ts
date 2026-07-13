@@ -305,6 +305,101 @@ describe("setConfigValue", () => {
     })).toBe("[REDACTED]");
   });
 
+  it.each([
+    ["anthropic", "anthropic"],
+    ["claude", "claude-process"],
+    ["codex", "codex-process"],
+    ["disabled", "disabled"],
+  ])("removes OpenAI-only settings when changing provider to %s", (provider, expectedProvider) => {
+    const { configPath } = makeConfig({
+      version: 1,
+      customSection: { keep: true },
+      llm: {
+        provider: "openai",
+        model: "shared-model",
+        apiKey: "shared-api-key",
+        baseUrl: "http://localhost:11435/v1",
+        apiMode: "responses",
+        reasoningEffort: "high",
+        requestTimeoutMs: 30_000,
+        retry: { maxAttempts: 4, initialDelayMs: 100, maxDelayMs: 1_000, multiplier: 2 },
+      },
+    });
+
+    expect(setConfigValue({
+      configPath,
+      path: "llm.provider",
+      value: provider,
+      env: {},
+    })).toBe(expectedProvider);
+
+    const stored = JSON.parse(readFileSync(configPath, "utf-8")) as {
+      customSection: unknown;
+      llm: Record<string, unknown>;
+    };
+    expect(stored.customSection).toEqual({ keep: true });
+    expect(stored.llm).toMatchObject({
+      provider: expectedProvider,
+      model: "shared-model",
+      apiKey: "shared-api-key",
+      baseUrl: "http://localhost:11435/v1",
+    });
+    for (const key of ["apiMode", "reasoningEffort", "requestTimeoutMs", "retry"]) {
+      expect(stored.llm).not.toHaveProperty(key);
+    }
+  });
+
+  it.each(["openai", "custom", "openai-compatible"])(
+    "retains OpenAI-only settings when setting the OpenAI provider alias %s",
+    (provider) => {
+      const { configPath } = makeConfig({
+        llm: {
+          provider: "openai",
+          model: "local-model",
+          baseUrl: "http://localhost:11435/v1",
+          apiMode: "responses",
+          reasoningEffort: "medium",
+          requestTimeoutMs: 30_000,
+          retry: { maxAttempts: 4 },
+        },
+      });
+
+      setConfigValue({ configPath, path: "llm.provider", value: provider, env: {} });
+
+      const stored = JSON.parse(readFileSync(configPath, "utf-8")) as {
+        llm: Record<string, unknown>;
+      };
+      expect(stored.llm).toMatchObject({
+        provider: "openai",
+        apiMode: "responses",
+        reasoningEffort: "medium",
+        requestTimeoutMs: 30_000,
+        retry: { maxAttempts: 4 },
+      });
+    },
+  );
+
+  it("does not rewrite the file when a provider transition remains invalid", () => {
+    const { configPath } = makeConfig({
+      llm: {
+        provider: "openai",
+        model: "local-model",
+        baseUrl: "http://localhost:11435/v1",
+        apiMode: "responses",
+        reasoningEffort: "medium",
+      },
+    });
+    const before = readFileSync(configPath, "utf-8");
+
+    expect(() => setConfigValue({
+      configPath,
+      path: "llm.provider",
+      value: "not-a-provider",
+      env: {},
+    })).toThrow("llm.provider");
+    expect(readFileSync(configPath, "utf-8")).toBe(before);
+  });
+
   it("rejects traversal through scalars and arrays without changing the file", () => {
     for (const initial of [{ parent: "scalar" }, { parent: [] }]) {
       const { configPath } = makeConfig(initial);

@@ -329,12 +329,12 @@ function invalidType(path: string, value: unknown, expected: string): never {
   );
 }
 
-function normalizeProvider(value: string): string {
+export function normalizeLlmProvider(value: string): string {
   return LLM_PROVIDER_ALIASES[value] ?? value;
 }
 
 function validateProviderChoice(path: string, value: string): LlmProvider {
-  const provider = normalizeProvider(value);
+  const provider = normalizeLlmProvider(value);
   if (!(CANONICAL_LLM_PROVIDERS as readonly string[]).includes(provider)) {
     throw new ConfigValidationError(
       path,
@@ -668,10 +668,13 @@ function validateLlmObject(
     { requestTimeoutMs: llm.requestTimeoutMs, retry: llm.retry },
   );
 
-  if (providerOverride !== undefined) {
-    llm.provider = providerOverride;
-  } else if (typeof llm.provider === "string") {
-    llm.provider = validateProviderChoice("llm.provider", llm.provider);
+  if (typeof llm.provider === "string") {
+    // Preserve the configured provider long enough to determine whether an
+    // environment override also invalidates its provider-specific model. An
+    // override still permits recovery from stale provider names.
+    llm.provider = providerOverride === undefined
+      ? validateProviderChoice("llm.provider", llm.provider)
+      : normalizeLlmProvider(llm.provider);
   }
   if (typeof llm.apiMode === "string" && !(LLM_API_MODES as readonly string[]).includes(llm.apiMode)) {
     throw new ConfigValidationError(
@@ -816,6 +819,11 @@ export function parseDaemonConfig(
   if (overrideLlm !== undefined) normalizedOverrides.llm = overrideLlm;
 
   const fileLlm = fileConfig.llm as Record<string, unknown> | undefined;
+  const fileModelProvider = typeof fileLlm?.provider === "string"
+    ? normalizeLlmProvider(fileLlm.provider)
+    : undefined;
+  const hasExplicitFileModel = typeof fileLlm?.model === "string";
+  const hasExplicitRuntimeModel = typeof overrideLlm?.model === "string";
   const explicitLlmKeys = new Set([
     ...Object.keys(fileLlm ?? {}),
     ...Object.keys(overrideLlm ?? {}),
@@ -843,6 +851,18 @@ export function parseDaemonConfig(
   // Env var override: LCM_SUMMARY_PROVIDER takes precedence over config
   if (providerOverride !== undefined) {
     merged.llm.provider = providerOverride;
+    // Runtime models belong to the runtime/environment selection. Only discard
+    // a model inherited from a file that explicitly paired it with another
+    // provider; provider-less file models remain intentionally portable.
+    if (
+      hasExplicitFileModel
+      && !hasExplicitRuntimeModel
+      && fileModelProvider !== undefined
+      && fileModelProvider !== providerOverride
+      && env.LCM_SUMMARY_MODEL === undefined
+    ) {
+      merged.llm.model = "";
+    }
     if (providerOverride !== "openai") {
       delete merged.llm.apiMode;
       delete merged.llm.reasoningEffort;

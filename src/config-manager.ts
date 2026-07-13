@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import {
+  normalizeLlmProvider,
   parseDaemonConfig,
   parseStoredConfig,
   resolveDaemonConfigEnv,
@@ -18,6 +19,12 @@ import { sanitizeUrlValueForDisplay } from "./url-display.js";
 
 const DENIED_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
 const REDACTED = "[REDACTED]";
+const OPENAI_ONLY_LLM_KEYS = [
+  "apiMode",
+  "reasoningEffort",
+  "requestTimeoutMs",
+  "retry",
+] as const;
 
 export type ConfigValueOptions = {
   configPath: string;
@@ -147,6 +154,26 @@ function setAtPath(root: Record<string, unknown>, segments: readonly string[], v
   current[segments.at(-1)!] = value;
 }
 
+/** Remove settings that cannot survive an intentional transition away from OpenAI. */
+function canonicalizeLlmProviderTransition(
+  root: Record<string, unknown>,
+  segments: readonly string[],
+  value: unknown,
+): void {
+  if (
+    segments.length !== 2
+    || segments[0] !== "llm"
+    || segments[1] !== "provider"
+    || typeof value !== "string"
+    || normalizeLlmProvider(value) === "openai"
+  ) {
+    return;
+  }
+  const llm = root.llm;
+  if (!isRecord(llm)) return;
+  for (const key of OPENAI_ONLY_LLM_KEYS) delete llm[key];
+}
+
 function writeConfigAtomic(configPath: string, content: string): void {
   const directory = dirname(configPath);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -169,6 +196,7 @@ export function setConfigValue(options: SetConfigValueOptions): unknown {
   const stored = structuredClone(parseStoredConfig(content));
   const value = parseConfigValue(options.value, options.json);
   setAtPath(stored, segments, value);
+  canonicalizeLlmProviderTransition(stored, segments, value);
 
   const candidateContent = JSON.stringify(stored);
   const env = resolveDaemonConfigEnv(options.env ?? process.env);

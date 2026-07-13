@@ -210,7 +210,10 @@ are aliases for `openai`. Aliases are accepted in both `~/.lcm/config.json` and
 after JSON and runtime configuration are merged and overrides `llm.model`. An
 explicitly empty `LCM_SUMMARY_MODEL` still overrides the file value, so remote
 providers that require a model fail validation instead of silently using the
-JSON value. For `claude-process` and `codex-process`, a non-empty effective model
+JSON value. When `LCM_SUMMARY_PROVIDER` switches away from an explicitly
+configured provider and `LCM_SUMMARY_MODEL` is unset, LCM discards the old
+provider-specific model. The configured model is preserved when the provider is
+unchanged. For `claude-process` and `codex-process`, a non-empty effective model
 is forwarded to the corresponding CLI with `--model`; an empty value preserves
 the process backend's existing default-model behavior.
 
@@ -311,15 +314,19 @@ LCM uses a non-secret local placeholder in that case and never borrows the
 public OpenAI credential for another host.
 
 ```bash
-export LOCAL_LLM_API_KEY=local-server-token
+export LCM_SUMMARY_API_KEY=local-server-token
 
 lcm config set llm.baseUrl http://127.0.0.1:8000/v1
 lcm config set llm.model local-model
-lcm config set llm.apiKey '${LOCAL_LLM_API_KEY}'
+lcm config set llm.apiKey '${LCM_SUMMARY_API_KEY}'
 lcm config set llm.provider openai
 lcm daemon restart
 lcm compact --verbose
 ```
+
+The single quotes store the environment-variable reference instead of the
+secret itself. `LCM_SUMMARY_API_KEY` is propagated to managed daemon launches,
+including the restart shown above.
 
 The equivalent JSON is:
 
@@ -328,7 +335,7 @@ The equivalent JSON is:
   "llm": {
     "provider": "openai",
     "model": "local-model",
-    "apiKey": "${LOCAL_LLM_API_KEY}",
+    "apiKey": "${LCM_SUMMARY_API_KEY}",
     "baseUrl": "http://127.0.0.1:8000/v1",
     "apiMode": "chat-completions"
   }
@@ -359,6 +366,13 @@ there is no raw-secret display mode. Writes validate the complete resulting
 configuration, preserve unrelated keys, use a mode-`0600` temporary file, and
 rename it atomically. A successful update prints `lcm daemon restart`, which
 must be run before an existing daemon uses the change.
+
+Setting `llm.provider` to a provider other than `openai` automatically removes
+the OpenAI-only `llm.apiMode`, `llm.reasoningEffort`,
+`llm.requestTimeoutMs`, and `llm.retry` settings. Provider aliases are
+normalized first, so `claude` and `codex` remove those settings while `custom`
+and `openai-compatible` retain them. Model, credential, endpoint, extension,
+and other unrelated settings are preserved.
 
 LCM validates `~/.lcm/config.json` strictly and fails loudly instead of silently
 falling back. Malformed JSON, an `llm` value that is not an object, unknown
