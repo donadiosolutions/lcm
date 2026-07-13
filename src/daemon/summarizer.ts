@@ -22,7 +22,9 @@ export async function createSummarizer(
   // Mock summarizer for E2E testing — deterministic, no LLM calls
   if (config.summarizer?.mock) return createMockSummarizer();
   if (provider === "disabled") return null;
-  if (provider === "claude-process") return createClaudeProcessSummarizer();
+  if (provider === "claude-process") {
+    return createClaudeProcessSummarizer({ model: config.llm.model });
+  }
   if (provider === "codex-process") {
     return createCodexProcessSummarizer({ model: config.llm.model });
   }

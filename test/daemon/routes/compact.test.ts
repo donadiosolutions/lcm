@@ -226,7 +226,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(makeConfig("claude-process"));
     const { res } = mockRes();
     await handler({} as any, res, JSON.stringify({ session_id: "s1", cwd: testCwd }));
-    expect(createClaudeProcessSummarizer).toHaveBeenCalled();
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith({ model: "test-model" });
     expect(createCodexProcessSummarizer).not.toHaveBeenCalled();
   });
 
@@ -282,8 +282,21 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(makeConfig("auto"));
     const { res } = mockRes();
     await handler({} as any, res, JSON.stringify({ session_id: "s1", cwd: testCwd, client: "claude" }));
-    expect(createClaudeProcessSummarizer).toHaveBeenCalled();
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith({ model: "test-model" });
     expect(createCodexProcessSummarizer).not.toHaveBeenCalled();
+  });
+
+  it("forwards LCM_SUMMARY_MODEL through auto + Claude resolution", async () => {
+    vi.clearAllMocks();
+    const config = loadDaemonConfig("/nonexistent/config.json", { llm: { provider: "auto" } }, {
+      LCM_SUMMARY_MODEL: "claude-opus-4-1",
+    });
+    const handler = createCompactHandler(config);
+    const { res } = mockRes();
+
+    await handler({} as any, res, JSON.stringify({ session_id: "s1-env-model", cwd: testCwd, client: "claude" }));
+
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith({ model: "claude-opus-4-1" });
   });
 
   it("auto + client=codex resolves to codex-process", async () => {
@@ -300,7 +313,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(makeConfig("auto"));
     const { res } = mockRes();
     await handler({} as any, res, JSON.stringify({ session_id: "s1", cwd: testCwd }));
-    expect(createClaudeProcessSummarizer).toHaveBeenCalled();
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith({ model: "test-model" });
     expect(createCodexProcessSummarizer).not.toHaveBeenCalled();
   });
 

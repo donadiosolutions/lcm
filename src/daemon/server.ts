@@ -111,7 +111,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   }
 
   routes.set("GET /health", async (_req, res) =>
-    sendJson(res, 200, { status: "ok", version: PKG_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) }));
+    sendJson(res, 200, { status: "ok", version: PKG_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000), pid: process.pid }));
   routes.set("POST /compact", createCompactHandler(config));
   routes.set("POST /promote", createPromoteHandler(config));
   routes.set("POST /restore", createRestoreHandler(config));

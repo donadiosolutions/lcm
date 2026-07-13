@@ -210,7 +210,9 @@ are aliases for `openai`. Aliases are accepted in both `~/.lcm/config.json` and
 after JSON and runtime configuration are merged and overrides `llm.model`. An
 explicitly empty `LCM_SUMMARY_MODEL` still overrides the file value, so remote
 providers that require a model fail validation instead of silently using the
-JSON value.
+JSON value. For `claude-process` and `codex-process`, a non-empty effective model
+is forwarded to the corresponding CLI with `--model`; an empty value preserves
+the process backend's existing default-model behavior.
 
 ### LLM configuration
 

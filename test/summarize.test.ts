@@ -488,6 +488,10 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         "fragment-secret",
         "opaque-secret",
         "protocol-secret",
+        "database-user",
+        "database-password",
+        "connection-user",
+        "connection-password",
       ];
       try {
         const deps = makeDeps({
@@ -500,8 +504,10 @@ describe("createLcmSummarizeFromLegacyParams", () => {
                 endpoint: `https://${secrets[0]}:${secrets[1]}@example.com/v1?token=${secrets[2]}#${secrets[3]}`,
                 opaqueEndpoint: `user:${secrets[4]}@example.com`,
                 protocolRelativeEndpoint: `//user:${secrets[5]}@example.com/v1?token=${secrets[2]}`,
+                dsn: `postgres://${secrets[6]}:${secrets[7]}@db.example.com/app`,
                 message: "Error: provider failed",
                 embeddedMessage: `request failed: https://${secrets[0]}:${secrets[1]}@example.com/v1?api_key=${secrets[2]}#${secrets[3]}; retrying`,
+                connectionMessage: `Server=db;User Id=${secrets[8]};Password=${secrets[9]};Database=app`,
               },
             }],
           })),
@@ -519,9 +525,13 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         expect(diagnostics).toContain("content_preview=");
         expect(diagnostics).toContain('"opaqueEndpoint":"[REDACTED]"');
         expect(diagnostics).toContain('"protocolRelativeEndpoint":"[REDACTED]"');
+        expect(diagnostics).toContain('"dsn":"[REDACTED]"');
         expect(diagnostics).toContain('"message":"Error: provider failed"');
         expect(diagnostics).toContain(
           '"embeddedMessage":"request failed: https://example.com/v1?[REDACTED]#[REDACTED]; retrying"',
+        );
+        expect(diagnostics).toContain(
+          '"connectionMessage":"Server=db;User Id=[REDACTED];Password=[REDACTED];Database=app"',
         );
         for (const secret of secrets) expect(diagnostics).not.toContain(secret);
       } finally {

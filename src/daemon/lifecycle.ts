@@ -56,6 +56,7 @@ type HealthResponse = {
   status: string;
   version?: string;
   uptime?: number;
+  pid?: number;
 };
 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
@@ -120,11 +121,50 @@ function readProcessCommand(pid: number, procRoot = "/proc"): string | null {
   }
 }
 
-function isLikelyLcmDaemonProcess(pid: number, procRoot = "/proc"): boolean {
-  const command = readProcessCommand(pid, procRoot);
+function isLikelyLcmDaemonCommand(command: string | null): boolean {
   if (!command) return false;
   const parts = command.split(/\s+/);
   return command.includes("lcm") && parts.includes("daemon") && parts.includes("start");
+}
+
+function isLikelyLcmDaemonProcess(pid: number, procRoot = "/proc"): boolean {
+  return isLikelyLcmDaemonCommand(readProcessCommand(pid, procRoot));
+}
+
+function findListeningTcpPorts(
+  pid: number,
+  platform: NodeJS.Platform,
+  spawnSyncImpl: typeof spawnSync,
+): number[] {
+  if (platform === "win32") return [];
+  try {
+    const command = platform === "darwin" ? "/usr/sbin/lsof" : "lsof";
+    const result = spawnSyncImpl(command, [
+      "-nP",
+      "-a",
+      "-p", String(pid),
+      "-iTCP",
+      "-sTCP:LISTEN",
+      "-Fn",
+    ], {
+      encoding: "utf-8",
+      timeout: 1000,
+      maxBuffer: 64 * 1024,
+    });
+    if (result.status !== 0 || typeof result.stdout !== "string") return [];
+    const ports = new Set<number>();
+    for (const line of result.stdout.split(/\r?\n/)) {
+      if (!line.startsWith("n")) continue;
+      const match = line.match(/:(\d+)(?:\s+\(LISTEN\))?$/);
+      if (!match) continue;
+      const port = Number.parseInt(match[1], 10);
+      if (Number.isInteger(port) && port >= 1 && port <= 65_535) ports.add(port);
+      if (ports.size >= 32) break;
+    }
+    return [...ports].sort((a, b) => a - b);
+  } catch {
+    return [];
+  }
 }
 
 export function findUserSystemdPid(options: { procRoot?: string; uid?: number } = {}): number | null {
@@ -673,13 +713,21 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   const platform = opts._platform ?? osPlatform();
   const fetchFn = opts._fetchOverride ?? globalThis.fetch;
   const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
+  async function isAuthenticatedDaemonAtPort(port: number, pid: number, allowLegacyHealth: boolean): Promise<boolean> {
+    const health = await checkDaemonHealth(port, fetchFn);
+    if (health?.status !== "ok") return false;
+    if (!await checkDaemonAccess(port, tokenPath, fetchFn)) return false;
+    return health.pid === undefined ? allowLegacyHealth : health.pid === pid;
+  }
   async function isManaged(pid: number): Promise<boolean> {
     if (_isManagedProcessOverride) return _isManagedProcessOverride(pid);
     if (platform === "linux") return isLikelyLcmDaemonProcess(pid, opts._procRoot ?? "/proc");
-    const health = await checkDaemonHealth(opts.port, fetchFn);
-    if (health?.status !== "ok") return false;
-    if (opts.expectedVersion && health.version !== opts.expectedVersion) return false;
-    return checkDaemonAccess(opts.port, tokenPath, fetchFn);
+    if (await isAuthenticatedDaemonAtPort(opts.port, pid, false)) return true;
+    const listenerPorts = findListeningTcpPorts(pid, platform, opts._spawnSyncOverride ?? spawnSync);
+    for (const port of listenerPorts) {
+      if (await isAuthenticatedDaemonAtPort(port, pid, true)) return true;
+    }
+    return false;
   }
   const killProcess = opts._killOverride ?? ((pid: number, signal?: NodeJS.Signals | number) => {
     process.kill(pid, signal);

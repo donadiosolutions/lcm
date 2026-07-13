@@ -1,7 +1,7 @@
 import type { LcmDependencies } from "./types.js";
 import { loadTemplate, renderTemplate } from "./prompts/loader.js";
 import { isSensitiveKey } from "./secret-key.js";
-import { sanitizeUrlForDisplay } from "./url-display.js";
+import { sanitizeUrlValueForDisplay } from "./url-display.js";
 
 export type LcmSummarizeOptions = {
   previousSummary?: string;
@@ -32,9 +32,6 @@ const DIAGNOSTIC_MAX_DEPTH = 4;
 const DIAGNOSTIC_MAX_ARRAY_ITEMS = 8;
 const DIAGNOSTIC_MAX_OBJECT_KEYS = 16;
 const DIAGNOSTIC_MAX_CHARS = 1200;
-const PROTOCOL_RELATIVE_URL_PATTERN = /^\s*\/\//;
-const EMBEDDED_HTTP_URL_PATTERN = /https?:\/\/[^\s<>"'`\])}]+/gi;
-const TRAILING_URL_PUNCTUATION_PATTERN = /[.,;!?]+$/;
 
 /** Normalize provider ids for stable config/profile lookup. */
 function normalizeProviderId(provider: string): string {
@@ -212,21 +209,6 @@ function truncateDiagnosticText(value: string, maxChars = DIAGNOSTIC_MAX_CHARS):
   return `${value.slice(0, maxChars)}...[truncated:${value.length - maxChars} chars]`;
 }
 
-function isUrlLikeKey(key: string | undefined): boolean {
-  if (!key) return false;
-  const normalized = key.replace(/[-_]/g, "").toLowerCase();
-  return ["url", "urls", "uri", "uris", "endpoint", "endpoints"]
-    .some((suffix) => normalized.endsWith(suffix));
-}
-
-function sanitizeEmbeddedHttpUrls(value: string): string {
-  return value.replace(EMBEDDED_HTTP_URL_PATTERN, (match) => {
-    const trailing = match.match(TRAILING_URL_PUNCTUATION_PATTERN)?.[0] ?? "";
-    const url = trailing.length > 0 ? match.slice(0, -trailing.length) : match;
-    return `${sanitizeUrlForDisplay(url)}${trailing}`;
-  });
-}
-
 /** Build a JSON-safe, redacted, depth-limited clone for diagnostic logging. */
 function sanitizeForDiagnostics(value: unknown, depth = 0, key?: string): unknown {
   if (depth >= DIAGNOSTIC_MAX_DEPTH) {
@@ -234,10 +216,7 @@ function sanitizeForDiagnostics(value: unknown, depth = 0, key?: string): unknow
   }
   if (typeof value === "string") {
     const boundedValue = truncateDiagnosticText(value);
-    if (PROTOCOL_RELATIVE_URL_PATTERN.test(boundedValue) || isUrlLikeKey(key)) {
-      return sanitizeUrlForDisplay(boundedValue);
-    }
-    return sanitizeEmbeddedHttpUrls(boundedValue);
+    return sanitizeUrlValueForDisplay(boundedValue, key);
   }
   if (
     value === null ||

@@ -193,6 +193,62 @@ describe("getConfigValue", () => {
     });
   });
 
+  it("recursively sanitizes credential-bearing URL values in extension fields", () => {
+    const secrets = [
+      "endpoint-user",
+      "endpoint-password",
+      "endpoint-query",
+      "endpoint-fragment",
+      "opaque-secret",
+      "database-user",
+      "database-password",
+      "connection-user",
+      "connection-password",
+      "proxy-user",
+      "proxy-password",
+      "proxy-token",
+    ];
+    const unsafeUrl = `https://${secrets[0]}:${secrets[1]}@api.example.com/v1?token=${secrets[2]}#${secrets[3]}`;
+    const databaseDsn = `postgres://${secrets[5]}:${secrets[6]}@db.example.com/app`;
+    const { configPath } = makeConfig({
+      extensions: {
+        endpoint: unsafeUrl,
+        callbackUrl: unsafeUrl,
+        dsn: databaseDsn,
+        nested: {
+          webhookUri: unsafeUrl,
+          arbitraryName: unsafeUrl,
+          opaqueEndpoint: `user:${secrets[4]}@example.com`,
+          statusMessage: `primary=${databaseDsn}; retrying`,
+          protocolMessage: `fallback=//${secrets[9]}:${secrets[10]}@proxy.example.com/v1?token=${secrets[11]}; retrying`,
+          connectionDetails: `Server=db;User Id=${secrets[7]};Password=${secrets[8]};Database=app`,
+        },
+        label: "visible",
+      },
+    });
+
+    const endpoint = getConfigValue({ configPath, path: "extensions.endpoint" });
+    const extensions = getConfigValue({ configPath, path: "extensions" });
+    expect(endpoint).toBe("https://api.example.com/v1?[REDACTED]#[REDACTED]");
+    expect(extensions).toMatchObject({
+      endpoint,
+      callbackUrl: endpoint,
+      dsn: "[REDACTED]",
+      nested: {
+        webhookUri: endpoint,
+        arbitraryName: endpoint,
+        opaqueEndpoint: "[REDACTED]",
+        statusMessage: "primary=[REDACTED]; retrying",
+        protocolMessage: "fallback=//proxy.example.com/v1?[REDACTED]; retrying",
+        connectionDetails: "Server=db;User Id=[REDACTED];Password=[REDACTED];Database=app",
+      },
+      label: "visible",
+    });
+    const output = JSON.stringify(extensions);
+    for (const secret of secrets) expect(output).not.toContain(secret);
+    expect(output).not.toContain("@");
+  });
+
   it("returns defaults and environment overrides for effective reads", () => {
     const { configPath } = makeConfig({});
     expect(getConfigValue({
@@ -275,6 +331,22 @@ describe("setConfigValue", () => {
     const { configPath } = makeConfig({ version: 1 });
     const before = readFileSync(configPath, "utf-8");
     expect(() => setConfigValue({ configPath, path, value, json, env: {} })).toThrow(expectedPath);
+    expect(readFileSync(configPath, "utf-8")).toBe(before);
+  });
+
+  it("validates persisted provider configuration independently of summary provider and model overrides", () => {
+    const { configPath } = makeConfig({
+      version: 1,
+      llm: { provider: "openai", baseUrl: "http://localhost:11435/v1" },
+    });
+    const before = readFileSync(configPath, "utf-8");
+    expect(() => setConfigValue({
+      configPath,
+      path: "hooks.disableAutoCompact",
+      value: "true",
+      json: true,
+      env: { LCM_SUMMARY_PROVIDER: "disabled", LCM_SUMMARY_MODEL: "environment-model" },
+    })).toThrow("llm.model");
     expect(readFileSync(configPath, "utf-8")).toBe(before);
   });
 

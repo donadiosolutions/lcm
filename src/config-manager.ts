@@ -12,9 +12,9 @@ import {
   parseDaemonConfig,
   parseStoredConfig,
   resolveDaemonConfigEnv,
-  sanitizeUrlForDisplay,
 } from "./daemon/config.js";
 import { isSensitiveKey } from "./secret-key.js";
+import { sanitizeUrlValueForDisplay } from "./url-display.js";
 
 const DENIED_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
 const REDACTED = "[REDACTED]";
@@ -90,15 +90,10 @@ function isSecretPath(segments: readonly string[]): boolean {
   return segments.some(isSensitiveKey);
 }
 
-function isBaseUrlPath(segments: readonly string[]): boolean {
-  const key = segments.at(-1);
-  return key === "baseUrl" || key === "baseURL";
-}
-
 /** Recursively redact secret-like keys. The supplied path protects scalar secret reads too. */
 export function maskConfigSecrets(value: unknown, path: readonly string[] = []): unknown {
   if (isSecretPath(path)) return REDACTED;
-  if (typeof value === "string" && isBaseUrlPath(path)) return sanitizeUrlForDisplay(value);
+  if (typeof value === "string") return sanitizeUrlValueForDisplay(value, path.at(-1));
   if (Array.isArray(value)) {
     return value.map((entry) => maskConfigSecrets(entry, path));
   }
@@ -177,7 +172,10 @@ export function setConfigValue(options: SetConfigValueOptions): unknown {
 
   const candidateContent = JSON.stringify(stored);
   const env = resolveDaemonConfigEnv(options.env ?? process.env);
-  parseDaemonConfig(candidateContent, {}, env);
+  const persistedValidationEnv = { ...env };
+  delete persistedValidationEnv.LCM_SUMMARY_PROVIDER;
+  delete persistedValidationEnv.LCM_SUMMARY_MODEL;
+  parseDaemonConfig(candidateContent, {}, persistedValidationEnv);
   const canonical = parseStoredConfig(candidateContent);
   writeConfigAtomic(options.configPath, `${JSON.stringify(canonical, null, 2)}\n`);
   return maskConfigSecrets(valueAtPath(canonical, segments, path), segments);

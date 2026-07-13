@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn as defaultSpawn } from "node:child_process";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
@@ -10,7 +10,17 @@ import {
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const TIMEOUT_MS = 120_000;
 
-export function createClaudeProcessSummarizer(): LcmSummarizeFn {
+type ClaudeProcessDeps = {
+  model?: string;
+  spawn?: typeof defaultSpawn;
+  timeoutMs?: number;
+};
+
+export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): LcmSummarizeFn {
+  const model = opts.model?.trim() || HAIKU_MODEL;
+  const spawn = opts.spawn ?? defaultSpawn;
+  const timeoutMs = opts.timeoutMs ?? TIMEOUT_MS;
+
   return async function summarize(text: string, aggressive?: boolean, ctx: SummarizeContext = {}): Promise<string> {
     const estimatedInputTokens = Math.ceil(text.length / 4);
     const targetTokens = ctx.targetTokens ?? resolveTargetTokens({
@@ -27,7 +37,7 @@ export function createClaudeProcessSummarizer(): LcmSummarizeFn {
     return new Promise((resolve, reject) => {
       const proc = spawn("claude", [
         "--print",
-        "--model", HAIKU_MODEL,
+        "--model", model,
         "--no-session-persistence",
         "--system-prompt", LCM_SUMMARIZER_SYSTEM_PROMPT,
         "--tools", "",
@@ -44,8 +54,8 @@ export function createClaudeProcessSummarizer(): LcmSummarizeFn {
 
       const timer = setTimeout(() => {
         proc.kill();
-        reject(new Error(`claude process timed out after ${TIMEOUT_MS / 1000}s`));
-      }, TIMEOUT_MS);
+        reject(new Error(`claude process timed out after ${Math.round(timeoutMs / 1000)}s`));
+      }, timeoutMs);
 
       proc.on("close", (code: number | null) => {
         clearTimeout(timer);
