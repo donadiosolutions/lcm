@@ -18,6 +18,31 @@ export type LlmApiMode = typeof LLM_API_MODES[number];
 export const LLM_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
 export type LlmReasoningEffort = typeof LLM_REASONING_EFFORTS[number];
 
+export interface LlmRetryPolicy {
+  maxAttempts: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+  multiplier: number;
+}
+
+export interface LlmRequestPolicy {
+  requestTimeoutMs: number;
+  retry: LlmRetryPolicy;
+}
+
+export interface LlmRequestPolicyOverride {
+  requestTimeoutMs?: unknown;
+  retry?: unknown;
+}
+
+export const DEFAULT_LLM_REQUEST_TIMEOUT_MS = 600_000;
+export const DEFAULT_LLM_RETRY_POLICY: Readonly<LlmRetryPolicy> = Object.freeze({
+  maxAttempts: 3,
+  initialDelayMs: 1_000,
+  maxDelayMs: 30_000,
+  multiplier: 2,
+});
+
 export const DEFAULT_DAEMON_PORT = 3737;
 
 export interface SecurityConfig {
@@ -64,9 +89,11 @@ export type DaemonConfig = {
     provider: LlmProvider;
     model: string;
     apiKey?: string;
-    baseURL: string;
+    baseUrl: string;
     apiMode?: LlmApiMode;
     reasoningEffort?: LlmReasoningEffort;
+    requestTimeoutMs: number;
+    retry: LlmRetryPolicy;
   };
   summarizer: { mock: boolean };
   security: SecurityConfig;
@@ -118,7 +145,14 @@ const DEFAULTS: DaemonConfig = {
     stalePenalty: 0.5,
     allowStaleOnStrongMatch: true,
   },
-  llm: { provider: "auto", model: "", apiKey: "", baseURL: "" },
+  llm: {
+    provider: "auto",
+    model: "",
+    apiKey: "",
+    baseUrl: "",
+    requestTimeoutMs: DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+    retry: { ...DEFAULT_LLM_RETRY_POLICY },
+  },
   summarizer: { mock: false },
   security: {
     sensitivePatterns: [],
@@ -231,14 +265,19 @@ const LLM_PROVIDER_ALIASES: Readonly<Record<string, LlmProvider>> = {
   claude: "claude-process",
   "claude-cli": "claude-process",
   codex: "codex-process",
+  custom: "openai",
+  "openai-compatible": "openai",
 };
-const LLM_KEYS = new Set(["provider", "model", "apiKey", "baseURL", "apiMode", "reasoningEffort"]);
+const LLM_KEYS = new Set([
+  "provider", "model", "apiKey", "baseUrl", "baseURL", "apiMode", "reasoningEffort",
+  "requestTimeoutMs", "retry",
+]);
 const CONFIG_EXAMPLE = JSON.stringify({
   llm: {
     provider: "openai",
     model: "gpt-5",
     apiKey: "${OPENAI_API_KEY}",
-    baseURL: "https://api.openai.com/v1",
+    baseUrl: "https://api.openai.com/v1",
     apiMode: "responses",
     reasoningEffort: "medium",
   },
@@ -262,9 +301,11 @@ function isCredentialPath(path: string): boolean {
   return /(?:api[-_]?key|token|secret|password|credential)/i.test(key);
 }
 
-function sanitizeUrlForDisplay(value: string): string {
+/** Remove URL userinfo, query values, and fragments before displaying configuration. */
+export function sanitizeUrlForDisplay(value: string): string {
   try {
     const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return "[REDACTED]";
     if (url.username || url.password) {
       url.username = "[REDACTED]";
       url.password = "";
@@ -273,9 +314,7 @@ function sanitizeUrlForDisplay(value: string): string {
     if (url.hash) url.hash = "#[REDACTED]";
     return url.toString();
   } catch {
-    return value
-      .replace(/\/\/[^/@\s]+@/, "//[REDACTED]@")
-      .replace(/[?#].*$/, "?[REDACTED]");
+    return "[REDACTED]";
   }
 }
 
@@ -284,7 +323,7 @@ function displayValue(path: string, value: unknown): string {
   // Structured values are only displayed for type errors, where their contents
   // are not useful and may contain credentials under arbitrary header names.
   if (value !== null && typeof value === "object") return '"[REDACTED]"';
-  if (path === "llm.baseURL" && typeof value === "string") {
+  if ((path === "llm.baseUrl" || path === "llm.baseURL") && typeof value === "string") {
     return JSON.stringify(sanitizeUrlForDisplay(value));
   }
   const serialized = JSON.stringify(value, (key, nestedValue) => {
@@ -325,6 +364,250 @@ function validateStringField(llm: Record<string, unknown>, key: string): void {
   }
 }
 
+function validateBoundedInteger(path: string, value: unknown, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
+    invalidType(path, value, `an integer between ${min} and ${max}`);
+  }
+  if (value < min || value > max) {
+    throw new ConfigValidationError(path, `expected an integer between ${min} and ${max}, received ${displayValue(path, value)}`);
+  }
+  return value;
+}
+
+function validateBoundedNumber(path: string, value: unknown, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    invalidType(path, value, `a finite number between ${min} and ${max}`);
+  }
+  if (value < min || value > max) {
+    throw new ConfigValidationError(path, `expected a number between ${min} and ${max}, received ${displayValue(path, value)}`);
+  }
+  return value;
+}
+
+function validateObject(path: string, value: unknown): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    invalidType(path, value, "an object");
+  }
+  return value as Record<string, unknown>;
+}
+
+function validateOptionalInteger(
+  object: Record<string, unknown>,
+  key: string,
+  path: string,
+  min = 0,
+  max = Number.MAX_SAFE_INTEGER,
+): void {
+  if (object[key] !== undefined) validateBoundedInteger(`${path}.${key}`, object[key], min, max);
+}
+
+function validateOptionalNumber(
+  object: Record<string, unknown>,
+  key: string,
+  path: string,
+  min = 0,
+  max = Number.MAX_SAFE_INTEGER,
+): void {
+  if (object[key] !== undefined) validateBoundedNumber(`${path}.${key}`, object[key], min, max);
+}
+
+function validateOptionalString(object: Record<string, unknown>, key: string, path: string): void {
+  if (object[key] !== undefined && typeof object[key] !== "string") {
+    invalidType(`${path}.${key}`, object[key], "a string");
+  }
+}
+
+function validateOptionalBoolean(object: Record<string, unknown>, key: string, path: string): void {
+  if (object[key] !== undefined && typeof object[key] !== "boolean") {
+    invalidType(`${path}.${key}`, object[key], "a boolean");
+  }
+}
+
+function validateStringArray(path: string, value: unknown): void {
+  if (!Array.isArray(value)) invalidType(path, value, "an array of strings");
+  for (const [index, entry] of value.entries()) {
+    if (typeof entry !== "string") invalidType(`${path}.${index}`, entry, "a string");
+  }
+}
+
+function validateOptionalStringArray(object: Record<string, unknown>, key: string, path: string): void {
+  if (object[key] !== undefined) validateStringArray(`${path}.${key}`, object[key]);
+}
+
+function validateDaemonSection(value: unknown, allowEphemeralPort: boolean): void {
+  const daemon = validateObject("daemon", value);
+  validateOptionalInteger(daemon, "port", "daemon", allowEphemeralPort ? 0 : 1, 65_535);
+  validateOptionalString(daemon, "socketPath", "daemon");
+  validateOptionalString(daemon, "logLevel", "daemon");
+  validateOptionalNumber(daemon, "logMaxSizeMB", "daemon", 0, Number.MAX_SAFE_INTEGER);
+  validateOptionalInteger(daemon, "logRetentionDays", "daemon");
+  validateOptionalInteger(daemon, "idleTimeoutMs", "daemon", 0, 86_400_000);
+}
+
+function validatePromotionThresholds(value: unknown): void {
+  const thresholds = validateObject("compaction.promotionThresholds", value);
+  const path = "compaction.promotionThresholds";
+  validateOptionalInteger(thresholds, "minDepth", path);
+  validateOptionalNumber(thresholds, "compressionRatio", path, 0, 1);
+  validateOptionalNumber(thresholds, "dedupBm25Threshold", path);
+  validateOptionalInteger(thresholds, "dedupCandidateLimit", path, 1);
+  validateOptionalNumber(thresholds, "reinforcementBoost", path, 0, 1);
+  validateOptionalNumber(thresholds, "maxConfidence", path, 0, 1);
+  validateOptionalInteger(thresholds, "insightsMaxAgeDays", path);
+  // Supported legacy fields remain valid until the post-merge migration removes them.
+  validateOptionalInteger(thresholds, "mergeMaxEntries", path, 1);
+  validateOptionalNumber(thresholds, "confidenceDecayRate", path, 0, 1);
+  validateOptionalStringArray(thresholds, "architecturePatterns", path);
+
+  if (thresholds.keywords !== undefined) {
+    const keywords = validateObject(`${path}.keywords`, thresholds.keywords);
+    for (const [category, entries] of Object.entries(keywords)) {
+      validateStringArray(`${path}.keywords.${category}`, entries);
+    }
+  }
+  if (thresholds.eventConfidence !== undefined) {
+    const confidence = validateObject(`${path}.eventConfidence`, thresholds.eventConfidence);
+    for (const key of ["decision", "plan", "errorFix", "batch", "pattern"]) {
+      validateOptionalNumber(confidence, key, `${path}.eventConfidence`, 0, 1);
+    }
+  }
+}
+
+function validateCompactionSection(value: unknown): void {
+  const compaction = validateObject("compaction", value);
+  validateOptionalInteger(compaction, "leafTokens", "compaction", 1);
+  validateOptionalInteger(compaction, "maxDepth", "compaction", 1);
+  validateOptionalInteger(compaction, "autoCompactMinTokens", "compaction");
+  if (compaction.promotionThresholds !== undefined) validatePromotionThresholds(compaction.promotionThresholds);
+}
+
+function validateRestorationSection(value: unknown): void {
+  const restoration = validateObject("restoration", value);
+  const path = "restoration";
+  for (const key of [
+    "recentSummaries", "promptSearchMaxResults", "promptSnippetLength", "maxInjectedMemoryBytes",
+    "reservedForLearningInstruction", "maxInjectedMemoryItems", "dedupMinPrefix",
+    "staleSurfacingWithoutUseLimit", "restoreMaxPromotedAgeDays",
+    "promptHintsByteBudget", "promptHintsReservedForLearningInstruction", "promptHintsMaxEmitted",
+    "promptHintsDedupMinPrefix",
+  ]) {
+    validateOptionalInteger(restoration, key, path);
+  }
+  for (const key of [
+    "promptSearchMinScore", "recallUsageBoost", "recallUsageSmoothing", "surfacingCooldownWindow",
+    "resurfaceMargin", "unusedSurfacingPenalty", "staleAfterDays",
+  ]) {
+    validateOptionalNumber(restoration, key, path);
+  }
+  for (const key of ["crossSessionAffinity", "stalePenalty"]) {
+    validateOptionalNumber(restoration, key, path, 0, 1);
+  }
+  if (restoration.recencyHalfLifeHours !== undefined) {
+    const halfLife = restoration.recencyHalfLifeHours;
+    if (typeof halfLife !== "number" || !Number.isFinite(halfLife)) {
+      invalidType(`${path}.recencyHalfLifeHours`, halfLife, "a positive finite number");
+    }
+    if (halfLife <= 0) {
+      throw new ConfigValidationError(`${path}.recencyHalfLifeHours`, `expected a positive number, received ${displayValue(`${path}.recencyHalfLifeHours`, halfLife)}`);
+    }
+  }
+  validateOptionalBoolean(restoration, "allowStaleOnStrongMatch", path);
+}
+
+/** Validate every known non-LLM configuration leaf while preserving extension keys. */
+function validateKnownConfigSections(
+  config: Record<string, unknown>,
+  options: { allowEphemeralDaemonPort?: boolean } = {},
+): void {
+  if (config.version !== undefined) validateBoundedInteger("version", config.version, 1, Number.MAX_SAFE_INTEGER);
+  if (config.daemon !== undefined) validateDaemonSection(config.daemon, options.allowEphemeralDaemonPort === true);
+  if (config.compaction !== undefined) validateCompactionSection(config.compaction);
+  if (config.restoration !== undefined) validateRestorationSection(config.restoration);
+  if (config.summarizer !== undefined) {
+    const summarizer = validateObject("summarizer", config.summarizer);
+    validateOptionalBoolean(summarizer, "mock", "summarizer");
+  }
+  if (config.security !== undefined) {
+    const security = validateObject("security", config.security);
+    validateOptionalStringArray(security, "sensitivePatterns", "security");
+    validateOptionalBoolean(security, "notify_on_filter", "security");
+  }
+  if (config.hooks !== undefined) {
+    const hooks = validateObject("hooks", config.hooks);
+    validateOptionalInteger(hooks, "snapshotIntervalSec", "hooks");
+    validateOptionalBoolean(hooks, "disableAutoCompact", "hooks");
+  }
+}
+
+/** Validate and merge a partial request policy over an already-effective policy. */
+export function resolveLlmRequestPolicy(
+  configPolicy: LlmRequestPolicy,
+  partialOverride: LlmRequestPolicyOverride = {},
+  pathPrefix = "llm",
+): LlmRequestPolicy {
+  if (partialOverride === null || typeof partialOverride !== "object" || Array.isArray(partialOverride)) {
+    invalidType(pathPrefix, partialOverride, "an object");
+  }
+  const override = partialOverride as Record<string, unknown>;
+  for (const key of Object.keys(override)) {
+    if (key !== "requestTimeoutMs" && key !== "retry") {
+      throw new ConfigValidationError(`${pathPrefix}.${key}`, `unknown request policy key ${JSON.stringify(key)}`);
+    }
+  }
+  const requestTimeoutMs = override.requestTimeoutMs === undefined
+    ? configPolicy.requestTimeoutMs
+    : validateBoundedInteger(`${pathPrefix}.requestTimeoutMs`, override.requestTimeoutMs, 1, 3_600_000);
+
+  let retryOverride: Record<string, unknown> = {};
+  if (override.retry !== undefined) {
+    if (override.retry === null || typeof override.retry !== "object" || Array.isArray(override.retry)) {
+      invalidType(`${pathPrefix}.retry`, override.retry, "an object");
+    }
+    retryOverride = override.retry as Record<string, unknown>;
+    const validRetryKeys = new Set(["maxAttempts", "initialDelayMs", "maxDelayMs", "multiplier"]);
+    for (const key of Object.keys(retryOverride)) {
+      if (!validRetryKeys.has(key)) {
+        throw new ConfigValidationError(`${pathPrefix}.retry.${key}`, `unknown retry policy key ${JSON.stringify(key)}`);
+      }
+    }
+  }
+
+  const retry: LlmRetryPolicy = {
+    maxAttempts: retryOverride.maxAttempts === undefined
+      ? configPolicy.retry.maxAttempts
+      : validateBoundedInteger(`${pathPrefix}.retry.maxAttempts`, retryOverride.maxAttempts, 1, 10),
+    initialDelayMs: retryOverride.initialDelayMs === undefined
+      ? configPolicy.retry.initialDelayMs
+      : validateBoundedInteger(`${pathPrefix}.retry.initialDelayMs`, retryOverride.initialDelayMs, 0, 600_000),
+    maxDelayMs: retryOverride.maxDelayMs === undefined
+      ? configPolicy.retry.maxDelayMs
+      : validateBoundedInteger(`${pathPrefix}.retry.maxDelayMs`, retryOverride.maxDelayMs, 0, 600_000),
+    multiplier: retryOverride.multiplier === undefined
+      ? configPolicy.retry.multiplier
+      : validateBoundedNumber(`${pathPrefix}.retry.multiplier`, retryOverride.multiplier, 1, 10),
+  };
+  if (retry.initialDelayMs > retry.maxDelayMs) {
+    throw new ConfigValidationError(
+      `${pathPrefix}.retry.initialDelayMs`,
+      `must be less than or equal to ${pathPrefix}.retry.maxDelayMs (${retry.maxDelayMs}), received ${retry.initialDelayMs}`,
+    );
+  }
+  return { requestTimeoutMs, retry };
+}
+
+function normalizeBaseUrl(llm: Record<string, unknown>): void {
+  validateStringField(llm, "baseUrl");
+  validateStringField(llm, "baseURL");
+  if (llm.baseUrl !== undefined && llm.baseURL !== undefined && llm.baseUrl !== llm.baseURL) {
+    throw new ConfigValidationError(
+      "llm.baseUrl",
+      "conflicts with legacy llm.baseURL; remove llm.baseURL or make both values identical",
+    );
+  }
+  if (llm.baseUrl === undefined && llm.baseURL !== undefined) llm.baseUrl = llm.baseURL;
+  delete llm.baseURL;
+}
+
 function validateLlmObject(
   value: unknown,
   providerOverride?: LlmProvider,
@@ -344,9 +627,14 @@ function validateLlmObject(
     }
   }
 
-  for (const key of ["provider", "model", "apiKey", "baseURL", "apiMode", "reasoningEffort"]) {
+  for (const key of ["provider", "model", "apiKey", "apiMode", "reasoningEffort"]) {
     validateStringField(llm, key);
   }
+  normalizeBaseUrl(llm);
+  resolveLlmRequestPolicy(
+    { requestTimeoutMs: DEFAULT_LLM_REQUEST_TIMEOUT_MS, retry: { ...DEFAULT_LLM_RETRY_POLICY } },
+    { requestTimeoutMs: llm.requestTimeoutMs, retry: llm.retry },
+  );
 
   if (providerOverride !== undefined) {
     llm.provider = providerOverride;
@@ -380,9 +668,15 @@ function parseConfigRoot(content: string, providerOverride?: LlmProvider): Recor
     invalidType("$", parsed, "a JSON object");
   }
   const root = { ...(parsed as Record<string, unknown>) };
+  validateKnownConfigSections(root);
   const llm = validateLlmObject(root.llm, providerOverride);
   if (llm !== undefined) root.llm = llm;
   return root;
+}
+
+/** Parse and normalize stored configuration without applying defaults or environment values. */
+export function parseStoredConfig(content: string): Record<string, unknown> {
+  return parseConfigRoot(content);
 }
 
 function requireNonEmpty(value: string, path: string, provider: LlmProvider): void {
@@ -394,9 +688,9 @@ function requireNonEmpty(value: string, path: string, provider: LlmProvider): vo
   }
 }
 
-function isPublicOpenAIBaseURL(baseURL: string): boolean {
+function isPublicOpenAIBaseURL(baseUrl: string): boolean {
   try {
-    return new URL(baseURL).hostname.toLowerCase().replace(/\.+$/, "") === "api.openai.com";
+    return new URL(baseUrl).hostname.toLowerCase().replace(/\.+$/, "") === "api.openai.com";
   } catch {
     return false;
   }
@@ -411,17 +705,17 @@ function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: Readonl
 
   if (llm.provider === "openai") {
     requireNonEmpty(llm.model, "llm.model", llm.provider);
-    requireNonEmpty(llm.baseURL, "llm.baseURL", llm.provider);
-    let baseURL: URL;
+    requireNonEmpty(llm.baseUrl, "llm.baseUrl", llm.provider);
+    let baseUrl: URL;
     try {
-      baseURL = new URL(llm.baseURL);
+      baseUrl = new URL(llm.baseUrl);
     } catch {
-      throw new ConfigValidationError("llm.baseURL", `expected an absolute HTTP(S) URL, received string ${displayValue("llm.baseURL", llm.baseURL)}`);
+      throw new ConfigValidationError("llm.baseUrl", `expected an absolute HTTP(S) URL, received string ${displayValue("llm.baseUrl", llm.baseUrl)}`);
     }
-    if (!(["http:", "https:"] as const).includes(baseURL.protocol as "http:" | "https:")) {
-      throw new ConfigValidationError("llm.baseURL", `expected an absolute HTTP(S) URL, received string ${displayValue("llm.baseURL", llm.baseURL)}`);
+    if (!(["http:", "https:"] as const).includes(baseUrl.protocol as "http:" | "https:")) {
+      throw new ConfigValidationError("llm.baseUrl", `expected an absolute HTTP(S) URL, received string ${displayValue("llm.baseUrl", llm.baseUrl)}`);
     }
-    if (isPublicOpenAIBaseURL(llm.baseURL)) {
+    if (isPublicOpenAIBaseURL(llm.baseUrl)) {
       requireNonEmpty(llm.apiKey ?? "", "llm.apiKey", llm.provider);
     }
     llm.apiMode ??= "chat-completions";
@@ -436,6 +730,12 @@ function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: Readonl
       throw new ConfigValidationError(
         "llm.reasoningEffort",
         `is only valid when llm.provider is "openai" and llm.apiMode is "responses"`,
+      );
+    }
+    if (explicitlyConfigured.has("requestTimeoutMs") || explicitlyConfigured.has("retry")) {
+      throw new ConfigValidationError(
+        explicitlyConfigured.has("requestTimeoutMs") ? "llm.requestTimeoutMs" : "llm.retry",
+        `is only valid when llm.provider is "openai"`,
       );
     }
   }
@@ -462,6 +762,9 @@ export function parseDaemonConfig(
     invalidType("overrides", overrides, "an object");
   }
   const normalizedOverrides = { ...(overrides as Record<string, unknown>) };
+  // Port 0 is an internal runtime/testing escape hatch for ephemeral binding.
+  // Persisted configuration must always name a reconnectable TCP port.
+  validateKnownConfigSections(normalizedOverrides, { allowEphemeralDaemonPort: true });
   const overrideLlm = validateLlmObject(normalizedOverrides.llm, providerOverride);
   if (overrideLlm !== undefined) normalizedOverrides.llm = overrideLlm;
 
@@ -475,6 +778,12 @@ export function parseDaemonConfig(
   // applies before any untrusted key reaches the result object.
   const withFile = deepMerge(structuredClone(DEFAULTS) as Record<string, unknown>, fileConfig);
   const merged = deepMerge(withFile, normalizedOverrides) as DaemonConfig;
+  const effectivePolicy = resolveLlmRequestPolicy(
+    { requestTimeoutMs: DEFAULT_LLM_REQUEST_TIMEOUT_MS, retry: { ...DEFAULT_LLM_RETRY_POLICY } },
+    { requestTimeoutMs: merged.llm.requestTimeoutMs, retry: merged.llm.retry },
+  );
+  merged.llm.requestTimeoutMs = effectivePolicy.requestTimeoutMs;
+  merged.llm.retry = effectivePolicy.retry;
   // Migrate legacy mergeMaxEntries (renamed to dedupCandidateLimit)
   const thresholds = merged.compaction.promotionThresholds as Record<string, unknown>;
   if (thresholds["mergeMaxEntries"] !== undefined && thresholds["dedupCandidateLimit"] === undefined) {
@@ -492,7 +801,12 @@ export function parseDaemonConfig(
       delete merged.llm.reasoningEffort;
       explicitLlmKeys.delete("apiMode");
       explicitLlmKeys.delete("reasoningEffort");
+      explicitLlmKeys.delete("requestTimeoutMs");
+      explicitLlmKeys.delete("retry");
     }
+  }
+  if (env.LCM_SUMMARY_MODEL !== undefined) {
+    merged.llm.model = env.LCM_SUMMARY_MODEL;
   }
 
   // Migrate old config names to new names for backward compatibility
@@ -517,7 +831,7 @@ export function parseDaemonConfig(
   if (!merged.llm.apiKey && merged.llm.provider === "anthropic") {
     merged.llm.apiKey = env.LCM_SUMMARY_API_KEY || env.ANTHROPIC_API_KEY || "";
   }
-  if (!merged.llm.apiKey && merged.llm.provider === "openai" && isPublicOpenAIBaseURL(merged.llm.baseURL)) {
+  if (!merged.llm.apiKey && merged.llm.provider === "openai" && isPublicOpenAIBaseURL(merged.llm.baseUrl)) {
     merged.llm.apiKey = env.LCM_SUMMARY_API_KEY || env.OPENAI_API_KEY || "";
   }
 

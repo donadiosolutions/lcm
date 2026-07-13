@@ -302,7 +302,8 @@ describe("summarizer picker", () => {
     expect(configCall).toBeDefined();
     const written = JSON.parse(configCall![1]);
     expect(written.llm.provider).toBe("openai");
-    expect(written.llm.baseURL).toBe("http://192.168.1.5:8080/v1");
+    expect(written.llm.baseUrl).toBe("http://192.168.1.5:8080/v1");
+    expect(written.llm.baseURL).toBeUndefined();
     expect(written.llm.model).toBe("my-model");
   });
 

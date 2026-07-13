@@ -1,6 +1,13 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { getLcmConnection, closeLcmConnection } from "../../db/connection.js";
-import { LLM_REASONING_EFFORTS, type DaemonConfig, type LlmReasoningEffort } from "../config.js";
+import {
+  ConfigValidationError,
+  LLM_REASONING_EFFORTS,
+  resolveLlmRequestPolicy,
+  type DaemonConfig,
+  type LlmReasoningEffort,
+  type LlmRequestPolicy,
+} from "../config.js";
 import { projectPaths, ensureProjectDir, isSafeTranscriptPath } from "../project.js";
 import { enqueue } from "../project-queue.js";
 import { sendJson } from "../server.js";
@@ -28,6 +35,8 @@ interface CompactRequestBody {
   client?: CompactClient;
   previous_summary?: string;
   reasoning_effort?: unknown;
+  request_timeout_ms?: unknown;
+  retry?: unknown;
 }
 
 const COMPACT_CLIENTS: readonly CompactClient[] = ["claude", "codex"];
@@ -57,7 +66,37 @@ function validateCompactRequestBody(input: Record<string, unknown>): string | un
   if (input.reasoning_effort !== undefined && typeof input.reasoning_effort !== "string") {
     return "reasoning_effort must be a string";
   }
+  if (input.request_timeout_ms !== undefined && typeof input.request_timeout_ms !== "number") {
+    return "request_timeout_ms must be a number";
+  }
+  if (input.retry !== undefined && (typeof input.retry !== "object" || input.retry === null || Array.isArray(input.retry))) {
+    return "retry must be an object";
+  }
   return undefined;
+}
+
+function resolveCompactRequestPolicy(config: DaemonConfig, input: CompactRequestBody): LlmRequestPolicy {
+  const retryInput = input.retry as Record<string, unknown> | undefined;
+  let retry: Record<string, unknown> | undefined;
+  if (retryInput !== undefined) {
+    const keyMap: Readonly<Record<string, string>> = {
+      max_attempts: "maxAttempts",
+      initial_delay_ms: "initialDelayMs",
+      max_delay_ms: "maxDelayMs",
+      multiplier: "multiplier",
+    };
+    retry = {};
+    for (const [key, value] of Object.entries(retryInput)) {
+      const canonical = keyMap[key];
+      if (!canonical) throw new ConfigValidationError(`retry.${key}`, `unknown retry policy key ${JSON.stringify(key)}`);
+      retry[canonical] = value;
+    }
+  }
+  return resolveLlmRequestPolicy(
+    { requestTimeoutMs: config.llm.requestTimeoutMs, retry: config.llm.retry },
+    { requestTimeoutMs: input.request_timeout_ms, retry },
+    "compact",
+  );
 }
 
 function fmtN(n: number): string {
@@ -182,6 +221,22 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
     const effectiveReasoningEffort = effectiveProvider === "openai" && apiMode === "responses"
       ? reasoningEffortOverride ?? config.llm.reasoningEffort
       : undefined;
+    const hasRequestPolicyOverride = input.request_timeout_ms !== undefined || input.retry !== undefined;
+    if (hasRequestPolicyOverride && effectiveProvider !== "openai") {
+      sendJson(res, 400, { error: "request_timeout_ms and retry require llm.provider=\"openai\"" });
+      return;
+    }
+    let effectiveRequestPolicy: LlmRequestPolicy | undefined;
+    if (effectiveProvider === "openai") {
+      try {
+        effectiveRequestPolicy = resolveCompactRequestPolicy(config, input);
+      } catch (error) {
+        sendJson(res, 400, {
+          error: error instanceof ConfigValidationError ? error.message : "Invalid request policy",
+        });
+        return;
+      }
+    }
 
     // Guard must be checked and set synchronously (before any await) to prevent
     // concurrent requests from racing through the has() check before add() runs.
@@ -201,7 +256,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
     const providerLabel = providerLabels[effectiveProvider] ?? effectiveProvider;
 
     try {
-      const summarize = await getSummarizer(effectiveProvider, effectiveReasoningEffort);
+      const summarize = await getSummarizer(effectiveProvider, effectiveReasoningEffort, effectiveRequestPolicy);
       if (!summarize) {
         sendJson(res, 200, {
           summary: "Summarization disabled — no summarizer configured.",
@@ -209,6 +264,8 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
           providerLabel,
           apiMode,
           reasoningEffort: effectiveReasoningEffort ?? null,
+          requestTimeoutMs: effectiveRequestPolicy?.requestTimeoutMs ?? null,
+          retry: effectiveRequestPolicy?.retry ?? null,
         });
         return;
       }
@@ -271,6 +328,8 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
               providerLabel,
               apiMode,
               reasoningEffort: effectiveReasoningEffort ?? null,
+              requestTimeoutMs: effectiveRequestPolicy?.requestTimeoutMs ?? null,
+              retry: effectiveRequestPolicy?.retry ?? null,
             };
           }
 
@@ -347,6 +406,8 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
             providerLabel,
             apiMode,
             reasoningEffort: effectiveReasoningEffort ?? null,
+            requestTimeoutMs: effectiveRequestPolicy?.requestTimeoutMs ?? null,
+            retry: effectiveRequestPolicy?.retry ?? null,
           };
         } finally {
           closeLcmConnection(dbPath);

@@ -125,6 +125,59 @@ describe("batch compaction discovery", () => {
     expect(result).toEqual({ compacted: 1, failures: 1 });
     expect(post).toHaveBeenCalledTimes(2);
   });
+
+  it("counts each successful session once and falls back to discovered input tokens", async () => {
+    const cwd = makeDir("compact-aggregate-totals");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }, null, 2) + "\n");
+    seedConversations(paths.dbPath);
+    const post = vi.spyOn(DaemonClient.prototype, "post")
+      .mockResolvedValueOnce({ tokensAfter: 60 })
+      .mockResolvedValueOnce({ tokensBefore: 300, tokensAfter: 30 });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Record<string, unknown>> = [];
+
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      verbose: true,
+      requestPolicy: {
+        requestTimeoutMs: 120_000,
+        retry: { maxAttempts: 4, initialDelayMs: 500, maxDelayMs: 10_000, multiplier: 2 },
+      },
+      onProgress: patch => progress.push(patch),
+    });
+
+    expect(result).toEqual({ compacted: 2, failures: 0 });
+    expect(progress.at(-1)).toMatchObject({
+      completed: 2,
+      messagesIn: 2,
+      tokensIn: 550,
+      tokensOut: 90,
+      lastResult: {
+        sessionId: "session-2",
+        tokensBefore: 300,
+        tokensAfter: 30,
+      },
+    });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(
+      "2 sessions compacted, 0.6k → 0.1k tokens (84% reduction, 0.5k freed)",
+    ));
+    expect(log).toHaveBeenCalledWith(" done  (0.3k → 0.1k tokens, 76% reduction)");
+    expect(post).toHaveBeenNthCalledWith(1, "/compact", expect.objectContaining({
+      request_timeout_ms: 120_000,
+      retry: {
+        max_attempts: 4,
+        initial_delay_ms: 500,
+        max_delay_ms: 10_000,
+        multiplier: 2,
+      },
+    }));
+  });
 });
 
 describe("formatLlmDiagnostic", () => {
@@ -146,5 +199,16 @@ describe("formatLlmDiagnostic", () => {
 
   it("preserves the existing provider-only diagnostic for other providers", () => {
     expect(formatLlmDiagnostic({ providerLabel: "Codex (process)" })).toBe("Codex (process)");
+  });
+
+  it("includes the effective request timeout and retry policy", () => {
+    expect(formatLlmDiagnostic({
+      providerLabel: "OpenAI-compatible API",
+      apiMode: "chat-completions",
+      requestTimeoutMs: 120_000,
+      retry: { maxAttempts: 4, initialDelayMs: 500, maxDelayMs: 10_000, multiplier: 2 },
+    })).toBe(
+      "OpenAI-compatible API · chat-completions · timeout=120000ms · retry=4 attempts (500-10000ms ×2)",
+    );
   });
 });

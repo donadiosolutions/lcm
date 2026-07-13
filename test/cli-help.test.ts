@@ -48,11 +48,36 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("--dry-run");
     expect(text).toContain("--replay");
     expect(text).toContain("--reasoning-effort <level>");
+    expect(text).toContain("--timeout-ms <ms>");
+    expect(text).toContain("--retry-max-attempts <n>");
+    expect(text).toContain("--retry-initial-delay-ms <ms>");
+    expect(text).toContain("--retry-max-delay-ms <ms>");
+    expect(text).toContain("--retry-multiplier <n>");
     expect(text).toContain("none, minimal, low, medium, high, or xhigh");
     expect(text).toContain("overrides llm.reasoningEffort for this invocation without rewriting ~/.lcm/config.json");
     expect(text).toContain("llm.provider=openai with llm.apiMode=responses");
     expect(text).toContain("lcm compact --reasoning-effort high");
+    expect(text).toContain("lcm compact --timeout-ms 120000 --retry-max-attempts 4");
     expect(text).toContain("Examples:");
+  });
+
+  it("prints config command help with masking and restart guidance", () => {
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    printHelp("config");
+    const text = out.mock.calls.map(c => c[0]).join("");
+    expect(text).toContain("lcm config <get|set>");
+    expect(text).toContain("--effective");
+    expect(text).toContain("--json");
+    expect(text).toContain("always masked");
+    expect(text).toContain("lcm daemon restart");
+  });
+
+  it("prints daemon restart help", () => {
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    printHelp("daemon");
+    const text = out.mock.calls.map(c => c[0]).join("");
+    expect(text).toContain("lcm daemon <start|restart>");
+    expect(text).toContain("lcm daemon restart");
   });
 
   it("prints sensitive command help with purge warning", () => {

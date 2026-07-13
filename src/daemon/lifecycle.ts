@@ -40,6 +40,18 @@ export type EnsureDaemonResult = {
   warning?: string;
 };
 
+export type RestartDaemonOptions = EnsureDaemonOptions & {
+  /** Optional caller validation hook. It always completes before any signal is sent. */
+  validateBeforeRestart?: () => void | Promise<void>;
+  _ensureDaemonOverride?: (options: EnsureDaemonOptions) => Promise<EnsureDaemonResult>;
+  _isManagedProcessOverride?: (pid: number) => boolean;
+};
+
+export type RestartDaemonResult = EnsureDaemonResult & {
+  restarted: boolean;
+  stoppedPid?: number;
+};
+
 type HealthResponse = {
   status: string;
   version?: string;
@@ -640,4 +652,56 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const combinedWarning = warning && detachedWarning ? `${warning}; ${detachedWarning}` : warning ?? detachedWarning;
   cleanupSystemdCredentials?.();
   return { connected: false, port: opts.port, spawned: true, startMethod, warning: combinedWarning, restartedForParent };
+}
+
+/**
+ * Safely stop the verified PID-file daemon and ensure a daemon is running with
+ * the caller's already-resolved options. Callers should derive `port` and other
+ * options from validated configuration; `validateBeforeRestart` is available
+ * when validation and restart need to be kept in one operation.
+ */
+export async function restartDaemon(opts: RestartDaemonOptions): Promise<RestartDaemonResult> {
+  const {
+    validateBeforeRestart,
+    _ensureDaemonOverride,
+    _isManagedProcessOverride,
+    ...ensureOptions
+  } = opts;
+  await validateBeforeRestart?.();
+
+  const isAlive = opts._isProcessAliveOverride ?? isProcessAlive;
+  const isManaged = _isManagedProcessOverride ?? ((pid: number) => isLikelyLcmDaemonProcess(pid, opts._procRoot ?? "/proc"));
+  const killProcess = opts._killOverride ?? ((pid: number, signal?: NodeJS.Signals | number) => {
+    process.kill(pid, signal);
+  });
+  const sleepFn = opts._sleepOverride ?? sleep;
+  let restarted = false;
+  let stoppedPid: number | undefined;
+
+  const pid = readPidFile(opts.pidFilePath);
+  if (pid === null) {
+    cleanStalePid(opts.pidFilePath);
+  } else if (!isAlive(pid)) {
+    cleanStalePid(opts.pidFilePath);
+  } else {
+    if (!isManaged(pid)) {
+      throw new Error(`Refusing to restart: PID ${pid} is running but is not a verified LCM daemon.`);
+    }
+    await terminatePid(pid, { isAlive, killProcess, sleepFn });
+    if (isAlive(pid)) {
+      throw new Error(`Unable to stop verified LCM daemon PID ${pid}; restart aborted.`);
+    }
+    cleanStalePid(opts.pidFilePath);
+    restarted = true;
+    stoppedPid = pid;
+  }
+
+  const ensure = _ensureDaemonOverride ?? ensureDaemon;
+  const result = await ensure(ensureOptions);
+  if (!restarted && result.connected && !result.spawned) {
+    throw new Error(
+      "Refusing to report a restart: a daemon is reachable but no verified daemon PID was available to stop.",
+    );
+  }
+  return { ...result, restarted, stoppedPid };
 }

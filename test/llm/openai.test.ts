@@ -1,3 +1,4 @@
+import { createServer } from "node:http";
 import { describe, it, expect, vi } from "vitest";
 import { createOpenAISummarizer } from "../../src/llm/openai.js";
 
@@ -211,7 +212,7 @@ describe("createOpenAISummarizer", () => {
     expect(mockClient.chat.completions.create).toHaveBeenCalledTimes(3);
   });
 
-  it("safely wraps a non-Error rejection after retries", async () => {
+  it("safely wraps an unclassified rejection without retrying", async () => {
     const secretRejection = "provider rejected PRIVATE PROMPT with sk-secret";
     const mockClient = {
       chat: { completions: { create: vi.fn().mockRejectedValue(secretRejection) } },
@@ -231,16 +232,16 @@ describe("createOpenAISummarizer", () => {
     }
 
     expect(thrown).toBeInstanceOf(Error);
-    expect((thrown as Error).message).toContain("OpenAI Chat Completions request failed after retries");
+    expect((thrown as Error).message).toContain("OpenAI Chat Completions request rejected");
     expect((thrown as Error).message).toContain("api mode chat-completions");
     expect((thrown as Error).message).toContain('model "test-model\\nFORGED LOG LINE"');
     expect((thrown as Error).message).not.toContain(secretRejection);
     expect((thrown as Error).message).not.toContain("PRIVATE PROMPT");
     expect((thrown as Error).message).not.toContain("sk-secret");
-    expect(mockClient.chat.completions.create).toHaveBeenCalledTimes(3);
+    expect(mockClient.chat.completions.create).toHaveBeenCalledOnce();
   });
 
-  it.each([400, 403, 404, 409, 422])(
+  it.each([400, 403, 404, 422])(
     "safely wraps a Chat Completions %s configuration error without retrying",
     async (status) => {
       const secretPrompt = "PRIVATE CHAT PROMPT";
@@ -462,5 +463,89 @@ describe("createOpenAISummarizer", () => {
     });
 
     await expect(summarizer(longText, false)).resolves.toBe(longText.slice(0, 500));
+  });
+
+  it("uses exact bounded backoff and succeeds within the configured attempt count", async () => {
+    const create = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error("busy"), { status: 409, code: "conflict" }))
+      .mockRejectedValueOnce(Object.assign(new Error("busy"), { status: 500 }))
+      .mockRejectedValueOnce(Object.assign(new Error("busy"), { status: 429 }))
+      .mockResolvedValueOnce({ choices: [{ message: { content: "Recovered." } }] });
+    const delays: number[] = [];
+    const summarizer = createOpenAISummarizer({
+      model: "test-model",
+      baseUrl: "http://localhost/v1",
+      retry: { maxAttempts: 4, initialDelayMs: 10, maxDelayMs: 25, multiplier: 2 },
+      _clientOverride: { chat: { completions: { create } } } as any,
+      _sleep: async (ms) => { delays.push(ms); },
+    });
+
+    await expect(summarizer("text", false)).resolves.toBe("Recovered.");
+    expect(create).toHaveBeenCalledTimes(4);
+    expect(delays).toEqual([10, 20, 25]);
+  });
+
+  it.each([408, 409, 429, 500, 503])("retries HTTP %s", async (status) => {
+    const create = vi.fn().mockRejectedValue(Object.assign(new Error("provider body secret"), { status }));
+    const summarizer = createOpenAISummarizer({
+      model: "test-model",
+      baseUrl: "http://localhost/v1",
+      retry: { maxAttempts: 2, initialDelayMs: 0, maxDelayMs: 0, multiplier: 2 },
+      _clientOverride: { chat: { completions: { create } } } as any,
+    });
+    await expect(summarizer("private prompt", false)).rejects.toThrow("attempts 2/2");
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["APIConnectionError", "APIConnectionTimeoutError"])("retries %s failures", async (name) => {
+    const create = vi.fn().mockRejectedValue(Object.assign(new Error("connection secret"), { name }));
+    const summarizer = createOpenAISummarizer({
+      model: "test-model",
+      baseUrl: "http://localhost/v1",
+      retry: { maxAttempts: 2, initialDelayMs: 0, maxDelayMs: 0, multiplier: 2 },
+      _clientOverride: { chat: { completions: { create } } } as any,
+    });
+    await expect(summarizer("private prompt", false)).rejects.toThrow("attempts 2/2");
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("talks to an actual loopback OpenAI-v1 Chat Completions server", async () => {
+    const requests: string[] = [];
+    const authorizationHeaders: Array<string | undefined> = [];
+    const server = createServer((req, res) => {
+      let body = "";
+      req.setEncoding("utf8");
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        requests.push(body);
+        authorizationHeaders.push(req.headers.authorization);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          id: "chatcmpl-test",
+          object: "chat.completion",
+          created: 0,
+          model: "loopback-model",
+          choices: [{ index: 0, message: { role: "assistant", content: "Loopback summary." }, finish_reason: "stop" }],
+        }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("loopback server did not bind");
+      const summarizer = createOpenAISummarizer({
+        model: "loopback-model",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        apiKey: "sk-loopback-test",
+        requestTimeoutMs: 5_000,
+        retry: { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0, multiplier: 1 },
+      });
+      await expect(summarizer("Loopback conversation", false)).resolves.toBe("Loopback summary.");
+      expect(requests).toHaveLength(1);
+      expect(JSON.parse(requests[0])).toMatchObject({ model: "loopback-model" });
+      expect(authorizationHeaders).toEqual(["Bearer sk-loopback-test"]);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
   });
 });

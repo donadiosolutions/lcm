@@ -54,7 +54,14 @@ function makeConfig(provider: DaemonConfig["llm"]["provider"]): DaemonConfig {
       promotionThresholds: { minDepth: 2, compressionRatio: 0.3, keywords: {}, architecturePatterns: [], dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
     },
     restoration: { recentSummaries: 3, promptSearchMinScore: 10, promptSearchMaxResults: 3, promptSnippetLength: 200, recencyHalfLifeHours: 24, crossSessionAffinity: 0.5 },
-    llm: { provider, model: "test-model", apiKey: "sk-test", baseURL: "http://localhost:11435/v1" },
+    llm: {
+      provider,
+      model: "test-model",
+      apiKey: "sk-test",
+      baseUrl: "http://localhost:11435/v1",
+      requestTimeoutMs: 600_000,
+      retry: { maxAttempts: 3, initialDelayMs: 1_000, maxDelayMs: 30_000, multiplier: 2 },
+    },
     claudeCliProxy: { enabled: true, port: 3456, startupTimeoutMs: 10000, model: "claude-haiku-4-5" },
     cipher: { configPath: "/tmp/cipher.yml", collection: "test" },
     security: { sensitivePatterns: [] },
@@ -248,7 +255,12 @@ describe("createCompactHandler — summarizer branching", () => {
     const { res } = mockRes();
     await handler({} as any, res, JSON.stringify({ session_id: "s1", cwd: testCwd }));
     expect(createOpenAISummarizer).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "test-model", baseURL: "http://localhost:11435/v1" })
+      expect.objectContaining({
+        model: "test-model",
+        baseUrl: "http://localhost:11435/v1",
+        requestTimeoutMs: 600_000,
+        retry: { maxAttempts: 3, initialDelayMs: 1_000, maxDelayMs: 30_000, multiplier: 2 },
+      })
     );
     expect(createAnthropicSummarizer).not.toHaveBeenCalled();
   });
@@ -392,6 +404,68 @@ describe("createCompactHandler — summarizer branching", () => {
     expect(createOpenAISummarizer).toHaveBeenCalledTimes(2);
     expect(createOpenAISummarizer).toHaveBeenNthCalledWith(1, expect.objectContaining({ reasoningEffort: "low" }));
     expect(createOpenAISummarizer).toHaveBeenNthCalledWith(2, expect.objectContaining({ reasoningEffort: "high" }));
+  });
+
+  it("validates and applies one-invocation OpenAI timeout and retry overrides", async () => {
+    vi.clearAllMocks();
+    const handler = createCompactHandler(makeConfig("openai"));
+    const { res, getBody } = mockRes();
+    await handler({} as any, res, JSON.stringify({
+      session_id: "policy-override",
+      cwd: testCwd,
+      request_timeout_ms: 45_000,
+      retry: { max_attempts: 5, initial_delay_ms: 250, max_delay_ms: 2_000, multiplier: 1.5 },
+    }));
+
+    expect(createOpenAISummarizer).toHaveBeenCalledWith(expect.objectContaining({
+      requestTimeoutMs: 45_000,
+      retry: { maxAttempts: 5, initialDelayMs: 250, maxDelayMs: 2_000, multiplier: 1.5 },
+    }));
+    expect(getBody()).toMatchObject({
+      requestTimeoutMs: 45_000,
+      retry: { maxAttempts: 5, initialDelayMs: 250, maxDelayMs: 2_000, multiplier: 1.5 },
+    });
+  });
+
+  it("rejects invalid or unsupported request policy overrides before creating a summarizer", async () => {
+    vi.clearAllMocks();
+    const openaiHandler = createCompactHandler(makeConfig("openai"));
+    const { res: invalidRes, getBody: getInvalidBody } = mockRes();
+    await openaiHandler({} as any, invalidRes, JSON.stringify({
+      session_id: "policy-invalid",
+      cwd: testCwd,
+      retry: { max_attempts: 0 },
+    }));
+    expect(invalidRes.writeHead).toHaveBeenCalledWith(400, expect.anything());
+    expect(getInvalidBody().error).toContain("maxAttempts");
+
+    const processHandler = createCompactHandler(makeConfig("claude-process"));
+    const { res: unsupportedRes, getBody: getUnsupportedBody } = mockRes();
+    await processHandler({} as any, unsupportedRes, JSON.stringify({
+      session_id: "policy-unsupported",
+      cwd: testCwd,
+      request_timeout_ms: 30_000,
+    }));
+    expect(unsupportedRes.writeHead).toHaveBeenCalledWith(400, expect.anything());
+    expect(getUnsupportedBody().error).toContain('llm.provider="openai"');
+    expect(createOpenAISummarizer).not.toHaveBeenCalled();
+    expect(createClaudeProcessSummarizer).not.toHaveBeenCalled();
+  });
+
+  it("isolates cached OpenAI summarizers by effective request policy", async () => {
+    vi.clearAllMocks();
+    const handler = createCompactHandler(makeConfig("openai"));
+    const { res: first } = mockRes();
+    const { res: second } = mockRes();
+    await handler({} as any, first, JSON.stringify({
+      session_id: "policy-cache-one", cwd: testCwd, request_timeout_ms: 10_000,
+    }));
+    await handler({} as any, second, JSON.stringify({
+      session_id: "policy-cache-two", cwd: testCwd, request_timeout_ms: 20_000,
+    }));
+    expect(createOpenAISummarizer).toHaveBeenCalledTimes(2);
+    expect(createOpenAISummarizer).toHaveBeenNthCalledWith(1, expect.objectContaining({ requestTimeoutMs: 10_000 }));
+    expect(createOpenAISummarizer).toHaveBeenNthCalledWith(2, expect.objectContaining({ requestTimeoutMs: 20_000 }));
   });
 });
 

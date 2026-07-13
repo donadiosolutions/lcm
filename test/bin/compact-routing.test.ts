@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { Command, Option } from "commander";
-import { LLM_REASONING_EFFORTS } from "../../src/daemon/config.js";
-import { compactFailureExitCode, withHookOverrides } from "../../bin/lcm.js";
+import { LLM_REASONING_EFFORTS, parseDaemonConfig } from "../../src/daemon/config.js";
+import { compactFailureExitCode, resolveCompactRequestPolicyOverride, withHookOverrides } from "../../bin/lcm.js";
 
 /** Minimal replica of the compact command's option setup. */
 function makeCompactCmd() {
@@ -11,6 +11,11 @@ function makeCompactCmd() {
   cmd.option("--replay");
   cmd.option("-v, --verbose");
   cmd.addOption(new Option("--reasoning-effort <value>").choices([...LLM_REASONING_EFFORTS]));
+  cmd.option("--timeout-ms <ms>");
+  cmd.option("--retry-max-attempts <n>");
+  cmd.option("--retry-initial-delay-ms <ms>");
+  cmd.option("--retry-max-delay-ms <ms>");
+  cmd.option("--retry-multiplier <n>");
   cmd.addOption(new Option("--hook", "Hook dispatch mode (internal)").hideHelp());
   return cmd;
 }
@@ -46,6 +51,31 @@ describe("compact command --hook routing", () => {
     await cmd.parseAsync(["--reasoning-effort", "high"], { from: "user" });
     expect(cmd.opts().reasoningEffort).toBe("high");
   });
+
+  it("parses and resolves one-invocation timeout and retry overrides", async () => {
+    const cmd = makeCompactCmd();
+    await cmd.parseAsync([
+      "--timeout-ms", "120000",
+      "--retry-max-attempts", "4",
+      "--retry-initial-delay-ms", "500",
+      "--retry-max-delay-ms", "10000",
+      "--retry-multiplier", "2.5",
+    ], { from: "user" });
+    const config = parseDaemonConfig(JSON.stringify({
+      llm: { provider: "openai", model: "local", baseUrl: "http://localhost:11435/v1" },
+    }));
+
+    expect(resolveCompactRequestPolicyOverride(config, cmd.opts())).toEqual({
+      requestTimeoutMs: 120000,
+      retry: { maxAttempts: 4, initialDelayMs: 500, maxDelayMs: 10000, multiplier: 2.5 },
+    });
+  });
+
+  it("rejects timeout and retry overrides for process providers", () => {
+    const config = parseDaemonConfig(JSON.stringify({ llm: { provider: "codex-process" } }));
+    expect(() => resolveCompactRequestPolicyOverride(config, { timeoutMs: "1000" }))
+      .toThrow("require llm.provider=\"openai\"");
+  });
 });
 
 describe("withHookOverrides", () => {
@@ -59,6 +89,26 @@ describe("withHookOverrides", () => {
       cwd: "/tmp/project",
       client: "codex",
       reasoning_effort: "high",
+    });
+  });
+
+  it("adds one-invocation timeout and retry overrides using daemon wire names", () => {
+    expect(JSON.parse(withHookOverrides(
+      JSON.stringify({ session_id: "session-1", cwd: "/tmp/project" }),
+      "codex",
+      undefined,
+      {
+        requestTimeoutMs: 120000,
+        retry: { maxAttempts: 4, initialDelayMs: 500, maxDelayMs: 10000, multiplier: 2 },
+      },
+    ))).toMatchObject({
+      request_timeout_ms: 120000,
+      retry: {
+        max_attempts: 4,
+        initial_delay_ms: 500,
+        max_delay_ms: 10000,
+        multiplier: 2,
+      },
     });
   });
 

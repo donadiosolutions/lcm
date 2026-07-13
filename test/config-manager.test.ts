@@ -1,0 +1,290 @@
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  ConfigManagerError,
+  formatConfigValue,
+  getConfigValue,
+  maskConfigSecrets,
+  normalizeConfigPath,
+  parseConfigPath,
+  parseConfigValue,
+  setConfigValue,
+} from "../src/config-manager.js";
+
+const tempDirs: string[] = [];
+
+function makeConfig(content: unknown): { directory: string; configPath: string } {
+  const directory = mkdtempSync(join(tmpdir(), "lcm-config-manager-"));
+  tempDirs.push(directory);
+  const configPath = join(directory, "config.json");
+  writeFileSync(configPath, `${JSON.stringify(content, null, 2)}\n`);
+  return { directory, configPath };
+}
+
+afterEach(() => {
+  for (const directory of tempDirs.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+describe("config manager paths and values", () => {
+  it("canonicalizes the legacy baseURL path and rejects unsafe paths", () => {
+    expect(parseConfigPath("llm.baseURL")).toEqual(["llm", "baseUrl"]);
+    expect(normalizeConfigPath("llm.baseURL")).toBe("llm.baseUrl");
+    for (const path of ["", ".llm", "llm.", "llm..model", "__proto__.polluted", "llm.constructor.value", "prototype.x"]) {
+      expect(() => parseConfigPath(path)).toThrow(ConfigManagerError);
+    }
+  });
+
+  it("parses string and typed JSON values and formats CLI output", () => {
+    expect(parseConfigValue("false")).toBe("false");
+    expect(parseConfigValue("false", true)).toBe(false);
+    expect(parseConfigValue("[1,2]", true)).toEqual([1, 2]);
+    expect(() => parseConfigValue("{", true)).toThrow("Invalid JSON configuration value");
+    expect(formatConfigValue("value")).toBe("value");
+    expect(formatConfigValue({ enabled: true })).toBe('{\n  "enabled": true\n}');
+  });
+
+  it("recursively masks secret-like keys, including scalar reads", () => {
+    expect(maskConfigSecrets({
+      apiKey: "one",
+      nested: { password: "two", safe: "visible" },
+      list: [{ access_token: "three", value: 1 }],
+    })).toEqual({
+      apiKey: "[REDACTED]",
+      nested: { password: "[REDACTED]", safe: "visible" },
+      list: [{ access_token: "[REDACTED]", value: 1 }],
+    });
+    expect(maskConfigSecrets("one", ["llm", "apiKey"])).toBe("[REDACTED]");
+  });
+
+  it("sanitizes credentials and private URL components in direct and nested baseUrl values", () => {
+    const unsafeUrl = "https://private-user:private-password@example.com/v1?token=private-query#private-fragment";
+    const direct = maskConfigSecrets(unsafeUrl, ["llm", "baseUrl"]);
+    const nested = maskConfigSecrets({ llm: { baseURL: unsafeUrl } });
+    for (const output of [String(direct), JSON.stringify(nested)]) {
+      expect(output).not.toContain("private-user");
+      expect(output).not.toContain("private-password");
+      expect(output).not.toContain("private-query");
+      expect(output).not.toContain("private-fragment");
+      expect(output).toContain("REDACTED");
+    }
+  });
+
+  it.each([
+    "user:super-secret@example.com",
+    "not a valid URL containing malformed-secret",
+    "ftp://user:ftp-secret@example.com/v1",
+  ])("redacts opaque, malformed, or non-HTTP baseUrl values wholesale: %s", (unsafeUrl) => {
+    expect(maskConfigSecrets(unsafeUrl, ["llm", "baseUrl"])).toBe("[REDACTED]");
+    expect(maskConfigSecrets({ llm: { baseUrl: unsafeUrl } })).toEqual({
+      llm: { baseUrl: "[REDACTED]" },
+    });
+  });
+
+  it("recursively masks authorization, cookie, private-key, and credential variants", () => {
+    const secrets = [
+      "bearer-secret",
+      "proxy-secret",
+      "cookie-secret",
+      "set-cookie-secret",
+      "private-key-secret",
+      "private-underscore-key-secret",
+      "credential-secret",
+    ];
+    const masked = maskConfigSecrets({
+      extension: {
+        headers: {
+          Authorization: secrets[0],
+          "Proxy-Authorization": secrets[1],
+          Cookie: secrets[2],
+          "Set-Cookie": secrets[3],
+        },
+        privateKey: secrets[4],
+        private_key: secrets[5],
+        credentials: secrets[6],
+        safeLabel: "visible",
+      },
+    });
+    const output = JSON.stringify(masked);
+    for (const secret of secrets) expect(output).not.toContain(secret);
+    expect(masked).toMatchObject({
+      extension: {
+        headers: {
+          Authorization: "[REDACTED]",
+          "Proxy-Authorization": "[REDACTED]",
+          Cookie: "[REDACTED]",
+          "Set-Cookie": "[REDACTED]",
+        },
+        privateKey: "[REDACTED]",
+        private_key: "[REDACTED]",
+        credentials: "[REDACTED]",
+        safeLabel: "visible",
+      },
+    });
+  });
+});
+
+describe("getConfigValue", () => {
+  it("returns normalized stored values without defaults", () => {
+    const { configPath } = makeConfig({ llm: { baseURL: "http://localhost:11434/v1", apiKey: "secret" } });
+    expect(getConfigValue({ configPath, path: "llm.baseURL" })).toBe("http://localhost:11434/v1");
+    expect(getConfigValue({ configPath, path: "llm.apiKey" })).toBe("[REDACTED]");
+    expect(() => getConfigValue({ configPath, path: "daemon.port" })).toThrow("does not exist");
+  });
+
+  it("sanitizes baseUrl secrets for scalar and whole-object stored reads", () => {
+    const secrets = ["stored-user", "stored-password", "stored-query", "stored-fragment"];
+    const unsafeUrl = `https://${secrets[0]}:${secrets[1]}@example.com/v1?token=${secrets[2]}#${secrets[3]}`;
+    const { configPath } = makeConfig({ llm: { baseURL: unsafeUrl, apiKey: "stored-api-key" } });
+
+    const scalar = getConfigValue({ configPath, path: "llm.baseURL" });
+    const object = getConfigValue({ configPath, path: "llm" });
+    expect((object as Record<string, unknown>).apiKey).toBe("[REDACTED]");
+    expect(object).toHaveProperty("baseUrl", scalar);
+    for (const output of [String(scalar), JSON.stringify(object)]) {
+      for (const secret of secrets) expect(output).not.toContain(secret);
+      expect(output).toContain("REDACTED");
+    }
+  });
+
+  it("sanitizes baseUrl secrets for whole-object effective reads", () => {
+    const secrets = ["effective-user", "effective-password", "effective-query", "effective-fragment"];
+    const unsafeUrl = `http://${secrets[0]}:${secrets[1]}@localhost:11435/v1?token=${secrets[2]}#${secrets[3]}`;
+    const { configPath } = makeConfig({
+      llm: { provider: "openai", model: "local-model", baseUrl: unsafeUrl, apiKey: "effective-api-key" },
+    });
+    const object = getConfigValue({ configPath, path: "llm", effective: true, env: {} });
+    const output = JSON.stringify(object);
+    for (const secret of [...secrets, "effective-api-key"]) expect(output).not.toContain(secret);
+    expect(output).toContain("REDACTED");
+  });
+
+  it("masks sensitive extension fields in whole-object reads", () => {
+    const secrets = ["auth-value", "proxy-auth-value", "cookie-value", "private-key-value"];
+    const { configPath } = makeConfig({
+      extensions: {
+        headers: {
+          Authorization: secrets[0],
+          "Proxy-Authorization": secrets[1],
+          cookie: secrets[2],
+        },
+        privateKey: secrets[3],
+        displayName: "safe-extension",
+      },
+    });
+    const extension = getConfigValue({ configPath, path: "extensions" });
+    const output = JSON.stringify(extension);
+    for (const secret of secrets) expect(output).not.toContain(secret);
+    expect(output).toContain("safe-extension");
+    expect(extension).toMatchObject({
+      headers: {
+        Authorization: "[REDACTED]",
+        "Proxy-Authorization": "[REDACTED]",
+        cookie: "[REDACTED]",
+      },
+      privateKey: "[REDACTED]",
+    });
+  });
+
+  it("returns defaults and environment overrides for effective reads", () => {
+    const { configPath } = makeConfig({});
+    expect(getConfigValue({
+      configPath,
+      path: "daemon.port",
+      effective: true,
+      env: { LCM_SUMMARY_PROVIDER: "disabled" },
+    })).toBe(3737);
+  });
+});
+
+describe("setConfigValue", () => {
+  it("creates object parents, preserves unrelated keys, normalizes, and writes mode 0600 atomically", () => {
+    const { directory, configPath } = makeConfig({ version: 1, unrelated: { keep: true } });
+
+    expect(setConfigValue({
+      configPath,
+      path: "hooks.disableAutoCompact",
+      value: "true",
+      json: true,
+      env: { LCM_SUMMARY_PROVIDER: "disabled" },
+    })).toBe(true);
+
+    const stored = JSON.parse(readFileSync(configPath, "utf-8")) as Record<string, unknown>;
+    expect(stored).toMatchObject({
+      version: 1,
+      unrelated: { keep: true },
+      hooks: { disableAutoCompact: true },
+    });
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+    expect(readdirSync(directory).filter((name) => name.startsWith(".lcm-config-"))).toEqual([]);
+  });
+
+  it("writes only the canonical baseUrl spelling", () => {
+    const { configPath } = makeConfig({ llm: { baseURL: "http://old.example/v1" } });
+    setConfigValue({
+      configPath,
+      path: "llm.baseURL",
+      value: "http://new.example/v1",
+      env: { LCM_SUMMARY_PROVIDER: "disabled" },
+    });
+    const stored = JSON.parse(readFileSync(configPath, "utf-8")) as { llm: Record<string, unknown> };
+    expect(stored.llm.baseUrl).toBe("http://new.example/v1");
+    expect(stored.llm).not.toHaveProperty("baseURL");
+  });
+
+  it("masks the returned value for secret paths", () => {
+    const { configPath } = makeConfig({});
+    expect(setConfigValue({
+      configPath,
+      path: "llm.apiKey",
+      value: "very-secret",
+      env: { LCM_SUMMARY_PROVIDER: "disabled" },
+    })).toBe("[REDACTED]");
+  });
+
+  it("rejects traversal through scalars and arrays without changing the file", () => {
+    for (const initial of [{ parent: "scalar" }, { parent: [] }]) {
+      const { configPath } = makeConfig(initial);
+      const before = readFileSync(configPath, "utf-8");
+      expect(() => setConfigValue({
+        configPath,
+        path: "parent.child",
+        value: "value",
+        env: { LCM_SUMMARY_PROVIDER: "disabled" },
+      })).toThrow("non-object segment");
+      expect(readFileSync(configPath, "utf-8")).toBe(before);
+    }
+  });
+
+  it.each([
+    ["llm.provider", "not-a-provider", false, "llm.provider"],
+    ["daemon.port", "not-a-port", false, "daemon.port"],
+    ["daemon.port", "0", true, "daemon.port"],
+    ["daemon.port", "70000", true, "daemon.port"],
+    ["hooks.disableAutoCompact", "false", false, "hooks.disableAutoCompact"],
+  ] as const)("validates the full result before replacing the file when setting %s", (path, value, json, expectedPath) => {
+    const { configPath } = makeConfig({ version: 1 });
+    const before = readFileSync(configPath, "utf-8");
+    expect(() => setConfigValue({ configPath, path, value, json, env: {} })).toThrow(expectedPath);
+    expect(readFileSync(configPath, "utf-8")).toBe(before);
+  });
+
+  it("creates a missing configuration file only after validation succeeds", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-config-manager-missing-"));
+    tempDirs.push(directory);
+    const configPath = join(directory, "nested", "config.json");
+    expect(existsSync(configPath)).toBe(false);
+    setConfigValue({
+      configPath,
+      path: "hooks.disableAutoCompact",
+      value: "true",
+      json: true,
+      env: { LCM_SUMMARY_PROVIDER: "disabled" },
+    });
+    expect(existsSync(configPath)).toBe(true);
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+  });
+});

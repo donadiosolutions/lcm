@@ -9,6 +9,9 @@ import { DaemonClient } from "../src/daemon/client.js";
 import {
   ConfigValidationError,
   LLM_REASONING_EFFORTS,
+  resolveLlmRequestPolicy,
+  type DaemonConfig,
+  type LlmRequestPolicy,
   type LlmReasoningEffort,
 } from "../src/daemon/config.js";
 import {
@@ -39,6 +42,7 @@ export function withHookOverrides(
   stdinText: string,
   client: unknown,
   reasoningEffort: LlmReasoningEffort | undefined,
+  requestPolicy?: LlmRequestPolicy,
 ): string {
   try {
     const parsed = JSON.parse(stdinText || "{}");
@@ -47,10 +51,64 @@ export function withHookOverrides(
       ...parsed,
       ...(client === "claude" || client === "codex" ? { client } : {}),
       ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+      ...(requestPolicy ? {
+        request_timeout_ms: requestPolicy.requestTimeoutMs,
+        retry: {
+          max_attempts: requestPolicy.retry.maxAttempts,
+          initial_delay_ms: requestPolicy.retry.initialDelayMs,
+          max_delay_ms: requestPolicy.retry.maxDelayMs,
+          multiplier: requestPolicy.retry.multiplier,
+        },
+      } : {}),
     });
   } catch {
     return stdinText;
   }
+}
+
+type CompactRequestPolicyOptions = {
+  timeoutMs?: string;
+  retryMaxAttempts?: string;
+  retryInitialDelayMs?: string;
+  retryMaxDelayMs?: string;
+  retryMultiplier?: string;
+};
+
+function numericOption(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (value.trim() === "") return Number.NaN;
+  return Number(value);
+}
+
+/** Validate and resolve one-invocation timeout/retry flags over loaded config. */
+export function resolveCompactRequestPolicyOverride(
+  config: DaemonConfig,
+  options: CompactRequestPolicyOptions,
+): LlmRequestPolicy | undefined {
+  const requestTimeoutMs = numericOption(options.timeoutMs);
+  const retry = {
+    maxAttempts: numericOption(options.retryMaxAttempts),
+    initialDelayMs: numericOption(options.retryInitialDelayMs),
+    maxDelayMs: numericOption(options.retryMaxDelayMs),
+    multiplier: numericOption(options.retryMultiplier),
+  };
+  const hasRetryOverride = Object.values(retry).some((value) => value !== undefined);
+  const hasOverride = requestTimeoutMs !== undefined || hasRetryOverride;
+  if (!hasOverride) return undefined;
+  if (config.llm.provider !== "openai") {
+    throw new ConfigValidationError(
+      "compact",
+      "timeout and retry overrides require llm.provider=\"openai\"",
+    );
+  }
+  return resolveLlmRequestPolicy(
+    { requestTimeoutMs: config.llm.requestTimeoutMs, retry: config.llm.retry },
+    {
+      requestTimeoutMs,
+      retry: hasRetryOverride ? retry : undefined,
+    },
+    "compact",
+  );
 }
 
 export function compactFailureExitCode(failures: number): 1 | undefined {
@@ -510,10 +568,88 @@ async function main() {
       process.on("SIGTERM", () => exit(0));
       process.on("SIGINT", () => exit(0));
     });
+  daemonCmd.command("restart")
+    .description("Restart the managed context daemon and reload configuration")
+    .option("-h, --help", "Show help")
+    .action(async (opts: { help?: boolean }) => {
+      if (opts.help) { await withCustomHelp(daemonCmd, "daemon"); return; }
+      const { loadDaemonConfig } = await import("../src/daemon/config.js");
+      const { restartDaemon } = await import("../src/daemon/lifecycle.js");
+      const config = loadDaemonConfig(defaultConfigPath());
+      const port = config.daemon?.port ?? 3737;
+      const result = await restartDaemon({
+        port,
+        pidFilePath: daemonPidPath(),
+        spawnTimeoutMs: 10000,
+        expectedVersion: typeof pkg.version === "string" ? pkg.version : undefined,
+        enforceUserManagerParent: true,
+        validateBeforeRestart: () => { loadDaemonConfig(defaultConfigPath()); },
+      });
+      if (!result.connected) {
+        console.error("  Daemon restart failed. Try: lcm daemon start --foreground");
+        if (result.warning) console.error(`  Warning: ${result.warning}`);
+        exit(1);
+      }
+      if (result.warning) console.warn(`Warning: ${result.warning}`);
+      const action = result.restarted ? "restarted" : result.spawned ? "started" : "already running";
+      console.log(`lcm daemon ${action} on port ${port}${result.pid ? ` (PID ${result.pid})` : ""}`);
+      exit(0);
+    });
   daemonCmd.action(async (opts: DaemonRootOptions) => {
     if (opts.help) { await withCustomHelp(daemonCmd, "daemon"); return; }
   });
   program.addCommand(daemonCmd);
+
+  // ─── config ────────────────────────────────────────────────────────────────
+  const configCmd = new Command("config").description("Inspect or update validated local configuration");
+  configCmd.helpOption(false).option("-h, --help", "Show help");
+  configCmd.command("get")
+    .description("Read a configuration value")
+    .argument("<path>", "Dotted JSON configuration path")
+    .option("--effective", "Include defaults and environment-variable overrides")
+    .option("-h, --help", "Show help")
+    .action(async (path: string, opts: { effective?: boolean; help?: boolean }) => {
+      if (opts.help) { await withCustomHelp(configCmd, "config"); return; }
+      try {
+        const { formatConfigValue, getConfigValue } = await import("../src/config-manager.js");
+        console.log(formatConfigValue(getConfigValue({
+          configPath: defaultConfigPath(),
+          path,
+          effective: opts.effective ?? false,
+        })));
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : "Unable to read configuration");
+        exit(1);
+      }
+    });
+  configCmd.command("set")
+    .description("Write a validated configuration value")
+    .argument("<path>", "Dotted JSON configuration path")
+    .argument("<value>", "String value, or JSON when --json is supplied")
+    .option("--json", "Parse value as JSON")
+    .option("-h, --help", "Show help")
+    .action(async (path: string, value: string, opts: { json?: boolean; help?: boolean }) => {
+      if (opts.help) { await withCustomHelp(configCmd, "config"); return; }
+      try {
+        const { formatConfigValue, normalizeConfigPath, setConfigValue } = await import("../src/config-manager.js");
+        const stored = setConfigValue({
+          configPath: defaultConfigPath(),
+          path,
+          value,
+          json: opts.json ?? false,
+        });
+        console.log(`Updated ${normalizeConfigPath(path)} = ${formatConfigValue(stored)}`);
+        console.log("Restart the daemon to apply this change: lcm daemon restart");
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : "Unable to update configuration");
+        exit(1);
+      }
+    });
+  configCmd.action(async (opts: { help?: boolean }) => {
+    if (opts.help) { await withCustomHelp(configCmd, "config"); return; }
+    await withCustomHelp(configCmd, "config");
+  });
+  program.addCommand(configCmd);
 
   // ─── compact ───────────────────────────────────────────────────────────────
   program
@@ -525,6 +661,11 @@ async function main() {
     .option("--no-promote", "Skip the automatic promote step")
     .addOption(new Option("--reasoning-effort <value>", "Override OpenAI Responses reasoning effort for this invocation")
       .choices([...LLM_REASONING_EFFORTS]))
+    .option("--timeout-ms <ms>", "Override OpenAI-compatible request timeout for this invocation")
+    .option("--retry-max-attempts <n>", "Override OpenAI-compatible maximum attempts for this invocation")
+    .option("--retry-initial-delay-ms <ms>", "Override OpenAI-compatible initial retry delay")
+    .option("--retry-max-delay-ms <ms>", "Override OpenAI-compatible maximum retry delay")
+    .option("--retry-multiplier <n>", "Override OpenAI-compatible retry multiplier")
     .option("-v, --verbose", "Show per-session token details")
     .addOption(new Option("--hook", "Hook dispatch mode (internal)").hideHelp())
     .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
@@ -549,6 +690,7 @@ async function main() {
         const { homedir } = await import("node:os");
         const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
         const config = loadDaemonConfig(defaultConfigPath());
+        const requestPolicy = resolveCompactRequestPolicyOverride(config, opts);
         if (
           reasoningEffort
           && (config.llm.provider !== "openai" || config.llm.apiMode !== "responses")
@@ -583,7 +725,7 @@ async function main() {
         compactRenderer.start();
 
         const { compacted, failures } = await batchCompact({
-          minTokens, dryRun, port, cwd, replay, verbose, tokenPath, reasoningEffort,
+          minTokens, dryRun, port, cwd, replay, verbose, tokenPath, reasoningEffort, requestPolicy,
           onProgress: (patch) => {
             Object.assign(compactState, patch);
             if (patch.lastResult) compactRenderer.sessionDone();
@@ -637,7 +779,9 @@ async function main() {
       }
       // Piped stdin — hook dispatch (PreCompact hook invocation)
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const input = withHookOverrides(await readStdin(), opts.client, reasoningEffort);
+      const { loadDaemonConfig } = await import("../src/daemon/config.js");
+      const requestPolicy = resolveCompactRequestPolicyOverride(loadDaemonConfig(defaultConfigPath()), opts);
+      const input = withHookOverrides(await readStdin(), opts.client, reasoningEffort, requestPolicy);
       const r = await dispatchHook("compact", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);

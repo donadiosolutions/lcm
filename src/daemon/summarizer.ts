@@ -1,4 +1,4 @@
-import type { DaemonConfig, LlmReasoningEffort } from "./config.js";
+import type { DaemonConfig, LlmReasoningEffort, LlmRequestPolicy } from "./config.js";
 import { createClaudeProcessSummarizer } from "../llm/claude-process.js";
 import { createCodexProcessSummarizer } from "../llm/codex-process.js";
 import { createMockSummarizer } from "../llm/mock-summarizer.js";
@@ -17,7 +17,7 @@ export function resolveEffectiveProvider(config: DaemonConfig, client?: CompactC
 export async function createSummarizer(
   provider: EffectiveProvider,
   config: DaemonConfig,
-  overrides: { reasoningEffort?: LlmReasoningEffort } = {},
+  overrides: { reasoningEffort?: LlmReasoningEffort; requestPolicy?: LlmRequestPolicy } = {},
 ): Promise<LcmSummarizeFn | null> {
   // Mock summarizer for E2E testing — deterministic, no LLM calls
   if (config.summarizer?.mock) return createMockSummarizer();
@@ -30,10 +30,12 @@ export async function createSummarizer(
     const { createOpenAISummarizer } = await import("../llm/openai.js");
     return createOpenAISummarizer({
       model: config.llm.model,
-      baseURL: config.llm.baseURL,
+      baseUrl: config.llm.baseUrl,
       apiKey: config.llm.apiKey,
       apiMode: config.llm.apiMode ?? "chat-completions",
       reasoningEffort: overrides.reasoningEffort ?? config.llm.reasoningEffort,
+      requestTimeoutMs: overrides.requestPolicy?.requestTimeoutMs ?? config.llm.requestTimeoutMs,
+      retry: overrides.requestPolicy?.retry ?? config.llm.retry,
     });
   }
   // anthropic
@@ -50,11 +52,25 @@ export async function createSummarizer(
  */
 export function makeSummarizerCache(config: DaemonConfig) {
   const cache = new Map<string, Promise<LcmSummarizeFn | null>>();
-  return (provider: EffectiveProvider, reasoningEffort?: LlmReasoningEffort): Promise<LcmSummarizeFn | null> => {
-    const cacheKey = `${provider}:${config.llm.apiMode ?? ""}:${reasoningEffort ?? config.llm.reasoningEffort ?? ""}`;
+  return (
+    provider: EffectiveProvider,
+    reasoningEffort?: LlmReasoningEffort,
+    requestPolicy?: LlmRequestPolicy,
+  ): Promise<LcmSummarizeFn | null> => {
+    const effectivePolicy = requestPolicy ?? {
+      requestTimeoutMs: config.llm.requestTimeoutMs,
+      retry: config.llm.retry,
+    };
+    const cacheKey = JSON.stringify([
+      provider,
+      config.llm.apiMode ?? "",
+      reasoningEffort ?? config.llm.reasoningEffort ?? "",
+      effectivePolicy.requestTimeoutMs,
+      effectivePolicy.retry,
+    ]);
     let cached = cache.get(cacheKey);
     if (!cached) {
-      cached = createSummarizer(provider, config, { reasoningEffort });
+      cached = createSummarizer(provider, config, { reasoningEffort, requestPolicy: effectivePolicy });
       cache.set(cacheKey, cached);
     }
     return cached;

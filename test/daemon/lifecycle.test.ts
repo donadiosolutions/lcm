@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi, type TestContext } from "vitest";
-import { ensureDaemon, findUserSystemdPid, readProcessParentPid } from "../../src/daemon/lifecycle.js";
+import { ensureDaemon, findUserSystemdPid, readProcessParentPid, restartDaemon } from "../../src/daemon/lifecycle.js";
 
 const tempDirs: string[] = [];
 type EnsureDaemonOptions = Parameters<typeof ensureDaemon>[0];
@@ -815,5 +815,149 @@ describe("ensureDaemon", () => {
       ["daemon", "start"],
       expect.objectContaining({ detached: true, stdio: "ignore" }),
     );
+  });
+});
+
+describe("restartDaemon", () => {
+  it("validates before stopping a verified running daemon and starts with the new port", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-running-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "4242");
+    let alive = true;
+    const order: string[] = [];
+    const killMock = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+      order.push(String(signal));
+      alive = false;
+    });
+    const ensureMock = vi.fn(async (options: EnsureDaemonOptions) => {
+      order.push(`ensure:${options.port}`);
+      return { connected: true, port: options.port, spawned: true };
+    });
+
+    const result = await restartDaemon({
+      port: 4545,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      validateBeforeRestart: () => { order.push("validate"); },
+      _isProcessAliveOverride: () => alive,
+      _isManagedProcessOverride: () => true,
+      _killOverride: killMock,
+      _sleepOverride: async () => {},
+      _ensureDaemonOverride: ensureMock,
+    });
+
+    expect(order).toEqual(["validate", "SIGTERM", "ensure:4545"]);
+    expect(result).toMatchObject({ connected: true, port: 4545, restarted: true, stoppedPid: 4242 });
+    expect(existsSync(pidFile)).toBe(false);
+  });
+
+  it("starts when the PID file is absent", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-absent-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const ensureMock = vi.fn(async (options: EnsureDaemonOptions) => ({
+      connected: true,
+      port: options.port,
+      spawned: true,
+    }));
+
+    const result = await restartDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      _ensureDaemonOverride: ensureMock,
+    });
+
+    expect(result).toMatchObject({ connected: true, spawned: true, restarted: false });
+    expect(ensureMock).toHaveBeenCalledOnce();
+  });
+
+  it("refuses to claim a restart when a daemon is reachable without a verified PID", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-unverified-existing-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const ensureMock = vi.fn(async (options: EnsureDaemonOptions) => ({
+      connected: true,
+      port: options.port,
+      spawned: false,
+    }));
+
+    await expect(restartDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      _ensureDaemonOverride: ensureMock,
+    })).rejects.toThrow("no verified daemon PID was available");
+  });
+
+  it("cleans a stale PID file before starting", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-stale-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "4242");
+    const ensureMock = vi.fn(async (options: EnsureDaemonOptions) => ({
+      connected: false,
+      port: options.port,
+      spawned: true,
+    }));
+
+    const result = await restartDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      _isProcessAliveOverride: () => false,
+      _ensureDaemonOverride: ensureMock,
+    });
+
+    expect(result.restarted).toBe(false);
+    expect(existsSync(pidFile)).toBe(false);
+    expect(ensureMock).toHaveBeenCalledOnce();
+  });
+
+  it("refuses to signal or start when a live PID is not a verified daemon", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-refuse-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "4242");
+    const killMock = vi.fn();
+    const ensureMock = vi.fn();
+
+    await expect(restartDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      _isProcessAliveOverride: () => true,
+      _isManagedProcessOverride: () => false,
+      _killOverride: killMock,
+      _ensureDaemonOverride: ensureMock,
+    })).rejects.toThrow("not a verified LCM daemon");
+
+    expect(killMock).not.toHaveBeenCalled();
+    expect(ensureMock).not.toHaveBeenCalled();
+    expect(readFileSync(pidFile, "utf-8")).toBe("4242");
+  });
+
+  it("does not signal or start when pre-restart validation fails", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-validation-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "4242");
+    const killMock = vi.fn();
+    const ensureMock = vi.fn();
+
+    await expect(restartDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      validateBeforeRestart: () => { throw new Error("invalid config"); },
+      _isProcessAliveOverride: () => true,
+      _isManagedProcessOverride: () => true,
+      _killOverride: killMock,
+      _ensureDaemonOverride: ensureMock,
+    })).rejects.toThrow("invalid config");
+
+    expect(killMock).not.toHaveBeenCalled();
+    expect(ensureMock).not.toHaveBeenCalled();
   });
 });

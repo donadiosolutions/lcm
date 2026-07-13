@@ -1,5 +1,6 @@
 import type { LcmDependencies } from "./types.js";
 import { loadTemplate, renderTemplate } from "./prompts/loader.js";
+import { isSensitiveKey } from "./secret-key.js";
 
 export type LcmSummarizeOptions = {
   previousSummary?: string;
@@ -30,8 +31,6 @@ const DIAGNOSTIC_MAX_DEPTH = 4;
 const DIAGNOSTIC_MAX_ARRAY_ITEMS = 8;
 const DIAGNOSTIC_MAX_OBJECT_KEYS = 16;
 const DIAGNOSTIC_MAX_CHARS = 1200;
-const DIAGNOSTIC_SENSITIVE_KEY_PATTERN =
-  /(api[-_]?key|authorization|token|secret|password|cookie|set-cookie|private[-_]?key|bearer)/i;
 
 /** Normalize provider ids for stable config/profile lookup. */
 function normalizeProviderId(provider: string): string {
@@ -250,7 +249,7 @@ function sanitizeForDiagnostics(value: unknown, depth = 0): unknown {
   const out: Record<string, unknown> = {};
   const entries = Object.entries(value);
   for (const [key, entry] of entries.slice(0, DIAGNOSTIC_MAX_OBJECT_KEYS)) {
-    out[key] = DIAGNOSTIC_SENSITIVE_KEY_PATTERN.test(key)
+    out[key] = isSensitiveKey(key)
       ? "[redacted]"
       : sanitizeForDiagnostics(entry, depth + 1);
   }

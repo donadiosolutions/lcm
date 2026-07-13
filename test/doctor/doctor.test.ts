@@ -476,16 +476,18 @@ describe("runDoctor summarizer modes", () => {
     expect(results.some((result) => result.name === "codex-process")).toBe(true);
   });
 
-  it("reports effective OpenAI API mode and reasoning effort", async () => {
+  it("reports effective OpenAI API mode, reasoning effort, timeout, and retry policy", async () => {
     const results = await runDoctor(minimalDeps({
       readFileSync: (path: string) => {
         if (path.endsWith("config.json")) return JSON.stringify({
           llm: {
             provider: "openai",
             model: "gpt-test",
-            baseURL: "http://localhost:11435/v1",
+            baseUrl: "http://localhost:11435/v1",
             apiMode: "responses",
             reasoningEffort: "medium",
+            requestTimeoutMs: 45_000,
+            retry: { maxAttempts: 4, initialDelayMs: 250, maxDelayMs: 2_000, multiplier: 1.5 },
           },
         });
         if (path.endsWith("settings.json")) return buildCleanSettingsJson();
@@ -498,6 +500,8 @@ describe("runDoctor summarizer modes", () => {
     const stack = results.find((result) => result.name === "stack");
     expect(stack?.message).toContain("API mode: responses");
     expect(stack?.message).toContain("reasoning effort: medium");
+    expect(stack?.message).toContain("timeout: 45000ms");
+    expect(stack?.message).toContain("retry: 4 attempts, 250-2000ms x1.5");
   });
 });
 

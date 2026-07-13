@@ -6,12 +6,72 @@ import {
   CANONICAL_LLM_PROVIDERS,
   ConfigValidationError,
   DEFAULT_DAEMON_PORT,
+  DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+  DEFAULT_LLM_RETRY_POLICY,
   LLM_API_MODES,
   LLM_REASONING_EFFORTS,
   loadDaemonConfig,
   parseDaemonConfig,
+  parseStoredConfig,
+  resolveLlmRequestPolicy,
   deepMerge,
 } from "../../src/daemon/config.js";
+
+describe("known configuration schema validation", () => {
+  it.each([
+    [{ version: 0 }, "version"],
+    [{ daemon: "not-an-object" }, "daemon"],
+    [{ daemon: { port: "3737" } }, "daemon.port"],
+    [{ daemon: { port: -1 } }, "daemon.port"],
+    [{ daemon: { port: 65_536 } }, "daemon.port"],
+    [{ daemon: { idleTimeoutMs: 86_400_001 } }, "daemon.idleTimeoutMs"],
+    [{ hooks: { snapshotIntervalSec: 0.5 } }, "hooks.snapshotIntervalSec"],
+    [{ hooks: { disableAutoCompact: "false" } }, "hooks.disableAutoCompact"],
+    [{ summarizer: { mock: 1 } }, "summarizer.mock"],
+    [{ security: { sensitivePatterns: ["valid", 1] } }, "security.sensitivePatterns.1"],
+    [{ compaction: { leafTokens: 0 } }, "compaction.leafTokens"],
+    [{ compaction: { promotionThresholds: { compressionRatio: 1.1 } } }, "compaction.promotionThresholds.compressionRatio"],
+    [{ compaction: { promotionThresholds: { keywords: { decision: ["valid", false] } } } }, "compaction.promotionThresholds.keywords.decision.1"],
+    [{ restoration: { recencyHalfLifeHours: 0 } }, "restoration.recencyHalfLifeHours"],
+    [{ restoration: { crossSessionAffinity: 2 } }, "restoration.crossSessionAffinity"],
+    [{ restoration: { allowStaleOnStrongMatch: "true" } }, "restoration.allowStaleOnStrongMatch"],
+  ] as const)("rejects invalid known configuration %#", (config, expectedPath) => {
+    expect(() => parseStoredConfig(JSON.stringify(config))).toThrow(expectedPath);
+    expect(() => parseDaemonConfig("{}", config)).toThrow(expectedPath);
+  });
+
+  it("rejects stored port 0 while preserving the internal ephemeral runtime override", () => {
+    expect(() => parseStoredConfig(JSON.stringify({ daemon: { port: 0 } }))).toThrow("daemon.port");
+    expect(() => parseDaemonConfig(JSON.stringify({ daemon: { port: 0 } }))).toThrow("daemon.port");
+    expect(parseDaemonConfig("{}", { daemon: { port: 0 } }).daemon.port).toBe(0);
+  });
+
+  it("preserves extension keys and accepts supported legacy migration fields", () => {
+    const stored = parseStoredConfig(JSON.stringify({
+      extension: { enabled: true },
+      daemon: { extensionPortStrategy: "external" },
+      hooks: { extensionHook: { enabled: true } },
+      compaction: {
+        extensionCompactor: true,
+        promotionThresholds: { mergeMaxEntries: 25, confidenceDecayRate: 0.25 },
+      },
+      restoration: {
+        promptHintsByteBudget: 4096,
+        promptHintsReservedForLearningInstruction: 1024,
+        promptHintsMaxEmitted: 4,
+        promptHintsDedupMinPrefix: 80,
+      },
+    }));
+
+    expect(stored).toMatchObject({
+      extension: { enabled: true },
+      daemon: { extensionPortStrategy: "external" },
+      hooks: { extensionHook: { enabled: true } },
+      compaction: { extensionCompactor: true },
+    });
+    expect(() => parseDaemonConfig(JSON.stringify(stored))).not.toThrow();
+  });
+});
 
 function trustedCredentialBaseDir(): string | undefined {
   if (typeof process.getuid !== "function") return undefined;
@@ -155,7 +215,7 @@ describe("loadDaemonConfig", () => {
       llm: { provider: "openai", baseURL: "http://localhost:11435/v1", model: "qwen2.5:14b" }
     });
     expect(c.llm.provider).toBe("openai");
-    expect(c.llm.baseURL).toBe("http://localhost:11435/v1");
+    expect(c.llm.baseUrl).toBe("http://localhost:11435/v1");
     expect(c.llm.model).toBe("qwen2.5:14b");
   });
 
@@ -597,7 +657,7 @@ describe("strict LLM configuration validation", () => {
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     }
-    expect(message).toContain("llm.baseURL");
+    expect(message).toContain("llm.baseUrl");
     expect(message).toContain("[REDACTED]");
     expect(message).not.toContain(username);
     expect(message).not.toContain(password);
@@ -646,6 +706,99 @@ describe("strict LLM configuration validation", () => {
     expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "disabled", apiMode: "chat-completions" } }))).toThrow(
       'Invalid configuration at llm.apiMode: is only valid when llm.provider is "openai"',
     );
+  });
+
+  it.each(["custom", "openai-compatible"])("normalizes the OpenAI-compatible alias %s", (provider) => {
+    const config = parseDaemonConfig(JSON.stringify({
+      llm: { provider, model: "local-model", baseUrl: "http://localhost:11435/v1" },
+    }));
+    expect(config.llm.provider).toBe("openai");
+  });
+
+  it("normalizes legacy baseURL in stored config and rejects conflicting dual values", () => {
+    expect(parseStoredConfig(JSON.stringify({ llm: { baseURL: "http://localhost/v1" } }))).toEqual({
+      llm: { baseUrl: "http://localhost/v1" },
+    });
+    expect(parseStoredConfig(JSON.stringify({
+      llm: { baseUrl: "http://localhost/v1", baseURL: "http://localhost/v1" },
+    }))).toEqual({ llm: { baseUrl: "http://localhost/v1" } });
+    expect(() => parseStoredConfig(JSON.stringify({
+      llm: { baseUrl: "http://one/v1", baseURL: "http://two/v1" },
+    }))).toThrow("conflicts with legacy llm.baseURL");
+  });
+
+  it("applies LCM_SUMMARY_MODEL after file and runtime merging, including an empty override", () => {
+    const base = JSON.stringify({
+      llm: { provider: "openai", model: "file-model", baseUrl: "http://localhost/v1" },
+    });
+    expect(parseDaemonConfig(base, { llm: { model: "runtime-model" } }, {
+      LCM_SUMMARY_MODEL: "env-model",
+    }).llm.model).toBe("env-model");
+    expect(() => parseDaemonConfig(base, {}, { LCM_SUMMARY_MODEL: "" })).toThrow("llm.model");
+  });
+
+  it("uses validated OpenAI request policy defaults and accepts partial overrides", () => {
+    const config = parseDaemonConfig(JSON.stringify({
+      llm: {
+        provider: "openai",
+        model: "local-model",
+        baseUrl: "http://localhost/v1",
+        requestTimeoutMs: 30_000,
+        retry: { maxAttempts: 5, initialDelayMs: 250, maxDelayMs: 2_000, multiplier: 1.5 },
+      },
+    }));
+    expect(config.llm.requestTimeoutMs).toBe(30_000);
+    expect(config.llm.retry).toEqual({ maxAttempts: 5, initialDelayMs: 250, maxDelayMs: 2_000, multiplier: 1.5 });
+
+    const defaults = parseDaemonConfig("{}");
+    expect(defaults.llm.requestTimeoutMs).toBe(DEFAULT_LLM_REQUEST_TIMEOUT_MS);
+    expect(defaults.llm.retry).toEqual(DEFAULT_LLM_RETRY_POLICY);
+  });
+
+  it.each([
+    [{ requestTimeoutMs: 0 }, "requestTimeoutMs"],
+    [{ requestTimeoutMs: 1.5 }, "requestTimeoutMs"],
+    [{ retry: { maxAttempts: 0 } }, "maxAttempts"],
+    [{ retry: { maxAttempts: 11 } }, "maxAttempts"],
+    [{ retry: { initialDelayMs: -1 } }, "initialDelayMs"],
+    [{ retry: { maxDelayMs: Number.POSITIVE_INFINITY } }, "maxDelayMs"],
+    [{ retry: { multiplier: 0.5 } }, "multiplier"],
+    [{ retry: { initialDelayMs: 31_000 } }, "must be less than or equal"],
+    [{ retry: { unexpected: 1 } }, "unexpected"],
+  ])("rejects invalid request policy %j", (policy, expected) => {
+    expect(() => parseDaemonConfig(JSON.stringify({
+      llm: {
+        provider: "openai", model: "local-model", baseUrl: "http://localhost/v1", ...policy,
+      },
+    }))).toThrow(expected as string);
+  });
+
+  it("rejects explicitly configured request policies for non-OpenAI providers", () => {
+    expect(() => parseDaemonConfig(JSON.stringify({
+      llm: { provider: "claude-process", requestTimeoutMs: 10_000 },
+    }))).toThrow('only valid when llm.provider is "openai"');
+    expect(() => parseDaemonConfig(JSON.stringify({
+      llm: { provider: "codex-process", retry: { maxAttempts: 2 } },
+    }))).toThrow('only valid when llm.provider is "openai"');
+  });
+
+  it("exports a pure partial request policy resolver for CLI and route callers", () => {
+    const base = {
+      requestTimeoutMs: DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+      retry: { ...DEFAULT_LLM_RETRY_POLICY },
+    };
+    const resolved = resolveLlmRequestPolicy(base, {
+      requestTimeoutMs: 45_000,
+      retry: { maxAttempts: 4, initialDelayMs: 0 },
+    }, "compact");
+    expect(resolved).toEqual({
+      requestTimeoutMs: 45_000,
+      retry: { maxAttempts: 4, initialDelayMs: 0, maxDelayMs: 30_000, multiplier: 2 },
+    });
+    expect(base).toEqual({
+      requestTimeoutMs: DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+      retry: DEFAULT_LLM_RETRY_POLICY,
+    });
   });
 });
 
