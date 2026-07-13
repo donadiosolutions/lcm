@@ -68,7 +68,7 @@ describe("POST /restore", () => {
       ).run("# ~/.claude/CLAUDE.md\nDo not use emojis.", "abc123hash");
       closeLcmConnection(dbPath);
 
-      daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+      daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
       const res = await fetch(`http://127.0.0.1:${daemon.address().port}/restore`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: "compact-sess", cwd: tmpDir, source: "compact", hook_event_name: "SessionStart" }),
@@ -85,7 +85,7 @@ describe("POST /restore", () => {
       // Write a CLAUDE.md into the temp project dir
       writeFileSync(join(tmpDir, "CLAUDE.md"), "# Project Rules\nAlways write tests.", "utf8");
 
-      daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+      daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
       const res = await fetch(`http://127.0.0.1:${daemon.address().port}/restore`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: "startup-sess", cwd: tmpDir, source: "startup", hook_event_name: "SessionStart" }),
@@ -113,7 +113,7 @@ describe("POST /restore", () => {
       mkdirSync(join(tmpDir, ".codex"), { recursive: true });
       writeFileSync(join(tmpDir, ".codex", "AGENTS.md"), "Project Codex override.", "utf8");
 
-      daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+      daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
       const port = daemon.address().port;
 
       const claudeResponse = await fetch(`http://127.0.0.1:${port}/restore`, {
@@ -176,7 +176,7 @@ describe("POST /restore", () => {
       writeFileSync(join(tmpDir, "CLAUDE.md"), "Stable content.", "utf8");
       mkdirSync(join(tmpDir, ".lossless"), { recursive: true });
 
-      daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+      daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
       const port = daemon.address().port;
 
       // First startup call
@@ -242,7 +242,7 @@ describe("POST /restore", () => {
       });
       closeLcmConnection(dbPath);
 
-      daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+      daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
       const res = await fetch(`http://127.0.0.1:${daemon.address().port}/restore`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: "ins-sess", cwd: tmpDir, hook_event_name: "SessionStart" }),
@@ -261,7 +261,7 @@ describe("POST /restore", () => {
     });
 
     it("omits insights array when no passive-capture entries exist", async () => {
-      daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+      daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
       const res = await fetch(`http://127.0.0.1:${daemon.address().port}/restore`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: "no-ins-sess", cwd: tmpDir, hook_event_name: "SessionStart" }),
@@ -285,7 +285,7 @@ describe("POST /restore", () => {
       });
       closeLcmConnection(dbPath);
 
-      daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+      daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
       const res = await fetch(`http://127.0.0.1:${daemon.address().port}/restore`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: "low-conf-sess", cwd: tmpDir }),
@@ -338,7 +338,7 @@ describe("POST /restore", () => {
       closeLcmConnection(dbPath);
 
       // Use restoreMaxPromotedAgeDays = 180 (default)
-      daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+      daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
       const res = await fetch(`http://127.0.0.1:${daemon.address().port}/restore`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: "age-test", cwd: tmpDir, hook_event_name: "SessionStart" }),

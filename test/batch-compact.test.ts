@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { findUncompacted } from "../src/batch-compact.js";
+import { batchCompact, findUncompacted, formatLlmDiagnostic } from "../src/batch-compact.js";
+import { DaemonClient } from "../src/daemon/client.js";
 import { getPoolStats } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { addProjectAlias, clearProjectMapCache } from "../src/project-map.js";
@@ -34,6 +35,21 @@ function seedConversation(dbPath: string): void {
   }
 }
 
+function seedConversations(dbPath: string): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    runLcmMigrations(db);
+    for (const id of [1, 2]) {
+      db.prepare("INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)").run(id, `session-${id}`);
+      db.prepare(
+        "INSERT INTO messages (conversation_id, seq, role, content, token_count) VALUES (?, ?, ?, ?, ?)",
+      ).run(id, 1, "user", `hello ${id}`, 250);
+    }
+  } finally {
+    db.close();
+  }
+}
+
 describe("batch compaction discovery", () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
@@ -47,6 +63,7 @@ describe("batch compaction discovery", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     clearProjectMapCache();
     if (tempHome) rmSync(tempHome, { recursive: true, force: true });
     tempHome = undefined;
@@ -84,5 +101,50 @@ describe("batch compaction discovery", () => {
     seedConversation(paths.dbPath);
 
     expect(findUncompacted(100, true, unrelated)).toEqual([]);
+  });
+
+  it("returns failures while continuing to compact later sessions", async () => {
+    const cwd = makeDir("compact-partial-failure");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }, null, 2) + "\n");
+    seedConversations(paths.dbPath);
+    const post = vi.spyOn(DaemonClient.prototype, "post")
+      .mockRejectedValueOnce(new Error("provider unavailable"))
+      .mockResolvedValueOnce({ tokensBefore: 250, tokensAfter: 50 });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+    });
+
+    expect(result).toEqual({ compacted: 1, failures: 1 });
+    expect(post).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("formatLlmDiagnostic", () => {
+  it("includes Responses API mode and the effective reasoning effort", () => {
+    expect(formatLlmDiagnostic({
+      providerLabel: "OpenAI API",
+      apiMode: "responses",
+      reasoningEffort: "high",
+    })).toBe("OpenAI API · responses · reasoning=high");
+  });
+
+  it("shows the provider default when Responses reasoning is unset", () => {
+    expect(formatLlmDiagnostic({
+      providerLabel: "OpenAI API",
+      apiMode: "responses",
+      reasoningEffort: null,
+    })).toBe("OpenAI API · responses · reasoning=default");
+  });
+
+  it("preserves the existing provider-only diagnostic for other providers", () => {
+    expect(formatLlmDiagnostic({ providerLabel: "Codex (process)" })).toBe("Codex (process)");
   });
 });

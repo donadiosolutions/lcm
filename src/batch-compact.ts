@@ -7,6 +7,7 @@ import type { ProgressState } from "./cli/progress-state.js";
 import { DaemonClient } from "./daemon/client.js";
 import { projectsDir as lcmProjectsDir } from "./runtime-paths.js";
 import { normalizeProjectPath, projectMapPathsForHash } from "./project-map.js";
+import type { LlmApiMode, LlmReasoningEffort } from "./daemon/config.js";
 
 export interface UncompactedConversation {
   projectDir: string;
@@ -15,6 +16,20 @@ export interface UncompactedConversation {
   sessionId: string;
   messages: number;
   tokens: number;
+}
+
+export function formatLlmDiagnostic(input: {
+  providerLabel?: string;
+  apiMode?: LlmApiMode;
+  reasoningEffort?: LlmReasoningEffort | null;
+}): string | undefined {
+  if (!input.providerLabel) return undefined;
+  const parts = [input.providerLabel];
+  if (input.apiMode) parts.push(input.apiMode);
+  if (input.apiMode === "responses") {
+    parts.push(`reasoning=${input.reasoningEffort ?? "default"}`);
+  }
+  return parts.join(" · ");
 }
 
 /** Find conversations eligible for compaction, above the token threshold. */
@@ -102,15 +117,16 @@ export async function batchCompact(opts: {
   replay?: boolean;
   verbose?: boolean;
   tokenPath?: string;
+  reasoningEffort?: LlmReasoningEffort;
   /** Called with state patches as each session is processed — used by the ninja renderer */
   onProgress?: (patch: Partial<ProgressState>) => void;
-}): Promise<{ compacted: number }> {
+}): Promise<{ compacted: number; failures: number }> {
   const conversations = findUncompacted(opts.minTokens, opts.dryRun, opts.cwd, opts.replay);
   const onProgress = opts.onProgress;
 
   if (conversations.length === 0) {
     console.log("Nothing to compact — all sessions are up to date.");
-    return { compacted: 0 };
+    return { compacted: 0, failures: 0 };
   }
 
   const totalTokens = conversations.reduce((s, c) => s + c.tokens, 0);
@@ -141,11 +157,20 @@ export async function batchCompact(opts: {
     onProgress?.({ current: { sessionId: conv.sessionId, messages: conv.messages, tokens: conv.tokens, startedAt: sessionStart } });
     process.stdout.write(`  compacting: ${label}...`);
     try {
-      const data = await client.post<{ summary?: string; skipped?: boolean; tokensBefore?: number; tokensAfter?: number; providerLabel?: string }>("/compact", {
+      const data = await client.post<{
+        summary?: string;
+        skipped?: boolean;
+        tokensBefore?: number;
+        tokensAfter?: number;
+        providerLabel?: string;
+        apiMode?: LlmApiMode;
+        reasoningEffort?: LlmReasoningEffort | null;
+      }>("/compact", {
         session_id: conv.sessionId,
         cwd: conv.cwd,
         skip_ingest: true,
         client: "claude",
+        reasoning_effort: opts.reasoningEffort,
       });
 
       doneCount++;
@@ -182,7 +207,7 @@ export async function batchCompact(opts: {
             messages: conv.messages,
             tokensBefore: data.tokensBefore ?? conv.tokens,
             tokensAfter: data.tokensAfter,
-            provider: data.providerLabel,
+            provider: formatLlmDiagnostic(data),
             elapsed: Date.now() - sessionStart,
           },
         });
@@ -211,5 +236,5 @@ export async function batchCompact(opts: {
     }
   }
 
-  return { compacted };
+  return { compacted, failures: progressErrors.length };
 }

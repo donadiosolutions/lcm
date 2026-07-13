@@ -259,6 +259,86 @@ describe("createCompactHandler — summarizer branching", () => {
 
     expect(createCodexProcessSummarizer).toHaveBeenCalledTimes(1);
   });
+
+  it("passes a request reasoning override to an OpenAI Responses summarizer", async () => {
+    vi.clearAllMocks();
+    const config = makeConfig("openai");
+    config.llm.apiMode = "responses";
+    config.llm.reasoningEffort = "medium";
+    const handler = createCompactHandler(config);
+    const { res, getBody } = mockRes();
+
+    await handler({} as any, res, JSON.stringify({
+      session_id: "reasoning-high",
+      cwd: testCwd,
+      reasoning_effort: "high",
+    }));
+
+    expect(createOpenAISummarizer).toHaveBeenCalledWith(expect.objectContaining({
+      apiMode: "responses",
+      reasoningEffort: "high",
+    }));
+    expect(getBody()).toMatchObject({ apiMode: "responses", reasoningEffort: "high" });
+    expect(config.llm.reasoningEffort).toBe("medium");
+  });
+
+  it("rejects reasoning overrides outside the OpenAI Responses mode", async () => {
+    vi.clearAllMocks();
+    const handler = createCompactHandler(makeConfig("claude-process"));
+    const { res, getBody } = mockRes();
+
+    await handler({} as any, res, JSON.stringify({
+      session_id: "reasoning-unsupported",
+      cwd: testCwd,
+      reasoning_effort: "high",
+    }));
+
+    expect(res.writeHead).toHaveBeenCalledWith(400, expect.anything());
+    expect(getBody().error).toContain('llm.apiMode="responses"');
+    expect(createClaudeProcessSummarizer).not.toHaveBeenCalled();
+  });
+
+  it("rejects unknown reasoning effort values", async () => {
+    vi.clearAllMocks();
+    const config = makeConfig("openai");
+    config.llm.apiMode = "responses";
+    const handler = createCompactHandler(config);
+    const { res, getBody } = mockRes();
+
+    await handler({} as any, res, JSON.stringify({
+      session_id: "reasoning-invalid",
+      cwd: testCwd,
+      reasoning_effort: "extreme",
+    }));
+
+    expect(res.writeHead).toHaveBeenCalledWith(400, expect.anything());
+    expect(getBody().error).toContain("Valid values: none, minimal, low, medium, high, xhigh");
+    expect(createOpenAISummarizer).not.toHaveBeenCalled();
+  });
+
+  it("isolates cached OpenAI summarizers by effective reasoning effort", async () => {
+    vi.clearAllMocks();
+    const config = makeConfig("openai");
+    config.llm.apiMode = "responses";
+    const handler = createCompactHandler(config);
+    const { res: lowRes } = mockRes();
+    const { res: highRes } = mockRes();
+
+    await handler({} as any, lowRes, JSON.stringify({
+      session_id: "reasoning-low",
+      cwd: testCwd,
+      reasoning_effort: "low",
+    }));
+    await handler({} as any, highRes, JSON.stringify({
+      session_id: "reasoning-high-cache",
+      cwd: testCwd,
+      reasoning_effort: "high",
+    }));
+
+    expect(createOpenAISummarizer).toHaveBeenCalledTimes(2);
+    expect(createOpenAISummarizer).toHaveBeenNthCalledWith(1, expect.objectContaining({ reasoningEffort: "low" }));
+    expect(createOpenAISummarizer).toHaveBeenNthCalledWith(2, expect.objectContaining({ reasoningEffort: "high" }));
+  });
 });
 
 describe("POST /compact", () => {
@@ -458,7 +538,7 @@ describe("POST /compact", () => {
     // createAnthropicSummarizer is mocked at the top of this file
     daemon = await createDaemon(loadDaemonConfig("/x", {
       daemon: { port: 0 },
-      llm: { provider: "anthropic", apiKey: "sk-test" },
+      llm: { provider: "anthropic", model: "claude-haiku-4-5-20251001", apiKey: "sk-test" },
     }));
 
     const res = await fetch(`http://127.0.0.1:${daemon.address().port}/compact`, {

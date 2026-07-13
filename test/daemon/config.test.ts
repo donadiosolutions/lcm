@@ -340,6 +340,37 @@ describe("strict LLM configuration validation", () => {
     expect(message).not.toContain(secret);
   });
 
+  it("includes safely rendered unknown-key values in diagnostics", () => {
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { timeout: 1000 } })))
+      .toThrow('unknown key "timeout" with number value 1000');
+
+    const secret = "sk-unknown-key-secret";
+    let message = "";
+    try {
+      parseDaemonConfig(JSON.stringify({
+        llm: {
+          options: { apiKey: secret, label: "visible" },
+        },
+      }));
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain('"label":"visible"');
+    expect(message).toContain('"apiKey":"[REDACTED]"');
+    expect(message).not.toContain(secret);
+  });
+
+  it("redacts credential-like unknown keys", () => {
+    const secret = "private-token-value";
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { accessToken: secret } })))
+      .toThrow('unknown key "accessToken" with string value "[REDACTED]"');
+    try {
+      parseDaemonConfig(JSON.stringify({ llm: { accessToken: secret } }));
+    } catch (error) {
+      expect(error instanceof Error ? error.message : String(error)).not.toContain(secret);
+    }
+  });
+
   it("requires an Anthropic model and a resolved API key", () => {
     expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "anthropic", apiKey: "sk-test" } }))).toThrow("llm.model");
     expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "anthropic", model: "claude-sonnet" } }))).toThrow("llm.apiKey");
@@ -355,6 +386,41 @@ describe("strict LLM configuration validation", () => {
     expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "openai", model: "gpt-test", baseURL: "localhost/v1" } }))).toThrow("absolute HTTP(S) URL");
     expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "openai", model: "gpt-test", baseURL: "ftp://localhost/v1" } }))).toThrow("absolute HTTP(S) URL");
     expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "openai", model: "gpt-test", baseURL: "https://api.openai.com/v1" } }))).toThrow("llm.apiKey");
+  });
+
+  it.each([
+    "https://api.openai.com",
+    "https://API.OPENAI.COM/alternate/path",
+    "https://api.openai.com./alternate/path",
+    "https://api.openai.com/not-v1?feature=preview",
+  ])("requires credentials for the public OpenAI hostname regardless of path: %s", (baseURL) => {
+    expect(() => parseDaemonConfig(JSON.stringify({
+      llm: { provider: "openai", model: "gpt-test", baseURL },
+    }))).toThrow("llm.apiKey");
+  });
+
+  it("redacts URL credentials and query data from baseURL errors", () => {
+    const username = "private-user";
+    const password = "private-password";
+    const querySecret = "private-query-secret";
+    let message = "";
+    try {
+      parseDaemonConfig(JSON.stringify({
+        llm: {
+          provider: "openai",
+          model: "gpt-test",
+          baseURL: `ftp://${username}:${password}@localhost/v1?token=${querySecret}#fragment-secret`,
+        },
+      }));
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain("llm.baseURL");
+    expect(message).toContain("[REDACTED]");
+    expect(message).not.toContain(username);
+    expect(message).not.toContain(password);
+    expect(message).not.toContain(querySecret);
+    expect(message).not.toContain("fragment-secret");
   });
 
   it("defaults OpenAI-compatible endpoints to Chat Completions without requiring local credentials", () => {

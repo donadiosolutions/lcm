@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
+import type { LlmApiMode, LlmReasoningEffort } from "../daemon/config.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
   buildLeafSummaryPrompt,
@@ -11,8 +12,8 @@ type OpenAISummarizerOptions = {
   model: string;
   baseURL: string;
   apiKey?: string;
-  apiMode?: "chat-completions" | "responses";
-  reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  apiMode?: LlmApiMode;
+  reasoningEffort?: LlmReasoningEffort;
   _clientOverride?: any;
   _retryDelayMs?: number;
 };
@@ -32,11 +33,12 @@ function responsesConfigurationError(
     typeof err?.code === "string" || typeof err?.code === "number" ? String(err.code) : "";
   const safeCode = rawCode.replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 80);
   const code = safeCode ? `, code ${safeCode}` : "";
+  const reasoningEffort = opts.reasoningEffort ?? "default/omitted";
 
   return new Error(
-    `OpenAI Responses request rejected (${status}${code}): api mode responses, model ${opts.model}, ` +
-      `reasoning effort ${opts.reasoningEffort}. Verify that the selected model supports this reasoning ` +
-      "effort, choose a supported effort, or remove reasoningEffort.",
+    `OpenAI Responses request rejected (${status}${code}): api mode responses, model ${JSON.stringify(opts.model)}, ` +
+      `reasoning effort ${JSON.stringify(reasoningEffort)}. Verify that the selected model supports the Responses API ` +
+      "and requested reasoning configuration; choose a supported effort or omit reasoningEffort.",
   );
 }
 
@@ -108,7 +110,7 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
       } catch (err: any) {
         if (err?.status === 401) throw err; // auth error: no retry
         if (isConfigurationError(err)) {
-          if (opts.apiMode === "responses" && opts.reasoningEffort !== undefined) {
+          if (opts.apiMode === "responses") {
             throw responsesConfigurationError(err, opts);
           }
           throw err;

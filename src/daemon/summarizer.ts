@@ -1,4 +1,4 @@
-import type { DaemonConfig } from "./config.js";
+import type { DaemonConfig, LlmReasoningEffort } from "./config.js";
 import { createClaudeProcessSummarizer } from "../llm/claude-process.js";
 import { createCodexProcessSummarizer } from "../llm/codex-process.js";
 import { createMockSummarizer } from "../llm/mock-summarizer.js";
@@ -17,6 +17,7 @@ export function resolveEffectiveProvider(config: DaemonConfig, client?: CompactC
 export async function createSummarizer(
   provider: EffectiveProvider,
   config: DaemonConfig,
+  overrides: { reasoningEffort?: LlmReasoningEffort } = {},
 ): Promise<LcmSummarizeFn | null> {
   // Mock summarizer for E2E testing — deterministic, no LLM calls
   if (config.summarizer?.mock) return createMockSummarizer();
@@ -31,6 +32,8 @@ export async function createSummarizer(
       model: config.llm.model,
       baseURL: config.llm.baseURL,
       apiKey: config.llm.apiKey,
+      apiMode: config.llm.apiMode ?? "chat-completions",
+      reasoningEffort: overrides.reasoningEffort ?? config.llm.reasoningEffort,
     });
   }
   // anthropic
@@ -46,12 +49,13 @@ export async function createSummarizer(
  * The returned function lazily creates summarizers per provider and memoizes them.
  */
 export function makeSummarizerCache(config: DaemonConfig) {
-  const cache = new Map<EffectiveProvider, Promise<LcmSummarizeFn | null>>();
-  return (provider: EffectiveProvider): Promise<LcmSummarizeFn | null> => {
-    let cached = cache.get(provider);
+  const cache = new Map<string, Promise<LcmSummarizeFn | null>>();
+  return (provider: EffectiveProvider, reasoningEffort?: LlmReasoningEffort): Promise<LcmSummarizeFn | null> => {
+    const cacheKey = `${provider}:${config.llm.apiMode ?? ""}:${reasoningEffort ?? config.llm.reasoningEffort ?? ""}`;
+    let cached = cache.get(cacheKey);
     if (!cached) {
-      cached = createSummarizer(provider, config);
-      cache.set(provider, cached);
+      cached = createSummarizer(provider, config, { reasoningEffort });
+      cache.set(cacheKey, cached);
     }
     return cached;
   };

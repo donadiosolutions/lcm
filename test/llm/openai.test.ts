@@ -138,13 +138,49 @@ describe("createOpenAISummarizer", () => {
     }
 
     expect(thrown?.message).toContain("api mode responses");
-    expect(thrown?.message).toContain("model gpt-4.1");
-    expect(thrown?.message).toContain("reasoning effort xhigh");
+    expect(thrown?.message).toContain('model "gpt-4.1"');
+    expect(thrown?.message).toContain('reasoning effort "xhigh"');
     expect(thrown?.message).toContain("status 400");
     expect(thrown?.message).toContain("code unsupported_value");
     expect(thrown?.message).toContain("choose a supported effort");
     expect(thrown?.message).not.toContain(secretPrompt);
     expect(thrown?.message).not.toContain("sk-secret");
+    expect(mockClient.responses.create).toHaveBeenCalledOnce();
+  });
+
+  it("safely wraps Responses configuration errors when reasoning effort is omitted", async () => {
+    const secretPrompt = "PRIVATE CONVERSATION";
+    const model = "gpt-4.1\nFORGED LOG LINE";
+    const err = Object.assign(new Error(`invalid request: ${secretPrompt} sk-private`), {
+      status: 400,
+      request: { apiKey: "sk-private", input: secretPrompt },
+    });
+    const mockClient = {
+      responses: { create: vi.fn().mockRejectedValue(err) },
+    };
+    const summarizer = createOpenAISummarizer({
+      model,
+      baseURL: "https://api.openai.com/v1",
+      apiMode: "responses",
+      _clientOverride: mockClient as any,
+      _retryDelayMs: 0,
+    });
+
+    let thrown: Error | undefined;
+    try {
+      await summarizer(secretPrompt, false);
+    } catch (error) {
+      thrown = error as Error;
+    }
+
+    expect(thrown?.message).toContain("api mode responses");
+    expect(thrown?.message).toContain('model "gpt-4.1\\nFORGED LOG LINE"');
+    expect(thrown?.message).not.toContain(model);
+    expect(thrown?.message).toContain('reasoning effort "default/omitted"');
+    expect(thrown?.message).toContain("status 400");
+    expect(thrown?.message).toContain("supports the Responses API");
+    expect(thrown?.message).not.toContain(secretPrompt);
+    expect(thrown?.message).not.toContain("sk-private");
     expect(mockClient.responses.create).toHaveBeenCalledOnce();
   });
 

@@ -248,9 +248,40 @@ function valueType(value: unknown): string {
   return typeof value;
 }
 
+function isCredentialPath(path: string): boolean {
+  const key = path.split(".").at(-1) ?? path;
+  return /(?:api[-_]?key|token|secret|password|credential)/i.test(key);
+}
+
+function sanitizeUrlForDisplay(value: string): string {
+  try {
+    const url = new URL(value);
+    if (url.username || url.password) {
+      url.username = "[REDACTED]";
+      url.password = "";
+    }
+    if (url.search) url.search = "?[REDACTED]";
+    if (url.hash) url.hash = "#[REDACTED]";
+    return url.toString();
+  } catch {
+    return value
+      .replace(/\/\/[^/@\s]+@/, "//[REDACTED]@")
+      .replace(/[?#].*$/, "?[REDACTED]");
+  }
+}
+
 function displayValue(path: string, value: unknown): string {
-  if (path === "llm.apiKey") return '"[REDACTED]"';
-  const serialized = JSON.stringify(value);
+  if (isCredentialPath(path)) return '"[REDACTED]"';
+  if (path === "llm.baseURL" && typeof value === "string") {
+    return JSON.stringify(sanitizeUrlForDisplay(value));
+  }
+  const serialized = JSON.stringify(value, (key, nestedValue) => {
+    if (key && isCredentialPath(key)) return "[REDACTED]";
+    if (typeof nestedValue === "string" && /^[a-z][a-z\d+.-]*:\/\//i.test(nestedValue)) {
+      return sanitizeUrlForDisplay(nestedValue);
+    }
+    return nestedValue;
+  });
   return serialized === undefined ? String(value) : serialized;
 }
 
@@ -282,7 +313,7 @@ function validateLlmObject(value: unknown): Record<string, unknown> | undefined 
     if (!LLM_KEYS.has(key)) {
       throw new ConfigValidationError(
         `llm.${key}`,
-        `unknown key ${JSON.stringify(key)}; valid keys: ${[...LLM_KEYS].join(", ")}`,
+        `unknown key ${JSON.stringify(key)} with ${valueType(llm[key])} value ${displayValue(`llm.${key}`, llm[key])}; valid keys: ${[...LLM_KEYS].join(", ")}`,
       );
     }
   }
@@ -356,13 +387,13 @@ function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: Readonl
     try {
       baseURL = new URL(llm.baseURL);
     } catch {
-      throw new ConfigValidationError("llm.baseURL", `expected an absolute HTTP(S) URL, received string ${JSON.stringify(llm.baseURL)}`);
+      throw new ConfigValidationError("llm.baseURL", `expected an absolute HTTP(S) URL, received string ${displayValue("llm.baseURL", llm.baseURL)}`);
     }
     if (!(["http:", "https:"] as const).includes(baseURL.protocol as "http:" | "https:")) {
-      throw new ConfigValidationError("llm.baseURL", `expected an absolute HTTP(S) URL, received string ${JSON.stringify(llm.baseURL)}`);
+      throw new ConfigValidationError("llm.baseURL", `expected an absolute HTTP(S) URL, received string ${displayValue("llm.baseURL", llm.baseURL)}`);
     }
-    const path = baseURL.pathname.replace(/\/+$/, "") || "/";
-    if (baseURL.hostname.toLowerCase() === "api.openai.com" && (path === "/v1" || path.startsWith("/v1/"))) {
+    const normalizedHostname = baseURL.hostname.toLowerCase().replace(/\.+$/, "");
+    if (normalizedHostname === "api.openai.com") {
       requireNonEmpty(llm.apiKey ?? "", "llm.apiKey", llm.provider);
     }
     llm.apiMode ??= "chat-completions";

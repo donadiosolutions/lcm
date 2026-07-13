@@ -39,7 +39,7 @@ describe("POST /review-stale", () => {
   }
 
   it("returns 400 on invalid JSON body", async () => {
-    daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+    daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
     const res = await fetch(`http://127.0.0.1:${daemon.address().port}/review-stale`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: "not-json{{{",
@@ -50,7 +50,7 @@ describe("POST /review-stale", () => {
   });
 
   it("returns 400 when cwd is missing", async () => {
-    daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+    daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
     const res = await fetch(`http://127.0.0.1:${daemon.address().port}/review-stale`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
@@ -62,7 +62,7 @@ describe("POST /review-stale", () => {
 
   it("returns empty stale list when no DB exists", async () => {
     const emptyDir = mkdtempSync(join(tmpdir(), "no-db-"));
-    daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+    daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
     const res = await fetch(`http://127.0.0.1:${daemon.address().port}/review-stale`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ cwd: emptyDir }),
@@ -78,7 +78,7 @@ describe("POST /review-stale", () => {
     // staleAfterDays defaults to 90
     seedStaleMemory(tmpDir, "Old stale knowledge", 120);
 
-    daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+    daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
     const res = await fetch(`http://127.0.0.1:${daemon.address().port}/review-stale`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ cwd: tmpDir }),
@@ -93,7 +93,7 @@ describe("POST /review-stale", () => {
   it("archives a stale candidate", async () => {
     const id = seedStaleMemory(tmpDir, "Archive me", 120);
 
-    daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+    daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
     const port = daemon.address().port;
 
     const archiveRes = await fetch(`http://127.0.0.1:${port}/review-stale`, {
@@ -116,7 +116,7 @@ describe("POST /review-stale", () => {
   it("revives an archived candidate", async () => {
     const id = seedStaleMemory(tmpDir, "Revive me", 120);
 
-    daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+    daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
     const port = daemon.address().port;
 
     // Archive first
@@ -139,7 +139,7 @@ describe("POST /review-stale", () => {
     // Ensure DB exists
     seedStaleMemory(tmpDir, "Some memory", 120);
 
-    daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+    daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
     const res = await fetch(`http://127.0.0.1:${daemon.address().port}/review-stale`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ cwd: tmpDir, action: "archive", target_id: "nonexistent-id" }),
@@ -152,7 +152,7 @@ describe("POST /review-stale", () => {
   it("returns 400 for unknown action", async () => {
     const id = seedStaleMemory(tmpDir, "Bad action target", 120);
 
-    daemon = await createDaemon(loadDaemonConfig(tmpDir, { daemon: { port: 0 } }));
+    daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
     const res = await fetch(`http://127.0.0.1:${daemon.address().port}/review-stale`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ cwd: tmpDir, action: "delete", target_id: id }),
