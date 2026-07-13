@@ -24,7 +24,7 @@ function isConfigurationError(err: any): boolean {
   return CONFIGURATION_ERROR_STATUSES.has(err?.status);
 }
 
-function responsesConfigurationError(
+function configurationError(
   err: any,
   opts: OpenAISummarizerOptions,
 ): Error {
@@ -33,8 +33,17 @@ function responsesConfigurationError(
     typeof err?.code === "string" || typeof err?.code === "number" ? String(err.code) : "";
   const safeCode = rawCode.replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 80);
   const code = safeCode ? `, code ${safeCode}` : "";
-  const reasoningEffort = opts.reasoningEffort ?? "default/omitted";
+  const apiMode = opts.apiMode === "responses" ? "responses" : "chat-completions";
 
+  if (apiMode === "chat-completions") {
+    return new Error(
+      `OpenAI Chat Completions request rejected (${status}${code}): api mode chat-completions, ` +
+        `model ${JSON.stringify(opts.model)}. Verify that the selected model supports the Chat Completions API ` +
+        "and that the request configuration is valid.",
+    );
+  }
+
+  const reasoningEffort = opts.reasoningEffort ?? "default/omitted";
   return new Error(
     `OpenAI Responses request rejected (${status}${code}): api mode responses, model ${JSON.stringify(opts.model)}, ` +
       `reasoning effort ${JSON.stringify(reasoningEffort)}. Verify that the selected model supports the Responses API ` +
@@ -110,10 +119,7 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
       } catch (err: any) {
         if (err?.status === 401) throw err; // auth error: no retry
         if (isConfigurationError(err)) {
-          if (opts.apiMode === "responses") {
-            throw responsesConfigurationError(err, opts);
-          }
-          throw err;
+          throw configurationError(err, opts);
         }
         lastError = err;
         if (attempt < MAX_RETRIES - 1) await sleep(retryDelayMs * Math.pow(2, attempt));

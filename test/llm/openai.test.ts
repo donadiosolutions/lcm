@@ -199,21 +199,46 @@ describe("createOpenAISummarizer", () => {
     expect(mockClient.chat.completions.create).toHaveBeenCalledTimes(3);
   });
 
-  it("throws immediately on a Chat Completions configuration error", async () => {
-    const err = Object.assign(new Error("bad request"), { status: 400 });
-    const mockClient = {
-      chat: { completions: { create: vi.fn().mockRejectedValue(err) } },
-    };
-    const summarizer = createOpenAISummarizer({
-      model: "test-model",
-      baseURL: "http://localhost:11435/v1",
-      _clientOverride: mockClient as any,
-      _retryDelayMs: 0,
-    });
+  it.each([400, 403, 404, 409, 422])(
+    "safely wraps a Chat Completions %s configuration error without retrying",
+    async (status) => {
+      const secretPrompt = "PRIVATE CHAT PROMPT";
+      const secretProviderMessage = `bad request containing ${secretPrompt} and sk-secret`;
+      const model = "test-model\nFORGED LOG LINE";
+      const err = Object.assign(new Error(secretProviderMessage), {
+        status,
+        code: "invalid/request\n",
+        request: { apiKey: "sk-secret", messages: [{ content: secretPrompt }] },
+      });
+      const mockClient = {
+        chat: { completions: { create: vi.fn().mockRejectedValue(err) } },
+      };
+      const summarizer = createOpenAISummarizer({
+        model,
+        baseURL: "http://localhost:11435/v1",
+        _clientOverride: mockClient as any,
+        _retryDelayMs: 0,
+      });
 
-    await expect(summarizer("text", false)).rejects.toThrow("bad request");
-    expect(mockClient.chat.completions.create).toHaveBeenCalledOnce();
-  });
+      let thrown: Error | undefined;
+      try {
+        await summarizer(secretPrompt, false);
+      } catch (error) {
+        thrown = error as Error;
+      }
+
+      expect(thrown?.message).toContain("OpenAI Chat Completions request rejected");
+      expect(thrown?.message).toContain(`status ${status}`);
+      expect(thrown?.message).toContain("code invalidrequest");
+      expect(thrown?.message).toContain("api mode chat-completions");
+      expect(thrown?.message).toContain('model "test-model\\nFORGED LOG LINE"');
+      expect(thrown?.message).not.toContain(model);
+      expect(thrown?.message).not.toContain(secretPrompt);
+      expect(thrown?.message).not.toContain(secretProviderMessage);
+      expect(thrown?.message).not.toContain("sk-secret");
+      expect(mockClient.chat.completions.create).toHaveBeenCalledOnce();
+    },
+  );
 
   it("throws immediately on 401 auth error", async () => {
     const err = Object.assign(new Error("auth"), { status: 401 });
