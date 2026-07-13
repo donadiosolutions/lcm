@@ -448,6 +448,43 @@ describe("strict LLM configuration validation", () => {
     expect(message).not.toContain(secret);
   });
 
+  it("does not expose structured authorization credentials in startup errors", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-invalid-llm-credentials-"));
+    const path = join(dir, "config.json");
+    const secrets = [
+      "Bearer startup-authorization-secret",
+      "Basic startup-proxy-secret",
+      "startup-cookie-secret",
+      "startup-custom-auth-secret",
+    ];
+    try {
+      writeFileSync(path, JSON.stringify({
+        llm: {
+          baseURL: {
+            headers: {
+              Authorization: secrets[0],
+              "Proxy-Authorization": secrets[1],
+              Cookie: secrets[2],
+              "X-Custom-Auth": secrets[3],
+            },
+          },
+        },
+      }));
+
+      let message = "";
+      try {
+        loadDaemonConfig(path);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("llm.baseURL");
+      expect(message).toContain("[REDACTED]");
+      for (const secret of secrets) expect(message).not.toContain(secret);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("reports unknown-key types without reflecting their values", () => {
     expect(() => parseDaemonConfig(JSON.stringify({ llm: { timeout: 1000 } })))
       .toThrow('unknown key "timeout" with number value; valid keys:');

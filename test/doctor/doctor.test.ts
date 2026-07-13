@@ -554,10 +554,28 @@ describe("runDoctor configuration validation", () => {
   });
 
   it("fails the config check, redacts secrets, and continues diagnostics", async () => {
-    const secret = "sk-do-not-print";
+    const secrets = [
+      "Bearer doctor-authorization-secret",
+      "Basic doctor-proxy-secret",
+      "doctor-cookie-secret",
+      "doctor-custom-auth-secret",
+    ];
     const results = await runDoctor(minimalDeps({
       readFileSync: (path: string) => {
-        if (path.endsWith("config.json")) return JSON.stringify({ llm: { apiKey: { secret } } });
+        if (path.endsWith("config.json")) {
+          return JSON.stringify({
+            llm: {
+              baseURL: {
+                headers: {
+                  Authorization: secrets[0],
+                  "Proxy-Authorization": secrets[1],
+                  Cookie: secrets[2],
+                  "X-Custom-Auth": secrets[3],
+                },
+              },
+            },
+          });
+        }
         if (path.endsWith("settings.json")) return buildCleanSettingsJson();
         if (path.endsWith("package.json")) return JSON.stringify({ version: "0.5.0" });
         if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
@@ -569,9 +587,9 @@ describe("runDoctor configuration validation", () => {
     const stack = results.find((result) => result.name === "stack");
     expect(config?.status).toBe("fail");
     expect(config?.message).toContain("ConfigValidationError");
-    expect(config?.message).toContain("llm.apiKey");
+    expect(config?.message).toContain("llm.baseURL");
     expect(config?.message).toContain("[REDACTED]");
-    expect(JSON.stringify(results)).not.toContain(secret);
+    for (const secret of secrets) expect(JSON.stringify(results)).not.toContain(secret);
     expect(stack?.status).toBe("pass");
     expect(stack?.message).toContain("Summarizer: unavailable");
     expect(results.some((result) => result.name === "secret-detection")).toBe(true);

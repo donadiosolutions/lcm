@@ -281,6 +281,9 @@ function sanitizeUrlForDisplay(value: string): string {
 
 function displayValue(path: string, value: unknown): string {
   if (isCredentialPath(path)) return '"[REDACTED]"';
+  // Structured values are only displayed for type errors, where their contents
+  // are not useful and may contain credentials under arbitrary header names.
+  if (value !== null && typeof value === "object") return '"[REDACTED]"';
   if (path === "llm.baseURL" && typeof value === "string") {
     return JSON.stringify(sanitizeUrlForDisplay(value));
   }
