@@ -244,6 +244,24 @@ describe("loadDaemonConfig", () => {
     expect(c.llm.provider).toBe("openai");
   });
 
+  it("LCM_SUMMARY_PROVIDER recovers from a stale file provider", () => {
+    const c = parseDaemonConfig(
+      JSON.stringify({ llm: { provider: "ollama" } }),
+      {},
+      { LCM_SUMMARY_PROVIDER: "disabled" },
+    );
+    expect(c.llm.provider).toBe("disabled");
+  });
+
+  it("LCM_SUMMARY_PROVIDER recovers from a stale runtime provider", () => {
+    const c = parseDaemonConfig(
+      "{}",
+      { llm: { provider: "ollama" } },
+      { LCM_SUMMARY_PROVIDER: "claude" },
+    );
+    expect(c.llm.provider).toBe("claude-process");
+  });
+
   it("accepts LCM_SUMMARY_PROVIDER=auto", () => {
     const c = loadDaemonConfig("/nonexistent", {}, { LCM_SUMMARY_PROVIDER: "auto" });
     expect(c.llm.provider).toBe("auto");

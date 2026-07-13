@@ -308,13 +308,27 @@ function normalizeProvider(value: string): string {
   return LLM_PROVIDER_ALIASES[value] ?? value;
 }
 
+function validateProviderChoice(path: string, value: string): LlmProvider {
+  const provider = normalizeProvider(value);
+  if (!(CANONICAL_LLM_PROVIDERS as readonly string[]).includes(provider)) {
+    throw new ConfigValidationError(
+      path,
+      `received ${displayValue(path, value)}; valid choices: ${CANONICAL_LLM_PROVIDERS.join(", ")}`,
+    );
+  }
+  return provider as LlmProvider;
+}
+
 function validateStringField(llm: Record<string, unknown>, key: string): void {
   if (llm[key] !== undefined && typeof llm[key] !== "string") {
     invalidType(`llm.${key}`, llm[key], "a string");
   }
 }
 
-function validateLlmObject(value: unknown): Record<string, unknown> | undefined {
+function validateLlmObject(
+  value: unknown,
+  providerOverride?: LlmProvider,
+): Record<string, unknown> | undefined {
   if (value === undefined) return undefined;
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     invalidType("llm", value, "an object");
@@ -334,15 +348,10 @@ function validateLlmObject(value: unknown): Record<string, unknown> | undefined 
     validateStringField(llm, key);
   }
 
-  if (typeof llm.provider === "string") {
-    const provider = normalizeProvider(llm.provider);
-    llm.provider = provider;
-    if (!(CANONICAL_LLM_PROVIDERS as readonly string[]).includes(provider)) {
-      throw new ConfigValidationError(
-        "llm.provider",
-        `received ${displayValue("llm.provider", llm.provider)}; valid choices: ${CANONICAL_LLM_PROVIDERS.join(", ")}`,
-      );
-    }
+  if (providerOverride !== undefined) {
+    llm.provider = providerOverride;
+  } else if (typeof llm.provider === "string") {
+    llm.provider = validateProviderChoice("llm.provider", llm.provider);
   }
   if (typeof llm.apiMode === "string" && !(LLM_API_MODES as readonly string[]).includes(llm.apiMode)) {
     throw new ConfigValidationError(
@@ -359,7 +368,7 @@ function validateLlmObject(value: unknown): Record<string, unknown> | undefined 
   return llm;
 }
 
-function parseConfigRoot(content: string): Record<string, unknown> {
+function parseConfigRoot(content: string, providerOverride?: LlmProvider): Record<string, unknown> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
@@ -371,7 +380,7 @@ function parseConfigRoot(content: string): Record<string, unknown> {
     invalidType("$", parsed, "a JSON object");
   }
   const root = { ...(parsed as Record<string, unknown>) };
-  const llm = validateLlmObject(root.llm);
+  const llm = validateLlmObject(root.llm, providerOverride);
   if (llm !== undefined) root.llm = llm;
   return root;
 }
@@ -445,12 +454,15 @@ export function parseDaemonConfig(
   overrides: unknown = {},
   env: Record<string, string | undefined> = {},
 ): DaemonConfig {
-  const fileConfig = parseConfigRoot(content);
+  const providerOverride = env.LCM_SUMMARY_PROVIDER
+    ? validateProviderChoice("LCM_SUMMARY_PROVIDER", env.LCM_SUMMARY_PROVIDER)
+    : undefined;
+  const fileConfig = parseConfigRoot(content, providerOverride);
   if (overrides === null || typeof overrides !== "object" || Array.isArray(overrides)) {
     invalidType("overrides", overrides, "an object");
   }
   const normalizedOverrides = { ...(overrides as Record<string, unknown>) };
-  const overrideLlm = validateLlmObject(normalizedOverrides.llm);
+  const overrideLlm = validateLlmObject(normalizedOverrides.llm, providerOverride);
   if (overrideLlm !== undefined) normalizedOverrides.llm = overrideLlm;
 
   const fileLlm = fileConfig.llm as Record<string, unknown> | undefined;
@@ -473,16 +485,9 @@ export function parseDaemonConfig(
   if (merged.llm.apiKey) merged.llm.apiKey = merged.llm.apiKey.replace(/\$\{(\w+)\}/g, (_: string, k: string) => env[k] ?? "");
 
   // Env var override: LCM_SUMMARY_PROVIDER takes precedence over config
-  if (env.LCM_SUMMARY_PROVIDER) {
-    const normalized = normalizeProvider(env.LCM_SUMMARY_PROVIDER);
-    if (!(CANONICAL_LLM_PROVIDERS as readonly string[]).includes(normalized)) {
-      throw new ConfigValidationError(
-        "LCM_SUMMARY_PROVIDER",
-        `received ${JSON.stringify(env.LCM_SUMMARY_PROVIDER)}; valid choices: ${CANONICAL_LLM_PROVIDERS.join(", ")}`,
-      );
-    }
-    merged.llm.provider = normalized as LlmProvider;
-    if (normalized !== "openai") {
+  if (providerOverride !== undefined) {
+    merged.llm.provider = providerOverride;
+    if (providerOverride !== "openai") {
       delete merged.llm.apiMode;
       delete merged.llm.reasoningEffort;
       explicitLlmKeys.delete("apiMode");
