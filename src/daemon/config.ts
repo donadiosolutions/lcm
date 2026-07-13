@@ -466,6 +466,12 @@ export function parseDaemonConfig(
       );
     }
     merged.llm.provider = normalized as LlmProvider;
+    if (normalized !== "openai") {
+      delete merged.llm.apiMode;
+      delete merged.llm.reasoningEffort;
+      explicitLlmKeys.delete("apiMode");
+      explicitLlmKeys.delete("reasoningEffort");
+    }
   }
 
   // Migrate old config names to new names for backward compatibility

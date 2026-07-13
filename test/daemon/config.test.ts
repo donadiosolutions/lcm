@@ -201,6 +201,52 @@ describe("loadDaemonConfig", () => {
     expect(c.llm.provider).toBe("anthropic");
   });
 
+  it("clears OpenAI-only file settings when LCM_SUMMARY_PROVIDER selects another provider", () => {
+    const c = parseDaemonConfig(
+      JSON.stringify({
+        llm: {
+          provider: "openai",
+          model: "gpt-test",
+          baseURL: "http://localhost:11435/v1",
+          apiMode: "responses",
+          reasoningEffort: "high",
+        },
+      }),
+      {},
+      { LCM_SUMMARY_PROVIDER: "auto" },
+    );
+
+    expect(c.llm.provider).toBe("auto");
+    expect(c.llm.apiMode).toBeUndefined();
+    expect(c.llm.reasoningEffort).toBeUndefined();
+  });
+
+  it("clears OpenAI-only runtime overrides when LCM_SUMMARY_PROVIDER selects another provider", () => {
+    const c = parseDaemonConfig(
+      "{}",
+      { llm: { apiMode: "responses", reasoningEffort: "medium" } },
+      { LCM_SUMMARY_PROVIDER: "disabled" },
+    );
+
+    expect(c.llm.provider).toBe("disabled");
+    expect(c.llm.apiMode).toBeUndefined();
+    expect(c.llm.reasoningEffort).toBeUndefined();
+  });
+
+  it("still rejects invalid OpenAI settings when the effective provider is OpenAI", () => {
+    expect(() => parseDaemonConfig(
+      JSON.stringify({
+        llm: {
+          model: "gpt-test",
+          baseURL: "http://localhost:11435/v1",
+          reasoningEffort: "high",
+        },
+      }),
+      {},
+      { LCM_SUMMARY_PROVIDER: "openai" },
+    )).toThrow('apiMode "responses"');
+  });
+
   it("throws when LCM_SUMMARY_PROVIDER is set to an invalid value", () => {
     expect(() =>
       loadDaemonConfig("/nonexistent", {}, { LCM_SUMMARY_PROVIDER: "ollama" })
