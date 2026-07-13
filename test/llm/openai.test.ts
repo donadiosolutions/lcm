@@ -12,7 +12,7 @@ describe("createOpenAISummarizer", () => {
         },
       },
       responses: {
-        create: vi.fn().mockResolvedValue({ output_text: text }),
+        create: vi.fn().mockResolvedValue({ status: "completed", output_text: text }),
       },
     };
   }
@@ -184,8 +184,9 @@ describe("createOpenAISummarizer", () => {
     expect(mockClient.responses.create).toHaveBeenCalledOnce();
   });
 
-  it("retries 3 times on 5xx error then throws", async () => {
-    const err = Object.assign(new Error("server error"), { status: 500 });
+  it("retries 3 times on 5xx error then throws a safe contextual error", async () => {
+    const secretProviderMessage = "server error containing PRIVATE PROMPT and sk-secret";
+    const err = Object.assign(new Error(secretProviderMessage), { status: 500 });
     const mockClient = {
       chat: { completions: { create: vi.fn().mockRejectedValue(err) } },
     };
@@ -195,7 +196,18 @@ describe("createOpenAISummarizer", () => {
       _clientOverride: mockClient as any,
       _retryDelayMs: 0,
     });
-    await expect(summarizer("text", false)).rejects.toThrow("server error");
+    let thrown: Error | undefined;
+    try {
+      await summarizer("PRIVATE PROMPT", false);
+    } catch (error) {
+      thrown = error as Error;
+    }
+
+    expect(thrown?.message).toContain("OpenAI Chat Completions request failed after retries");
+    expect(thrown?.message).toContain('model "test-model"');
+    expect(thrown?.message).not.toContain(secretProviderMessage);
+    expect(thrown?.message).not.toContain("PRIVATE PROMPT");
+    expect(thrown?.message).not.toContain("sk-secret");
     expect(mockClient.chat.completions.create).toHaveBeenCalledTimes(3);
   });
 
@@ -361,8 +373,55 @@ describe("createOpenAISummarizer", () => {
       _retryDelayMs: 0,
     });
 
-    await expect(summarizer("text", false)).rejects.toThrow("rate limit");
+    await expect(summarizer("text", false)).rejects.toThrow(
+      "OpenAI Responses request failed after retries",
+    );
     expect(mockClient.responses.create).toHaveBeenCalledTimes(3);
+  });
+
+  it("retries an incomplete Responses result instead of accepting partial output", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "incomplete", output_text: "Partial summary." })
+      .mockResolvedValueOnce({ status: "completed", output_text: "Complete summary." });
+    const summarizer = createOpenAISummarizer({
+      model: "gpt-5",
+      baseURL: "https://api.openai.com/v1",
+      apiMode: "responses",
+      _clientOverride: { responses: { create } } as any,
+      _retryDelayMs: 0,
+    });
+
+    await expect(summarizer("text", false)).resolves.toBe("Complete summary.");
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails safely when Responses remain incomplete after retries", async () => {
+    const create = vi.fn().mockResolvedValue({
+      status: "incomplete",
+      output_text: "Partial summary containing PRIVATE PROMPT and sk-secret",
+    });
+    const summarizer = createOpenAISummarizer({
+      model: "gpt-5",
+      baseURL: "https://api.openai.com/v1",
+      apiMode: "responses",
+      _clientOverride: { responses: { create } } as any,
+      _retryDelayMs: 0,
+    });
+
+    let thrown: Error | undefined;
+    try {
+      await summarizer("PRIVATE PROMPT", false);
+    } catch (error) {
+      thrown = error as Error;
+    }
+
+    expect(thrown?.message).toContain("OpenAI Responses request failed after retries");
+    expect(thrown?.message).toContain('model "gpt-5"');
+    expect(thrown?.message).not.toContain("Partial summary");
+    expect(thrown?.message).not.toContain("PRIVATE PROMPT");
+    expect(thrown?.message).not.toContain("sk-secret");
+    expect(create).toHaveBeenCalledTimes(3);
   });
 
   it("uses 'local' as apiKey when none provided", async () => {
@@ -392,7 +451,7 @@ describe("createOpenAISummarizer", () => {
 
   it("falls back to truncated text if a Responses result is empty", async () => {
     const mockClient = {
-      responses: { create: vi.fn().mockResolvedValue({ output_text: "" }) },
+      responses: { create: vi.fn().mockResolvedValue({ status: "completed", output_text: "" }) },
     };
     const longText = "x".repeat(600);
     const summarizer = createOpenAISummarizer({

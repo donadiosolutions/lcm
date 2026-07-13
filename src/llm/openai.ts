@@ -64,13 +64,11 @@ function configurationError(
   );
 }
 
-function requestFailureError(err: unknown, opts: OpenAISummarizerOptions): Error {
-  if (err instanceof Error) return err;
-
+function requestFailureError(opts: OpenAISummarizerOptions): Error {
   const apiMode = opts.apiMode === "responses" ? "responses" : "chat-completions";
   const apiName = apiMode === "responses" ? "Responses" : "Chat Completions";
   return new Error(
-    `OpenAI ${apiName} request failed after retries with a non-Error rejection: ` +
+    `OpenAI ${apiName} request failed after retries: ` +
       `api mode ${apiMode}, model ${JSON.stringify(opts.model)}. ` +
       "Verify endpoint availability and the provider configuration.",
   );
@@ -105,8 +103,6 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
       ? buildCondensedSummaryPrompt({ text, targetTokens, depth: ctx.depth ?? 1 })
       : buildLeafSummaryPrompt({ text, mode: aggressive ? "aggressive" : "normal", targetTokens });
 
-    let lastError: unknown;
-
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
         if (opts.apiMode === "responses") {
@@ -126,6 +122,9 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
           }
 
           const response = await client.responses.create(request);
+          if (response.status !== "completed") {
+            throw new Error("OpenAI Responses request did not complete");
+          }
           return response.output_text || text.slice(0, 500);
         }
 
@@ -145,10 +144,9 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
         if (isConfigurationError(err)) {
           throw configurationError(err, opts);
         }
-        lastError = err;
         if (attempt < MAX_RETRIES - 1) await sleep(retryDelayMs * Math.pow(2, attempt));
       }
     }
-    throw requestFailureError(lastError, opts);
+    throw requestFailureError(opts);
   };
 }
