@@ -670,7 +670,17 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   await validateBeforeRestart?.();
 
   const isAlive = opts._isProcessAliveOverride ?? isProcessAlive;
-  const isManaged = _isManagedProcessOverride ?? ((pid: number) => isLikelyLcmDaemonProcess(pid, opts._procRoot ?? "/proc"));
+  const platform = opts._platform ?? osPlatform();
+  const fetchFn = opts._fetchOverride ?? globalThis.fetch;
+  const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
+  async function isManaged(pid: number): Promise<boolean> {
+    if (_isManagedProcessOverride) return _isManagedProcessOverride(pid);
+    if (platform === "linux") return isLikelyLcmDaemonProcess(pid, opts._procRoot ?? "/proc");
+    const health = await checkDaemonHealth(opts.port, fetchFn);
+    if (health?.status !== "ok") return false;
+    if (opts.expectedVersion && health.version !== opts.expectedVersion) return false;
+    return checkDaemonAccess(opts.port, tokenPath, fetchFn);
+  }
   const killProcess = opts._killOverride ?? ((pid: number, signal?: NodeJS.Signals | number) => {
     process.kill(pid, signal);
   });
@@ -684,7 +694,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   } else if (!isAlive(pid)) {
     cleanStalePid(opts.pidFilePath);
   } else {
-    if (!isManaged(pid)) {
+    if (!await isManaged(pid)) {
       throw new Error(`Refusing to restart: PID ${pid} is running but is not a verified LCM daemon.`);
     }
     await terminatePid(pid, { isAlive, killProcess, sleepFn });
