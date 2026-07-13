@@ -193,6 +193,66 @@ Valid provider values are:
 - `openai`
 - `disabled`
 
+For compatibility, `claude` and `claude-cli` are aliases for `claude-process`,
+and `codex` is an alias for `codex-process`. Aliases are accepted in both
+`~/.lcm/config.json` and `LCM_SUMMARY_PROVIDER`; LCM normalizes them to their
+canonical names.
+
+### LLM configuration
+
+The `llm` object in `~/.lcm/config.json` selects the summarizer backend. This
+example shows every supported `llm` field and enables OpenAI reasoning:
+
+```json
+{
+  "llm": {
+    "provider": "openai",
+    "model": "gpt-5.2",
+    "apiKey": "${OPENAI_API_KEY}",
+    "baseURL": "https://api.openai.com/v1",
+    "apiMode": "responses",
+    "reasoningEffort": "medium"
+  }
+}
+```
+
+`apiMode` accepts `chat-completions` or `responses`. It defaults to
+`chat-completions`, preserving the existing OpenAI-compatible Chat Completions
+behavior. Choose `responses` to use OpenAI's Responses API.
+
+`reasoningEffort` accepts `none`, `minimal`, `low`, `medium`, `high`, or
+`xhigh`. It is valid only when `provider` is `openai` and `apiMode` is
+`responses`; LCM rejects any other pairing before compaction starts. Individual
+models may support only some effort values. The OpenAI server is authoritative:
+if it rejects the selected model/effort combination, LCM reports an actionable
+error with the provider, API mode, model, effort, and response status or code.
+Prompts and credentials are omitted from that diagnostic.
+
+Override the configured effort for one manual compaction with:
+
+```bash
+lcm compact --reasoning-effort high
+```
+
+The CLI value takes precedence over `llm.reasoningEffort` for that invocation
+and does not rewrite `~/.lcm/config.json`. The override has the same
+`openai` + `responses` requirement.
+
+LCM validates `~/.lcm/config.json` strictly and fails loudly instead of silently
+falling back. Malformed JSON, an `llm` value that is not an object, unknown
+`llm` keys, invalid provider/API-mode/effort values, incorrect field types, and
+missing provider requirements all stop daemon startup and compaction. `lcm
+doctor` continues its remaining checks, reports the configuration failure using
+the relevant JSON path, and exits nonzero. Errors redact `llm.apiKey` and do not
+include secrets. For a valid OpenAI configuration, compact progress and doctor
+diagnostics show the effective API mode and reasoning effort so an invocation
+override is visible without exposing the request prompt.
+
+Remote Anthropic configuration requires a non-empty model and resolved API key.
+OpenAI requires a non-empty model and an absolute HTTP(S) `baseURL`; the public
+OpenAI endpoint also requires credentials. Process, `auto`, and `disabled`
+providers do not require remote credentials.
+
 Using a cheaper or faster model for summarization can reduce costs, but quality matters because poor summaries compound as they are condensed into higher-level nodes.
 
 ## Stale memory review

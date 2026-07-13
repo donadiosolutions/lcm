@@ -167,12 +167,13 @@ const HELP: Record<string, CommandHelp> = {
 
   compact: {
     summary: "Compact conversation context into DAG summary nodes.",
-    usage: "lcm compact [--all] [--dry-run] [--replay] [--no-promote]",
+    usage: "lcm compact [--all] [--dry-run] [--replay] [--no-promote] [--reasoning-effort <level>]",
     options: [
       ["--all", "Compact all tracked projects (default: current project only)"],
       ["--dry-run", "Show what would be compacted without writing anything"],
       ["--replay", "Compact sequentially, threading each summary through the prior context"],
       ["--no-promote", "Skip the automatic promote step that runs after compaction"],
+      ["--reasoning-effort <level>", "Override OpenAI Responses reasoning: none, minimal, low, medium, high, or xhigh"],
     ],
     examples: [
       ["lcm compact", "Compact current project"],
@@ -180,8 +181,9 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm compact --dry-run", "Preview compaction for current project"],
       ["lcm compact --all --replay", "Rebuild all projects with threaded context (slow)"],
       ["lcm compact --no-promote", "Compact without auto-promoting new insights"],
+      ["lcm compact --reasoning-effort high", "Use high reasoning for this OpenAI Responses compaction only"],
     ],
-    notes: "When invoked via the PreCompact hook (piped stdin), runs automatically during Claude Code context compaction. After a successful compact, promote runs automatically to surface new insights to long-term memory.",
+    notes: "When invoked via the PreCompact hook (piped stdin), runs automatically during Claude Code context compaction. After a successful compact, promote runs automatically to surface new insights to long-term memory. --reasoning-effort overrides llm.reasoningEffort for this invocation without rewriting ~/.lcm/config.json, and requires llm.provider=openai with llm.apiMode=responses.",
   },
 
   import: {

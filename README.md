@@ -234,6 +234,7 @@ lcm map remove <alias>     # remove an alias from its unambiguous project
 # Compaction & promotion
 lcm compact                # compact the current project
 lcm compact --all          # compact all tracked projects
+lcm compact --reasoning-effort high  # one-run OpenAI Responses reasoning override
 lcm promote                # promote durable insights to long-term memory
 lcm promote --all          # promote across all tracked projects
 
@@ -283,7 +284,7 @@ All environment variables are optional. The default summarizer mode is `auto`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `LCM_SUMMARY_PROVIDER` | `auto` | `auto`, `claude-process`, `codex-process`, `anthropic`, `openai`, or `disabled` |
+| `LCM_SUMMARY_PROVIDER` | `auto` | `auto`, `claude-process` (`claude`/`claude-cli` aliases), `codex-process` (`codex` alias), `anthropic`, `openai`, or `disabled` |
 | `LCM_SUMMARY_MODEL` | unset | Optional model override for the selected summarizer provider |
 | `LCM_CONTEXT_THRESHOLD` | `0.75` | Context fill ratio that triggers compaction |
 | `LCM_FRESH_TAIL_COUNT` | `32` | Most recent raw messages protected from compaction |
@@ -303,7 +304,15 @@ All environment variables are optional. The default summarizer mode is `auto`.
 - `lcm` -> `claude-process`
 - explicit config or `LCM_SUMMARY_PROVIDER` override always takes precedence
 
-See [`docs/configuration.md`](docs/configuration.md) for tuning notes and deeper operational guidance.
+OpenAI defaults to Chat Completions. To opt into the Responses API and reasoning,
+set `llm.apiMode` to `responses` and `llm.reasoningEffort` to `none`, `minimal`,
+`low`, `medium`, `high`, or `xhigh` in `~/.lcm/config.json`. A
+`--reasoning-effort` CLI value overrides JSON for one `lcm compact` invocation
+without rewriting the file. LCM validates the `llm` object strictly and reports
+configuration or model-capability errors without exposing prompts or credentials.
+
+See [`docs/configuration.md`](docs/configuration.md) for the complete JSON example,
+provider requirements, and deeper operational guidance.
 
 ## Development
 
