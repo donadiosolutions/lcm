@@ -577,6 +577,43 @@ describe("runDoctor configuration validation", () => {
     expect(results.some((result) => result.name === "secret-detection")).toBe(true);
   });
 
+  it("uses a valid configured daemon port when another config field is invalid", async () => {
+    const fetch = vi.fn().mockResolvedValue({ ok: false });
+    const results = await runDoctor(minimalDeps({
+      fetch,
+      readFileSync: (path: string) => {
+        if (path.endsWith("config.json")) {
+          return JSON.stringify({ daemon: { port: 4545 }, llm: { provider: "invalid" } });
+        }
+        return minimalDeps().readFileSync(path);
+      },
+    }));
+
+    expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
+    expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:4545/health");
+    expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({ port: 4545 }));
+    expect(results.find((result) => result.name === "daemon")?.message).toContain("localhost:4545");
+  });
+
+  it.each([0, 65536, 4545.5, "4545"])(
+    "does not use invalid daemon port %j while reporting config errors",
+    async (port) => {
+      const fetch = vi.fn().mockResolvedValue({ ok: false });
+      await runDoctor(minimalDeps({
+        fetch,
+        readFileSync: (path: string) => {
+          if (path.endsWith("config.json")) {
+            return JSON.stringify({ daemon: { port }, llm: { provider: "invalid" } });
+          }
+          return minimalDeps().readFileSync(path);
+        },
+      }));
+
+      expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3737/health");
+      expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({ port: 3737 }));
+    },
+  );
+
   it("reports malformed JSON without aborting doctor", async () => {
     const results = await runDoctor(minimalDeps({
       readFileSync: (path: string) => path.endsWith("config.json") ? "{" : minimalDeps().readFileSync(path),

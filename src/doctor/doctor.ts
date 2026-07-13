@@ -50,6 +50,7 @@ interface DoctorConfig {
 
 const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start";
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
+const DEFAULT_DAEMON_PORT = 3737;
 
 export interface DoctorRunOptions {
   verbose?: boolean;
@@ -73,14 +74,33 @@ function normalizeDoctorOptions(options: boolean | DoctorRunOptions = false): Re
   };
 }
 
+function recoverConfiguredPort(content: string): number {
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return DEFAULT_DAEMON_PORT;
+    const daemon = (parsed as Record<string, unknown>).daemon;
+    if (daemon === null || typeof daemon !== "object" || Array.isArray(daemon)) return DEFAULT_DAEMON_PORT;
+    const port = (daemon as Record<string, unknown>).port;
+    return typeof port === "number"
+      && Number.isInteger(port)
+      && port >= 1
+      && port <= 65535
+      ? port
+      : DEFAULT_DAEMON_PORT;
+  } catch {
+    return DEFAULT_DAEMON_PORT;
+  }
+}
+
 function loadConfig(deps: DoctorDeps): DoctorConfig {
   const resolvedConfigPath = configPath(deps.homedir);
   if (!deps.existsSync(resolvedConfigPath)) {
-    return { port: 3737, summarizer: "disabled" };
+    return { port: DEFAULT_DAEMON_PORT, summarizer: "disabled" };
   }
 
+  let content: string | undefined;
   try {
-    const content = deps.readFileSync(resolvedConfigPath, "utf-8");
+    content = deps.readFileSync(resolvedConfigPath, "utf-8");
     const config = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
     return {
       port: config.daemon.port,
@@ -92,7 +112,11 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
     const validationError = error instanceof ConfigValidationError
       ? error
       : new ConfigValidationError("$", error instanceof Error ? error.message : String(error));
-    return { port: 3737, summarizer: "disabled", validationError };
+    return {
+      port: typeof content === "string" ? recoverConfiguredPort(content) : DEFAULT_DAEMON_PORT,
+      summarizer: "disabled",
+      validationError,
+    };
   }
 }
 
