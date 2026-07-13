@@ -22,7 +22,7 @@ describe("createOpenAISummarizer", () => {
     const mockClient = makeClient("Summary.");
     const summarizer = createOpenAISummarizer({
       model: "qwen2.5:14b",
-      baseURL: "http://localhost:11435/v1",
+      baseUrl: "http://localhost:11435/v1",
       _clientOverride: mockClient as any,
     });
     const result = await summarizer("Conversation text", false, { isCondensed: false });
@@ -42,7 +42,7 @@ describe("createOpenAISummarizer", () => {
     const mockClient = makeClient();
     const summarizer = createOpenAISummarizer({
       model: "test-model",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "chat-completions",
       _clientOverride: mockClient as any,
     });
@@ -57,7 +57,7 @@ describe("createOpenAISummarizer", () => {
     const mockClient = makeClient("Responses summary.");
     const summarizer = createOpenAISummarizer({
       model: "gpt-5",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       reasoningEffort: "high",
       _clientOverride: mockClient as any,
@@ -80,7 +80,7 @@ describe("createOpenAISummarizer", () => {
     const mockClient = makeClient();
     const summarizer = createOpenAISummarizer({
       model: "gpt-5",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       _clientOverride: mockClient as any,
     });
@@ -97,7 +97,7 @@ describe("createOpenAISummarizer", () => {
       const mockClient = makeClient();
       const summarizer = createOpenAISummarizer({
         model: "gpt-5",
-        baseURL: "https://api.openai.com/v1",
+        baseUrl: "https://api.openai.com/v1",
         apiMode: "responses",
         reasoningEffort,
         _clientOverride: mockClient as any,
@@ -124,7 +124,7 @@ describe("createOpenAISummarizer", () => {
     };
     const summarizer = createOpenAISummarizer({
       model: "gpt-4.1",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       reasoningEffort: "xhigh",
       _clientOverride: mockClient as any,
@@ -161,7 +161,7 @@ describe("createOpenAISummarizer", () => {
     };
     const summarizer = createOpenAISummarizer({
       model,
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       _clientOverride: mockClient as any,
       _retryDelayMs: 0,
@@ -193,7 +193,7 @@ describe("createOpenAISummarizer", () => {
     };
     const summarizer = createOpenAISummarizer({
       model: "test-model",
-      baseURL: "http://localhost:11435/v1",
+      baseUrl: "http://localhost:11435/v1",
       _clientOverride: mockClient as any,
       _retryDelayMs: 0,
     });
@@ -220,7 +220,7 @@ describe("createOpenAISummarizer", () => {
     };
     const summarizer = createOpenAISummarizer({
       model: "test-model\nFORGED LOG LINE",
-      baseURL: "http://localhost:11435/v1",
+      baseUrl: "http://localhost:11435/v1",
       _clientOverride: mockClient as any,
       _retryDelayMs: 0,
     });
@@ -258,7 +258,7 @@ describe("createOpenAISummarizer", () => {
       };
       const summarizer = createOpenAISummarizer({
         model,
-        baseURL: "http://localhost:11435/v1",
+        baseUrl: "http://localhost:11435/v1",
         _clientOverride: mockClient as any,
         _retryDelayMs: 0,
       });
@@ -297,7 +297,7 @@ describe("createOpenAISummarizer", () => {
     };
     const summarizer = createOpenAISummarizer({
       model,
-      baseURL: "http://localhost:11435/v1",
+      baseUrl: "http://localhost:11435/v1",
       _clientOverride: mockClient as any,
       _retryDelayMs: 0,
     });
@@ -335,7 +335,7 @@ describe("createOpenAISummarizer", () => {
     };
     const summarizer = createOpenAISummarizer({
       model,
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       reasoningEffort: "high",
       _clientOverride: mockClient as any,
@@ -369,7 +369,7 @@ describe("createOpenAISummarizer", () => {
     };
     const summarizer = createOpenAISummarizer({
       model: "gpt-5",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       _clientOverride: mockClient as any,
       _retryDelayMs: 0,
@@ -388,7 +388,7 @@ describe("createOpenAISummarizer", () => {
       .mockResolvedValueOnce({ status: "completed", output_text: "Complete summary." });
     const summarizer = createOpenAISummarizer({
       model: "gpt-5",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       _clientOverride: { responses: { create } } as any,
       _retryDelayMs: 0,
@@ -405,7 +405,7 @@ describe("createOpenAISummarizer", () => {
     });
     const summarizer = createOpenAISummarizer({
       model: "gpt-5",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       _clientOverride: { responses: { create } } as any,
       _retryDelayMs: 0,
@@ -430,7 +430,7 @@ describe("createOpenAISummarizer", () => {
     const mockClient = makeClient();
     const summarizer = createOpenAISummarizer({
       model: "test-model",
-      baseURL: "http://localhost:11435/v1",
+      baseUrl: "http://localhost:11435/v1",
       _clientOverride: mockClient as any,
     });
     const result = await summarizer("text", false);
@@ -444,7 +444,7 @@ describe("createOpenAISummarizer", () => {
     const longText = "x".repeat(600);
     const summarizer = createOpenAISummarizer({
       model: "test-model",
-      baseURL: "http://localhost:11435/v1",
+      baseUrl: "http://localhost:11435/v1",
       _clientOverride: mockClient as any,
     });
     const result = await summarizer(longText, false);
@@ -458,7 +458,7 @@ describe("createOpenAISummarizer", () => {
     const longText = "x".repeat(600);
     const summarizer = createOpenAISummarizer({
       model: "gpt-5",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       _clientOverride: mockClient as any,
     });

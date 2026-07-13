@@ -76,7 +76,12 @@ describe("printHelp — per-command detail", () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     printHelp("daemon");
     const text = out.mock.calls.map(c => c[0]).join("");
-    expect(text).toContain("lcm daemon <start|restart>");
+    expect(text).toContain("Usage: lcm daemon start [--detach] [--foreground]\n         lcm daemon restart");
+    expect(text).not.toContain("lcm daemon <start|restart> [--detach] [--foreground]");
+    expect(text).toContain("--detach      For daemon start:");
+    expect(text).toContain("--foreground  For daemon start:");
+    expect(text).not.toContain("lcm daemon restart [--detach]");
+    expect(text).not.toContain("lcm daemon restart [--foreground]");
     expect(text).toContain("lcm daemon restart");
   });
 

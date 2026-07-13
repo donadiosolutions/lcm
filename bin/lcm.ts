@@ -645,8 +645,7 @@ async function main() {
         exit(1);
       }
     });
-  configCmd.action(async (opts: { help?: boolean }) => {
-    if (opts.help) { await withCustomHelp(configCmd, "config"); return; }
+  configCmd.action(async () => {
     await withCustomHelp(configCmd, "config");
   });
   program.addCommand(configCmd);

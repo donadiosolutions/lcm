@@ -44,10 +44,10 @@ const HELP: Record<string, CommandHelp> = {
 
   daemon: {
     summary: "Start or restart the context daemon that stores and processes memory.",
-    usage: "lcm daemon <start|restart> [--detach] [--foreground]",
+    usage: "lcm daemon start [--detach] [--foreground]\n         lcm daemon restart",
     options: [
-      ["--detach", "Compatibility alias for the default managed background start"],
-      ["--foreground", "Run in the current terminal for debugging"],
+      ["--detach", "For daemon start: compatibility alias for the default managed background start"],
+      ["--foreground", "For daemon start: run in the current terminal for debugging"],
     ],
     examples: [
       ["lcm daemon start", "Start managed daemon in background (recommended)"],
