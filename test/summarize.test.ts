@@ -539,6 +539,74 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       }
     });
 
+    it.each([
+      ["absolute", "https://"],
+      ["protocol-relative", "//"],
+    ])("sanitizes %s embedded URI credentials beyond the diagnostic boundary", async (_kind, scheme) => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      const credential = `${_kind}-boundary-secret`;
+      const querySecret = `${_kind}-query-secret`;
+      const lead = `request failed: ${scheme}${credential}`;
+      const message = `${lead}${"a".repeat(1200 - lead.length)}@example.com/v1?token=${querySecret}`;
+      expect(message.indexOf("@")).toBe(1200);
+
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({ provider: "openai", model: "gpt-5.3-codex" })),
+          complete: vi.fn(async () => ({
+            content: [{ type: "tool_use", name: "http", input: { message } }],
+          })),
+        });
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+        });
+
+        await summarize!("G".repeat(8_000), false);
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((call: unknown[]) => call.map((entry: unknown) => String(entry)))
+          .join(" ");
+        expect(diagnostics).toContain("content_preview=");
+        expect(diagnostics).toContain(`${scheme}example.com/v1?[REDACTED]`);
+        expect(diagnostics).not.toContain(credential);
+        expect(diagnostics).not.toContain(querySecret);
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("fails closed for oversized diagnostic strings", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      const credential = "oversized-diagnostic-secret";
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({ provider: "openai", model: "gpt-5.3-codex" })),
+          complete: vi.fn(async () => ({
+            content: [{
+              type: "tool_use",
+              name: "http",
+              input: { message: `https://${credential}${"a".repeat(70_000)}@example.com` },
+            }],
+          })),
+        });
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+        });
+
+        await summarize!("H".repeat(8_000), false);
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((call: unknown[]) => call.map((entry: unknown) => String(entry)))
+          .join(" ");
+        expect(diagnostics).toContain("[REDACTED oversized diagnostic text:");
+        expect(diagnostics).not.toContain(credential);
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
     it("does not retry when Anthropic provider returns a valid summary", async () => {
       const deps = makeDeps({
         // Default makeDeps uses anthropic + returns valid text — no retry expected.

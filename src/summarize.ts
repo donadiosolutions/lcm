@@ -32,6 +32,7 @@ const DIAGNOSTIC_MAX_DEPTH = 4;
 const DIAGNOSTIC_MAX_ARRAY_ITEMS = 8;
 const DIAGNOSTIC_MAX_OBJECT_KEYS = 16;
 const DIAGNOSTIC_MAX_CHARS = 1200;
+const DIAGNOSTIC_MAX_SANITIZE_INPUT_CHARS = 64 * 1024;
 
 /** Normalize provider ids for stable config/profile lookup. */
 function normalizeProviderId(provider: string): string {
@@ -209,14 +210,21 @@ function truncateDiagnosticText(value: string, maxChars = DIAGNOSTIC_MAX_CHARS):
   return `${value.slice(0, maxChars)}...[truncated:${value.length - maxChars} chars]`;
 }
 
+/** Sanitize diagnostic text before truncation without scanning unbounded provider output. */
+function sanitizeDiagnosticText(value: string, key?: string): string {
+  if (value.length > DIAGNOSTIC_MAX_SANITIZE_INPUT_CHARS) {
+    return `[REDACTED oversized diagnostic text:${value.length} chars]`;
+  }
+  return truncateDiagnosticText(sanitizeUrlValueForDisplay(value, key));
+}
+
 /** Build a JSON-safe, redacted, depth-limited clone for diagnostic logging. */
 function sanitizeForDiagnostics(value: unknown, depth = 0, key?: string): unknown {
   if (depth >= DIAGNOSTIC_MAX_DEPTH) {
     return "[max-depth]";
   }
   if (typeof value === "string") {
-    const boundedValue = truncateDiagnosticText(value);
-    return sanitizeUrlValueForDisplay(boundedValue, key);
+    return sanitizeDiagnosticText(value, key);
   }
   if (
     value === null ||
