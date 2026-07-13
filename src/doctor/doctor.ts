@@ -12,6 +12,7 @@ import { collectEventStats, collectDetailedEventStats } from "../db/events-stats
 import { validateRegex } from "../store/regex-safety.js";
 import { configPath, daemonPidPath } from "../runtime-paths.js";
 import { projectMapPath, validateProjectMap, type ProjectMapValidation } from "../project-map.js";
+import { ConfigValidationError, parseDaemonConfig } from "../daemon/config.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -42,6 +43,9 @@ function defaultDeps(): DoctorDeps {
 interface DoctorConfig {
   port: number;
   summarizer: string;
+  apiMode?: string;
+  reasoningEffort?: string;
+  validationError?: ConfigValidationError;
 }
 
 const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start";
@@ -71,16 +75,23 @@ function normalizeDoctorOptions(options: boolean | DoctorRunOptions = false): Re
 
 function loadConfig(deps: DoctorDeps): DoctorConfig {
   const resolvedConfigPath = configPath(deps.homedir);
-  let config: Record<string, unknown> = {};
   try {
-    config = JSON.parse(deps.readFileSync(resolvedConfigPath, "utf-8"));
-  } catch {}
-
-  const llm = config.llm as Record<string, string> | undefined;
-  return {
-    port: (config.daemon as Record<string, number> | undefined)?.port ?? (config as Record<string, unknown>).port as number ?? 3737,
-    summarizer: llm?.provider ?? "disabled",
-  };
+    const content = deps.existsSync(resolvedConfigPath)
+      ? deps.readFileSync(resolvedConfigPath, "utf-8")
+      : "{}";
+    const config = parseDaemonConfig(content, {}, process.env);
+    return {
+      port: config.daemon.port,
+      summarizer: config.llm.provider,
+      apiMode: config.llm.apiMode,
+      reasoningEffort: config.llm.reasoningEffort,
+    };
+  } catch (error) {
+    const validationError = error instanceof ConfigValidationError
+      ? error
+      : new ConfigValidationError("$", error instanceof Error ? error.message : String(error));
+    return { port: 3737, summarizer: "disabled", validationError };
+  }
 }
 
 function checkProjectMap(results: CheckResult[], deps: DoctorDeps): void {
@@ -330,9 +341,11 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     name: "stack",
     category: "Stack",
     status: "pass",
-    message: config.summarizer === "auto"
+    message: config.validationError
+      ? `Summarizer: unavailable (${config.validationError.name}: ${config.validationError.message})`
+      : config.summarizer === "auto"
       ? "Summarizer: auto (Claude->claude-process, Codex->codex-process)"
-      : `Summarizer: ${config.summarizer}`,
+      : `Summarizer: ${config.summarizer}${config.apiMode ? `; API mode: ${config.apiMode}` : ""}${config.reasoningEffort ? `; reasoning effort: ${config.reasoningEffort}` : ""}`,
   });
 
   // ── 1. Binary version ──
@@ -350,7 +363,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   // ── 2. config.json ──
   const resolvedConfigPath = configPath(deps.homedir);
   if (deps.existsSync(resolvedConfigPath)) {
-    results.push({ name: "config", category: "Stack", status: "pass", message: resolvedConfigPath });
+    results.push(config.validationError
+      ? { name: "config", category: "Stack", status: "fail", message: `${resolvedConfigPath}: ${config.validationError.name}: ${config.validationError.message}` }
+      : { name: "config", category: "Stack", status: "pass", message: resolvedConfigPath });
   } else {
     results.push({ name: "config", category: "Stack", status: "fail", message: `Missing — run: lcm install` });
   }

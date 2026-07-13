@@ -457,6 +457,65 @@ describe("runDoctor summarizer modes", () => {
     expect(results.some((result) => result.name === "claude-process")).toBe(true);
     expect(results.some((result) => result.name === "codex-process")).toBe(true);
   });
+
+  it("reports effective OpenAI API mode and reasoning effort", async () => {
+    const results = await runDoctor(minimalDeps({
+      readFileSync: (path: string) => {
+        if (path.endsWith("config.json")) return JSON.stringify({
+          llm: {
+            provider: "openai",
+            model: "gpt-test",
+            baseURL: "http://localhost:11435/v1",
+            apiMode: "responses",
+            reasoningEffort: "medium",
+          },
+        });
+        if (path.endsWith("settings.json")) return buildCleanSettingsJson();
+        if (path.endsWith("package.json")) return JSON.stringify({ version: "0.5.0" });
+        if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
+        if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
+        return "{}";
+      },
+    }));
+    const stack = results.find((result) => result.name === "stack");
+    expect(stack?.message).toContain("API mode: responses");
+    expect(stack?.message).toContain("reasoning effort: medium");
+  });
+});
+
+describe("runDoctor configuration validation", () => {
+  it("fails the config check, redacts secrets, and continues diagnostics", async () => {
+    const secret = "sk-do-not-print";
+    const results = await runDoctor(minimalDeps({
+      readFileSync: (path: string) => {
+        if (path.endsWith("config.json")) return JSON.stringify({ llm: { apiKey: { secret } } });
+        if (path.endsWith("settings.json")) return buildCleanSettingsJson();
+        if (path.endsWith("package.json")) return JSON.stringify({ version: "0.5.0" });
+        if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
+        if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
+        return "{}";
+      },
+    }));
+    const config = results.find((result) => result.name === "config");
+    const stack = results.find((result) => result.name === "stack");
+    expect(config?.status).toBe("fail");
+    expect(config?.message).toContain("ConfigValidationError");
+    expect(config?.message).toContain("llm.apiKey");
+    expect(config?.message).toContain("[REDACTED]");
+    expect(JSON.stringify(results)).not.toContain(secret);
+    expect(stack?.status).toBe("pass");
+    expect(stack?.message).toContain("Summarizer: unavailable");
+    expect(results.some((result) => result.name === "secret-detection")).toBe(true);
+  });
+
+  it("reports malformed JSON without aborting doctor", async () => {
+    const results = await runDoctor(minimalDeps({
+      readFileSync: (path: string) => path.endsWith("config.json") ? "{" : minimalDeps().readFileSync(path),
+    }));
+    expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
+    expect(results.find((result) => result.name === "config")?.message).toContain("malformed JSON");
+    expect(results.some((result) => result.name === "project-map")).toBe(true);
+  });
 });
 
 describe("Passive Learning checks", () => {
