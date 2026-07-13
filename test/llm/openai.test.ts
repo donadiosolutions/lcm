@@ -240,33 +240,82 @@ describe("createOpenAISummarizer", () => {
     },
   );
 
-  it("throws immediately on 401 auth error", async () => {
-    const err = Object.assign(new Error("auth"), { status: 401 });
+  it("safely wraps a Chat Completions 401 auth error without retrying", async () => {
+    const secretPrompt = "PRIVATE CHAT PROMPT";
+    const secretProviderMessage = `invalid key sk-secret for ${secretPrompt}`;
+    const model = "test-model\nFORGED LOG LINE";
+    const err = Object.assign(new Error(secretProviderMessage), {
+      status: 401,
+      code: "invalid/api-key\n",
+      request: { apiKey: "sk-secret", messages: [{ content: secretPrompt }] },
+    });
     const mockClient = {
       chat: { completions: { create: vi.fn().mockRejectedValue(err) } },
     };
     const summarizer = createOpenAISummarizer({
-      model: "test-model",
+      model,
       baseURL: "http://localhost:11435/v1",
       _clientOverride: mockClient as any,
+      _retryDelayMs: 0,
     });
-    await expect(summarizer("text", false)).rejects.toThrow("auth");
+
+    let thrown: Error | undefined;
+    try {
+      await summarizer(secretPrompt, false);
+    } catch (error) {
+      thrown = error as Error;
+    }
+
+    expect(thrown?.message).toContain("OpenAI Chat Completions request rejected");
+    expect(thrown?.message).toContain("status 401");
+    expect(thrown?.message).toContain("code invalidapi-key");
+    expect(thrown?.message).toContain("api mode chat-completions");
+    expect(thrown?.message).toContain('model "test-model\\nFORGED LOG LINE"');
+    expect(thrown?.message).not.toContain(model);
+    expect(thrown?.message).not.toContain(secretPrompt);
+    expect(thrown?.message).not.toContain(secretProviderMessage);
+    expect(thrown?.message).not.toContain("sk-secret");
     expect(mockClient.chat.completions.create).toHaveBeenCalledTimes(1);
   });
 
-  it("throws immediately on a Responses 401 auth error", async () => {
-    const err = Object.assign(new Error("auth"), { status: 401 });
+  it("safely wraps a Responses 401 auth error without retrying", async () => {
+    const secretPrompt = "PRIVATE RESPONSES PROMPT";
+    const secretProviderMessage = `invalid key sk-secret for ${secretPrompt}`;
+    const model = "gpt-5\nFORGED LOG LINE";
+    const err = Object.assign(new Error(secretProviderMessage), {
+      status: 401,
+      code: "invalid/api-key\n",
+      request: { apiKey: "sk-secret", input: secretPrompt },
+    });
     const mockClient = {
       responses: { create: vi.fn().mockRejectedValue(err) },
     };
     const summarizer = createOpenAISummarizer({
-      model: "gpt-5",
+      model,
       baseURL: "https://api.openai.com/v1",
       apiMode: "responses",
+      reasoningEffort: "high",
       _clientOverride: mockClient as any,
+      _retryDelayMs: 0,
     });
 
-    await expect(summarizer("text", false)).rejects.toThrow("auth");
+    let thrown: Error | undefined;
+    try {
+      await summarizer(secretPrompt, false);
+    } catch (error) {
+      thrown = error as Error;
+    }
+
+    expect(thrown?.message).toContain("OpenAI Responses request rejected");
+    expect(thrown?.message).toContain("status 401");
+    expect(thrown?.message).toContain("code invalidapi-key");
+    expect(thrown?.message).toContain("api mode responses");
+    expect(thrown?.message).toContain('model "gpt-5\\nFORGED LOG LINE"');
+    expect(thrown?.message).toContain('reasoning effort "high"');
+    expect(thrown?.message).not.toContain(model);
+    expect(thrown?.message).not.toContain(secretPrompt);
+    expect(thrown?.message).not.toContain(secretProviderMessage);
+    expect(thrown?.message).not.toContain("sk-secret");
     expect(mockClient.responses.create).toHaveBeenCalledTimes(1);
   });
 

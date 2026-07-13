@@ -18,7 +18,7 @@ type OpenAISummarizerOptions = {
   _retryDelayMs?: number;
 };
 
-const CONFIGURATION_ERROR_STATUSES = new Set([400, 403, 404, 409, 422]);
+const CONFIGURATION_ERROR_STATUSES = new Set([400, 401, 403, 404, 409, 422]);
 
 type OpenAIErrorMetadata = {
   status?: unknown;
@@ -130,7 +130,6 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
         const textContent = response.choices[0]?.message?.content ?? "";
         return textContent || text.slice(0, 500);
       } catch (err: unknown) {
-        if (getErrorMetadata(err).status === 401) throw err; // auth error: no retry
         if (isConfigurationError(err)) {
           throw configurationError(err, opts);
         }
