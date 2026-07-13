@@ -38,6 +38,7 @@ function makeTrustedCredentialDir(context: TestContext): string | undefined {
 describe("loadDaemonConfig", () => {
   it("returns defaults when no config file exists", () => {
     const c = loadDaemonConfig("/nonexistent/config.json");
+    expect(DEFAULT_DAEMON_PORT).toBe(3737);
     expect(c.daemon.port).toBe(DEFAULT_DAEMON_PORT);
     expect(c.daemon.socketPath).toContain("daemon.sock");
     expect(c.llm.provider).toBe("auto");
