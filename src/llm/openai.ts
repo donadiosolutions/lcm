@@ -20,17 +20,30 @@ type OpenAISummarizerOptions = {
 
 const CONFIGURATION_ERROR_STATUSES = new Set([400, 403, 404, 409, 422]);
 
-function isConfigurationError(err: any): boolean {
-  return CONFIGURATION_ERROR_STATUSES.has(err?.status);
+type OpenAIErrorMetadata = {
+  status?: unknown;
+  code?: unknown;
+};
+
+function getErrorMetadata(err: unknown): OpenAIErrorMetadata {
+  if (typeof err !== "object" || err === null) return {};
+  const candidate = err as Record<string, unknown>;
+  return { status: candidate.status, code: candidate.code };
+}
+
+function isConfigurationError(err: unknown): boolean {
+  const { status } = getErrorMetadata(err);
+  return typeof status === "number" && CONFIGURATION_ERROR_STATUSES.has(status);
 }
 
 function configurationError(
-  err: any,
+  err: unknown,
   opts: OpenAISummarizerOptions,
 ): Error {
-  const status = typeof err?.status === "number" ? `status ${err.status}` : "unknown status";
+  const metadata = getErrorMetadata(err);
+  const status = typeof metadata.status === "number" ? `status ${metadata.status}` : "unknown status";
   const rawCode =
-    typeof err?.code === "string" || typeof err?.code === "number" ? String(err.code) : "";
+    typeof metadata.code === "string" || typeof metadata.code === "number" ? String(metadata.code) : "";
   const safeCode = rawCode.replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 80);
   const code = safeCode ? `, code ${safeCode}` : "";
   const apiMode = opts.apiMode === "responses" ? "responses" : "chat-completions";
@@ -80,7 +93,7 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
       ? buildCondensedSummaryPrompt({ text, targetTokens, depth: ctx.depth ?? 1 })
       : buildLeafSummaryPrompt({ text, mode: aggressive ? "aggressive" : "normal", targetTokens });
 
-    let lastError: Error | undefined;
+    let lastError: unknown;
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
@@ -116,8 +129,8 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
 
         const textContent = response.choices[0]?.message?.content ?? "";
         return textContent || text.slice(0, 500);
-      } catch (err: any) {
-        if (err?.status === 401) throw err; // auth error: no retry
+      } catch (err: unknown) {
+        if (getErrorMetadata(err).status === 401) throw err; // auth error: no retry
         if (isConfigurationError(err)) {
           throw configurationError(err, opts);
         }
