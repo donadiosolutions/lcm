@@ -64,6 +64,18 @@ function configurationError(
   );
 }
 
+function requestFailureError(err: unknown, opts: OpenAISummarizerOptions): Error {
+  if (err instanceof Error) return err;
+
+  const apiMode = opts.apiMode === "responses" ? "responses" : "chat-completions";
+  const apiName = apiMode === "responses" ? "Responses" : "Chat Completions";
+  return new Error(
+    `OpenAI ${apiName} request failed after retries with a non-Error rejection: ` +
+      `api mode ${apiMode}, model ${JSON.stringify(opts.model)}. ` +
+      "Verify endpoint availability and the provider configuration.",
+  );
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -137,6 +149,6 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
         if (attempt < MAX_RETRIES - 1) await sleep(retryDelayMs * Math.pow(2, attempt));
       }
     }
-    throw lastError;
+    throw requestFailureError(lastError, opts);
   };
 }

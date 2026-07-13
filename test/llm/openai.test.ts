@@ -199,6 +199,35 @@ describe("createOpenAISummarizer", () => {
     expect(mockClient.chat.completions.create).toHaveBeenCalledTimes(3);
   });
 
+  it("safely wraps a non-Error rejection after retries", async () => {
+    const secretRejection = "provider rejected PRIVATE PROMPT with sk-secret";
+    const mockClient = {
+      chat: { completions: { create: vi.fn().mockRejectedValue(secretRejection) } },
+    };
+    const summarizer = createOpenAISummarizer({
+      model: "test-model\nFORGED LOG LINE",
+      baseURL: "http://localhost:11435/v1",
+      _clientOverride: mockClient as any,
+      _retryDelayMs: 0,
+    });
+
+    let thrown: unknown;
+    try {
+      await summarizer("PRIVATE PROMPT", false);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain("OpenAI Chat Completions request failed after retries");
+    expect((thrown as Error).message).toContain("api mode chat-completions");
+    expect((thrown as Error).message).toContain('model "test-model\\nFORGED LOG LINE"');
+    expect((thrown as Error).message).not.toContain(secretRejection);
+    expect((thrown as Error).message).not.toContain("PRIVATE PROMPT");
+    expect((thrown as Error).message).not.toContain("sk-secret");
+    expect(mockClient.chat.completions.create).toHaveBeenCalledTimes(3);
+  });
+
   it.each([400, 403, 404, 409, 422])(
     "safely wraps a Chat Completions %s configuration error without retrying",
     async (status) => {
