@@ -320,7 +320,7 @@ function validateLlmObject(value: unknown): Record<string, unknown> | undefined 
     if (!LLM_KEYS.has(key)) {
       throw new ConfigValidationError(
         `llm.${key}`,
-        `unknown key ${JSON.stringify(key)} with ${valueType(llm[key])} value ${displayValue(`llm.${key}`, llm[key])}; valid keys: ${[...LLM_KEYS].join(", ")}`,
+        `unknown key ${JSON.stringify(key)} with ${valueType(llm[key])} value; valid keys: ${[...LLM_KEYS].join(", ")}`,
       );
     }
   }

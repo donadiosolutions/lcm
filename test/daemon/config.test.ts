@@ -386,9 +386,9 @@ describe("strict LLM configuration validation", () => {
     expect(message).not.toContain(secret);
   });
 
-  it("includes safely rendered unknown-key values in diagnostics", () => {
+  it("reports unknown-key types without reflecting their values", () => {
     expect(() => parseDaemonConfig(JSON.stringify({ llm: { timeout: 1000 } })))
-      .toThrow('unknown key "timeout" with number value 1000');
+      .toThrow('unknown key "timeout" with number value; valid keys:');
 
     const secret = "sk-unknown-key-secret";
     let message = "";
@@ -401,20 +401,39 @@ describe("strict LLM configuration validation", () => {
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     }
-    expect(message).toContain('"label":"visible"');
-    expect(message).toContain('"apiKey":"[REDACTED]"');
+    expect(message).toContain('unknown key "options" with object value');
+    expect(message).not.toContain("visible");
     expect(message).not.toContain(secret);
   });
 
   it("redacts credential-like unknown keys", () => {
     const secret = "private-token-value";
     expect(() => parseDaemonConfig(JSON.stringify({ llm: { accessToken: secret } })))
-      .toThrow('unknown key "accessToken" with string value "[REDACTED]"');
+      .toThrow('unknown key "accessToken" with string value; valid keys:');
     try {
       parseDaemonConfig(JSON.stringify({ llm: { accessToken: secret } }));
     } catch (error) {
       expect(error instanceof Error ? error.message : String(error)).not.toContain(secret);
     }
+  });
+
+  it.each([
+    ["direct Authorization value", { Authorization: "Bearer direct-secret" }, ["Bearer direct-secret"]],
+    [
+      "nested header values",
+      { headers: { Authorization: "Bearer nested-secret", "X-Api-Key": "header-secret" } },
+      ["Bearer nested-secret", "header-secret"],
+    ],
+  ])("does not reflect %s from unknown llm keys", (_name, llm, secrets) => {
+    let message = "";
+    try {
+      parseDaemonConfig(JSON.stringify({ llm }));
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).toContain("unknown key");
+    for (const secret of secrets) expect(message).not.toContain(secret);
   });
 
   it("requires an Anthropic model and a resolved API key", () => {
