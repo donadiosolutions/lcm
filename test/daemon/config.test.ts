@@ -5,6 +5,7 @@ import { describe, it, expect, type TestContext } from "vitest";
 import {
   CANONICAL_LLM_PROVIDERS,
   ConfigValidationError,
+  DEFAULT_DAEMON_PORT,
   LLM_API_MODES,
   LLM_REASONING_EFFORTS,
   loadDaemonConfig,
@@ -37,7 +38,7 @@ function makeTrustedCredentialDir(context: TestContext): string | undefined {
 describe("loadDaemonConfig", () => {
   it("returns defaults when no config file exists", () => {
     const c = loadDaemonConfig("/nonexistent/config.json");
-    expect(c.daemon.port).toBe(3737);
+    expect(c.daemon.port).toBe(DEFAULT_DAEMON_PORT);
     expect(c.daemon.socketPath).toContain("daemon.sock");
     expect(c.llm.provider).toBe("auto");
     expect(c.llm.model).toBe("");

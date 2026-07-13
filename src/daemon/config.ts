@@ -18,6 +18,8 @@ export type LlmApiMode = typeof LLM_API_MODES[number];
 export const LLM_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
 export type LlmReasoningEffort = typeof LLM_REASONING_EFFORTS[number];
 
+export const DEFAULT_DAEMON_PORT = 3737;
+
 export interface SecurityConfig {
   /** User-defined global regex patterns (plain strings, no /.../ delimiters). */
   sensitivePatterns: string[];
@@ -73,7 +75,7 @@ export type DaemonConfig = {
 
 const DEFAULTS: DaemonConfig = {
   version: 1,
-  daemon: { port: 3737, socketPath: lcmPath("daemon.sock"), logLevel: "info", logMaxSizeMB: 10, logRetentionDays: 7, idleTimeoutMs: 1800000 },
+  daemon: { port: DEFAULT_DAEMON_PORT, socketPath: lcmPath("daemon.sock"), logLevel: "info", logMaxSizeMB: 10, logRetentionDays: 7, idleTimeoutMs: 1800000 },
   compaction: {
     leafTokens: 1000, maxDepth: 5, autoCompactMinTokens: 10000,
     promotionThresholds: {

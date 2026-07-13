@@ -12,7 +12,7 @@ import { collectEventStats, collectDetailedEventStats } from "../db/events-stats
 import { validateRegex } from "../store/regex-safety.js";
 import { configPath, daemonPidPath } from "../runtime-paths.js";
 import { projectMapPath, validateProjectMap, type ProjectMapValidation } from "../project-map.js";
-import { ConfigValidationError, parseDaemonConfig, resolveDaemonConfigEnv } from "../daemon/config.js";
+import { ConfigValidationError, DEFAULT_DAEMON_PORT, parseDaemonConfig, resolveDaemonConfigEnv } from "../daemon/config.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -50,7 +50,6 @@ interface DoctorConfig {
 
 const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start";
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
-const DEFAULT_DAEMON_PORT = 3737;
 
 export interface DoctorRunOptions {
   verbose?: boolean;
