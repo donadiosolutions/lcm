@@ -12,7 +12,13 @@ import { collectEventStats, collectDetailedEventStats } from "../db/events-stats
 import { validateRegex } from "../store/regex-safety.js";
 import { configPath, daemonPidPath } from "../runtime-paths.js";
 import { projectMapPath, validateProjectMap, type ProjectMapValidation } from "../project-map.js";
-import { ConfigValidationError, DEFAULT_DAEMON_PORT, parseDaemonConfig, resolveDaemonConfigEnv } from "../daemon/config.js";
+import {
+  ConfigValidationError,
+  DEFAULT_DAEMON_PORT,
+  parseDaemonConfig,
+  resolveDaemonConfigEnv,
+  type LlmRetryPolicy,
+} from "../daemon/config.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -45,6 +51,8 @@ interface DoctorConfig {
   summarizer: string;
   apiMode?: string;
   reasoningEffort?: string;
+  requestTimeoutMs?: number;
+  retry?: LlmRetryPolicy;
   validationError?: ConfigValidationError;
 }
 
@@ -106,6 +114,8 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
       summarizer: config.llm.provider,
       apiMode: config.llm.apiMode,
       reasoningEffort: config.llm.reasoningEffort,
+      requestTimeoutMs: config.llm.provider === "openai" ? config.llm.requestTimeoutMs : undefined,
+      retry: config.llm.provider === "openai" ? config.llm.retry : undefined,
     };
   } catch (error) {
     const validationError = error instanceof ConfigValidationError
@@ -370,7 +380,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       ? `Summarizer: unavailable (${config.validationError.name}: ${config.validationError.message})`
       : config.summarizer === "auto"
       ? "Summarizer: auto (Claude->claude-process, Codex->codex-process)"
-      : `Summarizer: ${config.summarizer}${config.apiMode ? `; API mode: ${config.apiMode}` : ""}${config.reasoningEffort ? `; reasoning effort: ${config.reasoningEffort}` : ""}`,
+      : `Summarizer: ${config.summarizer}${config.apiMode ? `; API mode: ${config.apiMode}` : ""}${config.reasoningEffort ? `; reasoning effort: ${config.reasoningEffort}` : ""}` +
+        `${config.requestTimeoutMs !== undefined ? `; timeout: ${config.requestTimeoutMs}ms` : ""}` +
+        `${config.retry ? `; retry: ${config.retry.maxAttempts} attempts, ${config.retry.initialDelayMs}-${config.retry.maxDelayMs}ms x${config.retry.multiplier}` : ""}`,
   });
 
   // ── 1. Binary version ──

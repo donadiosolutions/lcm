@@ -43,18 +43,35 @@ const HELP: Record<string, CommandHelp> = {
   },
 
   daemon: {
-    summary: "Start the context daemon that stores and processes memory.",
-    usage: "lcm daemon start [--detach] [--foreground]",
+    summary: "Start or restart the context daemon that stores and processes memory.",
+    usage: "lcm daemon start [--detach] [--foreground]\n         lcm daemon restart",
     options: [
-      ["--detach", "Compatibility alias for the default managed background start"],
-      ["--foreground", "Run in the current terminal for debugging"],
+      ["--detach", "For daemon start: compatibility alias for the default managed background start"],
+      ["--foreground", "For daemon start: run in the current terminal for debugging"],
     ],
     examples: [
       ["lcm daemon start", "Start managed daemon in background (recommended)"],
       ["lcm daemon start --detach", "Start managed daemon in background (compatibility alias)"],
       ["lcm daemon start --foreground", "Start daemon in foreground (for debugging)"],
+      ["lcm daemon restart", "Reload configuration by restarting the managed daemon"],
     ],
     notes: "On Linux, background starts prefer the user's systemd manager. The daemon runs on port 3737 by default. Configure via ~/.lcm/config.json.",
+  },
+
+  config: {
+    summary: "Inspect or update validated local configuration.",
+    usage: "lcm config <get|set> <json.config.key.path> [value] [--effective] [--json]",
+    options: [
+      ["--effective", "For get, include defaults and environment-variable overrides"],
+      ["--json", "For set, parse value as JSON instead of storing a string"],
+    ],
+    examples: [
+      ["lcm config get llm.provider", "Show the normalized value stored in config.json"],
+      ["lcm config get llm.model --effective", "Show the model after defaults and environment overrides"],
+      ["lcm config set llm.provider codex-process", "Store a validated string value"],
+      ["lcm config set hooks.disableAutoCompact true --json", "Store a typed boolean value"],
+    ],
+    notes: "Stored reads normalize compatibility aliases without rewriting the file. Secret-like values are always masked, including with --effective. Setting llm.provider away from OpenAI removes OpenAI-only API mode, reasoning, timeout, and retry settings; custom and openai-compatible normalize to OpenAI and retain those settings. Successful writes are atomic, preserve unrelated keys, and require `lcm daemon restart` before a running daemon uses the new configuration.",
   },
 
   status: {
@@ -167,13 +184,18 @@ const HELP: Record<string, CommandHelp> = {
 
   compact: {
     summary: "Compact conversation context into DAG summary nodes.",
-    usage: "lcm compact [--all] [--dry-run] [--replay] [--no-promote] [--reasoning-effort <level>]",
+    usage: "lcm compact [--all] [--dry-run] [--replay] [--no-promote] [LLM overrides]",
     options: [
       ["--all", "Compact all tracked projects (default: current project only)"],
       ["--dry-run", "Show what would be compacted without writing anything"],
       ["--replay", "Compact sequentially, threading each summary through the prior context"],
       ["--no-promote", "Skip the automatic promote step that runs after compaction"],
       ["--reasoning-effort <level>", "Override OpenAI Responses reasoning: none, minimal, low, medium, high, or xhigh"],
+      ["--timeout-ms <ms>", "Override llm.requestTimeoutMs for this invocation"],
+      ["--retry-max-attempts <n>", "Override llm.retry.maxAttempts for this invocation"],
+      ["--retry-initial-delay-ms <ms>", "Override llm.retry.initialDelayMs for this invocation"],
+      ["--retry-max-delay-ms <ms>", "Override llm.retry.maxDelayMs for this invocation"],
+      ["--retry-multiplier <n>", "Override llm.retry.multiplier for this invocation"],
     ],
     examples: [
       ["lcm compact", "Compact current project"],
@@ -182,8 +204,9 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm compact --all --replay", "Rebuild all projects with threaded context (slow)"],
       ["lcm compact --no-promote", "Compact without auto-promoting new insights"],
       ["lcm compact --reasoning-effort high", "Use high reasoning for this OpenAI Responses compaction only"],
+      ["lcm compact --timeout-ms 120000 --retry-max-attempts 4", "Use temporary timeout and retry limits"],
     ],
-    notes: "When invoked via the PreCompact hook (piped stdin), runs automatically during Claude Code context compaction. After a successful compact, promote runs automatically to surface new insights to long-term memory. --reasoning-effort overrides llm.reasoningEffort for this invocation without rewriting ~/.lcm/config.json, and requires llm.provider=openai with llm.apiMode=responses.",
+    notes: "When invoked via the PreCompact hook (piped stdin), runs automatically during Claude Code context compaction. After a successful compact, promote runs automatically to surface new insights to long-term memory. --reasoning-effort overrides llm.reasoningEffort for this invocation without rewriting ~/.lcm/config.json and requires llm.provider=openai with llm.apiMode=responses. Timeout and retry flags likewise override JSON without rewriting it and require the OpenAI-compatible provider.",
   },
 
   import: {
@@ -423,6 +446,8 @@ const GROUPS = [
     label: "Runtime",
     commands: [
       { name: "daemon start [--detach] [--foreground]", summary: "Start the context daemon" },
+      { name: "daemon restart", summary: "Restart the daemon and reload configuration" },
+      { name: "config <get|set> <path>", summary: "Inspect or update validated local configuration" },
       { name: "status [--json]", summary: "Daemon status and project memory stats" },
       { name: "doctor", summary: "Diagnostics: daemon, hooks, MCP, summarizer" },
       { name: "map <list|show|add|remove>", summary: "Manage project path aliases" },
@@ -437,7 +462,7 @@ const GROUPS = [
       { name: "describe <nodeId>", summary: "Inspect metadata for a memory node" },
       { name: "expand <nodeId> [--depth N]", summary: "Expand a summary node into source detail" },
       { name: "store <text> [--tag ...]", summary: "Store a durable memory entry" },
-      { name: "compact [--all] [--dry-run] [--replay] [--no-promote]", summary: "Compact conversations into DAG summaries (auto-promotes after)" },
+      { name: "compact [--all] [--dry-run] [--replay] [--no-promote] [LLM overrides]", summary: "Compact conversations into DAG summaries (auto-promotes after)" },
       { name: "import [--provider ...] [--all] [--verbose] [--dry-run] [--replay]", summary: "Import Claude Code and Codex session transcripts" },
       { name: "promote [--all] [--verbose] [--dry-run]", summary: "Promote insights to long-term memory" },
       { name: "stats [-v]", summary: "Memory inventory and compression ratios" },

@@ -1,6 +1,12 @@
 import OpenAI from "openai";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
-import type { LlmApiMode, LlmReasoningEffort } from "../daemon/config.js";
+import {
+  DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+  DEFAULT_LLM_RETRY_POLICY,
+  type LlmApiMode,
+  type LlmReasoningEffort,
+  type LlmRetryPolicy,
+} from "../daemon/config.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
   buildLeafSummaryPrompt,
@@ -8,22 +14,83 @@ import {
   resolveTargetTokens,
 } from "../summarize.js";
 
+type ChatCompletionRequest = Pick<
+  OpenAI.ChatCompletionCreateParamsNonStreaming,
+  "model" | "max_completion_tokens" | "max_tokens" | "messages"
+>;
+
+type ChatCompletionTokenLimit =
+  | {
+      max_completion_tokens: NonNullable<ChatCompletionRequest["max_completion_tokens"]>;
+      max_tokens?: never;
+    }
+  | {
+      max_completion_tokens?: never;
+      max_tokens: NonNullable<ChatCompletionRequest["max_tokens"]>;
+    };
+
+type ChatCompletionChoice = OpenAI.ChatCompletion["choices"][number];
+type ChatCompletionResult = {
+  choices: Array<{
+    message?: Partial<Pick<ChatCompletionChoice["message"], "content">>;
+  }>;
+};
+
+type ResponsesRequest = Pick<
+  OpenAI.Responses.ResponseCreateParamsNonStreaming,
+  "model" | "max_output_tokens" | "input" | "reasoning"
+>;
+
+type ResponsesResult = Partial<Pick<OpenAI.Responses.Response, "status" | "output_text">>;
+
+type OpenAISummarizerClient = {
+  chat?: {
+    completions: {
+      create(request: ChatCompletionRequest): PromiseLike<ChatCompletionResult>;
+    };
+  };
+  responses?: {
+    create(request: ResponsesRequest): PromiseLike<ResponsesResult>;
+  };
+};
+
 type OpenAISummarizerOptions = {
   model: string;
-  baseURL: string;
+  baseUrl: string;
   apiKey?: string;
   apiMode?: LlmApiMode;
   reasoningEffort?: LlmReasoningEffort;
-  _clientOverride?: any;
+  requestTimeoutMs?: number;
+  retry?: LlmRetryPolicy;
+  _clientOverride?: OpenAISummarizerClient;
+  _sleep?: (ms: number) => Promise<void>;
   _retryDelayMs?: number;
 };
 
-const CONFIGURATION_ERROR_STATUSES = new Set([400, 401, 403, 404, 409, 422]);
+const RETRYABLE_STATUSES = new Set([408, 409, 429]);
+const RETRYABLE_ERROR_NAMES = new Set(["APIConnectionError", "APIConnectionTimeoutError"]);
+const RETRYABLE_ERROR_CODES = new Set([
+  "ECONNABORTED", "ECONNREFUSED", "ECONNRESET", "EHOSTUNREACH", "ENETUNREACH",
+  "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "LCM_INCOMPLETE_RESPONSE",
+]);
+const MODERN_CHAT_COMPLETION_MODEL_PATTERN = /(?:^|[/:])(?:gpt-5(?:[.:-]|$)|o\d+(?:[.:-]|$))/i;
 
 type OpenAIErrorMetadata = {
   status?: unknown;
   code?: unknown;
 };
+
+type EffectiveOpenAIRequestPolicy = {
+  requestTimeoutMs: number;
+  retry: LlmRetryPolicy;
+};
+
+/** Select the one token-limit field supported by the model's Chat Completions family. */
+function selectChatCompletionTokenLimit(model: string, value: number): ChatCompletionTokenLimit {
+  return MODERN_CHAT_COMPLETION_MODEL_PATTERN.test(model.trim())
+    ? { max_completion_tokens: value }
+    : { max_tokens: value };
+}
 
 function getErrorMetadata(err: unknown): OpenAIErrorMetadata {
   if (typeof err !== "object" || err === null) return {};
@@ -31,26 +98,43 @@ function getErrorMetadata(err: unknown): OpenAIErrorMetadata {
   return { status: candidate.status, code: candidate.code };
 }
 
-function isConfigurationError(err: unknown): boolean {
-  const { status } = getErrorMetadata(err);
-  return typeof status === "number" && CONFIGURATION_ERROR_STATUSES.has(status);
+function isRetryableError(err: unknown): boolean {
+  if (err instanceof OpenAI.APIConnectionError || err instanceof OpenAI.APIConnectionTimeoutError) return true;
+  const { status, code } = getErrorMetadata(err);
+  if (typeof status === "number") return RETRYABLE_STATUSES.has(status) || status >= 500;
+  if (typeof err !== "object" || err === null) return false;
+  const candidate = err as Record<string, unknown>;
+  if (typeof candidate.name === "string" && RETRYABLE_ERROR_NAMES.has(candidate.name)) return true;
+  return typeof code === "string" && RETRYABLE_ERROR_CODES.has(code.toUpperCase());
 }
 
-function configurationError(
+function safeMetadata(err: unknown): string {
+  const metadata = getErrorMetadata(err);
+  const status = typeof metadata.status === "number" ? `status ${metadata.status}` : "status unavailable";
+  const rawCode = typeof metadata.code === "string" || typeof metadata.code === "number" ? String(metadata.code) : "";
+  const safeCode = rawCode.replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 80);
+  return safeCode ? `${status}, code ${safeCode}` : status;
+}
+
+function policyDescription(policy: EffectiveOpenAIRequestPolicy, attempts: number): string {
+  const { retry, requestTimeoutMs } = policy;
+  return `attempts ${attempts}/${retry.maxAttempts}; timeout ${requestTimeoutMs}ms; retry policy ` +
+    `initialDelayMs=${retry.initialDelayMs}, maxDelayMs=${retry.maxDelayMs}, multiplier=${retry.multiplier}`;
+}
+
+function terminalRequestError(
   err: unknown,
   opts: OpenAISummarizerOptions,
+  attempts: number,
+  policy: EffectiveOpenAIRequestPolicy,
 ): Error {
-  const metadata = getErrorMetadata(err);
-  const status = typeof metadata.status === "number" ? `status ${metadata.status}` : "unknown status";
-  const rawCode =
-    typeof metadata.code === "string" || typeof metadata.code === "number" ? String(metadata.code) : "";
-  const safeCode = rawCode.replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 80);
-  const code = safeCode ? `, code ${safeCode}` : "";
   const apiMode = opts.apiMode === "responses" ? "responses" : "chat-completions";
+  const metadata = safeMetadata(err);
+  const policyDetails = policyDescription(policy, attempts);
 
   if (apiMode === "chat-completions") {
     return new Error(
-      `OpenAI Chat Completions request rejected (${status}${code}): api mode chat-completions, ` +
+      `OpenAI Chat Completions request rejected (${metadata}; ${policyDetails}): api mode chat-completions, ` +
         `model ${JSON.stringify(opts.model)}. Verify that the selected model supports the Chat Completions API ` +
         "and that the request configuration is valid.",
     );
@@ -58,17 +142,22 @@ function configurationError(
 
   const reasoningEffort = opts.reasoningEffort ?? "default/omitted";
   return new Error(
-    `OpenAI Responses request rejected (${status}${code}): api mode responses, model ${JSON.stringify(opts.model)}, ` +
+    `OpenAI Responses request rejected (${metadata}; ${policyDetails}): api mode responses, model ${JSON.stringify(opts.model)}, ` +
       `reasoning effort ${JSON.stringify(reasoningEffort)}. Verify that the selected model supports the Responses API ` +
       "and requested reasoning configuration; choose a supported effort or omit reasoningEffort.",
   );
 }
 
-function requestFailureError(opts: OpenAISummarizerOptions): Error {
+function requestFailureError(
+  err: unknown,
+  opts: OpenAISummarizerOptions,
+  attempts: number,
+  policy: EffectiveOpenAIRequestPolicy,
+): Error {
   const apiMode = opts.apiMode === "responses" ? "responses" : "chat-completions";
   const apiName = apiMode === "responses" ? "Responses" : "Chat Completions";
   return new Error(
-    `OpenAI ${apiName} request failed after retries: ` +
+    `OpenAI ${apiName} request failed after retries (${safeMetadata(err)}; ${policyDescription(policy, attempts)}): ` +
       `api mode ${apiMode}, model ${JSON.stringify(opts.model)}. ` +
       "Verify endpoint availability and the provider configuration.",
   );
@@ -79,14 +168,22 @@ function sleep(ms: number): Promise<void> {
 }
 
 export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummarizeFn {
-  const client =
+  const retry = opts._retryDelayMs === undefined
+    ? opts.retry ?? { ...DEFAULT_LLM_RETRY_POLICY }
+    : { ...(opts.retry ?? DEFAULT_LLM_RETRY_POLICY), initialDelayMs: opts._retryDelayMs, maxDelayMs: opts._retryDelayMs };
+  const effectiveRequestPolicy: EffectiveOpenAIRequestPolicy = {
+    requestTimeoutMs: opts.requestTimeoutMs ?? DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+    retry,
+  };
+  const client: OpenAISummarizerClient =
     opts._clientOverride ??
     new OpenAI({
-      baseURL: opts.baseURL,
+      baseURL: opts.baseUrl,
       apiKey: opts.apiKey || "local", // many local servers require a non-empty key
+      timeout: effectiveRequestPolicy.requestTimeoutMs,
+      maxRetries: 0,
     });
-  const retryDelayMs = opts._retryDelayMs ?? 1000;
-  const MAX_RETRIES = 3;
+  const wait = opts._sleep ?? sleep;
 
   return async function summarize(text, aggressive, ctx: SummarizeContext = {}): Promise<string> {
     const estimatedInputTokens = Math.ceil(text.length / 4);
@@ -103,16 +200,15 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
       ? buildCondensedSummaryPrompt({ text, targetTokens, depth: ctx.depth ?? 1 })
       : buildLeafSummaryPrompt({ text, mode: aggressive ? "aggressive" : "normal", targetTokens });
 
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < retry.maxAttempts; attempt++) {
       try {
         if (opts.apiMode === "responses") {
+          if (!client.responses) {
+            throw new Error("OpenAI client does not provide the Responses API");
+          }
           const input = `${LCM_SUMMARIZER_SYSTEM_PROMPT}\n\n${prompt}`;
-          const request: {
-            model: string;
-            max_output_tokens: number;
-            input: string;
-            reasoning?: { effort: NonNullable<OpenAISummarizerOptions["reasoningEffort"]> };
-          } = {
+          const request: ResponsesRequest = {
             model: opts.model,
             max_output_tokens: 1024,
             input,
@@ -123,14 +219,19 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
 
           const response = await client.responses.create(request);
           if (response.status !== "completed") {
-            throw new Error("OpenAI Responses request did not complete");
+            throw Object.assign(new Error("OpenAI Responses request did not complete"), {
+              code: "LCM_INCOMPLETE_RESPONSE",
+            });
           }
           return response.output_text || text.slice(0, 500);
         }
 
+        if (!client.chat) {
+          throw new Error("OpenAI client does not provide the Chat Completions API");
+        }
         const response = await client.chat.completions.create({
           model: opts.model,
-          max_tokens: 1024,
+          ...selectChatCompletionTokenLimit(opts.model, 1024),
           // Merge system content into user message for compatibility with local
           // servers (e.g. MLX/llama.cpp) that don't support role:"system".
           messages: [
@@ -141,12 +242,15 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
         const textContent = response.choices[0]?.message?.content ?? "";
         return textContent || text.slice(0, 500);
       } catch (err: unknown) {
-        if (isConfigurationError(err)) {
-          throw configurationError(err, opts);
+        lastError = err;
+        const attempts = attempt + 1;
+        if (!isRetryableError(err)) throw terminalRequestError(err, opts, attempts, effectiveRequestPolicy);
+        if (attempts < retry.maxAttempts) {
+          const delay = Math.min(retry.maxDelayMs, retry.initialDelayMs * Math.pow(retry.multiplier, attempt));
+          await wait(delay);
         }
-        if (attempt < MAX_RETRIES - 1) await sleep(retryDelayMs * Math.pow(2, attempt));
       }
     }
-    throw requestFailureError(opts);
+    throw requestFailureError(lastError, opts, retry.maxAttempts, effectiveRequestPolicy);
   };
 }

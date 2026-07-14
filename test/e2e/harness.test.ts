@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it, expect, afterAll } from "vitest";
 import { createHarness, type HarnessHandle } from "./harness.js";
 
@@ -11,6 +13,7 @@ describe("E2E harness", { timeout: 30_000 }, () => {
   it("creates and cleans up in mock mode", async () => {
     handle = await createHarness("mock");
     expect(handle.daemonPort).toBeGreaterThan(0);
+    expect(JSON.parse(readFileSync(join(handle.tmpDir, "config.json"), "utf-8"))).toEqual({});
     // Use raw fetch since /health is GET, not POST
     const res = await fetch(`http://127.0.0.1:${handle.daemonPort}/health`);
     const health = await res.json() as { status: string };

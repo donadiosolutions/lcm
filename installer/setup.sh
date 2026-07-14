@@ -148,12 +148,12 @@ mkdir -p "$CONFIG_DIR"
 
 node - "$PROVIDER" "$MODEL" "$API_KEY" "$BASE_URL" "$CONFIG_FILE" <<'NODE'
 const fs = require('fs');
-const [provider, model, apiKey, baseURL, configFile] = process.argv.slice(2);
+const [provider, model, apiKey, baseUrl, configFile] = process.argv.slice(2);
 
 const llm = { provider };
 if (model)   llm.model   = model;
 if (apiKey)  llm.apiKey  = apiKey;
-if (baseURL) llm.baseURL = baseURL;
+if (baseUrl) llm.baseUrl = baseUrl;
 
 // If config doesn't exist, write a fresh file.
 if (!fs.existsSync(configFile)) {

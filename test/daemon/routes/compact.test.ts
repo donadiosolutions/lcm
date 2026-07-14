@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { createDaemon, type DaemonInstance } from "../../../src/daemon/server.js";
-import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { loadDaemonConfig, parseDaemonConfig } from "../../../src/daemon/config.js";
 import { projectDbPath, projectId } from "../../../src/daemon/project.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import { ConversationStore } from "../../../src/store/conversation-store.js";
@@ -54,7 +54,14 @@ function makeConfig(provider: DaemonConfig["llm"]["provider"]): DaemonConfig {
       promotionThresholds: { minDepth: 2, compressionRatio: 0.3, keywords: {}, architecturePatterns: [], dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
     },
     restoration: { recentSummaries: 3, promptSearchMinScore: 10, promptSearchMaxResults: 3, promptSnippetLength: 200, recencyHalfLifeHours: 24, crossSessionAffinity: 0.5 },
-    llm: { provider, model: "test-model", apiKey: "sk-test", baseURL: "http://localhost:11435/v1" },
+    llm: {
+      provider,
+      model: "test-model",
+      apiKey: "sk-test",
+      baseUrl: "http://localhost:11435/v1",
+      requestTimeoutMs: 600_000,
+      retry: { maxAttempts: 3, initialDelayMs: 1_000, maxDelayMs: 30_000, multiplier: 2 },
+    },
     claudeCliProxy: { enabled: true, port: 3456, startupTimeoutMs: 10000, model: "claude-haiku-4-5" },
     cipher: { configPath: "/tmp/cipher.yml", collection: "test" },
     security: { sensitivePatterns: [] },
@@ -219,7 +226,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(makeConfig("claude-process"));
     const { res } = mockRes();
     await handler({} as any, res, JSON.stringify({ session_id: "s1", cwd: testCwd }));
-    expect(createClaudeProcessSummarizer).toHaveBeenCalled();
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith({ model: "test-model" });
     expect(createCodexProcessSummarizer).not.toHaveBeenCalled();
   });
 
@@ -248,7 +255,12 @@ describe("createCompactHandler — summarizer branching", () => {
     const { res } = mockRes();
     await handler({} as any, res, JSON.stringify({ session_id: "s1", cwd: testCwd }));
     expect(createOpenAISummarizer).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "test-model", baseURL: "http://localhost:11435/v1" })
+      expect.objectContaining({
+        model: "test-model",
+        baseUrl: "http://localhost:11435/v1",
+        requestTimeoutMs: 600_000,
+        retry: { maxAttempts: 3, initialDelayMs: 1_000, maxDelayMs: 30_000, multiplier: 2 },
+      })
     );
     expect(createAnthropicSummarizer).not.toHaveBeenCalled();
   });
@@ -270,8 +282,45 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(makeConfig("auto"));
     const { res } = mockRes();
     await handler({} as any, res, JSON.stringify({ session_id: "s1", cwd: testCwd, client: "claude" }));
-    expect(createClaudeProcessSummarizer).toHaveBeenCalled();
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith({ model: "test-model" });
     expect(createCodexProcessSummarizer).not.toHaveBeenCalled();
+  });
+
+  it("forwards LCM_SUMMARY_MODEL through auto + Claude resolution", async () => {
+    vi.clearAllMocks();
+    const config = loadDaemonConfig("/nonexistent/config.json", { llm: { provider: "auto" } }, {
+      LCM_SUMMARY_MODEL: "claude-opus-4-1",
+    });
+    const handler = createCompactHandler(config);
+    const { res } = mockRes();
+
+    await handler({} as any, res, JSON.stringify({ session_id: "s1-env-model", cwd: testCwd, client: "claude" }));
+
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith({ model: "claude-opus-4-1" });
+  });
+
+  it.each([
+    ["claude", createClaudeProcessSummarizer],
+    ["codex", createCodexProcessSummarizer],
+  ] as const)("does not forward a persisted remote model through auto + %s resolution", async (client, factory) => {
+    vi.clearAllMocks();
+    const config = parseDaemonConfig(JSON.stringify({
+      llm: {
+        provider: "openai",
+        model: "remote-openai-model",
+        baseUrl: "http://localhost:11435/v1",
+      },
+    }), {}, { LCM_SUMMARY_PROVIDER: "auto" });
+    const handler = createCompactHandler(config);
+    const { res } = mockRes();
+
+    await handler(
+      new IncomingMessage(new Socket()),
+      res,
+      JSON.stringify({ session_id: `s1-${client}-default-model`, cwd: testCwd, client }),
+    );
+
+    expect(factory).toHaveBeenCalledWith({ model: "" });
   });
 
   it("auto + client=codex resolves to codex-process", async () => {
@@ -288,7 +337,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(makeConfig("auto"));
     const { res } = mockRes();
     await handler({} as any, res, JSON.stringify({ session_id: "s1", cwd: testCwd }));
-    expect(createClaudeProcessSummarizer).toHaveBeenCalled();
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith({ model: "test-model" });
     expect(createCodexProcessSummarizer).not.toHaveBeenCalled();
   });
 
@@ -392,6 +441,88 @@ describe("createCompactHandler — summarizer branching", () => {
     expect(createOpenAISummarizer).toHaveBeenCalledTimes(2);
     expect(createOpenAISummarizer).toHaveBeenNthCalledWith(1, expect.objectContaining({ reasoningEffort: "low" }));
     expect(createOpenAISummarizer).toHaveBeenNthCalledWith(2, expect.objectContaining({ reasoningEffort: "high" }));
+  });
+
+  it("validates and applies one-invocation OpenAI timeout and retry overrides", async () => {
+    vi.clearAllMocks();
+    const handler = createCompactHandler(makeConfig("openai"));
+    const { res, getBody } = mockRes();
+    await handler({} as any, res, JSON.stringify({
+      session_id: "policy-override",
+      cwd: testCwd,
+      request_timeout_ms: 45_000,
+      retry: { max_attempts: 5, initial_delay_ms: 250, max_delay_ms: 2_000, multiplier: 1.5 },
+    }));
+
+    expect(createOpenAISummarizer).toHaveBeenCalledWith(expect.objectContaining({
+      requestTimeoutMs: 45_000,
+      retry: { maxAttempts: 5, initialDelayMs: 250, maxDelayMs: 2_000, multiplier: 1.5 },
+    }));
+    expect(getBody()).toMatchObject({
+      requestTimeoutMs: 45_000,
+      retry: { maxAttempts: 5, initialDelayMs: 250, maxDelayMs: 2_000, multiplier: 1.5 },
+    });
+  });
+
+  it("rejects invalid or unsupported request policy overrides before creating a summarizer", async () => {
+    vi.clearAllMocks();
+    const openaiHandler = createCompactHandler(makeConfig("openai"));
+    const { res: invalidRes, getBody: getInvalidBody } = mockRes();
+    await openaiHandler({} as any, invalidRes, JSON.stringify({
+      session_id: "policy-invalid",
+      cwd: testCwd,
+      retry: { max_attempts: 0 },
+    }));
+    expect(invalidRes.writeHead).toHaveBeenCalledWith(400, expect.anything());
+    expect(getInvalidBody().error).toContain("maxAttempts");
+
+    const processHandler = createCompactHandler(makeConfig("claude-process"));
+    const { res: unsupportedRes, getBody: getUnsupportedBody } = mockRes();
+    await processHandler({} as any, unsupportedRes, JSON.stringify({
+      session_id: "policy-unsupported",
+      cwd: testCwd,
+      request_timeout_ms: 30_000,
+    }));
+    expect(unsupportedRes.writeHead).toHaveBeenCalledWith(400, expect.anything());
+    expect(getUnsupportedBody().error).toContain('llm.provider="openai"');
+    expect(createOpenAISummarizer).not.toHaveBeenCalled();
+    expect(createClaudeProcessSummarizer).not.toHaveBeenCalled();
+  });
+
+  it.each(["__proto__", "constructor", "prototype"])(
+    "rejects prototype-sensitive retry key %s without resolving inherited mappings",
+    async (key) => {
+      vi.clearAllMocks();
+      const handler = createCompactHandler(makeConfig("openai"));
+      const { res, getBody } = mockRes();
+      const retry = JSON.parse(`{${JSON.stringify(key)}:1}`) as Record<string, unknown>;
+      await handler({} as any, res, JSON.stringify({
+        session_id: `policy-${key}`,
+        cwd: testCwd,
+        retry,
+      }));
+
+      expect(res.writeHead).toHaveBeenCalledWith(400, expect.anything());
+      expect(getBody().error).toContain(`retry.${key}`);
+      expect(getBody().error).toContain("unknown retry policy key");
+      expect(createOpenAISummarizer).not.toHaveBeenCalled();
+    },
+  );
+
+  it("isolates cached OpenAI summarizers by effective request policy", async () => {
+    vi.clearAllMocks();
+    const handler = createCompactHandler(makeConfig("openai"));
+    const { res: first } = mockRes();
+    const { res: second } = mockRes();
+    await handler({} as any, first, JSON.stringify({
+      session_id: "policy-cache-one", cwd: testCwd, request_timeout_ms: 10_000,
+    }));
+    await handler({} as any, second, JSON.stringify({
+      session_id: "policy-cache-two", cwd: testCwd, request_timeout_ms: 20_000,
+    }));
+    expect(createOpenAISummarizer).toHaveBeenCalledTimes(2);
+    expect(createOpenAISummarizer).toHaveBeenNthCalledWith(1, expect.objectContaining({ requestTimeoutMs: 10_000 }));
+    expect(createOpenAISummarizer).toHaveBeenNthCalledWith(2, expect.objectContaining({ requestTimeoutMs: 20_000 }));
   });
 });
 

@@ -152,11 +152,19 @@ In practice, the hook asks the daemon for ranked candidates, the daemon dedupes 
 
 The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon requests to loopback HTTP origins and known daemon routes, so a malformed config or caller cannot redirect daemon traffic to another host.
 
-Use `lcm daemon start` to start or validate the managed background daemon. On Linux, lcm prefers the current user's `systemd --user` manager so the daemon remains a direct child of the user manager instead of being orphaned under PID 1. `lcm daemon start --detach` is kept as a compatibility alias for the same managed start behavior. Use `lcm daemon start --foreground` only when you want the daemon to stay attached to the current terminal for debugging.
+Use `lcm daemon start` to start or validate the managed background daemon. Use
+`lcm daemon restart` after configuration changes; it validates the new
+configuration before stopping the managed process, then starts the daemon with
+the updated settings. On Linux, lcm prefers the current user's `systemd --user`
+manager so the daemon remains a direct child of the user manager instead of
+being orphaned under PID 1. `lcm daemon start --detach` is kept as a compatibility
+alias for the same managed start behavior. Use `lcm daemon start --foreground`
+only when you want the daemon to stay attached to the current terminal for
+debugging.
 
 `lcm doctor` verifies daemon health and, on Linux, repairs a healthy daemon that is not parented by the current user's systemd manager by restarting it through the managed start path. If the user systemd manager is unavailable, lcm falls back to the older detached spawn behavior and reports that the parent invariant is not satisfied.
 
-Daemon port values must be integers from `1` through `65535` when connecting to an existing daemon. The daemon server also accepts port `0` for test and ephemeral-port binding. `daemon.idleTimeoutMs` must be an integer from `0` through `86400000` milliseconds; `0` disables the idle timer.
+Stored `daemon.port` values must be integers from `1` through `65535`; this includes values written with `lcm config set`. Port `0` is reserved for internal runtime overrides used by tests to request ephemeral binding and is not a valid `config.json` value because lifecycle commands must be able to reconnect to the configured port. `daemon.idleTimeoutMs` must be an integer from `0` through `86400000` milliseconds; `0` disables the idle timer.
 
 Hook error fallback logs write to `~/.lcm/logs/events.log`.
 
@@ -194,9 +202,20 @@ Valid provider values are:
 - `disabled`
 
 For compatibility, `claude` and `claude-cli` are aliases for `claude-process`,
-and `codex` is an alias for `codex-process`. Aliases are accepted in both
-`~/.lcm/config.json` and `LCM_SUMMARY_PROVIDER`; LCM normalizes them to their
-canonical names.
+`codex` is an alias for `codex-process`, and `custom` and `openai-compatible`
+are aliases for `openai`. Aliases are accepted in both `~/.lcm/config.json` and
+`LCM_SUMMARY_PROVIDER`; LCM normalizes them to their canonical names.
+
+`LCM_SUMMARY_PROVIDER` overrides `llm.provider`. `LCM_SUMMARY_MODEL` is applied
+after JSON and runtime configuration are merged and overrides `llm.model`. An
+explicitly empty `LCM_SUMMARY_MODEL` still overrides the file value, so remote
+providers that require a model fail validation instead of silently using the
+JSON value. When `LCM_SUMMARY_PROVIDER` switches away from an explicitly
+configured provider and `LCM_SUMMARY_MODEL` is unset, LCM discards the old
+provider-specific model. The configured model is preserved when the provider is
+unchanged. For `claude-process` and `codex-process`, a non-empty effective model
+is forwarded to the corresponding CLI with `--model`; an empty value preserves
+the process backend's existing default-model behavior.
 
 ### LLM configuration
 
@@ -209,12 +228,25 @@ example shows every supported `llm` field and enables OpenAI reasoning:
     "provider": "openai",
     "model": "gpt-5.2",
     "apiKey": "${OPENAI_API_KEY}",
-    "baseURL": "https://api.openai.com/v1",
+    "baseUrl": "https://api.openai.com/v1",
     "apiMode": "responses",
-    "reasoningEffort": "medium"
+    "reasoningEffort": "medium",
+    "requestTimeoutMs": 600000,
+    "retry": {
+      "maxAttempts": 3,
+      "initialDelayMs": 1000,
+      "maxDelayMs": 30000,
+      "multiplier": 2
+    }
   }
 }
 ```
+
+`baseUrl` is the canonical endpoint key. Legacy `baseURL` remains accepted so
+existing configurations keep working. When only the legacy key is present, LCM
+normalizes it to `baseUrl` in memory; configuration writes use only `baseUrl`.
+If both keys are present with the same value, LCM accepts them, while conflicting
+values fail validation.
 
 `apiMode` accepts `chat-completions` or `responses`. It defaults to
 `chat-completions`, preserving the existing OpenAI-compatible Chat Completions
@@ -238,6 +270,110 @@ The CLI value takes precedence over `llm.reasoningEffort` for that invocation
 and does not rewrite `~/.lcm/config.json`. The override has the same
 `openai` + `responses` requirement.
 
+### Timeouts and retries
+
+`llm.requestTimeoutMs` defaults to `600000` milliseconds. The default retry
+policy is `maxAttempts: 3`, `initialDelayMs: 1000`, `maxDelayMs: 30000`, and
+`multiplier: 2`. `maxAttempts` includes the initial request. LCM disables the
+OpenAI SDK's internal retries and applies this one bounded exponential-backoff
+policy, so configured attempt counts remain exact.
+
+The timeout must be an integer from `1` through `3600000` milliseconds.
+`maxAttempts` must be an integer from `1` through `10`; both delay values must
+be integers from `0` through `600000` milliseconds; and `multiplier` must be a
+finite number from `1` through `10`. `initialDelayMs` cannot exceed
+`maxDelayMs`. Invalid JSON settings and CLI overrides fail before a provider
+request is made.
+
+LCM retries connection errors, timeouts, HTTP 408, 409, 429, and 5xx responses,
+plus incomplete Responses API results. Authentication and configuration errors
+and other 4xx responses fail immediately. Final diagnostics identify the safe
+status or code and attempt count without including provider response bodies,
+prompts, API keys, or URLs containing credentials.
+
+Override the policy for one manual compaction without rewriting the file:
+
+```bash
+lcm compact \
+  --timeout-ms 120000 \
+  --retry-max-attempts 4 \
+  --retry-initial-delay-ms 500 \
+  --retry-max-delay-ms 10000 \
+  --retry-multiplier 2
+```
+
+The CLI values merge over the JSON policy for that invocation and require the
+OpenAI-compatible provider.
+
+### Local OpenAI-compatible server
+
+Any server that exposes an OpenAI-v1 Chat Completions endpoint can use the
+canonical `openai` provider. Set `llm.apiKey` when the custom endpoint requires
+authentication; it may be omitted for local servers that ignore credentials.
+LCM uses a non-secret local placeholder in that case and never borrows the
+public OpenAI credential for another host.
+
+```bash
+export LCM_SUMMARY_API_KEY=local-server-token
+
+lcm config set llm.baseUrl http://127.0.0.1:8000/v1
+lcm config set llm.model local-model
+lcm config set llm.apiKey '${LCM_SUMMARY_API_KEY}'
+lcm config set llm.provider openai
+lcm daemon restart
+lcm compact --verbose
+```
+
+The single quotes store the environment-variable reference instead of the
+secret itself. `LCM_SUMMARY_API_KEY` is propagated to managed daemon launches,
+including the restart shown above.
+
+The equivalent JSON is:
+
+```json
+{
+  "llm": {
+    "provider": "openai",
+    "model": "local-model",
+    "apiKey": "${LCM_SUMMARY_API_KEY}",
+    "baseUrl": "http://127.0.0.1:8000/v1",
+    "apiMode": "chat-completions"
+  }
+}
+```
+
+### Inspecting and updating configuration
+
+`lcm config get <path>` reads the normalized value stored in
+`~/.lcm/config.json`. Add `--effective` to include defaults and environment
+overrides used by the daemon:
+
+```bash
+lcm config get llm.provider
+lcm config get llm.model --effective
+```
+
+`lcm config set <path> <value>` stores a string by default. Add `--json` for a
+typed JSON value such as a number, boolean, object, array, or `null`:
+
+```bash
+lcm config set llm.model gpt-5-mini
+lcm config set hooks.disableAutoCompact true --json
+```
+
+Secret-like values are recursively masked in both stored and effective output;
+there is no raw-secret display mode. Writes validate the complete resulting
+configuration, preserve unrelated keys, use a mode-`0600` temporary file, and
+rename it atomically. A successful update prints `lcm daemon restart`, which
+must be run before an existing daemon uses the change.
+
+Setting `llm.provider` to a provider other than `openai` automatically removes
+the OpenAI-only `llm.apiMode`, `llm.reasoningEffort`,
+`llm.requestTimeoutMs`, and `llm.retry` settings. Provider aliases are
+normalized first, so `claude` and `codex` remove those settings while `custom`
+and `openai-compatible` retain them. Model, credential, endpoint, extension,
+and other unrelated settings are preserved.
+
 LCM validates `~/.lcm/config.json` strictly and fails loudly instead of silently
 falling back. Malformed JSON, an `llm` value that is not an object, unknown
 `llm` keys, invalid provider/API-mode/effort values, incorrect field types, and
@@ -249,7 +385,7 @@ diagnostics show the effective API mode and reasoning effort so an invocation
 override is visible without exposing the request prompt.
 
 Remote Anthropic configuration requires a non-empty model and resolved API key.
-OpenAI requires a non-empty model and an absolute HTTP(S) `baseURL`; the public
+OpenAI requires a non-empty model and an absolute HTTP(S) `baseUrl`; the public
 OpenAI endpoint also requires credentials. Process, `auto`, and `disabled`
 providers do not require remote credentials.
 

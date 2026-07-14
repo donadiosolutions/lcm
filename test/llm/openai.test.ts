@@ -1,3 +1,4 @@
+import { createServer } from "node:http";
 import { describe, it, expect, vi } from "vitest";
 import { createOpenAISummarizer } from "../../src/llm/openai.js";
 
@@ -21,8 +22,8 @@ describe("createOpenAISummarizer", () => {
     const mockClient = makeClient("Summary.");
     const summarizer = createOpenAISummarizer({
       model: "qwen2.5:14b",
-      baseURL: "http://localhost:11435/v1",
-      _clientOverride: mockClient as any,
+      baseUrl: "http://localhost:11435/v1",
+      _clientOverride: mockClient,
     });
     const result = await summarizer("Conversation text", false, { isCondensed: false });
     expect(result).toBe("Summary.");
@@ -30,6 +31,7 @@ describe("createOpenAISummarizer", () => {
     const args = mockClient.chat.completions.create.mock.calls[0][0];
     expect(args.model).toBe("qwen2.5:14b");
     expect(args.max_tokens).toBe(1024);
+    expect(args).not.toHaveProperty("max_completion_tokens");
     // System prompt is merged into user message for local LLM compatibility
     expect(args.messages).toHaveLength(1);
     expect(args.messages[0].role).toBe("user");
@@ -37,13 +39,56 @@ describe("createOpenAISummarizer", () => {
     expect(mockClient.responses.create).not.toHaveBeenCalled();
   });
 
+  it.each([
+    "gpt-5",
+    "gpt-5-mini-2025-08-07",
+    "openai/gpt-5.1-codex",
+    "ft:gpt-5-mini:organization:project:suffix",
+    "o1",
+    "o3-mini-2025-01-31",
+    "openai/o4-mini",
+    "ft:o3-mini:organization:project:suffix",
+  ])("uses max_completion_tokens for modern Chat Completions model %s", async (model) => {
+    const mockClient = makeClient();
+    const summarizer = createOpenAISummarizer({
+      model,
+      baseUrl: "https://api.openai.com/v1",
+      apiMode: "chat-completions",
+      _clientOverride: mockClient,
+    });
+
+    await summarizer("text", false);
+
+    const request = mockClient.chat.completions.create.mock.calls[0][0];
+    expect(request.max_completion_tokens).toBe(1024);
+    expect(request).not.toHaveProperty("max_tokens");
+  });
+
+  it.each(["local/gpt-4o-mini", "my-gpt-5-proxy"])(
+    "retains max_tokens for non-modern local model %s",
+    async (model) => {
+      const mockClient = makeClient();
+      const summarizer = createOpenAISummarizer({
+        model,
+        baseUrl: "http://localhost:11435/v1",
+        _clientOverride: mockClient,
+      });
+
+      await summarizer("text", false);
+
+      const request = mockClient.chat.completions.create.mock.calls[0][0];
+      expect(request.max_tokens).toBe(1024);
+      expect(request).not.toHaveProperty("max_completion_tokens");
+    },
+  );
+
   it("uses Chat Completions when apiMode is explicitly selected", async () => {
     const mockClient = makeClient();
     const summarizer = createOpenAISummarizer({
       model: "test-model",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "chat-completions",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
     });
 
     await summarizer("text", false);
@@ -56,10 +101,10 @@ describe("createOpenAISummarizer", () => {
     const mockClient = makeClient("Responses summary.");
     const summarizer = createOpenAISummarizer({
       model: "gpt-5",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       reasoningEffort: "high",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
     });
 
     await expect(summarizer("Conversation text", false)).resolves.toBe("Responses summary.");
@@ -79,9 +124,9 @@ describe("createOpenAISummarizer", () => {
     const mockClient = makeClient();
     const summarizer = createOpenAISummarizer({
       model: "gpt-5",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
     });
 
     await summarizer("text", false);
@@ -96,10 +141,10 @@ describe("createOpenAISummarizer", () => {
       const mockClient = makeClient();
       const summarizer = createOpenAISummarizer({
         model: "gpt-5",
-        baseURL: "https://api.openai.com/v1",
+        baseUrl: "https://api.openai.com/v1",
         apiMode: "responses",
         reasoningEffort,
-        _clientOverride: mockClient as any,
+        _clientOverride: mockClient,
       });
 
       await summarizer("text", false);
@@ -123,10 +168,10 @@ describe("createOpenAISummarizer", () => {
     };
     const summarizer = createOpenAISummarizer({
       model: "gpt-4.1",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       reasoningEffort: "xhigh",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
 
@@ -160,9 +205,9 @@ describe("createOpenAISummarizer", () => {
     };
     const summarizer = createOpenAISummarizer({
       model,
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
 
@@ -192,8 +237,8 @@ describe("createOpenAISummarizer", () => {
     };
     const summarizer = createOpenAISummarizer({
       model: "test-model",
-      baseURL: "http://localhost:11435/v1",
-      _clientOverride: mockClient as any,
+      baseUrl: "http://localhost:11435/v1",
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
     let thrown: Error | undefined;
@@ -205,21 +250,22 @@ describe("createOpenAISummarizer", () => {
 
     expect(thrown?.message).toContain("OpenAI Chat Completions request failed after retries");
     expect(thrown?.message).toContain('model "test-model"');
+    expect(thrown?.message).toContain("initialDelayMs=0, maxDelayMs=0, multiplier=2");
     expect(thrown?.message).not.toContain(secretProviderMessage);
     expect(thrown?.message).not.toContain("PRIVATE PROMPT");
     expect(thrown?.message).not.toContain("sk-secret");
     expect(mockClient.chat.completions.create).toHaveBeenCalledTimes(3);
   });
 
-  it("safely wraps a non-Error rejection after retries", async () => {
+  it("safely wraps an unclassified rejection without retrying", async () => {
     const secretRejection = "provider rejected PRIVATE PROMPT with sk-secret";
     const mockClient = {
       chat: { completions: { create: vi.fn().mockRejectedValue(secretRejection) } },
     };
     const summarizer = createOpenAISummarizer({
       model: "test-model\nFORGED LOG LINE",
-      baseURL: "http://localhost:11435/v1",
-      _clientOverride: mockClient as any,
+      baseUrl: "http://localhost:11435/v1",
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
 
@@ -231,16 +277,16 @@ describe("createOpenAISummarizer", () => {
     }
 
     expect(thrown).toBeInstanceOf(Error);
-    expect((thrown as Error).message).toContain("OpenAI Chat Completions request failed after retries");
+    expect((thrown as Error).message).toContain("OpenAI Chat Completions request rejected");
     expect((thrown as Error).message).toContain("api mode chat-completions");
     expect((thrown as Error).message).toContain('model "test-model\\nFORGED LOG LINE"');
     expect((thrown as Error).message).not.toContain(secretRejection);
     expect((thrown as Error).message).not.toContain("PRIVATE PROMPT");
     expect((thrown as Error).message).not.toContain("sk-secret");
-    expect(mockClient.chat.completions.create).toHaveBeenCalledTimes(3);
+    expect(mockClient.chat.completions.create).toHaveBeenCalledOnce();
   });
 
-  it.each([400, 403, 404, 409, 422])(
+  it.each([400, 403, 404, 422])(
     "safely wraps a Chat Completions %s configuration error without retrying",
     async (status) => {
       const secretPrompt = "PRIVATE CHAT PROMPT";
@@ -256,8 +302,8 @@ describe("createOpenAISummarizer", () => {
       };
       const summarizer = createOpenAISummarizer({
         model,
-        baseURL: "http://localhost:11435/v1",
-        _clientOverride: mockClient as any,
+        baseUrl: "http://localhost:11435/v1",
+        _clientOverride: mockClient,
         _retryDelayMs: 0,
       });
 
@@ -295,8 +341,8 @@ describe("createOpenAISummarizer", () => {
     };
     const summarizer = createOpenAISummarizer({
       model,
-      baseURL: "http://localhost:11435/v1",
-      _clientOverride: mockClient as any,
+      baseUrl: "http://localhost:11435/v1",
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
 
@@ -333,10 +379,10 @@ describe("createOpenAISummarizer", () => {
     };
     const summarizer = createOpenAISummarizer({
       model,
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       reasoningEffort: "high",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
 
@@ -367,9 +413,9 @@ describe("createOpenAISummarizer", () => {
     };
     const summarizer = createOpenAISummarizer({
       model: "gpt-5",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
 
@@ -386,9 +432,9 @@ describe("createOpenAISummarizer", () => {
       .mockResolvedValueOnce({ status: "completed", output_text: "Complete summary." });
     const summarizer = createOpenAISummarizer({
       model: "gpt-5",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
-      _clientOverride: { responses: { create } } as any,
+      _clientOverride: { responses: { create } },
       _retryDelayMs: 0,
     });
 
@@ -403,9 +449,9 @@ describe("createOpenAISummarizer", () => {
     });
     const summarizer = createOpenAISummarizer({
       model: "gpt-5",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
-      _clientOverride: { responses: { create } } as any,
+      _clientOverride: { responses: { create } },
       _retryDelayMs: 0,
     });
 
@@ -428,8 +474,8 @@ describe("createOpenAISummarizer", () => {
     const mockClient = makeClient();
     const summarizer = createOpenAISummarizer({
       model: "test-model",
-      baseURL: "http://localhost:11435/v1",
-      _clientOverride: mockClient as any,
+      baseUrl: "http://localhost:11435/v1",
+      _clientOverride: mockClient,
     });
     const result = await summarizer("text", false);
     expect(result).toBe("Summary.");
@@ -442,8 +488,8 @@ describe("createOpenAISummarizer", () => {
     const longText = "x".repeat(600);
     const summarizer = createOpenAISummarizer({
       model: "test-model",
-      baseURL: "http://localhost:11435/v1",
-      _clientOverride: mockClient as any,
+      baseUrl: "http://localhost:11435/v1",
+      _clientOverride: mockClient,
     });
     const result = await summarizer(longText, false);
     expect(result).toBe(longText.slice(0, 500));
@@ -456,11 +502,95 @@ describe("createOpenAISummarizer", () => {
     const longText = "x".repeat(600);
     const summarizer = createOpenAISummarizer({
       model: "gpt-5",
-      baseURL: "https://api.openai.com/v1",
+      baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
     });
 
     await expect(summarizer(longText, false)).resolves.toBe(longText.slice(0, 500));
+  });
+
+  it("uses exact bounded backoff and succeeds within the configured attempt count", async () => {
+    const create = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error("busy"), { status: 409, code: "conflict" }))
+      .mockRejectedValueOnce(Object.assign(new Error("busy"), { status: 500 }))
+      .mockRejectedValueOnce(Object.assign(new Error("busy"), { status: 429 }))
+      .mockResolvedValueOnce({ choices: [{ message: { content: "Recovered." } }] });
+    const delays: number[] = [];
+    const summarizer = createOpenAISummarizer({
+      model: "test-model",
+      baseUrl: "http://localhost/v1",
+      retry: { maxAttempts: 4, initialDelayMs: 10, maxDelayMs: 25, multiplier: 2 },
+      _clientOverride: { chat: { completions: { create } } },
+      _sleep: async (ms) => { delays.push(ms); },
+    });
+
+    await expect(summarizer("text", false)).resolves.toBe("Recovered.");
+    expect(create).toHaveBeenCalledTimes(4);
+    expect(delays).toEqual([10, 20, 25]);
+  });
+
+  it.each([408, 409, 429, 500, 503])("retries HTTP %s", async (status) => {
+    const create = vi.fn().mockRejectedValue(Object.assign(new Error("provider body secret"), { status }));
+    const summarizer = createOpenAISummarizer({
+      model: "test-model",
+      baseUrl: "http://localhost/v1",
+      retry: { maxAttempts: 2, initialDelayMs: 0, maxDelayMs: 0, multiplier: 2 },
+      _clientOverride: { chat: { completions: { create } } },
+    });
+    await expect(summarizer("private prompt", false)).rejects.toThrow("attempts 2/2");
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["APIConnectionError", "APIConnectionTimeoutError"])("retries %s failures", async (name) => {
+    const create = vi.fn().mockRejectedValue(Object.assign(new Error("connection secret"), { name }));
+    const summarizer = createOpenAISummarizer({
+      model: "test-model",
+      baseUrl: "http://localhost/v1",
+      retry: { maxAttempts: 2, initialDelayMs: 0, maxDelayMs: 0, multiplier: 2 },
+      _clientOverride: { chat: { completions: { create } } },
+    });
+    await expect(summarizer("private prompt", false)).rejects.toThrow("attempts 2/2");
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("talks to an actual loopback OpenAI-v1 Chat Completions server", async () => {
+    const requests: string[] = [];
+    const authorizationHeaders: Array<string | undefined> = [];
+    const server = createServer((req, res) => {
+      let body = "";
+      req.setEncoding("utf8");
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        requests.push(body);
+        authorizationHeaders.push(req.headers.authorization);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          id: "chatcmpl-test",
+          object: "chat.completion",
+          created: 0,
+          model: "loopback-model",
+          choices: [{ index: 0, message: { role: "assistant", content: "Loopback summary." }, finish_reason: "stop" }],
+        }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("loopback server did not bind");
+      const summarizer = createOpenAISummarizer({
+        model: "loopback-model",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        apiKey: "sk-loopback-test",
+        requestTimeoutMs: 5_000,
+        retry: { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0, multiplier: 1 },
+      });
+      await expect(summarizer("Loopback conversation", false)).resolves.toBe("Loopback summary.");
+      expect(requests).toHaveLength(1);
+      expect(JSON.parse(requests[0])).toMatchObject({ model: "loopback-model" });
+      expect(authorizationHeaders).toEqual(["Bearer sk-loopback-test"]);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
   });
 });

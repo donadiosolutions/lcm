@@ -52,9 +52,10 @@ describe("daemon server", () => {
     const port = daemon.address().port;
     try {
       const res = await fetch(`http://127.0.0.1:${port}/health`);
-      const data = await res.json() as { status: string; version: string; uptime: number };
+      const data = await res.json() as { status: string; version: string; uptime: number; pid: number };
       expect(data.version).toMatch(/^\d+\.\d+\.\d+$/);
       expect(data.status).toBe("ok");
+      expect(data.pid).toBe(process.pid);
     } finally {
       await daemon.stop();
     }

@@ -471,9 +471,137 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           .flatMap((call) => call.map((entry) => String(entry)))
           .join(" ");
         expect(diagnostics).toContain("content_preview=");
-        expect(diagnostics).toContain('"authorization":"[redacted]"');
+        expect(diagnostics).toContain('"authorization":"[REDACTED]"');
         expect(diagnostics).not.toContain("super-secret-token");
         expect(diagnostics).toContain("[truncated:");
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("sanitizes credential-bearing and opaque URL values in diagnostic previews", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      const secrets = [
+        "url-user",
+        "url-password",
+        "query-secret",
+        "fragment-secret",
+        "opaque-secret",
+        "protocol-secret",
+        "database-user",
+        "database-password",
+        "connection-user",
+        "connection-password",
+      ];
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({ provider: "openai", model: "gpt-5.3-codex" })),
+          complete: vi.fn(async () => ({
+            content: [{
+              type: "tool_use",
+              name: "http",
+              input: {
+                endpoint: `https://${secrets[0]}:${secrets[1]}@example.com/v1?token=${secrets[2]}#${secrets[3]}`,
+                opaqueEndpoint: `user:${secrets[4]}@example.com`,
+                protocolRelativeEndpoint: `//user:${secrets[5]}@example.com/v1?token=${secrets[2]}`,
+                dsn: `postgres://${secrets[6]}:${secrets[7]}@db.example.com/app`,
+                message: "Error: provider failed",
+                embeddedMessage: `request failed: https://${secrets[0]}:${secrets[1]}@example.com/v1?api_key=${secrets[2]}#${secrets[3]}; retrying`,
+                connectionMessage: `Server=db;User Id=${secrets[8]};Password=${secrets[9]};Database=app`,
+              },
+            }],
+          })),
+        });
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+        });
+
+        await summarize!("F".repeat(8_000), false);
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((call: unknown[]) => call.map((entry: unknown) => String(entry)))
+          .join(" ");
+        expect(diagnostics).toContain("content_preview=");
+        expect(diagnostics).toContain('"opaqueEndpoint":"[REDACTED]"');
+        expect(diagnostics).toContain('"protocolRelativeEndpoint":"[REDACTED]"');
+        expect(diagnostics).toContain('"dsn":"[REDACTED]"');
+        expect(diagnostics).toContain('"message":"Error: provider failed"');
+        expect(diagnostics).toContain(
+          '"embeddedMessage":"request failed: https://example.com/v1?[REDACTED]#[REDACTED]; retrying"',
+        );
+        expect(diagnostics).toContain(
+          '"connectionMessage":"Server=db;User Id=[REDACTED];Password=[REDACTED];Database=app"',
+        );
+        for (const secret of secrets) expect(diagnostics).not.toContain(secret);
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it.each([
+      ["absolute", "https://"],
+      ["protocol-relative", "//"],
+    ])("sanitizes %s embedded URI credentials beyond the diagnostic boundary", async (_kind, scheme) => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      const credential = `${_kind}-boundary-secret`;
+      const querySecret = `${_kind}-query-secret`;
+      const lead = `request failed: ${scheme}${credential}`;
+      const message = `${lead}${"a".repeat(1200 - lead.length)}@example.com/v1?token=${querySecret}`;
+      expect(message.indexOf("@")).toBe(1200);
+
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({ provider: "openai", model: "gpt-5.3-codex" })),
+          complete: vi.fn(async () => ({
+            content: [{ type: "tool_use", name: "http", input: { message } }],
+          })),
+        });
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+        });
+
+        await summarize!("G".repeat(8_000), false);
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((call: unknown[]) => call.map((entry: unknown) => String(entry)))
+          .join(" ");
+        expect(diagnostics).toContain("content_preview=");
+        expect(diagnostics).toContain(`${scheme}example.com/v1?[REDACTED]`);
+        expect(diagnostics).not.toContain(credential);
+        expect(diagnostics).not.toContain(querySecret);
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("fails closed for oversized diagnostic strings", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      const credential = "oversized-diagnostic-secret";
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({ provider: "openai", model: "gpt-5.3-codex" })),
+          complete: vi.fn(async () => ({
+            content: [{
+              type: "tool_use",
+              name: "http",
+              input: { message: `https://${credential}${"a".repeat(70_000)}@example.com` },
+            }],
+          })),
+        });
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+        });
+
+        await summarize!("H".repeat(8_000), false);
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((call: unknown[]) => call.map((entry: unknown) => String(entry)))
+          .join(" ");
+        expect(diagnostics).toContain("[REDACTED oversized diagnostic text:");
+        expect(diagnostics).not.toContain(credential);
       } finally {
         consoleError.mockRestore();
       }

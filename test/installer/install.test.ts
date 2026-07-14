@@ -10,6 +10,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { legacyLcmCommand, legacyLcmMcpServerName } from "../../src/legacy-names.js";
+import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../../src/daemon/config.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -282,6 +283,13 @@ describe("summarizer picker", () => {
     expect(written.llm.provider).toBe("anthropic");
     expect(written.llm.apiKey).toBe("${ANTHROPIC_API_KEY}");
     expect(written.llm.model).toBe("claude-haiku-4-5-20251001");
+    expect(written.llm).not.toHaveProperty("requestTimeoutMs");
+    expect(written.llm).not.toHaveProperty("retry");
+
+    const effective = parseDaemonConfig(configCall![1], {}, { ANTHROPIC_API_KEY: "sk-test" });
+    expect(effective.llm.provider).toBe("anthropic");
+    expect(effective.llm.requestTimeoutMs).toBe(DEFAULT_LLM_REQUEST_TIMEOUT_MS);
+    expect(effective.llm.retry).toEqual(DEFAULT_LLM_RETRY_POLICY);
   });
 
   it("option 3 (custom server): prompts for URL and model, writes provider=openai", async () => {
@@ -302,8 +310,11 @@ describe("summarizer picker", () => {
     expect(configCall).toBeDefined();
     const written = JSON.parse(configCall![1]);
     expect(written.llm.provider).toBe("openai");
-    expect(written.llm.baseURL).toBe("http://192.168.1.5:8080/v1");
+    expect(written.llm.baseUrl).toBe("http://192.168.1.5:8080/v1");
+    expect(written.llm.baseURL).toBeUndefined();
     expect(written.llm.model).toBe("my-model");
+    expect(written.llm.requestTimeoutMs).toBe(DEFAULT_LLM_REQUEST_TIMEOUT_MS);
+    expect(written.llm.retry).toEqual(DEFAULT_LLM_RETRY_POLICY);
   });
 
   it("invalid input re-prompts once then defaults to option 1 (auto)", async () => {

@@ -62,13 +62,13 @@ type SummarizerConfig = {
   provider: "auto" | "anthropic" | "openai";
   model: string;
   apiKey: string;
-  baseURL: string;
+  baseUrl: string;
 };
 
 async function pickSummarizer(deps: ServiceDeps): Promise<SummarizerConfig> {
   // Non-TTY (CI, piped stdin): skip interactive picker, default to auto.
   if (!process.stdin.isTTY) {
-    return { provider: "auto", model: "", apiKey: "", baseURL: "" };
+    return { provider: "auto", model: "", apiKey: "", baseUrl: "" };
   }
 
   console.log("\n  ─── Summarizer (for conversation compaction)\n");
@@ -87,22 +87,22 @@ async function pickSummarizer(deps: ServiceDeps): Promise<SummarizerConfig> {
   }
 
   if (choice === "1") {
-    return { provider: "auto", model: "", apiKey: "", baseURL: "" };
+    return { provider: "auto", model: "", apiKey: "", baseUrl: "" };
   }
 
   if (choice === "2") {
     const apiKey = process.env.ANTHROPIC_API_KEY ? "${ANTHROPIC_API_KEY}" : "";
-    return { provider: "anthropic", model: "claude-haiku-4-5-20251001", apiKey, baseURL: "" };
+    return { provider: "anthropic", model: "claude-haiku-4-5-20251001", apiKey, baseUrl: "" };
   }
 
   if (choice === "3") {
-    const baseURL = (await deps.promptUser("  Server URL (e.g. http://192.168.1.x:8080/v1): ")).trim();
+    const baseUrl = (await deps.promptUser("  Server URL (e.g. http://192.168.1.x:8080/v1): ")).trim();
     const model = (await deps.promptUser("  Model name: ")).trim();
-    return { provider: "openai", model, apiKey: "", baseURL };
+    return { provider: "openai", model, apiKey: "", baseUrl };
   }
 
   // Fallback (should not reach here)
-  return { provider: "auto", model: "", apiKey: "", baseURL: "" };
+  return { provider: "auto", model: "", apiKey: "", baseUrl: "" };
 }
 
 // ── Health-wait ──
@@ -206,11 +206,11 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   // For install, we inject summarizer config into the default config if creating fresh
   if (!deps.existsSync(configPath)) {
     const summarizerConfig = await pickSummarizer(deps);
-    const { loadDaemonConfig } = await import("../src/daemon/config.js");
+    const { daemonConfigForPersistence, loadDaemonConfig } = await import("../src/daemon/config.js");
     const defaults = loadDaemonConfig("/nonexistent");
     defaults.llm = { ...defaults.llm, ...summarizerConfig };
     deps.mkdirSync(dirname(configPath), { recursive: true });
-    deps.writeFileSync(configPath, JSON.stringify(defaults, null, 2));
+    deps.writeFileSync(configPath, JSON.stringify(daemonConfigForPersistence(defaults), null, 2));
     try { deps.chmodSync?.(configPath, 0o600); } catch { /* best-effort */ }
     console.log(`Created ${configPath}`);
   }

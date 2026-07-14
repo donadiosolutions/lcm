@@ -7,7 +7,7 @@ import type { ProgressState } from "./cli/progress-state.js";
 import { DaemonClient } from "./daemon/client.js";
 import { projectsDir as lcmProjectsDir } from "./runtime-paths.js";
 import { normalizeProjectPath, projectMapPathsForHash } from "./project-map.js";
-import type { LlmApiMode, LlmReasoningEffort } from "./daemon/config.js";
+import type { LlmApiMode, LlmReasoningEffort, LlmRequestPolicy, LlmRetryPolicy } from "./daemon/config.js";
 
 export interface UncompactedConversation {
   projectDir: string;
@@ -22,12 +22,23 @@ export function formatLlmDiagnostic(input: {
   providerLabel?: string;
   apiMode?: LlmApiMode;
   reasoningEffort?: LlmReasoningEffort | null;
+  requestTimeoutMs?: number | null;
+  retry?: LlmRetryPolicy | null;
 }): string | undefined {
   if (!input.providerLabel) return undefined;
   const parts = [input.providerLabel];
   if (input.apiMode) parts.push(input.apiMode);
   if (input.apiMode === "responses") {
     parts.push(`reasoning=${input.reasoningEffort ?? "default"}`);
+  }
+  if (typeof input.requestTimeoutMs === "number") {
+    parts.push(`timeout=${input.requestTimeoutMs}ms`);
+  }
+  if (input.retry) {
+    parts.push(
+      `retry=${input.retry.maxAttempts} attempts `
+      + `(${input.retry.initialDelayMs}-${input.retry.maxDelayMs}ms ×${input.retry.multiplier})`,
+    );
   }
   return parts.join(" · ");
 }
@@ -118,6 +129,7 @@ export async function batchCompact(opts: {
   verbose?: boolean;
   tokenPath?: string;
   reasoningEffort?: LlmReasoningEffort;
+  requestPolicy?: LlmRequestPolicy;
   /** Called with state patches as each session is processed — used by the ninja renderer */
   onProgress?: (patch: Partial<ProgressState>) => void;
 }): Promise<{ compacted: number; failures: number }> {
@@ -165,12 +177,21 @@ export async function batchCompact(opts: {
         providerLabel?: string;
         apiMode?: LlmApiMode;
         reasoningEffort?: LlmReasoningEffort | null;
+        requestTimeoutMs?: number | null;
+        retry?: LlmRetryPolicy | null;
       }>("/compact", {
         session_id: conv.sessionId,
         cwd: conv.cwd,
         skip_ingest: true,
         client: "claude",
         reasoning_effort: opts.reasoningEffort,
+        request_timeout_ms: opts.requestPolicy?.requestTimeoutMs,
+        retry: opts.requestPolicy ? {
+          max_attempts: opts.requestPolicy.retry.maxAttempts,
+          initial_delay_ms: opts.requestPolicy.retry.initialDelayMs,
+          max_delay_ms: opts.requestPolicy.retry.maxDelayMs,
+          multiplier: opts.requestPolicy.retry.multiplier,
+        } : undefined,
       });
 
       doneCount++;
@@ -182,20 +203,18 @@ export async function batchCompact(opts: {
           lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore: conv.tokens, elapsed: Date.now() - sessionStart },
         });
       } else {
-        const before = typeof data.tokensBefore === "number" ? data.tokensBefore : 0;
-        const after = typeof data.tokensAfter === "number" ? data.tokensAfter : 0;
-        tokensIn += before;
-        tokensOut += after;
-        if (opts.verbose && before > 0) {
-          const pct = before > 0 ? Math.round((1 - after / before) * 100) : 0;
-          console.log(` done  (${(before / 1000).toFixed(1)}k → ${(after / 1000).toFixed(1)}k tokens, ${pct}% reduction)`);
+        const tokensBefore = data.tokensBefore ?? conv.tokens;
+        const tokensAfter = data.tokensAfter ?? 0;
+        if (opts.verbose && tokensBefore > 0) {
+          const pct = Math.round((1 - tokensAfter / tokensBefore) * 100);
+          console.log(` done  (${(tokensBefore / 1000).toFixed(1)}k → ${(tokensAfter / 1000).toFixed(1)}k tokens, ${pct}% reduction)`);
         } else {
           console.log(" done");
         }
         compacted++;
         messagesIn += conv.messages;
-        tokensIn += data.tokensBefore ?? conv.tokens;
-        tokensOut += data.tokensAfter ?? 0;
+        tokensIn += tokensBefore;
+        tokensOut += tokensAfter;
         onProgress?.({
           completed: doneCount,
           messagesIn,
@@ -205,8 +224,8 @@ export async function batchCompact(opts: {
           lastResult: {
             sessionId: conv.sessionId,
             messages: conv.messages,
-            tokensBefore: data.tokensBefore ?? conv.tokens,
-            tokensAfter: data.tokensAfter,
+            tokensBefore,
+            tokensAfter,
             provider: formatLlmDiagnostic(data),
             elapsed: Date.now() - sessionStart,
           },

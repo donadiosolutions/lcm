@@ -235,8 +235,15 @@ lcm map remove <alias>     # remove an alias from its unambiguous project
 lcm compact                # compact the current project
 lcm compact --all          # compact all tracked projects
 lcm compact --reasoning-effort high  # one-run OpenAI Responses reasoning override
+lcm compact --timeout-ms 120000 --retry-max-attempts 4  # one-run request-policy overrides
 lcm promote                # promote durable insights to long-term memory
 lcm promote --all          # promote across all tracked projects
+
+# Configuration
+lcm config get llm.provider             # show the normalized stored value
+lcm config get llm.model --effective    # include defaults and environment overrides
+lcm config set llm.model gpt-5-mini        # store a string value
+lcm config set hooks.disableAutoCompact true --json  # store a typed JSON value
 
 # Import / export
 lcm import                 # import Claude Code sessions for the current project
@@ -261,6 +268,7 @@ lcm sensitive purge --yes  # remove all stored data for the current project
 
 # Daemon
 lcm daemon start           # start managed daemon in background
+lcm daemon restart         # validate config, restart daemon, and apply changes
 lcm daemon start --detach  # compatibility alias for managed background start
 lcm daemon start --foreground  # start daemon in current terminal for debugging
 # If doctor reports a stale daemon version, stop the stale daemon process and rerun this command.
@@ -284,7 +292,7 @@ All environment variables are optional. The default summarizer mode is `auto`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `LCM_SUMMARY_PROVIDER` | `auto` | `auto`, `claude-process` (`claude`/`claude-cli` aliases), `codex-process` (`codex` alias), `anthropic`, `openai`, or `disabled` |
+| `LCM_SUMMARY_PROVIDER` | `auto` | `auto`, `claude-process` (`claude`/`claude-cli` aliases), `codex-process` (`codex` alias), `anthropic`, `openai` (`custom`/`openai-compatible` aliases), or `disabled` |
 | `LCM_SUMMARY_MODEL` | unset | Optional model override for the selected summarizer provider |
 | `LCM_CONTEXT_THRESHOLD` | `0.75` | Context fill ratio that triggers compaction |
 | `LCM_FRESH_TAIL_COUNT` | `32` | Most recent raw messages protected from compaction |
@@ -304,12 +312,20 @@ All environment variables are optional. The default summarizer mode is `auto`.
 - `lcm` -> `claude-process`
 - explicit config or `LCM_SUMMARY_PROVIDER` override always takes precedence
 
-OpenAI defaults to Chat Completions. To opt into the Responses API and reasoning,
+`LCM_SUMMARY_MODEL` overrides `llm.model` after JSON and runtime configuration
+are merged. An explicitly empty environment value is still an override and
+fails validation when the selected remote provider requires a model.
+
+OpenAI defaults to Chat Completions. `llm.baseUrl` is the canonical endpoint key;
+legacy `llm.baseURL` remains readable for migration, but conflicting values are
+rejected. OpenAI requests default to a 600000 ms timeout and three total attempts
+with bounded exponential backoff. To opt into the Responses API and reasoning,
 set `llm.apiMode` to `responses` and `llm.reasoningEffort` to `none`, `minimal`,
 `low`, `medium`, `high`, or `xhigh` in `~/.lcm/config.json`. A
 `--reasoning-effort` CLI value overrides JSON for one `lcm compact` invocation
 without rewriting the file. LCM validates the `llm` object strictly and reports
-configuration or model-capability errors without exposing prompts or credentials.
+configuration, retry, or model-capability errors without exposing prompts,
+provider bodies, credential-bearing URLs, or credentials.
 
 See [`docs/configuration.md`](docs/configuration.md) for the complete JSON example,
 provider requirements, and deeper operational guidance.

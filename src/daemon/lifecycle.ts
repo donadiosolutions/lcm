@@ -40,10 +40,23 @@ export type EnsureDaemonResult = {
   warning?: string;
 };
 
+export type RestartDaemonOptions = EnsureDaemonOptions & {
+  /** Optional caller validation hook. It always completes before any signal is sent. */
+  validateBeforeRestart?: () => void | Promise<void>;
+  _ensureDaemonOverride?: (options: EnsureDaemonOptions) => Promise<EnsureDaemonResult>;
+  _isManagedProcessOverride?: (pid: number) => boolean;
+};
+
+export type RestartDaemonResult = EnsureDaemonResult & {
+  restarted: boolean;
+  stoppedPid?: number;
+};
+
 type HealthResponse = {
   status: string;
   version?: string;
   uptime?: number;
+  pid?: number;
 };
 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
@@ -108,11 +121,50 @@ function readProcessCommand(pid: number, procRoot = "/proc"): string | null {
   }
 }
 
-function isLikelyLcmDaemonProcess(pid: number, procRoot = "/proc"): boolean {
-  const command = readProcessCommand(pid, procRoot);
+function isLikelyLcmDaemonCommand(command: string | null): boolean {
   if (!command) return false;
   const parts = command.split(/\s+/);
   return command.includes("lcm") && parts.includes("daemon") && parts.includes("start");
+}
+
+function isLikelyLcmDaemonProcess(pid: number, procRoot = "/proc"): boolean {
+  return isLikelyLcmDaemonCommand(readProcessCommand(pid, procRoot));
+}
+
+function findListeningTcpPorts(
+  pid: number,
+  platform: NodeJS.Platform,
+  spawnSyncImpl: typeof spawnSync,
+): number[] {
+  if (platform === "win32") return [];
+  try {
+    const command = platform === "darwin" ? "/usr/sbin/lsof" : "lsof";
+    const result = spawnSyncImpl(command, [
+      "-nP",
+      "-a",
+      "-p", String(pid),
+      "-iTCP",
+      "-sTCP:LISTEN",
+      "-Fn",
+    ], {
+      encoding: "utf-8",
+      timeout: 1000,
+      maxBuffer: 64 * 1024,
+    });
+    if (result.status !== 0 || typeof result.stdout !== "string") return [];
+    const ports = new Set<number>();
+    for (const line of result.stdout.split(/\r?\n/)) {
+      if (!line.startsWith("n")) continue;
+      const match = line.match(/:(\d+)(?:\s+\(LISTEN\))?$/);
+      if (!match) continue;
+      const port = Number.parseInt(match[1], 10);
+      if (Number.isInteger(port) && port >= 1 && port <= 65_535) ports.add(port);
+      if (ports.size >= 32) break;
+    }
+    return [...ports].sort((a, b) => a - b);
+  } catch {
+    return [];
+  }
 }
 
 export function findUserSystemdPid(options: { procRoot?: string; uid?: number } = {}): number | null {
@@ -640,4 +692,74 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const combinedWarning = warning && detachedWarning ? `${warning}; ${detachedWarning}` : warning ?? detachedWarning;
   cleanupSystemdCredentials?.();
   return { connected: false, port: opts.port, spawned: true, startMethod, warning: combinedWarning, restartedForParent };
+}
+
+/**
+ * Safely stop the verified PID-file daemon and ensure a daemon is running with
+ * the caller's already-resolved options. Callers should derive `port` and other
+ * options from validated configuration; `validateBeforeRestart` is available
+ * when validation and restart need to be kept in one operation.
+ */
+export async function restartDaemon(opts: RestartDaemonOptions): Promise<RestartDaemonResult> {
+  const {
+    validateBeforeRestart,
+    _ensureDaemonOverride,
+    _isManagedProcessOverride,
+    ...ensureOptions
+  } = opts;
+  await validateBeforeRestart?.();
+
+  const isAlive = opts._isProcessAliveOverride ?? isProcessAlive;
+  const platform = opts._platform ?? osPlatform();
+  const fetchFn = opts._fetchOverride ?? globalThis.fetch;
+  const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
+  async function isAuthenticatedDaemonAtPort(port: number, pid: number, allowLegacyHealth: boolean): Promise<boolean> {
+    const health = await checkDaemonHealth(port, fetchFn);
+    if (health?.status !== "ok") return false;
+    if (!await checkDaemonAccess(port, tokenPath, fetchFn)) return false;
+    return health.pid === undefined ? allowLegacyHealth : health.pid === pid;
+  }
+  async function isManaged(pid: number): Promise<boolean> {
+    if (_isManagedProcessOverride) return _isManagedProcessOverride(pid);
+    if (platform === "linux") return isLikelyLcmDaemonProcess(pid, opts._procRoot ?? "/proc");
+    if (await isAuthenticatedDaemonAtPort(opts.port, pid, false)) return true;
+    const listenerPorts = findListeningTcpPorts(pid, platform, opts._spawnSyncOverride ?? spawnSync);
+    for (const port of listenerPorts) {
+      if (await isAuthenticatedDaemonAtPort(port, pid, true)) return true;
+    }
+    return false;
+  }
+  const killProcess = opts._killOverride ?? ((pid: number, signal?: NodeJS.Signals | number) => {
+    process.kill(pid, signal);
+  });
+  const sleepFn = opts._sleepOverride ?? sleep;
+  let restarted = false;
+  let stoppedPid: number | undefined;
+
+  const pid = readPidFile(opts.pidFilePath);
+  if (pid === null) {
+    cleanStalePid(opts.pidFilePath);
+  } else if (!isAlive(pid)) {
+    cleanStalePid(opts.pidFilePath);
+  } else {
+    if (!await isManaged(pid)) {
+      throw new Error(`Refusing to restart: PID ${pid} is running but is not a verified LCM daemon.`);
+    }
+    await terminatePid(pid, { isAlive, killProcess, sleepFn });
+    if (isAlive(pid)) {
+      throw new Error(`Unable to stop verified LCM daemon PID ${pid}; restart aborted.`);
+    }
+    cleanStalePid(opts.pidFilePath);
+    restarted = true;
+    stoppedPid = pid;
+  }
+
+  const ensure = _ensureDaemonOverride ?? ensureDaemon;
+  const result = await ensure(ensureOptions);
+  if (!restarted && result.connected && !result.spawned) {
+    throw new Error(
+      "Refusing to report a restart: a daemon is reachable but no verified daemon PID was available to stop.",
+    );
+  }
+  return { ...result, restarted, stoppedPid };
 }

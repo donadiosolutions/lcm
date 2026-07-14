@@ -144,9 +144,10 @@ export async function createHarness(mode: "mock" | "live"): Promise<HarnessHandl
     },
   };
 
-  // Write the test config to a temp file so loadDaemonConfig can read it
+  // Keep config.json representative of a valid persisted user config. Test-only
+  // values such as daemon.port=0 belong exclusively to runtime overrides.
   const configPath = join(tmpDir, "config.json");
-  writeFileSync(configPath, JSON.stringify(configOverrides, null, 2));
+  writeFileSync(configPath, "{}\n");
 
   const config = loadDaemonConfig(configPath, configOverrides, {
     // Pass empty env to avoid env-var overrides interfering with tests
