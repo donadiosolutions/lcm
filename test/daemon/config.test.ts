@@ -41,6 +41,28 @@ describe("known configuration schema validation", () => {
   });
 
   it.each([
+    [Number.NaN, "NaN"],
+    [Number.POSITIVE_INFINITY, "Infinity"],
+    [Number.NEGATIVE_INFINITY, "-Infinity"],
+  ])("renders the non-finite number %s accurately in validation errors", (value, displayed) => {
+    expect(() => parseDaemonConfig("{}", { daemon: { idleTimeoutMs: value } })).toThrow(
+      `received number ${displayed}`,
+    );
+  });
+
+  it("preserves existing finite, string, and structured validation displays", () => {
+    expect(() => parseDaemonConfig("{}", { daemon: { idleTimeoutMs: 86_400_001 } })).toThrow(
+      "received 86400001",
+    );
+    expect(() => parseDaemonConfig("{}", { daemon: { port: "3737" } })).toThrow(
+      'received string "3737"',
+    );
+    expect(() => parseDaemonConfig("{}", { daemon: [] })).toThrow(
+      'received array "[REDACTED]"',
+    );
+  });
+
+  it.each([
     [{ daemon: { prt: 3737 } }, "daemon.prt"],
     [{ compaction: { leafToken: 1000 } }, "compaction.leafToken"],
     [{ compaction: { promotionThresholds: { compressionRato: 0.3 } } }, "compaction.promotionThresholds.compressionRato"],

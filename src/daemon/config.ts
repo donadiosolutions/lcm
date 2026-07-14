@@ -312,6 +312,7 @@ function displayValue(path: string, value: unknown): string {
   if ((path === "llm.baseUrl" || path === "llm.baseURL") && typeof value === "string") {
     return JSON.stringify(sanitizeUrlForDisplay(value));
   }
+  if (typeof value === "number" && !Number.isFinite(value)) return String(value);
   const serialized = JSON.stringify(value, (key, nestedValue) => {
     if (key && isCredentialPath(key)) return "[REDACTED]";
     if (typeof nestedValue === "string" && /^[a-z][a-z\d+.-]*:\/\//i.test(nestedValue)) {
