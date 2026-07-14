@@ -14,27 +14,24 @@ import {
   resolveTargetTokens,
 } from "../summarize.js";
 
-type ChatCompletionRequest = {
-  model: string;
-  max_tokens: number;
-  messages: Array<{ role: "user"; content: string }>;
-};
+type ChatCompletionRequest = Pick<
+  OpenAI.ChatCompletionCreateParamsNonStreaming,
+  "model" | "max_tokens" | "messages"
+>;
 
+type ChatCompletionChoice = OpenAI.ChatCompletion["choices"][number];
 type ChatCompletionResult = {
-  choices: Array<{ message?: { content?: string | null } }>;
+  choices: Array<{
+    message?: Partial<Pick<ChatCompletionChoice["message"], "content">>;
+  }>;
 };
 
-type ResponsesRequest = {
-  model: string;
-  max_output_tokens: number;
-  input: string;
-  reasoning?: { effort: LlmReasoningEffort };
-};
+type ResponsesRequest = Pick<
+  OpenAI.Responses.ResponseCreateParamsNonStreaming,
+  "model" | "max_output_tokens" | "input" | "reasoning"
+>;
 
-type ResponsesResult = {
-  status?: string;
-  output_text?: string | null;
-};
+type ResponsesResult = Partial<Pick<OpenAI.Responses.Response, "status" | "output_text">>;
 
 type OpenAISummarizerClient = {
   chat?: {
