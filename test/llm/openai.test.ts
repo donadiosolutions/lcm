@@ -31,12 +31,56 @@ describe("createOpenAISummarizer", () => {
     const args = mockClient.chat.completions.create.mock.calls[0][0];
     expect(args.model).toBe("qwen2.5:14b");
     expect(args.max_tokens).toBe(1024);
+    expect(args).not.toHaveProperty("max_completion_tokens");
     // System prompt is merged into user message for local LLM compatibility
     expect(args.messages).toHaveLength(1);
     expect(args.messages[0].role).toBe("user");
     expect(args.messages[0].content).toContain("context-compaction summarization engine");
     expect(mockClient.responses.create).not.toHaveBeenCalled();
   });
+
+  it.each([
+    "gpt-5",
+    "gpt-5-mini-2025-08-07",
+    "openai/gpt-5.1-codex",
+    "ft:gpt-5-mini:organization:project:suffix",
+    "o1",
+    "o3-mini-2025-01-31",
+    "openai/o4-mini",
+    "ft:o3-mini:organization:project:suffix",
+  ])("uses max_completion_tokens for modern Chat Completions model %s", async (model) => {
+    const mockClient = makeClient();
+    const summarizer = createOpenAISummarizer({
+      model,
+      baseUrl: "https://api.openai.com/v1",
+      apiMode: "chat-completions",
+      _clientOverride: mockClient,
+    });
+
+    await summarizer("text", false);
+
+    const request = mockClient.chat.completions.create.mock.calls[0][0];
+    expect(request.max_completion_tokens).toBe(1024);
+    expect(request).not.toHaveProperty("max_tokens");
+  });
+
+  it.each(["local/gpt-4o-mini", "my-gpt-5-proxy"])(
+    "retains max_tokens for non-modern local model %s",
+    async (model) => {
+      const mockClient = makeClient();
+      const summarizer = createOpenAISummarizer({
+        model,
+        baseUrl: "http://localhost:11435/v1",
+        _clientOverride: mockClient,
+      });
+
+      await summarizer("text", false);
+
+      const request = mockClient.chat.completions.create.mock.calls[0][0];
+      expect(request.max_tokens).toBe(1024);
+      expect(request).not.toHaveProperty("max_completion_tokens");
+    },
+  );
 
   it("uses Chat Completions when apiMode is explicitly selected", async () => {
     const mockClient = makeClient();

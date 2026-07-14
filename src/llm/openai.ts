@@ -16,8 +16,18 @@ import {
 
 type ChatCompletionRequest = Pick<
   OpenAI.ChatCompletionCreateParamsNonStreaming,
-  "model" | "max_tokens" | "messages"
+  "model" | "max_completion_tokens" | "max_tokens" | "messages"
 >;
+
+type ChatCompletionTokenLimit =
+  | {
+      max_completion_tokens: NonNullable<ChatCompletionRequest["max_completion_tokens"]>;
+      max_tokens?: never;
+    }
+  | {
+      max_completion_tokens?: never;
+      max_tokens: NonNullable<ChatCompletionRequest["max_tokens"]>;
+    };
 
 type ChatCompletionChoice = OpenAI.ChatCompletion["choices"][number];
 type ChatCompletionResult = {
@@ -63,6 +73,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "ECONNABORTED", "ECONNREFUSED", "ECONNRESET", "EHOSTUNREACH", "ENETUNREACH",
   "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "LCM_INCOMPLETE_RESPONSE",
 ]);
+const MODERN_CHAT_COMPLETION_MODEL_PATTERN = /(?:^|[/:])(?:gpt-5(?:[.:-]|$)|o\d+(?:[.:-]|$))/i;
 
 type OpenAIErrorMetadata = {
   status?: unknown;
@@ -73,6 +84,13 @@ type EffectiveOpenAIRequestPolicy = {
   requestTimeoutMs: number;
   retry: LlmRetryPolicy;
 };
+
+/** Select the one token-limit field supported by the model's Chat Completions family. */
+function selectChatCompletionTokenLimit(model: string, value: number): ChatCompletionTokenLimit {
+  return MODERN_CHAT_COMPLETION_MODEL_PATTERN.test(model.trim())
+    ? { max_completion_tokens: value }
+    : { max_tokens: value };
+}
 
 function getErrorMetadata(err: unknown): OpenAIErrorMetadata {
   if (typeof err !== "object" || err === null) return {};
@@ -213,7 +231,7 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
         }
         const response = await client.chat.completions.create({
           model: opts.model,
-          max_tokens: 1024,
+          ...selectChatCompletionTokenLimit(opts.model, 1024),
           // Merge system content into user message for compatibility with local
           // servers (e.g. MLX/llama.cpp) that don't support role:"system".
           messages: [
