@@ -14,6 +14,39 @@ import {
   resolveTargetTokens,
 } from "../summarize.js";
 
+type ChatCompletionRequest = {
+  model: string;
+  max_tokens: number;
+  messages: Array<{ role: "user"; content: string }>;
+};
+
+type ChatCompletionResult = {
+  choices: Array<{ message?: { content?: string | null } }>;
+};
+
+type ResponsesRequest = {
+  model: string;
+  max_output_tokens: number;
+  input: string;
+  reasoning?: { effort: LlmReasoningEffort };
+};
+
+type ResponsesResult = {
+  status?: string;
+  output_text?: string | null;
+};
+
+type OpenAISummarizerClient = {
+  chat?: {
+    completions: {
+      create(request: ChatCompletionRequest): PromiseLike<ChatCompletionResult>;
+    };
+  };
+  responses?: {
+    create(request: ResponsesRequest): PromiseLike<ResponsesResult>;
+  };
+};
+
 type OpenAISummarizerOptions = {
   model: string;
   baseUrl: string;
@@ -22,7 +55,7 @@ type OpenAISummarizerOptions = {
   reasoningEffort?: LlmReasoningEffort;
   requestTimeoutMs?: number;
   retry?: LlmRetryPolicy;
-  _clientOverride?: any;
+  _clientOverride?: OpenAISummarizerClient;
   _sleep?: (ms: number) => Promise<void>;
   _retryDelayMs?: number;
 };
@@ -127,7 +160,7 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
     requestTimeoutMs: opts.requestTimeoutMs ?? DEFAULT_LLM_REQUEST_TIMEOUT_MS,
     retry,
   };
-  const client =
+  const client: OpenAISummarizerClient =
     opts._clientOverride ??
     new OpenAI({
       baseURL: opts.baseUrl,
@@ -156,13 +189,11 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
     for (let attempt = 0; attempt < retry.maxAttempts; attempt++) {
       try {
         if (opts.apiMode === "responses") {
+          if (!client.responses) {
+            throw new Error("OpenAI client does not provide the Responses API");
+          }
           const input = `${LCM_SUMMARIZER_SYSTEM_PROMPT}\n\n${prompt}`;
-          const request: {
-            model: string;
-            max_output_tokens: number;
-            input: string;
-            reasoning?: { effort: NonNullable<OpenAISummarizerOptions["reasoningEffort"]> };
-          } = {
+          const request: ResponsesRequest = {
             model: opts.model,
             max_output_tokens: 1024,
             input,
@@ -180,6 +211,9 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
           return response.output_text || text.slice(0, 500);
         }
 
+        if (!client.chat) {
+          throw new Error("OpenAI client does not provide the Chat Completions API");
+        }
         const response = await client.chat.completions.create({
           model: opts.model,
           max_tokens: 1024,

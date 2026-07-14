@@ -23,7 +23,7 @@ describe("createOpenAISummarizer", () => {
     const summarizer = createOpenAISummarizer({
       model: "qwen2.5:14b",
       baseUrl: "http://localhost:11435/v1",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
     });
     const result = await summarizer("Conversation text", false, { isCondensed: false });
     expect(result).toBe("Summary.");
@@ -44,7 +44,7 @@ describe("createOpenAISummarizer", () => {
       model: "test-model",
       baseUrl: "https://api.openai.com/v1",
       apiMode: "chat-completions",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
     });
 
     await summarizer("text", false);
@@ -60,7 +60,7 @@ describe("createOpenAISummarizer", () => {
       baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       reasoningEffort: "high",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
     });
 
     await expect(summarizer("Conversation text", false)).resolves.toBe("Responses summary.");
@@ -82,7 +82,7 @@ describe("createOpenAISummarizer", () => {
       model: "gpt-5",
       baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
     });
 
     await summarizer("text", false);
@@ -100,7 +100,7 @@ describe("createOpenAISummarizer", () => {
         baseUrl: "https://api.openai.com/v1",
         apiMode: "responses",
         reasoningEffort,
-        _clientOverride: mockClient as any,
+        _clientOverride: mockClient,
       });
 
       await summarizer("text", false);
@@ -127,7 +127,7 @@ describe("createOpenAISummarizer", () => {
       baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       reasoningEffort: "xhigh",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
 
@@ -163,7 +163,7 @@ describe("createOpenAISummarizer", () => {
       model,
       baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
 
@@ -194,7 +194,7 @@ describe("createOpenAISummarizer", () => {
     const summarizer = createOpenAISummarizer({
       model: "test-model",
       baseUrl: "http://localhost:11435/v1",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
     let thrown: Error | undefined;
@@ -221,7 +221,7 @@ describe("createOpenAISummarizer", () => {
     const summarizer = createOpenAISummarizer({
       model: "test-model\nFORGED LOG LINE",
       baseUrl: "http://localhost:11435/v1",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
 
@@ -259,7 +259,7 @@ describe("createOpenAISummarizer", () => {
       const summarizer = createOpenAISummarizer({
         model,
         baseUrl: "http://localhost:11435/v1",
-        _clientOverride: mockClient as any,
+        _clientOverride: mockClient,
         _retryDelayMs: 0,
       });
 
@@ -298,7 +298,7 @@ describe("createOpenAISummarizer", () => {
     const summarizer = createOpenAISummarizer({
       model,
       baseUrl: "http://localhost:11435/v1",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
 
@@ -338,7 +338,7 @@ describe("createOpenAISummarizer", () => {
       baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
       reasoningEffort: "high",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
 
@@ -371,7 +371,7 @@ describe("createOpenAISummarizer", () => {
       model: "gpt-5",
       baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
       _retryDelayMs: 0,
     });
 
@@ -390,7 +390,7 @@ describe("createOpenAISummarizer", () => {
       model: "gpt-5",
       baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
-      _clientOverride: { responses: { create } } as any,
+      _clientOverride: { responses: { create } },
       _retryDelayMs: 0,
     });
 
@@ -407,7 +407,7 @@ describe("createOpenAISummarizer", () => {
       model: "gpt-5",
       baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
-      _clientOverride: { responses: { create } } as any,
+      _clientOverride: { responses: { create } },
       _retryDelayMs: 0,
     });
 
@@ -431,7 +431,7 @@ describe("createOpenAISummarizer", () => {
     const summarizer = createOpenAISummarizer({
       model: "test-model",
       baseUrl: "http://localhost:11435/v1",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
     });
     const result = await summarizer("text", false);
     expect(result).toBe("Summary.");
@@ -445,7 +445,7 @@ describe("createOpenAISummarizer", () => {
     const summarizer = createOpenAISummarizer({
       model: "test-model",
       baseUrl: "http://localhost:11435/v1",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
     });
     const result = await summarizer(longText, false);
     expect(result).toBe(longText.slice(0, 500));
@@ -460,7 +460,7 @@ describe("createOpenAISummarizer", () => {
       model: "gpt-5",
       baseUrl: "https://api.openai.com/v1",
       apiMode: "responses",
-      _clientOverride: mockClient as any,
+      _clientOverride: mockClient,
     });
 
     await expect(summarizer(longText, false)).resolves.toBe(longText.slice(0, 500));
@@ -477,7 +477,7 @@ describe("createOpenAISummarizer", () => {
       model: "test-model",
       baseUrl: "http://localhost/v1",
       retry: { maxAttempts: 4, initialDelayMs: 10, maxDelayMs: 25, multiplier: 2 },
-      _clientOverride: { chat: { completions: { create } } } as any,
+      _clientOverride: { chat: { completions: { create } } },
       _sleep: async (ms) => { delays.push(ms); },
     });
 
@@ -492,7 +492,7 @@ describe("createOpenAISummarizer", () => {
       model: "test-model",
       baseUrl: "http://localhost/v1",
       retry: { maxAttempts: 2, initialDelayMs: 0, maxDelayMs: 0, multiplier: 2 },
-      _clientOverride: { chat: { completions: { create } } } as any,
+      _clientOverride: { chat: { completions: { create } } },
     });
     await expect(summarizer("private prompt", false)).rejects.toThrow("attempts 2/2");
     expect(create).toHaveBeenCalledTimes(2);
@@ -504,7 +504,7 @@ describe("createOpenAISummarizer", () => {
       model: "test-model",
       baseUrl: "http://localhost/v1",
       retry: { maxAttempts: 2, initialDelayMs: 0, maxDelayMs: 0, multiplier: 2 },
-      _clientOverride: { chat: { completions: { create } } } as any,
+      _clientOverride: { chat: { completions: { create } } },
     });
     await expect(summarizer("private prompt", false)).rejects.toThrow("attempts 2/2");
     expect(create).toHaveBeenCalledTimes(2);
