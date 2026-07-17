@@ -55,7 +55,7 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("--retry-initial-delay-ms <ms>");
     expect(text).toContain("--retry-max-delay-ms <ms>");
     expect(text).toContain("--retry-multiplier <n>");
-    expect(text).toContain("Codex process: low, medium, high, xhigh, max, ultra");
+    expect(text).toContain("Codex process: minimal, low, medium, high, xhigh");
     expect(text).toContain("Stored llm.provider=auto configuration accepts the shared low, medium, high, and xhigh values");
     expect(text).toContain("invocation overrides under auto validate against the actual resolved process provider");
     expect(text).toContain("overrides llm.reasoningEffort for this invocation without rewriting ~/.lcm/config.json");

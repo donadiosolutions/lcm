@@ -257,7 +257,7 @@ The accepted values depend on the configured provider:
 
 - OpenAI Responses: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`
 - Claude process: `low`, `medium`, `high`, `xhigh`, `max`
-- Codex process: `low`, `medium`, `high`, `xhigh`, `max`, `ultra`
+- Codex process: `minimal`, `low`, `medium`, `high`, `xhigh`
 - Stored `auto` configuration: `low`, `medium`, `high`, `xhigh`, the shared
   process-provider values
 
@@ -272,14 +272,21 @@ The intersection applies only to `llm.reasoningEffort` stored with
 `llm.provider: "auto"`, because that value must work for either process provider.
 A one-invocation `--reasoning-effort` override under `auto` is validated against
 the process provider resolved from the actual client. For example, a manual
-batch resolves to Claude and can use `max`; a Codex hook can use `ultra`.
+batch resolves to Claude and can use `max`; a Codex hook can use `minimal`.
 
 `fastMode` is a boolean supported by `auto`, `claude-process`, and
 `codex-process`; it defaults to `false`. For Codex, LCM configures
-`model_reasoning_effort`, the `fast_mode` feature, and fast service tier when
-enabled. For Claude, LCM passes `--effort` and process-local settings containing
+`model_reasoning_effort`, the `fast_mode` feature, and the `fast` service tier
+when enabled. When disabled, LCM disables the feature and selects the `default`
+service tier so a global fast tier is not inherited. For Claude, LCM passes
+`--effort` and process-local settings containing
 the fast-mode selection. These controls apply only to the spawned summarizer
 process and do not modify the user's provider configuration.
+
+Codex strict configuration validation is enabled when LCM supplies a reasoning
+effort or enables fast mode. A default-off or explicitly disabled fast mode uses
+only the process-local feature and `default` tier overrides, so unrelated fields
+in the user's Codex configuration do not become fatal to ordinary compactions.
 
 ```json
 {

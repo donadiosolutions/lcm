@@ -422,7 +422,7 @@ describe("setConfigValue", () => {
 
   it("preserves process controls only when the destination provider supports them", () => {
     const { configPath } = makeConfig({
-      llm: { provider: "codex-process", reasoningEffort: "ultra", fastMode: true },
+      llm: { provider: "codex-process", reasoningEffort: "minimal", fastMode: true },
     });
 
     setConfigValue({ configPath, path: "llm.provider", value: "claude-process", env: {} });

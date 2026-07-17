@@ -482,7 +482,7 @@ describe("runDoctor summarizer modes", () => {
     const results = await runDoctor(minimalDeps({
       readFileSync: (path: string) => {
         if (path.endsWith("config.json")) return JSON.stringify({
-          llm: { provider: "codex-process", reasoningEffort: "ultra", fastMode: true },
+          llm: { provider: "codex-process", reasoningEffort: "minimal", fastMode: true },
         });
         if (path.endsWith("settings.json")) return buildCleanSettingsJson();
         if (path.endsWith("package.json")) return JSON.stringify({ version: "0.5.0" });
@@ -493,7 +493,7 @@ describe("runDoctor summarizer modes", () => {
     }));
     const stack = results.find((result) => result.name === "stack");
     expect(stack?.message).toContain("Summarizer: codex-process");
-    expect(stack?.message).toContain("reasoning effort: ultra");
+    expect(stack?.message).toContain("reasoning effort: minimal");
     expect(stack?.message).toContain("fast mode: on");
   });
 

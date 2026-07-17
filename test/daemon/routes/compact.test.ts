@@ -436,11 +436,11 @@ describe("createCompactHandler — summarizer branching", () => {
       session_id: "reasoning-auto-codex",
       cwd: testCwd,
       client: "codex",
-      reasoning_effort: "ultra",
+      reasoning_effort: "minimal",
     }));
 
-    expect(createCodexProcessSummarizer).toHaveBeenCalledWith(expect.objectContaining({ reasoningEffort: "ultra" }));
-    expect(getBody()).toMatchObject({ reasoningEffort: "ultra", fastMode: false });
+    expect(createCodexProcessSummarizer).toHaveBeenCalledWith(expect.objectContaining({ reasoningEffort: "minimal" }));
+    expect(getBody()).toMatchObject({ reasoningEffort: "minimal", fastMode: false });
   });
 
   it("rejects process-only controls for API providers", async () => {

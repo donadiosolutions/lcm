@@ -107,7 +107,7 @@ describe("createCodexProcessSummarizer", () => {
     const spawn = vi.fn().mockReturnValue(child);
     const summarizer = createCodexProcessSummarizer({
       model: "gpt-5.4",
-      reasoningEffort: "ultra",
+      reasoningEffort: "minimal",
       fastMode: true,
       spawn: spawn as unknown as SpawnFn,
       mkdtempSync: vi.fn(() => {
@@ -126,7 +126,7 @@ describe("createCodexProcessSummarizer", () => {
       "exec",
       "--model", "gpt-5.4",
       "--strict-config",
-      "-c", 'model_reasoning_effort="ultra"',
+      "-c", 'model_reasoning_effort="minimal"',
       "--enable", "fast_mode",
       "-c", 'service_tier="fast"',
       "-",
@@ -154,11 +154,15 @@ describe("createCodexProcessSummarizer", () => {
     await expect(summarizer("Conversation text", false)).resolves.toBe("summary text");
 
     const args = spawn.mock.calls[0][1] as string[];
-    expect(args).toContain("--strict-config");
-    expect(args.slice(args.indexOf("--disable"), args.indexOf("--disable") + 2)).toEqual([
+    expect(args).toEqual([
+      "exec",
       "--disable", "fast_mode",
+      "-c", 'service_tier="default"',
+      "-",
+      "--skip-git-repo-check",
+      "--sandbox", "read-only",
+      "--output-last-message", expect.any(String),
     ]);
-    expect(args).not.toContain("service_tier=\"fast\"");
   });
 
   it("returns a friendly ENOENT error when codex is missing", async () => {
@@ -206,7 +210,7 @@ describe("createCodexProcessSummarizer", () => {
     const spawn = vi.fn().mockReturnValue(child);
     const summarizer = createCodexProcessSummarizer({
       model: `gpt-${"x".repeat(400)}`,
-      reasoningEffort: "ultra",
+      reasoningEffort: "minimal",
       fastMode: true,
       spawn: spawn as unknown as SpawnFn,
       mkdtempSync: vi.fn(() => {
@@ -221,7 +225,7 @@ describe("createCodexProcessSummarizer", () => {
     const error = await summarizer("Conversation text", false).catch((caught: unknown) => caught as Error);
     expect(error.message).toContain('model "gpt-');
     expect(error.message).toContain("...[truncated]");
-    expect(error.message).toContain('reasoning effort "ultra"');
+    expect(error.message).toContain('reasoning effort "minimal"');
     expect(error.message).toContain("fast mode true");
     expect(error.message).toContain("diagnostic output omitted");
     expect(error.message).not.toContain(secret);

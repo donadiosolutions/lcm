@@ -676,10 +676,10 @@ describe("strict LLM configuration validation", () => {
   it("exports the canonical provider, API mode, and reasoning effort contracts", () => {
     expect(CANONICAL_LLM_PROVIDERS).toEqual(["auto", "claude-process", "codex-process", "anthropic", "openai", "disabled"]);
     expect(LLM_API_MODES).toEqual(["chat-completions", "responses"]);
-    expect(LLM_REASONING_EFFORTS).toEqual(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+    expect(LLM_REASONING_EFFORTS).toEqual(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
     expect(OPENAI_REASONING_EFFORTS).toEqual(["none", "minimal", "low", "medium", "high", "xhigh"]);
     expect(CLAUDE_PROCESS_REASONING_EFFORTS).toEqual(["low", "medium", "high", "xhigh", "max"]);
-    expect(CODEX_PROCESS_REASONING_EFFORTS).toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+    expect(CODEX_PROCESS_REASONING_EFFORTS).toEqual(["minimal", "low", "medium", "high", "xhigh"]);
     expect(AUTO_REASONING_EFFORTS).toEqual(["low", "medium", "high", "xhigh"]);
   });
 
@@ -894,7 +894,10 @@ describe("strict LLM configuration validation", () => {
       },
     });
     expect(parseDaemonConfig(content).llm.reasoningEffort).toBe("high");
-    expect(parseDaemonConfig(JSON.stringify({ llm: { provider: "codex", reasoningEffort: "ultra" } })).llm.reasoningEffort).toBe("ultra");
+    expect(parseDaemonConfig(JSON.stringify({ llm: { provider: "codex", reasoningEffort: "minimal" } })).llm.reasoningEffort).toBe("minimal");
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "codex", reasoningEffort: "max" } }))).toThrow(
+      "valid choices for llm.provider \"codex-process\": minimal, low, medium, high, xhigh",
+    );
     expect(parseDaemonConfig(JSON.stringify({ llm: { provider: "claude", reasoningEffort: "max" } })).llm.reasoningEffort).toBe("max");
     expect(parseDaemonConfig(JSON.stringify({ llm: { provider: "auto", reasoningEffort: "xhigh" } })).llm.reasoningEffort).toBe("xhigh");
     expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "auto", reasoningEffort: "max" } }))).toThrow(

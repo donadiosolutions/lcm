@@ -69,7 +69,7 @@ function buildArgs(
     args.push("--model", model.trim());
   }
 
-  if (reasoningEffort !== undefined || fastMode !== undefined) {
+  if (reasoningEffort !== undefined || fastMode === true) {
     args.push("--strict-config");
   }
   if (reasoningEffort !== undefined) {
@@ -78,7 +78,7 @@ function buildArgs(
   if (fastMode === true) {
     args.push("--enable", "fast_mode", "-c", 'service_tier="fast"');
   } else if (fastMode === false) {
-    args.push("--disable", "fast_mode");
+    args.push("--disable", "fast_mode", "-c", 'service_tier="default"');
   }
 
   args.push(

@@ -325,7 +325,7 @@ set `llm.apiMode` to `responses` and `llm.reasoningEffort` to `none`, `minimal`,
 `--reasoning-effort` CLI value overrides JSON for one `lcm compact` invocation
 without rewriting the file. Process summarizers accept their provider-native
 reasoning levels: Claude accepts `low`, `medium`, `high`, `xhigh`, and `max`;
-Codex accepts `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. Set
+Codex accepts `minimal`, `low`, `medium`, `high`, and `xhigh`. Set
 `llm.fastMode` (default `false`), or use `--fast-mode`/`--no-fast-mode` for one
 compaction, to control process-provider priority processing. LCM passes these
 controls to the provider CLI, whose installed version and selected model remain

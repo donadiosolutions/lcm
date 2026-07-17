@@ -18,14 +18,14 @@ export type LlmProvider = typeof CANONICAL_LLM_PROVIDERS[number];
 export const LLM_API_MODES = ["chat-completions", "responses"] as const;
 export type LlmApiMode = typeof LLM_API_MODES[number];
 
-export const LLM_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
+export const LLM_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type LlmReasoningEffort = typeof LLM_REASONING_EFFORTS[number];
 
 export const OPENAI_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
 export type OpenAIReasoningEffort = typeof OPENAI_REASONING_EFFORTS[number];
 export const CLAUDE_PROCESS_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type ClaudeProcessReasoningEffort = typeof CLAUDE_PROCESS_REASONING_EFFORTS[number];
-export const CODEX_PROCESS_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
+export const CODEX_PROCESS_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"] as const;
 export type CodexProcessReasoningEffort = typeof CODEX_PROCESS_REASONING_EFFORTS[number];
 export const AUTO_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"] as const;
 
