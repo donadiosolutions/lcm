@@ -45,26 +45,26 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
     "@sinclair/typebox": "0.34.49",
-    "commander": "^14.0.3",
-    "js-yaml": "^4.1.1",
+    "commander": "14.0.3",
+    "js-yaml": "5.2.0",
     "safe-regex": "^2.1.1"
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "^0.98.0",
+    "@anthropic-ai/sdk": "0.106.0",
     "@changesets/cli": "^2.30.0",
     "@types/js-yaml": "^4.0.9",
-    "@types/node": ">=22",
+    "@types/node": "26.0.1",
     "@types/safe-regex": "^1.1.6",
-    "@vitest/coverage-v8": "4.1.7",
-    "eslint": "10.4.0",
-    "openai": "^6.32.0",
+    "@vitest/coverage-v8": "4.1.9",
+    "eslint": "10.6.0",
+    "openai": "6.45.0",
     "typescript": "^6.0.3",
-    "typescript-eslint": "8.60.0",
-    "vitest": "^4.1.7"
+    "typescript-eslint": "8.62.0",
+    "vitest": "4.1.9"
   },
   "peerDependencies": {
-    "@anthropic-ai/sdk": "^0.98.0",
-    "openai": "^6.32.0"
+    "@anthropic-ai/sdk": "0.106.0",
+    "openai": "6.45.0"
   },
   "peerDependenciesMeta": {
     "@anthropic-ai/sdk": {
