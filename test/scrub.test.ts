@@ -1,5 +1,9 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { ScrubEngine } from "../src/scrub.js";
+import {
+  getGitleaksSyncDate,
+  readGitleaksSyncDate,
+  ScrubEngine,
+} from "../src/scrub.js";
 
 describe("ScrubEngine — built-in patterns", () => {
   const engine = new ScrubEngine([], []);
@@ -125,6 +129,25 @@ describe("ScrubEngine — custom patterns", () => {
     const engine = new ScrubEngine(["[invalid"], ["VALID_[A-Z]+"]);
     expect(engine.scrub("VALID_ABC")).toContain("[REDACTED]");
     expect(engine.invalidPatterns).toContain("[invalid");
+  });
+
+  it("handles escaped dots and zero-width token and spanning matches", () => {
+    const engine = new ScrubEngine(["literal\\.value", "(?=TOKEN)", "(?=SPAN.)"], []);
+    const result = engine.scrubWithCounts("literal.value TOKEN SPANx");
+    expect(result.text).toContain("[REDACTED]");
+    expect(result.global).toBeGreaterThan(0);
+  });
+
+  it("merges overlapping matches and preserves disjoint surrounding text", () => {
+    const engine = new ScrubEngine(["SECRET_[A-Z]+", "SECRET_ALPHA"], []);
+    expect(engine.scrub("before SECRET_ALPHA after")).toBe("before [REDACTED] after");
+  });
+});
+
+describe("gitleaks metadata", () => {
+  it("reports no generated sync date from an unbuilt source checkout", () => {
+    expect(readGitleaksSyncDate()).toBeNull();
+    expect(getGitleaksSyncDate()).toBeNull();
   });
 });
 

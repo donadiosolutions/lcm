@@ -20,6 +20,16 @@ vi.mock("../src/daemon/project.js", async () => {
   };
 });
 
+vi.mock("../src/runtime-paths.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/runtime-paths.js")>();
+  const { join: j } = await import("node:path");
+  return {
+    ...actual,
+    configPath: () => j(_projectBase.current, "config.json"),
+    projectsDir: () => j(_projectBase.current, "all-projects"),
+  };
+});
+
 import { handleSensitive } from "../src/sensitive.js";
 import { NATIVE_PATTERNS } from "../src/scrub.js";
 import { GITLEAKS_PATTERNS } from "../src/generated-patterns.js";
@@ -117,6 +127,52 @@ describe("lcm sensitive", () => {
     expect(cfg.security.sensitivePatterns.filter((p: string) => p === "CORP_SECRET_.*")).toHaveLength(1);
   });
 
+  it.each([
+    ["invalid JSON", "{"],
+    ["not a JSON object", "[]"],
+  ])("add --global: refuses a config with %s", async (message, content) => {
+    writeFileSync(configPath, content);
+    const r = await handleSensitive(["add", "--global", "CORP_SECRET_.*"], cwd, configPath);
+    expect(r).toMatchObject({ exitCode: 1 });
+    expect(r.stdout).toContain(message);
+    expect(readFileSync(configPath, "utf-8")).toBe(content);
+  });
+
+  it("add --global: creates missing security structures and config directories", async () => {
+    configPath = join(tempBase, "nested", "config.json");
+    const r = await handleSensitive(["add", "--global", "CORP_SECRET_.*"], cwd, configPath);
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(configPath, "utf-8"))).toMatchObject({
+      security: { sensitivePatterns: ["CORP_SECRET_.*"] },
+    });
+
+    writeFileSync(configPath, JSON.stringify({ security: { sensitivePatterns: "invalid" } }));
+    await expect(handleSensitive(["add", "--global", "SECOND_.*"], cwd, configPath))
+      .resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it("add: preserves a project pattern file without a trailing newline", async () => {
+    writeFileSync(join(pDir, "sensitive-patterns.txt"), "PAT_A");
+    await expect(handleSensitive(["add", "PAT_B"], cwd, configPath)).resolves.toMatchObject({ exitCode: 0 });
+    expect(readFileSync(join(pDir, "sensitive-patterns.txt"), "utf-8")).toBe("PAT_A\nPAT_B\n");
+  });
+
+  it("add: preserves an existing project pattern file with a trailing newline", async () => {
+    writeFileSync(join(pDir, "sensitive-patterns.txt"), "PAT_A\n");
+    await expect(handleSensitive(["add", "PAT_B"], cwd, configPath)).resolves.toMatchObject({ exitCode: 0 });
+    expect(readFileSync(join(pDir, "sensitive-patterns.txt"), "utf-8")).toBe("PAT_A\nPAT_B\n");
+  });
+
+  it("add --global: rethrows non-missing filesystem failures", async () => {
+    await expect(handleSensitive(["add", "--global", "PATTERN"], cwd, tempBase)).rejects.toThrow();
+  });
+
+  it.each([["add"], ["remove"], ["test"]])("%s: reports missing input", async (command) => {
+    const r = await handleSensitive([command], cwd, configPath);
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toContain("Usage:");
+  });
+
   // --- remove ---
 
   it("remove: removes exact match from project file", async () => {
@@ -151,6 +207,25 @@ describe("lcm sensitive", () => {
     expect(r.stdout).toContain("hello world");
   });
 
+  it("test: skips invalid global and project patterns", async () => {
+    writeFileSync(configPath, JSON.stringify({ security: { sensitivePatterns: ["[invalid"] } }));
+    writeFileSync(join(pDir, "sensitive-patterns.txt"), "[also-invalid\n");
+    await expect(handleSensitive(["test", "ordinary"], cwd, configPath)).resolves.toMatchObject({
+      exitCode: 0,
+      stdout: expect.stringContaining("No patterns matched"),
+    });
+  });
+
+  it("test: reports matching gitleaks and user patterns", async () => {
+    const githubToken = `ghp_${"A".repeat(36)}`;
+    writeFileSync(configPath, JSON.stringify({ security: { sensitivePatterns: ["CORP_[A-Z]+"] } }));
+    writeFileSync(join(pDir, "sensitive-patterns.txt"), "PROJECT_[A-Z]+\n");
+    const r = await handleSensitive(["test", `token=${githubToken} CORP_ALPHA PROJECT_BETA`], cwd, configPath);
+    expect(r.stdout).toContain("[gitleaks:");
+    expect(r.stdout).toContain("[global]");
+    expect(r.stdout).toContain("[project]");
+  });
+
   // --- purge ---
 
   it("purge: requires --yes — exits 1 without it", async () => {
@@ -165,5 +240,34 @@ describe("lcm sensitive", () => {
     const r = await handleSensitive(["purge", "--yes"], cwd, configPath);
     expect(r.exitCode).toBe(0);
     expect(existsSync(pDir)).toBe(false);
+  });
+
+  it("purge --yes: succeeds when project data is already absent", async () => {
+    rmSync(pDir, { recursive: true, force: true });
+    await expect(handleSensitive(["purge", "--yes"], cwd, configPath)).resolves.toEqual({
+      exitCode: 0,
+      stdout: "No project data to purge.\n",
+    });
+  });
+
+  it("purge --all --yes handles both existing and absent project roots", async () => {
+    const allProjects = join(tempBase, "all-projects");
+    mkdirSync(allProjects, { recursive: true });
+    writeFileSync(join(allProjects, "data"), "value");
+    const removed = await handleSensitive(["purge", "--all", "--yes"], cwd, configPath);
+    expect(removed).toMatchObject({ exitCode: 0, stdout: expect.stringContaining("Purged all") });
+    expect(existsSync(allProjects)).toBe(false);
+    await expect(handleSensitive(["purge", "--all", "--yes"], cwd, configPath)).resolves.toEqual({
+      exitCode: 0,
+      stdout: "No project data to purge.\n",
+    });
+  });
+
+  it("uses the isolated default config path when none is supplied", async () => {
+    await expect(handleSensitive(["list"], cwd)).resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it("reports usage for unknown subcommands", async () => {
+    await expect(handleSensitive(["unknown"], cwd, configPath)).resolves.toMatchObject({ exitCode: 1 });
   });
 });
