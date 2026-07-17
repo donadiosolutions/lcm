@@ -53,6 +53,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Validation errors must report resolved effective values; do not hard-code the required value as though it were the current configuration.
 - Treat a successful child-process exit with empty output as an empty-output failure, not a CLI rejection.
 - When a provider supports no values for an optional control, say the control is unsupported; do not render an empty set as `Valid values: none`.
+- Retry and backoff duration accounting must use a monotonic clock so wall-clock corrections cannot shorten or extend a wait.
+- Normalize non-finite delay values before entering timer loops; security-sensitive timer scheduling must keep user-derived values out of `setTimeout` durations by using literal constants only.
 
 ## What to skip
 - Don't flag `DatabaseSync` usage in test fixtures that mock the connection — context matters.

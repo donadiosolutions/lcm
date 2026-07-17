@@ -163,8 +163,41 @@ function requestFailureError(
   );
 }
 
+const MAX_SLEEP_MS = 600_000; // matches the upper bound enforced by validateBoundedInteger for maxDelayMs
+
+/** Schedule one retry-delay slice using a fixed literal timer duration, not one derived from user input. */
+function scheduleRetrySleepSlice(callback: () => void, remainingMs: number): void {
+  if (remainingMs >= 60_000) {
+    setTimeout(callback, 60_000);
+  } else if (remainingMs >= 10_000) {
+    setTimeout(callback, 10_000);
+  } else if (remainingMs >= 1_000) {
+    setTimeout(callback, 1_000);
+  } else if (remainingMs >= 100) {
+    setTimeout(callback, 100);
+  } else if (remainingMs >= 10) {
+    setTimeout(callback, 10);
+  } else {
+    setTimeout(callback, 1);
+  }
+}
+
 function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+  const boundedMs = Number.isFinite(ms) ? Math.max(0, Math.min(ms, MAX_SLEEP_MS)) : 0;
+  if (boundedMs === 0) return new Promise((resolve) => setTimeout(resolve, 0));
+
+  const deadline = performance.now() + boundedMs;
+  return new Promise((resolve) => {
+    const waitForDeadline = (): void => {
+      const remainingMs = deadline - performance.now();
+      if (remainingMs <= 0) {
+        resolve();
+        return;
+      }
+      scheduleRetrySleepSlice(waitForDeadline, remainingMs);
+    };
+    waitForDeadline();
+  });
 }
 
 export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummarizeFn {
