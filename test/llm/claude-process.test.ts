@@ -116,6 +116,15 @@ describe("createClaudeProcessSummarizer", () => {
     );
   });
 
+  it("reports empty output separately from a CLI rejection after exit 0", async () => {
+    const spawn = vi.fn().mockReturnValue(makeChild(0, "   "));
+    const summarizer = createClaudeProcessSummarizer({ spawn: spawn as unknown as SpawnFn });
+
+    const error = await summarizer("Conversation text", false).catch((caught: unknown) => caught as Error);
+    expect(error.message).toBe("claude output was empty");
+    expect(error.message).not.toContain("CLI rejected");
+  });
+
   it("reports bounded controls without exposing CLI diagnostics", async () => {
     const secret = "super-secret-provider-token";
     const child = makeChild(1, "", `Bearer ${secret}\nprompt and provider response body`);

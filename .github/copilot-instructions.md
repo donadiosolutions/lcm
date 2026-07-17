@@ -51,6 +51,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - When disabling a provider feature that also selects a related tier or mode, explicitly reset both process-local settings so global configuration cannot remain partially active.
 - Keep shared process-adapter error sanitization, metadata bounding, and compatibility formatting in one helper rather than duplicating it across providers.
 - Validation errors must report resolved effective values; do not hard-code the required value as though it were the current configuration.
+- Treat a successful child-process exit with empty output as an empty-output failure, not a CLI rejection.
+- When a provider supports no values for an optional control, say the control is unsupported; do not render an empty set as `Valid values: none`.
 
 ## What to skip
 - Don't flag `DatabaseSync` usage in test fixtures that mock the connection — context matters.

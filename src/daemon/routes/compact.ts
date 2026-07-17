@@ -207,13 +207,22 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
     let reasoningEffortOverride: LlmReasoningEffort | undefined;
     const validReasoningEfforts = reasoningEffortsForProvider(effectiveProvider, apiMode);
     if (input.reasoning_effort !== undefined) {
+      if (validReasoningEfforts.length === 0) {
+        const providerContext = effectiveProvider === "openai"
+          ? `${effectiveProvider} with apiMode ${JSON.stringify(apiMode)}`
+          : effectiveProvider;
+        sendJson(res, 400, {
+          error: `reasoning_effort is not supported by ${providerContext}`,
+        });
+        return;
+      }
       if (
         typeof input.reasoning_effort !== "string"
         || !LLM_REASONING_EFFORTS.includes(input.reasoning_effort as LlmReasoningEffort)
         || !validReasoningEfforts.includes(input.reasoning_effort as LlmReasoningEffort)
       ) {
         sendJson(res, 400, {
-          error: `Invalid reasoning_effort=${JSON.stringify(input.reasoning_effort)} for ${effectiveProvider}. Valid values: ${validReasoningEfforts.join(", ") || "none"}`,
+          error: `Invalid reasoning_effort=${JSON.stringify(input.reasoning_effort)} for ${effectiveProvider}. Valid values: ${validReasoningEfforts.join(", ")}`,
         });
         return;
       }

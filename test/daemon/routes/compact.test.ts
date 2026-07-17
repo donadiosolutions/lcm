@@ -427,6 +427,33 @@ describe("createCompactHandler — summarizer branching", () => {
     expect(createOpenAISummarizer).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["anthropic", undefined, "reasoning_effort is not supported by anthropic"],
+    ["openai", "chat-completions", 'reasoning_effort is not supported by openai with apiMode "chat-completions"'],
+  ] as const)("reports unsupported reasoning controls for %s without suggesting a value named none", async (
+    provider,
+    apiMode,
+    expectedError,
+  ) => {
+    vi.clearAllMocks();
+    const config = makeConfig(provider);
+    config.llm.apiMode = apiMode;
+    const handler = createCompactHandler(config);
+    const { res, getBody } = mockRes();
+
+    await handler(mockReq(), res, JSON.stringify({
+      session_id: `reasoning-unsupported-${provider}`,
+      cwd: testCwd,
+      reasoning_effort: "high",
+    }));
+
+    expect(res.writeHead).toHaveBeenCalledWith(400, expect.anything());
+    expect(getBody().error).toBe(expectedError);
+    expect(getBody().error).not.toContain("Valid values: none");
+    expect(createAnthropicSummarizer).not.toHaveBeenCalled();
+    expect(createOpenAISummarizer).not.toHaveBeenCalled();
+  });
+
   it("validates reasoning against the resolved auto provider", async () => {
     vi.clearAllMocks();
     const handler = createCompactHandler(makeConfig("auto"));

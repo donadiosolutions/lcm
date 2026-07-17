@@ -103,8 +103,12 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
         finished = true;
         clearTimeout(timer);
         const out = stdout.trim();
-        if (code === 0 && out) {
-          resolve(out);
+        if (code === 0) {
+          if (out) {
+            resolve(out);
+          } else {
+            reject(new Error("claude output was empty"));
+          }
         } else {
           reject(createProcessCompatibilityError({
             cliName: "Claude",
