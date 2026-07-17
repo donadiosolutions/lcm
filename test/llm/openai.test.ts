@@ -566,6 +566,87 @@ describe("createOpenAISummarizer", () => {
     }
   });
 
+  it("uses monotonic elapsed time when the wall clock moves backward", async () => {
+    vi.useFakeTimers({ now: new Date("2026-01-01T00:00:00Z") });
+    try {
+      const create = vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error("busy"), { status: 429 }))
+        .mockResolvedValueOnce({ choices: [{ message: { content: "Recovered." } }] });
+      const summarizer = createOpenAISummarizer({
+        model: "test-model",
+        baseUrl: "http://localhost/v1",
+        retry: { maxAttempts: 2, initialDelayMs: 10_000, maxDelayMs: 10_000, multiplier: 1 },
+        _clientOverride: { chat: { completions: { create } } },
+      });
+
+      const result = summarizer("text", false);
+      await vi.advanceTimersByTimeAsync(5_000);
+      vi.setSystemTime(new Date("2025-01-01T00:00:00Z"));
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await expect(result).resolves.toBe("Recovered.");
+      expect(create).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses monotonic elapsed time when the wall clock moves forward", async () => {
+    vi.useFakeTimers({ now: new Date("2026-01-01T00:00:00Z") });
+    try {
+      const create = vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error("busy"), { status: 429 }))
+        .mockResolvedValueOnce({ choices: [{ message: { content: "Recovered." } }] });
+      const summarizer = createOpenAISummarizer({
+        model: "test-model",
+        baseUrl: "http://localhost/v1",
+        retry: { maxAttempts: 2, initialDelayMs: 100_000, maxDelayMs: 100_000, multiplier: 1 },
+        _clientOverride: { chat: { completions: { create } } },
+      });
+
+      const result = summarizer("text", false);
+      await vi.advanceTimersByTimeAsync(60_000);
+      vi.setSystemTime(new Date("2027-01-01T00:00:00Z"));
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(create).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      await expect(result).resolves.toBe("Recovered.");
+      expect(create).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    "normalizes a non-finite retry delay (%s) to an immediate timer",
+    async (delay) => {
+      vi.useFakeTimers();
+      const timerSpy = vi.spyOn(globalThis, "setTimeout");
+      try {
+        const create = vi.fn()
+          .mockRejectedValueOnce(Object.assign(new Error("busy"), { status: 429 }))
+          .mockResolvedValueOnce({ choices: [{ message: { content: "Recovered." } }] });
+        const summarizer = createOpenAISummarizer({
+          model: "test-model",
+          baseUrl: "http://localhost/v1",
+          retry: { maxAttempts: 2, initialDelayMs: delay, maxDelayMs: delay, multiplier: 1 },
+          _clientOverride: { chat: { completions: { create } } },
+        });
+
+        const result = summarizer("text", false);
+        await vi.advanceTimersByTimeAsync(0);
+
+        await expect(result).resolves.toBe("Recovered.");
+        expect(create).toHaveBeenCalledTimes(2);
+        expect(timerSpy.mock.calls.map((call) => call[1])).toEqual([0]);
+      } finally {
+        timerSpy.mockRestore();
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it.each([408, 409, 429, 500, 503])("retries HTTP %s", async (status) => {
     const create = vi.fn().mockRejectedValue(Object.assign(new Error("provider body secret"), { status }));
     const summarizer = createOpenAISummarizer({

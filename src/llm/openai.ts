@@ -183,13 +183,13 @@ function scheduleRetrySleepSlice(callback: () => void, remainingMs: number): voi
 }
 
 function sleep(ms: number): Promise<void> {
-  const boundedMs = Math.max(0, Math.min(ms, MAX_SLEEP_MS));
+  const boundedMs = Number.isFinite(ms) ? Math.max(0, Math.min(ms, MAX_SLEEP_MS)) : 0;
   if (boundedMs === 0) return new Promise((resolve) => setTimeout(resolve, 0));
 
-  const deadline = Date.now() + boundedMs;
+  const deadline = performance.now() + boundedMs;
   return new Promise((resolve) => {
     const waitForDeadline = (): void => {
-      const remainingMs = deadline - Date.now();
+      const remainingMs = deadline - performance.now();
       if (remainingMs <= 0) {
         resolve();
         return;
