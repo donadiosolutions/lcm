@@ -49,6 +49,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Child-process timeout cleanup must guard `kill()` because the process can exit concurrently or the injected process implementation can throw.
 - Provider CLI option enums must match the provider's configuration schema, not broader model capability labels exposed elsewhere in the product.
 - When disabling a provider feature that also selects a related tier or mode, explicitly reset both process-local settings so global configuration cannot remain partially active.
+- Keep shared process-adapter error sanitization, metadata bounding, and compatibility formatting in one helper rather than duplicating it across providers.
+- Validation errors must report resolved effective values; do not hard-code the required value as though it were the current configuration.
 
 ## What to skip
 - Don't flag `DatabaseSync` usage in test fixtures that mock the connection — context matters.

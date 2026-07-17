@@ -590,7 +590,7 @@ describe("loadDaemonConfig", () => {
       }),
       {},
       { LCM_SUMMARY_PROVIDER: "openai" },
-    )).toThrow('apiMode "responses"');
+    )).toThrow('llm.provider "openai" with llm.apiMode "chat-completions"');
   });
 
   it("throws when LCM_SUMMARY_PROVIDER is set to an invalid value", () => {
@@ -910,7 +910,7 @@ describe("strict LLM configuration validation", () => {
         baseURL: "http://localhost:11435/v1",
         reasoningEffort: "high",
       },
-    }))).toThrow('apiMode "responses"');
+    }))).toThrow('llm.provider "openai" with llm.apiMode "chat-completions"');
     expect(parseDaemonConfig(JSON.stringify({
       llm: {
         provider: "openai",

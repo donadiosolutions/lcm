@@ -824,7 +824,7 @@ function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: Readonl
     const validEfforts = reasoningEffortsForProvider(llm.provider, llm.apiMode);
     if (!validEfforts.includes(llm.reasoningEffort)) {
       const providerContext = llm.provider === "openai"
-        ? `llm.provider "openai" with llm.apiMode "responses"`
+        ? `llm.provider "openai" with llm.apiMode ${JSON.stringify(llm.apiMode)}`
         : `llm.provider ${JSON.stringify(llm.provider)}`;
       throw new ConfigValidationError(
         "llm.reasoningEffort",

@@ -1,6 +1,7 @@
 import { spawn as defaultSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
 import type { ClaudeProcessReasoningEffort } from "../daemon/config.js";
+import { createProcessCompatibilityError } from "./process-utils.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
   buildLeafSummaryPrompt,
@@ -10,7 +11,6 @@ import {
 
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const TIMEOUT_MS = 120_000;
-const MAX_MODEL_DISPLAY_LENGTH = 80;
 
 type ClaudeProcessDeps = {
   model?: string;
@@ -32,30 +32,6 @@ function normalizeSpawnError(error: unknown): Error {
     return friendlyMissingClaudeError();
   }
   return error instanceof Error ? error : new Error(String(error));
-}
-
-function boundedModelForDisplay(model: string): string {
-  const sanitized = model
-    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (sanitized.length <= MAX_MODEL_DISPLAY_LENGTH) return sanitized || "default";
-  return `${sanitized.slice(0, MAX_MODEL_DISPLAY_LENGTH)}...[truncated]`;
-}
-
-function compatibilityError(
-  code: number | null,
-  model: string,
-  reasoningEffort?: ClaudeProcessReasoningEffort,
-  fastMode?: boolean,
-): Error {
-  const effort = reasoningEffort ?? "default/omitted";
-  const fast = fastMode === undefined ? "default/omitted" : String(fastMode);
-  return new Error(
-    `Claude CLI rejected the compaction request (exit ${code ?? "unknown"}; diagnostic output omitted): ` +
-      `provider claude-process, model ${JSON.stringify(boundedModelForDisplay(model))}, reasoning effort ${JSON.stringify(effort)}, ` +
-      `fast mode ${fast}. Upgrade the Claude CLI or choose a supported model and control combination.`,
-  );
 }
 
 export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): LcmSummarizeFn {
@@ -130,7 +106,14 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
         if (code === 0 && out) {
           resolve(out);
         } else {
-          reject(compatibilityError(code, model, reasoningEffort, fastMode));
+          reject(createProcessCompatibilityError({
+            cliName: "Claude",
+            providerId: "claude-process",
+            code,
+            model,
+            reasoningEffort,
+            fastMode,
+          }));
         }
       });
 

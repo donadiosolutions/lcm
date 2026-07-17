@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
 import type { CodexProcessReasoningEffort } from "../daemon/config.js";
+import { createProcessCompatibilityError } from "./process-utils.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
   buildLeafSummaryPrompt,
@@ -12,7 +13,6 @@ import {
 } from "../summarize.js";
 
 const TIMEOUT_MS = 120_000;
-const MAX_MODEL_DISPLAY_LENGTH = 80;
 
 type CodexProcessDeps = {
   model?: string;
@@ -93,29 +93,6 @@ function buildArgs(
   return args;
 }
 
-function boundedModelForDisplay(model: string): string {
-  const sanitized = model
-    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (sanitized.length <= MAX_MODEL_DISPLAY_LENGTH) return sanitized || "default";
-  return `${sanitized.slice(0, MAX_MODEL_DISPLAY_LENGTH)}...[truncated]`;
-}
-
-function compatibilityError(
-  code: number | null,
-  deps: Pick<CodexProcessDeps, "model" | "reasoningEffort" | "fastMode">,
-): Error {
-  const model = boundedModelForDisplay(deps.model ?? "default");
-  const reasoningEffort = deps.reasoningEffort ?? "default/omitted";
-  const fastMode = deps.fastMode === undefined ? "default/omitted" : String(deps.fastMode);
-  return new Error(
-    `Codex CLI rejected the compaction request (exit ${code ?? "unknown"}; diagnostic output omitted): ` +
-      `provider codex-process, model ${JSON.stringify(model)}, reasoning effort ${JSON.stringify(reasoningEffort)}, ` +
-      `fast mode ${fastMode}. Upgrade the Codex CLI or choose a supported model and control combination.`,
-  );
-}
-
 function cleanupTempDir(rmSync: typeof defaultRmSync, tempDir: string): void {
   try {
     rmSync(tempDir, { recursive: true, force: true });
@@ -183,7 +160,14 @@ function runCodexSummarizer(
 
       try {
         if (code !== 0) {
-          throw compatibilityError(code, deps);
+          throw createProcessCompatibilityError({
+            cliName: "Codex",
+            providerId: "codex-process",
+            code,
+            model: deps.model,
+            reasoningEffort: deps.reasoningEffort,
+            fastMode: deps.fastMode,
+          });
         }
         const summary = deps.readFileSync(outputPath, "utf-8").trim();
         if (!summary) {
