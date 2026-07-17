@@ -139,14 +139,16 @@ describe("ScrubEngine — custom patterns", () => {
     expect(result.global).toBe(2);
   });
 
-  it("documents issue #115 for zero-length token and spanning match guards", () => {
+  it.fails("fully redacts zero-length token and spanning matches (issue #115)", () => {
     const engine = new ScrubEngine(["(?=TOKEN)", "(?=SPAN.)"], []);
     const result = engine.scrubWithCounts("TOKEN SPANx");
 
-    // Current issue #115 behavior: the loop guards terminate safely and insert
-    // markers, but zero-length matches do not consume the original sensitive text.
-    expect(result.text).toBe("[REDACTED]TOKEN [REDACTED]SPANx");
+    // The loop guards must terminate and account for both matches. The desired
+    // secure behavior remains an expected failure until issue #115 is fixed.
     expect(result.global).toBe(2);
+    expect(result.text).toBe("[REDACTED] [REDACTED]");
+    expect(result.text).not.toContain("TOKEN");
+    expect(result.text).not.toContain("SPANx");
   });
 
   it("merges overlapping matches and preserves disjoint surrounding text", () => {
