@@ -530,6 +530,34 @@ describe("createOpenAISummarizer", () => {
     expect(delays).toEqual([10, 20, 25]);
   });
 
+  it("keeps user-configured retry delays out of timer durations", async () => {
+    vi.useFakeTimers();
+    const timerSpy = vi.spyOn(globalThis, "setTimeout");
+    try {
+      const create = vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error("busy"), { status: 429 }))
+        .mockResolvedValueOnce({ choices: [{ message: { content: "Recovered." } }] });
+      const summarizer = createOpenAISummarizer({
+        model: "test-model",
+        baseUrl: "http://localhost/v1",
+        retry: { maxAttempts: 2, initialDelayMs: 600_000, maxDelayMs: 600_000, multiplier: 1 },
+        _clientOverride: { chat: { completions: { create } } },
+      });
+
+      const result = summarizer("text", false);
+      await vi.advanceTimersByTimeAsync(600_000);
+
+      await expect(result).resolves.toBe("Recovered.");
+      expect(create).toHaveBeenCalledTimes(2);
+      const timerDurations = timerSpy.mock.calls.map((call) => call[1]);
+      expect(timerDurations).toEqual(Array(10).fill(60_000));
+      expect(timerDurations.reduce((total, duration) => total + Number(duration), 0)).toBe(600_000);
+    } finally {
+      timerSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it.each([408, 409, 429, 500, 503])("retries HTTP %s", async (status) => {
     const create = vi.fn().mockRejectedValue(Object.assign(new Error("provider body secret"), { status }));
     const summarizer = createOpenAISummarizer({
