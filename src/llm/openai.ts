@@ -163,8 +163,10 @@ function requestFailureError(
   );
 }
 
+const MAX_SLEEP_MS = 600_000; // matches the upper bound enforced by validateBoundedInteger for maxDelayMs
+
 function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+  return new Promise((r) => setTimeout(r, Math.min(ms, MAX_SLEEP_MS)));
 }
 
 export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummarizeFn {
