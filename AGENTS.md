@@ -3,6 +3,23 @@
 <!-- Claude Code include: @WORKFLOW.md -->
 See [WORKFLOW.md](./WORKFLOW.md) for the full development workflow.
 
+## Test Coverage Goal
+
+- Maintain 100% line and branch coverage for every executable production
+  TypeScript file matched by `bin/**/*.ts`, `installer/**/*.ts`, and
+  `src/**/*.ts`.
+- Run `npm run test:ci` to measure the complete production scope and use
+  focused Vitest coverage runs while developing individual subsystems.
+- Coverage thresholds are a ratchet: every coverage PR must raise the
+  aggregate line and branch thresholds and add 100% glob thresholds for any
+  completed subsystem. Never lower a threshold or narrow the collected scope.
+- Do not use coverage exclusions, `v8 ignore` directives, skipped tests, or
+  untested production wrappers to satisfy the goal. Cover behavior through
+  observable public seams and deterministic failure injection.
+- Once the repository reaches the goal, replace the ratchet with a final gate
+  that enforces `lines: 100`, `branches: 100`, and `perFile: true` for the
+  complete collected scope.
+
 ## PR Review And Merge
 
 - Before merging a PR, check whether it changes user-facing behavior or should appear in npm release notes.

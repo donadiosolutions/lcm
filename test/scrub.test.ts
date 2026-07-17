@@ -1,5 +1,8 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { ScrubEngine } from "../src/scrub.js";
+import {
+  getGitleaksSyncDate,
+  ScrubEngine,
+} from "../src/scrub.js";
 
 describe("ScrubEngine — built-in patterns", () => {
   const engine = new ScrubEngine([], []);
@@ -125,6 +128,38 @@ describe("ScrubEngine — custom patterns", () => {
     const engine = new ScrubEngine(["[invalid"], ["VALID_[A-Z]+"]);
     expect(engine.scrub("VALID_ABC")).toContain("[REDACTED]");
     expect(engine.invalidPatterns).toContain("[invalid");
+  });
+
+  it("fully redacts consuming escaped-dot and spanning patterns", () => {
+    const engine = new ScrubEngine(["literal\\.value", "SPAN."], []);
+    const result = engine.scrubWithCounts("literal.value SPANx");
+    expect(result.text).toBe("[REDACTED] [REDACTED]");
+    expect(result.text).not.toContain("literal.value");
+    expect(result.text).not.toContain("SPANx");
+    expect(result.global).toBe(2);
+  });
+
+  it.fails("fully redacts zero-length token and spanning matches (issue #115)", () => {
+    const engine = new ScrubEngine(["(?=TOKEN)", "(?=SPAN.)"], []);
+    const result = engine.scrubWithCounts("TOKEN SPANx");
+
+    // The loop guards must terminate and account for both matches. The desired
+    // secure behavior remains an expected failure until issue #115 is fixed.
+    expect(result.global).toBe(2);
+    expect(result.text).toBe("[REDACTED] [REDACTED]");
+    expect(result.text).not.toContain("TOKEN");
+    expect(result.text).not.toContain("SPANx");
+  });
+
+  it("merges overlapping matches and preserves disjoint surrounding text", () => {
+    const engine = new ScrubEngine(["SECRET_[A-Z]+", "SECRET_ALPHA"], []);
+    expect(engine.scrub("before SECRET_ALPHA after")).toBe("before [REDACTED] after");
+  });
+});
+
+describe("gitleaks metadata", () => {
+  it("reports no generated sync date from an unbuilt source checkout", () => {
+    expect(getGitleaksSyncDate()).toBeNull();
   });
 });
 

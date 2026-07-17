@@ -6,9 +6,25 @@
  * Flow 13: Teardown — cleanup removes temp dir and project data
  */
 
-import { beforeAll, afterAll, describe, expect, it } from "vitest";
+import { beforeAll, afterAll, describe, expect, it, vi } from "vitest";
 import { createHarness, type HarnessHandle } from "../harness.js";
 import { existsSync } from "node:fs";
+
+vi.mock("../../../src/daemon/lifecycle.js", async (): Promise<typeof import("../../../src/daemon/lifecycle.js")> => {
+  const actual = await vi.importActual<typeof import("../../../src/daemon/lifecycle.js")>(
+    "../../../src/daemon/lifecycle.js",
+  );
+  const ensureDaemon = vi.fn<typeof actual.ensureDaemon>();
+  ensureDaemon.mockResolvedValue({
+    connected: false,
+    port: 3737,
+    spawned: false,
+  });
+  return {
+    ...actual,
+    ensureDaemon,
+  };
+});
 
 let handle: HarnessHandle | null = null;
 

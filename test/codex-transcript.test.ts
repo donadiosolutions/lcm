@@ -7,6 +7,7 @@ import {
   extractCodexSessionCwd,
   findCodexSessionFiles,
   findAllCodexTranscripts,
+  type CodexSessionFile,
 } from "../src/codex-transcript.js";
 
 // ---------------------------------------------------------------------------
@@ -264,6 +265,22 @@ describe("findCodexSessionFiles", () => {
     const files = findCodexSessionFiles(dir);
     expect(files.map(f => f.sessionId)).toEqual(["old-session", "new-session"]);
   });
+
+  it("uses session IDs as a deterministic tie-breaker for equal mtimes", (): void => {
+    const dir = makeTmpDir();
+    const alpha = join(dir, "alpha-session.jsonl");
+    const beta = join(dir, "beta-session.jsonl");
+    writeFileSync(beta, "");
+    writeFileSync(alpha, "");
+    const sameTime = new Date("2026-01-01T00:00:00.000Z");
+    utimesSync(alpha, sameTime, sameTime);
+    utimesSync(beta, sameTime, sameTime);
+
+    expect(findCodexSessionFiles(dir).map((file: CodexSessionFile): string => file.sessionId)).toEqual([
+      "alpha-session",
+      "beta-session",
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -288,10 +305,15 @@ describe("findAllCodexTranscripts", () => {
     const sessions = join(codexDir, "sessions");
     const sessionDir = join(sessions, "session-2");
     mkdirSync(sessionDir, { recursive: true });
-    writeFileSync(join(sessionDir, "session-2.jsonl"), "");
+    const activeSession = join(sessionDir, "session-2.jsonl");
+    writeFileSync(activeSession, "");
+
+    const sameTime = new Date("2026-01-01T00:00:00.000Z");
+    utimesSync(join(archived, "rollout-session-1.jsonl"), sameTime, sameTime);
+    utimesSync(activeSession, sameTime, sameTime);
 
     const files = findAllCodexTranscripts(codexDir);
-    const ids = files.map(f => f.sessionId).sort();
+    const ids = files.map((file: CodexSessionFile): string => file.sessionId);
     expect(ids).toEqual(["rollout-session-1", "session-2"]);
   });
 

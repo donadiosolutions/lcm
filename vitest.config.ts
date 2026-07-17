@@ -14,6 +14,14 @@ export default defineConfig({
     exclude: ["node_modules/**", ".claude/**"],
     coverage: {
       include: ["bin/**/*.ts", "installer/**/*.ts", "src/**/*.ts"],
+      thresholds: {
+        lines: 76.23,
+        branches: 66.84,
+        "src/scrub.ts": { lines: 100, branches: 100 },
+        "src/transcript.ts": { lines: 100, branches: 100 },
+        "src/llm/process-utils.ts": { lines: 100, branches: 100 },
+        "src/url-display.ts": { lines: 100, branches: 100 },
+      },
     },
     projects: [
       {
