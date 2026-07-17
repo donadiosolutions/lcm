@@ -13,7 +13,21 @@ vi.mock("node:http", async (importOriginal): Promise<typeof import("node:http")>
   return { ...actual, createServer: httpMocks.createServer };
 });
 
-import { captureProcessWrites, withHttpHandler } from "./runtime.js";
+import { captureProcessWrites, createTemporaryDatabase, withHttpHandler } from "./runtime.js";
+
+describe("createTemporaryDatabase", (): void => {
+  it("configures the production SQLite pragmas", (): void => {
+    const database = createTemporaryDatabase();
+
+    const journalMode = database.prepare("PRAGMA journal_mode").get() as { journal_mode: string };
+    const foreignKeys = database.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number };
+    const busyTimeout = database.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+
+    expect(journalMode.journal_mode).toBe("wal");
+    expect(foreignKeys.foreign_keys).toBe(1);
+    expect(busyTimeout.timeout).toBe(5000);
+  });
+});
 
 describe("captureProcessWrites", (): void => {
   it("preserves strings and decodes Uint8Array chunks as UTF-8", (): void => {

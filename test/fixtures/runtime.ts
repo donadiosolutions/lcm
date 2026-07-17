@@ -44,6 +44,9 @@ export function createIsolatedHome(): IsolatedHome {
 export function createTemporaryDatabase(): DatabaseSync {
   const directory = createTemporaryDirectory("lcm-sqlite-");
   const database = new DatabaseSync(join(directory, "test.db"));
+  database.exec("PRAGMA journal_mode = WAL");
+  database.exec("PRAGMA busy_timeout = 5000");
+  database.exec("PRAGMA foreign_keys = ON");
   temporaryDatabases.add(database);
   return database;
 }
