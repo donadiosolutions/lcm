@@ -159,7 +159,7 @@ describe("lcm sensitive", () => {
     expect(repairedConfig.security.sensitivePatterns).toEqual(["SECOND_.*"]);
   });
 
-  it("add: preserves a project pattern file without a trailing newline", async (): Promise<void> => {
+  it("add: appends and normalizes a missing trailing newline in a project pattern file", async (): Promise<void> => {
     writeFileSync(join(pDir, "sensitive-patterns.txt"), "PAT_A");
     await expect(handleSensitive(["add", "PAT_B"], cwd, configPath)).resolves.toMatchObject({ exitCode: 0 });
     expect(readFileSync(join(pDir, "sensitive-patterns.txt"), "utf-8")).toBe("PAT_A\nPAT_B\n");

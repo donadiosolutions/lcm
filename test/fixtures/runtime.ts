@@ -59,7 +59,7 @@ export function captureConsole(method: "log" | "error" = "log"): string[] {
 export function captureProcessWrites(stream: "stdout" | "stderr" = "stdout"): string[] {
   const output: string[] = [];
   vi.spyOn(process[stream], "write").mockImplementation(((chunk: string | Uint8Array): true => {
-    output.push(String(chunk));
+    output.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
     return true;
   }) as typeof process.stdout.write);
   return output;
@@ -102,8 +102,13 @@ export async function withHttpHandler(
         }
       });
   });
-  await new Promise<void>((resolve: () => void): void => {
-    server.listen(0, "127.0.0.1", resolve);
+  await new Promise<void>((resolve: () => void, reject: (reason?: unknown) => void): void => {
+    const rejectOnError = (error: Error): void => reject(error);
+    server.once("error", rejectOnError);
+    server.listen(0, "127.0.0.1", (): void => {
+      server.removeListener("error", rejectOnError);
+      resolve();
+    });
   });
   try {
     const address = server.address();

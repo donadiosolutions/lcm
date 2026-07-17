@@ -16,8 +16,9 @@ See [WORKFLOW.md](./WORKFLOW.md) for the full development workflow.
 - Do not use coverage exclusions, `v8 ignore` directives, skipped tests, or
   untested production wrappers to satisfy the goal. Cover behavior through
   observable public seams and deterministic failure injection.
-- The final gate must enforce `lines: 100`, `branches: 100`, and
-  `perFile: true` for the complete collected scope.
+- Once the repository reaches the goal, replace the ratchet with a final gate
+  that enforces `lines: 100`, `branches: 100`, and `perFile: true` for the
+  complete collected scope.
 
 ## PR Review And Merge
 
