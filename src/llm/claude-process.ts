@@ -1,5 +1,7 @@
-import { spawn as defaultSpawn } from "node:child_process";
+import { spawn as defaultSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
+import type { ClaudeProcessReasoningEffort } from "../daemon/config.js";
+import { createProcessCompatibilityError } from "./process-utils.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
   buildLeafSummaryPrompt,
@@ -12,12 +14,30 @@ const TIMEOUT_MS = 120_000;
 
 type ClaudeProcessDeps = {
   model?: string;
+  reasoningEffort?: ClaudeProcessReasoningEffort;
+  fastMode?: boolean;
   spawn?: typeof defaultSpawn;
   timeoutMs?: number;
 };
 
+function friendlyMissingClaudeError(): Error {
+  return new Error([
+    "Claude CLI is not installed or not on PATH.",
+    "Install it first, then run lcm again.",
+  ].join("\n"));
+}
+
+function normalizeSpawnError(error: unknown): Error {
+  if (error && typeof error === "object" && (error as { code?: unknown }).code === "ENOENT") {
+    return friendlyMissingClaudeError();
+  }
+  return error instanceof Error ? error : new Error(String(error));
+}
+
 export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): LcmSummarizeFn {
   const model = opts.model?.trim() || HAIKU_MODEL;
+  const reasoningEffort = opts.reasoningEffort;
+  const fastMode = opts.fastMode;
   const spawn = opts.spawn ?? defaultSpawn;
   const timeoutMs = opts.timeoutMs ?? TIMEOUT_MS;
 
@@ -35,41 +55,77 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
       : buildLeafSummaryPrompt({ text, mode: aggressive ? "aggressive" : "normal", targetTokens });
 
     return new Promise((resolve, reject) => {
-      const proc = spawn("claude", [
+      const args = [
         "--print",
         "--model", model,
         "--no-session-persistence",
         "--system-prompt", LCM_SUMMARIZER_SYSTEM_PROMPT,
         "--tools", "",
         "--disable-slash-commands",
-      ], {
-        stdio: ["pipe", "pipe", "pipe"],
-      });
+      ];
+      if (reasoningEffort !== undefined) {
+        args.push("--effort", reasoningEffort);
+      }
+      if (fastMode !== undefined) {
+        const settings = fastMode
+          ? { fastMode: true, fastModePerSessionOptIn: false }
+          : { fastMode: false };
+        args.push("--settings", JSON.stringify(settings));
+      }
+
+      let proc: ChildProcessWithoutNullStreams;
+      try {
+        proc = spawn("claude", args, { stdio: ["pipe", "pipe", "pipe"] });
+      } catch (error) {
+        reject(normalizeSpawnError(error));
+        return;
+      }
 
       let stdout = "";
-      let stderr = "";
+      let finished = false;
 
       proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
-      proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+      proc.stderr.resume();
 
       const timer = setTimeout(() => {
-        proc.kill();
+        if (finished) return;
+        finished = true;
+        try {
+          proc.kill();
+        } catch {
+          // ignore kill failures during timeout cleanup
+        }
         reject(new Error(`claude process timed out after ${Math.round(timeoutMs / 1000)}s`));
       }, timeoutMs);
 
       proc.on("close", (code: number | null) => {
+        if (finished) return;
+        finished = true;
         clearTimeout(timer);
         const out = stdout.trim();
-        if (code === 0 && out) {
-          resolve(out);
+        if (code === 0) {
+          if (out) {
+            resolve(out);
+          } else {
+            reject(new Error("claude output was empty"));
+          }
         } else {
-          reject(new Error(`claude exited ${code}: ${stderr.slice(0, 200) || "no output"}`));
+          reject(createProcessCompatibilityError({
+            cliName: "Claude",
+            providerId: "claude-process",
+            code,
+            model,
+            reasoningEffort,
+            fastMode,
+          }));
         }
       });
 
       proc.on("error", (err) => {
+        if (finished) return;
+        finished = true;
         clearTimeout(timer);
-        reject(err);
+        reject(normalizeSpawnError(err));
       });
 
       proc.stdin.write(prompt);

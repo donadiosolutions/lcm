@@ -9,8 +9,11 @@ import { DaemonClient } from "../src/daemon/client.js";
 import {
   ConfigValidationError,
   LLM_REASONING_EFFORTS,
+  reasoningEffortsForProvider,
   resolveLlmRequestPolicy,
+  supportsFastMode,
   type DaemonConfig,
+  type LlmProvider,
   type LlmRequestPolicy,
   type LlmReasoningEffort,
 } from "../src/daemon/config.js";
@@ -43,6 +46,7 @@ export function withHookOverrides(
   client: unknown,
   reasoningEffort: LlmReasoningEffort | undefined,
   requestPolicy?: LlmRequestPolicy,
+  fastMode?: boolean,
 ): string {
   try {
     const parsed = JSON.parse(stdinText || "{}");
@@ -51,6 +55,7 @@ export function withHookOverrides(
       ...parsed,
       ...(client === "claude" || client === "codex" ? { client } : {}),
       ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+      ...(fastMode !== undefined ? { fast_mode: fastMode } : {}),
       ...(requestPolicy ? {
         request_timeout_ms: requestPolicy.requestTimeoutMs,
         retry: {
@@ -72,6 +77,19 @@ type CompactRequestPolicyOptions = {
   retryInitialDelayMs?: string;
   retryMaxDelayMs?: string;
   retryMultiplier?: string;
+};
+
+type CompactOptions = CompactRequestPolicyOptions & {
+  all?: boolean;
+  dryRun?: boolean;
+  replay?: boolean;
+  promote?: boolean;
+  reasoningEffort?: LlmReasoningEffort;
+  fastMode?: boolean;
+  verbose?: boolean;
+  hook?: boolean;
+  client?: unknown;
+  help?: boolean;
 };
 
 function numericOption(value: string | undefined): number | undefined {
@@ -113,6 +131,11 @@ export function resolveCompactRequestPolicyOverride(
 
 export function compactFailureExitCode(failures: number): 1 | undefined {
   return failures > 0 ? 1 : undefined;
+}
+
+/** Manual batch requests identify as Claude, so auto resolves to its process provider. */
+export function resolveManualCompactProvider(provider: LlmProvider): LlmProvider {
+  return provider === "auto" ? "claude-process" : provider;
 }
 
 function withHookClient(stdinText: string, client: unknown): string {
@@ -658,8 +681,10 @@ async function main() {
     .option("--dry-run", "Show what would be compacted without writing")
     .option("--replay", "Compact sequentially with threaded context")
     .option("--no-promote", "Skip the automatic promote step")
-    .addOption(new Option("--reasoning-effort <value>", "Override OpenAI Responses reasoning effort for this invocation")
+    .addOption(new Option("--reasoning-effort <value>", "Override provider reasoning effort for this invocation")
       .choices([...LLM_REASONING_EFFORTS]))
+    .option("--fast-mode", "Enable provider fast mode for this invocation")
+    .option("--no-fast-mode", "Disable provider fast mode for this invocation")
     .option("--timeout-ms <ms>", "Override OpenAI-compatible request timeout for this invocation")
     .option("--retry-max-attempts <n>", "Override OpenAI-compatible maximum attempts for this invocation")
     .option("--retry-initial-delay-ms <ms>", "Override OpenAI-compatible initial retry delay")
@@ -670,7 +695,7 @@ async function main() {
     .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .helpOption(false)
     .option("-h, --help", "Show help")
-    .action(async (opts) => {
+    .action(async (opts: CompactOptions) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("compact"); exit(0);
@@ -679,7 +704,8 @@ async function main() {
       const dryRun: boolean = opts.dryRun ?? false;
       const verbose: boolean = opts.verbose ?? false;
       const replay: boolean = opts.replay ?? false;
-      const reasoningEffort = opts.reasoningEffort as LlmReasoningEffort | undefined;
+      const reasoningEffort = opts.reasoningEffort;
+      const fastMode = opts.fastMode;
       // Hook dispatch only when --hook is explicit; all other invocations go to batch.
       const hook: boolean = opts.hook ?? false;
       if (!hook) {
@@ -690,11 +716,14 @@ async function main() {
         const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
         const config = loadDaemonConfig(defaultConfigPath());
         const requestPolicy = resolveCompactRequestPolicyOverride(config, opts);
-        if (
-          reasoningEffort
-          && (config.llm.provider !== "openai" || config.llm.apiMode !== "responses")
-        ) {
-          console.error('  --reasoning-effort requires llm.provider="openai" and llm.apiMode="responses"');
+        const effectiveProvider = resolveManualCompactProvider(config.llm.provider);
+        const supportedEfforts = reasoningEffortsForProvider(effectiveProvider, config.llm.apiMode);
+        if (reasoningEffort && !supportedEfforts.includes(reasoningEffort)) {
+          console.error(`  --reasoning-effort ${reasoningEffort} is not supported by the effective provider "${effectiveProvider}"${effectiveProvider === "openai" ? ` with llm.apiMode="${config.llm.apiMode}"` : ""}; supported values: ${supportedEfforts.join(", ") || "none"}`);
+          exit(1);
+        }
+        if (fastMode !== undefined && !supportsFastMode(effectiveProvider)) {
+          console.error(`  --${fastMode ? "fast-mode" : "no-fast-mode"} requires llm.provider="auto", "claude-process", or "codex-process"`);
           exit(1);
         }
         const port = config.daemon?.port ?? 3737;
@@ -724,7 +753,7 @@ async function main() {
         compactRenderer.start();
 
         const { compacted, failures } = await batchCompact({
-          minTokens, dryRun, port, cwd, replay, verbose, tokenPath, reasoningEffort, requestPolicy,
+          minTokens, dryRun, port, cwd, replay, verbose, tokenPath, reasoningEffort, fastMode, requestPolicy,
           onProgress: (patch) => {
             Object.assign(compactState, patch);
             if (patch.lastResult) compactRenderer.sessionDone();
@@ -780,7 +809,7 @@ async function main() {
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
       const requestPolicy = resolveCompactRequestPolicyOverride(loadDaemonConfig(defaultConfigPath()), opts);
-      const input = withHookOverrides(await readStdin(), opts.client, reasoningEffort, requestPolicy);
+      const input = withHookOverrides(await readStdin(), opts.client, reasoningEffort, requestPolicy, fastMode);
       const r = await dispatchHook("compact", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);

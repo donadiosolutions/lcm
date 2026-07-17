@@ -145,6 +145,7 @@ describe("batch compaction discovery", () => {
       port: 3737,
       cwd,
       verbose: true,
+      fastMode: false,
       requestPolicy: {
         requestTimeoutMs: 120_000,
         retry: { maxAttempts: 4, initialDelayMs: 500, maxDelayMs: 10_000, multiplier: 2 },
@@ -169,6 +170,7 @@ describe("batch compaction discovery", () => {
     ));
     expect(log).toHaveBeenCalledWith(" done  (0.3k → 0.1k tokens, 76% reduction)");
     expect(post).toHaveBeenNthCalledWith(1, "/compact", expect.objectContaining({
+      fast_mode: false,
       request_timeout_ms: 120_000,
       retry: {
         max_attempts: 4,
@@ -197,8 +199,18 @@ describe("formatLlmDiagnostic", () => {
     })).toBe("OpenAI API · responses · reasoning=default");
   });
 
-  it("preserves the existing provider-only diagnostic for other providers", () => {
-    expect(formatLlmDiagnostic({ providerLabel: "Codex (process)" })).toBe("Codex (process)");
+  it("shows effective process controls including an explicit false", () => {
+    expect(formatLlmDiagnostic({
+      providerLabel: "Codex (process)",
+      reasoningEffort: null,
+      fastMode: false,
+    })).toBe("Codex (process) · reasoning=default · fast=off");
+
+    expect(formatLlmDiagnostic({
+      providerLabel: "Claude (process)",
+      reasoningEffort: "max",
+      fastMode: true,
+    })).toBe("Claude (process) · reasoning=max · fast=on");
   });
 
   it("includes the effective request timeout and retry policy", () => {

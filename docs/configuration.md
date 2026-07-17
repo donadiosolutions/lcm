@@ -220,7 +220,7 @@ the process backend's existing default-model behavior.
 ### LLM configuration
 
 The `llm` object in `~/.lcm/config.json` selects the summarizer backend. This
-example shows every supported `llm` field and enables OpenAI reasoning:
+example shows the OpenAI-specific fields and enables reasoning:
 
 ```json
 {
@@ -252,13 +252,51 @@ values fail validation.
 `chat-completions`, preserving the existing OpenAI-compatible Chat Completions
 behavior. Choose `responses` to use OpenAI's Responses API.
 
-`reasoningEffort` accepts `none`, `minimal`, `low`, `medium`, `high`, or
-`xhigh`. It is valid only when `provider` is `openai` and `apiMode` is
-`responses`; LCM rejects any other pairing before compaction starts. Individual
-models may support only some effort values. The OpenAI server is authoritative:
-if it rejects the selected model/effort combination, LCM reports an actionable
-error with the provider, API mode, model, effort, and response status or code.
-Prompts and credentials are omitted from that diagnostic.
+`reasoningEffort` is supported by OpenAI Responses and both process providers.
+The accepted values depend on the configured provider:
+
+- OpenAI Responses: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`
+- Claude process: `low`, `medium`, `high`, `xhigh`, `max`
+- Codex process: `minimal`, `low`, `medium`, `high`, `xhigh`
+- Stored `auto` configuration: `low`, `medium`, `high`, `xhigh`, the shared
+  process-provider values
+
+OpenAI Chat Completions does not accept reasoning effort. Individual provider
+CLI versions and models may support only some otherwise valid values. LCM passes
+the control through and treats the provider as authoritative, including
+provider-accepted fallback behavior. A rejection produces a bounded diagnostic
+with the provider, model, effort, and fast-mode state; prompts and credentials
+are omitted.
+
+The intersection applies only to `llm.reasoningEffort` stored with
+`llm.provider: "auto"`, because that value must work for either process provider.
+A one-invocation `--reasoning-effort` override under `auto` is validated against
+the process provider resolved from the actual client. For example, a manual
+batch resolves to Claude and can use `max`; a Codex hook can use `minimal`.
+
+`fastMode` is a boolean supported by `auto`, `claude-process`, and
+`codex-process`; it defaults to `false`. For Codex, LCM configures
+`model_reasoning_effort`, the `fast_mode` feature, and the `fast` service tier
+when enabled. When disabled, LCM disables the feature and selects the `default`
+service tier so a global fast tier is not inherited. For Claude, LCM passes
+`--effort` and process-local settings containing
+the fast-mode selection. These controls apply only to the spawned summarizer
+process and do not modify the user's provider configuration.
+
+Codex strict configuration validation is enabled when LCM supplies a reasoning
+effort or enables fast mode. A default-off or explicitly disabled fast mode uses
+only the process-local feature and `default` tier overrides, so unrelated fields
+in the user's Codex configuration do not become fatal to ordinary compactions.
+
+```json
+{
+  "llm": {
+    "provider": "codex-process",
+    "reasoningEffort": "high",
+    "fastMode": true
+  }
+}
+```
 
 Override the configured effort for one manual compaction with:
 
@@ -267,8 +305,17 @@ lcm compact --reasoning-effort high
 ```
 
 The CLI value takes precedence over `llm.reasoningEffort` for that invocation
-and does not rewrite `~/.lcm/config.json`. The override has the same
-`openai` + `responses` requirement.
+and does not rewrite `~/.lcm/config.json`. Override the process fast-mode default
+the same way:
+
+```bash
+lcm compact --fast-mode
+lcm compact --no-fast-mode
+```
+
+When both fast-mode flags are supplied, the last flag wins. If neither is
+supplied, `llm.fastMode` applies. These invocation overrides are also forwarded
+by automatic Claude and Codex compaction hooks without rewriting configuration.
 
 ### Timeouts and retries
 
@@ -351,6 +398,7 @@ overrides used by the daemon:
 ```bash
 lcm config get llm.provider
 lcm config get llm.model --effective
+lcm config get llm.fastMode --effective
 ```
 
 `lcm config set <path> <value>` stores a string by default. Add `--json` for a
@@ -359,6 +407,7 @@ typed JSON value such as a number, boolean, object, array, or `null`:
 ```bash
 lcm config set llm.model gpt-5-mini
 lcm config set hooks.disableAutoCompact true --json
+lcm config set llm.fastMode true --json
 ```
 
 Secret-like values are recursively masked in both stored and effective output;
@@ -367,12 +416,14 @@ configuration, preserve unrelated keys, use a mode-`0600` temporary file, and
 rename it atomically. A successful update prints `lcm daemon restart`, which
 must be run before an existing daemon uses the change.
 
-Setting `llm.provider` to a provider other than `openai` automatically removes
-the OpenAI-only `llm.apiMode`, `llm.reasoningEffort`,
-`llm.requestTimeoutMs`, and `llm.retry` settings. Provider aliases are
-normalized first, so `claude` and `codex` remove those settings while `custom`
-and `openai-compatible` retain them. Model, credential, endpoint, extension,
-and other unrelated settings are preserved.
+Changing `llm.provider` removes controls that the destination cannot use.
+`llm.apiMode`, `llm.requestTimeoutMs`, and `llm.retry` are OpenAI-only and are
+removed when switching to another provider. `llm.reasoningEffort` is preserved
+only when its value is valid for the destination provider; `llm.fastMode` is
+preserved only when switching among `auto`, `claude-process`, and
+`codex-process`. Provider aliases are normalized first, so `custom` and
+`openai-compatible` retain OpenAI settings. Model, credential, endpoint,
+extension, and other unrelated settings are preserved.
 
 LCM validates `~/.lcm/config.json` strictly and fails loudly instead of silently
 falling back. Malformed JSON, an `llm` value that is not an object, unknown

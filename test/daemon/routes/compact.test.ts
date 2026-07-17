@@ -45,6 +45,10 @@ function mockRes() {
   return { res, getBody: () => JSON.parse(body || "{}") };
 }
 
+function mockReq(): IncomingMessage {
+  return new IncomingMessage(new Socket());
+}
+
 function makeConfig(provider: DaemonConfig["llm"]["provider"]): DaemonConfig {
   return {
     version: 1,
@@ -226,7 +230,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(makeConfig("claude-process"));
     const { res } = mockRes();
     await handler({} as any, res, JSON.stringify({ session_id: "s1", cwd: testCwd }));
-    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith({ model: "test-model" });
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith(expect.objectContaining({ model: "test-model" }));
     expect(createCodexProcessSummarizer).not.toHaveBeenCalled();
   });
 
@@ -282,7 +286,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(makeConfig("auto"));
     const { res } = mockRes();
     await handler({} as any, res, JSON.stringify({ session_id: "s1", cwd: testCwd, client: "claude" }));
-    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith({ model: "test-model" });
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith(expect.objectContaining({ model: "test-model" }));
     expect(createCodexProcessSummarizer).not.toHaveBeenCalled();
   });
 
@@ -296,7 +300,7 @@ describe("createCompactHandler — summarizer branching", () => {
 
     await handler({} as any, res, JSON.stringify({ session_id: "s1-env-model", cwd: testCwd, client: "claude" }));
 
-    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith({ model: "claude-opus-4-1" });
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith(expect.objectContaining({ model: "claude-opus-4-1" }));
   });
 
   it.each([
@@ -320,7 +324,7 @@ describe("createCompactHandler — summarizer branching", () => {
       JSON.stringify({ session_id: `s1-${client}-default-model`, cwd: testCwd, client }),
     );
 
-    expect(factory).toHaveBeenCalledWith({ model: "" });
+    expect(factory).toHaveBeenCalledWith(expect.objectContaining({ model: "" }));
   });
 
   it("auto + client=codex resolves to codex-process", async () => {
@@ -337,7 +341,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(makeConfig("auto"));
     const { res } = mockRes();
     await handler({} as any, res, JSON.stringify({ session_id: "s1", cwd: testCwd }));
-    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith({ model: "test-model" });
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith(expect.objectContaining({ model: "test-model" }));
     expect(createCodexProcessSummarizer).not.toHaveBeenCalled();
   });
 
@@ -371,7 +375,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(config);
     const { res, getBody } = mockRes();
 
-    await handler({} as any, res, JSON.stringify({
+    await handler(mockReq(), res, JSON.stringify({
       session_id: "reasoning-high",
       cwd: testCwd,
       reasoning_effort: "high",
@@ -385,20 +389,24 @@ describe("createCompactHandler — summarizer branching", () => {
     expect(config.llm.reasoningEffort).toBe("medium");
   });
 
-  it("rejects reasoning overrides outside the OpenAI Responses mode", async () => {
+  it("passes provider-native reasoning and fast-mode overrides to process summarizers", async () => {
     vi.clearAllMocks();
     const handler = createCompactHandler(makeConfig("claude-process"));
     const { res, getBody } = mockRes();
 
-    await handler({} as any, res, JSON.stringify({
+    await handler(mockReq(), res, JSON.stringify({
       session_id: "reasoning-unsupported",
       cwd: testCwd,
-      reasoning_effort: "high",
+      reasoning_effort: "max",
+      fast_mode: true,
     }));
 
-    expect(res.writeHead).toHaveBeenCalledWith(400, expect.anything());
-    expect(getBody().error).toContain('llm.apiMode="responses"');
-    expect(createClaudeProcessSummarizer).not.toHaveBeenCalled();
+    expect(res.writeHead).toHaveBeenCalledWith(200, expect.anything());
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith(expect.objectContaining({
+      reasoningEffort: "max",
+      fastMode: true,
+    }));
+    expect(getBody()).toMatchObject({ reasoningEffort: "max", fastMode: true });
   });
 
   it("rejects unknown reasoning effort values", async () => {
@@ -408,7 +416,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(config);
     const { res, getBody } = mockRes();
 
-    await handler({} as any, res, JSON.stringify({
+    await handler(mockReq(), res, JSON.stringify({
       session_id: "reasoning-invalid",
       cwd: testCwd,
       reasoning_effort: "extreme",
@@ -417,6 +425,79 @@ describe("createCompactHandler — summarizer branching", () => {
     expect(res.writeHead).toHaveBeenCalledWith(400, expect.anything());
     expect(getBody().error).toContain("Valid values: none, minimal, low, medium, high, xhigh");
     expect(createOpenAISummarizer).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["anthropic", undefined, "reasoning_effort is not supported by anthropic"],
+    ["openai", "chat-completions", 'reasoning_effort is not supported by openai with apiMode "chat-completions"'],
+  ] as const)("reports unsupported reasoning controls for %s without suggesting a value named none", async (
+    provider,
+    apiMode,
+    expectedError,
+  ) => {
+    vi.clearAllMocks();
+    const config = makeConfig(provider);
+    config.llm.apiMode = apiMode;
+    const handler = createCompactHandler(config);
+    const { res, getBody } = mockRes();
+
+    await handler(mockReq(), res, JSON.stringify({
+      session_id: `reasoning-unsupported-${provider}`,
+      cwd: testCwd,
+      reasoning_effort: "high",
+    }));
+
+    expect(res.writeHead).toHaveBeenCalledWith(400, expect.anything());
+    expect(getBody().error).toBe(expectedError);
+    expect(getBody().error).not.toContain("Valid values: none");
+    expect(createAnthropicSummarizer).not.toHaveBeenCalled();
+    expect(createOpenAISummarizer).not.toHaveBeenCalled();
+  });
+
+  it("validates reasoning against the resolved auto provider", async () => {
+    vi.clearAllMocks();
+    const handler = createCompactHandler(makeConfig("auto"));
+    const { res, getBody } = mockRes();
+
+    await handler(mockReq(), res, JSON.stringify({
+      session_id: "reasoning-auto-codex",
+      cwd: testCwd,
+      client: "codex",
+      reasoning_effort: "minimal",
+    }));
+
+    expect(createCodexProcessSummarizer).toHaveBeenCalledWith(expect.objectContaining({ reasoningEffort: "minimal" }));
+    expect(getBody()).toMatchObject({ reasoningEffort: "minimal", fastMode: false });
+  });
+
+  it("rejects process-only controls for API providers", async () => {
+    vi.clearAllMocks();
+    const handler = createCompactHandler(makeConfig("anthropic"));
+    const { res, getBody } = mockRes();
+
+    await handler(mockReq(), res, JSON.stringify({
+      session_id: "fast-api",
+      cwd: testCwd,
+      fast_mode: true,
+    }));
+
+    expect(res.writeHead).toHaveBeenCalledWith(400, expect.anything());
+    expect(getBody().error).toContain("fast_mode requires");
+    expect(createAnthropicSummarizer).not.toHaveBeenCalled();
+  });
+
+  it("isolates cached process summarizers by fast mode", async () => {
+    vi.clearAllMocks();
+    const handler = createCompactHandler(makeConfig("codex-process"));
+    const { res: fast } = mockRes();
+    const { res: standard } = mockRes();
+
+    await handler(mockReq(), fast, JSON.stringify({ session_id: "fast-cache", cwd: testCwd, fast_mode: true }));
+    await handler(mockReq(), standard, JSON.stringify({ session_id: "standard-cache", cwd: testCwd, fast_mode: false }));
+
+    expect(createCodexProcessSummarizer).toHaveBeenCalledTimes(2);
+    expect(createCodexProcessSummarizer).toHaveBeenNthCalledWith(1, expect.objectContaining({ fastMode: true }));
+    expect(createCodexProcessSummarizer).toHaveBeenNthCalledWith(2, expect.objectContaining({ fastMode: false }));
   });
 
   it("isolates cached OpenAI summarizers by effective reasoning effort", async () => {

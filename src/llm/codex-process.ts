@@ -3,6 +3,8 @@ import { mkdtempSync as defaultMkdtempSync, readFileSync as defaultReadFileSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
+import type { CodexProcessReasoningEffort } from "../daemon/config.js";
+import { createProcessCompatibilityError } from "./process-utils.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
   buildLeafSummaryPrompt,
@@ -14,6 +16,8 @@ const TIMEOUT_MS = 120_000;
 
 type CodexProcessDeps = {
   model?: string;
+  reasoningEffort?: CodexProcessReasoningEffort;
+  fastMode?: boolean;
   spawn?: typeof defaultSpawn;
   mkdtempSync?: typeof defaultMkdtempSync;
   readFileSync?: typeof defaultReadFileSync;
@@ -53,20 +57,38 @@ function normalizeSpawnError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-function buildArgs(outputPath: string, model?: string): string[] {
-  const args = [
-    "exec",
+function buildArgs(
+  outputPath: string,
+  model?: string,
+  reasoningEffort?: CodexProcessReasoningEffort,
+  fastMode?: boolean,
+): string[] {
+  const args = ["exec"];
+
+  if (model && model.trim()) {
+    args.push("--model", model.trim());
+  }
+
+  if (reasoningEffort !== undefined || fastMode === true) {
+    args.push("--strict-config");
+  }
+  if (reasoningEffort !== undefined) {
+    args.push("-c", `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
+  }
+  if (fastMode === true) {
+    args.push("--enable", "fast_mode", "-c", 'service_tier="fast"');
+  } else if (fastMode === false) {
+    args.push("--disable", "fast_mode", "-c", 'service_tier="default"');
+  }
+
+  args.push(
     "-",
     "--skip-git-repo-check",
     "--sandbox",
     "read-only",
     "--output-last-message",
     outputPath,
-  ];
-
-  if (model && model.trim()) {
-    args.splice(1, 0, "--model", model.trim());
-  }
+  );
 
   return args;
 }
@@ -83,6 +105,8 @@ function runCodexSummarizer(
   prompt: string,
   deps: Required<Pick<CodexProcessDeps, "spawn" | "mkdtempSync" | "readFileSync" | "rmSync" | "tmpdir" | "timeoutMs">> & {
     model?: string;
+    reasoningEffort?: CodexProcessReasoningEffort;
+    fastMode?: boolean;
   },
 ): Promise<string> {
   const tempDir = deps.mkdtempSync(join(deps.tmpdir(), "lcm-codex-"));
@@ -92,7 +116,7 @@ function runCodexSummarizer(
     let child: ChildProcessWithoutNullStreams;
 
     try {
-      child = deps.spawn("codex", buildArgs(outputPath, deps.model), {
+      child = deps.spawn("codex", buildArgs(outputPath, deps.model, deps.reasoningEffort, deps.fastMode), {
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (error) {
@@ -102,7 +126,6 @@ function runCodexSummarizer(
     }
 
     let stdout = "";
-    let stderr = "";
     let finished = false;
 
     const timer = setTimeout(() => {
@@ -120,9 +143,7 @@ function runCodexSummarizer(
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
+    child.stderr.resume();
 
     child.on("error", (error) => {
       if (finished) return;
@@ -139,7 +160,14 @@ function runCodexSummarizer(
 
       try {
         if (code !== 0) {
-          throw new Error(`codex exited ${code}: ${stderr.slice(0, 200) || "no output"}`);
+          throw createProcessCompatibilityError({
+            cliName: "Codex",
+            providerId: "codex-process",
+            code,
+            model: deps.model,
+            reasoningEffort: deps.reasoningEffort,
+            fastMode: deps.fastMode,
+          });
         }
         const summary = deps.readFileSync(outputPath, "utf-8").trim();
         if (!summary) {
@@ -161,6 +189,8 @@ function runCodexSummarizer(
 export function createCodexProcessSummarizer(opts: CodexProcessDeps = {}): LcmSummarizeFn {
   const deps = {
     model: opts.model,
+    reasoningEffort: opts.reasoningEffort,
+    fastMode: opts.fastMode,
     spawn: opts.spawn ?? defaultSpawn,
     mkdtempSync: opts.mkdtempSync ?? defaultMkdtempSync,
     readFileSync: opts.readFileSync ?? defaultReadFileSync,

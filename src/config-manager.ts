@@ -12,7 +12,12 @@ import {
   normalizeLlmProvider,
   parseDaemonConfig,
   parseStoredConfig,
+  reasoningEffortsForProvider,
   resolveDaemonConfigEnv,
+  supportsFastMode,
+  type LlmApiMode,
+  type LlmProvider,
+  type LlmReasoningEffort,
 } from "./daemon/config.js";
 import { isSensitiveKey } from "./secret-key.js";
 import { sanitizeUrlValueForDisplay } from "./url-display.js";
@@ -21,7 +26,6 @@ const DENIED_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
 const REDACTED = "[REDACTED]";
 const OPENAI_ONLY_LLM_KEYS = [
   "apiMode",
-  "reasoningEffort",
   "requestTimeoutMs",
   "retry",
 ] as const;
@@ -159,7 +163,7 @@ function setAtPath(root: Record<string, unknown>, segments: readonly string[], v
   current[segments.at(-1)!] = value;
 }
 
-/** Remove settings that cannot survive an intentional transition away from OpenAI. */
+/** Remove settings that are incompatible with an intentional provider transition. */
 function canonicalizeLlmProviderTransition(
   root: Record<string, unknown>,
   segments: readonly string[],
@@ -170,13 +174,24 @@ function canonicalizeLlmProviderTransition(
     || segments[0] !== "llm"
     || segments[1] !== "provider"
     || typeof value !== "string"
-    || normalizeLlmProvider(value) === "openai"
   ) {
     return;
   }
   const llm = root.llm;
   if (!isRecord(llm)) return;
-  for (const key of OPENAI_ONLY_LLM_KEYS) delete llm[key];
+  const provider = normalizeLlmProvider(value) as LlmProvider;
+  if (provider !== "openai") {
+    for (const key of OPENAI_ONLY_LLM_KEYS) delete llm[key];
+  }
+  const apiMode = typeof llm.apiMode === "string" ? llm.apiMode as LlmApiMode : undefined;
+  const reasoningEffort = llm.reasoningEffort;
+  if (
+    typeof reasoningEffort === "string"
+    && !reasoningEffortsForProvider(provider, apiMode).includes(reasoningEffort as LlmReasoningEffort)
+  ) {
+    delete llm.reasoningEffort;
+  }
+  if (!supportsFastMode(provider)) delete llm.fastMode;
 }
 
 function writeConfigAtomic(configPath: string, content: string): void {

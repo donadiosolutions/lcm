@@ -22,15 +22,17 @@ export function formatLlmDiagnostic(input: {
   providerLabel?: string;
   apiMode?: LlmApiMode;
   reasoningEffort?: LlmReasoningEffort | null;
+  fastMode?: boolean | null;
   requestTimeoutMs?: number | null;
   retry?: LlmRetryPolicy | null;
 }): string | undefined {
   if (!input.providerLabel) return undefined;
   const parts = [input.providerLabel];
   if (input.apiMode) parts.push(input.apiMode);
-  if (input.apiMode === "responses") {
+  if (input.apiMode === "responses" || typeof input.fastMode === "boolean") {
     parts.push(`reasoning=${input.reasoningEffort ?? "default"}`);
   }
+  if (typeof input.fastMode === "boolean") parts.push(`fast=${input.fastMode ? "on" : "off"}`);
   if (typeof input.requestTimeoutMs === "number") {
     parts.push(`timeout=${input.requestTimeoutMs}ms`);
   }
@@ -129,6 +131,7 @@ export async function batchCompact(opts: {
   verbose?: boolean;
   tokenPath?: string;
   reasoningEffort?: LlmReasoningEffort;
+  fastMode?: boolean;
   requestPolicy?: LlmRequestPolicy;
   /** Called with state patches as each session is processed — used by the ninja renderer */
   onProgress?: (patch: Partial<ProgressState>) => void;
@@ -177,6 +180,7 @@ export async function batchCompact(opts: {
         providerLabel?: string;
         apiMode?: LlmApiMode;
         reasoningEffort?: LlmReasoningEffort | null;
+        fastMode?: boolean | null;
         requestTimeoutMs?: number | null;
         retry?: LlmRetryPolicy | null;
       }>("/compact", {
@@ -185,6 +189,7 @@ export async function batchCompact(opts: {
         skip_ingest: true,
         client: "claude",
         reasoning_effort: opts.reasoningEffort,
+        fast_mode: opts.fastMode,
         request_timeout_ms: opts.requestPolicy?.requestTimeoutMs,
         retry: opts.requestPolicy ? {
           max_attempts: opts.requestPolicy.retry.maxAttempts,

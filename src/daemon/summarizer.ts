@@ -1,4 +1,11 @@
-import type { DaemonConfig, LlmReasoningEffort, LlmRequestPolicy } from "./config.js";
+import type {
+  ClaudeProcessReasoningEffort,
+  CodexProcessReasoningEffort,
+  DaemonConfig,
+  LlmReasoningEffort,
+  LlmRequestPolicy,
+  OpenAIReasoningEffort,
+} from "./config.js";
 import { createClaudeProcessSummarizer } from "../llm/claude-process.js";
 import { createCodexProcessSummarizer } from "../llm/codex-process.js";
 import { createMockSummarizer } from "../llm/mock-summarizer.js";
@@ -17,16 +24,24 @@ export function resolveEffectiveProvider(config: DaemonConfig, client?: CompactC
 export async function createSummarizer(
   provider: EffectiveProvider,
   config: DaemonConfig,
-  overrides: { reasoningEffort?: LlmReasoningEffort; requestPolicy?: LlmRequestPolicy } = {},
+  overrides: { reasoningEffort?: LlmReasoningEffort; fastMode?: boolean; requestPolicy?: LlmRequestPolicy } = {},
 ): Promise<LcmSummarizeFn | null> {
   // Mock summarizer for E2E testing — deterministic, no LLM calls
   if (config.summarizer?.mock) return createMockSummarizer();
   if (provider === "disabled") return null;
   if (provider === "claude-process") {
-    return createClaudeProcessSummarizer({ model: config.llm.model });
+    return createClaudeProcessSummarizer({
+      model: config.llm.model,
+      reasoningEffort: (overrides.reasoningEffort ?? config.llm.reasoningEffort) as ClaudeProcessReasoningEffort | undefined,
+      fastMode: overrides.fastMode ?? config.llm.fastMode ?? false,
+    });
   }
   if (provider === "codex-process") {
-    return createCodexProcessSummarizer({ model: config.llm.model });
+    return createCodexProcessSummarizer({
+      model: config.llm.model,
+      reasoningEffort: (overrides.reasoningEffort ?? config.llm.reasoningEffort) as CodexProcessReasoningEffort | undefined,
+      fastMode: overrides.fastMode ?? config.llm.fastMode ?? false,
+    });
   }
   if (provider === "openai") {
     const { createOpenAISummarizer } = await import("../llm/openai.js");
@@ -35,7 +50,7 @@ export async function createSummarizer(
       baseUrl: config.llm.baseUrl,
       apiKey: config.llm.apiKey,
       apiMode: config.llm.apiMode ?? "chat-completions",
-      reasoningEffort: overrides.reasoningEffort ?? config.llm.reasoningEffort,
+      reasoningEffort: (overrides.reasoningEffort ?? config.llm.reasoningEffort) as OpenAIReasoningEffort | undefined,
       requestTimeoutMs: overrides.requestPolicy?.requestTimeoutMs ?? config.llm.requestTimeoutMs,
       retry: overrides.requestPolicy?.retry ?? config.llm.retry,
     });
@@ -57,6 +72,7 @@ export function makeSummarizerCache(config: DaemonConfig) {
   return (
     provider: EffectiveProvider,
     reasoningEffort?: LlmReasoningEffort,
+    fastMode?: boolean,
     requestPolicy?: LlmRequestPolicy,
   ): Promise<LcmSummarizeFn | null> => {
     const effectivePolicy = requestPolicy ?? {
@@ -67,12 +83,13 @@ export function makeSummarizerCache(config: DaemonConfig) {
       provider,
       config.llm.apiMode ?? "",
       reasoningEffort ?? config.llm.reasoningEffort ?? "",
+      fastMode ?? config.llm.fastMode ?? false,
       effectivePolicy.requestTimeoutMs,
       effectivePolicy.retry,
     ]);
     let cached = cache.get(cacheKey);
     if (!cached) {
-      cached = createSummarizer(provider, config, { reasoningEffort, requestPolicy: effectivePolicy });
+      cached = createSummarizer(provider, config, { reasoningEffort, fastMode, requestPolicy: effectivePolicy });
       cache.set(cacheKey, cached);
     }
     return cached;
