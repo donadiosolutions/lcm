@@ -13,13 +13,16 @@ type FakeChild = EventEmitter & {
   kill: ReturnType<typeof vi.fn>;
 };
 
-function makeChild(exitCode = 0): FakeChild {
+function makeChild(exitCode = 0, stderr = ""): FakeChild {
   const child = new EventEmitter() as FakeChild;
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
   child.stdin = new PassThrough();
   child.kill = vi.fn();
-  queueMicrotask(() => child.emit("close", exitCode));
+  queueMicrotask(() => {
+    if (stderr) child.stderr.end(stderr);
+    child.emit("close", exitCode);
+  });
   return child;
 }
 
@@ -63,6 +66,9 @@ describe("createCodexProcessSummarizer", () => {
     expect(args).toContain("--sandbox");
     expect(args).toContain("read-only");
     expect(args).toContain("--output-last-message");
+    expect(args).not.toContain("--strict-config");
+    expect(args).not.toContain("--enable");
+    expect(args).not.toContain("--disable");
     expect(readFileSyncMock).toHaveBeenCalledTimes(1);
     expect(stdin).toContain("context-compaction summarization engine");
     expect(stdin).toContain("Conversation text");
@@ -91,6 +97,65 @@ describe("createCodexProcessSummarizer", () => {
     expect(spawn.mock.calls[0][1]).toContain("gpt-5.4");
   });
 
+  it("passes reasoning effort and enabled fast mode as process-local strict config", async () => {
+    const child = makeChild(0);
+    const spawn = vi.fn().mockReturnValue(child);
+    const summarizer = createCodexProcessSummarizer({
+      model: "gpt-5.4",
+      reasoningEffort: "ultra",
+      fastMode: true,
+      spawn: spawn as any,
+      mkdtempSync: vi.fn(() => {
+        const dir = mkdtempSync(join(tmpdir(), "lcm-codex-"));
+        tempDirs.push(dir);
+        return dir;
+      }) as any,
+      readFileSync: vi.fn(() => "summary text") as any,
+      rmSync: vi.fn() as any,
+    });
+
+    await expect(summarizer("Conversation text", false)).resolves.toBe("summary text");
+
+    const args = spawn.mock.calls[0][1] as string[];
+    expect(args).toEqual([
+      "exec",
+      "--model", "gpt-5.4",
+      "--strict-config",
+      "-c", 'model_reasoning_effort="ultra"',
+      "--enable", "fast_mode",
+      "-c", 'service_tier="fast"',
+      "-",
+      "--skip-git-repo-check",
+      "--sandbox", "read-only",
+      "--output-last-message", expect.any(String),
+    ]);
+  });
+
+  it("explicitly disables fast mode without inheriting global Codex config", async () => {
+    const child = makeChild(0);
+    const spawn = vi.fn().mockReturnValue(child);
+    const summarizer = createCodexProcessSummarizer({
+      fastMode: false,
+      spawn: spawn as any,
+      mkdtempSync: vi.fn(() => {
+        const dir = mkdtempSync(join(tmpdir(), "lcm-codex-"));
+        tempDirs.push(dir);
+        return dir;
+      }) as any,
+      readFileSync: vi.fn(() => "summary text") as any,
+      rmSync: vi.fn() as any,
+    });
+
+    await expect(summarizer("Conversation text", false)).resolves.toBe("summary text");
+
+    const args = spawn.mock.calls[0][1] as string[];
+    expect(args).toContain("--strict-config");
+    expect(args.slice(args.indexOf("--disable"), args.indexOf("--disable") + 2)).toEqual([
+      "--disable", "fast_mode",
+    ]);
+    expect(args).not.toContain("service_tier=\"fast\"");
+  });
+
   it("returns a friendly ENOENT error when codex is missing", async () => {
     const summarizer = createCodexProcessSummarizer({
       spawn: vi.fn(() => {
@@ -110,9 +175,7 @@ describe("createCodexProcessSummarizer", () => {
   });
 
   it("rejects on non-zero exit", async () => {
-    const child = makeChild(1);
-    child.stderr.write("boom");
-    child.stderr.end();
+    const child = makeChild(1, "boom");
     const spawn = vi.fn().mockReturnValue(child);
     const readFileSyncMock = vi.fn(() => "summary text");
     const summarizer = createCodexProcessSummarizer({
@@ -126,8 +189,37 @@ describe("createCodexProcessSummarizer", () => {
       rmSync: vi.fn() as any,
     });
 
-    await expect(summarizer("Conversation text", false)).rejects.toThrow("codex exited 1");
+    await expect(summarizer("Conversation text", false)).rejects.toThrow(
+      /Codex CLI rejected.*provider codex-process.*reasoning effort "default\/omitted".*fast mode default\/omitted.*Upgrade the Codex CLI/s,
+    );
     expect(readFileSyncMock).not.toHaveBeenCalled();
+  });
+
+  it("reports requested controls and sanitizes bounded CLI diagnostics", async () => {
+    const child = makeChild(2, `\u001b[31munsupported\u001b[0m\ncontrol\u0000${"x".repeat(400)}`);
+    const spawn = vi.fn().mockReturnValue(child);
+    const summarizer = createCodexProcessSummarizer({
+      model: "gpt-test",
+      reasoningEffort: "ultra",
+      fastMode: true,
+      spawn: spawn as any,
+      mkdtempSync: vi.fn(() => {
+        const dir = mkdtempSync(join(tmpdir(), "lcm-codex-"));
+        tempDirs.push(dir);
+        return dir;
+      }) as any,
+      readFileSync: vi.fn() as any,
+      rmSync: vi.fn() as any,
+    });
+
+    const error = await summarizer("Conversation text", false).catch((caught: unknown) => caught as Error);
+    expect(error.message).toContain('model "gpt-test"');
+    expect(error.message).toContain('reasoning effort "ultra"');
+    expect(error.message).toContain("fast mode true");
+    expect(error.message).toContain("unsupported control");
+    expect(error.message).not.toContain("\u001b");
+    expect(error.message).not.toContain("\u0000");
+    expect(error.message.length).toBeLessThan(600);
   });
 
   it("rejects when the output file is empty", async () => {

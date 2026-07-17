@@ -346,7 +346,7 @@ describe("setConfigValue", () => {
     ["claude", "claude-process"],
     ["codex", "codex-process"],
     ["disabled", "disabled"],
-  ])("removes OpenAI-only settings when changing provider to %s", (provider, expectedProvider) => {
+  ])("removes incompatible settings when changing provider to %s", (provider, expectedProvider) => {
     const { configPath } = makeConfig({
       version: 1,
       customSection: { keep: true },
@@ -380,8 +380,13 @@ describe("setConfigValue", () => {
       apiKey: "shared-api-key",
       baseUrl: "http://localhost:11435/v1",
     });
-    for (const key of ["apiMode", "reasoningEffort", "requestTimeoutMs", "retry"]) {
+    for (const key of ["apiMode", "requestTimeoutMs", "retry"]) {
       expect(stored.llm).not.toHaveProperty(key);
+    }
+    if (expectedProvider === "claude-process" || expectedProvider === "codex-process") {
+      expect(stored.llm.reasoningEffort).toBe("high");
+    } else {
+      expect(stored.llm).not.toHaveProperty("reasoningEffort");
     }
   });
 
@@ -414,6 +419,38 @@ describe("setConfigValue", () => {
       });
     },
   );
+
+  it("preserves process controls only when the destination provider supports them", () => {
+    const { configPath } = makeConfig({
+      llm: { provider: "codex-process", reasoningEffort: "ultra", fastMode: true },
+    });
+
+    setConfigValue({ configPath, path: "llm.provider", value: "claude-process", env: {} });
+
+    const stored = JSON.parse(readFileSync(configPath, "utf-8")) as { llm: Record<string, unknown> };
+    expect(stored.llm.provider).toBe("claude-process");
+    expect(stored.llm.fastMode).toBe(true);
+    expect(stored.llm).not.toHaveProperty("reasoningEffort");
+  });
+
+  it("drops process-only fast mode when changing to an API provider", () => {
+    const { configPath } = makeConfig({
+      llm: {
+        provider: "codex-process",
+        model: "local-model",
+        baseUrl: "http://localhost:11435/v1",
+        reasoningEffort: "high",
+        fastMode: true,
+      },
+    });
+
+    setConfigValue({ configPath, path: "llm.provider", value: "openai", env: {} });
+
+    const stored = JSON.parse(readFileSync(configPath, "utf-8")) as { llm: Record<string, unknown> };
+    expect(stored.llm.provider).toBe("openai");
+    expect(stored.llm).not.toHaveProperty("fastMode");
+    expect(stored.llm).not.toHaveProperty("reasoningEffort");
+  });
 
   it("does not rewrite the file when a provider transition remains invalid", () => {
     const { configPath } = makeConfig({

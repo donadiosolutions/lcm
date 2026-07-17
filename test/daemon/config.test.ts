@@ -4,12 +4,16 @@ import { join } from "node:path";
 import { describe, it, expect, type TestContext } from "vitest";
 import {
   CANONICAL_LLM_PROVIDERS,
+  AUTO_REASONING_EFFORTS,
+  CLAUDE_PROCESS_REASONING_EFFORTS,
+  CODEX_PROCESS_REASONING_EFFORTS,
   ConfigValidationError,
   DEFAULT_DAEMON_PORT,
   DEFAULT_LLM_REQUEST_TIMEOUT_MS,
   DEFAULT_LLM_RETRY_POLICY,
   LLM_API_MODES,
   LLM_REASONING_EFFORTS,
+  OPENAI_REASONING_EFFORTS,
   loadDaemonConfig,
   parseDaemonConfig,
   parseStoredConfig,
@@ -543,7 +547,7 @@ describe("loadDaemonConfig", () => {
     expect(c.llm.provider).toBe("anthropic");
   });
 
-  it("clears OpenAI-only file settings when LCM_SUMMARY_PROVIDER selects another provider", () => {
+  it("preserves compatible reasoning while clearing OpenAI-only settings on an env provider transition", () => {
     const c = parseDaemonConfig(
       JSON.stringify({
         llm: {
@@ -560,7 +564,7 @@ describe("loadDaemonConfig", () => {
 
     expect(c.llm.provider).toBe("auto");
     expect(c.llm.apiMode).toBeUndefined();
-    expect(c.llm.reasoningEffort).toBeUndefined();
+    expect(c.llm.reasoningEffort).toBe("high");
   });
 
   it("clears OpenAI-only runtime overrides when LCM_SUMMARY_PROVIDER selects another provider", () => {
@@ -672,7 +676,11 @@ describe("strict LLM configuration validation", () => {
   it("exports the canonical provider, API mode, and reasoning effort contracts", () => {
     expect(CANONICAL_LLM_PROVIDERS).toEqual(["auto", "claude-process", "codex-process", "anthropic", "openai", "disabled"]);
     expect(LLM_API_MODES).toEqual(["chat-completions", "responses"]);
-    expect(LLM_REASONING_EFFORTS).toEqual(["none", "minimal", "low", "medium", "high", "xhigh"]);
+    expect(LLM_REASONING_EFFORTS).toEqual(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+    expect(OPENAI_REASONING_EFFORTS).toEqual(["none", "minimal", "low", "medium", "high", "xhigh"]);
+    expect(CLAUDE_PROCESS_REASONING_EFFORTS).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(CODEX_PROCESS_REASONING_EFFORTS).toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+    expect(AUTO_REASONING_EFFORTS).toEqual(["low", "medium", "high", "xhigh"]);
   });
 
   it.each([
@@ -875,7 +883,7 @@ describe("strict LLM configuration validation", () => {
     expect(config.llm.apiKey).toBe("");
   });
 
-  it("accepts reasoning effort only for OpenAI Responses mode", () => {
+  it("accepts provider-native reasoning efforts and rejects incompatible values", () => {
     const content = JSON.stringify({
       llm: {
         provider: "openai",
@@ -886,8 +894,11 @@ describe("strict LLM configuration validation", () => {
       },
     });
     expect(parseDaemonConfig(content).llm.reasoningEffort).toBe("high");
-    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "codex", reasoningEffort: "high" } }))).toThrow(
-      'Invalid configuration at llm.reasoningEffort: is only valid when llm.provider is "openai" and llm.apiMode is "responses"',
+    expect(parseDaemonConfig(JSON.stringify({ llm: { provider: "codex", reasoningEffort: "ultra" } })).llm.reasoningEffort).toBe("ultra");
+    expect(parseDaemonConfig(JSON.stringify({ llm: { provider: "claude", reasoningEffort: "max" } })).llm.reasoningEffort).toBe("max");
+    expect(parseDaemonConfig(JSON.stringify({ llm: { provider: "auto", reasoningEffort: "xhigh" } })).llm.reasoningEffort).toBe("xhigh");
+    expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "auto", reasoningEffort: "max" } }))).toThrow(
+      "valid choices for llm.provider \"auto\": low, medium, high, xhigh",
     );
     expect(() => parseDaemonConfig(JSON.stringify({
       llm: {
@@ -908,6 +919,21 @@ describe("strict LLM configuration validation", () => {
     expect(() => parseDaemonConfig(JSON.stringify({ llm: { provider: "disabled", apiMode: "chat-completions" } }))).toThrow(
       'Invalid configuration at llm.apiMode: is only valid when llm.provider is "openai"',
     );
+  });
+
+  it("defaults fast mode to false and accepts it only for auto and process providers", () => {
+    expect(parseDaemonConfig("{}").llm.fastMode).toBe(false);
+    for (const provider of ["auto", "claude-process", "codex-process"] as const) {
+      expect(parseDaemonConfig(JSON.stringify({ llm: { provider, fastMode: true } })).llm.fastMode).toBe(true);
+    }
+    for (const provider of ["anthropic", "openai", "disabled"] as const) {
+      const llm = provider === "anthropic"
+        ? { provider, model: "claude-test", apiKey: "test", fastMode: true }
+        : provider === "openai"
+          ? { provider, model: "gpt-test", baseUrl: "http://localhost/v1", fastMode: true }
+          : { provider, fastMode: true };
+      expect(() => parseDaemonConfig(JSON.stringify({ llm }))).toThrow("llm.fastMode");
+    }
   });
 
   it.each(["custom", "openai-compatible"])("normalizes the OpenAI-compatible alias %s", (provider) => {

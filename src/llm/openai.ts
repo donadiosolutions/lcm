@@ -4,8 +4,8 @@ import {
   DEFAULT_LLM_REQUEST_TIMEOUT_MS,
   DEFAULT_LLM_RETRY_POLICY,
   type LlmApiMode,
-  type LlmReasoningEffort,
   type LlmRetryPolicy,
+  type OpenAIReasoningEffort,
 } from "../daemon/config.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
@@ -59,7 +59,7 @@ type OpenAISummarizerOptions = {
   baseUrl: string;
   apiKey?: string;
   apiMode?: LlmApiMode;
-  reasoningEffort?: LlmReasoningEffort;
+  reasoningEffort?: OpenAIReasoningEffort;
   requestTimeoutMs?: number;
   retry?: LlmRetryPolicy;
   _clientOverride?: OpenAISummarizerClient;

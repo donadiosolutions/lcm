@@ -323,9 +323,13 @@ with bounded exponential backoff. To opt into the Responses API and reasoning,
 set `llm.apiMode` to `responses` and `llm.reasoningEffort` to `none`, `minimal`,
 `low`, `medium`, `high`, or `xhigh` in `~/.lcm/config.json`. A
 `--reasoning-effort` CLI value overrides JSON for one `lcm compact` invocation
-without rewriting the file. LCM validates the `llm` object strictly and reports
-configuration, retry, or model-capability errors without exposing prompts,
-provider bodies, credential-bearing URLs, or credentials.
+without rewriting the file. Process summarizers also accept provider-native
+reasoning levels: Claude adds `max`, while Codex adds `max` and `ultra`. Set
+`llm.fastMode` (default `false`), or use `--fast-mode`/`--no-fast-mode` for one
+compaction, to control process-provider priority processing. LCM passes these
+controls to the provider CLI, whose installed version and selected model remain
+authoritative, and reports failures without exposing prompts, provider bodies,
+credential-bearing URLs, or credentials.
 
 See [`docs/configuration.md`](docs/configuration.md) for the complete JSON example,
 provider requirements, and deeper operational guidance.

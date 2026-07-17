@@ -18,8 +18,33 @@ export type LlmProvider = typeof CANONICAL_LLM_PROVIDERS[number];
 export const LLM_API_MODES = ["chat-completions", "responses"] as const;
 export type LlmApiMode = typeof LLM_API_MODES[number];
 
-export const LLM_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
+export const LLM_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type LlmReasoningEffort = typeof LLM_REASONING_EFFORTS[number];
+
+export const OPENAI_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
+export type OpenAIReasoningEffort = typeof OPENAI_REASONING_EFFORTS[number];
+export const CLAUDE_PROCESS_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type ClaudeProcessReasoningEffort = typeof CLAUDE_PROCESS_REASONING_EFFORTS[number];
+export const CODEX_PROCESS_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
+export type CodexProcessReasoningEffort = typeof CODEX_PROCESS_REASONING_EFFORTS[number];
+export const AUTO_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"] as const;
+
+export function reasoningEffortsForProvider(
+  provider: LlmProvider,
+  apiMode?: LlmApiMode,
+): readonly LlmReasoningEffort[] {
+  switch (provider) {
+    case "auto": return AUTO_REASONING_EFFORTS;
+    case "claude-process": return CLAUDE_PROCESS_REASONING_EFFORTS;
+    case "codex-process": return CODEX_PROCESS_REASONING_EFFORTS;
+    case "openai": return apiMode === "responses" ? OPENAI_REASONING_EFFORTS : [];
+    default: return [];
+  }
+}
+
+export function supportsFastMode(provider: LlmProvider): boolean {
+  return provider === "auto" || provider === "claude-process" || provider === "codex-process";
+}
 
 export interface LlmRetryPolicy {
   maxAttempts: number;
@@ -95,6 +120,7 @@ export type DaemonConfig = {
     baseUrl: string;
     apiMode?: LlmApiMode;
     reasoningEffort?: LlmReasoningEffort;
+    fastMode: boolean;
     requestTimeoutMs: number;
     retry: LlmRetryPolicy;
   };
@@ -153,6 +179,7 @@ const DEFAULTS: DaemonConfig = {
     model: "",
     apiKey: "",
     baseUrl: "",
+    fastMode: false,
     requestTimeoutMs: DEFAULT_LLM_REQUEST_TIMEOUT_MS,
     retry: { ...DEFAULT_LLM_RETRY_POLICY },
   },
@@ -272,7 +299,7 @@ const LLM_PROVIDER_ALIASES: Readonly<Record<string, LlmProvider>> = {
   "openai-compatible": "openai",
 };
 const LLM_KEYS = new Set([
-  "provider", "model", "apiKey", "baseUrl", "baseURL", "apiMode", "reasoningEffort",
+  "provider", "model", "apiKey", "baseUrl", "baseURL", "apiMode", "reasoningEffort", "fastMode",
   "requestTimeoutMs", "retry",
 ]);
 const CONFIG_EXAMPLE = JSON.stringify({
@@ -663,6 +690,7 @@ function validateLlmObject(
   for (const key of ["provider", "model", "apiKey", "apiMode", "reasoningEffort"]) {
     validateStringField(llm, key);
   }
+  validateOptionalBoolean(llm, "fastMode", "llm");
   normalizeBaseUrl(llm);
   resolveLlmRequestPolicy(
     { requestTimeoutMs: DEFAULT_LLM_REQUEST_TIMEOUT_MS, retry: { ...DEFAULT_LLM_RETRY_POLICY } },
@@ -727,6 +755,13 @@ export function daemonConfigForPersistence(config: DaemonConfig): Record<string,
     delete llm.requestTimeoutMs;
     delete llm.retry;
   }
+  if (!supportsFastMode(config.llm.provider)) delete llm.fastMode;
+  if (
+    config.llm.reasoningEffort !== undefined
+    && !reasoningEffortsForProvider(config.llm.provider, config.llm.apiMode).includes(config.llm.reasoningEffort)
+  ) {
+    delete llm.reasoningEffort;
+  }
   return stored;
 }
 
@@ -777,12 +812,6 @@ function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: Readonl
         `is only valid when llm.provider is "openai"`,
       );
     }
-    if (explicitlyConfigured.has("reasoningEffort")) {
-      throw new ConfigValidationError(
-        "llm.reasoningEffort",
-        `is only valid when llm.provider is "openai" and llm.apiMode is "responses"`,
-      );
-    }
     if (explicitlyConfigured.has("requestTimeoutMs") || explicitlyConfigured.has("retry")) {
       throw new ConfigValidationError(
         explicitlyConfigured.has("requestTimeoutMs") ? "llm.requestTimeoutMs" : "llm.retry",
@@ -791,10 +820,24 @@ function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: Readonl
     }
   }
 
-  if (llm.reasoningEffort !== undefined && llm.apiMode !== "responses") {
+  if (explicitlyConfigured.has("reasoningEffort") && llm.reasoningEffort !== undefined) {
+    const validEfforts = reasoningEffortsForProvider(llm.provider, llm.apiMode);
+    if (!validEfforts.includes(llm.reasoningEffort)) {
+      const providerContext = llm.provider === "openai"
+        ? `llm.provider "openai" with llm.apiMode "responses"`
+        : `llm.provider ${JSON.stringify(llm.provider)}`;
+      throw new ConfigValidationError(
+        "llm.reasoningEffort",
+        validEfforts.length > 0
+          ? `received ${displayValue("llm.reasoningEffort", llm.reasoningEffort)}; valid choices for ${providerContext}: ${validEfforts.join(", ")}`
+          : `is not supported for ${providerContext}`,
+      );
+    }
+  }
+  if (explicitlyConfigured.has("fastMode") && !supportsFastMode(llm.provider)) {
     throw new ConfigValidationError(
-      "llm.reasoningEffort",
-      `requires llm.provider "openai" and llm.apiMode "responses"; current apiMode is ${JSON.stringify(llm.apiMode)}`,
+      "llm.fastMode",
+      `is only valid when llm.provider is "auto", "claude-process", or "codex-process"`,
     );
   }
 }
@@ -873,11 +916,24 @@ export function parseDaemonConfig(
     merged.llm.provider = providerOverride;
     if (providerOverride !== "openai") {
       delete merged.llm.apiMode;
-      delete merged.llm.reasoningEffort;
       explicitLlmKeys.delete("apiMode");
-      explicitLlmKeys.delete("reasoningEffort");
       explicitLlmKeys.delete("requestTimeoutMs");
       explicitLlmKeys.delete("retry");
+    }
+    const transitioningToOpenAI = providerOverride === "openai"
+      && fileModelProvider !== undefined
+      && fileModelProvider !== providerOverride;
+    if (
+      merged.llm.reasoningEffort !== undefined
+      && (providerOverride !== "openai" || transitioningToOpenAI)
+      && !reasoningEffortsForProvider(providerOverride, merged.llm.apiMode).includes(merged.llm.reasoningEffort)
+    ) {
+      delete merged.llm.reasoningEffort;
+      explicitLlmKeys.delete("reasoningEffort");
+    }
+    if (!supportsFastMode(providerOverride)) {
+      merged.llm.fastMode = false;
+      explicitLlmKeys.delete("fastMode");
     }
   }
   if (env.LCM_SUMMARY_MODEL !== undefined) {

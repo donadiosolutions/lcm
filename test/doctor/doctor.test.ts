@@ -472,8 +472,29 @@ describe("runDoctor summarizer modes", () => {
     });
 
     expect(results.find((result) => result.name === "stack")?.message).toContain("Summarizer: auto");
+    expect(results.find((result) => result.name === "stack")?.message).toContain("reasoning effort: default");
+    expect(results.find((result) => result.name === "stack")?.message).toContain("fast mode: off");
     expect(results.some((result) => result.name === "claude-process")).toBe(true);
     expect(results.some((result) => result.name === "codex-process")).toBe(true);
+  });
+
+  it("reports effective process reasoning and fast-mode controls", async () => {
+    const results = await runDoctor(minimalDeps({
+      readFileSync: (path: string) => {
+        if (path.endsWith("config.json")) return JSON.stringify({
+          llm: { provider: "codex-process", reasoningEffort: "ultra", fastMode: true },
+        });
+        if (path.endsWith("settings.json")) return buildCleanSettingsJson();
+        if (path.endsWith("package.json")) return JSON.stringify({ version: "0.5.0" });
+        if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
+        if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
+        return "{}";
+      },
+    }));
+    const stack = results.find((result) => result.name === "stack");
+    expect(stack?.message).toContain("Summarizer: codex-process");
+    expect(stack?.message).toContain("reasoning effort: ultra");
+    expect(stack?.message).toContain("fast mode: on");
   });
 
   it("reports effective OpenAI API mode, reasoning effort, timeout, and retry policy", async () => {

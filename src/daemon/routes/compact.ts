@@ -3,6 +3,7 @@ import { getLcmConnection, closeLcmConnection } from "../../db/connection.js";
 import {
   ConfigValidationError,
   LLM_REASONING_EFFORTS,
+  reasoningEffortsForProvider,
   resolveLlmRequestPolicy,
   type DaemonConfig,
   type LlmReasoningEffort,
@@ -35,6 +36,7 @@ interface CompactRequestBody {
   client?: CompactClient;
   previous_summary?: string;
   reasoning_effort?: unknown;
+  fast_mode?: boolean;
   request_timeout_ms?: unknown;
   retry?: unknown;
 }
@@ -65,6 +67,9 @@ function validateCompactRequestBody(input: Record<string, unknown>): string | un
   }
   if (input.reasoning_effort !== undefined && typeof input.reasoning_effort !== "string") {
     return "reasoning_effort must be a string";
+  }
+  if (input.fast_mode !== undefined && typeof input.fast_mode !== "boolean") {
+    return "fast_mode must be a boolean";
   }
   if (input.request_timeout_ms !== undefined && typeof input.request_timeout_ms !== "number") {
     return "request_timeout_ms must be a number";
@@ -200,27 +205,29 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
       ? config.llm.apiMode ?? "chat-completions"
       : undefined;
     let reasoningEffortOverride: LlmReasoningEffort | undefined;
+    const validReasoningEfforts = reasoningEffortsForProvider(effectiveProvider, apiMode);
     if (input.reasoning_effort !== undefined) {
       if (
         typeof input.reasoning_effort !== "string"
         || !LLM_REASONING_EFFORTS.includes(input.reasoning_effort as LlmReasoningEffort)
+        || !validReasoningEfforts.includes(input.reasoning_effort as LlmReasoningEffort)
       ) {
         sendJson(res, 400, {
-          error: `Invalid reasoning_effort=${JSON.stringify(input.reasoning_effort)}. Valid values: ${LLM_REASONING_EFFORTS.join(", ")}`,
-        });
-        return;
-      }
-      if (effectiveProvider !== "openai" || apiMode !== "responses") {
-        sendJson(res, 400, {
-          error: "reasoning_effort requires llm.provider=\"openai\" and llm.apiMode=\"responses\"",
+          error: `Invalid reasoning_effort=${JSON.stringify(input.reasoning_effort)} for ${effectiveProvider}. Valid values: ${validReasoningEfforts.join(", ") || "none"}`,
         });
         return;
       }
       reasoningEffortOverride = input.reasoning_effort as LlmReasoningEffort;
     }
-    const effectiveReasoningEffort = effectiveProvider === "openai" && apiMode === "responses"
+    const effectiveReasoningEffort = validReasoningEfforts.length > 0
       ? reasoningEffortOverride ?? config.llm.reasoningEffort
       : undefined;
+    const processProvider = effectiveProvider === "claude-process" || effectiveProvider === "codex-process";
+    if (input.fast_mode !== undefined && !processProvider) {
+      sendJson(res, 400, { error: "fast_mode requires a claude-process or codex-process provider" });
+      return;
+    }
+    const effectiveFastMode = processProvider ? input.fast_mode ?? config.llm.fastMode ?? false : undefined;
     const hasRequestPolicyOverride = input.request_timeout_ms !== undefined || input.retry !== undefined;
     if (hasRequestPolicyOverride && effectiveProvider !== "openai") {
       sendJson(res, 400, { error: "request_timeout_ms and retry require llm.provider=\"openai\"" });
@@ -256,7 +263,12 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
     const providerLabel = providerLabels[effectiveProvider] ?? effectiveProvider;
 
     try {
-      const summarize = await getSummarizer(effectiveProvider, effectiveReasoningEffort, effectiveRequestPolicy);
+      const summarize = await getSummarizer(
+        effectiveProvider,
+        effectiveReasoningEffort,
+        effectiveFastMode,
+        effectiveRequestPolicy,
+      );
       if (!summarize) {
         sendJson(res, 200, {
           summary: "Summarization disabled — no summarizer configured.",
@@ -264,6 +276,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
           providerLabel,
           apiMode,
           reasoningEffort: effectiveReasoningEffort ?? null,
+          fastMode: effectiveFastMode ?? null,
           requestTimeoutMs: effectiveRequestPolicy?.requestTimeoutMs ?? null,
           retry: effectiveRequestPolicy?.retry ?? null,
         });
@@ -328,6 +341,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
               providerLabel,
               apiMode,
               reasoningEffort: effectiveReasoningEffort ?? null,
+              fastMode: effectiveFastMode ?? null,
               requestTimeoutMs: effectiveRequestPolicy?.requestTimeoutMs ?? null,
               retry: effectiveRequestPolicy?.retry ?? null,
             };
@@ -406,6 +420,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
             providerLabel,
             apiMode,
             reasoningEffort: effectiveReasoningEffort ?? null,
+            fastMode: effectiveFastMode ?? null,
             requestTimeoutMs: effectiveRequestPolicy?.requestTimeoutMs ?? null,
             retry: effectiveRequestPolicy?.retry ?? null,
           };

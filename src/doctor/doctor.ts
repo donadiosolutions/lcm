@@ -51,6 +51,7 @@ interface DoctorConfig {
   summarizer: string;
   apiMode?: string;
   reasoningEffort?: string;
+  fastMode?: boolean;
   requestTimeoutMs?: number;
   retry?: LlmRetryPolicy;
   validationError?: ConfigValidationError;
@@ -114,6 +115,7 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
       summarizer: config.llm.provider,
       apiMode: config.llm.apiMode,
       reasoningEffort: config.llm.reasoningEffort,
+      fastMode: config.llm.fastMode,
       requestTimeoutMs: config.llm.provider === "openai" ? config.llm.requestTimeoutMs : undefined,
       retry: config.llm.provider === "openai" ? config.llm.retry : undefined,
     };
@@ -379,8 +381,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     message: config.validationError
       ? `Summarizer: unavailable (${config.validationError.name}: ${config.validationError.message})`
       : config.summarizer === "auto"
-      ? "Summarizer: auto (Claude->claude-process, Codex->codex-process)"
-      : `Summarizer: ${config.summarizer}${config.apiMode ? `; API mode: ${config.apiMode}` : ""}${config.reasoningEffort ? `; reasoning effort: ${config.reasoningEffort}` : ""}` +
+      ? `Summarizer: auto (Claude->claude-process, Codex->codex-process); reasoning effort: ${config.reasoningEffort ?? "default"}; fast mode: ${config.fastMode ? "on" : "off"}`
+      : `Summarizer: ${config.summarizer}${config.apiMode ? `; API mode: ${config.apiMode}` : ""}${config.reasoningEffort && config.summarizer !== "claude-process" && config.summarizer !== "codex-process" ? `; reasoning effort: ${config.reasoningEffort}` : ""}` +
+        `${config.summarizer === "claude-process" || config.summarizer === "codex-process" ? `; reasoning effort: ${config.reasoningEffort ?? "default"}; fast mode: ${config.fastMode ? "on" : "off"}` : ""}` +
         `${config.requestTimeoutMs !== undefined ? `; timeout: ${config.requestTimeoutMs}ms` : ""}` +
         `${config.retry ? `; retry: ${config.retry.maxAttempts} attempts, ${config.retry.initialDelayMs}-${config.retry.maxDelayMs}ms x${config.retry.multiplier}` : ""}`,
   });

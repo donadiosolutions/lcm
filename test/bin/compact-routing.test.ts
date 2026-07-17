@@ -1,7 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { Command, Option } from "commander";
-import { LLM_REASONING_EFFORTS, parseDaemonConfig } from "../../src/daemon/config.js";
-import { compactFailureExitCode, resolveCompactRequestPolicyOverride, withHookOverrides } from "../../bin/lcm.js";
+import { LLM_REASONING_EFFORTS, parseDaemonConfig, reasoningEffortsForProvider } from "../../src/daemon/config.js";
+import {
+  compactFailureExitCode,
+  resolveCompactRequestPolicyOverride,
+  resolveManualCompactProvider,
+  withHookOverrides,
+} from "../../bin/lcm.js";
 
 /** Minimal replica of the compact command's option setup. */
 function makeCompactCmd() {
@@ -11,6 +16,8 @@ function makeCompactCmd() {
   cmd.option("--replay");
   cmd.option("-v, --verbose");
   cmd.addOption(new Option("--reasoning-effort <value>").choices([...LLM_REASONING_EFFORTS]));
+  cmd.option("--fast-mode");
+  cmd.option("--no-fast-mode");
   cmd.option("--timeout-ms <ms>");
   cmd.option("--retry-max-attempts <n>");
   cmd.option("--retry-initial-delay-ms <ms>");
@@ -50,6 +57,29 @@ describe("compact command --hook routing", () => {
     const cmd = makeCompactCmd();
     await cmd.parseAsync(["--reasoning-effort", "high"], { from: "user" });
     expect(cmd.opts().reasoningEffort).toBe("high");
+  });
+
+  it("resolves stored auto to the Claude provider used by manual batches", () => {
+    const provider = resolveManualCompactProvider("auto");
+    expect(provider).toBe("claude-process");
+    expect(reasoningEffortsForProvider(provider)).toContain("max");
+    expect(resolveManualCompactProvider("codex-process")).toBe("codex-process");
+  });
+
+  it("leaves fast mode undefined unless explicitly overridden", async () => {
+    const cmd = makeCompactCmd();
+    await cmd.parseAsync([], { from: "user" });
+    expect(cmd.opts().fastMode).toBeUndefined();
+  });
+
+  it("uses the last fast-mode flag when both are supplied", async () => {
+    const enabledLast = makeCompactCmd();
+    await enabledLast.parseAsync(["--no-fast-mode", "--fast-mode"], { from: "user" });
+    expect(enabledLast.opts().fastMode).toBe(true);
+
+    const disabledLast = makeCompactCmd();
+    await disabledLast.parseAsync(["--fast-mode", "--no-fast-mode"], { from: "user" });
+    expect(disabledLast.opts().fastMode).toBe(false);
   });
 
   it("parses and resolves one-invocation timeout and retry overrides", async () => {
@@ -109,6 +139,13 @@ describe("withHookOverrides", () => {
         max_delay_ms: 10000,
         multiplier: 2,
       },
+    });
+  });
+
+  it("preserves an explicit false fast-mode override", () => {
+    expect(JSON.parse(withHookOverrides("{}", "claude", undefined, undefined, false))).toEqual({
+      client: "claude",
+      fast_mode: false,
     });
   });
 

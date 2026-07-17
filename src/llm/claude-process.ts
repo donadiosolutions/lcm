@@ -1,5 +1,6 @@
-import { spawn as defaultSpawn } from "node:child_process";
+import { spawn as defaultSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
+import type { ClaudeProcessReasoningEffort } from "../daemon/config.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
   buildLeafSummaryPrompt,
@@ -9,15 +10,59 @@ import {
 
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const TIMEOUT_MS = 120_000;
+const MAX_ERROR_DETAIL_LENGTH = 200;
 
 type ClaudeProcessDeps = {
   model?: string;
+  reasoningEffort?: ClaudeProcessReasoningEffort;
+  fastMode?: boolean;
   spawn?: typeof defaultSpawn;
   timeoutMs?: number;
 };
 
+function friendlyMissingClaudeError(): Error {
+  return new Error([
+    "Claude CLI is not installed or not on PATH.",
+    "Install it first, then run lcm again.",
+  ].join("\n"));
+}
+
+function normalizeSpawnError(error: unknown): Error {
+  if (error && typeof error === "object" && (error as { code?: unknown }).code === "ENOENT") {
+    return friendlyMissingClaudeError();
+  }
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function safeErrorDetail(stderr: string): string {
+  const sanitized = stderr
+    .replace(/\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return sanitized.slice(0, MAX_ERROR_DETAIL_LENGTH) || "no diagnostic output";
+}
+
+function compatibilityError(
+  code: number | null,
+  stderr: string,
+  model: string,
+  reasoningEffort?: ClaudeProcessReasoningEffort,
+  fastMode?: boolean,
+): Error {
+  const effort = reasoningEffort ?? "default/omitted";
+  const fast = fastMode === undefined ? "default/omitted" : String(fastMode);
+  return new Error(
+    `Claude CLI rejected the compaction request (exit ${code ?? "unknown"}; ${safeErrorDetail(stderr)}): ` +
+      `provider claude-process, model ${JSON.stringify(model)}, reasoning effort ${JSON.stringify(effort)}, ` +
+      `fast mode ${fast}. Upgrade the Claude CLI or choose a supported model and control combination.`,
+  );
+}
+
 export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): LcmSummarizeFn {
   const model = opts.model?.trim() || HAIKU_MODEL;
+  const reasoningEffort = opts.reasoningEffort;
+  const fastMode = opts.fastMode;
   const spawn = opts.spawn ?? defaultSpawn;
   const timeoutMs = opts.timeoutMs ?? TIMEOUT_MS;
 
@@ -35,41 +80,63 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
       : buildLeafSummaryPrompt({ text, mode: aggressive ? "aggressive" : "normal", targetTokens });
 
     return new Promise((resolve, reject) => {
-      const proc = spawn("claude", [
+      const args = [
         "--print",
         "--model", model,
         "--no-session-persistence",
         "--system-prompt", LCM_SUMMARIZER_SYSTEM_PROMPT,
         "--tools", "",
         "--disable-slash-commands",
-      ], {
-        stdio: ["pipe", "pipe", "pipe"],
-      });
+      ];
+      if (reasoningEffort !== undefined) {
+        args.push("--effort", reasoningEffort);
+      }
+      if (fastMode !== undefined) {
+        const settings = fastMode
+          ? { fastMode: true, fastModePerSessionOptIn: false }
+          : { fastMode: false };
+        args.push("--settings", JSON.stringify(settings));
+      }
+
+      let proc: ChildProcessWithoutNullStreams;
+      try {
+        proc = spawn("claude", args, { stdio: ["pipe", "pipe", "pipe"] });
+      } catch (error) {
+        reject(normalizeSpawnError(error));
+        return;
+      }
 
       let stdout = "";
       let stderr = "";
+      let finished = false;
 
       proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
       proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
 
       const timer = setTimeout(() => {
+        if (finished) return;
+        finished = true;
         proc.kill();
         reject(new Error(`claude process timed out after ${Math.round(timeoutMs / 1000)}s`));
       }, timeoutMs);
 
       proc.on("close", (code: number | null) => {
+        if (finished) return;
+        finished = true;
         clearTimeout(timer);
         const out = stdout.trim();
         if (code === 0 && out) {
           resolve(out);
         } else {
-          reject(new Error(`claude exited ${code}: ${stderr.slice(0, 200) || "no output"}`));
+          reject(compatibilityError(code, stderr, model, reasoningEffort, fastMode));
         }
       });
 
       proc.on("error", (err) => {
+        if (finished) return;
+        finished = true;
         clearTimeout(timer);
-        reject(err);
+        reject(normalizeSpawnError(err));
       });
 
       proc.stdin.write(prompt);

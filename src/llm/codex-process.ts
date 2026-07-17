@@ -3,6 +3,7 @@ import { mkdtempSync as defaultMkdtempSync, readFileSync as defaultReadFileSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
+import type { CodexProcessReasoningEffort } from "../daemon/config.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
   buildLeafSummaryPrompt,
@@ -11,9 +12,12 @@ import {
 } from "../summarize.js";
 
 const TIMEOUT_MS = 120_000;
+const MAX_ERROR_DETAIL_LENGTH = 200;
 
 type CodexProcessDeps = {
   model?: string;
+  reasoningEffort?: CodexProcessReasoningEffort;
+  fastMode?: boolean;
   spawn?: typeof defaultSpawn;
   mkdtempSync?: typeof defaultMkdtempSync;
   readFileSync?: typeof defaultReadFileSync;
@@ -53,22 +57,64 @@ function normalizeSpawnError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-function buildArgs(outputPath: string, model?: string): string[] {
-  const args = [
-    "exec",
+function buildArgs(
+  outputPath: string,
+  model?: string,
+  reasoningEffort?: CodexProcessReasoningEffort,
+  fastMode?: boolean,
+): string[] {
+  const args = ["exec"];
+
+  if (model && model.trim()) {
+    args.push("--model", model.trim());
+  }
+
+  if (reasoningEffort !== undefined || fastMode !== undefined) {
+    args.push("--strict-config");
+  }
+  if (reasoningEffort !== undefined) {
+    args.push("-c", `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
+  }
+  if (fastMode === true) {
+    args.push("--enable", "fast_mode", "-c", 'service_tier="fast"');
+  } else if (fastMode === false) {
+    args.push("--disable", "fast_mode");
+  }
+
+  args.push(
     "-",
     "--skip-git-repo-check",
     "--sandbox",
     "read-only",
     "--output-last-message",
     outputPath,
-  ];
-
-  if (model && model.trim()) {
-    args.splice(1, 0, "--model", model.trim());
-  }
+  );
 
   return args;
+}
+
+function safeErrorDetail(stderr: string): string {
+  const sanitized = stderr
+    .replace(/\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return sanitized.slice(0, MAX_ERROR_DETAIL_LENGTH) || "no diagnostic output";
+}
+
+function compatibilityError(
+  code: number | null,
+  stderr: string,
+  deps: Pick<CodexProcessDeps, "model" | "reasoningEffort" | "fastMode">,
+): Error {
+  const model = deps.model?.trim() || "default";
+  const reasoningEffort = deps.reasoningEffort ?? "default/omitted";
+  const fastMode = deps.fastMode === undefined ? "default/omitted" : String(deps.fastMode);
+  return new Error(
+    `Codex CLI rejected the compaction request (exit ${code ?? "unknown"}; ${safeErrorDetail(stderr)}): ` +
+      `provider codex-process, model ${JSON.stringify(model)}, reasoning effort ${JSON.stringify(reasoningEffort)}, ` +
+      `fast mode ${fastMode}. Upgrade the Codex CLI or choose a supported model and control combination.`,
+  );
 }
 
 function cleanupTempDir(rmSync: typeof defaultRmSync, tempDir: string): void {
@@ -83,6 +129,8 @@ function runCodexSummarizer(
   prompt: string,
   deps: Required<Pick<CodexProcessDeps, "spawn" | "mkdtempSync" | "readFileSync" | "rmSync" | "tmpdir" | "timeoutMs">> & {
     model?: string;
+    reasoningEffort?: CodexProcessReasoningEffort;
+    fastMode?: boolean;
   },
 ): Promise<string> {
   const tempDir = deps.mkdtempSync(join(deps.tmpdir(), "lcm-codex-"));
@@ -92,7 +140,7 @@ function runCodexSummarizer(
     let child: ChildProcessWithoutNullStreams;
 
     try {
-      child = deps.spawn("codex", buildArgs(outputPath, deps.model), {
+      child = deps.spawn("codex", buildArgs(outputPath, deps.model, deps.reasoningEffort, deps.fastMode), {
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (error) {
@@ -139,7 +187,7 @@ function runCodexSummarizer(
 
       try {
         if (code !== 0) {
-          throw new Error(`codex exited ${code}: ${stderr.slice(0, 200) || "no output"}`);
+          throw compatibilityError(code, stderr, deps);
         }
         const summary = deps.readFileSync(outputPath, "utf-8").trim();
         if (!summary) {
@@ -161,6 +209,8 @@ function runCodexSummarizer(
 export function createCodexProcessSummarizer(opts: CodexProcessDeps = {}): LcmSummarizeFn {
   const deps = {
     model: opts.model,
+    reasoningEffort: opts.reasoningEffort,
+    fastMode: opts.fastMode,
     spawn: opts.spawn ?? defaultSpawn,
     mkdtempSync: opts.mkdtempSync ?? defaultMkdtempSync,
     readFileSync: opts.readFileSync ?? defaultReadFileSync,
