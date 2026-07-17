@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import yaml from "js-yaml";
+import { load } from "js-yaml";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -31,7 +31,7 @@ export function loadTemplate(name: string): PromptTemplate {
     throw new Error(`Prompt template not found: ${name} (looked at ${filePath})`);
   }
 
-  const parsed = yaml.load(raw) as PromptTemplate;
+  const parsed = load(raw) as PromptTemplate;
   if (!parsed || typeof parsed.template !== "string") {
     throw new Error(`Invalid prompt template: ${name} — missing 'template' field`);
   }
