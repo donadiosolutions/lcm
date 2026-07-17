@@ -736,9 +736,11 @@ describe("POST /prompt-search", () => {
     const db = new DatabaseSync(dbPath);
     runLcmMigrations(db);
     const store = new PromotedStore(db);
-    const firstId = store.insert({ content: `Primary memory ${"alpha ".repeat(30)}`, tags: ["workflow"], projectId: "p1" });
-    const secondId = store.insert({ content: `Secondary memory ${"beta ".repeat(30)}`, tags: ["workflow"], projectId: "p1" });
-    const thirdId = store.insert({ content: `Tertiary memory ${"gamma ".repeat(30)}`, tags: ["workflow"], projectId: "p1" });
+    const firstId = store.insert({ content: `Memory candidate A ${"detail ".repeat(30)}`, tags: ["workflow"], projectId: "p1", confidence: 0.9 });
+    const secondId = store.insert({ content: `Memory candidate B ${"detail ".repeat(30)}`, tags: ["workflow"], projectId: "p1", confidence: 0.8 });
+    const thirdId = store.insert({ content: `Memory candidate C ${"detail ".repeat(30)}`, tags: ["workflow"], projectId: "p1", confidence: 0.7 });
+    const createdAt = new Date().toISOString();
+    db.prepare("UPDATE promoted SET created_at = ? WHERE id IN (?, ?, ?)").run(createdAt, firstId, secondId, thirdId);
     db.close();
 
     const config = loadDaemonConfig("/nonexistent");
@@ -771,6 +773,8 @@ describe("POST /prompt-search", () => {
       expect(res.status).toBe(200);
       expect(data.ids).toHaveLength(data.hints.length);
       expect(data.ids).toHaveLength(data.debug.budget.emittedCount);
+      expect(data.ids[0]).toBe(firstId);
+      expect(data.ids).not.toContain(thirdId);
       expect(data.debug.budget.emittedCount).toBeGreaterThan(0);
       expect(data.debug.budget.emittedCount).toBeLessThan(3);
       expect(data.debug.budget.droppedForBudget).toBeGreaterThan(0);
