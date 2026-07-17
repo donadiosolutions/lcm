@@ -23,8 +23,8 @@ import {
   injectedFailure,
 } from "./fixtures/runtime.js";
 
-describe("foundation leaf-module boundaries", () => {
-  it("parses nested transcript blocks and ignores every non-message shape", () => {
+describe("foundation leaf-module boundaries", (): void => {
+  it("parses nested transcript blocks and ignores every non-message shape", (): void => {
     const directory = createTemporaryDirectory("lcm-transcript-");
     const path = join(directory, "session.jsonl");
     writeFileSync(path, [
@@ -46,7 +46,7 @@ describe("foundation leaf-module boundaries", () => {
     expect(estimateTokens("")).toBe(1);
   });
 
-  it("covers URL key, protocol-relative, punctuation, and invalid URL boundaries", () => {
+  it("covers URL key, protocol-relative, punctuation, and invalid URL boundaries", (): void => {
     expect(isUrlLikeKey(undefined)).toBe(false);
     expect(isUrlLikeKey("callback_uri")).toBe(true);
     expect(isUrlLikeKey("label")).toBe(false);
@@ -74,18 +74,18 @@ describe("foundation leaf-module boundaries", () => {
     }
   });
 
-  it("covers non-object config traversal, non-string masking, and undefined formatting", () => {
+  it("covers non-object config traversal, non-string masking, and undefined formatting", (): void => {
     const directory = createTemporaryDirectory("lcm-config-leaf-");
     const configPath = join(directory, "config.json");
     writeFileSync(configPath, JSON.stringify({ extension: { scalar: 1 }, list: [1] }));
 
-    expect(() => getConfigValue({ configPath, path: "extension.scalar.child" })).toThrow("does not exist");
-    expect(() => getConfigValue({ configPath: directory, path: "llm" })).toThrow();
+    expect((): unknown => getConfigValue({ configPath, path: "extension.scalar.child" })).toThrow("does not exist");
+    expect((): unknown => getConfigValue({ configPath: directory, path: "llm" })).toThrow();
     expect(maskConfigSecrets(null)).toBeNull();
     expect(formatConfigValue(undefined)).toBe("undefined");
   });
 
-  it("bounds process diagnostics across omitted, empty, long, and explicit controls", () => {
+  it("bounds process diagnostics across omitted, empty, long, and explicit controls", (): void => {
     expect(boundedModelForDisplay("\u0000  \n")).toBe("default");
     expect(boundedModelForDisplay("x".repeat(MAX_MODEL_DISPLAY_LENGTH))).toHaveLength(MAX_MODEL_DISPLAY_LENGTH);
     expect(boundedModelForDisplay("x".repeat(MAX_MODEL_DISPLAY_LENGTH + 1))).toBe(
@@ -103,7 +103,7 @@ describe("foundation leaf-module boundaries", () => {
     }).message).toContain("fast mode false");
   });
 
-  it("creates deterministic errno failures for process and filesystem tests", () => {
+  it("creates deterministic errno failures for process and filesystem tests", (): void => {
     expect(injectedFailure("cross-device", "EXDEV")).toMatchObject({
       message: "cross-device",
       code: "EXDEV",

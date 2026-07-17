@@ -7,6 +7,7 @@ import {
   extractCodexSessionCwd,
   findCodexSessionFiles,
   findAllCodexTranscripts,
+  type CodexSessionFile,
 } from "../src/codex-transcript.js";
 
 // ---------------------------------------------------------------------------
@@ -265,7 +266,7 @@ describe("findCodexSessionFiles", () => {
     expect(files.map(f => f.sessionId)).toEqual(["old-session", "new-session"]);
   });
 
-  it("uses session IDs as a deterministic tie-breaker for equal mtimes", () => {
+  it("uses session IDs as a deterministic tie-breaker for equal mtimes", (): void => {
     const dir = makeTmpDir();
     const alpha = join(dir, "alpha-session.jsonl");
     const beta = join(dir, "beta-session.jsonl");
@@ -275,7 +276,7 @@ describe("findCodexSessionFiles", () => {
     utimesSync(alpha, sameTime, sameTime);
     utimesSync(beta, sameTime, sameTime);
 
-    expect(findCodexSessionFiles(dir).map((file) => file.sessionId)).toEqual([
+    expect(findCodexSessionFiles(dir).map((file: CodexSessionFile): string => file.sessionId)).toEqual([
       "alpha-session",
       "beta-session",
     ]);

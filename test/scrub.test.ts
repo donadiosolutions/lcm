@@ -1,7 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import {
   getGitleaksSyncDate,
-  readGitleaksSyncDate,
   ScrubEngine,
 } from "../src/scrub.js";
 
@@ -146,7 +145,6 @@ describe("ScrubEngine — custom patterns", () => {
 
 describe("gitleaks metadata", () => {
   it("reports no generated sync date from an unbuilt source checkout", () => {
-    expect(readGitleaksSyncDate()).toBeNull();
     expect(getGitleaksSyncDate()).toBeNull();
   });
 });
