@@ -538,7 +538,7 @@ describe("createOpenAISummarizer", () => {
     [10, [10]],
     [1, [1]],
     [0, [0]],
-  ])("keeps a %i ms user-configured retry delay out of timer durations", async (delay, expectedDurations) => {
+  ])("schedules a %i ms retry using fixed allowlisted literal slice durations", async (delay, expectedDurations) => {
     vi.useFakeTimers();
     const timerSpy = vi.spyOn(globalThis, "setTimeout");
     try {
