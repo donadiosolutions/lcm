@@ -165,7 +165,7 @@ function requestFailureError(
 
 const MAX_SLEEP_MS = 600_000; // matches the upper bound enforced by validateBoundedInteger for maxDelayMs
 
-/** Schedule one fixed retry-delay slice so user policy values never reach a timer duration. */
+/** Schedule one retry-delay slice using a fixed literal timer duration, not one derived from user input. */
 function scheduleRetrySleepSlice(callback: () => void, remainingMs: number): void {
   if (remainingMs >= 60_000) {
     setTimeout(callback, 60_000);
