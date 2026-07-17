@@ -530,7 +530,15 @@ describe("createOpenAISummarizer", () => {
     expect(delays).toEqual([10, 20, 25]);
   });
 
-  it("keeps user-configured retry delays out of timer durations", async () => {
+  it.each([
+    [600_000, Array(10).fill(60_000)],
+    [10_000, [10_000]],
+    [1_000, [1_000]],
+    [100, [100]],
+    [10, [10]],
+    [1, [1]],
+    [0, [0]],
+  ])("keeps a %i ms user-configured retry delay out of timer durations", async (delay, expectedDurations) => {
     vi.useFakeTimers();
     const timerSpy = vi.spyOn(globalThis, "setTimeout");
     try {
@@ -540,18 +548,18 @@ describe("createOpenAISummarizer", () => {
       const summarizer = createOpenAISummarizer({
         model: "test-model",
         baseUrl: "http://localhost/v1",
-        retry: { maxAttempts: 2, initialDelayMs: 600_000, maxDelayMs: 600_000, multiplier: 1 },
+        retry: { maxAttempts: 2, initialDelayMs: delay, maxDelayMs: delay, multiplier: 1 },
         _clientOverride: { chat: { completions: { create } } },
       });
 
       const result = summarizer("text", false);
-      await vi.advanceTimersByTimeAsync(600_000);
+      await vi.advanceTimersByTimeAsync(delay);
 
       await expect(result).resolves.toBe("Recovered.");
       expect(create).toHaveBeenCalledTimes(2);
       const timerDurations = timerSpy.mock.calls.map((call) => call[1]);
-      expect(timerDurations).toEqual(Array(10).fill(60_000));
-      expect(timerDurations.reduce((total, duration) => total + Number(duration), 0)).toBe(600_000);
+      expect(timerDurations).toEqual(expectedDurations);
+      expect(timerDurations.reduce((total, duration) => total + Number(duration), 0)).toBe(delay);
     } finally {
       timerSpy.mockRestore();
       vi.useRealTimers();
