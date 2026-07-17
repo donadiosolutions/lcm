@@ -2,4 +2,4 @@
 "@donadiosolutions/lcm": patch
 ---
 
-Restore prompt template loading compatibility with js-yaml v5.
+Refresh the supported YAML, SDK, lint, type, and test dependencies while retaining Commander 14 compatibility with Node.js 22. Update prompt template loading for js-yaml v5's named exports.
