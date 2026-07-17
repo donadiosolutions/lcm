@@ -736,6 +736,7 @@ describe("POST /prompt-search", () => {
     const db = new DatabaseSync(dbPath);
     runLcmMigrations(db);
     const store = new PromotedStore(db);
+    // Equal FTS inputs and timestamps isolate confidence as the deterministic ordering signal.
     const firstId = store.insert({ content: `Memory candidate A ${"detail ".repeat(30)}`, tags: ["workflow"], projectId: "p1", confidence: 0.9 });
     const secondId = store.insert({ content: `Memory candidate B ${"detail ".repeat(30)}`, tags: ["workflow"], projectId: "p1", confidence: 0.8 });
     const thirdId = store.insert({ content: `Memory candidate C ${"detail ".repeat(30)}`, tags: ["workflow"], projectId: "p1", confidence: 0.7 });
