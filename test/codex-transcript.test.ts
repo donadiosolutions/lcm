@@ -264,6 +264,22 @@ describe("findCodexSessionFiles", () => {
     const files = findCodexSessionFiles(dir);
     expect(files.map(f => f.sessionId)).toEqual(["old-session", "new-session"]);
   });
+
+  it("uses session IDs as a deterministic tie-breaker for equal mtimes", () => {
+    const dir = makeTmpDir();
+    const alpha = join(dir, "alpha-session.jsonl");
+    const beta = join(dir, "beta-session.jsonl");
+    writeFileSync(beta, "");
+    writeFileSync(alpha, "");
+    const sameTime = new Date("2026-01-01T00:00:00.000Z");
+    utimesSync(alpha, sameTime, sameTime);
+    utimesSync(beta, sameTime, sameTime);
+
+    expect(findCodexSessionFiles(dir).map((file) => file.sessionId)).toEqual([
+      "alpha-session",
+      "beta-session",
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------
