@@ -45,6 +45,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Route handlers must catch errors and return structured JSON: `{ error: string, code?: string }`.
 - Flag `res.send(e.message)` or unstructured error responses that leak stack traces.
 - Unhandled promise rejections in route handlers are bugs — flag missing `try/catch` in `async` handlers.
+- User-facing child-process errors must not include raw stdout or stderr; use an allowlisted summary and bound all user-controlled metadata before interpolation.
+- Child-process timeout cleanup must guard `kill()` because the process can exit concurrently or the injected process implementation can throw.
 
 ## What to skip
 - Don't flag `DatabaseSync` usage in test fixtures that mock the connection — context matters.

@@ -12,7 +12,7 @@ import {
 } from "../summarize.js";
 
 const TIMEOUT_MS = 120_000;
-const MAX_ERROR_DETAIL_LENGTH = 200;
+const MAX_MODEL_DISPLAY_LENGTH = 80;
 
 type CodexProcessDeps = {
   model?: string;
@@ -93,25 +93,24 @@ function buildArgs(
   return args;
 }
 
-function safeErrorDetail(stderr: string): string {
-  const sanitized = stderr
-    .replace(/\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, "")
+function boundedModelForDisplay(model: string): string {
+  const sanitized = model
     .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  return sanitized.slice(0, MAX_ERROR_DETAIL_LENGTH) || "no diagnostic output";
+  if (sanitized.length <= MAX_MODEL_DISPLAY_LENGTH) return sanitized || "default";
+  return `${sanitized.slice(0, MAX_MODEL_DISPLAY_LENGTH)}...[truncated]`;
 }
 
 function compatibilityError(
   code: number | null,
-  stderr: string,
   deps: Pick<CodexProcessDeps, "model" | "reasoningEffort" | "fastMode">,
 ): Error {
-  const model = deps.model?.trim() || "default";
+  const model = boundedModelForDisplay(deps.model ?? "default");
   const reasoningEffort = deps.reasoningEffort ?? "default/omitted";
   const fastMode = deps.fastMode === undefined ? "default/omitted" : String(deps.fastMode);
   return new Error(
-    `Codex CLI rejected the compaction request (exit ${code ?? "unknown"}; ${safeErrorDetail(stderr)}): ` +
+    `Codex CLI rejected the compaction request (exit ${code ?? "unknown"}; diagnostic output omitted): ` +
       `provider codex-process, model ${JSON.stringify(model)}, reasoning effort ${JSON.stringify(reasoningEffort)}, ` +
       `fast mode ${fastMode}. Upgrade the Codex CLI or choose a supported model and control combination.`,
   );
@@ -150,7 +149,6 @@ function runCodexSummarizer(
     }
 
     let stdout = "";
-    let stderr = "";
     let finished = false;
 
     const timer = setTimeout(() => {
@@ -168,9 +166,7 @@ function runCodexSummarizer(
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
+    child.stderr.resume();
 
     child.on("error", (error) => {
       if (finished) return;
@@ -187,7 +183,7 @@ function runCodexSummarizer(
 
       try {
         if (code !== 0) {
-          throw compatibilityError(code, stderr, deps);
+          throw compatibilityError(code, deps);
         }
         const summary = deps.readFileSync(outputPath, "utf-8").trim();
         if (!summary) {

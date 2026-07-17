@@ -45,6 +45,10 @@ function mockRes() {
   return { res, getBody: () => JSON.parse(body || "{}") };
 }
 
+function mockReq(): IncomingMessage {
+  return new IncomingMessage(new Socket());
+}
+
 function makeConfig(provider: DaemonConfig["llm"]["provider"]): DaemonConfig {
   return {
     version: 1,
@@ -371,7 +375,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(config);
     const { res, getBody } = mockRes();
 
-    await handler({} as any, res, JSON.stringify({
+    await handler(mockReq(), res, JSON.stringify({
       session_id: "reasoning-high",
       cwd: testCwd,
       reasoning_effort: "high",
@@ -390,7 +394,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(makeConfig("claude-process"));
     const { res, getBody } = mockRes();
 
-    await handler({} as any, res, JSON.stringify({
+    await handler(mockReq(), res, JSON.stringify({
       session_id: "reasoning-unsupported",
       cwd: testCwd,
       reasoning_effort: "max",
@@ -412,7 +416,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(config);
     const { res, getBody } = mockRes();
 
-    await handler({} as any, res, JSON.stringify({
+    await handler(mockReq(), res, JSON.stringify({
       session_id: "reasoning-invalid",
       cwd: testCwd,
       reasoning_effort: "extreme",
@@ -428,7 +432,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(makeConfig("auto"));
     const { res, getBody } = mockRes();
 
-    await handler({} as any, res, JSON.stringify({
+    await handler(mockReq(), res, JSON.stringify({
       session_id: "reasoning-auto-codex",
       cwd: testCwd,
       client: "codex",
@@ -444,7 +448,7 @@ describe("createCompactHandler — summarizer branching", () => {
     const handler = createCompactHandler(makeConfig("anthropic"));
     const { res, getBody } = mockRes();
 
-    await handler({} as any, res, JSON.stringify({
+    await handler(mockReq(), res, JSON.stringify({
       session_id: "fast-api",
       cwd: testCwd,
       fast_mode: true,
@@ -461,8 +465,8 @@ describe("createCompactHandler — summarizer branching", () => {
     const { res: fast } = mockRes();
     const { res: standard } = mockRes();
 
-    await handler({} as any, fast, JSON.stringify({ session_id: "fast-cache", cwd: testCwd, fast_mode: true }));
-    await handler({} as any, standard, JSON.stringify({ session_id: "standard-cache", cwd: testCwd, fast_mode: false }));
+    await handler(mockReq(), fast, JSON.stringify({ session_id: "fast-cache", cwd: testCwd, fast_mode: true }));
+    await handler(mockReq(), standard, JSON.stringify({ session_id: "standard-cache", cwd: testCwd, fast_mode: false }));
 
     expect(createCodexProcessSummarizer).toHaveBeenCalledTimes(2);
     expect(createCodexProcessSummarizer).toHaveBeenNthCalledWith(1, expect.objectContaining({ fastMode: true }));

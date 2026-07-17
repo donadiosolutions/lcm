@@ -10,7 +10,7 @@ import {
 
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const TIMEOUT_MS = 120_000;
-const MAX_ERROR_DETAIL_LENGTH = 200;
+const MAX_MODEL_DISPLAY_LENGTH = 80;
 
 type ClaudeProcessDeps = {
   model?: string;
@@ -34,18 +34,17 @@ function normalizeSpawnError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-function safeErrorDetail(stderr: string): string {
-  const sanitized = stderr
-    .replace(/\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, "")
+function boundedModelForDisplay(model: string): string {
+  const sanitized = model
     .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  return sanitized.slice(0, MAX_ERROR_DETAIL_LENGTH) || "no diagnostic output";
+  if (sanitized.length <= MAX_MODEL_DISPLAY_LENGTH) return sanitized || "default";
+  return `${sanitized.slice(0, MAX_MODEL_DISPLAY_LENGTH)}...[truncated]`;
 }
 
 function compatibilityError(
   code: number | null,
-  stderr: string,
   model: string,
   reasoningEffort?: ClaudeProcessReasoningEffort,
   fastMode?: boolean,
@@ -53,8 +52,8 @@ function compatibilityError(
   const effort = reasoningEffort ?? "default/omitted";
   const fast = fastMode === undefined ? "default/omitted" : String(fastMode);
   return new Error(
-    `Claude CLI rejected the compaction request (exit ${code ?? "unknown"}; ${safeErrorDetail(stderr)}): ` +
-      `provider claude-process, model ${JSON.stringify(model)}, reasoning effort ${JSON.stringify(effort)}, ` +
+    `Claude CLI rejected the compaction request (exit ${code ?? "unknown"}; diagnostic output omitted): ` +
+      `provider claude-process, model ${JSON.stringify(boundedModelForDisplay(model))}, reasoning effort ${JSON.stringify(effort)}, ` +
       `fast mode ${fast}. Upgrade the Claude CLI or choose a supported model and control combination.`,
   );
 }
@@ -107,16 +106,19 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
       }
 
       let stdout = "";
-      let stderr = "";
       let finished = false;
 
       proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
-      proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+      proc.stderr.resume();
 
       const timer = setTimeout(() => {
         if (finished) return;
         finished = true;
-        proc.kill();
+        try {
+          proc.kill();
+        } catch {
+          // ignore kill failures during timeout cleanup
+        }
         reject(new Error(`claude process timed out after ${Math.round(timeoutMs / 1000)}s`));
       }, timeoutMs);
 
@@ -128,7 +130,7 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
         if (code === 0 && out) {
           resolve(out);
         } else {
-          reject(compatibilityError(code, stderr, model, reasoningEffort, fastMode));
+          reject(compatibilityError(code, model, reasoningEffort, fastMode));
         }
       });
 

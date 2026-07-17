@@ -6,6 +6,11 @@ import { join } from "node:path";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { createCodexProcessSummarizer } from "../../src/llm/codex-process.js";
 
+type SpawnFn = typeof import("node:child_process").spawn;
+type MkdtempSyncFn = typeof import("node:fs").mkdtempSync;
+type ReadFileSyncFn = typeof import("node:fs").readFileSync;
+type RmSyncFn = typeof import("node:fs").rmSync;
+
 type FakeChild = EventEmitter & {
   stdout: PassThrough;
   stderr: PassThrough;
@@ -49,10 +54,10 @@ describe("createCodexProcessSummarizer", () => {
     });
     const readFileSyncMock = vi.fn(() => "summary text");
     const summarizer = createCodexProcessSummarizer({
-      spawn: spawn as any,
-      mkdtempSync: mkdtempSyncMock as any,
-      readFileSync: readFileSyncMock as any,
-      rmSync: vi.fn() as any,
+      spawn: spawn as unknown as SpawnFn,
+      mkdtempSync: mkdtempSyncMock as unknown as MkdtempSyncFn,
+      readFileSync: readFileSyncMock as unknown as ReadFileSyncFn,
+      rmSync: vi.fn() as unknown as RmSyncFn,
     });
 
     const promise = summarizer("Conversation text", false, { isCondensed: false });
@@ -80,14 +85,14 @@ describe("createCodexProcessSummarizer", () => {
     const readFileSyncMock = vi.fn(() => "summary text");
     const summarizer = createCodexProcessSummarizer({
       model: "gpt-5.4",
-      spawn: spawn as any,
+      spawn: spawn as unknown as SpawnFn,
       mkdtempSync: vi.fn(() => {
         const dir = mkdtempSync(join(tmpdir(), "lcm-codex-"));
         tempDirs.push(dir);
         return dir;
-      }) as any,
-      readFileSync: readFileSyncMock as any,
-      rmSync: vi.fn() as any,
+      }) as unknown as MkdtempSyncFn,
+      readFileSync: readFileSyncMock as unknown as ReadFileSyncFn,
+      rmSync: vi.fn() as unknown as RmSyncFn,
     });
 
     const promise = summarizer("Conversation text", false, { isCondensed: false });
@@ -104,14 +109,14 @@ describe("createCodexProcessSummarizer", () => {
       model: "gpt-5.4",
       reasoningEffort: "ultra",
       fastMode: true,
-      spawn: spawn as any,
+      spawn: spawn as unknown as SpawnFn,
       mkdtempSync: vi.fn(() => {
         const dir = mkdtempSync(join(tmpdir(), "lcm-codex-"));
         tempDirs.push(dir);
         return dir;
-      }) as any,
-      readFileSync: vi.fn(() => "summary text") as any,
-      rmSync: vi.fn() as any,
+      }) as unknown as MkdtempSyncFn,
+      readFileSync: vi.fn(() => "summary text") as unknown as ReadFileSyncFn,
+      rmSync: vi.fn() as unknown as RmSyncFn,
     });
 
     await expect(summarizer("Conversation text", false)).resolves.toBe("summary text");
@@ -136,14 +141,14 @@ describe("createCodexProcessSummarizer", () => {
     const spawn = vi.fn().mockReturnValue(child);
     const summarizer = createCodexProcessSummarizer({
       fastMode: false,
-      spawn: spawn as any,
+      spawn: spawn as unknown as SpawnFn,
       mkdtempSync: vi.fn(() => {
         const dir = mkdtempSync(join(tmpdir(), "lcm-codex-"));
         tempDirs.push(dir);
         return dir;
-      }) as any,
-      readFileSync: vi.fn(() => "summary text") as any,
-      rmSync: vi.fn() as any,
+      }) as unknown as MkdtempSyncFn,
+      readFileSync: vi.fn(() => "summary text") as unknown as ReadFileSyncFn,
+      rmSync: vi.fn() as unknown as RmSyncFn,
     });
 
     await expect(summarizer("Conversation text", false)).resolves.toBe("summary text");
@@ -162,10 +167,10 @@ describe("createCodexProcessSummarizer", () => {
         const err = new Error("spawn codex ENOENT") as NodeJS.ErrnoException;
         err.code = "ENOENT";
         throw err;
-      }) as any,
-      mkdtempSync: vi.fn(() => mkdtempSync(join(tmpdir(), "lcm-codex-"))) as any,
-      readFileSync: vi.fn() as any,
-      rmSync: vi.fn() as any,
+      }) as unknown as SpawnFn,
+      mkdtempSync: vi.fn(() => mkdtempSync(join(tmpdir(), "lcm-codex-"))) as unknown as MkdtempSyncFn,
+      readFileSync: vi.fn() as unknown as ReadFileSyncFn,
+      rmSync: vi.fn() as unknown as RmSyncFn,
       tmpdir: () => tmpdir(),
     });
 
@@ -179,14 +184,14 @@ describe("createCodexProcessSummarizer", () => {
     const spawn = vi.fn().mockReturnValue(child);
     const readFileSyncMock = vi.fn(() => "summary text");
     const summarizer = createCodexProcessSummarizer({
-      spawn: spawn as any,
+      spawn: spawn as unknown as SpawnFn,
       mkdtempSync: vi.fn(() => {
         const dir = mkdtempSync(join(tmpdir(), "lcm-codex-"));
         tempDirs.push(dir);
         return dir;
-      }) as any,
-      readFileSync: readFileSyncMock as any,
-      rmSync: vi.fn() as any,
+      }) as unknown as MkdtempSyncFn,
+      readFileSync: readFileSyncMock as unknown as ReadFileSyncFn,
+      rmSync: vi.fn() as unknown as RmSyncFn,
     });
 
     await expect(summarizer("Conversation text", false)).rejects.toThrow(
@@ -195,30 +200,32 @@ describe("createCodexProcessSummarizer", () => {
     expect(readFileSyncMock).not.toHaveBeenCalled();
   });
 
-  it("reports requested controls and sanitizes bounded CLI diagnostics", async () => {
-    const child = makeChild(2, `\u001b[31munsupported\u001b[0m\ncontrol\u0000${"x".repeat(400)}`);
+  it("reports bounded controls without exposing CLI diagnostics", async () => {
+    const secret = "super-secret-provider-token";
+    const child = makeChild(2, `Bearer ${secret}\nprompt and provider response body`);
     const spawn = vi.fn().mockReturnValue(child);
     const summarizer = createCodexProcessSummarizer({
-      model: "gpt-test",
+      model: `gpt-${"x".repeat(400)}`,
       reasoningEffort: "ultra",
       fastMode: true,
-      spawn: spawn as any,
+      spawn: spawn as unknown as SpawnFn,
       mkdtempSync: vi.fn(() => {
         const dir = mkdtempSync(join(tmpdir(), "lcm-codex-"));
         tempDirs.push(dir);
         return dir;
-      }) as any,
-      readFileSync: vi.fn() as any,
-      rmSync: vi.fn() as any,
+      }) as unknown as MkdtempSyncFn,
+      readFileSync: vi.fn() as unknown as ReadFileSyncFn,
+      rmSync: vi.fn() as unknown as RmSyncFn,
     });
 
     const error = await summarizer("Conversation text", false).catch((caught: unknown) => caught as Error);
-    expect(error.message).toContain('model "gpt-test"');
+    expect(error.message).toContain('model "gpt-');
+    expect(error.message).toContain("...[truncated]");
     expect(error.message).toContain('reasoning effort "ultra"');
     expect(error.message).toContain("fast mode true");
-    expect(error.message).toContain("unsupported control");
-    expect(error.message).not.toContain("\u001b");
-    expect(error.message).not.toContain("\u0000");
+    expect(error.message).toContain("diagnostic output omitted");
+    expect(error.message).not.toContain(secret);
+    expect(error.message).not.toContain("provider response body");
     expect(error.message.length).toBeLessThan(600);
   });
 
@@ -227,14 +234,14 @@ describe("createCodexProcessSummarizer", () => {
     const spawn = vi.fn().mockReturnValue(child);
     const readFileSyncMock = vi.fn(() => "");
     const summarizer = createCodexProcessSummarizer({
-      spawn: spawn as any,
+      spawn: spawn as unknown as SpawnFn,
       mkdtempSync: vi.fn(() => {
         const dir = mkdtempSync(join(tmpdir(), "lcm-codex-"));
         tempDirs.push(dir);
         return dir;
-      }) as any,
-      readFileSync: readFileSyncMock as any,
-      rmSync: vi.fn() as any,
+      }) as unknown as MkdtempSyncFn,
+      readFileSync: readFileSyncMock as unknown as ReadFileSyncFn,
+      rmSync: vi.fn() as unknown as RmSyncFn,
     });
 
     await expect(summarizer("Conversation text", false)).rejects.toThrow("codex output was empty");

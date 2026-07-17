@@ -79,6 +79,19 @@ type CompactRequestPolicyOptions = {
   retryMultiplier?: string;
 };
 
+type CompactOptions = CompactRequestPolicyOptions & {
+  all?: boolean;
+  dryRun?: boolean;
+  replay?: boolean;
+  promote?: boolean;
+  reasoningEffort?: LlmReasoningEffort;
+  fastMode?: boolean;
+  verbose?: boolean;
+  hook?: boolean;
+  client?: unknown;
+  help?: boolean;
+};
+
 function numericOption(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   if (value.trim() === "") return Number.NaN;
@@ -682,7 +695,7 @@ async function main() {
     .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .helpOption(false)
     .option("-h, --help", "Show help")
-    .action(async (opts) => {
+    .action(async (opts: CompactOptions) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("compact"); exit(0);
@@ -691,8 +704,8 @@ async function main() {
       const dryRun: boolean = opts.dryRun ?? false;
       const verbose: boolean = opts.verbose ?? false;
       const replay: boolean = opts.replay ?? false;
-      const reasoningEffort = opts.reasoningEffort as LlmReasoningEffort | undefined;
-      const fastMode = opts.fastMode as boolean | undefined;
+      const reasoningEffort = opts.reasoningEffort;
+      const fastMode = opts.fastMode;
       // Hook dispatch only when --hook is explicit; all other invocations go to batch.
       const hook: boolean = opts.hook ?? false;
       if (!hook) {

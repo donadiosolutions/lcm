@@ -27,6 +27,15 @@ function makeChild(exitCode = 0, output = "summary text", stderr = ""): FakeChil
   return child;
 }
 
+function makeHangingChild(): FakeChild {
+  const child = new EventEmitter() as FakeChild;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = new PassThrough();
+  child.kill = vi.fn(() => { throw new Error("already exited"); });
+  return child;
+}
+
 describe("createClaudeProcessSummarizer", () => {
   it("passes the configured model to the Claude CLI", async () => {
     const spawn = vi.fn().mockReturnValue(makeChild());
@@ -107,11 +116,12 @@ describe("createClaudeProcessSummarizer", () => {
     );
   });
 
-  it("reports requested controls and sanitizes bounded CLI diagnostics", async () => {
-    const child = makeChild(1, "", `\u001b[31munsupported\u001b[0m\ncontrol\u0000${"x".repeat(400)}`);
+  it("reports bounded controls without exposing CLI diagnostics", async () => {
+    const secret = "super-secret-provider-token";
+    const child = makeChild(1, "", `Bearer ${secret}\nprompt and provider response body`);
     const spawn = vi.fn().mockReturnValue(child);
     const summarizer = createClaudeProcessSummarizer({
-      model: "claude-test",
+      model: `claude-${"x".repeat(400)}`,
       reasoningEffort: "max",
       fastMode: true,
       spawn: spawn as unknown as SpawnFn,
@@ -119,12 +129,25 @@ describe("createClaudeProcessSummarizer", () => {
 
     const error = await summarizer("Conversation text", false).catch((caught: unknown) => caught as Error);
     expect(error.message).toContain("provider claude-process");
-    expect(error.message).toContain('model "claude-test"');
+    expect(error.message).toContain('model "claude-');
+    expect(error.message).toContain("...[truncated]");
     expect(error.message).toContain('reasoning effort "max"');
     expect(error.message).toContain("fast mode true");
-    expect(error.message).toContain("unsupported control");
-    expect(error.message).not.toContain("\u001b");
-    expect(error.message).not.toContain("\u0000");
+    expect(error.message).toContain("diagnostic output omitted");
+    expect(error.message).not.toContain(secret);
+    expect(error.message).not.toContain("provider response body");
     expect(error.message.length).toBeLessThan(600);
+  });
+
+  it("rejects cleanly when killing a timed-out process throws", async () => {
+    const spawn = vi.fn().mockReturnValue(makeHangingChild());
+    const summarizer = createClaudeProcessSummarizer({
+      spawn: spawn as unknown as SpawnFn,
+      timeoutMs: 1,
+    });
+
+    await expect(summarizer("Conversation text", false)).rejects.toThrow(
+      "claude process timed out after 0s",
+    );
   });
 });
