@@ -12,7 +12,7 @@
         "repo": "donadiosolutions/lcm"
       },
       "description": "Long Context Manager (LCM) — DAG-based summarization that preserves every message",
-      "version": "1.3.0",
+      "version": "1.4.0",
       "strict": true
     }
   ]

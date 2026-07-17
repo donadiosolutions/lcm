@@ -1,5 +1,18 @@
 # @donadiosolutions/lcm
 
+## 1.4.0
+
+### Minor Changes
+
+- aff66cc: Add configurable OpenAI-compatible timeouts and retries, safe configuration get/set and daemon restart commands, model environment overrides, and accurate batch compaction token totals.
+- a589e11: Add strict LLM configuration validation, provider aliases, and opt-in OpenAI Responses API reasoning effort for compaction.
+- 3495cc7: Add provider-native reasoning effort and compaction-scoped fast-mode controls for Claude and Codex process summarizers.
+
+### Patch Changes
+
+- d77ed1a: Refresh the supported YAML, SDK, lint, type, and test dependencies while retaining Commander 14 compatibility with Node.js 22. Update prompt template loading for js-yaml v5's named exports.
+- d063722: Prevent user-configured OpenAI retry delays from reaching timer durations directly while preserving the configured aggregate backoff.
+
 ## 1.3.0
 
 ### Minor Changes
