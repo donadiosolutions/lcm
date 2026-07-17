@@ -66,9 +66,12 @@ describe("foundation leaf-module boundaries", () => {
         super(value, base);
       }
     });
-    expect(sanitizeEmbeddedUrlValuesForDisplay("//user:password@example.com/path"))
-      .toBe("[REDACTED]");
-    vi.unstubAllGlobals();
+    try {
+      expect(sanitizeEmbeddedUrlValuesForDisplay("//user:password@example.com/path"))
+        .toBe("[REDACTED]");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("covers non-object config traversal, non-string masking, and undefined formatting", () => {

@@ -80,7 +80,18 @@ export async function withHttpHandler(
   handler: (request: IncomingMessage, response: ServerResponse) => void | Promise<void>,
   run: (baseUrl: string) => Promise<void>,
 ): Promise<void> {
-  const server = createServer((request, response) => void handler(request, response));
+  const server = createServer((request, response) => {
+    void Promise.resolve()
+      .then(() => handler(request, response))
+      .catch((error: unknown) => {
+        if (!response.headersSent) {
+          response.statusCode = 500;
+          response.end("Internal Server Error");
+        } else if (!response.writableEnded) {
+          response.destroy(error instanceof Error ? error : undefined);
+        }
+      });
+  });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     const address = server.address();
