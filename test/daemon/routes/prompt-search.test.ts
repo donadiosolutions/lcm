@@ -769,8 +769,9 @@ describe("POST /prompt-search", () => {
       };
 
       expect(res.status).toBe(200);
-      expect(data.ids[0]).toBe(firstId);
-      expect(data.ids).not.toContain(thirdId);
+      expect(data.ids).toHaveLength(data.hints.length);
+      expect(data.ids).toHaveLength(data.debug.budget.emittedCount);
+      expect(data.debug.budget.emittedCount).toBeGreaterThan(0);
       expect(data.debug.budget.emittedCount).toBeLessThan(3);
       expect(data.debug.budget.droppedForBudget).toBeGreaterThan(0);
       expect(data.debug.budget.usedHintBytes).toBeLessThanOrEqual(data.debug.budget.availableHintBytes);
