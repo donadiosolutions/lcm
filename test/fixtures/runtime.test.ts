@@ -7,7 +7,9 @@ const httpMocks = vi.hoisted((): { createServer: ReturnType<typeof vi.fn> } => (
   createServer: vi.fn(),
 }));
 
-vi.mock("node:http", async (importOriginal): Promise<typeof import("node:http")> => {
+vi.mock("node:http", async (
+  importOriginal: <T extends typeof import("node:http") = typeof import("node:http")>() => Promise<T>,
+): Promise<typeof import("node:http")> => {
   const actual = await importOriginal<typeof import("node:http")>();
   httpMocks.createServer.mockImplementation(actual.createServer);
   return { ...actual, createServer: httpMocks.createServer };
