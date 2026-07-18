@@ -508,9 +508,10 @@ const SYSTEMD_LCM_SECRET_ENV_NAMES = new Set(["LCM_SUMMARY_API_KEY"]);
 const SYSTEMD_SECRET_ENV_PATTERN = /(?:API_)?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/;
 const SYSTEMD_CREDENTIAL_DIR_PREFIX = "lcm-systemd-credentials-";
 const SYSTEMD_CREDENTIAL_SOURCE_MAX_AGE_MS = 10 * 60 * 1000;
+const SYSTEMD_DAEMON_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 function shouldPropagateDaemonEnv(name: string, value: string | undefined): value is string {
-  return value !== undefined && (name === "PATH" || name.startsWith("LCM_") || SYSTEMD_PROVIDER_SECRET_ENV_NAMES.has(name));
+  return value !== undefined && (name.startsWith("LCM_") || SYSTEMD_PROVIDER_SECRET_ENV_NAMES.has(name));
 }
 
 function isSecretDaemonEnvName(name: string): boolean {
@@ -541,6 +542,7 @@ function systemdDaemonSetenvArgs(env: NodeJS.ProcessEnv, credentialNames: string
     .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && !SYSTEMD_SECRET_ENV_PATTERN.test(name))
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, value]) => `--setenv=${name}=${value}`);
+  args.push(`--setenv=PATH=${SYSTEMD_DAEMON_PATH}`);
   if (credentialNames.length > 0) {
     args.push(`--setenv=LCM_SYSTEMD_CRED_IDS=${credentialNames.join(",")}`);
   }

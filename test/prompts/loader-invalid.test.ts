@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("node:fs", () => ({
+  existsSync: vi.fn().mockReturnValue(false),
   readFileSync: vi.fn().mockReturnValue("name: invalid\ndescription: missing template\nvariables: []\n"),
 }));
 

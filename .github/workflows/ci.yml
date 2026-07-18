@@ -54,6 +54,11 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Verify committed plugin bundles
+        run: |
+          npm run check:plugin-bundles
+          git diff --exit-code -- lcm.mjs mcp.mjs
+
       - name: Check for workspace artifacts
         run: |
           UNTRACKED=$(git status --porcelain | grep "^??" | grep -vE "^\?\? (node_modules|dist|coverage)/|^\?\? test-report\.junit\.xml$" || true)

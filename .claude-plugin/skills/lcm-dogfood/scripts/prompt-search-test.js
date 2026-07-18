@@ -4,6 +4,7 @@ import http from "node:http";
 const query = process.argv[2] || "summarizer";
 const cwd = process.argv[3] || process.cwd();
 const data = JSON.stringify({ query, cwd });
+const singleLine = (value) => String(value).replace(/[\r\n]/g, " ");
 
 const req = http.request(
   {
@@ -22,14 +23,14 @@ const req = http.request(
         const parsed = JSON.parse(body);
         console.log(`Hints: ${parsed.hints?.length ?? 0}`);
         if (parsed.hints?.length > 0) {
-          parsed.hints.forEach((h, i) => console.log(`  ${i + 1}. ${h.slice(0, 120)}`));
+          parsed.hints.forEach((h, i) => console.log(`  ${i + 1}. ${singleLine(h).slice(0, 120)}`));
         }
       } catch {
-        console.log(`Raw: ${body}`);
+        console.log(`Raw: ${singleLine(body)}`);
       }
     });
   }
 );
-req.on("error", (e) => console.log(`Error: ${e.message}`));
+req.on("error", (e) => console.log(`Error: ${singleLine(e.message)}`));
 req.write(data);
 req.end();

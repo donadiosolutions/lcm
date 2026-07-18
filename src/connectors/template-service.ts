@@ -1,11 +1,10 @@
 import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import type { Agent, ConnectorType } from "./types.js";
 import { LCM_MARKERS } from "./constants.js";
+import { packageAsset, packageRootFor } from "../runtime-root.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const TEMPLATES_DIR = join(__dirname, "templates");
+const TEMPLATES_DIR = packageAsset(packageRootFor(import.meta.url, 3), "dist/src/connectors/templates", "src/connectors/templates");
 
 function loadFile(path: string): string {
   return readFileSync(join(TEMPLATES_DIR, path), "utf-8");

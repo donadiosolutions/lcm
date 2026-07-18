@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { packageRootFor } from "../runtime-root.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -15,8 +16,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  */
 export const PKG_VERSION: string | undefined = (() => {
   const candidates = [
-    // Production / installed: dist/src/daemon → 3 levels up = package root
-    join(__dirname, "..", "..", "..", "package.json"),
+    join(packageRootFor(import.meta.url, 3), "package.json"),
     // Dev / vitest: src/daemon → 2 levels up = package root
     join(__dirname, "..", "..", "package.json"),
   ];
