@@ -14,7 +14,7 @@
 #   5  Open PR targeting main
 #   6  Wait for CI
 #   7  Merge release PR
-#   8  Wait for publish.yml
+#   8  Create/verify signed release tag and wait for publish.yml
 set -euo pipefail
 
 # ─── Args ────────────────────────────────────────────────────────────────────
@@ -55,15 +55,22 @@ done
 if [[ -z "$VERSION" ]]; then
   echo "Usage: $0 <version> [--from-step N]"
   echo "       $0 0.4.2"
-  echo "       $0 0.4.2 --from-step 8   # resume after publish.yml failure"
+  echo "       $0 0.4.2 --from-step 8   # create/verify tag and resume publish"
   exit 1
 fi
 
 # Validate version is semver (fail fast, also guards node interpolation)
-SEMVER_REGEX='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+SEMVER_REGEX='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 if ! [[ "$VERSION" =~ $SEMVER_REGEX ]]; then
-  echo "Invalid version '$VERSION'. Expected semver like '0.4.2' or '1.2.3-beta.1'."
+  echo "Invalid version '$VERSION'. Expected a stable semver like '0.4.2'; prerelease and build metadata versions are not supported."
   echo "Usage: $0 <version> [--from-step N]"
+  exit 1
+fi
+if ! node -e '
+  const parts = process.argv[1].split(".");
+  process.exit(parts.every((part) => Number.isSafeInteger(Number(part))) ? 0 : 1);
+' "$VERSION"; then
+  echo "Invalid version '$VERSION'. Each numeric component must be within npm's JavaScript safe-integer range."
   exit 1
 fi
 
@@ -77,17 +84,89 @@ REPO="donadiosolutions/lcm"
 RELEASE_BRANCH="release/v$VERSION"
 PACKAGE_NAME=$(node -p "require('./package.json').name")
 
-# Validate origin points at the canonical repo (not a fork)
-ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
-if [[ "$ORIGIN_URL" != *"$REPO"* ]]; then
-  err "origin does not point to $REPO (got: $ORIGIN_URL). Run from the canonical repo, not a fork."
-fi
-
 err()    { echo ""; echo "✗ ERROR: $*" >&2; exit 1; }
 step()   { echo ""; echo "━━━ $* ━━━"; }
 ok()     { echo "  ✓ $*"; }
 skip()   { echo "  (skipping — already past this step)"; }
 run_step() { [[ "$1" -ge "$FROM_STEP" ]]; }  # true if step N should run
+
+monotonic_seconds() {
+  node -e 'process.stdout.write(String(process.hrtime.bigint() / 1000000000n));'
+}
+
+is_canonical_origin() {
+  case "$1" in
+    "https://github.com/$REPO" | \
+      "https://github.com/$REPO.git" | \
+      "git@github.com:$REPO" | \
+      "git@github.com:$REPO.git" | \
+      "ssh://git@github.com/$REPO" | \
+      "ssh://git@github.com/$REPO.git")
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+remote_tag_refs() {
+  git ls-remote --tags origin "refs/tags/$1" "refs/tags/$1^{}"
+}
+
+tag_object_from_refs() {
+  local tag="$1"
+  awk -v tag_ref="refs/tags/$tag" '$2 == tag_ref { print $1; exit }'
+}
+
+tag_target_from_refs() {
+  local tag="$1"
+  awk -v tag_ref="refs/tags/$tag" -v peeled_ref="refs/tags/$tag^{}" '
+    $2 == tag_ref { tag_object = $1 }
+    $2 == peeled_ref { peeled = $1 }
+    END {
+      if (peeled != "") print peeled
+      else if (tag_object != "") print tag_object
+    }
+  '
+}
+
+tag_peeled_from_refs() {
+  local tag="$1"
+  awk -v peeled_ref="refs/tags/$tag^{}" '$2 == peeled_ref { print $1; exit }'
+}
+
+commit_json_version() {
+  local commit="$1"
+  local path="$2"
+  local selector="$3"
+  git show "$commit:$path" | node -e '
+    let input = "";
+    const selector = process.argv[1];
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("end", () => {
+      const parsed = JSON.parse(input);
+      const version = selector === "marketplace" ? parsed.plugins?.[0]?.version : parsed.version;
+      process.stdout.write(String(version ?? ""));
+    });
+  ' "$selector"
+}
+
+# Validate origin points at the canonical repo (not a fork)
+ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
+if ! is_canonical_origin "$ORIGIN_URL"; then
+  err "origin does not point to $REPO (got: $ORIGIN_URL). Run from the canonical repo, not a fork."
+fi
+ORIGIN_PUSH_URLS=()
+while IFS= read -r push_url; do
+  [[ -n "$push_url" ]] && ORIGIN_PUSH_URLS+=("$push_url")
+done < <(git remote get-url --push --all origin 2>/dev/null || true)
+ORIGIN_PUSH_URL_DISPLAY="(none)"
+[[ "${#ORIGIN_PUSH_URLS[@]}" -gt 0 ]] && ORIGIN_PUSH_URL_DISPLAY="${ORIGIN_PUSH_URLS[*]}"
+if [[ "${#ORIGIN_PUSH_URLS[@]}" -ne 1 ]] || ! is_canonical_origin "${ORIGIN_PUSH_URLS[0]:-}"; then
+  err "origin must have exactly one canonical push URL for $REPO (got: $ORIGIN_PUSH_URL_DISPLAY)."
+fi
 
 # When resuming mid-flow, look up state we would have captured earlier.
 PR_NUMBER=""
@@ -104,6 +183,8 @@ if [[ "$FROM_STEP" -eq 8 ]]; then
     --state merged --json mergeCommit --jq '.[0].mergeCommit.oid' 2>/dev/null || true)
   [[ -z "$MERGE_SHA" || "$MERGE_SHA" == "null" ]] && \
     err "Resuming from step 8 but could not find merge commit for $RELEASE_BRANCH → main. Has the PR been merged? Check https://github.com/$REPO manually."
+  [[ "$MERGE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || \
+    err "Resuming from step 8 returned an invalid merge commit SHA: $MERGE_SHA"
   echo "  Resuming: found merge commit $MERGE_SHA"
 fi
 
@@ -295,32 +376,159 @@ if run_step 7; then
   MERGE_SHA=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeCommit --jq '.mergeCommit.oid')
   [[ -z "$MERGE_SHA" || "$MERGE_SHA" == "null" ]] && \
     err "Could not determine merge commit SHA for PR #$PR_NUMBER. Check https://github.com/$REPO/pull/$PR_NUMBER."
+  [[ "$MERGE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || \
+    err "GitHub returned an invalid merge commit SHA for PR #$PR_NUMBER: $MERGE_SHA"
   ok "PR #$PR_NUMBER merged to main (commit $MERGE_SHA)."
 else
   step "Step 7 — Merge release PR"; skip
 fi
 
-# ─── STEP 8: Wait for publish.yml ────────────────────────────────────────────
+# ─── STEP 8: Tag merge commit and wait for publish.yml ───────────────────────
 if run_step 8; then
-  step "Step 8 — Wait for publish.yml"
+  step "Step 8 — Tag merge commit and wait for publish.yml"
 
-  # Use the exact merge commit SHA (not main HEAD, which may advance before we query it).
+  # Use the exact merge commit SHA (not main HEAD, which may advance before we tag it).
   [[ -z "$MERGE_SHA" || "$MERGE_SHA" == "null" ]] && \
     err "MERGE_SHA not set — internal error. Re-run from step 7."
-  echo "  Waiting for publish.yml run for commit $MERGE_SHA..."
+  [[ "$MERGE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || \
+    err "MERGE_SHA is not a valid commit SHA: $MERGE_SHA"
+  MERGE_SHA=$(printf '%s' "$MERGE_SHA" | tr '[:upper:]' '[:lower:]')
+  MAX_WAIT=${PUBLISH_MAX_WAIT:-900}
+  [[ "$MAX_WAIT" =~ ^[0-9]+$ ]] || \
+    err "PUBLISH_MAX_WAIT must be a non-negative integer in seconds (got: $MAX_WAIT)."
+  NORMALIZED_MAX_WAIT=$MAX_WAIT
+  while [[ "$NORMALIZED_MAX_WAIT" == 0* && "${#NORMALIZED_MAX_WAIT}" -gt 1 ]]; do
+    NORMALIZED_MAX_WAIT=${NORMALIZED_MAX_WAIT#0}
+  done
+  MAX_WAIT_LIMIT="9223372036854775807"
+  # Equal-width decimal strings need lexical comparison before arithmetic.
+  # shellcheck disable=SC2071
+  if [[ "${#NORMALIZED_MAX_WAIT}" -gt 19 ]] || \
+    { [[ "${#NORMALIZED_MAX_WAIT}" -eq 19 ]] && [[ "$NORMALIZED_MAX_WAIT" > "$MAX_WAIT_LIMIT" ]]; }; then
+    err "PUBLISH_MAX_WAIT must be a non-negative integer in seconds (got: $MAX_WAIT)."
+  fi
+  MAX_WAIT=$((10#$NORMALIZED_MAX_WAIT))
+
+  TAG="v$VERSION"
+  git fetch --no-tags origin main || \
+    err "Failed to fetch origin/main before creating $TAG."
+  git merge-base --is-ancestor "$MERGE_SHA" origin/main || \
+    err "Merge commit $MERGE_SHA is not reachable from origin/main; refusing to tag it."
+  MERGED_PACKAGE_VERSION=$(commit_json_version "$MERGE_SHA" "package.json" "root") || \
+    err "Could not read package.json version from merge commit $MERGE_SHA."
+  MERGED_PLUGIN_VERSION=$(commit_json_version "$MERGE_SHA" ".claude-plugin/plugin.json" "root") || \
+    err "Could not read .claude-plugin/plugin.json version from merge commit $MERGE_SHA."
+  MERGED_MARKETPLACE_VERSION=$(commit_json_version "$MERGE_SHA" ".claude-plugin/marketplace.json" "marketplace") || \
+    err "Could not read .claude-plugin/marketplace.json version from merge commit $MERGE_SHA."
+  [[ "$MERGED_PACKAGE_VERSION" == "$VERSION" && "$MERGED_PLUGIN_VERSION" == "$VERSION" && "$MERGED_MARKETPLACE_VERSION" == "$VERSION" ]] || \
+    err "Merge commit $MERGE_SHA has inconsistent release versions (package=$MERGED_PACKAGE_VERSION, plugin=$MERGED_PLUGIN_VERSION, marketplace=$MERGED_MARKETPLACE_VERSION; expected $VERSION); refusing to create $TAG."
+  MERGED_CHANGELOG=$(git show "$MERGE_SHA:CHANGELOG.md") || \
+    err "Could not read CHANGELOG.md from merge commit $MERGE_SHA."
+  CHANGELOG_BLOCK=$(printf '%s\n' "$MERGED_CHANGELOG" | awk -v version="$VERSION" '
+    $0 == "## " version || $0 == "## [" version "]" ||
+    index($0, "## " version " ") == 1 || index($0, "## [" version "] ") == 1 {
+      found=1
+      next
+    }
+    found && /^## / { exit }
+    found { print }
+  ')
+  [[ -n "$(printf '%s' "$CHANGELOG_BLOCK" | tr -d '[:space:]')" ]] || \
+    err "Merge commit $MERGE_SHA has no nonempty CHANGELOG.md block for $VERSION; refusing to create $TAG."
+
+  REMOTE_TAG_REFS=$(remote_tag_refs "$TAG") || \
+    err "Failed to inspect $TAG on origin."
+  REMOTE_TAG_OBJECT=$(printf '%s\n' "$REMOTE_TAG_REFS" | tag_object_from_refs "$TAG")
+  REMOTE_TAG_TARGET=$(printf '%s\n' "$REMOTE_TAG_REFS" | tag_target_from_refs "$TAG")
+  REMOTE_TAG_PEELED=$(printf '%s\n' "$REMOTE_TAG_REFS" | tag_peeled_from_refs "$TAG")
+
+  if [[ -n "$REMOTE_TAG_OBJECT" ]]; then
+    [[ "$REMOTE_TAG_TARGET" == "$MERGE_SHA" ]] || \
+      err "Remote tag $TAG points to $REMOTE_TAG_TARGET, not merge commit $MERGE_SHA. Never overwrite a public release tag."
+    [[ -n "$REMOTE_TAG_PEELED" ]] || \
+      err "Remote tag $TAG is not annotated. Never overwrite a public release tag."
+  fi
+
+  if [[ -z "$REMOTE_TAG_OBJECT" ]]; then
+    NPM_STATUS=0
+    NPM_OUT=$(npm view "$PACKAGE_NAME@$VERSION" version 2>&1) || NPM_STATUS=$?
+    if [[ "$NPM_STATUS" -eq 0 ]]; then
+      err "$VERSION is already published to npm for $PACKAGE_NAME, but origin has no $TAG tag; refusing to associate an existing artifact with a new release tag."
+    elif ! printf '%s\n' "$NPM_OUT" | grep -qiE 'E404|404 Not Found'; then
+      err "Failed to query npm for $PACKAGE_NAME@$VERSION before creating $TAG; verify registry access and retry."
+    fi
+  fi
+
+  if ! git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+    if [[ -n "$REMOTE_TAG_OBJECT" ]]; then
+      git fetch origin "refs/tags/$TAG:refs/tags/$TAG" || \
+        err "Failed to fetch existing remote tag $TAG."
+      ok "Fetched existing remote tag $TAG."
+    else
+      git tag -s -a "$TAG" "$MERGE_SHA" -m "Release $TAG" || \
+        err "Failed to create signed annotated tag $TAG at $MERGE_SHA."
+      ok "Created signed annotated tag $TAG at $MERGE_SHA."
+    fi
+  fi
+
+  LOCAL_TAG_OBJECT=$(git rev-parse "refs/tags/$TAG") || \
+    err "Could not resolve local tag $TAG after creation or fetch."
+  LOCAL_TAG_TARGET=$(git rev-parse "refs/tags/$TAG^{commit}" 2>/dev/null) || \
+    err "Local tag $TAG does not resolve to a commit."
+  [[ "$LOCAL_TAG_TARGET" == "$MERGE_SHA" ]] || \
+    err "Local tag $TAG points to $LOCAL_TAG_TARGET, not merge commit $MERGE_SHA. Never overwrite a release tag."
+  [[ "$(git cat-file -t "refs/tags/$TAG")" == "tag" ]] || \
+    err "Local tag $TAG is not annotated. Never overwrite a release tag."
+  LOCAL_TAG_NAME=$(git cat-file -p "refs/tags/$TAG" | awk '$1 == "tag" { print $2; exit }') || \
+    err "Could not inspect the embedded name of local tag $TAG."
+  [[ "$LOCAL_TAG_NAME" == "$TAG" ]] || \
+    err "Local tag ref $TAG contains a signed tag object naming $LOCAL_TAG_NAME. Never publish a tag name the signer did not authorize."
+  git tag -v "$TAG" >/dev/null 2>&1 || \
+    err "Could not verify the cryptographic signature on local tag $TAG. Never overwrite a release tag."
+
+  if [[ -n "$REMOTE_TAG_OBJECT" && "$REMOTE_TAG_OBJECT" != "$LOCAL_TAG_OBJECT" ]]; then
+    err "Local and remote $TAG tag objects differ. Never overwrite a public release tag."
+  fi
+
+  if [[ -z "$REMOTE_TAG_OBJECT" ]]; then
+    git push origin "refs/tags/$TAG" || \
+      err "Failed to push signed tag $TAG. Inspect origin for a conflicting tag before retrying."
+    ok "Pushed signed tag $TAG."
+  else
+    ok "Remote tag $TAG already exists at the expected merge commit."
+  fi
+
+  REMOTE_TAG_REFS=$(remote_tag_refs "$TAG") || \
+    err "Failed to verify $TAG on origin after the tag step."
+  REMOTE_TAG_OBJECT=$(printf '%s\n' "$REMOTE_TAG_REFS" | tag_object_from_refs "$TAG")
+  REMOTE_TAG_TARGET=$(printf '%s\n' "$REMOTE_TAG_REFS" | tag_target_from_refs "$TAG")
+  REMOTE_TAG_PEELED=$(printf '%s\n' "$REMOTE_TAG_REFS" | tag_peeled_from_refs "$TAG")
+  [[ -n "$REMOTE_TAG_OBJECT" && -n "$REMOTE_TAG_PEELED" ]] || \
+    err "Remote tag $TAG is missing or is not annotated after the tag step."
+  [[ "$REMOTE_TAG_TARGET" == "$MERGE_SHA" ]] || \
+    err "Remote tag $TAG points to $REMOTE_TAG_TARGET after the tag step, expected $MERGE_SHA."
+  [[ "$REMOTE_TAG_OBJECT" == "$LOCAL_TAG_OBJECT" ]] || \
+    err "Remote tag $TAG does not match the verified local signed tag."
+
+  echo "  Waiting for tag-triggered publish.yml run for $TAG at commit $MERGE_SHA..."
 
   RUN_ID=""
   WAIT_SECS=0
-  MAX_WAIT=${PUBLISH_MAX_WAIT:-900}
+  WAIT_START=$(monotonic_seconds) || err "Could not read the monotonic clock before waiting for publish.yml."
   while [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; do
+    RUN_ID=$(gh run list --repo "$REPO" --workflow publish.yml --event push --limit 20 \
+      --json databaseId,headSha,headBranch \
+      --jq "map(select(.headSha == \"$MERGE_SHA\" and .headBranch == \"$TAG\")) | .[0].databaseId // empty" 2>/dev/null || true)
+    [[ -n "$RUN_ID" && "$RUN_ID" != "null" ]] && break
+    WAIT_NOW=$(monotonic_seconds) || err "Could not read the monotonic clock while waiting for publish.yml."
+    WAIT_SECS=$((WAIT_NOW - WAIT_START))
     if [[ "$WAIT_SECS" -ge "$MAX_WAIT" ]]; then
-      err "publish.yml run not found after ${MAX_WAIT}s. Check https://github.com/$REPO/actions manually."
+      err "Tag-triggered publish.yml run for $TAG at $MERGE_SHA not found after ${MAX_WAIT}s. Check https://github.com/$REPO/actions manually."
     fi
-    sleep 5
-    WAIT_SECS=$((WAIT_SECS + 5))
-    RUN_ID=$(gh run list --repo "$REPO" --workflow publish.yml --branch main --limit 20 \
-      --json databaseId,headSha \
-      --jq "map(select(.headSha == \"$MERGE_SHA\")) | .[0].databaseId // empty" 2>/dev/null || true)
+    REMAINING_WAIT=$((MAX_WAIT - WAIT_SECS))
+    SLEEP_SECS=5
+    [[ "$REMAINING_WAIT" -lt "$SLEEP_SECS" ]] && SLEEP_SECS=$REMAINING_WAIT
+    sleep "$SLEEP_SECS"
   done
 
   echo "  Watching run $RUN_ID..."
@@ -339,13 +547,17 @@ if run_step 8; then
   if [[ "$PUBLISHED_VERSION" != "$VERSION" ]]; then
     err "publish.yml succeeded but $PACKAGE_NAME@$VERSION was not found on npm. Check https://github.com/$REPO/actions/runs/$RUN_ID and npm manually."
   fi
-  git fetch --tags
-  if ! git rev-parse --verify "refs/tags/v$VERSION" >/dev/null 2>&1; then
-    err "publish.yml succeeded but git tag v$VERSION was not found on origin. Check https://github.com/$REPO/actions/runs/$RUN_ID."
+  FINAL_REMOTE_TAG_REFS=$(remote_tag_refs "$TAG") || \
+    err "Failed to verify $TAG on origin after publish.yml completed."
+  FINAL_TAG_OBJECT=$(printf '%s\n' "$FINAL_REMOTE_TAG_REFS" | tag_object_from_refs "$TAG")
+  FINAL_TAG_TARGET=$(printf '%s\n' "$FINAL_REMOTE_TAG_REFS" | tag_target_from_refs "$TAG")
+  FINAL_TAG_PEELED=$(printf '%s\n' "$FINAL_REMOTE_TAG_REFS" | tag_peeled_from_refs "$TAG")
+  if [[ -z "$FINAL_TAG_OBJECT" || -z "$FINAL_TAG_PEELED" || "$FINAL_TAG_TARGET" != "$MERGE_SHA" || "$FINAL_TAG_OBJECT" != "$LOCAL_TAG_OBJECT" ]]; then
+    err "publish.yml succeeded but git tag $TAG does not resolve to merge commit $MERGE_SHA. Check https://github.com/$REPO/actions/runs/$RUN_ID."
   fi
-  ok "$PACKAGE_NAME@$VERSION published to npm and tagged."
+  ok "$PACKAGE_NAME@$VERSION published to npm from signed tag $TAG."
 else
-  step "Step 8 — Wait for publish.yml"; skip
+  step "Step 8 — Tag merge commit and wait for publish.yml"; skip
 fi
 
 # ─── Done ────────────────────────────────────────────────────────────────────
