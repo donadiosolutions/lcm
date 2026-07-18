@@ -178,6 +178,15 @@ describe("ScrubEngine — custom patterns", () => {
     });
   });
 
+  it("redacts the preceding token for a zero-width lookbehind at its end boundary", () => {
+    const result = new ScrubEngine(["(?<=SECRET)(?=\\s)"], [])
+      .scrubWithCounts("SECRET NEXT");
+
+    expect(result).toEqual({
+      text: "[REDACTED] NEXT", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
   it("bounds repeated zero-width matching work for long tokens in both paths", () => {
     const token = "A".repeat(16_384);
     const engine = new ScrubEngine(["(?=.)", "(?=.)", "(?=A)", "(?=A)"], []);

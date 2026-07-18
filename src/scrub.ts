@@ -108,7 +108,15 @@ function nonWhitespaceRanges(text: string): TextRange[] {
   ]);
 }
 
-function zeroWidthTokenRange(ranges: readonly TextRange[], anchor: number): TextRange | null {
+function hasPositiveLookbehind(source: string): boolean {
+  return /(?:^|[^\\])(?:\\\\)*\(\?<=/u.test(source);
+}
+
+function zeroWidthTokenRange(
+  ranges: readonly TextRange[],
+  anchor: number,
+  preferPrecedingAtBoundary: boolean,
+): TextRange | null {
   let low = 0;
   let high = ranges.length;
   while (low < high) {
@@ -116,7 +124,9 @@ function zeroWidthTokenRange(ranges: readonly TextRange[], anchor: number): Text
     if (ranges[middle][1] <= anchor) low = middle + 1;
     else high = middle;
   }
-  return ranges[low] ?? ranges.at(-1) ?? null;
+  const preceding = ranges[low - 1];
+  if (preferPrecedingAtBoundary && preceding?.[1] === anchor) return preceding;
+  return ranges[low] ?? preceding ?? null;
 }
 
 /**
@@ -130,9 +140,10 @@ function zeroWidthTokenRange(ranges: readonly TextRange[], anchor: number): Text
 function consumingMatchRange(
   match: RegExpExecArray,
   getTokenRanges: () => readonly TextRange[],
+  preferPrecedingAtBoundary: boolean,
 ): TextRange | null {
   if (match[0].length > 0) return [match.index, match.index + match[0].length];
-  return zeroWidthTokenRange(getTokenRanges(), match.index);
+  return zeroWidthTokenRange(getTokenRanges(), match.index, preferPrecedingAtBoundary);
 }
 
 function collectConsumingRanges(
@@ -142,11 +153,12 @@ function collectConsumingRanges(
   collect: (range: TextRange) => void,
 ): void {
   regex.lastIndex = 0;
+  const preferPrecedingAtBoundary = hasPositiveLookbehind(regex.source);
   let previousZeroRange: TextRange | null = null;
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {
     const isZeroWidth = match[0].length === 0;
-    const range = consumingMatchRange(match, getTokenRanges);
+    const range = consumingMatchRange(match, getTokenRanges, preferPrecedingAtBoundary);
     const isRepeatedZeroRange = isZeroWidth
       && previousZeroRange?.[0] === range?.[0]
       && previousZeroRange?.[1] === range?.[1];
