@@ -143,7 +143,7 @@ describe("project map", () => {
     expect(readFileSync(projectMapPath(), "utf-8")).toBe("{not-json");
   });
 
-  it("reports a stable validation error when parsing throws a non-Error value", () => {
+  it("reports a stable validation error when parsing throws a non-Error value", (): void => {
     writeFileSync(projectMapPath(), "{not-json");
     vi.spyOn(JSON, "parse").mockImplementationOnce(() => {
       throw "parse failed";
@@ -166,7 +166,7 @@ describe("project map", () => {
     expect(readFileSync(projectMapPath(), "utf-8")).toBe("{not-json");
   });
 
-  it("refuses an overwrite when map parsing throws a non-Error value", () => {
+  it("refuses an overwrite when map parsing throws a non-Error value", (): void => {
     const canonical = makeDir("cached-canonical-non-error");
     resolveProjectIdentity(canonical);
     const unseen = makeDir("unseen-while-non-error");

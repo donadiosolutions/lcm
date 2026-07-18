@@ -107,4 +107,14 @@ describe("store persistence boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "store failed" });
     expect(mocks.close).toHaveBeenCalledTimes(2);
   });
+
+  it("returns a structured error without closing when acquisition fails", async () => {
+    const handler = createStoreHandler(config);
+    mocks.getConnection.mockImplementationOnce(() => { throw new Error("open failed"); });
+
+    await handler({} as never, response, JSON.stringify({ text: "value", cwd: "/open-error" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "open failed" });
+    expect(mocks.close).not.toHaveBeenCalled();
+  });
 });

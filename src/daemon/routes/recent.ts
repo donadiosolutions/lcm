@@ -4,8 +4,6 @@ import { projectDbPath } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { runLcmMigrations } from "../../db/migration.js";
-import { ConversationStore } from "../../store/conversation-store.js";
-import { SummaryStore } from "../../store/summary-store.js";
 import { validateCwd } from "../validate-cwd.js";
 import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
 
@@ -36,7 +34,6 @@ export function createRecentHandler(_config: DaemonConfig): RouteHandler {
       try {
         const db = getLcmConnection(dbPath);
         runLcmMigrations(db);
-        const convStore = new ConversationStore(db);
         const rows = db.prepare(
           `SELECT s.summary_id, s.content, s.depth, s.token_count, s.created_at
            FROM summaries s

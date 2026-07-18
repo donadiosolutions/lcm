@@ -65,8 +65,9 @@ export function createStoreHandler(config: DaemonConfig): RouteHandler {
     const scrubbedText = scrubber.scrub(text);
 
     const dbPath = projectDbPath(projectPath);
-    const db = getLcmConnection(dbPath);
+    let db: ReturnType<typeof getLcmConnection> | undefined;
     try {
+      db = getLcmConnection(dbPath);
       // Core: write to SQLite promoted table
       runLcmMigrations(db);
       const store = new PromotedStore(db);
@@ -84,7 +85,7 @@ export function createStoreHandler(config: DaemonConfig): RouteHandler {
     } catch (err) {
       sendJson(res, 500, { error: sanitizeError(err instanceof Error ? err.message : "store failed") });
     } finally {
-      closeLcmConnection(dbPath);
+      if (db) closeLcmConnection(dbPath);
     }
   };
 }

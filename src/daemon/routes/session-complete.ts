@@ -22,8 +22,9 @@ export function createSessionCompleteHandler(): RouteHandler {
     }
     ensureProjectDir(cwd);
     const dbPath = projectDbPath(cwd);
-    const db = getLcmConnection(dbPath);
+    let db: ReturnType<typeof getLcmConnection> | undefined;
     try {
+      db = getLcmConnection(dbPath);
       runLcmMigrations(db);
       db.prepare(
         "INSERT INTO session_ingest_log (session_id, message_count) VALUES (?, ?) " +
@@ -33,7 +34,7 @@ export function createSessionCompleteHandler(): RouteHandler {
     } catch (err) {
       sendJson(res, 500, { error: err instanceof Error ? err.message : "session completion failed" });
     } finally {
-      closeLcmConnection(dbPath);
+      if (db) closeLcmConnection(dbPath);
     }
   };
 }

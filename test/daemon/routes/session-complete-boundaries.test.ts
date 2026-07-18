@@ -61,4 +61,15 @@ describe("session complete persistence boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "session completion failed" });
     expect(mocks.close).toHaveBeenCalledTimes(4);
   });
+
+  it("returns a structured error without closing when acquisition fails", async () => {
+    const handler = createSessionCompleteHandler();
+    const response = {} as never;
+    mocks.getConnection.mockImplementationOnce(() => { throw new Error("open failed"); });
+
+    await handler({} as never, response, JSON.stringify({ session_id: "s", cwd: "/ok" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "open failed" });
+    expect(mocks.close).not.toHaveBeenCalled();
+  });
 });

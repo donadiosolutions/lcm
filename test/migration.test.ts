@@ -269,7 +269,7 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(rows.find((row) => row.summary_id === "cross-conversation")?.depth).toBe(1);
   });
 
-  it("normalizes legacy timestamps when direct parsing fails", () => {
+  it("normalizes legacy timestamps when direct parsing fails", (): void => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-migration-legacy-timestamp-"));
     tempDirs.push(tempDir);
     const db = getLcmConnection(join(tempDir, "legacy.db"));
