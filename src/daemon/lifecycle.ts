@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, win32 } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
 import { PKG_VERSION } from "./version.js";
 
@@ -158,12 +158,31 @@ function isLikelyLcmDaemonProcess(pid: number, procRoot = "/proc"): boolean {
   return isLikelyLcmDaemonCommand(readProcessCommand(pid, procRoot));
 }
 
+function resolveWindowsNetstatPath(
+  systemRoot: string | undefined,
+  windir: string | undefined,
+  fileExists: (path: string) => boolean = existsSync,
+): string | null {
+  for (const candidate of [systemRoot, windir]) {
+    if (typeof candidate !== "string") continue;
+    const normalized = win32.normalize(candidate.trim()).replace(/[\\/]+$/, "");
+    // SystemRoot/WINDIR should identify the OS Windows directory itself. Do
+    // not accept arbitrary absolute directories supplied through the process
+    // environment, UNC paths, relative paths, or executable search fallback.
+    if (!/^[A-Za-z]:\\Windows$/i.test(normalized)) continue;
+    const executable = win32.join(normalized, "System32", "netstat.exe");
+    if (fileExists(executable)) return executable;
+  }
+  return null;
+}
+
 function findListeningTcpPorts(
   pid: number,
   platform: NodeJS.Platform,
   spawnSyncImpl: typeof spawnSync,
   procRoot = "/proc",
   targetPort?: number,
+  windowsNetstatPath = resolveWindowsNetstatPath(process.env.SystemRoot, process.env.WINDIR),
 ): number[] {
   if (platform === "linux") {
     try {
@@ -202,8 +221,9 @@ function findListeningTcpPorts(
     }
   }
   if (platform === "win32") {
+    if (windowsNetstatPath === null) return [];
     try {
-      const result = spawnSyncImpl("netstat", ["-ano", "-p", "tcp"], {
+      const result = spawnSyncImpl(windowsNetstatPath, ["-ano", "-p", "tcp"], {
         encoding: "utf-8", timeout: 1000, maxBuffer: 256 * 1024,
       });
       if (result.status !== 0 || typeof result.stdout !== "string") return [];
@@ -978,6 +998,7 @@ export const __lifecycleTestUtils = {
   healthVersionMatches,
   inspectDaemonParent,
   parentInvariantWarning,
+  resolveWindowsNetstatPath,
   systemdDaemonSetenvArgs,
   systemdRunProcessEnv,
 };

@@ -22,6 +22,12 @@ describe("lifecycle procfs and parent warnings", () => {
     expect(__lifecycleTestUtils.healthVersionMatches(null, undefined)).toBe(false);
     expect(__lifecycleTestUtils.healthVersionMatches({ status: "ok", version: "" }, "")).toBe(false);
     expect(__lifecycleTestUtils.healthVersionMatches({ status: "ok", version: "1" }, "1")).toBe(true);
+    expect(__lifecycleTestUtils.resolveWindowsNetstatPath(undefined, undefined)).toBeNull();
+    expect(__lifecycleTestUtils.resolveWindowsNetstatPath("C:\\project", "relative", () => true)).toBeNull();
+    const windowsFileExists = vi.fn((path: string) => path.startsWith("D:\\"));
+    expect(__lifecycleTestUtils.resolveWindowsNetstatPath("C:\\Windows", " D:\\Windows\\ ", windowsFileExists)).toBe("D:\\Windows\\System32\\netstat.exe");
+    expect(windowsFileExists).toHaveBeenCalledWith("C:\\Windows\\System32\\netstat.exe");
+    expect(windowsFileExists).toHaveBeenCalledWith("D:\\Windows\\System32\\netstat.exe");
     const many = Array.from({ length: 40 }, (_, index) => `n127.0.0.1:${1000 + index}`).join("\n");
     const spawnSync = vi.fn(() => ({ status: 0, stdout: many }));
     expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", spawnSync as never)).toHaveLength(32);
@@ -44,9 +50,15 @@ describe("lifecycle procfs and parent warnings", () => {
         "TCP 127.0.0.1:4545 0.0.0.0:0 LISTENING 99",
       ].join("\n"),
     }));
-    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", win32Netstat as never)).toEqual([3737]);
-    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", win32Netstat as never, "/proc", 3737)).toEqual([3737]);
-    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", vi.fn(() => { throw new Error("netstat failed"); }) as never)).toEqual([]);
+    const trustedNetstat = "C:\\Windows\\System32\\netstat.exe";
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", win32Netstat as never, "/proc", undefined, trustedNetstat)).toEqual([3737]);
+    expect(win32Netstat).toHaveBeenCalledWith(trustedNetstat, ["-ano", "-p", "tcp"], expect.any(Object));
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", win32Netstat as never, "/proc", 3737, trustedNetstat)).toEqual([3737]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", vi.fn(() => ({ status: 1, stdout: "" })) as never, "/proc", undefined, trustedNetstat)).toEqual([]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", vi.fn(() => { throw new Error("netstat failed"); }) as never, "/proc", undefined, trustedNetstat)).toEqual([]);
+    const hijackedNetstat = vi.fn();
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", hijackedNetstat as never, "/proc", undefined, null)).toEqual([]);
+    expect(hijackedNetstat).not.toHaveBeenCalled();
 
     const linuxRoot = temp();
     mkdirSync(join(linuxRoot, "42", "fd"), { recursive: true });
