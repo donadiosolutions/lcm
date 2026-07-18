@@ -555,8 +555,8 @@ export class ScrubEngine {
     const segments = text.split(/(\s+)/);
     let offset = 0;
     for (const seg of segments) {
-      if (!/^\s+$/.test(seg) && this.tokenPatterns.length > 0) {
-        const segmentTokenRanges: TextRange[] = seg.length > 0 ? [[0, seg.length]] : [];
+      if (seg.length > 0 && !/^\s+$/.test(seg) && this.tokenPatterns.length > 0) {
+        const segmentTokenRanges: TextRange[] = [[0, seg.length]];
         for (let pi = 0; pi < this.tokenPatterns.length; pi++) {
           const pattern = this.tokenPatterns[pi];
           collectConsumingRanges(seg, pattern, () => segmentTokenRanges, (range) => {

@@ -367,6 +367,26 @@ describe("ScrubEngine — custom patterns", () => {
     }
   });
 
+  it("skips regex execution for empty token segments at whitespace boundaries", () => {
+    const engine = new ScrubEngine(["TOKEN"], []);
+    const originalExec = RegExp.prototype.exec;
+    let tokenPatternCalls = 0;
+    const execSpy = vi.spyOn(RegExp.prototype, "exec").mockImplementation(function (
+      this: RegExp,
+      value: string,
+    ): RegExpExecArray | null {
+      if (this.source === "TOKEN") tokenPatternCalls++;
+      return originalExec.call(this, value);
+    });
+
+    try {
+      expect(engine.scrub(" TOKEN ")).toBe(" [REDACTED] ");
+    } finally {
+      execSpy.mockRestore();
+    }
+    expect(tokenPatternCalls).toBe(2);
+  });
+
   it("falls back to the final preceding token from trailing whitespace", () => {
     expect(new ScrubEngine(["(?=\\s*$)"], []).scrubWithCounts("TOKEN  ")).toEqual({
       text: "[REDACTED]  ", gitleaks: 0, builtIn: 0, global: 1, project: 0,
