@@ -6,6 +6,8 @@ import { ensureAuthToken, readAuthToken } from "./auth.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
+type SetTimeoutFn = (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+type ClearTimeoutFn = (timeout: ReturnType<typeof setTimeout>) => void;
 
 export type EnsureDaemonOptions = {
   port: number;
@@ -26,6 +28,8 @@ export type EnsureDaemonOptions = {
   _killOverride?: KillProcess;
   _sleepOverride?: SleepFn;
   _monotonicNowOverride?: () => number;
+  _setTimeoutOverride?: SetTimeoutFn;
+  _clearTimeoutOverride?: ClearTimeoutFn;
   _isProcessAliveOverride?: (pid: number) => boolean;
 };
 
@@ -291,17 +295,56 @@ async function terminatePid(
   }
 }
 
-async function checkDaemonHealth(
+async function requestDaemonHealth(
   port: number,
   fetchFn: typeof globalThis.fetch,
+  signal?: AbortSignal,
 ): Promise<HealthResponse | null> {
   try {
-    const res = await fetchFn(`http://127.0.0.1:${port}/health`);
+    const url = `http://127.0.0.1:${port}/health`;
+    const res = signal ? await fetchFn(url, { signal }) : await fetchFn(url);
     if (!res.ok) return null;
     return (await res.json()) as HealthResponse;
   } catch {
     return null;
   }
+}
+
+async function checkDaemonHealth(
+  port: number,
+  fetchFn: typeof globalThis.fetch,
+  deadline?: {
+    timeoutMs: number;
+    setTimeoutFn: SetTimeoutFn;
+    clearTimeoutFn: ClearTimeoutFn;
+  },
+): Promise<HealthResponse | null> {
+  if (deadline) {
+    const controller = new AbortController();
+    let rejectTimeout: (reason?: unknown) => void = () => {};
+    const timeout = new Promise<never>((
+      _resolve: (value: never | PromiseLike<never>) => void,
+      reject: (reason?: unknown) => void,
+    ): void => {
+      rejectTimeout = reject;
+    });
+    const timeoutHandle = deadline.setTimeoutFn((): void => {
+      controller.abort();
+      rejectTimeout(new Error("daemon health check timed out"));
+    }, deadline.timeoutMs);
+    try {
+      return await Promise.race([
+        requestDaemonHealth(port, fetchFn, controller.signal),
+        timeout,
+      ]);
+    } catch {
+      return null;
+    } finally {
+      deadline.clearTimeoutFn(timeoutHandle);
+    }
+  }
+
+  return requestDaemonHealth(port, fetchFn);
 }
 
 async function checkDaemonAccess(
@@ -515,6 +558,8 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const procRoot = opts._procRoot ?? "/proc";
   const sleepFn = opts._sleepOverride ?? sleep;
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
+  const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
+  const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
   const isAlive = opts._isProcessAliveOverride ?? isProcessAlive;
   const killProcess = opts._killOverride ?? ((pid, signal) => {
     process.kill(pid, signal);
@@ -679,8 +724,14 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
 
   // Step 4: Wait for health — only connect if version matches (if expected)
   const deadline = monotonicNow() + opts.spawnTimeoutMs;
-  while (monotonicNow() < deadline) {
-    const h = await checkDaemonHealth(opts.port, fetchFn);
+  while (true) {
+    const attemptTimeoutMs = deadline - monotonicNow();
+    if (attemptTimeoutMs <= 0) break;
+    const h = await checkDaemonHealth(opts.port, fetchFn, {
+      timeoutMs: attemptTimeoutMs,
+      setTimeoutFn,
+      clearTimeoutFn,
+    });
     const accepted = await daemonResult(h, true, startMethod, warning, warning !== undefined);
     if (accepted) {
       cleanupSystemdCredentials?.();
