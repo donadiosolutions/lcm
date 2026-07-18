@@ -51,8 +51,10 @@ make sure a maintainer gets a `.changeset/*.md` file onto `main`.
    - publish to npm
    - create or update the GitHub release for the tag
 
-For an explicitly requested manual release or recovery, the release helper owns
-the tag step:
+For an explicitly requested manual release created by the release helper, the
+helper also owns recovery of the tag step. The command below looks up the merged
+PR by the helper-created `release/vX.Y.Z` branch, so it does not apply to a
+Changesets `Version Packages` PR or another manually named branch:
 
 ```bash
 bash .agents/skills/lcm-release/scripts/release.sh 1.2.3 --from-step 8

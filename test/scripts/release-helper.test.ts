@@ -24,6 +24,7 @@ interface HarnessOptions {
   originUrl?: string;
   originPushUrls?: string[];
   postPublishRemoteTagState?: string;
+  preTagNpmVersion?: string;
   publishMaxWait?: string;
   remoteTagState?: string;
   runId?: string;
@@ -52,6 +53,7 @@ function runRelease(options: HarnessOptions = {}): HarnessResult {
   const localTagState = join(root, "local-tag.state");
   const remoteTagState = join(root, "remote-tag.state");
   const postPublishRemoteTagState = join(root, "post-publish-remote-tag.state");
+  const npmPreTagChecked = join(root, "npm-pretag-checked.state");
   const releaseVersion = options.version ?? version;
   const releaseTag = `v${releaseVersion}`;
   const releaseMergeSha = options.mergeSha ?? mergeSha;
@@ -69,7 +71,8 @@ printf '|%s' "$@" >> "$FAKE_CALL_LOG"
 printf '\n' >> "$FAKE_CALL_LOG"
 
 load_state() {
-  read -r STATE_OBJECT STATE_TARGET STATE_TYPE STATE_SIGNED < "$1"
+  read -r STATE_OBJECT STATE_TARGET STATE_TYPE STATE_SIGNED STATE_TAG_NAME < "$1"
+  STATE_TAG_NAME="\${STATE_TAG_NAME:-$FAKE_TAG}"
 }
 
 if [[ "$1" == "rev-parse" && "$2" == "--show-toplevel" ]]; then
@@ -143,13 +146,18 @@ if [[ "$1" == "cat-file" && "$2" == "-t" ]]; then
   printf '%s\n' "$STATE_TYPE"
   exit 0
 fi
+if [[ "$1" == "cat-file" && "$2" == "-p" ]]; then
+  load_state "$FAKE_LOCAL_TAG_STATE"
+  printf 'object %s\ntype commit\ntag %s\n' "$STATE_TARGET" "$STATE_TAG_NAME"
+  exit 0
+fi
 if [[ "$1" == "tag" && "$2" == "-v" ]]; then
   load_state "$FAKE_LOCAL_TAG_STATE"
   [[ "$STATE_SIGNED" == "signed" ]]
   exit
 fi
 if [[ "$1" == "tag" && "$2" == "-s" && "$3" == "-a" ]]; then
-  printf '%s %s tag signed\n' "$FAKE_TAG_OBJECT_SHA" "$5" > "$FAKE_LOCAL_TAG_STATE"
+  printf '%s %s tag signed %s\n' "$FAKE_TAG_OBJECT_SHA" "$5" "$FAKE_TAG" > "$FAKE_LOCAL_TAG_STATE"
   exit 0
 fi
 if [[ "$1" == "push" && "$2" == "origin" && "$3" == "refs/tags/$FAKE_TAG" ]]; then
@@ -198,6 +206,15 @@ printf 'npm' >> "$FAKE_CALL_LOG"
 printf '|%s' "$@" >> "$FAKE_CALL_LOG"
 printf '\n' >> "$FAKE_CALL_LOG"
 if [[ "$1" == "view" ]]; then
+  if [[ ! -f "$FAKE_REMOTE_TAG_STATE" && ! -f "$FAKE_NPM_PRETAG_CHECKED" ]]; then
+    : > "$FAKE_NPM_PRETAG_CHECKED"
+    if [[ -n "$FAKE_PRETAG_NPM_VERSION" ]]; then
+      printf '%s\n' "$FAKE_PRETAG_NPM_VERSION"
+      exit 0
+    fi
+    printf 'npm ERR! code E404\n' >&2
+    exit 1
+  fi
   printf '%s\n' "$FAKE_NPM_VERSION"
   exit 0
 fi
@@ -229,9 +246,11 @@ exit 0
         FAKE_MERGED_PLUGIN_VERSION: options.mergedPluginVersion ?? releaseVersion,
         FAKE_MERGED_MARKETPLACE_VERSION: options.mergedMarketplaceVersion ?? releaseVersion,
         FAKE_NPM_VERSION: options.npmVersion ?? version,
+        FAKE_NPM_PRETAG_CHECKED: npmPreTagChecked,
         FAKE_ORIGIN_URL: options.originUrl ?? "git@github.com:donadiosolutions/lcm.git",
         FAKE_ORIGIN_PUSH_URLS: `${(options.originPushUrls ?? [options.originUrl ?? "git@github.com:donadiosolutions/lcm.git"]).join("\n")}\n`,
         FAKE_POST_PUBLISH_REMOTE_TAG_STATE: postPublishRemoteTagState,
+        FAKE_PRETAG_NPM_VERSION: options.preTagNpmVersion ?? "",
         FAKE_REMOTE_TAG_STATE: remoteTagState,
         FAKE_REAL_SLEEP: String(options.realSleep ?? false),
         FAKE_REPO_ROOT: root,
@@ -255,7 +274,7 @@ exit 0
   }
 }
 
-const signedMatchingTag = `${tagObjectSha} ${mergeSha} tag signed`;
+const signedMatchingTag = `${tagObjectSha} ${mergeSha} tag signed ${tag}`;
 
 describe("manual release helper step 8", () => {
   it("creates and pushes a signed annotated tag at the exact merge SHA", () => {
@@ -375,6 +394,16 @@ describe("manual release helper step 8", () => {
     expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
   });
 
+  it("rejects a signed tag object whose embedded name differs from its ref", () => {
+    const result = runRelease({
+      localTagState: `${tagObjectSha} ${mergeSha} tag signed v9.9.8`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`tag ref ${tag} contains a signed tag object naming v9.9.8`);
+    expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
+  });
+
   it("refuses to tag a merge commit that is not reachable from origin main", () => {
     const result = runRelease({ mergeReachable: false });
 
@@ -388,6 +417,15 @@ describe("manual release helper step 8", () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`package=9.9.8, plugin=${version}, marketplace=${version}; expected ${version}`);
+    expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
+    expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
+  });
+
+  it("refuses to create a missing release tag for an already-published npm version", () => {
+    const result = runRelease({ preTagNpmVersion: version });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`${version} is already published to npm`);
     expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
     expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
   });
@@ -506,11 +544,13 @@ describe("manual release helper step 8", () => {
   );
 
   it("caps polling sleep at the remaining monotonic timeout", () => {
-    const result = runRelease({ publishMaxWait: "1", realSleep: true, runId: "" });
+    const result = runRelease({ publishMaxWait: "2", realSleep: true, runId: "" });
+    const sleepCalls = result.calls.filter((call: string) => call.startsWith("sleep|"));
 
     expect(result.status).toBe(1);
-    expect(result.calls).toContain("sleep|1");
-    expect(result.stderr).toContain(`not found after 1s`);
+    expect(sleepCalls.length).toBeGreaterThan(0);
+    expect(sleepCalls.every((call: string) => Number(call.slice("sleep|".length)) <= 2)).toBe(true);
+    expect(result.stderr).toContain(`not found after 2s`);
   });
 
   it.each(["1.2.3-beta.1", "1.2.3+build.1"])(

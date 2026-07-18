@@ -438,6 +438,16 @@ if run_step 8; then
       err "Remote tag $TAG is not annotated. Never overwrite a public release tag."
   fi
 
+  if [[ -z "$REMOTE_TAG_OBJECT" ]]; then
+    NPM_STATUS=0
+    NPM_OUT=$(npm view "$PACKAGE_NAME@$VERSION" version 2>&1) || NPM_STATUS=$?
+    if [[ "$NPM_STATUS" -eq 0 ]]; then
+      err "$VERSION is already published to npm for $PACKAGE_NAME, but origin has no $TAG tag; refusing to associate an existing artifact with a new release tag."
+    elif ! echo "$NPM_OUT" | grep -qiE 'E404|404 Not Found'; then
+      err "Failed to query npm for $PACKAGE_NAME@$VERSION before creating $TAG: $NPM_OUT"
+    fi
+  fi
+
   if ! git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
     if [[ -n "$REMOTE_TAG_OBJECT" ]]; then
       git fetch origin "refs/tags/$TAG:refs/tags/$TAG" || \
@@ -458,6 +468,10 @@ if run_step 8; then
     err "Local tag $TAG points to $LOCAL_TAG_TARGET, not merge commit $MERGE_SHA. Never overwrite a release tag."
   [[ "$(git cat-file -t "refs/tags/$TAG")" == "tag" ]] || \
     err "Local tag $TAG is not annotated. Never overwrite a release tag."
+  LOCAL_TAG_NAME=$(git cat-file -p "refs/tags/$TAG" | awk '$1 == "tag" { print $2; exit }') || \
+    err "Could not inspect the embedded name of local tag $TAG."
+  [[ "$LOCAL_TAG_NAME" == "$TAG" ]] || \
+    err "Local tag ref $TAG contains a signed tag object naming $LOCAL_TAG_NAME. Never publish a tag name the signer did not authorize."
   git tag -v "$TAG" >/dev/null 2>&1 || \
     err "Could not verify the cryptographic signature on local tag $TAG. Never overwrite a release tag."
 
