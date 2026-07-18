@@ -6,6 +6,13 @@ import { ensureAuthToken, readAuthToken } from "./auth.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
+type SetTimeoutFn = (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+type ClearTimeoutFn = (timeout: ReturnType<typeof setTimeout>) => void;
+type RequestDeadline = {
+  timeoutMs: number;
+  setTimeoutFn: SetTimeoutFn;
+  clearTimeoutFn: ClearTimeoutFn;
+};
 
 export type EnsureDaemonOptions = {
   port: number;
@@ -25,6 +32,9 @@ export type EnsureDaemonOptions = {
   _uid?: number;
   _killOverride?: KillProcess;
   _sleepOverride?: SleepFn;
+  _monotonicNowOverride?: () => number;
+  _setTimeoutOverride?: SetTimeoutFn;
+  _clearTimeoutOverride?: ClearTimeoutFn;
   _isProcessAliveOverride?: (pid: number) => boolean;
 };
 
@@ -60,10 +70,17 @@ type HealthResponse = {
 };
 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const userSystemdPidCache = new Map<string, { pid: number | null; expiresAt: number }>();
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function validateSpawnTimeout(spawnTimeoutMs: number): void {
+  if (!Number.isFinite(spawnTimeoutMs) || spawnTimeoutMs < 0 || spawnTimeoutMs > MAX_TIMER_DELAY_MS) {
+    throw new RangeError(`spawnTimeoutMs must be between 0 and ${MAX_TIMER_DELAY_MS}`);
+  }
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -290,31 +307,81 @@ async function terminatePid(
   }
 }
 
-async function checkDaemonHealth(
+async function requestDaemonHealth(
   port: number,
   fetchFn: typeof globalThis.fetch,
+  signal?: AbortSignal,
 ): Promise<HealthResponse | null> {
   try {
-    const res = await fetchFn(`http://127.0.0.1:${port}/health`);
-    if (!res.ok) return null;
-    return (await res.json()) as HealthResponse;
+    const url = `http://127.0.0.1:${port}/health`;
+    const res = signal ? await fetchFn(url, { signal }) : await fetchFn(url);
+    return res.ok ? (await res.json()) as HealthResponse : null;
   } catch {
     return null;
   }
+}
+
+async function runWithDeadline<T>(
+  request: (signal: AbortSignal) => Promise<T>,
+  deadline: RequestDeadline,
+): Promise<T> {
+  const controller = new AbortController();
+  let rejectTimeout: (reason?: unknown) => void = () => {};
+  const timeout = new Promise<never>((
+    _resolve: (value: never | PromiseLike<never>) => void,
+    reject: (reason?: unknown) => void,
+  ): void => {
+    rejectTimeout = reject;
+  });
+  const timeoutHandle = deadline.setTimeoutFn((): void => {
+    controller.abort();
+    rejectTimeout(new Error("daemon request timed out"));
+  }, deadline.timeoutMs);
+  try {
+    return await Promise.race([request(controller.signal), timeout]);
+  } finally {
+    deadline.clearTimeoutFn(timeoutHandle);
+  }
+}
+
+async function checkDaemonHealth(
+  port: number,
+  fetchFn: typeof globalThis.fetch,
+  deadline?: RequestDeadline,
+): Promise<HealthResponse | null> {
+  if (deadline) {
+    try {
+      return await runWithDeadline(
+        (signal: AbortSignal): Promise<HealthResponse | null> => requestDaemonHealth(port, fetchFn, signal),
+        deadline,
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  return requestDaemonHealth(port, fetchFn);
 }
 
 async function checkDaemonAccess(
   port: number,
   tokenPath: string,
   fetchFn: typeof globalThis.fetch,
+  deadline?: RequestDeadline,
 ): Promise<boolean> {
   const token = readAuthToken(tokenPath);
   if (!token) return false;
-  try {
+  const request = async (signal?: AbortSignal): Promise<boolean> => {
     const res = await fetchFn(`http://127.0.0.1:${port}/stats/pool`, {
       headers: { Authorization: `Bearer ${token}` },
+      ...(signal ? { signal } : {}),
     });
     return res.ok;
+  };
+  try {
+    return deadline
+      ? await runWithDeadline((signal: AbortSignal): Promise<boolean> => request(signal), deadline)
+      : await request();
   } catch {
     return false;
   }
@@ -504,17 +571,28 @@ function startViaUserSystemd(
 }
 
 export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDaemonResult> {
+  validateSpawnTimeout(opts.spawnTimeoutMs);
+
   const fetchFn = opts._fetchOverride ?? globalThis.fetch;
   const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
   const platform = opts._platform ?? osPlatform();
   const procRoot = opts._procRoot ?? "/proc";
   const sleepFn = opts._sleepOverride ?? sleep;
+  const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
+  const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
+  const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
+  const deadline = monotonicNow() + opts.spawnTimeoutMs;
   const isAlive = opts._isProcessAliveOverride ?? isProcessAlive;
   const killProcess = opts._killOverride ?? ((pid, signal) => {
     process.kill(pid, signal);
   });
   const enforceParent = opts.enforceUserManagerParent === true && platform === "linux";
   let restartedForParent = false;
+
+  function remainingRequestDeadline(): RequestDeadline | null {
+    const timeoutMs = deadline - monotonicNow();
+    return timeoutMs <= 0 ? null : { timeoutMs, setTimeoutFn, clearTimeoutFn };
+  }
 
   function inspectParent(): ParentInspection {
     return inspectDaemonParent(opts.pidFilePath, {
@@ -536,13 +614,22 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     health: HealthResponse | null,
     spawned: boolean,
     startMethod: EnsureDaemonResult["startMethod"],
+    access: { alreadyVerified: true } | { alreadyVerified: false; deadline: number },
     warning?: string,
     allowParentWarning = false,
-    accessAlreadyVerified = false,
   ): Promise<EnsureDaemonResult | null> {
     if (health?.status !== "ok") return null;
     if (opts.expectedVersion && health.version !== opts.expectedVersion) return null;
-    if (!accessAlreadyVerified && !await checkDaemonAccess(opts.port, tokenPath, fetchFn)) return null;
+    if (!access.alreadyVerified) {
+      const accessTimeoutMs = access.deadline - monotonicNow();
+      if (accessTimeoutMs <= 0) return null;
+      const deadlineOptions = {
+        timeoutMs: accessTimeoutMs,
+        setTimeoutFn,
+        clearTimeoutFn,
+      };
+      if (!await checkDaemonAccess(opts.port, tokenPath, fetchFn, deadlineOptions)) return null;
+    }
 
     let parent: ParentInspection | undefined;
     if (enforceParent) {
@@ -582,13 +669,19 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   // Step 1: Check if daemon is already running via health check
-  const health = await checkDaemonHealth(opts.port, fetchFn);
+  const initialHealthDeadline = remainingRequestDeadline();
+  const health = initialHealthDeadline
+    ? await checkDaemonHealth(opts.port, fetchFn, initialHealthDeadline)
+    : null;
   if (health?.status === "ok") {
-    const hasAccess = await checkDaemonAccess(opts.port, tokenPath, fetchFn);
+    const initialAccessDeadline = remainingRequestDeadline();
+    const hasAccess = initialAccessDeadline
+      ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, initialAccessDeadline)
+      : false;
     if (hasAccess && opts.expectedVersion && health.version !== opts.expectedVersion) {
       await terminatePidFileProcess();
     } else if (hasAccess) {
-      const accepted = await daemonResult(health, false, "existing", undefined, false, true);
+      const accepted = await daemonResult(health, false, "existing", { alreadyVerified: true });
       if (accepted) return accepted;
       // A null result here can only be the verified wrong-parent case: health,
       // access, and version were already accepted, while unavailable identity
@@ -609,14 +702,21 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     try {
       const pid = parseInt(readFileSync(opts.pidFilePath, "utf-8").trim(), 10);
       if (!isNaN(pid) && isAlive(pid)) {
-        await sleepFn(1000);
-        const retry = await checkDaemonHealth(opts.port, fetchFn);
+        const sleepRemainingMs = deadline - monotonicNow();
+        if (sleepRemainingMs > 0) await sleepFn(Math.min(1000, sleepRemainingMs));
+        const retryHealthDeadline = remainingRequestDeadline();
+        const retry = retryHealthDeadline
+          ? await checkDaemonHealth(opts.port, fetchFn, retryHealthDeadline)
+          : null;
         if (retry?.status === "ok") {
-          const retryHasAccess = await checkDaemonAccess(opts.port, tokenPath, fetchFn);
+          const retryAccessDeadline = remainingRequestDeadline();
+          const retryHasAccess = retryAccessDeadline
+            ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, retryAccessDeadline)
+            : false;
           if (retryHasAccess && opts.expectedVersion && retry.version !== opts.expectedVersion) {
             await terminatePidFileProcess();
           } else if (retryHasAccess) {
-            const accepted = await daemonResult(retry, false, "existing", undefined, false, retryHasAccess);
+            const accepted = await daemonResult(retry, false, "existing", { alreadyVerified: true });
             if (accepted) {
               return accepted;
             }
@@ -637,7 +737,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   // Step 3: Spawn daemon (unless skipped for testing)
-  if (opts._skipSpawn) {
+  if (opts._skipSpawn || monotonicNow() >= deadline) {
     return { connected: false, port: opts.port, spawned: false };
   }
 
@@ -672,15 +772,29 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   // Step 4: Wait for health — only connect if version matches (if expected)
-  const deadline = Date.now() + opts.spawnTimeoutMs;
-  while (Date.now() < deadline) {
-    const h = await checkDaemonHealth(opts.port, fetchFn);
-    const accepted = await daemonResult(h, true, startMethod, warning, warning !== undefined);
+  while (true) {
+    const attemptTimeoutMs = deadline - monotonicNow();
+    if (attemptTimeoutMs <= 0) break;
+    const h = await checkDaemonHealth(opts.port, fetchFn, {
+      timeoutMs: attemptTimeoutMs,
+      setTimeoutFn,
+      clearTimeoutFn,
+    });
+    const accepted = await daemonResult(
+      h,
+      true,
+      startMethod,
+      { alreadyVerified: false, deadline },
+      warning,
+      warning !== undefined,
+    );
     if (accepted) {
       cleanupSystemdCredentials?.();
       return accepted;
     }
-    await sleepFn(300);
+    const remainingMs = deadline - monotonicNow();
+    if (remainingMs <= 0) break;
+    await sleepFn(Math.min(300, remainingMs));
   }
 
   const detachedWarning = detachedStart?.getWarning();
@@ -696,6 +810,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
  * when validation and restart need to be kept in one operation.
  */
 export async function restartDaemon(opts: RestartDaemonOptions): Promise<RestartDaemonResult> {
+  validateSpawnTimeout(opts.spawnTimeoutMs);
   const {
     validateBeforeRestart,
     _ensureDaemonOverride,

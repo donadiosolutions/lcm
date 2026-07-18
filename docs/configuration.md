@@ -14,6 +14,13 @@ lcm install
 
 `lcm install` is the Claude Code setup path. It writes config, registers hooks, installs slash commands, registers MCP, and verifies the daemon.
 
+When the setup wizard's **Custom server** summarizer is selected, both the
+OpenAI-compatible server URL and model name are required. The wizard retries an
+empty value once. If the retry is also empty, it falls back to the native CLI
+default and does not save a partial custom-server configuration. Installer
+health polling uses a bounded monotonic deadline, so wall-clock adjustments do
+not extend or shorten the verification window.
+
 ### VS Code (GitHub Copilot)
 
 Install the repo-local connector:
