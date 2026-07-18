@@ -74,6 +74,10 @@ publish workflow does not accept prerelease or build-metadata tags. The
 publication-run wait defaults to 900 seconds; override it with
 `PUBLISH_MAX_WAIT=<non-negative integer seconds>` when needed.
 
+Before running the manual helper, configure Git tag signing with an available
+signing key and agent, and confirm that local signed-tag creation and signature
+verification succeed with the trusted public key.
+
 ## External setup required
 
 The repo-side files are not enough by themselves. A maintainer still needs to configure npm trusted publishing for this GitHub repository/workflow pair.

@@ -90,6 +90,10 @@ ok()     { echo "  ✓ $*"; }
 skip()   { echo "  (skipping — already past this step)"; }
 run_step() { [[ "$1" -ge "$FROM_STEP" ]]; }  # true if step N should run
 
+monotonic_seconds() {
+  node -e 'process.stdout.write(String(process.hrtime.bigint() / 1000000000n));'
+}
+
 is_canonical_origin() {
   case "$1" in
     "https://github.com/$REPO" | \
@@ -510,13 +514,14 @@ if run_step 8; then
 
   RUN_ID=""
   WAIT_SECS=0
-  WAIT_START=$SECONDS
+  WAIT_START=$(monotonic_seconds) || err "Could not read the monotonic clock before waiting for publish.yml."
   while [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; do
     RUN_ID=$(gh run list --repo "$REPO" --workflow publish.yml --event push --limit 20 \
       --json databaseId,headSha,headBranch \
       --jq "map(select(.headSha == \"$MERGE_SHA\" and .headBranch == \"$TAG\")) | .[0].databaseId // empty" 2>/dev/null || true)
     [[ -n "$RUN_ID" && "$RUN_ID" != "null" ]] && break
-    WAIT_SECS=$((SECONDS - WAIT_START))
+    WAIT_NOW=$(monotonic_seconds) || err "Could not read the monotonic clock while waiting for publish.yml."
+    WAIT_SECS=$((WAIT_NOW - WAIT_START))
     if [[ "$WAIT_SECS" -ge "$MAX_WAIT" ]]; then
       err "Tag-triggered publish.yml run for $TAG at $MERGE_SHA not found after ${MAX_WAIT}s. Check https://github.com/$REPO/actions manually."
     fi

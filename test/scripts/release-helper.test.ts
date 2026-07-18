@@ -283,6 +283,13 @@ exit 0
 const signedMatchingTag = `${tagObjectSha} ${mergeSha} tag signed ${tag}`;
 
 describe("manual release helper step 8", () => {
+  it("uses a monotonic clock for the publication timeout", () => {
+    const script = readFileSync(releaseScript, "utf8");
+
+    expect(script).toContain("process.hrtime.bigint()");
+    expect(script).not.toContain("$SECONDS");
+  });
+
   it("rejects numeric version components outside npm's safe-integer range", () => {
     const result = runRelease({ version: "9007199254740992.1.1" });
 

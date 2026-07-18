@@ -43,6 +43,8 @@ The script handles everything end-to-end:
 
 - All feature PRs for this release are merged into `main`
 - `gh` CLI is authenticated
+- Git tag signing is configured with an available signing key and agent, and
+  local signed-tag verification succeeds with the trusted public key
 - You have a stable `MAJOR.MINOR.PATCH` version that is higher than any existing tag/npm release; prerelease and build-metadata versions are not supported by `publish.yml`
 
 ## Key invariants
