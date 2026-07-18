@@ -536,9 +536,14 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
 
   // ── Settings ──
   const settingsPath = join(deps.homedir, ".claude", "settings.json");
+  const readSettings = (): Record<string, unknown> => {
+    const parsed: unknown = JSON.parse(deps.readFileSync(settingsPath, "utf-8"));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return parsed as Record<string, unknown>;
+  };
   let settingsData: Record<string, unknown> = {};
   try {
-    settingsData = JSON.parse(deps.readFileSync(settingsPath, "utf-8"));
+    settingsData = readSettings();
   } catch {}
 
   // Hooks are owned by plugin.json, not settings.json.
@@ -584,7 +589,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
 
   // Re-read settings in case the hooks cleanup branch already modified the file
   let currentSettings: Record<string, unknown> = {};
-  try { currentSettings = JSON.parse(deps.readFileSync(settingsPath, "utf-8")); } catch {}
+  try { currentSettings = readSettings(); } catch {}
   const mcpServers = currentSettings.mcpServers as Record<string, unknown> | undefined;
   // For local installs, settings.json is the canonical source for MCP servers (written by lcm install / doctor);
   // plugin.json may also declare mcpServers.lcm but is a secondary/optional registration path.

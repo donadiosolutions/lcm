@@ -112,6 +112,56 @@ describe("known configuration schema validation", () => {
     });
     expect(() => parseDaemonConfig(JSON.stringify(stored))).not.toThrow();
   });
+
+  it("migrates legacy promotion limits per source before applying precedence", () => {
+    const storedLegacy = JSON.stringify({
+      compaction: { promotionThresholds: { mergeMaxEntries: 17 } },
+    });
+    const storedCurrent = JSON.stringify({
+      compaction: { promotionThresholds: { dedupCandidateLimit: 23 } },
+    });
+
+    expect(parseDaemonConfig(storedLegacy).compaction.promotionThresholds.dedupCandidateLimit).toBe(17);
+    expect(parseDaemonConfig(storedCurrent, {
+      compaction: { promotionThresholds: { mergeMaxEntries: 29 } },
+    }).compaction.promotionThresholds.dedupCandidateLimit).toBe(29);
+    expect(parseDaemonConfig(storedLegacy, {
+      compaction: { promotionThresholds: { dedupCandidateLimit: 31 } },
+    }).compaction.promotionThresholds.dedupCandidateLimit).toBe(31);
+  });
+
+  it("prefers the current promotion-limit key within each source without mutating inputs", () => {
+    const stored = parseStoredConfig(JSON.stringify({
+      compaction: {
+        promotionThresholds: {
+          mergeMaxEntries: 17,
+          dedupCandidateLimit: 19,
+          confidenceDecayRate: 0.25,
+        },
+      },
+    }));
+    expect(stored.compaction).toEqual({ promotionThresholds: { dedupCandidateLimit: 19 } });
+
+    const overrides = {
+      compaction: {
+        promotionThresholds: {
+          mergeMaxEntries: 23,
+          dedupCandidateLimit: 29,
+          confidenceDecayRate: 0.5,
+        },
+      },
+    };
+    expect(parseDaemonConfig("{}", overrides).compaction.promotionThresholds.dedupCandidateLimit).toBe(29);
+    expect(overrides).toEqual({
+      compaction: {
+        promotionThresholds: {
+          mergeMaxEntries: 23,
+          dedupCandidateLimit: 29,
+          confidenceDecayRate: 0.5,
+        },
+      },
+    });
+  });
 });
 
 function trustedCredentialBaseDir(): string | undefined {

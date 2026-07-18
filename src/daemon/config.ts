@@ -734,7 +734,7 @@ function parseConfigRoot(content: string, providerOverride?: LlmProvider): Recor
   validateKnownConfigSections(root);
   const llm = validateLlmObject(root.llm, providerOverride);
   if (llm !== undefined) root.llm = llm;
-  return root;
+  return migrateLegacyConfig(root);
 }
 
 /** Parse and normalize stored configuration without applying defaults or environment values. */
@@ -789,6 +789,20 @@ function migrateLegacyPromotionThresholds(thresholds: Record<string, unknown>): 
   delete migrated.mergeMaxEntries;
   delete migrated.confidenceDecayRate;
   return migrated;
+}
+
+function migrateLegacyConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const compaction = config.compaction as Record<string, unknown> | undefined;
+  const thresholds = compaction?.promotionThresholds as Record<string, unknown> | undefined;
+  if (thresholds === undefined) return config;
+
+  return {
+    ...config,
+    compaction: {
+      ...compaction,
+      promotionThresholds: migrateLegacyPromotionThresholds(thresholds),
+    },
+  };
 }
 
 function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: ReadonlySet<string>): void {
@@ -870,6 +884,7 @@ export function parseDaemonConfig(
   validateKnownConfigSections(normalizedOverrides, { allowEphemeralDaemonPort: true });
   const overrideLlm = validateLlmObject(normalizedOverrides.llm, providerOverride);
   if (overrideLlm !== undefined) normalizedOverrides.llm = overrideLlm;
+  const migratedOverrides = migrateLegacyConfig(normalizedOverrides);
 
   const fileLlm = fileConfig.llm as Record<string, unknown> | undefined;
   const fileModelProvider = typeof fileLlm?.provider === "string"
@@ -890,16 +905,13 @@ export function parseDaemonConfig(
   // Always merge untrusted sources into a trusted target so DENIED_KEYS filtering
   // applies before any untrusted key reaches the result object.
   const withFile = deepMerge(structuredClone(DEFAULTS) as Record<string, unknown>, fileConfig);
-  const merged = deepMerge(withFile, normalizedOverrides) as DaemonConfig;
+  const merged = deepMerge(withFile, migratedOverrides) as DaemonConfig;
   const effectivePolicy = resolveLlmRequestPolicy(
     { requestTimeoutMs: DEFAULT_LLM_REQUEST_TIMEOUT_MS, retry: { ...DEFAULT_LLM_RETRY_POLICY } },
     { requestTimeoutMs: merged.llm.requestTimeoutMs, retry: merged.llm.retry },
   );
   merged.llm.requestTimeoutMs = effectivePolicy.requestTimeoutMs;
   merged.llm.retry = effectivePolicy.retry;
-  // Migrate legacy mergeMaxEntries (renamed to dedupCandidateLimit)
-  const thresholds = merged.compaction.promotionThresholds as Record<string, unknown>;
-  merged.compaction.promotionThresholds = migrateLegacyPromotionThresholds(thresholds) as DaemonConfig["compaction"]["promotionThresholds"];
   if (merged.llm.apiKey) merged.llm.apiKey = merged.llm.apiKey.replace(/\$\{(\w+)\}/g, (_: string, k: string) => env[k] ?? "");
 
   // Runtime models belong to the runtime/environment selection. Only discard

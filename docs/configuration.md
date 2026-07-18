@@ -166,6 +166,17 @@ debugging.
 
 Stored `daemon.port` values must be integers from `1` through `65535`; this includes values written with `lcm config set`. Port `0` is reserved for internal runtime overrides used by tests to request ephemeral binding and is not a valid `config.json` value because lifecycle commands must be able to reconnect to the configured port. `daemon.idleTimeoutMs` must be an integer from `0` through `86400000` milliseconds; `0` disables the idle timer.
 
+Legacy `compaction.promotionThresholds.mergeMaxEntries` values are migrated to
+`dedupCandidateLimit`. LCM migrates stored configuration and runtime overrides
+independently before merging them: the current key wins when both names occur
+in the same source, while runtime overrides continue to take precedence over
+stored configuration.
+
+When `lcm doctor` finds that `~/.claude/settings.json` has a malformed or
+non-object JSON root, it treats the file as empty settings and rebuilds the
+managed `mcpServers.lcm` entry instead of crashing. Other fields are preserved
+when the settings root is a valid JSON object.
+
 Hook error fallback logs write to `~/.lcm/logs/events.log`.
 
 ## Project path aliases
