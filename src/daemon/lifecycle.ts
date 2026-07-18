@@ -70,6 +70,7 @@ type HealthResponse = {
 };
 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const userSystemdPidCache = new Map<string, { pid: number | null; expiresAt: number }>();
 
 function sleep(ms: number): Promise<void> {
@@ -77,8 +78,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 function validateSpawnTimeout(spawnTimeoutMs: number): void {
-  if (!Number.isFinite(spawnTimeoutMs) || spawnTimeoutMs < 0) {
-    throw new RangeError("spawnTimeoutMs must be a finite, non-negative number");
+  if (!Number.isFinite(spawnTimeoutMs) || spawnTimeoutMs < 0 || spawnTimeoutMs > MAX_TIMER_DELAY_MS) {
+    throw new RangeError(`spawnTimeoutMs must be between 0 and ${MAX_TIMER_DELAY_MS}`);
   }
 }
 
@@ -314,8 +315,7 @@ async function requestDaemonHealth(
   try {
     const url = `http://127.0.0.1:${port}/health`;
     const res = signal ? await fetchFn(url, { signal }) : await fetchFn(url);
-    if (!res.ok) return null;
-    return (await res.json()) as HealthResponse;
+    return res.ok ? (await res.json()) as HealthResponse : null;
   } catch {
     return null;
   }
@@ -581,12 +581,18 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
   const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
+  const deadline = monotonicNow() + opts.spawnTimeoutMs;
   const isAlive = opts._isProcessAliveOverride ?? isProcessAlive;
   const killProcess = opts._killOverride ?? ((pid, signal) => {
     process.kill(pid, signal);
   });
   const enforceParent = opts.enforceUserManagerParent === true && platform === "linux";
   let restartedForParent = false;
+
+  function remainingRequestDeadline(): RequestDeadline | null {
+    const timeoutMs = deadline - monotonicNow();
+    return timeoutMs <= 0 ? null : { timeoutMs, setTimeoutFn, clearTimeoutFn };
+  }
 
   function inspectParent(): ParentInspection {
     return inspectDaemonParent(opts.pidFilePath, {
@@ -663,9 +669,15 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   // Step 1: Check if daemon is already running via health check
-  const health = await checkDaemonHealth(opts.port, fetchFn);
+  const initialHealthDeadline = remainingRequestDeadline();
+  const health = initialHealthDeadline
+    ? await checkDaemonHealth(opts.port, fetchFn, initialHealthDeadline)
+    : null;
   if (health?.status === "ok") {
-    const hasAccess = await checkDaemonAccess(opts.port, tokenPath, fetchFn);
+    const initialAccessDeadline = remainingRequestDeadline();
+    const hasAccess = initialAccessDeadline
+      ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, initialAccessDeadline)
+      : false;
     if (hasAccess && opts.expectedVersion && health.version !== opts.expectedVersion) {
       await terminatePidFileProcess();
     } else if (hasAccess) {
@@ -690,10 +702,17 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     try {
       const pid = parseInt(readFileSync(opts.pidFilePath, "utf-8").trim(), 10);
       if (!isNaN(pid) && isAlive(pid)) {
-        await sleepFn(1000);
-        const retry = await checkDaemonHealth(opts.port, fetchFn);
+        const sleepRemainingMs = deadline - monotonicNow();
+        if (sleepRemainingMs > 0) await sleepFn(Math.min(1000, sleepRemainingMs));
+        const retryHealthDeadline = remainingRequestDeadline();
+        const retry = retryHealthDeadline
+          ? await checkDaemonHealth(opts.port, fetchFn, retryHealthDeadline)
+          : null;
         if (retry?.status === "ok") {
-          const retryHasAccess = await checkDaemonAccess(opts.port, tokenPath, fetchFn);
+          const retryAccessDeadline = remainingRequestDeadline();
+          const retryHasAccess = retryAccessDeadline
+            ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, retryAccessDeadline)
+            : false;
           if (retryHasAccess && opts.expectedVersion && retry.version !== opts.expectedVersion) {
             await terminatePidFileProcess();
           } else if (retryHasAccess) {
@@ -718,7 +737,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   // Step 3: Spawn daemon (unless skipped for testing)
-  if (opts._skipSpawn) {
+  if (opts._skipSpawn || monotonicNow() >= deadline) {
     return { connected: false, port: opts.port, spawned: false };
   }
 
@@ -753,7 +772,6 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   // Step 4: Wait for health — only connect if version matches (if expected)
-  const deadline = monotonicNow() + opts.spawnTimeoutMs;
   while (true) {
     const attemptTimeoutMs = deadline - monotonicNow();
     if (attemptTimeoutMs <= 0) break;

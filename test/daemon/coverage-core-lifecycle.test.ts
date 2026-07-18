@@ -286,6 +286,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
         port: 9, pidFilePath: join(dir, "daemon.pid"), spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
         _fetchOverride: vi.fn().mockRejectedValue(new Error("down")),
         _spawnOverride: vi.fn(() => ({ pid: undefined, once: vi.fn(), unref: vi.fn() })) as never, _skipHealthWait: true,
+        _monotonicNowOverride: () => 0,
       });
       expect(result.warning).toContain("credential setup failed");
     } finally {
