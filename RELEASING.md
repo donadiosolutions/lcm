@@ -66,6 +66,11 @@ signed tag causes the helper to stop; it never moves or overwrites a release
 tag. The helper then selects the tag-triggered `publish.yml` run by tag name and
 merge commit SHA without assuming `main` still points at that commit.
 
+Manual helper versions must use stable `MAJOR.MINOR.PATCH` form because the
+publish workflow does not accept prerelease or build-metadata tags. The
+publication-run wait defaults to 900 seconds; override it with
+`PUBLISH_MAX_WAIT=<non-negative integer seconds>` when needed.
+
 ## External setup required
 
 The repo-side files are not enough by themselves. A maintainer still needs to configure npm trusted publishing for this GitHub repository/workflow pair.

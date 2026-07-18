@@ -43,7 +43,7 @@ The script handles everything end-to-end:
 
 - All feature PRs for this release are merged into `main`
 - `gh` CLI is authenticated
-- You have a version number that is higher than any existing tag/npm release
+- You have a stable `MAJOR.MINOR.PATCH` version that is higher than any existing tag/npm release; prerelease and build-metadata versions are not supported by `publish.yml`
 
 ## Key invariants
 
@@ -66,6 +66,7 @@ The script handles everything end-to-end:
 | Existing tag is lightweight, unsigned, or differs between local and origin | The tag does not satisfy the release-signing invariant | Stop and inspect it manually; never overwrite a public release tag |
 | Merge commit is not reachable from `origin/main` | The wrong PR/SHA was selected or main has not updated | Verify the merged release PR before retrying step 8 |
 | publish.yml conclusion is `skipped` | Tag or npm version exists (race) | Pick a higher version; start over |
+| `PUBLISH_MAX_WAIT` is invalid | The override is not a non-negative integer number of seconds | Set it to `0` or a positive whole number; the default is `900` |
 | main diverged from origin/main | Local branch was manually changed or cherry-picked | Reconcile local `main` with `origin/main`, then rerun |
 | publish.yml conclusion is not `success` | Build/test/publish failed | Check the run URL printed by the script |
 

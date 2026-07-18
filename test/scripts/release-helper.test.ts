@@ -17,8 +17,12 @@ interface HarnessOptions {
   mergeReachable?: boolean;
   npmVersion?: string;
   originUrl?: string;
+  originPushUrls?: string[];
+  postPublishRemoteTagState?: string;
+  publishMaxWait?: string;
   remoteTagState?: string;
   runId?: string;
+  version?: string;
 }
 
 interface HarnessResult {
@@ -41,10 +45,16 @@ function runRelease(options: HarnessOptions = {}): HarnessResult {
   const callLog = join(root, "calls.log");
   const localTagState = join(root, "local-tag.state");
   const remoteTagState = join(root, "remote-tag.state");
+  const postPublishRemoteTagState = join(root, "post-publish-remote-tag.state");
+  const releaseVersion = options.version ?? version;
+  const releaseTag = `v${releaseVersion}`;
   mkdirSync(binDir);
   writeFileSync(join(root, "package.json"), JSON.stringify({ name: "@donadiosolutions/lcm" }));
   if (options.localTagState) writeFileSync(localTagState, options.localTagState);
   if (options.remoteTagState) writeFileSync(remoteTagState, options.remoteTagState);
+  if (options.postPublishRemoteTagState !== undefined) {
+    writeFileSync(postPublishRemoteTagState, options.postPublishRemoteTagState);
+  }
 
   writeExecutable(join(binDir, "git"), `#!/usr/bin/env bash
 printf 'git' >> "$FAKE_CALL_LOG"
@@ -61,6 +71,10 @@ if [[ "$1" == "rev-parse" && "$2" == "--show-toplevel" ]]; then
 fi
 if [[ "$1" == "remote" && "$2" == "get-url" && "$3" == "origin" ]]; then
   printf '%s\n' "$FAKE_ORIGIN_URL"
+  exit 0
+fi
+if [[ "$1" == "remote" && "$2" == "get-url" && "$3" == "--push" && "$4" == "--all" && "$5" == "origin" ]]; then
+  printf '%s' "$FAKE_ORIGIN_PUSH_URLS"
   exit 0
 fi
 if [[ "$1" == "fetch" ]]; then
@@ -138,6 +152,13 @@ if [[ "$1" == "run" && "$2" == "list" ]]; then
   exit 0
 fi
 if [[ "$1" == "run" && "$2" == "watch" ]]; then
+  if [[ -f "$FAKE_POST_PUBLISH_REMOTE_TAG_STATE" ]]; then
+    if [[ -s "$FAKE_POST_PUBLISH_REMOTE_TAG_STATE" ]]; then
+      cp "$FAKE_POST_PUBLISH_REMOTE_TAG_STATE" "$FAKE_REMOTE_TAG_STATE"
+    else
+      rm -f "$FAKE_REMOTE_TAG_STATE"
+    fi
+  fi
   exit 0
 fi
 if [[ "$1" == "run" && "$2" == "view" ]]; then
@@ -168,7 +189,7 @@ exit 0
 `);
 
   try {
-    const result = spawnSync("bash", [releaseScript, version, "--from-step", "8"], {
+    const result = spawnSync("bash", [releaseScript, releaseVersion, "--from-step", "8"], {
       cwd: root,
       encoding: "utf8",
       env: {
@@ -179,13 +200,15 @@ exit 0
         FAKE_MERGE_SHA: mergeSha,
         FAKE_NPM_VERSION: options.npmVersion ?? version,
         FAKE_ORIGIN_URL: options.originUrl ?? "git@github.com:donadiosolutions/lcm.git",
+        FAKE_ORIGIN_PUSH_URLS: `${(options.originPushUrls ?? [options.originUrl ?? "git@github.com:donadiosolutions/lcm.git"]).join("\n")}\n`,
+        FAKE_POST_PUBLISH_REMOTE_TAG_STATE: postPublishRemoteTagState,
         FAKE_REMOTE_TAG_STATE: remoteTagState,
         FAKE_REPO_ROOT: root,
         FAKE_RUN_ID: options.runId ?? "9001",
-        FAKE_TAG: tag,
+        FAKE_TAG: releaseTag,
         FAKE_TAG_OBJECT_SHA: tagObjectSha,
         PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
-        PUBLISH_MAX_WAIT: "0",
+        PUBLISH_MAX_WAIT: options.publishMaxWait ?? "0",
       },
     });
     return {
@@ -212,14 +235,14 @@ describe("manual release helper step 8", () => {
     expect(result.remoteTagState).toBe(signedMatchingTag);
     expect(result.calls).toContain(`git|tag|-s|-a|${tag}|${mergeSha}|-m|Release ${tag}`);
     expect(result.calls).toContain(`git|push|origin|refs/tags/${tag}`);
-    expect(result.calls).toContain("git|fetch|--tags");
+    expect(result.calls.filter((call: string) => call.startsWith(`git|ls-remote|--tags|origin|refs/tags/${tag}`))).toHaveLength(3);
     expect(result.calls).toContain(`git|rev-parse|refs/tags/${tag}^{commit}`);
     expect(result.stdout).toContain(`published to npm from signed tag ${tag}`);
   });
 
   it("finds the tag-triggered publish run by tag and head SHA without filtering main", () => {
     const result = runRelease();
-    const runListCall = result.calls.find((call) => call.startsWith("gh|run|list|"));
+    const runListCall = result.calls.find((call: string) => call.startsWith("gh|run|list|"));
 
     expect(result.status).toBe(0);
     expect(runListCall).toContain("|--event|push|");
@@ -233,7 +256,7 @@ describe("manual release helper step 8", () => {
 
     expect(result.status).toBe(0);
     expect(result.calls).toContain(`git|fetch|origin|refs/tags/${tag}:refs/tags/${tag}`);
-    expect(result.calls.some((call) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
+    expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
     expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
   });
 
@@ -244,7 +267,7 @@ describe("manual release helper step 8", () => {
     });
 
     expect(result.status).toBe(0);
-    expect(result.calls.some((call) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
+    expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
     expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
     expect(result.calls).not.toContain(`git|fetch|origin|refs/tags/${tag}:refs/tags/${tag}`);
   });
@@ -258,7 +281,7 @@ describe("manual release helper step 8", () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`Local and remote ${tag} tag objects differ`);
     expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
-    expect(result.calls.some((call) => call.startsWith("gh|run|list|"))).toBe(false);
+    expect(result.calls.some((call: string) => call.startsWith("gh|run|list|"))).toBe(false);
   });
 
   it("aborts when a remote version tag targets a different commit", () => {
@@ -269,7 +292,7 @@ describe("manual release helper step 8", () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`Remote tag ${tag} points to ${otherSha}, not merge commit ${mergeSha}`);
     expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
-    expect(result.calls.some((call) => call.startsWith("gh|run|list|"))).toBe(false);
+    expect(result.calls.some((call: string) => call.startsWith("gh|run|list|"))).toBe(false);
   });
 
   it("aborts when a local version tag targets a different commit", () => {
@@ -317,7 +340,7 @@ describe("manual release helper step 8", () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`Merge commit ${mergeSha} is not reachable from origin/main`);
-    expect(result.calls.some((call) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
+    expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
   });
 
   it("uses the formatted origin error after helper declarations", () => {
@@ -335,7 +358,7 @@ describe("manual release helper step 8", () => {
     `git@github.com:donadiosolutions/lcm.git`,
     `ssh://git@github.com/donadiosolutions/lcm`,
     `ssh://git@github.com/donadiosolutions/lcm.git`,
-  ])("accepts canonical origin URL %s", (originUrl) => {
+  ])("accepts canonical origin URL %s", (originUrl: string) => {
     const result = runRelease({ originUrl });
 
     expect(result.status).toBe(0);
@@ -347,12 +370,72 @@ describe("manual release helper step 8", () => {
     `git@github.com:donadiosolutions/lcm-mirror.git`,
     `git@github.com:mirror/donadiosolutions/lcm.git`,
     `ssh://git@github.com/donadiosolutions/lcm/extra`,
-  ])("rejects origin URL collision %s", (originUrl) => {
+  ])("rejects origin URL collision %s", (originUrl: string) => {
     const result = runRelease({ originUrl });
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`origin does not point to donadiosolutions/lcm`);
-    expect(result.calls.some((call) => call.startsWith("gh|pr|list|"))).toBe(false);
+    expect(result.calls.some((call: string) => call.startsWith("gh|pr|list|"))).toBe(false);
+  });
+
+  it("rejects a non-canonical push URL even when the fetch URL is canonical", () => {
+    const result = runRelease({ originPushUrls: ["git@github.com:example/lcm.git"] });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("origin must have exactly one canonical push URL");
+    expect(result.calls.some((call: string) => call.startsWith("gh|pr|list|"))).toBe(false);
+  });
+
+  it("rejects multiple push URLs even when each one is canonical", () => {
+    const canonical = "git@github.com:donadiosolutions/lcm.git";
+    const result = runRelease({ originPushUrls: [canonical, canonical] });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("origin must have exactly one canonical push URL");
+  });
+
+  it.each(["-1", "10s", "1.5"])(
+    "rejects invalid PUBLISH_MAX_WAIT value %s",
+    (publishMaxWait: string) => {
+      const result = runRelease({ publishMaxWait });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("PUBLISH_MAX_WAIT must be a non-negative integer in seconds");
+    },
+  );
+
+  it.each(["0", "1", "900"])(
+    "accepts PUBLISH_MAX_WAIT boundary %s",
+    (publishMaxWait: string) => {
+      const result = runRelease({ publishMaxWait });
+
+      expect(result.status).toBe(0);
+    },
+  );
+
+  it.each(["1.2.3-beta.1", "1.2.3+build.1"])(
+    "rejects unsupported release version %s before repository access",
+    (releaseVersion: string) => {
+      const result = runRelease({ version: releaseVersion });
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("prerelease and build metadata versions are not supported");
+      expect(result.calls).toEqual([]);
+    },
+  );
+
+  it("fails final verification when the remote tag is deleted after publication", () => {
+    const result = runRelease({ postPublishRemoteTagState: "" });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`git tag ${tag} does not resolve to merge commit ${mergeSha}`);
+  });
+
+  it("fails final verification when the remote tag moves after publication", () => {
+    const result = runRelease({ postPublishRemoteTagState: `${otherTagObjectSha} ${otherSha} tag signed` });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`git tag ${tag} does not resolve to merge commit ${mergeSha}`);
   });
 
   it("retains npm publication verification after a successful workflow", () => {

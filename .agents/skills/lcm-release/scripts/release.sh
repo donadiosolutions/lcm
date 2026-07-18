@@ -60,9 +60,9 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 # Validate version is semver (fail fast, also guards node interpolation)
-SEMVER_REGEX='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+SEMVER_REGEX='^[0-9]+\.[0-9]+\.[0-9]+$'
 if ! [[ "$VERSION" =~ $SEMVER_REGEX ]]; then
-  echo "Invalid version '$VERSION'. Expected semver like '0.4.2' or '1.2.3-beta.1'."
+  echo "Invalid version '$VERSION'. Expected a stable semver like '0.4.2'; prerelease and build metadata versions are not supported."
   echo "Usage: $0 <version> [--from-step N]"
   exit 1
 fi
@@ -129,6 +129,10 @@ tag_peeled_from_refs() {
 ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
 if ! is_canonical_origin "$ORIGIN_URL"; then
   err "origin does not point to $REPO (got: $ORIGIN_URL). Run from the canonical repo, not a fork."
+fi
+mapfile -t ORIGIN_PUSH_URLS < <(git remote get-url --push --all origin 2>/dev/null || true)
+if [[ "${#ORIGIN_PUSH_URLS[@]}" -ne 1 ]] || ! is_canonical_origin "${ORIGIN_PUSH_URLS[0]:-}"; then
+  err "origin must have exactly one canonical push URL for $REPO (got: ${ORIGIN_PUSH_URLS[*]:-(none)})."
 fi
 
 # When resuming mid-flow, look up state we would have captured earlier.
@@ -427,6 +431,8 @@ if run_step 8; then
   RUN_ID=""
   WAIT_SECS=0
   MAX_WAIT=${PUBLISH_MAX_WAIT:-900}
+  [[ "$MAX_WAIT" =~ ^[0-9]+$ ]] || \
+    err "PUBLISH_MAX_WAIT must be a non-negative integer in seconds (got: $MAX_WAIT)."
   while [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; do
     RUN_ID=$(gh run list --repo "$REPO" --workflow publish.yml --event push --limit 20 \
       --json databaseId,headSha,headBranch \
@@ -455,9 +461,12 @@ if run_step 8; then
   if [[ "$PUBLISHED_VERSION" != "$VERSION" ]]; then
     err "publish.yml succeeded but $PACKAGE_NAME@$VERSION was not found on npm. Check https://github.com/$REPO/actions/runs/$RUN_ID and npm manually."
   fi
-  git fetch --tags || err "Failed to refresh release tags after publish.yml completed."
-  FINAL_TAG_TARGET=$(git rev-parse "refs/tags/$TAG^{commit}" 2>/dev/null || true)
-  if [[ "$FINAL_TAG_TARGET" != "$MERGE_SHA" ]]; then
+  FINAL_REMOTE_TAG_REFS=$(remote_tag_refs "$TAG") || \
+    err "Failed to verify $TAG on origin after publish.yml completed."
+  FINAL_TAG_OBJECT=$(printf '%s\n' "$FINAL_REMOTE_TAG_REFS" | tag_object_from_refs "$TAG")
+  FINAL_TAG_TARGET=$(printf '%s\n' "$FINAL_REMOTE_TAG_REFS" | tag_target_from_refs "$TAG")
+  FINAL_TAG_PEELED=$(printf '%s\n' "$FINAL_REMOTE_TAG_REFS" | tag_peeled_from_refs "$TAG")
+  if [[ -z "$FINAL_TAG_OBJECT" || -z "$FINAL_TAG_PEELED" || "$FINAL_TAG_TARGET" != "$MERGE_SHA" || "$FINAL_TAG_OBJECT" != "$LOCAL_TAG_OBJECT" ]]; then
     err "publish.yml succeeded but git tag $TAG does not resolve to merge commit $MERGE_SHA. Check https://github.com/$REPO/actions/runs/$RUN_ID."
   fi
   ok "$PACKAGE_NAME@$VERSION published to npm from signed tag $TAG."
