@@ -366,7 +366,7 @@ describe("install", () => {
         readFileSync: (path, encoding) => path.endsWith("package.json")
           ? JSON.stringify({ version: "1.4.0" })
           : fs.readFileSync(path, encoding as BufferEncoding) as string,
-        writeFileSync: fs.writeFileSync as any,
+        writeFileSync: (path, data) => fs.writeFileSync(path, data),
         mkdirSync: fs.mkdirSync,
         existsSync: fs.existsSync,
         promptUser: vi.fn(),
