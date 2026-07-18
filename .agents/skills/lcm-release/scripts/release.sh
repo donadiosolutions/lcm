@@ -368,7 +368,18 @@ if run_step 8; then
   MAX_WAIT=${PUBLISH_MAX_WAIT:-900}
   [[ "$MAX_WAIT" =~ ^[0-9]+$ ]] || \
     err "PUBLISH_MAX_WAIT must be a non-negative integer in seconds (got: $MAX_WAIT)."
-  MAX_WAIT=$((10#$MAX_WAIT))
+  NORMALIZED_MAX_WAIT=$MAX_WAIT
+  while [[ "$NORMALIZED_MAX_WAIT" == 0* && "${#NORMALIZED_MAX_WAIT}" -gt 1 ]]; do
+    NORMALIZED_MAX_WAIT=${NORMALIZED_MAX_WAIT#0}
+  done
+  MAX_WAIT_LIMIT="9223372036854775807"
+  # Equal-width decimal strings need lexical comparison before arithmetic.
+  # shellcheck disable=SC2071
+  if [[ "${#NORMALIZED_MAX_WAIT}" -gt 19 ]] || \
+    { [[ "${#NORMALIZED_MAX_WAIT}" -eq 19 ]] && [[ "$NORMALIZED_MAX_WAIT" > "$MAX_WAIT_LIMIT" ]]; }; then
+    err "PUBLISH_MAX_WAIT must be a non-negative integer in seconds (got: $MAX_WAIT)."
+  fi
+  MAX_WAIT=$((10#$NORMALIZED_MAX_WAIT))
 
   TAG="v$VERSION"
   git fetch --no-tags origin main || \

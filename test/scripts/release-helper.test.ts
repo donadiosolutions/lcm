@@ -441,7 +441,7 @@ describe("manual release helper step 8", () => {
     expect(runListCall).toContain(`.headSha == "${mergeSha}"`);
   });
 
-  it.each(["-1", "10s", "1.5"])(
+  it.each(["-1", "10s", "1.5", "9223372036854775808", "999999999999999999999999"])(
     "rejects invalid PUBLISH_MAX_WAIT value %s",
     (publishMaxWait: string) => {
       const result = runRelease({ publishMaxWait });
@@ -453,7 +453,7 @@ describe("manual release helper step 8", () => {
     },
   );
 
-  it.each(["0", "1", "08", "09", "900"])(
+  it.each(["0", "1", "08", "09", "900", "9223372036854775807"])(
     "accepts PUBLISH_MAX_WAIT boundary %s",
     (publishMaxWait: string) => {
       const result = runRelease({ publishMaxWait });
