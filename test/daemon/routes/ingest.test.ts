@@ -1,11 +1,11 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { createDaemon, type DaemonInstance } from "../../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { projectDbPath } from "../../../src/daemon/project.js";
+import { closeLcmConnection, getLcmConnection } from "../../../src/db/connection.js";
 
 const tempDirs: string[] = [];
 
@@ -162,12 +162,13 @@ describe("POST /ingest", () => {
     expect(res.status).toBe(200);
 
     // Verify the stored content was scrubbed
-    const db = new DatabaseSync(projectDbPath(tempDir));
+    const dbPath = projectDbPath(tempDir);
+    const db = getLcmConnection(dbPath);
     let row: { content: string } | undefined;
     try {
       row = db.prepare("SELECT content FROM messages LIMIT 1").get() as { content: string } | undefined;
     } finally {
-      db.close();
+      closeLcmConnection(dbPath);
     }
     expect(row?.content).toContain("[REDACTED]");
     expect(row?.content).not.toContain("MY_PROJECT_SECRET");
@@ -203,7 +204,8 @@ describe("POST /ingest", () => {
 
     expect(res.status).toBe(200);
 
-    const db = new DatabaseSync(projectDbPath(tempDir));
+    const dbPath = projectDbPath(tempDir);
+    const db = getLcmConnection(dbPath);
     try {
       const rows = db.prepare(
         "SELECT category, count FROM redaction_stats ORDER BY category"
@@ -213,7 +215,7 @@ describe("POST /ingest", () => {
       expect(byCategory["gitleaks"]).toBeGreaterThan(0);
       expect(byCategory["global"]).toBeGreaterThan(0);
     } finally {
-      db.close();
+      closeLcmConnection(dbPath);
     }
   });
 
@@ -233,6 +235,66 @@ describe("POST /ingest", () => {
     });
 
     expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ingested: 0, totalTokens: 0 });
+  });
+
+  it("filters malformed structured messages and returns zero when none remain", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-invalid-messages-"));
+    tempDirs.push(tempDir);
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const res = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "invalid-messages",
+        cwd: tempDir,
+        messages: [null, "text", {}, { role: "invalid", content: "x", tokenCount: 1 },
+          { role: "user", content: 1, tokenCount: 1 },
+          { role: "user", content: "x", tokenCount: "1" }],
+      }),
+    });
+    expect(await res.json()).toEqual({ ingested: 0, totalTokens: 0 });
+  });
+
+  it("does not append messages already persisted for the session", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-repeat-"));
+    tempDirs.push(tempDir);
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const payload = {
+      session_id: "repeat-session",
+      cwd: tempDir,
+      messages: [{ role: "user", content: "once", tokenCount: 1 }],
+    };
+    const first = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    expect((await first.json()).ingested).toBe(1);
+    const second = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    expect(await second.json()).toEqual({ ingested: 0, totalTokens: 0 });
+  });
+
+  it("skips a session recorded as fully ingested", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-complete-"));
+    tempDirs.push(tempDir);
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const bootstrap = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "bootstrap", cwd: tempDir, messages: [{ role: "user", content: "x", tokenCount: 1 }] }),
+    });
+    expect(bootstrap.status).toBe(200);
+    const dbPath = projectDbPath(tempDir);
+    const db = getLcmConnection(dbPath);
+    try {
+      db.prepare("INSERT INTO session_ingest_log (session_id, message_count) VALUES (?, ?)").run("complete-session", 1);
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+    const res = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "complete-session", cwd: tempDir, messages: [{ role: "user", content: "ignored", tokenCount: 1 }] }),
+    });
     expect(await res.json()).toEqual({ ingested: 0, totalTokens: 0 });
   });
 });

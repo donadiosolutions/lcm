@@ -22,6 +22,21 @@ afterEach(() => {
 });
 
 describe("isLcmConnectionOpen", () => {
+  it("evicts and replaces an unhealthy pooled handle", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-unhealthy-test-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "test.sqlite");
+    const first = getLcmConnection(dbPath);
+    first.close();
+
+    const replacement = getLcmConnection(dbPath);
+    expect(replacement.prepare("SELECT 1").get()).toBeDefined();
+  });
+
+  it("ignores a path-specific close for an unknown connection", () => {
+    expect(() => closeLcmConnection("/tmp/lcm-never-opened.sqlite")).not.toThrow();
+  });
+
   it("returns false when no connection has been opened for the path", () => {
     const fakePath = "/tmp/this/path/was/never/opened.sqlite";
     expect(isLcmConnectionOpen(fakePath)).toBe(false);

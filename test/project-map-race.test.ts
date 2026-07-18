@@ -52,4 +52,25 @@ describe("project map file races", () => {
     expect(readFileSync).toHaveBeenCalledWith(projectMapPath(), "utf-8");
     expect(actualFs.existsSync(projectMapPath())).toBe(true);
   });
+
+  it("propagates non-ENOENT map read failures", async () => {
+    const tempHome = mkdtempSync(join(tmpdir(), "lcm-project-map-error-home-"));
+    tempHomes.push(tempHome);
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    const canonical = join(tempHome, "canonical");
+    mkdirSync(canonical, { recursive: true });
+
+    const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+    vi.doMock("node:fs", () => ({
+      ...actualFs,
+      readFileSync: vi.fn(() => {
+        const error = new Error("permission denied") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }),
+    }));
+    const { resolveProjectIdentity } = await import("../src/project-map.js");
+    expect(() => resolveProjectIdentity(canonical)).toThrow("permission denied");
+  });
 });

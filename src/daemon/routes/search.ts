@@ -1,6 +1,4 @@
-import { existsSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { existsSync } from "node:fs";
 import { projectDbPath } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
@@ -10,6 +8,7 @@ import { SummaryStore } from "../../store/summary-store.js";
 import { RetrievalEngine } from "../../retrieval.js";
 import { PromotedStore } from "../../db/promoted.js";
 import { validateCwd } from "../validate-cwd.js";
+import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
 
 export function createSearchHandler(): RouteHandler {
   return async (_req, res, body) => {
@@ -39,8 +38,7 @@ export function createSearchHandler(): RouteHandler {
     if (cwd) {
       const dbPath = projectDbPath(cwd);
       if (existsSync(dbPath)) {
-        mkdirSync(dirname(dbPath), { recursive: true });
-        const db = new DatabaseSync(dbPath);
+        const db = getLcmConnection(dbPath);
         try {
           runLcmMigrations(db);
 
@@ -71,7 +69,7 @@ export function createSearchHandler(): RouteHandler {
           }
         } catch { /* non-fatal */ }
         finally {
-          db.close();
+          closeLcmConnection(dbPath);
         }
       }
     }

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,12 +8,14 @@ import {
   hashProjectPath,
   listProjectMapEntries,
   normalizeProjectPath,
+  projectMapPathsForHash,
   projectMapPath,
   reloadProjectMapCache,
   removeProjectAlias,
   resolveProjectIdentity,
   showProjectMapEntry,
   validateProjectMap,
+  watchProjectMap,
 } from "../src/project-map.js";
 import { eventsDbPath } from "../src/db/events-path.js";
 import { projectDbPath, projectId, projectMetaPath } from "../src/daemon/project.js";
@@ -43,6 +45,7 @@ describe("project map", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     clearProjectMapCache();
     if (tempHome) rmSync(tempHome, { recursive: true, force: true });
     tempHome = undefined;
@@ -140,6 +143,18 @@ describe("project map", () => {
     expect(readFileSync(projectMapPath(), "utf-8")).toBe("{not-json");
   });
 
+  it("reports a stable validation error when parsing throws a non-Error value", (): void => {
+    writeFileSync(projectMapPath(), "{not-json");
+    vi.spyOn(JSON, "parse").mockImplementationOnce(() => {
+      throw "parse failed";
+    });
+
+    const validation = validateProjectMap({ fix: true });
+
+    expect(validation.errors).toEqual(["map.json is invalid"]);
+    expect(validation.fixApplied).toBe(false);
+  });
+
   it("does not overwrite invalid map edits from a stale cache", () => {
     const canonical = makeDir("cached-canonical");
     resolveProjectIdentity(canonical);
@@ -149,6 +164,19 @@ describe("project map", () => {
 
     expect(() => resolveProjectIdentity(unseen)).toThrow(/refusing to overwrite invalid map\.json/);
     expect(readFileSync(projectMapPath(), "utf-8")).toBe("{not-json");
+  });
+
+  it("refuses an overwrite when map parsing throws a non-Error value", (): void => {
+    const canonical = makeDir("cached-canonical-non-error");
+    resolveProjectIdentity(canonical);
+    const unseen = makeDir("unseen-while-non-error");
+    vi.spyOn(JSON, "parse").mockImplementation(() => {
+      throw "parse failed";
+    });
+
+    expect(() => resolveProjectIdentity(unseen)).toThrow(
+      "refusing to overwrite invalid map.json: map.json is invalid",
+    );
   });
 
   it("keeps cached aliases when map.json temporarily disappears", () => {
@@ -407,6 +435,17 @@ describe("project map", () => {
     expect(() => removeProjectAlias(makeDir("ambiguous-remove-alias"), { canonical })).toThrow(/multiple hashes/);
   });
 
+  it("removes an alias selected by its canonical path", () => {
+    const canonical = makeDir("canonical-remove-target");
+    const alias = makeDir("canonical-remove-alias");
+    projectId(canonical);
+    addProjectAlias(alias, { canonical });
+
+    const removed = removeProjectAlias(alias, { canonical });
+    expect(removed.removed).toBe(true);
+    expect(removed.entry.aliases).not.toContain(normalizeProjectPath(alias));
+  });
+
   it("converts an already-seen canonical-only path into an alias", () => {
     const canonical = makeDir("adopt-canonical");
     const alias = makeDir("adopt-alias");
@@ -507,5 +546,91 @@ describe("project map", () => {
 
     expect(() => removeProjectAlias(shared)).toThrow(/multiple hashes/);
     expect(readdirSync(join(homedir(), ".lcm")).includes("oldmaps")).toBe(false);
+  });
+
+  it("covers missing and invalid project map targets", () => {
+    const alias = makeDir("target-errors-alias");
+    const missingCanonical = join(homedir(), "missing-add-canonical");
+    const unknownHash = "f".repeat(64);
+
+    expect(() => addProjectAlias(alias, { canonical: missingCanonical })).toThrow(/does not exist/);
+    expect(() => addProjectAlias(alias, { hash: "not-a-hash" })).toThrow(/invalid project hash/);
+    expect(() => addProjectAlias(alias, { hash: unknownHash })).toThrow(/unknown project hash/);
+    expect(() => removeProjectAlias(join(homedir(), "unmapped-alias"))).toThrow(/not mapped/);
+    expect(projectMapPathsForHash(unknownHash)).toEqual([]);
+  });
+
+  it("rejects a file as a canonical alias-removal target", () => {
+    const canonicalFile = join(homedir(), "remove-canonical-file");
+    writeFileSync(canonicalFile, "file");
+
+    expect(() => removeProjectAlias(makeDir("remove-file-alias"), { canonical: canonicalFile }))
+      .toThrow(/existing directory/);
+  });
+
+  it("detects ambiguous current and explicit show targets", () => {
+    const originalCwd = process.cwd();
+    const shared = makeDir("show-ambiguous-shared");
+    const firstHash = hashProjectPath(`${shared}-first`);
+    const secondHash = hashProjectPath(`${shared}-second`);
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [firstHash]: { canonical: makeDir("show-ambiguous-first"), aliases: [shared] },
+      [secondHash]: { canonical: makeDir("show-ambiguous-second"), aliases: [shared] },
+    }));
+    clearProjectMapCache();
+
+    expect(() => showProjectMapEntry(shared)).toThrow(/multiple hashes/);
+    process.chdir(shared);
+    try {
+      expect(() => showProjectMapEntry()).toThrow(/multiple hashes/);
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+
+  it("ignores non-project metadata entries and malformed metadata", () => {
+    const root = join(homedir(), ".lcm", "projects");
+    const emptyHash = "1".repeat(64);
+    const nonStringHash = "2".repeat(64);
+    const corruptHash = "3".repeat(64);
+    mkdirSync(join(root, "not-a-hash"), { recursive: true });
+    writeFileSync(join(root, "plain-file"), "ignored");
+    for (const hash of [emptyHash, nonStringHash, corruptHash]) {
+      mkdirSync(join(root, hash), { recursive: true });
+    }
+    writeFileSync(join(root, emptyHash, "meta.json"), JSON.stringify({ cwd: "" }));
+    writeFileSync(join(root, nonStringHash, "meta.json"), JSON.stringify({ cwd: 42 }));
+    writeFileSync(join(root, corruptHash, "meta.json"), "{");
+
+    expect(listProjectMapEntries()).toEqual({});
+  });
+
+  it("preserves an existing hash entry discovered through a different canonical path", () => {
+    const target = makeDir("hash-collision-target");
+    const id = hashProjectPath(normalizeProjectPath(target));
+    const other = makeDir("hash-collision-other");
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [id]: { canonical: other, aliases: [] },
+    }));
+    clearProjectMapCache();
+
+    expect(resolveProjectIdentity(target)).toEqual({ id, canonical: normalizeProjectPath(other) });
+  });
+
+  it("reloads map watches for directory creation, deletion, and file changes", async () => {
+    const directoryWatcher = watchProjectMap();
+    writeFileSync(join(homedir(), ".lcm", "unrelated"), "ignored");
+    writeFileSync(projectMapPath(), "{}\n");
+    rmSync(projectMapPath());
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    directoryWatcher.close();
+
+    writeFileSync(projectMapPath(), "{}\n");
+    const fileWatcher = watchProjectMap();
+    writeFileSync(projectMapPath(), "{ }\n");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    fileWatcher.close();
+
+    expect(reloadProjectMapCache()).toBe(true);
   });
 });

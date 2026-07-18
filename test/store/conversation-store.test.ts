@@ -366,6 +366,22 @@ describe("ConversationStore — searchMessages regex", () => {
 // ── withTransaction ───────────────────────────────────────────────────────────
 
 describe("ConversationStore — withTransaction", () => {
+  it("commits and returns a successful operation result", async () => {
+    const store = makeStore(makeDb());
+    const conversation = await store.createConversation({ sessionId: "tx-commit" });
+    await expect(store.withTransaction(async () => {
+      await store.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "committed write",
+        tokenCount: 2,
+      });
+      return "committed";
+    })).resolves.toBe("committed");
+    await expect(store.getMessageCount(conversation.conversationId)).resolves.toBe(1);
+  });
+
   it("rolls back on thrown error and re-throws", async () => {
     const store = makeStore(makeDb());
     const conv = await store.createConversation({ sessionId: "tx-sess" });
@@ -385,5 +401,128 @@ describe("ConversationStore — withTransaction", () => {
 
     // Message should not exist after rollback
     expect(await store.getMessageCount(conv.conversationId)).toBe(0);
+  });
+});
+
+describe("ConversationStore — persistence boundaries", () => {
+  it("returns defensive zero counts when a database adapter returns no aggregate row", async () => {
+    const db = {
+      prepare: () => ({ get: () => undefined }),
+    } as unknown as DatabaseSync;
+    const store = makeStore(db);
+    await expect(store.countMessagesByIdentity(1, "user", "missing")).resolves.toBe(0);
+    await expect(store.getMessageCount(1)).resolves.toBe(0);
+    await expect(store.getMaxSeq(1)).resolves.toBe(0);
+  });
+
+  it("preserves messages that are already referenced by summaries", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    const conv = await store.createConversation({ sessionId: "referenced-message" });
+    const message = await store.createMessage({
+      conversationId: conv.conversationId,
+      seq: 1,
+      role: "user",
+      content: "retained",
+      tokenCount: 1,
+    });
+    db.prepare(`INSERT INTO summaries
+      (summary_id, conversation_id, kind, depth, content, token_count, file_ids)
+      VALUES (?, ?, 'leaf', 0, 'summary', 1, '[]')`).run("ref-summary", conv.conversationId);
+    db.prepare(`INSERT INTO summary_messages (summary_id, message_id, ordinal) VALUES (?, ?, 0)`)
+      .run("ref-summary", message.messageId);
+
+    expect(await store.deleteMessages([message.messageId])).toBe(0);
+    expect(await store.getMessageById(message.messageId)).not.toBeNull();
+  });
+
+  it("uses FTS with all filters and maps ranked search rows", async () => {
+    const db = makeDb();
+    const store = new ConversationStore(db);
+    const conv = await store.createConversation({ sessionId: "message-fts" });
+    await store.createMessage({
+      conversationId: conv.conversationId,
+      seq: 1,
+      role: "user",
+      content: "persistent searchable phrase",
+      tokenCount: 3,
+    });
+
+    const results = await store.searchMessages({
+      conversationId: conv.conversationId,
+      query: "searchable",
+      mode: "full_text",
+      since: new Date("2000-01-01T00:00:00.000Z"),
+      before: new Date("2100-01-01T00:00:00.000Z"),
+      limit: 1,
+    });
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ conversationId: conv.conversationId, role: "user" });
+    expect(results[0].createdAt).toBeInstanceOf(Date);
+    expect(typeof results[0].rank).toBe("number");
+    await expect(store.searchMessages({ query: "searchable", mode: "full_text" }))
+      .resolves.toHaveLength(1);
+  });
+
+  it("falls back to LIKE after FTS failures and tolerates index cleanup failures", async () => {
+    const db = makeDb();
+    const store = new ConversationStore(db);
+    const conv = await store.createConversation({ sessionId: "message-fts-failure" });
+    db.exec("DROP TABLE messages_fts");
+    const message = await store.createMessage({
+      conversationId: conv.conversationId,
+      seq: 1,
+      role: "assistant",
+      content: "fallback needle",
+      tokenCount: 2,
+    });
+
+    const results = await store.searchMessages({
+      conversationId: conv.conversationId,
+      query: "needle",
+      mode: "full_text",
+      since: new Date("2000-01-01T00:00:00.000Z"),
+      before: new Date("2100-01-01T00:00:00.000Z"),
+    });
+    expect(results).toHaveLength(1);
+    expect(results[0].snippet).toContain("needle");
+    await expect(store.deleteMessages([message.messageId])).resolves.toBe(1);
+  });
+
+  it("returns no LIKE results for an empty query", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    await expect(store.searchMessages({ query: "", mode: "full_text" })).resolves.toEqual([]);
+    const conv = await store.createConversation({ sessionId: "unfiltered-like" });
+    await store.createMessage({
+      conversationId: conv.conversationId,
+      seq: 1,
+      role: "user",
+      content: "unfiltered fallback",
+      tokenCount: 1,
+    });
+    await expect(store.searchMessages({ query: "unfiltered", mode: "full_text" }))
+      .resolves.toHaveLength(1);
+  });
+
+  it("applies conversation and time filters to regex searches", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    const conv = await store.createConversation({ sessionId: "message-regex-filters" });
+    await store.createMessage({
+      conversationId: conv.conversationId,
+      seq: 1,
+      role: "user",
+      content: "bounded regex value",
+      tokenCount: 2,
+    });
+
+    expect(await store.searchMessages({
+      conversationId: conv.conversationId,
+      query: "bounded",
+      mode: "regex",
+      since: new Date("2000-01-01T00:00:00.000Z"),
+      before: new Date("2100-01-01T00:00:00.000Z"),
+    })).toHaveLength(1);
   });
 });

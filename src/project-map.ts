@@ -216,9 +216,7 @@ function loadProjectMapWithMetadata(opts: { strict?: boolean; reload?: boolean; 
     return populated.map;
   }
 
-  if (cache?.path === path) {
-    cache = { ...cache, map: cloneMap(map), metadataPopulated: true };
-  }
+  cache = { ...cache!, map: cloneMap(map), metadataPopulated: true };
   return map;
 }
 
@@ -549,7 +547,6 @@ export function watchProjectMap(): { close: () => void } {
   let timer: ReturnType<typeof setTimeout> | undefined;
 
   const arm = () => {
-    if (closed) return;
     try {
       watcher?.close();
       const watchPath = existsSync(path) ? path : dirname(path);

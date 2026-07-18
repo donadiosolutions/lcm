@@ -104,10 +104,11 @@ async function withSidecarPromotionLock<T>(sidecarPath: string, fn: () => Promis
   const previous = sidecarPromotionLocks.get(sidecarPath) ?? Promise.resolve();
   let release!: () => void;
   const next = new Promise<void>(resolve => { release = resolve; });
-  const chained = previous.catch(() => {}).then(() => next);
+  // Stored lock promises only resolve; promotion failures are not stored in the map.
+  const chained = previous.then(() => next);
   sidecarPromotionLocks.set(sidecarPath, chained);
 
-  await previous.catch(() => {});
+  await previous;
   try {
     return await fn();
   } finally {

@@ -1,6 +1,4 @@
-import { mkdirSync, statSync } from "node:fs";
-import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { statSync } from "node:fs";
 import { projectDbPath, projectDir } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
@@ -10,6 +8,7 @@ import { runLcmMigrations } from "../../db/migration.js";
 import { PromotedStore } from "../../db/promoted.js";
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
+import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
 
 /** Cache entry for a per-project ScrubEngine. */
 interface ScrubCacheEntry {
@@ -66,11 +65,10 @@ export function createStoreHandler(config: DaemonConfig): RouteHandler {
     const scrubbedText = scrubber.scrub(text);
 
     const dbPath = projectDbPath(projectPath);
-    mkdirSync(dirname(dbPath), { recursive: true });
-    const db = new DatabaseSync(dbPath);
+    let db: ReturnType<typeof getLcmConnection> | undefined;
     try {
+      db = getLcmConnection(dbPath);
       // Core: write to SQLite promoted table
-      db.exec("PRAGMA busy_timeout = 5000");
       runLcmMigrations(db);
       const store = new PromotedStore(db);
 
@@ -87,7 +85,7 @@ export function createStoreHandler(config: DaemonConfig): RouteHandler {
     } catch (err) {
       sendJson(res, 500, { error: sanitizeError(err instanceof Error ? err.message : "store failed") });
     } finally {
-      db.close();
+      if (db) closeLcmConnection(dbPath);
     }
   };
 }

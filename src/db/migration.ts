@@ -174,11 +174,7 @@ function backfillSummaryDepths(db: DatabaseSync): void {
     }
 
     for (const summary of summaries) {
-      const depth = depthBySummaryId.get(summary.summary_id);
-      if (depth == null) {
-        continue;
-      }
-      updateDepthStmt.run(depth, summary.summary_id);
+      updateDepthStmt.run(depthBySummaryId.get(summary.summary_id)!, summary.summary_id);
     }
   }
 }
@@ -208,10 +204,6 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
          ORDER BY depth ASC, created_at ASC`,
       )
       .all(conversationId) as SummaryDepthRow[];
-    if (summaries.length === 0) {
-      continue;
-    }
-
     const leafRanges = db
       .prepare(
         `SELECT
@@ -264,7 +256,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
       }
     >();
     const tokenCountBySummaryId = new Map(
-      summaries.map((summary) => [summary.summary_id, Math.max(0, Math.floor(summary.token_count ?? 0))]),
+      summaries.map((summary) => [summary.summary_id, Math.max(0, Math.floor(summary.token_count))]),
     );
 
     for (const summary of summaries) {
@@ -322,7 +314,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
         }
 
         descendantCount += Math.max(0, parentMetadata.descendantCount) + 1;
-        const parentTokenCount = tokenCountBySummaryId.get(parentId) ?? 0;
+        const parentTokenCount = tokenCountBySummaryId.get(parentId)!;
         descendantTokenCount +=
           Math.max(0, parentTokenCount) + Math.max(0, parentMetadata.descendantTokenCount);
         sourceMessageTokenCount += Math.max(0, parentMetadata.sourceMessageTokenCount);
@@ -338,11 +330,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
     }
 
     for (const summary of summaries) {
-      const metadata = metadataBySummaryId.get(summary.summary_id);
-      if (!metadata) {
-        continue;
-      }
-
+      const metadata = metadataBySummaryId.get(summary.summary_id)!;
       updateMetadataStmt.run(
         isoStringOrNull(metadata.earliestAt),
         isoStringOrNull(metadata.latestAt),
@@ -617,14 +605,29 @@ export function runLcmMigrations(
         .get() as { sql: string } | undefined
     )?.sql;
     if (ftsSchema && ftsSchema.includes("content_rowid")) {
-      db.exec("DROP TABLE messages_fts");
-      db.exec(`
-        CREATE VIRTUAL TABLE messages_fts USING fts5(
-          content,
-          tokenize='porter unicode61'
-        );
-        INSERT INTO messages_fts(rowid, content) SELECT message_id, content FROM messages;
-      `);
+      db.exec("BEGIN");
+      try {
+        db.exec(`
+          CREATE TEMP TABLE messages_fts_migration (
+            rowid INTEGER PRIMARY KEY,
+            content TEXT NOT NULL
+          );
+          INSERT INTO messages_fts_migration(rowid, content)
+            SELECT rowid, content FROM messages_fts;
+          DROP TABLE messages_fts;
+          CREATE VIRTUAL TABLE messages_fts USING fts5(
+            content,
+            tokenize='porter unicode61'
+          );
+          INSERT INTO messages_fts(rowid, content)
+            SELECT rowid, content FROM messages_fts_migration;
+          DROP TABLE messages_fts_migration;
+        `);
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
     }
   } else {
     db.exec(`

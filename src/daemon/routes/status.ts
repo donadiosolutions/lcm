@@ -1,5 +1,4 @@
 import { existsSync, readFileSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
 import type { DaemonConfig } from "../config.js";
 import { projectDbPath, projectMetaPath } from "../project.js";
 import { sendJson } from "../server.js";
@@ -7,6 +6,7 @@ import type { RouteHandler } from "../server.js";
 import { PKG_VERSION } from "../server.js";
 import { validateCwd } from "../validate-cwd.js";
 import { sanitizeError } from "../safe-error.js";
+import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
 
 export function createStatusHandler(config: DaemonConfig, startTime: number, actualPort?: number): RouteHandler {
   return async (_req, res, body) => {
@@ -39,10 +39,8 @@ export function createStatusHandler(config: DaemonConfig, startTime: number, act
 
       const dbPath = projectDbPath(cwd);
       if (existsSync(dbPath)) {
-        const db = new DatabaseSync(dbPath);
+        const db = getLcmConnection(dbPath);
         try {
-          db.exec("PRAGMA busy_timeout = 5000");
-
           // Count messages
           const msgResult = db.prepare("SELECT COUNT(*) as count FROM messages").get() as { count: number };
           messageCount = msgResult?.count ?? 0;
@@ -60,7 +58,7 @@ export function createStatusHandler(config: DaemonConfig, startTime: number, act
           summaryCount = 0;
           promotedCount = 0;
         } finally {
-          db.close();
+          closeLcmConnection(dbPath);
         }
       }
 

@@ -1,6 +1,4 @@
-import { existsSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { existsSync } from "node:fs";
 import type { DaemonConfig } from "../config.js";
 import { projectDbPath } from "../project.js";
 import { sendJson } from "../server.js";
@@ -10,6 +8,7 @@ import { ConversationStore } from "../../store/conversation-store.js";
 import { SummaryStore } from "../../store/summary-store.js";
 import { RetrievalEngine } from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
+import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
 
 export function createGrepHandler(_config: DaemonConfig): RouteHandler {
   return async (_req, res, body) => {
@@ -40,15 +39,17 @@ export function createGrepHandler(_config: DaemonConfig): RouteHandler {
         sendJson(res, 200, { matches: [] });
         return;
       }
-      mkdirSync(dirname(dbPath), { recursive: true });
-      const db = new DatabaseSync(dbPath);
-      runLcmMigrations(db);
-      const convStore = new ConversationStore(db);
-      const summStore = new SummaryStore(db);
-      const engine = new RetrievalEngine(convStore, summStore);
-      const result = await engine.grep({ query, mode: mode ?? "full_text", scope: scope ?? "both", since });
-      db.close();
-      sendJson(res, 200, result);
+      try {
+        const db = getLcmConnection(dbPath);
+        runLcmMigrations(db);
+        const convStore = new ConversationStore(db);
+        const summStore = new SummaryStore(db);
+        const engine = new RetrievalEngine(convStore, summStore);
+        const result = await engine.grep({ query, mode: mode ?? "full_text", scope: scope ?? "both", since });
+        sendJson(res, 200, result);
+      } finally {
+        closeLcmConnection(dbPath);
+      }
     } catch (err) {
       sendJson(res, 200, { matches: [] });
     }

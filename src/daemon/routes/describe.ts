@@ -1,6 +1,4 @@
-import { existsSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { existsSync } from "node:fs";
 import type { DaemonConfig } from "../config.js";
 import { projectDbPath } from "../project.js";
 import { sendJson } from "../server.js";
@@ -10,6 +8,7 @@ import { ConversationStore } from "../../store/conversation-store.js";
 import { SummaryStore } from "../../store/summary-store.js";
 import { RetrievalEngine } from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
+import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
 
 export function createDescribeHandler(_config: DaemonConfig): RouteHandler {
   return async (_req, res, body) => {
@@ -36,19 +35,19 @@ export function createDescribeHandler(_config: DaemonConfig): RouteHandler {
       return;
     }
 
+    const dbPath = projectDbPath(cwd);
     try {
-      const dbPath = projectDbPath(cwd);
-      mkdirSync(dirname(dbPath), { recursive: true });
-      const db = new DatabaseSync(dbPath);
+      const db = getLcmConnection(dbPath);
       runLcmMigrations(db);
       const convStore = new ConversationStore(db);
       const summStore = new SummaryStore(db);
       const engine = new RetrievalEngine(convStore, summStore);
       const result = await engine.describe(nodeId);
-      db.close();
       sendJson(res, 200, { node: result });
     } catch (err) {
       sendJson(res, 200, { node: null, error: err instanceof Error ? err.message : "describe failed" });
+    } finally {
+      closeLcmConnection(dbPath);
     }
   };
 }

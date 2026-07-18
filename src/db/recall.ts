@@ -64,8 +64,8 @@ export class RecallStore {
     }
 
     for (const [memoryId, usageCount] of this.collectUsageCounts(memoryIds)) {
-      const current = feedback.get(memoryId);
-      if (!current) continue;
+      // collectUsageCounts(memoryIds) only returns IDs from the requested set.
+      const current = feedback.get(memoryId)!;
       feedback.set(memoryId, {
         ...current,
         usageCount,

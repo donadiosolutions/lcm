@@ -553,3 +553,224 @@ describe("SummaryStore — LargeFile CRUD", () => {
     expect(await store.getLargeFilesByConversation(99999)).toEqual([]);
   });
 });
+
+describe("SummaryStore — persistence boundaries", () => {
+  it("normalizes malformed persisted summary metadata", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    const convId = await makeConversation(db);
+    await store.insertSummary({
+      summaryId: "malformed-row",
+      conversationId: convId,
+      kind: "leaf",
+      content: "malformed",
+      tokenCount: 1,
+    });
+    db.prepare(`UPDATE summaries SET
+      file_ids = 'not-json', descendant_count = 'bad',
+      descendant_token_count = -2, source_message_token_count = 'bad'
+      WHERE summary_id = ?`).run("malformed-row");
+
+    const result = await store.getSummary("malformed-row");
+    expect(result).toMatchObject({
+      fileIds: [],
+      descendantCount: 0,
+      descendantTokenCount: 0,
+      sourceMessageTokenCount: 0,
+    });
+  });
+
+  it("normalizes defensive subtree row fallbacks from database adapters", async () => {
+    const row = {
+      summary_id: "adapter-row",
+      conversation_id: 1,
+      kind: "leaf",
+      depth: 0,
+      content: "adapter",
+      token_count: 1,
+      file_ids: "[]",
+      earliest_at: null,
+      latest_at: null,
+      descendant_count: 0,
+      descendant_token_count: 0,
+      source_message_token_count: 0,
+      created_at: new Date(0).toISOString(),
+      depth_from_root: undefined,
+      parent_summary_id: undefined,
+      path: 42,
+      child_count: "invalid",
+    };
+    const db = { prepare: () => ({ all: () => [row] }) } as unknown as DatabaseSync;
+    const result = await makeStore(db).getSummarySubtree("adapter-row");
+    expect(result[0]).toMatchObject({
+      depthFromRoot: 0,
+      parentSummaryId: null,
+      path: "",
+      childCount: 0,
+    });
+  });
+
+  it("returns a defensive zero token count when an adapter returns no aggregate row", async () => {
+    const db = { prepare: () => ({ get: () => undefined }) } as unknown as DatabaseSync;
+    await expect(makeStore(db).getContextTokenCount(1)).resolves.toBe(0);
+  });
+
+  it("normalizes non-finite and fractional input counters and depth", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    const convId = await makeConversation(db);
+    const result = await store.insertSummary({
+      summaryId: "normalized-input",
+      conversationId: convId,
+      kind: "condensed",
+      depth: 2.9,
+      content: "normalized",
+      tokenCount: 1,
+      descendantCount: Number.NaN,
+      descendantTokenCount: Number.POSITIVE_INFINITY,
+      sourceMessageTokenCount: "invalid" as unknown as number,
+    });
+    expect(result).toMatchObject({
+      depth: 2,
+      descendantCount: 0,
+      descendantTokenCount: 0,
+      sourceMessageTokenCount: 0,
+    });
+  });
+
+  it("maps an existing large file loaded by id", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    const convId = await makeConversation(db);
+    await store.insertLargeFile({
+      fileId: "loaded-file",
+      conversationId: convId,
+      storageUri: "file:///loaded",
+    });
+    expect(await store.getLargeFile("loaded-file")).toMatchObject({
+      fileId: "loaded-file",
+      storageUri: "file:///loaded",
+    });
+  });
+
+  it("indexes and searches FTS summaries with every filter", async () => {
+    const db = makeDb();
+    const store = new SummaryStore(db);
+    const convId = await makeConversation(db);
+    await store.insertSummary({
+      summaryId: "summary-fts-success",
+      conversationId: convId,
+      kind: "leaf",
+      content: "persistent summary needle",
+      tokenCount: 3,
+    });
+
+    const results = await store.searchSummaries({
+      conversationId: convId,
+      query: "needle",
+      mode: "full_text",
+      since: new Date("2000-01-01T00:00:00.000Z"),
+      before: new Date("2100-01-01T00:00:00.000Z"),
+      limit: 1,
+    });
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ summaryId: "summary-fts-success", conversationId: convId });
+    expect(results[0].createdAt).toBeInstanceOf(Date);
+    expect(typeof results[0].rank).toBe("number");
+    await expect(store.searchSummaries({ query: "needle", mode: "full_text" }))
+      .resolves.toHaveLength(1);
+  });
+
+  it("falls back to LIKE when FTS indexing and searching fail", async () => {
+    const db = makeDb();
+    const store = new SummaryStore(db);
+    const convId = await makeConversation(db);
+    db.exec("DROP TABLE summaries_fts");
+    await store.insertSummary({
+      summaryId: "summary-fts-failure",
+      conversationId: convId,
+      kind: "leaf",
+      content: "fallback summary value",
+      tokenCount: 2,
+    });
+
+    const results = await store.searchSummaries({
+      conversationId: convId,
+      query: "fallback",
+      mode: "full_text",
+      since: new Date("2000-01-01T00:00:00.000Z"),
+      before: new Date("2100-01-01T00:00:00.000Z"),
+    });
+    expect(results).toHaveLength(1);
+    expect(results[0].snippet).toContain("fallback");
+  });
+
+  it("returns no LIKE results for an empty query", async () => {
+    await expect(makeStore(makeDb()).searchSummaries({ query: "", mode: "full_text" }))
+      .resolves.toEqual([]);
+  });
+
+  it("applies every filter to regex summary searches", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    const convId = await makeConversation(db);
+    await store.insertSummary({
+      summaryId: "summary-regex-filters",
+      conversationId: convId,
+      kind: "leaf",
+      content: "bounded summary value",
+      tokenCount: 2,
+    });
+    expect(await store.searchSummaries({
+      conversationId: convId,
+      query: "bounded",
+      mode: "regex",
+      since: new Date("2000-01-01T00:00:00.000Z"),
+      before: new Date("2100-01-01T00:00:00.000Z"),
+    })).toHaveLength(1);
+  });
+
+  it("deduplicates a shared descendant in a diamond subtree", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    const convId = await makeConversation(db);
+    for (const summaryId of ["diamond-root", "diamond-left", "diamond-right", "diamond-leaf"]) {
+      await store.insertSummary({
+        summaryId,
+        conversationId: convId,
+        kind: "condensed",
+        content: summaryId,
+        tokenCount: 1,
+      });
+    }
+    await store.linkSummaryToParents("diamond-left", ["diamond-root"]);
+    await store.linkSummaryToParents("diamond-right", ["diamond-root"]);
+    await store.linkSummaryToParents("diamond-leaf", ["diamond-left", "diamond-right"]);
+
+    const subtree = await store.getSummarySubtree("diamond-root");
+    expect(subtree.filter((row) => row.summaryId === "diamond-leaf")).toHaveLength(1);
+  });
+
+  it("rolls back context replacement failures", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    const convId = await makeConversation(db);
+    const conversations = new ConversationStore(db, { fts5Available: false });
+    const message = await conversations.createMessage({
+      conversationId: convId,
+      seq: 1,
+      role: "user",
+      content: "keep after rollback",
+      tokenCount: 1,
+    });
+    await store.appendContextMessage(convId, message.messageId);
+
+    await expect(store.replaceContextRangeWithSummary({
+      conversationId: convId,
+      startOrdinal: 0,
+      endOrdinal: 0,
+      summaryId: "missing-summary",
+    })).rejects.toThrow();
+    expect(await store.getContextItems(convId)).toHaveLength(1);
+  });
+});

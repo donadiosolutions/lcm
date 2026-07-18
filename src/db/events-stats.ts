@@ -60,26 +60,26 @@ export function collectEventStats(options: EventStatsOptions = {}): EventStats {
   };
 
   for (const sidecar of collectEventSidecars(scanOptions)) {
-    result.sidecars = (result.sidecars ?? 0) + 1;
+    result.sidecars = result.sidecars! + 1;
     if (sidecar.pruned) {
-      result.prunedSidecars = (result.prunedSidecars ?? 0) + 1;
+      result.prunedSidecars = result.prunedSidecars! + 1;
       continue;
     }
     if (sidecar.scanSkipped) {
-      result.scanSkipped = (result.scanSkipped ?? 0) + 1;
+      result.scanSkipped = result.scanSkipped! + 1;
       continue;
     }
     result.captured += sidecar.captured;
     result.unprocessed += sidecar.unprocessed;
     if (sidecar.scanError) {
-      result.scanErrors = (result.scanErrors ?? 0) + 1;
+      result.scanErrors = result.scanErrors! + 1;
     } else {
       result.errors += sidecar.errors;
     }
     if (sidecar.unprocessed > 0) {
-      result.sidecarsWithUnprocessed = (result.sidecarsWithUnprocessed ?? 0) + 1;
+      result.sidecarsWithUnprocessed = result.sidecarsWithUnprocessed! + 1;
       if (sidecar.metadataMissing) {
-        result.orphanedSidecarsWithUnprocessed = (result.orphanedSidecarsWithUnprocessed ?? 0) + 1;
+        result.orphanedSidecarsWithUnprocessed = result.orphanedSidecarsWithUnprocessed! + 1;
       }
     }
     if (sidecar.lastCapture && (!result.lastCapture || sidecar.lastCapture > result.lastCapture)) {
@@ -102,23 +102,23 @@ export function collectDetailedEventStats(options: EventStatsOptions = {}): Deta
   };
 
   for (const sidecar of collectEventSidecars({ ...scanOptions, includeRecentErrors: true })) {
-    result.sidecars = (result.sidecars ?? 0) + 1;
+    result.sidecars = result.sidecars! + 1;
     if (sidecar.pruned) {
-      result.prunedSidecars = (result.prunedSidecars ?? 0) + 1;
+      result.prunedSidecars = result.prunedSidecars! + 1;
     } else if (sidecar.scanSkipped) {
-      result.scanSkipped = (result.scanSkipped ?? 0) + 1;
+      result.scanSkipped = result.scanSkipped! + 1;
     } else {
       result.captured += sidecar.captured;
       result.unprocessed += sidecar.unprocessed;
       if (sidecar.scanError) {
-        result.scanErrors = (result.scanErrors ?? 0) + 1;
+        result.scanErrors = result.scanErrors! + 1;
       } else {
         result.errors += sidecar.errors;
       }
       if (sidecar.unprocessed > 0) {
-        result.sidecarsWithUnprocessed = (result.sidecarsWithUnprocessed ?? 0) + 1;
+        result.sidecarsWithUnprocessed = result.sidecarsWithUnprocessed! + 1;
         if (sidecar.metadataMissing) {
-          result.orphanedSidecarsWithUnprocessed = (result.orphanedSidecarsWithUnprocessed ?? 0) + 1;
+          result.orphanedSidecarsWithUnprocessed = result.orphanedSidecarsWithUnprocessed! + 1;
         }
       }
       if (sidecar.lastCapture && (!result.lastCapture || sidecar.lastCapture > result.lastCapture)) {
