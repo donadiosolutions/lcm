@@ -4,7 +4,6 @@ import {
   resolveBinaryPath,
   install,
   ensureLcmMd,
-  waitForHealth,
   REQUIRED_HOOKS,
   type ServiceDeps,
 } from "../../installer/install.js";
@@ -212,83 +211,6 @@ describe("resolveBinaryPath", () => {
       spawnSync: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from("/bin/lcm") }),
       existsSync: vi.fn().mockImplementation((path: string) => path === "/opt/homebrew/bin/lcm"),
     })).toBe("/opt/homebrew/bin/lcm");
-  });
-});
-
-describe("waitForHealth", () => {
-  it("returns immediately for a healthy response", async () => {
-    await expect(waitForHealth("http://localhost/health", 10, vi.fn().mockResolvedValue({ ok: true }) as any))
-      .resolves.toBe(true);
-  });
-
-  it("retries failed and throwing responses against a monotonic deadline", async () => {
-    vi.useFakeTimers();
-    const wallClock = vi.spyOn(Date, "now").mockReturnValue(-1_000_000_000);
-    const fetchFn = vi.fn()
-      .mockRejectedValueOnce(new Error("offline"))
-      .mockResolvedValue({ ok: false });
-    try {
-      const result = waitForHealth("http://localhost/health", 1000, fetchFn as any);
-      await vi.advanceTimersByTimeAsync(1000);
-      await expect(result).resolves.toBe(false);
-      expect(fetchFn).toHaveBeenCalledTimes(2);
-    } finally {
-      wallClock.mockRestore();
-      vi.useRealTimers();
-    }
-  });
-
-  it("bounds the final retry sleep to the remaining deadline", async () => {
-    vi.useFakeTimers();
-    const fetchFn = vi.fn().mockResolvedValue({ ok: false });
-    try {
-      let settled = false;
-      const result = waitForHealth("http://localhost/health", 750, fetchFn as any)
-        .finally(() => { settled = true; });
-
-      await vi.advanceTimersByTimeAsync(749);
-      expect(settled).toBe(false);
-      await vi.advanceTimersByTimeAsync(1);
-      await expect(result).resolves.toBe(false);
-      expect(fetchFn).toHaveBeenCalledTimes(2);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("does not sleep after a request consumes the remaining deadline", async () => {
-    const monotonicClock = vi.spyOn(performance, "now")
-      .mockReturnValueOnce(0)
-      .mockReturnValueOnce(0)
-      .mockReturnValueOnce(10);
-    const timer = vi.spyOn(globalThis, "setTimeout");
-    try {
-      await expect(waitForHealth(
-        "http://localhost/health",
-        10,
-        vi.fn().mockResolvedValue({ ok: false }) as any,
-      )).resolves.toBe(false);
-      expect(timer).not.toHaveBeenCalled();
-    } finally {
-      timer.mockRestore();
-      monotonicClock.mockRestore();
-    }
-  });
-
-  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
-    "rejects non-finite timeout %s",
-    async (timeoutMs) => {
-      await expect(waitForHealth("http://localhost/health", timeoutMs, vi.fn() as any))
-        .rejects.toThrow(new RangeError("timeoutMs must be a finite, non-negative number"));
-    },
-  );
-
-  it("rejects negative timeouts but permits an immediate zero timeout", async () => {
-    const fetchFn = vi.fn();
-    await expect(waitForHealth("http://localhost/health", -1, fetchFn as any))
-      .rejects.toThrow(new RangeError("timeoutMs must be a finite, non-negative number"));
-    await expect(waitForHealth("http://localhost/health", 0, fetchFn as any)).resolves.toBe(false);
-    expect(fetchFn).not.toHaveBeenCalled();
   });
 });
 

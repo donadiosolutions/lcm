@@ -132,31 +132,6 @@ async function pickSummarizer(deps: ServiceDeps): Promise<SummarizerConfig> {
   return { provider: "openai", model, apiKey: "", baseUrl };
 }
 
-// ── Health-wait ──
-
-export async function waitForHealth(
-  url: string,
-  timeoutMs: number = 10000,
-  fetchFn: typeof globalThis.fetch = globalThis.fetch,
-): Promise<boolean> {
-  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
-    throw new RangeError("timeoutMs must be a finite, non-negative number");
-  }
-
-  const deadline = performance.now() + timeoutMs;
-  while (performance.now() < deadline) {
-    try {
-      const res = await fetchFn(url);
-      if (res.ok) return true;
-    } catch {}
-
-    const remainingMs = deadline - performance.now();
-    if (remainingMs <= 0) break;
-    await new Promise(r => setTimeout(r, Math.min(500, remainingMs)));
-  }
-  return false;
-}
-
 const LCM_BLOCK_START = "<!-- lcm:start -->";
 const LCM_BLOCK_END = "<!-- lcm:end -->";
 

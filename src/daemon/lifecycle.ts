@@ -25,6 +25,7 @@ export type EnsureDaemonOptions = {
   _uid?: number;
   _killOverride?: KillProcess;
   _sleepOverride?: SleepFn;
+  _monotonicNowOverride?: () => number;
   _isProcessAliveOverride?: (pid: number) => boolean;
 };
 
@@ -504,11 +505,16 @@ function startViaUserSystemd(
 }
 
 export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDaemonResult> {
+  if (!Number.isFinite(opts.spawnTimeoutMs) || opts.spawnTimeoutMs < 0) {
+    throw new RangeError("spawnTimeoutMs must be a finite, non-negative number");
+  }
+
   const fetchFn = opts._fetchOverride ?? globalThis.fetch;
   const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
   const platform = opts._platform ?? osPlatform();
   const procRoot = opts._procRoot ?? "/proc";
   const sleepFn = opts._sleepOverride ?? sleep;
+  const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const isAlive = opts._isProcessAliveOverride ?? isProcessAlive;
   const killProcess = opts._killOverride ?? ((pid, signal) => {
     process.kill(pid, signal);
@@ -672,15 +678,17 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   // Step 4: Wait for health — only connect if version matches (if expected)
-  const deadline = Date.now() + opts.spawnTimeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = monotonicNow() + opts.spawnTimeoutMs;
+  while (monotonicNow() < deadline) {
     const h = await checkDaemonHealth(opts.port, fetchFn);
     const accepted = await daemonResult(h, true, startMethod, warning, warning !== undefined);
     if (accepted) {
       cleanupSystemdCredentials?.();
       return accepted;
     }
-    await sleepFn(300);
+    const remainingMs = deadline - monotonicNow();
+    if (remainingMs <= 0) break;
+    await sleepFn(Math.min(300, remainingMs));
   }
 
   const detachedWarning = detachedStart?.getWarning();
