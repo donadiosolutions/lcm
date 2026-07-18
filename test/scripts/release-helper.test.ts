@@ -24,6 +24,7 @@ interface HarnessOptions {
   originUrl?: string;
   originPushUrls?: string[];
   postPublishRemoteTagState?: string;
+  preTagNpmError?: string;
   preTagNpmVersion?: string;
   publishMaxWait?: string;
   remoteTagState?: string;
@@ -212,6 +213,10 @@ if [[ "$1" == "view" ]]; then
       printf '%s\n' "$FAKE_PRETAG_NPM_VERSION"
       exit 0
     fi
+    if [[ -n "$FAKE_PRETAG_NPM_ERROR" ]]; then
+      printf '%s\n' "$FAKE_PRETAG_NPM_ERROR" >&2
+      exit 1
+    fi
     printf 'npm ERR! code E404\n' >&2
     exit 1
   fi
@@ -250,6 +255,7 @@ exit 0
         FAKE_ORIGIN_URL: options.originUrl ?? "git@github.com:donadiosolutions/lcm.git",
         FAKE_ORIGIN_PUSH_URLS: `${(options.originPushUrls ?? [options.originUrl ?? "git@github.com:donadiosolutions/lcm.git"]).join("\n")}\n`,
         FAKE_POST_PUBLISH_REMOTE_TAG_STATE: postPublishRemoteTagState,
+        FAKE_PRETAG_NPM_ERROR: options.preTagNpmError ?? "",
         FAKE_PRETAG_NPM_VERSION: options.preTagNpmVersion ?? "",
         FAKE_REMOTE_TAG_STATE: remoteTagState,
         FAKE_REAL_SLEEP: String(options.realSleep ?? false),
@@ -277,6 +283,15 @@ exit 0
 const signedMatchingTag = `${tagObjectSha} ${mergeSha} tag signed ${tag}`;
 
 describe("manual release helper step 8", () => {
+  it("rejects numeric version components outside npm's safe-integer range", () => {
+    const result = runRelease({ version: "9007199254740992.1.1" });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("within npm's JavaScript safe-integer range");
+    expect(result.calls).toEqual([]);
+  });
+
   it("creates and pushes a signed annotated tag at the exact merge SHA", () => {
     const result = runRelease();
 
@@ -428,6 +443,17 @@ describe("manual release helper step 8", () => {
     expect(result.stderr).toContain(`${version} is already published to npm`);
     expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
     expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
+  });
+
+  it("reports a bounded diagnostic when the pre-tag npm query fails", () => {
+    const registryDetail = `registry-secret-detail-${"x".repeat(10_000)}`;
+    const result = runRelease({ preTagNpmError: registryDetail });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("verify registry access and retry");
+    expect(result.stderr).not.toContain(registryDetail);
+    expect(result.stderr.length).toBeLessThan(500);
+    expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
   });
 
   it.each([

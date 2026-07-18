@@ -66,6 +66,13 @@ if ! [[ "$VERSION" =~ $SEMVER_REGEX ]]; then
   echo "Usage: $0 <version> [--from-step N]"
   exit 1
 fi
+if ! node -e '
+  const parts = process.argv[1].split(".");
+  process.exit(parts.every((part) => Number.isSafeInteger(Number(part))) ? 0 : 1);
+' "$VERSION"; then
+  echo "Invalid version '$VERSION'. Each numeric component must be within npm's JavaScript safe-integer range."
+  exit 1
+fi
 
 # ─── Repo root ───────────────────────────────────────────────────────────────
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || \
@@ -443,8 +450,8 @@ if run_step 8; then
     NPM_OUT=$(npm view "$PACKAGE_NAME@$VERSION" version 2>&1) || NPM_STATUS=$?
     if [[ "$NPM_STATUS" -eq 0 ]]; then
       err "$VERSION is already published to npm for $PACKAGE_NAME, but origin has no $TAG tag; refusing to associate an existing artifact with a new release tag."
-    elif ! echo "$NPM_OUT" | grep -qiE 'E404|404 Not Found'; then
-      err "Failed to query npm for $PACKAGE_NAME@$VERSION before creating $TAG: $NPM_OUT"
+    elif ! printf '%s\n' "$NPM_OUT" | grep -qiE 'E404|404 Not Found'; then
+      err "Failed to query npm for $PACKAGE_NAME@$VERSION before creating $TAG; verify registry access and retry."
     fi
   fi
 
