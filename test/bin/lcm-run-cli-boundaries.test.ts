@@ -1,0 +1,491 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Command } from "commander";
+
+const state = vi.hoisted(() => ({
+  exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
+  ensureDaemon: vi.fn(async () => ({ connected: true, spawned: false, restartedForParent: false, pid: 42 })),
+  restartDaemon: vi.fn(async () => ({ connected: true, restarted: true, spawned: false, pid: 42 })),
+  createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }) })),
+  post: vi.fn(async () => ({ processed: 1, promoted: 1 })),
+  get: vi.fn(async () => ({ totalConnections: 1, activeConnections: 0, idleConnections: 1, connections: [] })),
+  health: vi.fn(async () => true),
+  loadConfig: vi.fn(() => ({
+    daemon: { port: 3737 },
+    llm: {
+      provider: "openai", apiMode: "responses", requestTimeoutMs: 1000,
+      retry: { maxAttempts: 2, initialDelayMs: 1, maxDelayMs: 2, multiplier: 2 },
+    },
+    compaction: { autoCompactMinTokens: 1 },
+  })),
+  fileText: "{}",
+  packageVersion: "1.4.0" as unknown,
+  readError: undefined as unknown,
+  files: new Map<string, string>(),
+  exists: new Set<string>(),
+  entries: [] as Array<{ name: string; isDirectory: () => boolean }>,
+  mapList: vi.fn(() => ({ hash: { canonical: "/canonical", aliases: ["/alias"] } })),
+  mapShow: vi.fn(() => ({ hash: "hash", entry: { canonical: "/canonical", aliases: ["/alias"] } })),
+  mapAdd: vi.fn(() => ({ hash: "hash", warning: "already mapped" })),
+  mapRemove: vi.fn(() => ({ hash: "hash", removed: true })),
+  installConnector: vi.fn(() => ({ path: "/hook", requiresRestart: false })),
+  removeConnector: vi.fn(() => true),
+  installed: [] as Array<{ agentId: string; type: string; path: string }>,
+  batchResult: { compacted: 1, failures: 0 },
+  batchPatch: { lastResult: { ok: true } } as Record<string, unknown>,
+  portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
+  importResult: { imported: 1, skipped: 0 },
+  importPatch: { lastResult: { ok: true } } as Record<string, unknown>,
+  renderer: { start: vi.fn(), stop: vi.fn(), sessionDone: vi.fn(), printSummary: vi.fn() },
+  writeFile: vi.fn(), unlink: vi.fn(), mkdir: vi.fn(),
+  dispatchHook: vi.fn(async () => ({ stdout: "", exitCode: 0 })),
+}));
+
+const fakeStdin = vi.hoisted(() => ({ isTTY: true, destroy: vi.fn(), on: vi.fn() }));
+
+vi.mock("node:process", async importOriginal => ({
+  ...(await importOriginal<typeof import("node:process")>()),
+  exit: state.exit,
+  stdin: fakeStdin,
+}));
+vi.mock("node:fs", async importOriginal => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
+  realpathSync: vi.fn((path: unknown) => String(path)),
+  readFileSync: vi.fn((path: unknown) => {
+    const key = String(path);
+    if (key.endsWith("package.json")) return JSON.stringify({ version: state.packageVersion });
+    if (state.readError !== undefined) throw state.readError;
+    return state.files.get(key) ?? state.fileText;
+  }),
+  existsSync: vi.fn((path: unknown) => state.exists.has(String(path))),
+  readdirSync: vi.fn(() => state.entries),
+  mkdirSync: state.mkdir,
+  writeFileSync: state.writeFile,
+  unlinkSync: state.unlink,
+}));
+vi.mock("../../src/runtime-paths.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/runtime-paths.js")>()),
+  configPath: () => "/lcm/config.json", daemonPidPath: () => "/lcm/daemon.pid",
+  daemonTokenPath: () => "/lcm/daemon.token", lcmHomeDir: () => "/lcm",
+  migrateLegacyHomeIfNeeded: vi.fn(), projectsDir: () => "/lcm/projects",
+}));
+vi.mock("../../src/daemon/config.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/daemon/config.js")>()), loadDaemonConfig: state.loadConfig,
+}));
+vi.mock("../../src/daemon/lifecycle.js", () => ({ ensureDaemon: state.ensureDaemon, restartDaemon: state.restartDaemon }));
+vi.mock("../../src/daemon/client.js", () => ({ DaemonClient: class { post = state.post; get = state.get; health = state.health; } }));
+vi.mock("../../src/daemon/server.js", () => ({ createDaemon: state.createDaemon }));
+vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: vi.fn() }));
+vi.mock("../../src/cli-help.js", () => ({ printHelp: vi.fn() }));
+vi.mock("../../src/project-map.js", () => ({
+  listProjectMapEntries: state.mapList, showProjectMapEntry: state.mapShow,
+  addProjectAlias: state.mapAdd, removeProjectAlias: state.mapRemove,
+}));
+vi.mock("../../src/config-manager.js", () => ({
+  getConfigValue: vi.fn(() => "value"), formatConfigValue: vi.fn((value: unknown) => String(value)),
+  normalizeConfigPath: vi.fn((path: string) => path), setConfigValue: vi.fn(() => "stored"),
+}));
+vi.mock("../../src/batch-compact.js", () => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void }) => {
+  opts.onProgress?.(state.batchPatch); return state.batchResult;
+}) }));
+vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((value: Record<string, unknown>) => ({ ...value })) }));
+vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
+  start = state.renderer.start; stop = state.renderer.stop;
+  sessionDone = state.renderer.sessionDone; printSummary = state.renderer.printSummary;
+} }));
+vi.mock("../../src/hooks/dispatch.js", () => ({ dispatchHook: state.dispatchHook }));
+vi.mock("../../src/connectors/registry.js", () => ({
+  AGENTS: [{ id: "codex", name: "Codex", category: "agent", defaultTypes: ["hook", "mcp"], supportedTypes: ["hook", "mcp"] }],
+  findAgent: vi.fn((name: string) => name === "codex" ? ({ id: "codex", name: "Codex" }) : undefined),
+}));
+vi.mock("../../src/connectors/installer.js", () => ({
+  listConnectors: vi.fn(() => state.installed), installConnector: state.installConnector, removeConnector: state.removeConnector,
+}));
+vi.mock("../../src/import.js", () => ({
+  cwdToProjectHash: vi.fn(() => "cwd-hash"), findSessionFiles: vi.fn(() => ["one", "two"]),
+  importSessions: vi.fn(async (_client: unknown, opts: { onProgress?: (patch: unknown) => void }) => {
+    opts.onProgress?.(state.importPatch); return state.importResult;
+  }),
+}));
+vi.mock("../../src/codex-transcript.js", () => ({ findAllCodexTranscripts: vi.fn(() => ["codex-one"]) }));
+vi.mock("../../src/import-summary.js", () => ({ printImportSummary: vi.fn() }));
+vi.mock("../../src/portable-knowledge.js", () => ({
+  exportKnowledge: vi.fn(async () => state.portableResult), importKnowledge: vi.fn(async () => state.portableResult),
+}));
+vi.mock("../../src/mcp/server.js", () => ({ startMcpServer: vi.fn(async () => undefined) }));
+vi.mock("../../src/stats.js", () => ({ collectStats: vi.fn(() => ({})), printStats: vi.fn() }));
+vi.mock("../../src/doctor/doctor.js", () => ({ runDoctor: vi.fn(async () => []), printResults: vi.fn() }));
+vi.mock("../../src/diagnose.js", () => ({ diagnose: vi.fn(async () => ({})), formatDiagnoseResult: vi.fn(() => "ok") }));
+vi.mock("../../src/sensitive.js", () => ({ handleSensitive: vi.fn(async () => ({ stdout: "", exitCode: 0 })) }));
+vi.mock("../../installer/install.js", () => ({ install: vi.fn(async () => undefined) }));
+vi.mock("../../installer/uninstall.js", () => ({ uninstall: vi.fn(async () => undefined) }));
+vi.mock("../../installer/dry-run-deps.js", () => ({ DryRunServiceDeps: class {} }));
+
+const {
+  compactFailureExitCode, registerMapCommand, registerMemoryCommands,
+  resolveCompactRequestPolicyOverride, resolveManualCompactProvider, runCli, withHookOverrides,
+} = await import("../../bin/lcm.js");
+
+type ActionHandler = (...args: any[]) => unknown;
+
+const stdoutIsTTYDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+
+function captureActions(register: (program: Command) => void): Map<string, ActionHandler> {
+  const captured = new Map<string, ActionHandler>();
+  const original = Command.prototype.action;
+  const spy = vi.spyOn(Command.prototype, "action").mockImplementation(function (this: Command, handler: ActionHandler) {
+    captured.set(this.name(), handler);
+    return original.call(this, handler);
+  });
+  try { register(new Command()); } finally { spy.mockRestore(); }
+  return captured;
+}
+
+async function captureRunCliActions(): Promise<Map<string, ActionHandler>> {
+  const captured = new Map<string, ActionHandler>();
+  const original = Command.prototype.action;
+  const spy = vi.spyOn(Command.prototype, "action").mockImplementation(function (this: Command, handler: ActionHandler) {
+    captured.set(`${this.parent?.name() ?? "root"}/${this.name()}`, handler);
+    return original.call(this, handler);
+  });
+  try { await invoke([]); } finally { spy.mockRestore(); }
+  return captured;
+}
+
+async function invoke(args: string[]): Promise<Error | undefined> {
+  try { await runCli(["node", "lcm", ...args]); return undefined; }
+  catch (error) { return error instanceof Error ? error : new Error(String(error)); }
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  fakeStdin.isTTY = true;
+  state.ensureDaemon.mockResolvedValue({ connected: true, spawned: false, restartedForParent: false, pid: 42 });
+  state.restartDaemon.mockResolvedValue({ connected: true, restarted: true, spawned: false, pid: 42 });
+  state.loadConfig.mockReturnValue({
+    daemon: { port: 3737 },
+    llm: { provider: "openai", apiMode: "responses", requestTimeoutMs: 1000, retry: { maxAttempts: 2, initialDelayMs: 1, maxDelayMs: 2, multiplier: 2 } },
+    compaction: { autoCompactMinTokens: 1 },
+  });
+  state.files.clear(); state.exists.clear(); state.entries = []; state.readError = undefined;
+  state.fileText = "{}"; state.packageVersion = "1.4.0"; state.installed = []; state.batchResult = { compacted: 1, failures: 0 };
+  state.batchPatch = { lastResult: { ok: true } };
+  state.importPatch = { lastResult: { ok: true } };
+  state.health.mockResolvedValue(true);
+  state.portableResult = { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false };
+  state.mapList.mockReturnValue({ hash: { canonical: "/canonical", aliases: ["/alias"] } });
+  state.mapShow.mockReturnValue({ hash: "hash", entry: { canonical: "/canonical", aliases: ["/alias"] } });
+  state.mapAdd.mockReturnValue({ hash: "hash", warning: "already mapped" });
+  state.mapRemove.mockReturnValue({ hash: "hash", removed: true });
+  state.installConnector.mockReturnValue({ path: "/hook", requiresRestart: false });
+  state.removeConnector.mockReturnValue(true);
+  process.exitCode = undefined;
+});
+
+afterEach(() => {
+  process.exitCode = undefined;
+  if (stdoutIsTTYDescriptor) Object.defineProperty(process.stdout, "isTTY", stdoutIsTTYDescriptor);
+  else Reflect.deleteProperty(process.stdout, "isTTY");
+  vi.restoreAllMocks();
+});
+
+describe("runCli map boundaries", () => {
+  it("covers nested help callbacks through the registration seam", async () => {
+    const actions = captureActions(registerMapCommand);
+    await expect(actions.get("map")!({ help: true })).rejects.toThrow("exit:0");
+    await expect(actions.get("map")!({})).rejects.toThrow("exit:1");
+    for (const name of ["list", "show", "add", "remove"]) {
+      const handler = actions.get(name)!;
+      const args = name === "list" ? [{ help: true }] : name === "show" ? [undefined, { help: true }] : ["/alias", { help: true }];
+      await expect(Promise.resolve().then(() => handler(...args))).rejects.toThrow("exit:0");
+    }
+  });
+
+  it("covers pure compact option boundary combinations", () => {
+    const config = state.loadConfig();
+    expect(resolveCompactRequestPolicyOverride(config as never, { timeoutMs: "250" })).toMatchObject({ requestTimeoutMs: 250 });
+    expect(resolveCompactRequestPolicyOverride(config as never, { retryMaxAttempts: "2" })).toMatchObject({ retry: { maxAttempts: 2 } });
+    expect(() => resolveCompactRequestPolicyOverride({ ...config, llm: { ...config.llm, provider: "claude-process" } } as never, { retryMaxAttempts: "2" }))
+      .toThrow("timeout and retry overrides require");
+    expect(compactFailureExitCode(0)).toBeUndefined();
+    expect(compactFailureExitCode(2)).toBe(1);
+    expect(resolveManualCompactProvider("auto")).toBe("claude-process");
+    expect(resolveManualCompactProvider("openai")).toBe("openai");
+    expect(withHookOverrides("{}", "other", undefined, undefined, undefined)).toBe("{}");
+    expect(withHookOverrides("{}", "codex", "low", {
+      requestTimeoutMs: 100, retry: { maxAttempts: 2, initialDelayMs: 3, maxDelayMs: 4, multiplier: 2 },
+    }, false)).toContain('"fast_mode":false');
+  });
+
+  it("renders every map operation in text and JSON forms", async () => {
+    expect(await invoke(["map", "list"])).toBeUndefined();
+    expect(await invoke(["map", "list", "--json"])).toBeUndefined();
+    expect(await invoke(["map", "show", "/alias"])).toBeUndefined();
+    expect(await invoke(["map", "show", "--json"])).toBeUndefined();
+    expect(await invoke(["map", "add", "/new", "--canonical", "/canonical"])).toBeUndefined();
+    expect(await invoke(["map", "add", "/new", "--hash", "hash", "--json"])).toBeUndefined();
+    state.mapRemove.mockReturnValueOnce({ hash: "hash", removed: false });
+    expect(await invoke(["map", "remove", "/missing"])).toBeUndefined();
+    expect(await invoke(["map", "remove", "/alias", "--json"])).toBeUndefined();
+  });
+
+  it("reports Error and primitive map failures in text and JSON", async () => {
+    state.mapList.mockImplementationOnce(() => { throw new Error("list failed"); });
+    expect((await invoke(["map", "list"]))?.message).toBe("exit:1");
+    state.mapShow.mockImplementationOnce(() => { throw "show failed"; });
+    expect((await invoke(["map", "show", "--json"]))?.message).toBe("exit:1");
+    state.mapAdd.mockImplementationOnce(() => { throw new Error("add failed"); });
+    expect((await invoke(["map", "add", "/x"]))?.message).toBe("exit:1");
+    state.mapRemove.mockImplementationOnce(() => { throw new Error("remove failed"); });
+    expect((await invoke(["map", "remove", "/x"]))?.message).toBe("exit:1");
+  });
+
+  it("covers malformed memory option shapes through registration callbacks", async () => {
+    const actions = captureActions(registerMemoryCommands);
+    await expect(actions.get("search")!("query", { limit: "5", layer: "episodic", tag: "tag" })).resolves.toBeUndefined();
+    await expect(actions.get("search")!("query", { limit: undefined, layer: undefined, tag: undefined })).resolves.toBeUndefined();
+    await expect(actions.get("grep")!("query", { mode: undefined, scope: undefined, since: "" })).resolves.toBeUndefined();
+    await expect(actions.get("describe")!("node", { help: true })).rejects.toThrow("exit:0");
+    await expect(actions.get("expand")!("node", { help: true })).rejects.toThrow("exit:0");
+    await expect(actions.get("expand")!("node", { depth: undefined })).resolves.toBeUndefined();
+    await expect(actions.get("store")!("text", { help: true })).rejects.toThrow("exit:0");
+    await expect(actions.get("store")!("text", { tag: "not-an-array" })).resolves.toBeUndefined();
+  });
+});
+
+describe("runCli lifecycle and connector boundaries", () => {
+  it("ignores timeout after stdin end has resolved", async () => {
+    fakeStdin.isTTY = false;
+    let timeout: (() => void) | undefined;
+    let end: (() => void) | undefined;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void) => {
+      timeout = callback;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    vi.spyOn(globalThis, "clearTimeout").mockImplementation(() => undefined);
+    fakeStdin.on.mockImplementation((event: string, callback: () => void) => {
+      if (event === "end") end = callback;
+      return fakeStdin;
+    });
+    const pending = invoke(["restore"]);
+    await vi.waitFor(() => expect(end).toBeDefined());
+    end!();
+    expect((await pending)?.message).toBe("exit:0");
+    timeout!();
+  });
+
+  it("ignores stdin end after the timeout has resolved", async () => {
+    fakeStdin.isTTY = false;
+    let timeout: (() => void) | undefined;
+    let end: (() => void) | undefined;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void) => {
+      timeout = callback;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    fakeStdin.on.mockImplementation((event: string, callback: () => void) => {
+      if (event === "end") end = callback;
+      return fakeStdin;
+    });
+    const pending = invoke(["restore"]);
+    await vi.waitFor(() => expect(timeout).toBeDefined());
+    timeout!();
+    expect((await pending)?.message).toBe("exit:0");
+    end!();
+  });
+
+  it("covers custom help callbacks through captured Commander actions", async () => {
+    const captured = await captureRunCliActions();
+
+    const helpCases: Array<[string, unknown[]]> = [
+      ["daemon/start", [{ help: true }]], ["daemon/restart", [{ help: true }]], ["root/daemon", [{ help: true }]],
+      ["config/get", ["x", { help: true }]], ["config/set", ["x", "y", { help: true }]],
+      ["lcm/compact", [{ help: true }]], ["lcm/restore", [{ help: true }]], ["lcm/session-end", [{ help: true }]],
+      ["lcm/user-prompt", [{ help: true }]], ["lcm/post-tool", [{ help: true }]], ["lcm/session-snapshot", [{ help: true }]],
+      ["lcm/mcp", [{ help: true }]], ["lcm/status", [{ help: true }]], ["lcm/stats", [{ help: true }]],
+      ["lcm/doctor", [{ help: true }]], ["lcm/diagnose", [{ help: true }]], ["lcm/sensitive", [[], { help: true }]],
+      ["lcm/import", [{ help: true }]], ["lcm/promote", [{ help: true }]], ["lcm/export", [{ help: true }]],
+      ["lcm/import-knowledge", ["x", { help: true }]],
+    ];
+    for (const [key, args] of helpCases) {
+      await expect(Promise.resolve().then(() => captured.get(key)!(...args))).rejects.toThrow("exit:0");
+    }
+  });
+
+  it("covers daemon PID, warning, cleanup, and signal branches", async () => {
+    const on = vi.spyOn(process, "on").mockImplementation((() => process) as typeof process.on);
+    state.ensureDaemon.mockResolvedValueOnce({ connected: true, spawned: false, restartedForParent: true, pid: 7, warning: "moved" });
+    expect((await invoke(["daemon", "start"]))?.message).toBe("exit:0");
+    state.ensureDaemon.mockResolvedValueOnce({ connected: true, spawned: true, restartedForParent: false, pid: 8 });
+    expect((await invoke(["daemon", "start"]))?.message).toBe("exit:0");
+    state.restartDaemon.mockResolvedValueOnce({ connected: true, restarted: false, spawned: true, pid: 9, warning: "started" });
+    expect((await invoke(["daemon", "restart"]))?.message).toBe("exit:0");
+
+    state.files.set("/lcm/daemon.pid", String(process.pid));
+    expect(await invoke(["daemon", "start", "--foreground"])).toBeUndefined();
+    const exitHandler = on.mock.calls.find(([event]) => event === "exit")?.[1] as (() => void);
+    exitHandler();
+    expect(state.unlink).toHaveBeenCalledWith("/lcm/daemon.pid");
+    for (const signal of ["SIGTERM", "SIGINT"]) {
+      const handler = on.mock.calls.find(([event]) => event === signal)?.[1] as (() => void);
+      expect(() => handler()).toThrow("exit:0");
+    }
+
+    state.files.set("/lcm/daemon.pid", "someone-else");
+    await invoke(["daemon", "start", "--foreground"]);
+    const mismatchCleanup = on.mock.calls.filter(([event]) => event === "exit").at(-1)?.[1] as (() => void);
+    mismatchCleanup();
+  });
+
+  it("covers defaulted raw action options and empty service results", async () => {
+    const actions = await captureRunCliActions();
+    state.loadConfig.mockReturnValue({
+      daemon: undefined,
+      llm: { provider: "auto", apiMode: "responses", requestTimeoutMs: 1000, retry: { maxAttempts: 2, initialDelayMs: 1, maxDelayMs: 2, multiplier: 2 } },
+      compaction: { autoCompactMinTokens: 1 },
+    });
+
+    await expect(actions.get("root/daemon")!({})).resolves.toBeUndefined();
+    state.ensureDaemon.mockResolvedValueOnce({ connected: true, spawned: false, restartedForParent: false, pid: undefined });
+    await expect(actions.get("daemon/start")!({})).rejects.toThrow("exit:0");
+    state.restartDaemon.mockResolvedValueOnce({ connected: true, restarted: false, spawned: false, pid: undefined });
+    await expect(actions.get("daemon/restart")!({})).rejects.toThrow("exit:0");
+
+    state.batchResult = { compacted: 0, failures: 1 };
+    state.batchPatch = {};
+    await expect(actions.get("lcm/compact")!({})).resolves.toBeUndefined();
+    expect(process.exitCode).toBe(1);
+
+    state.importPatch = {};
+    await expect(actions.get("lcm/import")!({ provider: undefined })).resolves.toBeUndefined();
+    await expect(actions.get("lcm/promote")!({ all: true })).resolves.toBeUndefined();
+    await expect(actions.get("lcm/export")!({ all: true })).resolves.toBeUndefined();
+  });
+
+  it("covers omitted warnings, versions, defaults, and singular output", async () => {
+    state.packageVersion = 14;
+    const actions = await captureRunCliActions();
+    state.ensureDaemon.mockResolvedValueOnce({ connected: false, spawned: false, restartedForParent: false, pid: undefined });
+    await expect(actions.get("daemon/start")!({})).rejects.toThrow("exit:1");
+    state.restartDaemon.mockResolvedValueOnce({ connected: false, restarted: false, spawned: false, pid: undefined });
+    await expect(actions.get("daemon/restart")!({})).rejects.toThrow("exit:1");
+
+    state.mapAdd.mockReturnValueOnce({ hash: "hash" });
+    const mapActions = captureActions(registerMapCommand);
+    await expect(mapActions.get("add")!("/new", {})).resolves.toBeUndefined();
+    state.mapRemove.mockReturnValueOnce({ hash: "hash", removed: true });
+    await expect(mapActions.get("remove")!("/new", {})).resolves.toBeUndefined();
+
+    state.batchResult = { compacted: 1, failures: 0 };
+    state.post.mockResolvedValueOnce({ processed: 1, promoted: 1 });
+    await expect(actions.get("lcm/compact")!({ promote: true })).resolves.toBeUndefined();
+
+    state.health.mockResolvedValueOnce(false);
+    await expect(actions.get("lcm/status")!({ json: true })).resolves.toBeUndefined();
+    await expect(actions.get("lcm/doctor")!({ eventsMaxDbs: undefined })).rejects.toThrow("exit:0");
+    await expect(actions.get("connectors/list")!({ format: undefined })).resolves.toBeUndefined();
+
+    state.post.mockResolvedValueOnce({ promoted: 1, processedProjects: 1, skipped: 0, errors: 0, orphanedProjects: 0 });
+    await expect(actions.get("events/promote")!({ all: true })).resolves.toBeUndefined();
+    state.post.mockRejectedValueOnce("request failed");
+    await expect(actions.get("lcm/promote")!({ verbose: false })).resolves.toBeUndefined();
+  });
+
+  it("covers connector help, installed display, and installer errors", async () => {
+    state.installed = [{ agentId: "codex", type: "hook", path: "/hook" }];
+    expect(await invoke(["connectors", "list"])).toBeUndefined();
+    expect(await invoke(["connectors", "list", "--format", "json"])).toBeUndefined();
+    state.installConnector.mockImplementationOnce(() => { throw new Error("install failed"); });
+    expect((await invoke(["connectors", "install", "codex"]))?.message).toBe("exit:1");
+    state.removeConnector.mockImplementationOnce(() => { throw new Error("remove failed"); });
+    expect((await invoke(["connectors", "remove", "codex"]))?.message).toBe("exit:1");
+  });
+
+  it("covers nested connector callbacks which Commander cannot route", async () => {
+    const captured = new Map<string, ActionHandler>();
+    const original = Command.prototype.action;
+    const spy = vi.spyOn(Command.prototype, "action").mockImplementation(function (this: Command, handler: ActionHandler) {
+      if (["list", "install", "remove", "doctor"].includes(this.name())) captured.set(this.name(), handler);
+      return original.call(this, handler);
+    });
+    try { await invoke([]); } finally { spy.mockRestore(); }
+
+    await expect(captured.get("list")!({ help: true })).rejects.toThrow("exit:0");
+    await expect(captured.get("install")!("codex", { help: true })).rejects.toThrow("exit:0");
+    await expect(captured.get("remove")!("codex", { help: true })).rejects.toThrow("exit:0");
+    await expect(captured.get("doctor")!("codex", { help: true })).rejects.toThrow("exit:0");
+    await expect(captured.get("install")!("", {})).rejects.toThrow("exit:1");
+    await expect(captured.get("remove")!("", {})).rejects.toThrow("exit:1");
+  });
+});
+
+describe("runCli scanning and portable knowledge boundaries", () => {
+  it("covers compact TTY summary and all-project best-effort promotion", async () => {
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+    state.entries = [
+      { name: "file", isDirectory: () => false },
+      { name: "missing", isDirectory: () => true },
+      { name: "bad", isDirectory: () => true },
+      { name: "good", isDirectory: () => true },
+    ];
+    state.exists.add("/lcm/projects");
+    state.exists.add("/lcm/projects/bad/meta.json");
+    state.exists.add("/lcm/projects/good/meta.json");
+    state.files.set("/lcm/projects/bad/meta.json", "not json");
+    state.files.set("/lcm/projects/good/meta.json", JSON.stringify({ cwd: "/good" }));
+    state.post.mockRejectedValueOnce(new Error("best effort"));
+    expect(await invoke(["compact", "--all"])).toBeUndefined();
+    expect(state.renderer.printSummary).toHaveBeenCalled();
+  });
+
+  it("covers TTY all-provider import directory filtering", async () => {
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+    state.entries = [{ name: "file", isDirectory: () => false }, { name: "project", isDirectory: () => true }];
+    state.exists.add(`${process.env.HOME}/.claude/projects`);
+    expect(await invoke(["import", "--provider", "all", "--all"])).toBeUndefined();
+    expect(state.renderer.printSummary).toHaveBeenCalled();
+  });
+
+  it("covers verbose promotion successes, primitive failures, and plural summaries", async () => {
+    state.entries = [
+      { name: "file", isDirectory: () => false },
+      { name: "missing", isDirectory: () => true },
+      { name: "bad", isDirectory: () => true },
+      { name: "one", isDirectory: () => true },
+      { name: "two", isDirectory: () => true },
+    ];
+    state.exists.add("/lcm/projects");
+    for (const name of ["bad", "one", "two"]) state.exists.add(`/lcm/projects/${name}/meta.json`);
+    state.files.set("/lcm/projects/bad/meta.json", "bad json");
+    state.files.set("/lcm/projects/one/meta.json", JSON.stringify({ cwd: "/one" }));
+    state.files.set("/lcm/projects/two/meta.json", JSON.stringify({ cwd: "/two" }));
+    state.post.mockResolvedValueOnce({ processed: 2, promoted: 1, conversations: 2 }).mockRejectedValueOnce("failed");
+    expect(await invoke(["promote", "--all", "--verbose", "--dry-run"])).toBeUndefined();
+  });
+
+  it("covers all-project exports, generated slugs, metadata skips, and warnings", async () => {
+    state.entries = [
+      { name: "file", isDirectory: () => false },
+      { name: "missing", isDirectory: () => true },
+      { name: "bad", isDirectory: () => true },
+      { name: "one", isDirectory: () => true },
+      { name: "two", isDirectory: () => true },
+    ];
+    state.exists.add("/lcm/projects");
+    for (const name of ["bad", "one", "two"]) state.exists.add(`/lcm/projects/${name}/meta.json`);
+    state.files.set("/lcm/projects/bad/meta.json", "bad json");
+    state.files.set("/lcm/projects/one/meta.json", JSON.stringify({ cwd: "/a path/one" }));
+    state.files.set("/lcm/projects/two/meta.json", JSON.stringify({ cwd: "/two" }));
+    const portable = await import("../../src/portable-knowledge.js");
+    vi.mocked(portable.exportKnowledge).mockResolvedValueOnce({ exported: 2, entries: [] }).mockRejectedValueOnce(new Error("export failed"));
+    expect(await invoke(["export", "--all"])).toBeUndefined();
+  });
+
+  it("covers import result dry-run and rejection branches", async () => {
+    state.fileText = JSON.stringify({ version: 1, entries: [] });
+    state.portableResult = { exported: 0, imported: 0, skipped: 0, total: 2, dryRun: true };
+    expect(await invoke(["import-knowledge", "input.json"])).toBeUndefined();
+    const portable = await import("../../src/portable-knowledge.js");
+    vi.mocked(portable.importKnowledge).mockRejectedValueOnce(new Error("import failed"));
+    expect((await invoke(["import-knowledge", "input.json"]))?.message).toBe("exit:1");
+  });
+
+});

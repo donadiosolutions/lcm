@@ -86,6 +86,30 @@ describe("ensureCore", () => {
     await ensureCore(deps);
     expect(chmodSync).toHaveBeenCalledWith(deps.configPath, 0o600);
   });
+
+  it("continues when hardening a new config fails", async () => {
+    const deps = makeDeps({
+      chmodSync: vi.fn(() => { throw new Error("unsupported"); }),
+    });
+    const { ensureCore } = await import("../src/bootstrap.js");
+    await expect(ensureCore(deps)).resolves.toBeUndefined();
+  });
+
+  it("does not rewrite unchanged settings and ignores malformed settings", async () => {
+    const unchanged = makeDeps({
+      existsSync: vi.fn().mockReturnValue(true),
+      readFileSync: vi.fn().mockReturnValue("{}"),
+    });
+    const malformed = makeDeps({
+      existsSync: vi.fn().mockReturnValue(true),
+      readFileSync: vi.fn().mockReturnValue("{"),
+    });
+    const { ensureCore } = await import("../src/bootstrap.js");
+    await ensureCore(unchanged);
+    await expect(ensureCore(malformed)).resolves.toBeUndefined();
+    expect(unchanged.writeFileSync).not.toHaveBeenCalled();
+    expect(malformed.writeFileSync).not.toHaveBeenCalled();
+  });
 });
 
 describe("ensureBootstrapped", () => {
@@ -113,5 +137,16 @@ describe("ensureBootstrapped", () => {
       expect.objectContaining({ enforceUserManagerParent: true }),
     );
     expect(writeFlag).toHaveBeenCalled();
+  });
+
+  it("continues when flag inspection and writing fail", async () => {
+    const coreDeps = makeDeps();
+    const { ensureBootstrapped } = await import("../src/bootstrap.js");
+    await expect(ensureBootstrapped("unsafe/session:id", {
+      ...coreDeps,
+      flagExists: vi.fn(() => { throw new Error("unreadable"); }),
+      writeFlag: vi.fn(() => { throw new Error("unwritable"); }),
+    })).resolves.toBeUndefined();
+    expect(coreDeps.ensureDaemon).toHaveBeenCalled();
   });
 });

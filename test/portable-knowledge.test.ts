@@ -138,6 +138,20 @@ describe("portable-knowledge — export", () => {
     expect(doc.entries[0].content).toBe("Entry one");
   });
 
+  it("scrubs secrets by default", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const outFile = join(makeTempDir(), "scrubbed.json");
+    seedProject(baseDir, cwd, [
+      { content: "token: sk-abcdefghijklmnopqrstuvwxyz123456", tags: ["secret"] },
+    ]);
+
+    await exportKnowledge(cwd, { output: outFile, _lcmBaseDir: baseDir });
+
+    const doc: ExportDocument = JSON.parse(readFileSync(outFile, "utf-8"));
+    expect(doc.entries[0].content).not.toContain("sk-abcdefghijklmnopqrstuvwxyz123456");
+  });
+
   it("exports canonical project knowledge when invoked from an alias", async () => {
     const baseDir = lcmHomeDir();
     const canonical = makeTempDir();
@@ -429,5 +443,36 @@ describe("portable-knowledge — import", () => {
 
     const exported: ExportDocument = JSON.parse(readFileSync(outFile, "utf-8"));
     expect(exported.entries[0].content).toBe("Round-trip test entry");
+  });
+
+  it("preserves an existing meta.json", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const { projDir } = seedProject(baseDir, cwd, []);
+    const metaPath = join(projDir, "meta.json");
+    writeFileSync(metaPath, JSON.stringify({ cwd, marker: "keep" }));
+
+    await importKnowledge(cwd, makeDoc([]), { _lcmBaseDir: baseDir });
+
+    expect(JSON.parse(readFileSync(metaPath, "utf-8"))).toEqual({ cwd, marker: "keep" });
+  });
+
+  it.each([
+    ["Error objects", new Error("failed entry"), "failed entry"],
+    ["non-Error values", "plain failure", "plain failure"],
+  ])("records %s thrown while importing an entry", async (_label, thrown, message) => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const entry = {
+      get content(): string { throw thrown; },
+      tags: [],
+      confidence: 1,
+      createdAt: new Date().toISOString(),
+      sessionId: "source-session",
+    };
+
+    const result = await importKnowledge(cwd, makeDoc([entry]), { _lcmBaseDir: baseDir });
+
+    expect(result).toMatchObject({ total: 1, imported: 0, skipped: 1, errors: [message] });
   });
 });
