@@ -13,12 +13,16 @@ vi.mock("node:fs", async importOriginal => ({
 import { ensureDaemon } from "../../src/daemon/lifecycle.js";
 
 const saved = { anthropic: process.env.ANTHROPIC_API_KEY, openai: process.env.OPENAI_API_KEY, lcm: process.env.LCM_SUMMARY_API_KEY };
+const originalGetuid = Object.getOwnPropertyDescriptor(process, "getuid");
 beforeEach(() => {
+  Object.defineProperty(process, "getuid", { configurable: true, value: vi.fn(() => 1000) });
   vi.clearAllMocks(); fs.exists.mockImplementation((path: string) => path.endsWith("daemon.token")); fs.mkdtemp.mockReturnValue("/run/user/1000/lcm-systemd-credentials-test");
   fs.stat.mockReturnValue({ isDirectory: () => true, mtimeMs: 0 }); fs.readdir.mockReturnValue([]);
   delete process.env.ANTHROPIC_API_KEY; delete process.env.OPENAI_API_KEY; delete process.env.LCM_SUMMARY_API_KEY;
 });
 afterEach(() => {
+  if (originalGetuid) Object.defineProperty(process, "getuid", originalGetuid);
+  else Reflect.deleteProperty(process, "getuid");
   vi.restoreAllMocks();
   if (saved.anthropic === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = saved.anthropic;
   if (saved.openai === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = saved.openai;

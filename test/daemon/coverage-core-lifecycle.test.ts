@@ -45,7 +45,16 @@ describe("lifecycle procfs and parent warnings", () => {
     expect(readProcessParentPid(2, root)).toBeNull();
     expect(findUserSystemdPid({ procRoot: root, uid: 1000 })).toBe(3);
     expect(findUserSystemdPid({ procRoot: root, uid: 1000 })).toBe(3);
-    expect(findUserSystemdPid({ procRoot: root })).toBe(3);
+    const getuidDescriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    const getuid = vi.fn(() => 1000);
+    Object.defineProperty(process, "getuid", { configurable: true, value: getuid });
+    try {
+      expect(findUserSystemdPid({ procRoot: root })).toBe(3);
+      expect(getuid).toHaveBeenCalledOnce();
+    } finally {
+      if (getuidDescriptor) Object.defineProperty(process, "getuid", getuidDescriptor);
+      else Reflect.deleteProperty(process, "getuid");
+    }
     expect(findUserSystemdPid({ uid: 987_654 })).toBeNull();
 
     const noUidRoot = temp(); proc(noUidRoot, 90, "Name:\tsystemd\n", "systemd --user");
