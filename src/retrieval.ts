@@ -287,10 +287,6 @@ export class RetrievalEngine {
     if (depth <= 0) {
       return;
     }
-    if (result.truncated) {
-      return;
-    }
-
     const summary = await this.summaryStore.getSummary(summaryId);
     if (!summary) {
       return;
@@ -328,10 +324,6 @@ export class RetrievalEngine {
       const messageIds = await this.summaryStore.getSummaryMessages(summaryId);
 
       for (const msgId of messageIds) {
-        if (result.truncated) {
-          break;
-        }
-
         const msg = await this.conversationStore.getMessageById(msgId);
         if (!msg) {
           continue;

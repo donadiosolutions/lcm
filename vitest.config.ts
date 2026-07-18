@@ -15,8 +15,8 @@ export default defineConfig({
     coverage: {
       include: ["bin/**/*.ts", "installer/**/*.ts", "src/**/*.ts"],
       thresholds: {
-        lines: 80.22,
-        branches: 75.10,
+        lines: 84.52,
+        branches: 81.08,
         "src/scrub.ts": { lines: 100, branches: 100 },
         "src/transcript.ts": { lines: 100, branches: 100 },
         "src/llm/process-utils.ts": { lines: 100, branches: 100 },
@@ -45,6 +45,14 @@ export default defineConfig({
         "src/installer/**/*.ts": { lines: 100, branches: 100 },
         "src/llm/**/*.ts": { lines: 100, branches: 100 },
         "src/prompts/**/*.ts": { lines: 100, branches: 100 },
+        "src/batch-compact.ts": { lines: 100, branches: 100 },
+        "src/compaction.ts": { lines: 100, branches: 100 },
+        "src/expansion.ts": { lines: 100, branches: 100 },
+        "src/import-summary.ts": { lines: 100, branches: 100 },
+        "src/import.ts": { lines: 100, branches: 100 },
+        "src/large-files.ts": { lines: 100, branches: 100 },
+        "src/retrieval.ts": { lines: 100, branches: 100 },
+        "src/summarize.ts": { lines: 100, branches: 100 },
       },
     },
     projects: [

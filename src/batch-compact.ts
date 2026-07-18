@@ -79,10 +79,11 @@ export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?:
     if (!cwd) continue;
     if (!projectMatchesCwdFilter(entry.name, cwd, cwdFilter)) continue;
 
-    const db = getLcmConnection(dbPath);
     try {
-      if (!readOnly) runLcmMigrations(db);
-      const rows = db.prepare(`
+      const db = getLcmConnection(dbPath);
+      try {
+        if (!readOnly) runLcmMigrations(db);
+        const rows = db.prepare(`
         SELECT
           c.conversation_id,
           c.session_id,
@@ -102,20 +103,22 @@ export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?:
           AND (? OR COALESCE(s.sum_count, 0) = 0)
           AND COALESCE(m.raw_tokens, 0) >= ?
         ORDER BY COALESCE(m.raw_tokens, 0) DESC
-      `).all(replay ? 1 : 0, minTokens) as { conversation_id: number; session_id: string; messages: number; tokens: number; summaries: number }[];
+        `).all(replay ? 1 : 0, minTokens) as { conversation_id: number; session_id: string; messages: number; tokens: number; summaries: number }[];
 
-      for (const row of rows) {
-        results.push({
-          projectDir: projDir,
-          cwd,
-          conversationId: row.conversation_id,
-          sessionId: row.session_id,
-          messages: row.messages,
-          tokens: row.tokens,
-        });
+        for (const row of rows) {
+          results.push({
+            projectDir: projDir,
+            cwd,
+            conversationId: row.conversation_id,
+            sessionId: row.session_id,
+            messages: row.messages,
+            tokens: row.tokens,
+          });
+        }
+      } finally {
+        closeLcmConnection(dbPath);
       }
     } catch { /* skip corrupt databases */ }
-    finally { closeLcmConnection(dbPath); }
   }
 
   return results;

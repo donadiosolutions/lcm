@@ -2,10 +2,11 @@
  * Extended connection pool tests covering the untested `isLcmConnectionOpen` export.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, it, expect } from "vitest";
+import { DatabaseSync } from "node:sqlite";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import {
   getLcmConnection,
   closeLcmConnection,
@@ -31,6 +32,22 @@ describe("isLcmConnectionOpen", () => {
 
     const replacement = getLcmConnection(dbPath);
     expect(replacement.prepare("SELECT 1").get()).toBeDefined();
+  });
+
+  it("closes an unpooled handle when SQLite initialization fails", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-init-failure-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "corrupt.sqlite");
+    writeFileSync(dbPath, "not a sqlite database");
+    const close = vi.spyOn(DatabaseSync.prototype, "close");
+
+    try {
+      expect(() => getLcmConnection(dbPath)).toThrow();
+      expect(close).toHaveBeenCalledOnce();
+      expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    } finally {
+      close.mockRestore();
+    }
   });
 
   it("ignores a path-specific close for an unknown connection", () => {

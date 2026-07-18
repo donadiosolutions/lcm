@@ -51,6 +51,11 @@ describe("exploreStructuredData — CSV", () => {
     expect(result).toContain("Rows: 0");
     expect(result).toContain("no data rows");
   });
+
+  it("reports empty header cells as no detected columns", () => {
+    const result = exploreStructuredData(",,,", "text/csv");
+    expect(result).toContain("Columns (0): (none detected)");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -99,6 +104,12 @@ describe("exploreStructuredData — XML", () => {
     expect(result).toContain("Structured summary (XML)");
     expect(result).toContain("Root element: feed");
   });
+
+  it("reports unknown structure when XML contains no tags", () => {
+    const result = exploreStructuredData("plain text", "application/xml");
+    expect(result).toContain("Root element: unknown");
+    expect(result).toContain("Child elements seen: (none detected)");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -138,6 +149,17 @@ describe("exploreStructuredData — JSON error path", () => {
   it("returns parse error message for invalid JSON", () => {
     const result = exploreStructuredData("{not valid json}", "application/json");
     expect(result).toContain("failed to parse as valid JSON");
+  });
+
+  it.each([
+    ["nested values", '{"outer":{"inner":{"value":1}}}', "object(keys=1: outer)"],
+    ["empty array", "[]", "array(len=0)"],
+    ["sampled array", '[1,null,{"key":true}]', "sample=[number, object, object(keys=1: key)]"],
+    ["deep array", "[[[1]]]", "sample=[array(len=1, sample=[...])]"],
+    ["empty object", "{}", "object(keys=0)"],
+    ["primitive", "null", "Shape: object"],
+  ])("describes %s", (_label, content, shape) => {
+    expect(exploreStructuredData(content, "application/json")).toContain(shape);
   });
 });
 
@@ -192,6 +214,13 @@ describe("exploreCode", () => {
     const code = "const x = 42;\nconsole.log(x);";
     const result = exploreCode(code);
     expect(result).toContain("none detected");
+  });
+
+  it("truncates long imports and definitions", () => {
+    const long = "x".repeat(240);
+    const result = exploreCode(`import ${long} from 'module';\nexport const fn = (${long}) => 1;`);
+    expect(result).toMatch(/Imports\/dependencies \(1\): import x+\.\.\./);
+    expect(result).toMatch(/Top-level definitions \(1\): export const fn = \(x+\.\.\./);
   });
 });
 
@@ -288,6 +317,16 @@ describe("parseFileBlocks — edge cases", () => {
     expect(blocks[0].fileName).toBe("notes.txt");
   });
 
+  it("parses attributes with single-quoted values", () => {
+    const blocks = parseFileBlocks("<file name='notes.txt'>content</file>");
+    expect(blocks[0].fileName).toBe("notes.txt");
+  });
+
+  it("ignores empty attribute values", () => {
+    const blocks = parseFileBlocks('<file name="">content</file>');
+    expect(blocks[0].attributes).toEqual({});
+  });
+
   it("stores all parsed attributes on the attributes map", () => {
     const blocks = parseFileBlocks('<file name="f.csv" mime="text/csv" size="42">data</file>');
     expect(blocks).toHaveLength(1);
@@ -318,6 +357,10 @@ describe("extensionFromNameOrMime — edge cases", () => {
 
   it("handles path separators in fileName (extracts basename)", () => {
     expect(extensionFromNameOrMime("some/path/to/file.py")).toBe("py");
+  });
+
+  it("rejects invalid filename extensions before using the mime type", () => {
+    expect(extensionFromNameOrMime("data.extensiontoolong", "application/json")).toBe("json");
   });
 });
 
@@ -374,6 +417,39 @@ describe("generateExplorationSummary — structured types via filename", () => {
       content: "some content",
       fileName: "notes.txt",
       summarizeText,
+    });
+    expect(result).toContain("Text exploration summary");
+  });
+
+  it("summarises empty unnamed text deterministically", async () => {
+    const result = await generateExplorationSummary({ content: "" });
+    expect(result).toContain("Words: 0");
+    expect(result).toContain("Opening excerpt: (empty)");
+    expect(result).toContain("Closing excerpt: (empty)");
+  });
+
+  it("builds a sampled prompt for long unnamed text", async () => {
+    const summarizeText = vi.fn(async () => "model summary");
+    const result = await generateExplorationSummary({
+      content: `# HEADER\n${"a".repeat(10_000)}`,
+      summarizeText,
+    });
+    expect(result).toBe("model summary");
+    const prompt = summarizeText.mock.calls[0][0];
+    expect(prompt).toContain("File name: unknown");
+    expect(prompt).toContain("Mime type: unknown");
+    expect(prompt).toContain("Detected section headers: # HEADER");
+    expect(prompt).toContain("[Document Start]");
+    expect(prompt).toContain("[Document Middle]");
+    expect(prompt).toContain("[Document End]");
+  });
+
+  it("uses deterministic fallback when text summarization rejects", async () => {
+    const result = await generateExplorationSummary({
+      content: "text",
+      summarizeText: vi.fn(async () => {
+        throw new Error("unavailable");
+      }),
     });
     expect(result).toContain("Text exploration summary");
   });

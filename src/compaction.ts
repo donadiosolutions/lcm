@@ -159,6 +159,14 @@ function dedupeOrderedIds(ids: Iterable<string>): string[] {
   return ordered;
 }
 
+/** Internal pure-function seams used by exhaustive boundary tests. */
+export const __compactionTestUtils = {
+  estimateTokens,
+  shortTzAbbr,
+  generateSummaryId,
+  dedupeOrderedIds,
+};
+
 // ── CompactionEngine ─────────────────────────────────────────────────────────
 
 export class CompactionEngine {
@@ -610,7 +618,7 @@ export class CompactionEngine {
     }
 
     const tailStartIdx = Math.max(0, rawMessageItems.length - freshTailCount);
-    return rawMessageItems[tailStartIdx]?.ordinal ?? Infinity;
+    return rawMessageItems[tailStartIdx]!.ordinal;
   }
 
   /** Resolve message token count with a content-length fallback. */
@@ -687,9 +695,6 @@ export class CompactionEngine {
         break;
       }
 
-      if (item.messageId == null) {
-        continue;
-      }
       const messageTokens = await this.getMessageTokenCount(item.messageId);
       if (chunk.length > 0 && chunkTokens + messageTokens > threshold) {
         break;
@@ -735,10 +740,7 @@ export class CompactionEngine {
 
     const summaryContents: string[] = [];
     for (const item of priorSummaryItems) {
-      if (typeof item.summaryId !== "string") {
-        continue;
-      }
-      const summary = await this.summaryStore.getSummary(item.summaryId);
+      const summary = await this.summaryStore.getSummary(item.summaryId!);
       const content = summary?.content.trim();
       if (content) {
         summaryContents.push(content);
@@ -954,10 +956,7 @@ export class CompactionEngine {
 
     const summaryContents: string[] = [];
     for (const item of priorSummaryItems) {
-      if (typeof item.summaryId !== "string") {
-        continue;
-      }
-      const summary = await this.summaryStore.getSummary(item.summaryId);
+      const summary = await this.summaryStore.getSummary(item.summaryId!);
       if (!summary || summary.depth !== targetDepth) {
         continue;
       }

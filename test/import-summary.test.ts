@@ -68,6 +68,12 @@ describe("printImportSummary", () => {
     expect(logs.some(l => l.includes("failed"))).toBe(false);
   });
 
+  it("does not show an empty-transcript count when none were skipped", () => {
+    capture();
+    printImportSummary(baseResult({ skippedEmpty: 0 }));
+    expect(logs.some(l => l.includes("skipped (empty transcript)"))).toBe(false);
+  });
+
   it("shows failed count when > 0", () => {
     capture();
     printImportSummary(baseResult({ failed: 2 }));

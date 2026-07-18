@@ -75,6 +75,48 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("returns undefined for non-Error resolution failures and empty resolved IDs", async () => {
+    const thrown = makeDeps({ resolveModel: vi.fn(() => { throw "failure"; }) });
+    await expect(createLcmSummarizeFromLegacyParams({ deps: thrown, legacyParams: {} })).resolves.toBeUndefined();
+    for (const resolved of [{ provider: "", model: "model" }, { provider: "provider", model: "" }]) {
+      const deps = makeDeps({ resolveModel: vi.fn(() => resolved) });
+      await expect(createLcmSummarizeFromLegacyParams({ deps, legacyParams: {} })).resolves.toBeUndefined();
+    }
+  });
+
+  it("normalizes optional legacy parameters and default target configuration", async () => {
+    const deps = makeDeps();
+    deps.config.condensedTargetTokens = Number.NaN;
+    const summarize = await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: 1,
+        model: null,
+        authProfileId: " profile ",
+        agentDir: " agent ",
+        config: { models: { providers: { anthropic: { api: " messages " } } } },
+      },
+    });
+    expect(deps.resolveModel).toHaveBeenCalledWith(undefined, undefined);
+    await expect(summarize!("   ")).resolves.toBe("");
+    await summarize!("text", false, { isCondensed: true, depth: Number.NaN });
+    const request = vi.mocked(deps.complete).mock.calls[0][0];
+    expect(request).toMatchObject({ providerApi: "messages", authProfileId: "profile", agentDir: "agent", maxTokens: 2000 });
+  });
+
+  it("handles empty optional strings, non-positive targets, and finite condensed depths", async () => {
+    const deps = makeDeps();
+    deps.config.condensedTargetTokens = 0;
+    const summarize = await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: { provider: " ", model: " ", authProfileId: " ", agentDir: " " },
+    });
+    await summarize!("text", false, { isCondensed: true, depth: 2.9 });
+    expect(vi.mocked(deps.complete).mock.calls[0][0]).toMatchObject({
+      authProfileId: undefined, agentDir: undefined, maxTokens: 2000,
+    });
+  });
+
   it("builds distinct normal vs aggressive prompts", async () => {
     const deps = makeDeps();
 
@@ -376,6 +418,18 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       } finally {
         consoleError.mockRestore();
       }
+    });
+
+    it("falls back gracefully when retry throws a non-Error value", async () => {
+      let calls = 0;
+      const deps = makeDeps({
+        complete: vi.fn(async () => {
+          if (++calls === 1) return { content: [] };
+          throw "retry failure";
+        }),
+      });
+      const summarize = await createLcmSummarizeFromLegacyParams({ deps, legacyParams: {} });
+      await expect(summarize!("short input")).resolves.toBe("short input");
     });
 
     it("logs response envelope metadata (request-id, usage) in diagnostics", async () => {
