@@ -15,6 +15,22 @@ function makeDeps(overrides: Partial<AutoHealDeps> = {}): AutoHealDeps {
 }
 
 describe("validateAndFixHooks", () => {
+  it("uses filesystem defaults safely", () => {
+    expect(() => validateAndFixHooks()).not.toThrow();
+  });
+
+  it("reads settings through the default filesystem adapter", async () => {
+    const { mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { homedir } = await import("node:os");
+    const claudeDir = join(homedir(), ".claude");
+    const settingsPath = join(claudeDir, "settings.json");
+    mkdirSync(claudeDir, { recursive: true });
+    writeFileSync(settingsPath, "{}");
+    expect(() => validateAndFixHooks()).not.toThrow();
+    rmSync(settingsPath, { force: true });
+  });
+
   it("removes duplicate lcm hooks from settings.json", () => {
     const deps = makeDeps({
       readFileSync: vi.fn().mockReturnValue(JSON.stringify({
@@ -159,5 +175,44 @@ describe("validateAndFixHooks", () => {
     validateAndFixHooks(deps);
     // No rewrite, no duplicate → no write
     expect(deps.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("skips malformed hook collections and commands", () => {
+    const deps = makeDeps({
+      readFileSync: vi.fn().mockReturnValue(JSON.stringify({
+        hooks: {
+          InvalidEvent: "invalid",
+          PreCompact: [
+            { matcher: "missing-hooks" },
+            { hooks: [{ type: "prompt" }] },
+          ],
+        },
+      })),
+    });
+    validateAndFixHooks(deps);
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("handles missing hooks and logs non-Error failures", () => {
+    const noHooks = makeDeps({ readFileSync: vi.fn().mockReturnValue("{}") });
+    validateAndFixHooks(noHooks);
+    expect(noHooks.writeFileSync).not.toHaveBeenCalled();
+
+    const stringFailure = makeDeps({
+      readFileSync: vi.fn(() => { throw "plain failure"; }),
+    });
+    validateAndFixHooks(stringFailure);
+    expect(stringFailure.appendFileSync).toHaveBeenCalledWith(
+      stringFailure.logPath,
+      expect.stringContaining("plain failure"),
+    );
+  });
+
+  it("swallows a fallback logging failure", () => {
+    const deps = makeDeps({
+      readFileSync: vi.fn(() => { throw new Error("read failed"); }),
+      mkdirSync: vi.fn(() => { throw new Error("log failed"); }),
+    });
+    expect(() => validateAndFixHooks(deps)).not.toThrow();
   });
 });

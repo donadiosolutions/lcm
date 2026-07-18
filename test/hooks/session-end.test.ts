@@ -44,6 +44,30 @@ describe("handleSessionEnd", () => {
     expect(client.post).toHaveBeenCalledWith("/ingest", { session_id: "s1", cwd: "/tmp", client: "claude" });
   });
 
+  it("returns early when the daemon is unavailable", async () => {
+    const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({ connected: false } as any);
+    const client = createMockClient({ ingested: 1 });
+    expect(await handleSessionEnd("{}", client)).toEqual({ exitCode: 0, stdout: "" });
+    expect(client.post).not.toHaveBeenCalled();
+  });
+
+  it("sends auth and exercises the promote-events notification helper", async () => {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const { dirname } = await import("node:path");
+    const { daemonTokenPath } = await import("../../src/runtime-paths.js");
+    const { firePromoteEventsNotifyRequest } = await import("../../src/hooks/session-end.js");
+    const { request } = await import("node:http");
+    const tokenPath = daemonTokenPath();
+    mkdirSync(dirname(tokenPath), { recursive: true });
+    writeFileSync(tokenPath, "secret-token\n");
+    firePromoteEventsNotifyRequest(4545, { cwd: "/project" });
+    expect(vi.mocked(request)).toHaveBeenCalledWith(expect.objectContaining({
+      path: "/promote-events/notify",
+      headers: expect.objectContaining({ Authorization: "Bearer secret-token" }),
+    }));
+  });
+
   it("fires compact via http.request when totalTokens exceeds threshold", async () => {
     const { request } = await import("node:http");
     const client = createMockClient({ ingested: 100, totalTokens: 25000 });
@@ -217,6 +241,29 @@ describe("handleSessionEnd", () => {
     );
     expect(filteredCalls.length).toBe(0);
     stderrSpy.mockRestore();
+  });
+
+  it("uses an empty category list and default ingested count", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const { request } = await import("node:http");
+    await handleSessionEnd(
+      JSON.stringify({ session_id: "s1", cwd: "/tmp" }),
+      createMockClient({ redacted: 1 } as any),
+    );
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("pattern: )"));
+    const complete = vi.mocked(request).mock.calls.find((args: any[]) => args[0]?.path === "/session-complete");
+    expect(complete).toBeDefined();
+    stderrSpy.mockRestore();
+  });
+
+  it("fails open when ingest rejects or input is malformed", async () => {
+    await expect(handleSessionEnd("not json", { post: vi.fn() } as any)).resolves.toEqual({
+      exitCode: 0,
+      stdout: "",
+    });
+    await expect(handleSessionEnd("{}", {
+      post: vi.fn().mockRejectedValue(new Error("failed")),
+    } as any)).resolves.toEqual({ exitCode: 0, stdout: "" });
   });
 });
 

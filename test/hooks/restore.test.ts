@@ -34,7 +34,7 @@ const mockEnsureDaemon = vi.mocked(ensureDaemon);
 describe("handleSessionStart", () => {
   beforeEach(() => {
     // Clear session locks between tests to prevent cross-test bleed
-    for (const id of ["s1", "s2", "s3", "s4", "dedup-guard-test-abc123", "dead-pid-test-session"]) {
+    for (const id of ["s1", "s2", "s3", "s4", "dedup-guard-test-abc123", "dead-pid-test-session", "invalid-pid", "request-failure"]) {
       rmSync(join(tmpdir(), `lcm-restore-${id}.lock`), { force: true });
     }
   });
@@ -56,6 +56,11 @@ describe("handleSessionStart", () => {
     const result = await handleSessionStart("{}", client as any);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe("");
+  });
+
+  it("accepts empty stdin", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: false, port: 3737, spawned: false });
+    expect(await handleSessionStart("", { post: vi.fn() } as any)).toEqual({ exitCode: 0, stdout: "" });
   });
 
   it("includes learned-insights block when insights returned from daemon", async () => {
@@ -171,5 +176,27 @@ describe("handleSessionStart", () => {
     };
     await handleSessionStart(JSON.stringify({ session_id: "s4", cwd: "/proj" }), client as any);
     expect(mockFirePromote).toHaveBeenCalledWith(3737, { cwd: "/proj" });
+  });
+
+  it("fails closed when an existing lock has an invalid owner pid", async () => {
+    const lockPath = join(tmpdir(), "lcm-restore-invalid-pid.lock");
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(lockPath, "not-a-pid");
+    mockEnsureDaemon.mockClear();
+    const result = await handleSessionStart(
+      JSON.stringify({ session_id: "invalid-pid" }),
+      { post: vi.fn() } as any,
+    );
+    expect(result).toEqual({ exitCode: 0, stdout: "" });
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
+  });
+
+  it("fails open when restore request rejects", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const result = await handleSessionStart(
+      JSON.stringify({ session_id: "request-failure" }),
+      { post: vi.fn().mockRejectedValue(new Error("failed")) } as any,
+    );
+    expect(result).toEqual({ exitCode: 0, stdout: "" });
   });
 });

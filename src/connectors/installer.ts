@@ -163,7 +163,7 @@ export function installConnector(agentIdOrName: string, type?: ConnectorType, cw
 
   if (connectorType === 'hook') {
     if (agent.id === 'codex') {
-      const hooksPath = resolveConfigPath(agent.configPaths.hook ?? '', cwd);
+      const hooksPath = resolveConfigPath(agent.configPaths.hook!, cwd);
       const configPath = resolveConfigPath(CODEX_CONFIG_PATH, cwd);
       installCodexHooks(hooksPath, configPath);
       for (const legacyPath of LEGACY_CODEX_HOOKS_PATHS.map((path) => resolveConfigPath(path, cwd))) {

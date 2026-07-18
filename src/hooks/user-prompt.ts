@@ -68,7 +68,7 @@ export async function handleUserPromptSubmit(
       const { eventsDbPath } = await import("../db/events-path.js");
       const { ensureProjectDir } = await import("../daemon/project.js");
 
-      const prompt = String(input.prompt ?? "");
+      const prompt = String(input.prompt);
       const events = extractUserPromptEvents(prompt);
 
       if (events.length > 0 && input.session_id && typeof input.session_id === "string") {
@@ -108,10 +108,7 @@ export async function handleUserPromptSubmit(
       return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
     }
 
-    const hint = buildMemoryContext(result.hints, result.ids ?? []);
-    if (!hint) {
-      return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
-    }
+    const hint = buildMemoryContext(result.hints, result.ids ?? [])!;
     return { exitCode: 0, stdout: `${hint}\n${LEARNING_INSTRUCTION}` };
   } catch {
     return { exitCode: 0, stdout: LEARNING_INSTRUCTION };

@@ -39,4 +39,23 @@ describe("handlePreCompact", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe("");
   });
+
+  it("joins a short latest summary without a primary summary", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const client = { post: vi.fn().mockResolvedValue({ summary: "", latestSummaryContent: "latest" }) };
+    const result = await handlePreCompact(JSON.stringify({ client: "codex" }), client as any, 4545);
+    expect(result.stdout).toBe("latest");
+  });
+
+  it("fails open on malformed input or daemon request errors", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const client = { post: vi.fn().mockRejectedValue(new Error("failed")) };
+    await expect(handlePreCompact("not json", client as any)).resolves.toEqual({ exitCode: 0, stdout: "" });
+  });
+
+  it("accepts empty stdin and defaults the daemon port", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const client = { post: vi.fn().mockResolvedValue({ summary: "done" }) };
+    expect((await handlePreCompact("", client as any)).stdout).toBe("done");
+  });
 });

@@ -31,8 +31,34 @@ function makeChild(exitCode = 0, stderr = ""): FakeChild {
   return child;
 }
 
+function makeHangingChild(killThrows = false): FakeChild {
+  const child = new EventEmitter() as FakeChild;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = new PassThrough();
+  child.kill = vi.fn(() => {
+    if (killThrows) throw new Error("already exited");
+    return true;
+  });
+  return child;
+}
+
+function baseDeps(child: FakeChild, overrides: Record<string, unknown> = {}) {
+  return {
+    spawn: vi.fn().mockReturnValue(child) as unknown as SpawnFn,
+    mkdtempSync: vi.fn(() => mkdtempSync(join(tmpdir(), "lcm-codex-"))) as unknown as MkdtempSyncFn,
+    readFileSync: vi.fn(() => "summary") as unknown as ReadFileSyncFn,
+    rmSync: vi.fn() as unknown as RmSyncFn,
+    ...overrides,
+  };
+}
+
 describe("createCodexProcessSummarizer", () => {
   const tempDirs: string[] = [];
+
+  it("constructs with default process dependencies", () => {
+    expect(createCodexProcessSummarizer()).toBeTypeOf("function");
+  });
 
   afterEach(() => {
     for (const dir of tempDirs.splice(0)) {
@@ -249,5 +275,91 @@ describe("createCodexProcessSummarizer", () => {
     });
 
     await expect(summarizer("Conversation text", false)).rejects.toThrow("codex output was empty");
+  });
+
+  it("omits a whitespace-only model and builds a condensed prompt", async () => {
+    const child = makeChild(0);
+    const deps = baseDeps(child);
+    let stdin = "";
+    child.stdin.on("data", (chunk) => { stdin += chunk.toString(); });
+    const summarizer = createCodexProcessSummarizer({
+      model: "   ",
+      ...deps,
+    });
+    await summarizer("text", true, { isCondensed: true, targetTokens: 40, depth: 2 });
+    expect((deps.spawn as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain("--model");
+    expect(stdin).toContain("40");
+  });
+
+  it("normalizes non-Error synchronous spawn failures and ignores cleanup failure", async () => {
+    const summarizer = createCodexProcessSummarizer({
+      spawn: vi.fn(() => { throw "plain failure"; }) as unknown as SpawnFn,
+      mkdtempSync: vi.fn(() => "/tmp/lcm-codex-fake") as unknown as MkdtempSyncFn,
+      readFileSync: vi.fn() as unknown as ReadFileSyncFn,
+      rmSync: vi.fn(() => { throw new Error("cleanup failed"); }) as unknown as RmSyncFn,
+    });
+    await expect(summarizer("text", false)).rejects.toThrow("plain failure");
+  });
+
+  it.each([false, true])("times out and cleans up when killThrows=%s", async (killThrows) => {
+    const child = makeHangingChild(killThrows);
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      timeoutMs: 1,
+    });
+    await expect(summarizer("text", false)).rejects.toThrow("codex process timed out after 0s");
+    child.emit("close", 0);
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  it("handles asynchronous ENOENT and ignores a later error", async () => {
+    const child = makeHangingChild();
+    const summarizer = createCodexProcessSummarizer(baseDeps(child));
+    const promise = summarizer("text", false);
+    child.emit("error", Object.assign(new Error("missing"), { code: "ENOENT" }));
+    await expect(promise).rejects.toThrow("Codex CLI is not installed");
+    child.emit("error", new Error("late"));
+  });
+
+  it("normalizes a non-Error output read failure", async () => {
+    const child = makeChild(0);
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      readFileSync: vi.fn(() => { throw "read failed"; }) as unknown as ReadFileSyncFn,
+    });
+    await expect(summarizer("text", false)).rejects.toThrow("read failed");
+  });
+
+  it("preserves ordinary Error spawn failures and builds default prompt variants", async () => {
+    const failed = createCodexProcessSummarizer({
+      spawn: vi.fn(() => { throw new Error("ordinary failure"); }) as unknown as SpawnFn,
+      mkdtempSync: vi.fn(() => "/tmp/lcm-codex-fake") as unknown as MkdtempSyncFn,
+      rmSync: vi.fn() as unknown as RmSyncFn,
+    });
+    await expect(failed("text", false)).rejects.toThrow("ordinary failure");
+
+    const first = makeChild(0);
+    const spawn = vi.fn().mockReturnValueOnce(first);
+    const summarize = createCodexProcessSummarizer({
+      ...baseDeps(first), spawn: spawn as unknown as SpawnFn,
+    });
+    await summarize("text", true, { isCondensed: false });
+    spawn.mockReturnValueOnce(makeChild(0));
+    await summarize("text", false, { isCondensed: true });
+  });
+
+  it("ignores a timeout callback after completion", async () => {
+    vi.useFakeTimers();
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
+    try {
+      const summarize = createCodexProcessSummarizer({ ...baseDeps(makeChild(0)), timeoutMs: 10 });
+      const result = summarize("text", false);
+      await vi.runAllTicks();
+      await expect(result).resolves.toBe("summary");
+      await vi.advanceTimersByTimeAsync(10);
+    } finally {
+      clearSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });

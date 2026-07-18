@@ -178,5 +178,58 @@ describe("dispatchHook", () => {
 
   it("recognizes post-tool as a valid hook command", () => {
     expect(isHookCommand("post-tool")).toBe(true);
+    expect(isHookCommand("invalid")).toBe(false);
+  });
+
+  it.each([0, 65536, 1.5, "4545"])("rejects invalid payload port %j", async (daemon_port) => {
+    vi.mocked(handlePostToolUse).mockClear();
+    await dispatchHook("post-tool", JSON.stringify({ daemon_port }));
+    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String), 3737);
+  });
+
+  it("uses config fallback for malformed post-tool JSON", async () => {
+    await dispatchHook("post-tool", "not json");
+    expect(handlePostToolUse).toHaveBeenCalledWith("not json", 3737);
+  });
+
+  it("uses the handler default when post-tool config loading fails", async () => {
+    vi.mocked(loadDaemonConfig).mockImplementationOnce(() => { throw new Error("bad config"); });
+    await dispatchHook("post-tool", "{}");
+    expect(handlePostToolUse).toHaveBeenCalledWith("{}");
+  });
+
+  it("skips bootstrap when the payload has no session or malformed JSON", async () => {
+    vi.mocked(ensureBootstrapped).mockClear();
+    await dispatchHook("restore", "{}");
+    await dispatchHook("restore", "not json");
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+  });
+
+  it("uses the environment client when the payload client is absent or malformed", async () => {
+    const previous = process.env.LCM_CLIENT;
+    process.env.LCM_CLIENT = "codex";
+    vi.mocked(validateAndFixHooks).mockClear();
+    try {
+      await dispatchHook("compact", "not json");
+      expect(validateAndFixHooks).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.LCM_CLIENT;
+      else process.env.LCM_CLIENT = previous;
+    }
+  });
+
+  it("rejects an impossible hook command defensively", async () => {
+    await expect(dispatchHook("invalid" as any, "{}")).rejects.toThrow("Unknown hook command: invalid");
+  });
+
+  it("handles empty hook payloads and a config without a daemon port", async () => {
+    vi.mocked(loadDaemonConfig).mockReturnValueOnce({ daemon: {} } as any);
+    await dispatchHook("restore", "");
+    expect(handleSessionStart).toHaveBeenCalledWith("", expect.anything(), 3737);
+    await dispatchHook("post-tool", "");
+    expect(handlePostToolUse).toHaveBeenCalled();
+    vi.mocked(loadDaemonConfig).mockReturnValueOnce({} as any);
+    await dispatchHook("post-tool", "{}");
+    expect(handlePostToolUse).toHaveBeenCalledWith("{}", 3737);
   });
 });

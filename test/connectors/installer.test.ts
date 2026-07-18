@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { installConnector, removeConnector, listConnectors } from '../../src/connectors/installer.js';
 import { LCM_MARKERS } from '../../src/connectors/constants.js';
+import { AGENTS } from '../../src/connectors/registry.js';
 
 let tmpDir: string;
 
@@ -26,6 +27,18 @@ afterEach(() => {
 
 // Claude Code uses rules (append mode) and skill
 describe('installConnector — rules (markdown append)', () => {
+  it.each([
+    [LEGACY_LCM_MARKERS, LCM_MARKERS],
+    [LCM_MARKERS, LEGACY_LCM_MARKERS],
+  ])('selects the earliest managed block across marker pairs', (first, second) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(rulesPath, [
+      first.START, '# Workflow Instruction', 'FIRST_OLD_BLOCK', first.END,
+      second.START, '# Workflow Instruction', 'SECOND_OLD_BLOCK', second.END,
+    ].join('\n'));
+    installConnector('claude-code', 'rules', tmpDir);
+    expect(readFileSync(rulesPath, 'utf-8')).not.toContain('FIRST_OLD_BLOCK');
+  });
   it('writes a rules file with LCM markers', () => {
     const result = installConnector('claude-code', 'rules', tmpDir);
     expect(result.success).toBe(true);
@@ -110,9 +123,29 @@ describe('installConnector — MCP JSON', () => {
     const result = installConnector('claude-code', 'mcp', tmpDir);
     expect(result.requiresRestart).toBe(true);
   });
+
+  it('recovers from malformed JSON and malformed root/server shapes', () => {
+    const mcpPath = join(tmpDir, '.mcp.json');
+    writeFileSync(mcpPath, 'invalid');
+    installConnector('claude-code', 'mcp', tmpDir);
+    expect(JSON.parse(readFileSync(mcpPath, 'utf-8')).mcpServers.lcm).toBeDefined();
+    writeFileSync(mcpPath, 'null');
+    installConnector('claude-code', 'mcp', tmpDir);
+    writeFileSync(mcpPath, JSON.stringify({ mcpServers: [] }));
+    installConnector('claude-code', 'mcp', tmpDir);
+    expect(JSON.parse(readFileSync(mcpPath, 'utf-8')).mcpServers.lcm).toBeDefined();
+  });
+
+  it('returns manual instructions for missing and TOML MCP configs', () => {
+    expect(installConnector('cline', 'mcp', tmpDir).manual).toContain('manually');
+    expect(installConnector('codex', 'mcp', tmpDir).manual).toContain('[mcp_servers.lcm]');
+  });
 });
 
 describe('installConnector — skill', () => {
+  it('uses an agent default type when no type is supplied', () => {
+    expect(installConnector('claude-code', undefined, tmpDir).path).toContain('SKILL.md');
+  });
   it('creates SKILL.md in subdirectory', () => {
     const result = installConnector('claude-code', 'skill', tmpDir);
     expect(result.success).toBe(true);
@@ -464,6 +497,13 @@ describe('removeConnector — MCP JSON', () => {
     writeFileSync(mcpPath, JSON.stringify({ mcpServers: {} }, null, 2));
     expect(removeConnector('claude-code', 'mcp', tmpDir)).toBe(false);
   });
+
+  it('returns false for malformed JSON and TOML configs', () => {
+    const mcpPath = join(tmpDir, '.mcp.json');
+    writeFileSync(mcpPath, 'invalid');
+    expect(removeConnector('claude-code', 'mcp', tmpDir)).toBe(false);
+    expect(removeConnector('codex', 'mcp', tmpDir)).toBe(false);
+  });
 });
 
 describe('removeConnector — skill', () => {
@@ -546,6 +586,13 @@ describe('listConnectors', () => {
     }
   });
 
+  it('ignores malformed and unconfigured MCP files', () => {
+    writeFileSync(join(tmpDir, '.mcp.json'), 'invalid');
+    mkdirSync(join(tmpDir, '.qwen'), { recursive: true });
+    writeFileSync(join(tmpDir, '.qwen', 'mcp.json'), JSON.stringify({ mcpServers: {} }), { flag: 'w' });
+    expect(listConnectors(tmpDir).some(c => c.type === 'mcp')).toBe(false);
+  });
+
   it('does not list removed connectors', () => {
     installConnector('claude-code', 'rules', tmpDir);
     removeConnector('claude-code', 'rules', tmpDir);
@@ -556,6 +603,9 @@ describe('listConnectors', () => {
 });
 
 describe('error handling', () => {
+  it('throws when removing an unknown agent', () => {
+    expect(() => removeConnector('unknown-agent-xyz', 'rules', tmpDir)).toThrow('Unknown agent');
+  });
   it('throws for unknown agent', () => {
     expect(() => installConnector('unknown-agent-xyz', 'rules', tmpDir)).toThrow('Unknown agent');
   });
@@ -569,5 +619,40 @@ describe('error handling', () => {
     const result = installConnector('claude-code', 'hook', tmpDir);
     expect(result.manual).toBeDefined();
     expect(result.manual).toContain('Hook connectors');
+  });
+
+  it('throws when a supported connector has no configured non-MCP path', () => {
+    const agent = AGENTS.find((candidate: any) => candidate.id === 'zed')!;
+    const original = agent.configPaths.rules;
+    delete agent.configPaths.rules;
+    try {
+      expect(() => installConnector('zed', 'rules', tmpDir)).toThrow('No config path defined');
+      expect(removeConnector('zed', 'rules', tmpDir)).toBe(false);
+    } finally {
+      agent.configPaths.rules = original;
+    }
+  });
+
+  it('removes all default Codex connector types', () => {
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      installConnector('codex', undefined, tmpDir);
+      expect(removeConnector('codex', undefined, tmpDir)).toBe(true);
+    } finally {
+      process.env.HOME = originalHome;
+    }
+  });
+
+  it('handles absent default connector installs and a default single type removal', () => {
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      expect(removeConnector('codex', undefined, tmpDir)).toBe(false);
+      installConnector('claude-code', undefined, tmpDir);
+      expect(removeConnector('claude-code', undefined, tmpDir)).toBe(true);
+    } finally {
+      process.env.HOME = originalHome;
+    }
   });
 });

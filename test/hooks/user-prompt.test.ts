@@ -134,6 +134,50 @@ describe("handleUserPromptSubmit", () => {
     expect(result.stdout).toContain("<learning-instruction>");
   });
 
+  it.each([null, 42, "   "])("returns learning instruction for invalid prompt %j", async (prompt) => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const result = await handleUserPromptSubmit(JSON.stringify({ prompt }), { post: vi.fn() } as any);
+    expect(result.stdout).toContain("<learning-instruction>");
+  });
+
+  it("falls back to process cwd and skips sidecar persistence without a session", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    mockExtractUserPromptEvents.mockReturnValue([
+      { type: "decision", category: "decision", data: "choice", priority: 1 },
+    ]);
+    const client = { post: vi.fn().mockResolvedValue({ hints: [] }) };
+    await handleUserPromptSubmit(JSON.stringify({ prompt: "always choose this" }), client as any);
+    expect(client.post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({ cwd: process.cwd() }));
+    expect(MockEventsDb).not.toHaveBeenCalled();
+  });
+
+  it("handles a missing hints property and prompt-search failure", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    mockExtractUserPromptEvents.mockReturnValue([]);
+    const missing = await handleUserPromptSubmit(
+      JSON.stringify({ prompt: "hello", session_id: "s1" }),
+      { post: vi.fn().mockResolvedValue({}) } as any,
+    );
+    expect(missing.stdout).toContain("<learning-instruction>");
+
+    const failed = await handleUserPromptSubmit(
+      JSON.stringify({ prompt: "hello", session_id: "s1" }),
+      { post: vi.fn().mockRejectedValue(new Error("failed")) } as any,
+    );
+    expect(failed.stdout).toContain("<learning-instruction>");
+  });
+
+  it("handles empty stdin and logs extraction errors using the environment cwd", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    expect((await handleUserPromptSubmit("", { post: vi.fn() } as any)).stdout).toContain("<learning-instruction>");
+    process.env.CLAUDE_PROJECT_DIR = "/env-project";
+    mockExtractUserPromptEvents.mockImplementationOnce(() => { throw new Error("failed"); });
+    await handleUserPromptSubmit(
+      JSON.stringify({ prompt: "hello", session_id: "s1" }),
+      { post: vi.fn().mockResolvedValue({ hints: [] }) } as any,
+    );
+  });
+
   it("includes learning-instruction block in output", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const mockClient = {

@@ -1,8 +1,12 @@
 import { createServer } from "node:http";
+import OpenAI from "openai";
 import { describe, it, expect, vi } from "vitest";
 import { createOpenAISummarizer } from "../../src/llm/openai.js";
 
 describe("createOpenAISummarizer", () => {
+  it("constructs the default OpenAI client", () => {
+    expect(createOpenAISummarizer({ model: "model", baseUrl: "http://localhost" })).toBeTypeOf("function");
+  });
   function makeClient(text = "Summary.") {
     return {
       chat: {
@@ -95,6 +99,68 @@ describe("createOpenAISummarizer", () => {
 
     expect(mockClient.chat.completions.create).toHaveBeenCalledOnce();
     expect(mockClient.responses.create).not.toHaveBeenCalled();
+  });
+
+  it("reports clients missing the selected API", async () => {
+    const responses = createOpenAISummarizer({
+      model: "gpt-5", baseUrl: "http://localhost", apiMode: "responses",
+      retry: { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0, multiplier: 1 },
+      _clientOverride: {},
+    });
+    await expect(responses("text", false)).rejects.toThrow("OpenAI Responses request rejected");
+
+    const chat = createOpenAISummarizer({
+      model: "model", baseUrl: "http://localhost",
+      retry: { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0, multiplier: 1 },
+      _clientOverride: {},
+    });
+    await expect(chat("text", false)).rejects.toThrow("OpenAI Chat Completions request rejected");
+  });
+
+  it("builds condensed and aggressive prompts with explicit targets", async () => {
+    const mockClient = makeClient();
+    const summarizer = createOpenAISummarizer({
+      model: "model", baseUrl: "http://localhost", _clientOverride: mockClient,
+    });
+    await summarizer("text", true, { isCondensed: true, targetTokens: 40, depth: 2 });
+    expect(mockClient.chat.completions.create.mock.calls[0][0].messages[0].content).toContain("40");
+  });
+
+  it("builds an aggressive leaf prompt with default target selection", async () => {
+    const mockClient = makeClient();
+    const summarizer = createOpenAISummarizer({ model: "model", baseUrl: "http://localhost", _clientOverride: mockClient });
+    await summarizer("text", true, { isCondensed: false });
+    expect(mockClient.chat.completions.create).toHaveBeenCalled();
+  });
+
+  it("builds a default-depth condensed prompt", async () => {
+    const mockClient = makeClient();
+    const summarizer = createOpenAISummarizer({ model: "model", baseUrl: "http://localhost", _clientOverride: mockClient });
+    await summarizer("text", false, { isCondensed: true });
+    expect(mockClient.chat.completions.create).toHaveBeenCalled();
+  });
+
+  it("retries actual SDK connection error instances", async () => {
+    const error = Object.create(OpenAI.APIConnectionError.prototype);
+    const create = vi.fn().mockRejectedValue(error);
+    const summarizer = createOpenAISummarizer({
+      model: "model", baseUrl: "http://localhost",
+      retry: { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0, multiplier: 1 },
+      _clientOverride: { chat: { completions: { create } } },
+    });
+    await expect(summarizer("text", false)).rejects.toThrow("failed after retries");
+  });
+
+  it("falls back when Chat Completions omits choices or messages", async () => {
+    const create = vi.fn()
+      .mockResolvedValueOnce({ choices: [] })
+      .mockResolvedValueOnce({ choices: [{}] });
+    const summarizer = createOpenAISummarizer({
+      model: "model", baseUrl: "http://localhost",
+      _clientOverride: { chat: { completions: { create } } },
+    });
+    await expect(summarizer("first", false)).resolves.toBe("first");
+    await expect(summarizer("second", false)).resolves.toBe("second");
   });
 
   it("calls the Responses API with the combined prompt", async () => {

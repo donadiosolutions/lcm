@@ -4,6 +4,7 @@ import {
   resolveBinaryPath,
   install,
   ensureLcmMd,
+  waitForHealth,
   REQUIRED_HOOKS,
   type ServiceDeps,
 } from "../../installer/install.js";
@@ -133,6 +134,46 @@ describe("mergeClaudeSettings", () => {
     expect(result.mcpServers["lcm"]).toBeUndefined();
     expect(result.mcpServers.other).toEqual({ command: "other", args: ["mcp"] });
   });
+
+  it("normalizes malformed settings containers", () => {
+    expect(mergeClaudeSettings({ hooks: [], mcpServers: "invalid" })).toEqual({});
+    expect(mergeClaudeSettings({ hooks: null, mcpServers: [] })).toEqual({});
+  });
+
+  it("preserves malformed hook events and entries without hooks", () => {
+    const result = mergeClaudeSettings({
+      hooks: {
+        InvalidEvent: "invalid",
+        PreCompact: [{ matcher: "missing-hooks" }],
+      },
+    });
+
+    expect(result.hooks).toEqual({
+      InvalidEvent: "invalid",
+      PreCompact: [{ matcher: "missing-hooks" }],
+    });
+  });
+
+  it("deduplicates migrated commands and commandless hooks", () => {
+    const legacy = legacyLcmCommand("lcm compact");
+    const result = mergeClaudeSettings({
+      hooks: {
+        Custom: [{
+          hooks: [
+            { type: "command", command: legacy },
+            { type: "command", command: "lcm compact --hook" },
+            { type: "prompt" },
+            { type: "prompt", prompt: "duplicate commandless hook" },
+          ],
+        }],
+      },
+    });
+
+    expect(result.hooks.Custom[0].hooks).toEqual([
+      { type: "command", command: "lcm compact --hook" },
+      { type: "prompt" },
+    ]);
+  });
 });
 
 // ─── resolveBinaryPath ──────────────────────────────────────────────────────
@@ -163,6 +204,36 @@ describe("resolveBinaryPath", () => {
       existsSync: vi.fn().mockReturnValue(false),
     };
     expect(resolveBinaryPath(deps)).toBe("lcm");
+  });
+
+  it("ignores non-string and blank command output before checking all fallbacks", () => {
+    expect(resolveBinaryPath({ spawnSync: makeSpawn(0, "   "), existsSync: vi.fn().mockReturnValue(false) })).toBe("lcm");
+    expect(resolveBinaryPath({
+      spawnSync: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from("/bin/lcm") }),
+      existsSync: vi.fn().mockImplementation((path: string) => path === "/opt/homebrew/bin/lcm"),
+    })).toBe("/opt/homebrew/bin/lcm");
+  });
+});
+
+describe("waitForHealth", () => {
+  it("returns immediately for a healthy response", async () => {
+    await expect(waitForHealth("http://localhost/health", 10, vi.fn().mockResolvedValue({ ok: true }) as any))
+      .resolves.toBe(true);
+  });
+
+  it("retries failed and throwing responses until the deadline", async () => {
+    vi.useFakeTimers();
+    const fetchFn = vi.fn()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValue({ ok: false });
+    try {
+      const result = waitForHealth("http://localhost/health", 1000, fetchFn as any);
+      await vi.advanceTimersByTimeAsync(1000);
+      await expect(result).resolves.toBe(false);
+      expect(fetchFn).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -211,6 +282,102 @@ describe("install", () => {
       expect.stringContaining("config.json"),
       0o600,
     );
+  });
+
+  it("ignores chmod failures and reports doctor failures", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const deps = makeDeps({
+      existsSync: vi.fn().mockReturnValue(false),
+      chmodSync: vi.fn(() => { throw new Error("chmod failed"); }),
+      runDoctor: vi.fn().mockResolvedValue([{ name: "daemon", status: "fail" }]),
+    });
+    await install(deps);
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("1 check(s) failed"));
+    errorSpy.mockRestore();
+  });
+
+  it("clears stale cache directories, copies only markdown commands, and repairs malformed MCP settings", async () => {
+    const rmSync = vi.fn();
+    const copyFileSync = vi.fn();
+    const readdirSync = vi.fn((path: string, options?: { withFileTypes?: boolean }) => {
+      if (options?.withFileTypes) {
+        return [
+          { name: "1.3.0", isDirectory: () => true },
+          { name: "1.4.0", isDirectory: () => true },
+          { name: "README", isDirectory: () => false },
+        ];
+      }
+      return ["one.md", "ignore.txt", "two.md"];
+    });
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    let settingsReads = 0;
+    const deps = makeDeps({
+      existsSync: vi.fn((path: string) =>
+        path.endsWith("config.json") || path.includes("plugins/cache") || path.endsWith(".claude-plugin/commands") || path === settingsPath),
+      readFileSync: vi.fn((path: string) => {
+        if (path.endsWith("package.json")) return JSON.stringify({ version: "1.4.0" });
+        if (path === settingsPath) return settingsReads++ === 0 ? "{}" : "null";
+        return "{}";
+      }),
+      readdirSync: readdirSync as any,
+      rmSync: rmSync as any,
+      copyFileSync: copyFileSync as any,
+    });
+
+    await install(deps);
+    expect(rmSync).toHaveBeenCalledWith(expect.stringContaining("1.3.0"), { recursive: true, force: true });
+    expect(copyFileSync).toHaveBeenCalledTimes(2);
+    const settingsWrite = vi.mocked(deps.writeFileSync).mock.calls.filter(([path]) => path === settingsPath).at(-1);
+    expect(JSON.parse(settingsWrite![1]).mcpServers.lcm).toBeDefined();
+  });
+
+  it("preserves a valid MCP server map and ignores cache inspection failures", async () => {
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    const deps = makeDeps({
+      existsSync: vi.fn((path: string) => path.endsWith("config.json") || path.includes("plugins/cache") || path === settingsPath),
+      readFileSync: vi.fn((path: string) => path === settingsPath
+        ? JSON.stringify({ mcpServers: { other: { command: "other" } } })
+        : "invalid package json"),
+    });
+    await install(deps);
+    const settingsWrite = vi.mocked(deps.writeFileSync).mock.calls.filter(([path]) => path === settingsPath).at(-1);
+    expect(JSON.parse(settingsWrite![1]).mcpServers.other).toBeDefined();
+  });
+
+  it("uses default filesystem operations for cache cleanup and command copies", async () => {
+    const fs = await import("node:fs");
+    const { legacyLcmSlug } = await import("../../src/legacy-names.js");
+    const home = homedir();
+    const lcmDir = join(home, ".lcm");
+    const cacheDir = join(home, ".claude", "plugins", "cache", legacyLcmSlug(), "lcm");
+    const commandsSourceDir = fs.mkdtempSync(join(home, "commands-source-"));
+    fs.mkdirSync(lcmDir, { recursive: true });
+    fs.writeFileSync(join(lcmDir, "config.json"), "{}");
+    fs.mkdirSync(join(cacheDir, "1.3.0"), { recursive: true });
+    fs.mkdirSync(join(cacheDir, "1.4.0"), { recursive: true });
+    fs.writeFileSync(join(commandsSourceDir, "command.md"), "command");
+    fs.writeFileSync(join(commandsSourceDir, "ignore.txt"), "ignore");
+
+    const deps: ServiceDeps = {
+      spawnSync: makeSpawn(1, ""),
+      readFileSync: (path, encoding) => path.endsWith("package.json")
+        ? JSON.stringify({ version: "1.4.0" })
+        : fs.readFileSync(path, encoding as BufferEncoding) as string,
+      writeFileSync: fs.writeFileSync as any,
+      mkdirSync: fs.mkdirSync,
+      existsSync: fs.existsSync,
+      promptUser: vi.fn(),
+      ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
+      runDoctor: vi.fn().mockResolvedValue([]),
+      commandsSourceDir,
+    };
+
+    await install(deps);
+    expect(fs.existsSync(join(cacheDir, "1.3.0"))).toBe(false);
+    expect(fs.existsSync(join(cacheDir, "1.4.0"))).toBe(true);
+    expect(fs.readFileSync(join(home, ".claude", "commands", "command.md"), "utf-8")).toBe("command");
+    await install(deps);
+    fs.rmSync(commandsSourceDir, { recursive: true, force: true });
   });
 });
 
@@ -290,6 +457,18 @@ describe("summarizer picker", () => {
     expect(effective.llm.provider).toBe("anthropic");
     expect(effective.llm.requestTimeoutMs).toBe(DEFAULT_LLM_REQUEST_TIMEOUT_MS);
     expect(effective.llm.retry).toEqual(DEFAULT_LLM_RETRY_POLICY);
+  });
+
+  it("option 2 leaves the key empty when the environment variable is absent", async () => {
+    delete process.env.ANTHROPIC_API_KEY;
+    Object.defineProperty(process.stdin, "isTTY", { value: true, writable: true });
+    const deps = makeDeps({
+      existsSync: vi.fn().mockReturnValue(false),
+      promptUser: vi.fn().mockResolvedValue("2"),
+    });
+    await install(deps);
+    const configCall = vi.mocked(deps.writeFileSync).mock.calls.find(([path]) => path.endsWith("config.json"));
+    expect(JSON.parse(configCall![1]).llm.apiKey).toBe("");
   });
 
   it("option 3 (custom server): prompts for URL and model, writes provider=openai", async () => {
@@ -454,5 +633,32 @@ describe("ensureLcmMd", () => {
     const result = ensureLcmMd(deps, CONTENT, "/home");
     expect(result.lcmMdWritten).toBe(true);
     expect(written.get("/home/.claude/lcm.md")).toBe(CONTENT);
+  });
+
+  it("overwrites unreadable lcm.md and appends after unreadable CLAUDE.md", () => {
+    const writeFileSync = vi.fn();
+    const deps = {
+      existsSync: vi.fn().mockReturnValue(true),
+      readFileSync: vi.fn(() => { throw new Error("unreadable"); }),
+      writeFileSync,
+      mkdirSync: vi.fn(),
+    };
+    expect(ensureLcmMd(deps, CONTENT, "/home")).toEqual({ lcmMdWritten: true, claudeMdPatched: true });
+    expect(writeFileSync).toHaveBeenCalledWith("/home/.claude/lcm.md", CONTENT);
+  });
+
+  it("does not rewrite an already current lcm.md", () => {
+    const files = new Map([
+      ["/home/.claude/lcm.md", CONTENT],
+      ["/home/.claude/CLAUDE.md", BLOCK + "\n"],
+    ]);
+    const writeFileSync = vi.fn();
+    const result = ensureLcmMd({
+      existsSync: (path) => files.has(path),
+      readFileSync: (path) => files.get(path)!,
+      writeFileSync,
+      mkdirSync: vi.fn(),
+    }, CONTENT, "/home");
+    expect(result.lcmMdWritten).toBe(false);
   });
 });

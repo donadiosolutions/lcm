@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { loadTemplate, interpolate } from "../../src/prompts/loader.js";
+import { loadTemplate, interpolate, renderTemplate } from "../../src/prompts/loader.js";
 
 describe("interpolate", () => {
   it("replaces {{var}} placeholders", () => {
@@ -19,6 +19,11 @@ describe("interpolate", () => {
     const result = interpolate("{{x}} and {{x}}", { x: "yes" });
     expect(result).toBe("yes and yes");
   });
+
+  it("uses an empty string for explicitly undefined values", () => {
+    const result = interpolate("{{value}}", { value: undefined as unknown as string });
+    expect(result).toBe("");
+  });
 });
 
 describe("loadTemplate", () => {
@@ -31,5 +36,18 @@ describe("loadTemplate", () => {
 
   it("throws on unknown template name", () => {
     expect(() => loadTemplate("nonexistent-template")).toThrow();
+  });
+
+  it.each(["../system", "nested/system", "system\0yaml"])(
+    "rejects unsafe template name %j",
+    (name) => {
+      expect(() => loadTemplate(name)).toThrow(`Invalid template name: ${name}`);
+    },
+  );
+
+  it("returns cached templates and renders them", () => {
+    const first = loadTemplate("system");
+    expect(loadTemplate("system")).toBe(first);
+    expect(renderTemplate("system", {})).toBe(first.template.replace(/\{\{(\w+)\}\}/g, ""));
   });
 });

@@ -147,11 +147,9 @@ export class EventsDb {
             CREATE INDEX IF NOT EXISTS idx_error_log_created ON error_log(created_at);
           `);
         }
-        if (currentVersion < 3) {
-          this.db.exec(
-            "CREATE INDEX IF NOT EXISTS idx_events_pattern_lookup ON events(type, category, data, created_at)"
-          );
-        }
+        this.db.exec(
+          "CREATE INDEX IF NOT EXISTS idx_events_pattern_lookup ON events(type, category, data, created_at)"
+        );
         this.db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
         this.db.exec("COMMIT");
       } catch (e) {
@@ -213,7 +211,7 @@ export class EventsDb {
          AND created_at >= datetime('now', '-' || ? || ' days')`
     ).get(type, category, data, maxAgeDays) as unknown as PatternReinforcementStats | undefined;
 
-    return row ?? { totalCount: 0, distinctSessions: 0 };
+    return row!;
   }
 
   logHookError(hook: string, error: unknown, sessionId?: string): void {

@@ -90,6 +90,33 @@ describe("DryRunServiceDeps", () => {
     rmSync(scriptPath);
   });
 
+  it("forwards setup stdout and stderr with the default environment", () => {
+    const scriptPath = join(tmpdir(), `lc-output-setup.sh`);
+    writeFileSync(scriptPath, "#!/bin/bash\necho stdout-line\necho stderr-line >&2");
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const deps = new DryRunServiceDeps();
+
+    const result = deps.spawnSync("bash", [scriptPath]);
+
+    expect(result.status).toBe(0);
+    expect(stdoutSpy).toHaveBeenCalledWith(expect.stringContaining("stdout-line"));
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("stderr-line"));
+    stdoutSpy.mockRestore();
+    stderrSpy.mockRestore();
+    rmSync(scriptPath);
+  });
+
+  it("does not write absent setup output", () => {
+    const scriptPath = join(tmpdir(), `lc-silent-setup.sh`);
+    writeFileSync(scriptPath, "#!/bin/bash\nexit 0");
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    new DryRunServiceDeps().spawnSync("bash", [scriptPath]);
+    expect(stdoutSpy).not.toHaveBeenCalled();
+    stdoutSpy.mockRestore();
+    rmSync(scriptPath);
+  });
+
   // ── promptUser ───────────────────────────────────────────────────────────
 
   it("promptUser logs [dry-run] would prompt and returns empty string", async () => {
@@ -115,5 +142,14 @@ describe("DryRunServiceDeps", () => {
     const deps = new DryRunServiceDeps();
     expect(deps.existsSync(tmpdir())).toBe(true);
     expect(deps.existsSync("/definitely/does/not/exist/12345")).toBe(false);
+  });
+
+  it("previews daemon startup and doctor checks", async () => {
+    const deps = new DryRunServiceDeps();
+    await expect(deps.ensureDaemon({ port: 4545, pidFilePath: "/tmp/pid", spawnTimeoutMs: 1 }))
+      .resolves.toEqual({ connected: true });
+    await expect(deps.runDoctor()).resolves.toEqual([]);
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("port 4545"));
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("doctor checks"));
   });
 });

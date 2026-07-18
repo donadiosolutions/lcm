@@ -125,7 +125,6 @@ function runCodexSummarizer(
       return;
     }
 
-    let stdout = "";
     let finished = false;
 
     const timer = setTimeout(() => {
@@ -140,9 +139,7 @@ function runCodexSummarizer(
       reject(new Error(`codex process timed out after ${Math.round(deps.timeoutMs / 1000)}s`));
     }, deps.timeoutMs);
 
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
+    child.stdout.resume();
     child.stderr.resume();
 
     child.on("error", (error) => {
