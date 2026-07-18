@@ -41,7 +41,8 @@ describe("package.json", () => {
 
   it("keeps dogfood diagnostics single-line even though the helper is not shipped", () => {
     const helper = readFileSync(new URL("../.claude-plugin/skills/lcm-dogfood/scripts/prompt-search-test.js", import.meta.url), "utf8");
-    expect(helper.match(/replace\(\/\[\\r\\n\]\/g, " "\)/g)).toHaveLength(3);
+    expect(helper.match(/replace\(\/\[\\r\\n\]\/g, " "\)/g)).toHaveLength(2);
+    expect(helper).toContain('req.on("error", () => console.log("Request failed"))');
   });
 
   it("ships inert plugin bundles without runtime package installation", () => {

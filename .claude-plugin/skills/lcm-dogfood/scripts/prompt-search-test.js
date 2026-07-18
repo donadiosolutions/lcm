@@ -30,6 +30,6 @@ const req = http.request(
     });
   }
 );
-req.on("error", (e) => console.log(`Error: ${e.message.replace(/[\r\n]/g, " ")}`));
+req.on("error", () => console.log("Request failed"));
 req.write(data);
 req.end();
