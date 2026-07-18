@@ -106,15 +106,17 @@ describe("mocked systemd credential boundaries", () => {
     process.env.ANTHROPIC_API_KEY = "secret";
     fs.read.mockImplementation((path: string) => {
       if (path.endsWith("daemon.token")) return "token";
-      throw new Error("missing pid");
+      if (path.endsWith("daemon.pid")) return "20";
+      throw new Error(`unexpected read ${path}`);
     });
     const fetch = vi.fn()
       .mockRejectedValueOnce(new Error("initially down"))
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1", pid: 20 }) })
       .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
     const result = await ensureDaemon({
       ...base(), _skipHealthWait: false, _fetchOverride: fetch,
       _spawnSyncOverride: vi.fn(() => ({ status: 0 })) as never, _sleepOverride: async () => {},
+      expectedVersion: "1", _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [1],
     });
     expect(result).toMatchObject({ connected: true, startMethod: "systemd-user" });
     expect(fs.rm).toHaveBeenCalledWith("/run/user/1000/lcm-systemd-credentials-test", { recursive: true, force: true });

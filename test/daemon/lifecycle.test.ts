@@ -256,11 +256,12 @@ describe("ensureDaemon", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-missing-token-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "4242");
 
     const mockFetch = vi.fn()
       .mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ status: "ok", version: "1.2.3", uptime: 100 }),
+        json: async () => ({ status: "ok", version: "1.2.3", uptime: 100, pid: 4242 }),
       } as Response)
       .mockResolvedValueOnce({
         ok: false,
@@ -275,6 +276,8 @@ describe("ensureDaemon", () => {
       expectedVersion: "1.2.3",
       _skipSpawn: true,
       _fetchOverride: mockFetch as FetchOverride,
+      _isProcessAliveOverride: (): boolean => true,
+      _listeningPortsOverride: (): number[] => [19999],
     });
 
     expect(result.connected).toBe(false);
@@ -308,6 +311,80 @@ describe("ensureDaemon", () => {
     expect(result.connected).toBe(false);
     expect(result.spawned).toBe(true);
     expect(spawnMock).toHaveBeenCalled();
+  });
+
+  it.each(["version", "deadline", "access"] as const)(
+    "rejects a spawned daemon at the %s verification boundary",
+    async (boundary): Promise<void> => {
+      const tempDir = mkdtempSync(join(tmpdir(), `lcm-lifecycle-spawn-${boundary}-`));
+      tempDirs.push(tempDir);
+      const pidFile = join(tempDir, "daemon.pid");
+      let monotonicMs = 0;
+      const fetchMock = vi.fn(async (url: string): Promise<Response> => {
+        if (fetchMock.mock.calls.length === 1) return { ok: false } as Response;
+        if (url.endsWith("/health")) {
+          return {
+            ok: true,
+            json: async () => {
+              if (boundary === "deadline") monotonicMs = 100;
+              return { status: "ok", version: boundary === "version" ? "0.0.0" : "1.2.3", pid: 4242 };
+            },
+          } as Response;
+        }
+        return { ok: false, status: 401 } as Response;
+      });
+      const spawnMock = vi.fn(() => {
+        writeFileSync(pidFile, "4242");
+        return makeSpawnChild(4242);
+      });
+
+      const result = await ensureDaemon({
+        port: 19999,
+        pidFilePath: pidFile,
+        spawnTimeoutMs: 100,
+        expectedVersion: "1.2.3",
+        _fetchOverride: fetchMock as FetchOverride,
+        _spawnOverride: spawnMock as unknown as SpawnOverride,
+        _isProcessAliveOverride: (): boolean => true,
+        _listeningPortsOverride: (): number[] => [19999],
+        _monotonicNowOverride: (): number => monotonicMs,
+        _sleepOverride: async (durationMs: number): Promise<void> => { monotonicMs += durationMs; },
+      });
+
+      expect(result).toMatchObject({ connected: false, spawned: true });
+    },
+  );
+
+  it("does not terminate an unverified PID-file process on version mismatch", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-version-unverified-pid-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "4242");
+    let monotonicMs = 0;
+    const killMock = vi.fn();
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      _platform: "linux",
+      _procRoot: join(tempDir, "missing-proc"),
+      _fetchOverride: vi.fn(async () => ({
+        ok: true,
+        json: async () => {
+          monotonicMs = 100;
+          return { status: "ok", version: "0.0.0", pid: 4242 };
+        },
+      })) as FetchOverride,
+      _isProcessAliveOverride: (): boolean => true,
+      _listeningPortsOverride: (): number[] => [19999],
+      _killOverride: killMock,
+      _monotonicNowOverride: (): number => monotonicMs,
+      _skipSpawn: true,
+    });
+
+    expect(result.connected).toBe(false);
+    expect(killMock).not.toHaveBeenCalled();
   });
 
   it("starts via user systemd when parent enforcement is requested on Linux", async (context: TestContext): Promise<void> => {
@@ -1363,7 +1440,7 @@ describe("restartDaemon", () => {
     expect(ensureMock).toHaveBeenCalledOnce();
   });
 
-  it("restarts an older non-Linux daemon after matching its authenticated health PID", async () => {
+  it("refuses an older non-Linux daemon before sending the token", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-darwin-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
@@ -1384,7 +1461,7 @@ describe("restartDaemon", () => {
       spawned: true,
     }));
 
-    const result = await restartDaemon({
+    await expect(restartDaemon({
       port: 19999,
       pidFilePath: pidFile,
       spawnTimeoutMs: 100,
@@ -1396,12 +1473,11 @@ describe("restartDaemon", () => {
       _killOverride: killMock,
       _sleepOverride: async () => {},
       _ensureDaemonOverride: ensureMock,
-    });
+    })).rejects.toThrow("not a verified LCM daemon");
 
-    expect(result).toMatchObject({ connected: true, restarted: true, stoppedPid: 4242 });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(killMock).toHaveBeenCalledWith(4242, "SIGTERM");
-    expect(ensureMock).toHaveBeenCalledWith(expect.objectContaining({ expectedVersion: "2.0.0" }));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(killMock).not.toHaveBeenCalled();
+    expect(ensureMock).not.toHaveBeenCalled();
   });
 
   it("refuses a non-Linux restart when protected-route authentication fails", async () => {
@@ -1427,6 +1503,7 @@ describe("restartDaemon", () => {
       expectedVersion: "1.2.3",
       _platform: "darwin",
       _fetchOverride: fetchMock as FetchOverride,
+      _listeningPortsOverride: (): number[] => [19999],
       _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
       _isProcessAliveOverride: () => true,
       _killOverride: killMock,
@@ -1518,7 +1595,7 @@ describe("restartDaemon", () => {
     expect(ensureMock).not.toHaveBeenCalled();
   });
 
-  it("restarts a non-Linux daemon on its owned old listener after the configured port changes", async () => {
+  it("does not probe an old non-Linux listener after the configured port changes", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-darwin-port-change-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
@@ -1547,7 +1624,7 @@ describe("restartDaemon", () => {
       spawned: true,
     }));
 
-    const result = await restartDaemon({
+    await expect(restartDaemon({
       port: 20000,
       pidFilePath: pidFile,
       spawnTimeoutMs: 100,
@@ -1559,11 +1636,11 @@ describe("restartDaemon", () => {
       _killOverride: killMock,
       _sleepOverride: async () => {},
       _ensureDaemonOverride: ensureMock,
-    });
+    })).rejects.toThrow("not a verified LCM daemon");
 
-    expect(result).toMatchObject({ restarted: true, stoppedPid: 4242, port: 20000 });
-    expect(killMock).toHaveBeenCalledWith(4242, "SIGTERM");
-    expect(ensureMock).toHaveBeenCalledWith(expect.objectContaining({ port: 20000, expectedVersion: "2.0.0" }));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(killMock).not.toHaveBeenCalled();
+    expect(ensureMock).not.toHaveBeenCalled();
   });
 
   it("refuses a legacy non-Linux daemon when the authenticated port is not owned by the pidfile PID", async () => {
@@ -1632,6 +1709,7 @@ describe("restartDaemon", () => {
       spawnTimeoutMs: 100,
       _platform: "linux",
       _procRoot: procRoot,
+      expectedVersion: "1.2.3",
       _fetchOverride: fetchMock as FetchOverride,
       _isProcessAliveOverride: () => alive,
       _listeningPortsOverride: (): number[] => [19999],

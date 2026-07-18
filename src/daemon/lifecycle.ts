@@ -72,6 +72,13 @@ type HealthResponse = {
   pid?: number;
 };
 
+function healthVersionMatches(health: HealthResponse | null, expectedVersion: string | undefined): boolean {
+  return typeof expectedVersion === "string"
+    && expectedVersion.length > 0
+    && typeof health?.version === "string"
+    && health.version === expectedVersion;
+}
+
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const userSystemdPidCache = new Map<string, { pid: number | null; expiresAt: number }>();
@@ -685,7 +692,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     allowParentWarning = false,
   ): Promise<EnsureDaemonResult | null> {
     if (health === null || !endpointIdentityMatches(health)) return null;
-    if (health.version !== expectedVersion) return null;
+    if (!healthVersionMatches(health, expectedVersion)) return null;
     if (!access.alreadyVerified) {
       const accessTimeoutMs = access.deadline - monotonicNow();
       if (accessTimeoutMs <= 0) return null;
@@ -725,7 +732,9 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       connected: true,
       port: opts.port,
       spawned,
-      pid: parent?.pid ?? readPidFile(opts.pidFilePath) ?? undefined,
+      // Endpoint identity verification above proves health.pid is the live
+      // PID-file process, so it is the authoritative fallback here.
+      pid: parent?.pid ?? health.pid,
       parentPid: parent?.parentPid,
       userSystemdPid: parent?.userSystemdPid,
       restartedForParent,
@@ -742,7 +751,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   if (health?.status === "ok") {
     const initialAccessDeadline = remainingRequestDeadline();
     const identityMatches = endpointIdentityMatches(health);
-    const versionMatches = health.version === expectedVersion;
+    const versionMatches = healthVersionMatches(health, expectedVersion);
     const hasAccess = identityMatches && versionMatches && initialAccessDeadline
       ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, initialAccessDeadline)
       : false;
@@ -755,10 +764,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       // access, and version were already accepted, while unavailable identity
       // metadata returns a connected result with a warning.
       const parent = inspectParent();
-      if (parent.available && parent.pid !== undefined && isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
-        await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
-        restartedForParent = true;
-      }
+      // A rejected daemonResult here is only possible for verified, available
+      // wrong-parent metadata; unavailable metadata returns a warning result.
+      await terminatePid(parent.pid!, { isAlive, killProcess, sleepFn });
+      restartedForParent = true;
       cleanStalePid(opts.pidFilePath);
     } else {
       cleanStalePid(opts.pidFilePath);
@@ -779,7 +788,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         if (retry?.status === "ok") {
           const retryAccessDeadline = remainingRequestDeadline();
           const retryIdentityMatches = endpointIdentityMatches(retry);
-          const retryVersionMatches = retry.version === expectedVersion;
+          const retryVersionMatches = healthVersionMatches(retry, expectedVersion);
           const retryHasAccess = retryIdentityMatches && retryVersionMatches && retryAccessDeadline
             ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, retryAccessDeadline)
             : false;
@@ -893,29 +902,22 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   const platform = opts._platform ?? osPlatform();
   const fetchFn = opts._fetchOverride ?? globalThis.fetch;
   const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
+  const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
   async function isAuthenticatedDaemonAtPort(port: number, pid: number): Promise<boolean> {
     const health = await checkDaemonHealth(port, fetchFn);
     if (health?.status !== "ok" || health.pid !== pid) return false;
+    if (!healthVersionMatches(health, expectedVersion)) return false;
     if (!await checkDaemonAccess(port, tokenPath, fetchFn)) return false;
     return true;
   }
   async function isManaged(pid: number): Promise<boolean> {
     if (_isManagedProcessOverride) return _isManagedProcessOverride(pid);
-    if (platform === "linux") {
-      if (!isLikelyLcmDaemonProcess(pid, opts._procRoot ?? "/proc")) return false;
-      const ports = opts._listeningPortsOverride
-        ? opts._listeningPortsOverride(pid)
-        : findListeningTcpPorts(pid, platform, opts._spawnSyncOverride ?? spawnSync, opts._procRoot ?? "/proc");
-      if (!ports.includes(opts.port)) return false;
-      return await isAuthenticatedDaemonAtPort(opts.port, pid);
-    }
+    if (platform === "linux" && !isLikelyLcmDaemonProcess(pid, opts._procRoot ?? "/proc")) return false;
     const listenerPorts = opts._listeningPortsOverride
       ? opts._listeningPortsOverride(pid)
       : findListeningTcpPorts(pid, platform, opts._spawnSyncOverride ?? spawnSync, opts._procRoot ?? "/proc");
-    for (const port of listenerPorts) {
-      if (await isAuthenticatedDaemonAtPort(port, pid)) return true;
-    }
-    return false;
+    if (!listenerPorts.includes(opts.port)) return false;
+    return await isAuthenticatedDaemonAtPort(opts.port, pid);
   }
   const killProcess = opts._killOverride ?? ((pid: number, signal?: NodeJS.Signals | number) => {
     process.kill(pid, signal);
@@ -955,6 +957,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
 /** Internal branch-level seams used by the daemon lifecycle test suite. */
 export const __lifecycleTestUtils = {
   findListeningTcpPorts,
+  healthVersionMatches,
   inspectDaemonParent,
   parentInvariantWarning,
   systemdDaemonSetenvArgs,

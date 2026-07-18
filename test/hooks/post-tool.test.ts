@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { projectMetaPath } from "../../src/daemon/project.js";
 import { eventsDbPath } from "../../src/db/events-path.js";
+import { EventsDb } from "../../src/hooks/events-db.js";
 
 // Mock eventsDbPath to use temp directory
 vi.mock("../../src/db/events-path.js", () => ({
@@ -18,6 +19,21 @@ describe("handlePostToolUse", () => {
   let homeDir: string;
   let extraDirs: string[];
   let originalHome: string | undefined;
+
+  function expectPersistedDecision(inputCwd: string): void {
+    const db = new EventsDb(eventsDbPath(inputCwd));
+    try {
+      expect(db.getUnprocessed()).toEqual([
+        expect.objectContaining({
+          session_id: "test-session",
+          data: expect.stringContaining("Use SQLite?"),
+          source_hook: "PostToolUse",
+        }),
+      ]);
+    } finally {
+      db.close();
+    }
+  }
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "post-tool-test-"));
@@ -129,7 +145,7 @@ describe("handlePostToolUse", () => {
       tool_response: "yes",
     }));
 
-    expect(existsSync(eventsDbPath(inputCwd))).toBe(true);
+    expectPersistedDecision(inputCwd);
   });
 
   it("ignores daemon_port values even when a caller also supplies a port", async () => {
@@ -145,7 +161,7 @@ describe("handlePostToolUse", () => {
       tool_response: "yes",
     }), 4568);
 
-    expect(existsSync(eventsDbPath(inputCwd))).toBe(true);
+    expectPersistedDecision(inputCwd);
   });
 
   it("ignores a non-boolean tool output error marker", async () => {
