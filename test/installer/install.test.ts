@@ -4,7 +4,6 @@ import {
   resolveBinaryPath,
   install,
   ensureLcmMd,
-  waitForHealth,
   REQUIRED_HOOKS,
   type ServiceDeps,
 } from "../../installer/install.js";
@@ -212,28 +211,6 @@ describe("resolveBinaryPath", () => {
       spawnSync: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from("/bin/lcm") }),
       existsSync: vi.fn().mockImplementation((path: string) => path === "/opt/homebrew/bin/lcm"),
     })).toBe("/opt/homebrew/bin/lcm");
-  });
-});
-
-describe("waitForHealth", () => {
-  it("returns immediately for a healthy response", async () => {
-    await expect(waitForHealth("http://localhost/health", 10, vi.fn().mockResolvedValue({ ok: true }) as any))
-      .resolves.toBe(true);
-  });
-
-  it("retries failed and throwing responses until the deadline", async () => {
-    vi.useFakeTimers();
-    const fetchFn = vi.fn()
-      .mockRejectedValueOnce(new Error("offline"))
-      .mockResolvedValue({ ok: false });
-    try {
-      const result = waitForHealth("http://localhost/health", 1000, fetchFn as any);
-      await vi.advanceTimersByTimeAsync(1000);
-      await expect(result).resolves.toBe(false);
-      expect(fetchFn).toHaveBeenCalledTimes(2);
-    } finally {
-      vi.useRealTimers();
-    }
   });
 });
 
@@ -505,6 +482,72 @@ describe("summarizer picker", () => {
     expect(written.llm.model).toBe("my-model");
     expect(written.llm.requestTimeoutMs).toBe(DEFAULT_LLM_REQUEST_TIMEOUT_MS);
     expect(written.llm.retry).toEqual(DEFAULT_LLM_RETRY_POLICY);
+  });
+
+  it("option 3 retries each empty required value once before accepting it", async (): Promise<void> => {
+    Object.defineProperty(process.stdin, "isTTY", { value: true, writable: true });
+    const deps = makeDeps({
+      existsSync: vi.fn().mockReturnValue(false),
+      promptUser: vi.fn()
+        .mockResolvedValueOnce("3")
+        .mockResolvedValueOnce("   ")
+        .mockResolvedValueOnce("http://localhost:8080/v1")
+        .mockResolvedValueOnce("")
+        .mockResolvedValueOnce("local-model"),
+    });
+
+    await install(deps);
+
+    const configCall = vi.mocked(deps.writeFileSync).mock.calls.find(([path]) => path.endsWith("config.json"));
+    expect(JSON.parse(configCall![1]).llm).toMatchObject({
+      provider: "openai",
+      baseUrl: "http://localhost:8080/v1",
+      model: "local-model",
+    });
+    expect(deps.promptUser).toHaveBeenCalledTimes(5);
+  });
+
+  it("option 3 falls back atomically to auto after two empty server URLs", async (): Promise<void> => {
+    Object.defineProperty(process.stdin, "isTTY", { value: true, writable: true });
+    const deps = makeDeps({
+      existsSync: vi.fn().mockReturnValue(false),
+      promptUser: vi.fn()
+        .mockResolvedValueOnce("3")
+        .mockResolvedValueOnce("")
+        .mockResolvedValueOnce("   "),
+    });
+
+    await install(deps);
+
+    const configCall = vi.mocked(deps.writeFileSync).mock.calls.find(([path]) => path.endsWith("config.json"));
+    expect(JSON.parse(configCall![1]).llm).toMatchObject({
+      provider: "auto",
+      baseUrl: "",
+      model: "",
+    });
+    expect(deps.promptUser).toHaveBeenCalledTimes(3);
+  });
+
+  it("option 3 discards a valid URL when two model attempts are empty", async (): Promise<void> => {
+    Object.defineProperty(process.stdin, "isTTY", { value: true, writable: true });
+    const deps = makeDeps({
+      existsSync: vi.fn().mockReturnValue(false),
+      promptUser: vi.fn()
+        .mockResolvedValueOnce("3")
+        .mockResolvedValueOnce("http://localhost:8080/v1")
+        .mockResolvedValueOnce("")
+        .mockResolvedValueOnce("   "),
+    });
+
+    await install(deps);
+
+    const configCall = vi.mocked(deps.writeFileSync).mock.calls.find(([path]) => path.endsWith("config.json"));
+    expect(JSON.parse(configCall![1]).llm).toMatchObject({
+      provider: "auto",
+      baseUrl: "",
+      model: "",
+    });
+    expect(deps.promptUser).toHaveBeenCalledTimes(4);
   });
 
   it("invalid input re-prompts once then defaults to option 1 (auto)", async () => {

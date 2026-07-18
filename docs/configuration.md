@@ -14,6 +14,13 @@ lcm install
 
 `lcm install` is the Claude Code setup path. It writes config, registers hooks, installs slash commands, registers MCP, and verifies the daemon.
 
+When the setup wizard's **Custom server** summarizer is selected, both the
+OpenAI-compatible server URL and model name are required. The wizard retries an
+empty value once. If the retry is also empty, it falls back to the native CLI
+default and does not save a partial custom-server configuration. Installer
+health polling uses a bounded monotonic deadline, so wall-clock adjustments do
+not extend or shorten the verification window.
+
 ### VS Code (GitHub Copilot)
 
 Install the repo-local connector:
@@ -42,6 +49,13 @@ Import historical Codex sessions with:
 lcm import --codex
 lcm import --provider all
 ```
+
+Claude imports recognize both current flat transcripts
+(`<project>/<session-id>.jsonl`) and legacy nested transcripts
+(`<project>/<session-id>/<session-id>.jsonl`). When both layouts contain the
+same session, the flat transcript is preferred; other similarly named files and
+subagent transcripts remain independent. Files with equal modification times
+are imported deterministically by session ID and then path.
 
 The default Codex connector writes native hooks to `~/.codex/hooks.json`, enables Codex's current `hooks` feature in `~/.codex/config.toml`, installs the LCM skill at `.codex/skills/lcm-memory/SKILL.md`, and ensures the LCM rules block is present in `~/.codex/AGENTS.md`. Its hook set restores memory at session start, searches memory before prompts, captures passive tool-use signals, snapshots transcript deltas on `Stop`, and force-snapshots transcript deltas on `PreCompact` before manual or automatic Codex compaction. Use `lcm connectors install codex --type skill` or `lcm connectors install codex --type rules` only when you want one guidance surface without hooks.
 
@@ -165,6 +179,18 @@ debugging.
 `lcm doctor` verifies daemon health and, on Linux, repairs a healthy daemon that is not parented by the current user's systemd manager by restarting it through the managed start path. If the user systemd manager is unavailable, lcm falls back to the older detached spawn behavior and reports that the parent invariant is not satisfied.
 
 Stored `daemon.port` values must be integers from `1` through `65535`; this includes values written with `lcm config set`. Port `0` is reserved for internal runtime overrides used by tests to request ephemeral binding and is not a valid `config.json` value because lifecycle commands must be able to reconnect to the configured port. `daemon.idleTimeoutMs` must be an integer from `0` through `86400000` milliseconds; `0` disables the idle timer.
+
+Legacy `compaction.promotionThresholds.mergeMaxEntries` values are migrated to
+`dedupCandidateLimit`. LCM migrates stored configuration and runtime overrides
+independently before merging them: the current key wins when both names occur
+in the same source, while runtime overrides continue to take precedence over
+stored configuration. `lcm config get` and `lcm config set` accept the legacy
+path and report its canonical `dedupCandidateLimit` spelling.
+
+When `lcm doctor` finds that `~/.claude/settings.json` has a malformed or
+non-object JSON root, it treats the file as empty settings and rebuilds the
+managed `mcpServers.lcm` entry instead of crashing. Other fields are preserved
+when the settings root is a valid JSON object.
 
 Hook error fallback logs write to `~/.lcm/logs/events.log`.
 

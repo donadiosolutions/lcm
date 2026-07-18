@@ -115,8 +115,7 @@ describe("daemon configuration uncovered boundaries", () => {
     expect(() => parseStoredConfig("[]")).toThrow("JSON object");
     expect(() => parseDaemonConfig("{}", { llm: { provider: "openai", model: "m", baseUrl: "ftp://example.com" } })).toThrow("HTTP(S)");
     const migrated = parseDaemonConfig("{}", { compaction: { promotionThresholds: { mergeMaxEntries: 17 } } });
-    // Issue #132 tracks that this legacy value is accepted but currently cannot override the default.
-    expect(migrated.compaction.promotionThresholds.dedupCandidateLimit).toBe(100);
+    expect(migrated.compaction.promotionThresholds.dedupCandidateLimit).toBe(17);
     expect(() => loadDaemonConfig("/tmp", {})).toThrow();
   });
 

@@ -35,6 +35,14 @@ const state = vi.hoisted(() => ({
   doctorResults: [{ status: "pass" }],
   configGetError: undefined as unknown,
   configSetError: undefined as unknown,
+  configGetValue: vi.fn(() => {
+    if (state.configGetError !== undefined) throw state.configGetError;
+    return "value";
+  }),
+  configSetValue: vi.fn(() => {
+    if (state.configSetError !== undefined) throw state.configSetError;
+    return "stored";
+  }),
   exportError: undefined as Error | undefined,
   importKnowledgeError: undefined as Error | undefined,
   daemonPort: 3737 as number | undefined,
@@ -106,9 +114,9 @@ vi.mock("../../src/connectors/installer.js", () => ({
   removeConnector: vi.fn(() => state.removeResult),
 }));
 vi.mock("../../src/config-manager.js", () => ({
-  getConfigValue: vi.fn(() => { if (state.configGetError !== undefined) throw state.configGetError; return "value"; }),
+  getConfigValue: state.configGetValue,
   formatConfigValue: vi.fn((value: unknown) => JSON.stringify(value)), normalizeConfigPath: vi.fn((path: string) => path),
-  setConfigValue: vi.fn(() => { if (state.configSetError !== undefined) throw state.configSetError; return "stored"; }),
+  setConfigValue: state.configSetValue,
 }));
 vi.mock("../../installer/install.js", () => ({ install: vi.fn(async () => undefined) }));
 vi.mock("../../installer/uninstall.js", () => ({ uninstall: vi.fn(async () => undefined) }));
@@ -254,17 +262,30 @@ describe("runCli registration and help dispatch", () => {
     vi.useRealTimers();
   });
 
-  it("runs the currently asynchronous unknown-command fallback", async () => {
+  it("waits for the unknown-command fallback before settling", async () => {
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
-    state.exit.mockImplementationOnce((() => undefined) as never);
-    expect(await invoke(["unknown"])).toBeUndefined();
-    await vi.waitFor(() => expect(state.printHelp).toHaveBeenCalled());
+    const order: string[] = [];
+    state.printHelp.mockImplementationOnce(() => { order.push("help"); });
+    state.exit.mockImplementationOnce((() => { order.push("exit"); }) as never);
+    const result = await invoke(["unknown"]).then(error => {
+      order.push("settled");
+      return error;
+    });
+
+    expect(result).toBeUndefined();
+    expect(order).toEqual(["help", "exit", "settled"]);
     expect(stderr).toHaveBeenCalledWith("lcm: unknown command 'unknown'\n\n");
   });
 
   it.each([
     [[], undefined], [["--help"], undefined], [["help"], undefined], [["help", "compact"], "compact"],
     [["daemon", "--help"], "daemon"], [["daemon", "start", "--help"], "daemon"], [["daemon", "restart", "--help"], "daemon"],
+    [["map", "--help"], "map"], [["map", "list", "--help"], "map"], [["map", "show", "--help"], "map"],
+    [["map", "add", "--help"], "map"], [["map", "remove", "--help"], "map"],
+    [["connectors", "list", "--help"], "connectors"], [["connectors", "install", "--help"], "connectors"],
+    [["connectors", "remove", "--help"], "connectors"], [["connectors", "doctor", "--help"], "connectors"],
+    [["config", "get", "daemon.port", "--help"], "config"],
+    [["config", "set", "daemon.port", "4242", "-h"], "config"],
     [["config"], "config"],
     [["compact", "--help"], "compact"], [["restore", "--help"], "restore"], [["session-end", "--help"], "session-end"],
     [["user-prompt", "--help"], "user-prompt"], [["post-tool", "--help"], "post-tool"], [["session-snapshot", "--help"], "session-snapshot"],
@@ -278,16 +299,15 @@ describe("runCli registration and help dispatch", () => {
     expect((await invoke(args))?.message).toBe("exit:0");
     expect(state.exit).toHaveBeenCalledOnce();
     expect(state.exit).toHaveBeenCalledWith(0);
-    if (args[0] === "daemon" && args.length === 3) {
-      // Preserve the current nested-child behavior tracked in #139.
-      expect(state.printHelp).not.toHaveBeenCalled();
+    expect(state.printHelp).toHaveBeenCalledOnce();
+    if (expectedCommand === undefined && args[0] !== "help") {
+      expect(state.printHelp.mock.calls[0]).toEqual([undefined]);
     } else {
-      expect(state.printHelp).toHaveBeenCalledOnce();
-      if (expectedCommand === undefined && args[0] !== "help") {
-        expect(state.printHelp.mock.calls[0]).toEqual([]);
-      } else {
-        expect(state.printHelp).toHaveBeenCalledWith(expectedCommand);
-      }
+      expect(state.printHelp).toHaveBeenCalledWith(expectedCommand);
+    }
+    if (args[0] === "config" && args.length > 2) {
+      expect(state.configGetValue).not.toHaveBeenCalled();
+      expect(state.configSetValue).not.toHaveBeenCalled();
     }
   });
 });

@@ -190,7 +190,10 @@ describe("findSessionFiles", () => {
   });
 
   it("sorts equal mtimes by session ID and then path", () => {
-    const dir = makeTmpDir();
+    // A project directory ending in "a" used to make its flat a.jsonl file
+    // look like the nested suffix a/a.jsonl and disappear during deduplication.
+    const dir = join(makeTmpDir(), "a");
+    mkdirSync(dir);
     const nested = join(dir, "same");
     const agents = join(nested, "subagents");
     mkdirSync(agents, { recursive: true });

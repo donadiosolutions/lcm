@@ -32,10 +32,12 @@ export class NinjaRenderer {
   private firstFrame = true;
   private sigintHandler?: () => void;
   private sigwinchHandler?: () => void;
+  private onReady?: () => void;
 
   constructor(opts: PipelineRunnerOpts) {
     this.state = opts.state;
     this.opts = opts.renderOpts;
+    this.onReady = opts.onReady;
   }
 
   /** Start the render loop and register signal handlers. */
@@ -67,6 +69,10 @@ export class NinjaRenderer {
         this._writeFrame();
       }, 62);
     }
+
+    const onReady = this.onReady;
+    this.onReady = undefined;
+    onReady?.();
   }
 
   /** Stop the render loop and remove signal handlers. */

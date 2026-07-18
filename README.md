@@ -206,6 +206,9 @@ flowchart LR
 
 ## CLI
 
+See [Command-line behavior](docs/cli.md) for custom and nested help behavior
+and unknown-command handling.
+
 ```bash
 # Setup & diagnostics
 lcm install                # setup wizard

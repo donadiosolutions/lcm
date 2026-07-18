@@ -258,6 +258,23 @@ describe("NinjaRenderer lifecycle", () => {
     expect(writes.join("")).toContain("Sessions");
   });
 
+  it("calls onReady once after setup across renderer restarts", () => {
+    const onReady = vi.fn();
+    const renderer = new NinjaRenderer({
+      state: makeProgressState({ total: 1 }),
+      renderOpts: opts({ isTTY: false }),
+      onReady,
+    });
+
+    renderer.start();
+    expect(onReady).toHaveBeenCalledOnce();
+    renderer.stop();
+    renderer.start();
+    renderer.stop();
+
+    expect(onReady).toHaveBeenCalledOnce();
+  });
+
   it("emits session lines for non-TTY and verbose modes", () => {
     const state = completedState();
     const nonTty = new NinjaRenderer({ state, renderOpts: opts({ isTTY: false }) });

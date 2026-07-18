@@ -134,9 +134,10 @@ describe("ensureDaemon", () => {
     });
 
     expect(result.connected).toBe(false);
-    expect(mockFetch).toHaveBeenNthCalledWith(2, "http://127.0.0.1:19999/stats/pool", {
+    expect(mockFetch).toHaveBeenNthCalledWith(2, "http://127.0.0.1:19999/stats/pool", expect.objectContaining({
       headers: { Authorization: "Bearer local-token" },
-    });
+      signal: expect.any(AbortSignal),
+    }));
   });
 
   it("reuses the healthy daemon access probe on the existing-daemon fast path", async (): Promise<void> => {
@@ -792,6 +793,382 @@ describe("ensureDaemon", () => {
     expect(result.connected).toBe(false);
   });
 
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2_147_483_648])(
+    "rejects invalid spawn timeout %s before inspecting or spawning",
+    async (spawnTimeoutMs: number): Promise<void> => {
+      const fetchMock = vi.fn();
+      const spawnMock = vi.fn();
+      const isAliveMock = vi.fn((): boolean => true);
+      const killMock = vi.fn();
+      const sleepMock = vi.fn(async (_durationMs: number): Promise<void> => {});
+      await expect(ensureDaemon({
+        port: 19999,
+        pidFilePath: "/unused/daemon.pid",
+        spawnTimeoutMs,
+        _fetchOverride: fetchMock as FetchOverride,
+        _spawnOverride: spawnMock as unknown as SpawnOverride,
+        _isProcessAliveOverride: isAliveMock,
+        _killOverride: killMock,
+        _sleepOverride: sleepMock,
+      })).rejects.toThrow(new RangeError("spawnTimeoutMs must be between 0 and 2147483647"));
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(spawnMock).not.toHaveBeenCalled();
+      expect(isAliveMock).not.toHaveBeenCalled();
+      expect(killMock).not.toHaveBeenCalled();
+      expect(sleepMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("accepts a zero timeout but performs no startup side effects", async (): Promise<void> => {
+    const fetchMock = vi.fn();
+    const spawnMock = vi.fn();
+    const isAliveMock = vi.fn((): boolean => true);
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: "/unused/daemon.pid",
+      spawnTimeoutMs: 0,
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+      _isProcessAliveOverride: isAliveMock,
+      _monotonicNowOverride: (): number => 0,
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(isAliveMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a negative spawn timeout before inspecting or spawning", async (): Promise<void> => {
+    const fetchMock = vi.fn();
+    const spawnMock = vi.fn();
+    await expect(ensureDaemon({
+      port: 19999,
+      pidFilePath: "/unused/daemon.pid",
+      spawnTimeoutMs: -1,
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+    })).rejects.toThrow(new RangeError("spawnTimeoutMs must be between 0 and 2147483647"));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("uses a monotonic spawn deadline and bounds the final health-wait sleep", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-monotonic-"));
+    tempDirs.push(tempDir);
+    let monotonicMs = 0;
+    const sleepDurations: number[] = [];
+    const wallClock = vi.spyOn(Date, "now").mockReturnValue(-1_000_000_000);
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false } as Response);
+
+    try {
+      const result = await ensureDaemon({
+        port: 19999,
+        pidFilePath: join(tempDir, "daemon.pid"),
+        spawnTimeoutMs: 350,
+        _fetchOverride: fetchMock as FetchOverride,
+        _spawnOverride: vi.fn().mockReturnValue(makeSpawnChild(12345)) as unknown as SpawnOverride,
+        _monotonicNowOverride: (): number => monotonicMs,
+        _sleepOverride: async (durationMs: number): Promise<void> => {
+          sleepDurations.push(durationMs);
+          monotonicMs += durationMs;
+        },
+      });
+
+      expect(result).toMatchObject({ connected: false, spawned: true });
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(sleepDurations).toEqual([300, 50]);
+    } finally {
+      wallClock.mockRestore();
+    }
+  });
+
+  it("does not sleep when a health request consumes the remaining spawn deadline", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-deadline-"));
+    tempDirs.push(tempDir);
+    let monotonicMs = 0;
+    let fetchCalls = 0;
+    const fetchMock = vi.fn(async (): Promise<Response> => {
+      fetchCalls++;
+      if (fetchCalls === 2) {
+        monotonicMs = 350;
+        return { ok: true, json: async (): Promise<{ status: string }> => ({ status: "ok" }) } as Response;
+      }
+      return { ok: false } as Response;
+    });
+    const sleepMock = vi.fn(async (): Promise<void> => {});
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: join(tempDir, "daemon.pid"),
+      spawnTimeoutMs: 350,
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: vi.fn().mockReturnValue(makeSpawnChild(12345)) as unknown as SpawnOverride,
+      _monotonicNowOverride: (): number => monotonicMs,
+      _sleepOverride: sleepMock,
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: true });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(sleepMock).not.toHaveBeenCalled();
+  });
+
+  it("aborts a hanging health request at the remaining monotonic deadline and clears its timer", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-hanging-health-"));
+    tempDirs.push(tempDir);
+    let monotonicMs = 0;
+    let fetchCalls = 0;
+    let healthSignal: AbortSignal | undefined;
+    let signalWasInitiallyAborted: boolean | undefined;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      fetchCalls++;
+      healthSignal = init?.signal ?? undefined;
+      signalWasInitiallyAborted = healthSignal?.aborted;
+      return new Promise<Response>((
+        _resolve: (value: Response | PromiseLike<Response>) => void,
+      ): void => {});
+    });
+    const timerHandle = 123 as unknown as ReturnType<typeof setTimeout>;
+    const setTimeoutMock = vi.fn((callback: () => void, delayMs: number): ReturnType<typeof setTimeout> => {
+      queueMicrotask((): void => {
+        monotonicMs += delayMs;
+        callback();
+      });
+      return timerHandle;
+    });
+    const clearTimeoutMock = vi.fn((_timeout: ReturnType<typeof setTimeout>): void => {});
+    const sleepMock = vi.fn(async (_durationMs: number): Promise<void> => {});
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: join(tempDir, "daemon.pid"),
+      spawnTimeoutMs: 350,
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: vi.fn().mockReturnValue(makeSpawnChild(12345)) as unknown as SpawnOverride,
+      _monotonicNowOverride: (): number => monotonicMs,
+      _setTimeoutOverride: setTimeoutMock,
+      _clearTimeoutOverride: clearTimeoutMock,
+      _sleepOverride: sleepMock,
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(setTimeoutMock).toHaveBeenCalledWith(expect.any(Function), 350);
+    expect(signalWasInitiallyAborted).toBe(false);
+    expect(healthSignal?.aborted).toBe(true);
+    expect(clearTimeoutMock).toHaveBeenCalledWith(timerHandle);
+    expect(sleepMock).not.toHaveBeenCalled();
+  });
+
+  it("aborts a hanging access check at the remaining monotonic deadline and clears both request timers", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-hanging-access-"));
+    tempDirs.push(tempDir);
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    let monotonicMs = 0;
+    let fetchCalls = 0;
+    let accessSignal: AbortSignal | undefined;
+    let accessSignalWasInitiallyAborted: boolean | undefined;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      fetchCalls++;
+      if (fetchCalls === 1) {
+        return { ok: true, json: async (): Promise<{ status: string }> => ({ status: "ok" }) } as Response;
+      }
+      accessSignal = init?.signal ?? undefined;
+      accessSignalWasInitiallyAborted = accessSignal?.aborted;
+      return new Promise<Response>((
+        _resolve: (value: Response | PromiseLike<Response>) => void,
+      ): void => {});
+    });
+    const healthTimer = 201 as unknown as ReturnType<typeof setTimeout>;
+    const accessTimer = 202 as unknown as ReturnType<typeof setTimeout>;
+    let timerCalls = 0;
+    const setTimeoutMock = vi.fn((callback: () => void, delayMs: number): ReturnType<typeof setTimeout> => {
+      timerCalls++;
+      if (timerCalls === 2) {
+        queueMicrotask((): void => {
+          monotonicMs += delayMs;
+          callback();
+        });
+        return accessTimer;
+      }
+      return healthTimer;
+    });
+    const clearTimeoutMock = vi.fn((_timeout: ReturnType<typeof setTimeout>): void => {});
+    const sleepMock = vi.fn(async (_durationMs: number): Promise<void> => {});
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: join(tempDir, "daemon.pid"),
+      spawnTimeoutMs: 350,
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: vi.fn().mockReturnValue(makeSpawnChild(12345)) as unknown as SpawnOverride,
+      _monotonicNowOverride: (): number => monotonicMs,
+      _setTimeoutOverride: setTimeoutMock,
+      _clearTimeoutOverride: clearTimeoutMock,
+      _sleepOverride: sleepMock,
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(setTimeoutMock).toHaveBeenNthCalledWith(1, expect.any(Function), 350);
+    expect(setTimeoutMock).toHaveBeenNthCalledWith(2, expect.any(Function), 350);
+    expect(accessSignalWasInitiallyAborted).toBe(false);
+    expect(accessSignal?.aborted).toBe(true);
+    expect(clearTimeoutMock).toHaveBeenCalledWith(healthTimer);
+    expect(clearTimeoutMock).toHaveBeenCalledWith(accessTimer);
+    expect(sleepMock).not.toHaveBeenCalled();
+  });
+
+  it("aborts a hanging PID retry health probe at the remaining deadline without spawning", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-hanging-pid-retry-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "12345");
+    let monotonicMs = 0;
+    let fetchCalls = 0;
+    let retrySignal: AbortSignal | undefined;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      fetchCalls++;
+      if (fetchCalls === 1) return { ok: false } as Response;
+      retrySignal = init?.signal ?? undefined;
+      return new Promise<Response>((
+        _resolve: (value: Response | PromiseLike<Response>) => void,
+      ): void => {});
+    });
+    const initialTimer = 301 as unknown as ReturnType<typeof setTimeout>;
+    const retryTimer = 302 as unknown as ReturnType<typeof setTimeout>;
+    let timerCalls = 0;
+    const setTimeoutMock = vi.fn((callback: () => void, delayMs: number): ReturnType<typeof setTimeout> => {
+      timerCalls++;
+      if (timerCalls === 2) {
+        queueMicrotask((): void => {
+          monotonicMs += delayMs;
+          callback();
+        });
+        return retryTimer;
+      }
+      return initialTimer;
+    });
+    const clearTimeoutMock = vi.fn((_timeout: ReturnType<typeof setTimeout>): void => {});
+    const sleepMock = vi.fn(async (_durationMs: number): Promise<void> => {});
+    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(12345));
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 350,
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+      _isProcessAliveOverride: (): boolean => true,
+      _monotonicNowOverride: (): number => monotonicMs,
+      _setTimeoutOverride: setTimeoutMock,
+      _clearTimeoutOverride: clearTimeoutMock,
+      _sleepOverride: sleepMock,
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(sleepMock).toHaveBeenCalledWith(350);
+    expect(retrySignal?.aborted).toBe(true);
+    expect(clearTimeoutMock).toHaveBeenCalledWith(initialTimer);
+    expect(clearTimeoutMock).toHaveBeenCalledWith(retryTimer);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("skips the initial access probe when health consumes the operation deadline", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-initial-access-deadline-"));
+    tempDirs.push(tempDir);
+    let monotonicMs = 0;
+    const fetchMock = vi.fn(async (): Promise<Response> => ({
+      ok: true,
+      json: async (): Promise<{ status: string }> => {
+        monotonicMs = 350;
+        return { status: "ok" };
+      },
+    } as Response));
+    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(12345));
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: join(tempDir, "daemon.pid"),
+      spawnTimeoutMs: 350,
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+      _monotonicNowOverride: (): number => monotonicMs,
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("skips PID sleep and retry health when the initial probe consumes the deadline", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-pid-health-deadline-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "12345");
+    let monotonicMs = 0;
+    const fetchMock = vi.fn(async (): Promise<Response> => {
+      monotonicMs = 350;
+      return { ok: false } as Response;
+    });
+    const sleepMock = vi.fn(async (_durationMs: number): Promise<void> => {});
+    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(12345));
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 350,
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+      _isProcessAliveOverride: (): boolean => true,
+      _monotonicNowOverride: (): number => monotonicMs,
+      _sleepOverride: sleepMock,
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(sleepMock).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("skips PID retry access when retry health consumes the operation deadline", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-pid-access-deadline-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "12345");
+    let monotonicMs = 0;
+    let fetchCalls = 0;
+    const fetchMock = vi.fn(async (): Promise<Response> => {
+      fetchCalls++;
+      if (fetchCalls === 1) return { ok: false } as Response;
+      return {
+        ok: true,
+        json: async (): Promise<{ status: string }> => {
+          monotonicMs = 350;
+          return { status: "ok" };
+        },
+      } as Response;
+    });
+    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(12345));
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 350,
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+      _isProcessAliveOverride: (): boolean => true,
+      _monotonicNowOverride: (): number => monotonicMs,
+      _sleepOverride: async (_durationMs: number): Promise<void> => {},
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
   it("spawns a caller-specified command instead of process.argv[1] when provided", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-spawn-"));
     tempDirs.push(tempDir);
@@ -819,6 +1196,31 @@ describe("ensureDaemon", () => {
 });
 
 describe("restartDaemon", () => {
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648])(
+    "rejects invalid spawn timeout %s before validation, inspection, or signaling",
+    async (spawnTimeoutMs: number): Promise<void> => {
+      const validateBeforeRestart = vi.fn();
+      const fetchMock = vi.fn();
+      const killMock = vi.fn();
+      const ensureMock = vi.fn();
+
+      await expect(restartDaemon({
+        port: 19999,
+        pidFilePath: "/unused/daemon.pid",
+        spawnTimeoutMs,
+        validateBeforeRestart,
+        _fetchOverride: fetchMock as FetchOverride,
+        _killOverride: killMock,
+        _ensureDaemonOverride: ensureMock,
+      })).rejects.toThrow(new RangeError("spawnTimeoutMs must be between 0 and 2147483647"));
+
+      expect(validateBeforeRestart).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(killMock).not.toHaveBeenCalled();
+      expect(ensureMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("validates before stopping a verified running daemon and starts with the new port", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-running-"));
     tempDirs.push(tempDir);
