@@ -15,9 +15,9 @@ export interface ServiceDeps {
   mkdirSync: (path: string, opts?: any) => void;
   existsSync: (path: string) => boolean;
   chmodSync?: (path: string, mode: number) => void;
-  readdirSync?: (path: string, options?: any) => any[];
-  copyFileSync?: (source: string, destination: string) => void;
-  rmSync?: (path: string, options?: any) => void;
+  readdirSync?: typeof readdirSync;
+  copyFileSync?: typeof copyFileSync;
+  rmSync?: typeof rmSync;
   commandsSourceDir?: string;
   promptUser: (question: string) => Promise<string>;
   ensureDaemon?: (opts: { port: number; pidFilePath: string; spawnTimeoutMs: number }) => Promise<{ connected: boolean }>;
