@@ -3,7 +3,12 @@ import { join } from "node:path";
 import { load } from "js-yaml";
 import { packageAsset, packageRootFor } from "../runtime-root.js";
 
-const PROMPTS_DIR = packageAsset(packageRootFor(import.meta.url, 3), "dist/src/prompts", "src/prompts");
+const PROMPTS_DIR = packageAsset(
+  import.meta.url,
+  packageRootFor(import.meta.url, 3),
+  "dist/src/prompts",
+  "src/prompts",
+);
 
 export type PromptTemplate = {
   name: string;

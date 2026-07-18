@@ -4,7 +4,12 @@ import type { Agent, ConnectorType } from "./types.js";
 import { LCM_MARKERS } from "./constants.js";
 import { packageAsset, packageRootFor } from "../runtime-root.js";
 
-const TEMPLATES_DIR = packageAsset(packageRootFor(import.meta.url, 3), "dist/src/connectors/templates", "src/connectors/templates");
+const TEMPLATES_DIR = packageAsset(
+  import.meta.url,
+  packageRootFor(import.meta.url, 3),
+  "dist/src/connectors/templates",
+  "src/connectors/templates",
+);
 
 function loadFile(path: string): string {
   return readFileSync(join(TEMPLATES_DIR, path), "utf-8");

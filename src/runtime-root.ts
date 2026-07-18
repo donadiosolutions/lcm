@@ -12,9 +12,12 @@ export function packageRootFor(moduleUrl: string, compiledParentLevels: number):
   return root;
 }
 
-export function packageAsset(root: string, builtPath: string, sourcePath: string): string {
+export function packageAsset(moduleUrl: string, root: string, builtPath: string, sourcePath: string): string {
+  const modulePath = fileURLToPath(moduleUrl);
   const built = join(root, builtPath);
-  return existsSync(built) ? built : join(root, sourcePath);
+  const source = join(root, sourcePath);
+  if (["lcm.mjs", "mcp.mjs"].includes(basename(modulePath))) return existsSync(built) ? built : source;
+  return modulePath.split(sep).includes("dist") ? built : source;
 }
 
 export function packageEntrypoint(moduleUrl: string, root: string, defaultPath: string): string {

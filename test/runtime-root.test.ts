@@ -24,12 +24,25 @@ describe("runtime package layout", () => {
       .toBe("/opt/lcm/dist/bin/lcm.js");
   });
 
-  it("prefers built assets and falls back to source assets", () => {
+  it("selects assets from the caller layout instead of ambient build artifacts", () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-layout-"));
     cleanup.push(root);
-    expect(packageAsset(root, "dist/data", "src/data")).toBe(join(root, "src/data"));
     mkdirSync(join(root, "dist"));
     writeFileSync(join(root, "dist", "data"), "built");
-    expect(packageAsset(root, "dist/data", "src/data")).toBe(join(root, "dist/data"));
+    expect(packageAsset("file:///opt/lcm/src/loader.ts", root, "dist/data", "src/data"))
+      .toBe(join(root, "src/data"));
+    expect(packageAsset("file:///opt/lcm/dist/src/loader.js", root, "dist/data", "src/data"))
+      .toBe(join(root, "dist/data"));
+  });
+
+  it("uses package-local availability only for collapsed bundles", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-layout-bundle-"));
+    cleanup.push(root);
+    expect(packageAsset(`file://${root}/lcm.mjs`, root, "dist/data", "src/data"))
+      .toBe(join(root, "src/data"));
+    mkdirSync(join(root, "dist"));
+    writeFileSync(join(root, "dist", "data"), "built");
+    expect(packageAsset(`file://${root}/mcp.mjs`, root, "dist/data", "src/data"))
+      .toBe(join(root, "dist/data"));
   });
 });
