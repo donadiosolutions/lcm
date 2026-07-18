@@ -14,7 +14,7 @@ This document is a living record. **Update it whenever you learn something:**
 
 **When to update:** At the end of every feature cycle (after the implementation PR merges), review this doc against what actually happened. If reality diverged from the doc, fix the doc — not reality.
 
-**How to update:** Create a `docs/<topic>` branch, push, get Copilot review, merge to main. Same flow as any other docs change.
+**How to update:** Create a `docs/<topic>` branch, push, get Copilot review, then queue it for main with `gh pr merge <number> --repo donadiosolutions/lcm --auto --squash`. Same flow as any other docs change.
 
 ## Branch Strategy
 
