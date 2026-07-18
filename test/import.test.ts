@@ -2,8 +2,10 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, utimesSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { cwdToProjectHash, findSessionFiles, importSessions } from "../src/import.js";
 import type { DaemonClient } from "../src/daemon/client.js";
+import { projectId } from "../src/daemon/project.js";
 
 // --- cwdToProjectHash ---
 
@@ -186,6 +188,25 @@ describe("findSessionFiles", () => {
     const result = findSessionFiles(dir);
     expect(result.map(f => f.sessionId)).toEqual(["session-old", "session-new"]);
   });
+
+  it("sorts equal mtimes by session ID and then path", () => {
+    const dir = makeTmpDir();
+    const nested = join(dir, "same");
+    const agents = join(nested, "subagents");
+    mkdirSync(agents, { recursive: true });
+    writeFileSync(join(agents, "ignored.txt"), "");
+    const paths = [
+      join(dir, "z.jsonl"),
+      join(dir, "a.jsonl"),
+      join(dir, "same.jsonl"),
+      join(agents, "same.jsonl"),
+    ];
+    for (const path of paths) writeFileSync(path, "");
+    const time = new Date("2026-01-01T00:00:00Z");
+    for (const path of paths) utimesSync(path, time, time);
+    const result = findSessionFiles(dir);
+    expect(result.map((item) => item.sessionId)).toEqual(["a", "same", "same", "z"]);
+  });
 });
 
 // --- importSessions ---
@@ -234,6 +255,200 @@ describe("importSessions", () => {
     // dry-run counts found sessions as "imported" for reporting
     expect(result.imported).toBe(1);
     expect(result.failed).toBe(0);
+  });
+
+  it("reports verbose replay dry-runs and progress", async () => {
+    const claudeProjectsDir = makeTmpDir();
+    const cwd = "/dry/run";
+    const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, "session-1.jsonl"), "");
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const onProgress = vi.fn();
+    const result = await importSessions(makeMockClient(async () => ({})), {
+      cwd, _claudeProjectsDir: claudeProjectsDir, dryRun: true, replay: true, verbose: true, onProgress,
+    });
+    expect(result.imported).toBe(1);
+    expect(log).toHaveBeenCalledWith("  [dry-run] session-1 (would compact)");
+    expect(onProgress).toHaveBeenCalledWith(expect.objectContaining({ completed: 1, total: 1 }));
+  });
+
+  it("reports verbose non-replay dry-runs", async () => {
+    const claudeProjectsDir = makeTmpDir();
+    const cwd = "/dry/plain";
+    const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, "session.jsonl"), "");
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await importSessions(makeMockClient(async () => ({})), {
+      cwd, _claudeProjectsDir: claudeProjectsDir, dryRun: true, verbose: true,
+    });
+    expect(log).toHaveBeenCalledWith("  [dry-run] session");
+  });
+
+  it("discovers all Claude projects through valid project metadata", async () => {
+    const claudeProjectsDir = makeTmpDir();
+    const lcmDir = makeTmpDir();
+    const cwd = "/mapped/project";
+    const hash = cwdToProjectHash(cwd);
+    mkdirSync(join(claudeProjectsDir, hash), { recursive: true });
+    writeFileSync(join(claudeProjectsDir, hash, "mapped.jsonl"), "");
+    mkdirSync(join(claudeProjectsDir, "unmapped"));
+    writeFileSync(join(claudeProjectsDir, "not-a-project"), "");
+    mkdirSync(join(lcmDir, "projects", "valid"), { recursive: true });
+    writeFileSync(join(lcmDir, "projects", "valid", "meta.json"), JSON.stringify({ cwd }));
+    mkdirSync(join(lcmDir, "projects", "missing-meta"));
+    mkdirSync(join(lcmDir, "projects", "empty-meta"));
+    writeFileSync(join(lcmDir, "projects", "empty-meta", "meta.json"), "{}");
+    mkdirSync(join(lcmDir, "projects", "bad-meta"));
+    writeFileSync(join(lcmDir, "projects", "bad-meta", "meta.json"), "{");
+    writeFileSync(join(lcmDir, "projects", "not-a-directory"), "");
+    const client = makeMockClient(async () => ({ ingested: 1, totalTokens: 1 }));
+    const result = await importSessions(client, { all: true, _claudeProjectsDir: claudeProjectsDir, _lcmDir: lcmDir });
+    expect(result.imported).toBe(1);
+  });
+
+  it("handles absent project maps and default path options", async () => {
+    const claudeProjectsDir = makeTmpDir();
+    const emptyLcmDir = makeTmpDir();
+    const client = makeMockClient(async () => ({ ingested: 1, totalTokens: 1 }));
+    await expect(importSessions(client, { all: true, _claudeProjectsDir: claudeProjectsDir, _lcmDir: emptyLcmDir })).resolves.toMatchObject({ imported: 0 });
+    await expect(importSessions(client, { all: true, _claudeProjectsDir: claudeProjectsDir })).resolves.toMatchObject({ imported: 0 });
+    await expect(importSessions(client, { all: true, _claudeProjectsDir: join(claudeProjectsDir, "missing") })).resolves.toMatchObject({ imported: 0 });
+    await expect(importSessions(client, { _claudeProjectsDir: claudeProjectsDir })).resolves.toMatchObject({ imported: 0 });
+    await expect(importSessions(client, { cwd: "/coverage/nonexistent/default-claude-project" })).resolves.toMatchObject({ imported: 0 });
+  });
+
+  it("skips sessions recorded in the local ingest log and closes the database", async () => {
+    const claudeProjectsDir = makeTmpDir();
+    const lcmDir = makeTmpDir();
+    const cwd = "/already/imported";
+    const sessionId = "recorded";
+    const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, `${sessionId}.jsonl`), "");
+    const dbDir = join(lcmDir, "projects", projectId(cwd));
+    mkdirSync(dbDir, { recursive: true });
+    const db = new DatabaseSync(join(dbDir, "db.sqlite"));
+    db.exec("CREATE TABLE session_ingest_log (session_id TEXT PRIMARY KEY)");
+    db.prepare("INSERT INTO session_ingest_log(session_id) VALUES (?)").run(sessionId);
+    db.close();
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const onProgress = vi.fn();
+    const client = makeMockClient(async () => ({ ingested: 1, totalTokens: 1 }));
+    const result = await importSessions(client, {
+      cwd, _claudeProjectsDir: claudeProjectsDir, _lcmDir: lcmDir, verbose: true, onProgress,
+    });
+    expect(client.post).not.toHaveBeenCalled();
+    expect(result.skippedEmpty).toBe(1);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("already fully ingested"));
+    expect(onProgress).toHaveBeenCalled();
+  });
+
+  it("quietly skips a recorded session without a progress callback", async () => {
+    const claudeProjectsDir = makeTmpDir();
+    const lcmDir = makeTmpDir();
+    const cwd = "/already/quiet";
+    const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, "recorded.jsonl"), "");
+    const dbDir = join(lcmDir, "projects", projectId(cwd));
+    mkdirSync(dbDir, { recursive: true });
+    const db = new DatabaseSync(join(dbDir, "db.sqlite"));
+    db.exec("CREATE TABLE session_ingest_log (session_id TEXT PRIMARY KEY); INSERT INTO session_ingest_log VALUES ('recorded')");
+    db.close();
+    const result = await importSessions(makeMockClient(async () => ({})), {
+      cwd, _claudeProjectsDir: claudeProjectsDir, _lcmDir: lcmDir,
+    });
+    expect(result.skippedEmpty).toBe(1);
+  });
+
+  it("prints verbose empty and successful ingest results", async () => {
+    const claudeProjectsDir = makeTmpDir();
+    const cwd = "/verbose/ingest";
+    const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, "empty.jsonl"), "");
+    writeFileSync(join(projectDir, "success.jsonl"), "");
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const client = makeMockClient(async (_path, body) => (body as { session_id: string }).session_id === "empty"
+      ? { ingested: 0, totalTokens: 0 }
+      : { ingested: 2, totalTokens: 100 });
+    const result = await importSessions(client, { cwd, _claudeProjectsDir: claudeProjectsDir, verbose: true });
+    expect(result).toMatchObject({ imported: 1, skippedEmpty: 1 });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("empty or already ingested"));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("2 messages"));
+  });
+
+  it("covers every verbose replay statistics outcome and prior-context label", async () => {
+    const claudeProjectsDir = makeTmpDir();
+    const cwd = "/verbose/replay";
+    const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
+    mkdirSync(projectDir, { recursive: true });
+    for (const id of ["a", "b", "c", "d"]) writeFileSync(join(projectDir, `${id}.jsonl`), "");
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const responses: Record<string, object> = {
+      a: { latestSummaryContent: "a", tokensBefore: 100, tokensAfter: 10 },
+      b: { latestSummaryContent: "b", tokensAfter: 10 },
+      c: { latestSummaryContent: "c", tokensBefore: 100 },
+      d: { latestSummaryContent: "d", tokensBefore: 10, tokensAfter: 10 },
+    };
+    const client = makeMockClient(async (path, body) => path === "/ingest"
+      ? { ingested: 1, totalTokens: 100 }
+      : responses[(body as { session_id: string }).session_id]);
+    await importSessions(client, { cwd, _claudeProjectsDir: claudeProjectsDir, replay: true, verbose: true });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("100 → 10"));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("compacted (with prior context)"));
+  });
+
+  it("handles non-Error compact and ingest failures in verbose replay mode", async () => {
+    const claudeProjectsDir = makeTmpDir();
+    const cwd = "/failure/values";
+    const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, "compact-fail.jsonl"), "");
+    writeFileSync(join(projectDir, "ingest-fail.jsonl"), "");
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const client = makeMockClient(async (path, body) => {
+      const id = (body as { session_id: string }).session_id;
+      if (path === "/ingest" && id === "ingest-fail") throw "ingest value";
+      if (path === "/compact" && id === "compact-fail") throw "compact value";
+      return { ingested: 1, totalTokens: 10 };
+    });
+    const result = await importSessions(client, { cwd, _claudeProjectsDir: claudeProjectsDir, replay: true, verbose: true });
+    expect(result.failed).toBe(1);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("unknown error"));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("failed"));
+  });
+
+  it("prints Error details for verbose ingest failures", async () => {
+    const claudeProjectsDir = makeTmpDir();
+    const cwd = "/failure/error";
+    const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, "session.jsonl"), "");
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await importSessions(makeMockClient(async () => { throw new Error("specific failure"); }), {
+      cwd, _claudeProjectsDir: claudeProjectsDir, verbose: true,
+    });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("specific failure"));
+  });
+
+  it("imports when the ingest database is missing or malformed", async () => {
+    const claudeProjectsDir = makeTmpDir();
+    const lcmDir = makeTmpDir();
+    const cwd = "/malformed/database";
+    const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, "session.jsonl"), "");
+    const dbDir = join(lcmDir, "projects", projectId(cwd));
+    mkdirSync(dbDir, { recursive: true });
+    writeFileSync(join(dbDir, "db.sqlite"), "not sqlite");
+    const result = await importSessions(makeMockClient(async () => ({ ingested: 1, totalTokens: 1 })), {
+      cwd, _claudeProjectsDir: claudeProjectsDir, _lcmDir: lcmDir,
+    });
+    expect(result.imported).toBe(1);
   });
 
   it("calls /ingest with transcript_path and counts imported", async () => {

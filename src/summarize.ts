@@ -252,12 +252,8 @@ function sanitizeForDiagnostics(value: unknown, depth = 0, key?: string): unknow
     }
     return head;
   }
-  if (!isRecord(value)) {
-    return String(value);
-  }
-
   const out: Record<string, unknown> = {};
-  const entries = Object.entries(value);
+  const entries = Object.entries(value as Record<string, unknown>);
   for (const [key, entry] of entries.slice(0, DIAGNOSTIC_MAX_OBJECT_KEYS)) {
     out[key] = isSensitiveKey(key)
       ? "[REDACTED]"
@@ -273,10 +269,7 @@ function sanitizeForDiagnostics(value: unknown, depth = 0, key?: string): unknow
 function formatDiagnosticPayload(value: unknown): string {
   try {
     const json = JSON.stringify(sanitizeForDiagnostics(value));
-    if (!json) {
-      return "\"\"";
-    }
-    return truncateDiagnosticText(json);
+    return truncateDiagnosticText(json!);
   } catch {
     return "\"[unserializable]\"";
   }
@@ -538,10 +531,6 @@ export function buildCondensedSummaryPrompt(params: {
  */
 function buildDeterministicFallbackSummary(text: string, targetTokens: number): string {
   const trimmed = text.trim();
-  if (!trimmed) {
-    return "";
-  }
-
   const maxChars = Math.max(256, targetTokens * 4);
   if (trimmed.length <= maxChars) {
     return trimmed;
@@ -549,6 +538,16 @@ function buildDeterministicFallbackSummary(text: string, targetTokens: number): 
 
   return `${trimmed.slice(0, maxChars)}\n[LCM fallback summary; truncated for context management]`;
 }
+
+/** Internal diagnostic seams used by exhaustive boundary tests. */
+export const __summarizeTestUtils = {
+  resolveProviderApiFromLegacyConfig,
+  normalizeCompletionSummary,
+  sanitizeForDiagnostics,
+  formatDiagnosticPayload,
+  extractResponseDiagnostics,
+  buildDeterministicFallbackSummary,
+};
 
 /**
  * Builds a model-backed LCM summarize callback from runtime legacy params.
@@ -685,9 +684,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         `block_types=${formatBlockTypes(normalized.blockTypes)}`,
         `response_blocks=${result.content.length}`,
       ];
-      if (responseDiag) {
-        diagParts.push(responseDiag);
-      }
+      diagParts.push(responseDiag);
       console.error(`${diagParts.join("; ")}; retrying with conservative settings`);
 
       // Single retry with conservative parameters: low temperature and low
@@ -732,9 +729,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             `block_types=${formatBlockTypes(retryNormalized.blockTypes)}`,
             `response_blocks=${retryResult.content.length}`,
           ];
-          if (retryDiag) {
-            retryParts.push(retryDiag);
-          }
+          retryParts.push(retryDiag);
           console.error(`${retryParts.join("; ")}; falling back to truncation`);
         }
       } catch (retryErr) {

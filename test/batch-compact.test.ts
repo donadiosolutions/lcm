@@ -7,7 +7,7 @@ import { batchCompact, findUncompacted, formatLlmDiagnostic } from "../src/batch
 import { DaemonClient } from "../src/daemon/client.js";
 import { closeLcmConnection, getLcmConnection, getPoolStats } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
-import { addProjectAlias, clearProjectMapCache } from "../src/project-map.js";
+import { addProjectAlias, clearProjectMapCache, projectMapPath } from "../src/project-map.js";
 import { ensureProjectDir, projectPaths } from "../src/daemon/project.js";
 
 function resetLcmHome(): void {
@@ -180,9 +180,128 @@ describe("batch compaction discovery", () => {
       },
     }));
   });
+
+  it("handles absent, malformed, summarized, and replay discovery entries", () => {
+    expect(findUncompacted(100, true)).toEqual([]);
+
+    const projectsDir = join(homedir(), ".lcm", "projects");
+    mkdirSync(projectsDir, { recursive: true });
+    writeFileSync(join(projectsDir, "not-a-directory"), "ignored");
+    mkdirSync(join(projectsDir, "missing-db"));
+
+    const corruptMeta = join(projectsDir, "corrupt-meta");
+    mkdirSync(corruptMeta);
+    writeFileSync(join(corruptMeta, "db.sqlite"), "not sqlite");
+    writeFileSync(join(corruptMeta, "meta.json"), "{");
+
+    const missingCwd = join(projectsDir, "missing-cwd");
+    mkdirSync(missingCwd);
+    writeFileSync(join(missingCwd, "db.sqlite"), "not sqlite");
+    writeFileSync(join(missingCwd, "meta.json"), "{}");
+
+    const missingMeta = join(projectsDir, "missing-meta");
+    mkdirSync(missingMeta);
+    seedConversation(join(missingMeta, "db.sqlite"));
+
+    const corruptDb = join(projectsDir, "corrupt-db");
+    mkdirSync(corruptDb);
+    writeFileSync(join(corruptDb, "db.sqlite"), "not sqlite");
+    writeFileSync(join(corruptDb, "meta.json"), JSON.stringify({ cwd: "/corrupt" }));
+
+    const cwd = makeDir("compact-replay");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    const db = new DatabaseSync(paths.dbPath);
+    db.prepare(
+      "INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, file_ids) VALUES (?, ?, ?, ?, ?, '[]')",
+    ).run("summary-1", 1, "leaf", "summary", 10);
+    db.close();
+
+    expect(findUncompacted(100, true, cwd)).toEqual([]);
+    expect(findUncompacted(100, true, cwd, true)).toHaveLength(1);
+    expect(findUncompacted(100, false, cwd, true)).toHaveLength(1);
+    expect(findUncompacted(100, true)).toHaveLength(0);
+
+    writeFileSync(projectMapPath(), "{");
+    clearProjectMapCache();
+    expect(findUncompacted(100, true, "/unmapped", true)).toEqual([]);
+  });
+
+  it("reports empty, dry-run, skipped, and unknown-error batch outcomes", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737 })).toEqual({
+      compacted: 0,
+      failures: 0,
+    });
+    expect(log).toHaveBeenCalledWith("Nothing to compact — all sessions are up to date.");
+
+    const cwd = makeDir("compact-boundary-outcomes");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversations(paths.dbPath);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: true,
+      port: 3737,
+      cwd,
+      onProgress: patch => progress.push(patch),
+    })).toEqual({ compacted: 0, failures: 0 });
+    expect(progress).toContainEqual({ total: 2 });
+    expect(progress.at(-1)).toEqual({ completed: 2 });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("Found 2 uncompacted conversations"));
+
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const post = vi.spyOn(DaemonClient.prototype, "post")
+      .mockResolvedValueOnce({ skipped: true })
+      .mockRejectedValueOnce("no details");
+    progress.length = 0;
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      onProgress: patch => progress.push(patch),
+    })).toEqual({ compacted: 0, failures: 1 });
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledWith(" skipped (already in progress)");
+    expect(log).toHaveBeenCalledWith(" FAILED (unknown error)");
+    expect(log).toHaveBeenCalledWith("\nBatch compact complete.");
+  });
+
+  it("prints the singular non-verbose success path", async () => {
+    const cwd = makeDir("compact-single-success");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensBefore: 250 });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    expect(await batchCompact({ minTokens: 100, dryRun: false, port: 3737, cwd })).toEqual({
+      compacted: 1,
+      failures: 0,
+    });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("Found 1 uncompacted conversation ("));
+    expect(log).toHaveBeenCalledWith(" done");
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("1 session compacted"));
+  });
 });
 
 describe("formatLlmDiagnostic", () => {
+  it("omits diagnostics without a provider and optional controls when absent", () => {
+    expect(formatLlmDiagnostic({})).toBeUndefined();
+    expect(formatLlmDiagnostic({ providerLabel: "Anthropic API" })).toBe("Anthropic API");
+    expect(formatLlmDiagnostic({
+      providerLabel: "OpenAI-compatible API",
+      apiMode: "chat-completions",
+    })).toBe("OpenAI-compatible API · chat-completions");
+  });
   it("includes Responses API mode and the effective reasoning effort", () => {
     expect(formatLlmDiagnostic({
       providerLabel: "OpenAI API",

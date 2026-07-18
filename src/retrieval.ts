@@ -287,10 +287,6 @@ export class RetrievalEngine {
     if (depth <= 0) {
       return;
     }
-    if (result.truncated) {
-      return;
-    }
-
     const summary = await this.summaryStore.getSummary(summaryId);
     if (!summary) {
       return;
@@ -300,10 +296,6 @@ export class RetrievalEngine {
       const children = await this.summaryStore.getSummaryChildren(summaryId);
 
       for (const child of children) {
-        if (result.truncated) {
-          break;
-        }
-
         // Check if adding this child would exceed the token cap
         if (result.estimatedTokens + child.tokenCount > tokenCap) {
           result.truncated = true;
@@ -328,10 +320,6 @@ export class RetrievalEngine {
       const messageIds = await this.summaryStore.getSummaryMessages(summaryId);
 
       for (const msgId of messageIds) {
-        if (result.truncated) {
-          break;
-        }
-
         const msg = await this.conversationStore.getMessageById(msgId);
         if (!msg) {
           continue;

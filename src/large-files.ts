@@ -111,8 +111,8 @@ function parseFileAttributes(raw: string): Record<string, string> {
   let match: RegExpExecArray | null;
   while ((match = attrRe.exec(raw)) !== null) {
     const key = match[1].trim().toLowerCase();
-    const value = (match[3] ?? match[4] ?? match[5] ?? "").trim();
-    if (key.length > 0 && value.length > 0) {
+    const value = match.slice(3, 6).join("").trim();
+    if (value.length > 0) {
       attrs[key] = value;
     }
   }
@@ -132,7 +132,7 @@ function collectFileNameExtension(fileName?: string): string | undefined {
   if (!fileName) {
     return undefined;
   }
-  const base = fileName.trim().split(/[\\/]/).pop() ?? "";
+  const base = fileName.trim().split(/[\\/]/).pop()!;
   const idx = base.lastIndexOf(".");
   if (idx <= 0 || idx === base.length - 1) {
     return undefined;
@@ -153,20 +153,20 @@ function guessMimeExtension(mimeType?: string): string | undefined {
   return MIME_EXTENSION_MAP[normalized];
 }
 
-function isStructured(params: { mimeType?: string; extension?: string }): boolean {
+function isStructured(params: { mimeType?: string; extension: string }): boolean {
   const mime = params.mimeType?.trim().toLowerCase();
   if (mime && STRUCTURED_MIME_PREFIXES.some((candidate) => mime.startsWith(candidate))) {
     return true;
   }
-  return params.extension ? STRUCTURED_EXTENSIONS.has(params.extension) : false;
+  return STRUCTURED_EXTENSIONS.has(params.extension);
 }
 
-function isCode(params: { mimeType?: string; extension?: string }): boolean {
+function isCode(params: { mimeType?: string; extension: string }): boolean {
   const mime = params.mimeType?.trim().toLowerCase();
   if (mime && CODE_MIME_PREFIXES.some((candidate) => mime.startsWith(candidate))) {
     return true;
   }
-  return params.extension ? CODE_EXTENSIONS.has(params.extension) : false;
+  return CODE_EXTENSIONS.has(params.extension);
 }
 
 function uniqueOrdered(values: Iterable<string>): string[] {
@@ -454,8 +454,8 @@ export function parseFileBlocks(content: string): FileBlock[] {
   FILE_BLOCK_RE.lastIndex = 0;
   while ((match = FILE_BLOCK_RE.exec(content)) !== null) {
     const fullMatch = match[0];
-    const rawAttrs = match[1] ?? "";
-    const text = match[2] ?? "";
+    const rawAttrs = match[1];
+    const text = match[2];
     const start = match.index;
     const end = start + fullMatch.length;
     const attributes = parseFileAttributes(rawAttrs);
