@@ -205,13 +205,16 @@ export async function startMcpServer(): Promise<void> {
   const pidFilePath = daemonPidPath();
 
   const lcmBin = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "lcm.mjs");
-  await ensureDaemon({
+  const daemon = await ensureDaemon({
     port, pidFilePath, spawnTimeoutMs: 10000,
     expectedVersion: PKG_VERSION,
     spawnCommand: process.execPath,
     spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
     enforceUserManagerParent: true,
   });
+  if (!daemon.connected) {
+    throw new Error("Refusing to start MCP server: daemon endpoint identity could not be verified.");
+  }
 
   const client = new DaemonClient(`http://127.0.0.1:${port}`);
   const server = new Server({ name: "lcm", version: "1.0.0" }, { capabilities: { tools: {} } });
