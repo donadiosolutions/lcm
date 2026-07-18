@@ -35,10 +35,22 @@ export async function dispatchHook(
     try {
       const { session_id } = JSON.parse(stdinText || "{}");
       if (session_id) {
-        const { ensureBootstrapped } = await import("../bootstrap.js");
-        await ensureBootstrapped(session_id);
+        const { ensureBootstrapped, ensureCore } = await import("../bootstrap.js");
+        // Session snapshots contain transcript paths and payload data, so they
+        // reverify the current endpoint even when this session has a bootstrap
+        // flag from an earlier healthy daemon.
+        const verified = command === "session-snapshot"
+          ? await ensureCore()
+          : await ensureBootstrapped(session_id);
+        if (command === "session-snapshot" && !verified) {
+          return { exitCode: 0, stdout: "" };
+        }
       }
-    } catch {} // bootstrap failure must not block hooks
+    } catch {
+      // Most hooks retain their existing best-effort behavior, but snapshots
+      // must never send transcript data or credentials to an unverified port.
+      if (command === "session-snapshot") return { exitCode: 0, stdout: "" };
+    }
   }
 
   const hookClient = hookClientFromPayload(stdinText) ?? process.env.LCM_CLIENT;

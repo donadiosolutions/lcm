@@ -26,6 +26,9 @@ describe("lifecycle procfs and parent warnings", () => {
     const spawnSync = vi.fn(() => ({ status: 0, stdout: many }));
     expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", spawnSync as never)).toHaveLength(32);
     expect(spawnSync).toHaveBeenCalledWith("lsof", expect.any(Array), expect.any(Object));
+    expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", vi.fn(() => ({
+      status: 0, stdout: "n127.0.0.2:3737\nn127.0.0.1:invalid\nn127.0.0.1:4545",
+    })) as never)).toEqual([4545]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(1, "darwin", vi.fn(() => ({ status: 1, stdout: "" })) as never)).toEqual([]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", vi.fn(() => ({
       status: 0,
@@ -34,6 +37,8 @@ describe("lifecycle procfs and parent warnings", () => {
         "UDP 127.0.0.1:1111 *:* LISTENING 42",
         "TCP 127.0.0.1:2222 0.0.0.0:0 ESTABLISHED 42",
         "TCP invalid 0.0.0.0:0 LISTENING 42",
+        "TCP 127.0.0.2:3333 0.0.0.0:0 LISTENING 42",
+        "TCP 127.0.0.1:invalid 0.0.0.0:0 LISTENING 42",
         "TCP 127.0.0.1:3737 0.0.0.0:0 LISTENING 42",
         "TCP 127.0.0.1:4545 0.0.0.0:0 LISTENING 99",
       ].join("\n"),
@@ -44,7 +49,7 @@ describe("lifecycle procfs and parent warnings", () => {
     mkdirSync(join(linuxRoot, "42", "fd"), { recursive: true });
     mkdirSync(join(linuxRoot, "net"), { recursive: true });
     symlinkSync("socket:[12345]", join(linuxRoot, "42", "fd", "7"));
-    writeFileSync(join(linuxRoot, "net", "tcp"), "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n 0: : 00000000:0000 0A 0:0 00:0 0 1000 0 12345\n 1: 0100007F:0E99 00000000:0000 0A 0:0 00:0 0 1000 0 12345\n");
+    writeFileSync(join(linuxRoot, "net", "tcp"), "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n 0: : 00000000:0000 0A 0:0 00:0 0 1000 0 12345\n 1: 0200007F:0D05 00000000:0000 0A 0:0 00:0 0 1000 0 12345\n 2: 0100007F: 00000000:0000 0A 0:0 00:0 0 1000 0 12345\n 3: 0100007F:0E99 00000000:0000 0A 0:0 00:0 0 1000 0 12345\n");
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot)).toEqual([3737]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, join(linuxRoot, "missing"))).toEqual([]);
 

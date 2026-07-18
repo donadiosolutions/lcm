@@ -187,7 +187,10 @@ function findListeningTcpPorts(
         for (const row of rows.split(/\r?\n/).slice(1)) {
           const columns = row.trim().split(/\s+/);
           if (columns.length < 10 || columns[3] !== "0A" || !socketInodes.has(columns[9])) continue;
-          const portHex = columns[1]?.split(":").pop();
+          const [addressHex, portHex] = columns[1]!.split(":");
+          // Requests are sent specifically to 127.0.0.1. A socket on another
+          // loopback address does not prove ownership of that endpoint.
+          if (addressHex !== "0100007F") continue;
           const port = portHex ? Number.parseInt(portHex, 16) : NaN;
           if (Number.isInteger(port) && port >= 1 && port <= 65_535) ports.add(port);
         }
@@ -208,6 +211,7 @@ function findListeningTcpPorts(
         const columns = line.trim().split(/\s+/);
         if (columns.length < 5 || columns[0]?.toUpperCase() !== "TCP" || columns[3]?.toUpperCase() !== "LISTENING") continue;
         if (Number.parseInt(columns[4], 10) !== pid) continue;
+        if (!columns[1]?.startsWith("127.0.0.1:")) continue;
         const port = Number.parseInt(columns[1]?.match(/:(\d+)$/)?.[1] ?? "", 10);
         if (Number.isInteger(port) && port >= 1 && port <= 65_535) ports.add(port);
       }
@@ -233,7 +237,7 @@ function findListeningTcpPorts(
     if (result.status !== 0 || typeof result.stdout !== "string") return [];
     const ports = new Set<number>();
     for (const line of result.stdout.split(/\r?\n/)) {
-      if (!line.startsWith("n")) continue;
+      if (!line.startsWith("n127.0.0.1:")) continue;
       const match = line.match(/:(\d+)(?:\s+\(LISTEN\))?$/);
       if (!match) continue;
       const port = Number.parseInt(match[1], 10);
@@ -372,11 +376,11 @@ async function terminatePid(
 async function requestDaemonHealth(
   port: number,
   fetchFn: typeof globalThis.fetch,
-  signal?: AbortSignal,
+  signal: AbortSignal,
 ): Promise<HealthResponse | null> {
   try {
     const url = `http://127.0.0.1:${port}/health`;
-    const res = signal ? await fetchFn(url, { signal }) : await fetchFn(url);
+    const res = await fetchFn(url, { signal });
     return res.ok ? (await res.json()) as HealthResponse : null;
   } catch {
     return null;
@@ -409,41 +413,35 @@ async function runWithDeadline<T>(
 async function checkDaemonHealth(
   port: number,
   fetchFn: typeof globalThis.fetch,
-  deadline?: RequestDeadline,
+  deadline: RequestDeadline,
 ): Promise<HealthResponse | null> {
-  if (deadline) {
-    try {
-      return await runWithDeadline(
-        (signal: AbortSignal): Promise<HealthResponse | null> => requestDaemonHealth(port, fetchFn, signal),
-        deadline,
-      );
-    } catch {
-      return null;
-    }
+  try {
+    return await runWithDeadline(
+      (signal: AbortSignal): Promise<HealthResponse | null> => requestDaemonHealth(port, fetchFn, signal),
+      deadline,
+    );
+  } catch {
+    return null;
   }
-
-  return requestDaemonHealth(port, fetchFn);
 }
 
 async function checkDaemonAccess(
   port: number,
   tokenPath: string,
   fetchFn: typeof globalThis.fetch,
-  deadline?: RequestDeadline,
+  deadline: RequestDeadline,
 ): Promise<boolean> {
   const token = readAuthToken(tokenPath);
   if (!token) return false;
-  const request = async (signal?: AbortSignal): Promise<boolean> => {
+  const request = async (signal: AbortSignal): Promise<boolean> => {
     const res = await fetchFn(`http://127.0.0.1:${port}/stats/pool`, {
       headers: { Authorization: `Bearer ${token}` },
-      ...(signal ? { signal } : {}),
+      signal,
     });
     return res.ok;
   };
   try {
-    return deadline
-      ? await runWithDeadline((signal: AbortSignal): Promise<boolean> => request(signal), deadline)
-      : await request();
+    return await runWithDeadline((signal: AbortSignal): Promise<boolean> => request(signal), deadline);
   } catch {
     return false;
   }
@@ -903,11 +901,22 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   const fetchFn = opts._fetchOverride ?? globalThis.fetch;
   const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
+  const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
+  const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
+  const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
+  const verificationDeadline = monotonicNow() + opts.spawnTimeoutMs;
+  function remainingVerificationDeadline(): RequestDeadline | null {
+    const timeoutMs = verificationDeadline - monotonicNow();
+    return timeoutMs <= 0 ? null : { timeoutMs, setTimeoutFn, clearTimeoutFn };
+  }
   async function isAuthenticatedDaemonAtPort(port: number, pid: number): Promise<boolean> {
-    const health = await checkDaemonHealth(port, fetchFn);
+    const healthDeadline = remainingVerificationDeadline();
+    if (!healthDeadline) return false;
+    const health = await checkDaemonHealth(port, fetchFn, healthDeadline);
     if (health?.status !== "ok" || health.pid !== pid) return false;
     if (!healthVersionMatches(health, expectedVersion)) return false;
-    if (!await checkDaemonAccess(port, tokenPath, fetchFn)) return false;
+    const accessDeadline = remainingVerificationDeadline();
+    if (!accessDeadline || !await checkDaemonAccess(port, tokenPath, fetchFn, accessDeadline)) return false;
     return true;
   }
   async function isManaged(pid: number): Promise<boolean> {

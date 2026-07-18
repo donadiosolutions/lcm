@@ -35,12 +35,13 @@ vi.mock("../../src/daemon/config.js", () => ({
   loadDaemonConfig: vi.fn().mockReturnValue({ daemon: { port: 3737 } }),
 }));
 vi.mock("../../src/bootstrap.js", () => ({
-  ensureBootstrapped: vi.fn().mockResolvedValue(undefined),
+  ensureBootstrapped: vi.fn().mockResolvedValue(true),
+  ensureCore: vi.fn().mockResolvedValue(true),
 }));
 
 import { validateAndFixHooks } from "../../src/hooks/auto-heal.js";
 import { dispatchHook, isHookCommand } from "../../src/hooks/dispatch.js";
-import { ensureBootstrapped } from "../../src/bootstrap.js";
+import { ensureBootstrapped, ensureCore } from "../../src/bootstrap.js";
 
 describe("HOOK_COMMANDS", () => {
   it("has an entry for every REQUIRED_HOOKS event", () => {
@@ -149,6 +150,29 @@ describe("dispatchHook", () => {
     vi.mocked(handleSessionStart).mockResolvedValue({ exitCode: 0, stdout: "" });
     const result = await dispatchHook("restore", JSON.stringify({ session_id: "s1" }));
     expect(result.exitCode).toBe(0);
+  });
+
+  it("retains best-effort dispatch for non-snapshot hooks when bootstrap is unverified", async () => {
+    vi.mocked(ensureBootstrapped).mockResolvedValueOnce(false);
+    vi.mocked(handleSessionStart).mockClear();
+    await dispatchHook("restore", JSON.stringify({ session_id: "s1" }));
+    expect(handleSessionStart).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, "throw"] as const)("does not dispatch snapshots when bootstrap verification is %s", async (mode) => {
+    vi.mocked(handleSessionSnapshot).mockClear();
+    if (mode === "throw") vi.mocked(ensureCore).mockRejectedValueOnce(new Error("bootstrap failed"));
+    else vi.mocked(ensureCore).mockResolvedValueOnce(false);
+    await expect(dispatchHook("session-snapshot", JSON.stringify({ session_id: "s1" }))).resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(handleSessionSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("reverifies snapshot identity even when the session was already bootstrapped", async () => {
+    vi.mocked(ensureBootstrapped).mockClear();
+    vi.mocked(ensureCore).mockClear();
+    await dispatchHook("session-snapshot", JSON.stringify({ session_id: "s1" }));
+    expect(ensureCore).toHaveBeenCalledOnce();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
   });
 
   it("routes post-tool without calling ensureBootstrapped", async () => {

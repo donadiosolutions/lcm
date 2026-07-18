@@ -1514,6 +1514,75 @@ describe("restartDaemon", () => {
     expect(ensureMock).not.toHaveBeenCalled();
   });
 
+  it("bounds restart identity probes by the caller's monotonic deadline", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-deadline-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "4242");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    let monotonicMs = 0;
+    let healthSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit): Promise<Response> => {
+      healthSignal = init?.signal ?? undefined;
+      return new Promise<Response>(() => {});
+    });
+    const timer = 701 as unknown as ReturnType<typeof setTimeout>;
+    const setTimeoutMock = vi.fn((callback: () => void, delayMs: number): ReturnType<typeof setTimeout> => {
+      queueMicrotask(() => { monotonicMs += delayMs; callback(); });
+      return timer;
+    });
+    const clearTimeoutMock = vi.fn();
+
+    await expect(restartDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      _platform: "darwin",
+      _fetchOverride: fetchMock as FetchOverride,
+      _listeningPortsOverride: (): number[] => [19999],
+      _isProcessAliveOverride: (): boolean => true,
+      _monotonicNowOverride: (): number => monotonicMs,
+      _setTimeoutOverride: setTimeoutMock,
+      _clearTimeoutOverride: clearTimeoutMock,
+    })).rejects.toThrow("not a verified LCM daemon");
+
+    expect(healthSignal?.aborted).toBe(true);
+    expect(clearTimeoutMock).toHaveBeenCalledWith(timer);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it.each(["health", "access"] as const)("refuses restart when the %s verification deadline is exhausted", async (boundary): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), `lcm-lifecycle-restart-${boundary}-expired-`));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "4242");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    let monotonicCalls = 0;
+    const fetchMock = vi.fn(async (): Promise<Response> => ({
+      ok: true,
+      json: async () => ({ status: "ok", version: "1.2.3", pid: 4242 }),
+    } as Response));
+
+    await expect(restartDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      _platform: "darwin",
+      _fetchOverride: fetchMock as FetchOverride,
+      _listeningPortsOverride: (): number[] => [19999],
+      _isProcessAliveOverride: (): boolean => true,
+      _monotonicNowOverride: (): number => {
+        monotonicCalls++;
+        if (boundary === "health") return monotonicCalls === 1 ? 0 : 100;
+        return monotonicCalls >= 3 ? 100 : 0;
+      },
+    })).rejects.toThrow("not a verified LCM daemon");
+
+    expect(fetchMock).toHaveBeenCalledTimes(boundary === "health" ? 0 : 1);
+  });
+
   it("refuses to signal a reused non-Linux PID that does not own the authenticated daemon", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-darwin-pid-mismatch-"));
     tempDirs.push(tempDir);
