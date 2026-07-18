@@ -93,6 +93,10 @@ Invoked after every tool call. lcm extracts structured events (decisions, errors
 
 **Response:** Always exit code `0`. This hook runs on every tool call and must be fast; it does no network I/O and only writes to a local sidecar SQLite database.
 
+The `daemon_port` payload field is ignored. PostToolUse never sends the daemon
+bearer token or captured event data to a payload-selected listener; queued
+events are collected by the daemon's bounded background processing instead.
+
 ## SessionSnapshot Hook
 
 **Command:** `lcm session-snapshot`

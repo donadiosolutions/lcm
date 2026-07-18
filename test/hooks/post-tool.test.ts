@@ -5,18 +5,13 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { projectMetaPath } from "../../src/daemon/project.js";
+import { eventsDbPath } from "../../src/db/events-path.js";
 
 // Mock eventsDbPath to use temp directory
 vi.mock("../../src/db/events-path.js", () => ({
   eventsDbPath: () => join(process.env.TEST_EVENTS_DIR!, "test.db"),
   eventsDir: () => process.env.TEST_EVENTS_DIR!,
 }));
-
-vi.mock("../../src/hooks/session-end.js", () => ({
-  firePromoteEventsNotifyRequest: vi.fn(),
-}));
-
-import { firePromoteEventsNotifyRequest } from "../../src/hooks/session-end.js";
 
 describe("handlePostToolUse", () => {
   let dir: string;
@@ -31,7 +26,6 @@ describe("handlePostToolUse", () => {
     process.env.HOME = homeDir;
     extraDirs = [];
     process.env.TEST_EVENTS_DIR = dir;
-    vi.mocked(firePromoteEventsNotifyRequest).mockClear();
   });
 
   afterEach(() => {
@@ -122,7 +116,7 @@ describe("handlePostToolUse", () => {
     expect(JSON.parse(readFileSync(projectMetaPath(inputCwd), "utf-8")).cwd).toBe(inputCwd);
   });
 
-  it("notifies daemon after captured passive events", async () => {
+  it("persists captured passive events without trusting a payload daemon port", async () => {
     const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-notify-cwd-"));
     extraDirs.push(inputCwd);
 
@@ -135,14 +129,10 @@ describe("handlePostToolUse", () => {
       tool_response: "yes",
     }));
 
-    expect(firePromoteEventsNotifyRequest).toHaveBeenCalledWith(4567, expect.objectContaining({
-      cwd: inputCwd,
-      priority: 1,
-      sourceHook: "PostToolUse",
-    }));
+    expect(existsSync(eventsDbPath(inputCwd))).toBe(true);
   });
 
-  it("ignores invalid daemon_port values", async () => {
+  it("ignores daemon_port values even when a caller also supplies a port", async () => {
     const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-invalid-port-cwd-"));
     extraDirs.push(inputCwd);
 
@@ -155,11 +145,7 @@ describe("handlePostToolUse", () => {
       tool_response: "yes",
     }), 4568);
 
-    expect(firePromoteEventsNotifyRequest).toHaveBeenCalledWith(4568, expect.objectContaining({
-      cwd: inputCwd,
-      priority: 1,
-      sourceHook: "PostToolUse",
-    }));
+    expect(existsSync(eventsDbPath(inputCwd))).toBe(true);
   });
 
   it("ignores a non-boolean tool output error marker", async () => {

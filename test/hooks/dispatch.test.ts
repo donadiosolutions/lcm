@@ -162,11 +162,11 @@ describe("dispatchHook", () => {
     }));
     expect(result.exitCode).toBe(0);
     expect(handlePostToolUse).toHaveBeenCalledTimes(1);
-    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String), 4545);
+    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String));
     expect(ensureBootstrapped).not.toHaveBeenCalled();
   });
 
-  it("uses daemon_port from post-tool payload without loading config", async () => {
+  it("ignores daemon_port from post-tool payload without loading config", async () => {
     vi.mocked(handlePostToolUse).mockClear();
     vi.mocked(loadDaemonConfig).mockClear();
 
@@ -177,7 +177,7 @@ describe("dispatchHook", () => {
       tool_input: { file_path: "/test.ts" },
     }));
 
-    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String), 4546);
+    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String));
     expect(loadDaemonConfig).not.toHaveBeenCalled();
   });
 
@@ -189,18 +189,19 @@ describe("dispatchHook", () => {
   it.each([0, 65536, 1.5, "4545"])("rejects invalid payload port %j", async (daemon_port) => {
     vi.mocked(handlePostToolUse).mockClear();
     await dispatchHook("post-tool", JSON.stringify({ daemon_port }));
-    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String), 3737);
+    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String));
   });
 
   it("uses config fallback for malformed post-tool JSON", async () => {
     await dispatchHook("post-tool", "not json");
-    expect(handlePostToolUse).toHaveBeenCalledWith("not json", 3737);
+    expect(handlePostToolUse).toHaveBeenCalledWith("not json");
   });
 
-  it("uses the handler default when post-tool config loading fails", async () => {
-    vi.mocked(loadDaemonConfig).mockImplementationOnce(() => { throw new Error("bad config"); });
+  it("does not load daemon config for post-tool dispatch", async () => {
+    vi.mocked(loadDaemonConfig).mockClear();
     await dispatchHook("post-tool", "{}");
     expect(handlePostToolUse).toHaveBeenCalledWith("{}");
+    expect(loadDaemonConfig).not.toHaveBeenCalled();
   });
 
   it("skips bootstrap when the payload has no session or malformed JSON", async () => {
@@ -237,6 +238,6 @@ describe("dispatchHook", () => {
     expect(handlePostToolUse).toHaveBeenCalled();
     vi.mocked(loadDaemonConfig).mockReturnValueOnce({} as unknown as ReturnType<typeof loadDaemonConfig>);
     await dispatchHook("post-tool", "{}");
-    expect(handlePostToolUse).toHaveBeenCalledWith("{}", 3737);
+    expect(handlePostToolUse).toHaveBeenCalledWith("{}");
   });
 });

@@ -8,17 +8,6 @@ export function isHookCommand(cmd: string): cmd is HookCommand {
   return (HOOK_COMMANDS as readonly string[]).includes(cmd);
 }
 
-function daemonPortFromHookPayload(stdinText: string): number | undefined {
-  try {
-    const parsed = JSON.parse(stdinText || "{}") as { daemon_port?: unknown };
-    const value = parsed.daemon_port;
-    if (typeof value !== "number" || !Number.isInteger(value)) return undefined;
-    return value >= 1 && value <= 65535 ? value : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function hookClientFromPayload(stdinText: string): string | undefined {
   try {
     const parsed = JSON.parse(stdinText || "{}") as { client?: unknown };
@@ -35,17 +24,7 @@ export async function dispatchHook(
   // Early return for post-tool — runs on EVERY tool call, must skip bootstrap for performance
   if (command === "post-tool") {
     const { handlePostToolUse } = await import("./post-tool.js");
-    const payloadPort = daemonPortFromHookPayload(stdinText);
-    if (payloadPort !== undefined) {
-      return handlePostToolUse(stdinText, payloadPort);
-    }
-    try {
-      const { loadDaemonConfig } = await import("../daemon/config.js");
-      const config = loadDaemonConfig(defaultConfigPath());
-      return handlePostToolUse(stdinText, config.daemon?.port ?? 3737);
-    } catch {
-      return handlePostToolUse(stdinText);
-    }
+    return handlePostToolUse(stdinText);
   }
 
   // Skip bootstrap for compact — the daemon is already running by the time

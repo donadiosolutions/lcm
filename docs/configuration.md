@@ -164,7 +164,7 @@ In practice, the hook asks the daemon for ranked candidates, the daemon dedupes 
 
 ## Daemon safety
 
-The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon requests to loopback HTTP origins and known daemon routes, so a malformed config or caller cannot redirect daemon traffic to another host.
+The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon requests to loopback HTTP origins and known daemon routes, so a malformed config or caller cannot redirect daemon traffic to another host. Before sending a bearer token or request body, lifecycle checks require the PID file, `/health` PID and installed version, and operating-system listener ownership to agree. An occupied port with missing or unverifiable identity is rejected rather than trusted. PostToolUse also ignores payload-provided daemon ports and performs no network I/O.
 
 Use `lcm daemon start` to start or validate the managed background daemon. Use
 `lcm daemon restart` after configuration changes; it validates the new
