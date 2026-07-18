@@ -224,6 +224,15 @@ describe("ScrubEngine — custom patterns", () => {
     }
   });
 
+  it("analyzes negative lookbehinds and incomplete quantifier-like literals", () => {
+    const result = new ScrubEngine(["(?<!X)(?=TOKEN)", "A{2"], [])
+      .scrubWithCounts("TOKEN A{2");
+
+    expect(result).toEqual({
+      text: "[REDACTED] [REDACTED]", gitleaks: 0, builtIn: 0, global: 2, project: 0,
+    });
+  });
+
   it("ignores lookbehind-like text inside a character class when choosing direction", () => {
     const result = new ScrubEngine([
       "(?=[(?<=])|(?=\\s+SECRET_[A-Z]+)",
@@ -252,6 +261,15 @@ describe("ScrubEngine — custom patterns", () => {
       text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
     });
     expect(result.text).not.toContain("VALUE");
+  });
+
+  it("continues within an expanded token when its consuming alternative does not match", () => {
+    const result = new ScrubEngine(["(?=SAFE)|SECRET\\s+VALUE"], [])
+      .scrubWithCounts("SAFE OTHER");
+
+    expect(result).toEqual({
+      text: "[REDACTED] OTHER", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
   });
 
   it("handles long escaped regex sources without backtracking in syntax analysis", () => {

@@ -142,7 +142,7 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
       continue;
     }
     if (character === "\\") {
-      const escapedCharacter = source[index + 1] ?? "";
+      const escapedCharacter = source.charAt(index + 1);
       const isBackreference = (escapedCharacter >= "1" && escapedCharacter <= "9")
         || source.startsWith("\\k<", index);
       if (positiveLookaheadDepth > 0 && isBackreference) {
@@ -180,8 +180,8 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
       } else if (source.startsWith("(?:", index)) {
         index += 2;
       } else if (source.startsWith("(?<", index)) {
-        const nameEnd = source.indexOf(">", index + 3);
-        if (nameEnd >= 0) index = nameEnd;
+        // The RegExp constructor already proved that every named group closes.
+        index = source.indexOf(">", index + 3);
       }
       groupStack.push({ assertion, positiveLookaheadBodyStart });
       if (assertion) assertionDepth++;
