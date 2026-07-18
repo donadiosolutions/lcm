@@ -1,9 +1,9 @@
-import { DatabaseSync } from "node:sqlite";
 import { projectDbPath, ensureProjectDir } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { runLcmMigrations } from "../../db/migration.js";
 import { validateCwd } from "../validate-cwd.js";
+import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
 
 export function createSessionCompleteHandler(): RouteHandler {
   return async (_req, res, body) => {
@@ -21,17 +21,19 @@ export function createSessionCompleteHandler(): RouteHandler {
       return;
     }
     ensureProjectDir(cwd);
-    const db = new DatabaseSync(projectDbPath(cwd));
+    const dbPath = projectDbPath(cwd);
+    const db = getLcmConnection(dbPath);
     try {
-      db.exec("PRAGMA busy_timeout = 5000");
       runLcmMigrations(db);
       db.prepare(
         "INSERT INTO session_ingest_log (session_id, message_count) VALUES (?, ?) " +
           "ON CONFLICT(session_id) DO UPDATE SET message_count = excluded.message_count",
       ).run(session_id, message_count ?? 0);
       sendJson(res, 200, { recorded: true });
+    } catch (err) {
+      sendJson(res, 500, { error: err instanceof Error ? err.message : "session completion failed" });
     } finally {
-      db.close();
+      closeLcmConnection(dbPath);
     }
   };
 }

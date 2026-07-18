@@ -316,6 +316,14 @@ describe("runLcmMigrations summary depth backfill", () => {
     db.exec(`CREATE VIRTUAL TABLE messages_fts USING fts5(
       content, content='messages', content_rowid='message_id'
     )`);
+    db.prepare(
+      "INSERT INTO conversations (session_id) VALUES (?)",
+    ).run("legacy-fts-session");
+    db.prepare(`
+      INSERT INTO messages (conversation_id, seq, role, content, token_count)
+      VALUES (1, 1, 'user', 'legacy searchable phrase', 3)
+    `).run();
+    db.prepare("INSERT INTO messages_fts(rowid, content) VALUES (1, 'legacy searchable phrase')").run();
 
     runLcmMigrations(db);
 
@@ -323,6 +331,37 @@ describe("runLcmMigrations summary depth backfill", () => {
       "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'",
     ).get() as { sql: string };
     expect(schema.sql).not.toContain("content_rowid");
+    expect(db.prepare(
+      "SELECT rowid, content FROM messages_fts WHERE messages_fts MATCH 'searchable'",
+    ).get()).toEqual({ rowid: 1, content: "legacy searchable phrase" });
+  });
+
+  it("rolls back a staged messages FTS rebuild when copying fails", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-migration-fts-rollback-"));
+    tempDirs.push(tempDir);
+    const db = getLcmConnection(join(tempDir, "legacy.db"));
+    runLcmMigrations(db, { fts5Available: false });
+    db.exec(`CREATE VIRTUAL TABLE messages_fts USING fts5(
+      content, content='messages', content_rowid='message_id'
+    )`);
+
+    const exec = db.exec.bind(db);
+    vi.spyOn(db, "exec").mockImplementation((sql) => {
+      if (sql.includes("CREATE TEMP TABLE messages_fts_migration")) {
+        exec("CREATE TEMP TABLE migration_probe(value TEXT)");
+        throw new Error("copy failed");
+      }
+      exec(sql);
+    });
+
+    expect(() => runLcmMigrations(db)).toThrow("copy failed");
+    const schema = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'",
+    ).get() as { sql: string };
+    expect(schema.sql).toContain("content_rowid");
+    expect(db.prepare(
+      "SELECT name FROM sqlite_temp_master WHERE type='table' AND name='migration_probe'",
+    ).get()).toBeUndefined();
   });
 });
 

@@ -4,18 +4,15 @@ const mocks = vi.hoisted(() => ({
   ensure: vi.fn(),
   validate: vi.fn((cwd: string) => cwd),
   migrate: vi.fn(),
-  exec: vi.fn(),
+  getConnection: vi.fn(),
   run: vi.fn(),
   close: vi.fn(),
   send: vi.fn(),
 }));
 
-vi.mock("node:sqlite", () => ({
-  DatabaseSync: class {
-    exec = mocks.exec;
-    close = mocks.close;
-    prepare() { return { run: mocks.run }; }
-  },
+vi.mock("../../../src/db/connection.js", () => ({
+  getLcmConnection: mocks.getConnection,
+  closeLcmConnection: mocks.close,
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
   ensureProjectDir: mocks.ensure,
@@ -31,6 +28,7 @@ describe("session complete persistence boundaries", () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockClear();
     mocks.validate.mockImplementation((cwd: string) => cwd);
+    mocks.getConnection.mockReturnValue({ prepare: () => ({ run: mocks.run }) });
   });
 
   it("validates required fields and cwd failures", async () => {
@@ -56,8 +54,11 @@ describe("session complete persistence boundaries", () => {
     expect(mocks.close).toHaveBeenCalledTimes(2);
 
     mocks.migrate.mockImplementationOnce(() => { throw new Error("migration failed"); });
-    await expect(handler({} as never, response, JSON.stringify({ session_id: "s3", cwd: "/ok" })))
-      .rejects.toThrow("migration failed");
-    expect(mocks.close).toHaveBeenCalledTimes(3);
+    await handler({} as never, response, JSON.stringify({ session_id: "s3", cwd: "/ok" }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "migration failed" });
+    mocks.migrate.mockImplementationOnce(() => { throw "failure"; });
+    await handler({} as never, response, JSON.stringify({ session_id: "s4", cwd: "/ok" }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "session completion failed" });
+    expect(mocks.close).toHaveBeenCalledTimes(4);
   });
 });

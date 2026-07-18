@@ -307,6 +307,16 @@ describe("PromotedStore extended", () => {
     expect(rows.map((r) => r.content)).not.toContain("Should be rolled back");
   });
 
+  it("rolls back promoted content when FTS synchronization fails", () => {
+    const db = makeDb();
+    const store = new PromotedStore(db);
+    const id = store.insert({ content: "original content", tags: ["old"], projectId: "p1" });
+    db.exec("DROP TABLE promoted_fts");
+
+    expect(() => store.update(id, { content: "partial update", tags: ["new"] })).toThrow();
+    expect(store.getById(id)).toMatchObject({ content: "original content", tags: '["old"]' });
+  });
+
   // ── deleteById ───────────────────────────────────────────────────────────
 
   it("deleteById on a non-existent id does not throw", () => {

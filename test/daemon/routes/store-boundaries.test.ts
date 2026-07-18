@@ -3,8 +3,7 @@ import { loadDaemonConfig } from "../../../src/daemon/config.js";
 
 const mocks = vi.hoisted(() => ({
   stat: vi.fn(() => ({ mtimeMs: 1 })),
-  mkdir: vi.fn(),
-  exec: vi.fn(),
+  getConnection: vi.fn(),
   close: vi.fn(),
   insert: vi.fn(() => "stored-id"),
   scrub: vi.fn((text: string) => `scrubbed:${text}`),
@@ -16,11 +15,11 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("node:fs", async (importOriginal) => ({
   ...await importOriginal<typeof import("node:fs")>(),
-  mkdirSync: mocks.mkdir,
   statSync: mocks.stat,
 }));
-vi.mock("node:sqlite", () => ({
-  DatabaseSync: class { exec = mocks.exec; close = mocks.close; },
+vi.mock("../../../src/db/connection.js", () => ({
+  getLcmConnection: mocks.getConnection,
+  closeLcmConnection: mocks.close,
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
   projectDbPath: (cwd: string) => `${cwd}/lcm.db`,
@@ -46,6 +45,7 @@ describe("store persistence boundaries", () => {
     mocks.scrub.mockImplementation((text: string) => `scrubbed:${text}`);
     mocks.forProject.mockImplementation(async () => ({ scrub: mocks.scrub }));
     mocks.validate.mockImplementation((cwd: string) => cwd);
+    mocks.getConnection.mockReturnValue({});
   });
 
   it("validates text, path sources, and typed cwd failures", async () => {

@@ -38,8 +38,9 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Flag multi-table writes without transactions — they risk partial writes on crash.
 
 ### Migration safety
-- Schema migrations must be additive only: `ADD COLUMN`, `CREATE TABLE`, `CREATE INDEX`.
-- Flag `DROP COLUMN`, `DROP TABLE`, `ALTER COLUMN type`, or any destructive DDL.
+- Prefer additive schema migrations: `ADD COLUMN`, `CREATE TABLE`, `CREATE INDEX`.
+- When an incompatible virtual table must be replaced, require a staged migration that snapshots its data, replaces and restores it within one transaction, and proves rollback plus data preservation in tests.
+- Flag `DROP COLUMN`, `DROP TABLE`, `ALTER COLUMN type`, or other destructive DDL outside such a tested staged replacement.
 - Migrations must be idempotent (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`).
 
 ### Error handling

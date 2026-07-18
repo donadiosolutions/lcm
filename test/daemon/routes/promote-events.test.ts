@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { EventsDb } from "../../../src/hooks/events-db.js";
 import { createPromoteAllEventsHandler, createPromoteEventsHandler, drainEventsForCwd, promoteEventsForCwd } from "../../../src/daemon/routes/promote-events.js";
 import { ensureProjectDir, projectDbPath, projectId } from "../../../src/daemon/project.js";
@@ -67,9 +68,11 @@ function mockRes() {
   const res = {
     writeHead: vi.fn().mockReturnThis(),
     end: vi.fn((data?: string) => { body = data ?? ""; }),
-  } as any;
+  } as unknown as ServerResponse;
   return { res, getBody: () => JSON.parse(body || "{}") };
 }
+
+const request = {} as IncomingMessage;
 
 function setupProjectDb(cwd: string): DatabaseSync {
   const dbPath = projectDbPath(cwd);
@@ -124,7 +127,7 @@ describe("promote-events route", () => {
 
     const handler = createPromoteEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler({} as any, res, JSON.stringify({ cwd: dir }));
+    await handler(request, res, JSON.stringify({ cwd: dir }));
 
     const result = getBody();
     expect(result.promoted).toBe(1);
@@ -148,7 +151,7 @@ describe("promote-events route", () => {
 
     const handler = createPromoteEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler({} as any, res, JSON.stringify({ cwd: dir }));
+    await handler(request, res, JSON.stringify({ cwd: dir }));
 
     const result = getBody();
     // Both events should be promoted
@@ -166,7 +169,7 @@ describe("promote-events route", () => {
 
     const handler = createPromoteEventsHandler(makeConfig());
     const { res } = mockRes();
-    await handler({} as any, res, JSON.stringify({ cwd: dir }));
+    await handler(request, res, JSON.stringify({ cwd: dir }));
 
     // Re-open events DB and check that nothing is unprocessed
     const edb2 = new EventsDb(sidecarPath);
@@ -208,7 +211,7 @@ describe("promote-events route", () => {
     const reinforcementSpy = vi.spyOn(EventsDb.prototype, "getPatternReinforcement");
     const handler = createPromoteEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler({} as any, res, JSON.stringify({ cwd: dir }));
+    await handler(request, res, JSON.stringify({ cwd: dir }));
 
     const result = getBody();
     expect(result.promoted).toBe(3);
@@ -234,7 +237,7 @@ describe("promote-events route", () => {
 
     const handler = createPromoteEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler({} as any, res, JSON.stringify({ cwd: dir }));
+    await handler(request, res, JSON.stringify({ cwd: dir }));
 
     const result = getBody();
     expect(result.promoted).toBe(0);
@@ -254,7 +257,7 @@ describe("promote-events route", () => {
 
     const handler = createPromoteEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler({} as any, res, JSON.stringify({ cwd: dir }));
+    await handler(request, res, JSON.stringify({ cwd: dir }));
 
     const result = getBody();
     expect(result.promoted).toBe(0);
@@ -265,24 +268,24 @@ describe("promote-events route", () => {
   it("returns 400 when cwd is missing", async () => {
     const handler = createPromoteEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler({} as any, res, JSON.stringify({}));
+    await handler(request, res, JSON.stringify({}));
 
     expect(res.writeHead).toHaveBeenCalledWith(400, expect.any(Object));
     expect(getBody().error).toBe("cwd is required");
     const emptyBody = mockRes();
-    await handler({} as any, emptyBody.res, "");
+    await handler(request, emptyBody.res, "");
     expect(emptyBody.getBody().error).toBe("cwd is required");
   });
 
   it("returns generic errors for invalid cwd and sidecar failures", async () => {
     const handler = createPromoteEventsHandler(makeConfig());
     const invalid = mockRes();
-    await handler({} as any, invalid.res, JSON.stringify({ cwd: join(dir, "missing") }));
+    await handler(request, invalid.res, JSON.stringify({ cwd: join(dir, "missing") }));
     expect(invalid.getBody()).toEqual({ error: "cwd is invalid" });
 
     writeFileSync(sidecarPath, "not sqlite");
     const failed = mockRes();
-    await handler({} as any, failed.res, JSON.stringify({ cwd: dir }));
+    await handler(request, failed.res, JSON.stringify({ cwd: dir }));
     expect(failed.res.writeHead).toHaveBeenCalledWith(500, expect.any(Object));
     expect(failed.getBody()).toEqual({ error: "failed to promote events" });
   });
@@ -338,7 +341,7 @@ describe("promote-events route", () => {
     });
     try {
       const output = mockRes();
-      await createPromoteAllEventsHandler(makeConfig())({} as any, output.res, "");
+      await createPromoteAllEventsHandler(makeConfig())(request, output.res, "");
       expect(output.getBody()).toMatchObject({ failedProjects: 1, errors: 1 });
     } finally {
       getUnprocessed.mockRestore();
@@ -363,7 +366,7 @@ describe("promote-events route", () => {
 
     const handler = createPromoteAllEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler({} as any, res, "");
+    await handler(request, res, "");
 
     const result = getBody();
     expect(result.scanned).toBe(1);
@@ -393,7 +396,7 @@ describe("promote-events route", () => {
 
     const handler = createPromoteAllEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler({} as any, res, "");
+    await handler(request, res, "");
 
     const result = getBody();
     expect(result.promoted).toBe(1);
@@ -419,7 +422,7 @@ describe("promote-events route", () => {
     const handler = createPromoteAllEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
     try {
-      await handler({} as any, res, "");
+      await handler(request, res, "");
     } finally {
       now.mockRestore();
     }
@@ -454,7 +457,7 @@ describe("promote-events route", () => {
 
     const handler = createPromoteAllEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler({} as any, res, "");
+    await handler(request, res, "");
 
     const result = getBody();
     expect(result.promoted).toBe(501);
@@ -482,7 +485,7 @@ describe("promote-events route", () => {
 
     const handler = createPromoteEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler({} as any, res, JSON.stringify({ cwd: dir, drain: true }));
+    await handler(request, res, JSON.stringify({ cwd: dir, drain: true }));
 
     const result = getBody();
     expect(result.promoted).toBe(501);
@@ -504,7 +507,7 @@ describe("promote-events route", () => {
 
     const handler = createPromoteAllEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler({} as any, res, "");
+    await handler(request, res, "");
 
     const result = getBody();
     expect(result.promoted).toBe(0);
@@ -519,7 +522,7 @@ describe("promote-events route", () => {
 
     const handler = createPromoteAllEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler({} as any, res, "");
+    await handler(request, res, "");
 
     const result = getBody();
     expect(result.scanned).toBe(1);

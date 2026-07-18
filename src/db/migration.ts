@@ -605,14 +605,29 @@ export function runLcmMigrations(
         .get() as { sql: string } | undefined
     )?.sql;
     if (ftsSchema && ftsSchema.includes("content_rowid")) {
-      db.exec("DROP TABLE messages_fts");
-      db.exec(`
-        CREATE VIRTUAL TABLE messages_fts USING fts5(
-          content,
-          tokenize='porter unicode61'
-        );
-        INSERT INTO messages_fts(rowid, content) SELECT message_id, content FROM messages;
-      `);
+      db.exec("BEGIN");
+      try {
+        db.exec(`
+          CREATE TEMP TABLE messages_fts_migration (
+            rowid INTEGER PRIMARY KEY,
+            content TEXT NOT NULL
+          );
+          INSERT INTO messages_fts_migration(rowid, content)
+            SELECT rowid, content FROM messages_fts;
+          DROP TABLE messages_fts;
+          CREATE VIRTUAL TABLE messages_fts USING fts5(
+            content,
+            tokenize='porter unicode61'
+          );
+          INSERT INTO messages_fts(rowid, content)
+            SELECT rowid, content FROM messages_fts_migration;
+          DROP TABLE messages_fts_migration;
+        `);
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
     }
   } else {
     db.exec(`

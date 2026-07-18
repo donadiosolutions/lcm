@@ -368,7 +368,18 @@ describe("ConversationStore — searchMessages regex", () => {
 describe("ConversationStore — withTransaction", () => {
   it("commits and returns a successful operation result", async () => {
     const store = makeStore(makeDb());
-    await expect(store.withTransaction(() => "committed")).resolves.toBe("committed");
+    const conversation = await store.createConversation({ sessionId: "tx-commit" });
+    await expect(store.withTransaction(async () => {
+      await store.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "committed write",
+        tokenCount: 2,
+      });
+      return "committed";
+    })).resolves.toBe("committed");
+    await expect(store.getMessageCount(conversation.conversationId)).resolves.toBe(1);
   });
 
   it("rolls back on thrown error and re-throws", async () => {

@@ -4,8 +4,7 @@ import { loadDaemonConfig } from "../../../src/daemon/config.js";
 
 const mocks = vi.hoisted(() => ({
   exists: vi.fn(() => true),
-  mkdir: vi.fn(),
-  dbExec: vi.fn(),
+  getConnection: vi.fn(),
   dbClose: vi.fn(),
   dbAll: vi.fn(() => [] as unknown[]),
   migrate: vi.fn(),
@@ -24,14 +23,6 @@ const mocks = vi.hoisted(() => ({
 vi.mock("node:fs", async (importOriginal) => ({
   ...await importOriginal<typeof import("node:fs")>(),
   existsSync: mocks.exists,
-  mkdirSync: mocks.mkdir,
-}));
-vi.mock("node:sqlite", () => ({
-  DatabaseSync: class {
-    exec = mocks.dbExec;
-    close = mocks.dbClose;
-    prepare() { return { all: mocks.dbAll }; }
-  },
 }));
 vi.mock("../../../src/daemon/project.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../../src/daemon/project.js")>(),
@@ -54,7 +45,11 @@ vi.mock("../../../src/expansion.js", () => ({
 }));
 vi.mock("../../../src/store/conversation-store.js", () => ({ ConversationStore: class {} }));
 vi.mock("../../../src/store/summary-store.js", () => ({ SummaryStore: class {} }));
-vi.mock("../../../src/db/connection.js", () => ({ getPoolStats: mocks.poolStats }));
+vi.mock("../../../src/db/connection.js", () => ({
+  getLcmConnection: mocks.getConnection,
+  closeLcmConnection: mocks.dbClose,
+  getPoolStats: mocks.poolStats,
+}));
 vi.mock("../../../src/db/promoted.js", () => ({
   PromotedStore: class { search = mocks.promotedSearch; },
 }));
@@ -100,6 +95,7 @@ describe("persistence read route boundaries", () => {
     mocks.describe.mockResolvedValue({ id: "node" });
     mocks.expand.mockResolvedValue({ expanded: ["node"] });
     mocks.grep.mockResolvedValue({ messages: [], summaries: [], matches: [] });
+    mocks.getConnection.mockReturnValue({ prepare: () => ({ all: mocks.dbAll }) });
     mocks.dbAll.mockReturnValue([]);
     mocks.poolStats.mockReturnValue({ totalConnections: 0 });
     mocks.stats.mockReturnValue({ projects: 0 });
@@ -120,9 +116,11 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { node: null });
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
     expectLast(200, { node: { id: "node" } });
+    expect(mocks.dbClose).toHaveBeenLastCalledWith("/ok/lcm.db");
     mocks.describe.mockRejectedValueOnce(new Error("describe broke"));
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
     expectLast(200, { node: null, error: "describe broke" });
+    expect(mocks.dbClose).toHaveBeenLastCalledWith("/ok/lcm.db");
     mocks.describe.mockRejectedValueOnce("failure");
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
     expectLast(200, { node: null, error: "describe failed" });
@@ -145,6 +143,7 @@ describe("persistence read route boundaries", () => {
     mocks.expand.mockRejectedValueOnce(new Error("expand broke"));
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
     expectLast(200, { expanded: null, error: "expand broke" });
+    expect(mocks.dbClose).toHaveBeenLastCalledWith("/ok/lcm.db");
     mocks.expand.mockRejectedValueOnce("failure");
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
     expectLast(200, { expanded: null, error: "expansion failed" });

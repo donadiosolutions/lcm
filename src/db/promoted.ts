@@ -172,31 +172,45 @@ export class PromotedStore {
 
     if (fields.content !== undefined) {
       const newTags = fields.tags !== undefined ? JSON.stringify(fields.tags) : row.tags;
-      this.db.prepare(
-        "UPDATE promoted SET content = ?, confidence = COALESCE(?, confidence), tags = ? WHERE id = ?"
-      ).run(fields.content, fields.confidence ?? null, newTags, id);
-      // Re-sync FTS5: delete old row and insert new one
-      this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
-      this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
-        row.rowid,
-        fields.content,
-        newTags,
-      );
+      this.withUpdateSavepoint(() => {
+        this.db.prepare(
+          "UPDATE promoted SET content = ?, confidence = COALESCE(?, confidence), tags = ? WHERE id = ?"
+        ).run(fields.content!, fields.confidence ?? null, newTags, id);
+        this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
+        this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
+          row.rowid,
+          fields.content!,
+          newTags,
+        );
+      });
     } else {
       if (fields.confidence !== undefined) {
         this.db.prepare("UPDATE promoted SET confidence = ? WHERE id = ?").run(fields.confidence, id);
       }
       if (fields.tags !== undefined) {
         const newTags = JSON.stringify(fields.tags);
-        this.db.prepare("UPDATE promoted SET tags = ? WHERE id = ?").run(newTags, id);
-        // Re-sync FTS5 tags
-        this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
-        this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
-          row.rowid,
-          row.content,
-          newTags,
-        );
+        this.withUpdateSavepoint(() => {
+          this.db.prepare("UPDATE promoted SET tags = ? WHERE id = ?").run(newTags, id);
+          this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
+          this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
+            row.rowid,
+            row.content,
+            newTags,
+          );
+        });
       }
+    }
+  }
+
+  private withUpdateSavepoint(operation: () => void): void {
+    this.db.exec("SAVEPOINT promoted_update");
+    try {
+      operation();
+      this.db.exec("RELEASE SAVEPOINT promoted_update");
+    } catch (error) {
+      this.db.exec("ROLLBACK TO SAVEPOINT promoted_update");
+      this.db.exec("RELEASE SAVEPOINT promoted_update");
+      throw error;
     }
   }
 

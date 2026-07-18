@@ -4,7 +4,7 @@ import { loadDaemonConfig } from "../../../src/daemon/config.js";
 const mocks = vi.hoisted(() => ({
   exists: vi.fn(() => false),
   read: vi.fn(() => "{}"),
-  exec: vi.fn(),
+  getConnection: vi.fn(),
   get: vi.fn(() => undefined as { count: number } | undefined),
   close: vi.fn(),
   validate: vi.fn((cwd: string) => cwd),
@@ -12,12 +12,9 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("node:fs", () => ({ existsSync: mocks.exists, readFileSync: mocks.read }));
-vi.mock("node:sqlite", () => ({
-  DatabaseSync: class {
-    exec = mocks.exec;
-    close = mocks.close;
-    prepare() { return { get: mocks.get }; }
-  },
+vi.mock("../../../src/db/connection.js", () => ({
+  getLcmConnection: mocks.getConnection,
+  closeLcmConnection: mocks.close,
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
   projectDbPath: (cwd: string) => `${cwd}/lcm.db`,
@@ -37,6 +34,7 @@ describe("status persistence boundaries", () => {
     mocks.exists.mockReturnValue(false);
     mocks.read.mockReturnValue("{}");
     mocks.get.mockReturnValue(undefined);
+    mocks.getConnection.mockReturnValue({ prepare: () => ({ get: mocks.get }) });
     mocks.validate.mockImplementation((cwd: string) => cwd);
   });
 

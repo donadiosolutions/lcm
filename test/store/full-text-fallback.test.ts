@@ -74,10 +74,9 @@ describe("buildLikeSearchPlan", () => {
     expect(plan.terms).toEqual([]);
   });
 
-  it("falls back to the normalized whole query when every token is punctuation", () => {
+  it("returns an empty plan when normalization leaves only whitespace", () => {
     const plan = buildLikeSearchPlan("content", "- -");
-    expect(plan.terms).toEqual([" "]);
-    expect(plan.args).toEqual(["% %"]);
+    expect(plan).toEqual({ terms: [], where: [], args: [] });
   });
 
   it("uses the column name in WHERE clauses", () => {

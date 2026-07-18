@@ -82,7 +82,8 @@ function skippedSidecarSummary(file: string, path: string, scanSkipped: string):
   };
 }
 
-function parseSqliteDate(value: string): number | undefined {
+function parseSqliteDate(value: string | null): number | undefined {
+  if (value === null) return undefined;
   const parsed = Date.parse(`${value.replace(" ", "T")}Z`);
   return Number.isNaN(parsed) ? undefined : parsed;
 }
@@ -99,8 +100,7 @@ function orphanPruneReason(summary: EventSidecarSummary, olderThanDays: number):
   }
   if (summary.captured === 0) return "empty orphan sidecar";
 
-  // A non-empty sidecar has a MAX(created_at) value from SQLite.
-  const lastCaptureMs = parseSqliteDate(summary.lastCapture!);
+  const lastCaptureMs = parseSqliteDate(summary.lastCapture);
   if (lastCaptureMs === undefined) return undefined;
   const ageMs = olderThanDays * 24 * 60 * 60 * 1000;
   if (Date.now() - lastCaptureMs >= ageMs) {

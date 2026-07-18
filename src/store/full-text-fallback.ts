@@ -8,7 +8,7 @@ export type LikeSearchPlan = {
 };
 
 function normalizeFallbackTerm(raw: string): string {
-  return raw.trim().replace(EDGE_PUNCTUATION_RE, "").toLowerCase();
+  return raw.trim().replace(EDGE_PUNCTUATION_RE, "").trim().toLowerCase();
 }
 
 function escapeLike(term: string): string {
@@ -29,13 +29,6 @@ export function buildLikeSearchPlan(column: string, query: string): LikeSearchPl
     const normalized = normalizeFallbackTerm(raw);
     if (normalized.length > 0 && !terms.includes(normalized)) {
       terms.push(normalized);
-    }
-  }
-
-  if (terms.length === 0) {
-    const fallback = normalizeFallbackTerm(query);
-    if (fallback.length > 0) {
-      terms.push(fallback);
     }
   }
 

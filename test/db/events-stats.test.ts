@@ -123,7 +123,11 @@ describe("collectEventStats", () => {
   });
 
   it("preserves fresh and malformed-date processed orphan sidecars", () => {
-    for (const [file, createdAt] of [["fresh.db", "datetime('now')"], ["invalid-date.db", "'invalid'"]] as const) {
+    for (const [file, createdAt] of [
+      ["fresh.db", "datetime('now')"],
+      ["invalid-date.db", "'invalid'"],
+      ["null-date.db", "NULL"],
+    ] as const) {
       const path = join(tempDir, file);
       const db = new EventsDb(path);
       db.insertEvent("s", { type: "decision", category: "decision", data: file, priority: 1 }, "PostToolUse");
@@ -136,6 +140,7 @@ describe("collectEventStats", () => {
     const sidecars = collectEventSidecars({ pruneOrphanSidecars: true });
     expect(sidecars.find((entry) => entry.file === "fresh.db")?.pruned).toBeUndefined();
     expect(sidecars.find((entry) => entry.file === "invalid-date.db")?.pruned).toBeUndefined();
+    expect(sidecars.find((entry) => entry.file === "null-date.db")?.pruned).toBeUndefined();
   });
 
   it("normalizes non-Error sidecar scan failures", () => {
