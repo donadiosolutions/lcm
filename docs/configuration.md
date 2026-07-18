@@ -170,7 +170,8 @@ Legacy `compaction.promotionThresholds.mergeMaxEntries` values are migrated to
 `dedupCandidateLimit`. LCM migrates stored configuration and runtime overrides
 independently before merging them: the current key wins when both names occur
 in the same source, while runtime overrides continue to take precedence over
-stored configuration.
+stored configuration. `lcm config get` and `lcm config set` accept the legacy
+path and report its canonical `dedupCandidateLimit` spelling.
 
 When `lcm doctor` finds that `~/.claude/settings.json` has a malformed or
 non-object JSON root, it treats the file as empty settings and rebuilds the
