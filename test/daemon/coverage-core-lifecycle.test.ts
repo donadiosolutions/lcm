@@ -117,6 +117,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
       _spawnSyncOverride: vi.fn(() => { throw "systemd"; }) as never,
       _spawnOverride: vi.fn(() => { throw "detached"; }) as never,
       _skipHealthWait: true,
+      _monotonicNowOverride: (): number => 0,
     });
     expect(result.warning).toContain("systemd"); expect(result.warning).toContain("detached");
   });
