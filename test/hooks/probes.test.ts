@@ -22,6 +22,7 @@ describe("hook probes", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.resetModules();
     rmSync(homeDir, { recursive: true, force: true });
@@ -42,6 +43,7 @@ describe("hook probes", () => {
   });
 
   it("appends the complete SessionStart payload", async () => {
+    vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-18T00:00:00.000Z"));
     await import("../../src/hooks/probe-sessionstart.js");
     listeners.get("data")?.(Buffer.from('{"source":'));

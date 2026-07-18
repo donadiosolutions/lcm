@@ -1,5 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleUserPromptSubmit } from "../../src/hooks/user-prompt.js";
+import type { DaemonClient } from "../../src/daemon/client.js";
+import type { EventsDb as EventsDbType } from "../../src/hooks/events-db.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn(),
@@ -38,11 +40,39 @@ const mockEnsureProjectDir = vi.mocked(ensureProjectDir);
 const mockExtractUserPromptEvents = vi.mocked(extractUserPromptEvents);
 const MockEventsDb = vi.mocked(EventsDb);
 
+type ClientFixture = {
+  health?: ReturnType<typeof vi.fn>;
+  post: ReturnType<typeof vi.fn>;
+};
+
+function asDaemonClient(client: ClientFixture): DaemonClient {
+  // DaemonClient has private runtime state; these hook tests exercise only its public post seam.
+  return client as unknown as DaemonClient;
+}
+
+function eventsDbFixture(overrides: Partial<EventsDbType>): EventsDbType {
+  // EventsDb has private SQLite state; constructor-mocked tests supply only observed public methods.
+  return {
+    insertEvent: vi.fn(),
+    getHealthStats: vi.fn().mockReturnValue({ unprocessed: 1 }),
+    close: vi.fn(),
+    ...overrides,
+  } as unknown as EventsDbType;
+}
+
 describe("handleUserPromptSubmit", () => {
+  let originalClaudeProjectDir: string | undefined;
+
   beforeEach(() => {
+    originalClaudeProjectDir = process.env.CLAUDE_PROJECT_DIR;
     vi.clearAllMocks();
     vi.mocked(firePromoteEventsNotifyRequest).mockImplementation(() => {});
     delete process.env.CLAUDE_PROJECT_DIR;
+  });
+
+  afterEach(() => {
+    if (originalClaudeProjectDir === undefined) delete process.env.CLAUDE_PROJECT_DIR;
+    else process.env.CLAUDE_PROJECT_DIR = originalClaudeProjectDir;
   });
 
   it("returns hint when daemon returns matches", async () => {
@@ -56,7 +86,7 @@ describe("handleUserPromptSubmit", () => {
     };
     const result = await handleUserPromptSubmit(
       JSON.stringify({ session_id: "s1", cwd: "/proj", prompt: "what database do we use?" }),
-      client as any,
+      asDaemonClient(client),
     );
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("<memory-context>");
@@ -77,7 +107,7 @@ describe("handleUserPromptSubmit", () => {
     };
     const result = await handleUserPromptSubmit(
       JSON.stringify({ session_id: "s1", cwd: "/proj", prompt: "what framework?" }),
-      client as any,
+      asDaemonClient(client),
     );
     expect(result.stdout).toContain("<!-- surfaced-memory-ids: abc-123 -->");
   });
@@ -92,7 +122,7 @@ describe("handleUserPromptSubmit", () => {
     };
     const result = await handleUserPromptSubmit(
       JSON.stringify({ session_id: "s1", cwd: "/proj", prompt: "what framework?" }),
-      client as any,
+      asDaemonClient(client),
     );
     expect(result.stdout).not.toContain("surfaced-memory-ids");
   });
@@ -105,7 +135,7 @@ describe("handleUserPromptSubmit", () => {
     };
     const result = await handleUserPromptSubmit(
       JSON.stringify({ session_id: "s1", cwd: "/proj", prompt: "hello" }),
-      client as any,
+      asDaemonClient(client),
     );
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("<learning-instruction>");
@@ -115,7 +145,7 @@ describe("handleUserPromptSubmit", () => {
   it("returns learning-instruction when daemon unreachable", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: false, port: 3737, spawned: false });
     const client = { health: vi.fn(), post: vi.fn() };
-    const result = await handleUserPromptSubmit("{}", client as any);
+    const result = await handleUserPromptSubmit("{}", asDaemonClient(client));
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("<learning-instruction>");
   });
@@ -128,7 +158,7 @@ describe("handleUserPromptSubmit", () => {
     };
     const result = await handleUserPromptSubmit(
       JSON.stringify({ session_id: "s1", cwd: "/proj" }),
-      client as any,
+      asDaemonClient(client),
     );
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("<learning-instruction>");
@@ -136,7 +166,7 @@ describe("handleUserPromptSubmit", () => {
 
   it.each([null, 42, "   "])("returns learning instruction for invalid prompt %j", async (prompt) => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
-    const result = await handleUserPromptSubmit(JSON.stringify({ prompt }), { post: vi.fn() } as any);
+    const result = await handleUserPromptSubmit(JSON.stringify({ prompt }), asDaemonClient({ post: vi.fn() }));
     expect(result.stdout).toContain("<learning-instruction>");
   });
 
@@ -146,7 +176,7 @@ describe("handleUserPromptSubmit", () => {
       { type: "decision", category: "decision", data: "choice", priority: 1 },
     ]);
     const client = { post: vi.fn().mockResolvedValue({ hints: [] }) };
-    await handleUserPromptSubmit(JSON.stringify({ prompt: "always choose this" }), client as any);
+    await handleUserPromptSubmit(JSON.stringify({ prompt: "always choose this" }), asDaemonClient(client));
     expect(client.post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({ cwd: process.cwd() }));
     expect(MockEventsDb).not.toHaveBeenCalled();
   });
@@ -156,25 +186,25 @@ describe("handleUserPromptSubmit", () => {
     mockExtractUserPromptEvents.mockReturnValue([]);
     const missing = await handleUserPromptSubmit(
       JSON.stringify({ prompt: "hello", session_id: "s1" }),
-      { post: vi.fn().mockResolvedValue({}) } as any,
+      asDaemonClient({ post: vi.fn().mockResolvedValue({}) }),
     );
     expect(missing.stdout).toContain("<learning-instruction>");
 
     const failed = await handleUserPromptSubmit(
       JSON.stringify({ prompt: "hello", session_id: "s1" }),
-      { post: vi.fn().mockRejectedValue(new Error("failed")) } as any,
+      asDaemonClient({ post: vi.fn().mockRejectedValue(new Error("failed")) }),
     );
     expect(failed.stdout).toContain("<learning-instruction>");
   });
 
   it("handles empty stdin and logs extraction errors using the environment cwd", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
-    expect((await handleUserPromptSubmit("", { post: vi.fn() } as any)).stdout).toContain("<learning-instruction>");
+    expect((await handleUserPromptSubmit("", asDaemonClient({ post: vi.fn() }))).stdout).toContain("<learning-instruction>");
     process.env.CLAUDE_PROJECT_DIR = "/env-project";
     mockExtractUserPromptEvents.mockImplementationOnce(() => { throw new Error("failed"); });
     await handleUserPromptSubmit(
       JSON.stringify({ prompt: "hello", session_id: "s1" }),
-      { post: vi.fn().mockResolvedValue({ hints: [] }) } as any,
+      asDaemonClient({ post: vi.fn().mockResolvedValue({ hints: [] }) }),
     );
   });
 
@@ -186,7 +216,7 @@ describe("handleUserPromptSubmit", () => {
     };
     const result = await handleUserPromptSubmit(
       JSON.stringify({ prompt: "test query", cwd: "/tmp/test", session_id: "s1" }),
-      mockClient as any,
+      asDaemonClient(mockClient),
     );
     expect(result.stdout).toContain("<learning-instruction>");
     expect(result.stdout).toContain("lcm_store");
@@ -202,7 +232,7 @@ describe("handleUserPromptSubmit", () => {
     };
     const result = await handleUserPromptSubmit(
       JSON.stringify({ prompt: "test", cwd: "/tmp/test", session_id: "s1" }),
-      mockClient as any,
+      asDaemonClient(mockClient),
     );
     expect(result.stdout).toContain("signal:memory_used");
     expect(result.stdout).toContain("memory_id:<id>");
@@ -216,7 +246,7 @@ describe("handleUserPromptSubmit", () => {
     };
     const result = await handleUserPromptSubmit(
       JSON.stringify({ prompt: "test query", cwd: "/tmp/test", session_id: "s1" }),
-      mockClient as any,
+      asDaemonClient(mockClient),
     );
     expect(result.stdout).toContain("<learning-instruction>");
     expect(result.stdout).not.toContain("<memory-context>");
@@ -227,11 +257,11 @@ describe("handleUserPromptSubmit", () => {
     const mockInsertEvent = vi.fn();
     const mockClose = vi.fn();
     MockEventsDb.mockImplementation(function () {
-      return {
+      return eventsDbFixture({
         insertEvent: mockInsertEvent,
         getHealthStats: vi.fn().mockReturnValue({ unprocessed: 1 }),
         close: mockClose,
-      } as any;
+      });
     });
     mockExtractUserPromptEvents.mockReturnValue([
       { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
@@ -243,7 +273,7 @@ describe("handleUserPromptSubmit", () => {
 
     const result = await handleUserPromptSubmit(
       JSON.stringify({ prompt: "we decided to use SQLite", cwd: "/proj", session_id: "s1" }),
-      mockClient as any,
+      asDaemonClient(mockClient),
     );
 
     expect(result.exitCode).toBe(0);
@@ -269,11 +299,11 @@ describe("handleUserPromptSubmit", () => {
     const mockInsertEvent = vi.fn();
     const mockClose = vi.fn();
     MockEventsDb.mockImplementation(function () {
-      return {
+      return eventsDbFixture({
         insertEvent: mockInsertEvent,
         getHealthStats: vi.fn().mockReturnValue({ unprocessed: 1 }),
         close: mockClose,
-      } as any;
+      });
     });
     mockExtractUserPromptEvents.mockReturnValue([
       { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
@@ -286,7 +316,7 @@ describe("handleUserPromptSubmit", () => {
 
     await handleUserPromptSubmit(
       JSON.stringify({ prompt: "we decided to use SQLite", cwd: "   ", session_id: "s1" }),
-      mockClient as any,
+      asDaemonClient(mockClient),
     );
 
     expect(mockEnsureProjectDir).toHaveBeenCalledWith("/env-project");
@@ -301,11 +331,11 @@ describe("handleUserPromptSubmit", () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const mockClose = vi.fn();
     MockEventsDb.mockImplementation(function () {
-      return {
+      return eventsDbFixture({
         insertEvent: vi.fn(),
         getHealthStats: vi.fn().mockReturnValue({ unprocessed: 1 }),
         close: mockClose,
-      } as any;
+      });
     });
     mockExtractUserPromptEvents.mockReturnValue([
       { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
@@ -317,7 +347,7 @@ describe("handleUserPromptSubmit", () => {
 
     await handleUserPromptSubmit(
       JSON.stringify({ prompt: "we decided to use SQLite", cwd: "  /trimmed-project  ", session_id: "s1" }),
-      mockClient as any,
+      asDaemonClient(mockClient),
     );
 
     expect(mockEnsureProjectDir).toHaveBeenCalledWith("/trimmed-project");
@@ -330,11 +360,11 @@ describe("handleUserPromptSubmit", () => {
   it("continues prompt search if daemon notify fails", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     MockEventsDb.mockImplementation(function () {
-      return {
+      return eventsDbFixture({
         insertEvent: vi.fn(),
         getHealthStats: vi.fn().mockReturnValue({ unprocessed: 1 }),
         close: vi.fn(),
-      } as any;
+      });
     });
     mockExtractUserPromptEvents.mockReturnValue([
       { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
@@ -349,7 +379,7 @@ describe("handleUserPromptSubmit", () => {
 
     const result = await handleUserPromptSubmit(
       JSON.stringify({ prompt: "we decided to use SQLite", cwd: "/proj", session_id: "s1" }),
-      mockClient as any,
+      asDaemonClient(mockClient),
     );
 
     expect(result.stdout).toContain("recovered hint");
@@ -368,7 +398,7 @@ describe("handleUserPromptSubmit", () => {
 
     const result = await handleUserPromptSubmit(
       JSON.stringify({ prompt: "hello world", cwd: "/proj", session_id: "s2" }),
-      mockClient as any,
+      asDaemonClient(mockClient),
     );
 
     expect(result.exitCode).toBe(0);
@@ -390,7 +420,7 @@ describe("handleUserPromptSubmit", () => {
 
     const result = await handleUserPromptSubmit(
       JSON.stringify({ prompt: "scripts", cwd: "/tmp/test", session_id: "s1" }),
-      mockClient as any,
+      asDaemonClient(mockClient),
     );
 
     expect(result.stdout).toContain("<!-- surfaced-memory-ids: memory-1 -->");

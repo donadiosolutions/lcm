@@ -87,11 +87,19 @@ describe("handleSessionSnapshot default integrations", () => {
       compaction: { autoCompactMinTokens: 100 },
     });
     await handleSessionSnapshot(JSON.stringify(payload));
+    expect(mocks.fireCompactRequest).toHaveBeenCalledTimes(0);
+
+    mocks.loadDaemonConfig.mockReturnValue({
+      daemon: {},
+      hooks: { disableAutoCompact: false },
+      compaction: { autoCompactMinTokens: 100 },
+    });
     mocks.daemonJsonRequest.mockResolvedValueOnce({ totalTokens: 99 });
     await handleSessionSnapshot(JSON.stringify({ ...payload, session_id: "low" }));
+    expect(mocks.fireCompactRequest).toHaveBeenCalledTimes(0);
     mocks.daemonJsonRequest.mockResolvedValueOnce({});
     await handleSessionSnapshot(JSON.stringify({ ...payload, session_id: "missing-total" }));
-    expect(mocks.fireCompactRequest).not.toHaveBeenCalled();
+    expect(mocks.fireCompactRequest).toHaveBeenCalledTimes(0);
   });
 
   it("fails open for chmod, auto-compact, and promotion errors", async () => {

@@ -145,10 +145,11 @@ describe("createOpenAISummarizer", () => {
     const create = vi.fn().mockRejectedValue(error);
     const summarizer = createOpenAISummarizer({
       model: "model", baseUrl: "http://localhost",
-      retry: { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0, multiplier: 1 },
+      retry: { maxAttempts: 2, initialDelayMs: 0, maxDelayMs: 0, multiplier: 1 },
       _clientOverride: { chat: { completions: { create } } },
     });
     await expect(summarizer("text", false)).rejects.toThrow("failed after retries");
+    expect(create).toHaveBeenCalledTimes(2);
   });
 
   it("falls back when Chat Completions omits choices or messages", async () => {

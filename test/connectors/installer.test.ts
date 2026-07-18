@@ -622,7 +622,7 @@ describe('error handling', () => {
   });
 
   it('throws when a supported connector has no configured non-MCP path', () => {
-    const agent = AGENTS.find((candidate: any) => candidate.id === 'zed')!;
+    const agent = AGENTS.find((candidate) => candidate.id === 'zed')!;
     const original = agent.configPaths.rules;
     delete agent.configPaths.rules;
     try {
@@ -633,6 +633,18 @@ describe('error handling', () => {
     }
   });
 
+  it('throws the config-path contract error when Codex has no hook path', () => {
+    const agent = AGENTS.find((candidate) => candidate.id === 'codex')!;
+    const original = agent.configPaths.hook;
+    delete agent.configPaths.hook;
+    try {
+      expect(() => installConnector('codex', 'hook', tmpDir))
+        .toThrow('No config path defined for Codex with type hook');
+    } finally {
+      agent.configPaths.hook = original;
+    }
+  });
+
   it('removes all default Codex connector types', () => {
     const originalHome = process.env.HOME;
     process.env.HOME = tmpDir;
@@ -640,7 +652,8 @@ describe('error handling', () => {
       installConnector('codex', undefined, tmpDir);
       expect(removeConnector('codex', undefined, tmpDir)).toBe(true);
     } finally {
-      process.env.HOME = originalHome;
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
     }
   });
 
@@ -652,7 +665,8 @@ describe('error handling', () => {
       installConnector('claude-code', undefined, tmpDir);
       expect(removeConnector('claude-code', undefined, tmpDir)).toBe(true);
     } finally {
-      process.env.HOME = originalHome;
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
     }
   });
 });

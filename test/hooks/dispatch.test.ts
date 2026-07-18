@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { HOOK_COMMANDS } from "../../src/hooks/dispatch.js";
+import { HOOK_COMMANDS, type HookCommand } from "../../src/hooks/dispatch.js";
 import { REQUIRED_HOOKS } from "../../installer/install.js";
 
 // Mock auto-heal to verify it's called
@@ -70,6 +70,11 @@ import { handleSessionSnapshot } from "../../src/hooks/session-snapshot.js";
 import { handlePostToolUse } from "../../src/hooks/post-tool.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 
+function configWithDaemon(daemon: { port?: number }): ReturnType<typeof loadDaemonConfig> {
+  // Dispatch only reads daemon.port; the typed fixture intentionally omits unrelated config sections.
+  return { daemon } as unknown as ReturnType<typeof loadDaemonConfig>;
+}
+
 describe("dispatchHook", () => {
   it("calls validateAndFixHooks before every handler", async () => {
     const callOrder: string[] = [];
@@ -96,12 +101,12 @@ describe("dispatchHook", () => {
   });
 
   it("dispatches each command to its correct handler", async () => {
-    const mapping: [typeof HOOK_COMMANDS[number], any][] = [
+    const mapping = [
       ["compact", handlePreCompact],
       ["restore", handleSessionStart],
       ["session-end", handleSessionEnd],
       ["user-prompt", handleUserPromptSubmit],
-    ];
+    ] as const;
     for (const [cmd, handler] of mapping) {
       vi.mocked(handler).mockClear();
       await dispatchHook(cmd, '{"test":true}');
@@ -117,12 +122,12 @@ describe("dispatchHook", () => {
   });
 
   it("passes configured port to handlers", async () => {
-    vi.mocked(loadDaemonConfig).mockReturnValue({ daemon: { port: 9999 } } as any);
+    vi.mocked(loadDaemonConfig).mockReturnValue(configWithDaemon({ port: 9999 }));
     vi.mocked(handlePreCompact).mockClear();
     await dispatchHook("compact", "{}");
     expect(handlePreCompact).toHaveBeenCalledWith("{}", expect.anything(), 9999);
     // Reset to default
-    vi.mocked(loadDaemonConfig).mockReturnValue({ daemon: { port: 3737 } } as any);
+    vi.mocked(loadDaemonConfig).mockReturnValue(configWithDaemon({ port: 3737 }));
   });
 
   it("calls ensureBootstrapped with session_id before dispatching non-compact hooks", async () => {
@@ -147,7 +152,7 @@ describe("dispatchHook", () => {
   });
 
   it("routes post-tool without calling ensureBootstrapped", async () => {
-    vi.mocked(loadDaemonConfig).mockReturnValueOnce({ daemon: { port: 4545 } } as any);
+    vi.mocked(loadDaemonConfig).mockReturnValueOnce(configWithDaemon({ port: 4545 }));
     vi.mocked(handlePostToolUse).mockClear();
     vi.mocked(ensureBootstrapped).mockClear();
     const result = await dispatchHook("post-tool", JSON.stringify({
@@ -219,16 +224,18 @@ describe("dispatchHook", () => {
   });
 
   it("rejects an impossible hook command defensively", async () => {
-    await expect(dispatchHook("invalid" as any, "{}")).rejects.toThrow("Unknown hook command: invalid");
+    // Deliberately cross the public type boundary to exercise the defensive runtime default.
+    const invalidCommand = "invalid" as HookCommand;
+    await expect(dispatchHook(invalidCommand, "{}")).rejects.toThrow("Unknown hook command: invalid");
   });
 
   it("handles empty hook payloads and a config without a daemon port", async () => {
-    vi.mocked(loadDaemonConfig).mockReturnValueOnce({ daemon: {} } as any);
+    vi.mocked(loadDaemonConfig).mockReturnValueOnce(configWithDaemon({}));
     await dispatchHook("restore", "");
     expect(handleSessionStart).toHaveBeenCalledWith("", expect.anything(), 3737);
     await dispatchHook("post-tool", "");
     expect(handlePostToolUse).toHaveBeenCalled();
-    vi.mocked(loadDaemonConfig).mockReturnValueOnce({} as any);
+    vi.mocked(loadDaemonConfig).mockReturnValueOnce({} as unknown as ReturnType<typeof loadDaemonConfig>);
     await dispatchHook("post-tool", "{}");
     expect(handlePostToolUse).toHaveBeenCalledWith("{}", 3737);
   });

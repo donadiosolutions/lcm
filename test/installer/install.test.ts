@@ -350,34 +350,45 @@ describe("install", () => {
     const home = homedir();
     const lcmDir = join(home, ".lcm");
     const cacheDir = join(home, ".claude", "plugins", "cache", legacyLcmSlug(), "lcm");
+    const claudeDir = join(home, ".claude");
+    const commandsDestDir = join(claudeDir, "commands");
     const commandsSourceDir = fs.mkdtempSync(join(home, "commands-source-"));
-    fs.mkdirSync(lcmDir, { recursive: true });
-    fs.writeFileSync(join(lcmDir, "config.json"), "{}");
-    fs.mkdirSync(join(cacheDir, "1.3.0"), { recursive: true });
-    fs.mkdirSync(join(cacheDir, "1.4.0"), { recursive: true });
-    fs.writeFileSync(join(commandsSourceDir, "command.md"), "command");
-    fs.writeFileSync(join(commandsSourceDir, "ignore.txt"), "ignore");
+    try {
+      fs.mkdirSync(lcmDir, { recursive: true });
+      fs.writeFileSync(join(lcmDir, "config.json"), "{}");
+      fs.mkdirSync(join(cacheDir, "1.3.0"), { recursive: true });
+      fs.mkdirSync(join(cacheDir, "1.4.0"), { recursive: true });
+      fs.writeFileSync(join(commandsSourceDir, "command.md"), "command");
+      fs.writeFileSync(join(commandsSourceDir, "ignore.txt"), "ignore");
 
-    const deps: ServiceDeps = {
-      spawnSync: makeSpawn(1, ""),
-      readFileSync: (path, encoding) => path.endsWith("package.json")
-        ? JSON.stringify({ version: "1.4.0" })
-        : fs.readFileSync(path, encoding as BufferEncoding) as string,
-      writeFileSync: fs.writeFileSync as any,
-      mkdirSync: fs.mkdirSync,
-      existsSync: fs.existsSync,
-      promptUser: vi.fn(),
-      ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
-      runDoctor: vi.fn().mockResolvedValue([]),
-      commandsSourceDir,
-    };
+      const deps: ServiceDeps = {
+        spawnSync: makeSpawn(1, ""),
+        readFileSync: (path, encoding) => path.endsWith("package.json")
+          ? JSON.stringify({ version: "1.4.0" })
+          : fs.readFileSync(path, encoding as BufferEncoding) as string,
+        writeFileSync: fs.writeFileSync as any,
+        mkdirSync: fs.mkdirSync,
+        existsSync: fs.existsSync,
+        promptUser: vi.fn(),
+        ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
+        runDoctor: vi.fn().mockResolvedValue([]),
+        commandsSourceDir,
+      };
 
-    await install(deps);
-    expect(fs.existsSync(join(cacheDir, "1.3.0"))).toBe(false);
-    expect(fs.existsSync(join(cacheDir, "1.4.0"))).toBe(true);
-    expect(fs.readFileSync(join(home, ".claude", "commands", "command.md"), "utf-8")).toBe("command");
-    await install(deps);
-    fs.rmSync(commandsSourceDir, { recursive: true, force: true });
+      await install(deps);
+      expect(fs.existsSync(join(cacheDir, "1.3.0"))).toBe(false);
+      expect(fs.existsSync(join(cacheDir, "1.4.0"))).toBe(true);
+      expect(fs.readFileSync(join(commandsDestDir, "command.md"), "utf-8")).toBe("command");
+      await install(deps);
+    } finally {
+      fs.rmSync(lcmDir, { recursive: true, force: true });
+      fs.rmSync(cacheDir, { recursive: true, force: true });
+      fs.rmSync(commandsDestDir, { recursive: true, force: true });
+      for (const file of ["settings.json", "lcm.md", "CLAUDE.md"]) {
+        fs.rmSync(join(claudeDir, file), { force: true });
+      }
+      fs.rmSync(commandsSourceDir, { recursive: true, force: true });
+    }
   });
 });
 

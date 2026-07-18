@@ -83,11 +83,14 @@ describe("DryRunServiceDeps", () => {
     // Script must end in "setup.sh" to trigger the special case
     const scriptPath = join(tmpdir(), `lc-test-setup.sh`);
     writeFileSync(scriptPath, `#!/bin/bash\necho "[dry-run] backend: ollama (test)"`);
-    const deps = new DryRunServiceDeps();
-    const result = deps.spawnSync("bash", [scriptPath], { env: { ...process.env, XGH_DRY_RUN: "1" } });
-    expect(result.status).toBe(0);
-    expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("[dry-run] would run: bash"));
-    rmSync(scriptPath);
+    try {
+      const deps = new DryRunServiceDeps();
+      const result = deps.spawnSync("bash", [scriptPath], { env: { ...process.env, XGH_DRY_RUN: "1" } });
+      expect(result.status).toBe(0);
+      expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("[dry-run] would run: bash"));
+    } finally {
+      rmSync(scriptPath, { force: true });
+    }
   });
 
   it("forwards setup stdout and stderr with the default environment", () => {
@@ -95,16 +98,18 @@ describe("DryRunServiceDeps", () => {
     writeFileSync(scriptPath, "#!/bin/bash\necho stdout-line\necho stderr-line >&2");
     const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
-    const deps = new DryRunServiceDeps();
+    try {
+      const deps = new DryRunServiceDeps();
+      const result = deps.spawnSync("bash", [scriptPath]);
 
-    const result = deps.spawnSync("bash", [scriptPath]);
-
-    expect(result.status).toBe(0);
-    expect(stdoutSpy).toHaveBeenCalledWith(expect.stringContaining("stdout-line"));
-    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("stderr-line"));
-    stdoutSpy.mockRestore();
-    stderrSpy.mockRestore();
-    rmSync(scriptPath);
+      expect(result.status).toBe(0);
+      expect(stdoutSpy).toHaveBeenCalledWith(expect.stringContaining("stdout-line"));
+      expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("stderr-line"));
+    } finally {
+      stdoutSpy.mockRestore();
+      stderrSpy.mockRestore();
+      rmSync(scriptPath, { force: true });
+    }
   });
 
   it("does not write absent setup output", () => {
