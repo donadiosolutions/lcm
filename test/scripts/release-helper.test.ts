@@ -450,9 +450,11 @@ describe("manual release helper step 8", () => {
     const result = runRelease({ preTagNpmError: registryDetail });
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("verify registry access and retry");
-    expect(result.stderr).not.toContain(registryDetail);
-    expect(result.stderr.length).toBeLessThan(500);
+    expect(result.stderr).toBe(
+      `✗ ERROR: Failed to query npm for @donadiosolutions/lcm@${version} before creating ${tag}; verify registry access and retry.\n`,
+    );
+    expect(result.stderr).not.toContain("registry-secret-detail-");
+    expect(result.stdout).not.toContain("registry-secret-detail-");
     expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
   });
 
