@@ -112,11 +112,39 @@ function hasPositiveLookbehind(source: string): boolean {
   return /(?:^|[^\\])(?:\\\\)*\(\?<=/u.test(source);
 }
 
-function zeroWidthTokenRange(
+function hasUnescapedAlternation(source: string): boolean {
+  return /(?:^|[^\\])(?:\\\\)*\|/u.test(source);
+}
+
+function hasPotentialConsumingAlternative(source: string): boolean {
+  const withoutSimpleAssertions = source.replace(
+    /\(\?(?:[=!]|<[=!])(?:\\.|[^()[\]]|\[[^\]]*\])*\)/gu,
+    "",
+  );
+  const withoutStructuralSyntax = withoutSimpleAssertions.replace(
+    /\(\?:|\(\?<\w+>|[()|^$*+?]|\{\d+(?:,\d*)?\}/gu,
+    "",
+  );
+  return withoutStructuralSyntax.length > 0;
+}
+
+function positiveLookaheadBodies(source: string): string[] {
+  return Array.from(
+    source.matchAll(/(?<!\\)(?:\\\\)*\(\?=((?:\\.|[^()[\]]|\[[^\]]*\])*)\)/gu),
+    (match) => match[1],
+  );
+}
+
+function positiveLookaheadCount(source: string): number {
+  return Array.from(source.matchAll(/(?<!\\)(?:\\\\)*\(\?=/gu)).length;
+}
+
+function zeroWidthTokenRanges(
   ranges: readonly TextRange[],
   anchor: number,
   preferPrecedingAtBoundary: boolean,
-): TextRange | null {
+  includeFollowingAtBoundary: boolean,
+): readonly TextRange[] {
   let low = 0;
   let high = ranges.length;
   while (low < high) {
@@ -125,25 +153,37 @@ function zeroWidthTokenRange(
     else high = middle;
   }
   const preceding = ranges[low - 1];
-  if (preferPrecedingAtBoundary && preceding?.[1] === anchor) return preceding;
-  return ranges[low] ?? preceding ?? null;
+  const following = ranges[low];
+  if (preferPrecedingAtBoundary && preceding?.[1] === anchor) {
+    return includeFollowingAtBoundary && following ? [preceding, following] : [preceding];
+  }
+  const selected = following ?? preceding;
+  return selected ? [selected] : [];
 }
 
 /**
  * Convert a regex match into a consuming source range.
  *
  * Consuming matches retain their exact range. A zero-width match uses cached
- * non-whitespace boundaries to select the containing or following token,
- * falling back to the final preceding token only when nothing follows it.
- * Inputs containing no token do not produce a redaction.
+ * non-whitespace boundaries to select the containing or following token. At a
+ * token-end boundary, positive lookbehind prefers the preceding token; when a
+ * matching lookahead also identifies non-whitespace text, both plausible token
+ * ranges are returned. The final preceding token is the fallback when nothing
+ * follows the anchor. Inputs containing no token do not produce a redaction.
  */
-function consumingMatchRange(
+function consumingMatchRanges(
   match: RegExpExecArray,
   getTokenRanges: () => readonly TextRange[],
   preferPrecedingAtBoundary: boolean,
-): TextRange | null {
-  if (match[0].length > 0) return [match.index, match.index + match[0].length];
-  return zeroWidthTokenRange(getTokenRanges(), match.index, preferPrecedingAtBoundary);
+  includeFollowingAtBoundary: boolean,
+): readonly TextRange[] {
+  if (match[0].length > 0) return [[match.index, match.index + match[0].length]];
+  return zeroWidthTokenRanges(
+    getTokenRanges(),
+    match.index,
+    preferPrecedingAtBoundary,
+    includeFollowingAtBoundary,
+  );
 }
 
 function collectConsumingRanges(
@@ -154,22 +194,41 @@ function collectConsumingRanges(
 ): void {
   regex.lastIndex = 0;
   const preferPrecedingAtBoundary = hasPositiveLookbehind(regex.source);
-  let previousZeroRange: TextRange | null = null;
+  const lookaheadBodies = positiveLookaheadBodies(regex.source);
+  const hasUnparsedLookahead = positiveLookaheadCount(regex.source) > lookaheadBodies.length;
+  const lookaheadFlags = regex.flags.replace(/[dgy]/gu, "");
+  const lookaheadProbes = lookaheadBodies.map(
+    (body) => new RegExp(`^(?:${body})`, lookaheadFlags),
+  );
+  const preserveAlternativeMatches = hasUnescapedAlternation(regex.source)
+    && hasPotentialConsumingAlternative(regex.source);
+  let previousZeroRanges: readonly TextRange[] = [];
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {
     const isZeroWidth = match[0].length === 0;
-    const range = consumingMatchRange(match, getTokenRanges, preferPrecedingAtBoundary);
-    const isRepeatedZeroRange = isZeroWidth
-      && previousZeroRange?.[0] === range?.[0]
-      && previousZeroRange?.[1] === range?.[1];
-    if (range && !isRepeatedZeroRange) collect(range);
+    const anchor = match.index;
+    const includeFollowingAtBoundary = preferPrecedingAtBoundary && (
+      hasUnparsedLookahead
+      || lookaheadProbes.some((probe) => /\S/u.test(probe.exec(text.slice(anchor))?.[0] ?? ""))
+    );
+    const ranges = consumingMatchRanges(
+      match,
+      getTokenRanges,
+      preferPrecedingAtBoundary,
+      includeFollowingAtBoundary,
+    );
+    for (const range of ranges) {
+      if (!isZeroWidth || !previousZeroRanges.includes(range)) collect(range);
+    }
 
     if (!isZeroWidth) continue;
-    if (!range) break;
+    if (ranges.length === 0) break;
 
-    previousZeroRange = range;
+    previousZeroRanges = ranges;
     const lastIndexAfterMatch = regex.lastIndex;
-    regex.lastIndex = Math.max(regex.lastIndex, range[1]);
+    if (!preserveAlternativeMatches) {
+      regex.lastIndex = Math.max(regex.lastIndex, ...ranges.map((range) => range[1]));
+    }
     if (regex.lastIndex === lastIndexAfterMatch) regex.lastIndex++;
   }
 }

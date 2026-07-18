@@ -187,16 +187,48 @@ describe("ScrubEngine — custom patterns", () => {
     });
   });
 
+  it("redacts both plausible tokens when mixed assertions make direction ambiguous", () => {
+    for (const pattern of [
+      "(?:(?<=X)(?=Y)|(?=\\s+SECRET_[A-Z]+))",
+      "(?<=safe)(?=(?:\\s+SECRET_[A-Z]+))",
+    ]) {
+      const result = new ScrubEngine([pattern], []).scrubWithCounts("safe SECRET_VALUE");
+
+      expect(result).toEqual({
+        text: "[REDACTED] [REDACTED]", gitleaks: 0, builtIn: 0, global: 2, project: 0,
+      });
+      expect(result.text).not.toContain("SECRET_VALUE");
+    }
+  });
+
+  it("preserves consuming alternatives after expanding a zero-width match", () => {
+    const result = new ScrubEngine(["(?=SAFE)|SECRET\\s+VALUE"], [])
+      .scrubWithCounts("SAFESECRET VALUE");
+
+    expect(result).toEqual({
+      text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+    expect(result.text).not.toContain("VALUE");
+  });
+
+  it("falls back to the final preceding token from trailing whitespace", () => {
+    expect(new ScrubEngine(["(?=\\s*$)"], []).scrubWithCounts("TOKEN  ")).toEqual({
+      text: "[REDACTED]  ", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
   it("bounds repeated zero-width matching work for long tokens in both paths", () => {
     const token = "A".repeat(16_384);
-    const engine = new ScrubEngine(["(?=.)", "(?=.)", "(?=A)", "(?=A)"], []);
+    const engine = new ScrubEngine([
+      "(?=.)", "(?=.)", "(?=A)", "(?=A)", "(?=A)|(?=B)", "(?=A)|(?=B)",
+    ], []);
     const originalExec = RegExp.prototype.exec;
     const execCounts = new Map<string, number>();
     const execSpy = vi.spyOn(RegExp.prototype, "exec").mockImplementation(function (
       this: RegExp,
       value: string,
     ): RegExpExecArray | null {
-      if (this.source === "(?=.)" || this.source === "(?=A)") {
+      if (this.source === "(?=.)" || this.source === "(?=A)" || this.source === "(?=A)|(?=B)") {
         execCounts.set(this.source, (execCounts.get(this.source) ?? 0) + 1);
       }
       return originalExec.call(this, value);
@@ -212,6 +244,7 @@ describe("ScrubEngine — custom patterns", () => {
 
     expect(execCounts.get("(?=.)")).toBeLessThanOrEqual(4);
     expect(execCounts.get("(?=A)")).toBeLessThanOrEqual(4);
+    expect(execCounts.get("(?=A)|(?=B)")).toBeLessThanOrEqual(4);
   });
 
   it("merges overlapping matches and preserves disjoint surrounding text", () => {

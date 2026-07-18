@@ -28,6 +28,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Flag any `collectStats()` call that isn't in a dedicated stats endpoint or background job.
 - In synchronous redaction paths, zero-width regex matches must reuse cached token boundaries, skip to the end of the consuming range, and avoid collecting duplicate ranges. Flag per-match rescans of the same token or one range allocation per character.
 - At a token-end boundary, a zero-width positive lookbehind identifies the preceding token, while a whitespace lookahead identifies the following token. Require regressions for both directions when changing zero-width range selection.
+- Do not derive zero-width token direction from the entire regex source when mixed assertions or alternatives can match different branches. Determine direction from the active match or redact every plausible adjacent token.
+- Range skipping after a zero-width match must not hide a later consuming alternative that starts inside the expanded token and extends beyond it. Preserve such alternatives while retaining bounded work for pure repeated-zero patterns.
 
 ### Test coverage
 - New HTTP routes must have corresponding tests in `test/daemon/routes/`.
