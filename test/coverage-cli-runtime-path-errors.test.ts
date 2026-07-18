@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -42,6 +42,8 @@ describe("runtime home rename failures", () => {
       from: paths.legacy,
       to: paths.next,
     });
+    expect(readFileSync(join(paths.next, "value.txt"), "utf-8")).toBe("value");
+    expect(existsSync(paths.legacy)).toBe(false);
   });
 
   it("rethrows non-cross-device rename failures", () => {

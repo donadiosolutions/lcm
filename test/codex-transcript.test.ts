@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync, utimesSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import {
   parseCodexTranscript,
   extractCodexSessionCwd,
@@ -347,7 +347,14 @@ describe("findAllCodexTranscripts", () => {
   });
 
   it("uses the default Codex home when no directory is supplied", () => {
-    expect(findAllCodexTranscripts()).toEqual(expect.any(Array));
+    const sessionsRoot = join(homedir(), ".codex", "sessions");
+    mkdirSync(sessionsRoot, { recursive: true });
+    const sessionDir = mkdtempSync(join(sessionsRoot, "coverage-default-"));
+    dirs.push(sessionDir);
+    const sessionId = basename(sessionDir);
+    writeFileSync(join(sessionDir, `${sessionId}.jsonl`), "");
+
+    expect(findAllCodexTranscripts().map((file) => file.sessionId)).toContain(sessionId);
   });
 
   it("collects from archived_sessions/ (flat) and sessions/ (nested)", () => {

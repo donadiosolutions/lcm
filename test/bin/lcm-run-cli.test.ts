@@ -185,11 +185,15 @@ describe("runCli registration and help dispatch", () => {
     expect(withHookOverrides("null", "codex", undefined)).toBe("null");
     expect(shouldRunMain(undefined, "/bin/lcm.js")).toBe(false);
     expect(() => resolveCompactRequestPolicyOverride(state.loadConfig() as never, { timeoutMs: " " })).toThrow();
-    expect(() => handleCliError(new Error("boom"))).toThrow("exit:1");
-    expect(() => handleCliError(new ConfigValidationError("cli", "invalid"))).toThrow("exit:1");
+    const genericError = new Error("boom");
+    const configError = new ConfigValidationError("cli", "invalid");
+    expect(() => handleCliError(genericError)).toThrow("exit:1");
+    expect(() => handleCliError(configError)).toThrow("exit:1");
     expect(() => writeCliOutput("out")).not.toThrow();
     expect(() => writeCliError("err")).not.toThrow();
     expect(consoleError).toHaveBeenCalledTimes(2);
+    expect(consoleError).toHaveBeenNthCalledWith(1, genericError);
+    expect(consoleError).toHaveBeenNthCalledWith(2, configError.message);
     expect(stdout).toHaveBeenCalledWith("out");
     expect(stderr).toHaveBeenCalledWith("err");
     const runner = vi.fn(async () => undefined);
@@ -259,19 +263,32 @@ describe("runCli registration and help dispatch", () => {
   });
 
   it.each([
-    [], ["--help"], ["help"], ["help", "compact"],
-    ["daemon", "--help"], ["daemon", "start", "--help"], ["daemon", "restart", "--help"],
-    ["config"],
-    ["compact", "--help"], ["restore", "--help"], ["session-end", "--help"],
-    ["user-prompt", "--help"], ["post-tool", "--help"], ["session-snapshot", "--help"],
-    ["mcp", "--help"], ["install", "--help"], ["uninstall", "--help"], ["status", "--help"],
-    ["stats", "--help"], ["doctor", "--help"], ["events", "--help"], ["events", "promote", "--help"],
-    ["diagnose", "--help"], ["connectors", "--help"], ["sensitive", "--help"], ["import", "--help"],
-    ["promote", "--help"], ["export", "--help"], ["import-knowledge", "x", "--help"],
-    ["search", "q", "--help"], ["grep", "q", "--help"], ["describe", "n", "--help"],
-    ["expand", "n", "--help"], ["store", "text", "--help"],
-  ])("routes custom help for %#", async (...args) => {
+    [[], undefined], [["--help"], undefined], [["help"], undefined], [["help", "compact"], "compact"],
+    [["daemon", "--help"], "daemon"], [["daemon", "start", "--help"], "daemon"], [["daemon", "restart", "--help"], "daemon"],
+    [["config"], "config"],
+    [["compact", "--help"], "compact"], [["restore", "--help"], "restore"], [["session-end", "--help"], "session-end"],
+    [["user-prompt", "--help"], "user-prompt"], [["post-tool", "--help"], "post-tool"], [["session-snapshot", "--help"], "session-snapshot"],
+    [["mcp", "--help"], "mcp"], [["install", "--help"], "install"], [["uninstall", "--help"], "uninstall"], [["status", "--help"], "status"],
+    [["stats", "--help"], "stats"], [["doctor", "--help"], "doctor"], [["events", "--help"], "events"], [["events", "promote", "--help"], "events"],
+    [["diagnose", "--help"], "diagnose"], [["connectors", "--help"], "connectors"], [["sensitive", "--help"], "sensitive"], [["import", "--help"], "import"],
+    [["promote", "--help"], "promote"], [["export", "--help"], "export"], [["import-knowledge", "x", "--help"], "import-knowledge"],
+    [["search", "q", "--help"], "search"], [["grep", "q", "--help"], "grep"], [["describe", "n", "--help"], "describe"],
+    [["expand", "n", "--help"], "expand"], [["store", "text", "--help"], "store"],
+  ] as const)("routes custom help for %#", async (args, expectedCommand) => {
     expect((await invoke(args))?.message).toBe("exit:0");
+    expect(state.exit).toHaveBeenCalledOnce();
+    expect(state.exit).toHaveBeenCalledWith(0);
+    if (args[0] === "daemon" && args.length === 3) {
+      // Preserve the current nested-child behavior tracked in #139.
+      expect(state.printHelp).not.toHaveBeenCalled();
+    } else {
+      expect(state.printHelp).toHaveBeenCalledOnce();
+      if (expectedCommand === undefined && args[0] !== "help") {
+        expect(state.printHelp.mock.calls[0]).toEqual([]);
+      } else {
+        expect(state.printHelp).toHaveBeenCalledWith(expectedCommand);
+      }
+    }
   });
 });
 
@@ -505,7 +522,9 @@ describe("runCli failure and alternate presentation branches", () => {
       { name: "project", isDirectory: () => true },
     ];
     state.fileText = JSON.stringify({ cwd: "/project" });
-    state.post.mockResolvedValue({ processed: 2, promoted: 2, conversations: 2, errors: 0, skipped: 0 });
+    state.post
+      .mockResolvedValueOnce({ processed: 2, promoted: 2 })
+      .mockResolvedValueOnce({ processed: 2, promoted: 2, conversations: 2, errors: 0, skipped: 0 });
 
     expect(await invoke(["compact", "--all"])).toBeUndefined();
     expect(await invoke(["import", "--all", "--provider", "claude"])).toBeUndefined();

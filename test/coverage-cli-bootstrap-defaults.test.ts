@@ -29,6 +29,6 @@ describe("bootstrap default dependencies", () => {
     await ensureCore();
     await ensureBootstrapped("unsafe/session:id");
     await ensureBootstrapped("unsafe/session:id");
-    expect(lifecycle.ensureDaemon).toHaveBeenCalled();
+    expect(lifecycle.ensureDaemon).toHaveBeenCalledTimes(2);
   });
 });

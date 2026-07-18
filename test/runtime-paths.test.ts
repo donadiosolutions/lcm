@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { afterEach, describe, it, expect } from "vitest";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +15,18 @@ import {
   tmpDir,
 } from "../src/runtime-paths.js";
 import { legacyLcmHomeDirname } from "../src/legacy-names.js";
+
+const homes: string[] = [];
+
+afterEach(() => {
+  for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
+});
+
+function makeHome(): string {
+  const home = mkdtempSync(join(tmpdir(), "lcm-runtime-paths-"));
+  homes.push(home);
+  return home;
+}
 
 describe("runtime paths", () => {
   it("uses ~/.lcm as the default LCM home", () => {
@@ -36,7 +48,7 @@ describe("runtime paths", () => {
   });
 
   it("does not migrate when the legacy home is absent", () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-paths-"));
+    const home = makeHome();
     expect(migrateLegacyHomeIfNeeded(home)).toEqual({
       migrated: false,
       from: legacyLcmHomeDir(home),
@@ -45,7 +57,7 @@ describe("runtime paths", () => {
   });
 
   it("migrates an existing legacy home when the new home is absent", () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-paths-"));
+    const home = makeHome();
     const legacy = legacyLcmHomeDir(home);
     const next = lcmHomeDir(home);
     mkdirSync(legacy, { recursive: true });
@@ -59,7 +71,7 @@ describe("runtime paths", () => {
   });
 
   it("does not migrate when the new home already has lcm data", () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-paths-"));
+    const home = makeHome();
     const legacy = legacyLcmHomeDir(home);
     const next = lcmHomeDir(home);
     mkdirSync(legacy, { recursive: true });
@@ -75,7 +87,7 @@ describe("runtime paths", () => {
   });
 
   it.each(["projects", "events"])("does not migrate when the new home has %s data", (name) => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-paths-"));
+    const home = makeHome();
     const legacy = legacyLcmHomeDir(home);
     const next = lcmHomeDir(home);
     mkdirSync(legacy, { recursive: true });
@@ -85,7 +97,7 @@ describe("runtime paths", () => {
   });
 
   it("merges legacy contents when the new home already contains unrelated files", () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-paths-"));
+    const home = makeHome();
     const legacy = legacyLcmHomeDir(home);
     const next = lcmHomeDir(home);
     mkdirSync(legacy, { recursive: true });
@@ -102,7 +114,7 @@ describe("runtime paths", () => {
   });
 
   it("preserves duplicate targets while merging a legacy home", () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-paths-"));
+    const home = makeHome();
     const legacy = legacyLcmHomeDir(home);
     const next = lcmHomeDir(home);
     mkdirSync(legacy, { recursive: true });
