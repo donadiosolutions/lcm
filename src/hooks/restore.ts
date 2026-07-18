@@ -2,7 +2,6 @@ import type { DaemonClient } from "../daemon/client.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { openSync, closeSync, writeFileSync } from "node:fs";
 import { daemonPidPath, tmpDir } from "../runtime-paths.js";
 import {
