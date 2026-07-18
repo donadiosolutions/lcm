@@ -25,6 +25,8 @@ function makeDir(name: string): string {
 function seedConversation(dbPath: string): void {
   const db = new DatabaseSync(dbPath);
   try {
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA foreign_keys = ON");
     runLcmMigrations(db);
     db.prepare("INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)").run(1, "session-1");
     db.prepare(
@@ -214,6 +216,8 @@ describe("batch compaction discovery", () => {
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
     seedConversation(paths.dbPath);
     const db = new DatabaseSync(paths.dbPath);
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA foreign_keys = ON");
     db.prepare(
       "INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, file_ids) VALUES (?, ?, ?, ?, ?, '[]')",
     ).run("summary-1", 1, "leaf", "summary", 10);

@@ -296,6 +296,10 @@ export class RetrievalEngine {
       const children = await this.summaryStore.getSummaryChildren(summaryId);
 
       for (const child of children) {
+        if (result.truncated) {
+          break;
+        }
+
         // Check if adding this child would exceed the token cap
         if (result.estimatedTokens + child.tokenCount > tokenCap) {
           result.truncated = true;

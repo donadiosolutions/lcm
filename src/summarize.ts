@@ -252,6 +252,10 @@ function sanitizeForDiagnostics(value: unknown, depth = 0, key?: string): unknow
     }
     return head;
   }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return sanitizeDiagnosticText(String(value), key);
+  }
   const out: Record<string, unknown> = {};
   const entries = Object.entries(value as Record<string, unknown>);
   for (const [key, entry] of entries.slice(0, DIAGNOSTIC_MAX_OBJECT_KEYS)) {
@@ -397,6 +401,14 @@ function extractResponseDiagnostics(result: unknown): string {
   }
 
   return parts.join("; ");
+}
+
+/** Append response diagnostics only when the provider returned usable metadata. */
+function appendResponseDiagnostics(parts: string[], result: unknown): void {
+  const diagnostics = extractResponseDiagnostics(result);
+  if (diagnostics) {
+    parts.push(diagnostics);
+  }
 }
 
 /**
@@ -546,6 +558,7 @@ export const __summarizeTestUtils = {
   sanitizeForDiagnostics,
   formatDiagnosticPayload,
   extractResponseDiagnostics,
+  appendResponseDiagnostics,
   buildDeterministicFallbackSummary,
 };
 
@@ -676,7 +689,6 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     }
 
     if (!summary) {
-      const responseDiag = extractResponseDiagnostics(result);
       const diagParts = [
         `[lcm] empty normalized summary on first attempt`,
         `provider=${provider}`,
@@ -684,7 +696,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         `block_types=${formatBlockTypes(normalized.blockTypes)}`,
         `response_blocks=${result.content.length}`,
       ];
-      diagParts.push(responseDiag);
+      appendResponseDiagnostics(diagParts, result);
       console.error(`${diagParts.join("; ")}; retrying with conservative settings`);
 
       // Single retry with conservative parameters: low temperature and low
@@ -721,7 +733,6 @@ export async function createLcmSummarizeFromLegacyParams(params: {
               `block_types=${formatBlockTypes(retryNormalized.blockTypes)}; source=retry`,
           );
         } else {
-          const retryDiag = extractResponseDiagnostics(retryResult);
           const retryParts = [
             `[lcm] retry also returned empty summary`,
             `provider=${provider}`,
@@ -729,7 +740,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             `block_types=${formatBlockTypes(retryNormalized.blockTypes)}`,
             `response_blocks=${retryResult.content.length}`,
           ];
-          retryParts.push(retryDiag);
+          appendResponseDiagnostics(retryParts, retryResult);
           console.error(`${retryParts.join("; ")}; falling back to truncation`);
         }
       } catch (retryErr) {

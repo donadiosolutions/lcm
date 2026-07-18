@@ -205,7 +205,12 @@ describe("findSessionFiles", () => {
     const time = new Date("2026-01-01T00:00:00Z");
     for (const path of paths) utimesSync(path, time, time);
     const result = findSessionFiles(dir);
-    expect(result.map((item) => item.sessionId)).toEqual(["a", "same", "same", "z"]);
+    expect(result.map((item) => item.path)).toEqual([
+      join(dir, "a.jsonl"),
+      join(dir, "same.jsonl"),
+      join(agents, "same.jsonl"),
+      join(dir, "z.jsonl"),
+    ]);
   });
 });
 
@@ -330,6 +335,8 @@ describe("importSessions", () => {
     const dbDir = join(lcmDir, "projects", projectId(cwd));
     mkdirSync(dbDir, { recursive: true });
     const db = new DatabaseSync(join(dbDir, "db.sqlite"));
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA foreign_keys = ON");
     db.exec("CREATE TABLE session_ingest_log (session_id TEXT PRIMARY KEY)");
     db.prepare("INSERT INTO session_ingest_log(session_id) VALUES (?)").run(sessionId);
     db.close();
@@ -355,6 +362,8 @@ describe("importSessions", () => {
     const dbDir = join(lcmDir, "projects", projectId(cwd));
     mkdirSync(dbDir, { recursive: true });
     const db = new DatabaseSync(join(dbDir, "db.sqlite"));
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA foreign_keys = ON");
     db.exec("CREATE TABLE session_ingest_log (session_id TEXT PRIMARY KEY); INSERT INTO session_ingest_log VALUES ('recorded')");
     db.close();
     const result = await importSessions(makeMockClient(async () => ({})), {

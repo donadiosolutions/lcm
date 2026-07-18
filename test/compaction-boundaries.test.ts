@@ -96,6 +96,16 @@ describe("compaction pure boundaries", () => {
     expect(utils.shortTzAbbr(now, "invalid/timezone")).toBe("invalid/timezone");
   });
 
+  it("falls back to the timezone when ICU omits its abbreviation part", () => {
+    const formatToParts = vi.spyOn(Intl.DateTimeFormat.prototype, "formatToParts")
+      .mockReturnValue([{ type: "literal", value: "unavailable" }]);
+    try {
+      expect(utils.shortTzAbbr(now, "America/New_York")).toBe("America/New_York");
+    } finally {
+      formatToParts.mockRestore();
+    }
+  });
+
   it("estimates, hashes, and deduplicates deterministically", () => {
     expect(utils.estimateTokens("12345")).toBe(2);
     expect(utils.generateSummaryId("content")).toMatch(/^sum_[a-f0-9]{16}$/);

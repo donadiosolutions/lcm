@@ -124,6 +124,27 @@ describe("diagnostic sanitization boundaries", () => {
     expect(utils.formatDiagnosticPayload(1n)).toBe('"[unserializable]"');
   });
 
+  it("preserves and redacts non-plain Error diagnostics", () => {
+    const error = new Error("provider rejected https://user:secret@example.com/v1?token=hidden");
+    const diagnostic = utils.formatDiagnosticPayload(error);
+    expect(diagnostic).toContain("Error: provider rejected https://example.com/v1?[REDACTED]");
+    expect(diagnostic).not.toContain("user:secret");
+    expect(diagnostic).not.toContain("token=hidden");
+
+    const nullPrototype = Object.assign(Object.create(null) as Record<string, unknown>, { value: "kept" });
+    expect(utils.formatDiagnosticPayload(nullPrototype)).toBe('{"value":"kept"}');
+  });
+
+  it("appends only non-empty response diagnostics", () => {
+    const empty: string[] = ["base"];
+    utils.appendResponseDiagnostics(empty, null);
+    expect(empty).toEqual(["base"]);
+
+    const populated: string[] = ["base"];
+    utils.appendResponseDiagnostics(populated, { content: [] });
+    expect(populated).toEqual(["base", expect.stringContaining("content_kind=array")]);
+  });
+
   it.each([
     [null, ""],
     [{}, "content_kind=missing"],

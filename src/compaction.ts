@@ -125,7 +125,7 @@ function shortTzAbbr(value: Date, timezone: string): string {
     })
       .formatToParts(value)
       .find((p) => p.type === "timeZoneName")?.value;
-    return abbr!;
+    return abbr ?? timezone;
   } catch {
     return timezone;
   }

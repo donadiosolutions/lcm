@@ -23,13 +23,36 @@ function summary(summaryId: string, kind: "leaf" | "condensed" = "leaf"): Summar
   };
 }
 
-function stores(overrides: Record<string, unknown> = {}) {
-  const conversation = {
+type ConversationMethods = Pick<ConversationStore, "searchMessages" | "getMessageById">;
+type SummaryMethods = Pick<
+  SummaryStore,
+  | "getSummary"
+  | "getLargeFile"
+  | "getSummaryParents"
+  | "getSummaryChildren"
+  | "getSummaryMessages"
+  | "getSummarySubtree"
+  | "searchSummaries"
+>;
+
+interface StoreOverrides {
+  conversation?: Partial<ConversationMethods>;
+  summaries?: Partial<SummaryMethods>;
+}
+
+interface StoreFixture {
+  conversation: ConversationMethods;
+  summaries: SummaryMethods;
+  engine: RetrievalEngine;
+}
+
+function stores(overrides: StoreOverrides = {}): StoreFixture {
+  const conversation: ConversationMethods = {
     searchMessages: vi.fn(async () => []),
     getMessageById: vi.fn(async () => null),
-    ...overrides.conversation as object,
+    ...overrides.conversation,
   };
-  const summaries = {
+  const summaries: SummaryMethods = {
     getSummary: vi.fn(async () => null),
     getLargeFile: vi.fn(async () => null),
     getSummaryParents: vi.fn(async () => []),
@@ -37,7 +60,7 @@ function stores(overrides: Record<string, unknown> = {}) {
     getSummaryMessages: vi.fn(async () => []),
     getSummarySubtree: vi.fn(async () => []),
     searchSummaries: vi.fn(async () => []),
-    ...overrides.summaries as object,
+    ...overrides.summaries,
   };
   return {
     conversation,
@@ -154,6 +177,31 @@ describe("RetrievalEngine expand", () => {
       estimatedTokens: 4,
       truncated: true,
     });
+  });
+
+  it("stops traversing siblings after a recursive child reaches the token cap", async () => {
+    const root = summary("sum_root", "condensed");
+    const child = summary("sum_child", "condensed");
+    const grandchild = { ...summary("sum_grandchild"), tokenCount: 3 };
+    const sibling = summary("sum_sibling", "condensed");
+    const getSummary = vi.fn(async (id: string) => id === root.summaryId ? root : child);
+    const { engine } = stores({
+      summaries: {
+        getSummary,
+        getSummaryChildren: vi.fn(async (id: string) => id === root.summaryId
+          ? [child, sibling]
+          : [grandchild]),
+      },
+    });
+
+    await expect(engine.expand({ summaryId: root.summaryId, depth: 2, tokenCap: 2 }))
+      .resolves.toMatchObject({
+        children: [{ summaryId: child.summaryId }],
+        estimatedTokens: 2,
+        truncated: true,
+      });
+    expect(getSummary).toHaveBeenCalledTimes(2);
+    expect(getSummary).not.toHaveBeenCalledWith(sibling.summaryId);
   });
 
   it("loads leaf messages, skips missing ones, estimates zero token counts, and truncates", async () => {

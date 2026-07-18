@@ -46,13 +46,17 @@ export function getLcmConnection(dbPath: string): DatabaseSync {
   mkdirSync(dirname(dbPath), { recursive: true });
 
   const db = new DatabaseSync(dbPath);
-
-  // Enable WAL mode for better concurrent read performance
-  db.exec("PRAGMA journal_mode = WAL");
-  // Wait up to 5 seconds on busy instead of failing immediately
-  db.exec("PRAGMA busy_timeout = 5000");
-  // Enable foreign key enforcement
-  db.exec("PRAGMA foreign_keys = ON");
+  try {
+    // Enable WAL mode for better concurrent read performance
+    db.exec("PRAGMA journal_mode = WAL");
+    // Wait up to 5 seconds on busy instead of failing immediately
+    db.exec("PRAGMA busy_timeout = 5000");
+    // Enable foreign key enforcement
+    db.exec("PRAGMA foreign_keys = ON");
+  } catch (error) {
+    forceCloseConnection({ db, refs: 0 });
+    throw error;
+  }
 
   _connections.set(dbPath, { db, refs: 1 });
   return db;

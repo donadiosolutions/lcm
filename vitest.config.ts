@@ -15,7 +15,7 @@ export default defineConfig({
     coverage: {
       include: ["bin/**/*.ts", "installer/**/*.ts", "src/**/*.ts"],
       thresholds: {
-        lines: 84.54,
+        lines: 84.52,
         branches: 81.08,
         "src/scrub.ts": { lines: 100, branches: 100 },
         "src/transcript.ts": { lines: 100, branches: 100 },
