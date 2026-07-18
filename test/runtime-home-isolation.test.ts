@@ -18,6 +18,8 @@ describe("test runtime home isolation", () => {
     const realHome = process.env.LCM_TEST_REAL_HOME;
     expect(testHome).toBeTruthy();
     expect(process.env.LCM_TEST_HOME).toBe(testHome);
+    expect(process.env.USERPROFILE).toBe(testHome);
+    expect(process.env.LCM_TEST_REAL_USERPROFILE).toBeDefined();
     expect(realHome).toBeDefined();
     expect(testHome).not.toBe(realHome);
 

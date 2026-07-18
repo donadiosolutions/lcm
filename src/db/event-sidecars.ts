@@ -142,12 +142,16 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
     const file = files[index];
     const path = join(dir, file);
     if (scanned >= maxDbs || Date.now() >= deadline) {
-      const scanSkipped = scanned >= maxDbs
+      const skippedCount = files.length - index;
+      const reason = scanned >= maxDbs
         ? "sidecar scan skipped after maxDbs limit"
         : "sidecar scan skipped after timeout";
-      for (const skippedFile of files.slice(index)) {
-        sidecars.push(skippedSidecarSummary(skippedFile, join(dir, skippedFile), scanSkipped));
-      }
+      const skippedFile = files[index];
+      sidecars.push(skippedSidecarSummary(
+        skippedFile,
+        join(dir, skippedFile),
+        `${skippedCount} ${skippedCount === 1 ? "sidecar" : "sidecars"} ${reason}`,
+      ));
       break;
     }
     scanned++;

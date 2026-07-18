@@ -15,12 +15,12 @@ interface PostToolHookInput {
 }
 
 function resolveHookCwd(inputCwd: unknown): string {
-  const cwd = typeof inputCwd === "string" ? inputCwd.trim() : "";
+  const cwd = typeof inputCwd === "string" ? inputCwd : "";
   const envCwd = typeof process.env.CLAUDE_PROJECT_DIR === "string"
-    ? process.env.CLAUDE_PROJECT_DIR.trim()
+    ? process.env.CLAUDE_PROJECT_DIR
     : "";
-  if (cwd.length > 0) return cwd;
-  if (envCwd.length > 0) return envCwd;
+  if (cwd.trim().length > 0) return cwd;
+  if (envCwd.trim().length > 0) return envCwd;
   return process.cwd();
 }
 

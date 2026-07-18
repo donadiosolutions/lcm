@@ -105,7 +105,12 @@ function removeMarkers(content: string): string {
 function installMarkdown(content: string, filePath: string, writeMode: 'append' | 'overwrite'): void {
   mkdirSync(dirname(filePath), { recursive: true });
   if (writeMode === 'append') {
-    const existing = existsSync(filePath) ? readFileSync(filePath, 'utf-8') : '';
+    let existing = '';
+    try {
+      existing = readFileSync(filePath, 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
     // Remove old markers if present before re-appending
     const cleaned = removeMarkers(existing);
     writeFileSync(filePath, cleaned + (cleaned.endsWith('\n') || cleaned === '' ? '' : '\n') + content + '\n');
@@ -118,9 +123,7 @@ function installMarkdown(content: string, filePath: string, writeMode: 'append' 
 function installMcpJson(filePath: string): void {
   mkdirSync(dirname(filePath), { recursive: true });
   let existing: any = {};
-  if (existsSync(filePath)) {
-    try { existing = JSON.parse(readFileSync(filePath, 'utf-8')); } catch { existing = {}; }
-  }
+  try { existing = JSON.parse(readFileSync(filePath, 'utf-8')); } catch { existing = {}; }
   if (typeof existing !== 'object' || existing === null) existing = {};
   if (typeof existing.mcpServers !== 'object' || existing.mcpServers === null || Array.isArray(existing.mcpServers)) {
     existing.mcpServers = {};
@@ -131,7 +134,6 @@ function installMcpJson(filePath: string): void {
 
 function removeMcpJson(filePath: string): boolean {
   if (filePath.endsWith('.toml')) return false; // TOML removal not supported
-  if (!existsSync(filePath)) return false;
   let config: any;
   try { config = JSON.parse(readFileSync(filePath, 'utf-8')); } catch { return false; }
   if (!config.mcpServers?.lcm) return false;
@@ -260,8 +262,8 @@ export function removeConnector(agentIdOrName: string, type?: ConnectorType, cwd
   }
 
   // rules: remove markers from file
-  if (!existsSync(resolvedPath)) return false;
-  const content = readFileSync(resolvedPath, 'utf-8');
+  let content: string;
+  try { content = readFileSync(resolvedPath, 'utf-8'); } catch { return false; }
   if (!hasManagedBlock(content)) return false;
   const cleaned = removeMarkers(content);
   if (cleaned.trim() === '') {

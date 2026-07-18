@@ -91,6 +91,11 @@ describe('installConnector — rules (markdown append)', () => {
     const result = installConnector('claude-code', 'rules', tmpDir);
     expect(result.requiresRestart).toBe(false);
   });
+
+  it('does not treat non-missing rules read failures as an absent file', () => {
+    mkdirSync(join(tmpDir, 'CLAUDE.md'));
+    expect(() => installConnector('claude-code', 'rules', tmpDir)).toThrow();
+  });
 });
 
 describe('installConnector — MCP JSON', () => {

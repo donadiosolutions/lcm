@@ -157,7 +157,9 @@ describe("ingest persistence boundaries", () => {
     mocks.read.mockImplementationOnce(() => { throw new Error("metadata failed"); });
     await handler({} as never, response, JSON.stringify({ session_id: "metadata-failure", cwd: "/ok", messages: [validMessage] }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
-    mocks.exists.mockReturnValueOnce(false);
+    mocks.read.mockImplementationOnce(() => {
+      throw Object.assign(new Error("missing metadata"), { code: "ENOENT" });
+    });
     await handler({} as never, response, JSON.stringify({ session_id: "metadata-absent", cwd: "/ok", messages: [validMessage] }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
   });

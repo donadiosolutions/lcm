@@ -122,7 +122,7 @@ describe("promote persistence boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { processed: 2, promoted: 1, conversations: 1 });
     expect(mocks.write).toHaveBeenCalledOnce();
 
-    mocks.exists.mockReturnValueOnce(true).mockReturnValueOnce(false);
+    mocks.exists.mockReturnValueOnce(true);
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
     expect(mocks.write).toHaveBeenCalledTimes(2);
     mocks.read.mockImplementationOnce(() => { throw new Error("meta failed"); });

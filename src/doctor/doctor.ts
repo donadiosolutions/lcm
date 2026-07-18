@@ -13,6 +13,7 @@ import { validateRegex } from "../store/regex-safety.js";
 import { configPath, daemonPidPath } from "../runtime-paths.js";
 import { projectMapPath, validateProjectMap, type ProjectMapValidation } from "../project-map.js";
 import { packageEntrypoint, packageRootFor } from "../runtime-root.js";
+import { sanitizeTerminalText } from "../terminal-sanitize.js";
 import {
   ConfigValidationError,
   DEFAULT_DAEMON_PORT,
@@ -344,24 +345,28 @@ function checkPassiveLearning(
   if (options.verbose && "projects" in stats) {
     const detailed = stats as import("../db/events-stats.js").DetailedEventStats;
     for (const p of detailed.projects) {
+      const safeFile = sanitizeTerminalText(p.file);
+      const safePath = sanitizeTerminalText(p.path);
       if (p.pruned) {
-        results.push({ name: `events-project-${p.file}`, category: "Passive Learning", status: "pass", message: `${p.file.slice(0, 8)}… pruned: ${p.pruneReason ?? "orphan sidecar"} — ${p.path}` });
+        results.push({ name: `events-project-${safeFile}`, category: "Passive Learning", status: "pass", message: `${safeFile.slice(0, 8)}… pruned: ${sanitizeTerminalText(p.pruneReason ?? "orphan sidecar")} — ${safePath}` });
         continue;
       }
       if (p.scanError) {
-        results.push({ name: `events-project-${p.file}`, category: "Passive Learning", status: "warn", message: `${p.file.slice(0, 8)}… scan failed: ${p.scanError} — ${p.path}` });
+        results.push({ name: `events-project-${safeFile}`, category: "Passive Learning", status: "warn", message: `${safeFile.slice(0, 8)}… scan failed: ${sanitizeTerminalText(p.scanError)} — ${safePath}` });
         continue;
       }
       if (p.scanSkipped) {
-        results.push({ name: `events-project-${p.file}`, category: "Passive Learning", status: "skip", message: `${p.file.slice(0, 8)}… scan skipped: ${p.scanSkipped} — ${p.path}` });
+        results.push({ name: `events-project-${safeFile}`, category: "Passive Learning", status: "skip", message: `${safeFile.slice(0, 8)}… scan skipped: ${sanitizeTerminalText(p.scanSkipped)} — ${safePath}` });
         continue;
       }
       const ago = p.lastCapture ? formatTimeAgo(new Date(`${p.lastCapture.replace(" ", "T")}Z`)) : "never";
       const projectLabel = p.cwd ?? (p.metadataMissing ? "metadata missing" : p.projectId);
-      results.push({ name: `events-project-${p.file}`, category: "Passive Learning", status: "pass", message: `${p.file.slice(0, 8)}… ${p.captured} events (${p.unprocessed} unprocessed) last: ${ago} — ${projectLabel}` });
+      results.push({ name: `events-project-${safeFile}`, category: "Passive Learning", status: "pass", message: `${safeFile.slice(0, 8)}… ${p.captured} events (${p.unprocessed} unprocessed) last: ${ago} — ${sanitizeTerminalText(projectLabel)}` });
     }
     if (detailed.recentErrors.length > 0) {
-      const errorLines = detailed.recentErrors.map(e => `  ${e.created_at} ${e.hook}: ${e.error}`).join("\n");
+      const errorLines = detailed.recentErrors.map(e =>
+        `  ${sanitizeTerminalText(e.created_at)} ${sanitizeTerminalText(e.hook)}: ${sanitizeTerminalText(e.error)}`
+      ).join("\n");
       results.push({ name: "events-recent-errors", category: "Passive Learning", status: "warn", message: `Recent errors:\n${errorLines}` });
     }
   }

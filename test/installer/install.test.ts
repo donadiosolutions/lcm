@@ -711,6 +711,13 @@ describe("ensureLcmMd", () => {
     expect(claudeMd).toContain(BLOCK);
   });
 
+  it("scans whitespace-heavy CLAUDE.md content without a backtracking regex", () => {
+    const existing = " ".repeat(100_000) + "not a marker\n";
+    const { deps, written } = makeDepsForLcm(existing);
+    expect(ensureLcmMd(deps, CONTENT, "/home").claudeMdPatched).toBe(true);
+    expect(written.get("/home/.claude/CLAUDE.md")).toContain(BLOCK);
+  });
+
   it("does not rewrite CLAUDE.md when managed block is already correct", () => {
     const existing = `@RTK.md\n<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n@other.md\n`;
     const { deps, written } = makeDepsForLcm(existing);

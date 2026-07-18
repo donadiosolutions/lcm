@@ -120,8 +120,10 @@ export function createPromoteHandler(
           try {
             const metaPath = paths.metaPath;
             let meta: Record<string, unknown> = {};
-            if (existsSync(metaPath)) {
+            try {
               meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
             }
             meta.cwd = paths.canonical;
             meta.lastPromote = new Date().toISOString();
