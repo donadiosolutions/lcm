@@ -290,14 +290,17 @@ describe("handleSessionEnd", () => {
     stderrSpy.mockRestore();
   });
 
-  it("uses an empty category list and default ingested count", async () => {
+  it.each([
+    ["missing", { redacted: 1 }],
+    ["empty", { redacted: 1, redactedCategories: [] }],
+  ])("uses the unknown category for %s category metadata", async (_label, ingestResponse) => {
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const { request } = await import("node:http");
     await handleSessionEnd(
       JSON.stringify({ session_id: "s1", cwd: "/tmp" }),
-      createMockClient({ redacted: 1 }),
+      createMockClient(ingestResponse),
     );
-    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("pattern: )"));
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("pattern: unknown)"));
     const complete = vi.mocked(request).mock.calls.find(
       (args) => httpCallPath(args) === "/session-complete",
     );

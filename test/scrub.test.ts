@@ -139,16 +139,34 @@ describe("ScrubEngine — custom patterns", () => {
     expect(result.global).toBe(2);
   });
 
-  it.fails("fully redacts zero-length token and spanning matches (issue #115)", () => {
+  it("fully redacts zero-length token and spanning matches (issue #115)", () => {
     const engine = new ScrubEngine(["(?=TOKEN)", "(?=SPAN.)"], []);
     const result = engine.scrubWithCounts("TOKEN SPANx");
 
-    // The loop guards must terminate and account for both matches. The desired
-    // secure behavior remains an expected failure until issue #115 is fixed.
     expect(result.global).toBe(2);
     expect(result.text).toBe("[REDACTED] [REDACTED]");
     expect(result.text).not.toContain("TOKEN");
     expect(result.text).not.toContain("SPANx");
+  });
+
+  it("expands zero-length matches to the complete token at each boundary", () => {
+    expect(new ScrubEngine(["(?=KEN)"], []).scrubWithCounts("TOKEN")).toEqual({
+      text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+    expect(new ScrubEngine(["$"], []).scrubWithCounts("TOKEN")).toEqual({
+      text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+    expect(new ScrubEngine(["(?=\\s)"], []).scrubWithCounts("  TOKEN")).toEqual({
+      text: "  [REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
+  it("does not report zero-length redactions when no token can be consumed", () => {
+    const spanning = new ScrubEngine(["(?=\\s)"], []).scrubWithCounts("  ");
+    const token = new ScrubEngine(["(?=)"], []).scrubWithCounts("");
+
+    expect(spanning).toEqual({ text: "  ", gitleaks: 0, builtIn: 0, global: 0, project: 0 });
+    expect(token).toEqual({ text: "", gitleaks: 0, builtIn: 0, global: 0, project: 0 });
   });
 
   it("merges overlapping matches and preserves disjoint surrounding text", () => {

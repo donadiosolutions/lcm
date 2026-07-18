@@ -115,7 +115,7 @@ export async function handleSessionEnd(
     // Notify user when sensitive data was filtered (default: on)
     const notifyOnFilter = config.security?.notify_on_filter !== false;
     if (notifyOnFilter && ingestResult.redacted && ingestResult.redacted > 0) {
-      const categories = (ingestResult.redactedCategories ?? []).join(", ");
+      const categories = ingestResult.redactedCategories?.join(", ") || "unknown";
       process.stderr.write(
         `⚠️  lcm: filtered sensitive data from history (pattern: ${categories})\n`,
       );

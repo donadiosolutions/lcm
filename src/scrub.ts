@@ -99,6 +99,36 @@ function isSpanningPattern(source: string): boolean {
   return false;
 }
 
+/**
+ * Convert a regex match into a consuming source range.
+ *
+ * Consuming matches retain their exact range. A zero-width match expands to
+ * the complete non-whitespace token at its boundary. If the boundary is not
+ * adjacent to a token, the next token is used. Inputs containing no token do
+ * not produce a redaction, which prevents reporting a redaction that removed
+ * no source text.
+ */
+function consumingMatchRange(text: string, match: RegExpExecArray): [number, number] | null {
+  if (match[0].length > 0) return [match.index, match.index + match[0].length];
+
+  let anchor = match.index;
+  if (anchor >= text.length || /^\s$/.test(text[anchor])) {
+    if (anchor > 0 && !/^\s$/.test(text[anchor - 1])) {
+      anchor--;
+    } else {
+      const nextTokenOffset = text.slice(anchor).search(/\S/);
+      if (nextTokenOffset === -1) return null;
+      anchor += nextTokenOffset;
+    }
+  }
+
+  let start = anchor;
+  while (start > 0 && !/^\s$/.test(text[start - 1])) start--;
+  let end = anchor + 1;
+  while (end < text.length && !/^\s$/.test(text[end])) end++;
+  return [start, end];
+}
+
 export interface ScrubCounts {
   text: string;
   gitleaks: number;
@@ -209,7 +239,8 @@ export class ScrubEngine {
       regex.lastIndex = 0;
       let m: RegExpExecArray | null;
       while ((m = regex.exec(text)) !== null) {
-        taggedRanges.push({ range: [m.index, m.index + m[0].length], idx: this._spanningOrigIdx[pi] });
+        const range = consumingMatchRange(text, m);
+        if (range) taggedRanges.push({ range, idx: this._spanningOrigIdx[pi] });
         if (m[0].length === 0) regex.lastIndex++;
       }
     }
@@ -224,7 +255,13 @@ export class ScrubEngine {
           regex.lastIndex = 0;
           let m: RegExpExecArray | null;
           while ((m = regex.exec(seg)) !== null) {
-            taggedRanges.push({ range: [offset + m.index, offset + m.index + m[0].length], idx: this._tokenOrigIdx[pi] });
+            const range = consumingMatchRange(seg, m);
+            if (range) {
+              taggedRanges.push({
+                range: [offset + range[0], offset + range[1]],
+                idx: this._tokenOrigIdx[pi],
+              });
+            }
             if (m[0].length === 0) regex.lastIndex++;
           }
         }
