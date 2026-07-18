@@ -22,8 +22,12 @@ This document is a living record. **Update it whenever you learn something:**
 feature/docs branches → main (default, protected)
 ```
 
-- **`main`** — Default branch. All PRs target main. Protected: PRs required, no force push. Pushing a matching `vX.Y.Z` tag triggers the publish workflow.
-- **Feature branches** — `feat/<topic>`, `docs/<topic>`, `fix/<topic>`. Always branch from main.
+- **`main`** — Default branch. All PRs target main. Protected: PRs and the merge queue are required; no force push. Pushing a matching `vX.Y.Z` tag triggers the publish workflow.
+- **Feature branches** — `feat/<topic>`, `docs/<topic>`, `fix/<topic>`. Always branch from main and use an isolated worktree for each concurrent change.
+
+Independent changes may be developed in parallel on isolated branches and worktrees, but the required merge queue serializes landings into `main`. Dependent work must wait for its upstream PR to merge, then fetch and rebase onto the new `main` before it is queued.
+
+The merge queue uses squash merging and an `ALLGREEN` grouping strategy. It builds one entry at a time, with both the minimum and maximum merge-group size set to one, no minimum wait, and a 60-minute check-response timeout. Routine administrator bypasses are prohibited; the existing bypass is reserved for documented emergencies.
 
 ### Release Flow
 
@@ -44,7 +48,8 @@ The manual release helper performs step 4 idempotently: it pushes or fetches a v
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `ci.yml` | Push to main + all PRs | Type-check, test, build |
+| `ci.yml` | Push to main and release + all PRs + merge groups (`checks_requested`) | Type-check, test, build |
+| `codeql.yml` | Push to main + all PRs + merge groups (`checks_requested`) | Required CodeQL analysis and SARIF upload |
 | `version-pr.yml` | Push to main | Auto-create version PR from changesets |
 | `publish.yml` | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag | Publish npm + create GitHub release |
 
@@ -79,14 +84,14 @@ The manual release helper performs step 4 idempotently: it pushes or fetches a v
 4. Push and open PR
 5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
 6. Run review loop (see Copilot Review Loop below)
-7. Merge once Copilot has no issues (max 3 rounds — see Review Loop)
+7. Once Copilot has no issues (max 3 rounds — see Review Loop), queue the PR with `gh pr merge <number> --repo donadiosolutions/lcm --auto --squash`
 
 ## Phase 3: Implementation (Sonnet subagents)
 
-1. **Sync first:** `git pull origin main` to get latest (including merged specs)
+1. **Sync first:** `git pull --ff-only origin main` to get latest (including merged specs)
 2. Dispatch `model: sonnet` subagents with `isolation: worktree` for each task in the plan
 3. **Independent tasks** → launch in parallel (e.g., PR A: delete files, PR D: add new module)
-4. **Sequential tasks** → launch one at a time; after merging upstream PR, rebase downstream branch: `git fetch origin main && git rebase origin/main`
+4. **Sequential tasks** → launch one at a time; wait for the upstream PR to land through the queue, then rebase the downstream branch onto the new main: `git fetch origin main && git rebase origin/main`
 5. Each subagent: implement code + tests, run `npm test`, commit (do NOT push)
 6. After subagent completes: review the diff, push, open PR, request Copilot review
 
@@ -102,7 +107,7 @@ The manual release helper performs step 4 idempotently: it pushes or fetches a v
 1. Push implementation branch, open PR
 2. Request Copilot review (add to reviewers list)
 3. Run review loop (see below)
-4. Merge once Copilot review has no remaining inline comments
+4. Once Copilot review has no remaining inline comments, queue the PR with `gh pr merge <number> --repo donadiosolutions/lcm --auto --squash`
 
 ## Copilot Interaction
 

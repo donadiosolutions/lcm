@@ -70,8 +70,10 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 
 ### GitHub Actions and CodeQL
 
+- Required GitHub Actions and CodeQL workflows must retain the `merge_group` trigger with the `checks_requested` activity type so required checks run on merge-queue commits.
+- Keep the merge-group security split intentional: Codecov steps that require secrets must remain skipped for `merge_group`, while CodeQL SARIF upload remains required using the pinned build-mode-none CodeQL actions.
 - Advanced CodeQL workflows require GitHub default setup to be disabled before they upload SARIF.
-- Keep CodeQL analysis enabled for fork pull requests, but set the analyze action's `upload` input to `never` for fork-origin pull requests and `always` for same-repository pull requests and pushes.
+- Keep CodeQL analysis enabled for fork pull requests, but set the analyze action's `upload` input to `never` for fork-origin pull requests and `always` for merge groups, same-repository pull requests, and pushes.
 - Grant `security-events: write` only on the CodeQL analysis job that uploads SARIF; job-level permissions must restate every required read permission because they replace workflow defaults.
 - Follow least privilege in workflow `permissions`; omit `packages: read` unless a step actually reads packages.
 - Set `persist-credentials: false` on checkout steps in read-only workflows.
