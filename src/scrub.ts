@@ -108,51 +108,114 @@ function nonWhitespaceRanges(text: string): TextRange[] {
   ]);
 }
 
-function hasPositiveLookbehind(source: string): boolean {
+interface RegexSourceAnalysis {
+  hasPositiveLookbehind: boolean;
+  hasUnescapedAlternation: boolean;
+  hasPotentialConsumingAlternative: boolean;
+  positiveLookaheadBodies: string[];
+  topLevelAlternativeSources: string[];
+}
+
+interface RegexGroupFrame {
+  assertion: boolean;
+  positiveLookaheadBodyStart: number | null;
+}
+
+function analyzeRegexSource(source: string): RegexSourceAnalysis {
+  const groupStack: RegexGroupFrame[] = [];
+  const positiveLookaheadBodies: string[] = [];
+  const topLevelAlternationIndexes: number[] = [];
+  let assertionDepth = 0;
   let inCharacterClass = false;
+  let hasPositiveLookbehind = false;
+  let hasUnescapedAlternation = false;
+  let hasPotentialConsumingAlternative = false;
+
   for (let index = 0; index < source.length; index++) {
-    if (source[index] === "\\") {
+    const character = source[index];
+    if (inCharacterClass) {
+      if (character === "\\") index++;
+      else if (character === "]") inCharacterClass = false;
+      continue;
+    }
+    if (character === "\\") {
+      if (assertionDepth === 0 && source[index + 1] !== "b" && source[index + 1] !== "B") {
+        hasPotentialConsumingAlternative = true;
+      }
       index++;
       continue;
     }
-    if (source[index] === "[") {
+    if (character === "[") {
+      if (assertionDepth === 0) hasPotentialConsumingAlternative = true;
       inCharacterClass = true;
       continue;
     }
-    if (source[index] === "]" && inCharacterClass) {
-      inCharacterClass = false;
+    if (character === "(") {
+      let assertion = false;
+      let positiveLookaheadBodyStart: number | null = null;
+      if (source.startsWith("(?=", index)) {
+        assertion = true;
+        positiveLookaheadBodyStart = index + 3;
+        index += 2;
+      } else if (source.startsWith("(?!", index)) {
+        assertion = true;
+        index += 2;
+      } else if (source.startsWith("(?<=", index)) {
+        assertion = true;
+        hasPositiveLookbehind = true;
+        index += 3;
+      } else if (source.startsWith("(?<!", index)) {
+        assertion = true;
+        index += 3;
+      } else if (source.startsWith("(?:", index)) {
+        index += 2;
+      } else if (source.startsWith("(?<", index)) {
+        const nameEnd = source.indexOf(">", index + 3);
+        if (nameEnd >= 0) index = nameEnd;
+      }
+      groupStack.push({ assertion, positiveLookaheadBodyStart });
+      if (assertion) assertionDepth++;
       continue;
     }
-    if (!inCharacterClass && source.startsWith("(?<=", index)) return true;
+    if (character === ")") {
+      const group = groupStack.pop();
+      if (group?.positiveLookaheadBodyStart != null) {
+        positiveLookaheadBodies.push(source.slice(group.positiveLookaheadBodyStart, index));
+      }
+      if (group?.assertion) assertionDepth--;
+      continue;
+    }
+    if (character === "|") {
+      hasUnescapedAlternation = true;
+      if (groupStack.length === 0) topLevelAlternationIndexes.push(index);
+      continue;
+    }
+    if (assertionDepth > 0 || "^$*+?".includes(character)) continue;
+    const quantifierFirst = source[index + 1] ?? "";
+    if (character === "{" && quantifierFirst >= "0" && quantifierFirst <= "9") {
+      const quantifierEnd = source.indexOf("}", index + 2);
+      if (quantifierEnd >= 0) {
+        index = quantifierEnd;
+        continue;
+      }
+    }
+    hasPotentialConsumingAlternative = true;
   }
-  return false;
-}
-
-function hasUnescapedAlternation(source: string): boolean {
-  return /(?:^|[^\\])(?:\\\\)*\|/u.test(source);
-}
-
-function hasPotentialConsumingAlternative(source: string): boolean {
-  const withoutSimpleAssertions = source.replace(
-    /\(\?(?:[=!]|<[=!])(?:\\.|[^()[\]]|\[[^\]]*\])*\)/gu,
-    "",
-  );
-  const withoutStructuralSyntax = withoutSimpleAssertions.replace(
-    /\(\?:|\(\?<\w+>|[()|^$*+?]|\{\d+(?:,\d*)?\}/gu,
-    "",
-  );
-  return withoutStructuralSyntax.length > 0;
-}
-
-function positiveLookaheadBodies(source: string): string[] {
-  return Array.from(
-    source.matchAll(/(?<!\\)(?:\\\\)*\(\?=((?:\\.|[^()[\]]|\[[^\]]*\])*)\)/gu),
-    (match) => match[1],
-  );
-}
-
-function positiveLookaheadCount(source: string): number {
-  return Array.from(source.matchAll(/(?<!\\)(?:\\\\)*\(\?=/gu)).length;
+  return {
+    hasPositiveLookbehind,
+    hasUnescapedAlternation,
+    hasPotentialConsumingAlternative,
+    positiveLookaheadBodies,
+    topLevelAlternativeSources: topLevelAlternationIndexes.length === 0
+      ? []
+      : [
+          -1,
+          ...topLevelAlternationIndexes,
+          source.length,
+        ].slice(1).map((end, branchIndex, boundaries) =>
+          source.slice((boundaries[branchIndex - 1] ?? -1) + 1, end)
+        ),
+  };
 }
 
 function zeroWidthTokenRanges(
@@ -170,6 +233,15 @@ function zeroWidthTokenRanges(
   }
   const preceding = ranges[low - 1];
   const following = ranges[low];
+  if (
+    preferPrecedingAtBoundary
+    && preceding
+    && following
+    && preceding[1] < anchor
+    && following[0] >= anchor
+  ) {
+    return [preceding, following];
+  }
   if (preferPrecedingAtBoundary && preceding?.[1] === anchor) {
     return includeFollowingAtBoundary && following ? [preceding, following] : [preceding];
   }
@@ -209,23 +281,27 @@ function collectConsumingRanges(
   collect: (range: TextRange) => void,
 ): void {
   regex.lastIndex = 0;
-  const preferPrecedingAtBoundary = hasPositiveLookbehind(regex.source);
-  const lookaheadBodies = positiveLookaheadBodies(regex.source);
-  const hasUnparsedLookahead = positiveLookaheadCount(regex.source) > lookaheadBodies.length;
+  const sourceAnalysis = analyzeRegexSource(regex.source);
+  const preferPrecedingAtBoundary = sourceAnalysis.hasPositiveLookbehind;
   const lookaheadFlags = regex.flags.replace(/[dgy]/gu, "");
-  const lookaheadProbes = lookaheadBodies.map(
+  const lookaheadProbes = sourceAnalysis.positiveLookaheadBodies.map(
     (body) => new RegExp(`^(?:${body})`, lookaheadFlags),
   );
-  const preserveAlternativeMatches = hasUnescapedAlternation(regex.source)
-    && hasPotentialConsumingAlternative(regex.source);
+  const preserveAlternativeMatches = sourceAnalysis.hasUnescapedAlternation
+    && sourceAnalysis.hasPotentialConsumingAlternative;
+  const alternativeFlags = regex.flags.replace(/[dy]/gu, "");
+  const alternativeProbes = preserveAlternativeMatches
+    ? sourceAnalysis.topLevelAlternativeSources.map(
+        (source) => new RegExp(source, alternativeFlags),
+      )
+    : [];
   let previousZeroRanges: readonly TextRange[] = [];
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {
     const isZeroWidth = match[0].length === 0;
     const anchor = match.index;
     const includeFollowingAtBoundary = preferPrecedingAtBoundary && (
-      hasUnparsedLookahead
-      || lookaheadProbes.some((probe) => /\S/u.test(probe.exec(text.slice(anchor))?.[0] ?? ""))
+      lookaheadProbes.some((probe) => /\S/u.test(probe.exec(text.slice(anchor))?.[0] ?? ""))
     );
     const ranges = consumingMatchRanges(
       match,
@@ -240,10 +316,27 @@ function collectConsumingRanges(
     if (!isZeroWidth) continue;
     if (ranges.length === 0) break;
 
+    let consumingAlternativeEnd = anchor;
+    const expandedEnd = Math.max(...ranges.map((range) => range[1]));
+    for (const probe of alternativeProbes) {
+      probe.lastIndex = anchor;
+      const alternativeMatch = probe.exec(text);
+      if (
+        alternativeMatch
+        && alternativeMatch[0].length > 0
+        && alternativeMatch.index < expandedEnd
+      ) {
+        const alternativeEnd = alternativeMatch.index + alternativeMatch[0].length;
+        collect([alternativeMatch.index, alternativeEnd]);
+        consumingAlternativeEnd = Math.max(consumingAlternativeEnd, alternativeEnd);
+      }
+    }
+
     previousZeroRanges = ranges;
     const lastIndexAfterMatch = regex.lastIndex;
-    if (!preserveAlternativeMatches) {
+    if (!preserveAlternativeMatches || consumingAlternativeEnd > anchor) {
       regex.lastIndex = Math.max(regex.lastIndex, ...ranges.map((range) => range[1]));
+      regex.lastIndex = Math.max(regex.lastIndex, consumingAlternativeEnd);
     }
     if (regex.lastIndex === lastIndexAfterMatch) regex.lastIndex++;
   }

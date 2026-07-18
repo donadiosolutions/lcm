@@ -31,6 +31,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Do not derive zero-width token direction from the entire regex source when mixed assertions or alternatives can match different branches. Determine direction from the active match or redact every plausible adjacent token.
 - Range skipping after a zero-width match must not hide a later consuming alternative that starts inside the expanded token and extends beyond it. Preserve such alternatives while retaining bounded work for pure repeated-zero patterns.
 - Regex syntax detection must skip escaped characters and character classes; text such as `(?<=` inside `[...]` is not a lookbehind assertion.
+- Parse user-configured regex source with one linear scanner; avoid nested or overlapping quantifier regexes that can backtrack over long escaped sequences.
 - Normalize sensitive-data category metadata by trimming and filtering entries before joining or applying the `unknown` fallback. Whitespace-only arrays must never render an empty `pattern:` warning.
 
 ### Test coverage

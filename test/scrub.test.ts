@@ -187,6 +187,16 @@ describe("ScrubEngine — custom patterns", () => {
     });
   });
 
+  it("fails closed when a lookbehind consumes the separator before its anchor", () => {
+    const result = new ScrubEngine(["(?<=SECRET\\s)"], [])
+      .scrubWithCounts("SECRET NEXT");
+
+    expect(result).toEqual({
+      text: "[REDACTED] [REDACTED]", gitleaks: 0, builtIn: 0, global: 2, project: 0,
+    });
+    expect(result.text).not.toContain("SECRET");
+  });
+
   it("redacts both plausible tokens when mixed assertions make direction ambiguous", () => {
     for (const pattern of [
       "(?:(?<=X)(?=Y)|(?=\\s+SECRET_[A-Z]+))",
@@ -219,6 +229,28 @@ describe("ScrubEngine — custom patterns", () => {
       text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
     });
     expect(result.text).not.toContain("VALUE");
+  });
+
+  it("evaluates consuming alternatives hidden by a zero-width match at the same anchor", () => {
+    const result = new ScrubEngine(["(?=SECRET)|SECRET\\s+VALUE"], [])
+      .scrubWithCounts("SECRET VALUE");
+
+    expect(result).toEqual({
+      text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+    expect(result.text).not.toContain("VALUE");
+  });
+
+  it("handles long escaped regex sources without backtracking in syntax analysis", () => {
+    const escapedBackslashes = "\\\\".repeat(8_192);
+    const result = new ScrubEngine([
+      `(?!${escapedBackslashes})A`,
+      `(?=${escapedBackslashes})|A`,
+    ], []).scrubWithCounts("A");
+
+    expect(result).toEqual({
+      text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
   });
 
   it("falls back to the final preceding token from trailing whitespace", () => {
