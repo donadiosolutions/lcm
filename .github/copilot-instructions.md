@@ -26,6 +26,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
   - Any path that runs more than once per user action
   - Startup initialization (lazy evaluation only)
 - Flag any `collectStats()` call that isn't in a dedicated stats endpoint or background job.
+- In synchronous redaction paths, zero-width regex matches must reuse cached token boundaries, skip to the end of the consuming range, and avoid collecting duplicate ranges. Flag per-match rescans of the same token or one range allocation per character.
 
 ### Test coverage
 - New HTTP routes must have corresponding tests in `test/daemon/routes/`.

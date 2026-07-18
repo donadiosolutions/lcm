@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import {
   getGitleaksSyncDate,
   ScrubEngine,
@@ -167,6 +167,42 @@ describe("ScrubEngine — custom patterns", () => {
 
     expect(spanning).toEqual({ text: "  ", gitleaks: 0, builtIn: 0, global: 0, project: 0 });
     expect(token).toEqual({ text: "", gitleaks: 0, builtIn: 0, global: 0, project: 0 });
+  });
+
+  it("redacts the following token for a zero-width lookahead on whitespace", () => {
+    const result = new ScrubEngine(["(?=\\s+SECRET_[A-Z]+)"], [])
+      .scrubWithCounts("safe SECRET_VALUE");
+
+    expect(result).toEqual({
+      text: "safe [REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
+  it("bounds repeated zero-width matching work for long tokens in both paths", () => {
+    const token = "A".repeat(16_384);
+    const engine = new ScrubEngine(["(?=.)", "(?=.)", "(?=A)", "(?=A)"], []);
+    const originalExec = RegExp.prototype.exec;
+    const execCounts = new Map<string, number>();
+    const execSpy = vi.spyOn(RegExp.prototype, "exec").mockImplementation(function (
+      this: RegExp,
+      value: string,
+    ): RegExpExecArray | null {
+      if (this.source === "(?=.)" || this.source === "(?=A)") {
+        execCounts.set(this.source, (execCounts.get(this.source) ?? 0) + 1);
+      }
+      return originalExec.call(this, value);
+    });
+
+    try {
+      expect(engine.scrubWithCounts(token)).toEqual({
+        text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+      });
+    } finally {
+      execSpy.mockRestore();
+    }
+
+    expect(execCounts.get("(?=.)")).toBeLessThanOrEqual(4);
+    expect(execCounts.get("(?=A)")).toBeLessThanOrEqual(4);
   });
 
   it("merges overlapping matches and preserves disjoint surrounding text", () => {

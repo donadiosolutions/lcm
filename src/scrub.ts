@@ -99,34 +99,67 @@ function isSpanningPattern(source: string): boolean {
   return false;
 }
 
+type TextRange = [number, number];
+
+function nonWhitespaceRanges(text: string): TextRange[] {
+  return Array.from(text.matchAll(/\S+/g), (match) => [
+    match.index,
+    match.index + match[0].length,
+  ]);
+}
+
+function zeroWidthTokenRange(ranges: readonly TextRange[], anchor: number): TextRange | null {
+  let low = 0;
+  let high = ranges.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (ranges[middle][1] <= anchor) low = middle + 1;
+    else high = middle;
+  }
+  return ranges[low] ?? ranges.at(-1) ?? null;
+}
+
 /**
  * Convert a regex match into a consuming source range.
  *
- * Consuming matches retain their exact range. A zero-width match expands to
- * the complete non-whitespace token at its boundary. If the boundary is not
- * adjacent to a token, the next token is used. Inputs containing no token do
- * not produce a redaction, which prevents reporting a redaction that removed
- * no source text.
+ * Consuming matches retain their exact range. A zero-width match uses cached
+ * non-whitespace boundaries to select the containing or following token,
+ * falling back to the final preceding token only when nothing follows it.
+ * Inputs containing no token do not produce a redaction.
  */
-function consumingMatchRange(text: string, match: RegExpExecArray): [number, number] | null {
+function consumingMatchRange(
+  match: RegExpExecArray,
+  getTokenRanges: () => readonly TextRange[],
+): TextRange | null {
   if (match[0].length > 0) return [match.index, match.index + match[0].length];
+  return zeroWidthTokenRange(getTokenRanges(), match.index);
+}
 
-  let anchor = match.index;
-  if (anchor >= text.length || /^\s$/.test(text[anchor])) {
-    if (anchor > 0 && !/^\s$/.test(text[anchor - 1])) {
-      anchor--;
-    } else {
-      const nextTokenOffset = text.slice(anchor).search(/\S/);
-      if (nextTokenOffset === -1) return null;
-      anchor += nextTokenOffset;
-    }
+function collectConsumingRanges(
+  text: string,
+  regex: RegExp,
+  getTokenRanges: () => readonly TextRange[],
+  collect: (range: TextRange) => void,
+): void {
+  regex.lastIndex = 0;
+  let previousZeroRange: TextRange | null = null;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(text)) !== null) {
+    const isZeroWidth = match[0].length === 0;
+    const range = consumingMatchRange(match, getTokenRanges);
+    const isRepeatedZeroRange = isZeroWidth
+      && previousZeroRange?.[0] === range?.[0]
+      && previousZeroRange?.[1] === range?.[1];
+    if (range && !isRepeatedZeroRange) collect(range);
+
+    if (!isZeroWidth) continue;
+    if (!range) break;
+
+    previousZeroRange = range;
+    const lastIndexAfterMatch = regex.lastIndex;
+    regex.lastIndex = Math.max(regex.lastIndex, range[1]);
+    if (regex.lastIndex === lastIndexAfterMatch) regex.lastIndex++;
   }
-
-  let start = anchor;
-  while (start > 0 && !/^\s$/.test(text[start - 1])) start--;
-  let end = anchor + 1;
-  while (end < text.length && !/^\s$/.test(text[end])) end++;
-  return [start, end];
 }
 
 export interface ScrubCounts {
@@ -232,17 +265,23 @@ export class ScrubEngine {
 
     // Step 1: collect ranges from spanning patterns applied to full text
     // (includes all gitleaks patterns + spanning native/user patterns)
-    type TaggedRange = { range: [number, number]; idx: number };
-    const taggedRanges: TaggedRange[] = [];
+    type TaggedRange = { range: TextRange; idx: number };
+    const taggedRangesByKey = new Map<string, TaggedRange>();
+    const addTaggedRange = (range: TextRange, idx: number): void => {
+      const key = `${range[0]}:${range[1]}`;
+      const winnerIdx = Math.min(idx, taggedRangesByKey.get(key)?.idx ?? idx);
+      taggedRangesByKey.set(key, { range, idx: winnerIdx });
+    };
+    let textTokenRanges: TextRange[] | null = null;
+    const getTextTokenRanges = (): readonly TextRange[] => {
+      textTokenRanges ??= nonWhitespaceRanges(text);
+      return textTokenRanges;
+    };
     for (let pi = 0; pi < this.spanningPatterns.length; pi++) {
       const { regex } = this.spanningPatterns[pi];
-      regex.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      while ((m = regex.exec(text)) !== null) {
-        const range = consumingMatchRange(text, m);
-        if (range) taggedRanges.push({ range, idx: this._spanningOrigIdx[pi] });
-        if (m[0].length === 0) regex.lastIndex++;
-      }
+      collectConsumingRanges(text, regex, getTextTokenRanges, (range) => {
+        addTaggedRange(range, this._spanningOrigIdx[pi]);
+      });
     }
 
     // Step 2: apply token patterns per whitespace-separated segment
@@ -250,25 +289,21 @@ export class ScrubEngine {
     let offset = 0;
     for (const seg of segments) {
       if (!/^\s+$/.test(seg) && this.tokenPatterns.length > 0) {
+        const segmentTokenRanges: TextRange[] = seg.length > 0 ? [[0, seg.length]] : [];
         for (let pi = 0; pi < this.tokenPatterns.length; pi++) {
           const { regex } = this.tokenPatterns[pi];
-          regex.lastIndex = 0;
-          let m: RegExpExecArray | null;
-          while ((m = regex.exec(seg)) !== null) {
-            const range = consumingMatchRange(seg, m);
-            if (range) {
-              taggedRanges.push({
-                range: [offset + range[0], offset + range[1]],
-                idx: this._tokenOrigIdx[pi],
-              });
-            }
-            if (m[0].length === 0) regex.lastIndex++;
-          }
+          collectConsumingRanges(seg, regex, () => segmentTokenRanges, (range) => {
+            addTaggedRange(
+              [offset + range[0], offset + range[1]],
+              this._tokenOrigIdx[pi],
+            );
+          });
         }
       }
       offset += seg.length;
     }
 
+    const taggedRanges = [...taggedRangesByKey.values()];
     if (taggedRanges.length === 0) return { text, gitleaks: 0, builtIn: 0, global: 0, project: 0 };
 
     // Sort by start position
