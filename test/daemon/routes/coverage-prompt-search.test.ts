@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ServerResponse } from "node:http";
 import type { SearchResult } from "../../../src/db/promoted.js";
 import type { RecallFeedback } from "../../../src/db/recall.js";
+import type { DaemonConfig } from "../../../src/daemon/config.js";
 
 const state = vi.hoisted(() => ({
   exists: true,
@@ -77,14 +79,25 @@ type PromptSearchDebugBody = {
   debug: { candidates: DebugCandidate[] };
 };
 
-function response() {
+type PromptSearchResponse = {
+  hints: string[];
+  ids?: string[];
+  debug?: PromptSearchDebugBody["debug"];
+};
+
+type MockResponse = {
+  res: ServerResponse;
+  json: () => PromptSearchResponse;
+};
+
+function response(): MockResponse {
   let payload = "";
   return {
     res: {
       writeHead: vi.fn().mockReturnThis(),
       end: vi.fn((body?: string) => { payload = body ?? ""; }),
-    } as never,
-    json: () => JSON.parse(payload || "{}") as Record<string, unknown>,
+    } as unknown as ServerResponse,
+    json: () => JSON.parse(payload || "{}") as PromptSearchResponse,
   };
 }
 
@@ -103,7 +116,7 @@ function result(overrides: Partial<SearchResult> = {}): SearchResult {
   };
 }
 
-function config() {
+function config(): DaemonConfig {
   const value = loadDaemonConfig("/does-not-exist");
   value.restoration.promptSearchMinScore = -100;
   value.restoration.maxInjectedMemoryBytes = 10_000;
@@ -112,7 +125,7 @@ function config() {
   return value;
 }
 
-async function call(body: string, mutate?: (value: ReturnType<typeof config>) => void) {
+async function call(body: string, mutate?: (value: DaemonConfig) => void): Promise<PromptSearchResponse> {
   const value = config();
   mutate?.(value);
   const output = response();
@@ -181,9 +194,8 @@ describe("prompt-search route coverage", () => {
     vi.useFakeTimers();
     const now = new Date("2026-01-01T00:00:00.000Z");
     vi.setSystemTime(now);
-    let usageReads = 0;
     const defensiveUsageCount = {
-      valueOf: () => ++usageReads === 1 ? 1 : -1,
+      [Symbol.toPrimitive]: (hint: string) => hint === "number" ? 1 : -1,
       toJSON: () => 1,
     } as unknown as number;
     state.searchResults = [
@@ -208,8 +220,10 @@ describe("prompt-search route coverage", () => {
         value.restoration.recallUsageBoost = 1;
         value.restoration.recallUsageSmoothing = 0;
       },
-    ) as unknown as PromptSearchDebugBody;
-    expect(body.ids).toEqual([
+    );
+    expect(body.debug).toBeDefined();
+    const debugBody = body as PromptSearchDebugBody;
+    expect(debugBody.ids).toEqual([
       "defensive-denominator",
       "invalid-surfaced",
       "created-a",
@@ -219,7 +233,7 @@ describe("prompt-search route coverage", () => {
       "base-high",
       "boosted-base-low",
     ]);
-    expect(body.debug.candidates.map(({ id, baseScore, finalScore, usageBoost }) => ({ id, baseScore, finalScore, usageBoost })))
+    expect(debugBody.debug.candidates.map(({ id, baseScore, finalScore, usageBoost }) => ({ id, baseScore, finalScore, usageBoost })))
       .toEqual([
         { id: "defensive-denominator", baseScore: 6, finalScore: 6, usageBoost: 1 },
         { id: "invalid-surfaced", baseScore: 5, finalScore: 5, usageBoost: 1 },
@@ -281,9 +295,11 @@ describe("prompt-search route coverage", () => {
         value.restoration.stalePenalty = 0.5;
         value.restoration.allowStaleOnStrongMatch = false;
       },
-    ) as unknown as PromptSearchDebugBody;
-    expect(body.ids).toEqual(["fresh", "stale"]);
-    expect(body.debug.candidates.map(({ id, finalScore, stalePenalty, surfaced }) => ({ id, finalScore, stalePenalty, surfaced })))
+    );
+    expect(body.debug).toBeDefined();
+    const debugBody = body as PromptSearchDebugBody;
+    expect(debugBody.ids).toEqual(["fresh", "stale"]);
+    expect(debugBody.debug.candidates.map(({ id, finalScore, stalePenalty, surfaced }) => ({ id, finalScore, stalePenalty, surfaced })))
       .toEqual([
         { id: "fresh", finalScore: 2, stalePenalty: 0, surfaced: true },
         { id: "stale", finalScore: -0.5, stalePenalty: 0.5, surfaced: true },
@@ -306,7 +322,8 @@ describe("prompt-search route coverage", () => {
         value.restoration.allowStaleOnStrongMatch = false;
       },
     );
-    const debugBody = body as unknown as PromptSearchDebugBody;
+    expect(body.debug).toBeDefined();
+    const debugBody = body as PromptSearchDebugBody;
     expect(debugBody.ids).toEqual(["base-two", "base-one"]);
     expect(debugBody.debug.candidates.map(({ id, finalScore, baseScore }) => ({ id, finalScore, baseScore })))
       .toEqual([

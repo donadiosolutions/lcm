@@ -246,10 +246,16 @@ describe("MCP service coverage", () => {
 
   it("default-denies a tool definition without schema properties", async () => {
     vi.resetModules();
-    vi.doMock("../src/mcp/tools/lcm-doctor.js", () => ({
-      lcmDoctorTool: { name: "lcm_doctor", description: "doctor", inputSchema: { type: "object" } },
+    vi.doMock("../src/mcp/tools/lcm-search.js", () => ({
+      lcmSearchTool: { name: "lcm_search", description: "search", inputSchema: { type: "object" } },
     }));
     const isolated = await import("../src/mcp/server.js");
     expect(isolated.getMcpToolDefinitions()).toHaveLength(7);
+    mocks.post.mockResolvedValueOnce({ accepted: true });
+    await isolated.startMcpServer();
+    await call("lcm_search", { unexpected: "must-not-cross-boundary" });
+    expect(mocks.post).toHaveBeenLastCalledWith("/search", {
+      cwd: process.env.PWD ?? process.cwd(),
+    });
   });
 });

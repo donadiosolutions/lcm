@@ -44,6 +44,15 @@ describe("server helper boundaries", () => {
 });
 
 describe("daemon route and lifecycle boundaries", () => {
+  it.each([
+    { overrides: { _setTimeout: vi.fn() as unknown as typeof setTimeout }, missing: "_clearTimeout" },
+    { overrides: { _clearTimeout: vi.fn() as unknown as typeof clearTimeout }, missing: "_setTimeout" },
+  ])("rejects an incomplete idle timer override pair missing $missing", async ({ overrides }) => {
+    await expect(createDaemon(config(), overrides)).rejects.toThrow(
+      "Daemon idle timer overrides must provide both _setTimeout and _clearTimeout",
+    );
+  });
+
   it("rejects a missing token file", async () => {
     await expect(createDaemon(config(), { tokenPath: join(home, "missing-token") })).rejects.toThrow("could not be read");
   });

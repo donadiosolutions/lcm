@@ -34,6 +34,16 @@ async function listen(handler: Parameters<typeof createServer>[0]): Promise<numb
   return (server.address() as { port: number }).port;
 }
 
+function captureThrownMessage(run: () => unknown): string {
+  try {
+    run();
+  } catch (error) {
+    expect(error).toBeInstanceOf(Error);
+    return (error as Error).message;
+  }
+  throw new Error("Expected operation to throw");
+}
+
 describe("daemon URL validation boundaries", () => {
   it.each([
     [3737, {}, 3737], ["42", {}, 42], [0, { allowZero: true }, 0],
@@ -172,11 +182,33 @@ describe("filesystem boundary fallbacks", () => {
     }
   });
 
-  it("sanitizes non-ENOENT stat failures and falls back when realpath fails", () => {
+  it("validates invalid cwd types and non-directory paths", () => {
     expect(() => validateCwd(42 as unknown as string)).toThrow("cwd is required");
     const dir = mkdtempSync(join(tmpdir(), "lcm-core-file-")); tempDirs.push(dir);
     const file = join(dir, "file");
     writeFileSync(file, "x");
     expect(() => validateCwd(file)).toThrow("cwd must be a directory");
+  });
+
+  it("sanitizes injected EACCES stat failures without leaking the supplied cwd", async () => {
+    const suppliedCwd = "/private/review/secret-project";
+    vi.resetModules();
+    vi.doMock("node:fs", async importOriginal => ({
+      ...(await importOriginal<typeof import("node:fs")>()),
+      statSync: vi.fn(() => {
+        throw Object.assign(new Error(`EACCES: permission denied, stat '${suppliedCwd}'`), { code: "EACCES" });
+      }),
+    }));
+
+    try {
+      const { validateCwd: validateCwdWithDeniedStat } = await import("../../src/daemon/validate-cwd.js");
+      const message = captureThrownMessage(() => validateCwdWithDeniedStat(suppliedCwd));
+      expect(message).toContain("EACCES");
+      expect(message).toContain("<path>");
+      expect(message).not.toContain(suppliedCwd);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
   });
 });

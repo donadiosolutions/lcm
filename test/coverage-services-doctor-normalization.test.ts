@@ -1,4 +1,5 @@
 import { expect, it, vi } from "vitest";
+import { join } from "node:path";
 
 const mergeClaudeSettingsMock = vi.hoisted(() => vi.fn(() => ({})));
 
@@ -16,10 +17,17 @@ vi.mock("../src/db/events-stats.js", () => ({
 
 import { runDoctor } from "../src/doctor/doctor.js";
 import { LCM_MD_CONTENT } from "../src/daemon/orientation.js";
+import type { DoctorDeps } from "../src/doctor/types.js";
+
+function isolatedPath(name: string): string {
+  const runtimeHome = process.env.HOME;
+  if (!runtimeHome) throw new Error("Vitest runtime HOME is not configured");
+  return join(runtimeHome, name);
+}
 
 it("normalizes a merge result without an MCP servers object", async () => {
   const written: string[] = [];
-  const deps = {
+  const deps: DoctorDeps = {
     existsSync: () => true,
     readFileSync: (path: string) => {
       if (path.endsWith("config.json")) return "{}";
@@ -33,9 +41,9 @@ it("normalizes a merge result without an MCP servers object", async () => {
     mkdirSync: vi.fn(),
     spawnSync: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" }),
     fetch: vi.fn().mockResolvedValue({ ok: false }) as typeof fetch,
-    homedir: "/tmp/lcm-doctor-normalization",
+    homedir: isolatedPath("coverage-services-doctor-normalization-home"),
     platform: "linux",
-    cwd: "/tmp/lcm-doctor-normalization-project",
+    cwd: isolatedPath("coverage-services-doctor-normalization-project"),
   };
 
   mergeClaudeSettingsMock.mockReturnValueOnce({});

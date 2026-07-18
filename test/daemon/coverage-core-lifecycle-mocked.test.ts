@@ -12,6 +12,9 @@ vi.mock("node:fs", async importOriginal => ({
 
 import { ensureDaemon } from "../../src/daemon/lifecycle.js";
 
+type EnsureDaemonOptions = Parameters<typeof ensureDaemon>[0];
+type SpawnOverride = NonNullable<EnsureDaemonOptions["_spawnOverride"]>;
+
 const saved = { anthropic: process.env.ANTHROPIC_API_KEY, openai: process.env.OPENAI_API_KEY, lcm: process.env.LCM_SUMMARY_API_KEY };
 const originalGetuid = Object.getOwnPropertyDescriptor(process, "getuid");
 beforeEach(() => {
@@ -29,10 +32,10 @@ afterEach(() => {
   if (saved.lcm === undefined) delete process.env.LCM_SUMMARY_API_KEY; else process.env.LCM_SUMMARY_API_KEY = saved.lcm;
 });
 
-const base = () => ({
+const base = (): EnsureDaemonOptions => ({
   port: 1, pidFilePath: "/runtime/daemon.pid", spawnTimeoutMs: 1, _platform: "linux" as const,
   enforceUserManagerParent: true, _fetchOverride: vi.fn().mockRejectedValue(new Error("down")),
-  _spawnOverride: vi.fn(() => ({ pid: undefined, once: vi.fn(), unref: vi.fn() })) as never,
+  _spawnOverride: vi.fn(() => ({ pid: undefined, once: vi.fn(), unref: vi.fn() })) as unknown as SpawnOverride,
   _skipHealthWait: true,
 });
 

@@ -1,27 +1,55 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { RecallStats } from "../src/stats.js";
+
+interface FakeDatabaseState {
+  readonly project: string;
+}
+
+interface FakeStaleQuery {
+  staleAfterDays: number;
+  staleSurfacingWithoutUseLimit: number;
+  projectId: string;
+}
+
+interface CountRow { count: number }
+interface MessageStatsRow extends CountRow { tokens: number }
+interface SummaryStatsRow extends MessageStatsRow { maxDepth: number }
+interface RedactionRow { category: string; count: number }
+interface ConversationRow {
+  conversation_id: number;
+  messages: number;
+  summaries: number;
+  max_depth: number;
+  raw_tokens: number;
+  summary_tokens: number;
+}
+
+type FakeGetRow = CountRow | MessageStatsRow | SummaryStatsRow;
+type FakeAllRow = RedactionRow | ConversationRow;
+
+interface FakeStatement {
+  get(): FakeGetRow;
+  all(): FakeAllRow[];
+}
 
 const mocks = vi.hoisted(() => ({
   baseExists: true,
   configFails: false,
   eventsFail: false,
   entries: [] as Array<{ name: string; directory: boolean; dbExists: boolean }>,
-  close: vi.fn(),
-  migrate: vi.fn(),
-  collectEvents: vi.fn(),
-  loadConfig: vi.fn(),
-  findStale: vi.fn(),
-  getRecallStats: vi.fn(),
+  close: vi.fn<(project: string) => void>(),
+  migrate: vi.fn<(db: FakeDatabaseState) => void>(),
+  collectEvents: vi.fn<(maxDbs: number) => void>(),
+  loadConfig: vi.fn<(path: string) => void>(),
+  findStale: vi.fn<(args: FakeStaleQuery) => unknown[]>(),
+  getRecallStats: vi.fn<() => RecallStats>(),
 }));
 
 const projects = new Map<string, {
   messages: number; messageTokens: number; summaries: number; summaryTokens: number; maxDepth: number;
-  promoted: number; redactions: Array<{ category: string; count: number }>;
-  conversations: Array<{ conversation_id: number; messages: number; summaries: number; max_depth: number; raw_tokens: number; summary_tokens: number }>;
+  promoted: number; redactions: RedactionRow[];
+  conversations: ConversationRow[];
 }>();
-
-interface FakeDatabaseState {
-  readonly project: string;
-}
 
 vi.mock("node:fs", () => ({
   existsSync: (path: string) => path === "/coverage/projects"
@@ -34,43 +62,45 @@ vi.mock("../src/runtime-paths.js", () => ({
   projectsDir: () => "/coverage/projects",
 }));
 vi.mock("../src/daemon/config.js", () => ({
-  loadDaemonConfig: (...args: unknown[]) => {
-    mocks.loadConfig(...args);
+  loadDaemonConfig: (path: string): { restoration: { staleAfterDays: number; staleSurfacingWithoutUseLimit: number } } => {
+    mocks.loadConfig(path);
     if (mocks.configFails) throw new Error("config broken");
     return { restoration: { staleAfterDays: 12, staleSurfacingWithoutUseLimit: 3 } };
   },
 }));
 vi.mock("../src/db/migration.js", () => ({
-  runLcmMigrations: (db: unknown) => mocks.migrate(db),
+  runLcmMigrations: (db: FakeDatabaseState): void => mocks.migrate(db),
 }));
 vi.mock("../src/db/events-stats.js", () => ({
-  collectEventStats: (...args: unknown[]) => {
-    mocks.collectEvents(...args);
+  collectEventStats: (maxDbs: number): { captured: number; unprocessed: number; errors: number } => {
+    mocks.collectEvents(maxDbs);
     if (mocks.eventsFail) throw new Error("event db broken");
     return { captured: 9, unprocessed: 2, errors: 1 };
   },
 }));
 vi.mock("../src/db/recall.js", () => ({
-  RecallStore: class { getStats() { return mocks.getRecallStats(); } },
+  RecallStore: class { getStats(): RecallStats { return mocks.getRecallStats(); } },
 }));
 vi.mock("../src/db/promoted.js", () => ({
-  PromotedStore: class { findStale(args: unknown) { return mocks.findStale(args); } },
+  PromotedStore: class { findStale(args: FakeStaleQuery): unknown[] { return mocks.findStale(args); } },
 }));
 vi.mock("node:sqlite", () => ({
   DatabaseSync: class {
     readonly project: string;
     constructor(path: string) { this.project = path.split("/").at(-2)!; }
-    exec() {}
-    close() { mocks.close(this.project); }
-    prepare(sql: string) {
+    exec(): void {}
+    close(): void { mocks.close(this.project); }
+    prepare(sql: string): FakeStatement {
       const data = projects.get(this.project)!;
       return {
-        get: () => {
+        get(): FakeGetRow {
           if (sql.includes("FROM messages")) return { count: data.messages, tokens: data.messageTokens };
           if (sql.includes("FROM summaries")) return { count: data.summaries, tokens: data.summaryTokens, maxDepth: data.maxDepth };
           return { count: data.promoted };
         },
-        all: () => sql.includes("redaction_stats") ? data.redactions : data.conversations,
+        all(): FakeAllRow[] {
+          return sql.includes("redaction_stats") ? data.redactions : data.conversations;
+        },
       };
     }
   },

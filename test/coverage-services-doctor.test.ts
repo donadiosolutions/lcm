@@ -47,6 +47,15 @@ import { ScrubEngine } from "../src/scrub.js";
 import { REQUIRED_HOOKS } from "../installer/install.js";
 import type { CheckResult, DoctorDeps } from "../src/doctor/types.js";
 
+function isolatedPath(name: string): string {
+  const runtimeHome = process.env.HOME;
+  if (!runtimeHome) throw new Error("Vitest runtime HOME is not configured");
+  return join(runtimeHome, name);
+}
+
+const DOCTOR_HOME = isolatedPath("coverage-services-doctor-home");
+const DOCTOR_CWD = isolatedPath("coverage-services-doctor-project");
+
 function makeDeps(options: {
   config?: unknown;
   configText?: string;
@@ -76,9 +85,9 @@ function makeDeps(options: {
     mkdirSync: vi.fn(),
     spawnSync: (...args) => mocks.spawnSync(...args),
     fetch: vi.fn().mockImplementation(async () => health.shift() ?? { ok: false }) as typeof fetch,
-    homedir: "/tmp/lcm-coverage-doctor",
+    homedir: DOCTOR_HOME,
     platform: "linux",
-    cwd: "/tmp/lcm-coverage-project",
+    cwd: DOCTOR_CWD,
   };
 }
 

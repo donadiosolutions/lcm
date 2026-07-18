@@ -26,7 +26,10 @@ vi.mock("../../../src/daemon/routes/compact.js", () => ({
   justCompactedMap: new Map<string, number>(),
   JUST_COMPACTED_TTL_MS: 30_000,
 }));
-vi.mock("node:os", async (importOriginal) => ({ ...(await importOriginal<typeof import("node:os")>()), homedir: () => "/home/test" }));
+vi.mock("node:os", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:os")>()),
+  homedir: () => process.env.HOME!,
+}));
 vi.mock("node:fs", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:fs")>()),
   existsSync: () => state.existsSequence.shift() ?? state.exists,

@@ -7,13 +7,32 @@ import { cwdToProjectHash } from "../src/import.js";
 import { legacyLcmSlug } from "../src/legacy-names.js";
 
 const roots: string[] = [];
-const tempRoot = () => { const root = mkdtempSync(join(tmpdir(), "lcm-coverage-diagnose-")); roots.push(root); return root; };
-const writeLines = (path: string, lines: unknown[]) => writeFileSync(path, lines.map((line) => typeof line === "string" ? line : JSON.stringify(line)).join("\n") + "\n");
-const hook = (command: string, hookEvent?: string, id?: string, timestamp?: string) => ({
-  type: "progress", timestamp,
-  data: { type: "hook_progress", hookEvent, command },
-  ...(id ? { parent_tool_use_id: id } : {}),
-});
+
+interface HookProgressEntry {
+  type: "progress";
+  timestamp?: string;
+  data: { type: "hook_progress"; hookEvent?: string; command: string };
+  parent_tool_use_id?: string;
+}
+
+function tempRoot(): string {
+  const root = mkdtempSync(join(tmpdir(), "lcm-coverage-diagnose-"));
+  roots.push(root);
+  return root;
+}
+
+function writeLines(path: string, lines: unknown[]): void {
+  writeFileSync(path, lines.map((line) => typeof line === "string" ? line : JSON.stringify(line)).join("\n") + "\n");
+}
+
+function hook(command: string, hookEvent?: string, id?: string, timestamp?: string): HookProgressEntry {
+  return {
+    type: "progress",
+    timestamp,
+    data: { type: "hook_progress", hookEvent, command },
+    ...(id ? { parent_tool_use_id: id } : {}),
+  };
+}
 
 describe("diagnose service coverage", () => {
   afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });

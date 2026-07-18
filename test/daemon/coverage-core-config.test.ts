@@ -9,6 +9,16 @@ import {
   resolveLlmRequestPolicy,
 } from "../../src/daemon/config.js";
 
+function captureErrorMessage(run: () => unknown): string {
+  try {
+    run();
+  } catch (error) {
+    expect(error).toBeInstanceOf(Error);
+    return (error as Error).message;
+  }
+  throw new Error("Expected operation to throw");
+}
+
 describe("daemon configuration uncovered boundaries", () => {
   it("covers deep merge scalar, array, undefined, denied, and invalid source branches", () => {
     const source = JSON.parse('{"nested":{"replace":[2]},"scalar":2,"skip":null,"__proto__":{"polluted":true}}') as Record<string, unknown>;
@@ -31,9 +41,20 @@ describe("daemon configuration uncovered boundaries", () => {
   });
 
   it("redacts nested credentials and sanitizes nested URLs in validation output", () => {
-    expect(() => parseStoredConfig(JSON.stringify({ daemon: { port: { apiKey: "secret", endpoint: "https://user:pass@example.com/x" } } }))).toThrow("[REDACTED]");
-    expect(() => parseStoredConfig(JSON.stringify({ llm: { provider: "bad", apiKey: "secret" } }))).toThrow("valid choices");
-    expect(() => parseStoredConfig(JSON.stringify({ llm: { provider: "https://user:pass@example.com/path" } }))).toThrow("https://example.com/path");
+    const nested = captureErrorMessage(() => parseStoredConfig(JSON.stringify({
+      daemon: { port: { apiKey: "secret", endpoint: "https://user:pass@example.com/x" } },
+    })));
+    expect(nested).toContain("[REDACTED]");
+    expect(nested).not.toContain("secret");
+    expect(nested).not.toContain("user:pass");
+
+    const provider = captureErrorMessage(() => parseStoredConfig(JSON.stringify({ llm: { provider: "bad", apiKey: "secret" } })));
+    expect(provider).toContain("valid choices");
+    expect(provider).not.toContain("secret");
+
+    const url = captureErrorMessage(() => parseStoredConfig(JSON.stringify({ llm: { provider: "https://user:pass@example.com/path" } })));
+    expect(url).toContain("https://example.com/path");
+    expect(url).not.toContain("user:pass");
   });
 
   it("handles unusual validation display and parser failures", () => {

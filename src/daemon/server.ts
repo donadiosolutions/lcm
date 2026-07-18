@@ -97,6 +97,11 @@ function clearIdleTimer(timer: ReturnType<typeof setTimeout> | null, clearTimer:
 }
 
 export async function createDaemon(config: DaemonConfig, options?: DaemonOptions): Promise<DaemonInstance> {
+  const hasSetTimeoutOverride = options?._setTimeout !== undefined;
+  const hasClearTimeoutOverride = options?._clearTimeout !== undefined;
+  if (hasSetTimeoutOverride !== hasClearTimeoutOverride) {
+    throw new Error("Daemon idle timer overrides must provide both _setTimeout and _clearTimeout");
+  }
   const startTime = Date.now();
   const proxyManager = options?.proxyManager;
   const setIdleTimeout = options?._setTimeout ?? setTimeout;
