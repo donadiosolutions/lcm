@@ -55,7 +55,7 @@ describe("doctor hook validation", () => {
   });
 
   it("re-adds mcpServers.lcm when missing from settings.json", async () => {
-    const settings = JSON.stringify({ mcpServers: {} });
+    const settings = JSON.stringify({ theme: "dark", mcpServers: {} });
     const writtenFiles = new Map<string, string>();
     const results = await runDoctor({
       existsSync: () => true,
@@ -75,5 +75,32 @@ describe("doctor hook validation", () => {
     expect(settingsWritten).toBeDefined();
     const written = JSON.parse(settingsWritten!);
     expect(written.mcpServers?.lcm).toBeDefined();
+    expect(written.theme).toBe("dark");
   });
+
+  it.each(["null", "false", "0", '"invalid-root"', "[]"])(
+    "repairs a non-object settings root without crashing: %s",
+    async (settings) => {
+      const writtenFiles = new Map<string, string>();
+      const results = await runDoctor({
+        existsSync: () => true,
+        readFileSync: (p: string) => baseReadFileSync(p, settings),
+        writeFileSync: (p: string, data: string) => { writtenFiles.set(p, data); },
+        mkdirSync: vi.fn(),
+        spawnSync: () => ({ status: 0, stdout: "", stderr: "" }),
+        fetch: vi.fn().mockResolvedValue({ ok: false }),
+        homedir: "/tmp/test-home",
+        platform: "darwin",
+      });
+
+      expect(results.find(r => r.name === "hooks")?.status).toBe("pass");
+      expect(results.find(r => r.name === "mcp-lcm")).toMatchObject({
+        status: "warn",
+        fixApplied: true,
+      });
+      expect(JSON.parse(writtenFiles.get("/tmp/test-home/.claude/settings.json")!)).toEqual({
+        mcpServers: { lcm: { command: expect.any(String), args: ["mcp"] } },
+      });
+    },
+  );
 });

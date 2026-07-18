@@ -32,9 +32,16 @@ afterEach(() => {
 });
 
 describe("config manager paths and values", () => {
-  it("canonicalizes the legacy baseURL path and rejects unsafe paths", () => {
+  it("canonicalizes legacy paths and rejects unsafe paths", () => {
     expect(parseConfigPath("llm.baseURL")).toEqual(["llm", "baseUrl"]);
     expect(normalizeConfigPath("llm.baseURL")).toBe("llm.baseUrl");
+    expect(parseConfigPath("compaction.promotionThresholds.mergeMaxEntries")).toEqual([
+      "compaction",
+      "promotionThresholds",
+      "dedupCandidateLimit",
+    ]);
+    expect(normalizeConfigPath("compaction.promotionThresholds.mergeMaxEntries"))
+      .toBe("compaction.promotionThresholds.dedupCandidateLimit");
     for (const path of [
       "",
       ".llm",
@@ -361,6 +368,26 @@ describe("setConfigValue", () => {
     const stored = JSON.parse(readFileSync(configPath, "utf-8")) as { llm: Record<string, unknown> };
     expect(stored.llm.baseUrl).toBe("http://new.example/v1");
     expect(stored.llm).not.toHaveProperty("baseURL");
+  });
+
+  it("sets and returns a typed value through the legacy promotion-limit path", () => {
+    const { configPath } = makeConfig({ version: 1 });
+    const legacyPath = "compaction.promotionThresholds.mergeMaxEntries";
+
+    expect(setConfigValue({
+      configPath,
+      path: legacyPath,
+      value: "17",
+      json: true,
+      env: { LCM_SUMMARY_PROVIDER: "disabled" },
+    })).toBe(17);
+
+    const stored = JSON.parse(readFileSync(configPath, "utf-8")) as {
+      compaction: { promotionThresholds: Record<string, unknown> };
+    };
+    expect(stored.compaction.promotionThresholds).toMatchObject({ dedupCandidateLimit: 17 });
+    expect(stored.compaction.promotionThresholds).not.toHaveProperty("mergeMaxEntries");
+    expect(getConfigValue({ configPath, path: legacyPath })).toBe(17);
   });
 
   it("masks the returned value for secret paths", () => {

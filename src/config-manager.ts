@@ -29,6 +29,13 @@ const OPENAI_ONLY_LLM_KEYS = [
   "requestTimeoutMs",
   "retry",
 ] as const;
+const CONFIG_PATH_ALIASES: ReadonlyMap<string, readonly string[]> = new Map([
+  ["llm.baseURL", ["llm", "baseUrl"]],
+  [
+    "compaction.promotionThresholds.mergeMaxEntries",
+    ["compaction", "promotionThresholds", "dedupCandidateLimit"],
+  ],
+]);
 
 export type ConfigValueOptions = {
   configPath: string;
@@ -68,10 +75,8 @@ export function parseConfigPath(path: string): string[] {
       throw new ConfigManagerError(`Configuration path contains forbidden segment ${JSON.stringify(segment)}.`);
     }
   }
-  if (segments.length === 2 && segments[0] === "llm" && segments[1] === "baseURL") {
-    segments[1] = "baseUrl";
-  }
-  return segments;
+  const aliasedSegments = CONFIG_PATH_ALIASES.get(segments.join("."));
+  return aliasedSegments === undefined ? segments : [...aliasedSegments];
 }
 
 function canonicalPath(path: string): string {
