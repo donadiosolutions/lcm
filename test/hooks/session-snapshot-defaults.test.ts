@@ -70,6 +70,13 @@ describe("handleSessionSnapshot default integrations", () => {
     expect(mocks.firePromoteEventsRequest).toHaveBeenCalledWith(4545, { cwd: "/project" });
   });
 
+  it("reuses the verified port for ingest, compact, and promotion after config changes", async () => {
+    await handleSessionSnapshot(JSON.stringify(payload), { verifiedPort: 7777 });
+    expect(mocks.daemonJsonRequest).toHaveBeenCalledWith(7777, "/ingest", expect.any(Object));
+    expect(mocks.fireCompactRequest).toHaveBeenCalledWith(7777, expect.any(Object));
+    expect(mocks.firePromoteEventsRequest).toHaveBeenCalledWith(7777, { cwd: "/project" });
+  });
+
   it("proceeds without auth when the token file is missing or empty", async () => {
     mocks.readFileSync.mockImplementationOnce(() => { throw new Error("missing token"); });
     await handleSessionSnapshot(JSON.stringify({ ...payload, client: "claude" }));
