@@ -10,6 +10,7 @@ const tag = `v${version}`;
 const mergeSha = "a".repeat(40);
 const otherSha = "b".repeat(40);
 const tagObjectSha = "c".repeat(40);
+const otherTagObjectSha = "d".repeat(40);
 
 interface HarnessOptions {
   localTagState?: string;
@@ -248,6 +249,18 @@ describe("manual release helper step 8", () => {
     expect(result.calls).not.toContain(`git|fetch|origin|refs/tags/${tag}:refs/tags/${tag}`);
   });
 
+  it("refuses different signed local and remote tag objects for the same target", () => {
+    const result = runRelease({
+      localTagState: signedMatchingTag,
+      remoteTagState: `${otherTagObjectSha} ${mergeSha} tag signed`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`Local and remote ${tag} tag objects differ`);
+    expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
+    expect(result.calls.some((call) => call.startsWith("gh|run|list|"))).toBe(false);
+  });
+
   it("aborts when a remote version tag targets a different commit", () => {
     const result = runRelease({
       remoteTagState: `${tagObjectSha} ${otherSha} tag signed`,
@@ -313,6 +326,33 @@ describe("manual release helper step 8", () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`✗ ERROR: origin does not point to donadiosolutions/lcm`);
     expect(result.stderr).not.toContain("command not found");
+  });
+
+  it.each([
+    `https://github.com/donadiosolutions/lcm`,
+    `https://github.com/donadiosolutions/lcm.git`,
+    `git@github.com:donadiosolutions/lcm`,
+    `git@github.com:donadiosolutions/lcm.git`,
+    `ssh://git@github.com/donadiosolutions/lcm`,
+    `ssh://git@github.com/donadiosolutions/lcm.git`,
+  ])("accepts canonical origin URL %s", (originUrl) => {
+    const result = runRelease({ originUrl });
+
+    expect(result.status).toBe(0);
+  });
+
+  it.each([
+    `https://github.com/donadiosolutions/lcm-fork.git`,
+    `https://github.com/example/donadiosolutions/lcm.git`,
+    `git@github.com:donadiosolutions/lcm-mirror.git`,
+    `git@github.com:mirror/donadiosolutions/lcm.git`,
+    `ssh://git@github.com/donadiosolutions/lcm/extra`,
+  ])("rejects origin URL collision %s", (originUrl) => {
+    const result = runRelease({ originUrl });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`origin does not point to donadiosolutions/lcm`);
+    expect(result.calls.some((call) => call.startsWith("gh|pr|list|"))).toBe(false);
   });
 
   it("retains npm publication verification after a successful workflow", () => {

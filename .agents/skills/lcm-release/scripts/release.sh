@@ -83,6 +83,22 @@ ok()     { echo "  ✓ $*"; }
 skip()   { echo "  (skipping — already past this step)"; }
 run_step() { [[ "$1" -ge "$FROM_STEP" ]]; }  # true if step N should run
 
+is_canonical_origin() {
+  case "$1" in
+    "https://github.com/$REPO" | \
+      "https://github.com/$REPO.git" | \
+      "git@github.com:$REPO" | \
+      "git@github.com:$REPO.git" | \
+      "ssh://git@github.com/$REPO" | \
+      "ssh://git@github.com/$REPO.git")
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 remote_tag_refs() {
   git ls-remote --tags origin "refs/tags/$1" "refs/tags/$1^{}"
 }
@@ -111,7 +127,7 @@ tag_peeled_from_refs() {
 
 # Validate origin points at the canonical repo (not a fork)
 ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
-if [[ "$ORIGIN_URL" != *"$REPO"* ]]; then
+if ! is_canonical_origin "$ORIGIN_URL"; then
   err "origin does not point to $REPO (got: $ORIGIN_URL). Run from the canonical repo, not a fork."
 fi
 
