@@ -14,6 +14,7 @@ const otherTagObjectSha = "d".repeat(40);
 
 interface HarnessOptions {
   localTagState?: string;
+  mergeSha?: string;
   mergeReachable?: boolean;
   npmVersion?: string;
   originUrl?: string;
@@ -22,6 +23,7 @@ interface HarnessOptions {
   publishMaxWait?: string;
   remoteTagState?: string;
   runId?: string;
+  realSleep?: boolean;
   version?: string;
 }
 
@@ -48,6 +50,7 @@ function runRelease(options: HarnessOptions = {}): HarnessResult {
   const postPublishRemoteTagState = join(root, "post-publish-remote-tag.state");
   const releaseVersion = options.version ?? version;
   const releaseTag = `v${releaseVersion}`;
+  const releaseMergeSha = options.mergeSha ?? mergeSha;
   mkdirSync(binDir);
   writeFileSync(join(root, "package.json"), JSON.stringify({ name: "@donadiosolutions/lcm" }));
   if (options.localTagState) writeFileSync(localTagState, options.localTagState);
@@ -181,10 +184,13 @@ fi
 exit 99
 `);
 
-  writeExecutable(join(binDir, "sleep"), `#!/usr/bin/env bash
+writeExecutable(join(binDir, "sleep"), `#!/usr/bin/env bash
 printf 'sleep' >> "$FAKE_CALL_LOG"
 printf '|%s' "$@" >> "$FAKE_CALL_LOG"
 printf '\n' >> "$FAKE_CALL_LOG"
+if [[ "$FAKE_REAL_SLEEP" == "true" ]]; then
+  /bin/sleep "$1"
+fi
 exit 0
 `);
 
@@ -197,12 +203,13 @@ exit 0
         FAKE_CALL_LOG: callLog,
         FAKE_LOCAL_TAG_STATE: localTagState,
         FAKE_MERGE_REACHABLE: String(options.mergeReachable ?? true),
-        FAKE_MERGE_SHA: mergeSha,
+        FAKE_MERGE_SHA: releaseMergeSha,
         FAKE_NPM_VERSION: options.npmVersion ?? version,
         FAKE_ORIGIN_URL: options.originUrl ?? "git@github.com:donadiosolutions/lcm.git",
         FAKE_ORIGIN_PUSH_URLS: `${(options.originPushUrls ?? [options.originUrl ?? "git@github.com:donadiosolutions/lcm.git"]).join("\n")}\n`,
         FAKE_POST_PUBLISH_REMOTE_TAG_STATE: postPublishRemoteTagState,
         FAKE_REMOTE_TAG_STATE: remoteTagState,
+        FAKE_REAL_SLEEP: String(options.realSleep ?? false),
         FAKE_REPO_ROOT: root,
         FAKE_RUN_ID: options.runId ?? "9001",
         FAKE_TAG: releaseTag,
@@ -331,7 +338,7 @@ describe("manual release helper step 8", () => {
     });
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain(`Local tag ${tag} does not have a valid cryptographic signature`);
+    expect(result.stderr).toContain(`Could not verify the cryptographic signature on local tag ${tag}`);
     expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
   });
 
@@ -394,6 +401,22 @@ describe("manual release helper step 8", () => {
     expect(result.stderr).toContain("origin must have exactly one canonical push URL");
   });
 
+  it("reports a missing push URL explicitly", () => {
+    const result = runRelease({ originPushUrls: [] });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("got: (none)");
+  });
+
+  it("canonicalizes uppercase merge SHAs before comparisons and workflow lookup", () => {
+    const result = runRelease({ mergeSha: mergeSha.toUpperCase() });
+    const runListCall = result.calls.find((call: string) => call.startsWith("gh|run|list|"));
+
+    expect(result.status).toBe(0);
+    expect(result.localTagState).toBe(signedMatchingTag);
+    expect(runListCall).toContain(`.headSha == "${mergeSha}"`);
+  });
+
   it.each(["-1", "10s", "1.5"])(
     "rejects invalid PUBLISH_MAX_WAIT value %s",
     (publishMaxWait: string) => {
@@ -412,6 +435,14 @@ describe("manual release helper step 8", () => {
       expect(result.status).toBe(0);
     },
   );
+
+  it("caps polling sleep at the remaining monotonic timeout", () => {
+    const result = runRelease({ publishMaxWait: "1", realSleep: true, runId: "" });
+
+    expect(result.status).toBe(1);
+    expect(result.calls).toContain("sleep|1");
+    expect(result.stderr).toContain(`not found after 1s`);
+  });
 
   it.each(["1.2.3-beta.1", "1.2.3+build.1"])(
     "rejects unsupported release version %s before repository access",

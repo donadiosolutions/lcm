@@ -130,9 +130,14 @@ ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
 if ! is_canonical_origin "$ORIGIN_URL"; then
   err "origin does not point to $REPO (got: $ORIGIN_URL). Run from the canonical repo, not a fork."
 fi
-mapfile -t ORIGIN_PUSH_URLS < <(git remote get-url --push --all origin 2>/dev/null || true)
+ORIGIN_PUSH_URLS=()
+while IFS= read -r push_url; do
+  [[ -n "$push_url" ]] && ORIGIN_PUSH_URLS+=("$push_url")
+done < <(git remote get-url --push --all origin 2>/dev/null || true)
+ORIGIN_PUSH_URL_DISPLAY="(none)"
+[[ "${#ORIGIN_PUSH_URLS[@]}" -gt 0 ]] && ORIGIN_PUSH_URL_DISPLAY="${ORIGIN_PUSH_URLS[*]}"
 if [[ "${#ORIGIN_PUSH_URLS[@]}" -ne 1 ]] || ! is_canonical_origin "${ORIGIN_PUSH_URLS[0]:-}"; then
-  err "origin must have exactly one canonical push URL for $REPO (got: ${ORIGIN_PUSH_URLS[*]:-(none)})."
+  err "origin must have exactly one canonical push URL for $REPO (got: $ORIGIN_PUSH_URL_DISPLAY)."
 fi
 
 # When resuming mid-flow, look up state we would have captured earlier.
@@ -359,6 +364,7 @@ if run_step 8; then
     err "MERGE_SHA not set — internal error. Re-run from step 7."
   [[ "$MERGE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || \
     err "MERGE_SHA is not a valid commit SHA: $MERGE_SHA"
+  MERGE_SHA=$(printf '%s' "$MERGE_SHA" | tr '[:upper:]' '[:lower:]')
 
   TAG="v$VERSION"
   git fetch --no-tags origin main || \
@@ -400,7 +406,7 @@ if run_step 8; then
   [[ "$(git cat-file -t "refs/tags/$TAG")" == "tag" ]] || \
     err "Local tag $TAG is not annotated. Never overwrite a release tag."
   git tag -v "$TAG" >/dev/null 2>&1 || \
-    err "Local tag $TAG does not have a valid cryptographic signature. Never overwrite a release tag."
+    err "Could not verify the cryptographic signature on local tag $TAG. Never overwrite a release tag."
 
   if [[ -n "$REMOTE_TAG_OBJECT" && "$REMOTE_TAG_OBJECT" != "$LOCAL_TAG_OBJECT" ]]; then
     err "Local and remote $TAG tag objects differ. Never overwrite a public release tag."
@@ -434,16 +440,20 @@ if run_step 8; then
   [[ "$MAX_WAIT" =~ ^[0-9]+$ ]] || \
     err "PUBLISH_MAX_WAIT must be a non-negative integer in seconds (got: $MAX_WAIT)."
   MAX_WAIT=$((10#$MAX_WAIT))
+  WAIT_START=$SECONDS
   while [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; do
     RUN_ID=$(gh run list --repo "$REPO" --workflow publish.yml --event push --limit 20 \
       --json databaseId,headSha,headBranch \
       --jq "map(select(.headSha == \"$MERGE_SHA\" and .headBranch == \"$TAG\")) | .[0].databaseId // empty" 2>/dev/null || true)
     [[ -n "$RUN_ID" && "$RUN_ID" != "null" ]] && break
+    WAIT_SECS=$((SECONDS - WAIT_START))
     if [[ "$WAIT_SECS" -ge "$MAX_WAIT" ]]; then
       err "Tag-triggered publish.yml run for $TAG at $MERGE_SHA not found after ${MAX_WAIT}s. Check https://github.com/$REPO/actions manually."
     fi
-    sleep 5
-    WAIT_SECS=$((WAIT_SECS + 5))
+    REMAINING_WAIT=$((MAX_WAIT - WAIT_SECS))
+    SLEEP_SECS=5
+    [[ "$REMAINING_WAIT" -lt "$SLEEP_SECS" ]] && SLEEP_SECS=$REMAINING_WAIT
+    sleep "$SLEEP_SECS"
   done
 
   echo "  Watching run $RUN_ID..."
