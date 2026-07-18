@@ -11,6 +11,10 @@ vi.mock("../../src/hooks/extractors.js", () => ({
   extractUserPromptEvents: vi.fn(),
 }));
 
+vi.mock("../../src/hooks/event-scrubbing.js", () => ({
+  scrubExtractedEvents: vi.fn(async (events: unknown[]) => events),
+}));
+
 vi.mock("../../src/hooks/events-db.js", () => ({
   EventsDb: vi.fn(),
 }));

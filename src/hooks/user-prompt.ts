@@ -69,7 +69,8 @@ export async function handleUserPromptSubmit(
       const { ensureProjectDir } = await import("../daemon/project.js");
 
       const prompt = String(input.prompt);
-      const events = extractUserPromptEvents(prompt);
+      const { scrubExtractedEvents } = await import("./event-scrubbing.js");
+      const events = await scrubExtractedEvents(extractUserPromptEvents(prompt), cwd);
 
       if (events.length > 0 && input.session_id && typeof input.session_id === "string") {
         ensureProjectDir(cwd);

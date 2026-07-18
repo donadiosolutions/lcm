@@ -180,8 +180,30 @@ export function extractPostToolEvents(input: PostToolInput): ExtractedEvent[] {
 
 // Extract text content from <channel> XML tags, or return prompt as-is
 export function normalizePromptWithChannels(prompt: string): { text: string; fromChannel: boolean } {
-  const normalized = prompt.replace(/<channel[^>]*>([\s\S]*?)<\/channel>/g, (_, content) => content.trim());
-  return { text: normalized, fromChannel: normalized !== prompt };
+  const parts: string[] = [];
+  let cursor = 0;
+  let fromChannel = false;
+  while (cursor < prompt.length) {
+    const open = prompt.indexOf("<channel", cursor);
+    if (open < 0) {
+      parts.push(prompt.slice(cursor));
+      break;
+    }
+    const openEnd = prompt.indexOf(">", open + 8);
+    if (openEnd < 0) {
+      parts.push(prompt.slice(cursor));
+      break;
+    }
+    const close = prompt.indexOf("</channel>", openEnd + 1);
+    if (close < 0) {
+      parts.push(prompt.slice(cursor));
+      break;
+    }
+    parts.push(prompt.slice(cursor, open), prompt.slice(openEnd + 1, close).trim());
+    cursor = close + "</channel>".length;
+    fromChannel = true;
+  }
+  return { text: parts.join(""), fromChannel };
 }
 
 export function extractUserPromptEvents(prompt: string): ExtractedEvent[] {

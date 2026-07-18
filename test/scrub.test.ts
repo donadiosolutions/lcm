@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import {
   getGitleaksSyncDate,
+  normalizeGitleaksRegex,
   ScrubEngine,
 } from "../src/scrub.js";
 
@@ -105,6 +106,25 @@ describe("ScrubEngine — built-in patterns", () => {
 
   it("does not redact partial JWT-like strings without dots", () => {
     expect(engine.scrub("eyJhbGciOiJIUzI1NiJ9")).not.toContain("[REDACTED]");
+  });
+});
+
+describe("Gitleaks RE2 normalization", () => {
+  it("converts POSIX classes, end anchors, and scoped case flags", () => {
+    expect(normalizeGitleaksRegex("pat[[:alnum:]]+\\z", "")).toEqual({
+      source: "pat[A-Za-z0-9]+$",
+      flags: "",
+    });
+    const scoped = normalizeGitleaksRegex("(?i:token)-(?-i:ABC)", "");
+    expect(scoped).toEqual({ source: "(?:token)-(?:ABC)", flags: "i" });
+    expect(new RegExp(scoped.source, scoped.flags).test("TOKEN-abc")).toBe(true);
+  });
+
+  it("redacts long database URLs without catastrophic backtracking", () => {
+    const engine = new ScrubEngine([], []);
+    const secret = `postgres://user:${"p".repeat(20_000)}@db.example/app`;
+    expect(engine.scrub(secret)).toBe("[REDACTED]/app");
+    expect(engine.scrub(`postgres://user:${"p".repeat(20_000)}`)).toContain("postgres://");
   });
 });
 

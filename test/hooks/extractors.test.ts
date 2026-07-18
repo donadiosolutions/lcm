@@ -336,6 +336,18 @@ describe("normalizePromptWithChannels", () => {
     expect(text).toBe("always use TypeScript\nfor new files");
     expect(fromChannel).toBe(true);
   });
+
+  it("handles large unterminated channel text in one pass", () => {
+    const raw = `<channel source="telegram">${" ".repeat(100_000)}`;
+    expect(normalizePromptWithChannels(raw)).toEqual({ text: raw, fromChannel: false });
+  });
+
+  it("preserves a channel opener without a closing angle bracket", () => {
+    expect(normalizePromptWithChannels("prefix <channel source=telegram")).toEqual({
+      text: "prefix <channel source=telegram",
+      fromChannel: false,
+    });
+  });
 });
 
 describe("extractUserPromptEvents — Telegram channel wrapping", () => {

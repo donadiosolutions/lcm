@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { openSync, closeSync, writeFileSync } from "node:fs";
 import { daemonPidPath, tmpDir } from "../runtime-paths.js";
+import { fenceContent } from "../daemon/content-fence.js";
 import {
   deleteRegularFile,
   ensurePrivateDirectory,
@@ -163,7 +164,11 @@ export async function handleSessionStart(stdin: string, client: Pick<DaemonClien
       const insightsBlock = result.insights
         .map((i) => `- ${i.content} (confidence: ${i.confidence})`)
         .join("\n");
-      stdout += `\n<learned-insights source="passive-capture">\nRecent learnings from your previous sessions:\n${insightsBlock}\n</learned-insights>`;
+      const fenced = fenceContent(
+        `Recent learnings from your previous sessions:\n${insightsBlock}`,
+        "learned-insights",
+      ).replace("<learned-insights>", '<learned-insights source="passive-capture">');
+      stdout += `\n${fenced}`;
     }
 
     return { exitCode: 0, stdout };

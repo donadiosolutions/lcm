@@ -9,6 +9,25 @@ type ConnectionEntry = {
 };
 
 const _connections = new Map<string, ConnectionEntry>();
+const _connectionLocks = new Map<string, Promise<void>>();
+
+export async function withLcmConnectionLock<T>(
+  dbPath: string,
+  operation: () => Promise<T> | T,
+): Promise<T> {
+  const previous = _connectionLocks.get(dbPath) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const queued = previous.then(() => current);
+  _connectionLocks.set(dbPath, queued);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (_connectionLocks.get(dbPath) === queued) _connectionLocks.delete(dbPath);
+  }
+}
 
 function isConnectionHealthy(db: DatabaseSync): boolean {
   try {

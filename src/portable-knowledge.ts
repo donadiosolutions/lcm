@@ -19,13 +19,15 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 
-import { PromotedStore } from "./db/promoted.js";
+import { parsePromotedTags, PromotedStore } from "./db/promoted.js";
 import { runLcmMigrations } from "./db/migration.js";
 import { deduplicateAndInsert } from "./promotion/dedup.js";
 import { ScrubEngine } from "./scrub.js";
 import { getLcmConnection, closeLcmConnection } from "./db/connection.js";
 import { lcmHomeDir } from "./runtime-paths.js";
 import { resolveProjectIdentity } from "./project-map.js";
+import { loadDaemonConfig } from "./daemon/config.js";
+import { configPath } from "./runtime-paths.js";
 
 export const EXPORT_VERSION = 1;
 
@@ -89,6 +91,8 @@ export interface ExportOptions {
   skipScrub?: boolean;
   /** Override the ~/.lcm base directory (for testing) */
   _lcmBaseDir?: string;
+  /** Override global sensitive patterns (tests only). */
+  _globalPatterns?: string[];
 }
 
 export interface ExportResult {
@@ -124,7 +128,9 @@ export async function exportKnowledge(
     // Build scrubber for secret redaction
     let scrubber: ScrubEngine | null = null;
     if (!opts.skipScrub) {
-      scrubber = await ScrubEngine.forProject([], project.dir);
+      const globalPatterns = opts._globalPatterns
+        ?? loadDaemonConfig(configPath()).security.sensitivePatterns;
+      scrubber = await ScrubEngine.forProject(globalPatterns, project.dir);
     }
 
     entries = rows.map((r) => {
@@ -134,7 +140,7 @@ export async function exportKnowledge(
       }
       return {
         content,
-        tags: JSON.parse(r.tags) as string[],
+        tags: parsePromotedTags(r.tags).map((tag) => scrubber ? scrubber.scrub(tag) : tag),
         confidence: r.confidence,
         createdAt: r.created_at,
         // sessionId is per-project and per-machine. Nullify on export so that
@@ -176,6 +182,8 @@ export interface ImportOptions {
   confidence?: number;
   /** Override the ~/.lcm base directory (for testing) */
   _lcmBaseDir?: string;
+  /** Override global sensitive patterns (tests only). */
+  _globalPatterns?: string[];
 }
 
 export interface ImportResult {
@@ -219,6 +227,9 @@ export async function importKnowledge(
   mkdirSync(projDir, { recursive: true });
 
   const db = getLcmConnection(dbPath);
+  const globalPatterns = opts._globalPatterns
+    ?? loadDaemonConfig(configPath()).security.sensitivePatterns;
+  const scrubber = await ScrubEngine.forProject(globalPatterns, projDir);
 
   let imported = 0;
   let skipped = 0;
@@ -234,8 +245,8 @@ export async function importKnowledge(
       try {
         await deduplicateAndInsert({
           store,
-          content: entry.content,
-          tags: entry.tags,
+          content: scrubber.scrub(entry.content),
+          tags: entry.tags.map((tag) => scrubber.scrub(tag)),
           projectId: project.id,
           sessionId: entry.sessionId ?? undefined,
           depth: 0,

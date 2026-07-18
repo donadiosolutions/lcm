@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   migrate: vi.fn(),
   getConnection: vi.fn(),
   run: vi.fn(),
+  storedGet: vi.fn(() => ({ message_count: 7 }) as { message_count: number } | undefined),
   close: vi.fn(),
   send: vi.fn(),
 }));
@@ -28,7 +29,11 @@ describe("session complete persistence boundaries", () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockClear();
     mocks.validate.mockImplementation((cwd: string) => cwd);
-    mocks.getConnection.mockReturnValue({ prepare: () => ({ run: mocks.run }) });
+    mocks.getConnection.mockReturnValue({
+      prepare: (sql: string) => sql.includes("COUNT(m.message_id)")
+        ? { get: mocks.storedGet }
+        : { run: mocks.run },
+    });
   });
 
   it("validates required fields and cwd failures", async () => {
@@ -47,11 +52,14 @@ describe("session complete persistence boundaries", () => {
     const handler = createSessionCompleteHandler();
     const response = {} as never;
     await handler({} as never, response, JSON.stringify({ session_id: "s1", cwd: "/ok", message_count: 9 }));
-    expect(mocks.run).toHaveBeenLastCalledWith("s1", 9);
+    expect(mocks.run).toHaveBeenLastCalledWith("s1", 7);
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { recorded: true });
     await handler({} as never, response, JSON.stringify({ session_id: "s2", cwd: "/ok" }));
-    expect(mocks.run).toHaveBeenLastCalledWith("s2", 0);
-    expect(mocks.close).toHaveBeenCalledTimes(2);
+    expect(mocks.run).toHaveBeenLastCalledWith("s2", 7);
+    mocks.storedGet.mockReturnValueOnce(undefined);
+    await handler({} as never, response, JSON.stringify({ session_id: "s-empty", cwd: "/ok" }));
+    expect(mocks.run).toHaveBeenLastCalledWith("s-empty", 0);
+    expect(mocks.close).toHaveBeenCalledTimes(3);
 
     mocks.migrate.mockImplementationOnce(() => { throw new Error("migration failed"); });
     await handler({} as never, response, JSON.stringify({ session_id: "s3", cwd: "/ok" }));
@@ -59,7 +67,7 @@ describe("session complete persistence boundaries", () => {
     mocks.migrate.mockImplementationOnce(() => { throw "failure"; });
     await handler({} as never, response, JSON.stringify({ session_id: "s4", cwd: "/ok" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "session completion failed" });
-    expect(mocks.close).toHaveBeenCalledTimes(4);
+    expect(mocks.close).toHaveBeenCalledTimes(5);
   });
 
   it("returns a structured error without closing when acquisition fails", async () => {

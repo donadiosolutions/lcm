@@ -42,8 +42,12 @@ export function createStoreHandler(config: DaemonConfig): RouteHandler {
     const input = JSON.parse(body || "{}");
     const { text, tags = [], metadata = {} } = input;
 
-    if (!text) {
+    if (typeof text !== "string" || !text) {
       sendJson(res, 400, { error: "text is required" });
+      return;
+    }
+    if (!Array.isArray(tags) || !tags.every((tag) => typeof tag === "string")) {
+      sendJson(res, 400, { error: "tags must be an array of strings" });
       return;
     }
 
@@ -63,6 +67,7 @@ export function createStoreHandler(config: DaemonConfig): RouteHandler {
 
     const scrubber = await getScrubEngine(config, projectDir(projectPath));
     const scrubbedText = scrubber.scrub(text);
+    const scrubbedTags = tags.map((tag: string) => scrubber.scrub(tag));
 
     const dbPath = projectDbPath(projectPath);
     let db: ReturnType<typeof getLcmConnection> | undefined;
@@ -74,7 +79,7 @@ export function createStoreHandler(config: DaemonConfig): RouteHandler {
 
       const id = store.insert({
         content: scrubbedText,
-        tags,
+        tags: scrubbedTags,
         projectId: metadata.projectId ?? "manual",
         sessionId: metadata.sessionId ?? "manual",
         depth: metadata.depth ?? 0,

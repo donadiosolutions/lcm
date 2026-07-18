@@ -297,4 +297,37 @@ describe("POST /ingest", () => {
     });
     expect(await res.json()).toEqual({ ingested: 0, totalTokens: 0 });
   });
+
+  it("records completion from stored messages and resumes when the transcript grows", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-growing-"));
+    tempDirs.push(tempDir);
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const base = `http://127.0.0.1:${daemon.address().port}`;
+    const firstMessage = { role: "user", content: "first", tokenCount: 1 };
+    const first = await fetch(`${base}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "growing", cwd: tempDir, messages: [firstMessage] }),
+    });
+    expect((await first.json()).ingested).toBe(1);
+
+    const completed = await fetch(`${base}/session-complete`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "growing", cwd: tempDir, message_count: 999_999 }),
+    });
+    expect(completed.status).toBe(200);
+    const db = getLcmConnection(projectDbPath(tempDir));
+    try {
+      const row = db.prepare("SELECT message_count FROM session_ingest_log WHERE session_id = ?").get("growing") as { message_count: number };
+      expect(row.message_count).toBe(1);
+    } finally { closeLcmConnection(projectDbPath(tempDir)); }
+
+    const grown = await fetch(`${base}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "growing", cwd: tempDir,
+        messages: [firstMessage, { role: "assistant", content: "second", tokenCount: 1 }],
+      }),
+    });
+    expect((await grown.json()).ingested).toBe(1);
+  });
 });

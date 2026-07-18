@@ -12,6 +12,7 @@ import { PromotedStore } from "../../db/promoted.js";
 import { shouldPromote } from "../../promotion/detector.js";
 import { deduplicateAndInsert } from "../../promotion/dedup.js";
 import { validateCwd } from "../validate-cwd.js";
+import { ScrubEngine } from "../../scrub.js";
 
 export function createPromoteHandler(
   config: DaemonConfig,
@@ -53,6 +54,10 @@ export function createPromoteHandler(
         const convStore = new ConversationStore(db);
         const summStore = new SummaryStore(db);
         const pid = paths.id;
+        const scrubber = await ScrubEngine.forProject(
+          config.security.sensitivePatterns,
+          dirname(dbPath),
+        );
 
         // Get summary IDs that have already been promoted (to avoid re-promoting)
         const promotedStore = new PromotedStore(db);
@@ -91,8 +96,8 @@ export function createPromoteHandler(
               try {
                 await deduplicateAndInsert({
                   store: promotedStore,
-                  content: summary.content,
-                  tags: promotionResult.tags,
+                  content: scrubber.scrub(summary.content),
+                  tags: promotionResult.tags.map((tag) => scrubber.scrub(tag)),
                   projectId: pid,
                   sessionId: conversation.sessionId,
                   depth: summary.depth,

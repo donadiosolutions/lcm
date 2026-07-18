@@ -44,16 +44,18 @@ export async function handlePostToolUse(
 
     if (typeof tool_name !== "string" || typeof session_id !== "string") return { exitCode: 0, stdout: "" };
 
-    const events = extractPostToolEvents({
+    const extractedEvents = extractPostToolEvents({
       tool_name,
       tool_input: isRecord(tool_input) ? tool_input : {},
       tool_response,
       tool_output: normalizeToolOutput(tool_output),
     });
-    if (events.length === 0) return { exitCode: 0, stdout: "" };
+    if (extractedEvents.length === 0) return { exitCode: 0, stdout: "" };
 
     const resolvedCwd = resolveHookCwd(input.cwd);
     cwd = resolvedCwd;
+    const { scrubExtractedEvents } = await import("./event-scrubbing.js");
+    const events = await scrubExtractedEvents(extractedEvents, resolvedCwd);
     ensureProjectDir(resolvedCwd);
     const dbPath = eventsDbPath(resolvedCwd);
     const db = new EventsDb(dbPath);

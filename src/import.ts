@@ -1,12 +1,10 @@
 import { readdirSync, readFileSync, existsSync, lstatSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
-import { DatabaseSync } from "node:sqlite";
 import type { DaemonClient } from "./daemon/client.js";
 import { formatNumber, formatRatio } from "./stats.js";
 import { findAllCodexTranscripts, extractCodexSessionCwd } from "./codex-transcript.js";
 import type { ProgressState } from "./cli/progress-state.js";
-import { projectDbPath, projectId } from "./daemon/project.js";
 import type { TranscriptClient } from "./transcript-provider.js";
 import { lcmHomeDir } from "./runtime-paths.js";
 
@@ -164,57 +162,23 @@ interface SessionEntry {
   client: TranscriptClient;
 }
 
-/**
- * Checks if a session has already been recorded in session_ingest_log,
- * indicating it was fully ingested in a previous run.
- */
-function isSessionAlreadyIngested(cwd: string, sessionId: string, lcmDir?: string): boolean {
-  try {
-    const dbPath = lcmDir
-      ? join(lcmDir, "projects", projectId(cwd), "db.sqlite")
-      : projectDbPath(cwd);
-    if (!existsSync(dbPath)) {
-      return false;
-    }
-    const db = new DatabaseSync(dbPath);
-    try {
-      db.exec("PRAGMA busy_timeout = 5000");
-      const row = db.prepare("SELECT 1 FROM session_ingest_log WHERE session_id = ?").get(sessionId);
-      return !!row;
-    } finally {
-      db.close();
-    }
-  } catch {
-    // Table may not exist yet or db is inaccessible — proceed with import
-    return false;
-  }
-}
-
 async function ingestSessionList(
   client: DaemonClient,
   sessions: SessionEntry[],
   options: ImportOptions,
   result: ImportResult,
 ): Promise<void> {
-  let previousSummary: string | undefined;
+  const previousSummaries = new Map<string, string>();
   const total = sessions.length;
 
   for (const { path, sessionId, cwd, client: clientName } of sessions) {
+    const replayKey = `${clientName}\u0000${cwd}`;
     if (options.dryRun) {
       if (options.verbose) {
         const replayNote = options.replay ? " (would compact)" : "";
         console.log(`  [dry-run] ${sessionId}${replayNote}`);
       }
       result.imported++;
-      options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
-      continue;
-    }
-
-    // Skip sessions already recorded in session_ingest_log (unless in replay mode,
-    // where compaction must still run to keep the temporal chain intact).
-    if (!options.replay && isSessionAlreadyIngested(cwd, sessionId, options._lcmDir)) {
-      result.skippedEmpty++;
-      if (options.verbose) console.log(`  ↩️ ${sessionId}: already fully ingested`);
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
       continue;
     }
@@ -255,11 +219,11 @@ async function ingestSessionList(
             cwd,
             skip_ingest: true,
             client: clientName,
-            ...(previousSummary !== undefined ? { previous_summary: previousSummary } : {}),
+            ...(previousSummaries.has(replayKey) ? { previous_summary: previousSummaries.get(replayKey) } : {}),
           });
-          const hadPrevious = previousSummary !== undefined;
+          const hadPrevious = previousSummaries.has(replayKey);
           if (compactRes.latestSummaryContent !== undefined) {
-            previousSummary = compactRes.latestSummaryContent;
+            previousSummaries.set(replayKey, compactRes.latestSummaryContent);
           }
           // Use compact's tokensBefore as the authoritative token count for this session.
           // This avoids under-reporting when /ingest returns totalTokens=0 (already-ingested).
@@ -280,7 +244,7 @@ async function ingestSessionList(
           }
         } catch (err) {
           // Non-fatal: import succeeded; compact failure breaks the chain at this link.
-          previousSummary = undefined;
+          previousSummaries.delete(replayKey);
           // Always warn on chain breakage so users know the DAG is incomplete,
           // regardless of whether --verbose was passed.
           console.error(`  \u26a0\ufe0f [replay] compact failed for session ${sessionId}: ${err instanceof Error ? err.message : 'unknown error'}`);
@@ -291,7 +255,7 @@ async function ingestSessionList(
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
     } catch (err) {
       result.failed++;
-      if (options.replay) previousSummary = undefined; // chain broken by ingest failure
+      if (options.replay) previousSummaries.delete(replayKey); // chain broken for this project/client
       if (options.verbose) console.log(`  \u274c ${sessionId}: ${err instanceof Error ? err.message : "failed"}`);
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
     }

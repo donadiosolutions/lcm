@@ -96,6 +96,17 @@ function convertGoRegex(goRegex: string): { regex: string; flags: string } {
     jsRegex = jsRegex.replace(/\(\?i\)/g, "");
   }
 
+  // RE2 constructs that do not exist in JavaScript.
+  jsRegex = jsRegex
+    .replace(/\[\[:alnum:\]\]/g, "[A-Za-z0-9]")
+    .replace(/\\z/g, "$");
+
+  // JavaScript has no scoped flag groups. Gitleaks patterns are redaction
+  // detectors, so broadening the whole expression to ignore case is safer
+  // than silently dropping an otherwise valid secret detector.
+  if (jsRegex.includes("(?i:")) flags = "i";
+  jsRegex = jsRegex.replace(/\(\?[i-]+:/g, "(?:");
+
   // Go's hex escape for backtick → literal backtick
   jsRegex = jsRegex.replace(/\\x60/g, "`");
 

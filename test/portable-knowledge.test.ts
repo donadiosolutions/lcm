@@ -152,6 +152,20 @@ describe("portable-knowledge — export", () => {
     expect(doc.entries[0].content).not.toContain("sk-abcdefghijklmnopqrstuvwxyz123456");
   });
 
+  it("applies global patterns to exported content and tags", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const outFile = join(makeTempDir(), "global-scrubbed.json");
+    seedProject(baseDir, cwd, [{ content: "private GLOBAL-1234", tags: ["token:GLOBAL-1234"] }]);
+    await exportKnowledge(cwd, {
+      output: outFile,
+      _lcmBaseDir: baseDir,
+      _globalPatterns: ["GLOBAL-[0-9]{4}"],
+    });
+    const doc: ExportDocument = JSON.parse(readFileSync(outFile, "utf-8"));
+    expect(doc.entries[0]).toMatchObject({ content: "private [REDACTED]", tags: ["[REDACTED]"] });
+  });
+
   it("exports canonical project knowledge when invoked from an alias", async () => {
     const baseDir = lcmHomeDir();
     const canonical = makeTempDir();

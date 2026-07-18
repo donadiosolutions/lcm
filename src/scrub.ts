@@ -67,7 +67,7 @@ export const NATIVE_PATTERNS: string[] = [
   // Doppler API tokens (dp.pt. prefix)
   "dp\\.pt\\.[a-z0-9]{43}",
   // Database connection strings with embedded credentials
-  "(postgres|mysql|mongodb|redis|rediss)://\\S+:\\S+@\\S+",
+  "(?:postgres|mysql|mongodb|redis|rediss)://[^\\s:@/]+:[^\\s@/]+@[^\\s/]+",
   // JSON Web Tokens (three base64url segments separated by dots)
   "eyJ[A-Za-z0-9_-]+\\.eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+",
 ];
@@ -281,6 +281,21 @@ interface CompiledScrubPattern {
   source: string;
 }
 
+/** Convert the remaining RE2 syntax emitted by Gitleaks into safe JS syntax. */
+export function normalizeGitleaksRegex(
+  source: string,
+  flags: string,
+): { source: string; flags: string } {
+  let normalized = source
+    .replace(/\[\[:alnum:\]\]/g, "[A-Za-z0-9]")
+    .replace(/\\z/g, "$");
+  const needsIgnoreCase = flags.includes("i") || normalized.includes("(?i:");
+  // JavaScript does not support scoped flag groups. Broadening a secret
+  // detector to case-insensitive is conservative: it can redact more, never less.
+  normalized = normalized.replace(/\(\?[i-]+:/g, "(?:");
+  return { source: normalized, flags: needsIgnoreCase ? "i" : "" };
+}
+
 function createRegexCollectionPlan(regex: RegExp): RegexCollectionPlan {
   const sourceAnalysis = analyzeRegexSource(regex.source);
   const lookaheadFlags = regex.flags.replace(/[dgy]/gu, "");
@@ -477,7 +492,12 @@ export class ScrubEngine {
       ...projectPatterns.map((p) => ({ source: p, isGitleaks: false as const, flags: "" })),
     ];
     for (let i = 0; i < trustedPatterns.length; i++) {
-      const { source, isGitleaks, flags } = trustedPatterns[i];
+      const original = trustedPatterns[i];
+      const converted = original.isGitleaks
+        ? normalizeGitleaksRegex(original.source, original.flags)
+        : { source: original.source, flags: original.flags };
+      const { source, flags } = converted;
+      const { isGitleaks } = original;
       try {
         const regex = new RegExp(source, "g" + flags);
         const pattern = { source, regex, plan: createRegexCollectionPlan(regex) };

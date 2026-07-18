@@ -32,6 +32,7 @@ vi.mock("node:fs", () => ({ existsSync: mocks.exists, readFileSync: mocks.read, 
 vi.mock("../../../src/db/connection.js", () => ({
   getLcmConnection: mocks.getConnection,
   closeLcmConnection: mocks.closeConnection,
+  withLcmConnectionLock: (_path: string, work: () => unknown) => work(),
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
   projectPaths: (cwd: string) => ({ id: "pid", dir: `${cwd}/project`, dbPath: `${cwd}/lcm.db`, metaPath: `${cwd}/meta.json`, canonical: cwd }),
@@ -130,7 +131,7 @@ describe("ingest persistence boundaries", () => {
 
   it("skips completed and already stored sessions and tolerates missing log tables", async () => {
     const handler = createIngestHandler(config);
-    mocks.sessionGet.mockReturnValueOnce({ found: 1 });
+    mocks.sessionGet.mockReturnValueOnce({ message_count: 1 });
     await handler({} as never, response, JSON.stringify({ session_id: "complete", cwd: "/ok", messages: [validMessage] }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 0, totalTokens: 0 });
     mocks.sessionGet.mockImplementationOnce(() => { throw new Error("table missing"); });

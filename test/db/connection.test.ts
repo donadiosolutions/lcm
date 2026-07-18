@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it, expect } from "vitest";
-import { getLcmConnection, closeLcmConnection, getPoolStats } from "../../src/db/connection.js";
+import { getLcmConnection, closeLcmConnection, getPoolStats, withLcmConnectionLock } from "../../src/db/connection.js";
 
 const tempDirs: string[] = [];
 
@@ -95,5 +95,24 @@ describe("getPoolStats", () => {
     expect(stats).toHaveProperty("idleConnections");
     expect(stats).toHaveProperty("connections");
     expect(Array.isArray(stats.connections)).toBe(true);
+  });
+});
+
+describe("withLcmConnectionLock", () => {
+  it("serializes the same database while allowing another database to proceed", async () => {
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const first = withLcmConnectionLock("one", async () => {
+      order.push("first-start");
+      await gate;
+      order.push("first-end");
+    });
+    const second = withLcmConnectionLock("one", () => { order.push("second"); });
+    await withLcmConnectionLock("two", () => { order.push("other"); });
+    expect(order).toEqual(["first-start", "other"]);
+    release();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first-start", "other", "first-end", "second"]);
   });
 });
