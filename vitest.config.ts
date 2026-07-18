@@ -15,8 +15,8 @@ export default defineConfig({
     coverage: {
       include: ["bin/**/*.ts", "installer/**/*.ts", "src/**/*.ts"],
       thresholds: {
-        lines: 84.52,
-        branches: 81.08,
+        lines: 89.82,
+        branches: 89.43,
         "src/scrub.ts": { lines: 100, branches: 100 },
         "src/transcript.ts": { lines: 100, branches: 100 },
         "src/llm/process-utils.ts": { lines: 100, branches: 100 },
@@ -53,6 +53,11 @@ export default defineConfig({
         "src/large-files.ts": { lines: 100, branches: 100 },
         "src/retrieval.ts": { lines: 100, branches: 100 },
         "src/summarize.ts": { lines: 100, branches: 100 },
+        "src/daemon/**/*.ts": { lines: 100, branches: 100 },
+        "src/diagnose.ts": { lines: 100, branches: 100 },
+        "src/doctor/doctor.ts": { lines: 100, branches: 100 },
+        "src/mcp/**/*.ts": { lines: 100, branches: 100 },
+        "src/stats.ts": { lines: 100, branches: 100 },
       },
     },
     projects: [

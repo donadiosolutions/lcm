@@ -16,4 +16,6 @@ export interface DoctorDeps {
   homedir: string;
   platform: string;
   cwd?: string;
+  /** Internal deterministic seam for exercising MCP handshake failures. */
+  _testMcpHandshake?: () => Promise<CheckResult>;
 }

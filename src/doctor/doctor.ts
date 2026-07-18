@@ -255,12 +255,9 @@ function formatTimeAgo(date: Date): string {
 
 function checkPassiveLearning(
   results: CheckResult[],
-  hooksInstalled: boolean,
   options: Required<DoctorRunOptions>,
   daemonHealthy: boolean,
 ): void {
-  if (!hooksInstalled) return;
-
   const statsOptions = { timeoutMs: 2000, maxDbs: options.eventsMaxDbs, pruneOrphanSidecars: true };
   const stats = options.verbose ? collectDetailedEventStats(statsOptions) : collectEventStats(statsOptions);
 
@@ -662,7 +659,8 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   // ── MCP handshake ──
   if (daemonHealthy) {
     try {
-      const mcpResult = await testMcpHandshake();
+      const handshake = deps._testMcpHandshake ?? testMcpHandshake;
+      const mcpResult = await handshake();
       results.push(mcpResult);
     } catch {
       results.push({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "Could not test MCP handshake" });
@@ -737,10 +735,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   }
 
   // ── Passive Learning ──
-  const hooksInstalled = results.some(
-    r => r.category === "Settings" && r.name === "hooks" && r.status !== "fail"
-  );
-  checkPassiveLearning(results, hooksInstalled, options, daemonHealthy);
+  // The hooks check above always reports pass or warn, so passive-learning
+  // diagnostics are always applicable by the time this point is reached.
+  checkPassiveLearning(results, options, daemonHealthy);
 
   return results;
 }
