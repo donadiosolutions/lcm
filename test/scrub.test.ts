@@ -224,6 +224,20 @@ describe("ScrubEngine — custom patterns", () => {
     }
   });
 
+  it("fails closed when detached lookahead probes contain nested lookbehind", () => {
+    for (const pattern of [
+      "(?=(?<=safe)\\s+SECRET_[A-Z]+)",
+      "(?=(?<!unsafe)\\s+SECRET_[A-Z]+)",
+    ]) {
+      const result = new ScrubEngine([pattern], []).scrubWithCounts("safe SECRET_VALUE");
+
+      expect(result).toEqual({
+        text: "[REDACTED] [REDACTED]", gitleaks: 0, builtIn: 0, global: 2, project: 0,
+      });
+      expect(result.text).not.toContain("SECRET_VALUE");
+    }
+  });
+
   it("does not detach capture-dependent consuming alternatives", () => {
     const result = new ScrubEngine(["(?=SECRET)|(?<value>SECRET)\\s+\\k<value>"], [])
       .scrubWithCounts("SECRET SECRET tail");
@@ -279,6 +293,53 @@ describe("ScrubEngine — custom patterns", () => {
     expect(result).toEqual({
       text: "[REDACTED] OTHER", gitleaks: 0, builtIn: 0, global: 1, project: 0,
     });
+  });
+
+  it("does not execute detached lookahead probes for consuming matches", () => {
+    const engine = new ScrubEngine(["(?<=X)(?=Y)|SECRET"], []);
+    const originalExec = RegExp.prototype.exec;
+    let lookaheadProbeCalls = 0;
+    const execSpy = vi.spyOn(RegExp.prototype, "exec").mockImplementation(function (
+      this: RegExp,
+      value: string,
+    ): RegExpExecArray | null {
+      if (this.source === "^(?:Y)") lookaheadProbeCalls++;
+      return originalExec.call(this, value);
+    });
+
+    try {
+      expect(engine.scrub("SECRET")).toBe("[REDACTED]");
+    } finally {
+      execSpy.mockRestore();
+    }
+    expect(lookaheadProbeCalls).toBe(0);
+  });
+
+  it("bounds wrapped and otherwise unprobeable mixed alternatives", () => {
+    const token = "A".repeat(16_384);
+    const patterns = [
+      "(?:(?=.)|CONSUMING)",
+      "(?:(?=.)|CONSUMING)X?",
+    ];
+    const engine = new ScrubEngine(patterns, []);
+    const originalExec = RegExp.prototype.exec;
+    const execCounts = new Map<string, number>();
+    const execSpy = vi.spyOn(RegExp.prototype, "exec").mockImplementation(function (
+      this: RegExp,
+      value: string,
+    ): RegExpExecArray | null {
+      if (patterns.includes(this.source)) {
+        execCounts.set(this.source, (execCounts.get(this.source) ?? 0) + 1);
+      }
+      return originalExec.call(this, value);
+    });
+
+    try {
+      expect(engine.scrub(token)).toBe("[REDACTED]");
+    } finally {
+      execSpy.mockRestore();
+    }
+    for (const pattern of patterns) expect(execCounts.get(pattern)).toBeLessThanOrEqual(2);
   });
 
   it("handles long escaped regex sources without backtracking in syntax analysis", () => {

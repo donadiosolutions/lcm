@@ -110,28 +110,33 @@ function nonWhitespaceRanges(text: string): TextRange[] {
 
 interface RegexSourceAnalysis {
   hasBackreference: boolean;
-  hasCaptureDependentLookahead: boolean;
+  hasContextDependentLookahead: boolean;
   hasPositiveLookbehind: boolean;
   hasUnescapedAlternation: boolean;
   hasPotentialConsumingAlternative: boolean;
+  effectiveAlternativeSources: string[];
   positiveLookaheadBodies: string[];
-  topLevelAlternativeSources: string[];
 }
 
 interface RegexGroupFrame {
+  alternativeSources: string[];
+  alternativeStart: number;
   assertion: boolean;
+  start: number;
   positiveLookaheadBodyStart: number | null;
 }
 
 function analyzeRegexSource(source: string): RegexSourceAnalysis {
   const groupStack: RegexGroupFrame[] = [];
   const positiveLookaheadBodies: string[] = [];
-  const topLevelAlternationIndexes: number[] = [];
+  const rootAlternativeSources: string[] = [];
+  let rootAlternativeStart = 0;
+  let wrappedAlternativeSources: string[] = [];
   let assertionDepth = 0;
   let positiveLookaheadDepth = 0;
   let inCharacterClass = false;
   let hasBackreference = false;
-  let hasCaptureDependentLookahead = false;
+  let hasContextDependentLookahead = false;
   let hasPositiveLookbehind = false;
   let hasUnescapedAlternation = false;
   let hasPotentialConsumingAlternative = false;
@@ -149,7 +154,7 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
         || source.startsWith("\\k<", index);
       if (isBackreference) hasBackreference = true;
       if (positiveLookaheadDepth > 0 && isBackreference) {
-        hasCaptureDependentLookahead = true;
+        hasContextDependentLookahead = true;
       }
       if (assertionDepth === 0 && escapedCharacter !== "b" && escapedCharacter !== "B") {
         hasPotentialConsumingAlternative = true;
@@ -163,30 +168,46 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
       continue;
     }
     if (character === "(") {
+      const groupStart = index;
+      let bodyStart = index + 1;
       let assertion = false;
       let positiveLookaheadBodyStart: number | null = null;
       if (source.startsWith("(?=", index)) {
         assertion = true;
         positiveLookaheadBodyStart = index + 3;
+        bodyStart = positiveLookaheadBodyStart;
         positiveLookaheadDepth++;
         index += 2;
       } else if (source.startsWith("(?!", index)) {
         assertion = true;
+        bodyStart = index + 3;
         index += 2;
       } else if (source.startsWith("(?<=", index)) {
         assertion = true;
+        bodyStart = index + 4;
+        if (positiveLookaheadDepth > 0) hasContextDependentLookahead = true;
         hasPositiveLookbehind = true;
         index += 3;
       } else if (source.startsWith("(?<!", index)) {
         assertion = true;
+        bodyStart = index + 4;
+        if (positiveLookaheadDepth > 0) hasContextDependentLookahead = true;
         index += 3;
       } else if (source.startsWith("(?:", index)) {
+        bodyStart = index + 3;
         index += 2;
       } else if (source.startsWith("(?<", index)) {
         // The RegExp constructor already proved that every named group closes.
         index = source.indexOf(">", index + 3);
+        bodyStart = index + 1;
       }
-      groupStack.push({ assertion, positiveLookaheadBodyStart });
+      groupStack.push({
+        alternativeSources: [],
+        alternativeStart: bodyStart,
+        assertion,
+        positiveLookaheadBodyStart,
+        start: groupStart,
+      });
       if (assertion) assertionDepth++;
       continue;
     }
@@ -196,12 +217,29 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
         positiveLookaheadBodies.push(source.slice(group.positiveLookaheadBodyStart, index));
         positiveLookaheadDepth--;
       }
+      if (
+        group?.start === 0
+        && index === source.length - 1
+        && group.alternativeSources.length > 0
+      ) {
+        wrappedAlternativeSources = [
+          ...group.alternativeSources,
+          source.slice(group.alternativeStart, index),
+        ];
+      }
       if (group?.assertion) assertionDepth--;
       continue;
     }
     if (character === "|") {
       hasUnescapedAlternation = true;
-      if (groupStack.length === 0) topLevelAlternationIndexes.push(index);
+      if (groupStack.length === 0) {
+        rootAlternativeSources.push(source.slice(rootAlternativeStart, index));
+        rootAlternativeStart = index + 1;
+      } else if (groupStack.length === 1) {
+        const outerGroup = groupStack[0];
+        outerGroup.alternativeSources.push(source.slice(outerGroup.alternativeStart, index));
+        outerGroup.alternativeStart = index + 1;
+      }
       continue;
     }
     if (assertionDepth > 0 || "^$*+?".includes(character)) continue;
@@ -215,32 +253,26 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
     }
     hasPotentialConsumingAlternative = true;
   }
+  const effectiveAlternativeSources = rootAlternativeSources.length > 0
+    ? [...rootAlternativeSources, source.slice(rootAlternativeStart)]
+    : wrappedAlternativeSources;
   return {
     hasBackreference,
-    hasCaptureDependentLookahead,
+    hasContextDependentLookahead,
     hasPositiveLookbehind,
     hasUnescapedAlternation,
     hasPotentialConsumingAlternative,
+    effectiveAlternativeSources,
     positiveLookaheadBodies,
-    topLevelAlternativeSources: topLevelAlternationIndexes.length === 0
-      ? []
-      : [
-          -1,
-          ...topLevelAlternationIndexes,
-          source.length,
-        ].slice(1).map((end, branchIndex, boundaries) =>
-          source.slice((boundaries[branchIndex - 1] ?? -1) + 1, end)
-        ),
   };
 }
 
 interface RegexCollectionPlan {
   alternativeProbes: RegExp[];
-  hasCaptureDependentAlternative: boolean;
-  hasCaptureDependentLookahead: boolean;
+  hasAmbiguousAlternative: boolean;
+  hasContextDependentLookahead: boolean;
   lookaheadProbes: RegExp[];
   preferPrecedingAtBoundary: boolean;
-  preserveAlternativeMatches: boolean;
 }
 
 interface CompiledScrubPattern {
@@ -252,29 +284,30 @@ interface CompiledScrubPattern {
 function createRegexCollectionPlan(regex: RegExp): RegexCollectionPlan {
   const sourceAnalysis = analyzeRegexSource(regex.source);
   const lookaheadFlags = regex.flags.replace(/[dgy]/gu, "");
-  const lookaheadProbes = sourceAnalysis.hasCaptureDependentLookahead
+  const lookaheadProbes = sourceAnalysis.hasContextDependentLookahead
     ? []
     : sourceAnalysis.positiveLookaheadBodies.map(
         (body) => new RegExp(`^(?:${body})`, lookaheadFlags),
       );
   const preserveAlternativeMatches = sourceAnalysis.hasUnescapedAlternation
     && sourceAnalysis.hasPotentialConsumingAlternative;
-  const hasCaptureDependentAlternative = preserveAlternativeMatches
-    && sourceAnalysis.hasBackreference
-    && sourceAnalysis.topLevelAlternativeSources.length > 0;
+  const hasAmbiguousAlternative = preserveAlternativeMatches && (
+    sourceAnalysis.hasBackreference
+    || sourceAnalysis.effectiveAlternativeSources.length === 0
+  );
   const alternativeFlags = regex.flags.replace(/[dy]/gu, "");
-  const alternativeProbes = preserveAlternativeMatches && !hasCaptureDependentAlternative
-    ? sourceAnalysis.topLevelAlternativeSources.map(
+  const alternativeProbes = preserveAlternativeMatches && !hasAmbiguousAlternative
+    ? sourceAnalysis.effectiveAlternativeSources.map(
         (source) => new RegExp(source, alternativeFlags),
       )
     : [];
   return {
     alternativeProbes,
-    hasCaptureDependentAlternative,
-    hasCaptureDependentLookahead: sourceAnalysis.hasCaptureDependentLookahead,
+    hasAmbiguousAlternative,
+    hasContextDependentLookahead: sourceAnalysis.hasContextDependentLookahead,
     lookaheadProbes,
-    preferPrecedingAtBoundary: sourceAnalysis.hasPositiveLookbehind,
-    preserveAlternativeMatches,
+    preferPrecedingAtBoundary: sourceAnalysis.hasPositiveLookbehind
+      || sourceAnalysis.hasContextDependentLookahead,
   };
 }
 
@@ -347,8 +380,8 @@ function collectConsumingRanges(
   while ((match = regex.exec(text)) !== null) {
     const isZeroWidth = match[0].length === 0;
     const anchor = match.index;
-    const includeFollowingAtBoundary = plan.preferPrecedingAtBoundary && (
-      plan.hasCaptureDependentLookahead
+    const includeFollowingAtBoundary = isZeroWidth && plan.preferPrecedingAtBoundary && (
+      plan.hasContextDependentLookahead
       || plan.lookaheadProbes.some(
         (probe) => /\S/u.test(probe.exec(text.slice(anchor))?.[0] ?? ""),
       )
@@ -368,7 +401,7 @@ function collectConsumingRanges(
 
     let consumingAlternativeEnd = anchor;
     const expandedEnd = Math.max(...ranges.map((range) => range[1]));
-    if (plan.hasCaptureDependentAlternative) {
+    if (plan.hasAmbiguousAlternative) {
       const expandedStart = Math.min(...ranges.map((range) => range[0]));
       collect([expandedStart, text.length]);
       consumingAlternativeEnd = text.length;
@@ -389,10 +422,7 @@ function collectConsumingRanges(
 
     previousZeroRanges = ranges;
     const lastIndexAfterMatch = regex.lastIndex;
-    if (!plan.preserveAlternativeMatches || consumingAlternativeEnd > anchor) {
-      regex.lastIndex = Math.max(regex.lastIndex, ...ranges.map((range) => range[1]));
-      regex.lastIndex = Math.max(regex.lastIndex, consumingAlternativeEnd);
-    }
+    regex.lastIndex = Math.max(regex.lastIndex, expandedEnd, consumingAlternativeEnd);
     if (regex.lastIndex === lastIndexAfterMatch) regex.lastIndex++;
   }
 }
