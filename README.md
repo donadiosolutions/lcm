@@ -17,6 +17,10 @@
 </p>
 
 <p align="center">
+  <a href="https://codecov.io/gh/donadiosolutions/lcm"><img src="https://codecov.io/gh/donadiosolutions/lcm/graphs/sunburst.svg?token=xtSdannOJf" alt="Codecov sunburst coverage graph"></a>
+</p>
+
+<p align="center">
   <a href="#runtime-model">Runtime Model</a> &bull;
   <a href="#installation">Installation</a> &bull;
   <a href="#mcp-tools">MCP Tools</a> &bull;
