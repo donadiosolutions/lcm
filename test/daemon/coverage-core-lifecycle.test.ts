@@ -117,6 +117,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
       _spawnSyncOverride: vi.fn(() => { throw "systemd"; }) as never,
       _spawnOverride: vi.fn(() => { throw "detached"; }) as never,
       _skipHealthWait: true,
+      _monotonicNowOverride: (): number => 0,
     });
     expect(result.warning).toContain("systemd"); expect(result.warning).toContain("detached");
   });
@@ -133,8 +134,25 @@ describe("lifecycle spawn and restart failure boundaries", () => {
       port: 3, pidFilePath: join(dir, "daemon.pid"), spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
       _fetchOverride: vi.fn().mockRejectedValue(new Error("down")), _spawnSyncOverride: vi.fn(() => spawnResult) as never,
       _spawnOverride: vi.fn(() => ({ pid: undefined, once: vi.fn(), unref: vi.fn() })) as never, _skipHealthWait: true,
+      _monotonicNowOverride: (): number => 0,
     });
     expect(result.warning).toContain(detail);
+  });
+
+  it("skips systemd-run when the initial health check consumes the startup deadline", async () => {
+    const dir = temp();
+    const monotonicNow = vi.fn()
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValue(2);
+    const spawnSync = vi.fn();
+    const result = await ensureDaemon({
+      port: 3, pidFilePath: join(dir, "daemon.pid"), spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("down")), _spawnSyncOverride: spawnSync as never,
+      _monotonicNowOverride: monotonicNow,
+    });
+    expect(result).toEqual({ connected: false, port: 3, spawned: false });
+    expect(spawnSync).not.toHaveBeenCalled();
   });
 
   it("covers early-dead and throwing termination paths", async () => {
