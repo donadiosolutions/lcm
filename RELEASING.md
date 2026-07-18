@@ -41,8 +41,8 @@ make sure a maintainer gets a `.changeset/*.md` file onto `main`.
 2. Let the `Version Packages` workflow open or update the release PR
 3. Review the generated version bump and `CHANGELOG.md`
 4. Merge the release PR to `main`
-5. Create and push the matching semver release tag, for example `vX.Y.Z`, from
-   the merged `main` commit
+5. Create and push the matching signed annotated semver release tag, for example
+   `vX.Y.Z`, at the exact release PR merge commit
 6. Let the `Publish Package` workflow run automatically from that tag
 7. Approve the workflow if a protected GitHub Environment is configured
 8. Let the workflow:
@@ -50,6 +50,33 @@ make sure a maintainer gets a `.changeset/*.md` file onto `main`.
    - run tests
    - publish to npm
    - create or update the GitHub release for the tag
+
+For an explicitly requested manual release created by the release helper, the
+helper also owns recovery of the tag step. The command below looks up the merged
+PR by the helper-created `release/vX.Y.Z` branch, so it does not apply to a
+Changesets `Version Packages` PR or another manually named branch:
+
+```bash
+bash .agents/skills/lcm-release/scripts/release.sh 1.2.3 --from-step 8
+```
+
+Step 8 checks that the merge commit is reachable from `origin/main`, creates a
+signed annotated tag when no local or remote tag exists, and pushes that exact
+tag object. On retries it pushes a valid local-only tag or fetches a valid
+remote-only tag; when both copies exist, their tag objects and peeled commits
+must match. A conflicting, lightweight, or invalidly signed tag causes the
+helper to stop; it never moves or overwrites a release tag. The helper then
+selects the tag-triggered `publish.yml` run by tag name and merge commit SHA
+without assuming `main` still points at that commit.
+
+Manual helper versions must use stable `MAJOR.MINOR.PATCH` form because the
+publish workflow does not accept prerelease or build-metadata tags. The
+publication-run wait defaults to 900 seconds; override it with
+`PUBLISH_MAX_WAIT=<non-negative integer seconds>` when needed.
+
+Before running the manual helper, configure Git tag signing with an available
+signing key and agent, and confirm that local signed-tag creation and signature
+verification succeed with the trusted public key.
 
 ## External setup required
 

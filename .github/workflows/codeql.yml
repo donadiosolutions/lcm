@@ -1,0 +1,51 @@
+name: CodeQL
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }}, default)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      # Required to upload CodeQL SARIF results.
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - actions
+          - javascript-typescript
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1
+        with:
+          category: /language:${{ matrix.language }}/profile:default
+          upload: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'never' || 'always' }}

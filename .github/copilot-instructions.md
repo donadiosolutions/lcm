@@ -26,6 +26,16 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
   - Any path that runs more than once per user action
   - Startup initialization (lazy evaluation only)
 - Flag any `collectStats()` call that isn't in a dedicated stats endpoint or background job.
+- In synchronous redaction paths, zero-width regex matches must reuse cached token boundaries, skip to the end of the consuming range, and avoid collecting duplicate ranges. Flag per-match rescans of the same token or one range allocation per character.
+- At a token-end boundary, a zero-width positive lookbehind identifies the preceding token, while a whitespace lookahead identifies the following token. Require regressions for both directions when changing zero-width range selection.
+- Do not derive zero-width token direction from the entire regex source when mixed assertions or alternatives can match different branches. Determine direction from the active match or redact every plausible adjacent token.
+- Range skipping after a zero-width match must not hide a later consuming alternative that starts inside the expanded token and extends beyond it. Preserve such alternatives while retaining bounded work for pure repeated-zero patterns.
+- Regex syntax detection must skip escaped characters and character classes; text such as `(?<=` inside `[...]` is not a lookbehind assertion.
+- Parse user-configured regex source with one linear scanner; avoid nested or overlapping quantifier regexes that can backtrack over long escaped sequences.
+- Cache immutable regex-source analysis when each scrub pattern is constructed; token-by-token collection must not reparse the same source.
+- Skip empty segments from whitespace-preserving token splits before executing scrub patterns.
+- Detached lookahead probes cannot preserve captures or assertions that inspect text before the anchor. Treat backreferences and nested lookbehinds as ambiguous, fail closed across plausible token boundaries, and require regressions for both dependency types.
+- Normalize sensitive-data category metadata by trimming and filtering entries before joining or applying the `unknown` fallback. Whitespace-only arrays must never render an empty `pattern:` warning.
 
 ### Test coverage
 - New HTTP routes must have corresponding tests in `test/daemon/routes/`.
@@ -57,6 +67,16 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - When a provider supports no values for an optional control, say the control is unsupported; do not render an empty set as `Valid values: none`.
 - Retry and backoff duration accounting must use a monotonic clock so wall-clock corrections cannot shorten or extend a wait.
 - Normalize non-finite delay values before entering timer loops; security-sensitive timer scheduling must keep user-derived values out of `setTimeout` durations by using literal constants only.
+
+### GitHub Actions and CodeQL
+
+- Advanced CodeQL workflows require GitHub default setup to be disabled before they upload SARIF.
+- Keep CodeQL analysis enabled for fork pull requests, but set the analyze action's `upload` input to `never` for fork-origin pull requests and `always` for same-repository pull requests and pushes.
+- Grant `security-events: write` only on the CodeQL analysis job that uploads SARIF; job-level permissions must restate every required read permission because they replace workflow defaults.
+- Follow least privilege in workflow `permissions`; omit `packages: read` unless a step actually reads packages.
+- Set `persist-credentials: false` on checkout steps in read-only workflows.
+- When replacing a generated workflow, update README badges and links to the new workflow filename.
+- Production-path allowlists must cover shipped executable plugin scripts such as `.claude-plugin/`, not only the primary source directories.
 
 ## What to skip
 - Don't flag `DatabaseSync` usage in test fixtures that mock the connection — context matters.

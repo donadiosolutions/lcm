@@ -12,7 +12,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/donadiosolutions/lcm" alt="License: MIT"></a>
   <a href="https://github.com/donadiosolutions/lcm/actions/workflows/ci.yml"><img src="https://github.com/donadiosolutions/lcm/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://socket.dev/npm/package/@donadiosolutions/lcm"><img src="https://badge.socket.dev/npm/package/@donadiosolutions/lcm" alt="Socket"></a>
-  <a href="https://github.com/donadiosolutions/lcm/actions/workflows/github-code-scanning/codeql"><img src="https://github.com/donadiosolutions/lcm/actions/workflows/github-code-scanning/codeql/badge.svg" alt="CodeQL"></a>
+  <a href="https://github.com/donadiosolutions/lcm/actions/workflows/codeql.yml"><img src="https://github.com/donadiosolutions/lcm/actions/workflows/codeql.yml/badge.svg?branch=main" alt="CodeQL"></a>
   <a href="https://codecov.io/gh/donadiosolutions/lcm"><img src="https://codecov.io/gh/donadiosolutions/lcm/graph/badge.svg?branch=main" alt="Codecov"></a>
 </p>
 

@@ -30,13 +30,15 @@ feature/docs branches → main (default, protected)
 1. Changesets accumulate on PRs targeting `main` (`.changeset/*.md` files)
 2. Version PR is auto-created by `changesets/action` on each main push
 3. When ready to release: merge the version PR on `main` (bumps package.json)
-4. Create and push the matching semver tag from the merged `main` commit, for example `vX.Y.Z`
+4. Create and push a signed annotated semver tag at the exact merged `main` commit, for example `vX.Y.Z`
 5. The `publish.yml` workflow runs automatically from that tag
 6. Let the publish workflow:
    - Type-check, test, build
    - Publish to npm (`@donadiosolutions/lcm`)
    - Create or update the GitHub release
    - Use the plugin manifest version already included in the version PR
+
+The manual release helper performs step 4 idempotently: it pushes or fetches a valid one-sided signed annotated tag, requires exact tag-object and peeled-commit equality when both copies exist, and refuses to move, replace, or overwrite conflicts. It locates the resulting tag-triggered workflow using both the tag name and merge commit SHA, so later updates to `main` cannot select the wrong run.
 
 ### CI Triggers
 
