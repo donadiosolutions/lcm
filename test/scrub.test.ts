@@ -211,6 +211,19 @@ describe("ScrubEngine — custom patterns", () => {
     }
   });
 
+  it("fails closed when lookahead probes depend on lookbehind captures", () => {
+    for (const pattern of [
+      "(?<=(?<value>safe))(?=\\s+\\k<value>)",
+      "(?<=(safe))(?=\\s+\\1)",
+    ]) {
+      const result = new ScrubEngine([pattern], []).scrubWithCounts("safe safe");
+
+      expect(result).toEqual({
+        text: "[REDACTED] [REDACTED]", gitleaks: 0, builtIn: 0, global: 2, project: 0,
+      });
+    }
+  });
+
   it("ignores lookbehind-like text inside a character class when choosing direction", () => {
     const result = new ScrubEngine([
       "(?=[(?<=])|(?=\\s+SECRET_[A-Z]+)",
@@ -251,6 +264,19 @@ describe("ScrubEngine — custom patterns", () => {
     expect(result).toEqual({
       text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
     });
+  });
+
+  it("caches regex source analysis when patterns are constructed", () => {
+    const startsWithSpy = vi.spyOn(String.prototype, "startsWith");
+    const engine = new ScrubEngine(["(?=TOKEN)|SECRET\\s+VALUE"], []);
+    startsWithSpy.mockClear();
+
+    try {
+      expect(engine.scrub("ordinary ".repeat(1_000))).toBe("ordinary ".repeat(1_000));
+      expect(startsWithSpy).not.toHaveBeenCalled();
+    } finally {
+      startsWithSpy.mockRestore();
+    }
   });
 
   it("falls back to the final preceding token from trailing whitespace", () => {

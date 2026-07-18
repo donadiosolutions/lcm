@@ -109,6 +109,7 @@ function nonWhitespaceRanges(text: string): TextRange[] {
 }
 
 interface RegexSourceAnalysis {
+  hasCaptureDependentLookahead: boolean;
   hasPositiveLookbehind: boolean;
   hasUnescapedAlternation: boolean;
   hasPotentialConsumingAlternative: boolean;
@@ -126,7 +127,9 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
   const positiveLookaheadBodies: string[] = [];
   const topLevelAlternationIndexes: number[] = [];
   let assertionDepth = 0;
+  let positiveLookaheadDepth = 0;
   let inCharacterClass = false;
+  let hasCaptureDependentLookahead = false;
   let hasPositiveLookbehind = false;
   let hasUnescapedAlternation = false;
   let hasPotentialConsumingAlternative = false;
@@ -139,7 +142,13 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
       continue;
     }
     if (character === "\\") {
-      if (assertionDepth === 0 && source[index + 1] !== "b" && source[index + 1] !== "B") {
+      const escapedCharacter = source[index + 1] ?? "";
+      const isBackreference = (escapedCharacter >= "1" && escapedCharacter <= "9")
+        || source.startsWith("\\k<", index);
+      if (positiveLookaheadDepth > 0 && isBackreference) {
+        hasCaptureDependentLookahead = true;
+      }
+      if (assertionDepth === 0 && escapedCharacter !== "b" && escapedCharacter !== "B") {
         hasPotentialConsumingAlternative = true;
       }
       index++;
@@ -156,6 +165,7 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
       if (source.startsWith("(?=", index)) {
         assertion = true;
         positiveLookaheadBodyStart = index + 3;
+        positiveLookaheadDepth++;
         index += 2;
       } else if (source.startsWith("(?!", index)) {
         assertion = true;
@@ -181,6 +191,7 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
       const group = groupStack.pop();
       if (group?.positiveLookaheadBodyStart != null) {
         positiveLookaheadBodies.push(source.slice(group.positiveLookaheadBodyStart, index));
+        positiveLookaheadDepth--;
       }
       if (group?.assertion) assertionDepth--;
       continue;
@@ -202,6 +213,7 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
     hasPotentialConsumingAlternative = true;
   }
   return {
+    hasCaptureDependentLookahead,
     hasPositiveLookbehind,
     hasUnescapedAlternation,
     hasPotentialConsumingAlternative,
@@ -215,6 +227,43 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
         ].slice(1).map((end, branchIndex, boundaries) =>
           source.slice((boundaries[branchIndex - 1] ?? -1) + 1, end)
         ),
+  };
+}
+
+interface RegexCollectionPlan {
+  alternativeProbes: RegExp[];
+  hasCaptureDependentLookahead: boolean;
+  lookaheadProbes: RegExp[];
+  preferPrecedingAtBoundary: boolean;
+  preserveAlternativeMatches: boolean;
+}
+
+interface CompiledScrubPattern {
+  plan: RegexCollectionPlan;
+  regex: RegExp;
+  source: string;
+}
+
+function createRegexCollectionPlan(regex: RegExp): RegexCollectionPlan {
+  const sourceAnalysis = analyzeRegexSource(regex.source);
+  const lookaheadFlags = regex.flags.replace(/[dgy]/gu, "");
+  const lookaheadProbes = sourceAnalysis.positiveLookaheadBodies.map(
+    (body) => new RegExp(`^(?:${body})`, lookaheadFlags),
+  );
+  const preserveAlternativeMatches = sourceAnalysis.hasUnescapedAlternation
+    && sourceAnalysis.hasPotentialConsumingAlternative;
+  const alternativeFlags = regex.flags.replace(/[dy]/gu, "");
+  const alternativeProbes = preserveAlternativeMatches
+    ? sourceAnalysis.topLevelAlternativeSources.map(
+        (source) => new RegExp(source, alternativeFlags),
+      )
+    : [];
+  return {
+    alternativeProbes,
+    hasCaptureDependentLookahead: sourceAnalysis.hasCaptureDependentLookahead,
+    lookaheadProbes,
+    preferPrecedingAtBoundary: sourceAnalysis.hasPositiveLookbehind,
+    preserveAlternativeMatches,
   };
 }
 
@@ -276,37 +325,27 @@ function consumingMatchRanges(
 
 function collectConsumingRanges(
   text: string,
-  regex: RegExp,
+  pattern: CompiledScrubPattern,
   getTokenRanges: () => readonly TextRange[],
   collect: (range: TextRange) => void,
 ): void {
+  const { plan, regex } = pattern;
   regex.lastIndex = 0;
-  const sourceAnalysis = analyzeRegexSource(regex.source);
-  const preferPrecedingAtBoundary = sourceAnalysis.hasPositiveLookbehind;
-  const lookaheadFlags = regex.flags.replace(/[dgy]/gu, "");
-  const lookaheadProbes = sourceAnalysis.positiveLookaheadBodies.map(
-    (body) => new RegExp(`^(?:${body})`, lookaheadFlags),
-  );
-  const preserveAlternativeMatches = sourceAnalysis.hasUnescapedAlternation
-    && sourceAnalysis.hasPotentialConsumingAlternative;
-  const alternativeFlags = regex.flags.replace(/[dy]/gu, "");
-  const alternativeProbes = preserveAlternativeMatches
-    ? sourceAnalysis.topLevelAlternativeSources.map(
-        (source) => new RegExp(source, alternativeFlags),
-      )
-    : [];
   let previousZeroRanges: readonly TextRange[] = [];
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {
     const isZeroWidth = match[0].length === 0;
     const anchor = match.index;
-    const includeFollowingAtBoundary = preferPrecedingAtBoundary && (
-      lookaheadProbes.some((probe) => /\S/u.test(probe.exec(text.slice(anchor))?.[0] ?? ""))
+    const includeFollowingAtBoundary = plan.preferPrecedingAtBoundary && (
+      plan.hasCaptureDependentLookahead
+      || plan.lookaheadProbes.some(
+        (probe) => /\S/u.test(probe.exec(text.slice(anchor))?.[0] ?? ""),
+      )
     );
     const ranges = consumingMatchRanges(
       match,
       getTokenRanges,
-      preferPrecedingAtBoundary,
+      plan.preferPrecedingAtBoundary,
       includeFollowingAtBoundary,
     );
     for (const range of ranges) {
@@ -318,7 +357,7 @@ function collectConsumingRanges(
 
     let consumingAlternativeEnd = anchor;
     const expandedEnd = Math.max(...ranges.map((range) => range[1]));
-    for (const probe of alternativeProbes) {
+    for (const probe of plan.alternativeProbes) {
       probe.lastIndex = anchor;
       const alternativeMatch = probe.exec(text);
       if (
@@ -334,7 +373,7 @@ function collectConsumingRanges(
 
     previousZeroRanges = ranges;
     const lastIndexAfterMatch = regex.lastIndex;
-    if (!preserveAlternativeMatches || consumingAlternativeEnd > anchor) {
+    if (!plan.preserveAlternativeMatches || consumingAlternativeEnd > anchor) {
       regex.lastIndex = Math.max(regex.lastIndex, ...ranges.map((range) => range[1]));
       regex.lastIndex = Math.max(regex.lastIndex, consumingAlternativeEnd);
     }
@@ -360,8 +399,8 @@ export function getGitleaksSyncDate(): string | null {
 }
 
 export class ScrubEngine {
-  private readonly spanningPatterns: Array<{ source: string; regex: RegExp }> = [];
-  private readonly tokenPatterns: Array<{ source: string; regex: RegExp }> = [];
+  private readonly spanningPatterns: CompiledScrubPattern[] = [];
+  private readonly tokenPatterns: CompiledScrubPattern[] = [];
   /**
    * Original index (into the combined [gitleaks, native, global, project] array) for each spanning pattern.
    * Gitleaks patterns are always "spanning" (applied to full text regardless of isSpanningPattern).
@@ -395,12 +434,13 @@ export class ScrubEngine {
       const { source, isGitleaks, flags } = trustedPatterns[i];
       try {
         const regex = new RegExp(source, "g" + flags);
+        const pattern = { source, regex, plan: createRegexCollectionPlan(regex) };
         // Gitleaks patterns always run against full text (bypass spanning check)
         if (isGitleaks || isSpanningPattern(source)) {
-          this.spanningPatterns.push({ source, regex });
+          this.spanningPatterns.push(pattern);
           this._spanningOrigIdx.push(i);
         } else {
-          this.tokenPatterns.push({ source, regex });
+          this.tokenPatterns.push(pattern);
           this._tokenOrigIdx.push(i);
         }
       } catch {
@@ -413,11 +453,12 @@ export class ScrubEngine {
       const originalIndex = trustedPatterns.length + i;
       try {
         const regex = validateRegex(source, "g" + flags);
+        const pattern = { source, regex, plan: createRegexCollectionPlan(regex) };
         if (isSpanningPattern(source)) {
-          this.spanningPatterns.push({ source, regex });
+          this.spanningPatterns.push(pattern);
           this._spanningOrigIdx.push(originalIndex);
         } else {
-          this.tokenPatterns.push({ source, regex });
+          this.tokenPatterns.push(pattern);
           this._tokenOrigIdx.push(originalIndex);
         }
       } catch {
@@ -458,8 +499,8 @@ export class ScrubEngine {
       return textTokenRanges;
     };
     for (let pi = 0; pi < this.spanningPatterns.length; pi++) {
-      const { regex } = this.spanningPatterns[pi];
-      collectConsumingRanges(text, regex, getTextTokenRanges, (range) => {
+      const pattern = this.spanningPatterns[pi];
+      collectConsumingRanges(text, pattern, getTextTokenRanges, (range) => {
         addTaggedRange(range, this._spanningOrigIdx[pi]);
       });
     }
@@ -471,8 +512,8 @@ export class ScrubEngine {
       if (!/^\s+$/.test(seg) && this.tokenPatterns.length > 0) {
         const segmentTokenRanges: TextRange[] = seg.length > 0 ? [[0, seg.length]] : [];
         for (let pi = 0; pi < this.tokenPatterns.length; pi++) {
-          const { regex } = this.tokenPatterns[pi];
-          collectConsumingRanges(seg, regex, () => segmentTokenRanges, (range) => {
+          const pattern = this.tokenPatterns[pi];
+          collectConsumingRanges(seg, pattern, () => segmentTokenRanges, (range) => {
             addTaggedRange(
               [offset + range[0], offset + range[1]],
               this._tokenOrigIdx[pi],
