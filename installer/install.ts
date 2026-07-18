@@ -71,10 +71,32 @@ type SummarizerConfig = {
   baseUrl: string;
 };
 
+const AUTO_SUMMARIZER_CONFIG: SummarizerConfig = {
+  provider: "auto",
+  model: "",
+  apiKey: "",
+  baseUrl: "",
+};
+
+async function promptRequiredValue(
+  deps: Pick<ServiceDeps, "promptUser">,
+  question: string,
+): Promise<string | null> {
+  const value = (await deps.promptUser(question)).trim();
+  if (value) return value;
+
+  console.log("  A value is required — please try once more.");
+  const retry = (await deps.promptUser(question)).trim();
+  if (retry) return retry;
+
+  console.log("  Still empty — using the native CLI default instead.");
+  return null;
+}
+
 async function pickSummarizer(deps: ServiceDeps): Promise<SummarizerConfig> {
   // Non-TTY (CI, piped stdin): skip interactive picker, default to auto.
   if (!process.stdin.isTTY) {
-    return { provider: "auto", model: "", apiKey: "", baseUrl: "" };
+    return AUTO_SUMMARIZER_CONFIG;
   }
 
   console.log("\n  ─── Summarizer (for conversation compaction)\n");
@@ -93,7 +115,7 @@ async function pickSummarizer(deps: ServiceDeps): Promise<SummarizerConfig> {
   }
 
   if (choice === "1") {
-    return { provider: "auto", model: "", apiKey: "", baseUrl: "" };
+    return AUTO_SUMMARIZER_CONFIG;
   }
 
   if (choice === "2") {
@@ -101,8 +123,12 @@ async function pickSummarizer(deps: ServiceDeps): Promise<SummarizerConfig> {
     return { provider: "anthropic", model: "claude-haiku-4-5-20251001", apiKey, baseUrl: "" };
   }
 
-  const baseUrl = (await deps.promptUser("  Server URL (e.g. http://192.168.1.x:8080/v1): ")).trim();
-  const model = (await deps.promptUser("  Model name: ")).trim();
+  const baseUrl = await promptRequiredValue(deps, "  Server URL (e.g. http://192.168.1.x:8080/v1): ");
+  if (baseUrl === null) return AUTO_SUMMARIZER_CONFIG;
+
+  const model = await promptRequiredValue(deps, "  Model name: ");
+  if (model === null) return AUTO_SUMMARIZER_CONFIG;
+
   return { provider: "openai", model, apiKey: "", baseUrl };
 }
 
@@ -113,13 +139,20 @@ export async function waitForHealth(
   timeoutMs: number = 10000,
   fetchFn: typeof globalThis.fetch = globalThis.fetch,
 ): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new RangeError("timeoutMs must be a finite, non-negative number");
+  }
+
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
     try {
       const res = await fetchFn(url);
       if (res.ok) return true;
     } catch {}
-    await new Promise(r => setTimeout(r, 500));
+
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) break;
+    await new Promise(r => setTimeout(r, Math.min(500, remainingMs)));
   }
   return false;
 }

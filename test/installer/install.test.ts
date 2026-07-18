@@ -221,8 +221,9 @@ describe("waitForHealth", () => {
       .resolves.toBe(true);
   });
 
-  it("retries failed and throwing responses until the deadline", async () => {
+  it("retries failed and throwing responses against a monotonic deadline", async () => {
     vi.useFakeTimers();
+    const wallClock = vi.spyOn(Date, "now").mockReturnValue(-1_000_000_000);
     const fetchFn = vi.fn()
       .mockRejectedValueOnce(new Error("offline"))
       .mockResolvedValue({ ok: false });
@@ -232,8 +233,62 @@ describe("waitForHealth", () => {
       await expect(result).resolves.toBe(false);
       expect(fetchFn).toHaveBeenCalledTimes(2);
     } finally {
+      wallClock.mockRestore();
       vi.useRealTimers();
     }
+  });
+
+  it("bounds the final retry sleep to the remaining deadline", async () => {
+    vi.useFakeTimers();
+    const fetchFn = vi.fn().mockResolvedValue({ ok: false });
+    try {
+      let settled = false;
+      const result = waitForHealth("http://localhost/health", 750, fetchFn as any)
+        .finally(() => { settled = true; });
+
+      await vi.advanceTimersByTimeAsync(749);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(result).resolves.toBe(false);
+      expect(fetchFn).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not sleep after a request consumes the remaining deadline", async () => {
+    const monotonicClock = vi.spyOn(performance, "now")
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(10);
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    try {
+      await expect(waitForHealth(
+        "http://localhost/health",
+        10,
+        vi.fn().mockResolvedValue({ ok: false }) as any,
+      )).resolves.toBe(false);
+      expect(timer).not.toHaveBeenCalled();
+    } finally {
+      timer.mockRestore();
+      monotonicClock.mockRestore();
+    }
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    "rejects non-finite timeout %s",
+    async (timeoutMs) => {
+      await expect(waitForHealth("http://localhost/health", timeoutMs, vi.fn() as any))
+        .rejects.toThrow(new RangeError("timeoutMs must be a finite, non-negative number"));
+    },
+  );
+
+  it("rejects negative timeouts but permits an immediate zero timeout", async () => {
+    const fetchFn = vi.fn();
+    await expect(waitForHealth("http://localhost/health", -1, fetchFn as any))
+      .rejects.toThrow(new RangeError("timeoutMs must be a finite, non-negative number"));
+    await expect(waitForHealth("http://localhost/health", 0, fetchFn as any)).resolves.toBe(false);
+    expect(fetchFn).not.toHaveBeenCalled();
   });
 });
 
@@ -505,6 +560,72 @@ describe("summarizer picker", () => {
     expect(written.llm.model).toBe("my-model");
     expect(written.llm.requestTimeoutMs).toBe(DEFAULT_LLM_REQUEST_TIMEOUT_MS);
     expect(written.llm.retry).toEqual(DEFAULT_LLM_RETRY_POLICY);
+  });
+
+  it("option 3 retries each empty required value once before accepting it", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { value: true, writable: true });
+    const deps = makeDeps({
+      existsSync: vi.fn().mockReturnValue(false),
+      promptUser: vi.fn()
+        .mockResolvedValueOnce("3")
+        .mockResolvedValueOnce("   ")
+        .mockResolvedValueOnce("http://localhost:8080/v1")
+        .mockResolvedValueOnce("")
+        .mockResolvedValueOnce("local-model"),
+    });
+
+    await install(deps);
+
+    const configCall = vi.mocked(deps.writeFileSync).mock.calls.find(([path]) => path.endsWith("config.json"));
+    expect(JSON.parse(configCall![1]).llm).toMatchObject({
+      provider: "openai",
+      baseUrl: "http://localhost:8080/v1",
+      model: "local-model",
+    });
+    expect(deps.promptUser).toHaveBeenCalledTimes(5);
+  });
+
+  it("option 3 falls back atomically to auto after two empty server URLs", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { value: true, writable: true });
+    const deps = makeDeps({
+      existsSync: vi.fn().mockReturnValue(false),
+      promptUser: vi.fn()
+        .mockResolvedValueOnce("3")
+        .mockResolvedValueOnce("")
+        .mockResolvedValueOnce("   "),
+    });
+
+    await install(deps);
+
+    const configCall = vi.mocked(deps.writeFileSync).mock.calls.find(([path]) => path.endsWith("config.json"));
+    expect(JSON.parse(configCall![1]).llm).toMatchObject({
+      provider: "auto",
+      baseUrl: "",
+      model: "",
+    });
+    expect(deps.promptUser).toHaveBeenCalledTimes(3);
+  });
+
+  it("option 3 discards a valid URL when two model attempts are empty", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { value: true, writable: true });
+    const deps = makeDeps({
+      existsSync: vi.fn().mockReturnValue(false),
+      promptUser: vi.fn()
+        .mockResolvedValueOnce("3")
+        .mockResolvedValueOnce("http://localhost:8080/v1")
+        .mockResolvedValueOnce("")
+        .mockResolvedValueOnce("   "),
+    });
+
+    await install(deps);
+
+    const configCall = vi.mocked(deps.writeFileSync).mock.calls.find(([path]) => path.endsWith("config.json"));
+    expect(JSON.parse(configCall![1]).llm).toMatchObject({
+      provider: "auto",
+      baseUrl: "",
+      model: "",
+    });
+    expect(deps.promptUser).toHaveBeenCalledTimes(4);
   });
 
   it("invalid input re-prompts once then defaults to option 1 (auto)", async () => {
