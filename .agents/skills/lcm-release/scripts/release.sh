@@ -60,7 +60,7 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 # Validate version is semver (fail fast, also guards node interpolation)
-SEMVER_REGEX='^[0-9]+\.[0-9]+\.[0-9]+$'
+SEMVER_REGEX='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 if ! [[ "$VERSION" =~ $SEMVER_REGEX ]]; then
   echo "Invalid version '$VERSION'. Expected a stable semver like '0.4.2'; prerelease and build metadata versions are not supported."
   echo "Usage: $0 <version> [--from-step N]"
@@ -365,12 +365,24 @@ if run_step 8; then
   [[ "$MERGE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || \
     err "MERGE_SHA is not a valid commit SHA: $MERGE_SHA"
   MERGE_SHA=$(printf '%s' "$MERGE_SHA" | tr '[:upper:]' '[:lower:]')
+  MAX_WAIT=${PUBLISH_MAX_WAIT:-900}
+  [[ "$MAX_WAIT" =~ ^[0-9]+$ ]] || \
+    err "PUBLISH_MAX_WAIT must be a non-negative integer in seconds (got: $MAX_WAIT)."
+  MAX_WAIT=$((10#$MAX_WAIT))
 
   TAG="v$VERSION"
   git fetch --no-tags origin main || \
     err "Failed to fetch origin/main before creating $TAG."
   git merge-base --is-ancestor "$MERGE_SHA" origin/main || \
     err "Merge commit $MERGE_SHA is not reachable from origin/main; refusing to tag it."
+  MERGED_PACKAGE_VERSION=$(git show "$MERGE_SHA:package.json" | node -e '
+    let input = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("end", () => { process.stdout.write(String(JSON.parse(input).version ?? "")); });
+  ') || err "Could not read package.json version from merge commit $MERGE_SHA."
+  [[ "$MERGED_PACKAGE_VERSION" == "$VERSION" ]] || \
+    err "Merge commit $MERGE_SHA contains package version $MERGED_PACKAGE_VERSION, expected $VERSION; refusing to create $TAG."
 
   REMOTE_TAG_REFS=$(remote_tag_refs "$TAG") || \
     err "Failed to inspect $TAG on origin."
@@ -436,10 +448,6 @@ if run_step 8; then
 
   RUN_ID=""
   WAIT_SECS=0
-  MAX_WAIT=${PUBLISH_MAX_WAIT:-900}
-  [[ "$MAX_WAIT" =~ ^[0-9]+$ ]] || \
-    err "PUBLISH_MAX_WAIT must be a non-negative integer in seconds (got: $MAX_WAIT)."
-  MAX_WAIT=$((10#$MAX_WAIT))
   WAIT_START=$SECONDS
   while [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; do
     RUN_ID=$(gh run list --repo "$REPO" --workflow publish.yml --event push --limit 20 \

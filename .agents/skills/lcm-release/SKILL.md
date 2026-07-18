@@ -49,7 +49,7 @@ The script handles everything end-to-end:
 
 - **Never delete tags** on a public package — if a version is taken, pick a higher one
 - **Release tags are signed and annotated** and must resolve to the exact release PR merge commit
-- **Step 8 is idempotent** only when local and remote tags have the same signed tag object and expected commit; any conflict aborts without overwriting the tag
+- **Step 8 is idempotent** for a valid one-sided tag by pushing the local copy or fetching the remote copy; when both copies exist, their signed tag object and expected commit must match exactly
 - **Release PRs target `main`**
 - **Use `--merge`** (not squash) so the version bump SHA is preserved on main
 - **All 3 version files must match**: `package.json`, `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`

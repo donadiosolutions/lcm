@@ -60,11 +60,12 @@ bash .agents/skills/lcm-release/scripts/release.sh 1.2.3 --from-step 8
 
 Step 8 checks that the merge commit is reachable from `origin/main`, creates a
 signed annotated tag when no local or remote tag exists, and pushes that exact
-tag object. On retries it reuses the tag only when the local and remote tag
-objects and their peeled commit match. A conflicting, lightweight, or invalidly
-signed tag causes the helper to stop; it never moves or overwrites a release
-tag. The helper then selects the tag-triggered `publish.yml` run by tag name and
-merge commit SHA without assuming `main` still points at that commit.
+tag object. On retries it pushes a valid local-only tag or fetches a valid
+remote-only tag; when both copies exist, their tag objects and peeled commits
+must match. A conflicting, lightweight, or invalidly signed tag causes the
+helper to stop; it never moves or overwrites a release tag. The helper then
+selects the tag-triggered `publish.yml` run by tag name and merge commit SHA
+without assuming `main` still points at that commit.
 
 Manual helper versions must use stable `MAJOR.MINOR.PATCH` form because the
 publish workflow does not accept prerelease or build-metadata tags. The

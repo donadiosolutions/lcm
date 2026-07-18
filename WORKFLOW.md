@@ -38,7 +38,7 @@ feature/docs branches → main (default, protected)
    - Create or update the GitHub release
    - Use the plugin manifest version already included in the version PR
 
-The manual release helper performs step 4 idempotently: it reuses a local or remote tag only when the signed annotated tag object and peeled commit match exactly, and it refuses to move, replace, or overwrite conflicts. It locates the resulting tag-triggered workflow using both the tag name and merge commit SHA, so later updates to `main` cannot select the wrong run.
+The manual release helper performs step 4 idempotently: it pushes or fetches a valid one-sided signed annotated tag, requires exact tag-object and peeled-commit equality when both copies exist, and refuses to move, replace, or overwrite conflicts. It locates the resulting tag-triggered workflow using both the tag name and merge commit SHA, so later updates to `main` cannot select the wrong run.
 
 ### CI Triggers
 

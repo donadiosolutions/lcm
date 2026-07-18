@@ -16,6 +16,7 @@ interface HarnessOptions {
   localTagState?: string;
   mergeSha?: string;
   mergeReachable?: boolean;
+  mergedPackageVersion?: string;
   npmVersion?: string;
   originUrl?: string;
   originPushUrls?: string[];
@@ -91,6 +92,10 @@ fi
 if [[ "$1" == "merge-base" && "$2" == "--is-ancestor" ]]; then
   [[ "$FAKE_MERGE_REACHABLE" == "true" ]]
   exit
+fi
+if [[ "$1" == "show" && "$2" == *:package.json ]]; then
+  printf '{"version":"%s"}\n' "$FAKE_MERGED_PACKAGE_VERSION"
+  exit 0
 fi
 if [[ "$1" == "ls-remote" && "$2" == "--tags" ]]; then
   if [[ -f "$FAKE_REMOTE_TAG_STATE" ]]; then
@@ -204,6 +209,7 @@ exit 0
         FAKE_LOCAL_TAG_STATE: localTagState,
         FAKE_MERGE_REACHABLE: String(options.mergeReachable ?? true),
         FAKE_MERGE_SHA: releaseMergeSha,
+        FAKE_MERGED_PACKAGE_VERSION: options.mergedPackageVersion ?? releaseVersion,
         FAKE_NPM_VERSION: options.npmVersion ?? version,
         FAKE_ORIGIN_URL: options.originUrl ?? "git@github.com:donadiosolutions/lcm.git",
         FAKE_ORIGIN_PUSH_URLS: `${(options.originPushUrls ?? [options.originUrl ?? "git@github.com:donadiosolutions/lcm.git"]).join("\n")}\n`,
@@ -265,6 +271,15 @@ describe("manual release helper step 8", () => {
     expect(result.calls).toContain(`git|fetch|origin|refs/tags/${tag}:refs/tags/${tag}`);
     expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
     expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
+  });
+
+  it("pushes a matching signed local tag when the remote tag is absent", () => {
+    const result = runRelease({ localTagState: signedMatchingTag });
+
+    expect(result.status).toBe(0);
+    expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
+    expect(result.calls).toContain(`git|push|origin|refs/tags/${tag}`);
+    expect(result.remoteTagState).toBe(signedMatchingTag);
   });
 
   it("reuses matching local and remote signed tag objects idempotently", () => {
@@ -350,6 +365,15 @@ describe("manual release helper step 8", () => {
     expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
   });
 
+  it("refuses to tag a merge commit whose package version differs", () => {
+    const result = runRelease({ mergedPackageVersion: "9.9.8" });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`contains package version 9.9.8, expected ${version}`);
+    expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
+    expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
+  });
+
   it("uses the formatted origin error after helper declarations", () => {
     const result = runRelease({ originUrl: "git@github.com:example/lcm.git" });
 
@@ -424,6 +448,8 @@ describe("manual release helper step 8", () => {
 
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("PUBLISH_MAX_WAIT must be a non-negative integer in seconds");
+      expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
+      expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
     },
   );
 
@@ -455,6 +481,16 @@ describe("manual release helper step 8", () => {
     },
   );
 
+  it.each(["01.2.3", "1.02.3", "1.2.03"])(
+    "rejects stable-looking versions with leading zeros before repository access",
+    (releaseVersion: string) => {
+      const result = runRelease({ version: releaseVersion });
+
+      expect(result.status).toBe(1);
+      expect(result.calls).toEqual([]);
+    },
+  );
+
   it("fails final verification when the remote tag is deleted after publication", () => {
     const result = runRelease({ postPublishRemoteTagState: "" });
 
@@ -464,6 +500,15 @@ describe("manual release helper step 8", () => {
 
   it("fails final verification when the remote tag moves after publication", () => {
     const result = runRelease({ postPublishRemoteTagState: `${otherTagObjectSha} ${otherSha} tag signed` });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`git tag ${tag} does not resolve to merge commit ${mergeSha}`);
+  });
+
+  it("fails final verification when the remote tag object is replaced at the same commit", () => {
+    const result = runRelease({
+      postPublishRemoteTagState: `${otherTagObjectSha} ${mergeSha} tag signed`,
+    });
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`git tag ${tag} does not resolve to merge commit ${mergeSha}`);
