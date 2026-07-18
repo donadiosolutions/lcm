@@ -31,6 +31,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - New HTTP routes must have corresponding tests in `test/daemon/routes/`.
 - Tests should cover: happy path, missing required fields (400), and resource-not-found (404).
 - Flag PRs adding routes without tests.
+- Never delete legacy parsing fallbacks or defensive handling for non-`Error` thrown values merely to satisfy coverage. Cover those branches with deterministic failure injection while preserving compatibility behavior.
 
 ### SQLite transaction safety
 - Any operation that modifies more than one table must be wrapped in `BEGIN`/`COMMIT`.

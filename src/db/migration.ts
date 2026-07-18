@@ -71,7 +71,9 @@ function parseTimestamp(value: string | null | undefined): Date | null {
     return direct;
   }
 
-  return null;
+  const normalized = value.includes("T") ? value : `${value.replace(" ", "T")}Z`;
+  const parsed = new Date(normalized);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 function isoStringOrNull(value: Date | null): string | null {

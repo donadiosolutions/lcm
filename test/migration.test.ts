@@ -1,13 +1,14 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 
 const tempDirs: string[] = [];
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   closeLcmConnection();
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
@@ -266,6 +267,45 @@ describe("runLcmMigrations summary depth backfill", () => {
     });
     expect(rows.filter((row) => row.summary_id.startsWith("cycle-")).map((row) => row.depth)).toEqual([1, 1]);
     expect(rows.find((row) => row.summary_id === "cross-conversation")?.depth).toBe(1);
+  });
+
+  it("normalizes legacy timestamps when direct parsing fails", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-migration-legacy-timestamp-"));
+    tempDirs.push(tempDir);
+    const db = getLcmConnection(join(tempDir, "legacy.db"));
+    runLcmMigrations(db, { fts5Available: false });
+    db.prepare("INSERT INTO conversations (conversation_id, session_id) VALUES (1, 'legacy')").run();
+    db.prepare(
+      `INSERT INTO summaries
+       (summary_id, conversation_id, kind, content, token_count, created_at, file_ids)
+       VALUES ('legacy-leaf', 1, 'leaf', 'legacy', 1, 'legacy date', '[]')`,
+    ).run();
+
+    const NativeDate = Date;
+    class LegacyCompatibleDate extends NativeDate {
+      constructor(value?: string | number) {
+        if (value === undefined) {
+          super();
+        } else if (value === "legacy date") {
+          super(Number.NaN);
+        } else if (value === "legacyTdateZ") {
+          super("2026-01-01T00:00:00.000Z");
+        } else {
+          super(value);
+        }
+      }
+    }
+    vi.stubGlobal("Date", LegacyCompatibleDate);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const row = db.prepare(
+      "SELECT earliest_at, latest_at FROM summaries WHERE summary_id = 'legacy-leaf'",
+    ).get() as { earliest_at: string; latest_at: string };
+    expect(row).toEqual({
+      earliest_at: "2026-01-01T00:00:00.000Z",
+      latest_at: "2026-01-01T00:00:00.000Z",
+    });
   });
 
   it("rebuilds a stale external-content messages FTS table", () => {

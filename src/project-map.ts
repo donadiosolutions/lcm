@@ -151,7 +151,8 @@ function assertCurrentMapIsWritable(path: string): void {
   try {
     parseProjectMap(file.content);
   } catch (err) {
-    throw new Error(`refusing to overwrite invalid map.json: ${(err as Error).message}`);
+    const detail = err instanceof Error ? err.message : "map.json is invalid";
+    throw new Error(`refusing to overwrite invalid map.json: ${detail}`);
   }
 }
 
@@ -477,7 +478,7 @@ export function validateProjectMap(opts: { homeDir?: string; fix?: boolean } = {
       ok: false,
       map: null,
       path,
-      errors: [(err as Error).message],
+      errors: [err instanceof Error ? err.message : "map.json is invalid"],
       warnings: [],
       fixApplied: false,
     };

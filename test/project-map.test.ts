@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -45,6 +45,7 @@ describe("project map", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     clearProjectMapCache();
     if (tempHome) rmSync(tempHome, { recursive: true, force: true });
     tempHome = undefined;
@@ -142,6 +143,18 @@ describe("project map", () => {
     expect(readFileSync(projectMapPath(), "utf-8")).toBe("{not-json");
   });
 
+  it("reports a stable validation error when parsing throws a non-Error value", () => {
+    writeFileSync(projectMapPath(), "{not-json");
+    vi.spyOn(JSON, "parse").mockImplementationOnce(() => {
+      throw "parse failed";
+    });
+
+    const validation = validateProjectMap({ fix: true });
+
+    expect(validation.errors).toEqual(["map.json is invalid"]);
+    expect(validation.fixApplied).toBe(false);
+  });
+
   it("does not overwrite invalid map edits from a stale cache", () => {
     const canonical = makeDir("cached-canonical");
     resolveProjectIdentity(canonical);
@@ -151,6 +164,19 @@ describe("project map", () => {
 
     expect(() => resolveProjectIdentity(unseen)).toThrow(/refusing to overwrite invalid map\.json/);
     expect(readFileSync(projectMapPath(), "utf-8")).toBe("{not-json");
+  });
+
+  it("refuses an overwrite when map parsing throws a non-Error value", () => {
+    const canonical = makeDir("cached-canonical-non-error");
+    resolveProjectIdentity(canonical);
+    const unseen = makeDir("unseen-while-non-error");
+    vi.spyOn(JSON, "parse").mockImplementation(() => {
+      throw "parse failed";
+    });
+
+    expect(() => resolveProjectIdentity(unseen)).toThrow(
+      "refusing to overwrite invalid map.json: map.json is invalid",
+    );
   });
 
   it("keeps cached aliases when map.json temporarily disappears", () => {
