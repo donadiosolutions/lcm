@@ -1,0 +1,18 @@
+name: "LCM CodeQL security-extended"
+
+queries:
+  - uses: security-extended
+
+paths:
+  - src
+  - bin
+  - installer
+  - scripts
+  - .claude-plugin
+  - lcm.mjs
+  - mcp.mjs
+
+paths-ignore:
+  - dist
+  - coverage
+  - node_modules
