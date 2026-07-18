@@ -64,8 +64,18 @@ describe("lifecycle procfs and parent warnings", () => {
     mkdirSync(join(linuxRoot, "42", "fd"), { recursive: true });
     mkdirSync(join(linuxRoot, "net"), { recursive: true });
     symlinkSync("socket:[12345]", join(linuxRoot, "42", "fd", "7"));
-    writeFileSync(join(linuxRoot, "net", "tcp"), "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n 0: : 00000000:0000 0A 0:0 00:0 0 1000 0 12345\n 1: 0200007F:0D05 00000000:0000 0A 0:0 00:0 0 1000 0 12345\n 2: 0100007F: 00000000:0000 0A 0:0 00:0 0 1000 0 12345\n 3: 0100007F:0E99 00000000:0000 0A 0:0 00:0 0 1000 0 12345\n");
+    writeFileSync(join(linuxRoot, "net", "tcp"), [
+      "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+      "   0: 0100007F:0AAA 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 99999 1 0000000000000001 100 0 0 10 0",
+      "   1: 0200007F:0D05 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000002 100 0 0 10 0",
+      "   2: 0100007F:     00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000003 100 0 0 10 0",
+      "   3: 0100007F:0E99 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000004 100 0 0 10 0",
+      "",
+    ].join("\n"));
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot)).toEqual([3737]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 2730)).toEqual([]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 3333)).toEqual([]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 3737)).toEqual([3737]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, join(linuxRoot, "missing"))).toEqual([]);
 
     expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: false, reason: "missing-pid" })).toContain("PID file missing");

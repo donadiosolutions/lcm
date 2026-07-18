@@ -206,6 +206,9 @@ function findListeningTcpPorts(
         }
         for (const row of rows.split(/\r?\n/).slice(1)) {
           const columns = row.trim().split(/\s+/);
+          // Canonical /proc/net/tcp tokenization is: sl=0, local=1,
+          // remote=2, state=3, queues/timers=4..6, uid=7, timeout=8,
+          // inode=9, followed by ref/pointer fields.
           if (columns.length < 10 || columns[3] !== "0A" || !socketInodes.has(columns[9])) continue;
           const [addressHex, portHex] = columns[1]!.split(":");
           // Requests are sent specifically to 127.0.0.1. A socket on another
