@@ -42,7 +42,9 @@ function defaultDeps(): EnsureCoreDeps {
   };
 }
 
-export async function ensureCore(deps: EnsureCoreDeps = defaultDeps()): Promise<boolean> {
+export type VerifiedCoreEndpoint = { connected: boolean; port: number };
+
+export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): Promise<VerifiedCoreEndpoint> {
   if (deps.configPath === defaultConfigPath()) {
     migrateLegacyHomeIfNeeded();
   }
@@ -77,7 +79,11 @@ export async function ensureCore(deps: EnsureCoreDeps = defaultDeps()): Promise<
     spawnTimeoutMs: 5000,
     enforceUserManagerParent: true,
   });
-  return result.connected;
+  return { connected: result.connected, port: config.daemon.port };
+}
+
+export async function ensureCore(deps: EnsureCoreDeps = defaultDeps()): Promise<boolean> {
+  return (await ensureCoreEndpoint(deps)).connected;
 }
 
 export interface BootstrapDeps extends EnsureCoreDeps {

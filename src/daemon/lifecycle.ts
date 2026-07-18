@@ -672,6 +672,15 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
   let restartedForParent = false;
 
+  if (typeof expectedVersion !== "string" || expectedVersion.length === 0) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      warning: "daemon identity could not be verified because the installed version is unknown",
+    };
+  }
+
   function endpointIdentityMatches(health: HealthResponse | null): boolean {
     if (health?.status !== "ok" || health.pid === undefined) return false;
     const pid = readPidFile(opts.pidFilePath);

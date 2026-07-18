@@ -21,6 +21,7 @@ export async function dispatchHook(
   command: HookCommand,
   stdinText: string,
 ): Promise<{ exitCode: number; stdout: string }> {
+  let verifiedSnapshotPort: number | undefined;
   // Early return for post-tool — runs on EVERY tool call, must skip bootstrap for performance
   if (command === "post-tool") {
     const { handlePostToolUse } = await import("./post-tool.js");
@@ -35,16 +36,16 @@ export async function dispatchHook(
     try {
       const { session_id } = JSON.parse(stdinText || "{}");
       if (session_id) {
-        const { ensureBootstrapped, ensureCore } = await import("../bootstrap.js");
+        const { ensureBootstrapped, ensureCoreEndpoint } = await import("../bootstrap.js");
         // Session snapshots contain transcript paths and payload data, so they
         // reverify the current endpoint even when this session has a bootstrap
         // flag from an earlier healthy daemon.
-        const verified = command === "session-snapshot"
-          ? await ensureCore()
-          : await ensureBootstrapped(session_id);
+        const endpoint = command === "session-snapshot" ? await ensureCoreEndpoint() : undefined;
+        const verified = endpoint?.connected ?? await ensureBootstrapped(session_id);
         if (command === "session-snapshot" && !verified) {
           return { exitCode: 0, stdout: "" };
         }
+        if (command === "session-snapshot") verifiedSnapshotPort = endpoint!.port;
       }
     } catch {
       // Most hooks retain their existing best-effort behavior, but snapshots
@@ -81,7 +82,9 @@ export async function dispatchHook(
     }
     case "session-snapshot": {
       const { handleSessionSnapshot } = await import("./session-snapshot.js");
-      return handleSessionSnapshot(stdinText);
+      return verifiedSnapshotPort === undefined
+        ? handleSessionSnapshot(stdinText)
+        : handleSessionSnapshot(stdinText, { verifiedPort: verifiedSnapshotPort });
     }
     case "user-prompt": {
       const { handleUserPromptSubmit } = await import("./user-prompt.js");

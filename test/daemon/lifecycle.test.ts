@@ -52,6 +52,30 @@ function writeProcEntry(procRoot: string, pid: number, status: string, cmdline: 
 }
 
 describe("ensureDaemon", () => {
+  it("fails closed without inspecting or mutating PID state when the expected version is unknown", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-unknown-version-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "4242");
+    const fetchMock = vi.fn();
+    const killMock = vi.fn();
+    const listenerMock = vi.fn();
+
+    await expect(ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "",
+      _fetchOverride: fetchMock as FetchOverride,
+      _killOverride: killMock,
+      _listeningPortsOverride: listenerMock,
+    })).resolves.toMatchObject({ connected: false, spawned: false, warning: expect.stringContaining("version is unknown") });
+
+    expect(readFileSync(pidFile, "utf-8")).toBe("4242");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(killMock).not.toHaveBeenCalled();
+    expect(listenerMock).not.toHaveBeenCalled();
+  });
   it("finds the current user systemd manager and process parent from procfs", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-proc-"));
     tempDirs.push(tempDir);

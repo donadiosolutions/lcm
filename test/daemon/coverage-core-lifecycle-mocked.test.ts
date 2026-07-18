@@ -33,7 +33,7 @@ afterEach(() => {
 });
 
 const base = (): EnsureDaemonOptions => ({
-  port: 1, pidFilePath: "/runtime/daemon.pid", spawnTimeoutMs: 1, _platform: "linux" as const,
+  port: 1, pidFilePath: "/runtime/daemon.pid", spawnTimeoutMs: 1, expectedVersion: "1", _platform: "linux" as const,
   enforceUserManagerParent: true, _fetchOverride: vi.fn().mockRejectedValue(new Error("down")),
   _spawnOverride: vi.fn(() => ({ pid: undefined, once: vi.fn(), unref: vi.fn() })) as unknown as SpawnOverride,
   _monotonicNowOverride: (): number => 0,

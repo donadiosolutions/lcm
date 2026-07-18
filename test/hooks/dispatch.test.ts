@@ -36,12 +36,12 @@ vi.mock("../../src/daemon/config.js", () => ({
 }));
 vi.mock("../../src/bootstrap.js", () => ({
   ensureBootstrapped: vi.fn().mockResolvedValue(true),
-  ensureCore: vi.fn().mockResolvedValue(true),
+  ensureCoreEndpoint: vi.fn().mockResolvedValue({ connected: true, port: 3737 }),
 }));
 
 import { validateAndFixHooks } from "../../src/hooks/auto-heal.js";
 import { dispatchHook, isHookCommand } from "../../src/hooks/dispatch.js";
-import { ensureBootstrapped, ensureCore } from "../../src/bootstrap.js";
+import { ensureBootstrapped, ensureCoreEndpoint } from "../../src/bootstrap.js";
 
 describe("HOOK_COMMANDS", () => {
   it("has an entry for every REQUIRED_HOOKS event", () => {
@@ -161,18 +161,26 @@ describe("dispatchHook", () => {
 
   it.each([false, "throw"] as const)("does not dispatch snapshots when bootstrap verification is %s", async (mode) => {
     vi.mocked(handleSessionSnapshot).mockClear();
-    if (mode === "throw") vi.mocked(ensureCore).mockRejectedValueOnce(new Error("bootstrap failed"));
-    else vi.mocked(ensureCore).mockResolvedValueOnce(false);
+    if (mode === "throw") vi.mocked(ensureCoreEndpoint).mockRejectedValueOnce(new Error("bootstrap failed"));
+    else vi.mocked(ensureCoreEndpoint).mockResolvedValueOnce({ connected: false, port: 3737 });
     await expect(dispatchHook("session-snapshot", JSON.stringify({ session_id: "s1" }))).resolves.toEqual({ exitCode: 0, stdout: "" });
     expect(handleSessionSnapshot).not.toHaveBeenCalled();
   });
 
   it("reverifies snapshot identity even when the session was already bootstrapped", async () => {
     vi.mocked(ensureBootstrapped).mockClear();
-    vi.mocked(ensureCore).mockClear();
+    vi.mocked(ensureCoreEndpoint).mockClear();
     await dispatchHook("session-snapshot", JSON.stringify({ session_id: "s1" }));
-    expect(ensureCore).toHaveBeenCalledOnce();
+    expect(ensureCoreEndpoint).toHaveBeenCalledOnce();
     expect(ensureBootstrapped).not.toHaveBeenCalled();
+  });
+
+  it("binds snapshot dispatch to the verified port when configuration changes afterward", async () => {
+    vi.mocked(ensureCoreEndpoint).mockResolvedValueOnce({ connected: true, port: 3737 });
+    vi.mocked(loadDaemonConfig).mockReturnValueOnce(configWithDaemon({ port: 9999 }));
+    vi.mocked(handleSessionSnapshot).mockClear();
+    await dispatchHook("session-snapshot", JSON.stringify({ session_id: "s1" }));
+    expect(handleSessionSnapshot).toHaveBeenCalledWith(expect.any(String), { verifiedPort: 3737 });
   });
 
   it("routes post-tool without calling ensureBootstrapped", async () => {

@@ -10,6 +10,7 @@ export interface SnapshotDeps {
   writeFileSync: (path: string, data: string) => void;
   snapshotIntervalSec: number;
   post: (path: string, body: Record<string, unknown>) => Promise<unknown>;
+  verifiedPort: number;
 }
 
 function defaultStatSync(path: string): { mtimeMs: number } | null {
@@ -67,7 +68,7 @@ export async function handleSessionSnapshot(
       const { loadDaemonConfig } = await import("../daemon/config.js");
       const { readFileSync: _readFileSync } = await import("node:fs");
       const config = loadDaemonConfig(defaultConfigPath());
-      const port = normalizeDaemonPort(config.daemon?.port ?? 3737);
+      const port = deps?.verifiedPort ?? normalizeDaemonPort(config.daemon?.port ?? 3737);
 
       // Read token from token file if available (silent fallback if not found)
       let token: string | null = null;
