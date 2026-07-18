@@ -109,7 +109,23 @@ function nonWhitespaceRanges(text: string): TextRange[] {
 }
 
 function hasPositiveLookbehind(source: string): boolean {
-  return /(?:^|[^\\])(?:\\\\)*\(\?<=/u.test(source);
+  let inCharacterClass = false;
+  for (let index = 0; index < source.length; index++) {
+    if (source[index] === "\\") {
+      index++;
+      continue;
+    }
+    if (source[index] === "[") {
+      inCharacterClass = true;
+      continue;
+    }
+    if (source[index] === "]" && inCharacterClass) {
+      inCharacterClass = false;
+      continue;
+    }
+    if (!inCharacterClass && source.startsWith("(?<=", index)) return true;
+  }
+  return false;
 }
 
 function hasUnescapedAlternation(source: string): boolean {

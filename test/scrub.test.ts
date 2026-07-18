@@ -201,6 +201,16 @@ describe("ScrubEngine — custom patterns", () => {
     }
   });
 
+  it("ignores lookbehind-like text inside a character class when choosing direction", () => {
+    const result = new ScrubEngine([
+      "(?=[(?<=])|(?=\\s+SECRET_[A-Z]+)",
+    ], []).scrubWithCounts("safe SECRET_VALUE");
+
+    expect(result).toEqual({
+      text: "safe [REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
   it("preserves consuming alternatives after expanding a zero-width match", () => {
     const result = new ScrubEngine(["(?=SAFE)|SECRET\\s+VALUE"], [])
       .scrubWithCounts("SAFESECRET VALUE");
