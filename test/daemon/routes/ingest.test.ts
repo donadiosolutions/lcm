@@ -235,4 +235,60 @@ describe("POST /ingest", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ingested: 0, totalTokens: 0 });
   });
+
+  it("filters malformed structured messages and returns zero when none remain", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-invalid-messages-"));
+    tempDirs.push(tempDir);
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const res = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "invalid-messages",
+        cwd: tempDir,
+        messages: [null, "text", {}, { role: "invalid", content: "x", tokenCount: 1 },
+          { role: "user", content: 1, tokenCount: 1 },
+          { role: "user", content: "x", tokenCount: "1" }],
+      }),
+    });
+    expect(await res.json()).toEqual({ ingested: 0, totalTokens: 0 });
+  });
+
+  it("does not append messages already persisted for the session", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-repeat-"));
+    tempDirs.push(tempDir);
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const payload = {
+      session_id: "repeat-session",
+      cwd: tempDir,
+      messages: [{ role: "user", content: "once", tokenCount: 1 }],
+    };
+    const first = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    expect((await first.json()).ingested).toBe(1);
+    const second = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    expect(await second.json()).toEqual({ ingested: 0, totalTokens: 0 });
+  });
+
+  it("skips a session recorded as fully ingested", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-complete-"));
+    tempDirs.push(tempDir);
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const bootstrap = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "bootstrap", cwd: tempDir, messages: [{ role: "user", content: "x", tokenCount: 1 }] }),
+    });
+    expect(bootstrap.status).toBe(200);
+    const db = new DatabaseSync(projectDbPath(tempDir));
+    db.prepare("INSERT INTO session_ingest_log (session_id, message_count) VALUES (?, ?)").run("complete-session", 1);
+    db.close();
+    const res = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "complete-session", cwd: tempDir, messages: [{ role: "user", content: "ignored", tokenCount: 1 }] }),
+    });
+    expect(await res.json()).toEqual({ ingested: 0, totalTokens: 0 });
+  });
 });

@@ -683,7 +683,8 @@ export class ConversationStore {
     }
     args.push(limit);
 
-    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    // A non-empty search plan always contributes at least one predicate.
+    const whereClause = `WHERE ${where.join(" AND ")}`;
     const rows = this.db
       .prepare(
         `SELECT message_id, conversation_id, seq, role, content, token_count, created_at

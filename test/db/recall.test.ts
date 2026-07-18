@@ -57,6 +57,34 @@ describe("RecallStore.logSurfacing", () => {
 });
 
 describe("RecallStore.getStats", () => {
+  it("uses a placeholder when an acted-upon memory no longer exists", () => {
+    const db = makeDb();
+    db.prepare(
+      `INSERT INTO promoted (id, content, tags, project_id, confidence, depth)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "orphan-signal",
+      "orphan action",
+      JSON.stringify(["signal:memory_used", "memory_id:missing-memory"]),
+      "p1",
+      1,
+      0,
+    );
+    expect(new RecallStore(db).getStats().topRecalled[0]).toMatchObject({
+      id: "missing-memory",
+      content: "(memory not found)",
+    });
+  });
+
+  it("ignores usage signals without a memory id tag", () => {
+    const db = makeDb();
+    db.prepare(
+      `INSERT INTO promoted (id, content, tags, project_id, confidence, depth)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run("no-memory-id", "action", JSON.stringify(["signal:memory_used"]), "p1", 1, 0);
+    expect(new RecallStore(db).getStats().memoriesActedUpon).toBe(0);
+  });
+
   it("returns zeros when no data exists", () => {
     const db = makeDb();
     const store = new RecallStore(db);
@@ -169,6 +197,42 @@ describe("RecallStore.getStats", () => {
 });
 
 describe("RecallStore.getFeedback", () => {
+  it("returns an empty map for no requested memories", () => {
+    const store = new RecallStore(makeDb());
+    expect(store.getFeedback([]).size).toBe(0);
+    expect((store as unknown as { collectUsageCounts(ids: string[]): Map<string, number> })
+      .collectUsageCounts([]).size).toBe(0);
+  });
+
+  it("ignores a filtered row whose actual memory id was not requested", () => {
+    const db = makeDb();
+    db.prepare(
+      `INSERT INTO promoted (id, content, tags, project_id, confidence, depth)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "misleading-signal",
+      "action",
+      JSON.stringify(["signal:memory_used", "memory_id:other", "memory_id:requested"]),
+      "p1",
+      1,
+      0,
+    );
+    expect(new RecallStore(db).getFeedback(["requested"]).get("requested")?.usageCount).toBe(0);
+  });
+
+  it("defensively handles adapter rows outside the requested id set", () => {
+    const db = {
+      prepare: (sql: string) => ({
+        all: () => sql.includes("recall_surfacing")
+          ? [{ memory_id: "other", surfacing_count: 2, last_surfaced_at: null }]
+          : [{ tags: JSON.stringify(["signal:memory_used", "memory_id:requested"]) }],
+      }),
+    } as unknown as DatabaseSync;
+    const feedback = new RecallStore(db).getFeedback(["requested"]);
+    expect(feedback.get("requested")?.usageCount).toBe(1);
+    expect(feedback.get("other")?.surfacingCount).toBe(2);
+  });
+
   it("aggregates usage counts and surfacing metadata for requested memories", () => {
     const db = makeDb();
     const promoted = new PromotedStore(db);

@@ -74,6 +74,12 @@ describe("buildLikeSearchPlan", () => {
     expect(plan.terms).toEqual([]);
   });
 
+  it("falls back to the normalized whole query when every token is punctuation", () => {
+    const plan = buildLikeSearchPlan("content", "- -");
+    expect(plan.terms).toEqual([" "]);
+    expect(plan.args).toEqual(["% %"]);
+  });
+
   it("uses the column name in WHERE clauses", () => {
     const plan = buildLikeSearchPlan("my_column", "test");
     expect(plan.where[0]).toContain("my_column");
@@ -136,6 +142,10 @@ describe("createFallbackSnippet", () => {
     const result = createFallbackSnippet("some content", []);
     // Falls back to head truncation — no crash
     expect(typeof result).toBe("string");
+  });
+
+  it("handles an explicitly empty matching term", () => {
+    expect(createFallbackSnippet("content", [""])).toBe("content");
   });
 
   it("is case-insensitive when finding matches", () => {

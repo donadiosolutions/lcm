@@ -4,10 +4,11 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { EventsDb } from "../../../src/hooks/events-db.js";
-import { createPromoteAllEventsHandler, createPromoteEventsHandler, promoteEventsForCwd } from "../../../src/daemon/routes/promote-events.js";
+import { createPromoteAllEventsHandler, createPromoteEventsHandler, drainEventsForCwd, promoteEventsForCwd } from "../../../src/daemon/routes/promote-events.js";
 import { ensureProjectDir, projectDbPath, projectId } from "../../../src/daemon/project.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
+import { PromotedStore } from "../../../src/db/promoted.js";
 
 const eventPathMocks = vi.hoisted(() => ({
   eventsDir: vi.fn(),
@@ -268,6 +269,80 @@ describe("promote-events route", () => {
 
     expect(res.writeHead).toHaveBeenCalledWith(400, expect.any(Object));
     expect(getBody().error).toBe("cwd is required");
+    const emptyBody = mockRes();
+    await handler({} as any, emptyBody.res, "");
+    expect(emptyBody.getBody().error).toBe("cwd is required");
+  });
+
+  it("returns generic errors for invalid cwd and sidecar failures", async () => {
+    const handler = createPromoteEventsHandler(makeConfig());
+    const invalid = mockRes();
+    await handler({} as any, invalid.res, JSON.stringify({ cwd: join(dir, "missing") }));
+    expect(invalid.getBody()).toEqual({ error: "cwd is invalid" });
+
+    writeFileSync(sidecarPath, "not sqlite");
+    const failed = mockRes();
+    await handler({} as any, failed.res, JSON.stringify({ cwd: dir }));
+    expect(failed.res.writeHead).toHaveBeenCalledWith(500, expect.any(Object));
+    expect(failed.getBody()).toEqual({ error: "failed to promote events" });
+  });
+
+  it("stops a drain when all remaining promotions fail", async () => {
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "decision", category: "decision", data: "retry me", priority: 1 }, "PostToolUse");
+    edb.close();
+    setupProjectDb(dir).close();
+    vi.mocked(deduplicateAndInsert).mockRejectedValueOnce(new Error("transient"));
+
+    const result = await drainEventsForCwd(makeConfig(), dir);
+    expect(result).toMatchObject({ batches: 1, incomplete: true, errors: 1, message: "stopped because remaining events failed to promote" });
+  });
+
+  it("covers confidence defaults, tier variants, correlation guards, and existing pattern matches", async () => {
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "error", category: "error", data: "error without separator", priority: 1 }, "PostToolUse");
+    edb.insertEvent("s1", { type: "error", category: "error", data: "command: fixme broken", priority: 1 }, "PostToolUse");
+    edb.insertEvent("s1", { type: "plan", category: "plan", data: "plan fixme now", priority: 1 }, "PostToolUse");
+    edb.insertEvent("s2", { type: "git", category: "git", data: "batch workflow", priority: 2 }, "PostToolUse");
+    edb.insertEvent("s3", { type: "custom", category: "custom", data: "custom pattern", priority: 3 }, "PostToolUse");
+    edb.insertEvent("s4", { type: "file_read", category: "file", data: "known pattern", priority: 3 }, "PostToolUse");
+    edb.close();
+
+    const db = setupProjectDb(dir);
+    new PromotedStore(db).insert({ content: "known pattern", tags: [], projectId: projectId(dir) });
+    db.close();
+
+    const config = makeConfig();
+    config.compaction.promotionThresholds.eventConfidence = undefined;
+    config.compaction.promotionThresholds.dedupBm25Threshold = undefined;
+    config.compaction.promotionThresholds.dedupCandidateLimit = undefined;
+    config.compaction.promotionThresholds.insightsMaxAgeDays = undefined;
+    config.compaction.promotionThresholds.maxConfidence = undefined;
+    config.compaction.promotionThresholds.reinforcementBoost = undefined;
+    const result = await promoteEventsForCwd(config, dir);
+    expect(result.promoted).toBeGreaterThanOrEqual(5);
+    expect(vi.mocked(deduplicateAndInsert).mock.calls.some(([input]) => input.thresholds.dedupBm25Threshold === 15)).toBe(true);
+  });
+
+  it("reports a global project whose drain throws", async () => {
+    const projectCwd = mkdtempSync(join(tmpdir(), "promote-all-throw-"));
+    extraDirs.push(projectCwd);
+    const path = join(dir, `${projectId(projectCwd)}.db`);
+    ensureProjectDir(projectCwd);
+    const edb = new EventsDb(path);
+    edb.insertEvent("s", { type: "decision", category: "decision", data: "throw", priority: 1 }, "PostToolUse");
+    edb.close();
+    setupProjectDb(projectCwd).close();
+    const getUnprocessed = vi.spyOn(EventsDb.prototype, "getUnprocessed").mockImplementationOnce(() => {
+      throw new Error("sidecar read failed");
+    });
+    try {
+      const output = mockRes();
+      await createPromoteAllEventsHandler(makeConfig())({} as any, output.res, "");
+      expect(output.getBody()).toMatchObject({ failedProjects: 1, errors: 1 });
+    } finally {
+      getUnprocessed.mockRestore();
+    }
   });
 
   it("promotes metadata-backed sidecars across all projects", async () => {

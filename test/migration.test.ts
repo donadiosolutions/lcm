@@ -224,6 +224,66 @@ describe("runLcmMigrations summary depth backfill", () => {
 
     expect(ftsTables).toEqual([]);
   });
+
+  it("recovers cyclic lineage and malformed legacy timestamps", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-migration-cycle-"));
+    tempDirs.push(tempDir);
+    const db = getLcmConnection(join(tempDir, "legacy.db"));
+    runLcmMigrations(db, { fts5Available: false });
+    const conversation = db.prepare("INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)");
+    conversation.run(1, "cycle");
+    conversation.run(2, "external-parent");
+    const insert = db.prepare(
+      `INSERT INTO summaries
+       (summary_id, conversation_id, kind, content, token_count, created_at, file_ids)
+       VALUES (?, 1, ?, ?, ?, ?, '[]')`,
+    );
+    insert.run("leaf-empty", "leaf", "empty", -5, "");
+    insert.run("cycle-a", "condensed", "a", 10, "invalidT");
+    insert.run("cycle-b", "condensed", "b", 10, "not a timestamp");
+    db.prepare(
+      `INSERT INTO summaries
+       (summary_id, conversation_id, kind, content, token_count, created_at, file_ids)
+       VALUES (?, 2, 'leaf', 'external', 5, '2026-01-01T00:00:00.000Z', '[]')`,
+    ).run("external-leaf");
+    insert.run("cross-conversation", "condensed", "cross", 10, "2026-01-02T00:00:00.000Z");
+    const edge = db.prepare(
+      "INSERT INTO summary_parents (summary_id, parent_summary_id, ordinal) VALUES (?, ?, ?)",
+    );
+    edge.run("cycle-a", "cycle-b", 0);
+    edge.run("cycle-b", "cycle-a", 0);
+    edge.run("cross-conversation", "external-leaf", 0);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const rows = db.prepare(
+      "SELECT summary_id, depth, earliest_at, latest_at FROM summaries ORDER BY summary_id",
+    ).all() as Array<{ summary_id: string; depth: number; earliest_at: string | null; latest_at: string | null }>;
+    expect(rows.find((row) => row.summary_id === "leaf-empty")).toMatchObject({
+      depth: 0,
+      earliest_at: null,
+      latest_at: null,
+    });
+    expect(rows.filter((row) => row.summary_id.startsWith("cycle-")).map((row) => row.depth)).toEqual([1, 1]);
+    expect(rows.find((row) => row.summary_id === "cross-conversation")?.depth).toBe(1);
+  });
+
+  it("rebuilds a stale external-content messages FTS table", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-migration-stale-fts-"));
+    tempDirs.push(tempDir);
+    const db = getLcmConnection(join(tempDir, "legacy.db"));
+    runLcmMigrations(db, { fts5Available: false });
+    db.exec(`CREATE VIRTUAL TABLE messages_fts USING fts5(
+      content, content='messages', content_rowid='message_id'
+    )`);
+
+    runLcmMigrations(db);
+
+    const schema = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'",
+    ).get() as { sql: string };
+    expect(schema.sql).not.toContain("content_rowid");
+  });
 });
 
 describe("promoted table migration", () => {

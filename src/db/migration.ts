@@ -71,9 +71,7 @@ function parseTimestamp(value: string | null | undefined): Date | null {
     return direct;
   }
 
-  const normalized = value.includes("T") ? value : `${value.replace(" ", "T")}Z`;
-  const parsed = new Date(normalized);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
+  return null;
 }
 
 function isoStringOrNull(value: Date | null): string | null {
@@ -174,11 +172,7 @@ function backfillSummaryDepths(db: DatabaseSync): void {
     }
 
     for (const summary of summaries) {
-      const depth = depthBySummaryId.get(summary.summary_id);
-      if (depth == null) {
-        continue;
-      }
-      updateDepthStmt.run(depth, summary.summary_id);
+      updateDepthStmt.run(depthBySummaryId.get(summary.summary_id)!, summary.summary_id);
     }
   }
 }
@@ -208,10 +202,6 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
          ORDER BY depth ASC, created_at ASC`,
       )
       .all(conversationId) as SummaryDepthRow[];
-    if (summaries.length === 0) {
-      continue;
-    }
-
     const leafRanges = db
       .prepare(
         `SELECT
@@ -264,7 +254,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
       }
     >();
     const tokenCountBySummaryId = new Map(
-      summaries.map((summary) => [summary.summary_id, Math.max(0, Math.floor(summary.token_count ?? 0))]),
+      summaries.map((summary) => [summary.summary_id, Math.max(0, Math.floor(summary.token_count))]),
     );
 
     for (const summary of summaries) {
@@ -322,7 +312,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
         }
 
         descendantCount += Math.max(0, parentMetadata.descendantCount) + 1;
-        const parentTokenCount = tokenCountBySummaryId.get(parentId) ?? 0;
+        const parentTokenCount = tokenCountBySummaryId.get(parentId)!;
         descendantTokenCount +=
           Math.max(0, parentTokenCount) + Math.max(0, parentMetadata.descendantTokenCount);
         sourceMessageTokenCount += Math.max(0, parentMetadata.sourceMessageTokenCount);
@@ -338,11 +328,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
     }
 
     for (const summary of summaries) {
-      const metadata = metadataBySummaryId.get(summary.summary_id);
-      if (!metadata) {
-        continue;
-      }
-
+      const metadata = metadataBySummaryId.get(summary.summary_id)!;
       updateMetadataStmt.run(
         isoStringOrNull(metadata.earliestAt),
         isoStringOrNull(metadata.latestAt),

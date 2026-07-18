@@ -73,9 +73,10 @@ export function getPoolStats(): PoolStats {
   const connections = Array.from(_connections.entries()).map(([path, entry]) => ({
     path,
     refs: entry.refs,
-    status: (entry.refs > 0 ? "active" : "idle") as "active" | "idle",
+    // Zero-ref entries are evicted immediately by closeLcmConnection.
+    status: "active" as const,
   }));
-  const activeConnections = connections.filter((c) => c.status === "active").length;
+  const activeConnections = connections.length;
   return {
     totalConnections: connections.length,
     activeConnections,

@@ -31,6 +31,30 @@ function makeDb(): DatabaseSync {
 // ---------------------------------------------------------------------------
 
 describe("getLcmDbFeatures", () => {
+  it("reports unavailable FTS and ignores failed probe cleanup", () => {
+    let calls = 0;
+    const db = {
+      exec: () => {
+        calls += 1;
+        throw new Error("fts unavailable");
+      },
+    } as unknown as DatabaseSync;
+    expect(getLcmDbFeatures(db)).toEqual({ fts5Available: false });
+    expect(calls).toBe(2);
+  });
+
+  it("reports unavailable FTS after successful cleanup of a failed probe", () => {
+    let calls = 0;
+    const db = {
+      exec: () => {
+        calls += 1;
+        if (calls === 2) throw new Error("fts unavailable");
+      },
+    } as unknown as DatabaseSync;
+    expect(getLcmDbFeatures(db)).toEqual({ fts5Available: false });
+    expect(calls).toBe(3);
+  });
+
   it("returns a features object with fts5Available boolean", () => {
     const db = makeDb();
     const features = getLcmDbFeatures(db);

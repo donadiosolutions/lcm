@@ -19,6 +19,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { getLcmConnection, closeLcmConnection } from "../../src/db/connection.js";
 import { runLcmMigrations } from "../../src/db/migration.js";
 import { PromotedStore } from "../../src/db/promoted.js";
+import type { DatabaseSync } from "node:sqlite";
 
 const tempDirs: string[] = [];
 
@@ -39,6 +40,73 @@ function makeDb() {
 }
 
 describe("PromotedStore extended", () => {
+  it("handles persistence rows disappearing between promoted operations", () => {
+    const calls: string[] = [];
+    const db = {
+      exec: (sql: string) => calls.push(sql),
+      prepare: (sql: string) => ({
+        get: () => undefined,
+        run: (...args: unknown[]) => calls.push(`${sql}:${JSON.stringify(args)}`),
+      }),
+    } as unknown as DatabaseSync;
+    const store = new PromotedStore(db);
+
+    expect(store.insert({ content: "orphan", projectId: "project" })).toBeTypeOf("string");
+    store.archive("missing");
+    store.revive("missing");
+
+    expect(calls.some((call) => call.startsWith("UPDATE promoted SET archived_at"))).toBe(true);
+    expect(calls.every((call) => !call.startsWith("DELETE FROM promoted_fts"))).toBe(true);
+    expect(calls).not.toContain("BEGIN");
+  });
+
+  it("updates content with replacement tags and an explicit confidence", () => {
+    const db = makeDb();
+    const store = new PromotedStore(db);
+    const id = store.insert({ content: "before", tags: ["old"], projectId: "project" });
+
+    store.update(id, { content: "after", tags: ["new"], confidence: 0.25 });
+
+    const row = store.getById(id);
+    expect(row?.content).toBe("after");
+    expect(row?.confidence).toBe(0.25);
+    expect(JSON.parse(row?.tags ?? "[]")).toEqual(["new"]);
+
+    store.update(id, { content: "after again" });
+    expect(store.getById(id)?.confidence).toBe(0.25);
+  });
+
+  it("ignores usage signals for other stale candidates", () => {
+    const db = makeDb();
+    const store = new PromotedStore(db);
+    const staleId = store.insert({ content: "stale", projectId: "project" });
+    store.insert({
+      content: "unrelated usage",
+      tags: ["signal:memory_used", "memory_id:someone-else"],
+      projectId: "project",
+    });
+    db.prepare("UPDATE promoted SET created_at = ? WHERE id = ?").run("2020-01-01 00:00:00", staleId);
+
+    expect(store.findStale({ staleAfterDays: 1, staleSurfacingWithoutUseLimit: 2 })).toEqual([
+      expect.objectContaining({ id: staleId, usageCount: 0 }),
+    ]);
+  });
+
+  it("rolls back revive when the promoted row update fails", () => {
+    const execCalls: string[] = [];
+    const db = {
+      exec: (sql: string) => execCalls.push(sql),
+      prepare: (sql: string) => ({
+        get: () => ({ rowid: 1, content: "content", tags: "[]" }),
+        run: () => {
+          if (sql.startsWith("UPDATE promoted")) throw new Error("update failed");
+        },
+      }),
+    } as unknown as DatabaseSync;
+    expect(() => new PromotedStore(db).revive("id")).toThrow("update failed");
+    expect(execCalls).toEqual(["BEGIN", "ROLLBACK"]);
+  });
+
   // ── getById ──────────────────────────────────────────────────────────────
 
   it("getById returns null for a non-existent id", () => {

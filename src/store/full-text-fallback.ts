@@ -24,7 +24,8 @@ function escapeLike(term: string): string {
 export function buildLikeSearchPlan(column: string, query: string): LikeSearchPlan {
   const terms: string[] = [];
   for (const match of query.matchAll(RAW_TERM_RE)) {
-    const raw = match[1] ?? match[2] ?? "";
+    // RAW_TERM_RE always captures either the quoted or unquoted alternative.
+    const raw = match[1] ?? match[2]!;
     const normalized = normalizeFallbackTerm(raw);
     if (normalized.length > 0 && !terms.includes(normalized)) {
       terms.push(normalized);

@@ -1,13 +1,30 @@
 // test/db/events-stats.test.ts
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 let mockEventsDir: string;
+let mockProjectsDir: string;
 vi.mock("../../src/db/events-path.js", () => ({
   eventsDir: () => mockEventsDir,
 }));
+vi.mock("../../src/runtime-paths.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../src/runtime-paths.js")>(),
+  projectsDir: () => mockProjectsDir,
+}));
+vi.mock("../../src/hooks/events-db.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/hooks/events-db.js")>();
+  return {
+    ...actual,
+    EventsDb: class extends actual.EventsDb {
+      constructor(path: string) {
+        if (path.endsWith("string-error.db")) throw "non-error failure";
+        super(path);
+      }
+    },
+  };
+});
 
 import { collectDetailedEventStats, collectEventStats } from "../../src/db/events-stats.js";
 import { collectEventSidecars } from "../../src/db/event-sidecars.js";
@@ -19,6 +36,8 @@ describe("collectEventStats", () => {
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "events-stats-test-"));
     mockEventsDir = tempDir;
+    mockProjectsDir = join(tempDir, "projects");
+    mkdirSync(mockProjectsDir, { recursive: true });
   });
 
   afterEach(() => {
@@ -69,8 +88,60 @@ describe("collectEventStats", () => {
   });
 
   it("respects timeout budget", () => {
+    const db = new EventsDb(join(tempDir, "timeout.db"));
+    db.close();
     const stats = collectEventStats(0);
     expect(stats.captured).toBe(0);
+    expect(stats.scanSkipped).toBe(1);
+  });
+
+  it("returns no sidecars when the events directory cannot be read", () => {
+    mockEventsDir = join(tempDir, "missing-events-dir");
+    expect(collectEventSidecars()).toEqual([]);
+  });
+
+  it("loads valid project metadata and ignores invalid or empty metadata", () => {
+    for (const [projectId, metadata] of [
+      ["valid-meta", JSON.stringify({ cwd: "/workspace/project" })],
+      ["invalid-meta", "not-json"],
+      ["empty-meta", JSON.stringify({ cwd: "" })],
+      ["typed-meta", JSON.stringify({ cwd: 42 })],
+    ] as const) {
+      const db = new EventsDb(join(tempDir, `${projectId}.db`));
+      db.insertEvent("s", { type: "decision", category: "decision", data: projectId, priority: 1 }, "PostToolUse");
+      db.close();
+      const projectDir = join(mockProjectsDir, projectId);
+      mkdirSync(projectDir, { recursive: true });
+      writeFileSync(join(projectDir, "meta.json"), metadata);
+    }
+
+    const sidecars = collectEventSidecars({ pruneOrphanSidecars: false });
+    expect(sidecars.find((entry) => entry.projectId === "valid-meta")?.cwd).toBe("/workspace/project");
+    for (const projectId of ["invalid-meta", "empty-meta", "typed-meta"]) {
+      expect(sidecars.find((entry) => entry.projectId === projectId)?.cwd).toBeUndefined();
+    }
+  });
+
+  it("preserves fresh and malformed-date processed orphan sidecars", () => {
+    for (const [file, createdAt] of [["fresh.db", "datetime('now')"], ["invalid-date.db", "'invalid'"]] as const) {
+      const path = join(tempDir, file);
+      const db = new EventsDb(path);
+      db.insertEvent("s", { type: "decision", category: "decision", data: file, priority: 1 }, "PostToolUse");
+      const events = db.getUnprocessed();
+      db.markProcessed(events.map((event) => event.event_id));
+      db.raw().exec(`UPDATE events SET created_at = ${createdAt}`);
+      db.close();
+    }
+
+    const sidecars = collectEventSidecars({ pruneOrphanSidecars: true });
+    expect(sidecars.find((entry) => entry.file === "fresh.db")?.pruned).toBeUndefined();
+    expect(sidecars.find((entry) => entry.file === "invalid-date.db")?.pruned).toBeUndefined();
+  });
+
+  it("normalizes non-Error sidecar scan failures", () => {
+    writeFileSync(join(tempDir, "string-error.db"), "trigger");
+    expect(collectEventSidecars({ pruneOrphanSidecars: false })[0].scanError)
+      .toBe("failed to scan sidecar");
   });
 
   it("surfaces sidecars skipped by scan limits", () => {
@@ -169,5 +240,15 @@ describe("collectEventStats", () => {
     expect(stats.projects).toHaveLength(1);
     expect(stats.projects[0].scanError).toBeTruthy();
     expect(stats.projects[0].path).toContain("corrupt.db");
+  });
+
+  it("includes recent errors from healthy sidecars in detailed stats", () => {
+    const db = new EventsDb(join(tempDir, "detailed.db"));
+    db.insertEvent("s", { type: "decision", category: "decision", data: "d", priority: 1 }, "PostToolUse");
+    db.logHookError("PostToolUse", new Error("detailed failure"));
+    db.close();
+
+    const stats = collectDetailedEventStats({ pruneOrphanSidecars: false });
+    expect(stats.recentErrors.some((entry) => entry.error.includes("detailed failure"))).toBe(true);
   });
 });

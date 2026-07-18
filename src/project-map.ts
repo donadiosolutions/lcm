@@ -151,8 +151,7 @@ function assertCurrentMapIsWritable(path: string): void {
   try {
     parseProjectMap(file.content);
   } catch (err) {
-    const detail = err instanceof Error ? err.message : "map.json is invalid";
-    throw new Error(`refusing to overwrite invalid map.json: ${detail}`);
+    throw new Error(`refusing to overwrite invalid map.json: ${(err as Error).message}`);
   }
 }
 
@@ -216,9 +215,7 @@ function loadProjectMapWithMetadata(opts: { strict?: boolean; reload?: boolean; 
     return populated.map;
   }
 
-  if (cache?.path === path) {
-    cache = { ...cache, map: cloneMap(map), metadataPopulated: true };
-  }
+  cache = { ...cache!, map: cloneMap(map), metadataPopulated: true };
   return map;
 }
 
@@ -480,7 +477,7 @@ export function validateProjectMap(opts: { homeDir?: string; fix?: boolean } = {
       ok: false,
       map: null,
       path,
-      errors: [err instanceof Error ? err.message : "map.json is invalid"],
+      errors: [(err as Error).message],
       warnings: [],
       fixApplied: false,
     };
@@ -549,7 +546,6 @@ export function watchProjectMap(): { close: () => void } {
   let timer: ReturnType<typeof setTimeout> | undefined;
 
   const arm = () => {
-    if (closed) return;
     try {
       watcher?.close();
       const watchPath = existsSync(path) ? path : dirname(path);

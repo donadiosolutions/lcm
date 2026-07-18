@@ -50,16 +50,15 @@ function failedSidecarSummary(
   file: string,
   path: string,
   scanError: string,
-  resolveMetadata = true,
 ): EventSidecarSummary {
   const projectId = file.slice(0, -".db".length);
-  const cwd = resolveMetadata ? readCwdForProject(projectId) : undefined;
+  const cwd = readCwdForProject(projectId);
   return {
     file,
     projectId,
     path,
     cwd,
-    metadataMissing: resolveMetadata && cwd === undefined,
+    metadataMissing: cwd === undefined,
     captured: 0,
     unprocessed: 0,
     errors: 0,
@@ -83,8 +82,7 @@ function skippedSidecarSummary(file: string, path: string, scanSkipped: string):
   };
 }
 
-function parseSqliteDate(value: string | null): number | undefined {
-  if (!value) return undefined;
+function parseSqliteDate(value: string): number | undefined {
   const parsed = Date.parse(`${value.replace(" ", "T")}Z`);
   return Number.isNaN(parsed) ? undefined : parsed;
 }
@@ -101,7 +99,8 @@ function orphanPruneReason(summary: EventSidecarSummary, olderThanDays: number):
   }
   if (summary.captured === 0) return "empty orphan sidecar";
 
-  const lastCaptureMs = parseSqliteDate(summary.lastCapture);
+  // A non-empty sidecar has a MAX(created_at) value from SQLite.
+  const lastCaptureMs = parseSqliteDate(summary.lastCapture!);
   if (lastCaptureMs === undefined) return undefined;
   const ageMs = olderThanDays * 24 * 60 * 60 * 1000;
   if (Date.now() - lastCaptureMs >= ageMs) {

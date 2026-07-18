@@ -1,6 +1,27 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { shouldPromote } from "../../src/promotion/detector.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
+
+vi.mock("safe-regex", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("safe-regex")>();
+  return {
+    default: (pattern: string): boolean => {
+      if (pattern === "throw-from-safe-regex") throw new Error("probe failed");
+      return actual.default(pattern);
+    },
+  };
+});
+
+vi.mock("../../src/store/regex-safety.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/store/regex-safety.js")>();
+  return {
+    ...actual,
+    validateRegex: (pattern: string, flags?: string): RegExp => {
+      if (pattern === "compile-error") throw new Error("compile failed");
+      return actual.validateRegex(pattern, flags);
+    },
+  };
+});
 
 const thresholds = loadDaemonConfig("/x").compaction.promotionThresholds;
 
@@ -53,5 +74,17 @@ describe("shouldPromote", () => {
       // The unsafe pattern is filtered; "architecture" tag should not be added
       expect(r.tags).not.toContain("architecture");
     }).not.toThrow();
+  });
+
+  it("continues when a nominally safe architecture pattern cannot compile", () => {
+    const r = shouldPromote({ content: "routine content", depth: 0, tokenCount: 200, sourceMessageTokenCount: 500 }, {
+      ...thresholds,
+      architecturePatterns: ["compile-error", "throw-from-safe-regex"],
+    });
+    expect(r.tags).not.toContain("architecture");
+    expect(shouldPromote({ content: "routine", depth: 0, tokenCount: 1, sourceMessageTokenCount: 0 }, {
+      ...thresholds,
+      architecturePatterns: undefined,
+    }).tags).not.toContain("architecture");
   });
 });
