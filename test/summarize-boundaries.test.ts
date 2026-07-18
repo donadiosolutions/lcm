@@ -135,14 +135,17 @@ describe("diagnostic sanitization boundaries", () => {
     expect(utils.formatDiagnosticPayload(nullPrototype)).toBe('{"value":"kept"}');
   });
 
-  it("appends only non-empty response diagnostics", () => {
+  it("returns diagnostic parts without mutating the input", () => {
     const empty: string[] = ["base"];
-    utils.appendResponseDiagnostics(empty, null);
+    const emptyResult = utils.appendResponseDiagnostics(empty, null);
+    expect(emptyResult).toBe(empty);
     expect(empty).toEqual(["base"]);
 
     const populated: string[] = ["base"];
-    utils.appendResponseDiagnostics(populated, { content: [] });
-    expect(populated).toEqual(["base", expect.stringContaining("content_kind=array")]);
+    const populatedResult = utils.appendResponseDiagnostics(populated, { content: [] });
+    expect(populatedResult).not.toBe(populated);
+    expect(populatedResult).toEqual(["base", expect.stringContaining("content_kind=array")]);
+    expect(populated).toEqual(["base"]);
   });
 
   it.each([

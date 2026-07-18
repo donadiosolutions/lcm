@@ -403,12 +403,10 @@ function extractResponseDiagnostics(result: unknown): string {
   return parts.join("; ");
 }
 
-/** Append response diagnostics only when the provider returned usable metadata. */
-function appendResponseDiagnostics(parts: string[], result: unknown): void {
+/** Return diagnostic parts with response metadata appended when available. */
+function appendResponseDiagnostics(parts: string[], result: unknown): string[] {
   const diagnostics = extractResponseDiagnostics(result);
-  if (diagnostics) {
-    parts.push(diagnostics);
-  }
+  return diagnostics ? [...parts, diagnostics] : parts;
 }
 
 /**
@@ -689,14 +687,13 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     }
 
     if (!summary) {
-      const diagParts = [
+      const diagParts = appendResponseDiagnostics([
         `[lcm] empty normalized summary on first attempt`,
         `provider=${provider}`,
         `model=${model}`,
         `block_types=${formatBlockTypes(normalized.blockTypes)}`,
         `response_blocks=${result.content.length}`,
-      ];
-      appendResponseDiagnostics(diagParts, result);
+      ], result);
       console.error(`${diagParts.join("; ")}; retrying with conservative settings`);
 
       // Single retry with conservative parameters: low temperature and low
@@ -733,14 +730,13 @@ export async function createLcmSummarizeFromLegacyParams(params: {
               `block_types=${formatBlockTypes(retryNormalized.blockTypes)}; source=retry`,
           );
         } else {
-          const retryParts = [
+          const retryParts = appendResponseDiagnostics([
             `[lcm] retry also returned empty summary`,
             `provider=${provider}`,
             `model=${model}`,
             `block_types=${formatBlockTypes(retryNormalized.blockTypes)}`,
             `response_blocks=${retryResult.content.length}`,
-          ];
-          appendResponseDiagnostics(retryParts, retryResult);
+          ], retryResult);
           console.error(`${retryParts.join("; ")}; falling back to truncation`);
         }
       } catch (retryErr) {
