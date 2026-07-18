@@ -109,6 +109,7 @@ function nonWhitespaceRanges(text: string): TextRange[] {
 }
 
 interface RegexSourceAnalysis {
+  hasBackreference: boolean;
   hasCaptureDependentLookahead: boolean;
   hasPositiveLookbehind: boolean;
   hasUnescapedAlternation: boolean;
@@ -129,6 +130,7 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
   let assertionDepth = 0;
   let positiveLookaheadDepth = 0;
   let inCharacterClass = false;
+  let hasBackreference = false;
   let hasCaptureDependentLookahead = false;
   let hasPositiveLookbehind = false;
   let hasUnescapedAlternation = false;
@@ -145,6 +147,7 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
       const escapedCharacter = source.charAt(index + 1);
       const isBackreference = (escapedCharacter >= "1" && escapedCharacter <= "9")
         || source.startsWith("\\k<", index);
+      if (isBackreference) hasBackreference = true;
       if (positiveLookaheadDepth > 0 && isBackreference) {
         hasCaptureDependentLookahead = true;
       }
@@ -213,6 +216,7 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
     hasPotentialConsumingAlternative = true;
   }
   return {
+    hasBackreference,
     hasCaptureDependentLookahead,
     hasPositiveLookbehind,
     hasUnescapedAlternation,
@@ -232,6 +236,7 @@ function analyzeRegexSource(source: string): RegexSourceAnalysis {
 
 interface RegexCollectionPlan {
   alternativeProbes: RegExp[];
+  hasCaptureDependentAlternative: boolean;
   hasCaptureDependentLookahead: boolean;
   lookaheadProbes: RegExp[];
   preferPrecedingAtBoundary: boolean;
@@ -247,19 +252,25 @@ interface CompiledScrubPattern {
 function createRegexCollectionPlan(regex: RegExp): RegexCollectionPlan {
   const sourceAnalysis = analyzeRegexSource(regex.source);
   const lookaheadFlags = regex.flags.replace(/[dgy]/gu, "");
-  const lookaheadProbes = sourceAnalysis.positiveLookaheadBodies.map(
-    (body) => new RegExp(`^(?:${body})`, lookaheadFlags),
-  );
+  const lookaheadProbes = sourceAnalysis.hasCaptureDependentLookahead
+    ? []
+    : sourceAnalysis.positiveLookaheadBodies.map(
+        (body) => new RegExp(`^(?:${body})`, lookaheadFlags),
+      );
   const preserveAlternativeMatches = sourceAnalysis.hasUnescapedAlternation
     && sourceAnalysis.hasPotentialConsumingAlternative;
+  const hasCaptureDependentAlternative = preserveAlternativeMatches
+    && sourceAnalysis.hasBackreference
+    && sourceAnalysis.topLevelAlternativeSources.length > 0;
   const alternativeFlags = regex.flags.replace(/[dy]/gu, "");
-  const alternativeProbes = preserveAlternativeMatches
+  const alternativeProbes = preserveAlternativeMatches && !hasCaptureDependentAlternative
     ? sourceAnalysis.topLevelAlternativeSources.map(
         (source) => new RegExp(source, alternativeFlags),
       )
     : [];
   return {
     alternativeProbes,
+    hasCaptureDependentAlternative,
     hasCaptureDependentLookahead: sourceAnalysis.hasCaptureDependentLookahead,
     lookaheadProbes,
     preferPrecedingAtBoundary: sourceAnalysis.hasPositiveLookbehind,
@@ -357,6 +368,11 @@ function collectConsumingRanges(
 
     let consumingAlternativeEnd = anchor;
     const expandedEnd = Math.max(...ranges.map((range) => range[1]));
+    if (plan.hasCaptureDependentAlternative) {
+      const expandedStart = Math.min(...ranges.map((range) => range[0]));
+      collect([expandedStart, text.length]);
+      consumingAlternativeEnd = text.length;
+    }
     for (const probe of plan.alternativeProbes) {
       probe.lastIndex = anchor;
       const alternativeMatch = probe.exec(text);

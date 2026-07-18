@@ -224,6 +224,15 @@ describe("ScrubEngine — custom patterns", () => {
     }
   });
 
+  it("does not detach capture-dependent consuming alternatives", () => {
+    const result = new ScrubEngine(["(?=SECRET)|(?<value>SECRET)\\s+\\k<value>"], [])
+      .scrubWithCounts("SECRET SECRET tail");
+
+    expect(result).toEqual({
+      text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
   it("analyzes negative lookbehinds and incomplete quantifier-like literals", () => {
     const result = new ScrubEngine(["(?<!X)(?=TOKEN)", "A{2"], [])
       .scrubWithCounts("TOKEN A{2");
