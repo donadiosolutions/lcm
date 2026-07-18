@@ -79,6 +79,15 @@ describe("daemon configuration uncovered boundaries", () => {
     expect(() => parseDaemonConfig("{}", { llm: { provider: "openai", model: "m", baseUrl: "https://api.openai.com/v1", apiKey: "key" } })).not.toThrow();
   });
 
+  it("interpolates present and absent API key environment variables", () => {
+    const config = parseDaemonConfig(
+      "{}",
+      { llm: { apiKey: "${PRESENT_KEY}:${ABSENT_KEY}" } },
+      { PRESENT_KEY: "available" },
+    );
+    expect(config.llm.apiKey).toBe("available:");
+  });
+
   it("covers malformed JSON, bad roots, non-HTTP endpoints, migration, and read failures", () => {
     expect(() => parseStoredConfig("{")) .toThrow("malformed JSON");
     expect(() => parseStoredConfig("null")).toThrow("JSON object");

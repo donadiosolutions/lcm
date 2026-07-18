@@ -61,6 +61,21 @@ describe("portable systemd credential configuration", () => {
     });
   });
 
+  it("rejects an allowed credential whose canonical file leaves every trusted prefix", () => {
+    fsMocks.realpathSync.mockImplementation((path: string) =>
+      path.endsWith("OPENAI_API_KEY") ? "/portable/secrets/OPENAI_API_KEY" : path,
+    );
+
+    expect(resolveDaemonConfigEnv({
+      CREDENTIALS_DIRECTORY: credentialDir,
+      LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
+    })).toEqual({
+      CREDENTIALS_DIRECTORY: credentialDir,
+      LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
+    });
+    expect(fsMocks.readFileSync).not.toHaveBeenCalled();
+  });
+
   it("rejects relative, missing, and existing untrusted directories", () => {
     expect(resolveDaemonConfigEnv({ CREDENTIALS_DIRECTORY: "relative" })).toEqual({ CREDENTIALS_DIRECTORY: "relative" });
 
