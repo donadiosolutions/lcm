@@ -1,6 +1,6 @@
 // test/hooks/events-db.test.ts
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { EventsDb, type EventRow, type HealthStats } from "../../src/hooks/events-db.js";
+import { EventsDb, _resetMigratedPathsForTesting, type EventRow, type HealthStats } from "../../src/hooks/events-db.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -10,6 +10,7 @@ describe("EventsDb", () => {
   let dbPath: string;
 
   beforeEach(() => {
+    _resetMigratedPathsForTesting();
     dir = mkdtempSync(join(tmpdir(), "events-db-test-"));
     dbPath = join(dir, "test.db");
   });
@@ -73,6 +74,28 @@ describe("EventsDb", () => {
     db.close();
   });
 
+  it("ignores an empty processed-id list and links predecessor events", () => {
+    const db = new EventsDb(dbPath);
+    const first = db.insertEvent("s1", { type: "a", category: "file", data: "x", priority: 3 }, "PostToolUse");
+    const second = db.insertEvent("s1", { type: "b", category: "file", data: "y", priority: 3 }, "PostToolUse");
+    db.markProcessed([]);
+    db.setPrevEventId(second, first);
+    const row = db.raw().prepare("SELECT prev_event_id FROM events WHERE event_id = ?").get(second) as { prev_event_id: number };
+    expect(row.prev_event_id).toBe(first);
+    db.close();
+  });
+
+  it("reports pattern reinforcement with the default age window", () => {
+    const db = new EventsDb(dbPath);
+    db.insertEvent("s1", { type: "choice", category: "decision", data: "SQLite", priority: 1 }, "PostToolUse");
+    db.insertEvent("s2", { type: "choice", category: "decision", data: "SQLite", priority: 1 }, "PostToolUse");
+    expect(db.getPatternReinforcement("choice", "decision", "SQLite")).toEqual({
+      totalCount: 2,
+      distinctSessions: 2,
+    });
+    db.close();
+  });
+
   it("prunes old processed events", () => {
     const db = new EventsDb(dbPath);
     db.insertEvent("s1", { type: "a", category: "file", data: "x", priority: 3 }, "PostToolUse");
@@ -102,6 +125,57 @@ describe("EventsDb", () => {
   });
 
   describe("Schema migrations — error_log + pattern lookup index", () => {
+    it("repairs an empty schema-version table", () => {
+      const { DatabaseSync } = require("node:sqlite");
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.exec(`
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        CREATE TABLE events (
+          event_id INTEGER PRIMARY KEY, session_id TEXT, seq INTEGER, type TEXT,
+          category TEXT, data TEXT, priority INTEGER, source_hook TEXT,
+          prev_event_id INTEGER, processed_at TEXT, created_at TEXT
+        );
+      `);
+      rawDb.close();
+      const db = new EventsDb(dbPath);
+      expect((db.raw().prepare("SELECT version FROM schema_version").get() as any).version).toBe(3);
+      db.close();
+    });
+
+    it("migrates a v2 database by adding only the pattern index", () => {
+      const { DatabaseSync } = require("node:sqlite");
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.exec(`
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version VALUES (2);
+        CREATE TABLE events (
+          event_id INTEGER PRIMARY KEY, session_id TEXT, seq INTEGER, type TEXT,
+          category TEXT, data TEXT, priority INTEGER, source_hook TEXT,
+          prev_event_id INTEGER, processed_at TEXT, created_at TEXT
+        );
+      `);
+      rawDb.close();
+      const db = new EventsDb(dbPath);
+      expect(db.raw().prepare("SELECT name FROM sqlite_master WHERE name='idx_events_pattern_lookup'").get()).toBeDefined();
+      db.close();
+    });
+
+    it("releases the pooled connection when migration fails", () => {
+      const { DatabaseSync } = require("node:sqlite");
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.exec(`
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version VALUES (1);
+        CREATE TABLE events (
+          event_id INTEGER PRIMARY KEY, session_id TEXT, seq INTEGER, type TEXT,
+          category TEXT, data TEXT, priority INTEGER, source_hook TEXT,
+          prev_event_id INTEGER, processed_at TEXT, created_at TEXT
+        );
+        CREATE VIEW error_log AS SELECT 1 AS id;
+      `);
+      rawDb.close();
+      expect(() => new EventsDb(dbPath)).toThrow();
+    });
     it("migrates v1 DB to the latest schema on open", () => {
       // Create a v1 DB manually (no error_log table or pattern lookup index)
       const { DatabaseSync } = require("node:sqlite");
@@ -212,6 +286,29 @@ describe("EventsDb", () => {
       const minRemaining = Math.min(...after.map(e => e.event_id));
       const maxRemoved = Math.max(...before.slice(0, 5).map(e => e.event_id));
       expect(minRemaining).toBeGreaterThan(maxRemoved);
+      db.close();
+    });
+
+    it("prunes old unprocessed rows and no-ops when nothing qualifies", () => {
+      const db = new EventsDb(dbPath);
+      db.insertEvent("s1", { type: "a", category: "file", data: "old", priority: 3 }, "PostToolUse");
+      db.raw().exec("UPDATE events SET created_at = datetime('now', '-31 days')");
+      expect(db.pruneUnprocessed(10, 30)).toEqual({ pruned: 1 });
+      expect(db.pruneUnprocessed(10, 30)).toEqual({ pruned: 0 });
+      db.close();
+    });
+
+    it("rolls back a failed unprocessed prune", () => {
+      const db = new EventsDb(dbPath);
+      db.insertEvent("s1", { type: "a", category: "file", data: "old", priority: 3 }, "PostToolUse");
+      db.raw().exec(`
+        UPDATE events SET created_at = datetime('now', '-31 days');
+        CREATE TRIGGER reject_event_delete BEFORE DELETE ON events BEGIN
+          SELECT RAISE(ABORT, 'delete rejected');
+        END;
+      `);
+      expect(() => db.pruneUnprocessed(10, 30)).toThrow("delete rejected");
+      expect(db.getUnprocessed()).toHaveLength(1);
       db.close();
     });
 

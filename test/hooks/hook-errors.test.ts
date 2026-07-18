@@ -61,6 +61,11 @@ describe("safeLogError", () => {
     expect(content).toContain("no cwd");
   });
 
+  it("stringifies non-Error failures in the fallback log", () => {
+    safeLogError("PostToolUse", "plain failure", {});
+    expect(readFileSync(join(tempDir, "events.log"), "utf-8")).toContain('"error":"plain failure"');
+  });
+
   it("Layer 2: writes to flat file when DB fails", () => {
     const cwd = "/dev/null/impossible";
     safeLogError("PostToolUse", new Error("db fail"), { cwd, sessionId: "s1" });

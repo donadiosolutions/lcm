@@ -15,8 +15,8 @@ export default defineConfig({
     coverage: {
       include: ["bin/**/*.ts", "installer/**/*.ts", "src/**/*.ts"],
       thresholds: {
-        lines: 78.49,
-        branches: 71.62,
+        lines: 80.22,
+        branches: 75.10,
         "src/scrub.ts": { lines: 100, branches: 100 },
         "src/transcript.ts": { lines: 100, branches: 100 },
         "src/llm/process-utils.ts": { lines: 100, branches: 100 },
@@ -39,6 +39,12 @@ export default defineConfig({
         "src/daemon/routes/stats.ts": { lines: 100, branches: 100 },
         "src/daemon/routes/status.ts": { lines: 100, branches: 100 },
         "src/daemon/routes/store.ts": { lines: 100, branches: 100 },
+        "installer/**/*.ts": { lines: 100, branches: 100 },
+        "src/connectors/**/*.ts": { lines: 100, branches: 100 },
+        "src/hooks/**/*.ts": { lines: 100, branches: 100 },
+        "src/installer/**/*.ts": { lines: 100, branches: 100 },
+        "src/llm/**/*.ts": { lines: 100, branches: 100 },
+        "src/prompts/**/*.ts": { lines: 100, branches: 100 },
       },
     },
     projects: [

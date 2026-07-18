@@ -2,6 +2,9 @@ import { describe, it, expect, vi } from "vitest";
 import { createAnthropicSummarizer } from "../../src/llm/anthropic.js";
 
 describe("createAnthropicSummarizer", () => {
+  it("constructs the default SDK client lazily", () => {
+    expect(createAnthropicSummarizer({ model: "model", apiKey: "key" })).toBeTypeOf("function");
+  });
   it("calls Anthropic and returns text", async () => {
     const mockCreate = vi.fn().mockResolvedValue({
       content: [{ type: "text", text: "Summary." }],
@@ -52,5 +55,50 @@ describe("createAnthropicSummarizer", () => {
     });
     await expect(summarizer("text", false)).rejects.toThrow("rate limited");
     expect(mockCreate).toHaveBeenCalledTimes(3);
+  });
+
+  it("builds condensed and aggressive prompts with explicit targets", async () => {
+    const mockCreate = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "Summary" }] });
+    const summarizer = createAnthropicSummarizer({
+      model: "model", apiKey: "key", _clientOverride: { messages: { create: mockCreate } },
+    });
+    await summarizer("text", true, { isCondensed: true, targetTokens: 42, depth: 3 });
+    expect(mockCreate.mock.calls[0][0].messages[0].content).toContain("42");
+  });
+
+  it("builds an aggressive leaf prompt", async () => {
+    const create = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "done" }] });
+    const summarizer = createAnthropicSummarizer({ model: "model", apiKey: "key", _clientOverride: { messages: { create } } });
+    await summarizer("text", true, { isCondensed: false });
+    expect(create).toHaveBeenCalled();
+  });
+
+  it("falls back to source text when empty responses persist", async () => {
+    const mockCreate = vi.fn().mockResolvedValue({ content: [{ type: "tool_use" }] });
+    const summarizer = createAnthropicSummarizer({
+      model: "model", apiKey: "key", _clientOverride: { messages: { create: mockCreate } },
+    });
+    await expect(summarizer("source text", false)).resolves.toBe("source text");
+    expect(mockCreate).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns source fallback after a retryable error followed by empty content", async () => {
+    const mockCreate = vi.fn()
+      .mockRejectedValueOnce(new Error("temporary"))
+      .mockResolvedValueOnce({ content: [] });
+    const summarizer = createAnthropicSummarizer({
+      model: "model", apiKey: "key", _retryDelayMs: 0,
+      _clientOverride: { messages: { create: mockCreate } },
+    });
+    await expect(summarizer("source", true, { isCondensed: true })).resolves.toBe("source");
+  });
+
+  it("preserves a non-Error terminal failure", async () => {
+    const mockCreate = vi.fn().mockRejectedValue("plain failure");
+    const summarizer = createAnthropicSummarizer({
+      model: "model", apiKey: "key", _retryDelayMs: 0,
+      _clientOverride: { messages: { create: mockCreate } },
+    });
+    await expect(summarizer("source", false)).rejects.toBe("plain failure");
   });
 });

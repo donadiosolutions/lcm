@@ -1,14 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { handleSessionEnd } from "../../src/hooks/session-end.js";
+import { DaemonClient } from "../../src/daemon/client.js";
+import { loadDaemonConfig, type DaemonConfig } from "../../src/daemon/config.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
-  ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
+  ensureDaemon: vi.fn().mockResolvedValue({ connected: true, port: 3737, spawned: false }),
 }));
 
 vi.mock("../../src/daemon/config.js", () => ({
-  loadDaemonConfig: vi.fn().mockReturnValue({
-    compaction: { autoCompactMinTokens: 10000 },
-  }),
+  loadDaemonConfig: vi.fn(),
 }));
 
 const mockHttpReq = vi.hoisted(() => ({
@@ -21,19 +21,48 @@ vi.mock("node:http", () => ({
   request: vi.fn().mockReturnValue(mockHttpReq),
 }));
 
-function createMockClient(ingestResponse: unknown) {
-  return {
-    post: vi.fn().mockImplementation((path: string) => {
-      if (path === "/ingest") return Promise.resolve(ingestResponse);
-      return Promise.reject(new Error(`unexpected path: ${path}`));
-    }),
-  } as any;
+type IngestResponse = {
+  ingested?: number;
+  totalTokens?: number;
+  redacted?: number;
+  redactedCategories?: string[];
+};
+
+function createMockClient(ingestResponse: IngestResponse): DaemonClient {
+  const client = new DaemonClient("http://127.0.0.1:3737");
+  vi.spyOn(client, "post").mockImplementation(async <T>(path: string): Promise<T> => {
+    if (path === "/ingest") return ingestResponse as T;
+    throw new Error(`unexpected path: ${path}`);
+  });
+  return client;
+}
+
+function createRejectingClient(error: Error): DaemonClient {
+  const client = new DaemonClient("http://127.0.0.1:3737");
+  vi.spyOn(client, "post").mockRejectedValue(error);
+  return client;
+}
+
+function httpCallPath(args: readonly unknown[]): unknown {
+  const options = args[0];
+  return options && typeof options === "object" && "path" in options
+    ? options.path
+    : undefined;
 }
 
 describe("handleSessionEnd", () => {
-  beforeEach(() => {
+  let defaultConfig: DaemonConfig;
+
+  beforeEach(async () => {
     vi.clearAllMocks();
     mockHttpReq.on.mockReturnThis();
+    const actualConfig = await vi.importActual<typeof import("../../src/daemon/config.js")>(
+      "../../src/daemon/config.js",
+    );
+    defaultConfig = actualConfig.loadDaemonConfig(
+      `/definitely-missing-lcm-session-end-${process.pid}.json`,
+    );
+    vi.mocked(loadDaemonConfig).mockReturnValue(defaultConfig);
   });
 
   it("calls /ingest with parsed stdin", async () => {
@@ -42,6 +71,34 @@ describe("handleSessionEnd", () => {
     const result = await handleSessionEnd(stdin, client, 3737);
     expect(result.exitCode).toBe(0);
     expect(client.post).toHaveBeenCalledWith("/ingest", { session_id: "s1", cwd: "/tmp", client: "claude" });
+  });
+
+  it("returns early when the daemon is unavailable", async () => {
+    const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: false,
+      port: 3737,
+      spawned: false,
+    });
+    const client = createMockClient({ ingested: 1 });
+    expect(await handleSessionEnd("{}", client)).toEqual({ exitCode: 0, stdout: "" });
+    expect(client.post).not.toHaveBeenCalled();
+  });
+
+  it("sends auth and exercises the promote-events notification helper", async () => {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const { dirname } = await import("node:path");
+    const { daemonTokenPath } = await import("../../src/runtime-paths.js");
+    const { firePromoteEventsNotifyRequest } = await import("../../src/hooks/session-end.js");
+    const { request } = await import("node:http");
+    const tokenPath = daemonTokenPath();
+    mkdirSync(dirname(tokenPath), { recursive: true });
+    writeFileSync(tokenPath, "secret-token\n");
+    firePromoteEventsNotifyRequest(4545, { cwd: "/project" });
+    expect(vi.mocked(request)).toHaveBeenCalledWith(expect.objectContaining({
+      path: "/promote-events/notify",
+      headers: expect.objectContaining({ Authorization: "Bearer secret-token" }),
+    }));
   });
 
   it("fires compact via http.request when totalTokens exceeds threshold", async () => {
@@ -62,23 +119,40 @@ describe("handleSessionEnd", () => {
     await handleSessionEnd(stdin, client, 3737);
     const httpReqMock = vi.mocked(request);
     const compactCalls = httpReqMock.mock.calls.filter(
-      (args: any[]) => args[0]?.path === "/compact",
+      (args) => httpCallPath(args) === "/compact",
     );
     expect(compactCalls.length).toBeGreaterThan(0);
+  });
+
+  it("defaults to compact when a legacy config has no hooks section", async () => {
+    const configWithoutHooks = { ...defaultConfig };
+    Reflect.deleteProperty(configWithoutHooks, "hooks");
+    vi.mocked(loadDaemonConfig).mockReturnValueOnce(configWithoutHooks);
+    const { request } = await import("node:http");
+
+    await handleSessionEnd(
+      JSON.stringify({ session_id: "s1", cwd: "/tmp" }),
+      createMockClient({ ingested: 5, totalTokens: 500 }),
+      3737,
+    );
+
+    expect(vi.mocked(request).mock.calls.some(
+      (args) => httpCallPath(args) === "/compact",
+    )).toBe(true);
   });
 
   it("skips compact when hooks.disableAutoCompact is true", async () => {
     const { loadDaemonConfig } = await import("../../src/daemon/config.js");
     vi.mocked(loadDaemonConfig).mockReturnValueOnce({
-      compaction: { autoCompactMinTokens: 0 },
-      hooks: { disableAutoCompact: true, snapshotIntervalSec: 60 },
-    } as any);
+      ...defaultConfig,
+      hooks: { ...defaultConfig.hooks, disableAutoCompact: true },
+    });
     const { request } = await import("node:http");
     const client = createMockClient({ ingested: 100, totalTokens: 99999 });
     await handleSessionEnd(JSON.stringify({ session_id: "s1", cwd: "/tmp" }), client, 3737);
     const httpReqMock = vi.mocked(request);
     const compactCalls = httpReqMock.mock.calls.filter(
-      (args: any[]) => args[0]?.path === "/compact",
+      (args) => httpCallPath(args) === "/compact",
     );
     expect(compactCalls.length).toBe(0);
   });
@@ -92,7 +166,7 @@ describe("handleSessionEnd", () => {
     );
     const httpReqMock = vi.mocked(request);
     const promoteCalls = httpReqMock.mock.calls.filter(
-      (args: any[]) => args[0]?.path === "/promote",
+      (args) => httpCallPath(args) === "/promote",
     );
     expect(promoteCalls.length).toBe(1);
   });
@@ -106,7 +180,7 @@ describe("handleSessionEnd", () => {
     );
     const httpReqMock = vi.mocked(request);
     const manifestCalls = httpReqMock.mock.calls.filter(
-      (args: any[]) => args[0]?.path === "/session-complete",
+      (args) => httpCallPath(args) === "/session-complete",
     );
     expect(manifestCalls.length).toBe(1);
   });
@@ -121,7 +195,7 @@ describe("handleSessionEnd", () => {
     );
     const httpReqMock = vi.mocked(request);
     const manifestCalls = httpReqMock.mock.calls.filter(
-      (args: any[]) => args[0]?.path === "/session-complete",
+      (args) => httpCallPath(args) === "/session-complete",
     );
     expect(manifestCalls.length).toBe(0);
     expect(client.post).toHaveBeenCalledWith("/ingest", { session_id: "s1", cwd: "/tmp", client: "codex" });
@@ -163,10 +237,9 @@ describe("handleSessionEnd", () => {
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const { loadDaemonConfig } = await import("../../src/daemon/config.js");
     vi.mocked(loadDaemonConfig).mockReturnValueOnce({
-      compaction: {},
-      hooks: {},
+      ...defaultConfig,
       security: { sensitivePatterns: [], notify_on_filter: true },
-    } as any);
+    });
     const client = createMockClient({
       ingested: 2,
       totalTokens: 500,
@@ -184,10 +257,9 @@ describe("handleSessionEnd", () => {
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const { loadDaemonConfig } = await import("../../src/daemon/config.js");
     vi.mocked(loadDaemonConfig).mockReturnValueOnce({
-      compaction: {},
-      hooks: {},
+      ...defaultConfig,
       security: { sensitivePatterns: [], notify_on_filter: false },
-    } as any);
+    });
     const client = createMockClient({
       ingested: 2,
       totalTokens: 500,
@@ -206,10 +278,9 @@ describe("handleSessionEnd", () => {
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const { loadDaemonConfig } = await import("../../src/daemon/config.js");
     vi.mocked(loadDaemonConfig).mockReturnValueOnce({
-      compaction: {},
-      hooks: {},
+      ...defaultConfig,
       security: { sensitivePatterns: [] },
-    } as any);
+    });
     const client = createMockClient({ ingested: 3, totalTokens: 300 });
     await handleSessionEnd(JSON.stringify({ session_id: "s1", cwd: "/tmp" }), client, 3737);
     const filteredCalls = stderrSpy.mock.calls.filter((args) =>
@@ -217,6 +288,30 @@ describe("handleSessionEnd", () => {
     );
     expect(filteredCalls.length).toBe(0);
     stderrSpy.mockRestore();
+  });
+
+  it("uses an empty category list and default ingested count", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const { request } = await import("node:http");
+    await handleSessionEnd(
+      JSON.stringify({ session_id: "s1", cwd: "/tmp" }),
+      createMockClient({ redacted: 1 }),
+    );
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("pattern: )"));
+    const complete = vi.mocked(request).mock.calls.find(
+      (args) => httpCallPath(args) === "/session-complete",
+    );
+    expect(complete).toBeDefined();
+    stderrSpy.mockRestore();
+  });
+
+  it("fails open when ingest rejects or input is malformed", async () => {
+    await expect(handleSessionEnd("not json", createMockClient({ ingested: 0 }))).resolves.toEqual({
+      exitCode: 0,
+      stdout: "",
+    });
+    await expect(handleSessionEnd("{}", createRejectingClient(new Error("failed"))))
+      .resolves.toEqual({ exitCode: 0, stdout: "" });
   });
 });
 

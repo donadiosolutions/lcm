@@ -91,7 +91,7 @@ function extractFileEvents(toolName: string, input: PostToolInput): ExtractedEve
   };
 
   return [{
-    type: typeMap[toolName] ?? "file_access",
+    type: typeMap[toolName],
     category: "file",
     data: truncate(`${filePath} (${classifyFile(filePath)})`),
     priority: 3,

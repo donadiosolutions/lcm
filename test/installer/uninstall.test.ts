@@ -30,6 +30,24 @@ function makeDeps(existsResult = true, overrides: Partial<TeardownDeps> = {}): T
 // ─── removeClaudeSettings ───────────────────────────────────────────────────
 
 describe("removeClaudeSettings", () => {
+  it("normalizes malformed settings containers", () => {
+    expect(removeClaudeSettings({ hooks: [], mcpServers: "invalid" })).toEqual({
+      hooks: {},
+      mcpServers: {},
+    });
+  });
+
+  it("preserves non-array events and entries without hook arrays", () => {
+    const existing = {
+      hooks: {
+        InvalidEvent: "invalid",
+        PreCompact: [{ matcher: "missing-hooks" }],
+      },
+      mcpServers: {},
+    };
+    expect(removeClaudeSettings(existing).hooks).toEqual(existing.hooks);
+  });
+
   it("removes lcm hooks and mcpServer", () => {
     const r = removeClaudeSettings({
       hooks: {
@@ -211,6 +229,17 @@ describe("uninstall", () => {
     };
     await expect(uninstall(deps)).resolves.not.toThrow();
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("could not update"));
+    warnSpy.mockRestore();
+  });
+
+  it("stringifies non-Error settings failures", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const deps = makeDeps(true, {
+      readFileSync: vi.fn(() => { throw "plain failure"; }),
+    });
+
+    await expect(uninstall(deps)).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("plain failure"));
     warnSpy.mockRestore();
   });
 });

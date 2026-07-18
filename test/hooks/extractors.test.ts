@@ -23,6 +23,11 @@ describe("extractPostToolEvents", () => {
     });
   });
 
+  it("defaults missing question and answer fields", () => {
+    expect(extractPostToolEvents({ tool_name: "AskUserQuestion", tool_input: {} })[0].data)
+      .toBe("Q: \nA: ");
+  });
+
   it("extracts error from Bash with isError", () => {
     const events = extractPostToolEvents({
       tool_name: "Bash",
@@ -102,6 +107,26 @@ describe("extractPostToolEvents", () => {
     });
   });
 
+  it.each([
+    ["Plan rejected", "rejected"],
+    ["Closed without a decision", "exited"],
+  ])("extracts the %s plan outcome", (response, status) => {
+    expect(extractPostToolEvents({
+      tool_name: "ExitPlanMode",
+      tool_input: {},
+      tool_response: response,
+    })[0].data).toBe(`Plan ${status}`);
+  });
+
+  it("defaults a missing plan outcome to exited", () => {
+    expect(extractPostToolEvents({ tool_name: "ExitPlanMode", tool_input: {} })[0].data).toBe("Plan exited");
+  });
+
+  it("extracts plan entry", () => {
+    expect(extractPostToolEvents({ tool_name: "EnterPlanMode", tool_input: {} })[0].type)
+      .toBe("plan_enter");
+  });
+
   it("extracts env commands from Bash", () => {
     const events = extractPostToolEvents({
       tool_name: "Bash",
@@ -112,6 +137,59 @@ describe("extractPostToolEvents", () => {
       category: "env",
       priority: 2,
     });
+  });
+
+  it("returns no event for an unrelated or missing Bash command", () => {
+    expect(extractPostToolEvents({ tool_name: "Bash", tool_input: {} })).toEqual([]);
+    expect(extractPostToolEvents({
+      tool_name: "Bash",
+      tool_input: { command: "echo okay" },
+      tool_output: { isError: false },
+    })).toEqual([]);
+  });
+
+  it("extracts a git operation without a commit message", () => {
+    expect(extractPostToolEvents({
+      tool_name: "Bash",
+      tool_input: { command: "git push origin main" },
+    })[0]).toMatchObject({ type: "git_push", data: "git push" });
+  });
+
+  it.each([
+    ["Edit", { path: "/project/config.json" }, "file_edit", "config"],
+    ["Write", { file_path: "/project/docs/readme.md" }, "file_write", "docs"],
+    ["Glob", { pattern: "/project/__tests__/*.ts" }, "file_glob", "test"],
+    ["Grep", { path: "/project/src/main.ts" }, "file_grep", "source"],
+  ])("classifies %s file operations", (toolName, toolInput, type, classification) => {
+    const event = extractPostToolEvents({ tool_name: toolName, tool_input: toolInput })[0];
+    expect(event).toMatchObject({ type, category: "file" });
+    expect(event.data).toContain(`(${classification})`);
+  });
+
+  it("skips file operations without a path", () => {
+    expect(extractPostToolEvents({ tool_name: "Read", tool_input: {} })).toEqual([]);
+  });
+
+  it.each([
+    ["TaskCreate", { subject: "Ship it" }, "task_create", "Ship it → created"],
+    ["TaskUpdate", { taskId: "42", status: "done" }, "task_update", "42 → done"],
+  ])("extracts %s events", (toolName, toolInput, type, data) => {
+    expect(extractPostToolEvents({ tool_name: toolName, tool_input: toolInput })[0])
+      .toMatchObject({ type, data });
+  });
+
+  it("defaults missing task, agent, and skill fields", () => {
+    expect(extractPostToolEvents({ tool_name: "TaskUpdate", tool_input: {} })[0].data).toBe(" → created");
+    expect(extractPostToolEvents({ tool_name: "Agent", tool_input: {} })[0].data).toBe("");
+    expect(extractPostToolEvents({ tool_name: "Skill", tool_input: {} })[0].data).toBe("");
+  });
+
+  it("extracts a non-Bash tool error", () => {
+    expect(extractPostToolEvents({
+      tool_name: "CustomTool",
+      tool_input: {},
+      tool_output: { isError: true },
+    })[0]).toMatchObject({ type: "error_tool", data: "CustomTool error" });
   });
 
   it("extracts skill usage", () => {
@@ -214,6 +292,26 @@ describe("extractUserPromptEvents", () => {
     const events = extractUserPromptEvents("fix the bug in main.ts");
     // "fix" matches intent, so we expect 1 intent event
     expect(events.filter(e => e.category === "decision")).toHaveLength(0);
+  });
+
+  it.each([
+    ["build a feature", "intent_implement"],
+    ["verify the result", "intent_review"],
+    ["refactor this module", "intent_refactor"],
+  ])("extracts %s", (prompt, type) => {
+    expect(extractUserPromptEvents(prompt)[0].type).toBe(type);
+  });
+
+  it("extracts the senior engineer role pattern", () => {
+    expect(extractUserPromptEvents("staff engineer")[0].type).toBe("user_role");
+  });
+
+  it("adds channel tags to role and intent events", () => {
+    const events = extractUserPromptEvents(
+      '<channel source="telegram">staff engineer, please verify this</channel>',
+    );
+    expect(events.map((event) => event.type)).toEqual(["user_role", "intent_review"]);
+    expect(events.every((event) => event.tags?.includes("source:telegram"))).toBe(true);
   });
 });
 

@@ -602,8 +602,18 @@ describe("POST /prompt-search", () => {
     const db = new DatabaseSync(dbPath);
     runLcmMigrations(db);
     const store = new PromotedStore(db);
-    const firstId = store.insert({ content: "Node worker pool for queue jobs", tags: ["workflow"], projectId: "p1" });
-    const secondId = store.insert({ content: "Node worker pool for background tasks", tags: ["workflow"], projectId: "p1" });
+    const firstId = store.insert({
+      content: "Node worker pool for queue jobs",
+      tags: ["workflow"],
+      projectId: "p1",
+      confidence: 0.9,
+    });
+    const secondId = store.insert({
+      content: "Node worker pool for background tasks",
+      tags: ["workflow"],
+      projectId: "p1",
+      confidence: 0.8,
+    });
     db.close();
 
     const config = loadDaemonConfig("/nonexistent");

@@ -161,4 +161,30 @@ describe("handlePostToolUse", () => {
       sourceHook: "PostToolUse",
     }));
   });
+
+  it("ignores a non-boolean tool output error marker", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-output-cwd-"));
+    extraDirs.push(inputCwd);
+
+    const result = await handlePostToolUse(JSON.stringify({
+      session_id: "test-session",
+      tool_name: "AskUserQuestion",
+      cwd: inputCwd,
+      tool_input: { question: "Use SQLite?" },
+      tool_response: "yes",
+      tool_output: { isError: "false" },
+    }));
+
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("handles invalid payload shapes and default cwd/port paths", async () => {
+    expect(await handlePostToolUse(JSON.stringify({ session_id: "s1" }))).toEqual({ exitCode: 0, stdout: "" });
+    expect(await handlePostToolUse(JSON.stringify({ tool_name: "Read" }))).toEqual({ exitCode: 0, stdout: "" });
+    expect(await handlePostToolUse(JSON.stringify({ session_id: "s1", tool_name: "Read", tool_input: [] })))
+      .toEqual({ exitCode: 0, stdout: "" });
+    expect(await handlePostToolUse(JSON.stringify({
+      session_id: "s1", tool_name: "AskUserQuestion", tool_input: {}, tool_output: { isError: true }, daemon_port: 0,
+    }))).toEqual({ exitCode: 0, stdout: "" });
+  });
 });

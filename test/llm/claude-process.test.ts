@@ -36,7 +36,20 @@ function makeHangingChild(): FakeChild {
   return child;
 }
 
+function makeErrorChild(error: unknown): FakeChild {
+  const child = new EventEmitter() as FakeChild;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = new PassThrough();
+  child.kill = vi.fn();
+  queueMicrotask(() => child.emit("error", error));
+  return child;
+}
+
 describe("createClaudeProcessSummarizer", () => {
+  it("constructs with default process dependencies", () => {
+    expect(createClaudeProcessSummarizer()).toBeTypeOf("function");
+  });
   it("passes the configured model to the Claude CLI", async () => {
     const spawn = vi.fn().mockReturnValue(makeChild());
     const summarizer = createClaudeProcessSummarizer({
@@ -158,5 +171,80 @@ describe("createClaudeProcessSummarizer", () => {
     await expect(summarizer("Conversation text", false)).rejects.toThrow(
       "claude process timed out after 0s",
     );
+  });
+
+  it("kills a timed-out process and ignores a later close", async () => {
+    const child = makeHangingChild();
+    child.kill.mockImplementation(() => true);
+    const summarizer = createClaudeProcessSummarizer({
+      spawn: vi.fn().mockReturnValue(child) as unknown as SpawnFn,
+      timeoutMs: 1,
+    });
+    await expect(summarizer("text", false)).rejects.toThrow("timed out");
+    child.emit("close", 0);
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  it("normalizes asynchronous spawn failures and ignores later events", async () => {
+    const enoent = Object.assign(new Error("missing"), { code: "ENOENT" });
+    const child = makeErrorChild(enoent);
+    const summarizer = createClaudeProcessSummarizer({
+      spawn: vi.fn().mockReturnValue(child) as unknown as SpawnFn,
+    });
+    await expect(summarizer("text", false)).rejects.toThrow("Claude CLI is not installed");
+    child.emit("error", new Error("late"));
+  });
+
+  it("normalizes non-Error synchronous failures", async () => {
+    const summarizer = createClaudeProcessSummarizer({
+      spawn: vi.fn(() => { throw "plain failure"; }) as unknown as SpawnFn,
+    });
+    await expect(summarizer("text", false)).rejects.toThrow("plain failure");
+  });
+
+  it("preserves ordinary Error failures", async () => {
+    const summarizer = createClaudeProcessSummarizer({
+      spawn: vi.fn(() => { throw new Error("ordinary failure"); }) as unknown as SpawnFn,
+    });
+    await expect(summarizer("text", false)).rejects.toThrow("ordinary failure");
+  });
+
+  it("builds an aggressive leaf prompt and a default-depth condensed prompt", async () => {
+    const first = makeChild();
+    const spawn = vi.fn().mockReturnValueOnce(first);
+    const summarize = createClaudeProcessSummarizer({ spawn: spawn as unknown as SpawnFn });
+    await summarize("text", true, { isCondensed: false });
+    spawn.mockReturnValueOnce(makeChild());
+    await summarize("text", false, { isCondensed: true });
+    expect(spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores a timeout callback after completion", async () => {
+    vi.useFakeTimers();
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
+    try {
+      const summarize = createClaudeProcessSummarizer({
+        spawn: vi.fn().mockReturnValue(makeChild()) as unknown as SpawnFn,
+        timeoutMs: 10,
+      });
+      const result = summarize("text", false);
+      await vi.runAllTicks();
+      await expect(result).resolves.toBe("summary text");
+      await vi.advanceTimersByTimeAsync(10);
+    } finally {
+      clearSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("builds a condensed aggressive prompt with explicit target and depth", async () => {
+    const child = makeChild();
+    let stdin = "";
+    child.stdin.on("data", (chunk) => { stdin += chunk.toString(); });
+    const summarizer = createClaudeProcessSummarizer({
+      spawn: vi.fn().mockReturnValue(child) as unknown as SpawnFn,
+    });
+    await summarizer("text", true, { isCondensed: true, targetTokens: 40, depth: 2 });
+    expect(stdin).toContain("40");
   });
 });

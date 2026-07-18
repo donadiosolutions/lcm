@@ -1,6 +1,8 @@
 import {
   existsSync as realExistsSync,
   readFileSync as realReadFileSync,
+  type PathLike,
+  type RmOptions,
 } from "node:fs";
 import { spawnSync as realSpawnSync, type SpawnSyncReturns } from "node:child_process";
 import type { ServiceDeps } from "./install.js";
@@ -29,7 +31,7 @@ export class DryRunServiceDeps implements ServiceDeps, TeardownDeps {
     }
   }
 
-  rmSync(path: string): void {
+  rmSync(path: PathLike, _options?: RmOptions): void {
     console.log(`[dry-run] would remove: ${path}`);
   }
 

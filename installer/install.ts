@@ -15,6 +15,10 @@ export interface ServiceDeps {
   mkdirSync: (path: string, opts?: any) => void;
   existsSync: (path: string) => boolean;
   chmodSync?: (path: string, mode: number) => void;
+  readdirSync?: typeof readdirSync;
+  copyFileSync?: typeof copyFileSync;
+  rmSync?: typeof rmSync;
+  commandsSourceDir?: string;
   promptUser: (question: string) => Promise<string>;
   ensureDaemon?: (opts: { port: number; pidFilePath: string; spawnTimeoutMs: number }) => Promise<{ connected: boolean }>;
   runDoctor?: () => Promise<Array<{ name: string; status: string; category?: string; message?: string }>>;
@@ -31,6 +35,8 @@ async function readlinePrompt(question: string): Promise<string> {
     rl.close();
   }
 }
+
+export { readlinePrompt as _readlinePromptForTesting };
 
 const defaultDeps: ServiceDeps = { spawnSync: spawnSync as any, readFileSync: (path, encoding) => readFileSync(path, encoding as BufferEncoding) as string, writeFileSync, mkdirSync, existsSync, chmodSync: chmodSync, promptUser: readlinePrompt };
 
@@ -95,14 +101,9 @@ async function pickSummarizer(deps: ServiceDeps): Promise<SummarizerConfig> {
     return { provider: "anthropic", model: "claude-haiku-4-5-20251001", apiKey, baseUrl: "" };
   }
 
-  if (choice === "3") {
-    const baseUrl = (await deps.promptUser("  Server URL (e.g. http://192.168.1.x:8080/v1): ")).trim();
-    const model = (await deps.promptUser("  Model name: ")).trim();
-    return { provider: "openai", model, apiKey: "", baseUrl };
-  }
-
-  // Fallback (should not reach here)
-  return { provider: "auto", model: "", apiKey: "", baseUrl: "" };
+  const baseUrl = (await deps.promptUser("  Server URL (e.g. http://192.168.1.x:8080/v1): ")).trim();
+  const model = (await deps.promptUser("  Model name: ")).trim();
+  return { provider: "openai", model, apiKey: "", baseUrl };
 }
 
 // ── Health-wait ──
@@ -187,9 +188,9 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     const pkgVersion = (JSON.parse(deps.readFileSync(pkgJsonPath, "utf-8")) as { version: string }).version;
     const cacheDir = join(homedir(), ".claude", "plugins", "cache", legacyLcmSlug(), "lcm");
     if (deps.existsSync(cacheDir)) {
-      for (const entry of readdirSync(cacheDir, { withFileTypes: true })) {
+      for (const entry of (deps.readdirSync ?? readdirSync)(cacheDir, { withFileTypes: true })) {
         if (entry.isDirectory() && entry.name !== pkgVersion) {
-          rmSync(join(cacheDir, entry.name), { recursive: true, force: true });
+          (deps.rmSync ?? rmSync)(join(cacheDir, entry.name), { recursive: true, force: true });
           console.log(`Cleared plugin cache for v${entry.name}`);
         }
       }
@@ -252,13 +253,13 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   console.log(`Updated ${settingsPath}`);
 
   // 4. Install slash commands to ~/.claude/commands/
-  const commandsSrc = join(dirname(fileURLToPath(import.meta.url)), "../..", ".claude-plugin", "commands");
+  const commandsSrc = deps.commandsSourceDir ?? join(dirname(fileURLToPath(import.meta.url)), "../..", ".claude-plugin", "commands");
   const commandsDst = join(homedir(), ".claude", "commands");
   if (deps.existsSync(commandsSrc)) {
     deps.mkdirSync(commandsDst, { recursive: true });
-    for (const file of readdirSync(commandsSrc)) {
+    for (const file of (deps.readdirSync ?? readdirSync)(commandsSrc)) {
       if (file.endsWith(".md")) {
-        copyFileSync(join(commandsSrc, file), join(commandsDst, file));
+        (deps.copyFileSync ?? copyFileSync)(join(commandsSrc, file), join(commandsDst, file));
       }
     }
     console.log(`Installed slash commands to ${commandsDst}`);
