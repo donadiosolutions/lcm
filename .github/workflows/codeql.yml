@@ -11,7 +11,6 @@ on:
 permissions:
   actions: read
   contents: read
-  packages: read
   security-events: write
 
 concurrency:
@@ -43,3 +42,4 @@ jobs:
         uses: github/codeql-action/analyze@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1
         with:
           category: /language:${{ matrix.language }}/profile:default
+          upload: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'never' || 'always' }}
