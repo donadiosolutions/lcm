@@ -484,7 +484,7 @@ describe("summarizer picker", () => {
     expect(written.llm.retry).toEqual(DEFAULT_LLM_RETRY_POLICY);
   });
 
-  it("option 3 retries each empty required value once before accepting it", async () => {
+  it("option 3 retries each empty required value once before accepting it", async (): Promise<void> => {
     Object.defineProperty(process.stdin, "isTTY", { value: true, writable: true });
     const deps = makeDeps({
       existsSync: vi.fn().mockReturnValue(false),
@@ -507,7 +507,7 @@ describe("summarizer picker", () => {
     expect(deps.promptUser).toHaveBeenCalledTimes(5);
   });
 
-  it("option 3 falls back atomically to auto after two empty server URLs", async () => {
+  it("option 3 falls back atomically to auto after two empty server URLs", async (): Promise<void> => {
     Object.defineProperty(process.stdin, "isTTY", { value: true, writable: true });
     const deps = makeDeps({
       existsSync: vi.fn().mockReturnValue(false),
@@ -528,7 +528,7 @@ describe("summarizer picker", () => {
     expect(deps.promptUser).toHaveBeenCalledTimes(3);
   });
 
-  it("option 3 discards a valid URL when two model attempts are empty", async () => {
+  it("option 3 discards a valid URL when two model attempts are empty", async (): Promise<void> => {
     Object.defineProperty(process.stdin, "isTTY", { value: true, writable: true });
     const deps = makeDeps({
       existsSync: vi.fn().mockReturnValue(false),

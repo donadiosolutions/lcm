@@ -860,7 +860,10 @@ describe("ensureDaemon", () => {
     let fetchCalls = 0;
     const fetchMock = vi.fn(async (): Promise<Response> => {
       fetchCalls++;
-      if (fetchCalls === 2) monotonicMs = 350;
+      if (fetchCalls === 2) {
+        monotonicMs = 350;
+        return { ok: true, json: async (): Promise<{ status: string }> => ({ status: "ok" }) } as Response;
+      }
       return { ok: false } as Response;
     });
     const sleepMock = vi.fn(async (): Promise<void> => {});
@@ -886,18 +889,22 @@ describe("ensureDaemon", () => {
     let monotonicMs = 0;
     let fetchCalls = 0;
     let healthSignal: AbortSignal | undefined;
+    let signalWasInitiallyAborted: boolean | undefined;
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       fetchCalls++;
       if (fetchCalls === 1) return { ok: false } as Response;
       healthSignal = init?.signal ?? undefined;
+      signalWasInitiallyAborted = healthSignal?.aborted;
       return new Promise<Response>((
         _resolve: (value: Response | PromiseLike<Response>) => void,
       ): void => {});
     });
     const timerHandle = 123 as unknown as ReturnType<typeof setTimeout>;
     const setTimeoutMock = vi.fn((callback: () => void, delayMs: number): ReturnType<typeof setTimeout> => {
-      monotonicMs += delayMs;
-      callback();
+      queueMicrotask((): void => {
+        monotonicMs += delayMs;
+        callback();
+      });
       return timerHandle;
     });
     const clearTimeoutMock = vi.fn((_timeout: ReturnType<typeof setTimeout>): void => {});
@@ -918,8 +925,69 @@ describe("ensureDaemon", () => {
     expect(result).toMatchObject({ connected: false, spawned: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(setTimeoutMock).toHaveBeenCalledWith(expect.any(Function), 350);
+    expect(signalWasInitiallyAborted).toBe(false);
     expect(healthSignal?.aborted).toBe(true);
     expect(clearTimeoutMock).toHaveBeenCalledWith(timerHandle);
+    expect(sleepMock).not.toHaveBeenCalled();
+  });
+
+  it("aborts a hanging access check at the remaining monotonic deadline and clears both request timers", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-hanging-access-"));
+    tempDirs.push(tempDir);
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    let monotonicMs = 0;
+    let fetchCalls = 0;
+    let accessSignal: AbortSignal | undefined;
+    let accessSignalWasInitiallyAborted: boolean | undefined;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      fetchCalls++;
+      if (fetchCalls === 1) return { ok: false } as Response;
+      if (fetchCalls === 2) {
+        return { ok: true, json: async (): Promise<{ status: string }> => ({ status: "ok" }) } as Response;
+      }
+      accessSignal = init?.signal ?? undefined;
+      accessSignalWasInitiallyAborted = accessSignal?.aborted;
+      return new Promise<Response>((
+        _resolve: (value: Response | PromiseLike<Response>) => void,
+      ): void => {});
+    });
+    const healthTimer = 201 as unknown as ReturnType<typeof setTimeout>;
+    const accessTimer = 202 as unknown as ReturnType<typeof setTimeout>;
+    let timerCalls = 0;
+    const setTimeoutMock = vi.fn((callback: () => void, delayMs: number): ReturnType<typeof setTimeout> => {
+      timerCalls++;
+      if (timerCalls === 2) {
+        queueMicrotask((): void => {
+          monotonicMs += delayMs;
+          callback();
+        });
+        return accessTimer;
+      }
+      return healthTimer;
+    });
+    const clearTimeoutMock = vi.fn((_timeout: ReturnType<typeof setTimeout>): void => {});
+    const sleepMock = vi.fn(async (_durationMs: number): Promise<void> => {});
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: join(tempDir, "daemon.pid"),
+      spawnTimeoutMs: 350,
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: vi.fn().mockReturnValue(makeSpawnChild(12345)) as unknown as SpawnOverride,
+      _monotonicNowOverride: (): number => monotonicMs,
+      _setTimeoutOverride: setTimeoutMock,
+      _clearTimeoutOverride: clearTimeoutMock,
+      _sleepOverride: sleepMock,
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: true });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(setTimeoutMock).toHaveBeenNthCalledWith(1, expect.any(Function), 350);
+    expect(setTimeoutMock).toHaveBeenNthCalledWith(2, expect.any(Function), 350);
+    expect(accessSignalWasInitiallyAborted).toBe(false);
+    expect(accessSignal?.aborted).toBe(true);
+    expect(clearTimeoutMock).toHaveBeenCalledWith(healthTimer);
+    expect(clearTimeoutMock).toHaveBeenCalledWith(accessTimer);
     expect(sleepMock).not.toHaveBeenCalled();
   });
 
@@ -950,6 +1018,31 @@ describe("ensureDaemon", () => {
 });
 
 describe("restartDaemon", () => {
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects invalid spawn timeout %s before validation, inspection, or signaling",
+    async (spawnTimeoutMs: number): Promise<void> => {
+      const validateBeforeRestart = vi.fn();
+      const fetchMock = vi.fn();
+      const killMock = vi.fn();
+      const ensureMock = vi.fn();
+
+      await expect(restartDaemon({
+        port: 19999,
+        pidFilePath: "/unused/daemon.pid",
+        spawnTimeoutMs,
+        validateBeforeRestart,
+        _fetchOverride: fetchMock as FetchOverride,
+        _killOverride: killMock,
+        _ensureDaemonOverride: ensureMock,
+      })).rejects.toThrow(new RangeError("spawnTimeoutMs must be a finite, non-negative number"));
+
+      expect(validateBeforeRestart).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(killMock).not.toHaveBeenCalled();
+      expect(ensureMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("validates before stopping a verified running daemon and starts with the new port", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-running-"));
     tempDirs.push(tempDir);
