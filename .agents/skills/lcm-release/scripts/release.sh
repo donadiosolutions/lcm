@@ -125,6 +125,23 @@ tag_peeled_from_refs() {
   awk -v peeled_ref="refs/tags/$tag^{}" '$2 == peeled_ref { print $1; exit }'
 }
 
+commit_json_version() {
+  local commit="$1"
+  local path="$2"
+  local selector="$3"
+  git show "$commit:$path" | node -e '
+    let input = "";
+    const selector = process.argv[1];
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("end", () => {
+      const parsed = JSON.parse(input);
+      const version = selector === "marketplace" ? parsed.plugins?.[0]?.version : parsed.version;
+      process.stdout.write(String(version ?? ""));
+    });
+  ' "$selector"
+}
+
 # Validate origin points at the canonical repo (not a fork)
 ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
 if ! is_canonical_origin "$ORIGIN_URL"; then
@@ -386,14 +403,27 @@ if run_step 8; then
     err "Failed to fetch origin/main before creating $TAG."
   git merge-base --is-ancestor "$MERGE_SHA" origin/main || \
     err "Merge commit $MERGE_SHA is not reachable from origin/main; refusing to tag it."
-  MERGED_PACKAGE_VERSION=$(git show "$MERGE_SHA:package.json" | node -e '
-    let input = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => { input += chunk; });
-    process.stdin.on("end", () => { process.stdout.write(String(JSON.parse(input).version ?? "")); });
-  ') || err "Could not read package.json version from merge commit $MERGE_SHA."
-  [[ "$MERGED_PACKAGE_VERSION" == "$VERSION" ]] || \
-    err "Merge commit $MERGE_SHA contains package version $MERGED_PACKAGE_VERSION, expected $VERSION; refusing to create $TAG."
+  MERGED_PACKAGE_VERSION=$(commit_json_version "$MERGE_SHA" "package.json" "root") || \
+    err "Could not read package.json version from merge commit $MERGE_SHA."
+  MERGED_PLUGIN_VERSION=$(commit_json_version "$MERGE_SHA" ".claude-plugin/plugin.json" "root") || \
+    err "Could not read .claude-plugin/plugin.json version from merge commit $MERGE_SHA."
+  MERGED_MARKETPLACE_VERSION=$(commit_json_version "$MERGE_SHA" ".claude-plugin/marketplace.json" "marketplace") || \
+    err "Could not read .claude-plugin/marketplace.json version from merge commit $MERGE_SHA."
+  [[ "$MERGED_PACKAGE_VERSION" == "$VERSION" && "$MERGED_PLUGIN_VERSION" == "$VERSION" && "$MERGED_MARKETPLACE_VERSION" == "$VERSION" ]] || \
+    err "Merge commit $MERGE_SHA has inconsistent release versions (package=$MERGED_PACKAGE_VERSION, plugin=$MERGED_PLUGIN_VERSION, marketplace=$MERGED_MARKETPLACE_VERSION; expected $VERSION); refusing to create $TAG."
+  MERGED_CHANGELOG=$(git show "$MERGE_SHA:CHANGELOG.md") || \
+    err "Could not read CHANGELOG.md from merge commit $MERGE_SHA."
+  CHANGELOG_BLOCK=$(printf '%s\n' "$MERGED_CHANGELOG" | awk -v version="$VERSION" '
+    $0 == "## " version || $0 == "## [" version "]" ||
+    index($0, "## " version " ") == 1 || index($0, "## [" version "] ") == 1 {
+      found=1
+      next
+    }
+    found && /^## / { exit }
+    found { print }
+  ')
+  [[ -n "$(printf '%s' "$CHANGELOG_BLOCK" | tr -d '[:space:]')" ]] || \
+    err "Merge commit $MERGE_SHA has no nonempty CHANGELOG.md block for $VERSION; refusing to create $TAG."
 
   REMOTE_TAG_REFS=$(remote_tag_refs "$TAG") || \
     err "Failed to inspect $TAG on origin."

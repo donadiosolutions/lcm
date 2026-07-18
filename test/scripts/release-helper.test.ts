@@ -13,10 +13,13 @@ const tagObjectSha = "c".repeat(40);
 const otherTagObjectSha = "d".repeat(40);
 
 interface HarnessOptions {
+  changelogContent?: string;
   localTagState?: string;
   mergeSha?: string;
   mergeReachable?: boolean;
   mergedPackageVersion?: string;
+  mergedPluginVersion?: string;
+  mergedMarketplaceVersion?: string;
   npmVersion?: string;
   originUrl?: string;
   originPushUrls?: string[];
@@ -95,6 +98,18 @@ if [[ "$1" == "merge-base" && "$2" == "--is-ancestor" ]]; then
 fi
 if [[ "$1" == "show" && "$2" == *:package.json ]]; then
   printf '{"version":"%s"}\n' "$FAKE_MERGED_PACKAGE_VERSION"
+  exit 0
+fi
+if [[ "$1" == "show" && "$2" == *:.claude-plugin/plugin.json ]]; then
+  printf '{"version":"%s"}\n' "$FAKE_MERGED_PLUGIN_VERSION"
+  exit 0
+fi
+if [[ "$1" == "show" && "$2" == *:.claude-plugin/marketplace.json ]]; then
+  printf '{"plugins":[{"version":"%s"}]}\n' "$FAKE_MERGED_MARKETPLACE_VERSION"
+  exit 0
+fi
+if [[ "$1" == "show" && "$2" == *:CHANGELOG.md ]]; then
+  printf '%s' "$FAKE_CHANGELOG_CONTENT"
   exit 0
 fi
 if [[ "$1" == "ls-remote" && "$2" == "--tags" ]]; then
@@ -206,10 +221,13 @@ exit 0
       env: {
         ...process.env,
         FAKE_CALL_LOG: callLog,
+        FAKE_CHANGELOG_CONTENT: options.changelogContent ?? `## ${releaseVersion}\n\n- Release notes\n`,
         FAKE_LOCAL_TAG_STATE: localTagState,
         FAKE_MERGE_REACHABLE: String(options.mergeReachable ?? true),
         FAKE_MERGE_SHA: releaseMergeSha,
         FAKE_MERGED_PACKAGE_VERSION: options.mergedPackageVersion ?? releaseVersion,
+        FAKE_MERGED_PLUGIN_VERSION: options.mergedPluginVersion ?? releaseVersion,
+        FAKE_MERGED_MARKETPLACE_VERSION: options.mergedMarketplaceVersion ?? releaseVersion,
         FAKE_NPM_VERSION: options.npmVersion ?? version,
         FAKE_ORIGIN_URL: options.originUrl ?? "git@github.com:donadiosolutions/lcm.git",
         FAKE_ORIGIN_PUSH_URLS: `${(options.originPushUrls ?? [options.originUrl ?? "git@github.com:donadiosolutions/lcm.git"]).join("\n")}\n`,
@@ -369,7 +387,32 @@ describe("manual release helper step 8", () => {
     const result = runRelease({ mergedPackageVersion: "9.9.8" });
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain(`contains package version 9.9.8, expected ${version}`);
+    expect(result.stderr).toContain(`package=9.9.8, plugin=${version}, marketplace=${version}; expected ${version}`);
+    expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
+    expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
+  });
+
+  it.each([
+    { mergedPluginVersion: "9.9.8" },
+    { mergedMarketplaceVersion: "9.9.8" },
+  ])("refuses inconsistent packaged manifest versions before tagging", (manifestOptions: HarnessOptions) => {
+    const result = runRelease(manifestOptions);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("has inconsistent release versions");
+    expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
+    expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
+  });
+
+  it.each([
+    "",
+    `## ${version}\n\n## 9.9.8\n\n- Older notes\n`,
+    `## ${version}\n\n   \n## 9.9.8\n\n- Older notes\n`,
+  ])("refuses a missing or empty release changelog block before tagging", (changelogContent: string) => {
+    const result = runRelease({ changelogContent });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`has no nonempty CHANGELOG.md block for ${version}`);
     expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
     expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
   });
