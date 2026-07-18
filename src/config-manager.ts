@@ -177,8 +177,8 @@ function canonicalizeLlmProviderTransition(
   ) {
     return;
   }
-  const llm = root.llm;
-  if (!isRecord(llm)) return;
+  // setAtPath has just established llm as an object for this exact path.
+  const llm = root.llm as Record<string, unknown>;
   const provider = normalizeLlmProvider(value) as LlmProvider;
   if (provider !== "openai") {
     for (const key of OPENAI_ONLY_LLM_KEYS) delete llm[key];

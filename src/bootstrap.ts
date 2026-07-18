@@ -72,7 +72,7 @@ export async function ensureCore(deps: EnsureCoreDeps = defaultDeps()): Promise<
   // 3. Start daemon if not running
   const config = loadDaemonConfig(deps.configPath);
   await deps.ensureDaemon({
-    port: config.daemon?.port ?? 3737,
+    port: config.daemon.port,
     pidFilePath: join(dirname(deps.configPath), "daemon.pid"),
     spawnTimeoutMs: 5000,
     enforceUserManagerParent: true,

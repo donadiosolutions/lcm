@@ -13,7 +13,7 @@ interface CommandHelp {
   summary: string;
   usage: string;
   options?: FlagHelp[];
-  examples?: ExampleHelp[];
+  examples: ExampleHelp[];
   notes?: string;
 }
 
@@ -512,7 +512,7 @@ const GROUPS = [
 ];
 
 function pad(str: string, width: number): string {
-  return str.length >= width ? str : str + " ".repeat(width - str.length);
+  return str + " ".repeat(width - str.length);
 }
 
 export function printHelp(command?: string): void {
@@ -573,14 +573,12 @@ function printCommandHelp(command: string): void {
     lines.push("");
   }
 
-  if (h.examples && h.examples.length > 0) {
-    lines.push("  Examples:");
-    const maxLen = Math.max(...h.examples.map(([cmd]) => cmd.length));
-    for (const [cmd, desc] of h.examples) {
-      lines.push(`    ${pad(cmd, maxLen + 2)}${desc}`);
-    }
-    lines.push("");
+  lines.push("  Examples:");
+  const maxLen = Math.max(...h.examples.map(([cmd]) => cmd.length));
+  for (const [cmd, desc] of h.examples) {
+    lines.push(`    ${pad(cmd, maxLen + 2)}${desc}`);
   }
+  lines.push("");
 
   if (h.notes) {
     lines.push(`  Note: ${h.notes}`);

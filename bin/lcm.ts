@@ -471,6 +471,16 @@ function printJson(value: unknown): void {
   stdout.write(JSON.stringify(value, null, 2) + "\n");
 }
 
+/** @internal Output seams used by the executable's Commander configuration. */
+export function writeCliOutput(value: string): void {
+  stdout.write(value);
+}
+
+/** @internal Output seams used by the executable's Commander configuration. */
+export function writeCliError(value: string): void {
+  process.stderr.write(value);
+}
+
 async function createDaemonClientOrExit(): Promise<DaemonClient> {
   const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
   const { loadDaemonConfig } = await import("../src/daemon/config.js");
@@ -495,7 +505,8 @@ async function createDaemonClientOrExit(): Promise<DaemonClient> {
   return new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
 }
 
-async function main() {
+/** @internal CLI entry seam; defaults preserve the published executable behavior. */
+export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
   migrateLegacyHomeIfNeeded();
   const { readFileSync } = await import("node:fs");
   const { join, dirname } = await import("node:path");
@@ -511,8 +522,8 @@ async function main() {
     .helpCommand(false)
     .addHelpCommand(false)
     .configureOutput({
-      writeOut: (str) => stdout.write(str),
-      writeErr: (str) => process.stderr.write(str),
+      writeOut: writeCliOutput,
+      writeErr: writeCliError,
     });
 
   // Disable Commander's built-in help entirely — we handle it manually below
@@ -1127,7 +1138,7 @@ async function main() {
   const eventsCmd = new Command("events").description("Manage passive-learning sidecar events");
   eventsCmd.helpOption(false).option("-h, --help", "Show help");
   eventsCmd.action(async (opts) => {
-    if (opts.help || argv.includes("-h") || argv.includes("--help")) {
+    if (opts.help || cliArgv.includes("-h") || cliArgv.includes("--help")) {
       const { printHelp } = await import("../src/cli-help.js");
       printHelp("events"); exit(0);
     }
@@ -1143,7 +1154,7 @@ async function main() {
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
-      if (opts.help || argv.includes("-h") || argv.includes("--help")) {
+      if (opts.help || cliArgv.includes("-h") || cliArgv.includes("--help")) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("events"); exit(0);
       }
@@ -1777,18 +1788,31 @@ async function main() {
   // Handle root-level help and no-args before Commander parses — this prevents
   // Commander from seeing --help at the root level and intercepting it before
   // dispatching to subcommands (lcm import --help would otherwise show root help).
-  if (argv.length <= 2 || (argv.length === 3 && (argv[2] === "-h" || argv[2] === "--help"))) {
+  if (cliArgv.length <= 2 || (cliArgv.length === 3 && (cliArgv[2] === "-h" || cliArgv[2] === "--help"))) {
     const { printHelp } = await import("../src/cli-help.js");
     printHelp();
     exit(0);
   }
 
-  await program.parseAsync(argv);
+  await program.parseAsync(cliArgv);
 }
 
-if (shouldRunMain(argv[1], fileURLToPath(import.meta.url))) {
-  main().catch((err) => {
-    console.error(err instanceof ConfigValidationError ? err.message : err);
-    exit(1);
-  });
+/** @internal Top-level rejection handler kept separate for deterministic tests. */
+export function handleCliError(err: unknown): never {
+  console.error(err instanceof ConfigValidationError ? err.message : err);
+  return exit(1);
 }
+
+/** @internal Execute only when this module is the resolved process entrypoint. */
+export function runMainIfInvoked(
+  invokedPath: string | undefined,
+  currentFilePath: string,
+  runner: () => Promise<void> = runCli,
+  onError: (error: unknown) => unknown = handleCliError,
+): void {
+  if (shouldRunMain(invokedPath, currentFilePath)) {
+    void runner().catch(onError);
+  }
+}
+
+runMainIfInvoked(argv[1], fileURLToPath(import.meta.url));

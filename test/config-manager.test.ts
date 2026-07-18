@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ConfigManagerError,
   formatConfigValue,
@@ -24,6 +24,8 @@ function makeConfig(content: unknown): { directory: string; configPath: string }
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   for (const directory of tempDirs.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -57,6 +59,12 @@ describe("config manager paths and values", () => {
     expect(() => parseConfigValue("{", true)).toThrow("Invalid JSON configuration value");
     expect(formatConfigValue("value")).toBe("value");
     expect(formatConfigValue({ enabled: true })).toBe('{\n  "enabled": true\n}');
+    expect(formatConfigValue(undefined)).toBe("undefined");
+  });
+
+  it("reports a non-Error JSON parser failure", () => {
+    vi.spyOn(JSON, "parse").mockImplementationOnce(() => { throw "parser failed"; });
+    expect(() => parseConfigValue("ignored", true)).toThrow("parser failed");
   });
 
   it("recursively masks secret-like keys, including scalar reads", () => {
@@ -144,6 +152,20 @@ describe("config manager paths and values", () => {
 });
 
 describe("getConfigValue", () => {
+  it("rethrows non-missing filesystem failures and rejects traversal through a scalar", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-config-manager-directory-"));
+    tempDirs.push(directory);
+    expect(() => getConfigValue({ configPath: directory, path: "llm" })).toThrow();
+
+    const { configPath } = makeConfig({ llm: { provider: "disabled" } });
+    expect(() => getConfigValue({ configPath, path: "llm.provider.child" })).toThrow("does not exist");
+  });
+
+  it("uses the process environment for effective reads when env is omitted", () => {
+    vi.stubEnv("LCM_SUMMARY_PROVIDER", "disabled");
+    const { configPath } = makeConfig({ version: 1 });
+    expect(getConfigValue({ configPath, path: "llm.provider", effective: true })).toBe("disabled");
+  });
   it("returns normalized stored values without defaults", () => {
     const { configPath } = makeConfig({ llm: { baseURL: "http://localhost:11434/v1", apiKey: "secret" } });
     expect(getConfigValue({ configPath, path: "llm.baseURL" })).toBe("http://localhost:11434/v1");
@@ -281,6 +303,16 @@ describe("getConfigValue", () => {
 });
 
 describe("setConfigValue", () => {
+  it("uses the process environment when an explicit environment is omitted", () => {
+    vi.stubEnv("LCM_SUMMARY_PROVIDER", "disabled");
+    const { configPath } = makeConfig({ version: 1 });
+    expect(setConfigValue({
+      configPath,
+      path: "hooks.disableAutoCompact",
+      value: "true",
+      json: true,
+    })).toBe(true);
+  });
   it("creates object parents, preserves unrelated keys, normalizes, and writes mode 0600 atomically", () => {
     const { directory, configPath } = makeConfig({ version: 1, unrelated: { keep: true } });
 

@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, utimesSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync, utimesSync } from "node:fs";
+import { basename, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import {
   parseCodexTranscript,
   extractCodexSessionCwd,
@@ -159,6 +159,32 @@ describe("parseCodexTranscript", () => {
     expect(msgs[0].content).toBe("Plain string content");
   });
 
+  it("handles malformed payload and every supported content-block shape", () => {
+    const dir = makeTmpDir();
+    const file = join(dir, "session.jsonl");
+    writeFileSync(file, [
+      JSON.stringify({ type: "response_item" }),
+      JSON.stringify({ type: "response_item", payload: { type: "message" } }),
+      JSON.stringify({ type: "response_item", payload: { type: "message", role: "user" } }),
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [
+            { type: "input_text" },
+            { type: "output_text", text: "output" },
+            { type: "text", text: "plain" },
+            { type: "text", text: 42 },
+            { type: "unknown", text: "ignored" },
+          ],
+        },
+      }),
+    ].join("\n"));
+
+    expect(parseCodexTranscript(file).map((message) => message.content)).toEqual(["output\nplain"]);
+  });
+
   it("parses a full conversation (multiple turns)", () => {
     const dir = makeTmpDir();
     const file = join(dir, "session.jsonl");
@@ -219,6 +245,19 @@ describe("extractCodexSessionCwd", () => {
 
     expect(extractCodexSessionCwd(file)).toBe("/first/path");
   });
+
+  it("skips blank, malformed, and incomplete session metadata", () => {
+    const dir = makeTmpDir();
+    const file = join(dir, "session.jsonl");
+    writeFileSync(file, [
+      "",
+      "not-json",
+      JSON.stringify({ type: "session_meta" }),
+      JSON.stringify({ type: "session_meta", payload: { cwd: "" } }),
+      JSON.stringify({ type: "session_meta", payload: { cwd: 42 } }),
+    ].join("\n"));
+    expect(extractCodexSessionCwd(file)).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -251,6 +290,20 @@ describe("findCodexSessionFiles", () => {
     expect(files).toHaveLength(1);
     expect(files[0].sessionId).toBe("session-xyz");
     expect(files[0].path).toBe(join(sessionDir, "session-xyz.jsonl"));
+  });
+
+  it("ignores symlinks, missing nested transcripts, and nested non-files", () => {
+    const dir = makeTmpDir();
+    const target = join(dir, "target.jsonl");
+    writeFileSync(target, "");
+    symlinkSync(target, join(dir, "linked.jsonl"));
+    mkdirSync(join(dir, "missing"));
+    mkdirSync(join(dir, "nested-dir"));
+    mkdirSync(join(dir, "nested-dir", "nested-dir.jsonl"));
+    mkdirSync(join(dir, "nested-link"));
+    symlinkSync(target, join(dir, "nested-link", "nested-link.jsonl"));
+
+    expect(findCodexSessionFiles(dir).map((file) => file.sessionId)).toEqual(["target"]);
   });
 
   it("returns files sorted by mtime ascending", async () => {
@@ -291,6 +344,17 @@ describe("findAllCodexTranscripts", () => {
   it("returns empty array when codexDir has no sessions", () => {
     const dir = makeTmpDir();
     expect(findAllCodexTranscripts(dir)).toEqual([]);
+  });
+
+  it("uses the default Codex home when no directory is supplied", () => {
+    const sessionsRoot = join(homedir(), ".codex", "sessions");
+    mkdirSync(sessionsRoot, { recursive: true });
+    const sessionDir = mkdtempSync(join(sessionsRoot, "coverage-default-"));
+    dirs.push(sessionDir);
+    const sessionId = basename(sessionDir);
+    writeFileSync(join(sessionDir, `${sessionId}.jsonl`), "");
+
+    expect(findAllCodexTranscripts().map((file) => file.sessionId)).toContain(sessionId);
   });
 
   it("collects from archived_sessions/ (flat) and sessions/ (nested)", () => {
@@ -334,5 +398,18 @@ describe("findAllCodexTranscripts", () => {
     expect(matches).toHaveLength(1);
     // archived_sessions is added first, so it wins
     expect(matches[0].path).toBe(join(archived, "dup-session.jsonl"));
+  });
+
+  it("sorts collected transcripts by distinct modification times", () => {
+    const codexDir = makeTmpDir();
+    const archived = join(codexDir, "archived_sessions");
+    mkdirSync(archived, { recursive: true });
+    const newer = join(archived, "newer.jsonl");
+    const older = join(archived, "older.jsonl");
+    writeFileSync(newer, "");
+    writeFileSync(older, "");
+    const oldTime = new Date(Date.now() - 10_000);
+    utimesSync(older, oldTime, oldTime);
+    expect(findAllCodexTranscripts(codexDir).map((file) => file.sessionId)).toEqual(["older", "newer"]);
   });
 });
