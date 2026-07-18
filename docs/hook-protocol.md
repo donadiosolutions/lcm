@@ -93,11 +93,17 @@ Invoked after every tool call. lcm extracts structured events (decisions, errors
 
 **Response:** Always exit code `0`. This hook runs on every tool call and must be fast; it does no network I/O and only writes to a local sidecar SQLite database.
 
+The `daemon_port` payload field is ignored. PostToolUse never sends the daemon
+bearer token or captured event data to a payload-selected listener; queued
+events are collected by the daemon's bounded background processing instead.
+
 ## SessionSnapshot Hook
 
 **Command:** `lcm session-snapshot`
 
 An optional periodic hook that incrementally ingests the live session transcript between `SessionEnd` events. This is used for long-running sessions where you want memory to be updated without waiting for the session to end. Codex uses this command on `Stop` for rolling snapshots and on `PreCompact` to force-ingest deltas immediately before manual or automatic compaction.
+
+Snapshot ingestion is skipped when daemon bootstrap cannot verify the configured daemon PID, installed version, and exact loopback listener. This prevents transcript paths, request bodies, and bearer credentials from being sent to an occupied but unverified port.
 
 **Stdin fields:**
 

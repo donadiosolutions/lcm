@@ -164,12 +164,14 @@ In practice, the hook asks the daemon for ranked candidates, the daemon dedupes 
 
 ## Daemon safety
 
-The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon requests to loopback HTTP origins and known daemon routes, so a malformed config or caller cannot redirect daemon traffic to another host.
+The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon requests to loopback HTTP origins and known daemon routes, so a malformed config or caller cannot redirect daemon traffic to another host. Before sending a bearer token or request body, lifecycle checks require the PID file, `/health` PID and installed version, and exact `127.0.0.1` listener ownership to agree. An occupied port with missing or unverifiable identity is rejected rather than trusted. SessionSnapshot skips ingestion when bootstrap cannot verify that identity. PostToolUse also ignores payload-provided daemon ports and performs no network I/O.
 
 Use `lcm daemon start` to start or validate the managed background daemon. Use
 `lcm daemon restart` after configuration changes; it validates the new
 configuration before stopping the managed process, then starts the daemon with
-the updated settings. On Linux, lcm prefers the current user's `systemd --user`
+the updated settings. Because restart fails closed unless the running daemon
+owns the configured listener, stop the daemon before changing `daemon.port`,
+then start it again after saving the new port. On Linux, lcm prefers the current user's `systemd --user`
 manager so the daemon remains a direct child of the user manager instead of
 being orphaned under PID 1. `lcm daemon start --detach` is kept as a compatibility
 alias for the same managed start behavior. Use `lcm daemon start --foreground`

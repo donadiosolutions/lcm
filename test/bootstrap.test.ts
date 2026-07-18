@@ -92,7 +92,7 @@ describe("ensureCore", () => {
       chmodSync: vi.fn(() => { throw new Error("unsupported"); }),
     });
     const { ensureCore } = await import("../src/bootstrap.js");
-    await expect(ensureCore(deps)).resolves.toBeUndefined();
+    await expect(ensureCore(deps)).resolves.toBe(true);
   });
 
   it("does not rewrite unchanged settings and ignores malformed settings", async () => {
@@ -106,7 +106,7 @@ describe("ensureCore", () => {
     });
     const { ensureCore } = await import("../src/bootstrap.js");
     await ensureCore(unchanged);
-    await expect(ensureCore(malformed)).resolves.toBeUndefined();
+    await expect(ensureCore(malformed)).resolves.toBe(true);
     expect(unchanged.writeFileSync).not.toHaveBeenCalled();
     expect(malformed.writeFileSync).not.toHaveBeenCalled();
   });
@@ -146,7 +146,19 @@ describe("ensureBootstrapped", () => {
       ...coreDeps,
       flagExists: vi.fn(() => { throw new Error("unreadable"); }),
       writeFlag: vi.fn(() => { throw new Error("unwritable"); }),
-    })).resolves.toBeUndefined();
+    })).resolves.toBe(true);
     expect(coreDeps.ensureDaemon).toHaveBeenCalled();
+  });
+
+  it("does not write the bootstrap flag when daemon identity is unverified", async () => {
+    const writeFlag = vi.fn();
+    const coreDeps = makeDeps({ ensureDaemon: vi.fn().mockResolvedValue({ connected: false }) });
+    const { ensureBootstrapped } = await import("../src/bootstrap.js");
+    await expect(ensureBootstrapped("test-session", {
+      ...coreDeps,
+      flagExists: vi.fn().mockReturnValue(false),
+      writeFlag,
+    })).resolves.toBe(false);
+    expect(writeFlag).not.toHaveBeenCalled();
   });
 });

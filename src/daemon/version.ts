@@ -9,9 +9,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  * PKG_VERSION works correctly in both production (dist/src/daemon/) and
  * dev/test (src/daemon/) environments.
  *
- * Returns `undefined` when the version cannot be determined, so that callers
- * like ensureDaemon({ expectedVersion }) skip the version check rather than
- * restarting the daemon based on a stale "0.0.0" fallback.
+ * Returns `undefined` when the version cannot be determined. Security-sensitive
+ * lifecycle callers treat that as unverifiable and fail closed before sending
+ * daemon credentials.
  */
 export const PKG_VERSION: string | undefined = (() => {
   const candidates = [

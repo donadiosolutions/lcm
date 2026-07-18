@@ -1,8 +1,9 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, win32 } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
+import { PKG_VERSION } from "./version.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
@@ -36,6 +37,8 @@ export type EnsureDaemonOptions = {
   _setTimeoutOverride?: SetTimeoutFn;
   _clearTimeoutOverride?: ClearTimeoutFn;
   _isProcessAliveOverride?: (pid: number) => boolean;
+  /** @internal Deterministic listener-ownership seam for lifecycle tests. */
+  _listeningPortsOverride?: (pid: number) => number[];
 };
 
 export type EnsureDaemonResult = {
@@ -68,6 +71,13 @@ type HealthResponse = {
   uptime?: number;
   pid?: number;
 };
+
+function healthVersionMatches(health: HealthResponse | null, expectedVersion: string | undefined): boolean {
+  return typeof expectedVersion === "string"
+    && expectedVersion.length > 0
+    && typeof health?.version === "string"
+    && health.version === expectedVersion;
+}
 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
@@ -148,12 +158,92 @@ function isLikelyLcmDaemonProcess(pid: number, procRoot = "/proc"): boolean {
   return isLikelyLcmDaemonCommand(readProcessCommand(pid, procRoot));
 }
 
+function resolveWindowsNetstatPath(
+  systemRoot: string | undefined,
+  windir: string | undefined,
+  fileExists: (path: string) => boolean = existsSync,
+): string | null {
+  for (const candidate of [systemRoot, windir]) {
+    if (typeof candidate !== "string") continue;
+    const normalized = win32.normalize(candidate.trim()).replace(/[\\/]+$/, "");
+    // SystemRoot/WINDIR should identify the OS Windows directory itself. Do
+    // not accept arbitrary absolute directories supplied through the process
+    // environment, UNC paths, relative paths, or executable search fallback.
+    if (!/^[A-Za-z]:\\Windows$/i.test(normalized)) continue;
+    const executable = win32.join(normalized, "System32", "netstat.exe");
+    if (fileExists(executable)) return executable;
+  }
+  return null;
+}
+
 function findListeningTcpPorts(
   pid: number,
   platform: NodeJS.Platform,
   spawnSyncImpl: typeof spawnSync,
+  procRoot = "/proc",
+  targetPort?: number,
+  windowsNetstatPath = resolveWindowsNetstatPath(process.env.SystemRoot, process.env.WINDIR),
 ): number[] {
-  if (platform === "win32") return [];
+  if (platform === "linux") {
+    try {
+      const socketInodes = new Set<string>();
+      for (const entry of readdirSync(join(procRoot, String(pid), "fd"))) {
+        try {
+          const target = readlinkSync(join(procRoot, String(pid), "fd", entry));
+          const match = /^socket:\[(\d+)\]$/.exec(target);
+          if (match) socketInodes.add(match[1]);
+        } catch {
+          // File descriptors can disappear while the process is running.
+        }
+      }
+      const ports = new Set<number>();
+      for (const table of ["tcp", "tcp6"]) {
+        let rows: string;
+        try {
+          rows = readFileSync(join(procRoot, "net", table), "utf-8");
+        } catch {
+          continue;
+        }
+        for (const row of rows.split(/\r?\n/).slice(1)) {
+          const columns = row.trim().split(/\s+/);
+          // Canonical /proc/net/tcp tokenization is: sl=0, local=1,
+          // remote=2, state=3, queues/timers=4..6, uid=7, timeout=8,
+          // inode=9, followed by ref/pointer fields.
+          if (columns.length < 10 || columns[3] !== "0A" || !socketInodes.has(columns[9])) continue;
+          const [addressHex, portHex] = columns[1]!.split(":");
+          // Requests are sent specifically to 127.0.0.1. A socket on another
+          // loopback address does not prove ownership of that endpoint.
+          if (addressHex !== "0100007F") continue;
+          const port = portHex ? Number.parseInt(portHex, 16) : NaN;
+          if (Number.isInteger(port) && port >= 1 && port <= 65_535 && (targetPort === undefined || port === targetPort)) ports.add(port);
+        }
+      }
+      return [...ports].sort((a, b) => a - b);
+    } catch {
+      return [];
+    }
+  }
+  if (platform === "win32") {
+    if (windowsNetstatPath === null) return [];
+    try {
+      const result = spawnSyncImpl(windowsNetstatPath, ["-ano", "-p", "tcp"], {
+        encoding: "utf-8", timeout: 1000, maxBuffer: 256 * 1024,
+      });
+      if (result.status !== 0 || typeof result.stdout !== "string") return [];
+      const ports = new Set<number>();
+      for (const line of result.stdout.split(/\r?\n/)) {
+        const columns = line.trim().split(/\s+/);
+        if (columns.length < 5 || columns[0]?.toUpperCase() !== "TCP" || columns[3]?.toUpperCase() !== "LISTENING") continue;
+        if (Number.parseInt(columns[4], 10) !== pid) continue;
+        if (!columns[1]?.startsWith("127.0.0.1:")) continue;
+        const port = Number.parseInt(columns[1]?.match(/:(\d+)$/)?.[1] ?? "", 10);
+        if (Number.isInteger(port) && port >= 1 && port <= 65_535 && (targetPort === undefined || port === targetPort)) ports.add(port);
+      }
+      return [...ports].sort((a, b) => a - b);
+    } catch {
+      return [];
+    }
+  }
   try {
     const command = platform === "darwin" ? "/usr/sbin/lsof" : "lsof";
     const result = spawnSyncImpl(command, [
@@ -171,11 +261,12 @@ function findListeningTcpPorts(
     if (result.status !== 0 || typeof result.stdout !== "string") return [];
     const ports = new Set<number>();
     for (const line of result.stdout.split(/\r?\n/)) {
-      if (!line.startsWith("n")) continue;
+      if (!line.startsWith("n127.0.0.1:")) continue;
       const match = line.match(/:(\d+)(?:\s+\(LISTEN\))?$/);
       if (!match) continue;
       const port = Number.parseInt(match[1], 10);
-      if (Number.isInteger(port) && port >= 1 && port <= 65_535) ports.add(port);
+      if (Number.isInteger(port) && port >= 1 && port <= 65_535 && (targetPort === undefined || port === targetPort)) ports.add(port);
+      if (targetPort !== undefined && ports.has(targetPort)) break;
       if (ports.size >= 32) break;
     }
     return [...ports].sort((a, b) => a - b);
@@ -310,11 +401,11 @@ async function terminatePid(
 async function requestDaemonHealth(
   port: number,
   fetchFn: typeof globalThis.fetch,
-  signal?: AbortSignal,
+  signal: AbortSignal,
 ): Promise<HealthResponse | null> {
   try {
     const url = `http://127.0.0.1:${port}/health`;
-    const res = signal ? await fetchFn(url, { signal }) : await fetchFn(url);
+    const res = await fetchFn(url, { signal });
     return res.ok ? (await res.json()) as HealthResponse : null;
   } catch {
     return null;
@@ -347,41 +438,35 @@ async function runWithDeadline<T>(
 async function checkDaemonHealth(
   port: number,
   fetchFn: typeof globalThis.fetch,
-  deadline?: RequestDeadline,
+  deadline: RequestDeadline,
 ): Promise<HealthResponse | null> {
-  if (deadline) {
-    try {
-      return await runWithDeadline(
-        (signal: AbortSignal): Promise<HealthResponse | null> => requestDaemonHealth(port, fetchFn, signal),
-        deadline,
-      );
-    } catch {
-      return null;
-    }
+  try {
+    return await runWithDeadline(
+      (signal: AbortSignal): Promise<HealthResponse | null> => requestDaemonHealth(port, fetchFn, signal),
+      deadline,
+    );
+  } catch {
+    return null;
   }
-
-  return requestDaemonHealth(port, fetchFn);
 }
 
 async function checkDaemonAccess(
   port: number,
   tokenPath: string,
   fetchFn: typeof globalThis.fetch,
-  deadline?: RequestDeadline,
+  deadline: RequestDeadline,
 ): Promise<boolean> {
   const token = readAuthToken(tokenPath);
   if (!token) return false;
-  const request = async (signal?: AbortSignal): Promise<boolean> => {
+  const request = async (signal: AbortSignal): Promise<boolean> => {
     const res = await fetchFn(`http://127.0.0.1:${port}/stats/pool`, {
       headers: { Authorization: `Bearer ${token}` },
-      ...(signal ? { signal } : {}),
+      signal,
     });
     return res.ok;
   };
   try {
-    return deadline
-      ? await runWithDeadline((signal: AbortSignal): Promise<boolean> => request(signal), deadline)
-      : await request();
+    return await runWithDeadline((signal: AbortSignal): Promise<boolean> => request(signal), deadline);
   } catch {
     return false;
   }
@@ -587,7 +672,27 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     process.kill(pid, signal);
   });
   const enforceParent = opts.enforceUserManagerParent === true && platform === "linux";
+  const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
   let restartedForParent = false;
+
+  if (typeof expectedVersion !== "string" || expectedVersion.length === 0) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      warning: "daemon identity could not be verified because the installed version is unknown",
+    };
+  }
+
+  function endpointIdentityMatches(health: HealthResponse | null): boolean {
+    if (health?.status !== "ok" || health.pid === undefined) return false;
+    const pid = readPidFile(opts.pidFilePath);
+    if (pid === null || health.pid !== pid || !isAlive(pid)) return false;
+    const listenerPorts = opts._listeningPortsOverride
+      ? opts._listeningPortsOverride(pid)
+      : findListeningTcpPorts(pid, platform, opts._spawnSyncOverride ?? spawnSync, procRoot, opts.port);
+    return listenerPorts.includes(opts.port);
+  }
 
   function remainingRequestDeadline(): RequestDeadline | null {
     const timeoutMs = deadline - monotonicNow();
@@ -618,8 +723,8 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     warning?: string,
     allowParentWarning = false,
   ): Promise<EnsureDaemonResult | null> {
-    if (health?.status !== "ok") return null;
-    if (opts.expectedVersion && health.version !== opts.expectedVersion) return null;
+    if (health === null || !endpointIdentityMatches(health)) return null;
+    if (!healthVersionMatches(health, expectedVersion)) return null;
     if (!access.alreadyVerified) {
       const accessTimeoutMs = access.deadline - monotonicNow();
       if (accessTimeoutMs <= 0) return null;
@@ -659,7 +764,9 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       connected: true,
       port: opts.port,
       spawned,
-      pid: parent?.pid ?? readPidFile(opts.pidFilePath) ?? undefined,
+      // Endpoint identity verification above proves health.pid is the live
+      // PID-file process, so it is the authoritative fallback here.
+      pid: parent?.pid ?? health.pid,
       parentPid: parent?.parentPid,
       userSystemdPid: parent?.userSystemdPid,
       restartedForParent,
@@ -675,10 +782,12 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     : null;
   if (health?.status === "ok") {
     const initialAccessDeadline = remainingRequestDeadline();
-    const hasAccess = initialAccessDeadline
+    const identityMatches = endpointIdentityMatches(health);
+    const versionMatches = healthVersionMatches(health, expectedVersion);
+    const hasAccess = identityMatches && versionMatches && initialAccessDeadline
       ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, initialAccessDeadline)
       : false;
-    if (hasAccess && opts.expectedVersion && health.version !== opts.expectedVersion) {
+    if (identityMatches && !versionMatches) {
       await terminatePidFileProcess();
     } else if (hasAccess) {
       const accepted = await daemonResult(health, false, "existing", { alreadyVerified: true });
@@ -687,7 +796,14 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       // access, and version were already accepted, while unavailable identity
       // metadata returns a connected result with a warning.
       const parent = inspectParent();
-      if (parent.available && parent.pid !== undefined && isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
+      // Revalidate the authenticated endpoint and PID immediately before a
+      // signal; concurrent lifecycle operations may have replaced either.
+      if (endpointIdentityMatches(health)
+        && parent.available
+        && parent.pid !== undefined
+        && health.pid !== undefined
+        && parent.pid === health.pid
+        && isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
         await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
         restartedForParent = true;
       }
@@ -710,10 +826,12 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           : null;
         if (retry?.status === "ok") {
           const retryAccessDeadline = remainingRequestDeadline();
-          const retryHasAccess = retryAccessDeadline
+          const retryIdentityMatches = endpointIdentityMatches(retry);
+          const retryVersionMatches = healthVersionMatches(retry, expectedVersion);
+          const retryHasAccess = retryIdentityMatches && retryVersionMatches && retryAccessDeadline
             ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, retryAccessDeadline)
             : false;
-          if (retryHasAccess && opts.expectedVersion && retry.version !== opts.expectedVersion) {
+          if (retryIdentityMatches && !retryVersionMatches) {
             await terminatePidFileProcess();
           } else if (retryHasAccess) {
             const accepted = await daemonResult(retry, false, "existing", { alreadyVerified: true });
@@ -823,21 +941,33 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   const platform = opts._platform ?? osPlatform();
   const fetchFn = opts._fetchOverride ?? globalThis.fetch;
   const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
-  async function isAuthenticatedDaemonAtPort(port: number, pid: number, allowLegacyHealth: boolean): Promise<boolean> {
-    const health = await checkDaemonHealth(port, fetchFn);
-    if (health?.status !== "ok") return false;
-    if (!await checkDaemonAccess(port, tokenPath, fetchFn)) return false;
-    return health.pid === undefined ? allowLegacyHealth : health.pid === pid;
+  const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
+  const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
+  const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
+  const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
+  const verificationDeadline = monotonicNow() + opts.spawnTimeoutMs;
+  function remainingVerificationDeadline(): RequestDeadline | null {
+    const timeoutMs = verificationDeadline - monotonicNow();
+    return timeoutMs <= 0 ? null : { timeoutMs, setTimeoutFn, clearTimeoutFn };
+  }
+  async function isAuthenticatedDaemonAtPort(port: number, pid: number): Promise<boolean> {
+    const healthDeadline = remainingVerificationDeadline();
+    if (!healthDeadline) return false;
+    const health = await checkDaemonHealth(port, fetchFn, healthDeadline);
+    if (health?.status !== "ok" || health.pid !== pid) return false;
+    if (!healthVersionMatches(health, expectedVersion)) return false;
+    const accessDeadline = remainingVerificationDeadline();
+    if (!accessDeadline || !await checkDaemonAccess(port, tokenPath, fetchFn, accessDeadline)) return false;
+    return true;
   }
   async function isManaged(pid: number): Promise<boolean> {
     if (_isManagedProcessOverride) return _isManagedProcessOverride(pid);
-    if (platform === "linux") return isLikelyLcmDaemonProcess(pid, opts._procRoot ?? "/proc");
-    if (await isAuthenticatedDaemonAtPort(opts.port, pid, false)) return true;
-    const listenerPorts = findListeningTcpPorts(pid, platform, opts._spawnSyncOverride ?? spawnSync);
-    for (const port of listenerPorts) {
-      if (await isAuthenticatedDaemonAtPort(port, pid, true)) return true;
-    }
-    return false;
+    if (platform === "linux" && !isLikelyLcmDaemonProcess(pid, opts._procRoot ?? "/proc")) return false;
+    const listenerPorts = opts._listeningPortsOverride
+      ? opts._listeningPortsOverride(pid)
+      : findListeningTcpPorts(pid, platform, opts._spawnSyncOverride ?? spawnSync, opts._procRoot ?? "/proc", opts.port);
+    if (!listenerPorts.includes(opts.port)) return false;
+    return await isAuthenticatedDaemonAtPort(opts.port, pid);
   }
   const killProcess = opts._killOverride ?? ((pid: number, signal?: NodeJS.Signals | number) => {
     process.kill(pid, signal);
@@ -877,8 +1007,10 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
 /** Internal branch-level seams used by the daemon lifecycle test suite. */
 export const __lifecycleTestUtils = {
   findListeningTcpPorts,
+  healthVersionMatches,
   inspectDaemonParent,
   parentInvariantWarning,
+  resolveWindowsNetstatPath,
   systemdDaemonSetenvArgs,
   systemdRunProcessEnv,
 };

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -19,13 +19,67 @@ const fetchHealthy = (pid?: number) => vi.fn(async (url: string) => url.endsWith
 
 describe("lifecycle procfs and parent warnings", () => {
   it("covers internal platform parsing, parent equality, warning fallback, and environment shaping", () => {
+    expect(__lifecycleTestUtils.healthVersionMatches(null, undefined)).toBe(false);
+    expect(__lifecycleTestUtils.healthVersionMatches({ status: "ok", version: "" }, "")).toBe(false);
+    expect(__lifecycleTestUtils.healthVersionMatches({ status: "ok", version: "1" }, "1")).toBe(true);
+    expect(__lifecycleTestUtils.resolveWindowsNetstatPath(undefined, undefined)).toBeNull();
+    expect(__lifecycleTestUtils.resolveWindowsNetstatPath("C:\\project", "relative", () => true)).toBeNull();
+    const windowsFileExists = vi.fn((path: string) => path.startsWith("D:\\"));
+    expect(__lifecycleTestUtils.resolveWindowsNetstatPath("C:\\Windows", " D:\\Windows\\ ", windowsFileExists)).toBe("D:\\Windows\\System32\\netstat.exe");
+    expect(windowsFileExists).toHaveBeenCalledWith("C:\\Windows\\System32\\netstat.exe");
+    expect(windowsFileExists).toHaveBeenCalledWith("D:\\Windows\\System32\\netstat.exe");
     const many = Array.from({ length: 40 }, (_, index) => `n127.0.0.1:${1000 + index}`).join("\n");
     const spawnSync = vi.fn(() => ({ status: 0, stdout: many }));
-    expect(__lifecycleTestUtils.findListeningTcpPorts(1, "linux", spawnSync as never)).toHaveLength(32);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", spawnSync as never)).toHaveLength(32);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", spawnSync as never, "/proc", 1039)).toEqual([1039]);
     expect(spawnSync).toHaveBeenCalledWith("lsof", expect.any(Array), expect.any(Object));
+    expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", vi.fn(() => ({
+      status: 0, stdout: "n127.0.0.2:3737\nn127.0.0.1:invalid\nn127.0.0.1:4545",
+    })) as never)).toEqual([4545]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(1, "darwin", vi.fn(() => ({ status: 1, stdout: "" })) as never)).toEqual([]);
-    expect(__lifecycleTestUtils.findListeningTcpPorts(1, "win32", vi.fn() as never)).toEqual([]);
+    const win32Netstat = vi.fn(() => ({
+      status: 0,
+      stdout: [
+        "malformed",
+        "UDP 127.0.0.1:1111 *:* LISTENING 42",
+        "TCP 127.0.0.1:2222 0.0.0.0:0 ESTABLISHED 42",
+        "TCP invalid 0.0.0.0:0 LISTENING 42",
+        "TCP 127.0.0.2:3333 0.0.0.0:0 LISTENING 42",
+        "TCP 127.0.0.1:invalid 0.0.0.0:0 LISTENING 42",
+        "TCP 127.0.0.1:3737 0.0.0.0:0 LISTENING 42",
+        "TCP 127.0.0.1:4545 0.0.0.0:0 LISTENING 99",
+      ].join("\n"),
+    }));
+    const trustedNetstat = "C:\\Windows\\System32\\netstat.exe";
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", win32Netstat as never, "/proc", undefined, trustedNetstat)).toEqual([3737]);
+    expect(win32Netstat).toHaveBeenCalledWith(trustedNetstat, ["-ano", "-p", "tcp"], expect.any(Object));
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", win32Netstat as never, "/proc", 3737, trustedNetstat)).toEqual([3737]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", vi.fn(() => ({ status: 1, stdout: "" })) as never, "/proc", undefined, trustedNetstat)).toEqual([]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", vi.fn(() => { throw new Error("netstat failed"); }) as never, "/proc", undefined, trustedNetstat)).toEqual([]);
+    const hijackedNetstat = vi.fn();
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", hijackedNetstat as never, "/proc", undefined, null)).toEqual([]);
+    expect(hijackedNetstat).not.toHaveBeenCalled();
 
+    const linuxRoot = temp();
+    mkdirSync(join(linuxRoot, "42", "fd"), { recursive: true });
+    mkdirSync(join(linuxRoot, "net"), { recursive: true });
+    symlinkSync("socket:[12345]", join(linuxRoot, "42", "fd", "7"));
+    writeFileSync(join(linuxRoot, "net", "tcp"), [
+      "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+      "   0: 0100007F:0AAA 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 99999 1 0000000000000001 100 0 0 10 0",
+      "   1: 0200007F:0D05 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000002 100 0 0 10 0",
+      "   2: 0100007F:     00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000003 100 0 0 10 0",
+      "   3: 0100007F:0E99 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000004 100 0 0 10 0",
+      "",
+    ].join("\n"));
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot)).toEqual([3737]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 2730)).toEqual([]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 3333)).toEqual([]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 3737)).toEqual([3737]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, join(linuxRoot, "missing"))).toEqual([]);
+
+    expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: false, reason: "missing-pid" })).toContain("PID file missing");
+    expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: false, pid: 42, reason: "dead-pid" })).toContain("PID 42 is not running");
     expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: true, reason: "wrong-parent" })).toBe("daemon parent invariant is not verified");
     expect(__lifecycleTestUtils.systemdDaemonSetenvArgs({ PATH: "/bin", LCM_MODE: "x", OTHER: "y", OPENAI_API_KEY: "secret", EMPTY: undefined }, [])).toEqual([
       "--setenv=LCM_MODE=x", "--setenv=PATH=/bin",
@@ -71,24 +125,28 @@ describe("lifecycle procfs and parent warnings", () => {
     proc(root, 10, "Uid:\t1000\nPPid:\t1\n", "systemd --user");
     proc(root, 20, "Uid:\t1000\nPPid:\t10\n", "node lcm daemon start --foreground");
     expect(__lifecycleTestUtils.inspectDaemonParent(pidPath, { procRoot: root, uid: 1000, isAlive: () => true })).toMatchObject({ satisfies: true, reason: undefined });
+    expect(__lifecycleTestUtils.inspectDaemonParent(join(root, "missing.pid"), { procRoot: root, uid: 1000, isAlive: () => true })).toMatchObject({ available: false, reason: "missing-pid" });
+    expect(__lifecycleTestUtils.inspectDaemonParent(pidPath, { procRoot: root, uid: 1000, isAlive: () => false })).toMatchObject({ available: false, reason: "dead-pid" });
   });
 
   it.each([
-    ["dead", false, "node lcm daemon start --foreground", "PPid:\t1\n", "not running"],
-    ["wrong", true, "node other", "PPid:\t1\n", "not an LCM daemon"],
-    ["parent", true, "node lcm daemon start --foreground", "Uid:\t1000\n", "parent could not be read"],
-  ])("returns an authenticated warning for %s PID metadata", async (_name, alive, command, daemonStatus, warning) => {
+    ["dead", false, "node lcm daemon start --foreground", "PPid:\t1\n", false, undefined],
+    ["wrong", true, "node other", "PPid:\t1\n", true, "not an LCM daemon"],
+    ["parent", true, "node lcm daemon start --foreground", "Uid:\t1000\n", true, "parent could not be read"],
+  ])("handles %s PID metadata after endpoint identity checks", async (_name, alive, command, daemonStatus, connected, warning) => {
     const dir = temp(); const procRoot = join(dir, "proc"); mkdirSync(procRoot);
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "20"); ensureAuthToken(join(dir, "daemon.token"));
     proc(procRoot, 10, "Uid:\t1000\nPPid:\t1\n", "systemd --user");
     proc(procRoot, 20, daemonStatus, command);
     const result = await ensureDaemon({
       port: 1, pidFilePath: pidPath, spawnTimeoutMs: 1, enforceUserManagerParent: true,
+      expectedVersion: "1",
       _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(20) as never,
-      _isProcessAliveOverride: () => alive, _skipSpawn: true,
+      _isProcessAliveOverride: () => alive, _listeningPortsOverride: () => [1], _skipSpawn: true,
     });
-    expect(result.connected).toBe(true);
-    expect(result.warning).toContain(warning);
+    expect(result.connected).toBe(connected);
+    if (warning) expect(result.warning).toContain(warning);
+    else expect(result.warning).toBeUndefined();
   });
 
   it("handles an unavailable current uid and a missing daemon cmdline", async () => {
@@ -101,8 +159,9 @@ describe("lifecycle procfs and parent warnings", () => {
     proc(procRoot, 31, "Uid:\t1000\nPPid:\t1\n");
     const result = await ensureDaemon({
       port: 1, pidFilePath: pidPath, spawnTimeoutMs: 1, enforceUserManagerParent: true,
+      expectedVersion: "1",
       _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(31) as never,
-      _isProcessAliveOverride: () => true, _skipSpawn: true,
+      _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [1], _skipSpawn: true,
     });
     expect(result.warning).toContain("not an LCM daemon");
   });
@@ -193,10 +252,10 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "33"); ensureAuthToken(join(dir, "daemon.token"));
     proc(procRoot, 33, "Uid:\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
     const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
-    const alive = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(false);
+    const alive = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValue(false);
     await ensureDaemon({
       port: 6, pidFilePath: pidPath, spawnTimeoutMs: 1, expectedVersion: "2", _procRoot: procRoot,
-      _fetchOverride: fetchHealthy(33) as never, _isProcessAliveOverride: alive, _sleepOverride: async () => {}, _skipSpawn: true,
+      _fetchOverride: fetchHealthy(33) as never, _isProcessAliveOverride: alive, _listeningPortsOverride: () => [6], _sleepOverride: async () => {}, _skipSpawn: true,
     });
     expect(kill).toHaveBeenCalledWith(33, "SIGTERM");
   });
@@ -270,6 +329,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     const result = await ensureDaemon({
       port: 13, pidFilePath: pidPath, spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
       _procRoot: root, _uid: 1000, _isProcessAliveOverride: () => true, _fetchOverride: fetchHealthy(20) as never,
+      _listeningPortsOverride: () => [13], expectedVersion: "1",
     });
     expect(result.connected).toBe(true); expect(result.warning).toBeUndefined();
   });
@@ -279,11 +339,12 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     writeFileSync(accessPid, "20"); ensureAuthToken(join(accessDir, "daemon.token"));
     const accessFetch = vi.fn()
       .mockRejectedValueOnce(new Error("initial down"))
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1", pid: 20 }) })
       .mockResolvedValueOnce({ ok: false, json: async () => ({}) });
     await expect(ensureDaemon({
       port: 14, pidFilePath: accessPid, spawnTimeoutMs: 1, _fetchOverride: accessFetch,
-      _isProcessAliveOverride: () => true, _sleepOverride: async () => {}, _skipSpawn: true,
+      expectedVersion: "1", _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [14],
+      _sleepOverride: async () => {}, _monotonicNowOverride: () => 0, _skipSpawn: true,
     })).resolves.toMatchObject({ connected: false });
 
     const parentDir = temp(); const root = join(parentDir, "proc"); mkdirSync(root);
@@ -294,6 +355,20 @@ describe("lifecycle spawn and restart failure boundaries", () => {
       _procRoot: root, _uid: 1000, _fetchOverride: vi.fn().mockRejectedValue(new Error("down")),
       _isProcessAliveOverride: () => true, _sleepOverride: async () => {}, _skipSpawn: true,
     })).resolves.toMatchObject({ connected: false });
+  });
+
+  it("accepts an authenticated daemon after a live PID retry", async () => {
+    const dir = temp(); const pidPath = join(dir, "daemon.pid");
+    writeFileSync(pidPath, "20"); ensureAuthToken(join(dir, "daemon.token"));
+    const fetch = vi.fn()
+      .mockRejectedValueOnce(new Error("initial down"))
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1", pid: 20 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+    await expect(ensureDaemon({
+      port: 16, pidFilePath: pidPath, spawnTimeoutMs: 1, expectedVersion: "1",
+      _fetchOverride: fetch, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [16],
+      _sleepOverride: async () => {}, _monotonicNowOverride: () => 0, _skipSpawn: true,
+    })).resolves.toMatchObject({ connected: true, spawned: false, pid: 20 });
   });
 
   it("reports systemd credential setup errors when the user runtime directory is unavailable", async () => {
