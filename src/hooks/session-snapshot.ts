@@ -10,7 +10,7 @@ export interface SnapshotDeps {
   writeFileSync: (path: string, data: string) => void;
   snapshotIntervalSec: number;
   post: (path: string, body: Record<string, unknown>) => Promise<unknown>;
-  verifiedPort: number;
+  verifiedPort?: number;
 }
 
 function defaultStatSync(path: string): { mtimeMs: number } | null {
