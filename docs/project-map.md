@@ -24,7 +24,7 @@ This is useful when the same repository is reached through multiple mount points
 Paths are normalized before matching:
 
 - existing paths use `realpath`, so symlinked paths resolve to their real filesystem location
-- missing paths use absolute `resolve`, so aliases can be reserved before the path exists
+- aliases preserve the absolute path entered when they are added, so replacing that path later cannot redirect another project's identity
 
 ## CLI
 
@@ -41,7 +41,7 @@ lcm map add /alias/path --hash 64-character-sha256-hash
 lcm map remove /alias/path
 ```
 
-`lcm map add` defaults to the current project. `--canonical` and `--hash` are mutually exclusive. Canonical targets must exist; aliases may be missing, but the command prints a warning when an alias path is not present yet.
+`lcm map add` defaults to the current project. `--canonical` and `--hash` are mutually exclusive. Canonical targets and aliases must already exist as directories. LCM rejects missing aliases because a path reserved before creation could later be replaced by a symlink to another project.
 
 LCM refuses to add an alias that already exists under the target hash or that would make a path resolve to more than one hash.
 

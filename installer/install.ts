@@ -188,7 +188,8 @@ export function ensureLcmMd(
 
 export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   const lcDir = lcmHomeDir();
-  deps.mkdirSync(lcDir, { recursive: true });
+  deps.mkdirSync(lcDir, { recursive: true, mode: 0o700 });
+  deps.chmodSync?.(lcDir, 0o700);
 
   // Clear plugin cache entries for previous versions so stale/corrupted installs don't persist.
   try {

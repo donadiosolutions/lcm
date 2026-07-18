@@ -1,8 +1,11 @@
-import { existsSync, lstatSync, mkdirSync, realpathSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, normalize, join as pathJoin, dirname, basename } from "node:path";
+import { join, resolve, normalize, join as pathJoin, dirname, basename, parse } from "node:path";
 import { lcmHomeDir } from "../runtime-paths.js";
 import { resolveProjectIdentity, type ProjectIdentity } from "../project-map.js";
+import { atomicWritePrivateFile, ensurePrivateDirectory, readBoundedRegularFile } from "../security-files.js";
+
+const MAX_PROJECT_METADATA_BYTES = 1024 * 1024;
 
 export const projectIdentity = (cwd: string): ProjectIdentity =>
   resolveProjectIdentity(cwd);
@@ -38,12 +41,14 @@ function tryRealpath(p: string): string {
 }
 
 function allowedTranscriptBases(cwd: string): string[] {
-  return [
+  const bases = [
     tryRealpath(pathJoin(homedir(), ".claude", "projects")),
     tryRealpath(pathJoin(homedir(), ".codex", "sessions")),
     tryRealpath(pathJoin(homedir(), ".codex", "archived_sessions")),
-    tryRealpath(resolve(cwd)),
   ];
+  const workspace = tryRealpath(resolve(cwd));
+  if (workspace !== parse(workspace).root) bases.push(workspace);
+  return bases;
 }
 
 /**
@@ -112,16 +117,19 @@ export function isSafeTranscriptPath(transcriptPath: string, cwd: string): strin
 export const ensureProjectDir = (cwd: string): string => {
   const identity = resolveProjectIdentity(cwd);
   const dir = join(lcmHomeDir(), "projects", identity.id);
-  mkdirSync(dir, { recursive: true });
+  ensurePrivateDirectory(lcmHomeDir());
+  ensurePrivateDirectory(join(lcmHomeDir(), "projects"));
+  ensurePrivateDirectory(dir);
   const metaPath = join(dir, "meta.json");
   let meta: Record<string, unknown> = { cwd: identity.canonical };
-  if (existsSync(metaPath)) {
-    try {
-      const existing = JSON.parse(readFileSync(metaPath, "utf-8")) as Record<string, unknown>;
-      if (existing.cwd === identity.canonical) return dir;
-      meta = { ...existing, cwd: identity.canonical };
-    } catch { /* keep default */ }
-  }
-  writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
+  try {
+    const existing = JSON.parse(readBoundedRegularFile(metaPath, {
+      allowedRoot: dir,
+      maxBytes: MAX_PROJECT_METADATA_BYTES,
+    })) as Record<string, unknown>;
+    if (existing.cwd === identity.canonical) return dir;
+    meta = { ...existing, cwd: identity.canonical };
+  } catch { /* keep default */ }
+  atomicWritePrivateFile(metaPath, JSON.stringify(meta, null, 2) + "\n");
   return dir;
 };

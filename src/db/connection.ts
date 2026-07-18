@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "fs";
-import { dirname } from "path";
+import { chmodSync } from "node:fs";
+import { dirname } from "node:path";
+import { ensurePrivateDirectory, PRIVATE_FILE_MODE } from "../security-files.js";
 
 type ConnectionEntry = {
   db: DatabaseSync;
@@ -43,10 +44,11 @@ export function getLcmConnection(dbPath: string): DatabaseSync {
   }
 
   // Ensure parent directory exists
-  mkdirSync(dirname(dbPath), { recursive: true });
+  ensurePrivateDirectory(dirname(dbPath));
 
   const db = new DatabaseSync(dbPath);
   try {
+    chmodSync(dbPath, PRIVATE_FILE_MODE);
     // Enable WAL mode for better concurrent read performance
     db.exec("PRAGMA journal_mode = WAL");
     // Wait up to 5 seconds on busy instead of failing immediately

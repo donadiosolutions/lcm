@@ -2,17 +2,20 @@ import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
-  readFileSync,
   realpathSync,
   readdirSync,
   statSync,
   watch,
-  writeFileSync,
-  copyFileSync,
   type FSWatcher,
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { lcmHomeDir, projectsDir } from "./runtime-paths.js";
+import {
+  atomicWritePrivateFile,
+  ensurePrivateDirectory,
+  readBoundedRegularFile,
+  readBoundedRegularFileWithStat,
+} from "./security-files.js";
 
 export type ProjectMapEntry = {
   canonical: string;
@@ -37,6 +40,7 @@ export type ProjectMapValidation = {
 };
 
 const HASH_RE = /^[a-f0-9]{64}$/;
+const MAX_PROJECT_MAP_BYTES = 4 * 1024 * 1024;
 let cache: { path: string; mtimeMs: number | null; map: ProjectMap; metadataPopulated: boolean } | null = null;
 
 export function projectMapPath(homeDir?: string): string {
@@ -83,10 +87,10 @@ function isEnoent(err: unknown): boolean {
 
 function readMapFile(path: string): { content: string; mtimeMs: number | null } | null {
   try {
-    return {
-      content: readFileSync(path, "utf-8"),
-      mtimeMs: statSync(path).mtimeMs,
-    };
+    return readBoundedRegularFileWithStat(path, {
+      allowedRoot: dirname(path),
+      maxBytes: MAX_PROJECT_MAP_BYTES,
+    });
   } catch (err) {
     if (isEnoent(err)) return null;
     throw err;
@@ -137,10 +141,13 @@ function prettyMap(map: ProjectMap): string {
 function createBackupIfNeeded(path: string, homeDir?: string): string | undefined {
   if (!existsSync(path)) return undefined;
   const backupDir = oldMapsDir(homeDir);
-  mkdirSync(backupDir, { recursive: true });
+  ensurePrivateDirectory(backupDir);
   const backupPath = join(backupDir, `map-${Math.floor(Date.now() / 1000)}.json`);
   if (!existsSync(backupPath)) {
-    copyFileSync(path, backupPath);
+    atomicWritePrivateFile(backupPath, readBoundedRegularFile(path, {
+      allowedRoot: dirname(path),
+      maxBytes: MAX_PROJECT_MAP_BYTES,
+    }));
   }
   return backupPath;
 }
@@ -162,10 +169,10 @@ export function writeProjectMap(
   opts: { metadataPopulated?: boolean } = {},
 ): { path: string; backupPath?: string } {
   const path = projectMapPath(homeDir);
-  mkdirSync(dirname(path), { recursive: true });
+  ensurePrivateDirectory(dirname(path));
   assertCurrentMapIsWritable(path);
   const backupPath = createBackupIfNeeded(path, homeDir);
-  writeFileSync(path, prettyMap(map));
+  atomicWritePrivateFile(path, prettyMap(map));
   cache = {
     path,
     mtimeMs: statSync(path).mtimeMs,
@@ -224,7 +231,7 @@ function collectPathOwners(map: ProjectMap): Map<string, Set<string>> {
   const owners = new Map<string, Set<string>>();
   for (const [hash, entry] of Object.entries(map)) {
     for (const rawPath of [entry.canonical, ...entry.aliases]) {
-      const path = normalizeProjectPath(rawPath);
+      const path = resolve(rawPath);
       const set = owners.get(path) ?? new Set<string>();
       set.add(hash);
       owners.set(path, set);
@@ -239,11 +246,11 @@ function repairSameHashDuplicates(map: ProjectMap): { map: ProjectMap; changed: 
   let changed = false;
 
   for (const [hash, entry] of Object.entries(repaired)) {
-    const canonical = normalizeProjectPath(entry.canonical);
+    const canonical = resolve(entry.canonical);
     const seen = new Set<string>();
     const aliases: string[] = [];
     for (const alias of entry.aliases) {
-      const normalized = normalizeProjectPath(alias);
+      const normalized = resolve(alias);
       if (normalized === canonical) {
         changed = true;
         warnings.push(`${hash.slice(0, 8)} removed alias equal to canonical path: ${alias}`);
@@ -264,13 +271,19 @@ function repairSameHashDuplicates(map: ProjectMap): { map: ProjectMap; changed: 
 }
 
 function findPathMatches(map: ProjectMap, path: string): Set<string> {
-  const normalized = normalizeProjectPath(path);
-  const matches = new Set<string>();
+  const lexical = resolve(path);
+  const canonical = normalizeProjectPath(path);
+  const aliasMatches = new Set<string>();
   for (const [hash, entry] of Object.entries(map)) {
-    const paths = [entry.canonical, ...entry.aliases].map(normalizeProjectPath);
-    if (paths.includes(normalized)) matches.add(hash);
+    if (entry.aliases.some((alias) => resolve(alias) === lexical)) aliasMatches.add(hash);
   }
-  return matches;
+  if (aliasMatches.size > 0) return aliasMatches;
+
+  const canonicalMatches = new Set<string>();
+  for (const [hash, entry] of Object.entries(map)) {
+    if (resolve(entry.canonical) === canonical) canonicalMatches.add(hash);
+  }
+  return canonicalMatches;
 }
 
 function populateFromExistingProjectMetadata(map: ProjectMap, homeDir?: string): { map: ProjectMap; changed: boolean } {
@@ -284,7 +297,10 @@ function populateFromExistingProjectMetadata(map: ProjectMap, homeDir?: string):
     const metaPath = join(root, entry.name, "meta.json");
     if (!existsSync(metaPath) || next[entry.name]) continue;
     try {
-      const meta = JSON.parse(readFileSync(metaPath, "utf-8")) as { cwd?: unknown };
+      const meta = JSON.parse(readBoundedRegularFile(metaPath, {
+        allowedRoot: join(root, entry.name),
+        maxBytes: 1024 * 1024,
+      })) as { cwd?: unknown };
       if (typeof meta.cwd !== "string" || meta.cwd.length === 0) continue;
       const canonical = normalizeProjectPath(meta.cwd);
       if (findPathMatches(next, canonical).size > 0) continue;
@@ -306,13 +322,13 @@ export function resolveProjectIdentity(cwd: string): ProjectIdentity {
   const map = loadProjectMapWithMetadata();
 
   const normalized = normalizeProjectPath(cwd);
-  const matches = findPathMatches(map, normalized);
+  const matches = findPathMatches(map, cwd);
   if (matches.size > 1) {
     throw new Error(`project path maps to multiple hashes: ${normalized} (${[...matches].join(", ")})`);
   }
   if (matches.size === 1) {
     const id = [...matches][0];
-    return { id, canonical: normalizeProjectPath(map[id].canonical) };
+    return { id, canonical: resolve(map[id].canonical) };
   }
 
   const id = hashProjectPath(normalized);
@@ -320,7 +336,7 @@ export function resolveProjectIdentity(cwd: string): ProjectIdentity {
     map[id] = { canonical: normalized, aliases: [] };
     writeProjectMap(map, undefined, { metadataPopulated: true });
   }
-  return { id, canonical: normalizeProjectPath(map[id].canonical) };
+  return { id, canonical: resolve(map[id].canonical) };
 }
 
 export function listProjectMapEntries(): ProjectMap {
@@ -383,14 +399,15 @@ export function projectMapPathsForHash(hash: string): string[] {
   const map = loadProjectMapWithMetadata();
   const entry = map[hash];
   if (!entry) return [];
-  return [...new Set([entry.canonical, ...entry.aliases].map(normalizeProjectPath))];
+  return [...new Set([entry.canonical, ...entry.aliases].map((path) => resolve(path)))];
 }
 
 export function addProjectAlias(alias: string, opts: { canonical?: string; hash?: string } = {}): { hash: string; entry: ProjectMapEntry; warning?: string; backupPath?: string } {
-  const normalizedAlias = normalizeProjectPath(alias);
-  const warning = existsSync(normalizedAlias) ? undefined : `alias path does not exist: ${normalizedAlias}`;
+  const normalizedAlias = resolve(alias);
+  if (!existsSync(normalizedAlias)) throw new Error(`alias path does not exist: ${normalizedAlias}`);
+  if (!statSync(normalizedAlias).isDirectory()) throw new Error(`alias path must be an existing directory: ${normalizedAlias}`);
   const target = resolveCliTarget(opts);
-  const canonical = normalizeProjectPath(target.entry.canonical);
+  const canonical = resolve(target.entry.canonical);
   if (normalizedAlias === canonical) {
     throw new Error(`alias matches canonical path for ${target.hash}: ${normalizedAlias}`);
   }
@@ -405,7 +422,7 @@ export function addProjectAlias(alias: string, opts: { canonical?: string; hash?
       const entry = target.map[ownerHash];
       return entry
         && ownerHash === hashProjectPath(normalizedAlias)
-        && normalizeProjectPath(entry.canonical) === normalizedAlias
+        && resolve(entry.canonical) === normalizedAlias
         && entry.aliases.length === 0;
     });
     if (existingOwners.size === 1 && adoptableOwners.length === 1) {
@@ -420,11 +437,11 @@ export function addProjectAlias(alias: string, opts: { canonical?: string; hash?
 
   target.map[target.hash].aliases.push(normalizedAlias);
   const write = writeProjectMap(target.map);
-  return { hash: target.hash, entry: target.map[target.hash], warning, backupPath: write.backupPath };
+  return { hash: target.hash, entry: target.map[target.hash], backupPath: write.backupPath };
 }
 
 export function removeProjectAlias(alias: string, opts: { canonical?: string; hash?: string } = {}): { hash: string; entry: ProjectMapEntry; removed: boolean; backupPath?: string } {
-  const normalizedAlias = normalizeProjectPath(alias);
+  const normalizedAlias = resolve(alias);
   let map = loadProjectMap({ strict: true, reload: true });
   let hash: string;
 
@@ -437,7 +454,7 @@ export function removeProjectAlias(alias: string, opts: { canonical?: string; ha
     if (!existsSync(canonical)) throw new Error(`canonical path does not exist: ${canonical}`);
     if (!statSync(canonical).isDirectory()) throw new Error(`canonical path must be an existing directory: ${canonical}`);
     const owners = Object.entries(map)
-      .filter(([, entry]) => normalizeProjectPath(entry.canonical) === canonical)
+      .filter(([, entry]) => resolve(entry.canonical) === canonical)
       .map(([ownerHash]) => ownerHash);
     if (owners.length === 0) throw new Error(`unknown canonical project path: ${canonical}`);
     if (owners.length > 1) throw new Error(`canonical path maps to multiple hashes: ${canonical} (${owners.join(", ")})`);
@@ -448,7 +465,7 @@ export function removeProjectAlias(alias: string, opts: { canonical?: string; ha
     hash = opts.hash;
   } else {
     const owners = Object.entries(map)
-      .filter(([, entry]) => entry.aliases.map(normalizeProjectPath).includes(normalizedAlias))
+      .filter(([, entry]) => entry.aliases.map((candidate) => resolve(candidate)).includes(normalizedAlias))
       .map(([ownerHash]) => ownerHash);
     if (owners.length === 0) throw new Error(`alias is not mapped: ${normalizedAlias}`);
     if (owners.length > 1) throw new Error(`alias maps to multiple hashes: ${normalizedAlias} (${owners.join(", ")})`);
@@ -457,7 +474,7 @@ export function removeProjectAlias(alias: string, opts: { canonical?: string; ha
 
   const entry = map[hash];
   const before = entry.aliases.length;
-  entry.aliases = entry.aliases.filter((candidate) => normalizeProjectPath(candidate) !== normalizedAlias);
+  entry.aliases = entry.aliases.filter((candidate) => resolve(candidate) !== normalizedAlias);
   const removed = entry.aliases.length !== before;
   const write: { backupPath?: string } = removed ? writeProjectMap(map) : {};
   return { hash, entry, removed, backupPath: write.backupPath };
@@ -541,7 +558,7 @@ export function reloadProjectMapCache(opts: { reformat?: boolean } = {}): boolea
 
 export function watchProjectMap(): { close: () => void } {
   const path = projectMapPath();
-  mkdirSync(dirname(path), { recursive: true });
+  ensurePrivateDirectory(dirname(path));
   let closed = false;
   let watcher: FSWatcher | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;

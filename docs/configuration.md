@@ -196,6 +196,14 @@ when the settings root is a valid JSON object.
 
 Hook error fallback logs write to `~/.lcm/logs/events.log`.
 
+## Local filesystem protection
+
+LCM keeps `~/.lcm` and its project, event, and temporary directories accessible only to the current user (`0700`). Configuration, metadata, database, token, map, backup, and lock files use private file permissions (`0600`). Existing LCM roots are tightened during startup and installation.
+
+Session restore locks use a SHA-256 digest of the agent session ID under `~/.lcm/tmp`; session IDs are never used as path components. LCM reads restored `AGENTS.md` and `CLAUDE.md` instructions only from regular, non-symlink files inside their expected roots, with a combined 1 MiB limit. Unsafe instruction files are skipped.
+
+Project-local transcript paths remain supported for normal working directories. A working directory equal to the filesystem root does not authorize every file on the machine; provider-managed Claude and Codex transcript directories remain available in that case.
+
 ## Project path aliases
 
 LCM records canonical project paths and aliases in `~/.lcm/map.json`. All project database paths, passive-learning sidecars, metadata, sensitive-pattern files, and search/promotion routes resolve through that map before choosing a project hash.

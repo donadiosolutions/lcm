@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
@@ -169,6 +169,30 @@ describe("POST /restore", () => {
       expect(rows[1].content).toContain("Use Codex instructions.");
       expect(rows[1].content).toContain("Project Codex override.");
       expect(rows[1].content).not.toContain("Use Claude instructions.");
+    });
+
+    it("ignores symlinked and oversized Codex instruction files", async () => {
+      const outsideDir = mkdtempSync(join(tmpdir(), "restore-secret-"));
+      try {
+        const outsideFile = join(outsideDir, "secret.txt");
+        writeFileSync(outsideFile, "DO-NOT-RESTORE-SYMLINKED-SECRET", "utf8");
+        symlinkSync(outsideFile, join(tmpDir, "AGENTS.md"));
+        mkdirSync(join(tmpDir, ".codex"), { recursive: true });
+        writeFileSync(join(tmpDir, ".codex", "AGENTS.md"), `OVERSIZED-${"x".repeat(1024 * 1024)}`, "utf8");
+
+        daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
+        const response = await fetch(`http://127.0.0.1:${daemon.address().port}/restore`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: "codex-untrusted-instructions", cwd: tmpDir, source: "startup", client: "codex" }),
+        });
+        const body = await response.json() as { context: string };
+
+        expect(response.status).toBe(200);
+        expect(body.context).not.toContain("DO-NOT-RESTORE-SYMLINKED-SECRET");
+        expect(body.context).not.toContain("OVERSIZED-");
+      } finally {
+        rmSync(outsideDir, { recursive: true, force: true });
+      }
     });
 
     it("does not re-upsert session_instructions when content hash unchanged", async () => {

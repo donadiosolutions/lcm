@@ -2,6 +2,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { legacyLcmHomeDirname } from "./legacy-names.js";
+import { ensurePrivateDirectory } from "./security-files.js";
 
 export const LCM_HOME_DIRNAME = ".lcm";
 export const LEGACY_LCM_HOME_DIRNAME = legacyLcmHomeDirname();
@@ -48,9 +49,11 @@ export function migrateLegacyHomeIfNeeded(homeDir: string = homedir()): RuntimeH
   const from = legacyLcmHomeDir(homeDir);
   const to = lcmHomeDir(homeDir);
   if (!existsSync(from)) {
+    if (existsSync(to)) ensurePrivateDirectory(to);
     return { migrated: false, from, to };
   }
   if (existsSync(join(to, "config.json")) || existsSync(join(to, "projects")) || existsSync(join(to, "events"))) {
+    ensurePrivateDirectory(to);
     return { migrated: false, from, to };
   }
 
@@ -64,6 +67,7 @@ export function migrateLegacyHomeIfNeeded(homeDir: string = homedir()): RuntimeH
       renameSync(sourcePath, targetPath);
     }
     rmSync(from, { recursive: true, force: true });
+    ensurePrivateDirectory(to);
     return { migrated: true, from, to };
   }
   try {
@@ -73,6 +77,8 @@ export function migrateLegacyHomeIfNeeded(homeDir: string = homedir()): RuntimeH
     cpSync(from, to, { recursive: true, errorOnExist: true });
     rmSync(from, { recursive: true, force: true });
   }
+
+  ensurePrivateDirectory(to);
 
   return { migrated: true, from, to };
 }

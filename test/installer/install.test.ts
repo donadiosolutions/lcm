@@ -261,11 +261,22 @@ describe("install", () => {
     );
   });
 
-  it("ignores chmod failures and reports doctor failures", async () => {
+  it("fails installation when the LCM data root cannot be secured", async () => {
+    const deps = makeDeps({
+      chmodSync: vi.fn(() => { throw new Error("chmod failed"); }),
+    });
+
+    await expect(install(deps)).rejects.toThrow("chmod failed");
+    expect(deps.runDoctor).not.toHaveBeenCalled();
+  });
+
+  it("ignores config chmod failures and reports doctor failures", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const deps = makeDeps({
       existsSync: vi.fn().mockReturnValue(false),
-      chmodSync: vi.fn(() => { throw new Error("chmod failed"); }),
+      chmodSync: vi.fn((path) => {
+        if (String(path).endsWith("config.json")) throw new Error("chmod failed");
+      }),
       runDoctor: vi.fn().mockResolvedValue([{ name: "daemon", status: "fail" }]),
     });
     await install(deps);

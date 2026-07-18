@@ -1,39 +1,90 @@
 import type { DaemonClient } from "../daemon/client.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { homedir, tmpdir } from "node:os";
-import { writeFileSync, readFileSync } from "node:fs";
-import { daemonPidPath } from "../runtime-paths.js";
+import { homedir } from "node:os";
+import { openSync, closeSync, writeFileSync } from "node:fs";
+import { daemonPidPath, tmpDir } from "../runtime-paths.js";
+import {
+  deleteRegularFile,
+  ensurePrivateDirectory,
+  PRIVATE_FILE_MODE,
+  readBoundedRegularFile,
+} from "../security-files.js";
+
+function sessionLockPath(sessionId: string): string {
+  const digest = createHash("sha256").update(sessionId).digest("hex");
+  return join(tmpDir(), `restore-${digest}.lock`);
+}
+
+type SessionLockDeps = {
+  open: typeof openSync;
+  write: typeof writeFileSync;
+  close: typeof closeSync;
+  read: typeof readBoundedRegularFile;
+  delete: typeof deleteRegularFile;
+  isProcessAlive: (pid: number) => boolean;
+};
+
+const defaultSessionLockDeps: SessionLockDeps = {
+  open: openSync,
+  write: writeFileSync,
+  close: closeSync,
+  read: readBoundedRegularFile,
+  delete: deleteRegularFile,
+  isProcessAlive: (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+};
 
 /** Returns true if lock was acquired, false if another live process holds it. */
-function tryAcquireSessionLock(sessionId: string): boolean {
-  const lockPath = join(tmpdir(), `lcm-restore-${sessionId}.lock`);
-  try {
-    writeFileSync(lockPath, process.pid.toString(), { flag: "wx" });
-    return true;
-  } catch {
-    // Lock exists — check if the owner process is still alive
+export function tryAcquireSessionLockForTesting(
+  sessionId: string,
+  deps: SessionLockDeps = defaultSessionLockDeps,
+): boolean {
+  const lockDir = tmpDir();
+  ensurePrivateDirectory(lockDir);
+  const lockPath = sessionLockPath(sessionId);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const ownerPid = parseInt(readFileSync(lockPath, "utf-8").trim(), 10);
-      if (!isNaN(ownerPid)) {
-        try {
-          process.kill(ownerPid, 0); // throws if process is dead
-          return false; // owner alive, genuine dedup
-        } catch {
-          // Owner dead — take over the lock
-          writeFileSync(lockPath, process.pid.toString());
-          return true;
-        }
+      const fd = deps.open(lockPath, "wx", PRIVATE_FILE_MODE);
+      try {
+        deps.write(fd, process.pid.toString(), "utf-8");
+      } finally {
+        deps.close(fd);
       }
-    } catch { /* can't read lock — fall through to safe default */ }
-    return false;
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+      // Lock exists — check if the owner process is still alive.
+      try {
+        const ownerPid = parseInt(deps.read(lockPath, {
+          allowedRoot: lockDir,
+          maxBytes: 32,
+        }).trim(), 10);
+        if (isNaN(ownerPid)) return false;
+        if (deps.isProcessAlive(ownerPid)) return false; // owner alive, genuine dedup
+        // Owner dead — remove only a regular file, then retry once with wx.
+        deps.delete(lockPath);
+      } catch {
+        return false;
+      }
+    }
   }
+  return false;
 }
+
+export const sessionLockPathForTesting = sessionLockPath;
 
 export async function handleSessionStart(stdin: string, client: DaemonClient, port?: number): Promise<{ exitCode: number; stdout: string }> {
   const input = JSON.parse(stdin || "{}");
   const sessionId = input.session_id ?? "";
-  if (sessionId && !tryAcquireSessionLock(sessionId)) {
+  if (sessionId && !tryAcquireSessionLockForTesting(sessionId)) {
     return { exitCode: 0, stdout: "" };
   }
 

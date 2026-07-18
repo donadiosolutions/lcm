@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -79,16 +79,60 @@ describe("project map", () => {
     expect(eventsDbPath(alias)).toBe(eventsDbPath(canonical));
   });
 
-  it("warns for missing aliases and creates a backup before rewriting an existing map", () => {
+  it("rejects missing aliases before they can be reinterpreted as symlinks", () => {
     const canonical = makeDir("canonical");
     projectId(canonical);
     const missingAlias = join(homedir(), "missing-alias");
 
-    const result = addProjectAlias(missingAlias, { canonical });
+    expect(() => addProjectAlias(missingAlias, { canonical })).toThrow("alias path does not exist");
+    expect(existsSync(projectMapPath())).toBe(true);
+  });
 
-    expect(result.warning).toContain("does not exist");
+  it("rejects alias paths that are not directories", () => {
+    const canonical = makeDir("file-alias-canonical");
+    const alias = join(homedir(), "file-alias");
+    writeFileSync(alias, "not a directory");
+
+    expect(() => addProjectAlias(alias, { canonical })).toThrow("alias path must be an existing directory");
+  });
+
+  it("creates a private backup before adding an existing alias", () => {
+    const canonical = makeDir("canonical-with-backup");
+    const alias = makeDir("existing-alias");
+    projectId(canonical);
+
+    const result = addProjectAlias(alias, { canonical });
+
     expect(result.backupPath).toBeDefined();
     expect(existsSync(result.backupPath!)).toBe(true);
+    expect((statSync(result.backupPath!).mode & 0o777)).toBe(0o600);
+  });
+
+  it("keeps an alias identity stable when its path is later replaced by a symlink", () => {
+    const canonical = makeDir("stable-alias-canonical");
+    const alias = makeDir("stable-alias");
+    const victim = makeDir("stable-alias-victim");
+    const canonicalId = projectId(canonical);
+    addProjectAlias(alias, { canonical });
+
+    rmSync(alias, { recursive: true });
+    symlinkSync(victim, alias, "dir");
+
+    expect(projectId(victim)).not.toBe(canonicalId);
+    expect(projectId(alias)).toBe(canonicalId);
+    expect(projectMapPathsForHash(canonicalId)).toContain(alias);
+    expect(projectMapPathsForHash(canonicalId)).not.toContain(victim);
+  });
+
+  it("supports hash-targeted removal and reports an absent alias without rewriting", () => {
+    const canonical = makeDir("hash-remove-canonical");
+    const alias = makeDir("hash-remove-alias");
+    const unrelated = makeDir("hash-remove-unrelated");
+    const hash = projectId(canonical);
+    addProjectAlias(alias, { hash });
+
+    expect(removeProjectAlias(unrelated, { hash })).toMatchObject({ hash, removed: false });
+    expect(removeProjectAlias(alias, { hash })).toMatchObject({ hash, removed: true });
   });
 
   it("auto-populates missing entries from existing project metadata", () => {

@@ -144,7 +144,8 @@ fi
 # block, and rewrites the whole file (reformats + normalises key order).
 # Existing non-llm keys are always preserved.
 
-mkdir -p "$CONFIG_DIR"
+mkdir -p -m 700 "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
 
 node - "$PROVIDER" "$MODEL" "$API_KEY" "$BASE_URL" "$CONFIG_FILE" <<'NODE'
 const fs = require('fs');

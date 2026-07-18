@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -15,6 +15,7 @@ import { justCompactedMap, JUST_COMPACTED_TTL_MS } from "./compact.js";
 import { fenceContent } from "../content-fence.js";
 import { validateCwd } from "../validate-cwd.js";
 import { normalizeTranscriptClient, type TranscriptClient } from "../../transcript-provider.js";
+import { readBoundedRegularFile } from "../../security-files.js";
 
 type SessionInstructionsRow = {
   content: string;
@@ -23,12 +24,15 @@ type SessionInstructionsRow = {
 };
 
 const SESSION_INSTRUCTION_CACHE_TABLE = "session_instruction_cache";
+const MAX_SESSION_INSTRUCTIONS_BYTES = 1024 * 1024;
 
 function sessionInstructionsId(client: TranscriptClient): number {
   return client === "codex" ? 2 : 1;
 }
 
-function codexInstructionPaths(cwd: string): Array<{ label: string; path: string }> {
+type InstructionPath = { label: string; path: string; allowedRoot: string };
+
+function codexInstructionPaths(cwd: string): InstructionPath[] {
   const dirs: string[] = [];
   for (let dir = cwd; ; dir = dirname(dir)) {
     dirs.push(dir);
@@ -37,9 +41,9 @@ function codexInstructionPaths(cwd: string): Array<{ label: string; path: string
   }
 
   return [
-    { label: "~/.codex/AGENTS.md", path: join(homedir(), ".codex", "AGENTS.md") },
-    ...dirs.reverse().map((dir) => ({ label: `${dir}/AGENTS.md`, path: join(dir, "AGENTS.md") })),
-    { label: `${cwd}/.codex/AGENTS.md`, path: join(cwd, ".codex", "AGENTS.md") },
+    { label: "~/.codex/AGENTS.md", path: join(homedir(), ".codex", "AGENTS.md"), allowedRoot: join(homedir(), ".codex") },
+    ...dirs.reverse().map((dir) => ({ label: `${dir}/AGENTS.md`, path: join(dir, "AGENTS.md"), allowedRoot: dir })),
+    { label: `${cwd}/.codex/AGENTS.md`, path: join(cwd, ".codex", "AGENTS.md"), allowedRoot: cwd },
   ];
 }
 
@@ -63,16 +67,18 @@ function readSessionInstructionFiles(cwd: string, client: TranscriptClient): str
   const paths = isCodex
     ? codexInstructionPaths(cwd)
     : [
-      { label: "~/.claude/CLAUDE.md", path: join(homedir(), ".claude", "CLAUDE.md") },
-      { label: `${cwd}/CLAUDE.md`, path: join(cwd, "CLAUDE.md") },
-      { label: `${cwd}/.claude/CLAUDE.md`, path: join(cwd, ".claude", "CLAUDE.md") },
+      { label: "~/.claude/CLAUDE.md", path: join(homedir(), ".claude", "CLAUDE.md"), allowedRoot: join(homedir(), ".claude") },
+      { label: `${cwd}/CLAUDE.md`, path: join(cwd, "CLAUDE.md"), allowedRoot: cwd },
+      { label: `${cwd}/.claude/CLAUDE.md`, path: join(cwd, ".claude", "CLAUDE.md"), allowedRoot: cwd },
     ];
 
   const parts: string[] = [];
-  for (const { label, path } of paths) {
+  let remainingBytes = MAX_SESSION_INSTRUCTIONS_BYTES;
+  for (const { label, path, allowedRoot } of paths) {
     try {
-      const content = readFileSync(path, "utf8");
+      const content = readBoundedRegularFile(path, { allowedRoot, maxBytes: remainingBytes });
       parts.push(`# ${label}\n${content}`);
+      remainingBytes -= Buffer.byteLength(content, "utf-8");
     } catch {
       // file doesn't exist or can't be read — skip silently
     }
