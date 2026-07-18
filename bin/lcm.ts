@@ -168,6 +168,23 @@ export function shouldRunMain(invokedPath: string | undefined, currentFilePath: 
   }
 }
 
+type CustomHelpRequest = {
+  command?: string;
+};
+
+/** Resolve custom help before Commander can dispatch a nested command action. */
+function resolveCustomHelpRequest(cliArgv: string[]): CustomHelpRequest | undefined {
+  const args = cliArgv.slice(2);
+  if (args.length === 0) return {};
+  if (args.length === 1 && (args[0] === "-h" || args[0] === "--help")) return {};
+  if (!args.includes("-h") && !args.includes("--help")) return undefined;
+
+  const [command] = args;
+  return args.length >= 3 && ["daemon", "config", "map", "connectors"].includes(command)
+    ? { command }
+    : undefined;
+}
+
 
 
 export function registerMemoryCommands(program: Command): void {
@@ -1778,23 +1795,28 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
     });
 
   // ─── Unknown command fallback ──────────────────────────────────────────────
-  program.on("command:*", async (operands: string[]) => {
-    process.stderr.write(`lcm: unknown command '${operands[0]}'\n\n`);
-    const { printHelp } = await import("../src/cli-help.js");
-    printHelp();
-    exit(1);
+  let unknownCommandCompletion: Promise<void> | undefined;
+  program.on("command:*", (operands: string[]) => {
+    unknownCommandCompletion = (async () => {
+      process.stderr.write(`lcm: unknown command '${operands[0]}'\n\n`);
+      const { printHelp } = await import("../src/cli-help.js");
+      printHelp();
+      exit(1);
+    })();
   });
 
-  // Handle root-level help and no-args before Commander parses — this prevents
-  // Commander from seeing --help at the root level and intercepting it before
-  // dispatching to subcommands (lcm import --help would otherwise show root help).
-  if (cliArgv.length <= 2 || (cliArgv.length === 3 && (cliArgv[2] === "-h" || cliArgv[2] === "--help"))) {
+  // Resolve unsafe nested help from argv before parsing. Commander does not
+  // reliably expose a child help option to these nested actions, and those
+  // actions may read or mutate state before help can be rendered.
+  const customHelp = resolveCustomHelpRequest(cliArgv);
+  if (customHelp) {
     const { printHelp } = await import("../src/cli-help.js");
-    printHelp();
+    printHelp(customHelp.command);
     exit(0);
   }
 
   await program.parseAsync(cliArgv);
+  await unknownCommandCompletion;
 }
 
 /** @internal Top-level rejection handler kept separate for deterministic tests. */
