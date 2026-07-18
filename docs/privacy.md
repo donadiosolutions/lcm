@@ -70,6 +70,10 @@ lcm sensitive list
 
 Patterns are JavaScript-compatible regular expressions. Use specific patterns (e.g., `MY_SECRET_[A-Z0-9]+`) rather than broad ones (e.g., `MY_.*`) to avoid over-redaction.
 
+Patterns that produce a zero-width match still remove source text: lcm expands the match to the complete non-whitespace token at the match boundary. If the boundary is not adjacent to a token, lcm redacts the next token; when no following token exists, such as after the final token in trailing whitespace, it falls back to that final preceding token. If mixed assertions make both adjacent tokens plausible, lcm redacts both rather than risk exposing the sensitive value. Use a consuming pattern when you need more precise control over the redacted range. A zero-width match against text containing no non-whitespace token is ignored rather than reported as a redaction.
+
+When filtering occurs, session-end hooks warn that sensitive data was removed and identify the matching categories. Older or malformed ingest responses that omit category metadata are reported as `unknown`; the warning never displays an empty category.
+
 Custom patterns are safety-checked before use. Invalid expressions and patterns that can trigger catastrophic backtracking are rejected by `lcm sensitive test`, doctor checks, search, promotion detection, and redaction. Built-in redaction patterns are maintained by lcm and are not affected by this custom-pattern guard.
 
 ## Data retention

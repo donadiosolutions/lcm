@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import {
   getGitleaksSyncDate,
   ScrubEngine,
@@ -139,16 +139,288 @@ describe("ScrubEngine — custom patterns", () => {
     expect(result.global).toBe(2);
   });
 
-  it.fails("fully redacts zero-length token and spanning matches (issue #115)", () => {
+  it("fully redacts zero-length token and spanning matches (issue #115)", () => {
     const engine = new ScrubEngine(["(?=TOKEN)", "(?=SPAN.)"], []);
     const result = engine.scrubWithCounts("TOKEN SPANx");
 
-    // The loop guards must terminate and account for both matches. The desired
-    // secure behavior remains an expected failure until issue #115 is fixed.
     expect(result.global).toBe(2);
     expect(result.text).toBe("[REDACTED] [REDACTED]");
     expect(result.text).not.toContain("TOKEN");
     expect(result.text).not.toContain("SPANx");
+  });
+
+  it("expands zero-length matches to the complete token at each boundary", () => {
+    expect(new ScrubEngine(["(?=KEN)"], []).scrubWithCounts("TOKEN")).toEqual({
+      text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+    expect(new ScrubEngine(["$"], []).scrubWithCounts("TOKEN")).toEqual({
+      text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+    expect(new ScrubEngine(["(?=\\s)"], []).scrubWithCounts("  TOKEN")).toEqual({
+      text: "  [REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
+  it("does not report zero-length redactions when no token can be consumed", () => {
+    const spanning = new ScrubEngine(["(?=\\s)"], []).scrubWithCounts("  ");
+    const token = new ScrubEngine(["(?=)"], []).scrubWithCounts("");
+
+    expect(spanning).toEqual({ text: "  ", gitleaks: 0, builtIn: 0, global: 0, project: 0 });
+    expect(token).toEqual({ text: "", gitleaks: 0, builtIn: 0, global: 0, project: 0 });
+  });
+
+  it("redacts the following token for a zero-width lookahead on whitespace", () => {
+    const result = new ScrubEngine(["(?=\\s+SECRET_[A-Z]+)"], [])
+      .scrubWithCounts("safe SECRET_VALUE");
+
+    expect(result).toEqual({
+      text: "safe [REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
+  it("redacts the preceding token for a zero-width lookbehind at its end boundary", () => {
+    const result = new ScrubEngine(["(?<=SECRET)(?=\\s)"], [])
+      .scrubWithCounts("SECRET NEXT");
+
+    expect(result).toEqual({
+      text: "[REDACTED] NEXT", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
+  it("fails closed when a lookbehind consumes the separator before its anchor", () => {
+    const result = new ScrubEngine(["(?<=SECRET\\s)"], [])
+      .scrubWithCounts("SECRET NEXT");
+
+    expect(result).toEqual({
+      text: "[REDACTED] [REDACTED]", gitleaks: 0, builtIn: 0, global: 2, project: 0,
+    });
+    expect(result.text).not.toContain("SECRET");
+  });
+
+  it("redacts both plausible tokens when mixed assertions make direction ambiguous", () => {
+    for (const pattern of [
+      "(?:(?<=X)(?=Y)|(?=\\s+SECRET_[A-Z]+))",
+      "(?<=safe)(?=(?:\\s+SECRET_[A-Z]+))",
+    ]) {
+      const result = new ScrubEngine([pattern], []).scrubWithCounts("safe SECRET_VALUE");
+
+      expect(result).toEqual({
+        text: "[REDACTED] [REDACTED]", gitleaks: 0, builtIn: 0, global: 2, project: 0,
+      });
+      expect(result.text).not.toContain("SECRET_VALUE");
+    }
+  });
+
+  it("fails closed when lookahead probes depend on lookbehind captures", () => {
+    for (const pattern of [
+      "(?<=(?<value>safe))(?=\\s+\\k<value>)",
+      "(?<=(safe))(?=\\s+\\1)",
+    ]) {
+      const result = new ScrubEngine([pattern], []).scrubWithCounts("safe safe");
+
+      expect(result).toEqual({
+        text: "[REDACTED] [REDACTED]", gitleaks: 0, builtIn: 0, global: 2, project: 0,
+      });
+    }
+  });
+
+  it("fails closed when detached lookahead probes contain nested lookbehind", () => {
+    for (const pattern of [
+      "(?=(?<=safe)\\s+SECRET_[A-Z]+)",
+      "(?=(?<!unsafe)\\s+SECRET_[A-Z]+)",
+    ]) {
+      const result = new ScrubEngine([pattern], []).scrubWithCounts("safe SECRET_VALUE");
+
+      expect(result).toEqual({
+        text: "[REDACTED] [REDACTED]", gitleaks: 0, builtIn: 0, global: 2, project: 0,
+      });
+      expect(result.text).not.toContain("SECRET_VALUE");
+    }
+  });
+
+  it("does not detach capture-dependent consuming alternatives", () => {
+    const result = new ScrubEngine(["(?=SECRET)|(?<value>SECRET)\\s+\\k<value>"], [])
+      .scrubWithCounts("SECRET SECRET tail");
+
+    expect(result).toEqual({
+      text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
+  it("analyzes negative lookbehinds and incomplete quantifier-like literals", () => {
+    const result = new ScrubEngine(["(?<!X)(?=TOKEN)", "A{2"], [])
+      .scrubWithCounts("TOKEN A{2");
+
+    expect(result).toEqual({
+      text: "[REDACTED] [REDACTED]", gitleaks: 0, builtIn: 0, global: 2, project: 0,
+    });
+  });
+
+  it("ignores lookbehind-like text inside a character class when choosing direction", () => {
+    const result = new ScrubEngine([
+      "(?=[(?<=])|(?=\\s+SECRET_[A-Z]+)",
+    ], []).scrubWithCounts("safe SECRET_VALUE");
+
+    expect(result).toEqual({
+      text: "safe [REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
+  it("preserves consuming alternatives after expanding a zero-width match", () => {
+    const result = new ScrubEngine(["(?=SAFE)|SECRET\\s+VALUE"], [])
+      .scrubWithCounts("SAFESECRET VALUE");
+
+    expect(result).toEqual({
+      text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+    expect(result.text).not.toContain("VALUE");
+  });
+
+  it("evaluates consuming alternatives hidden by a zero-width match at the same anchor", () => {
+    const result = new ScrubEngine(["(?=SECRET)|SECRET\\s+VALUE"], [])
+      .scrubWithCounts("SECRET VALUE");
+
+    expect(result).toEqual({
+      text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+    expect(result.text).not.toContain("VALUE");
+  });
+
+  it("continues within an expanded token when its consuming alternative does not match", () => {
+    const result = new ScrubEngine(["(?=SAFE)|SECRET\\s+VALUE"], [])
+      .scrubWithCounts("SAFE OTHER");
+
+    expect(result).toEqual({
+      text: "[REDACTED] OTHER", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
+  it("does not execute detached lookahead probes for consuming matches", () => {
+    const engine = new ScrubEngine(["(?<=X)(?=Y)|SECRET"], []);
+    const originalExec = RegExp.prototype.exec;
+    let lookaheadProbeCalls = 0;
+    const execSpy = vi.spyOn(RegExp.prototype, "exec").mockImplementation(function (
+      this: RegExp,
+      value: string,
+    ): RegExpExecArray | null {
+      if (this.source === "^(?:Y)") lookaheadProbeCalls++;
+      return originalExec.call(this, value);
+    });
+
+    try {
+      expect(engine.scrub("SECRET")).toBe("[REDACTED]");
+    } finally {
+      execSpy.mockRestore();
+    }
+    expect(lookaheadProbeCalls).toBe(0);
+  });
+
+  it("bounds wrapped and otherwise unprobeable mixed alternatives", () => {
+    const token = "A".repeat(16_384);
+    const patterns = [
+      "(?:(?=.)|CONSUMING)",
+      "(?:(?=.)|CONSUMING)X?",
+    ];
+    const engine = new ScrubEngine(patterns, []);
+    const originalExec = RegExp.prototype.exec;
+    const execCounts = new Map<string, number>();
+    const execSpy = vi.spyOn(RegExp.prototype, "exec").mockImplementation(function (
+      this: RegExp,
+      value: string,
+    ): RegExpExecArray | null {
+      if (patterns.includes(this.source)) {
+        execCounts.set(this.source, (execCounts.get(this.source) ?? 0) + 1);
+      }
+      return originalExec.call(this, value);
+    });
+
+    try {
+      expect(engine.scrub(token)).toBe("[REDACTED]");
+    } finally {
+      execSpy.mockRestore();
+    }
+    for (const pattern of patterns) expect(execCounts.get(pattern)).toBeLessThanOrEqual(2);
+  });
+
+  it("handles long escaped regex sources without backtracking in syntax analysis", () => {
+    const escapedBackslashes = "\\\\".repeat(8_192);
+    const result = new ScrubEngine([
+      `(?!${escapedBackslashes})A`,
+      `(?=${escapedBackslashes})|A`,
+    ], []).scrubWithCounts("A");
+
+    expect(result).toEqual({
+      text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
+  it("caches regex source analysis when patterns are constructed", () => {
+    const startsWithSpy = vi.spyOn(String.prototype, "startsWith");
+    const engine = new ScrubEngine(["(?=TOKEN)|SECRET\\s+VALUE"], []);
+    startsWithSpy.mockClear();
+
+    try {
+      expect(engine.scrub("ordinary ".repeat(1_000))).toBe("ordinary ".repeat(1_000));
+      expect(startsWithSpy).not.toHaveBeenCalled();
+    } finally {
+      startsWithSpy.mockRestore();
+    }
+  });
+
+  it("skips regex execution for empty token segments at whitespace boundaries", () => {
+    const engine = new ScrubEngine(["TOKEN"], []);
+    const originalExec = RegExp.prototype.exec;
+    let tokenPatternCalls = 0;
+    const execSpy = vi.spyOn(RegExp.prototype, "exec").mockImplementation(function (
+      this: RegExp,
+      value: string,
+    ): RegExpExecArray | null {
+      if (this.source === "TOKEN") tokenPatternCalls++;
+      return originalExec.call(this, value);
+    });
+
+    try {
+      expect(engine.scrub(" TOKEN ")).toBe(" [REDACTED] ");
+    } finally {
+      execSpy.mockRestore();
+    }
+    expect(tokenPatternCalls).toBe(2);
+  });
+
+  it("falls back to the final preceding token from trailing whitespace", () => {
+    expect(new ScrubEngine(["(?=\\s*$)"], []).scrubWithCounts("TOKEN  ")).toEqual({
+      text: "[REDACTED]  ", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+    });
+  });
+
+  it("bounds repeated zero-width matching work for long tokens in both paths", () => {
+    const token = "A".repeat(16_384);
+    const engine = new ScrubEngine([
+      "(?=.)", "(?=.)", "(?=A)", "(?=A)", "(?=A)|(?=B)", "(?=A)|(?=B)",
+    ], []);
+    const originalExec = RegExp.prototype.exec;
+    const execCounts = new Map<string, number>();
+    const execSpy = vi.spyOn(RegExp.prototype, "exec").mockImplementation(function (
+      this: RegExp,
+      value: string,
+    ): RegExpExecArray | null {
+      if (this.source === "(?=.)" || this.source === "(?=A)" || this.source === "(?=A)|(?=B)") {
+        execCounts.set(this.source, (execCounts.get(this.source) ?? 0) + 1);
+      }
+      return originalExec.call(this, value);
+    });
+
+    try {
+      expect(engine.scrubWithCounts(token)).toEqual({
+        text: "[REDACTED]", gitleaks: 0, builtIn: 0, global: 1, project: 0,
+      });
+    } finally {
+      execSpy.mockRestore();
+    }
+
+    expect(execCounts.get("(?=.)")).toBeLessThanOrEqual(4);
+    expect(execCounts.get("(?=A)")).toBeLessThanOrEqual(4);
+    expect(execCounts.get("(?=A)|(?=B)")).toBeLessThanOrEqual(4);
   });
 
   it("merges overlapping matches and preserves disjoint surrounding text", () => {

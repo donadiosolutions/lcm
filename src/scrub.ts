@@ -99,6 +99,334 @@ function isSpanningPattern(source: string): boolean {
   return false;
 }
 
+type TextRange = [number, number];
+
+function nonWhitespaceRanges(text: string): TextRange[] {
+  return Array.from(text.matchAll(/\S+/g), (match) => [
+    match.index,
+    match.index + match[0].length,
+  ]);
+}
+
+interface RegexSourceAnalysis {
+  hasBackreference: boolean;
+  hasContextDependentLookahead: boolean;
+  hasPositiveLookbehind: boolean;
+  hasUnescapedAlternation: boolean;
+  hasPotentialConsumingAlternative: boolean;
+  effectiveAlternativeSources: string[];
+  positiveLookaheadBodies: string[];
+}
+
+interface RegexGroupFrame {
+  alternativeSources: string[];
+  alternativeStart: number;
+  assertion: boolean;
+  start: number;
+  positiveLookaheadBodyStart: number | null;
+}
+
+function analyzeRegexSource(source: string): RegexSourceAnalysis {
+  const groupStack: RegexGroupFrame[] = [];
+  const positiveLookaheadBodies: string[] = [];
+  const rootAlternativeSources: string[] = [];
+  let rootAlternativeStart = 0;
+  let wrappedAlternativeSources: string[] = [];
+  let assertionDepth = 0;
+  let positiveLookaheadDepth = 0;
+  let inCharacterClass = false;
+  let hasBackreference = false;
+  let hasContextDependentLookahead = false;
+  let hasPositiveLookbehind = false;
+  let hasUnescapedAlternation = false;
+  let hasPotentialConsumingAlternative = false;
+
+  for (let index = 0; index < source.length; index++) {
+    const character = source[index];
+    if (inCharacterClass) {
+      if (character === "\\") index++;
+      else if (character === "]") inCharacterClass = false;
+      continue;
+    }
+    if (character === "\\") {
+      const escapedCharacter = source.charAt(index + 1);
+      const isBackreference = (escapedCharacter >= "1" && escapedCharacter <= "9")
+        || source.startsWith("\\k<", index);
+      if (isBackreference) hasBackreference = true;
+      if (positiveLookaheadDepth > 0 && isBackreference) {
+        hasContextDependentLookahead = true;
+      }
+      if (assertionDepth === 0 && escapedCharacter !== "b" && escapedCharacter !== "B") {
+        hasPotentialConsumingAlternative = true;
+      }
+      index++;
+      continue;
+    }
+    if (character === "[") {
+      if (assertionDepth === 0) hasPotentialConsumingAlternative = true;
+      inCharacterClass = true;
+      continue;
+    }
+    if (character === "(") {
+      const groupStart = index;
+      let bodyStart = index + 1;
+      let assertion = false;
+      let positiveLookaheadBodyStart: number | null = null;
+      if (source.startsWith("(?=", index)) {
+        assertion = true;
+        positiveLookaheadBodyStart = index + 3;
+        bodyStart = positiveLookaheadBodyStart;
+        positiveLookaheadDepth++;
+        index += 2;
+      } else if (source.startsWith("(?!", index)) {
+        assertion = true;
+        bodyStart = index + 3;
+        index += 2;
+      } else if (source.startsWith("(?<=", index)) {
+        assertion = true;
+        bodyStart = index + 4;
+        if (positiveLookaheadDepth > 0) hasContextDependentLookahead = true;
+        hasPositiveLookbehind = true;
+        index += 3;
+      } else if (source.startsWith("(?<!", index)) {
+        assertion = true;
+        bodyStart = index + 4;
+        if (positiveLookaheadDepth > 0) hasContextDependentLookahead = true;
+        index += 3;
+      } else if (source.startsWith("(?:", index)) {
+        bodyStart = index + 3;
+        index += 2;
+      } else if (source.startsWith("(?<", index)) {
+        // The RegExp constructor already proved that every named group closes.
+        index = source.indexOf(">", index + 3);
+        bodyStart = index + 1;
+      }
+      groupStack.push({
+        alternativeSources: [],
+        alternativeStart: bodyStart,
+        assertion,
+        positiveLookaheadBodyStart,
+        start: groupStart,
+      });
+      if (assertion) assertionDepth++;
+      continue;
+    }
+    if (character === ")") {
+      const group = groupStack.pop();
+      if (group?.positiveLookaheadBodyStart != null) {
+        positiveLookaheadBodies.push(source.slice(group.positiveLookaheadBodyStart, index));
+        positiveLookaheadDepth--;
+      }
+      if (
+        group?.start === 0
+        && index === source.length - 1
+        && group.alternativeSources.length > 0
+      ) {
+        wrappedAlternativeSources = [
+          ...group.alternativeSources,
+          source.slice(group.alternativeStart, index),
+        ];
+      }
+      if (group?.assertion) assertionDepth--;
+      continue;
+    }
+    if (character === "|") {
+      hasUnescapedAlternation = true;
+      if (groupStack.length === 0) {
+        rootAlternativeSources.push(source.slice(rootAlternativeStart, index));
+        rootAlternativeStart = index + 1;
+      } else if (groupStack.length === 1) {
+        const outerGroup = groupStack[0];
+        outerGroup.alternativeSources.push(source.slice(outerGroup.alternativeStart, index));
+        outerGroup.alternativeStart = index + 1;
+      }
+      continue;
+    }
+    if (assertionDepth > 0 || "^$*+?".includes(character)) continue;
+    const quantifierFirst = source[index + 1] ?? "";
+    if (character === "{" && quantifierFirst >= "0" && quantifierFirst <= "9") {
+      const quantifierEnd = source.indexOf("}", index + 2);
+      if (quantifierEnd >= 0) {
+        index = quantifierEnd;
+        continue;
+      }
+    }
+    hasPotentialConsumingAlternative = true;
+  }
+  const effectiveAlternativeSources = rootAlternativeSources.length > 0
+    ? [...rootAlternativeSources, source.slice(rootAlternativeStart)]
+    : wrappedAlternativeSources;
+  return {
+    hasBackreference,
+    hasContextDependentLookahead,
+    hasPositiveLookbehind,
+    hasUnescapedAlternation,
+    hasPotentialConsumingAlternative,
+    effectiveAlternativeSources,
+    positiveLookaheadBodies,
+  };
+}
+
+interface RegexCollectionPlan {
+  alternativeProbes: RegExp[];
+  hasAmbiguousAlternative: boolean;
+  hasContextDependentLookahead: boolean;
+  lookaheadProbes: RegExp[];
+  preferPrecedingAtBoundary: boolean;
+}
+
+interface CompiledScrubPattern {
+  plan: RegexCollectionPlan;
+  regex: RegExp;
+  source: string;
+}
+
+function createRegexCollectionPlan(regex: RegExp): RegexCollectionPlan {
+  const sourceAnalysis = analyzeRegexSource(regex.source);
+  const lookaheadFlags = regex.flags.replace(/[dgy]/gu, "");
+  const lookaheadProbes = sourceAnalysis.hasContextDependentLookahead
+    ? []
+    : sourceAnalysis.positiveLookaheadBodies.map(
+        (body) => new RegExp(`^(?:${body})`, lookaheadFlags),
+      );
+  const preserveAlternativeMatches = sourceAnalysis.hasUnescapedAlternation
+    && sourceAnalysis.hasPotentialConsumingAlternative;
+  const hasAmbiguousAlternative = preserveAlternativeMatches && (
+    sourceAnalysis.hasBackreference
+    || sourceAnalysis.effectiveAlternativeSources.length === 0
+  );
+  const alternativeFlags = regex.flags.replace(/[dy]/gu, "");
+  const alternativeProbes = preserveAlternativeMatches && !hasAmbiguousAlternative
+    ? sourceAnalysis.effectiveAlternativeSources.map(
+        (source) => new RegExp(source, alternativeFlags),
+      )
+    : [];
+  return {
+    alternativeProbes,
+    hasAmbiguousAlternative,
+    hasContextDependentLookahead: sourceAnalysis.hasContextDependentLookahead,
+    lookaheadProbes,
+    preferPrecedingAtBoundary: sourceAnalysis.hasPositiveLookbehind
+      || sourceAnalysis.hasContextDependentLookahead,
+  };
+}
+
+function zeroWidthTokenRanges(
+  ranges: readonly TextRange[],
+  anchor: number,
+  preferPrecedingAtBoundary: boolean,
+  includeFollowingAtBoundary: boolean,
+): readonly TextRange[] {
+  let low = 0;
+  let high = ranges.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (ranges[middle][1] <= anchor) low = middle + 1;
+    else high = middle;
+  }
+  const preceding = ranges[low - 1];
+  const following = ranges[low];
+  if (
+    preferPrecedingAtBoundary
+    && preceding
+    && following
+    && preceding[1] < anchor
+    && following[0] >= anchor
+  ) {
+    return [preceding, following];
+  }
+  if (preferPrecedingAtBoundary && preceding?.[1] === anchor) {
+    return includeFollowingAtBoundary && following ? [preceding, following] : [preceding];
+  }
+  const selected = following ?? preceding;
+  return selected ? [selected] : [];
+}
+
+/**
+ * Convert a regex match into a consuming source range.
+ *
+ * Consuming matches retain their exact range. A zero-width match uses cached
+ * non-whitespace boundaries to select the containing or following token. At a
+ * token-end boundary, positive lookbehind prefers the preceding token; when a
+ * matching lookahead also identifies non-whitespace text, both plausible token
+ * ranges are returned. The final preceding token is the fallback when nothing
+ * follows the anchor. Inputs containing no token do not produce a redaction.
+ */
+function consumingMatchRanges(
+  match: RegExpExecArray,
+  getTokenRanges: () => readonly TextRange[],
+  preferPrecedingAtBoundary: boolean,
+  includeFollowingAtBoundary: boolean,
+): readonly TextRange[] {
+  if (match[0].length > 0) return [[match.index, match.index + match[0].length]];
+  return zeroWidthTokenRanges(
+    getTokenRanges(),
+    match.index,
+    preferPrecedingAtBoundary,
+    includeFollowingAtBoundary,
+  );
+}
+
+function collectConsumingRanges(
+  text: string,
+  pattern: CompiledScrubPattern,
+  getTokenRanges: () => readonly TextRange[],
+  collect: (range: TextRange) => void,
+): void {
+  const { plan, regex } = pattern;
+  regex.lastIndex = 0;
+  let previousZeroRanges: readonly TextRange[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(text)) !== null) {
+    const isZeroWidth = match[0].length === 0;
+    const anchor = match.index;
+    const includeFollowingAtBoundary = isZeroWidth && plan.preferPrecedingAtBoundary && (
+      plan.hasContextDependentLookahead
+      || plan.lookaheadProbes.some(
+        (probe) => /\S/u.test(probe.exec(text.slice(anchor))?.[0] ?? ""),
+      )
+    );
+    const ranges = consumingMatchRanges(
+      match,
+      getTokenRanges,
+      plan.preferPrecedingAtBoundary,
+      includeFollowingAtBoundary,
+    );
+    for (const range of ranges) {
+      if (!isZeroWidth || !previousZeroRanges.includes(range)) collect(range);
+    }
+
+    if (!isZeroWidth) continue;
+    if (ranges.length === 0) break;
+
+    let consumingAlternativeEnd = anchor;
+    const expandedEnd = Math.max(...ranges.map((range) => range[1]));
+    if (plan.hasAmbiguousAlternative) {
+      const expandedStart = Math.min(...ranges.map((range) => range[0]));
+      collect([expandedStart, text.length]);
+      consumingAlternativeEnd = text.length;
+    }
+    for (const probe of plan.alternativeProbes) {
+      probe.lastIndex = anchor;
+      const alternativeMatch = probe.exec(text);
+      if (
+        alternativeMatch
+        && alternativeMatch[0].length > 0
+        && alternativeMatch.index < expandedEnd
+      ) {
+        const alternativeEnd = alternativeMatch.index + alternativeMatch[0].length;
+        collect([alternativeMatch.index, alternativeEnd]);
+        consumingAlternativeEnd = Math.max(consumingAlternativeEnd, alternativeEnd);
+      }
+    }
+
+    previousZeroRanges = ranges;
+    const lastIndexAfterMatch = regex.lastIndex;
+    regex.lastIndex = Math.max(regex.lastIndex, expandedEnd, consumingAlternativeEnd);
+    if (regex.lastIndex === lastIndexAfterMatch) regex.lastIndex++;
+  }
+}
+
 export interface ScrubCounts {
   text: string;
   gitleaks: number;
@@ -117,8 +445,8 @@ export function getGitleaksSyncDate(): string | null {
 }
 
 export class ScrubEngine {
-  private readonly spanningPatterns: Array<{ source: string; regex: RegExp }> = [];
-  private readonly tokenPatterns: Array<{ source: string; regex: RegExp }> = [];
+  private readonly spanningPatterns: CompiledScrubPattern[] = [];
+  private readonly tokenPatterns: CompiledScrubPattern[] = [];
   /**
    * Original index (into the combined [gitleaks, native, global, project] array) for each spanning pattern.
    * Gitleaks patterns are always "spanning" (applied to full text regardless of isSpanningPattern).
@@ -152,12 +480,13 @@ export class ScrubEngine {
       const { source, isGitleaks, flags } = trustedPatterns[i];
       try {
         const regex = new RegExp(source, "g" + flags);
+        const pattern = { source, regex, plan: createRegexCollectionPlan(regex) };
         // Gitleaks patterns always run against full text (bypass spanning check)
         if (isGitleaks || isSpanningPattern(source)) {
-          this.spanningPatterns.push({ source, regex });
+          this.spanningPatterns.push(pattern);
           this._spanningOrigIdx.push(i);
         } else {
-          this.tokenPatterns.push({ source, regex });
+          this.tokenPatterns.push(pattern);
           this._tokenOrigIdx.push(i);
         }
       } catch {
@@ -170,11 +499,12 @@ export class ScrubEngine {
       const originalIndex = trustedPatterns.length + i;
       try {
         const regex = validateRegex(source, "g" + flags);
+        const pattern = { source, regex, plan: createRegexCollectionPlan(regex) };
         if (isSpanningPattern(source)) {
-          this.spanningPatterns.push({ source, regex });
+          this.spanningPatterns.push(pattern);
           this._spanningOrigIdx.push(originalIndex);
         } else {
-          this.tokenPatterns.push({ source, regex });
+          this.tokenPatterns.push(pattern);
           this._tokenOrigIdx.push(originalIndex);
         }
       } catch {
@@ -202,36 +532,45 @@ export class ScrubEngine {
 
     // Step 1: collect ranges from spanning patterns applied to full text
     // (includes all gitleaks patterns + spanning native/user patterns)
-    type TaggedRange = { range: [number, number]; idx: number };
-    const taggedRanges: TaggedRange[] = [];
+    type TaggedRange = { range: TextRange; idx: number };
+    const taggedRangesByKey = new Map<string, TaggedRange>();
+    const addTaggedRange = (range: TextRange, idx: number): void => {
+      const key = `${range[0]}:${range[1]}`;
+      const winnerIdx = Math.min(idx, taggedRangesByKey.get(key)?.idx ?? idx);
+      taggedRangesByKey.set(key, { range, idx: winnerIdx });
+    };
+    let textTokenRanges: TextRange[] | null = null;
+    const getTextTokenRanges = (): readonly TextRange[] => {
+      textTokenRanges ??= nonWhitespaceRanges(text);
+      return textTokenRanges;
+    };
     for (let pi = 0; pi < this.spanningPatterns.length; pi++) {
-      const { regex } = this.spanningPatterns[pi];
-      regex.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      while ((m = regex.exec(text)) !== null) {
-        taggedRanges.push({ range: [m.index, m.index + m[0].length], idx: this._spanningOrigIdx[pi] });
-        if (m[0].length === 0) regex.lastIndex++;
-      }
+      const pattern = this.spanningPatterns[pi];
+      collectConsumingRanges(text, pattern, getTextTokenRanges, (range) => {
+        addTaggedRange(range, this._spanningOrigIdx[pi]);
+      });
     }
 
     // Step 2: apply token patterns per whitespace-separated segment
     const segments = text.split(/(\s+)/);
     let offset = 0;
     for (const seg of segments) {
-      if (!/^\s+$/.test(seg) && this.tokenPatterns.length > 0) {
+      if (seg.length > 0 && !/^\s+$/.test(seg) && this.tokenPatterns.length > 0) {
+        const segmentTokenRanges: TextRange[] = [[0, seg.length]];
         for (let pi = 0; pi < this.tokenPatterns.length; pi++) {
-          const { regex } = this.tokenPatterns[pi];
-          regex.lastIndex = 0;
-          let m: RegExpExecArray | null;
-          while ((m = regex.exec(seg)) !== null) {
-            taggedRanges.push({ range: [offset + m.index, offset + m.index + m[0].length], idx: this._tokenOrigIdx[pi] });
-            if (m[0].length === 0) regex.lastIndex++;
-          }
+          const pattern = this.tokenPatterns[pi];
+          collectConsumingRanges(seg, pattern, () => segmentTokenRanges, (range) => {
+            addTaggedRange(
+              [offset + range[0], offset + range[1]],
+              this._tokenOrigIdx[pi],
+            );
+          });
         }
       }
       offset += seg.length;
     }
 
+    const taggedRanges = [...taggedRangesByKey.values()];
     if (taggedRanges.length === 0) return { text, gitleaks: 0, builtIn: 0, global: 0, project: 0 };
 
     // Sort by start position

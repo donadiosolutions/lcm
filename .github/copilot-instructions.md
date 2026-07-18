@@ -26,6 +26,16 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
   - Any path that runs more than once per user action
   - Startup initialization (lazy evaluation only)
 - Flag any `collectStats()` call that isn't in a dedicated stats endpoint or background job.
+- In synchronous redaction paths, zero-width regex matches must reuse cached token boundaries, skip to the end of the consuming range, and avoid collecting duplicate ranges. Flag per-match rescans of the same token or one range allocation per character.
+- At a token-end boundary, a zero-width positive lookbehind identifies the preceding token, while a whitespace lookahead identifies the following token. Require regressions for both directions when changing zero-width range selection.
+- Do not derive zero-width token direction from the entire regex source when mixed assertions or alternatives can match different branches. Determine direction from the active match or redact every plausible adjacent token.
+- Range skipping after a zero-width match must not hide a later consuming alternative that starts inside the expanded token and extends beyond it. Preserve such alternatives while retaining bounded work for pure repeated-zero patterns.
+- Regex syntax detection must skip escaped characters and character classes; text such as `(?<=` inside `[...]` is not a lookbehind assertion.
+- Parse user-configured regex source with one linear scanner; avoid nested or overlapping quantifier regexes that can backtrack over long escaped sequences.
+- Cache immutable regex-source analysis when each scrub pattern is constructed; token-by-token collection must not reparse the same source.
+- Skip empty segments from whitespace-preserving token splits before executing scrub patterns.
+- Detached lookahead probes cannot preserve captures or assertions that inspect text before the anchor. Treat backreferences and nested lookbehinds as ambiguous, fail closed across plausible token boundaries, and require regressions for both dependency types.
+- Normalize sensitive-data category metadata by trimming and filtering entries before joining or applying the `unknown` fallback. Whitespace-only arrays must never render an empty `pattern:` warning.
 
 ### Test coverage
 - New HTTP routes must have corresponding tests in `test/daemon/routes/`.
