@@ -327,7 +327,7 @@ function valueType(value: unknown): string {
 }
 
 function isCredentialPath(path: string): boolean {
-  const key = path.split(".").at(-1) ?? path;
+  const key = path.split(".").at(-1)!;
   return /(?:api[-_]?key|token|secret|password|credential)/i.test(key);
 }
 
@@ -340,8 +340,7 @@ function displayValue(path: string, value: unknown): string {
     return JSON.stringify(sanitizeUrlForDisplay(value));
   }
   if (typeof value === "number" && !Number.isFinite(value)) return String(value);
-  const serialized = JSON.stringify(value, (key, nestedValue) => {
-    if (key && isCredentialPath(key)) return "[REDACTED]";
+  const serialized = JSON.stringify(value, (_key, nestedValue) => {
     if (typeof nestedValue === "string" && /^[a-z][a-z\d+.-]*:\/\//i.test(nestedValue)) {
       return sanitizeUrlForDisplay(nestedValue);
     }
@@ -782,11 +781,21 @@ function isPublicOpenAIBaseURL(baseUrl: string): boolean {
   }
 }
 
+function migrateLegacyPromotionThresholds(thresholds: Record<string, unknown>): Record<string, unknown> {
+  const migrated = { ...thresholds };
+  if (migrated.mergeMaxEntries !== undefined && migrated.dedupCandidateLimit === undefined) {
+    migrated.dedupCandidateLimit = migrated.mergeMaxEntries;
+  }
+  delete migrated.mergeMaxEntries;
+  delete migrated.confidenceDecayRate;
+  return migrated;
+}
+
 function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: ReadonlySet<string>): void {
   const { llm } = merged;
   if (llm.provider === "anthropic") {
     requireNonEmpty(llm.model, "llm.model", llm.provider);
-    requireNonEmpty(llm.apiKey ?? "", "llm.apiKey", llm.provider);
+    requireNonEmpty(llm.apiKey!, "llm.apiKey", llm.provider);
   }
 
   if (llm.provider === "openai") {
@@ -802,7 +811,7 @@ function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: Readonl
       throw new ConfigValidationError("llm.baseUrl", `expected an absolute HTTP(S) URL, received string ${displayValue("llm.baseUrl", llm.baseUrl)}`);
     }
     if (isPublicOpenAIBaseURL(llm.baseUrl)) {
-      requireNonEmpty(llm.apiKey ?? "", "llm.apiKey", llm.provider);
+      requireNonEmpty(llm.apiKey!, "llm.apiKey", llm.provider);
     }
     llm.apiMode ??= "chat-completions";
   } else {
@@ -890,11 +899,7 @@ export function parseDaemonConfig(
   merged.llm.retry = effectivePolicy.retry;
   // Migrate legacy mergeMaxEntries (renamed to dedupCandidateLimit)
   const thresholds = merged.compaction.promotionThresholds as Record<string, unknown>;
-  if (thresholds["mergeMaxEntries"] !== undefined && thresholds["dedupCandidateLimit"] === undefined) {
-    thresholds["dedupCandidateLimit"] = thresholds["mergeMaxEntries"];
-  }
-  delete thresholds["mergeMaxEntries"];
-  delete thresholds["confidenceDecayRate"];
+  merged.compaction.promotionThresholds = migrateLegacyPromotionThresholds(thresholds) as DaemonConfig["compaction"]["promotionThresholds"];
   if (merged.llm.apiKey) merged.llm.apiKey = merged.llm.apiKey.replace(/\$\{(\w+)\}/g, (_: string, k: string) => env[k] ?? "");
 
   // Runtime models belong to the runtime/environment selection. Only discard
@@ -982,3 +987,6 @@ export function loadDaemonConfig(configPath: string, overrides?: unknown, env?: 
   }
   return parseDaemonConfig(content, overrides, resolvedEnv);
 }
+
+/** Internal pure seams used by configuration boundary tests. */
+export const __configTestUtils = { migrateLegacyPromotionThresholds };

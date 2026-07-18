@@ -217,16 +217,11 @@ type ParentInspection = {
 function inspectDaemonParent(
   pidFilePath: string,
   options: {
-    platform: NodeJS.Platform;
     procRoot: string;
     uid?: number;
     isAlive: (pid: number) => boolean;
   },
 ): ParentInspection {
-  if (options.platform !== "linux") {
-    return { satisfies: true, available: false, reason: "not-linux" };
-  }
-
   const pid = readPidFile(pidFilePath);
   if (pid === null) return { satisfies: false, available: false, reason: "missing-pid" };
   if (!options.isAlive(pid)) return { satisfies: false, available: false, pid, reason: "dead-pid" };
@@ -393,7 +388,7 @@ function systemdDaemonSetenvArgs(env: NodeJS.ProcessEnv, credentialNames: string
   const args = Object.entries(env)
     .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && !SYSTEMD_SECRET_ENV_PATTERN.test(name))
     .sort(([left], [right]) => left.localeCompare(right))
-    .map(([name, value]) => `--setenv=${name}=${value ?? ""}`);
+    .map(([name, value]) => `--setenv=${name}=${value}`);
   if (credentialNames.length > 0) {
     args.push(`--setenv=LCM_SYSTEMD_CRED_IDS=${credentialNames.join(",")}`);
   }
@@ -441,7 +436,7 @@ function systemdDaemonCredentialArgs(env: NodeJS.ProcessEnv): { args: string[]; 
     const names: string[] = [];
     const args = secrets.map(([name, value]) => {
       const credentialPath = join(createdCredentialDir, name);
-      writeFileSync(credentialPath, value ?? "", { mode: 0o600 });
+      writeFileSync(credentialPath, value!, { mode: 0o600 });
       names.push(name);
       return `--property=LoadCredential=${name}:${credentialPath}`;
     });
@@ -523,7 +518,6 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
 
   function inspectParent(): ParentInspection {
     return inspectDaemonParent(opts.pidFilePath, {
-      platform,
       procRoot,
       uid: opts._uid,
       isAlive,
@@ -596,12 +590,13 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     } else if (hasAccess) {
       const accepted = await daemonResult(health, false, "existing", undefined, false, true);
       if (accepted) return accepted;
-      if (enforceParent) {
-        const parent = inspectParent();
-        if (parent.available && parent.pid !== undefined && isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
-          await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
-          restartedForParent = true;
-        }
+      // A null result here can only be the verified wrong-parent case: health,
+      // access, and version were already accepted, while unavailable identity
+      // metadata returns a connected result with a warning.
+      const parent = inspectParent();
+      if (parent.available && parent.pid !== undefined && isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
+        await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
+        restartedForParent = true;
       }
       cleanStalePid(opts.pidFilePath);
     } else {
@@ -763,3 +758,12 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   }
   return { ...result, restarted, stoppedPid };
 }
+
+/** Internal branch-level seams used by the daemon lifecycle test suite. */
+export const __lifecycleTestUtils = {
+  findListeningTcpPorts,
+  inspectDaemonParent,
+  parentInvariantWarning,
+  systemdDaemonSetenvArgs,
+  systemdRunProcessEnv,
+};

@@ -30,7 +30,15 @@ export { PKG_VERSION };
 
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse, body: string) => Promise<void>;
 export type DaemonInstance = { address: () => AddressInfo; stop: () => Promise<void>; registerRoute: (method: string, path: string, handler: RouteHandler) => void; idleTriggered: boolean };
-export type DaemonOptions = { proxyManager?: ProxyManager; onIdle?: () => void; tokenPath?: string };
+export type DaemonOptions = {
+  proxyManager?: ProxyManager;
+  onIdle?: () => void;
+  tokenPath?: string;
+  /** @internal Deterministic idle-timer seams for lifecycle tests. */
+  _setTimeout?: typeof setTimeout;
+  /** @internal Deterministic idle-timer seams for lifecycle tests. */
+  _clearTimeout?: typeof clearTimeout;
+};
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
 
@@ -83,9 +91,16 @@ export function sendJson(res: ServerResponse, status: number, data: unknown): vo
   res.end(body);
 }
 
+function clearIdleTimer(timer: ReturnType<typeof setTimeout> | null, clearTimer: typeof clearTimeout): null {
+  if (timer) clearTimer(timer);
+  return null;
+}
+
 export async function createDaemon(config: DaemonConfig, options?: DaemonOptions): Promise<DaemonInstance> {
   const startTime = Date.now();
   const proxyManager = options?.proxyManager;
+  const setIdleTimeout = options?._setTimeout ?? setTimeout;
+  const clearIdleTimeout = options?._clearTimeout ?? clearTimeout;
   const listenPort = normalizeDaemonPort(config.daemon.port, { allowZero: true });
   const idleTimeoutMs = normalizeIdleTimeoutMs(config.daemon.idleTimeoutMs);
   const serverToken = options?.tokenPath ? readAuthToken(options.tokenPath) : null;
@@ -103,8 +118,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
 
   function resetIdleTimer() {
     if (idleTimeoutMs <= 0) return;
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
+    if (idleTimer) clearIdleTimeout(idleTimer);
+    idleTimer = setIdleTimeout(() => {
       idleTriggered = true;
       onIdle();
     }, idleTimeoutMs);
@@ -228,7 +243,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     clearInterval(ingestInterval);
     projectMapWatcher.close();
     passiveEventProcessor.stop();
-    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout);
     if (proxyManager) {
       try { await proxyManager.stop(); } catch { /* non-fatal */ }
     }
@@ -263,7 +278,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           clearInterval(ingestInterval);
           projectMapWatcher.close();
           passiveEventProcessor.stop();
-          if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+          idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout);
           if (proxyManager) {
             try { await proxyManager.stop(); } catch { /* non-fatal */ }
           }

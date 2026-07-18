@@ -130,7 +130,6 @@ function addAggregatedError(
   if (existing) {
     existing.count += increment;
     existing.timestamp = existing.timestamp ?? error.timestamp;
-    existing.details = existing.details ?? error.details;
     return;
   }
   aggregate.set(key, { ...error, count: increment });
@@ -559,3 +558,7 @@ export function formatDiagnoseResult(
   }
   return lines.join("\n") + "\n";
 }
+
+export const __diagnoseTestUtils = {
+  matchPendingHook,
+};
