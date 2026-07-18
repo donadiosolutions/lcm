@@ -14,7 +14,7 @@
 #   5  Open PR targeting main
 #   6  Wait for CI
 #   7  Merge release PR
-#   8  Wait for publish.yml
+#   8  Create/verify signed release tag and wait for publish.yml
 set -euo pipefail
 
 # ─── Args ────────────────────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ done
 if [[ -z "$VERSION" ]]; then
   echo "Usage: $0 <version> [--from-step N]"
   echo "       $0 0.4.2"
-  echo "       $0 0.4.2 --from-step 8   # resume after publish.yml failure"
+  echo "       $0 0.4.2 --from-step 8   # create/verify tag and resume publish"
   exit 1
 fi
 
@@ -77,17 +77,43 @@ REPO="donadiosolutions/lcm"
 RELEASE_BRANCH="release/v$VERSION"
 PACKAGE_NAME=$(node -p "require('./package.json').name")
 
-# Validate origin points at the canonical repo (not a fork)
-ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
-if [[ "$ORIGIN_URL" != *"$REPO"* ]]; then
-  err "origin does not point to $REPO (got: $ORIGIN_URL). Run from the canonical repo, not a fork."
-fi
-
 err()    { echo ""; echo "✗ ERROR: $*" >&2; exit 1; }
 step()   { echo ""; echo "━━━ $* ━━━"; }
 ok()     { echo "  ✓ $*"; }
 skip()   { echo "  (skipping — already past this step)"; }
 run_step() { [[ "$1" -ge "$FROM_STEP" ]]; }  # true if step N should run
+
+remote_tag_refs() {
+  git ls-remote --tags origin "refs/tags/$1" "refs/tags/$1^{}"
+}
+
+tag_object_from_refs() {
+  local tag="$1"
+  awk -v tag_ref="refs/tags/$tag" '$2 == tag_ref { print $1; exit }'
+}
+
+tag_target_from_refs() {
+  local tag="$1"
+  awk -v tag_ref="refs/tags/$tag" -v peeled_ref="refs/tags/$tag^{}" '
+    $2 == tag_ref { tag_object = $1 }
+    $2 == peeled_ref { peeled = $1 }
+    END {
+      if (peeled != "") print peeled
+      else if (tag_object != "") print tag_object
+    }
+  '
+}
+
+tag_peeled_from_refs() {
+  local tag="$1"
+  awk -v peeled_ref="refs/tags/$tag^{}" '$2 == peeled_ref { print $1; exit }'
+}
+
+# Validate origin points at the canonical repo (not a fork)
+ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
+if [[ "$ORIGIN_URL" != *"$REPO"* ]]; then
+  err "origin does not point to $REPO (got: $ORIGIN_URL). Run from the canonical repo, not a fork."
+fi
 
 # When resuming mid-flow, look up state we would have captured earlier.
 PR_NUMBER=""
@@ -104,6 +130,8 @@ if [[ "$FROM_STEP" -eq 8 ]]; then
     --state merged --json mergeCommit --jq '.[0].mergeCommit.oid' 2>/dev/null || true)
   [[ -z "$MERGE_SHA" || "$MERGE_SHA" == "null" ]] && \
     err "Resuming from step 8 but could not find merge commit for $RELEASE_BRANCH → main. Has the PR been merged? Check https://github.com/$REPO manually."
+  [[ "$MERGE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || \
+    err "Resuming from step 8 returned an invalid merge commit SHA: $MERGE_SHA"
   echo "  Resuming: found merge commit $MERGE_SHA"
 fi
 
@@ -295,32 +323,104 @@ if run_step 7; then
   MERGE_SHA=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeCommit --jq '.mergeCommit.oid')
   [[ -z "$MERGE_SHA" || "$MERGE_SHA" == "null" ]] && \
     err "Could not determine merge commit SHA for PR #$PR_NUMBER. Check https://github.com/$REPO/pull/$PR_NUMBER."
+  [[ "$MERGE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || \
+    err "GitHub returned an invalid merge commit SHA for PR #$PR_NUMBER: $MERGE_SHA"
   ok "PR #$PR_NUMBER merged to main (commit $MERGE_SHA)."
 else
   step "Step 7 — Merge release PR"; skip
 fi
 
-# ─── STEP 8: Wait for publish.yml ────────────────────────────────────────────
+# ─── STEP 8: Tag merge commit and wait for publish.yml ───────────────────────
 if run_step 8; then
-  step "Step 8 — Wait for publish.yml"
+  step "Step 8 — Tag merge commit and wait for publish.yml"
 
-  # Use the exact merge commit SHA (not main HEAD, which may advance before we query it).
+  # Use the exact merge commit SHA (not main HEAD, which may advance before we tag it).
   [[ -z "$MERGE_SHA" || "$MERGE_SHA" == "null" ]] && \
     err "MERGE_SHA not set — internal error. Re-run from step 7."
-  echo "  Waiting for publish.yml run for commit $MERGE_SHA..."
+  [[ "$MERGE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || \
+    err "MERGE_SHA is not a valid commit SHA: $MERGE_SHA"
+
+  TAG="v$VERSION"
+  git fetch --no-tags origin main || \
+    err "Failed to fetch origin/main before creating $TAG."
+  git merge-base --is-ancestor "$MERGE_SHA" origin/main || \
+    err "Merge commit $MERGE_SHA is not reachable from origin/main; refusing to tag it."
+
+  REMOTE_TAG_REFS=$(remote_tag_refs "$TAG") || \
+    err "Failed to inspect $TAG on origin."
+  REMOTE_TAG_OBJECT=$(printf '%s\n' "$REMOTE_TAG_REFS" | tag_object_from_refs "$TAG")
+  REMOTE_TAG_TARGET=$(printf '%s\n' "$REMOTE_TAG_REFS" | tag_target_from_refs "$TAG")
+  REMOTE_TAG_PEELED=$(printf '%s\n' "$REMOTE_TAG_REFS" | tag_peeled_from_refs "$TAG")
+
+  if [[ -n "$REMOTE_TAG_OBJECT" ]]; then
+    [[ "$REMOTE_TAG_TARGET" == "$MERGE_SHA" ]] || \
+      err "Remote tag $TAG points to $REMOTE_TAG_TARGET, not merge commit $MERGE_SHA. Never overwrite a public release tag."
+    [[ -n "$REMOTE_TAG_PEELED" ]] || \
+      err "Remote tag $TAG is not annotated. Never overwrite a public release tag."
+  fi
+
+  if ! git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+    if [[ -n "$REMOTE_TAG_OBJECT" ]]; then
+      git fetch origin "refs/tags/$TAG:refs/tags/$TAG" || \
+        err "Failed to fetch existing remote tag $TAG."
+      ok "Fetched existing remote tag $TAG."
+    else
+      git tag -s -a "$TAG" "$MERGE_SHA" -m "Release $TAG" || \
+        err "Failed to create signed annotated tag $TAG at $MERGE_SHA."
+      ok "Created signed annotated tag $TAG at $MERGE_SHA."
+    fi
+  fi
+
+  LOCAL_TAG_OBJECT=$(git rev-parse "refs/tags/$TAG") || \
+    err "Could not resolve local tag $TAG after creation or fetch."
+  LOCAL_TAG_TARGET=$(git rev-parse "refs/tags/$TAG^{commit}" 2>/dev/null) || \
+    err "Local tag $TAG does not resolve to a commit."
+  [[ "$LOCAL_TAG_TARGET" == "$MERGE_SHA" ]] || \
+    err "Local tag $TAG points to $LOCAL_TAG_TARGET, not merge commit $MERGE_SHA. Never overwrite a release tag."
+  [[ "$(git cat-file -t "refs/tags/$TAG")" == "tag" ]] || \
+    err "Local tag $TAG is not annotated. Never overwrite a release tag."
+  git tag -v "$TAG" >/dev/null 2>&1 || \
+    err "Local tag $TAG does not have a valid cryptographic signature. Never overwrite a release tag."
+
+  if [[ -n "$REMOTE_TAG_OBJECT" && "$REMOTE_TAG_OBJECT" != "$LOCAL_TAG_OBJECT" ]]; then
+    err "Local and remote $TAG tag objects differ. Never overwrite a public release tag."
+  fi
+
+  if [[ -z "$REMOTE_TAG_OBJECT" ]]; then
+    git push origin "refs/tags/$TAG" || \
+      err "Failed to push signed tag $TAG. Inspect origin for a conflicting tag before retrying."
+    ok "Pushed signed tag $TAG."
+  else
+    ok "Remote tag $TAG already exists at the expected merge commit."
+  fi
+
+  REMOTE_TAG_REFS=$(remote_tag_refs "$TAG") || \
+    err "Failed to verify $TAG on origin after the tag step."
+  REMOTE_TAG_OBJECT=$(printf '%s\n' "$REMOTE_TAG_REFS" | tag_object_from_refs "$TAG")
+  REMOTE_TAG_TARGET=$(printf '%s\n' "$REMOTE_TAG_REFS" | tag_target_from_refs "$TAG")
+  REMOTE_TAG_PEELED=$(printf '%s\n' "$REMOTE_TAG_REFS" | tag_peeled_from_refs "$TAG")
+  [[ -n "$REMOTE_TAG_OBJECT" && -n "$REMOTE_TAG_PEELED" ]] || \
+    err "Remote tag $TAG is missing or is not annotated after the tag step."
+  [[ "$REMOTE_TAG_TARGET" == "$MERGE_SHA" ]] || \
+    err "Remote tag $TAG points to $REMOTE_TAG_TARGET after the tag step, expected $MERGE_SHA."
+  [[ "$REMOTE_TAG_OBJECT" == "$LOCAL_TAG_OBJECT" ]] || \
+    err "Remote tag $TAG does not match the verified local signed tag."
+
+  echo "  Waiting for tag-triggered publish.yml run for $TAG at commit $MERGE_SHA..."
 
   RUN_ID=""
   WAIT_SECS=0
   MAX_WAIT=${PUBLISH_MAX_WAIT:-900}
   while [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; do
+    RUN_ID=$(gh run list --repo "$REPO" --workflow publish.yml --event push --limit 20 \
+      --json databaseId,headSha,headBranch \
+      --jq "map(select(.headSha == \"$MERGE_SHA\" and .headBranch == \"$TAG\")) | .[0].databaseId // empty" 2>/dev/null || true)
+    [[ -n "$RUN_ID" && "$RUN_ID" != "null" ]] && break
     if [[ "$WAIT_SECS" -ge "$MAX_WAIT" ]]; then
-      err "publish.yml run not found after ${MAX_WAIT}s. Check https://github.com/$REPO/actions manually."
+      err "Tag-triggered publish.yml run for $TAG at $MERGE_SHA not found after ${MAX_WAIT}s. Check https://github.com/$REPO/actions manually."
     fi
     sleep 5
     WAIT_SECS=$((WAIT_SECS + 5))
-    RUN_ID=$(gh run list --repo "$REPO" --workflow publish.yml --branch main --limit 20 \
-      --json databaseId,headSha \
-      --jq "map(select(.headSha == \"$MERGE_SHA\")) | .[0].databaseId // empty" 2>/dev/null || true)
   done
 
   echo "  Watching run $RUN_ID..."
@@ -339,13 +439,14 @@ if run_step 8; then
   if [[ "$PUBLISHED_VERSION" != "$VERSION" ]]; then
     err "publish.yml succeeded but $PACKAGE_NAME@$VERSION was not found on npm. Check https://github.com/$REPO/actions/runs/$RUN_ID and npm manually."
   fi
-  git fetch --tags
-  if ! git rev-parse --verify "refs/tags/v$VERSION" >/dev/null 2>&1; then
-    err "publish.yml succeeded but git tag v$VERSION was not found on origin. Check https://github.com/$REPO/actions/runs/$RUN_ID."
+  git fetch --tags || err "Failed to refresh release tags after publish.yml completed."
+  FINAL_TAG_TARGET=$(git rev-parse "refs/tags/$TAG^{commit}" 2>/dev/null || true)
+  if [[ "$FINAL_TAG_TARGET" != "$MERGE_SHA" ]]; then
+    err "publish.yml succeeded but git tag $TAG does not resolve to merge commit $MERGE_SHA. Check https://github.com/$REPO/actions/runs/$RUN_ID."
   fi
-  ok "$PACKAGE_NAME@$VERSION published to npm and tagged."
+  ok "$PACKAGE_NAME@$VERSION published to npm from signed tag $TAG."
 else
-  step "Step 8 — Wait for publish.yml"; skip
+  step "Step 8 — Tag merge commit and wait for publish.yml"; skip
 fi
 
 # ─── Done ────────────────────────────────────────────────────────────────────
