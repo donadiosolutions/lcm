@@ -579,6 +579,45 @@ describe("ensureDaemon", () => {
     expect(killMock).toHaveBeenCalledWith(200, "SIGKILL");
   });
 
+  it("does not signal a replacement PID when wrong-parent identity changes before termination", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-wrong-parent-race-"));
+    tempDirs.push(tempDir);
+    const procRoot = join(tempDir, "proc");
+    mkdirSync(procRoot);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    writeFileSync(pidFile, "200");
+    writeProcEntry(procRoot, 100, "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "/usr/lib/systemd/systemd --user");
+    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    const listenerPorts = vi.fn()
+      .mockReturnValueOnce([19999])
+      .mockReturnValueOnce([19999])
+      .mockReturnValue([]);
+    const killMock = vi.fn();
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _procRoot: procRoot,
+      _uid: 1000,
+      _fetchOverride: vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 200 }) } as Response)
+        .mockResolvedValueOnce({ ok: true } as Response) as FetchOverride,
+      _killOverride: killMock,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: listenerPorts,
+      _skipSpawn: true,
+    });
+
+    expect(result.connected).toBe(false);
+    expect(listenerPorts).toHaveBeenCalledTimes(3);
+    expect(killMock).not.toHaveBeenCalled();
+  });
+
   it("accepts a daemon with a warning when user systemd cannot be found", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-no-systemd-"));
     tempDirs.push(tempDir);

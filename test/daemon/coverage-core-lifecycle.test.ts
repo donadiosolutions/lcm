@@ -25,12 +25,13 @@ describe("lifecycle procfs and parent warnings", () => {
     const many = Array.from({ length: 40 }, (_, index) => `n127.0.0.1:${1000 + index}`).join("\n");
     const spawnSync = vi.fn(() => ({ status: 0, stdout: many }));
     expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", spawnSync as never)).toHaveLength(32);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", spawnSync as never, "/proc", 1039)).toEqual([1039]);
     expect(spawnSync).toHaveBeenCalledWith("lsof", expect.any(Array), expect.any(Object));
     expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", vi.fn(() => ({
       status: 0, stdout: "n127.0.0.2:3737\nn127.0.0.1:invalid\nn127.0.0.1:4545",
     })) as never)).toEqual([4545]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(1, "darwin", vi.fn(() => ({ status: 1, stdout: "" })) as never)).toEqual([]);
-    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", vi.fn(() => ({
+    const win32Netstat = vi.fn(() => ({
       status: 0,
       stdout: [
         "malformed",
@@ -42,7 +43,9 @@ describe("lifecycle procfs and parent warnings", () => {
         "TCP 127.0.0.1:3737 0.0.0.0:0 LISTENING 42",
         "TCP 127.0.0.1:4545 0.0.0.0:0 LISTENING 99",
       ].join("\n"),
-    })) as never)).toEqual([3737]);
+    }));
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", win32Netstat as never)).toEqual([3737]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", win32Netstat as never, "/proc", 3737)).toEqual([3737]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", vi.fn(() => { throw new Error("netstat failed"); }) as never)).toEqual([]);
 
     const linuxRoot = temp();

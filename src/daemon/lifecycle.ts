@@ -163,6 +163,7 @@ function findListeningTcpPorts(
   platform: NodeJS.Platform,
   spawnSyncImpl: typeof spawnSync,
   procRoot = "/proc",
+  targetPort?: number,
 ): number[] {
   if (platform === "linux") {
     try {
@@ -192,7 +193,7 @@ function findListeningTcpPorts(
           // loopback address does not prove ownership of that endpoint.
           if (addressHex !== "0100007F") continue;
           const port = portHex ? Number.parseInt(portHex, 16) : NaN;
-          if (Number.isInteger(port) && port >= 1 && port <= 65_535) ports.add(port);
+          if (Number.isInteger(port) && port >= 1 && port <= 65_535 && (targetPort === undefined || port === targetPort)) ports.add(port);
         }
       }
       return [...ports].sort((a, b) => a - b);
@@ -213,7 +214,7 @@ function findListeningTcpPorts(
         if (Number.parseInt(columns[4], 10) !== pid) continue;
         if (!columns[1]?.startsWith("127.0.0.1:")) continue;
         const port = Number.parseInt(columns[1]?.match(/:(\d+)$/)?.[1] ?? "", 10);
-        if (Number.isInteger(port) && port >= 1 && port <= 65_535) ports.add(port);
+        if (Number.isInteger(port) && port >= 1 && port <= 65_535 && (targetPort === undefined || port === targetPort)) ports.add(port);
       }
       return [...ports].sort((a, b) => a - b);
     } catch {
@@ -241,7 +242,8 @@ function findListeningTcpPorts(
       const match = line.match(/:(\d+)(?:\s+\(LISTEN\))?$/);
       if (!match) continue;
       const port = Number.parseInt(match[1], 10);
-      if (Number.isInteger(port) && port >= 1 && port <= 65_535) ports.add(port);
+      if (Number.isInteger(port) && port >= 1 && port <= 65_535 && (targetPort === undefined || port === targetPort)) ports.add(port);
+      if (targetPort !== undefined && ports.has(targetPort)) break;
       if (ports.size >= 32) break;
     }
     return [...ports].sort((a, b) => a - b);
@@ -656,7 +658,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (pid === null || health.pid !== pid || !isAlive(pid)) return false;
     const listenerPorts = opts._listeningPortsOverride
       ? opts._listeningPortsOverride(pid)
-      : findListeningTcpPorts(pid, platform, opts._spawnSyncOverride ?? spawnSync, procRoot);
+      : findListeningTcpPorts(pid, platform, opts._spawnSyncOverride ?? spawnSync, procRoot, opts.port);
     return listenerPorts.includes(opts.port);
   }
 
@@ -762,10 +764,17 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       // access, and version were already accepted, while unavailable identity
       // metadata returns a connected result with a warning.
       const parent = inspectParent();
-      // A rejected daemonResult here is only possible for verified, available
-      // wrong-parent metadata; unavailable metadata returns a warning result.
-      await terminatePid(parent.pid!, { isAlive, killProcess, sleepFn });
-      restartedForParent = true;
+      // Revalidate the authenticated endpoint and PID immediately before a
+      // signal; concurrent lifecycle operations may have replaced either.
+      if (endpointIdentityMatches(health)
+        && parent.available
+        && parent.pid !== undefined
+        && health.pid !== undefined
+        && parent.pid === health.pid
+        && isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
+        await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
+        restartedForParent = true;
+      }
       cleanStalePid(opts.pidFilePath);
     } else {
       cleanStalePid(opts.pidFilePath);
@@ -924,7 +933,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     if (platform === "linux" && !isLikelyLcmDaemonProcess(pid, opts._procRoot ?? "/proc")) return false;
     const listenerPorts = opts._listeningPortsOverride
       ? opts._listeningPortsOverride(pid)
-      : findListeningTcpPorts(pid, platform, opts._spawnSyncOverride ?? spawnSync, opts._procRoot ?? "/proc");
+      : findListeningTcpPorts(pid, platform, opts._spawnSyncOverride ?? spawnSync, opts._procRoot ?? "/proc", opts.port);
     if (!listenerPorts.includes(opts.port)) return false;
     return await isAuthenticatedDaemonAtPort(opts.port, pid);
   }
