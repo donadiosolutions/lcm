@@ -433,6 +433,7 @@ if run_step 8; then
   MAX_WAIT=${PUBLISH_MAX_WAIT:-900}
   [[ "$MAX_WAIT" =~ ^[0-9]+$ ]] || \
     err "PUBLISH_MAX_WAIT must be a non-negative integer in seconds (got: $MAX_WAIT)."
+  MAX_WAIT=$((10#$MAX_WAIT))
   while [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; do
     RUN_ID=$(gh run list --repo "$REPO" --workflow publish.yml --event push --limit 20 \
       --json databaseId,headSha,headBranch \

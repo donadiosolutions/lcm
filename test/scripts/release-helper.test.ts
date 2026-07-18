@@ -404,7 +404,7 @@ describe("manual release helper step 8", () => {
     },
   );
 
-  it.each(["0", "1", "900"])(
+  it.each(["0", "1", "08", "09", "900"])(
     "accepts PUBLISH_MAX_WAIT boundary %s",
     (publishMaxWait: string) => {
       const result = runRelease({ publishMaxWait });
