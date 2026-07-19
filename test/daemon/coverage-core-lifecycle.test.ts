@@ -6,6 +6,13 @@ import { ensureAuthToken } from "../../src/daemon/auth.js";
 import { __lifecycleTestUtils, ensureDaemon, findUserSystemdPid, readProcessParentPid, restartDaemon } from "../../src/daemon/lifecycle.js";
 
 const dirs: string[] = [];
+type EnsureDaemonOptions = Parameters<typeof ensureDaemon>[0];
+type MonotonicNowOverride = NonNullable<EnsureDaemonOptions["_monotonicNowOverride"]>;
+type SpawnOverride = NonNullable<EnsureDaemonOptions["_spawnOverride"]>;
+type SpawnChildDouble = Pick<ReturnType<SpawnOverride>, "pid" | "unref"> & {
+  once: (event: "error", callback: (error: Error) => void) => SpawnChildDouble;
+};
+type SpawnSyncOverride = NonNullable<EnsureDaemonOptions["_spawnSyncOverride"]>;
 afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const temp = () => { const d = mkdtempSync(join(tmpdir(), "lcm-core-life-")); dirs.push(d); return d; };
 const proc = (root: string, pid: number, status: string, command?: string) => {
@@ -280,6 +287,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
 
     const spawned = await ensureDaemon({
       port: 7, pidFilePath: join(dir, "spawn.pid"), spawnTimeoutMs: 1, spawnCommand: join(dir, "does-not-exist"), spawnArgs: [],
+      _monotonicNowOverride: (): number => 0,
       _fetchOverride: vi.fn().mockRejectedValue(new Error("down")), _skipHealthWait: true,
     });
     expect(spawned.spawned).toBe(true);
@@ -296,12 +304,35 @@ describe("lifecycle spawn and restart failure boundaries", () => {
 
   it("combines systemd and detached errors after health wait expires", async () => {
     const dir = temp();
-    const child = { pid: undefined, unref: vi.fn(), once: vi.fn((_event: string, callback: (error: Error) => void) => { callback(new Error("async spawn")); }) };
+    const child: SpawnChildDouble = {
+      pid: undefined,
+      unref: vi.fn((): void => {}),
+      once: vi.fn((_event: "error", callback: (error: Error) => void): SpawnChildDouble => {
+        callback(new Error("async spawn"));
+        return child;
+      }),
+    };
+    const spawnSync: SpawnSyncOverride = vi.fn();
+    vi.mocked(spawnSync).mockReturnValue({
+      pid: 0, output: [null, null, null], stdout: "", stderr: "", status: 1, signal: null,
+    });
+    const spawn: SpawnOverride = vi.fn();
+    vi.mocked(spawn).mockReturnValue(child as ReturnType<SpawnOverride>);
+    const monotonicNow: MonotonicNowOverride = vi.fn()
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValue(2);
     const result = await ensureDaemon({
       port: 11, pidFilePath: join(dir, "daemon.pid"), spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
-      _fetchOverride: vi.fn().mockRejectedValue(new Error("down")), _spawnSyncOverride: vi.fn(() => ({ status: 1 })) as never,
-      _spawnOverride: vi.fn(() => child) as never, _sleepOverride: async () => {},
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("down")), _spawnSyncOverride: spawnSync,
+      _spawnOverride: spawn, _sleepOverride: async () => {}, _monotonicNowOverride: monotonicNow,
     });
+    expect(spawnSync).toHaveBeenCalledTimes(1);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ connected: false, spawned: true, startMethod: "detached-spawn" });
+    expect(result.warning).toContain("exit status 1");
     expect(result.warning).toContain("async spawn");
   });
 
