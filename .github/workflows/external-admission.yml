@@ -13,6 +13,9 @@ on:
   merge_group:
     types:
       - checks_requested
+  # Provider result events intentionally restart exact-SHA admission after a
+  # rerun, revoking stale success. Irrelevant events create skipped runs, but
+  # identity-qualified concurrency groups keep that noise from the evaluator.
   status:
   check_run:
     types:
@@ -26,7 +29,24 @@ permissions:
   statuses: write
 
 concurrency:
-  group: external-admission-${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.event_name == 'status' && github.event.sha || github.event_name == 'check_run' && github.event.check_run.head_sha || github.sha }}
+  group: >-
+    external-admission-${{
+      github.event_name == 'pull_request_target' && github.event.pull_request.head.sha ||
+      github.event_name == 'status' && github.event.context == 'CodeRabbit' &&
+        github.event.creator.id == 136622811 && github.event.creator.login == 'coderabbitai[bot]' &&
+        github.event.sha ||
+      github.event_name == 'check_run' &&
+        ((github.event.check_run.name == 'codecov/patch' && github.event.check_run.app.id == 254 &&
+          github.event.check_run.app.slug == 'codecov') ||
+        (github.event.check_run.name == 'DCO' && github.event.check_run.app.id == 1861 &&
+          github.event.check_run.app.slug == 'dco')) && github.event.check_run.head_sha ||
+      github.event_name == 'status' &&
+        format('status-{0}-{1}-{2}', github.event.sha, github.event.creator.id, github.event.context) ||
+      github.event_name == 'check_run' &&
+        format('check-run-{0}-{1}-{2}', github.event.check_run.head_sha,
+          github.event.check_run.app.id, github.event.check_run.name) ||
+      format('merge-group-{0}', github.sha)
+    }}
   cancel-in-progress: true
 
 jobs:
