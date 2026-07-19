@@ -1,10 +1,16 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join, resolve } from "node:path";
+import { delimiter, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const releaseScript = resolve(".agents/skills/lcm-release/scripts/release.sh");
+const releaseScript = fileURLToPath(
+  new URL("../../.agents/skills/lcm-release/scripts/release.sh", import.meta.url),
+);
+const releasePolicyFixtures = fileURLToPath(
+  new URL("../../.github/scripts/", import.meta.url),
+);
 const version = "9.9.9";
 const tag = `v${version}`;
 const mergeSha = "a".repeat(40);
@@ -73,7 +79,7 @@ function runRelease(options: HarnessOptions = {}): HarnessResult {
   ]) {
     writeFileSync(
       join(scriptsDir, scriptName),
-      readFileSync(resolve(".github/scripts", scriptName), "utf8"),
+      readFileSync(join(releasePolicyFixtures, scriptName), "utf8"),
     );
   }
   if (options.localTagState) writeFileSync(localTagState, options.localTagState);
