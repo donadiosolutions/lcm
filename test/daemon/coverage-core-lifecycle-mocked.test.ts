@@ -104,6 +104,7 @@ describe("mocked systemd credential boundaries", () => {
 
   it("cleans credentials after a systemd-started daemon becomes healthy", async () => {
     process.env.ANTHROPIC_API_KEY = "secret";
+    process.env.LCM_SUMMARY_API_KEY = "summary-secret";
     fs.read.mockImplementation((path: string) => {
       if (path.endsWith("daemon.token")) return "token";
       if (path.endsWith("daemon.pid")) return "20";
