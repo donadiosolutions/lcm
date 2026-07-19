@@ -44,11 +44,11 @@ running package scripts.
 
 GitHub makes a release public before sending the `release: published` event, so
 the GitHub-to-npm transition is not fully transactional. A trusted-preflight or
-last-moment guard failure restores the release to draft, although a short public
-window can occur first. Failures after `npm publish` do not automatically
-redraft the release, because the npm version is immutable and may already be
-public. Fix a restored draft and publish it manually again; inspect npm first if
-publication may have begun.
+publish-job failure restores the release to draft, although a short public
+window can occur first. If npm publication completed before a later failure,
+publishing the restored draft again remains safe: the workflow recognizes the
+existing immutable package version, skips a duplicate publication, and repeats
+the final package and dist-tag verification.
 
 Beta packages publish to the `beta` npm dist-tag. Stable packages publish to
 `latest`, and the workflow verifies that `latest` remains the highest stable
@@ -77,12 +77,12 @@ The workflow fails instead of substituting commit hashes when a commit has no PR
 Release publication runs use GitHub's native `queue: max` concurrency mode: up
 to 100 runs wait in one global FIFO queue, so different release tags cannot race
 npm dist-tag validation and mutation. Once a queued run starts, it fails closed
-behind an earlier failed run for another tag unless that run succeeds on retry
-or its release was withdrawn to draft. A republished restored draft ignores its
-own tag's earlier failed attempt. Version-package runs use a separate native
-FIFO queue and block behind any failed manual beta/stable transition until that
-transition run succeeds on retry, preventing later automatic work from silently
-overtaking it.
+behind an earlier failed run for another tag unless a later run for that tag
+succeeds or its release was withdrawn to draft. A republished restored draft
+ignores its own tag's earlier failed attempt. Version-package runs use a
+separate native FIFO queue and block behind any failed manual beta/stable
+transition until that transition run succeeds on retry, preventing later
+automatic work from silently overtaking it.
 
 The version workflow grants no token permissions by default. Its sole job gets
 only the permissions it needs: Actions read access for the prior-failure guard,

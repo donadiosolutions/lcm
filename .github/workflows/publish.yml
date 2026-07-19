@@ -11,6 +11,7 @@ permissions: {}
 
 concurrency:
   group: publish-package
+  # Current GitHub syntax: preserve up to 100 pending runs FIFO; installed actionlint lags.
   queue: max
 
 jobs:
@@ -305,6 +306,7 @@ jobs:
       actions: read
       contents: read
     outputs:
+      artifact_name: ${{ steps.artifact.outputs.name }}
       commit: ${{ steps.tag.outputs.commit }}
       is_beta: ${{ steps.release.outputs.is_beta }}
       tag: ${{ steps.release.outputs.tag }}
@@ -331,10 +333,25 @@ jobs:
             const failedRuns = runs.filter(
               (run) => run.id < currentRunId && run.conclusion !== "success",
             );
+            const successfulRuns = runs.filter(
+              (run) => run.id < currentRunId && run.conclusion === "success",
+            );
             const blockingFailures = [];
             for (const run of failedRuns) {
               if (run.head_branch === currentTag) {
                 core.warning(`Ignoring failed earlier attempt ${run.id} for retry tag ${currentTag}`);
+                continue;
+              }
+              const supersedingRun =
+                typeof run.head_branch === "string" &&
+                successfulRuns.find(
+                  (candidate) =>
+                    candidate.head_branch === run.head_branch && candidate.id > run.id,
+                );
+              if (supersedingRun) {
+                core.warning(
+                  `Ignoring failed release run ${run.id}; later run ${supersedingRun.id} succeeded for ${run.head_branch}`,
+                );
                 continue;
               }
               try {
@@ -537,10 +554,14 @@ jobs:
           mkdir -p release-artifact
           npm pack --ignore-scripts --pack-destination release-artifact
 
+      - name: Name verified npm artifact
+        id: artifact
+        run: printf 'name=npm-package-%s-%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
       - name: Upload verified npm artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: npm-package-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.artifact.outputs.name }}
           path: release/release-artifact/*.tgz
           if-no-files-found: error
           retention-days: 1
@@ -574,7 +595,7 @@ jobs:
 
       - name: Download verified npm artifact
         env:
-          ARTIFACT_NAME: npm-package-${{ github.run_id }}-${{ github.run_attempt }}
+          ARTIFACT_NAME: ${{ needs.preflight.outputs.artifact_name }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir release-artifact
 
@@ -662,7 +683,7 @@ jobs:
         run: node trusted/.github/scripts/verify-npm-release.mjs "$RELEASE_VERSION"
 
   restore-draft:
-    if: ${{ always() && github.event_name == 'release' && (needs.preflight.result == 'failure' || needs.publish.outputs.guard_failed == 'true') }}
+    if: ${{ always() && github.event_name == 'release' && (needs.preflight.result == 'failure' || needs.publish.result == 'failure' || needs.publish.outputs.guard_failed == 'true') }}
     needs:
       - preflight
       - publish
@@ -683,5 +704,5 @@ jobs:
               prerelease: release.prerelease,
             });
             core.warning(
-              `Restored ${release.tag_name} to draft because trusted preflight or publication guards failed`,
+              `Restored ${release.tag_name} to draft because trusted preflight or publication failed`,
             );

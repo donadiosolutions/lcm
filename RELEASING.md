@@ -74,10 +74,12 @@ Every other included PR appears under **Extra notes**. Do not combine
 GitHub changes the release from draft to public before it emits the
 `release: published` event, so this gate cannot be fully transactional across
 GitHub and npm. If trusted preflight or either last-moment publication guard
-fails before `npm publish`, the workflow restores the GitHub release to draft.
-There can therefore be a short public window before that restoration completes.
-Failures after `npm publish` are not automatically redrafted, because doing so
-would advertise a draft while an immutable npm version is already public.
+fails, or if the publish job fails before its guard state is recorded, the
+workflow restores the GitHub release to draft. There can therefore be a short
+public window before that restoration completes. If npm was already published
+before a later step failed, republishing the restored draft is safe: the retry
+detects the existing immutable version, skips `npm publish`, and verifies its
+package version and dist-tags.
 
 For beta notes, the previous published release in the same `MAJOR.MINOR` series
 is the comparison base, falling back to the latest stable release for the first
@@ -148,11 +150,11 @@ Recommended external setup:
 When configuring npm trusted publishing, register the GitHub workflow using the exact workflow filename in this repo: `.github/workflows/publish.yml`.
 
 For recovery, rerun a failed tag-triggered draft run with its original event
-payload. When publication preflight or a last-moment guard restores a release to
+payload. When publication preflight or the publish job restores a release to
 draft, fix the failure and manually publish the draft again; an earlier failed
-release run for another tag must either be rerun successfully or remain
-withdrawn as a draft before later releases proceed. An earlier failed attempt
-for the same tag is treated as the history of that republished draft and does
-not block its retry. If npm publication itself may have started,
-inspect npm and the workflow run before changing GitHub state. There is no
-manual dispatch path that can bypass the GitHub draft-to-published transition.
+release run for another tag must either be followed by a successful run for that
+tag or remain withdrawn as a draft before later releases proceed. An earlier
+failed attempt for the same tag is treated as the history of that republished
+draft and does not block its retry. If npm publication itself may have started,
+inspect npm and the workflow run before changing GitHub state. There is no manual
+dispatch path that can bypass the GitHub draft-to-published transition.

@@ -79,6 +79,9 @@ describe("release workflows", () => {
       group: "version-packages-main",
       queue: "max",
     });
+    expect(versionSource).toContain(
+      "Current GitHub syntax: preserve up to 100 pending runs FIFO; installed actionlint lags.",
+    );
     expect(versionWorkflow.jobs.version["runs-on"]).toBe("ubuntu-latest");
     expect(versionWorkflow.jobs.version.permissions).toEqual({
       actions: "read",
@@ -131,6 +134,9 @@ describe("release workflows", () => {
       group: "publish-package",
       queue: "max",
     });
+    expect(publishSource).toContain(
+      "Current GitHub syntax: preserve up to 100 pending runs FIFO; installed actionlint lags.",
+    );
     expect(publishWorkflow.jobs.draft.permissions).toEqual({
       contents: "write",
       "pull-requests": "read",
@@ -159,6 +165,11 @@ describe("release workflows", () => {
     expect(publicationQueue?.with?.script).toContain('event: "release"');
     expect(publicationQueue?.with?.script).toContain('status: "completed"');
     expect(publicationQueue?.with?.script).toContain("run.conclusion !== \"success\"");
+    expect(publicationQueue?.with?.script).toContain('run.conclusion === "success"');
+    expect(publicationQueue?.with?.script).toContain(
+      "candidate.head_branch === run.head_branch && candidate.id > run.id",
+    );
+    expect(publicationQueue?.with?.script).toContain("later run ${supersedingRun.id} succeeded");
     expect(publicationQueue?.with?.script).toContain("run.head_branch === currentTag");
     expect(publicationQueue?.with?.script).toContain("for retry tag");
     expect(publicationQueue?.with?.script).toContain("if (release.draft)");
@@ -167,6 +178,7 @@ describe("release workflows", () => {
 
     const restore = publishWorkflow.jobs["restore-draft"];
     expect(restore.if).toContain("needs.preflight.result == 'failure'");
+    expect(restore.if).toContain("needs.publish.result == 'failure'");
     expect(restore.if).toContain("needs.publish.outputs.guard_failed == 'true'");
     expect(restore.steps).toHaveLength(1);
     expect(restore.steps[0]?.with?.script).toContain("draft: true");
@@ -307,10 +319,20 @@ describe("release workflows", () => {
     const upload = publishWorkflow.jobs.preflight.steps.find(
       (step) => step.name === "Upload verified npm artifact",
     );
+    const artifactName = publishWorkflow.jobs.preflight.steps.find(
+      (step) => step.name === "Name verified npm artifact",
+    );
+    expect(artifactName?.id).toBe("artifact");
+    expect(artifactName?.run).toContain("$GITHUB_RUN_ID");
+    expect(artifactName?.run).toContain("$GITHUB_RUN_ATTEMPT");
+    expect(publishWorkflow.jobs.preflight.outputs?.artifact_name).toBe(
+      "${{ steps.artifact.outputs.name }}",
+    );
     expect(upload?.uses).toBe(
       "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
     );
     expect(upload?.with).toMatchObject({
+      name: "${{ steps.artifact.outputs.name }}",
       path: "release/release-artifact/*.tgz",
       "if-no-files-found": "error",
       "retention-days": 1,
@@ -318,11 +340,14 @@ describe("release workflows", () => {
     const download = publishWorkflow.jobs.publish.steps.find(
       (step) => step.name === "Download verified npm artifact",
     );
+    expect(download?.env?.ARTIFACT_NAME).toBe("${{ needs.preflight.outputs.artifact_name }}");
+    expect(download?.env?.ARTIFACT_NAME).not.toContain("github.run_attempt");
     expect(download?.run).toContain('gh run download "$GITHUB_RUN_ID"');
     expect(publishSource).not.toContain("actions/download-artifact@");
     const publish = publishWorkflow.jobs.publish.steps.find(
       (step) => step.name === "Publish to npm",
     );
+    expect(publish?.if).toContain("steps.npm_guard.outputs.already_published != 'true'");
     expect(publish?.run).toContain("mapfile -d '' -t packages");
     expect(publish?.run).toContain("find release-artifact -type f -name '*.tgz' -print0");
     expect(publish?.run).toContain('"${#packages[@]}" -ne 1');

@@ -18,6 +18,7 @@ permissions: {}
 
 concurrency:
   group: version-packages-main
+  # Current GitHub syntax: preserve up to 100 pending runs FIFO; installed actionlint lags.
   queue: max
 
 jobs:
