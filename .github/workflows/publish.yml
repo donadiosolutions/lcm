@@ -249,6 +249,9 @@ jobs:
     if: ${{ github.event_name == 'release' }}
     runs-on: ubuntu-latest
     environment: npm-publish
+    concurrency:
+      group: npm-publish-dist-tags
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write

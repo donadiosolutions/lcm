@@ -126,6 +126,36 @@ test("classifies major changesets before PR labels and fails on conflicting labe
     undefined,
   );
   assert.throws(() => classifyPullRequest(pr(7, ["bug", "enhancement"])), /conflicting/u);
+  assert.equal(
+    classifyPullRequest(
+      pr(8, [], { head: { ref: "release/v1.5.0" }, title: "chore: release v1.5.0" }),
+    ),
+    undefined,
+  );
+  assert.equal(
+    classifyPullRequest(
+      pr(9, [], {
+        head: { ref: "release/v1.5.0-beta.2" },
+        title: "chore: release v1.5.0-beta.2",
+      }),
+    ),
+    undefined,
+  );
+  assert.equal(
+    classifyPullRequest(
+      pr(10, [], { head: { ref: "release/v1.5.0" }, title: "chore: release v1.5.1" }),
+    ),
+    "extra",
+  );
+  assert.equal(
+    classifyPullRequest(
+      pr(11, [], {
+        head: { ref: "release/v1.5.0-rc.1" },
+        title: "chore: release v1.5.0-rc.1",
+      }),
+    ),
+    "extra",
+  );
 });
 
 test("categorizes and deduplicates PRs while preserving every included PR", () => {

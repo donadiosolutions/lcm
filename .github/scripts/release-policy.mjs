@@ -133,12 +133,31 @@ function labelNames(pr) {
   );
 }
 
+function isManualReleasePullRequest(pr) {
+  const branchPrefix = "release/";
+  const titlePrefix = "chore: release ";
+  if (!pr.head?.ref?.startsWith(branchPrefix) || !pr.title?.startsWith(titlePrefix)) {
+    return false;
+  }
+
+  const branchTag = pr.head.ref.slice(branchPrefix.length);
+  const titleTag = pr.title.slice(titlePrefix.length);
+  if (branchTag !== titleTag) return false;
+  try {
+    parseReleaseTag(branchTag);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function isExcludedPullRequest(pr) {
   const labels = labelNames(pr);
   return (
     labels.has("no-release-notes") ||
     pr.head?.ref === "changeset-release/main" ||
-    pr.title?.trim().toLowerCase() === "chore: version packages"
+    pr.title?.trim().toLowerCase() === "chore: version packages" ||
+    isManualReleasePullRequest(pr)
   );
 }
 

@@ -2,10 +2,53 @@ import { readFileSync } from "node:fs";
 import { load as loadYaml } from "js-yaml";
 import { describe, expect, it } from "vitest";
 
+interface WorkflowStep {
+  id?: string;
+  name?: string;
+  uses?: string;
+  with?: Record<string, unknown>;
+  env?: Record<string, string>;
+}
+
+interface WorkflowJob {
+  if?: string;
+  "runs-on": string;
+  environment?: string;
+  permissions?: Record<string, string>;
+  concurrency?: {
+    group: string;
+    "cancel-in-progress": boolean;
+  };
+  steps: WorkflowStep[];
+}
+
+interface VersionWorkflow {
+  on: {
+    push: { branches: string[] };
+    workflow_dispatch: { inputs: { channel: { options: string[] } } };
+  };
+  concurrency: { group: string; "cancel-in-progress": boolean };
+  jobs: { version: WorkflowJob };
+}
+
+interface PublishWorkflow {
+  on: {
+    push: { tags: string[] };
+    release: { types: string[] };
+    workflow_dispatch?: never;
+  };
+  concurrency: { group: string; "cancel-in-progress": boolean };
+  jobs: { draft: WorkflowJob; publish: WorkflowJob };
+}
+
 const versionSource = readFileSync(new URL("../.github/workflows/version-pr.yml", import.meta.url), "utf8");
 const publishSource = readFileSync(new URL("../.github/workflows/publish.yml", import.meta.url), "utf8");
-const versionWorkflow = loadYaml(versionSource) as any;
-const publishWorkflow = loadYaml(publishSource) as any;
+const changesetSource = readFileSync(
+  new URL("../.changeset/calm-betas-draft.md", import.meta.url),
+  "utf8",
+);
+const versionWorkflow = loadYaml(versionSource) as VersionWorkflow;
+const publishWorkflow = loadYaml(publishSource) as PublishWorkflow;
 const highlightsSchema = JSON.parse(
   readFileSync(new URL("../.github/codex/release-highlights.schema.json", import.meta.url), "utf8"),
 );
@@ -19,16 +62,14 @@ describe("release workflows", () => {
       "cancel-in-progress": false,
     });
     expect(versionWorkflow.jobs.version["runs-on"]).toBe("ubuntu-latest");
-    const changesets = versionWorkflow.jobs.version.steps.find(
-      (step: any) => step.id === "changesets",
-    );
-    expect(changesets.with).toMatchObject({
+    const changesets = versionWorkflow.jobs.version.steps.find((step) => step.id === "changesets");
+    expect(changesets?.with).toMatchObject({
       branch: "main",
       commitMode: "github-api",
       version: "npm run version-packages",
       createGithubReleases: false,
     });
-    expect(changesets.env.LCM_RELEASE_CHANNEL).toContain("inputs.channel");
+    expect(changesets?.env?.LCM_RELEASE_CHANNEL).toContain("inputs.channel");
     expect(versionSource).toContain('name = "no-release-notes"');
   });
 
@@ -53,16 +94,20 @@ describe("release workflows", () => {
       "id-token": "write",
     });
     expect(publishWorkflow.jobs.publish.environment).toBe("npm-publish");
+    expect(publishWorkflow.jobs.publish.concurrency).toEqual({
+      group: "npm-publish-dist-tags",
+      "cancel-in-progress": false,
+    });
   });
 
   it("uses pinned Codex with the requested model, effort, and strict structured output", () => {
     const codex = publishWorkflow.jobs.draft.steps.find(
-      (step: any) => step.name === "Generate Highlights with Codex",
+      (step) => step.name === "Generate Highlights with Codex",
     );
-    expect(codex.uses).toBe(
+    expect(codex?.uses).toBe(
       "openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56",
     );
-    expect(codex.with).toMatchObject({
+    expect(codex?.with).toMatchObject({
       "openai-api-key": "${{ secrets.OPENAI_API_KEY }}",
       "codex-version": "0.144.6",
       model: "gpt-5.6-terra",
@@ -84,7 +129,7 @@ describe("release workflows", () => {
 
   it("pins every third-party action used by the release workflows", () => {
     for (const workflow of [versionWorkflow, publishWorkflow]) {
-      for (const job of Object.values(workflow.jobs) as any[]) {
+      for (const job of Object.values(workflow.jobs)) {
         for (const step of job.steps) {
           if (step.uses) expect(step.uses).toMatch(/^[^@]+@[0-9a-f]{40}$/u);
         }
@@ -99,5 +144,9 @@ describe("release workflows", () => {
     expect(publishSource).toContain("assertNpmDistTags");
     expect(publishSource).toContain("assertActionCreatedReleaseBody");
     expect(publishSource.match(/npm run test:ci/gu)).toHaveLength(2);
+  });
+
+  it("records prerelease support as a minor package change", () => {
+    expect(changesetSource).toMatch(/^---\n"@donadiosolutions\/lcm": minor\n---\n/u);
   });
 });
