@@ -105,11 +105,15 @@ function makeDeps(options: {
   writeError?: unknown;
   claudeMd?: string;
   lcmMd?: string;
+  managedDaemonPath?: string;
+  procEnviron?: string;
+  readPaths?: string[];
 } = {}): DoctorDeps {
   const health = [...(options.health ?? [{ ok: false }])];
   return {
     existsSync: options.exists ?? (() => true),
     readFileSync: (path: string) => {
+      options.readPaths?.push(path);
       const readError = options.readError?.(path);
       if (readError) throw readError;
       if (path.endsWith("config.json")) return options.configText ?? JSON.stringify(options.config ?? {});
@@ -117,6 +121,7 @@ function makeDeps(options: {
       if (path.endsWith("package.json")) return JSON.stringify(options.pkg ?? { version: "1.2.3" });
       if (path.endsWith("CLAUDE.md")) return options.claudeMd ?? "<!-- lcm:start -->\n@lcm.md\n<!-- lcm:end -->";
       if (path.endsWith("lcm.md")) return options.lcmMd ?? LCM_MD_CONTENT;
+      if (path.startsWith("/proc/")) return options.procEnviron ?? "";
       return "{}";
     },
     writeFileSync: () => { if (options.writeError) throw options.writeError; },
@@ -126,6 +131,7 @@ function makeDeps(options: {
     homedir: DOCTOR_HOME,
     platform: "linux",
     cwd: DOCTOR_CWD,
+    managedDaemonPath: options.managedDaemonPath,
   };
 }
 
@@ -623,6 +629,173 @@ describe("doctor service coverage", () => {
     mocks.spawnSync.mockReturnValue({ status: 0, stdout: "", stderr: "" });
     expect((await runDoctor(makeDeps({ config: { llm: { provider: "codex-process" } } })))
       .find((result) => result.name === "codex-process")?.status).toBe("pass");
+  });
+
+  it("checks Linux process providers against the managed daemon PATH", async () => {
+    mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
+      if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
+        const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
+        return { status: path?.startsWith("/trusted/lcm/bin:") ? 0 : 1, stdout: "", stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    const found = await runDoctor(makeDeps({
+      config: { llm: { provider: "codex-process" } },
+      managedDaemonPath: "/trusted/lcm/bin:/usr/bin:/bin",
+    }));
+    expect(found.find((result) => result.name === "codex-process")).toMatchObject({
+      status: "pass",
+      message: "codex CLI found on managed daemon PATH",
+    });
+
+    const missing = await runDoctor(makeDeps({
+      config: { llm: { provider: "codex-process" } },
+      managedDaemonPath: "/usr/bin:/bin",
+    }));
+    expect(missing.find((result) => result.name === "codex-process")).toMatchObject({
+      status: "fail",
+      message: expect.stringContaining("codex CLI not found on managed daemon PATH"),
+    });
+  });
+
+  it("checks providers against the reused daemon process PATH", async () => {
+    mocks.ensureDaemon.mockResolvedValue({ connected: true, pid: 4242 });
+    mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
+      if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
+        const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
+        return { status: path === "/daemon/runtime/bin:/usr/bin" ? 0 : 1, stdout: "", stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    const results = await runDoctor(makeDeps({
+      config: { llm: { provider: "codex-process" } },
+      procEnviron: "HOME=/isolated\0PATH=/daemon/runtime/bin:/usr/bin\0LANG=C\0",
+      health: [
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 4242 }) },
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 4242 }) },
+      ],
+    }));
+
+    expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
+  });
+
+  it("uses only the lifecycle-verified PID when post-validation health reports another PID", async () => {
+    const readPaths: string[] = [];
+    mocks.ensureDaemon.mockResolvedValue({ connected: true, pid: 4242 });
+    mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
+      if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
+        const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
+        return { status: path === "/verified/bin" ? 0 : 1, stdout: "", stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    const results = await runDoctor(makeDeps({
+      config: { llm: { provider: "codex-process" } },
+      procEnviron: "PATH=/verified/bin\0",
+      readPaths,
+      health: [
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 9999 }) },
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 9999 }) },
+      ],
+    }));
+
+    expect(readPaths).toContain("/proc/4242/environ");
+    expect(readPaths).not.toContain("/proc/9999/environ");
+    expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
+  });
+
+  it.each(["disconnected", "throws"] as const)(
+    "does not inspect the initial health PID when daemon validation %s",
+    async (failure) => {
+      const readPaths: string[] = [];
+      if (failure === "disconnected") {
+        mocks.ensureDaemon.mockResolvedValue({ connected: false });
+      } else {
+        mocks.ensureDaemon.mockRejectedValue(new Error("validation failed"));
+      }
+      mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
+        if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
+          const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
+          return { status: path?.includes("/stale/bin") ? 1 : 0, stdout: "", stderr: "" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      });
+
+      const results = await runDoctor(makeDeps({
+        config: { llm: { provider: "codex-process" } },
+        health: [{ ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 4242 }) }],
+        procEnviron: "PATH=/stale/bin\0",
+        readPaths,
+      }));
+
+      expect(readPaths).not.toContain("/proc/4242/environ");
+      expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
+    },
+  );
+
+  it.each([
+    [undefined, "HOME=/isolated\0", false],
+    [0, "HOME=/isolated\0", false],
+    [1.5, "HOME=/isolated\0", false],
+    [4242, "HOME=/isolated\0", false],
+    [4242, "", true],
+  ] as const)("uses the deterministic managed path when daemon environment pid=%s is unavailable", async (
+    pid,
+    procEnviron,
+    readFails,
+  ) => {
+    mocks.ensureDaemon.mockResolvedValue({ connected: true, pid });
+    mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
+      if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
+        const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
+        return {
+          status: path?.endsWith("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            && !path.startsWith("/daemon/runtime/bin:") ? 0 : 1,
+          stdout: "",
+          stderr: "",
+        };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    const results = await runDoctor(makeDeps({
+      config: { llm: { provider: "codex-process" } },
+      procEnviron,
+      readError: (path) => readFails && path === "/proc/4242/environ" ? new Error("proc hidden") : undefined,
+      health: [
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid }) },
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid }) },
+      ],
+    }));
+
+    expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
+  });
+
+  it("tests an explicitly empty daemon PATH without falling back", async () => {
+    mocks.ensureDaemon.mockResolvedValue({ connected: true, pid: 4242 });
+    let checkedPath: string | undefined;
+    mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
+      if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
+        checkedPath = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
+        return { status: 1, stdout: "", stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    const results = await runDoctor(makeDeps({
+      config: { llm: { provider: "codex-process" } },
+      procEnviron: "HOME=/isolated\0PATH=\0LANG=C\0",
+      health: [
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
+      ],
+    }));
+
+    expect(checkedPath).toBe("");
+    expect(results.find((result) => result.name === "codex-process")?.status).toBe("fail");
   });
 
   it("covers anthropic key states and valid/invalid project patterns", async () => {

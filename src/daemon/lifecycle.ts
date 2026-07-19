@@ -3,6 +3,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
 import { join, dirname, win32 } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
+import { managedDaemonPath, SYSTEMD_DAEMON_PATH } from "./managed-path.js";
 import { PKG_VERSION } from "./version.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
@@ -508,8 +509,6 @@ const SYSTEMD_LCM_SECRET_ENV_NAMES = new Set(["LCM_SUMMARY_API_KEY"]);
 const SYSTEMD_SECRET_ENV_PATTERN = /(?:API_)?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/;
 const SYSTEMD_CREDENTIAL_DIR_PREFIX = "lcm-systemd-credentials-";
 const SYSTEMD_CREDENTIAL_SOURCE_MAX_AGE_MS = 10 * 60 * 1000;
-const SYSTEMD_DAEMON_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-
 function shouldPropagateDaemonEnv(name: string, value: string | undefined): value is string {
   return value !== undefined && (name.startsWith("LCM_") || SYSTEMD_PROVIDER_SECRET_ENV_NAMES.has(name));
 }
@@ -537,12 +536,16 @@ function cleanupOldSystemdCredentialDirs(baseDir: string): void {
   }
 }
 
-function systemdDaemonSetenvArgs(env: NodeJS.ProcessEnv, credentialNames: string[]): string[] {
+function systemdDaemonSetenvArgs(
+  env: NodeJS.ProcessEnv,
+  credentialNames: string[],
+  executablePath = SYSTEMD_DAEMON_PATH,
+): string[] {
   const args = Object.entries(env)
     .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && !SYSTEMD_SECRET_ENV_PATTERN.test(name))
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, value]) => `--setenv=${name}=${value}`);
-  args.push(`--setenv=PATH=${SYSTEMD_DAEMON_PATH}`);
+  args.push(`--setenv=PATH=${executablePath}`);
   if (credentialNames.length > 0) {
     args.push(`--setenv=LCM_SYSTEMD_CRED_IDS=${credentialNames.join(",")}`);
   }
@@ -630,7 +633,7 @@ function startViaUserSystemd(
       "--no-block",
       "--quiet",
       `--unit=${unit}`,
-      ...systemdDaemonSetenvArgs(process.env, credentials.names),
+      ...systemdDaemonSetenvArgs(process.env, credentials.names, managedDaemonPath(spawnCommand, spawnArgs)),
       ...credentials.args,
       spawnCommand,
       ...spawnArgs,

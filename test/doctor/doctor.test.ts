@@ -478,6 +478,34 @@ describe("runDoctor summarizer modes", () => {
     expect(results.some((result) => result.name === "codex-process")).toBe(true);
   });
 
+  it("reports portable process-provider failures without managed PATH wording", async () => {
+    const results = await runDoctor({
+      ...minimalDeps({
+        readFileSync: (path: string) => {
+          if (path.endsWith("config.json")) return JSON.stringify({ llm: { provider: "auto" } });
+          if (path.endsWith("settings.json")) return buildCleanSettingsJson();
+          if (path.endsWith("package.json")) return JSON.stringify({ version: "0.5.0" });
+          if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
+          return "{}";
+        },
+        platform: "darwin",
+      }),
+      spawnSync: vi.fn((cmd: string, args: string[]) => ({
+        status: cmd === "sh" && args[1]?.startsWith("command -v ") ? 1 : 0,
+        stdout: "",
+        stderr: "",
+      })),
+    });
+
+    expect(results.find((result) => result.name === "claude-process")?.message)
+      .toContain("claude CLI not found\n");
+    expect(results.find((result) => result.name === "codex-process")?.message)
+      .toContain("codex CLI not found\n");
+    expect(results.filter((result) => result.category === "Summarizer").every((result) =>
+      !result.message.includes("managed daemon PATH"),
+    )).toBe(true);
+  });
+
   it("reports effective process reasoning and fast-mode controls", async () => {
     const results = await runDoctor(minimalDeps({
       readFileSync: (path: string) => {
