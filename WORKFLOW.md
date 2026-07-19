@@ -111,35 +111,87 @@ the Codecov result already verified on the exact PR head.
 5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
 6. Run review loop (see Copilot Review Loop below)
 7. Once Copilot has no issues (max 3 rounds — see Review Loop), set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
-8. Wait up to 65 minutes for the queued PR to land before starting implementation. This allows five minutes beyond the merge queue's 60-minute check timeout and fails with check diagnostics if GitHub removes or rejects the still-open PR:
+8. Wait for the queued PR to land before starting implementation. Allow up to 65 minutes for GitHub to admit the PR and then 65 minutes for each position in the serialized queue: a PR entering at position 1 gets 65 minutes, while a PR entering at position N gets `N * 65` minutes so every entry ahead can consume the queue's 60-minute check timeout without taking time from this PR. Both waits are finite and fail with check diagnostics if GitHub never admits, removes, or rejects the still-open PR:
 
    ```bash
    PR_NUMBER=123
-   deadline=$((SECONDS + 65 * 60))
 
    show_pr_checks() {
-     gh pr checks "$PR_NUMBER" --repo donadiosolutions/lcm >&2 || true
+     local pr_number=$1
+     gh pr checks "$pr_number" --repo donadiosolutions/lcm >&2 || true
    }
 
-   while :; do
-     state=$(gh pr view "$PR_NUMBER" --repo donadiosolutions/lcm --json state --jq .state)
-     case "$state" in
-       MERGED) break ;;
-       OPEN)
-         if ((SECONDS >= deadline)); then
-           echo "PR #$PR_NUMBER did not merge within 65 minutes; resolve failed checks and requeue it:" >&2
-           show_pr_checks
-           exit 1
-         fi
-         sleep 15
-         ;;
-       *)
-         echo "PR #$PR_NUMBER entered unexpected state: $state" >&2
-         show_pr_checks
-         exit 1
-         ;;
-     esac
-   done
+   wait_for_queued_pr() {
+     local pr_number=$1
+     local admission_deadline=$((SECONDS + 65 * 60))
+     local deadline queue_position state
+
+     # mergeQueueEntry can be temporarily absent while auto-merge waits for
+     # required checks or GitHub propagates the newly queued entry.
+     while :; do
+       state=$(gh pr view "$pr_number" --repo donadiosolutions/lcm --json state --jq .state)
+       case "$state" in
+         MERGED) return ;;
+         OPEN) ;;
+         *)
+           echo "PR #$pr_number entered unexpected state before queue admission: $state" >&2
+           show_pr_checks "$pr_number"
+           return 1
+           ;;
+       esac
+
+       if ! queue_position=$(gh api graphql \
+         -f query='query($owner: String!, $name: String!, $number: Int!) {
+           repository(owner: $owner, name: $name) {
+             pullRequest(number: $number) { mergeQueueEntry { position } }
+           }
+         }' \
+         -f owner=donadiosolutions \
+         -f name=lcm \
+         -F number="$pr_number" \
+         --jq '.data.repository.pullRequest.mergeQueueEntry.position // empty'); then
+         echo "Could not query the merge-queue position for PR #$pr_number." >&2
+         show_pr_checks "$pr_number"
+         return 1
+       fi
+
+       if [[ "$queue_position" =~ ^[1-9][0-9]*$ ]]; then
+         break
+       fi
+
+       if ((SECONDS >= admission_deadline)); then
+         echo "PR #$pr_number did not enter the merge queue within 65 minutes; inspect required checks and auto-merge state:" >&2
+         show_pr_checks "$pr_number"
+         return 1
+       fi
+       sleep 15
+     done
+
+     deadline=$((SECONDS + queue_position * 65 * 60))
+     echo "PR #$pr_number entered the merge queue at position $queue_position; waiting up to $((queue_position * 65)) minutes." >&2
+
+     while :; do
+       state=$(gh pr view "$pr_number" --repo donadiosolutions/lcm --json state --jq .state)
+       case "$state" in
+         MERGED) return ;;
+         OPEN)
+           if ((SECONDS >= deadline)); then
+             echo "PR #$pr_number did not merge within its position-$queue_position allowance of $((queue_position * 65)) minutes; inspect failed checks and requeue it:" >&2
+             show_pr_checks "$pr_number"
+             return 1
+           fi
+           sleep 15
+           ;;
+         *)
+           echo "PR #$pr_number entered unexpected state while queued: $state" >&2
+           show_pr_checks "$pr_number"
+           return 1
+           ;;
+       esac
+     done
+   }
+
+   wait_for_queued_pr "$PR_NUMBER"
    ```
 
 ## Phase 3: Implementation (Sonnet subagents)
@@ -164,7 +216,7 @@ the Codecov result already verified on the exact PR head.
 2. Request Copilot review (add to reviewers list)
 3. Run review loop (see below)
 4. Once Copilot review has no remaining inline comments, set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
-5. Wait for the implementation PR to land by repeating the bounded 65-minute merge wait from Phase 2, using the implementation PR number. Do not begin post-merge validation or dependent work until it reports `MERGED`.
+5. Wait for the implementation PR to land by calling `wait_for_queued_pr "$PR_NUMBER"` from Phase 2 with the implementation PR number. Do not begin post-merge validation or dependent work until it reports `MERGED`.
 
 ## Copilot Interaction
 
