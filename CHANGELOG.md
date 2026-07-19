@@ -1,5 +1,29 @@
 # @donadiosolutions/lcm
 
+## 1.4.1
+
+### Patch Changes
+
+- 6fedb37: Preserve passive-learning sidecars with missing timestamps, make promoted-memory search-index updates atomic, safely retain legacy message search indexes during migration, and ignore punctuation-only fallback searches.
+- 12c242e: Make custom-server setup retry empty required values before safely falling back
+  to the native provider, and make installer health polling reject invalid
+  timeouts while using a bounded monotonic deadline.
+- 5cb31b9: Keep `lcm doctor` responsive when the MCP helper exits early or its input pipe closes.
+- 0f9b8ee: Allow configured and one-invocation request timeouts to govern Claude and Codex process-provider compaction instead of stopping every subprocess after a hidden 120-second limit.
+- b1eaa7c: Protect local memory files with private permissions, safe atomic metadata writes, contained instruction reads, private hashed restore locks, stable project aliases, and a transcript allowlist that cannot be widened by using the filesystem root.
+- 31ab876: Harden local hooks, diagnostics, connector file updates, installer parsing, and test-home isolation against unsafe path aliasing, terminal controls, unbounded sidecar reports, filesystem races, and Windows profile writes.
+- cee718b: Keep flat Claude transcripts whose path only resembles a legacy nested-session path, preventing intermittent omissions during historical session import.
+- 9fa4f34: Prevent nested daemon, config, map, and connector help flags from executing command actions, await unknown-command output before the CLI settles, and honor the Ninja renderer's one-shot `onReady` callback.
+- 67112db: Verify daemon PID, version, and listener ownership before sending credentials or request data, and keep PostToolUse payloads from selecting notification ports.
+- eb7dfd4: Scrub every persistent memory path, fence restored model content, isolate replay and ingestion state, and serialize same-project database writes.
+- fb72194: Ship reproducible plugin entrypoint bundles, verify pinned Gitleaks update inputs, and prevent managed daemons from inheriting an untrusted shell path.
+- 3afd311: Redact complete tokens for zero-width sensitive patterns and show `unknown` instead of an empty category in sensitive-data warnings.
+- d8274d0: Prevent `lcm compact --all` from repeatedly selecting fresh-tail-only conversations, limit automatic promotion to projects compacted by the current run, and return exit status 1 when that automatic promotion fails.
+- ba3e98b: Honor legacy compaction candidate limits across stored and runtime configuration, and let `lcm doctor` repair Claude settings files whose JSON root is not an object.
+- 8d27ff7: Require Node.js 22.12.0 or newer for Commander 15 compatibility and align the
+  development Node.js types with the supported Node 22 runtime.
+- df87d63: Allow managed Linux daemons to launch process-provider CLIs installed alongside LCM without inheriting an untrusted shell path, and align doctor checks with the managed daemon environment.
+
 ## 1.4.0
 
 ### Minor Changes
