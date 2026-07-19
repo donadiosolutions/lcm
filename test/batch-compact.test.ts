@@ -160,16 +160,20 @@ describe("batch compaction discovery", () => {
       .mockResolvedValueOnce({ tokensBefore: 250, tokensAfter: 50 });
     vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Partial<ProgressState>> = [];
 
     const result = await batchCompact({
       minTokens: 100,
       dryRun: false,
       port: 3737,
       cwd,
+      onProgress: patch => progress.push(patch),
     });
 
     expect(result).toEqual({ compacted: 1, unchanged: 0, skipped: 0, failures: 1, compactedProjects: [paths.canonical] });
     expect(post).toHaveBeenCalledTimes(2);
+    expect(progress.find(patch => patch.errors)).toMatchObject({ completed: 0, current: undefined });
+    expect(progress.at(-1)).toMatchObject({ completed: 1, current: undefined });
   });
 
   it("counts each successful session once and falls back to discovered input tokens", async () => {
@@ -391,6 +395,8 @@ describe("batch compaction discovery", () => {
 
     const interruptedRunDb = new DatabaseSync(paths.dbPath);
     try {
+      interruptedRunDb.exec("PRAGMA journal_mode = WAL");
+      interruptedRunDb.exec("PRAGMA foreign_keys = ON");
       interruptedRunDb.prepare("UPDATE summaries SET depth = CASE summary_id WHEN 'summary-1' THEN 1 ELSE 0 END WHERE conversation_id = ?").run(1);
     } finally {
       interruptedRunDb.close();
@@ -399,6 +405,8 @@ describe("batch compaction discovery", () => {
 
     const chunkLimitDb = new DatabaseSync(paths.dbPath);
     try {
+      chunkLimitDb.exec("PRAGMA journal_mode = WAL");
+      chunkLimitDb.exec("PRAGMA foreign_keys = ON");
       chunkLimitDb.prepare("UPDATE summaries SET depth = 0, token_count = CASE summary_id WHEN 'summary-1' THEN 15000 WHEN 'summary-2' THEN 6000 ELSE 1000 END WHERE conversation_id = ?").run(1);
     } finally {
       chunkLimitDb.close();
@@ -407,6 +415,8 @@ describe("batch compaction discovery", () => {
 
     const fullChunkDb = new DatabaseSync(paths.dbPath);
     try {
+      fullChunkDb.exec("PRAGMA journal_mode = WAL");
+      fullChunkDb.exec("PRAGMA foreign_keys = ON");
       fullChunkDb.prepare("UPDATE summaries SET token_count = CASE summary_id WHEN 'summary-1' THEN 20000 ELSE 1000 END WHERE conversation_id = ?").run(1);
     } finally {
       fullChunkDb.close();
@@ -415,6 +425,8 @@ describe("batch compaction discovery", () => {
 
     const condensedDb = new DatabaseSync(paths.dbPath);
     try {
+      condensedDb.exec("PRAGMA journal_mode = WAL");
+      condensedDb.exec("PRAGMA foreign_keys = ON");
       condensedDb.prepare("UPDATE summaries SET depth = 1, token_count = 1000 WHERE conversation_id = ?").run(1);
     } finally {
       condensedDb.close();
@@ -423,6 +435,8 @@ describe("batch compaction discovery", () => {
 
     const summaryOnlyDb = new DatabaseSync(paths.dbPath);
     try {
+      summaryOnlyDb.exec("PRAGMA journal_mode = WAL");
+      summaryOnlyDb.exec("PRAGMA foreign_keys = ON");
       summaryOnlyDb.prepare("DELETE FROM context_items WHERE conversation_id = ? AND item_type = 'message'").run(1);
     } finally {
       summaryOnlyDb.close();

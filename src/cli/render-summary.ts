@@ -31,7 +31,11 @@ export function printSummary(state: ProgressState, opts: RenderOpts): void {
     const phaseBar = state.phases
       .map(p => `● ${p.name}`)
       .join('  →  ');
-    const doneLabel = state.aborted ? 'Aborted' : 'Done ✓';
+    const doneLabel = state.aborted
+      ? 'Aborted'
+      : state.errors.length > 0 || state.phaseErrors.length > 0
+        ? 'Failed ✗'
+        : 'Done ✓';
     process.stdout.write(`\n  ${phaseBar}          ${doneLabel}\n`);
   }
 

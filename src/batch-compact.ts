@@ -31,8 +31,7 @@ type ReplayContextRow = {
   ordinal: number;
   item_type: "message" | "summary";
   depth: number | null;
-  token_count: number | null;
-  content: string;
+  token_count: number;
 };
 
 const MANUAL_COMPACT_LEAF_MIN_FANOUT = 3;
@@ -84,7 +83,14 @@ function projectMatchesCwdFilter(projectHash: string, cwd: string, cwdFilter?: s
 
 function hasReplayCondensationCandidate(db: ReturnType<typeof getLcmConnection>, conversationId: number): boolean {
   const items = db.prepare(`
-    SELECT ci.ordinal, ci.item_type, s.depth, s.token_count, s.content
+    SELECT
+      ci.ordinal,
+      ci.item_type,
+      s.depth,
+      CASE
+        WHEN s.token_count > 0 THEN s.token_count
+        ELSE CAST((COALESCE(length(s.content), 0) + 3) / 4 AS INTEGER)
+      END AS token_count
     FROM context_items ci
     LEFT JOIN summaries s ON s.summary_id = ci.summary_id
     WHERE ci.conversation_id = ?
@@ -110,9 +116,7 @@ function hasReplayCondensationCandidate(db: ReturnType<typeof getLcmConnection>,
         if (started) break;
         continue;
       }
-      const tokenCount = typeof item.token_count === "number" && item.token_count > 0
-        ? item.token_count
-        : Math.ceil(item.content.length / 4);
+      const tokenCount = item.token_count;
       if (started && tokens + tokenCount > MANUAL_COMPACT_SUMMARY_CHUNK_TOKENS) break;
       started = true;
       count++;
@@ -233,7 +237,7 @@ export async function batchCompact(opts: {
   let compacted = 0;
   let unchanged = 0;
   let skipped = 0;
-  let doneCount = 0;
+  let completedCount = 0;
   let messagesIn = 0;
   let tokensIn = 0;
   let tokensOut = 0;
@@ -246,8 +250,8 @@ export async function batchCompact(opts: {
 
     if (opts.dryRun) {
       console.log(`  [dry-run] would compact: ${label}`);
-      doneCount++;
-      onProgress?.({ completed: doneCount });
+      completedCount++;
+      onProgress?.({ completed: completedCount });
       continue;
     }
 
@@ -283,23 +287,24 @@ export async function batchCompact(opts: {
         } } : {}),
       });
 
-      doneCount++;
       if (data.skipped) {
         skipped++;
+        completedCount++;
         console.log(" skipped (already in progress)");
         onProgress?.({
-          completed: doneCount,
+          completed: completedCount,
           current: undefined,
           lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore: conv.tokens, elapsed: Date.now() - sessionStart },
         });
       } else if (data.actionTaken === false) {
         unchanged++;
+        completedCount++;
         const tokensBefore = data.tokensBefore ?? conv.tokens;
         const tokensAfter = data.tokensAfter ?? tokensBefore;
         const summary = data.summary?.trim() || "No compaction needed.";
         console.log(` unchanged (${summary})`);
         onProgress?.({
-          completed: doneCount,
+          completed: completedCount,
           current: undefined,
           lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore, tokensAfter, provider: formatLlmDiagnostic(data), elapsed: Date.now() - sessionStart },
         });
@@ -313,12 +318,13 @@ export async function batchCompact(opts: {
           console.log(" done");
         }
         compacted++;
+        completedCount++;
         compactedProjects.add(normalizeProjectPath(conv.cwd));
         messagesIn += conv.messages;
         tokensIn += tokensBefore;
         tokensOut += tokensAfter;
         onProgress?.({
-          completed: doneCount,
+          completed: completedCount,
           messagesIn,
           tokensIn,
           tokensOut,
@@ -334,12 +340,11 @@ export async function batchCompact(opts: {
         });
       }
     } catch (err) {
-      doneCount++;
       const errMsg = err instanceof Error ? err.message : "unknown error";
       console.log(` FAILED (${errMsg})`);
       progressErrors.push({ sessionId: conv.sessionId, message: errMsg });
       onProgress?.({
-        completed: doneCount,
+        completed: completedCount,
         current: undefined,
         errors: progressErrors,
         lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore: conv.tokens, elapsed: Date.now() - sessionStart },

@@ -165,7 +165,7 @@ describe("printSummary", () => {
     });
     printSummary(state, opts());
     const output = writes.join("");
-    expect(output).toContain("● Import  →  ● Compact          Done ✓");
+    expect(output).toContain("● Import  →  ● Compact          Failed ✗");
     expect(output).toContain("[██████████████████████] 67%  1,234 msgs  ~1.0M → ~1.0k tokens, 1000.0×");
     expect(output).toContain("Sessions      3 processed");
     expect(output).toContain("DAG nodes     10  (+2 new)");
@@ -180,11 +180,12 @@ describe("printSummary", () => {
   });
 
   it("prints an empty narrow summary with a 100 percent default", () => {
-    const state = makeProgressState({});
+    const state = makeProgressState({ phases: [{ name: "Compact", status: "done" }] });
     state.startedAt = NOW.getTime();
     printSummary(state, opts({ width: 40 }));
     const output = writes.join("");
     expect(output).toContain("[████████████████████] 100%");
+    expect(output).toContain("● Compact          Done ✓");
     expect(output).toContain("Sessions    0 processed");
     expect(output).toContain("Total time  0.0s");
     expect(output).not.toContain("Compression");
