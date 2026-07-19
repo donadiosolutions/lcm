@@ -3,22 +3,20 @@
 <!-- Claude Code include: @WORKFLOW.md -->
 See [WORKFLOW.md](./WORKFLOW.md) for the full development workflow.
 
-## Test Coverage Goal
+## Test Coverage Approval Gate
 
-- Maintain 100% line and branch coverage for every executable production
-  TypeScript file matched by `bin/**/*.ts`, `installer/**/*.ts`, and
-  `src/**/*.ts`.
-- Run `npm run test:ci` to measure the complete production scope and use
-  focused Vitest coverage runs while developing individual subsystems.
-- Coverage thresholds are a ratchet: every coverage PR must raise the
-  aggregate line and branch thresholds and add 100% glob thresholds for any
-  completed subsystem. Never lower a threshold or narrow the collected scope.
+- Maintain 100% line, branch, function, and statement coverage for every
+  executable production TypeScript file matched by `bin/**/*.ts`,
+  `installer/**/*.ts`, and `src/**/*.ts`.
+- A change must not be approved, merged, or released unless a fresh
+  `npm run test:ci` reports 100% lines, 100% branches, 100% functions, and
+  100% statements and passes the per-file threshold for the complete collected
+  scope.
+- Use focused Vitest coverage runs while developing individual subsystems, but
+  never lower any threshold or narrow the collected scope.
 - Do not use coverage exclusions, `v8 ignore` directives, skipped tests, or
-  untested production wrappers to satisfy the goal. Cover behavior through
+  untested production wrappers to satisfy the gate. Cover behavior through
   observable public seams and deterministic failure injection.
-- Once the repository reaches the goal, replace the ratchet with a final gate
-  that enforces `lines: 100`, `branches: 100`, and `perFile: true` for the
-  complete collected scope.
 
 ## PR Review And Merge
 

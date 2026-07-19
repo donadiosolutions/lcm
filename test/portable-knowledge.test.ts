@@ -476,6 +476,16 @@ describe("portable-knowledge — import", () => {
     expect(exported.entries[0].content).toBe("Round-trip test entry");
   });
 
+  it("retains a nonexistent project path when canonicalization is unavailable", async () => {
+    const baseDir = makeTempDir();
+    const cwd = join(baseDir, "missing-project");
+
+    await importKnowledge(cwd, makeDoc([]), { _lcmBaseDir: baseDir, _globalPatterns: [] });
+
+    const metaPath = join(baseDir, "projects", toProjectId(cwd), "meta.json");
+    expect(JSON.parse(readFileSync(metaPath, "utf-8"))).toEqual({ cwd });
+  });
+
   it("preserves an existing meta.json", async () => {
     const baseDir = makeTempDir();
     const cwd = makeTempDir();

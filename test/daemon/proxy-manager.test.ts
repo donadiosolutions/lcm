@@ -88,6 +88,9 @@ describe("ClaudeCliProxyManager", () => {
         "/tmp/test-lcm-proxy.pid",
         "12345",
       );
+      const stderrHandler = child.stderr.on.mock.calls.find(([event]: [string]) => event === "data")?.[1];
+      expect(stderrHandler).toBeTypeOf("function");
+      expect(() => stderrHandler(Buffer.from("diagnostic output"))).not.toThrow();
       expect(manager.available).toBe(true);
     });
 
