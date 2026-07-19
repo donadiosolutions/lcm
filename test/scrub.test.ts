@@ -120,6 +120,15 @@ describe("Gitleaks RE2 normalization", () => {
     const scoped = normalizeGitleaksRegex("(?i:token)-(?-i:ABC)", "");
     expect(scoped).toEqual({ source: "(?:token)-(?:ABC)", flags: "i" });
     expect(new RegExp(scoped.source, scoped.flags).test("TOKEN-abc")).toBe(true);
+
+    const dotall = normalizeGitleaksRegex("start(?s:.){1,3}end", "");
+    expect(dotall).toEqual({ source: "start[\\s\\S]{1,3}end", flags: "" });
+    expect(new RegExp(dotall.source).test("start\nend")).toBe(true);
+  });
+
+  it("redacts multiline Kubernetes Secret YAML from bundled Gitleaks rules", () => {
+    const yaml = "kind: Secret\nmetadata:\n  name: example\ndata:\n  api-key: c2VjcmV0MTIzNA==";
+    expect(new ScrubEngine([], []).scrub(yaml)).toContain("[REDACTED]");
   });
 
   it("redacts long database URLs without catastrophic backtracking", () => {

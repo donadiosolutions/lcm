@@ -99,7 +99,8 @@ function convertGoRegex(goRegex: string): { regex: string; flags: string } {
   // RE2 constructs that do not exist in JavaScript.
   jsRegex = jsRegex
     .replace(/\[\[:alnum:\]\]/g, "[A-Za-z0-9]")
-    .replace(/\\z/g, "$");
+    .replace(/\\z/g, "$")
+    .replace(/\(\?s:\.\)/g, "[\\s\\S]");
 
   // JavaScript has no scoped flag groups. Gitleaks patterns are redaction
   // detectors, so broadening the whole expression to ignore case is safer

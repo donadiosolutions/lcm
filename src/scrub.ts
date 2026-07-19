@@ -290,7 +290,10 @@ export function normalizeGitleaksRegex(
 ): { source: string; flags: string } {
   let normalized = source
     .replace(/\[\[:alnum:\]\]/g, "[A-Za-z0-9]")
-    .replace(/\\z/g, "$");
+    .replace(/\\z/g, "$")
+    // RE2 supports scoped dotall groups; the bundled rules use the dot-only
+    // form, which is exactly equivalent to this JavaScript character class.
+    .replace(/\(\?s:\.\)/g, "[\\s\\S]");
   const needsIgnoreCase = flags.includes("i") || normalized.includes("(?i:");
   // JavaScript does not support scoped flag groups. Broadening a secret
   // detector to case-insensitive is conservative: it can redact more, never less.
