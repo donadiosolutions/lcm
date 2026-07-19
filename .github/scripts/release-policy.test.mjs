@@ -9,6 +9,7 @@ import {
   buildHighlightsPrompt,
   categorizeReleasePullRequests,
   classifyPullRequest,
+  collectReleasePullRequests,
   compareReleaseVersions,
   parseChangesetDocument,
   parseHighlightsResult,
@@ -158,6 +159,53 @@ test("maps release commits to merged main PRs and rejects direct commits", () =>
     () => associateCommitsWithPullRequests(["c".repeat(40)], new Map()),
     /no PR found/u,
   );
+});
+
+test("paginates every commit-to-PR association lookup", async () => {
+  const commit = "a".repeat(40);
+  const associatedPullRequest = pr(1, [], { merge_commit_sha: commit });
+  const associationEndpoint = () => {
+    throw new Error("association endpoint must be called through github.paginate");
+  };
+  const filesEndpoint = () => {
+    throw new Error("files endpoint must be called through github.paginate");
+  };
+  const paginateCalls = [];
+  const github = {
+    paginate: async (endpoint, parameters) => {
+      paginateCalls.push({ endpoint, parameters });
+      if (endpoint === associationEndpoint) return [associatedPullRequest];
+      if (endpoint === filesEndpoint) return [];
+      throw new Error("unexpected paginated endpoint");
+    },
+    rest: {
+      repos: {
+        listPullRequestsAssociatedWithCommit: associationEndpoint,
+      },
+      pulls: {
+        get: async () => ({ data: associatedPullRequest }),
+        listFiles: filesEndpoint,
+      },
+    },
+  };
+
+  const entries = await collectReleasePullRequests({
+    github,
+    owner: "donadiosolutions",
+    repo: "lcm",
+    baseTag: "v1.4.1",
+    targetTag: "v1.5.0",
+    runGit: () => commit,
+  });
+
+  assert.deepEqual(entries, [{ pr: associatedPullRequest, changesetContents: [] }]);
+  assert.equal(paginateCalls[0].endpoint, associationEndpoint);
+  assert.deepEqual(paginateCalls[0].parameters, {
+    owner: "donadiosolutions",
+    repo: "lcm",
+    commit_sha: commit,
+    per_page: 100,
+  });
 });
 
 test("builds an injection-aware Highlights prompt and validates structured output", () => {

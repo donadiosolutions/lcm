@@ -40,6 +40,14 @@ describe("release workflows", () => {
     expect(publishWorkflow.jobs.publish.if).toContain("github.event_name == 'release'");
     expect(publishWorkflow.jobs.draft["runs-on"]).toBe("ubuntu-latest");
     expect(publishWorkflow.jobs.publish["runs-on"]).toBe("ubuntu-latest");
+    expect(publishWorkflow.concurrency).toEqual({
+      group: "publish-${{ github.event.release.tag_name || github.ref_name }}",
+      "cancel-in-progress": false,
+    });
+    expect(publishWorkflow.jobs.draft.permissions).toEqual({
+      contents: "write",
+      "pull-requests": "read",
+    });
     expect(publishWorkflow.jobs.publish.permissions).toEqual({
       contents: "read",
       "id-token": "write",

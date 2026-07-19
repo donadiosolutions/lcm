@@ -10,7 +10,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: publish-${{ github.event_name }}-${{ github.event.release.tag_name || github.ref }}
+  group: publish-${{ github.event.release.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: read
     steps:
       - name: Checkout release tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

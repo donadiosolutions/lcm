@@ -237,13 +237,16 @@ export async function collectReleasePullRequests({
   const commits = output.length === 0 ? [] : output.split(/\r?\n/u).filter(Boolean);
   const associations = new Map();
   for (const commit of commits) {
-    const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-      owner,
-      repo,
-      commit_sha: commit,
-      per_page: 100,
-    });
-    associations.set(commit, data);
+    const pullRequests = await github.paginate(
+      github.rest.repos.listPullRequestsAssociatedWithCommit,
+      {
+        owner,
+        repo,
+        commit_sha: commit,
+        per_page: 100,
+      },
+    );
+    associations.set(commit, pullRequests);
   }
 
   const associated = associateCommitsWithPullRequests(commits, associations);
