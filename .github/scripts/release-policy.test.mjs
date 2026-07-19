@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { assertVerifiedReleaseTag } from "./release-tag-policy.mjs";
 import {
   RELEASE_DRAFT_MARKER,
   assertActionCreatedReleaseBody,
@@ -8,6 +9,7 @@ import {
   associateCommitsWithPullRequests,
   buildHighlightsPrompt,
   categorizeReleasePullRequests,
+  checkNpmReleaseState,
   classifyPullRequest,
   collectReleasePullRequests,
   compareReleaseVersions,
@@ -57,6 +59,125 @@ test("orders beta releases before their stable version", () => {
   assert.equal(compareReleaseVersions("1.5.0-beta.2", "1.5.0"), -1);
   assert.equal(compareReleaseVersions("1.5.1-beta.0", "1.5.0"), 1);
   assert.equal(compareReleaseVersions("1.5.0", "1.5.0"), 0);
+});
+
+test("requires an annotated GitHub-verified release tag targeting the checkout", async () => {
+  const tag = "v1.5.0-beta.2";
+  const expectedCommit = "a".repeat(40);
+  const tagSha = "b".repeat(40);
+  const getRef = async () => ({
+    data: { ref: `refs/tags/${tag}`, object: { type: "tag", sha: tagSha } },
+  });
+  const getTag = async () => ({
+    data: {
+      tag,
+      object: { type: "commit", sha: expectedCommit },
+      verification: { verified: true, reason: "valid" },
+    },
+  });
+  const github = { rest: { git: { getRef, getTag } } };
+
+  await assert.doesNotReject(() =>
+    assertVerifiedReleaseTag({
+      github,
+      owner: "donadiosolutions",
+      repo: "lcm",
+      tag,
+      expectedCommit,
+    }),
+  );
+  await assert.rejects(
+    () =>
+      assertVerifiedReleaseTag({
+        github: {
+          rest: {
+            git: {
+              getRef: async () => ({
+                data: { ref: `refs/tags/${tag}`, object: { type: "commit", sha: expectedCommit } },
+              }),
+              getTag,
+            },
+          },
+        },
+        owner: "donadiosolutions",
+        repo: "lcm",
+        tag,
+        expectedCommit,
+      }),
+    /annotated tag object/u,
+  );
+  await assert.rejects(
+    () =>
+      assertVerifiedReleaseTag({
+        github: {
+          rest: {
+            git: {
+              getRef,
+              getTag: async () => ({
+                data: {
+                  tag: "v1.5.0-beta.1",
+                  object: { type: "commit", sha: expectedCommit },
+                  verification: { verified: true, reason: "valid" },
+                },
+              }),
+            },
+          },
+        },
+        owner: "donadiosolutions",
+        repo: "lcm",
+        tag,
+        expectedCommit,
+      }),
+    /tag identity/u,
+  );
+  await assert.rejects(
+    () =>
+      assertVerifiedReleaseTag({
+        github: {
+          rest: {
+            git: {
+              getRef,
+              getTag: async () => ({
+                data: {
+                  tag,
+                  object: { type: "commit", sha: "c".repeat(40) },
+                  verification: { verified: true, reason: "valid" },
+                },
+              }),
+            },
+          },
+        },
+        owner: "donadiosolutions",
+        repo: "lcm",
+        tag,
+        expectedCommit,
+      }),
+    /does not target checked-out commit/u,
+  );
+  await assert.rejects(
+    () =>
+      assertVerifiedReleaseTag({
+        github: {
+          rest: {
+            git: {
+              getRef,
+              getTag: async () => ({
+                data: {
+                  tag,
+                  object: { type: "commit", sha: expectedCommit },
+                  verification: { verified: false, reason: "unsigned" },
+                },
+              }),
+            },
+          },
+        },
+        owner: "donadiosolutions",
+        repo: "lcm",
+        tag,
+        expectedCommit,
+      }),
+    /GitHub-verified signature: unsigned/u,
+  );
 });
 
 test("selects beta bases from the same major.minor series", () => {
@@ -274,7 +395,17 @@ test("paginates every commit-to-PR association lookup", async () => {
       },
     },
   };
+  /** @type {Array<{ args: string[], cwd: string }>} */
   const gitCalls = [];
+  /**
+   * @param {string[]} args
+   * @param {string} cwd
+   * @returns {string}
+   */
+  const runGit = (args, cwd) => {
+    gitCalls.push({ args, cwd });
+    return commit;
+  };
 
   const entries = await collectReleasePullRequests({
     github,
@@ -283,10 +414,7 @@ test("paginates every commit-to-PR association lookup", async () => {
     baseTag: "v1.4.1",
     targetTag: "v1.5.0",
     cwd: "/workspace",
-    runGit: (args, cwd) => {
-      gitCalls.push({ args, cwd });
-      return commit;
-    },
+    runGit,
   });
 
   assert.deepEqual(entries, [{ pr: associatedPullRequest, changesetContents: [] }]);
@@ -341,6 +469,65 @@ test("renders Highlights always and omits empty release sections", () => {
   assertActionCreatedReleaseBody(notes);
   assert.throws(() => assertActionCreatedReleaseBody("## Highlights\n\n- Missing marker"), /not created/u);
   assert.throws(() => renderReleaseNotes({ highlights: [], categorized }), /at least one/u);
+});
+
+test("queries npm release state with E404-only missing-package handling", () => {
+  /** @type {string[][]} */
+  const calls = [];
+  /** @type {Array<{ status: number, stdout: string, stderr: string }>} */
+  const missingResults = [
+    { status: 1, stdout: "", stderr: "npm error code E404" },
+    { status: 1, stdout: "", stderr: "404 Not Found" },
+  ];
+  /**
+   * @param {string[]} args
+   * @returns {{ status: number, stdout: string, stderr: string }}
+   */
+  const missingNpm = (args) => {
+    calls.push(args);
+    return missingResults.shift();
+  };
+  assert.deepEqual(
+    checkNpmReleaseState({ version: "1.5.0-beta.0", runNpm: missingNpm }),
+    { alreadyPublished: false, distTags: {} },
+  );
+  assert.deepEqual(calls, [
+    ["view", "@donadiosolutions/lcm@1.5.0-beta.0", "version"],
+    ["view", "@donadiosolutions/lcm", "dist-tags", "--json"],
+  ]);
+
+  assert.throws(
+    () =>
+      checkNpmReleaseState({
+        version: "1.5.0-beta.0",
+        runNpm: () => ({ status: 1, stdout: "", stderr: "npm error code E401" }),
+      }),
+    /Unable to query npm.*E401/su,
+  );
+  const distTagFailure = [
+    { status: 1, stdout: "", stderr: "npm error code E404" },
+    { status: 1, stdout: "", stderr: "npm error code E503" },
+  ];
+  assert.throws(
+    () =>
+      checkNpmReleaseState({
+        version: "1.5.0-beta.0",
+        runNpm: () => distTagFailure.shift(),
+      }),
+    /Unable to query npm for @donadiosolutions\/lcm dist-tags.*E503/su,
+  );
+  const staleResults = [
+    { status: 1, stdout: "", stderr: "npm error code E404" },
+    { status: 0, stdout: '{"latest":"1.4.1","beta":"1.5.0-beta.1"}', stderr: "" },
+  ];
+  assert.throws(
+    () =>
+      checkNpmReleaseState({
+        version: "1.5.0-beta.0",
+        runNpm: () => staleResults.shift(),
+      }),
+    /Refusing to move npm beta/u,
+  );
 });
 
 test("enforces monotonic npm channels and a stable latest dist-tag", () => {

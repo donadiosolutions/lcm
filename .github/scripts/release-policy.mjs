@@ -1,11 +1,12 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { load as loadYaml } from "js-yaml";
+import { parseReleaseTag } from "./release-tag-policy.mjs";
+
+export { assertVerifiedReleaseTag, parseReleaseTag } from "./release-tag-policy.mjs";
 
 export const PACKAGE_NAME = "@donadiosolutions/lcm";
 export const RELEASE_DRAFT_MARKER = "<!-- lcm-release-draft:v1 -->";
 
-const RELEASE_TAG_PATTERN =
-  /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*))?$/u;
 const CHANGESET_PATTERN = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)([\s\S]*)$/u;
 const CATEGORY_ORDER = Object.freeze([
   ["breaking", "Breaking changes"],
@@ -13,39 +14,6 @@ const CATEGORY_ORDER = Object.freeze([
   ["fixes", "Fixes"],
   ["extra", "Extra notes"],
 ]);
-
-function assertSafeComponent(value, label) {
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed)) {
-    throw new Error(`${label} exceeds JavaScript's safe integer range`);
-  }
-  return parsed;
-}
-
-export function parseReleaseTag(tag) {
-  if (typeof tag !== "string") throw new TypeError("Release tag must be a string");
-  const match = RELEASE_TAG_PATTERN.exec(tag);
-  if (!match) {
-    throw new Error(
-      `Unsupported release tag ${JSON.stringify(tag)}; expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-beta.N`,
-    );
-  }
-
-  const major = assertSafeComponent(match[1], "major version");
-  const minor = assertSafeComponent(match[2], "minor version");
-  const patch = assertSafeComponent(match[3], "patch version");
-  const beta = match[4] === undefined ? undefined : assertSafeComponent(match[4], "beta number");
-  return Object.freeze({
-    tag,
-    version: tag.slice(1),
-    major,
-    minor,
-    patch,
-    beta,
-    isBeta: beta !== undefined,
-    series: `${major}.${minor}`,
-  });
-}
 
 export function compareReleaseVersions(left, right) {
   const a = typeof left === "string" ? parseReleaseTag(left.startsWith("v") ? left : `v${left}`) : left;
@@ -419,6 +387,71 @@ function highestStableVersion(versions) {
   });
   stable.sort((left, right) => compareReleaseVersions(right, left));
   return stable[0]?.version;
+}
+
+function defaultRunNpm(args) {
+  return spawnSync("npm", args, { encoding: "utf8" });
+}
+
+function npmView(args, label, runNpm) {
+  let result;
+  try {
+    result = runNpm(args);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to query npm for ${label}: ${message}`, { cause: error });
+  }
+  if (result.error) {
+    throw new Error(`Unable to query npm for ${label}: ${result.error.message}`, {
+      cause: result.error,
+    });
+  }
+
+  const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
+  const output = [stdout, stderr].filter(Boolean).join("\n");
+  if (result.status === 0) return { found: true, output: stdout };
+  if (/E404|404 Not Found/iu.test(output)) return { found: false, output: "" };
+  throw new Error(`Unable to query npm for ${label}${output ? `:\n${output}` : ""}`);
+}
+
+export function checkNpmReleaseState({
+  version,
+  packageName = PACKAGE_NAME,
+  runNpm = defaultRunNpm,
+}) {
+  parseReleaseTag(`v${version}`);
+  const published = npmView(
+    ["view", `${packageName}@${version}`, "version"],
+    `${packageName}@${version}`,
+    runNpm,
+  );
+  if (published.found && published.output !== version) {
+    throw new Error(
+      `npm returned unexpected version ${JSON.stringify(published.output)} for ${packageName}@${version}`,
+    );
+  }
+
+  const distTagResult = npmView(
+    ["view", packageName, "dist-tags", "--json"],
+    `${packageName} dist-tags`,
+    runNpm,
+  );
+  let distTags = {};
+  if (distTagResult.found) {
+    try {
+      distTags = JSON.parse(distTagResult.output);
+    } catch (error) {
+      throw new Error(`npm returned invalid dist-tags JSON for ${packageName}`, { cause: error });
+    }
+    if (distTags === null || typeof distTags !== "object" || Array.isArray(distTags)) {
+      throw new Error(`npm returned invalid dist-tags JSON for ${packageName}`);
+    }
+  }
+
+  const alreadyPublished = published.found;
+  assertReleaseCanAdvanceDistTag({ version, distTags, alreadyPublished });
+  return { alreadyPublished, distTags };
 }
 
 export function assertReleaseCanAdvanceDistTag({ version, distTags = {}, alreadyPublished = false }) {

@@ -6,6 +6,7 @@ interface WorkflowStep {
   id?: string;
   name?: string;
   run?: string;
+  "timeout-minutes"?: number;
   uses?: string;
   with?: Record<string, unknown>;
   env?: Record<string, string>;
@@ -44,6 +45,10 @@ interface PublishWorkflow {
 
 const versionSource = readFileSync(new URL("../.github/workflows/version-pr.yml", import.meta.url), "utf8");
 const publishSource = readFileSync(new URL("../.github/workflows/publish.yml", import.meta.url), "utf8");
+const releaseTagPolicySource = readFileSync(
+  new URL("../.github/scripts/release-tag-policy.mjs", import.meta.url),
+  "utf8",
+);
 const changesetSource = readFileSync(
   new URL("../.changeset/calm-betas-draft.md", import.meta.url),
   "utf8",
@@ -97,14 +102,32 @@ describe("release workflows", () => {
       "pull-requests": "read",
     });
     expect(publishWorkflow.jobs.publish.permissions).toEqual({
+      actions: "read",
       contents: "read",
       "id-token": "write",
     });
     expect(publishWorkflow.jobs.publish.environment).toBe("npm-publish");
-    expect(publishWorkflow.jobs.publish.concurrency).toEqual({
-      group: "npm-publish-dist-tags",
-      "cancel-in-progress": false,
-    });
+    expect(publishWorkflow.jobs.publish.concurrency).toBeUndefined();
+    const publicationQueue = publishWorkflow.jobs.publish.steps.find(
+      (step: WorkflowStep): boolean => step.name === "Wait for earlier release publications",
+    );
+    expect(publicationQueue?.uses).toBe(
+      "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
+    );
+    expect(publicationQueue?.["timeout-minutes"]).toBe(65);
+    expect(publicationQueue?.with?.script).toContain('workflow_id: "publish.yml"');
+    expect(publicationQueue?.with?.script).toContain('event: "release"');
+    expect(publicationQueue?.with?.script).toContain(
+      'run.id < currentRunId && run.status !== "completed"',
+    );
+    expect(publicationQueue?.with?.script).toContain(
+      ".sort((left, right) => left.id - right.id)",
+    );
+    expect(publicationQueue?.with?.script).toContain(
+      "if (earlierActiveRuns.length === 0) break",
+    );
+    expect(publicationQueue?.with?.script).toContain("setTimeout(resolve, pollMs)");
+    expect(publicationQueue?.with?.script).toContain("const timeoutMs = 60 * 60 * 1000");
   });
 
   it("uses pinned Codex with the requested model, effort, and strict structured output", () => {
@@ -147,21 +170,79 @@ describe("release workflows", () => {
   it("publishes beta and stable versions to explicit npm dist-tags", () => {
     expect(publishSource).toContain("npm publish --access public --tag beta");
     expect(publishSource).toContain("npm publish --access public --tag latest");
-    expect(publishSource).toContain("assertReleaseCanAdvanceDistTag");
     expect(publishSource).toContain("assertNpmDistTags");
     expect(publishSource).toContain("assertActionCreatedReleaseBody");
     expect(publishSource.match(/npm run test:ci/gu)).toHaveLength(2);
+    const draftNpmState = publishWorkflow.jobs.draft.steps.find(
+      (step: WorkflowStep): boolean => step.name === "Check npm release ordering",
+    );
     const npmState = publishWorkflow.jobs.publish.steps.find(
-      (step) => step.name === "Check npm publication state",
+      (step: WorkflowStep): boolean => step.name === "Check npm publication state",
     );
-    const npmStateRun = npmState?.run;
-    expect(npmStateRun).toContain("dist_tags_status=0");
-    expect(npmStateRun).toContain(
-      'dist_tags="$(npm view "$name" dist-tags --json 2>&1)" || dist_tags_status=$?',
+    expect(draftNpmState?.run).toBe(
+      'node .github/scripts/check-npm-release-state.mjs "$RELEASE_VERSION"',
     );
-    expect(npmStateRun).toContain("grep -qiE 'E404|404 Not Found'");
-    expect(npmStateRun).toContain("dist_tags='{}'");
-    expect(npmStateRun).toContain("::error::Unable to query npm dist-tags for $name");
+    expect(npmState?.run).toBe(
+      'node .github/scripts/check-npm-release-state.mjs "$RELEASE_VERSION" >> "$GITHUB_OUTPUT"',
+    );
+    const draftNpmStateIndex = publishWorkflow.jobs.draft.steps.findIndex(
+      (step: WorkflowStep): boolean => step.name === "Check npm release ordering",
+    );
+    expect(draftNpmStateIndex).toBeGreaterThanOrEqual(0);
+    expect(draftNpmStateIndex).toBeLessThan(
+      publishWorkflow.jobs.draft.steps.findIndex(
+        (step: WorkflowStep): boolean => step.name === "Create or update draft GitHub release",
+      ),
+    );
+  });
+
+  it("filters drafts, fetches canonical published bases, and verifies signed tags twice", () => {
+    expect(releaseTagPolicySource).not.toMatch(/^\s*import\s/mu);
+    const collect = publishWorkflow.jobs.draft.steps.find(
+      (step: WorkflowStep): boolean => step.name === "Collect release pull requests",
+    );
+    expect(collect?.with?.script).toContain(
+      "if (release.draft || !release.published_at || release.tag_name === targetTag) continue;",
+    );
+    expect(collect?.with?.script).toContain("parseReleaseTag(release.tag_name)");
+    expect(collect?.with?.script).toContain(
+      '["fetch", "--no-tags", "origin", `${tagRef}:${tagRef}`]',
+    );
+    expect(collect?.with?.script).toContain(
+      '["merge-base", "--is-ancestor", tagRef, targetRef]',
+    );
+    const collectScript = String(collect?.with?.script);
+    expect(collectScript.indexOf("parseReleaseTag(release.tag_name)")).toBeLessThan(
+      collectScript.indexOf('["fetch", "--no-tags"'),
+    );
+    const tagChecks = [
+      ...publishWorkflow.jobs.draft.steps,
+      ...publishWorkflow.jobs.publish.steps,
+    ].filter(
+      (step: WorkflowStep): boolean => step.name === "Verify signed annotated release tag",
+    );
+    expect(tagChecks).toHaveLength(2);
+    for (const tagCheck of tagChecks) {
+      expect(tagCheck.uses).toBe(
+        "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
+      );
+      expect(tagCheck.with?.script).toContain("assertVerifiedReleaseTag");
+      expect(tagCheck.with?.script).toContain(".github/scripts/release-tag-policy.mjs");
+      expect(tagCheck.with?.script).toContain('["rev-parse", "HEAD"]');
+    }
+    for (const job of [publishWorkflow.jobs.draft, publishWorkflow.jobs.publish]) {
+      const checkoutIndex = job.steps.findIndex(
+        (step: WorkflowStep): boolean => step.name?.startsWith("Checkout ") === true,
+      );
+      const tagCheckIndex = job.steps.findIndex(
+        (step: WorkflowStep): boolean => step.name === "Verify signed annotated release tag",
+      );
+      const installIndex = job.steps.findIndex(
+        (step: WorkflowStep): boolean => step.name === "Install dependencies",
+      );
+      expect(tagCheckIndex).toBe(checkoutIndex + 1);
+      expect(tagCheckIndex).toBeLessThan(installIndex);
+    }
   });
 
   it("records prerelease support as a minor package change", () => {
