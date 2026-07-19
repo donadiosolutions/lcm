@@ -3,6 +3,9 @@
   "version": "1.4.0",
   "description": "Never lose context again. Long Context Manager (LCM) compresses Claude Code sessions into searchable memory — every message preserved, every insight remembered.",
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "main": "dist/src/memory/index.js",
   "exports": {
     ".": "./dist/src/memory/index.js"
@@ -58,7 +61,7 @@
     "@anthropic-ai/sdk": "0.111.0",
     "@changesets/cli": "^2.30.0",
     "@types/js-yaml": "^4.0.9",
-    "@types/node": "26.1.1",
+    "@types/node": "22.20.1",
     "@types/safe-regex": "^1.1.6",
     "@vitest/coverage-v8": "4.1.10",
     "esbuild": "0.28.1",

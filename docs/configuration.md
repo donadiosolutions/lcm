@@ -1,5 +1,7 @@
 # Configuration guide
 
+LCM requires Node.js 22.12.0 or newer.
+
 ## Quick start
 
 ### Claude Code
