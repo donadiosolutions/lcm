@@ -94,9 +94,10 @@ test("rejects duplicate and cross-group labels", () => {
   );
 });
 
-test("derives a strict schema from configuration and expected issues", () => {
+test("derives a supported strict schema from configuration and expected issues", () => {
   const schema = buildClassificationSchema(config, [42, 99]);
   assert.deepEqual(buildOutputSchema(config, [42, 99]), schema);
+  assert.equal(JSON.stringify(schema).includes('"uniqueItems":'), false);
   const item = schema.properties.issues.items;
   assert.deepEqual(item.properties.issueNumber.enum, [42, 99]);
   assert.deepEqual(item.properties.categories.items.enum, config.categories);
@@ -119,7 +120,6 @@ test("builds empty-array-only schemas for empty optional groups", () => {
     type: "array",
     minItems: 0,
     maxItems: 0,
-    uniqueItems: true,
     items: { type: "string" },
   });
   assert.deepEqual(properties.projects, properties.topics);
