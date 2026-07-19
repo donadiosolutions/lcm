@@ -310,7 +310,7 @@ export async function batchCompact(opts: {
         });
       } else {
         const tokensBefore = data.tokensBefore ?? conv.tokens;
-        const tokensAfter = data.tokensAfter ?? 0;
+        const tokensAfter = data.tokensAfter ?? tokensBefore;
         if (opts.verbose && tokensBefore > 0) {
           const pct = Math.round((1 - tokensAfter / tokensBefore) * 100);
           console.log(` done  (${(tokensBefore / 1000).toFixed(1)}k → ${(tokensAfter / 1000).toFixed(1)}k tokens, ${pct}% reduction)`);

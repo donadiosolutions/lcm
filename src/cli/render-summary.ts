@@ -23,7 +23,7 @@ function renderBar(barWidth: number): string {
 /** Print the compact (non-verbose) summary table to stdout. */
 export function printSummary(state: ProgressState, opts: RenderOpts): void {
   const elapsed = (Date.now() - state.startedAt) / 1_000;
-  const total = state.completed + state.errors.length;
+  const processed = state.completed + state.errors.length;
   const width = Math.max(opts.width, 40);
 
   // Phase bar (only if there are phases)
@@ -41,7 +41,7 @@ export function printSummary(state: ProgressState, opts: RenderOpts): void {
 
   // Progress bar
   const barWidth = width < 60 ? 20 : 22;
-  const pct = total > 0 ? Math.round((state.completed / total) * 100) : 100;
+  const pct = state.total > 0 ? Math.round((processed / state.total) * 100) : 100;
   let tokenFlowStr = '';
   if (state.tokensIn > 0) {
     if (state.tokensOut > 0 && state.tokensOut < state.tokensIn) {
@@ -60,7 +60,7 @@ export function printSummary(state: ProgressState, opts: RenderOpts): void {
 
   const rows: [string, string][] = [];
 
-  rows.push(['Sessions', `${total} processed`]);
+  rows.push(['Sessions', `${processed} processed`]);
 
   if (state.tokensIn > 0 && state.tokensOut > 0 && state.tokensOut < state.tokensIn) {
     rows.push(['Compression', fmtRatio(state.tokensIn, state.tokensOut)]);

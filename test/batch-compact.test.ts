@@ -183,7 +183,7 @@ describe("batch compaction discovery", () => {
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }, null, 2) + "\n");
     seedConversations(paths.dbPath);
     const post = vi.spyOn(DaemonClient.prototype, "post")
-      .mockResolvedValueOnce({ tokensAfter: 60 })
+      .mockResolvedValueOnce({})
       .mockResolvedValueOnce({ tokensBefore: 300, tokensAfter: 30 });
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
@@ -208,7 +208,7 @@ describe("batch compaction discovery", () => {
       completed: 2,
       messagesIn: 18,
       tokensIn: 550,
-      tokensOut: 90,
+      tokensOut: 280,
       lastResult: {
         sessionId: "session-2",
         tokensBefore: 300,
@@ -216,9 +216,10 @@ describe("batch compaction discovery", () => {
       },
     });
     expect(log).toHaveBeenCalledWith(expect.stringContaining(
-      "2 sessions compacted, 0.6k → 0.1k tokens (84% reduction, 0.5k freed)",
+      "2 sessions compacted, 0.6k → 0.3k tokens (49% reduction, 0.3k freed)",
     ));
-    expect(log).toHaveBeenCalledWith(" done  (0.3k → 0.1k tokens, 76% reduction)");
+    expect(log).toHaveBeenCalledWith(" done  (0.3k → 0.3k tokens, 0% reduction)");
+    expect(log).toHaveBeenCalledWith(" done  (0.3k → 0.0k tokens, 90% reduction)");
     expect(post).toHaveBeenNthCalledWith(1, "/compact", expect.objectContaining({
       fast_mode: false,
       request_timeout_ms: 120_000,

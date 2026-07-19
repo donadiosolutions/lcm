@@ -151,6 +151,7 @@ describe("printSummary", () => {
   it("prints full phases, compression, DAG, promoted memories, and errors", () => {
     const state = completedState({
       phases: [{ name: "Import", status: "done" }, { name: "Compact", status: "done" }],
+      total: 3,
       completed: 2,
       errors: [{ sessionId: "broken", message: "network failed" }],
       phaseErrors: [
@@ -166,7 +167,7 @@ describe("printSummary", () => {
     printSummary(state, opts());
     const output = writes.join("");
     expect(output).toContain("● Import  →  ● Compact          Failed ✗");
-    expect(output).toContain("[██████████████████████] 67%  1,234 msgs  ~1.0M → ~1.0k tokens, 1000.0×");
+    expect(output).toContain("[██████████████████████] 100%  1,234 msgs  ~1.0M → ~1.0k tokens, 1000.0×");
     expect(output).toContain("Sessions      3 processed");
     expect(output).toContain("DAG nodes     10  (+2 new)");
     expect(output).toContain("DAG depth     3");

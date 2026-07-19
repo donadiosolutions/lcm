@@ -125,12 +125,14 @@ describe("renderFrame — TTY non-verbose mode", () => {
     const state = makeProgressState({ total: 2 });
     state.errors.push({ sessionId: "failed-session", message: "provider unavailable" });
     state.errors.push({ sessionId: "also-failed", message: "request timed out" });
+    state.phaseErrors.push({ phase: "Promote", target: "/one", message: "daemon unavailable" });
+    state.phaseErrors.push({ phase: "Promote", target: "/two", message: "request failed" });
 
     const output = renderFrame(state, ttyOpts, 0);
 
     expect(output).toContain("2/2");
     expect(output).toContain("[██████████████████████] 100%");
-    expect(output).toContain("2 failed");
+    expect(output).toContain("4 failed");
   });
 
   it("shows phase bar when phases are provided", () => {
