@@ -67,9 +67,13 @@ function publishedTimestamp(release) {
   return value;
 }
 
-export function selectPreviousRelease(targetTag, releases, { ancestorTags } = {}) {
+export function selectPreviousRelease(targetTag, releases, options) {
   const target = parseReleaseTag(targetTag);
   if (!Array.isArray(releases)) throw new TypeError("Releases must be an array");
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("Release selection options must be an object containing ancestorTags");
+  }
+  const { ancestorTags } = options;
   if (!(ancestorTags instanceof Set)) throw new TypeError("ancestorTags must be a Set");
 
   const eligible = releases

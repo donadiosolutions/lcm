@@ -104,6 +104,27 @@ test("stable releases ignore intervening betas and use the last stable", () => {
   );
 });
 
+test("requires explicit ancestry information when selecting release bases", () => {
+  const releases = [
+    { tag_name: "v1.4.1", draft: false, published_at: "2026-07-01T00:00:00Z" },
+  ];
+  for (const options of [undefined, null, "invalid", []]) {
+    assert.throws(
+      () => selectPreviousRelease("v1.5.0", releases, options),
+      {
+        name: "TypeError",
+        message: "Release selection options must be an object containing ancestorTags",
+      },
+    );
+  }
+  for (const options of [{}, { ancestorTags: [] }]) {
+    assert.throws(
+      () => selectPreviousRelease("v1.5.0", releases, options),
+      { name: "TypeError", message: "ancestorTags must be a Set" },
+    );
+  }
+});
+
 test("parses changesets and detects invalid package bumps", () => {
   assert.deepEqual(parseChangesetDocument(changeset("major")), {
     bump: "major",
