@@ -233,9 +233,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      GH_TOKEN: ${{ github.token }}
-      REPOSITORY: ${{ github.repository }}
-      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       HEAD_SHA: ${{ github.sha }}
     steps:
       - name: Accept previously admitted merge group
@@ -250,9 +247,3 @@ jobs:
           # Every PR was admitted only after all three providers succeeded on
           # its exact head SHA. They do not report on synthetic merge commits.
           echo "External providers passed before merge-queue admission."
-          gh api --method POST \
-            "repos/$REPOSITORY/statuses/$HEAD_SHA" \
-            -f state=success \
-            -f context=external-admission \
-            -f description="Providers passed before merge-queue admission" \
-            -f target_url="$RUN_URL" >/dev/null
