@@ -38,12 +38,13 @@ reruns revalidate that SHA and replace a stale successful admission with a
 pending or failed result until all three providers pass again. Draft PRs are not
 eligible for admission.
 
-After admission, the same workflow immediately publishes the required
-`external-admission` success status for a synthetic `merge_group` commit because
-those providers cannot report on that commit. This exception applies only to
-the three external providers: CI, both default CodeQL analyses, the
-security-extended CodeQL analysis, and both Socket checks still run against the
-synthetic commit before it may merge.
+After PR-head admission, the separate
+`external-admission-merge-group.yml` workflow runs a permissionless Actions
+check named `external-admission` on each synthetic `merge_group` commit. It does
+not publish a commit status. This exception applies only to the three external
+providers, which cannot report on that commit: CI, both default CodeQL
+analyses, the security-extended CodeQL analysis, and both Socket checks still
+run against the synthetic commit before it may merge.
 
 ### Release Flow
 
@@ -62,14 +63,15 @@ The manual release helper performs step 4 idempotently: it pushes or fetches a v
 
 ### CI Triggers
 
-| Workflow                 | Trigger                                                                                                              | Purpose                                                                                                  |
-| ------------------------ | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `ci.yml`                 | Push to main and release + all PRs + merge groups (`checks_requested`)                                               | Type-check, test, and build; upload Codecov reports outside merge groups                                 |
-| `external-admission.yml` | Non-draft PR lifecycle + authenticated CodeRabbit status, Codecov/DCO check runs + merge groups (`checks_requested`) | Require all three providers on the exact PR head, then publish the same wrapper context for merge groups |
-| `codeql.yml`             | Push to main + PRs targeting main + merge groups (`checks_requested`)                                                | Required CodeQL analysis and SARIF upload                                                                |
-| `codeql-extended.yml`    | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`)                                 | Required security-extended CodeQL analysis and SARIF upload                                              |
-| `version-pr.yml`         | Push to main                                                                                                         | Auto-create version PR from changesets                                                                   |
-| `publish.yml`            | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag                                                            | Publish npm + create GitHub release                                                                      |
+| Workflow                             | Trigger                                                                              | Purpose                                                                                 |
+| ------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
+| `external-admission.yml`             | Non-draft PR lifecycle + authenticated CodeRabbit status and Codecov/DCO check runs  | Require all three external providers on the exact eligible PR head                      |
+| `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
+| `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
+| `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
+| `version-pr.yml`                     | Push to main                                                                         | Auto-create version PR from changesets                                                  |
+| `publish.yml`                        | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag                            | Publish npm + create GitHub release                                                     |
 
 The CI workflow keeps coverage reporting in a separate no-checkout job that
 consumes the fixed test artifact. Codecov uses OIDC for pushes and same-repository
@@ -102,20 +104,31 @@ the Codecov result already verified on the exact PR head.
 
 ## Phase 2: Spec Review via PR
 
-1. **Sync first:** `git pull --ff-only origin main` before branching — stale local bases cause Copilot to review unrelated code
+1. **Sync first:** `git checkout main && git pull --ff-only origin main` before branching — stale local bases cause Copilot to review unrelated code
 2. Create `docs/<topic>` branch from main
 3. Ensure only documentation files are in the diff — specs, plans, workflow docs
 4. Push and open PR
 5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
 6. Run review loop (see Copilot Review Loop below)
 7. Once Copilot has no issues (max 3 rounds — see Review Loop), queue the PR with `gh pr merge <number> --repo donadiosolutions/lcm --auto --squash`
+8. Wait for the queued PR to land before starting implementation:
+   ```bash
+   while :; do
+     state=$(gh pr view <number> --repo donadiosolutions/lcm --json state --jq .state)
+     case "$state" in
+       MERGED) break ;;
+       OPEN) sleep 15 ;;
+       *) echo "spec PR entered unexpected state: $state" >&2; exit 1 ;;
+     esac
+   done
+   ```
 
 ## Phase 3: Implementation (Sonnet subagents)
 
-1. **Sync first:** `git pull --ff-only origin main` to get latest (including merged specs)
+1. **Sync first:** `git checkout main && git pull --ff-only origin main` to get latest (including merged specs)
 2. Dispatch `model: sonnet` subagents with `isolation: worktree` for each task in the plan
 3. **Independent tasks** → launch in parallel (e.g., PR A: delete files, PR D: add new module)
-4. **Sequential tasks** → launch one at a time; wait for the upstream PR to land through the queue, then rebase the downstream branch onto the new main: `git fetch origin main && git rebase origin/main`
+4. **Sequential tasks** → launch the dependent branch only after the upstream PR lands through the queue, then branch from the updated `main`. If a downstream branch already exists on the old upstream tip, replay only its downstream commits with `git fetch origin main && git rebase --onto origin/main <old-upstream-tip> <downstream-branch>`.
 5. Each subagent: implement code + tests, run `npm test`, commit (do NOT push)
 6. After subagent completes: review the diff, push, open PR, request Copilot review
 
@@ -207,4 +220,4 @@ gh api repos/{owner}/{repo}/pulls/{n}/comments \
 - **REST API 422 for Copilot bot**: The `requested_reviewers` REST endpoint rejects bot slugs. Use `gh pr edit --add-reviewer` instead.
 - **Empty commits don't trigger Copilot**: Copilot only reviews on substantive diffs. Use `gh pr edit` re-request instead.
 - **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Use `git checkout -B <clean-branch> origin/main && git cherry-pick <docs-commits>`.
-- **Sequential PR chains**: After merging PR A, rebase PR B onto updated main before pushing: `git fetch origin main && git rebase origin/main`.
+- **Sequential PR chains**: Create PR B from updated `main` only after PR A lands. If PR B already contains commits based on PR A's old tip, replay only its own commits with `git fetch origin main && git rebase --onto origin/main <old-PR-A-tip> <PR-B-branch>`.
