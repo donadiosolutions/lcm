@@ -2,7 +2,7 @@
  * Extended connection pool tests covering the untested `isLcmConnectionOpen` export.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -30,6 +30,23 @@ describe("isLcmConnectionOpen", () => {
     db.prepare("INSERT INTO memory_only (value) VALUES (?)").run("available");
     expect(db.prepare("SELECT value FROM memory_only").get()).toEqual({ value: "available" });
     expect(isLcmConnectionOpen(":memory:")).toBe(true);
+  });
+
+  it("creates WAL and shared-memory sidecars with private permissions", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-sidecar-mode-test-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "private.sqlite");
+    const previousUmask = process.umask(0o022);
+    try {
+      const db = getLcmConnection(dbPath);
+      db.exec("CREATE TABLE private_data (value TEXT); INSERT INTO private_data VALUES ('secret')");
+
+      expect(statSync(dbPath).mode & 0o777).toBe(0o600);
+      expect(statSync(`${dbPath}-wal`).mode & 0o777).toBe(0o600);
+      expect(statSync(`${dbPath}-shm`).mode & 0o777).toBe(0o600);
+    } finally {
+      process.umask(previousUmask);
+    }
   });
 
   it("evicts and replaces an unhealthy pooled handle", () => {
