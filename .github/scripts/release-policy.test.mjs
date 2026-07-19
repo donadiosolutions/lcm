@@ -274,6 +274,7 @@ test("paginates every commit-to-PR association lookup", async () => {
       },
     },
   };
+  const gitCalls = [];
 
   const entries = await collectReleasePullRequests({
     github,
@@ -281,10 +282,20 @@ test("paginates every commit-to-PR association lookup", async () => {
     repo: "lcm",
     baseTag: "v1.4.1",
     targetTag: "v1.5.0",
-    runGit: () => commit,
+    cwd: "/workspace",
+    runGit: (args, cwd) => {
+      gitCalls.push({ args, cwd });
+      return commit;
+    },
   });
 
   assert.deepEqual(entries, [{ pr: associatedPullRequest, changesetContents: [] }]);
+  assert.deepEqual(gitCalls, [
+    {
+      args: ["rev-list", "--first-parent", "--reverse", "v1.4.1..v1.5.0"],
+      cwd: "/workspace",
+    },
+  ]);
   assert.equal(paginateCalls[0].endpoint, associationEndpoint);
   assert.deepEqual(paginateCalls[0].parameters, {
     owner: "donadiosolutions",

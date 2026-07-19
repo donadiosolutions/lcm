@@ -397,7 +397,17 @@ jobs:
             exit 1
           fi
 
-          dist_tags="$(npm view "$name" dist-tags --json)"
+          dist_tags_status=0
+          dist_tags="$(npm view "$name" dist-tags --json 2>&1)" || dist_tags_status=$?
+          if [[ "$dist_tags_status" -ne 0 ]]; then
+            if printf '%s\n' "$dist_tags" | grep -qiE 'E404|404 Not Found'; then
+              dist_tags='{}'
+            else
+              printf '%s\n' "$dist_tags" >&2
+              echo "::error::Unable to query npm dist-tags for $name"
+              exit 1
+            fi
+          fi
           DIST_TAGS="$dist_tags" ALREADY_PUBLISHED="$already_published" node --input-type=module <<'NODE'
           import { assertReleaseCanAdvanceDistTag } from "./.github/scripts/release-policy.mjs";
           assertReleaseCanAdvanceDistTag({

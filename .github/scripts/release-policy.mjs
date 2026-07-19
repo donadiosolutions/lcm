@@ -266,7 +266,10 @@ export async function collectReleasePullRequests({
   cwd = process.cwd(),
   runGit = defaultRunGit,
 }) {
-  const output = runGit(["rev-list", "--reverse", `${baseTag}..${targetTag}`], cwd);
+  const output = runGit(
+    ["rev-list", "--first-parent", "--reverse", `${baseTag}..${targetTag}`],
+    cwd,
+  );
   const commits = output.length === 0 ? [] : output.split(/\r?\n/u).filter(Boolean);
   const associations = new Map();
   for (const commit of commits) {

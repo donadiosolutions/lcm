@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 interface WorkflowStep {
   id?: string;
   name?: string;
+  run?: string;
   uses?: string;
   with?: Record<string, unknown>;
   env?: Record<string, string>;
@@ -150,6 +151,17 @@ describe("release workflows", () => {
     expect(publishSource).toContain("assertNpmDistTags");
     expect(publishSource).toContain("assertActionCreatedReleaseBody");
     expect(publishSource.match(/npm run test:ci/gu)).toHaveLength(2);
+    const npmState = publishWorkflow.jobs.publish.steps.find(
+      (step) => step.name === "Check npm publication state",
+    );
+    const npmStateRun = npmState?.run;
+    expect(npmStateRun).toContain("dist_tags_status=0");
+    expect(npmStateRun).toContain(
+      'dist_tags="$(npm view "$name" dist-tags --json 2>&1)" || dist_tags_status=$?',
+    );
+    expect(npmStateRun).toContain("grep -qiE 'E404|404 Not Found'");
+    expect(npmStateRun).toContain("dist_tags='{}'");
+    expect(npmStateRun).toContain("::error::Unable to query npm dist-tags for $name");
   });
 
   it("records prerelease support as a minor package change", () => {
