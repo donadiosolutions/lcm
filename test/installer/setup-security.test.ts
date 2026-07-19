@@ -58,6 +58,7 @@ describe("setup config leaf security", () => {
     });
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("Failed to parse existing config");
+    expect(result.stderr).toContain("exceeds the 1 MiB safety limit");
+    expect(result.stderr).not.toContain("invalid JSON");
   });
 });

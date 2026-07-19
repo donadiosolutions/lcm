@@ -214,8 +214,16 @@ try {
   raw = Buffer.concat(chunks, total).toString('utf8');
   JSON.parse(raw); // validate
 } catch (err) {
-  console.error(`Error: Failed to parse existing config at ${configFile}.`);
-  console.error('The file contains invalid JSON. Fix or remove it, then re-run setup.');
+  if (err instanceof SyntaxError) {
+    console.error(`Error: Failed to parse existing config at ${configFile}.`);
+    console.error('The file contains invalid JSON. Fix or remove it, then re-run setup.');
+  } else if (err instanceof Error && err.message === 'config file exceeds 1 MiB') {
+    console.error(`Error: Existing config at ${configFile} exceeds the 1 MiB safety limit.`);
+    console.error('Reduce the config file size, then re-run setup.');
+  } else {
+    console.error(`Error: Failed to read existing config at ${configFile}.`);
+    console.error('Check that it is a readable regular file, then re-run setup.');
+  }
   process.exit(1);
 } finally {
   if (configFd !== undefined) fs.closeSync(configFd);
