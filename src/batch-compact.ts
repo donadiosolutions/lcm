@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { runLcmMigrations } from "./db/migration.js";
 import { closeLcmConnection, getLcmConnection } from "./db/connection.js";
@@ -48,13 +48,16 @@ export function formatLlmDiagnostic(input: {
 /** Find conversations eligible for compaction, above the token threshold. */
 function projectMatchesCwdFilter(projectHash: string, cwd: string, cwdFilter?: string): boolean {
   if (!cwdFilter) return true;
+  const lexicalFilter = resolve(cwdFilter);
+  if (resolve(cwd) === lexicalFilter) return true;
+  try {
+    if (projectMapPathsForHash(projectHash).includes(lexicalFilter)) return true;
+  } catch {
+    // Fall back to the metadata cwd while map.json is being edited.
+  }
   const normalizedFilter = normalizeProjectPath(cwdFilter);
   if (normalizeProjectPath(cwd) === normalizedFilter) return true;
-  try {
-    return projectMapPathsForHash(projectHash).includes(normalizedFilter);
-  } catch {
-    return false;
-  }
+  return false;
 }
 
 export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): UncompactedConversation[] {

@@ -100,14 +100,15 @@ describe("map command registration", () => {
     clearProjectMapCache();
     const dir = mkdtempSync(join(tmpdir(), "lcm-map-cli-"));
     const canonical = join(dir, "canonical");
-    const alias = join(dir, "missing-alias");
+    const alias = join(dir, "alias");
     mkdirSync(canonical, { recursive: true });
+    mkdirSync(alias);
     process.chdir(canonical);
 
     try {
       const add = await runMapCommand(["add", alias, "--canonical", canonical]);
       const hash = hashProjectPath(normalizeProjectPath(canonical));
-      expect(add.stderr[0]).toContain("Warning: alias path does not exist");
+      expect(add.stderr).toEqual([]);
       expect(add.stdout).toEqual([`Added alias to ${hash}`]);
 
       const list = await runMapCommand(["list", "--json"]);
@@ -125,10 +126,9 @@ describe("map command registration", () => {
       expect(removed).toMatchObject({ hash, removed: true });
 
       const addJson = await runMapCommand(["add", alias, "--hash", hash, "--json"]);
-      const added = JSON.parse(addJson.stdout[0]) as { added: boolean; hash: string; warning?: string };
+      const added = JSON.parse(addJson.stdout[0]) as { added: boolean; hash: string };
       expect(added.added).toBe(true);
       expect(added.hash).toBe(hash);
-      expect(added.warning).toContain("alias path does not exist");
 
       const showJson = await runMapCommand(["show", alias, "--json"]);
       const shown = JSON.parse(showJson.stdout[0]) as { hash: string; entry: { aliases: string[] } };

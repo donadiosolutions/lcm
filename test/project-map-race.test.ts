@@ -30,18 +30,18 @@ describe("project map file races", () => {
     mkdirSync(canonical, { recursive: true });
 
     const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
-    const readFileSync = vi.fn((path: import("node:fs").PathOrFileDescriptor, options?: unknown) => {
+    const openSync = vi.fn((path: import("node:fs").PathLike, flags: import("node:fs").OpenMode) => {
       if (typeof path === "string" && path.endsWith(join(".lcm", "map.json"))) {
         const err = new Error("map.json disappeared") as NodeJS.ErrnoException;
         err.code = "ENOENT";
         throw err;
       }
-      return actualFs.readFileSync(path, options as BufferEncoding);
+      return actualFs.openSync(path, flags);
     });
 
     vi.doMock("node:fs", () => ({
       ...actualFs,
-      readFileSync,
+      openSync,
     }));
 
     const { projectMapPath, resolveProjectIdentity } = await import("../src/project-map.js");
@@ -49,7 +49,7 @@ describe("project map file races", () => {
     const identity = resolveProjectIdentity(canonical);
 
     expect(identity.canonical).toBe(canonical);
-    expect(readFileSync).toHaveBeenCalledWith(projectMapPath(), "utf-8");
+    expect(openSync).toHaveBeenCalledWith(projectMapPath(), expect.any(Number));
     expect(actualFs.existsSync(projectMapPath())).toBe(true);
   });
 
@@ -64,7 +64,7 @@ describe("project map file races", () => {
     const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
     vi.doMock("node:fs", () => ({
       ...actualFs,
-      readFileSync: vi.fn(() => {
+      openSync: vi.fn(() => {
         const error = new Error("permission denied") as NodeJS.ErrnoException;
         error.code = "EACCES";
         throw error;

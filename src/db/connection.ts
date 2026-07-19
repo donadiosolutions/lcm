@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "fs";
-import { dirname } from "path";
+import { chmodSync, lstatSync } from "node:fs";
+import { dirname } from "node:path";
+import { ensurePrivateDirectory, PRIVATE_FILE_MODE } from "../security-files.js";
 
 type ConnectionEntry = {
   db: DatabaseSync;
@@ -42,11 +43,27 @@ export function getLcmConnection(dbPath: string): DatabaseSync {
     _connections.delete(dbPath);
   }
 
-  // Ensure parent directory exists
-  mkdirSync(dirname(dbPath), { recursive: true });
+  const isInMemory = dbPath === ":memory:";
+  if (!isInMemory) {
+    // Filesystem hardening applies only to persistent database paths. SQLite's
+    // special :memory: target has no parent directory or file to secure.
+    ensurePrivateDirectory(dirname(dbPath));
+    try {
+      const stat = lstatSync(dbPath);
+      if (stat.isSymbolicLink()) {
+        throw new Error(`refusing to open a symlink database path: ${dbPath}`);
+      }
+      if (!stat.isFile()) {
+        throw new Error(`database path is not a regular file: ${dbPath}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
 
   const db = new DatabaseSync(dbPath);
   try {
+    if (!isInMemory) chmodSync(dbPath, PRIVATE_FILE_MODE);
     // Enable WAL mode for better concurrent read performance
     db.exec("PRAGMA journal_mode = WAL");
     // Wait up to 5 seconds on busy instead of failing immediately

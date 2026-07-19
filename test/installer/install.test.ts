@@ -261,11 +261,68 @@ describe("install", () => {
     );
   });
 
-  it("ignores chmod failures and reports doctor failures", async () => {
+  it("rejects stale config symlink leaves before reading or writing them", async () => {
+    const deps = makeDeps({
+      lstatSync: vi.fn(() => ({ isSymbolicLink: () => true, isFile: () => false }) as never),
+    });
+
+    await expect(install(deps)).rejects.toThrow("symlink config path");
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-regular config leaves before reading or writing them", async () => {
+    const deps = makeDeps({
+      lstatSync: vi.fn(() => ({ isSymbolicLink: () => false, isFile: () => false }) as never),
+    });
+
+    await expect(install(deps)).rejects.toThrow("not a regular file");
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("uses the atomic private writer when creating the production config", async () => {
+    const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+    const atomicWritePrivateFile = vi.fn();
+    const deps = makeDeps({
+      lstatSync: vi.fn(() => { throw missing; }),
+      atomicWritePrivateFile,
+    });
+
+    await install(deps);
+
+    expect(atomicWritePrivateFile).toHaveBeenCalledWith(
+      expect.stringContaining("config.json"),
+      expect.stringContaining('"provider": "auto"'),
+    );
+  });
+
+  it("accepts an existing regular config leaf", async () => {
+    const atomicWritePrivateFile = vi.fn();
+    const deps = makeDeps({
+      lstatSync: vi.fn(() => ({ isSymbolicLink: () => false, isFile: () => true }) as never),
+      existsSync: vi.fn((path: string) => path.endsWith("config.json")),
+      atomicWritePrivateFile,
+    });
+
+    await expect(install(deps)).resolves.not.toThrow();
+    expect(atomicWritePrivateFile).not.toHaveBeenCalled();
+  });
+
+  it("fails installation when the LCM data root cannot be secured", async () => {
+    const deps = makeDeps({
+      chmodSync: vi.fn(() => { throw new Error("chmod failed"); }),
+    });
+
+    await expect(install(deps)).rejects.toThrow("chmod failed");
+    expect(deps.runDoctor).not.toHaveBeenCalled();
+  });
+
+  it("ignores config chmod failures and reports doctor failures", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const deps = makeDeps({
       existsSync: vi.fn().mockReturnValue(false),
-      chmodSync: vi.fn(() => { throw new Error("chmod failed"); }),
+      chmodSync: vi.fn((path) => {
+        if (String(path).endsWith("config.json")) throw new Error("chmod failed");
+      }),
       runDoctor: vi.fn().mockResolvedValue([{ name: "daemon", status: "fail" }]),
     });
     await install(deps);

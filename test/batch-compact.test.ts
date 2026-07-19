@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -92,6 +92,12 @@ describe("batch compaction discovery", () => {
     expect(conversations[0].sessionId).toBe("session-1");
     expect(execSpy.mock.calls.filter(([sql]) => sql === "PRAGMA busy_timeout = 5000")).toHaveLength(1);
     expect(getPoolStats().totalConnections).toBe(0);
+
+    const victim = makeDir("compact-alias-victim");
+    rmSync(alias, { recursive: true });
+    symlinkSync(victim, alias, "dir");
+    expect(findUncompacted(100, true, alias)).toHaveLength(1);
+    expect(findUncompacted(100, true, victim)).toEqual([]);
   });
 
   it("does not match a current-project filter that is unrelated to the map entry", () => {
@@ -103,6 +109,18 @@ describe("batch compaction discovery", () => {
     seedConversation(paths.dbPath);
 
     expect(findUncompacted(100, true, unrelated)).toEqual([]);
+  });
+
+  it("falls back to canonical comparison for legacy symlink metadata", () => {
+    const canonical = makeDir("compact-legacy-canonical");
+    const legacyLink = join(homedir(), "compact-legacy-link");
+    symlinkSync(canonical, legacyLink, "dir");
+    const projectDir = join(homedir(), ".lcm", "projects", "legacy-project");
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, "meta.json"), JSON.stringify({ cwd: legacyLink }));
+    seedConversation(join(projectDir, "db.sqlite"));
+
+    expect(findUncompacted(100, true, canonical)).toHaveLength(1);
   });
 
   it("returns failures while continuing to compact later sessions", async () => {

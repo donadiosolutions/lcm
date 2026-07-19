@@ -2,7 +2,7 @@
  * Extended connection pool tests covering the untested `isLcmConnectionOpen` export.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -23,6 +23,32 @@ afterEach(() => {
 });
 
 describe("isLcmConnectionOpen", () => {
+  it("opens SQLite's in-memory target without filesystem permission work", () => {
+    const db = getLcmConnection(":memory:");
+
+    db.exec("CREATE TABLE memory_only (value TEXT)");
+    db.prepare("INSERT INTO memory_only (value) VALUES (?)").run("available");
+    expect(db.prepare("SELECT value FROM memory_only").get()).toEqual({ value: "available" });
+    expect(isLcmConnectionOpen(":memory:")).toBe(true);
+  });
+
+  it("creates WAL and shared-memory sidecars with private permissions", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-sidecar-mode-test-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "private.sqlite");
+    const previousUmask = process.umask(0o022);
+    try {
+      const db = getLcmConnection(dbPath);
+      db.exec("CREATE TABLE private_data (value TEXT); INSERT INTO private_data VALUES ('secret')");
+
+      expect(statSync(dbPath).mode & 0o777).toBe(0o600);
+      expect(statSync(`${dbPath}-wal`).mode & 0o777).toBe(0o600);
+      expect(statSync(`${dbPath}-shm`).mode & 0o777).toBe(0o600);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
   it("evicts and replaces an unhealthy pooled handle", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-unhealthy-test-"));
     tempDirs.push(tempDir);
@@ -48,6 +74,29 @@ describe("isLcmConnectionOpen", () => {
     } finally {
       close.mockRestore();
     }
+  });
+
+  it("rejects database symlink leaves without modifying their targets", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-symlink-test-"));
+    tempDirs.push(tempDir);
+    const victim = join(tempDir, "victim.sqlite");
+    const dbPath = join(tempDir, "linked.sqlite");
+    writeFileSync(victim, "preserve");
+    symlinkSync(victim, dbPath);
+
+    expect(() => getLcmConnection(dbPath)).toThrow("symlink database path");
+    expect(readFileSync(victim, "utf-8")).toBe("preserve");
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+  });
+
+  it("rejects an existing non-regular database leaf", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-nonregular-test-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "directory.sqlite");
+    mkdirSync(dbPath);
+
+    expect(() => getLcmConnection(dbPath)).toThrow("not a regular file");
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
   });
 
   it("ignores a path-specific close for an unknown connection", () => {

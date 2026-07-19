@@ -1,37 +1,122 @@
 import type { DaemonClient } from "../daemon/client.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { homedir, tmpdir } from "node:os";
-import { writeFileSync, readFileSync } from "node:fs";
-import { daemonPidPath } from "../runtime-paths.js";
+import { openSync, closeSync, writeFileSync } from "node:fs";
+import { daemonPidPath, tmpDir } from "../runtime-paths.js";
+import {
+  deleteRegularFile,
+  ensurePrivateDirectory,
+  PRIVATE_FILE_MODE,
+  readBoundedRegularFile,
+} from "../security-files.js";
 
-/** Returns true if lock was acquired, false if another live process holds it. */
-function tryAcquireSessionLock(sessionId: string): boolean {
-  const lockPath = join(tmpdir(), `lcm-restore-${sessionId}.lock`);
-  try {
-    writeFileSync(lockPath, process.pid.toString(), { flag: "wx" });
-    return true;
-  } catch {
-    // Lock exists — check if the owner process is still alive
+function sessionLockPath(sessionId: string): string {
+  const digest = createHash("sha256").update(sessionId).digest("hex");
+  return join(tmpDir(), `restore-${digest}.lock`);
+}
+
+type SessionLockDeps = {
+  open: typeof openSync;
+  write: typeof writeFileSync;
+  close: typeof closeSync;
+  read: typeof readBoundedRegularFile;
+  delete: typeof deleteRegularFile;
+  isProcessAlive: (pid: number) => boolean;
+};
+
+const defaultSessionLockDeps: SessionLockDeps = {
+  open: openSync,
+  write: writeFileSync,
+  close: closeSync,
+  read: readBoundedRegularFile,
+  delete: deleteRegularFile,
+  isProcessAlive: (pid) => {
     try {
-      const ownerPid = parseInt(readFileSync(lockPath, "utf-8").trim(), 10);
-      if (!isNaN(ownerPid)) {
-        try {
-          process.kill(ownerPid, 0); // throws if process is dead
-          return false; // owner alive, genuine dedup
-        } catch {
-          // Owner dead — take over the lock
-          writeFileSync(lockPath, process.pid.toString());
-          return true;
-        }
-      }
-    } catch { /* can't read lock — fall through to safe default */ }
-    return false;
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+};
+
+function createLockFile(path: string, deps: SessionLockDeps): void {
+  let fd: number | undefined;
+  try {
+    fd = deps.open(path, "wx", PRIVATE_FILE_MODE);
+    deps.write(fd, process.pid.toString(), "utf-8");
+    deps.close(fd);
+    fd = undefined;
+  } catch (error) {
+    if (fd !== undefined) {
+      try { deps.close(fd); } catch { /* preserve the initialization failure */ }
+      try { deps.delete(path); } catch { /* preserve the initialization failure */ }
+    }
+    throw error;
   }
 }
 
-export async function handleSessionStart(stdin: string, client: DaemonClient, port?: number): Promise<{ exitCode: number; stdout: string }> {
-  const input = JSON.parse(stdin || "{}");
+/** Returns true if acquired; false when ownership or safe reclamation cannot be verified. */
+function tryAcquireSessionLock(
+  sessionId: string,
+  deps: SessionLockDeps = defaultSessionLockDeps,
+): boolean {
+  const lockDir = tmpDir();
+  ensurePrivateDirectory(lockDir);
+  const lockPath = sessionLockPath(sessionId);
+  try {
+    createLockFile(lockPath, deps);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+  }
+
+  const reclaimPath = `${lockPath}.reclaim`;
+  try {
+    createLockFile(reclaimPath, deps);
+  } catch {
+    return false;
+  }
+  try {
+    const ownerPid = parseInt(deps.read(lockPath, {
+      allowedRoot: lockDir,
+      maxBytes: 32,
+    }).trim(), 10);
+    if (isNaN(ownerPid)) return false;
+    if (deps.isProcessAlive(ownerPid)) return false;
+    deps.delete(lockPath);
+    try {
+      createLockFile(lockPath, deps);
+      return true;
+    } catch {
+      return false;
+    }
+  } catch {
+    return false;
+  } finally {
+    try { deps.delete(reclaimPath); } catch { /* a failed cleanup safely blocks later reclaimers */ }
+  }
+}
+
+export const tryAcquireSessionLockForTesting = tryAcquireSessionLock;
+export const sessionLockPathForTesting = sessionLockPath;
+
+type RestoreHookInput = Record<string, unknown> & {
+  session_id?: string;
+  cwd?: string;
+};
+
+export async function handleSessionStart(stdin: string, client: Pick<DaemonClient, "post">, port?: number): Promise<{ exitCode: number; stdout: string }> {
+  const parsed: unknown = JSON.parse(stdin || "{}");
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { exitCode: 0, stdout: "" };
+  }
+  const input = parsed as RestoreHookInput;
+  if ((input.session_id != null && typeof input.session_id !== "string")
+    || (input.cwd != null && typeof input.cwd !== "string")) {
+    return { exitCode: 0, stdout: "" };
+  }
   const sessionId = input.session_id ?? "";
   if (sessionId && !tryAcquireSessionLock(sessionId)) {
     return { exitCode: 0, stdout: "" };

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -41,6 +41,31 @@ function makeProject(prefix: string): string {
 }
 
 describe("daemon routes with project path aliases", () => {
+  it("preserves a lexical symlink alias at the daemon validation boundary", async () => {
+    const canonical = makeProject("lcm-symlink-canonical-");
+    const aliasParent = makeProject("lcm-symlink-parent-");
+    const alias = join(aliasParent, "project-alias");
+    symlinkSync(canonical, alias, "dir");
+    addProjectAlias(alias, { canonical });
+
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    const daemon = await createDaemon(config);
+    const port = daemon.address().port;
+
+    try {
+      const storeRes = await fetch(`http://127.0.0.1:${port}/store`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd: alias, text: "Stored through a lexical symlink alias" }),
+      });
+      expect(storeRes.status).toBe(200);
+      expect(projectDbPath(alias)).toBe(projectDbPath(canonical));
+    } finally {
+      await daemon.stop();
+    }
+  });
+
   it("routes store/search/ingest/promote/passive sidecar paths through the canonical hash", async () => {
     const canonical = makeProject("lcm-canonical-");
     const alias = makeProject("lcm-alias-");
