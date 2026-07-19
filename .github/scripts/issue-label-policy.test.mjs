@@ -8,6 +8,7 @@ import {
   buildClassificationSchema,
   buildOutputSchema,
   computeLabelChanges,
+  includesLabelIgnoreCase,
   loadManagedLabelConfig,
   managedLabelNames,
   parseAndValidateClassification,
@@ -45,6 +46,26 @@ test("validates and loads managed-label configuration", async () => {
   await assert.rejects(loadManagedLabelConfig(join(directory, "missing.json")), /Unable to load/);
   await writeFile(path, "{");
   await assert.rejects(loadManagedLabelConfig(path), /Unable to load/);
+
+  const unknownFailure = "read failed without an Error instance";
+  await assert.rejects(
+    loadManagedLabelConfig(path, async () => {
+      throw unknownFailure;
+    }),
+    (error) => {
+      assert.match(error.message, new RegExp(unknownFailure));
+      assert.equal(error.cause, unknownFailure);
+      return true;
+    },
+  );
+});
+
+test("matches GitHub label names case-insensitively", () => {
+  assert.equal(includesLabelIgnoreCase(["Needs-Codex-Triage"], "needs-codex-triage"), true);
+  assert.equal(includesLabelIgnoreCase(["bug"], "needs-codex-triage"), false);
+  assert.equal(includesLabelIgnoreCase([null], "needs-codex-triage"), false);
+  assert.throws(() => includesLabelIgnoreCase(null, "label"), /Labels must be an array/);
+  assert.throws(() => includesLabelIgnoreCase([], null), /Expected label must be a string/);
 });
 
 test("rejects malformed groups, invalid labels, and empty required groups", () => {

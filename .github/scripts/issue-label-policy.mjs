@@ -79,16 +79,26 @@ export function validateManagedLabelConfig(value) {
   );
 }
 
-export async function loadManagedLabelConfig(path) {
+export async function loadManagedLabelConfig(path, readConfigFile = readFile) {
   let parsed;
   try {
-    parsed = JSON.parse(await readFile(path, "utf8"));
+    parsed = JSON.parse(await readConfigFile(path, "utf8"));
   } catch (error) {
-    throw new Error(`Unable to load managed-label configuration from ${path}: ${error.message}`, {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to load managed-label configuration from ${path}: ${message}`, {
       cause: error,
     });
   }
   return validateManagedLabelConfig(parsed);
+}
+
+export function includesLabelIgnoreCase(labels, expectedLabel) {
+  if (!Array.isArray(labels)) throw new TypeError("Labels must be an array");
+  if (typeof expectedLabel !== "string") throw new TypeError("Expected label must be a string");
+  const normalizedExpected = expectedLabel.toLowerCase();
+  return labels.some(
+    (label) => typeof label === "string" && label.toLowerCase() === normalizedExpected,
+  );
 }
 
 export function managedLabelNames(config) {

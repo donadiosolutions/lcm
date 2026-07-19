@@ -263,6 +263,7 @@ jobs:
             ).href;
             const {
               computeLabelChanges,
+              includesLabelIgnoreCase,
               loadManagedLabelConfig,
               removeIssueLabelIfPresent,
               validateClassificationResult,
@@ -295,7 +296,7 @@ jobs:
                   typeof label === "string" ? label : label.name,
                 );
 
-                if (!currentLabels.includes(process.env.QUEUE_LABEL)) {
+                if (!includesLabelIgnoreCase(currentLabels, process.env.QUEUE_LABEL)) {
                   core.info(
                     `Skipping #${issueNumber}: it is no longer queued for Codex triage.`,
                   );
