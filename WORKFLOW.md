@@ -121,10 +121,25 @@ the Codecov result already verified on the exact PR head.
      gh pr checks "$pr_number" --repo donadiosolutions/lcm >&2 || true
    }
 
+   query_merge_queue_entry() {
+     local pr_number=$1
+     gh api graphql \
+       -f query='query($owner: String!, $name: String!, $number: Int!) {
+         repository(owner: $owner, name: $name) {
+           pullRequest(number: $number) { mergeQueueEntry { position state } }
+         }
+       }' \
+       -f owner=donadiosolutions \
+       -f name=lcm \
+       -F number="$pr_number" \
+       --jq '.data.repository.pullRequest.mergeQueueEntry |
+         if . == null then "" else [.position, .state] | @tsv end'
+   }
+
    wait_for_queued_pr() {
      local pr_number=$1
      local admission_deadline=$((SECONDS + 65 * 60))
-     local deadline queue_position state
+     local current_queue_position deadline queue_entry queue_position queue_state state
 
      # mergeQueueEntry can be temporarily absent while auto-merge waits for
      # required checks or GitHub propagates the newly queued entry.
@@ -140,17 +155,15 @@ the Codecov result already verified on the exact PR head.
            ;;
        esac
 
-       if ! queue_position=$(gh api graphql \
-         -f query='query($owner: String!, $name: String!, $number: Int!) {
-           repository(owner: $owner, name: $name) {
-             pullRequest(number: $number) { mergeQueueEntry { position } }
-           }
-         }' \
-         -f owner=donadiosolutions \
-         -f name=lcm \
-         -F number="$pr_number" \
-         --jq '.data.repository.pullRequest.mergeQueueEntry.position // empty'); then
-         echo "Could not query the merge-queue position for PR #$pr_number." >&2
+       if ! queue_entry=$(query_merge_queue_entry "$pr_number"); then
+         echo "Could not query the merge-queue entry for PR #$pr_number." >&2
+         show_pr_checks "$pr_number"
+         return 1
+       fi
+       IFS=$'\t' read -r queue_position queue_state <<<"$queue_entry"
+
+       if [[ "$queue_state" == UNMERGEABLE ]]; then
+         echo "PR #$pr_number became unmergeable before queue admission completed; inspect failed checks and requeue it:" >&2
          show_pr_checks "$pr_number"
          return 1
        fi
@@ -175,12 +188,6 @@ the Codecov result already verified on the exact PR head.
        case "$state" in
          MERGED) return ;;
          OPEN)
-           if ((SECONDS >= deadline)); then
-             echo "PR #$pr_number did not merge within its position-$queue_position allowance of $((queue_position * 65)) minutes; inspect failed checks and requeue it:" >&2
-             show_pr_checks "$pr_number"
-             return 1
-           fi
-           sleep 15
            ;;
          *)
            echo "PR #$pr_number entered unexpected state while queued: $state" >&2
@@ -188,6 +195,32 @@ the Codecov result already verified on the exact PR head.
            return 1
            ;;
        esac
+
+       if ! queue_entry=$(query_merge_queue_entry "$pr_number"); then
+         echo "Could not query the merge-queue entry for PR #$pr_number." >&2
+         show_pr_checks "$pr_number"
+         return 1
+       fi
+       IFS=$'\t' read -r current_queue_position queue_state <<<"$queue_entry"
+
+       if [[ -z "$current_queue_position" ]]; then
+         echo "PR #$pr_number is still open but is no longer in the merge queue; inspect failed checks and requeue it:" >&2
+         show_pr_checks "$pr_number"
+         return 1
+       fi
+
+       if [[ "$queue_state" == UNMERGEABLE ]]; then
+         echo "PR #$pr_number became unmergeable at queue position $current_queue_position; inspect failed checks and requeue it:" >&2
+         show_pr_checks "$pr_number"
+         return 1
+       fi
+
+       if ((SECONDS >= deadline)); then
+         echo "PR #$pr_number did not merge within its position-$queue_position allowance of $((queue_position * 65)) minutes; inspect failed checks and requeue it:" >&2
+         show_pr_checks "$pr_number"
+         return 1
+       fi
+       sleep 15
      done
    }
 
