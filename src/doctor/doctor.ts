@@ -246,9 +246,12 @@ function testMcpHandshake(): Promise<CheckResult> {
       try { child.kill(); } catch {}
     };
     const stopChildAndFinish = (result: CheckResult): void => {
-      if (finished) return;
       stopChild();
       finish(result);
+    };
+    const finishForPipeFailure = (): void => {
+      if (finished || !childIsLive()) return;
+      stopChildAndFinish(resultFromOutput());
     };
     const stdinIsWritable = (): boolean => !finished
       && childIsLive()
@@ -261,9 +264,9 @@ function testMcpHandshake(): Promise<CheckResult> {
     child.on("error", () => {
       finish({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "Could not spawn MCP process" });
     });
-    child.stdin.on("error", () => { stopChildAndFinish(resultFromOutput()); });
+    child.stdin.on("error", finishForPipeFailure);
     child.stdin.on("close", () => {
-      if (!child.stdin.writableEnded) stopChildAndFinish(resultFromOutput());
+      if (!child.stdin.writableEnded) finishForPipeFailure();
     });
 
     timers.add(setTimeout(() => {
@@ -273,35 +276,35 @@ function testMcpHandshake(): Promise<CheckResult> {
 
     // Send initialize, wait 300ms, then send tools/list, then close stdin after 500ms
     if (!stdinIsWritable()) {
-      stopChildAndFinish(resultFromOutput());
+      finishForPipeFailure();
       return;
     }
     timers.add(setTimeout(() => {
       if (!stdinIsWritable()) {
-        stopChildAndFinish(resultFromOutput());
+        finishForPipeFailure();
         return;
       }
       timers.add(setTimeout(() => {
         if (!stdinIsWritable()) {
-          stopChildAndFinish(resultFromOutput());
+          finishForPipeFailure();
           return;
         }
         try {
           child.stdin.end();
         } catch {
-          stopChildAndFinish(resultFromOutput());
+          finishForPipeFailure();
         }
       }, 500));
       try {
         child.stdin.write(listMsg + "\n");
       } catch {
-        stopChildAndFinish(resultFromOutput());
+        finishForPipeFailure();
       }
     }, 300));
     try {
       child.stdin.write(initMsg + "\n");
     } catch {
-      stopChildAndFinish(resultFromOutput());
+      finishForPipeFailure();
     }
   });
 }

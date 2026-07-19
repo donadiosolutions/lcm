@@ -309,18 +309,35 @@ describe("doctor service coverage", () => {
     expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
   });
 
-  it("settles when the child exits before close and cancels delayed stdin work", async () => {
+  it.each([
+    ["exitCode", "tools-list"],
+    ["signalCode", "tools-list"],
+    ["exitCode", "stdin-end"],
+    ["signalCode", "stdin-end"],
+  ] as const)("waits for stdout close when the child sets %s before delayed %s", async (exitState, delayedAction) => {
     vi.useFakeTimers();
     mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      setTimeout(() => { child.exitCode = 0; }, 100);
-    };
+    mocks.mcpSetup = () => {};
 
-    const results = await runWithHandshake(healthyDeps());
-    expect(results.find((result) => result.name === "mcp-handshake-lcm")?.message).toContain("0/7");
-    expect(mocks.mcpChild?.stdin.write).toHaveBeenCalledTimes(1);
-    expect(mocks.mcpChild?.stdin.end).not.toHaveBeenCalled();
-    expect(mocks.mcpChild?.kill).not.toHaveBeenCalled();
+    const promise = runDoctor(healthyDeps());
+    await vi.advanceTimersByTimeAsync(0);
+    const child = mocks.mcpChild!;
+    await vi.advanceTimersByTimeAsync(delayedAction === "tools-list" ? 100 : 400);
+    if (exitState === "exitCode") child.exitCode = 0;
+    else child.signalCode = "SIGTERM";
+    await vi.advanceTimersByTimeAsync(delayedAction === "tools-list" ? 200 : 400);
+
+    expect(child.stdin.write).toHaveBeenCalledTimes(delayedAction === "tools-list" ? 1 : 2);
+    expect(child.stdin.end).not.toHaveBeenCalled();
+
+    child.stdout.emit("data", Buffer.from(JSON.stringify({ id: 2, method: "tools/list", result: { tools: Array(7).fill({}) } })));
+    child.emit("close", exitState === "exitCode" ? 0 : null, exitState === "signalCode" ? "SIGTERM" : null);
+
+    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({
+      status: "pass",
+      message: "lcm: 7/7 tools",
+    });
+    expect(child.kill).not.toHaveBeenCalled();
   });
 
   it("settles when stdin becomes unusable before the delayed close", async () => {
