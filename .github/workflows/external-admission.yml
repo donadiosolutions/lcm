@@ -50,10 +50,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  external-admission:
-    name: external-admission
+  external-admission-evaluator:
+    name: external-admission-evaluator
     if: >-
-      github.event_name == 'merge_group' ||
       (github.event_name == 'pull_request_target' && !github.event.pull_request.draft) ||
       (github.event_name == 'status' && github.event.context == 'CodeRabbit' &&
         github.event.creator.id == 136622811 && github.event.creator.login == 'coderabbitai[bot]') ||
@@ -69,30 +68,7 @@ jobs:
       REPOSITORY: ${{ github.repository }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
-      - name: Accept previously admitted merge group
-        if: ${{ github.event_name == 'merge_group' }}
-        env:
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          set -Eeuo pipefail
-
-          if [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "Invalid merge-group SHA." >&2
-            exit 1
-          fi
-
-          # Every PR was admitted only after all three providers succeeded on
-          # its exact head SHA. They do not report on synthetic merge commits.
-          echo "External providers passed before merge-queue admission."
-          gh api --method POST \
-            "repos/$REPOSITORY/statuses/$HEAD_SHA" \
-            -f state=success \
-            -f context=external-admission \
-            -f description="Providers passed before merge-queue admission" \
-            -f target_url="$RUN_URL" >/dev/null
-
       - name: Wait for external admission checks
-        if: ${{ github.event_name != 'merge_group' }}
         env:
           EVENT_HEAD_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.event_name == 'status' && github.event.sha || github.event.check_run.head_sha }}
           EVENT_PR_NUMBER: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || '' }}
@@ -250,3 +226,33 @@ jobs:
 
           echo "Timed out waiting for external admission checks." >&2
           exit 1
+
+  external-admission:
+    name: external-admission
+    if: ${{ github.event_name == 'merge_group' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      HEAD_SHA: ${{ github.sha }}
+    steps:
+      - name: Accept previously admitted merge group
+        run: |
+          set -Eeuo pipefail
+
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Invalid merge-group SHA." >&2
+            exit 1
+          fi
+
+          # Every PR was admitted only after all three providers succeeded on
+          # its exact head SHA. They do not report on synthetic merge commits.
+          echo "External providers passed before merge-queue admission."
+          gh api --method POST \
+            "repos/$REPOSITORY/statuses/$HEAD_SHA" \
+            -f state=success \
+            -f context=external-admission \
+            -f description="Providers passed before merge-queue admission" \
+            -f target_url="$RUN_URL" >/dev/null
