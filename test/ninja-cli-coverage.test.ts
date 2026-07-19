@@ -91,7 +91,7 @@ describe("renderFrame coverage boundaries", () => {
 
   it("renders a narrow terminal without a progress bar and with an uncolored failure", () => {
     const state = makeProgressState({ total: 2 });
-    state.errors.push({ sessionId: "bad", message: "failed" });
+    state.phaseErrors.push({ phase: "Promote", target: "/project", message: "failed" });
     const output = renderFrame(state, opts({ width: 20 }), 0);
     expect(output).toContain("1 failed");
     expect(output).not.toContain("[");
@@ -153,6 +153,10 @@ describe("printSummary", () => {
       phases: [{ name: "Import", status: "done" }, { name: "Compact", status: "done" }],
       completed: 2,
       errors: [{ sessionId: "broken", message: "network failed" }],
+      phaseErrors: [
+        { phase: "Promote", message: "daemon unavailable" },
+        { phase: "Promote", target: "/project", message: "request failed" },
+      ],
       messagesIn: 1_234,
       tokensIn: 1_000_000,
       tokensOut: 1_000,
@@ -163,13 +167,16 @@ describe("printSummary", () => {
     const output = writes.join("");
     expect(output).toContain("● Import  →  ● Compact          Done ✓");
     expect(output).toContain("[██████████████████████] 67%  1,234 msgs  ~1.0M → ~1.0k tokens, 1000.0×");
-    expect(output).toContain("Sessions     3 processed");
-    expect(output).toContain("DAG nodes    10  (+2 new)");
-    expect(output).toContain("DAG depth    3");
-    expect(output).toContain("Memories     4 promoted");
-    expect(output).toContain("Total time   2.5s");
-    expect(output).toContain("Failed       1");
+    expect(output).toContain("Sessions      3 processed");
+    expect(output).toContain("DAG nodes     10  (+2 new)");
+    expect(output).toContain("DAG depth     3");
+    expect(output).toContain("Memories      4 promoted");
+    expect(output).toContain("Total time    2.5s");
+    expect(output).toContain("Failed        1");
+    expect(output).toContain("Phase failed  2");
     expect(output).toContain("broken: network failed");
+    expect(output).toContain("Promote: daemon unavailable");
+    expect(output).toContain("Promote (/project): request failed");
   });
 
   it("prints an empty narrow summary with a 100 percent default", () => {

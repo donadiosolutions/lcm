@@ -75,6 +75,9 @@ export function printSummary(state: ProgressState, opts: RenderOpts): void {
   if (state.errors.length > 0) {
     rows.push(['Failed', String(state.errors.length)]);
   }
+  if (state.phaseErrors.length > 0) {
+    rows.push(['Phase failed', String(state.phaseErrors.length)]);
+  }
 
   const labelWidth = Math.max(...rows.map(([l]) => l.length));
   for (const [label, value] of rows) {
@@ -88,6 +91,12 @@ export function printSummary(state: ProgressState, opts: RenderOpts): void {
     process.stdout.write('\n  Failed:\n');
     for (const { sessionId, message } of state.errors) {
       process.stdout.write(`    ${sessionId}: ${message}\n`);
+    }
+  }
+  if (state.phaseErrors.length > 0) {
+    process.stdout.write('\n  Phase failures:\n');
+    for (const { phase, target, message } of state.phaseErrors) {
+      process.stdout.write(`    ${phase}${target ? ` (${target})` : ''}: ${message}\n`);
     }
   }
 

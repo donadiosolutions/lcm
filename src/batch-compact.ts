@@ -27,6 +27,19 @@ export interface BatchCompactResult {
   compactedProjects: string[];
 }
 
+type ReplayContextRow = {
+  ordinal: number;
+  item_type: "message" | "summary";
+  depth: number | null;
+  token_count: number | null;
+  content: string;
+};
+
+const MANUAL_COMPACT_LEAF_MIN_FANOUT = 3;
+const MANUAL_COMPACT_CONDENSED_MIN_FANOUT = 2;
+const MANUAL_COMPACT_SUMMARY_CHUNK_TOKENS = 20_000;
+const MANUAL_COMPACT_MIN_CONDENSED_TOKENS = 2_000;
+
 export function formatLlmDiagnostic(input: {
   providerLabel?: string;
   apiMode?: LlmApiMode;
@@ -69,6 +82,51 @@ function projectMatchesCwdFilter(projectHash: string, cwd: string, cwdFilter?: s
   return false;
 }
 
+function hasReplayCondensationCandidate(db: ReturnType<typeof getLcmConnection>, conversationId: number): boolean {
+  const items = db.prepare(`
+    SELECT ci.ordinal, ci.item_type, s.depth, s.token_count, s.content
+    FROM context_items ci
+    LEFT JOIN summaries s ON s.summary_id = ci.summary_id
+    WHERE ci.conversation_id = ?
+    ORDER BY ci.ordinal
+  `).all(conversationId) as unknown as ReplayContextRow[];
+  const rawOrdinals = items
+    .filter((item) => item.item_type === "message")
+    .map((item) => item.ordinal);
+  const freshTailOrdinal = rawOrdinals.length === 0
+    ? Infinity
+    : rawOrdinals[Math.max(0, rawOrdinals.length - MANUAL_COMPACT_FRESH_TAIL_COUNT)]!;
+  const depths = [...new Set(items
+    .filter((item) => item.ordinal < freshTailOrdinal && item.item_type === "summary" && item.depth !== null)
+    .map((item) => item.depth!))].sort((a, b) => a - b);
+
+  for (const depth of depths) {
+    let count = 0;
+    let tokens = 0;
+    let started = false;
+    for (const item of items) {
+      if (item.ordinal >= freshTailOrdinal) break;
+      if (item.item_type !== "summary" || item.depth !== depth) {
+        if (started) break;
+        continue;
+      }
+      const tokenCount = typeof item.token_count === "number" && item.token_count > 0
+        ? item.token_count
+        : Math.ceil(item.content.length / 4);
+      if (started && tokens + tokenCount > MANUAL_COMPACT_SUMMARY_CHUNK_TOKENS) break;
+      started = true;
+      count++;
+      tokens += tokenCount;
+      if (tokens >= MANUAL_COMPACT_SUMMARY_CHUNK_TOKENS) break;
+    }
+    const fanout = depth === 0
+      ? MANUAL_COMPACT_LEAF_MIN_FANOUT
+      : MANUAL_COMPACT_CONDENSED_MIN_FANOUT;
+    if (count >= fanout && tokens >= MANUAL_COMPACT_MIN_CONDENSED_TOKENS) return true;
+  }
+  return false;
+}
+
 export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): UncompactedConversation[] {
   const baseDir = lcmProjectsDir();
   if (!existsSync(baseDir)) return [];
@@ -101,6 +159,7 @@ export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?:
           c.session_id,
           COALESCE(m.msg_count, 0) as messages,
           COALESCE(m.raw_tokens, 0) as tokens,
+          COALESCE(ci.raw_context_count, 0) as raw_context_messages,
           COALESCE(s.sum_count, 0) as summaries
         FROM conversations c
         LEFT JOIN (
@@ -116,13 +175,14 @@ export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?:
           FROM summaries GROUP BY conversation_id
         ) s ON s.conversation_id = c.conversation_id
         WHERE COALESCE(m.msg_count, 0) > 0
-          AND COALESCE(ci.raw_context_count, 0) > ?
           AND (? OR COALESCE(s.sum_count, 0) = 0)
           AND COALESCE(m.raw_tokens, 0) >= ?
         ORDER BY COALESCE(m.raw_tokens, 0) DESC
-        `).all(MANUAL_COMPACT_FRESH_TAIL_COUNT, replay ? 1 : 0, minTokens) as { conversation_id: number; session_id: string; messages: number; tokens: number; summaries: number }[];
+        `).all(replay ? 1 : 0, minTokens) as { conversation_id: number; session_id: string; messages: number; tokens: number; raw_context_messages: number; summaries: number }[];
 
         for (const row of rows) {
+          const hasRawWork = row.raw_context_messages > MANUAL_COMPACT_FRESH_TAIL_COUNT;
+          if (!hasRawWork && !(replay && hasReplayCondensationCandidate(db, row.conversation_id))) continue;
           results.push({
             projectDir: projDir,
             cwd,
@@ -234,11 +294,14 @@ export async function batchCompact(opts: {
         });
       } else if (data.actionTaken === false) {
         unchanged++;
-        console.log(" unchanged (no compaction needed)");
+        const tokensBefore = data.tokensBefore ?? conv.tokens;
+        const tokensAfter = data.tokensAfter ?? tokensBefore;
+        const summary = data.summary?.trim() || "No compaction needed.";
+        console.log(` unchanged (${summary})`);
         onProgress?.({
           completed: doneCount,
           current: undefined,
-          lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore: conv.tokens, tokensAfter: conv.tokens, provider: formatLlmDiagnostic(data), elapsed: Date.now() - sessionStart },
+          lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore, tokensAfter, provider: formatLlmDiagnostic(data), elapsed: Date.now() - sessionStart },
         });
       } else {
         const tokensBefore = data.tokensBefore ?? conv.tokens;

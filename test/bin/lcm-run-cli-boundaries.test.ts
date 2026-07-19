@@ -37,6 +37,7 @@ const state = vi.hoisted(() => ({
   importResult: { imported: 1, skipped: 0 },
   importPatch: { lastResult: { ok: true } } as Record<string, unknown>,
   renderer: { start: vi.fn(), stop: vi.fn(), sessionDone: vi.fn(), printSummary: vi.fn() },
+  progressState: undefined as undefined | Record<string, unknown>,
   writeFile: vi.fn(), unlink: vi.fn(), mkdir: vi.fn(),
   dispatchHook: vi.fn(async () => ({ stdout: "", exitCode: 0 })),
 }));
@@ -89,9 +90,13 @@ vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.f
   if (state.batchError !== undefined) throw state.batchError;
   opts.onProgress?.(state.batchPatch); return state.batchResult;
 }) }));
-vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((value: Record<string, unknown>) => ({
-  total: 0, completed: 0, errors: [], tokensIn: 0, tokensOut: 0, messagesIn: 0, ...value,
-})) }));
+vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((value: Record<string, unknown>) => {
+  const progressState = {
+    total: 0, completed: 0, errors: [], phaseErrors: [], tokensIn: 0, tokensOut: 0, messagesIn: 0, ...value,
+  };
+  state.progressState = progressState;
+  return progressState;
+}) }));
 vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
   start = state.renderer.start; stop = state.renderer.stop;
   sessionDone = state.renderer.sessionDone; printSummary = state.renderer.printSummary;
@@ -455,6 +460,10 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     expect(state.renderer.printSummary).toHaveBeenCalled();
     expect(state.post).toHaveBeenCalledWith("/promote", { cwd: "/good", dry_run: false });
     expect(process.exitCode).toBe(1);
+    expect(state.progressState?.errors).toEqual([]);
+    expect(state.progressState?.phaseErrors).toEqual([
+      { phase: "Promote", target: "/good", message: "best effort" },
+    ]);
   });
 
   it("covers TTY all-provider import directory filtering", async () => {

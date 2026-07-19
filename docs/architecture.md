@@ -102,7 +102,9 @@ threshold. When the daemon reports `actionTaken`, LCM promotes only projects
 where it actually created a summary; explicit daemon no-ops are reported as
 unchanged and do not trigger promotion. Older daemons that omit `actionTaken`
 retain legacy success semantics, so a successful no-op response may still
-trigger promotion for that project.
+trigger promotion for that project. Replay mode also admits conversations with
+no leaf work outside the fresh tail when their existing in-context summaries
+meet the manual condensation fanout and token thresholds.
 
 **Budget-targeted (`compactUntilUnder`):**
 - Runs up to `maxRounds` (default 10) of full sweeps

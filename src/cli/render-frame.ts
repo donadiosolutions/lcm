@@ -116,7 +116,7 @@ export function renderFrame(
   // Line 1: phase bar + progress counter + failures
   const phaseBar = renderPhaseBar(state);
   const counter = state.total > 0 ? `${state.completed}/${state.total}` : '';
-  const failCount = state.errors.length;
+  const failCount = state.errors.length + state.phaseErrors.length;
   const failStr = failCount > 0
     ? (color ? `  ${RED}${failCount} failed${RESET}` : `  ${failCount} failed`)
     : '';

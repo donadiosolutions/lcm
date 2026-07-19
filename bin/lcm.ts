@@ -821,7 +821,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
               } catch (error) {
                 promotionFailures++;
                 const message = error instanceof Error ? error.message : "request failed";
-                compactState.errors.push({ sessionId: `promote:${promoteCwd}`, message });
+                compactState.phaseErrors.push({ phase: "Promote", target: promoteCwd, message });
                 console.error(`  promotion failed for ${promoteCwd}: ${message}`);
               }
             }

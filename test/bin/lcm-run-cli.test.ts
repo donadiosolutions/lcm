@@ -96,7 +96,7 @@ vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.f
   return state.batchResult;
 }) }));
 vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((value: Record<string, unknown>) => ({
-  total: 0, completed: 0, errors: [], tokensIn: 0, tokensOut: 0, messagesIn: 0, ...value,
+  total: 0, completed: 0, errors: [], phaseErrors: [], tokensIn: 0, tokensOut: 0, messagesIn: 0, ...value,
 })) }));
 vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
   start = vi.fn(); stop = vi.fn(); sessionDone = vi.fn(); printSummary = vi.fn();

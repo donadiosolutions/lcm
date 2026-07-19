@@ -234,15 +234,55 @@ describe("batch compaction discovery", () => {
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
     seedConversations(paths.dbPath);
     vi.spyOn(DaemonClient.prototype, "post")
-      .mockResolvedValueOnce({ actionTaken: false, tokensBefore: 250, tokensAfter: 250 })
+      .mockResolvedValueOnce({
+        actionTaken: false,
+        summary: "Summarization disabled — no summarizer configured.",
+        tokensBefore: 125,
+        tokensAfter: 120,
+      })
       .mockResolvedValueOnce({ actionTaken: true, tokensBefore: 250, tokensAfter: 50 });
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Partial<ProgressState>> = [];
 
-    const result = await batchCompact({ minTokens: 100, dryRun: false, port: 3737, cwd });
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      onProgress: patch => progress.push(patch),
+    });
 
     expect(result).toEqual({ compacted: 1, unchanged: 1, skipped: 0, failures: 0, compactedProjects: [paths.canonical] });
-    expect(log).toHaveBeenCalledWith(" unchanged (no compaction needed)");
+    expect(log).toHaveBeenCalledWith(" unchanged (Summarization disabled — no summarizer configured.)");
+    expect(progress.find(patch => patch.lastResult?.sessionId === "session-1")?.lastResult).toMatchObject({
+      tokensBefore: 125,
+      tokensAfter: 120,
+    });
+  });
+
+  it("falls back to stored tokens and a generic message for metadata-free daemon no-ops", async () => {
+    const cwd = makeDir("compact-noop-fallbacks");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ actionTaken: false });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      onProgress: patch => progress.push(patch),
+    });
+
+    expect(result).toEqual({ compacted: 0, unchanged: 1, skipped: 0, failures: 0, compactedProjects: [] });
+    expect(log).toHaveBeenCalledWith(" unchanged (No compaction needed.)");
+    expect(progress.at(-1)?.lastResult).toMatchObject({ tokensBefore: 250, tokensAfter: 250 });
   });
 
   it("sends a process-provider timeout without an implicit retry override", async () => {
@@ -327,6 +367,67 @@ describe("batch compaction discovery", () => {
       replayDb.close();
     }
     expect(findUncompacted(100, true, cwd, true)).toEqual([]);
+
+    const condensationDb = new DatabaseSync(paths.dbPath);
+    try {
+      condensationDb.exec("PRAGMA journal_mode = WAL");
+      condensationDb.exec("PRAGMA foreign_keys = ON");
+      condensationDb.exec("BEGIN");
+      const insertSummary = condensationDb.prepare(
+        "INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, depth, file_ids) VALUES (?, ?, ?, ?, ?, ?, '[]')",
+      );
+      insertSummary.run("summary-2", 1, "leaf", "summary", 1_000, 0);
+      insertSummary.run("summary-3", 1, "leaf", "x".repeat(4_000), 0, 0);
+      const replaceMessage = condensationDb.prepare(
+        "UPDATE context_items SET item_type = 'summary', message_id = NULL, summary_id = ? WHERE conversation_id = ? AND ordinal = ?",
+      );
+      replaceMessage.run("summary-2", 1, 1);
+      replaceMessage.run("summary-3", 1, 2);
+      condensationDb.exec("COMMIT");
+    } finally {
+      condensationDb.close();
+    }
+    expect(findUncompacted(100, true, cwd, true)).toHaveLength(1);
+
+    const interruptedRunDb = new DatabaseSync(paths.dbPath);
+    try {
+      interruptedRunDb.prepare("UPDATE summaries SET depth = CASE summary_id WHEN 'summary-1' THEN 1 ELSE 0 END WHERE conversation_id = ?").run(1);
+    } finally {
+      interruptedRunDb.close();
+    }
+    expect(findUncompacted(100, true, cwd, true)).toEqual([]);
+
+    const chunkLimitDb = new DatabaseSync(paths.dbPath);
+    try {
+      chunkLimitDb.prepare("UPDATE summaries SET depth = 0, token_count = CASE summary_id WHEN 'summary-1' THEN 15000 WHEN 'summary-2' THEN 6000 ELSE 1000 END WHERE conversation_id = ?").run(1);
+    } finally {
+      chunkLimitDb.close();
+    }
+    expect(findUncompacted(100, true, cwd, true)).toEqual([]);
+
+    const fullChunkDb = new DatabaseSync(paths.dbPath);
+    try {
+      fullChunkDb.prepare("UPDATE summaries SET token_count = CASE summary_id WHEN 'summary-1' THEN 20000 ELSE 1000 END WHERE conversation_id = ?").run(1);
+    } finally {
+      fullChunkDb.close();
+    }
+    expect(findUncompacted(100, true, cwd, true)).toEqual([]);
+
+    const condensedDb = new DatabaseSync(paths.dbPath);
+    try {
+      condensedDb.prepare("UPDATE summaries SET depth = 1, token_count = 1000 WHERE conversation_id = ?").run(1);
+    } finally {
+      condensedDb.close();
+    }
+    expect(findUncompacted(100, true, cwd, true)).toHaveLength(1);
+
+    const summaryOnlyDb = new DatabaseSync(paths.dbPath);
+    try {
+      summaryOnlyDb.prepare("DELETE FROM context_items WHERE conversation_id = ? AND item_type = 'message'").run(1);
+    } finally {
+      summaryOnlyDb.close();
+    }
+    expect(findUncompacted(100, true, cwd, true)).toHaveLength(1);
 
     writeFileSync(projectMapPath(), "{");
     clearProjectMapCache();

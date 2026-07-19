@@ -10,6 +10,7 @@ const verboseTTY: RenderOpts = { isTTY: true, width: 80, color: false, verbose: 
 describe("renderFrame — non-TTY mode", () => {
   it("returns empty string when no lastResult", () => {
     const state = makeProgressState({ total: 5 });
+    expect(state.phaseErrors).toEqual([]);
     expect(renderFrame(state, nonTTY)).toBe("");
   });
 
