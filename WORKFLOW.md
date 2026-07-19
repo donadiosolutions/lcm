@@ -117,6 +117,10 @@ the Codecov result already verified on the exact PR head.
    pr_number=<number>
    deadline=$((SECONDS + 65 * 60))
 
+   show_pr_checks() {
+     gh pr checks "$pr_number" --repo donadiosolutions/lcm >&2 || true
+   }
+
    while :; do
      state=$(gh pr view "$pr_number" --repo donadiosolutions/lcm --json state --jq .state)
      case "$state" in
@@ -124,12 +128,16 @@ the Codecov result already verified on the exact PR head.
        OPEN)
          if ((SECONDS >= deadline)); then
            echo "PR #$pr_number did not merge within 65 minutes; resolve failed checks and requeue it:" >&2
-           gh pr checks "$pr_number" --repo donadiosolutions/lcm >&2
+           show_pr_checks
            exit 1
          fi
          sleep 15
          ;;
-       *) echo "PR #$pr_number entered unexpected state: $state" >&2; exit 1 ;;
+       *)
+         echo "PR #$pr_number entered unexpected state: $state" >&2
+         show_pr_checks
+         exit 1
+         ;;
      esac
    done
    ```
@@ -139,7 +147,7 @@ the Codecov result already verified on the exact PR head.
 1. **Sync first:** `git checkout main && git pull --ff-only origin main` to get latest (including merged specs)
 2. Dispatch `model: sonnet` subagents with `isolation: worktree` for each task in the plan
 3. **Independent tasks** → launch in parallel (e.g., PR A: delete files, PR D: add new module)
-4. **Sequential tasks** → launch the dependent branch only after the upstream PR lands through the queue, then branch from the updated `main`. If a downstream branch already exists on the old upstream tip, replay only its downstream commits with `git fetch origin main && git rebase --onto origin/main <old-upstream-tip> <downstream-branch>`.
+4. **Sequential tasks** → launch the dependent branch only after the upstream PR lands through the queue, then branch from the updated `main`. If a downstream branch already exists on the old upstream tip, enter its isolated worktree and replay only its downstream commits with `git fetch origin main && git rebase --onto origin/main <old-upstream-tip>`. Omitting the branch argument rebases the already checked-out downstream branch without asking Git to check it out in another worktree.
 5. Each subagent: implement code + tests, run `npm test`, commit (do NOT push)
 6. After subagent completes: review the diff, push, open PR, request Copilot review
 
@@ -232,4 +240,4 @@ gh api repos/{owner}/{repo}/pulls/{n}/comments \
 - **REST API 422 for Copilot bot**: The `requested_reviewers` REST endpoint rejects bot slugs. Use `gh pr edit --add-reviewer` instead.
 - **Empty commits don't trigger Copilot**: Copilot only reviews on substantive diffs. Use `gh pr edit` re-request instead.
 - **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Use `git checkout -B <clean-branch> origin/main && git cherry-pick <docs-commits>`.
-- **Sequential PR chains**: Create PR B from updated `main` only after PR A lands. If PR B already contains commits based on PR A's old tip, replay only its own commits with `git fetch origin main && git rebase --onto origin/main <old-PR-A-tip> <PR-B-branch>`.
+- **Sequential PR chains**: Create PR B from updated `main` only after PR A lands. If PR B already contains commits based on PR A's old tip, enter PR B's isolated worktree and replay only its own commits with `git fetch origin main && git rebase --onto origin/main <old-PR-A-tip>`. Omit the branch argument so Git rebases the branch already checked out in that worktree instead of attempting a conflicting cross-worktree checkout.
