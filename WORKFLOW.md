@@ -14,7 +14,7 @@ This document is a living record. **Update it whenever you learn something:**
 
 **When to update:** At the end of every feature cycle (after the implementation PR merges), review this doc against what actually happened. If reality diverged from the doc, fix the doc — not reality.
 
-**How to update:** Create a `docs/<topic>` branch, push, get Copilot review, then queue it for main with `gh pr merge <number> --repo donadiosolutions/lcm --auto --squash`. Same flow as any other docs change.
+**How to update:** Create a `docs/TOPIC` branch, push, get Copilot review, then set `PR_NUMBER` to the pull request number and queue it for main with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`. Same flow as any other docs change.
 
 ## Branch Strategy
 
@@ -23,7 +23,7 @@ feature/docs branches → main (default, protected)
 ```
 
 - **`main`** — Default branch. All PRs target main. Protected: PRs and the merge queue are required; no force push. Pushing a matching `vX.Y.Z` tag triggers the publish workflow.
-- **Feature branches** — `feat/<topic>`, `docs/<topic>`, `fix/<topic>`. Always branch from main and use an isolated worktree for each concurrent change.
+- **Feature branches** — `feat/TOPIC`, `docs/TOPIC`, `fix/TOPIC`. Always branch from main and use an isolated worktree for each concurrent change.
 
 Independent changes may be developed in parallel on isolated branches and worktrees, but the required merge queue serializes landings into `main`. Dependent work must wait for its upstream PR to merge, then fetch and rebase onto the new `main` before it is queued.
 
@@ -105,36 +105,36 @@ the Codecov result already verified on the exact PR head.
 ## Phase 2: Spec Review via PR
 
 1. **Sync first:** `git checkout main && git pull --ff-only origin main` before branching — stale local bases cause Copilot to review unrelated code
-2. Create `docs/<topic>` branch from main
+2. Create a `docs/TOPIC` branch from main
 3. Ensure only documentation files are in the diff — specs, plans, workflow docs
 4. Push and open PR
 5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
 6. Run review loop (see Copilot Review Loop below)
-7. Once Copilot has no issues (max 3 rounds — see Review Loop), queue the PR with `gh pr merge <number> --repo donadiosolutions/lcm --auto --squash`
+7. Once Copilot has no issues (max 3 rounds — see Review Loop), set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
 8. Wait up to 65 minutes for the queued PR to land before starting implementation. This allows five minutes beyond the merge queue's 60-minute check timeout and fails with check diagnostics if GitHub removes or rejects the still-open PR:
 
    ```bash
-   pr_number=<number>
+   PR_NUMBER=123
    deadline=$((SECONDS + 65 * 60))
 
    show_pr_checks() {
-     gh pr checks "$pr_number" --repo donadiosolutions/lcm >&2 || true
+     gh pr checks "$PR_NUMBER" --repo donadiosolutions/lcm >&2 || true
    }
 
    while :; do
-     state=$(gh pr view "$pr_number" --repo donadiosolutions/lcm --json state --jq .state)
+     state=$(gh pr view "$PR_NUMBER" --repo donadiosolutions/lcm --json state --jq .state)
      case "$state" in
        MERGED) break ;;
        OPEN)
          if ((SECONDS >= deadline)); then
-           echo "PR #$pr_number did not merge within 65 minutes; resolve failed checks and requeue it:" >&2
+           echo "PR #$PR_NUMBER did not merge within 65 minutes; resolve failed checks and requeue it:" >&2
            show_pr_checks
            exit 1
          fi
          sleep 15
          ;;
        *)
-         echo "PR #$pr_number entered unexpected state: $state" >&2
+         echo "PR #$PR_NUMBER entered unexpected state: $state" >&2
          show_pr_checks
          exit 1
          ;;
@@ -147,7 +147,7 @@ the Codecov result already verified on the exact PR head.
 1. **Sync first:** `git checkout main && git pull --ff-only origin main` to get latest (including merged specs)
 2. Dispatch `model: sonnet` subagents with `isolation: worktree` for each task in the plan
 3. **Independent tasks** → launch in parallel (e.g., PR A: delete files, PR D: add new module)
-4. **Sequential tasks** → launch the dependent branch only after the upstream PR lands through the queue, then branch from the updated `main`. If a downstream branch already exists on the old upstream tip, enter its isolated worktree and replay only its downstream commits with `git fetch origin main && git rebase --onto origin/main <old-upstream-tip>`. Omitting the branch argument rebases the already checked-out downstream branch without asking Git to check it out in another worktree.
+4. **Sequential tasks** → launch the dependent branch only after the upstream PR lands through the queue, then branch from the updated `main`. If a downstream branch already exists on the old upstream tip, enter its isolated worktree, set `OLD_UPSTREAM_TIP` to that commit, and replay only its downstream commits with `git fetch origin main && git rebase --onto origin/main "${OLD_UPSTREAM_TIP}"`. Omitting the branch argument rebases the already checked-out downstream branch without asking Git to check it out in another worktree.
 5. Each subagent: implement code + tests, run `npm test`, commit (do NOT push)
 6. After subagent completes: review the diff, push, open PR, request Copilot review
 
@@ -163,7 +163,7 @@ the Codecov result already verified on the exact PR head.
 1. Push implementation branch, open PR
 2. Request Copilot review (add to reviewers list)
 3. Run review loop (see below)
-4. Once Copilot review has no remaining inline comments, queue the PR with `gh pr merge <number> --repo donadiosolutions/lcm --auto --squash`
+4. Once Copilot review has no remaining inline comments, set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
 5. Wait for the implementation PR to land by repeating the bounded 65-minute merge wait from Phase 2, using the implementation PR number. Do not begin post-merge validation or dependent work until it reports `MERGED`.
 
 ## Copilot Interaction
@@ -224,7 +224,7 @@ gh api repos/{owner}/{repo}/pulls/{n}/comments \
 ### Copilot Review Loop
 
 1. Request review (POST to requested_reviewers)
-2. Launch ONE background command: `sleep 180 && <check review count + comments>`
+2. Launch one background polling command that sleeps for 180 seconds before checking the review count and comments
 3. When notified, check latest review state and new comments
 4. If comments found:
    a. **Batch ALL fixes** into a single commit (do not fix-push-review one at a time)
@@ -239,5 +239,5 @@ gh api repos/{owner}/{repo}/pulls/{n}/comments \
 - **@copilot in comments**: Opens a new PR instead of triggering review. Always use the reviewers API.
 - **REST API 422 for Copilot bot**: The `requested_reviewers` REST endpoint rejects bot slugs. Use `gh pr edit --add-reviewer` instead.
 - **Empty commits don't trigger Copilot**: Copilot only reviews on substantive diffs. Use `gh pr edit` re-request instead.
-- **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Use `git checkout -B <clean-branch> origin/main && git cherry-pick <docs-commits>`.
-- **Sequential PR chains**: Create PR B from updated `main` only after PR A lands. If PR B already contains commits based on PR A's old tip, enter PR B's isolated worktree and replay only its own commits with `git fetch origin main && git rebase --onto origin/main <old-PR-A-tip>`. Omit the branch argument so Git rebases the branch already checked out in that worktree instead of attempting a conflicting cross-worktree checkout.
+- **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Set `CLEAN_BRANCH` to the new branch name and `DOCS_COMMIT_SHA` to the documentation commit, then use `git checkout -B "${CLEAN_BRANCH}" origin/main && git cherry-pick "${DOCS_COMMIT_SHA}"`.
+- **Sequential PR chains**: Create PR B from updated `main` only after PR A lands. If PR B already contains commits based on PR A's old tip, enter PR B's isolated worktree, set `OLD_PR_A_TIP` to that commit, and replay only its own commits with `git fetch origin main && git rebase --onto origin/main "${OLD_PR_A_TIP}"`. Omit the branch argument so Git rebases the branch already checked out in that worktree instead of attempting a conflicting cross-worktree checkout.
