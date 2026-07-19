@@ -303,10 +303,15 @@ async function drainEventsForCwdUnlocked(
       config.security.sensitivePatterns,
       dirname(dbPath),
     );
-    const scrubCache = new Map<string, string>();
-
     for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
-      const batchResult = await promoteEventsBatch(config, cwd, edb, store, scrubber, scrubCache);
+      const batchResult = await promoteEventsBatch(
+        config,
+        cwd,
+        edb,
+        store,
+        scrubber,
+        new Map(),
+      );
       if (batchResult.message === "no unprocessed events") {
         result.message = result.batches === 0
           ? "no unprocessed events"

@@ -981,9 +981,14 @@ describe("importSessions — provider: codex", () => {
     };
     const claudeProjectsDir = makeTmpDir();
     const codexDir = makeTmpDir();
+    const projectA = makeTmpDir();
+    const projectB = makeTmpDir();
+    const aliasParent = makeTmpDir();
+    const projectAAlias = join(aliasParent, "project-a-alias");
+    symlinkSync(projectA, projectAAlias, "dir");
     const archivedDir = join(codexDir, "archived_sessions");
     mkdirSync(archivedDir, { recursive: true });
-    const claudeProjectDir = join(claudeProjectsDir, cwdToProjectHash("/project-a"));
+    const claudeProjectDir = join(claudeProjectsDir, cwdToProjectHash(projectA));
     mkdirSync(claudeProjectDir, { recursive: true });
     const claudeSessions = ["claude-1", "claude-2"];
     claudeSessions.forEach((id, index) => {
@@ -993,9 +998,9 @@ describe("importSessions — provider: codex", () => {
       utimesSync(path, time, time);
     });
     const sessions = [
-      ["a1", "/project-a"],
-      ["b1", "/project-b"],
-      ["c1", "/project-a"],
+      ["a1", projectA],
+      ["b1", projectB],
+      ["c1", projectAAlias],
     ] as const;
     sessions.forEach(([id, cwd], index) => {
       const path = join(archivedDir, `${id}.jsonl`);
@@ -1014,7 +1019,7 @@ describe("importSessions — provider: codex", () => {
     });
     await importSessions(client, {
       provider: "all",
-      cwd: "/project-a",
+      cwd: projectA,
       replay: true,
       _claudeProjectsDir: claudeProjectsDir,
       _codexDir: codexDir,

@@ -2,7 +2,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it, expect } from "vitest";
-import { getLcmConnection, closeLcmConnection, getPoolStats, withLcmConnectionLock } from "../../src/db/connection.js";
+import {
+  getLcmConnection,
+  closeLcmConnection,
+  getPoolStats,
+  withLcmConnectionLock,
+  withYieldingLcmConnectionLock,
+} from "../../src/db/connection.js";
 
 const tempDirs: string[] = [];
 
@@ -114,5 +120,40 @@ describe("withLcmConnectionLock", () => {
     release();
     await Promise.all([first, second]);
     expect(order).toEqual(["first-start", "other", "first-end", "second"]);
+  });
+
+  it("lets queued database work proceed while a slow operation is yielded", async () => {
+    const order: string[] = [];
+    let releaseSlow!: () => void;
+    const slowGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
+    const first = withYieldingLcmConnectionLock("one", async (lock) => {
+      order.push("first-db");
+      await lock.yieldWhile(async () => {
+        order.push("slow-start");
+        await slowGate;
+        order.push("slow-end");
+      });
+      order.push("first-resumed");
+    });
+    await Promise.resolve();
+    const queued = withLcmConnectionLock("one", () => { order.push("queued-db"); });
+    await queued;
+    expect(order).toEqual(["first-db", "slow-start", "queued-db"]);
+    releaseSlow();
+    await first;
+    expect(order).toEqual(["first-db", "slow-start", "queued-db", "slow-end", "first-resumed"]);
+  });
+
+  it("reacquires the database lock before propagating a yielded failure", async () => {
+    const failure = new Error("summarizer failed");
+    const order: string[] = [];
+    const first = withYieldingLcmConnectionLock("one", async (lock) => {
+      await lock.yieldWhile(async () => { throw failure; });
+    });
+    const queued = withLcmConnectionLock("one", () => { order.push("queued"); });
+    await expect(first).rejects.toBe(failure);
+    await queued;
+    await withLcmConnectionLock("one", () => { order.push("after"); });
+    expect(order).toEqual(["queued", "after"]);
   });
 });

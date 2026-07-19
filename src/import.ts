@@ -7,6 +7,7 @@ import { findAllCodexTranscripts, extractCodexSessionCwd } from "./codex-transcr
 import type { ProgressState } from "./cli/progress-state.js";
 import type { TranscriptClient } from "./transcript-provider.js";
 import { lcmHomeDir } from "./runtime-paths.js";
+import { projectId } from "./daemon/project.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
 
@@ -172,7 +173,7 @@ async function ingestSessionList(
   const total = sessions.length;
 
   for (const { path, sessionId, cwd, client: clientName } of sessions) {
-    const replayKey = `${clientName}\u0000${cwd}`;
+    const replayKey = `${clientName}\u0000${projectId(cwd)}`;
     if (options.dryRun) {
       if (options.verbose) {
         const replayNote = options.replay ? " (would compact)" : "";

@@ -72,9 +72,10 @@ export function createPromoteHandler(
           const summaries = await summStore.getSummariesByConversation(conversation.conversationId);
 
           for (const summary of summaries) {
+            const scrubbedContent = scrubber.scrub(summary.content);
             // Skip summaries whose content prefix is already in the promoted store
             // This prevents re-promoting on repeated runs (which would decay confidence)
-            if (alreadyPromotedContent.has(summary.content.slice(0, 100))) continue;
+            if (alreadyPromotedContent.has(scrubbedContent.slice(0, 100))) continue;
 
             processed++;
 
@@ -96,7 +97,7 @@ export function createPromoteHandler(
               try {
                 await deduplicateAndInsert({
                   store: promotedStore,
-                  content: scrubber.scrub(summary.content),
+                  content: scrubbedContent,
                   tags: promotionResult.tags.map((tag) => scrubber.scrub(tag)),
                   projectId: pid,
                   sessionId: conversation.sessionId,
@@ -107,6 +108,7 @@ export function createPromoteHandler(
                     dedupCandidateLimit: config.compaction.promotionThresholds.dedupCandidateLimit,
                   },
                 });
+                alreadyPromotedContent.add(scrubbedContent.slice(0, 100));
                 promoted++;
               } catch { /* non-fatal — don't count failed promotions */ }
             }
