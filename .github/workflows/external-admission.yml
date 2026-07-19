@@ -230,6 +230,7 @@ jobs:
   external-admission:
     name: external-admission
     if: ${{ github.event_name == 'merge_group' }}
+    permissions: {}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
