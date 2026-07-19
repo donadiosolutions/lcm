@@ -23,6 +23,15 @@ afterEach(() => {
 });
 
 describe("isLcmConnectionOpen", () => {
+  it("opens SQLite's in-memory target without filesystem permission work", () => {
+    const db = getLcmConnection(":memory:");
+
+    db.exec("CREATE TABLE memory_only (value TEXT)");
+    db.prepare("INSERT INTO memory_only (value) VALUES (?)").run("available");
+    expect(db.prepare("SELECT value FROM memory_only").get()).toEqual({ value: "available" });
+    expect(isLcmConnectionOpen(":memory:")).toBe(true);
+  });
+
   it("evicts and replaces an unhealthy pooled handle", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-unhealthy-test-"));
     tempDirs.push(tempDir);

@@ -13,6 +13,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  type Stats,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -165,7 +166,7 @@ export function writePrivateFileExclusive(
 
 /** Delete a regular file without following a symlink. */
 export function deleteRegularFile(path: string): boolean {
-  let stat;
+  let stat: Stats;
   try {
     stat = lstatSync(path);
   } catch (error) {

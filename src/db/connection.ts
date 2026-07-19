@@ -43,19 +43,23 @@ export function getLcmConnection(dbPath: string): DatabaseSync {
     _connections.delete(dbPath);
   }
 
-  // Ensure parent directory exists
-  ensurePrivateDirectory(dirname(dbPath));
-  try {
-    if (lstatSync(dbPath).isSymbolicLink()) {
-      throw new Error(`refusing to open a symlink database path: ${dbPath}`);
+  const isInMemory = dbPath === ":memory:";
+  if (!isInMemory) {
+    // Filesystem hardening applies only to persistent database paths. SQLite's
+    // special :memory: target has no parent directory or file to secure.
+    ensurePrivateDirectory(dirname(dbPath));
+    try {
+      if (lstatSync(dbPath).isSymbolicLink()) {
+        throw new Error(`refusing to open a symlink database path: ${dbPath}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 
   const db = new DatabaseSync(dbPath);
   try {
-    chmodSync(dbPath, PRIVATE_FILE_MODE);
+    if (!isInMemory) chmodSync(dbPath, PRIVATE_FILE_MODE);
     // Enable WAL mode for better concurrent read performance
     db.exec("PRAGMA journal_mode = WAL");
     // Wait up to 5 seconds on busy instead of failing immediately
