@@ -16,8 +16,10 @@ import {
   parseChangesetDocument,
   parseHighlightsResult,
   parseReleaseTag,
+  releaseDraftMarker,
   renderReleaseNotes,
   selectPreviousRelease,
+  verifyNpmRelease,
 } from "./release-policy.mjs";
 
 const changeset = (bump, summary = "Ship the requested behavior.") =>
@@ -453,22 +455,32 @@ test("builds an injection-aware Highlights prompt and validates structured outpu
   assert.throws(() => parseHighlightsResult('{"highlights":["ok"],"extra":true}'), /only a highlights array/u);
 });
 
-test("renders Highlights always and omits empty release sections", () => {
+test("renders tag-bound Highlights and omits empty release sections", () => {
+  const targetTag = "v1.5.0-beta.2";
   const categorized = categorizeReleasePullRequests([
     { pr: pr(1, ["enhancement"], { title: "Add [beta] support" }) },
     { pr: pr(2) },
   ]);
-  const notes = renderReleaseNotes({ highlights: ["Beta releases are now available."], categorized });
-  assert.match(notes, new RegExp(RELEASE_DRAFT_MARKER));
+  const notes = renderReleaseNotes({
+    targetTag,
+    highlights: ["Beta releases are now available."],
+    categorized,
+  });
+  assert.equal(releaseDraftMarker(targetTag), `${RELEASE_DRAFT_MARKER}${targetTag} -->`);
+  assert.match(notes, new RegExp(releaseDraftMarker(targetTag)));
   assert.match(notes, /## Highlights/u);
   assert.doesNotMatch(notes, /## Breaking changes/u);
   assert.match(notes, /## Features/u);
   assert.doesNotMatch(notes, /## Fixes/u);
   assert.match(notes, /## Extra notes/u);
   assert.ok(notes.includes("Add \\[beta\\] support (#1)"));
-  assertActionCreatedReleaseBody(notes);
-  assert.throws(() => assertActionCreatedReleaseBody("## Highlights\n\n- Missing marker"), /not created/u);
-  assert.throws(() => renderReleaseNotes({ highlights: [], categorized }), /at least one/u);
+  assertActionCreatedReleaseBody(notes, targetTag);
+  assert.throws(() => assertActionCreatedReleaseBody(notes, "v1.5.0-beta.1"), /not created/u);
+  assert.throws(
+    () => assertActionCreatedReleaseBody("## Highlights\n\n- Missing marker", targetTag),
+    /not created/u,
+  );
+  assert.throws(() => renderReleaseNotes({ targetTag, highlights: [], categorized }), /at least one/u);
 });
 
 test("queries npm release state with E404-only missing-package handling", () => {
@@ -495,6 +507,26 @@ test("queries npm release state with E404-only missing-package handling", () => 
     ["view", "@donadiosolutions/lcm@1.5.0-beta.0", "version"],
     ["view", "@donadiosolutions/lcm", "dist-tags", "--json"],
   ]);
+
+  assert.throws(
+    () =>
+      checkNpmReleaseState({
+        version: "1.5.0-beta.0",
+        runNpm: () => ({ status: 0, stdout: "", stderr: "" }),
+      }),
+    /empty response.*1\.5\.0-beta\.0/u,
+  );
+  const emptyDistTags = [
+    { status: 1, stdout: "", stderr: "npm error code E404" },
+    { status: 0, stdout: "", stderr: "" },
+  ];
+  assert.deepEqual(
+    checkNpmReleaseState({
+      version: "1.5.0-beta.0",
+      runNpm: () => emptyDistTags.shift(),
+    }),
+    { alreadyPublished: false, distTags: {} },
+  );
 
   assert.throws(
     () =>
@@ -527,6 +559,38 @@ test("queries npm release state with E404-only missing-package handling", () => 
         runNpm: () => staleResults.shift(),
       }),
     /Refusing to move npm beta/u,
+  );
+});
+
+test("verifies published npm state without environment-sized JSON payloads", () => {
+  const success = [
+    { status: 0, stdout: "1.5.0-beta.2\n", stderr: "" },
+    { status: 0, stdout: '["1.4.1","1.5.0-beta.2"]', stderr: "" },
+    { status: 0, stdout: '{"latest":"1.4.1","beta":"1.5.0-beta.2"}', stderr: "" },
+  ];
+  assert.deepEqual(
+    verifyNpmRelease({ version: "1.5.0-beta.2", runNpm: () => success.shift() }),
+    {
+      versions: ["1.4.1", "1.5.0-beta.2"],
+      distTags: { latest: "1.4.1", beta: "1.5.0-beta.2" },
+    },
+  );
+  assert.throws(
+    () =>
+      verifyNpmRelease({
+        version: "1.5.0-beta.2",
+        runNpm: () => ({ status: 1, stdout: "", stderr: "npm error code E404" }),
+      }),
+    /was not published/u,
+  );
+  const malformed = [
+    { status: 0, stdout: "1.5.0-beta.2", stderr: "" },
+    { status: 0, stdout: "not-json", stderr: "" },
+    { status: 0, stdout: '{"latest":"1.4.1","beta":"1.5.0-beta.2"}', stderr: "" },
+  ];
+  assert.throws(
+    () => verifyNpmRelease({ version: "1.5.0-beta.2", runNpm: () => malformed.shift() }),
+    /invalid JSON.*versions/u,
   );
 });
 

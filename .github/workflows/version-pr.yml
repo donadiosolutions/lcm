@@ -15,18 +15,53 @@ on:
           - stable
 
 permissions:
+  actions: read
   contents: write
   issues: write
   pull-requests: write
-
-concurrency:
-  group: version-packages-main
-  cancel-in-progress: false
 
 jobs:
   version:
     runs-on: ubuntu-latest
     steps:
+      - name: Wait for earlier version runs
+        timeout-minutes: 65
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const currentRunId = Number(context.runId);
+            if (!Number.isSafeInteger(currentRunId)) {
+              throw new Error(`Invalid workflow run id ${context.runId}`);
+            }
+            const timeoutMs = 60 * 60 * 1000;
+            const pollMs = 15 * 1000;
+            const startedAt = performance.now();
+            for (;;) {
+              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                ...context.repo,
+                workflow_id: "version-pr.yml",
+                per_page: 100,
+              });
+              const earlierActiveRuns = runs
+                .filter(
+                  (run) =>
+                    run.id < currentRunId &&
+                    run.status !== "completed" &&
+                    ["push", "workflow_dispatch"].includes(run.event),
+                )
+                .sort((left, right) => left.id - right.id);
+              if (earlierActiveRuns.length === 0) break;
+              if (performance.now() - startedAt >= timeoutMs) {
+                throw new Error(
+                  `Timed out waiting for earlier version runs: ${earlierActiveRuns.map((run) => run.id).join(", ")}`,
+                );
+              }
+              core.info(
+                `Waiting for earlier version runs: ${earlierActiveRuns.map((run) => `${run.id} (${run.event}/${run.status})`).join(", ")}`,
+              );
+              await new Promise((resolve) => setTimeout(resolve, pollMs));
+            }
+
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

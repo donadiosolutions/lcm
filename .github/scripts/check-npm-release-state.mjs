@@ -1,4 +1,4 @@
-import { checkNpmReleaseState } from "./release-policy.mjs";
+import { checkNpmReleaseState } from "./npm-release-policy.mjs";
 
 const version = process.argv[2];
 if (!version) throw new Error("Usage: check-npm-release-state.mjs VERSION");

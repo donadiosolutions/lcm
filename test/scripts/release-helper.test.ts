@@ -21,6 +21,7 @@ interface HarnessOptions {
   mergedPluginVersion?: string;
   mergedMarketplaceVersion?: string;
   npmVersion?: string;
+  npmDistTags?: string;
   originUrl?: string;
   originPushUrls?: string[];
   postPublishRemoteTagState?: string;
@@ -63,6 +64,18 @@ function runRelease(options: HarnessOptions = {}): HarnessResult {
   const releaseMergeSha = options.mergeSha ?? mergeSha;
   mkdirSync(binDir);
   writeFileSync(join(root, "package.json"), JSON.stringify({ name: "@donadiosolutions/lcm" }));
+  const scriptsDir = join(root, ".github", "scripts");
+  mkdirSync(scriptsDir, { recursive: true });
+  for (const scriptName of [
+    "check-npm-release-state.mjs",
+    "npm-release-policy.mjs",
+    "release-tag-policy.mjs",
+  ]) {
+    writeFileSync(
+      join(scriptsDir, scriptName),
+      readFileSync(resolve(".github/scripts", scriptName), "utf8"),
+    );
+  }
   if (options.localTagState) writeFileSync(localTagState, options.localTagState);
   if (options.remoteTagState) writeFileSync(remoteTagState, options.remoteTagState);
   if (options.postPublishRemoteTagState !== undefined) {
@@ -214,6 +227,14 @@ printf 'npm' >> "$FAKE_CALL_LOG"
 printf '|%s' "$@" >> "$FAKE_CALL_LOG"
 printf '\n' >> "$FAKE_CALL_LOG"
 if [[ "$1" == "view" ]]; then
+  if [[ "$2" == "@donadiosolutions/lcm" && "$3" == "dist-tags" ]]; then
+    if [[ -n "$FAKE_NPM_DIST_TAGS" ]]; then
+      printf '%s\n' "$FAKE_NPM_DIST_TAGS"
+      exit 0
+    fi
+    printf 'npm ERR! code E404\n' >&2
+    exit 1
+  fi
   if [[ ! -f "$FAKE_REMOTE_TAG_STATE" && ! -f "$FAKE_NPM_PRETAG_CHECKED" ]]; then
     : > "$FAKE_NPM_PRETAG_CHECKED"
     if [[ -n "$FAKE_PRETAG_NPM_VERSION" ]]; then
@@ -262,6 +283,7 @@ exit 0
         FAKE_MERGED_PLUGIN_VERSION: options.mergedPluginVersion ?? releaseVersion,
         FAKE_MERGED_MARKETPLACE_VERSION: options.mergedMarketplaceVersion ?? releaseVersion,
         FAKE_NPM_VERSION: options.npmVersion ?? "",
+        FAKE_NPM_DIST_TAGS: options.npmDistTags ?? "",
         FAKE_NPM_PRETAG_CHECKED: npmPreTagChecked,
         FAKE_ORIGIN_URL: options.originUrl ?? "git@github.com:donadiosolutions/lcm.git",
         FAKE_ORIGIN_PUSH_URLS: `${(options.originPushUrls ?? [options.originUrl ?? "git@github.com:donadiosolutions/lcm.git"]).join("\n")}\n`,
@@ -349,6 +371,30 @@ describe("manual release helper step 8", () => {
     expect(result.calls).toContain(`git|tag|-s|-a|${betaTag}|${mergeSha}|-m|Release ${betaTag}`);
     expect(result.stdout).toContain(`Draft GitHub release ${betaTag} is ready`);
   });
+
+  it.each([
+    {
+      releaseVersion: "10.0.0-beta.0",
+      distTags: '{"latest":"9.9.9","beta":"10.0.0-beta.1"}',
+    },
+    {
+      releaseVersion: "9.9.9",
+      distTags: '{"latest":"10.0.0"}',
+    },
+  ])(
+    "rejects stale npm channel ordering before repository mutation for $releaseVersion",
+    ({ releaseVersion, distTags }: { releaseVersion: string; distTags: string }) => {
+      const result = runRelease({ version: releaseVersion, npmDistTags: distTags });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(`npm release ordering rejects ${releaseVersion}`);
+      expect(
+        result.calls.some((call: string) =>
+          /^(?:git\|(fetch|pull|checkout|tag|push)|gh\|)/u.test(call),
+        ),
+      ).toBe(false);
+    },
+  );
 
   it("fetches and reuses a matching signed remote tag without pushing it again", () => {
     const result = runRelease({ remoteTagState: signedMatchingTag });
@@ -485,7 +531,7 @@ describe("manual release helper step 8", () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toBe(
-      `✗ ERROR: Failed to query npm for @donadiosolutions/lcm@${version} before creating ${tag}; verify registry access and retry.\n`,
+      `✗ ERROR: npm release ordering rejects ${version}; no repository or tag mutation was attempted.\n`,
     );
     expect(result.stderr).not.toContain("registry-secret-detail-");
     expect(result.stdout).not.toContain("registry-secret-detail-");
@@ -659,12 +705,13 @@ describe("manual release helper step 8", () => {
     expect(result.stderr).toContain(`git tag ${tag} does not resolve to merge commit ${mergeSha}`);
   });
 
-  it("fails when npm was published before the draft release was manually finalized", () => {
+  it("fails the global guard when npm was published before the draft release was finalized", () => {
     const result = runRelease({ npmVersion: version });
 
     expect(result.status).toBe(1);
     expect(result.calls).toContain(`npm|view|@donadiosolutions/lcm@${version}|version`);
-    expect(result.stderr).toContain(`${version} was published before the GitHub draft was manually finalized`);
+    expect(result.stderr).toContain(`${version} is already published to npm`);
+    expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
   });
 
   it("fails when the tag workflow does not leave a draft release", () => {

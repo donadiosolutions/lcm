@@ -1,11 +1,18 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { load as loadYaml } from "js-yaml";
+import { PACKAGE_NAME } from "./npm-release-policy.mjs";
 import { parseReleaseTag } from "./release-tag-policy.mjs";
 
+export {
+  PACKAGE_NAME,
+  assertNpmDistTags,
+  assertReleaseCanAdvanceDistTag,
+  checkNpmReleaseState,
+  verifyNpmRelease,
+} from "./npm-release-policy.mjs";
 export { assertVerifiedReleaseTag, parseReleaseTag } from "./release-tag-policy.mjs";
 
-export const PACKAGE_NAME = "@donadiosolutions/lcm";
-export const RELEASE_DRAFT_MARKER = "<!-- lcm-release-draft:v1 -->";
+export const RELEASE_DRAFT_MARKER = "<!-- lcm-release-draft:v1:";
 
 const CHANGESET_PATTERN = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)([\s\S]*)$/u;
 const CATEGORY_ORDER = Object.freeze([
@@ -343,11 +350,16 @@ function escapeLinkText(value) {
   return value.replace(/([\\[\]])/gu, "\\$1");
 }
 
-export function renderReleaseNotes({ highlights, categorized }) {
+export function releaseDraftMarker(targetTag) {
+  parseReleaseTag(targetTag);
+  return `${RELEASE_DRAFT_MARKER}${targetTag} -->`;
+}
+
+export function renderReleaseNotes({ targetTag, highlights, categorized }) {
   if (!Array.isArray(highlights) || highlights.length === 0) {
     throw new Error("Highlights must always contain at least one entry");
   }
-  const lines = [RELEASE_DRAFT_MARKER, "", "## Highlights", ""];
+  const lines = [releaseDraftMarker(targetTag), "", "## Highlights", ""];
   for (const [index, highlight] of highlights.entries()) {
     lines.push(`- ${normalizeBullet(highlight, `Highlight ${index + 1}`)}`);
   }
@@ -365,126 +377,13 @@ export function renderReleaseNotes({ highlights, categorized }) {
   return `${lines.join("\n")}\n`;
 }
 
-export function assertActionCreatedReleaseBody(body) {
-  if (typeof body !== "string" || !body.includes(RELEASE_DRAFT_MARKER)) {
-    throw new Error("Release was not created by the draft release workflow");
+export function assertActionCreatedReleaseBody(body, targetTag) {
+  const expectedMarker = releaseDraftMarker(targetTag);
+  if (typeof body !== "string" || !body.includes(expectedMarker)) {
+    throw new Error(`Release was not created for ${targetTag} by the draft release workflow`);
   }
   const match = /(?:^|\n)## Highlights\r?\n([\s\S]*?)(?=\r?\n## |$)/u.exec(body);
   if (!match || match[1].trim().length === 0) {
     throw new Error("Release body is missing a non-empty Highlights section");
-  }
-}
-
-function highestStableVersion(versions) {
-  const values = Array.isArray(versions) ? versions : [versions];
-  const stable = values.flatMap((version) => {
-    try {
-      const parsed = parseReleaseTag(`v${version}`);
-      return parsed.isBeta ? [] : [parsed];
-    } catch {
-      return [];
-    }
-  });
-  stable.sort((left, right) => compareReleaseVersions(right, left));
-  return stable[0]?.version;
-}
-
-function defaultRunNpm(args) {
-  return spawnSync("npm", args, { encoding: "utf8" });
-}
-
-function npmView(args, label, runNpm) {
-  let result;
-  try {
-    result = runNpm(args);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Unable to query npm for ${label}: ${message}`, { cause: error });
-  }
-  if (result.error) {
-    throw new Error(`Unable to query npm for ${label}: ${result.error.message}`, {
-      cause: result.error,
-    });
-  }
-
-  const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
-  const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
-  const output = [stdout, stderr].filter(Boolean).join("\n");
-  if (result.status === 0) return { found: true, output: stdout };
-  if (/E404|404 Not Found/iu.test(output)) return { found: false, output: "" };
-  throw new Error(`Unable to query npm for ${label}${output ? `:\n${output}` : ""}`);
-}
-
-export function checkNpmReleaseState({
-  version,
-  packageName = PACKAGE_NAME,
-  runNpm = defaultRunNpm,
-}) {
-  parseReleaseTag(`v${version}`);
-  const published = npmView(
-    ["view", `${packageName}@${version}`, "version"],
-    `${packageName}@${version}`,
-    runNpm,
-  );
-  if (published.found && published.output !== version) {
-    throw new Error(
-      `npm returned unexpected version ${JSON.stringify(published.output)} for ${packageName}@${version}`,
-    );
-  }
-
-  const distTagResult = npmView(
-    ["view", packageName, "dist-tags", "--json"],
-    `${packageName} dist-tags`,
-    runNpm,
-  );
-  let distTags = {};
-  if (distTagResult.found) {
-    try {
-      distTags = JSON.parse(distTagResult.output);
-    } catch (error) {
-      throw new Error(`npm returned invalid dist-tags JSON for ${packageName}`, { cause: error });
-    }
-    if (distTags === null || typeof distTags !== "object" || Array.isArray(distTags)) {
-      throw new Error(`npm returned invalid dist-tags JSON for ${packageName}`);
-    }
-  }
-
-  const alreadyPublished = published.found;
-  assertReleaseCanAdvanceDistTag({ version, distTags, alreadyPublished });
-  return { alreadyPublished, distTags };
-}
-
-export function assertReleaseCanAdvanceDistTag({ version, distTags = {}, alreadyPublished = false }) {
-  const target = parseReleaseTag(`v${version}`);
-  const tagName = target.isBeta ? "beta" : "latest";
-  const current = distTags[tagName];
-  if (current === undefined) return;
-
-  const comparison = compareReleaseVersions(target, current);
-  if (comparison < 0 || (comparison === 0 && !alreadyPublished)) {
-    throw new Error(`Refusing to move npm ${tagName} from ${current} to ${version}`);
-  }
-}
-
-export function assertNpmDistTags({ version, versions, distTags }) {
-  const target = parseReleaseTag(`v${version}`);
-  const publishedVersions = Array.isArray(versions) ? versions : [versions];
-  if (!publishedVersions.includes(version)) {
-    throw new Error(`${PACKAGE_NAME}@${version} is not present in the npm version list`);
-  }
-
-  const highestStable = highestStableVersion(publishedVersions);
-  if (!highestStable) throw new Error("npm has no stable release for the latest dist-tag");
-  if (distTags.latest !== highestStable) {
-    throw new Error(
-      `npm latest must point to highest stable ${highestStable}, found ${distTags.latest ?? "unset"}`,
-    );
-  }
-  if (target.isBeta) {
-    if (distTags.beta !== version) {
-      throw new Error(`npm beta must point to ${version}, found ${distTags.beta ?? "unset"}`);
-    }
-  } else if (distTags.latest !== version) {
-    throw new Error(`npm latest must point to stable release ${version}`);
   }
 }

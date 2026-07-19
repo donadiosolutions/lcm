@@ -69,6 +69,11 @@ to npm.
   draft, and a maintainer must publish that draft to trigger npm
 - **npm dist-tags are channel-safe**: beta releases update `beta`; stable releases
   update `latest`, which must remain the highest stable version
+- **The helper checks npm channel ordering before mutation**: stale beta or
+  stable requests stop before pulling, branching, committing, or tagging
+- **GitHub publication is not transactional with npm**: GitHub briefly makes a
+  release public before the event workflow can restore a failed preflight or
+  last-moment guard to draft
 
 ## Failure modes
 
@@ -84,6 +89,8 @@ to npm.
 | main diverged from origin/main | Local branch was manually changed or cherry-picked | Reconcile local `main` with `origin/main`, then rerun |
 | publish.yml conclusion is not `success` | Validation, tests, Highlights generation, or draft creation failed | Check the run URL printed by the script |
 | Draft exists but npm already has the version | Publication bypassed the required manual draft transition | Stop and audit the release; never move or overwrite the tag |
+| Published release returns to draft | Trusted preflight or a last-moment tag/npm guard failed | Fix the workflow failure, then publish the restored draft manually again |
+| Earlier failed publication blocks a later release | The earlier release is still public and its run has not succeeded | Rerun the earlier event successfully, or withdraw its release to draft before retrying the later release |
 
 ## Scripts
 

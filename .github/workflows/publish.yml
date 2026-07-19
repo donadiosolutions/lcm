@@ -21,37 +21,43 @@ jobs:
       contents: write
       pull-requests: read
     steps:
-      - name: Checkout release tag
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-
       - name: Verify signed annotated release tag
+        id: tag
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         with:
           script: |
-            const { execFileSync } = await import("node:child_process");
-            const { join } = await import("node:path");
-            const { pathToFileURL } = await import("node:url");
-            const policyUrl = pathToFileURL(
-              join(process.env.GITHUB_WORKSPACE, ".github/scripts/release-tag-policy.mjs"),
-            ).href;
-            const { assertVerifiedReleaseTag } = await import(policyUrl);
-            const expectedCommit = execFileSync("git", ["rev-parse", "HEAD"], {
-              cwd: process.env.GITHUB_WORKSPACE,
-              encoding: "utf8",
-            }).trim();
-            await assertVerifiedReleaseTag({
-              github,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag: process.env.RELEASE_TAG,
-              expectedCommit,
+            const tag = process.env.RELEASE_TAG;
+            const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*))?$/.exec(tag);
+            if (!match) throw new Error(`Unsupported release tag ${tag}`);
+            const expectedRef = `refs/tags/${tag}`;
+            const { data: ref } = await github.rest.git.getRef({
+              ...context.repo,
+              ref: `tags/${tag}`,
             });
+            if (ref.ref !== expectedRef || ref.object.type !== "tag") {
+              throw new Error(`Release ref ${expectedRef} must be an annotated tag object`);
+            }
+            const { data: annotatedTag } = await github.rest.git.getTag({
+              ...context.repo,
+              tag_sha: ref.object.sha,
+            });
+            if (
+              annotatedTag.tag !== tag ||
+              annotatedTag.object.type !== "commit" ||
+              annotatedTag.verification?.verified !== true
+            ) {
+              throw new Error(`Release tag ${tag} failed identity, target, or signature verification`);
+            }
+            core.setOutput("commit", annotatedTag.object.sha);
+
+      - name: Checkout release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.tag.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -246,11 +252,12 @@ jobs:
 
             const releaseData = JSON.parse(readFileSync("release-data.json", "utf8"));
             const highlights = parseHighlightsResult(process.env.HIGHLIGHTS_RESULT);
+            const tag_name = process.env.RELEASE_TAG;
             const body = renderReleaseNotes({
+              targetTag: tag_name,
               highlights,
               categorized: releaseData.categorized,
             });
-            const tag_name = process.env.RELEASE_TAG;
             const prerelease = process.env.IS_BETA === "true";
 
             let existing;
@@ -288,14 +295,20 @@ jobs:
               core.info(`Created draft release ${tag_name}`);
             }
 
-  publish:
+  preflight:
     if: ${{ github.event_name == 'release' }}
     runs-on: ubuntu-latest
-    environment: npm-publish
+    defaults:
+      run:
+        working-directory: release
     permissions:
       actions: read
       contents: read
-      id-token: write
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
+      is_beta: ${{ steps.release.outputs.is_beta }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Wait for earlier release publications
         timeout-minutes: 65
@@ -316,9 +329,34 @@ jobs:
                 event: "release",
                 per_page: 100,
               });
-              const earlierActiveRuns = runs
-                .filter((run) => run.id < currentRunId && run.status !== "completed")
+              const earlierRuns = runs.filter((run) => run.id < currentRunId);
+              const earlierActiveRuns = earlierRuns
+                .filter((run) => run.status !== "completed")
                 .sort((left, right) => left.id - right.id);
+              const failedRuns = earlierRuns.filter(
+                (run) => run.status === "completed" && run.conclusion !== "success",
+              );
+              const blockingFailures = [];
+              for (const run of failedRuns) {
+                try {
+                  const { data: release } = await github.rest.repos.getReleaseByTag({
+                    ...context.repo,
+                    tag: run.head_branch,
+                  });
+                  if (release.draft) {
+                    core.warning(`Ignoring withdrawn draft from failed release run ${run.id}`);
+                    continue;
+                  }
+                } catch (error) {
+                  core.warning(`Could not prove failed release run ${run.id} was withdrawn: ${error.message}`);
+                }
+                blockingFailures.push(run);
+              }
+              if (blockingFailures.length > 0) {
+                throw new Error(
+                  `Earlier release runs failed and must be rerun successfully or withdrawn to draft: ${blockingFailures.map((run) => `${run.id} (${run.conclusion})`).join(", ")}`,
+                );
+              }
               if (earlierActiveRuns.length === 0) break;
               if (performance.now() - startedAt >= timeoutMs) {
                 throw new Error(
@@ -331,37 +369,62 @@ jobs:
               await new Promise((resolve) => setTimeout(resolve, pollMs));
             }
 
-      - name: Checkout published release tag
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: ${{ github.event.release.tag_name }}
-          fetch-depth: 0
-          persist-credentials: false
-
       - name: Verify signed annotated release tag
+        id: tag
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         with:
           script: |
-            const { execFileSync } = await import("node:child_process");
-            const { join } = await import("node:path");
-            const { pathToFileURL } = await import("node:url");
-            const policyUrl = pathToFileURL(
-              join(process.env.GITHUB_WORKSPACE, ".github/scripts/release-tag-policy.mjs"),
-            ).href;
-            const { assertVerifiedReleaseTag } = await import(policyUrl);
-            const expectedCommit = execFileSync("git", ["rev-parse", "HEAD"], {
-              cwd: process.env.GITHUB_WORKSPACE,
-              encoding: "utf8",
-            }).trim();
-            await assertVerifiedReleaseTag({
-              github,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag: process.env.RELEASE_TAG,
-              expectedCommit,
+            const tag = process.env.RELEASE_TAG;
+            const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*))?$/.exec(tag);
+            if (!match) throw new Error(`Unsupported release tag ${tag}`);
+            const { data: release } = await github.rest.repos.getReleaseByTag({
+              ...context.repo,
+              tag,
             });
+            if (release.id !== context.payload.release.id || release.draft) {
+              throw new Error(`Release ${tag} is not the currently published event release`);
+            }
+            const expectedRef = `refs/tags/${tag}`;
+            const { data: ref } = await github.rest.git.getRef({
+              ...context.repo,
+              ref: `tags/${tag}`,
+            });
+            if (ref.ref !== expectedRef || ref.object.type !== "tag") {
+              throw new Error(`Release ref ${expectedRef} must be an annotated tag object`);
+            }
+            const { data: annotatedTag } = await github.rest.git.getTag({
+              ...context.repo,
+              tag_sha: ref.object.sha,
+            });
+            if (
+              annotatedTag.tag !== tag ||
+              annotatedTag.object.type !== "commit" ||
+              annotatedTag.verification?.verified !== true
+            ) {
+              throw new Error(`Release tag ${tag} failed identity, target, or signature verification`);
+            }
+            core.setOutput("commit", annotatedTag.object.sha);
+            core.setOutput("tag", tag);
+            core.setOutput("version", tag.slice(1));
+            core.setOutput("is_beta", tag.includes("-beta."));
+
+      - name: Checkout trusted release tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Checkout verified release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.tag.outputs.commit }}
+          path: release
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -369,12 +432,18 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org/
 
+      - name: Check npm release ordering
+        id: npm
+        env:
+          RELEASE_VERSION: ${{ steps.tag.outputs.version }}
+        run: node ../trusted/.github/scripts/check-npm-release-state.mjs "$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Validate published release
         id: release
         env:
           RELEASE_DRAFT: ${{ github.event.release.draft }}
           RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -Eeuo pipefail
           tag="$RELEASE_TAG"
@@ -421,6 +490,7 @@ jobs:
           fi
 
           {
+            printf 'tag=%s\n' "$tag"
             printf 'version=%s\n' "$version"
             printf 'is_beta=%s\n' "$is_beta"
           } >> "$GITHUB_OUTPUT"
@@ -431,10 +501,11 @@ jobs:
       - name: Verify draft workflow marker and Highlights
         env:
           RELEASE_BODY: ${{ github.event.release.body }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           node --input-type=module <<'NODE'
           import { assertActionCreatedReleaseBody } from "./.github/scripts/release-policy.mjs";
-          assertActionCreatedReleaseBody(process.env.RELEASE_BODY);
+          assertActionCreatedReleaseBody(process.env.RELEASE_BODY, process.env.RELEASE_TAG);
           NODE
 
       - name: Verify trusted publishing prerequisites
@@ -473,41 +544,155 @@ jobs:
           npm run check:plugin-bundles
           git diff --exit-code -- lcm.mjs mcp.mjs
 
-      - name: Check npm publication state
-        id: npm
+      - name: Pack verified npm artifact
+        run: |
+          mkdir -p release-artifact
+          npm pack --ignore-scripts --pack-destination release-artifact
+
+      - name: Upload verified npm artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-package-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release/release-artifact/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    if: ${{ github.event_name == 'release' }}
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    outputs:
+      guard_failed: ${{ steps.guard_state.outputs.failed }}
+    steps:
+      - name: Checkout trusted release tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+
+      - name: Download verified npm artifact
         env:
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
-        run: node .github/scripts/check-npm-release-state.mjs "$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          ARTIFACT_NAME: npm-package-${{ github.run_id }}-${{ github.run_attempt }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir release-artifact
+
+      - name: Revalidate signed release tag
+        id: tag_guard
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          EXPECTED_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        with:
+          script: |
+            const tag = process.env.RELEASE_TAG;
+            const expectedCommit = process.env.EXPECTED_COMMIT;
+            if (!/^[0-9a-f]{40}$/.test(expectedCommit)) throw new Error("Invalid expected commit");
+            const { data: release } = await github.rest.repos.getReleaseByTag({
+              ...context.repo,
+              tag,
+            });
+            if (release.id !== context.payload.release.id || release.draft) {
+              throw new Error(`Release ${tag} is not the currently published event release`);
+            }
+            const { data: ref } = await github.rest.git.getRef({
+              ...context.repo,
+              ref: `tags/${tag}`,
+            });
+            if (ref.ref !== `refs/tags/${tag}` || ref.object.type !== "tag") {
+              throw new Error(`Release ref refs/tags/${tag} is no longer annotated`);
+            }
+            const { data: annotatedTag } = await github.rest.git.getTag({
+              ...context.repo,
+              tag_sha: ref.object.sha,
+            });
+            if (
+              annotatedTag.tag !== tag ||
+              annotatedTag.object.type !== "commit" ||
+              annotatedTag.object.sha !== expectedCommit ||
+              annotatedTag.verification?.verified !== true
+            ) {
+              throw new Error(`Release tag ${tag} changed or failed signature verification`);
+            }
+
+      - name: Recheck npm release ordering
+        id: npm_guard
+        continue-on-error: true
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: node trusted/.github/scripts/check-npm-release-state.mjs "$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Record publication guard state
+        id: guard_state
+        if: ${{ always() }}
+        env:
+          FAILED: ${{ steps.tag_guard.outcome != 'success' || steps.npm_guard.outcome != 'success' }}
+        run: printf 'failed=%s\n' "$FAILED" >> "$GITHUB_OUTPUT"
+
+      - name: Fail closed when publication guards fail
+        if: ${{ steps.guard_state.outputs.failed == 'true' }}
+        run: |
+          echo "::error::Release tag or npm ordering changed after preflight; restoring the GitHub release to draft"
+          exit 1
 
       - name: Publish to npm
-        if: ${{ steps.npm.outputs.already_published != 'true' }}
+        if: ${{ steps.npm_guard.outputs.already_published != 'true' }}
         env:
-          IS_BETA: ${{ steps.release.outputs.is_beta }}
+          IS_BETA: ${{ needs.preflight.outputs.is_beta }}
         run: |
+          set -Eeuo pipefail
+          shopt -s nullglob
+          packages=(release-artifact/*.tgz)
+          if [[ "${#packages[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one verified npm artifact, found ${#packages[@]}"
+            exit 1
+          fi
           if [[ "$IS_BETA" == "true" ]]; then
-            npm publish --access public --tag beta
+            npm publish "${packages[0]}" --ignore-scripts --access public --tag beta
           else
-            npm publish --access public --tag latest
+            npm publish "${packages[0]}" --ignore-scripts --access public --tag latest
           fi
 
       - name: Verify npm package and dist-tags
         env:
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
-        run: |
-          set -Eeuo pipefail
-          name="$(node -p "require('./package.json').name")"
-          published="$(npm view "$name@$RELEASE_VERSION" version)"
-          if [[ "$published" != "$RELEASE_VERSION" ]]; then
-            echo "::error::$name@$RELEASE_VERSION was not published"
-            exit 1
-          fi
-          versions="$(npm view "$name" versions --json)"
-          dist_tags="$(npm view "$name" dist-tags --json)"
-          VERSIONS="$versions" DIST_TAGS="$dist_tags" node --input-type=module <<'NODE'
-          import { assertNpmDistTags } from "./.github/scripts/release-policy.mjs";
-          assertNpmDistTags({
-            version: process.env.RELEASE_VERSION,
-            versions: JSON.parse(process.env.VERSIONS),
-            distTags: JSON.parse(process.env.DIST_TAGS),
-          });
-          NODE
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: node trusted/.github/scripts/verify-npm-release.mjs "$RELEASE_VERSION"
+
+  restore-draft:
+    if: ${{ always() && github.event_name == 'release' && (needs.preflight.result == 'failure' || needs.publish.outputs.guard_failed == 'true') }}
+    needs:
+      - preflight
+      - publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Restore failed publication to draft
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const release = context.payload.release;
+            if (!release?.id) throw new Error("Release event payload is missing its release id");
+            await github.rest.repos.updateRelease({
+              ...context.repo,
+              release_id: release.id,
+              draft: true,
+              prerelease: release.prerelease,
+            });
+            core.warning(
+              `Restored ${release.tag_name} to draft because trusted preflight or publication guards failed`,
+            );

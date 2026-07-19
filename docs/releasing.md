@@ -35,6 +35,21 @@ from the tag event; it starts only from GitHub's `release: published` event and
 requires the action-created draft marker and Highlights section. Do not remove
 either while editing the draft.
 
+The publication workflow separates trust domains. A read-only preflight without
+npm OIDC permission verifies the release again, runs the complete checks, and
+packs the package. The OIDC-enabled job checks out only trusted workflow tools,
+downloads that verified tarball with the runner-provided `gh` CLI, revalidates
+the signed tag and npm channel ordering, and publishes the tarball without
+running package scripts.
+
+GitHub makes a release public before sending the `release: published` event, so
+the GitHub-to-npm transition is not fully transactional. A trusted-preflight or
+last-moment guard failure restores the release to draft, although a short public
+window can occur first. Failures after `npm publish` do not automatically
+redraft the release, because the npm version is immutable and may already be
+public. Fix a restored draft and publish it manually again; inspect npm first if
+publication may have begun.
+
 Beta packages publish to the `beta` npm dist-tag. Stable packages publish to
 `latest`, and the workflow verifies that `latest` remains the highest stable
 version. Publishing a beta therefore never changes what users receive from an
@@ -52,3 +67,9 @@ Every included commit must map to a merged `main` pull request. Major package
 Changesets appear under Breaking changes; otherwise `enhancement` and `bug` PR
 labels select Features and Fixes. All remaining PRs appear under Extra notes.
 The workflow fails instead of substituting commit hashes when a commit has no PR.
+
+Release publication runs are ordered. A later release waits for earlier active
+runs and fails closed behind an earlier failed run unless that release was
+withdrawn to draft or the failed run is rerun successfully. Version-package
+runs use the same ordered-wait model so manual channel transitions are not lost
+behind a newer automatic run.

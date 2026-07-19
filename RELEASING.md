@@ -64,8 +64,20 @@ Every other included PR appears under **Extra notes**. Do not combine
    release as a draft. It does not publish npm.
 6. Review the draft without removing its workflow marker or Highlights section,
    then manually publish it in GitHub.
-7. The resulting `release: published` event repeats validation and tests, then
-   publishes npm. Betas use `--tag beta`; stable releases use `--tag latest`.
+7. The resulting `release: published` event first runs a read-only trusted
+   preflight without npm's OIDC permission. It repeats validation and tests and
+   packs the exact package tarball. A separate OIDC job downloads that verified
+   artifact with the runner-provided `gh` CLI, rechecks the release tag and npm
+   ordering using workflow-revision tools, and publishes it. Betas use
+   `--tag beta`; stable releases use `--tag latest`.
+
+GitHub changes the release from draft to public before it emits the
+`release: published` event, so this gate cannot be fully transactional across
+GitHub and npm. If trusted preflight or either last-moment publication guard
+fails before `npm publish`, the workflow restores the GitHub release to draft.
+There can therefore be a short public window before that restoration completes.
+Failures after `npm publish` are not automatically redrafted, because doing so
+would advertise a draft while an immutable npm version is already public.
 
 For beta notes, the previous published release in the same `MAJOR.MINOR` series
 is the comparison base, falling back to the latest stable release for the first
@@ -93,7 +105,8 @@ without assuming `main` still points at that commit. It verifies the draft and
 GitHub prerelease flag, confirms npm is still unpublished, and stops so a
 maintainer can publish the draft manually.
 
-Manual helper versions may use stable `MAJOR.MINOR.PATCH` or beta
+Before any pull, branch, commit, or tag mutation, the manual helper applies the
+same npm channel-ordering guard as the workflows. Manual helper versions may use stable `MAJOR.MINOR.PATCH` or beta
 `MAJOR.MINOR.PATCH-beta.N` form. Other prerelease identifiers and build metadata
 remain unsupported. The draft-run wait defaults to 900 seconds; override it with
 `PUBLISH_MAX_WAIT=<non-negative integer seconds>` when needed.
@@ -128,6 +141,10 @@ Recommended external setup:
 
 When configuring npm trusted publishing, register the GitHub workflow using the exact workflow filename in this repo: `.github/workflows/publish.yml`.
 
-For recovery, rerun the failed tag-triggered draft run or the failed
-`release: published` run with its original event payload. There is no manual
-dispatch path that can bypass the GitHub draft-to-published transition.
+For recovery, rerun a failed tag-triggered draft run with its original event
+payload. When publication preflight or a last-moment guard restores a release to
+draft, fix the failure and manually publish the draft again; an earlier failed
+release run must either be rerun successfully or remain withdrawn as a draft
+before later releases proceed. If npm publication itself may have started,
+inspect npm and the workflow run before changing GitHub state. There is no
+manual dispatch path that can bypass the GitHub draft-to-published transition.

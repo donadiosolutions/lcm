@@ -168,6 +168,18 @@ if [[ "${#ORIGIN_PUSH_URLS[@]}" -ne 1 ]] || ! is_canonical_origin "${ORIGIN_PUSH
   err "origin must have exactly one canonical push URL for $REPO (got: $ORIGIN_PUSH_URL_DISPLAY)."
 fi
 
+# Fail stale stable/beta releases before pulling, branching, committing, or tagging.
+NPM_GUARD_OUTPUT=""
+if ! NPM_GUARD_OUTPUT=$(node .github/scripts/check-npm-release-state.mjs "$VERSION" 2>&1); then
+  err "npm release ordering rejects $VERSION; no repository or tag mutation was attempted."
+fi
+if printf '%s\n' "$NPM_GUARD_OUTPUT" | grep -qx 'already_published=true'; then
+  err "$VERSION is already published to npm for $PACKAGE_NAME. Choose a higher version."
+fi
+printf '%s\n' "$NPM_GUARD_OUTPUT" | grep -qx 'already_published=false' || \
+  err "npm release ordering returned an invalid result for $VERSION."
+ok "npm channel ordering permits $PACKAGE_NAME@$VERSION."
+
 # When resuming mid-flow, look up state we would have captured earlier.
 PR_NUMBER=""
 MERGE_SHA=""
@@ -212,15 +224,7 @@ if run_step 1; then
     err "Tag v$VERSION already exists. Choose a higher version. Never delete tags on a public package."
   ok "Git tag v$VERSION is free."
 
-  NPM_STATUS=0
-  NPM_OUT=$(npm view "$PACKAGE_NAME@$VERSION" version 2>&1) || NPM_STATUS=$?
-  if [[ "$NPM_STATUS" -eq 0 ]]; then
-    err "$VERSION is already published to npm for $PACKAGE_NAME. Choose a higher version."
-  elif echo "$NPM_OUT" | grep -qiE 'E404|404 Not Found'; then
-    ok "npm $PACKAGE_NAME@$VERSION is free."
-  else
-    err "Failed to query npm for $PACKAGE_NAME@$VERSION: $NPM_OUT"
-  fi
+  ok "npm $PACKAGE_NAME@$VERSION is free and channel ordering is monotonic."
 else
   step "Step 1 — Guard"; skip
 fi
