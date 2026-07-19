@@ -41,7 +41,17 @@ async function readlinePrompt(question: string): Promise<string> {
 
 export { readlinePrompt as _readlinePromptForTesting };
 
-const defaultDeps: ServiceDeps = { spawnSync: (cmd, args, opts) => spawnSync(cmd, args, { encoding: "utf-8", ...opts }), readFileSync: (path, encoding) => readFileSync(path, encoding as BufferEncoding) as string, writeFileSync, mkdirSync, existsSync, chmodSync: chmodSync, lstatSync, atomicWritePrivateFile, promptUser: readlinePrompt };
+const defaultDeps: ServiceDeps = {
+  spawnSync: spawnSync as ServiceDeps["spawnSync"],
+  readFileSync: readFileSync as ServiceDeps["readFileSync"],
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  chmodSync,
+  lstatSync,
+  atomicWritePrivateFile,
+  promptUser: readlinePrompt,
+};
 
 function safeConfigExists(deps: ServiceDeps, path: string): boolean {
   if (!deps.lstatSync) return deps.existsSync(path);

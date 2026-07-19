@@ -15,8 +15,10 @@ export default defineConfig({
     coverage: {
       include: ["bin/**/*.ts", "installer/**/*.ts", "src/**/*.ts"],
       thresholds: {
+        statements: 100,
         lines: 100,
         branches: 100,
+        functions: 100,
         perFile: true,
       },
     },

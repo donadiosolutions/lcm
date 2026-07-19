@@ -418,7 +418,7 @@ async function runWithDeadline<T>(
   deadline: RequestDeadline,
 ): Promise<T> {
   const controller = new AbortController();
-  let rejectTimeout: (reason?: unknown) => void = () => {};
+  let rejectTimeout!: (reason?: unknown) => void;
   const timeout = new Promise<never>((
     _resolve: (value: never | PromiseLike<never>) => void,
     reject: (reason?: unknown) => void,
