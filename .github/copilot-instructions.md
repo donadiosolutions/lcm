@@ -5,22 +5,26 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 ## Primary concerns
 
 ### Database connection pattern (highest priority)
+
 - All SQLite access MUST use `getLcmConnection()` and `closeLcmConnection()` from the shared connection module. Flag any `new DatabaseSync(...)` instantiated directly in route handlers or utility files.
 - The shared connection ensures WAL mode and foreign key enforcement are set once at open time.
 - Flag double-open patterns: calling `getLcmConnection()` without a corresponding `closeLcmConnection()` on all exit paths.
 
 ### PRAGMA enforcement
+
 - If a new connection is ever opened directly (e.g., in migration scripts), it must immediately set:
   - `PRAGMA journal_mode=WAL`
   - `PRAGMA foreign_keys=ON`
 - Flag connections missing these PRAGMAs.
 
 ### Type safety
+
 - No implicit `any`. All function parameters, return types, and object shapes must be explicitly typed.
 - Flag `as any` casts unless accompanied by a comment explaining why it's necessary.
 - Route handler request/response objects must use typed interfaces, not `any`.
 
 ### `collectStats()` performance
+
 - `collectStats()` takes ~13 seconds due to full-table scans. It must NEVER be called in:
   - HTTP request handlers
   - Any path that runs more than once per user action
@@ -38,22 +42,26 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Normalize sensitive-data category metadata by trimming and filtering entries before joining or applying the `unknown` fallback. Whitespace-only arrays must never render an empty `pattern:` warning.
 
 ### Test coverage
+
 - New HTTP routes must have corresponding tests in `test/daemon/routes/`.
 - Tests should cover: happy path, missing required fields (400), and resource-not-found (404).
 - Flag PRs adding routes without tests.
 - Never delete legacy parsing fallbacks or defensive handling for non-`Error` thrown values merely to satisfy coverage. Cover those branches with deterministic failure injection while preserving compatibility behavior.
 
 ### SQLite transaction safety
+
 - Any operation that modifies more than one table must be wrapped in `BEGIN`/`COMMIT`.
 - Flag multi-table writes without transactions — they risk partial writes on crash.
 
 ### Migration safety
+
 - Prefer additive schema migrations: `ADD COLUMN`, `CREATE TABLE`, `CREATE INDEX`.
 - When an incompatible virtual table must be replaced, require a staged migration that snapshots its data, replaces and restores it within one transaction, and proves rollback plus data preservation in tests.
 - Flag `DROP COLUMN`, `DROP TABLE`, `ALTER COLUMN type`, or other destructive DDL outside such a tested staged replacement.
 - Migrations must be idempotent (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`).
 
 ### Error handling
+
 - Route handlers must catch errors and return structured JSON: `{ error: string, code?: string }`.
 - Flag `res.send(e.message)` or unstructured error responses that leak stack traces.
 - Unhandled promise rejections in route handlers are bugs — flag missing `try/catch` in `async` handlers.
@@ -71,7 +79,11 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 ### GitHub Actions and CodeQL
 
 - Required GitHub Actions and CodeQL workflows must retain the `merge_group` trigger with the `checks_requested` activity type so required checks run on merge-queue commits.
-- Keep the merge-group security split intentional: Codecov steps that require secrets must remain skipped for `merge_group`, while CodeQL SARIF upload remains required using the pinned build-mode-none CodeQL actions.
+- Keep `external-admission.yml` required. Its trusted `pull_request_target`, provider `status`, and provider `check_run` paths must authenticate CodeRabbit by creator ID, login, and status context, and authenticate `codecov/patch` and DCO by application ID, slug, and check name. Require all three successes on the exact head SHA of an open, non-draft PR targeting `main`.
+- Provider reruns must restart exact-SHA external admission and revoke stale success while revalidation is pending or failed. Do not allow a provider event to admit a different SHA, a draft PR, a closed PR, a PR targeting another branch, or an ambiguous set of PRs.
+- Keep the merge-group admission split intentional: `external-admission` immediately emits its same required context for `merge_group` because CodeRabbit, Codecov, and DCO do not report on synthetic queue commits. CI, all required CodeQL categories, and both Socket checks must still validate the synthetic commit.
+- Keep Codecov reporting in the separate no-checkout CI job. It must use OIDC for pushes and same-repository PRs (including Dependabot), use tokenless uploads for fork PRs, consume only the fixed CI artifact, and remain skipped for `merge_group`.
+- CodeQL SARIF upload remains required on merge groups using the pinned build-mode-none CodeQL actions.
 - Advanced CodeQL workflows require GitHub default setup to be disabled before they upload SARIF.
 - Keep CodeQL analysis enabled for fork pull requests, but set the analyze action's `upload` input to `never` for fork-origin pull requests and `always` for merge groups, same-repository pull requests, and pushes.
 - Grant `security-events: write` only on the CodeQL analysis job that uploads SARIF; job-level permissions must restate every required read permission because they replace workflow defaults.
@@ -81,5 +93,6 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Production-path allowlists must cover shipped executable plugin scripts such as `.claude-plugin/`, not only the primary source directories.
 
 ## What to skip
+
 - Don't flag `DatabaseSync` usage in test fixtures that mock the connection — context matters.
 - Don't flag TypeScript-specific patterns that are idiomatic (e.g., discriminated unions, assertion functions).

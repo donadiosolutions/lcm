@@ -29,6 +29,22 @@ Independent changes may be developed in parallel on isolated branches and worktr
 
 The merge queue uses squash merging and an `ALLGREEN` grouping strategy. It builds one entry at a time, with both the minimum and maximum merge-group size set to one, no minimum wait, and a 60-minute check-response timeout. Routine administrator bypasses are prohibited; the existing bypass is reserved for documented emergencies.
 
+The required `external-admission` status separates pull-request admission from
+merge-group validation for providers that do not report on synthetic queue
+commits. On a non-draft PR, the trusted `pull_request_target`, `status`, and
+`check_run` handlers in `external-admission.yml` require authenticated results
+from CodeRabbit, `codecov/patch`, and DCO on the PR's exact head SHA. Provider
+reruns revalidate that SHA and replace a stale successful admission with a
+pending or failed result until all three providers pass again. Draft PRs are not
+eligible for admission.
+
+After admission, the same workflow immediately publishes the required
+`external-admission` success status for a synthetic `merge_group` commit because
+those providers cannot report on that commit. This exception applies only to
+the three external providers: CI, both default CodeQL analyses, the
+security-extended CodeQL analysis, and both Socket checks still run against the
+synthetic commit before it may merge.
+
 ### Release Flow
 
 1. Changesets accumulate on PRs targeting `main` (`.changeset/*.md` files)
@@ -46,13 +62,20 @@ The manual release helper performs step 4 idempotently: it pushes or fetches a v
 
 ### CI Triggers
 
-| Workflow              | Trigger                                                                              | Purpose                                                     |
-| --------------------- | ------------------------------------------------------------------------------------ | ----------------------------------------------------------- |
-| `ci.yml`              | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, build                                     |
-| `codeql.yml`          | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                   |
-| `codeql-extended.yml` | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload |
-| `version-pr.yml`      | Push to main                                                                         | Auto-create version PR from changesets                      |
-| `publish.yml`         | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag                            | Publish npm + create GitHub release                         |
+| Workflow                 | Trigger                                                                                                              | Purpose                                                                                                  |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `ci.yml`                 | Push to main and release + all PRs + merge groups (`checks_requested`)                                               | Type-check, test, and build; upload Codecov reports outside merge groups                                 |
+| `external-admission.yml` | Non-draft PR lifecycle + authenticated CodeRabbit status, Codecov/DCO check runs + merge groups (`checks_requested`) | Require all three providers on the exact PR head, then publish the same wrapper context for merge groups |
+| `codeql.yml`             | Push to main + PRs targeting main + merge groups (`checks_requested`)                                                | Required CodeQL analysis and SARIF upload                                                                |
+| `codeql-extended.yml`    | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`)                                 | Required security-extended CodeQL analysis and SARIF upload                                              |
+| `version-pr.yml`         | Push to main                                                                                                         | Auto-create version PR from changesets                                                                   |
+| `publish.yml`            | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag                                                            | Publish npm + create GitHub release                                                                      |
+
+The CI workflow keeps coverage reporting in a separate no-checkout job that
+consumes the fixed test artifact. Codecov uses OIDC for pushes and same-repository
+PRs, including Dependabot PRs; fork PRs use Codecov's tokenless upload path. The
+reporting job is skipped for `merge_group`, where `external-admission` represents
+the Codecov result already verified on the exact PR head.
 
 ## Defaults (predefined answers for brainstorming)
 
