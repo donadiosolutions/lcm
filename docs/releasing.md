@@ -53,11 +53,11 @@ running package scripts.
 
 GitHub makes a release public before sending the `release: published` event, so
 the GitHub-to-npm transition is not fully transactional. A trusted-preflight or
-publish-job failure restores the release to draft, although a short public
-window can occur first. If npm publication completed before a later failure,
-publishing the restored draft again remains safe: the workflow recognizes the
-existing immutable package version, skips a duplicate publication, and repeats
-the final package and dist-tag verification.
+publish-job failure or cancellation restores the release to draft, although a
+short public window can occur first. If npm publication completed before a
+later failure, publishing the restored draft again remains safe: the workflow
+recognizes the existing immutable package version, skips a duplicate
+publication, and repeats the final package and dist-tag verification.
 
 Beta packages publish to the `beta` npm dist-tag. Stable packages publish to
 `latest`, and the workflow verifies that `latest` remains the highest stable

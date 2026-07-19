@@ -78,12 +78,13 @@ Every other included PR appears under **Extra notes**. Do not combine
 GitHub changes the release from draft to public before it emits the
 `release: published` event, so this gate cannot be fully transactional across
 GitHub and npm. If trusted preflight or either last-moment publication guard
-fails, or if the publish job fails before its guard state is recorded, the
-workflow restores the GitHub release to draft. There can therefore be a short
-public window before that restoration completes. If npm was already published
-before a later step failed, republishing the restored draft is safe: the retry
-detects the existing immutable version, skips `npm publish`, and verifies its
-package version and dist-tags.
+fails, or if the preflight or publish job is cancelled or fails before its
+guard state is recorded, the workflow restores the GitHub release to draft.
+There can therefore be a short public window before that restoration
+completes. If npm was already published before a later step failed,
+republishing the restored draft is safe: the retry detects the existing
+immutable version, skips `npm publish`, and verifies its package version and
+dist-tags.
 
 For beta notes, the previous published release in the same `MAJOR.MINOR` series
 is the comparison base, falling back to the latest stable release for the first

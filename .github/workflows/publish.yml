@@ -160,7 +160,7 @@ jobs:
 
             const targetTag = process.env.RELEASE_TAG;
             parseReleaseTag(targetTag);
-            const targetRef = `refs/tags/${targetTag}`;
+            const targetRef = "HEAD";
             const releases = await github.paginate(
               github.rest.repos.listReleases,
               { ...context.repo, per_page: 100 },
@@ -698,7 +698,7 @@ jobs:
         run: node trusted/.github/scripts/verify-npm-release.mjs "$RELEASE_VERSION"
 
   restore-draft:
-    if: ${{ always() && github.event_name == 'release' && (needs.preflight.result == 'failure' || needs.publish.result == 'failure' || needs.publish.outputs.guard_failed == 'true') }}
+    if: ${{ always() && github.event_name == 'release' && (needs.preflight.result == 'failure' || needs.preflight.result == 'cancelled' || needs.publish.result == 'failure' || needs.publish.result == 'cancelled' || needs.publish.outputs.guard_failed == 'true') }}
     needs:
       - preflight
       - publish
@@ -719,5 +719,5 @@ jobs:
               prerelease: release.prerelease,
             });
             core.warning(
-              `Restored ${release.tag_name} to draft because trusted preflight or publication failed`,
+              `Restored ${release.tag_name} to draft because trusted preflight or publication failed or was cancelled`,
             );

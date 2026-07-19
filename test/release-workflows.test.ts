@@ -224,7 +224,9 @@ describe("release workflows", () => {
 
     const restore = publishWorkflow.jobs["restore-draft"];
     expect(restore.if).toContain("needs.preflight.result == 'failure'");
+    expect(restore.if).toContain("needs.preflight.result == 'cancelled'");
     expect(restore.if).toContain("needs.publish.result == 'failure'");
+    expect(restore.if).toContain("needs.publish.result == 'cancelled'");
     expect(restore.if).toContain("needs.publish.outputs.guard_failed == 'true'");
     expect(restore.steps).toHaveLength(1);
     expect(restore.steps[0]?.with?.script).toContain("draft: true");
@@ -322,6 +324,8 @@ describe("release workflows", () => {
     expect(collect?.with?.script).toContain(
       '["merge-base", "--is-ancestor", tagRef, targetRef]',
     );
+    expect(collect?.with?.script).toContain('const targetRef = "HEAD"');
+    expect(collect?.with?.script).not.toContain('const targetRef = `refs/tags/${targetTag}`');
     const collectScript = String(collect?.with?.script);
     expect(collectScript.indexOf("parseReleaseTag(release.tag_name)")).toBeLessThan(
       collectScript.indexOf('["fetch", "--no-tags"'),

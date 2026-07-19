@@ -92,7 +92,7 @@ to npm.
 | main diverged from origin/main | Local branch was manually changed or cherry-picked | Reconcile local `main` with `origin/main`, then rerun |
 | publish.yml conclusion is not `success` | Validation, tests, Highlights generation, or draft creation failed | Check the run URL printed by the script |
 | Draft exists but npm already has the version | Publication bypassed the required manual draft transition | Stop and audit the release; never move or overwrite the tag |
-| Published release returns to draft | Trusted preflight or the publish job failed | Fix the workflow failure, then publish the restored draft manually again; an existing npm version is detected and verified without republishing |
+| Published release returns to draft | Trusted preflight or the publish job failed or was cancelled | Fix the workflow failure, then publish the restored draft manually again; an existing npm version is detected and verified without republishing |
 | Earlier failed publication blocks a later release | The earlier release is still public and its run has not succeeded | Rerun the earlier event successfully, or withdraw its release to draft before retrying the later release |
 | Republished restored draft has an earlier failed run for the same tag | Expected retry history | The same-tag failure is ignored; native FIFO concurrency still prevents overlap with every other release run |
 

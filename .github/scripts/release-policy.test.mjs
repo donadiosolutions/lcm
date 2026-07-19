@@ -522,12 +522,13 @@ test("queries npm release state with E404-only missing-package handling", () => 
     { status: 1, stdout: "", stderr: "npm error code E404" },
     { status: 0, stdout: "", stderr: "" },
   ];
-  assert.deepEqual(
-    checkNpmReleaseState({
-      version: "1.5.0-beta.0",
-      runNpm: () => emptyDistTags.shift(),
-    }),
-    { alreadyPublished: false, distTags: {} },
+  assert.throws(
+    () =>
+      checkNpmReleaseState({
+        version: "1.5.0-beta.0",
+        runNpm: () => emptyDistTags.shift(),
+      }),
+    /empty response.*dist-tags/u,
   );
 
   assert.throws(
@@ -536,7 +537,7 @@ test("queries npm release state with E404-only missing-package handling", () => 
         version: "1.5.0-beta.0",
         runNpm: () => ({ status: 1, stdout: "", stderr: "npm error code E401" }),
       }),
-    /Unable to query npm.*E401/su,
+    /npm query.*E401/u,
   );
   const timeoutError = Object.assign(new Error("spawnSync npm ETIMEDOUT"), {
     code: "ETIMEDOUT",
@@ -567,7 +568,7 @@ test("queries npm release state with E404-only missing-package handling", () => 
         version: "1.5.0-beta.0",
         runNpm: () => distTagFailure.shift(),
       }),
-    /Unable to query npm for @donadiosolutions\/lcm dist-tags.*E503/su,
+    /npm query for @donadiosolutions\/lcm dist-tags.*E503/u,
   );
   const staleResults = [
     { status: 1, stdout: "", stderr: "npm error code E404" },
@@ -613,6 +614,78 @@ test("verifies published npm state without environment-sized JSON payloads", () 
     () => verifyNpmRelease({ version: "1.5.0-beta.2", runNpm: () => malformed.shift() }),
     /invalid JSON.*versions/u,
   );
+  const emptyDistTags = [
+    { status: 0, stdout: "1.5.0-beta.2", stderr: "" },
+    { status: 0, stdout: '["1.4.1","1.5.0-beta.2"]', stderr: "" },
+    { status: 0, stdout: "", stderr: "" },
+  ];
+  assert.throws(
+    () => verifyNpmRelease({ version: "1.5.0-beta.2", runNpm: () => emptyDistTags.shift() }),
+    /empty response.*dist-tags/u,
+  );
+});
+
+test("sanitizes npm subprocess and unexpected registry failures", () => {
+  const secret = `credential-like-${"x".repeat(10_000)}`;
+  const assertSanitized = (callback, expected) => {
+    assert.throws(callback, (error) => {
+      assert.equal(error instanceof Error, true);
+      assert.match(error.message, expected);
+      assert.doesNotMatch(error.message, /credential-like/u);
+      assert.equal(error.cause, undefined);
+      return true;
+    });
+  };
+
+  assertSanitized(
+    () =>
+      checkNpmReleaseState({
+        version: "1.5.0-beta.0",
+        runNpm: () => {
+          throw Object.assign(new Error(secret), { code: "E401" });
+        },
+    }),
+    /failed with E401/u,
+  );
+  assertSanitized(
+    () =>
+      checkNpmReleaseState({
+        version: "1.5.0-beta.0",
+        runNpm: () => {
+          throw new Error(secret);
+        },
+      }),
+    /npm query for @donadiosolutions\/lcm@1\.5\.0-beta\.0 failed$/u,
+  );
+  assertSanitized(
+    () =>
+      checkNpmReleaseState({
+        version: "1.5.0-beta.0",
+        runNpm: () => ({ status: 7, stdout: `${secret} E401`, stderr: secret }),
+      }),
+    /failed with status 7/u,
+  );
+  assertSanitized(
+    () =>
+      checkNpmReleaseState({
+        version: "1.5.0-beta.0",
+        runNpm: () => ({ status: 0, stdout: secret, stderr: "" }),
+      }),
+    /unexpected exact-version response/u,
+  );
+
+  const unexpectedDistTags = [
+    { status: 1, stdout: "", stderr: "npm error code E404" },
+    { status: 0, stdout: JSON.stringify({ latest: secret }), stderr: "" },
+  ];
+  assertSanitized(
+    () =>
+      checkNpmReleaseState({
+        version: "1.5.0-beta.0",
+        runNpm: () => unexpectedDistTags.shift(),
+      }),
+    /npm latest points to an unsupported version/u,
+  );
 });
 
 test("enforces monotonic npm channels and a stable latest dist-tag", () => {
@@ -644,7 +717,7 @@ test("enforces monotonic npm channels and a stable latest dist-tag", () => {
         version: "1.5.0-beta.2",
         distTags: { beta: "1.5.0-beta.1", latest: "not-semver" },
       }),
-    /npm latest points to unsupported version/u,
+    /npm latest points to an unsupported version/u,
   );
   assert.throws(
     () =>
@@ -652,7 +725,7 @@ test("enforces monotonic npm channels and a stable latest dist-tag", () => {
         version: "1.5.0-beta.2",
         distTags: { beta: "1.4.1", latest: "1.4.1" },
       }),
-    /npm beta must point to a beta version/u,
+    /npm beta must point to a canonical beta version/u,
   );
   assert.throws(
     () =>
@@ -660,7 +733,7 @@ test("enforces monotonic npm channels and a stable latest dist-tag", () => {
         version: "1.5.0-beta.2",
         distTags: { beta: "1.5.0-beta.1", latest: "1.4.1-beta.0" },
       }),
-    /npm latest must point to a stable version/u,
+    /npm latest must point to a canonical stable version/u,
   );
   assert.doesNotThrow(() =>
     assertReleaseCanAdvanceDistTag({
