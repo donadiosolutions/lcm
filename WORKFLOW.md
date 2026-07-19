@@ -31,12 +31,17 @@ The merge queue uses squash merging and an `ALLGREEN` grouping strategy. It buil
 
 The required `external-admission` status separates pull-request admission from
 merge-group validation for providers that do not report on synthetic queue
-commits. On a non-draft PR, the trusted `pull_request_target`, `status`, and
-`check_run` handlers in `external-admission.yml` require authenticated results
-from CodeRabbit, `codecov/patch`, and DCO on the PR's exact head SHA. Provider
-reruns revalidate that SHA and replace a stale successful admission with a
-pending or failed result until all three providers pass again. Draft PRs are not
-eligible for admission.
+commits. Authenticated provider `status` and `check_run` events drive
+`external-admission.yml`; pull-request lifecycle events do not start this
+write-capable workflow. On a non-draft PR, the handlers require authenticated
+results from CodeRabbit, `codecov/patch`, and DCO on the PR's exact head SHA.
+Every authenticated provider event with a valid commit SHA replaces any stale
+successful admission with `pending` before the PR-association lookup. This is
+necessary because GitHub may omit closed unmerged PRs from a commit's PR
+associations. The handler admits only one open, non-draft, main-targeting PR at
+the exact event SHA and repeats that validation immediately before publishing
+success; a closed, draft, ineligible, unassociated, or ambiguous commit remains
+pending.
 
 After PR-head admission, the separate
 `external-admission-merge-group.yml` workflow runs a permissionless Actions
@@ -66,7 +71,7 @@ The manual release helper performs step 4 idempotently: it pushes or fetches a v
 | Workflow                             | Trigger                                                                              | Purpose                                                                                 |
 | ------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
-| `external-admission.yml`             | Non-draft PR lifecycle + authenticated CodeRabbit status and Codecov/DCO check runs  | Require all three external providers on the exact eligible PR head                      |
+| `external-admission.yml`             | Authenticated CodeRabbit status and Codecov/DCO check runs                           | Require all three external providers on the exact eligible PR head                      |
 | `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
 | `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
 | `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
