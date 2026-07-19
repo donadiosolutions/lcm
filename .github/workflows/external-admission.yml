@@ -96,6 +96,13 @@ jobs:
               -f target_url="$RUN_URL" >/dev/null
           }
 
+          fetch_associated_pull_requests() {
+            gh api --paginate --slurp \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/$REPOSITORY/commits/$HEAD_SHA/pulls?per_page=100" \
+              | jq -c 'flatten(1)'
+          }
+
           # Invoked indirectly by the EXIT trap.
           # shellcheck disable=SC2329
           admission_failed() {
@@ -129,9 +136,7 @@ jobs:
           post_admission_status pending \
             "Revalidating pull request and external providers"
 
-          matching_prs="$(gh api \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "repos/$REPOSITORY/commits/$HEAD_SHA/pulls?per_page=100")"
+          matching_prs="$(fetch_associated_pull_requests)"
           PR_NUMBER="$(resolve_eligible_pr_number <<<"$matching_prs")"
 
           if [[ -z "$PR_NUMBER" ]]; then
@@ -208,9 +213,7 @@ jobs:
 
             if [[ "$coderabbit_state" == success && \
               "$codecov_state" == success && "$dco_state" == success ]]; then
-              current_matching_prs="$(gh api \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                "repos/$REPOSITORY/commits/$HEAD_SHA/pulls?per_page=100")"
+              current_matching_prs="$(fetch_associated_pull_requests)"
               current_pr_number="$(resolve_eligible_pr_number <<<"$current_matching_prs")"
               if [[ "$current_pr_number" != "$PR_NUMBER" ]]; then
                 post_admission_status pending \
