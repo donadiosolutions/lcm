@@ -67,6 +67,7 @@ function makeDeps(options: {
   writeError?: unknown;
   claudeMd?: string;
   lcmMd?: string;
+  managedDaemonPath?: string;
 } = {}): DoctorDeps {
   const health = [...(options.health ?? [{ ok: false }])];
   return {
@@ -88,6 +89,7 @@ function makeDeps(options: {
     homedir: DOCTOR_HOME,
     platform: "linux",
     cwd: DOCTOR_CWD,
+    managedDaemonPath: options.managedDaemonPath,
   };
 }
 
@@ -257,6 +259,34 @@ describe("doctor service coverage", () => {
     mocks.spawnSync.mockReturnValue({ status: 0, stdout: "", stderr: "" });
     expect((await runDoctor(makeDeps({ config: { llm: { provider: "codex-process" } } })))
       .find((result) => result.name === "codex-process")?.status).toBe("pass");
+  });
+
+  it("checks Linux process providers against the managed daemon PATH", async () => {
+    mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
+      if (cmd === "sh" && args[1]?.includes("command -v codex")) {
+        const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
+        return { status: path?.startsWith("/trusted/lcm/bin:") ? 0 : 1, stdout: "", stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    const found = await runDoctor(makeDeps({
+      config: { llm: { provider: "codex-process" } },
+      managedDaemonPath: "/trusted/lcm/bin:/usr/bin:/bin",
+    }));
+    expect(found.find((result) => result.name === "codex-process")).toMatchObject({
+      status: "pass",
+      message: "codex CLI found on managed daemon PATH",
+    });
+
+    const missing = await runDoctor(makeDeps({
+      config: { llm: { provider: "codex-process" } },
+      managedDaemonPath: "/usr/bin:/bin",
+    }));
+    expect(missing.find((result) => result.name === "codex-process")).toMatchObject({
+      status: "fail",
+      message: expect.stringContaining("codex CLI not found on managed daemon PATH"),
+    });
   });
 
   it("covers anthropic key states and valid/invalid project patterns", async () => {

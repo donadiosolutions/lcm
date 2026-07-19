@@ -462,7 +462,7 @@ describe("ensureDaemon", () => {
           "--user",
           "--collect",
           "--no-block",
-          "--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "--setenv=PATH=/path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
           "--setenv=LCM_SUMMARY_PROVIDER=anthropic",
           "--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_SUMMARY_API_KEY",
           "node",

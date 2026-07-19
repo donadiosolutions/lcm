@@ -186,10 +186,13 @@ alias for the same managed start behavior. Use `lcm daemon start --foreground`
 only when you want the daemon to stay attached to the current terminal for
 debugging.
 
-The managed systemd service receives a fixed system executable path rather than
-the launching shell's `PATH`. Put provider configuration in LCM settings or the
-documented `LCM_*` environment variables instead of relying on executables from
-a project-local or shell-specific path.
+The managed systemd service receives a trusted executable path rather than the
+launching shell's `PATH`. It prepends the directory containing the exact LCM
+entrypoint that systemd executes to a fixed set of system directories. This
+allows globally co-installed `lcm`, `claude`, and `codex` commands to work while
+excluding the current directory, project-local binaries, and other arbitrary
+shell-specific path entries. Put provider configuration in LCM settings or the
+documented `LCM_*` environment variables.
 
 `lcm doctor` verifies daemon health and, on Linux, repairs a healthy daemon that is not parented by the current user's systemd manager by restarting it through the managed start path. If the user systemd manager is unavailable, lcm falls back to the older detached spawn behavior and reports that the parent invariant is not satisfied.
 

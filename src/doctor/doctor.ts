@@ -14,6 +14,7 @@ import { configPath, daemonPidPath } from "../runtime-paths.js";
 import { projectMapPath, validateProjectMap, type ProjectMapValidation } from "../project-map.js";
 import { packageEntrypoint, packageRootFor } from "../runtime-root.js";
 import { sanitizeTerminalText } from "../terminal-sanitize.js";
+import { managedDaemonPath } from "../daemon/managed-path.js";
 import {
   ConfigValidationError,
   DEFAULT_DAEMON_PORT,
@@ -185,22 +186,25 @@ function checkProjectMap(results: CheckResult[], deps: DoctorDeps): void {
 }
 
 function checkBinary(deps: DoctorDeps, command: string): boolean {
-  return deps.spawnSync("sh", ["-c", `command -v ${command}`], {}).status === 0;
+  const opts = deps.platform === "linux"
+    ? { env: { PATH: deps.managedDaemonPath ?? managedDaemonPath(process.execPath, [process.argv[1]]) } }
+    : {};
+  return deps.spawnSync("sh", ["-c", `command -v ${command}`], opts).status === 0;
 }
 
 function addClaudeProcessChecks(results: CheckResult[], deps: DoctorDeps): void {
   if (checkBinary(deps, "claude")) {
-    results.push({ name: "claude-process", category: "Summarizer", status: "pass", message: "claude CLI found" });
+    results.push({ name: "claude-process", category: "Summarizer", status: "pass", message: deps.platform === "linux" ? "claude CLI found on managed daemon PATH" : "claude CLI found" });
   } else {
-    results.push({ name: "claude-process", category: "Summarizer", status: "fail", message: "claude CLI not found\n     Fix: npm install -g @anthropic-ai/claude-code" });
+    results.push({ name: "claude-process", category: "Summarizer", status: "fail", message: `${deps.platform === "linux" ? "claude CLI not found on managed daemon PATH" : "claude CLI not found"}\n     Fix: npm install -g @anthropic-ai/claude-code alongside lcm` });
   }
 }
 
 function addCodexProcessChecks(results: CheckResult[], deps: DoctorDeps): void {
   if (checkBinary(deps, "codex")) {
-    results.push({ name: "codex-process", category: "Summarizer", status: "pass", message: "codex CLI found" });
+    results.push({ name: "codex-process", category: "Summarizer", status: "pass", message: deps.platform === "linux" ? "codex CLI found on managed daemon PATH" : "codex CLI found" });
   } else {
-    results.push({ name: "codex-process", category: "Summarizer", status: "fail", message: "codex CLI not found\n     Fix: npm install -g @openai/codex" });
+    results.push({ name: "codex-process", category: "Summarizer", status: "fail", message: `${deps.platform === "linux" ? "codex CLI not found on managed daemon PATH" : "codex CLI not found"}\n     Fix: npm install -g @openai/codex alongside lcm` });
   }
 }
 
