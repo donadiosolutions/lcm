@@ -216,34 +216,83 @@ function testMcpHandshake(): Promise<CheckResult> {
     const binPath = packageEntrypoint(import.meta.url, root, defaultBin);
     const child = spawn(process.execPath, [binPath, "mcp"], { stdio: ["pipe", "pipe", "ignore"] });
     let stdout = "";
-    const timer = setTimeout(() => { child.kill(); }, 6000);
+    let finished = false;
+    const timers = new Set<ReturnType<typeof setTimeout>>();
 
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.on("close", () => {
-      clearTimeout(timer);
+    const resultFromOutput = (): CheckResult => {
       const lines = stdout.trim().split("\n");
       const toolsLine = lines.find((l) => l.includes('"tools/list"') || (l.includes('"tools"') && l.includes('"id":2')));
       if (toolsLine) {
         try {
           const parsed = JSON.parse(toolsLine);
           const count = parsed.result?.tools?.length ?? 0;
-          resolve({ name: "mcp-handshake-lcm", category: "MCP Servers", status: count === 7 ? "pass" : "warn", message: `lcm: ${count}/7 tools` });
-          return;
+          return { name: "mcp-handshake-lcm", category: "MCP Servers", status: count === 7 ? "pass" : "warn", message: `lcm: ${count}/7 tools` };
         } catch {}
       }
-      resolve({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: `lcm: 0/7 tools` });
-    });
+      return { name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "lcm: 0/7 tools" };
+    };
+
+    const finish = (result: CheckResult): void => {
+      if (finished) return;
+      finished = true;
+      for (const timer of timers) clearTimeout(timer);
+      timers.clear();
+      resolve(result);
+    };
+
+    const childIsLive = (): boolean => child.exitCode === null && child.signalCode === null;
+    const stdinIsWritable = (): boolean => !finished
+      && childIsLive()
+      && child.stdin.writable
+      && !child.stdin.destroyed
+      && !child.stdin.writableEnded;
+
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.on("close", () => { finish(resultFromOutput()); });
     child.on("error", () => {
-      clearTimeout(timer);
-      resolve({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "Could not spawn MCP process" });
+      finish({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "Could not spawn MCP process" });
     });
+    child.stdin.on("error", () => { finish(resultFromOutput()); });
+
+    timers.add(setTimeout(() => {
+      if (childIsLive()) {
+        try { child.kill(); } catch {}
+      }
+      finish(resultFromOutput());
+    }, 6000));
 
     // Send initialize, wait 300ms, then send tools/list, then close stdin after 500ms
-    child.stdin.write(initMsg + "\n");
-    setTimeout(() => {
-      child.stdin.write(listMsg + "\n");
-      setTimeout(() => { child.stdin.end(); }, 500);
-    }, 300);
+    if (!stdinIsWritable()) {
+      finish(resultFromOutput());
+      return;
+    }
+    timers.add(setTimeout(() => {
+      if (!stdinIsWritable()) {
+        finish(resultFromOutput());
+        return;
+      }
+      timers.add(setTimeout(() => {
+        if (!stdinIsWritable()) {
+          finish(resultFromOutput());
+          return;
+        }
+        try {
+          child.stdin.end();
+        } catch {
+          finish(resultFromOutput());
+        }
+      }, 500));
+      try {
+        child.stdin.write(listMsg + "\n");
+      } catch {
+        finish(resultFromOutput());
+      }
+    }, 300));
+    try {
+      child.stdin.write(initMsg + "\n");
+    } catch {
+      finish(resultFromOutput());
+    }
   });
 }
 
