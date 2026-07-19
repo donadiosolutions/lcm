@@ -49,7 +49,7 @@ export function migrateLegacyHomeIfNeeded(homeDir: string = homedir()): RuntimeH
   const from = legacyLcmHomeDir(homeDir);
   const to = lcmHomeDir(homeDir);
   if (!existsSync(from)) {
-    if (existsSync(to)) ensurePrivateDirectory(to);
+    ensurePrivateDirectory(to);
     return { migrated: false, from, to };
   }
   if (existsSync(join(to, "config.json")) || existsSync(join(to, "projects")) || existsSync(join(to, "events"))) {

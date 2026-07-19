@@ -12,6 +12,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -35,6 +36,8 @@ export type BoundedFileOptions = {
   maxBytes: number;
   /** @internal Deterministic race seam for descriptor-bound tests. */
   _afterStatForTesting?: () => void;
+  /** @internal Deterministic parent-swap seam for descriptor-bound tests. */
+  _beforeOpenForTesting?: () => void;
 };
 
 export type BoundedFileResult = {
@@ -69,12 +72,25 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
     throw new Error("file is outside the permitted root");
   }
 
+  options._beforeOpenForTesting?.();
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const stat = fstatSync(fd);
     if (!stat.isFile()) throw new Error("path is not a regular file");
-    if (stat.size > options.maxBytes) throw new Error("file exceeds the configured size limit");
     options._afterStatForTesting?.();
+    // Re-resolve after opening and bind the pathname to the descriptor. This
+    // detects an intermediate directory or leaf replacement between the
+    // initial containment check and open(2). The descriptor is already fixed,
+    // so any later replacement cannot change the bytes we read.
+    const openedPath = realpathSync(path);
+    if (!isContainedPath(allowedRoot, openedPath)) {
+      throw new Error("file is outside the permitted root");
+    }
+    const current = statSync(openedPath);
+    if (current.dev !== stat.dev || current.ino !== stat.ino) {
+      throw new Error("file changed during validation");
+    }
+    if (stat.size > options.maxBytes) throw new Error("file exceeds the configured size limit");
     return { content: readDescriptorBounded(fd, options.maxBytes), mtimeMs: stat.mtimeMs };
   } finally {
     closeSync(fd);

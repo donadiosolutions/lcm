@@ -36,6 +36,7 @@ const mockEnsureDaemon = vi.mocked(ensureDaemon);
 
 describe("handleSessionStart", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     // Clear session locks between tests to prevent cross-test bleed
     for (const id of ["s1", "s2", "s3", "s4", "dedup-guard-test-abc123", "dead-pid-test-session", "invalid-pid", "request-failure"]) {
       rmSync(sessionLockPathForTesting(id), { force: true });
@@ -64,6 +65,17 @@ describe("handleSessionStart", () => {
   it("accepts empty stdin", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: false, port: 3737, spawned: false });
     expect(await handleSessionStart("", { post: vi.fn() })).toEqual({ exitCode: 0, stdout: "" });
+  });
+
+  it.each([123, { attacker: true }, ["session"]])("fails open before hashing a non-string session_id", async (sessionId) => {
+    const client = { post: vi.fn() };
+
+    await expect(handleSessionStart(JSON.stringify({ session_id: sessionId }), client)).resolves.toEqual({
+      exitCode: 0,
+      stdout: "",
+    });
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
   });
 
   it("includes learned-insights block when insights returned from daemon", async () => {

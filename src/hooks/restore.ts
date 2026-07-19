@@ -104,6 +104,9 @@ export const sessionLockPathForTesting = sessionLockPath;
 
 export async function handleSessionStart(stdin: string, client: Pick<DaemonClient, "post">, port?: number): Promise<{ exitCode: number; stdout: string }> {
   const input = JSON.parse(stdin || "{}");
+  if (input.session_id != null && typeof input.session_id !== "string") {
+    return { exitCode: 0, stdout: "" };
+  }
   const sessionId = input.session_id ?? "";
   if (sessionId && !tryAcquireSessionLock(sessionId)) {
     return { exitCode: 0, stdout: "" };

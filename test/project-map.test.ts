@@ -442,6 +442,20 @@ describe("project map", () => {
     expect(() => resolveProjectIdentity(shared)).toThrow(/multiple hashes/);
   });
 
+  it("rejects a lexical path owned as both an alias and another canonical path", () => {
+    const first = makeDir("identity-alias-owner");
+    const shared = makeDir("identity-alias-canonical-collision");
+    const firstHash = hashProjectPath(normalizeProjectPath(first));
+    const secondHash = hashProjectPath(normalizeProjectPath(shared));
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [firstHash]: { canonical: first, aliases: [shared] },
+      [secondHash]: { canonical: shared, aliases: [] },
+    }, null, 2) + "\n");
+    clearProjectMapCache();
+
+    expect(() => resolveProjectIdentity(shared)).toThrow(/multiple hashes/);
+  });
+
   it("rejects alias add and remove targets with both canonical and hash", () => {
     const canonical = makeDir("mutual-canonical");
     const alias = makeDir("mutual-alias");

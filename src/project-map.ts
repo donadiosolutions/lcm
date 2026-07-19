@@ -271,13 +271,21 @@ function repairSameHashDuplicates(map: ProjectMap): { map: ProjectMap; changed: 
 
 function findPathMatches(map: ProjectMap, path: string): Set<string> {
   const lexical = resolve(path);
-  const canonical = normalizeProjectPath(path);
   const aliasMatches = new Set<string>();
+  const lexicalCanonicalMatches = new Set<string>();
   for (const [hash, entry] of Object.entries(map)) {
     if (entry.aliases.some((alias) => resolve(alias) === lexical)) aliasMatches.add(hash);
+    if (resolve(entry.canonical) === lexical) lexicalCanonicalMatches.add(hash);
   }
-  if (aliasMatches.size > 0) return aliasMatches;
+  if (aliasMatches.size > 0) {
+    // A manually edited map may assign the same lexical path as both an alias
+    // and another hash's canonical path. Return every owner so the caller fails
+    // closed instead of silently preferring either entry.
+    for (const hash of lexicalCanonicalMatches) aliasMatches.add(hash);
+    return aliasMatches;
+  }
 
+  const canonical = normalizeProjectPath(path);
   const canonicalMatches = new Set<string>();
   for (const [hash, entry] of Object.entries(map)) {
     if (resolve(entry.canonical) === canonical) canonicalMatches.add(hash);

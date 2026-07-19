@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  renameSync,
   statSync,
   symlinkSync,
   appendFileSync,
@@ -80,6 +81,40 @@ describe("private filesystem primitives", () => {
       maxBytes: 3,
       _afterStatForTesting: () => appendFileSync(path, "4"),
     })).toThrow("size limit");
+  });
+
+  it("rejects an intermediate-directory swap between containment validation and open", () => {
+    const root = makeRoot();
+    const outside = makeRoot();
+    const parent = join(root, "instructions");
+    const movedParent = join(root, "instructions-original");
+    mkdirSync(parent);
+    writeFileSync(join(parent, "file"), "trusted");
+    writeFileSync(join(outside, "file"), "untrusted");
+
+    expect(() => readBoundedRegularFile(join(parent, "file"), {
+      allowedRoot: root,
+      maxBytes: 100,
+      _beforeOpenForTesting: () => {
+        renameSync(parent, movedParent);
+        symlinkSync(outside, parent, "dir");
+      },
+    })).toThrow("outside");
+  });
+
+  it("rejects a leaf replacement after opening the descriptor", () => {
+    const root = makeRoot();
+    const path = join(root, "replaceable");
+    writeFileSync(path, "original");
+
+    expect(() => readBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 100,
+      _afterStatForTesting: () => {
+        renameSync(path, join(root, "original"));
+        writeFileSync(path, "replacement");
+      },
+    })).toThrow("changed during validation");
   });
 
   it("rejects symlinks, directories, escaped parents, oversized files, and invalid limits", () => {
