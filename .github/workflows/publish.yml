@@ -21,7 +21,9 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # npm trusted publishing generates provenance automatically and only accepts
+    # provenance from GitHub-hosted runners.
+    runs-on: ubuntu-latest
     environment: npm-publish
     steps:
       - name: Checkout
