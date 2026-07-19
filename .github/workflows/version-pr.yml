@@ -4,19 +4,115 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Enter beta prerelease mode or exit an active beta for a stable release.
+        required: true
+        type: choice
+        options:
+          - beta
+          - stable
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
+
+concurrency:
+  group: version-packages-main
+  # Current GitHub syntax: preserve up to 100 pending runs FIFO; installed actionlint lags.
+  queue: max
 
 jobs:
   version:
     runs-on: ubuntu-latest
+    # Keep write access on the only job that creates version commits, PRs, and labels.
+    permissions:
+      actions: read
+      contents: write
+      issues: write
+      pull-requests: write
     steps:
+      - name: Enforce earlier manual transition success
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const currentRunId = Number(context.runId);
+            if (!Number.isSafeInteger(currentRunId)) {
+              throw new Error(`Invalid workflow run id ${context.runId}`);
+            }
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              ...context.repo,
+              workflow_id: "version-pr.yml",
+              event: "workflow_dispatch",
+              status: "completed",
+              per_page: 100,
+            });
+            const blockingFailures = runs.filter(
+              (run) => run.id < currentRunId && run.conclusion !== "success",
+            );
+            if (blockingFailures.length > 0) {
+              throw new Error(
+                `Earlier manual version transitions must be rerun successfully before versioning continues: ${blockingFailures.map((run) => `${run.id} (${run.conclusion})`).join(", ")}`,
+              );
+            }
+
+      - name: Resolve release channel
+        id: channel
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_CHANNEL: ${{ inputs.channel }}
+        with:
+          script: |
+            const channelLabels = new Map([
+              ["release-channel:beta", "beta"],
+              ["release-channel:stable", "stable"],
+            ]);
+            const eventName = process.env.EVENT_NAME;
+            let channel;
+
+            if (eventName === "workflow_dispatch") {
+              channel = process.env.REQUESTED_CHANNEL;
+              if (!["beta", "stable"].includes(channel)) {
+                throw new Error(`Manual version run has invalid channel ${JSON.stringify(channel)}`);
+              }
+            } else if (eventName === "push") {
+              const pulls = await github.paginate(github.rest.pulls.list, {
+                ...context.repo,
+                state: "open",
+                base: "main",
+                head: `${context.repo.owner}:changeset-release/main`,
+                per_page: 100,
+              });
+              if (pulls.length > 1) {
+                throw new Error(
+                  `Expected at most one open changeset-release/main PR, found ${pulls.length}`,
+                );
+              }
+
+              const persisted = new Set(
+                (pulls[0]?.labels ?? [])
+                  .map((label) => label?.name?.toLowerCase())
+                  .filter((name) => channelLabels.has(name)),
+              );
+              if (persisted.size > 1) {
+                throw new Error(
+                  `Version PR #${pulls[0].number} has conflicting release-channel labels`,
+                );
+              }
+              channel = persisted.size === 1 ? channelLabels.get([...persisted][0]) : "auto";
+            } else {
+              throw new Error(`Unsupported version workflow event ${eventName}`);
+            }
+
+            core.setOutput("channel", channel);
+            core.info(`Resolved release channel ${channel}`);
+
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: main
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -28,11 +124,95 @@ jobs:
         run: npm ci
 
       - name: Open or update release PR
+        id: changesets
         uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1
         with:
+          branch: main
           commit: "chore: version packages"
+          commitMode: github-api
           title: "chore: version packages"
           version: npm run version-packages
           createGithubReleases: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LCM_RELEASE_CHANNEL: ${{ steps.channel.outputs.channel }}
+
+      - name: Apply version PR policy labels
+        if: ${{ steps.changesets.outputs.pullRequestNumber != '' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR_NUMBER: ${{ steps.changesets.outputs.pullRequestNumber }}
+          RELEASE_CHANNEL: ${{ steps.channel.outputs.channel }}
+        with:
+          script: |
+            const issue_number = Number(process.env.PR_NUMBER);
+            if (!Number.isSafeInteger(issue_number) || issue_number <= 0) {
+              throw new Error(`Invalid Changesets PR number: ${process.env.PR_NUMBER}`);
+            }
+            const channel = process.env.RELEASE_CHANNEL;
+            if (!["auto", "beta", "stable"].includes(channel)) {
+              throw new Error(`Invalid resolved release channel ${JSON.stringify(channel)}`);
+            }
+
+            const definitions = new Map([
+              [
+                "no-release-notes",
+                {
+                  color: "ededed",
+                  description: "Exclude this pull request from generated release notes",
+                },
+              ],
+              [
+                "release-channel:beta",
+                {
+                  color: "fbca04",
+                  description: "Persist the beta Changesets version-PR channel",
+                },
+              ],
+              [
+                "release-channel:stable",
+                {
+                  color: "0e8a16",
+                  description: "Persist the stable Changesets version-PR channel",
+                },
+              ],
+            ]);
+            const desired = ["no-release-notes"];
+            if (channel !== "auto") desired.push(`release-channel:${channel}`);
+
+            for (const name of desired) {
+              try {
+                await github.rest.issues.getLabel({ ...context.repo, name });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                try {
+                  await github.rest.issues.createLabel({
+                    ...context.repo,
+                    name,
+                    ...definitions.get(name),
+                  });
+                } catch (createError) {
+                  if (createError.status !== 422) throw createError;
+                }
+              }
+            }
+
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number,
+              labels: desired,
+            });
+
+            if (channel !== "auto") {
+              const opposite =
+                channel === "beta" ? "release-channel:stable" : "release-channel:beta";
+              try {
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number,
+                  name: opposite,
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }

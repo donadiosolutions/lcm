@@ -22,7 +22,7 @@ This document is a living record. **Update it whenever you learn something:**
 feature/docs branches → main (default, protected)
 ```
 
-- **`main`** — Default branch. All PRs target main. Protected: PRs and the merge queue are required; no force push. Pushing a matching `vX.Y.Z` tag triggers the publish workflow.
+- **`main`** — Default branch. All PRs target main. Protected: PRs and the merge queue are required; no force push. Pushing a matching stable `vX.Y.Z` or beta `vX.Y.Z-beta.N` tag triggers draft-release creation.
 - **Feature branches** — `feat/TOPIC`, `docs/TOPIC`, `fix/TOPIC`. Always branch from main and use an isolated worktree for each concurrent change.
 
 Independent changes may be developed in parallel on isolated branches and worktrees, but the required merge queue serializes landings into `main`. Dependent work must wait for its upstream PR to merge, then fetch and rebase onto the new `main` before it is queued.
@@ -53,18 +53,18 @@ run against the synthetic commit before it may merge.
 
 ### Release Flow
 
-1. Changesets accumulate on PRs targeting `main` (`.changeset/*.md` files)
-2. Version PR is auto-created by `changesets/action` on each main push
-3. When ready to release: merge the version PR on `main` (bumps package.json)
-4. Create and push a signed annotated semver tag at the exact merged `main` commit, for example `vX.Y.Z`
-5. The `publish.yml` workflow runs automatically from that tag
-6. Let the publish workflow:
-   - Type-check, test, build
-   - Publish to npm (`@donadiosolutions/lcm`)
-   - Create or update the GitHub release
-   - Use the plugin manifest version already included in the version PR
+1. Changesets accumulate on PRs targeting `main` (`.changeset/*.md` files).
+2. `changesets/action` creates or updates the version PR. Manual dispatch with
+   `channel=beta` enters beta mode; `channel=stable` exits an active beta.
+3. Merge the version PR, then create and push its exact signed annotated stable
+   or `beta.N` tag.
+4. The tag-triggered `publish.yml` job runs the complete validation suite,
+   generates Highlights with Codex, and creates a draft GitHub release.
+5. A maintainer reviews and publishes that draft manually.
+6. Only the `release: published` job publishes npm: beta versions update the
+   `beta` dist-tag, while stable versions update `latest`.
 
-The manual release helper performs step 4 idempotently: it pushes or fetches a valid one-sided signed annotated tag, requires exact tag-object and peeled-commit equality when both copies exist, and refuses to move, replace, or overwrite conflicts. It locates the resulting tag-triggered workflow using both the tag name and merge commit SHA, so later updates to `main` cannot select the wrong run.
+The manual release helper performs the tag step idempotently: it pushes or fetches a valid one-sided signed annotated tag, requires exact tag-object and peeled-commit equality when both copies exist, and refuses to move, replace, or overwrite conflicts. It locates the resulting tag-triggered workflow using both the tag name and merge commit SHA, verifies the draft release and that npm remains unpublished, then returns control for manual publication.
 
 ### CI Triggers
 
@@ -75,8 +75,8 @@ The manual release helper performs step 4 idempotently: it pushes or fetches a v
 | `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
 | `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
 | `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
-| `version-pr.yml`                     | Push to main                                                                         | Auto-create version PR from changesets                                                  |
-| `publish.yml`                        | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag                            | Publish npm + create GitHub release                                                     |
+| `version-pr.yml`                     | Push to main + manual `beta`/`stable` dispatch                                      | Auto-create version PRs and enter or exit Changesets beta mode                          |
+| `publish.yml`                        | Stable/beta tag pushes + GitHub release publication                                  | Create draft releases from tags; publish npm only after manual draft publication        |
 
 The CI workflow keeps coverage reporting in a separate no-checkout job that
 consumes the fixed test artifact. Codecov uses OIDC for pushes and same-repository

@@ -14,7 +14,7 @@
 #   5  Open PR targeting main
 #   6  Wait for CI
 #   7  Merge release PR
-#   8  Create/verify signed release tag and wait for publish.yml
+#   8  Create/verify signed release tag and wait for the draft GitHub release
 set -euo pipefail
 
 # ─── Args ────────────────────────────────────────────────────────────────────
@@ -55,19 +55,19 @@ done
 if [[ -z "$VERSION" ]]; then
   echo "Usage: $0 <version> [--from-step N]"
   echo "       $0 0.4.2"
-  echo "       $0 0.4.2 --from-step 8   # create/verify tag and resume publish"
+  echo "       $0 0.4.2 --from-step 8   # create/verify tag and resume draft creation"
   exit 1
 fi
 
 # Validate version is semver (fail fast, also guards node interpolation)
-SEMVER_REGEX='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+SEMVER_REGEX='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.(0|[1-9][0-9]*))?$'
 if ! [[ "$VERSION" =~ $SEMVER_REGEX ]]; then
-  echo "Invalid version '$VERSION'. Expected a stable semver like '0.4.2'; prerelease and build metadata versions are not supported."
+  echo "Invalid version '$VERSION'. Expected a stable version like '0.4.2' or beta like '0.5.0-beta.0'; other prerelease and build metadata versions are not supported."
   echo "Usage: $0 <version> [--from-step N]"
   exit 1
 fi
 if ! node -e '
-  const parts = process.argv[1].split(".");
+  const parts = process.argv[1].match(/[0-9]+/g) ?? [];
   process.exit(parts.every((part) => Number.isSafeInteger(Number(part))) ? 0 : 1);
 ' "$VERSION"; then
   echo "Invalid version '$VERSION'. Each numeric component must be within npm's JavaScript safe-integer range."
@@ -168,6 +168,18 @@ if [[ "${#ORIGIN_PUSH_URLS[@]}" -ne 1 ]] || ! is_canonical_origin "${ORIGIN_PUSH
   err "origin must have exactly one canonical push URL for $REPO (got: $ORIGIN_PUSH_URL_DISPLAY)."
 fi
 
+# Fail stale stable/beta releases before pulling, branching, committing, or tagging.
+NPM_GUARD_OUTPUT=""
+if ! NPM_GUARD_OUTPUT=$(node .github/scripts/check-npm-release-state.mjs "$VERSION" 2>&1); then
+  err "npm release ordering rejects $VERSION; no repository or tag mutation was attempted."
+fi
+if printf '%s\n' "$NPM_GUARD_OUTPUT" | grep -qx 'already_published=true'; then
+  err "$VERSION is already published to npm for $PACKAGE_NAME. Choose a higher version."
+fi
+printf '%s\n' "$NPM_GUARD_OUTPUT" | grep -qx 'already_published=false' || \
+  err "npm release ordering returned an invalid result for $VERSION."
+ok "npm channel ordering permits $PACKAGE_NAME@$VERSION."
+
 # When resuming mid-flow, look up state we would have captured earlier.
 PR_NUMBER=""
 MERGE_SHA=""
@@ -212,15 +224,7 @@ if run_step 1; then
     err "Tag v$VERSION already exists. Choose a higher version. Never delete tags on a public package."
   ok "Git tag v$VERSION is free."
 
-  NPM_STATUS=0
-  NPM_OUT=$(npm view "$PACKAGE_NAME@$VERSION" version 2>&1) || NPM_STATUS=$?
-  if [[ "$NPM_STATUS" -eq 0 ]]; then
-    err "$VERSION is already published to npm for $PACKAGE_NAME. Choose a higher version."
-  elif echo "$NPM_OUT" | grep -qiE 'E404|404 Not Found'; then
-    ok "npm $PACKAGE_NAME@$VERSION is free."
-  else
-    err "Failed to query npm for $PACKAGE_NAME@$VERSION: $NPM_OUT"
-  fi
+  ok "npm $PACKAGE_NAME@$VERSION is free and channel ordering is monotonic."
 else
   step "Step 1 — Guard"; skip
 fi
@@ -383,9 +387,9 @@ else
   step "Step 7 — Merge release PR"; skip
 fi
 
-# ─── STEP 8: Tag merge commit and wait for publish.yml ───────────────────────
+# ─── STEP 8: Tag merge commit and wait for draft release ────────────────────
 if run_step 8; then
-  step "Step 8 — Tag merge commit and wait for publish.yml"
+  step "Step 8 — Tag merge commit and wait for draft GitHub release"
 
   # Use the exact merge commit SHA (not main HEAD, which may advance before we tag it).
   [[ -z "$MERGE_SHA" || "$MERGE_SHA" == "null" ]] && \
@@ -510,7 +514,7 @@ if run_step 8; then
   [[ "$REMOTE_TAG_OBJECT" == "$LOCAL_TAG_OBJECT" ]] || \
     err "Remote tag $TAG does not match the verified local signed tag."
 
-  echo "  Waiting for tag-triggered publish.yml run for $TAG at commit $MERGE_SHA..."
+  echo "  Waiting for the tag-triggered publish.yml draft run for $TAG at commit $MERGE_SHA..."
 
   RUN_ID=""
   WAIT_SECS=0
@@ -523,7 +527,7 @@ if run_step 8; then
     WAIT_NOW=$(monotonic_seconds) || err "Could not read the monotonic clock while waiting for publish.yml."
     WAIT_SECS=$((WAIT_NOW - WAIT_START))
     if [[ "$WAIT_SECS" -ge "$MAX_WAIT" ]]; then
-      err "Tag-triggered publish.yml run for $TAG at $MERGE_SHA not found after ${MAX_WAIT}s. Check https://github.com/$REPO/actions manually."
+      err "Tag-triggered publish.yml draft run for $TAG at $MERGE_SHA not found after ${MAX_WAIT}s. Check https://github.com/$REPO/actions manually."
     fi
     REMAINING_WAIT=$((MAX_WAIT - WAIT_SECS))
     SLEEP_SECS=5
@@ -536,32 +540,49 @@ if run_step 8; then
 
   CONCLUSION=$(gh run view "$RUN_ID" --repo "$REPO" --json conclusion --jq '.conclusion')
   if [[ "$CONCLUSION" == "skipped" ]]; then
-    err "publish.yml was skipped — tag or npm version already exists. Pick a higher version and start over."
+    err "publish.yml was skipped — inspect the tag and draft release before retrying."
   fi
   [[ "$CONCLUSION" != "success" ]] && \
     err "publish.yml $CONCLUSION. See https://github.com/$REPO/actions/runs/$RUN_ID"
 
-  # Verify publish actually landed — workflow conclusion can be 'success' even
-  # when individual steps were skipped via if: guards.
-  PUBLISHED_VERSION=$(npm view "$PACKAGE_NAME@$VERSION" version 2>/dev/null || true)
-  if [[ "$PUBLISHED_VERSION" != "$VERSION" ]]; then
-    err "publish.yml succeeded but $PACKAGE_NAME@$VERSION was not found on npm. Check https://github.com/$REPO/actions/runs/$RUN_ID and npm manually."
+  RELEASE_STATE=$(gh release view "$TAG" --repo "$REPO" \
+    --json isDraft,isPrerelease,tagName \
+    --jq '[.isDraft, .isPrerelease, .tagName] | @tsv') || \
+    err "publish.yml succeeded but draft release $TAG was not found. Check https://github.com/$REPO/actions/runs/$RUN_ID."
+  IFS=$'\t' read -r RELEASE_IS_DRAFT RELEASE_IS_PRERELEASE RELEASE_TAG_NAME <<< "$RELEASE_STATE"
+  [[ "$RELEASE_IS_DRAFT" == "true" ]] || \
+    err "GitHub release $TAG is not a draft; npm publication must require a manual draft-to-final transition."
+  EXPECTED_PRERELEASE="false"
+  [[ "$VERSION" == *-beta.* ]] && EXPECTED_PRERELEASE="true"
+  [[ "$RELEASE_IS_PRERELEASE" == "$EXPECTED_PRERELEASE" ]] || \
+    err "GitHub release $TAG prerelease flag is $RELEASE_IS_PRERELEASE, expected $EXPECTED_PRERELEASE."
+  [[ "$RELEASE_TAG_NAME" == "$TAG" ]] || \
+    err "GitHub draft release tag is $RELEASE_TAG_NAME, expected $TAG."
+
+  NPM_STATUS=0
+  NPM_OUT=$(npm view "$PACKAGE_NAME@$VERSION" version 2>&1) || NPM_STATUS=$?
+  if [[ "$NPM_STATUS" -eq 0 ]]; then
+    err "$PACKAGE_NAME@$VERSION was published before the GitHub draft was manually finalized."
+  elif ! printf '%s\n' "$NPM_OUT" | grep -qiE 'E404|404 Not Found'; then
+    err "Failed to verify that $PACKAGE_NAME@$VERSION remains unpublished while $TAG is a draft."
   fi
+
   FINAL_REMOTE_TAG_REFS=$(remote_tag_refs "$TAG") || \
-    err "Failed to verify $TAG on origin after publish.yml completed."
+    err "Failed to verify $TAG on origin after draft creation completed."
   FINAL_TAG_OBJECT=$(printf '%s\n' "$FINAL_REMOTE_TAG_REFS" | tag_object_from_refs "$TAG")
   FINAL_TAG_TARGET=$(printf '%s\n' "$FINAL_REMOTE_TAG_REFS" | tag_target_from_refs "$TAG")
   FINAL_TAG_PEELED=$(printf '%s\n' "$FINAL_REMOTE_TAG_REFS" | tag_peeled_from_refs "$TAG")
   if [[ -z "$FINAL_TAG_OBJECT" || -z "$FINAL_TAG_PEELED" || "$FINAL_TAG_TARGET" != "$MERGE_SHA" || "$FINAL_TAG_OBJECT" != "$LOCAL_TAG_OBJECT" ]]; then
     err "publish.yml succeeded but git tag $TAG does not resolve to merge commit $MERGE_SHA. Check https://github.com/$REPO/actions/runs/$RUN_ID."
   fi
-  ok "$PACKAGE_NAME@$VERSION published to npm from signed tag $TAG."
+  ok "Draft GitHub release $TAG is ready and $PACKAGE_NAME@$VERSION remains unpublished."
+  echo "  Publish the draft manually in GitHub to trigger npm publication."
 else
-  step "Step 8 — Tag merge commit and wait for publish.yml"; skip
+  step "Step 8 — Tag merge commit and wait for draft GitHub release"; skip
 fi
 
 # ─── Done ────────────────────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  ✓  $PACKAGE_NAME@$VERSION released successfully"
+echo "  ✓  Draft release v$VERSION is ready for manual publication"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

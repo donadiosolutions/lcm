@@ -73,6 +73,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Keep shared process-adapter error sanitization, metadata bounding, and compatibility formatting in one helper rather than duplicating it across providers.
 - Validation errors must report resolved effective values; do not hard-code the required value as though it were the current configuration.
 - Treat a successful child-process exit with empty output as an empty-output failure, not a CLI rejection.
+- Registry subprocess failures must expose only bounded, allowlisted summaries; never include raw registry values, stdout, stderr, thrown messages, or causes in user-facing errors.
 - When a provider supports no values for an optional control, say the control is unsupported; do not render an empty set as `Valid values: none`.
 - Retry and backoff duration accounting must use a monotonic clock so wall-clock corrections cannot shorten or extend a wait.
 - Normalize non-finite delay values before entering timer loops; security-sensitive timer scheduling must keep user-derived values out of `setTimeout` durations by using literal constants only.
@@ -82,6 +83,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 
 ### GitHub Actions and CodeQL
 
+- When a workflow checks out a verified commit SHA, use `HEAD` for ancestry checks against that checkout instead of assuming its tag ref was fetched.
 - Required CI and CodeQL workflows that validate synthetic merge-queue commits must retain the `merge_group` trigger with the `checks_requested` activity type. This requirement does not apply to the provider-driven `external-admission.yml`; `external-admission-merge-group.yml` handles synthetic admission.
 - Keep `external-admission.yml` limited to provider `status` and `check_run` events; never add a pull-request lifecycle trigger to this write-capable workflow. Authenticate CodeRabbit by creator ID, login, and status context, and authenticate `codecov/patch` and DCO by application ID, slug, and check name. Require all three successes on the exact head SHA of an open, non-draft PR targeting `main`.
 - Every authenticated provider event with a valid commit SHA must publish a non-success external-admission status before PR association or eligibility lookup, because GitHub may omit closed unmerged PRs from a commit's PR associations. Paginate and flatten every page of commit-associated PRs before deciding uniqueness. Admit only one open, non-draft, main-targeting PR at the exact event SHA, and repeat that complete validation immediately before publishing success; missing or ambiguous associations remain non-successful.
@@ -93,6 +95,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Grant `security-events: write` only on the CodeQL analysis job that uploads SARIF; job-level permissions must restate every required read permission because they replace workflow defaults.
 - Follow least privilege in workflow `permissions`; omit `packages: read` unless a step actually reads packages.
 - Set `persist-credentials: false` on checkout steps in read-only workflows.
+- Release-run recovery must read the canonical event tag from the workflow's strict `run-name`; do not infer historical tags from `head_branch`, a commit SHA, or another mutable/ref-derived field.
+- Persist manual Changesets beta/stable intent on the single open `changeset-release/main` PR with exactly one internal release-channel label, and fail closed on duplicate PRs or conflicting channel labels.
 - When replacing a generated workflow, update README badges and links to the new workflow filename.
 - Production-path allowlists must cover shipped executable plugin scripts such as `.claude-plugin/`, not only the primary source directories.
 
