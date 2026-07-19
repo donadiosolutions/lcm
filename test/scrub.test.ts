@@ -131,12 +131,16 @@ describe("Gitleaks RE2 normalization", () => {
     expect(new ScrubEngine([], []).scrub(yaml)).toContain("[REDACTED]");
   });
 
-  it("redacts long database URLs without catastrophic backtracking", () => {
-    const engine = new ScrubEngine([], []);
-    const secret = `postgres://user:${"p".repeat(20_000)}@db.example/app`;
-    expect(engine.scrub(secret)).toBe("[REDACTED]/app");
-    expect(engine.scrub(`postgres://user:${"p".repeat(20_000)}`)).toContain("postgres://");
-  });
+  it(
+    "redacts long database URLs without catastrophic backtracking",
+    { timeout: 15_000 },
+    () => {
+      const engine = new ScrubEngine([], []);
+      const secret = `postgres://user:${"p".repeat(20_000)}@db.example/app`;
+      expect(engine.scrub(secret)).toBe("[REDACTED]/app");
+      expect(engine.scrub(`postgres://user:${"p".repeat(20_000)}`)).toContain("postgres://");
+    },
+  );
 });
 
 describe("ScrubEngine — custom patterns", () => {

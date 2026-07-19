@@ -216,34 +216,105 @@ function testMcpHandshake(): Promise<CheckResult> {
     const binPath = packageEntrypoint(import.meta.url, root, defaultBin);
     const child = spawn(process.execPath, [binPath, "mcp"], { stdio: ["pipe", "pipe", "ignore"] });
     let stdout = "";
-    const timer = setTimeout(() => { child.kill(); }, 6000);
+    let finished = false;
+    let stopRequested = false;
+    let killAttempted = false;
+    const timers = new Set<ReturnType<typeof setTimeout>>();
 
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.on("close", () => {
-      clearTimeout(timer);
-      const lines = stdout.trim().split("\n");
-      const toolsLine = lines.find((l) => l.includes('"tools/list"') || (l.includes('"tools"') && l.includes('"id":2')));
-      if (toolsLine) {
+    const resultFromOutput = (): CheckResult => {
+      for (const line of stdout.split(/\r?\n/)) {
         try {
-          const parsed = JSON.parse(toolsLine);
-          const count = parsed.result?.tools?.length ?? 0;
-          resolve({ name: "mcp-handshake-lcm", category: "MCP Servers", status: count === 7 ? "pass" : "warn", message: `lcm: ${count}/7 tools` });
-          return;
+          const parsed = JSON.parse(line) as { id?: unknown; result?: { tools?: unknown } };
+          if (parsed.id !== 2 || !Array.isArray(parsed.result?.tools)) continue;
+          const count = parsed.result.tools.length;
+          return { name: "mcp-handshake-lcm", category: "MCP Servers", status: count === 7 ? "pass" : "warn", message: `lcm: ${count}/7 tools` };
         } catch {}
       }
-      resolve({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: `lcm: 0/7 tools` });
-    });
+      return { name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "lcm: 0/7 tools" };
+    };
+
+    const finish = (result: CheckResult): void => {
+      if (finished) return;
+      finished = true;
+      for (const timer of timers) clearTimeout(timer);
+      timers.clear();
+      resolve(result);
+    };
+
+    const childIsLive = (): boolean => child.exitCode === null && child.signalCode === null;
+    const stopChild = (retry = false): boolean => {
+      stopRequested = true;
+      if (!childIsLive()) return true;
+      if (killAttempted && !retry) return false;
+      killAttempted = true;
+      try { return child.kill(); } catch { return false; }
+    };
+    const stopChildForPipeFailure = (): void => {
+      if (finished) return;
+      // Killing can synchronously emit close. Otherwise keep the watchdog
+      // active so any stdout produced during shutdown can still be collected.
+      stopChild();
+    };
+    const stdinIsWritable = (): boolean => !finished
+      && !stopRequested
+      && childIsLive()
+      && child.stdin.writable
+      && !child.stdin.destroyed
+      && !child.stdin.writableEnded;
+
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stdout.on("error", stopChildForPipeFailure);
+    child.on("close", () => { finish(resultFromOutput()); });
     child.on("error", () => {
-      clearTimeout(timer);
-      resolve({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "Could not spawn MCP process" });
+      if (stopRequested) return;
+      finish({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "Could not spawn MCP process" });
+    });
+    child.stdin.on("error", stopChildForPipeFailure);
+    child.stdin.on("close", () => {
+      if (!child.stdin.writableEnded) stopChildForPipeFailure();
     });
 
+    timers.add(setTimeout(() => {
+      stopChild(true);
+      if (childIsLive()) {
+        try { child.stdout.destroy(); } catch {}
+        try { child.unref(); } catch {}
+      }
+      finish(resultFromOutput());
+    }, 6000));
+
     // Send initialize, wait 300ms, then send tools/list, then close stdin after 500ms
-    child.stdin.write(initMsg + "\n");
-    setTimeout(() => {
-      child.stdin.write(listMsg + "\n");
-      setTimeout(() => { child.stdin.end(); }, 500);
-    }, 300);
+    if (!stdinIsWritable()) {
+      stopChildForPipeFailure();
+      return;
+    }
+    timers.add(setTimeout(() => {
+      if (!stdinIsWritable()) {
+        stopChildForPipeFailure();
+        return;
+      }
+      timers.add(setTimeout(() => {
+        if (!stdinIsWritable()) {
+          stopChildForPipeFailure();
+          return;
+        }
+        try {
+          child.stdin.end();
+        } catch {
+          stopChildForPipeFailure();
+        }
+      }, 500));
+      try {
+        child.stdin.write(listMsg + "\n");
+      } catch {
+        stopChildForPipeFailure();
+      }
+    }, 300));
+    try {
+      child.stdin.write(initMsg + "\n");
+    } catch {
+      stopChildForPipeFailure();
+    }
   });
 }
 
