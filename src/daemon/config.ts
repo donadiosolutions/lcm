@@ -46,6 +46,10 @@ export function supportsFastMode(provider: LlmProvider): boolean {
   return provider === "auto" || provider === "claude-process" || provider === "codex-process";
 }
 
+export function supportsRequestTimeout(provider: LlmProvider): boolean {
+  return provider === "auto" || provider === "openai" || provider === "claude-process" || provider === "codex-process";
+}
+
 export interface LlmRetryPolicy {
   maxAttempts: number;
   initialDelayMs: number;
@@ -56,6 +60,11 @@ export interface LlmRetryPolicy {
 export interface LlmRequestPolicy {
   requestTimeoutMs: number;
   retry: LlmRetryPolicy;
+}
+
+export interface LlmInvocationRequestPolicy {
+  requestTimeoutMs: number;
+  retry?: LlmRetryPolicy;
 }
 
 export interface LlmRequestPolicyOverride {
@@ -744,14 +753,16 @@ export function parseStoredConfig(content: string): Record<string, unknown> {
 
 /**
  * Convert effective daemon configuration back to a safe persisted document.
- * OpenAI request policy defaults remain effective at runtime but are explicit
- * configuration only when the persisted provider is OpenAI-compatible.
+ * Request timeout defaults remain effective at runtime but are explicit only
+ * for providers that use them. Retry settings remain OpenAI-only.
  */
 export function daemonConfigForPersistence(config: DaemonConfig): Record<string, unknown> {
   const stored = structuredClone(config) as unknown as Record<string, unknown>;
   const llm = stored.llm as Record<string, unknown>;
-  if (llm.provider !== "openai") {
+  if (!supportsRequestTimeout(config.llm.provider)) {
     delete llm.requestTimeoutMs;
+  }
+  if (llm.provider !== "openai") {
     delete llm.retry;
   }
   if (!supportsFastMode(config.llm.provider)) delete llm.fastMode;
@@ -835,9 +846,15 @@ function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: Readonl
         `is only valid when llm.provider is "openai"`,
       );
     }
-    if (explicitlyConfigured.has("requestTimeoutMs") || explicitlyConfigured.has("retry")) {
+    if (explicitlyConfigured.has("requestTimeoutMs") && !supportsRequestTimeout(llm.provider)) {
       throw new ConfigValidationError(
-        explicitlyConfigured.has("requestTimeoutMs") ? "llm.requestTimeoutMs" : "llm.retry",
+        "llm.requestTimeoutMs",
+        `is only valid when llm.provider is "auto", "openai", "claude-process", or "codex-process"`,
+      );
+    }
+    if (explicitlyConfigured.has("retry")) {
+      throw new ConfigValidationError(
+        "llm.retry",
         `is only valid when llm.provider is "openai"`,
       );
     }
@@ -934,8 +951,10 @@ export function parseDaemonConfig(
     if (providerOverride !== "openai") {
       delete merged.llm.apiMode;
       explicitLlmKeys.delete("apiMode");
-      explicitLlmKeys.delete("requestTimeoutMs");
       explicitLlmKeys.delete("retry");
+      if (!supportsRequestTimeout(providerOverride)) {
+        explicitLlmKeys.delete("requestTimeoutMs");
+      }
     }
     const transitioningToOpenAI = providerOverride === "openai"
       && fileModelProvider !== undefined

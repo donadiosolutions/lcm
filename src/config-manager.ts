@@ -15,6 +15,7 @@ import {
   reasoningEffortsForProvider,
   resolveDaemonConfigEnv,
   supportsFastMode,
+  supportsRequestTimeout,
   type LlmApiMode,
   type LlmProvider,
   type LlmReasoningEffort,
@@ -26,7 +27,6 @@ const DENIED_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
 const REDACTED = "[REDACTED]";
 const OPENAI_ONLY_LLM_KEYS = [
   "apiMode",
-  "requestTimeoutMs",
   "retry",
 ] as const;
 const CONFIG_PATH_ALIASES: ReadonlyMap<string, readonly string[]> = new Map([
@@ -188,6 +188,7 @@ function canonicalizeLlmProviderTransition(
   if (provider !== "openai") {
     for (const key of OPENAI_ONLY_LLM_KEYS) delete llm[key];
   }
+  if (!supportsRequestTimeout(provider)) delete llm.requestTimeoutMs;
   const apiMode = typeof llm.apiMode === "string" ? llm.apiMode as LlmApiMode : undefined;
   const reasoningEffort = llm.reasoningEffort;
   if (

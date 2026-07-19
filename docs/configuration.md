@@ -363,7 +363,8 @@ in the user's Codex configuration do not become fatal to ordinary compactions.
   "llm": {
     "provider": "codex-process",
     "reasoningEffort": "high",
-    "fastMode": true
+    "fastMode": true,
+    "requestTimeoutMs": 600000
   }
 }
 ```
@@ -389,11 +390,19 @@ by automatic Claude and Codex compaction hooks without rewriting configuration.
 
 ### Timeouts and retries
 
-`llm.requestTimeoutMs` defaults to `600000` milliseconds. The default retry
-policy is `maxAttempts: 3`, `initialDelayMs: 1000`, `maxDelayMs: 30000`, and
-`multiplier: 2`. `maxAttempts` includes the initial request. LCM disables the
-OpenAI SDK's internal retries and applies this one bounded exponential-backoff
-policy, so configured attempt counts remain exact.
+`llm.requestTimeoutMs` defaults to `600000` milliseconds and bounds each OpenAI,
+Claude process, or Codex process request. The default OpenAI-only retry policy is
+`maxAttempts: 3`, `initialDelayMs: 1000`, `maxDelayMs: 30000`, and
+`multiplier: 2`. `maxAttempts` includes the initial request. LCM disables the OpenAI SDK's
+internal retries and applies this one bounded exponential-backoff policy, so
+configured attempt counts remain exact. Process providers do not retry because
+relaunching a CLI process could duplicate expensive work.
+
+With `llm.provider` set to `auto`, the timeout follows the effective process
+provider: manual batch compaction resolves to Claude, while Claude and Codex
+hooks resolve to their matching process provider. A one-invocation
+`--timeout-ms` value is forwarded after that resolution, so it applies to the
+actual Claude or Codex subprocess without enabling OpenAI retry behavior.
 
 The timeout must be an integer from `1` through `3600000` milliseconds.
 `maxAttempts` must be an integer from `1` through `10`; both delay values must
@@ -408,7 +417,14 @@ and other 4xx responses fail immediately. Final diagnostics identify the safe
 status or code and attempt count without including provider response bodies,
 prompts, API keys, or URLs containing credentials.
 
-Override the policy for one manual compaction without rewriting the file:
+Override the timeout for one OpenAI or process-provider manual compaction
+without rewriting the file:
+
+```bash
+lcm compact --timeout-ms 300000
+```
+
+OpenAI-compatible providers additionally support one-invocation retry controls:
 
 ```bash
 lcm compact \
@@ -419,8 +435,8 @@ lcm compact \
   --retry-multiplier 2
 ```
 
-The CLI values merge over the JSON policy for that invocation and require the
-OpenAI-compatible provider.
+The CLI values merge over the JSON policy for that invocation. Retry flags
+require the OpenAI-compatible provider.
 
 ### Local OpenAI-compatible server
 
@@ -487,8 +503,10 @@ rename it atomically. A successful update prints `lcm daemon restart`, which
 must be run before an existing daemon uses the change.
 
 Changing `llm.provider` removes controls that the destination cannot use.
-`llm.apiMode`, `llm.requestTimeoutMs`, and `llm.retry` are OpenAI-only and are
-removed when switching to another provider. `llm.reasoningEffort` is preserved
+`llm.requestTimeoutMs` is retained when switching among `auto`, OpenAI, Claude
+process, and Codex process providers. `llm.apiMode` and `llm.retry` are
+OpenAI-only and are removed when switching to another provider.
+`llm.reasoningEffort` is preserved
 only when its value is valid for the destination provider; `llm.fastMode` is
 preserved only when switching among `auto`, `claude-process`, and
 `codex-process`. Provider aliases are normalized first, so `custom` and

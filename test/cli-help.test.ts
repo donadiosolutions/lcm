@@ -61,7 +61,9 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("overrides llm.reasoningEffort for this invocation without rewriting ~/.lcm/config.json");
     expect(text).toContain("override llm.fastMode for one auto or process-provider invocation");
     expect(text).toContain("lcm compact --reasoning-effort high");
-    expect(text).toContain("lcm compact --timeout-ms 120000 --retry-max-attempts 4");
+    expect(text).toContain("lcm compact --timeout-ms 300000");
+    expect(text).toContain("lcm compact --retry-max-attempts 4");
+    expect(text).toContain("Retry flags remain OpenAI-compatible-only");
     expect(text).toContain("Examples:");
   });
 

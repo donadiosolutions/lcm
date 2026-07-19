@@ -545,7 +545,7 @@ describe("createCompactHandler — summarizer branching", () => {
     });
   });
 
-  it("rejects invalid or unsupported request policy overrides before creating a summarizer", async () => {
+  it("applies process timeouts while rejecting invalid or unsupported request policy overrides", async () => {
     vi.clearAllMocks();
     const openaiHandler = createCompactHandler(makeConfig("openai"));
     const { res: invalidRes, getBody: getInvalidBody } = mockRes();
@@ -558,16 +558,36 @@ describe("createCompactHandler — summarizer branching", () => {
     expect(getInvalidBody().error).toContain("maxAttempts");
 
     const processHandler = createCompactHandler(makeConfig("claude-process"));
+    const { res: processRes, getBody: getProcessBody } = mockRes();
+    await processHandler({} as any, processRes, JSON.stringify({
+      session_id: "policy-process-timeout",
+      cwd: testCwd,
+      request_timeout_ms: 30_000,
+    }));
+    expect(processRes.writeHead).toHaveBeenCalledWith(200, expect.anything());
+    expect(createClaudeProcessSummarizer).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 30_000 }));
+    expect(getProcessBody()).toMatchObject({ requestTimeoutMs: 30_000, retry: null });
+
+    const { res: retryRes, getBody: getRetryBody } = mockRes();
+    await processHandler({} as any, retryRes, JSON.stringify({
+      session_id: "policy-process-retry",
+      cwd: testCwd,
+      retry: { max_attempts: 2 },
+    }));
+    expect(retryRes.writeHead).toHaveBeenCalledWith(400, expect.anything());
+    expect(getRetryBody().error).toContain('retry requires llm.provider="openai"');
+
+    const anthropicHandler = createCompactHandler(makeConfig("anthropic"));
     const { res: unsupportedRes, getBody: getUnsupportedBody } = mockRes();
-    await processHandler({} as any, unsupportedRes, JSON.stringify({
-      session_id: "policy-unsupported",
+    await anthropicHandler({} as any, unsupportedRes, JSON.stringify({
+      session_id: "policy-unsupported-timeout",
       cwd: testCwd,
       request_timeout_ms: 30_000,
     }));
     expect(unsupportedRes.writeHead).toHaveBeenCalledWith(400, expect.anything());
-    expect(getUnsupportedBody().error).toContain('llm.provider="openai"');
+    expect(getUnsupportedBody().error).toContain("request_timeout_ms is not supported");
     expect(createOpenAISummarizer).not.toHaveBeenCalled();
-    expect(createClaudeProcessSummarizer).not.toHaveBeenCalled();
+    expect(createAnthropicSummarizer).not.toHaveBeenCalled();
   });
 
   it.each(["__proto__", "constructor", "prototype"])(

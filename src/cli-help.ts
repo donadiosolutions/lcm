@@ -71,7 +71,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm config set llm.provider codex-process", "Store a validated string value"],
       ["lcm config set hooks.disableAutoCompact true --json", "Store a typed boolean value"],
     ],
-    notes: "Stored reads normalize compatibility aliases without rewriting the file. Secret-like values are always masked, including with --effective. Setting llm.provider away from OpenAI removes OpenAI-only API mode, reasoning, timeout, and retry settings; custom and openai-compatible normalize to OpenAI and retain those settings. Successful writes are atomic, preserve unrelated keys, and require `lcm daemon restart` before a running daemon uses the new configuration.",
+    notes: "Stored reads normalize compatibility aliases without rewriting the file. Secret-like values are always masked, including with --effective. Setting llm.provider removes controls unsupported by the destination: request timeouts are retained for auto, OpenAI, Claude process, and Codex process providers, while API mode and retries remain OpenAI-only; custom and openai-compatible normalize to OpenAI and retain those settings. Successful writes are atomic, preserve unrelated keys, and require `lcm daemon restart` before a running daemon uses the new configuration.",
   },
 
   status: {
@@ -207,9 +207,10 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm compact --no-promote", "Compact without auto-promoting new insights"],
       ["lcm compact --reasoning-effort high", "Use high reasoning for this compaction only"],
       ["lcm compact --fast-mode", "Enable fast mode for this process-provider compaction only"],
-      ["lcm compact --timeout-ms 120000 --retry-max-attempts 4", "Use temporary timeout and retry limits"],
+      ["lcm compact --timeout-ms 300000", "Allow a longer OpenAI or process-provider request"],
+      ["lcm compact --retry-max-attempts 4", "Temporarily retry an OpenAI-compatible request"],
     ],
-    notes: "When invoked via the PreCompact hook (piped stdin), runs automatically during Claude Code context compaction. After a successful compact, promote runs automatically to surface new insights to long-term memory. --reasoning-effort overrides llm.reasoningEffort for this invocation without rewriting ~/.lcm/config.json. Supported values are OpenAI Responses: none, minimal, low, medium, high, xhigh; Claude process: low, medium, high, xhigh, max; Codex process: minimal, low, medium, high, xhigh. Stored llm.provider=auto configuration accepts the shared low, medium, high, and xhigh values; invocation overrides under auto validate against the actual resolved process provider. --fast-mode and --no-fast-mode override llm.fastMode for one auto or process-provider invocation without rewriting the file. Timeout and retry flags likewise override JSON without rewriting it and require the OpenAI-compatible provider.",
+    notes: "When invoked via the PreCompact hook (piped stdin), runs automatically during Claude Code context compaction. After a successful compact, promote runs automatically to surface new insights to long-term memory. --reasoning-effort overrides llm.reasoningEffort for this invocation without rewriting ~/.lcm/config.json. Supported values are OpenAI Responses: none, minimal, low, medium, high, xhigh; Claude process: low, medium, high, xhigh, max; Codex process: minimal, low, medium, high, xhigh. Stored llm.provider=auto configuration accepts the shared low, medium, high, and xhigh values; invocation overrides under auto validate against the actual resolved process provider. --fast-mode and --no-fast-mode override llm.fastMode for one auto or process-provider invocation without rewriting the file. --timeout-ms overrides JSON for OpenAI, auto, and process providers without rewriting it. Retry flags remain OpenAI-compatible-only.",
   },
 
   import: {

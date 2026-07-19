@@ -34,6 +34,7 @@ export async function createSummarizer(
       model: config.llm.model,
       reasoningEffort: (overrides.reasoningEffort ?? config.llm.reasoningEffort) as ClaudeProcessReasoningEffort | undefined,
       fastMode: overrides.fastMode ?? config.llm.fastMode ?? false,
+      timeoutMs: overrides.requestPolicy?.requestTimeoutMs ?? config.llm.requestTimeoutMs,
     });
   }
   if (provider === "codex-process") {
@@ -41,6 +42,7 @@ export async function createSummarizer(
       model: config.llm.model,
       reasoningEffort: (overrides.reasoningEffort ?? config.llm.reasoningEffort) as CodexProcessReasoningEffort | undefined,
       fastMode: overrides.fastMode ?? config.llm.fastMode ?? false,
+      timeoutMs: overrides.requestPolicy?.requestTimeoutMs ?? config.llm.requestTimeoutMs,
     });
   }
   if (provider === "openai") {

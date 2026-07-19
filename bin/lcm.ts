@@ -13,9 +13,10 @@ import {
   reasoningEffortsForProvider,
   resolveLlmRequestPolicy,
   supportsFastMode,
+  supportsRequestTimeout,
   type DaemonConfig,
+  type LlmInvocationRequestPolicy,
   type LlmProvider,
-  type LlmRequestPolicy,
   type LlmReasoningEffort,
 } from "../src/daemon/config.js";
 import {
@@ -46,7 +47,7 @@ export function withHookOverrides(
   stdinText: string,
   client: unknown,
   reasoningEffort: LlmReasoningEffort | undefined,
-  requestPolicy?: LlmRequestPolicy,
+  requestPolicy?: LlmInvocationRequestPolicy,
   fastMode?: boolean,
 ): string {
   try {
@@ -59,12 +60,12 @@ export function withHookOverrides(
       ...(fastMode !== undefined ? { fast_mode: fastMode } : {}),
       ...(requestPolicy ? {
         request_timeout_ms: requestPolicy.requestTimeoutMs,
-        retry: {
+        ...(requestPolicy.retry ? { retry: {
           max_attempts: requestPolicy.retry.maxAttempts,
           initial_delay_ms: requestPolicy.retry.initialDelayMs,
           max_delay_ms: requestPolicy.retry.maxDelayMs,
           multiplier: requestPolicy.retry.multiplier,
-        },
+        } } : {}),
       } : {}),
     });
   } catch {
@@ -103,7 +104,7 @@ function numericOption(value: string | undefined): number | undefined {
 export function resolveCompactRequestPolicyOverride(
   config: DaemonConfig,
   options: CompactRequestPolicyOptions,
-): LlmRequestPolicy | undefined {
+): LlmInvocationRequestPolicy | undefined {
   const requestTimeoutMs = numericOption(options.timeoutMs);
   const retry = {
     maxAttempts: numericOption(options.retryMaxAttempts),
@@ -114,13 +115,19 @@ export function resolveCompactRequestPolicyOverride(
   const hasRetryOverride = Object.values(retry).some((value) => value !== undefined);
   const hasOverride = requestTimeoutMs !== undefined || hasRetryOverride;
   if (!hasOverride) return undefined;
-  if (config.llm.provider !== "openai") {
+  if (requestTimeoutMs !== undefined && !supportsRequestTimeout(config.llm.provider)) {
     throw new ConfigValidationError(
       "compact",
-      "timeout and retry overrides require llm.provider=\"openai\"",
+      "timeout overrides require llm.provider=\"auto\", \"openai\", \"claude-process\", or \"codex-process\"",
     );
   }
-  return resolveLlmRequestPolicy(
+  if (hasRetryOverride && config.llm.provider !== "openai") {
+    throw new ConfigValidationError(
+      "compact",
+      "retry overrides require llm.provider=\"openai\"",
+    );
+  }
+  const effectivePolicy = resolveLlmRequestPolicy(
     { requestTimeoutMs: config.llm.requestTimeoutMs, retry: config.llm.retry },
     {
       requestTimeoutMs,
@@ -128,6 +135,9 @@ export function resolveCompactRequestPolicyOverride(
     },
     "compact",
   );
+  return config.llm.provider === "openai"
+    ? effectivePolicy
+    : { requestTimeoutMs: effectivePolicy.requestTimeoutMs };
 }
 
 export function compactFailureExitCode(failures: number): 1 | undefined {

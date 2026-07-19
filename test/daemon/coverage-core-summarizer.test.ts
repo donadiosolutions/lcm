@@ -43,16 +43,20 @@ describe("daemon summarizer selection", () => {
       llm: { model: "model", reasoningEffort: "high", fastMode: true },
     });
     await expect(createSummarizer("claude-process", config)).resolves.toBe(summary);
-    expect(mocks.claude).toHaveBeenCalledWith({ model: "model", reasoningEffort: "high", fastMode: true });
-    await createSummarizer("codex-process", config, { reasoningEffort: "low", fastMode: false });
-    expect(mocks.codex).toHaveBeenCalledWith({ model: "model", reasoningEffort: "low", fastMode: false });
+    expect(mocks.claude).toHaveBeenCalledWith({ model: "model", reasoningEffort: "high", fastMode: true, timeoutMs: 600_000 });
+    await createSummarizer("codex-process", config, {
+      reasoningEffort: "low",
+      fastMode: false,
+      requestPolicy: { requestTimeoutMs: 45_000, retry: config.llm.retry },
+    });
+    expect(mocks.codex).toHaveBeenCalledWith({ model: "model", reasoningEffort: "low", fastMode: false, timeoutMs: 45_000 });
 
     config.llm.reasoningEffort = undefined;
     config.llm.fastMode = undefined;
     await createSummarizer("claude-process", config);
-    expect(mocks.claude).toHaveBeenLastCalledWith({ model: "model", reasoningEffort: undefined, fastMode: false });
+    expect(mocks.claude).toHaveBeenLastCalledWith({ model: "model", reasoningEffort: undefined, fastMode: false, timeoutMs: 600_000 });
     await createSummarizer("codex-process", config);
-    expect(mocks.codex).toHaveBeenLastCalledWith({ model: "model", reasoningEffort: undefined, fastMode: false });
+    expect(mocks.codex).toHaveBeenLastCalledWith({ model: "model", reasoningEffort: undefined, fastMode: false, timeoutMs: 600_000 });
   });
 
   it("constructs OpenAI and Anthropic providers", async () => {

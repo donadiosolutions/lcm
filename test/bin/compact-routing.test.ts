@@ -101,10 +101,12 @@ describe("compact command --hook routing", () => {
     });
   });
 
-  it("rejects timeout and retry overrides for process providers", () => {
+  it("accepts timeout overrides and rejects retry overrides for process providers", () => {
     const config = parseDaemonConfig(JSON.stringify({ llm: { provider: "codex-process" } }));
-    expect(() => resolveCompactRequestPolicyOverride(config, { timeoutMs: "1000" }))
-      .toThrow("require llm.provider=\"openai\"");
+    expect(resolveCompactRequestPolicyOverride(config, { timeoutMs: "1000" }))
+      .toMatchObject({ requestTimeoutMs: 1000 });
+    expect(() => resolveCompactRequestPolicyOverride(config, { retryMaxAttempts: "2" }))
+      .toThrow("retry overrides require llm.provider=\"openai\"");
   });
 });
 
@@ -139,6 +141,20 @@ describe("withHookOverrides", () => {
         max_delay_ms: 10000,
         multiplier: 2,
       },
+    });
+  });
+
+  it("forwards a process-provider timeout without an implicit retry override", () => {
+    expect(JSON.parse(withHookOverrides(
+      JSON.stringify({ session_id: "session-1", cwd: "/tmp/project" }),
+      "codex",
+      undefined,
+      { requestTimeoutMs: 300000 },
+    ))).toEqual({
+      session_id: "session-1",
+      cwd: "/tmp/project",
+      client: "codex",
+      request_timeout_ms: 300000,
     });
   });
 

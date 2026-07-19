@@ -171,6 +171,24 @@ describe("compact route coverage", () => {
     expect(await call(JSON.stringify({ session_id: "s", cwd: "/tmp" }))).toEqual({ error: "Invalid request policy" });
   });
 
+  it("returns the effective timeout without retry diagnostics for an auto-resolved process provider", async () => {
+    const value = config();
+    value.llm.provider = "auto";
+    value.llm.requestTimeoutMs = 75_000;
+    state.provider = "codex-process";
+    state.summarizer = undefined;
+    const body = await call(JSON.stringify({
+      session_id: "auto-process-timeout",
+      cwd: "/tmp",
+      client: "codex",
+    }), value);
+    expect(body).toMatchObject({
+      providerLabel: "Codex (process)",
+      requestTimeoutMs: 75_000,
+      retry: null,
+    });
+  });
+
   it("labels an unknown runtime provider through the defensive fallback", async () => {
     state.provider = "future-provider";
     state.summarizer = undefined;

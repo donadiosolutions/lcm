@@ -92,7 +92,10 @@ describe("daemon configuration uncovered boundaries", () => {
     expect(storedOpenai.llm.reasoningEffort).toBe("medium");
 
     const claude = loadDaemonConfig("/missing", { llm: { provider: "claude-process", fastMode: true } });
-    expect((daemonConfigForPersistence(claude) as { llm: Record<string, unknown> }).llm.fastMode).toBe(true);
+    const storedClaude = (daemonConfigForPersistence(claude) as { llm: Record<string, unknown> }).llm;
+    expect(storedClaude.fastMode).toBe(true);
+    expect(storedClaude.requestTimeoutMs).toBe(600_000);
+    expect(storedClaude).not.toHaveProperty("retry");
   });
 
   it("accepts non-empty required public provider credentials", () => {

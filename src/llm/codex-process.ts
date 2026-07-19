@@ -3,7 +3,7 @@ import { mkdtempSync as defaultMkdtempSync, readFileSync as defaultReadFileSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
-import type { CodexProcessReasoningEffort } from "../daemon/config.js";
+import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, type CodexProcessReasoningEffort } from "../daemon/config.js";
 import { createProcessCompatibilityError } from "./process-utils.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
@@ -11,8 +11,6 @@ import {
   buildCondensedSummaryPrompt,
   resolveTargetTokens,
 } from "../summarize.js";
-
-const TIMEOUT_MS = 120_000;
 
 type CodexProcessDeps = {
   model?: string;
@@ -193,7 +191,7 @@ export function createCodexProcessSummarizer(opts: CodexProcessDeps = {}): LcmSu
     readFileSync: opts.readFileSync ?? defaultReadFileSync,
     rmSync: opts.rmSync ?? defaultRmSync,
     tmpdir: opts.tmpdir ?? tmpdir,
-    timeoutMs: opts.timeoutMs ?? TIMEOUT_MS,
+    timeoutMs: opts.timeoutMs ?? DEFAULT_LLM_REQUEST_TIMEOUT_MS,
   };
 
   return async function summarize(text, aggressive, ctx = {}): Promise<string> {
