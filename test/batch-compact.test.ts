@@ -168,7 +168,7 @@ describe("batch compaction discovery", () => {
       cwd,
     });
 
-    expect(result).toEqual({ compacted: 1, unchanged: 0, failures: 1, compactedProjects: [paths.canonical] });
+    expect(result).toEqual({ compacted: 1, unchanged: 0, skipped: 0, failures: 1, compactedProjects: [paths.canonical] });
     expect(post).toHaveBeenCalledTimes(2);
   });
 
@@ -199,7 +199,7 @@ describe("batch compaction discovery", () => {
       onProgress: patch => progress.push(patch),
     });
 
-    expect(result).toEqual({ compacted: 2, unchanged: 0, failures: 0, compactedProjects: [paths.canonical] });
+    expect(result).toEqual({ compacted: 2, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [paths.canonical] });
     expect(progress.at(-1)).toMatchObject({
       completed: 2,
       messagesIn: 18,
@@ -241,7 +241,7 @@ describe("batch compaction discovery", () => {
 
     const result = await batchCompact({ minTokens: 100, dryRun: false, port: 3737, cwd });
 
-    expect(result).toEqual({ compacted: 1, unchanged: 1, failures: 0, compactedProjects: [paths.canonical] });
+    expect(result).toEqual({ compacted: 1, unchanged: 1, skipped: 0, failures: 0, compactedProjects: [paths.canonical] });
     expect(log).toHaveBeenCalledWith(" unchanged (no compaction needed)");
   });
 
@@ -338,6 +338,7 @@ describe("batch compaction discovery", () => {
     expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737 })).toEqual({
       compacted: 0,
       unchanged: 0,
+      skipped: 0,
       failures: 0,
       compactedProjects: [],
     });
@@ -356,7 +357,7 @@ describe("batch compaction discovery", () => {
       port: 3737,
       cwd,
       onProgress: patch => progress.push(patch),
-    })).toEqual({ compacted: 0, unchanged: 0, failures: 0, compactedProjects: [] });
+    })).toEqual({ compacted: 0, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [] });
     expect(progress).toContainEqual({ total: 2 });
     expect(progress.at(-1)).toEqual({ completed: 2 });
     expect(log).toHaveBeenCalledWith(expect.stringContaining("Found 2 uncompacted conversations"));
@@ -372,7 +373,7 @@ describe("batch compaction discovery", () => {
       port: 3737,
       cwd,
       onProgress: patch => progress.push(patch),
-    })).toEqual({ compacted: 0, unchanged: 0, failures: 1, compactedProjects: [] });
+    })).toEqual({ compacted: 0, unchanged: 0, skipped: 1, failures: 1, compactedProjects: [] });
     expect(post).toHaveBeenCalledTimes(2);
     expect(log).toHaveBeenCalledWith(" skipped (already in progress)");
     expect(log).toHaveBeenCalledWith(" FAILED (unknown error)");
@@ -392,6 +393,7 @@ describe("batch compaction discovery", () => {
     expect(await batchCompact({ minTokens: 100, dryRun: false, port: 3737, cwd })).toEqual({
       compacted: 1,
       unchanged: 0,
+      skipped: 0,
       failures: 0,
       compactedProjects: [paths.canonical],
     });

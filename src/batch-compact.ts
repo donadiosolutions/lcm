@@ -19,6 +19,14 @@ export interface UncompactedConversation {
   tokens: number;
 }
 
+export interface BatchCompactResult {
+  compacted: number;
+  unchanged: number;
+  skipped: number;
+  failures: number;
+  compactedProjects: string[];
+}
+
 export function formatLlmDiagnostic(input: {
   providerLabel?: string;
   apiMode?: LlmApiMode;
@@ -147,13 +155,13 @@ export async function batchCompact(opts: {
   requestPolicy?: LlmInvocationRequestPolicy;
   /** Called with state patches as each session is processed — used by the ninja renderer */
   onProgress?: (patch: Partial<ProgressState>) => void;
-}): Promise<{ compacted: number; unchanged: number; failures: number; compactedProjects: string[] }> {
+}): Promise<BatchCompactResult> {
   const conversations = findUncompacted(opts.minTokens, opts.dryRun, opts.cwd, opts.replay);
   const onProgress = opts.onProgress;
 
   if (conversations.length === 0) {
     console.log("Nothing to compact — no sessions are currently eligible.");
-    return { compacted: 0, unchanged: 0, failures: 0, compactedProjects: [] };
+    return { compacted: 0, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [] };
   }
 
   const totalTokens = conversations.reduce((s, c) => s + c.tokens, 0);
@@ -164,6 +172,7 @@ export async function batchCompact(opts: {
 
   let compacted = 0;
   let unchanged = 0;
+  let skipped = 0;
   let doneCount = 0;
   let messagesIn = 0;
   let tokensIn = 0;
@@ -216,6 +225,7 @@ export async function batchCompact(opts: {
 
       doneCount++;
       if (data.skipped) {
+        skipped++;
         console.log(" skipped (already in progress)");
         onProgress?.({
           completed: doneCount,
@@ -284,5 +294,5 @@ export async function batchCompact(opts: {
     }
   }
 
-  return { compacted, unchanged, failures: progressErrors.length, compactedProjects: [...compactedProjects] };
+  return { compacted, unchanged, skipped, failures: progressErrors.length, compactedProjects: [...compactedProjects] };
 }

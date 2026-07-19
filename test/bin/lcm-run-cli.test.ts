@@ -25,7 +25,7 @@ const state = vi.hoisted(() => ({
   installed: [] as Array<{ agentId: string; type: string; path: string }>,
   installResult: { path: "/connector", requiresRestart: false } as Record<string, unknown>,
   removeResult: true,
-  batchResult: { compacted: 1, unchanged: 0, failures: 0, compactedProjects: ["/project"] },
+  batchResult: { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/project"] },
   importResult: { imported: 1, skipped: 0 },
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
   provider: "openai",
@@ -177,7 +177,7 @@ beforeEach(() => {
   state.importProgressLast = true;
   state.sensitiveStdout = "sensitive";
   state.packageVersion = "1.4.0";
-  state.batchResult = { compacted: 1, unchanged: 0, failures: 0, compactedProjects: ["/project"] };
+  state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/project"] };
 });
 
 afterEach(() => {

@@ -30,7 +30,7 @@ const state = vi.hoisted(() => ({
   installConnector: vi.fn(() => ({ path: "/hook", requiresRestart: false })),
   removeConnector: vi.fn(() => true),
   installed: [] as Array<{ agentId: string; type: string; path: string }>,
-  batchResult: { compacted: 1, unchanged: 0, failures: 0, compactedProjects: ["/good"] },
+  batchResult: { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] },
   batchError: undefined as unknown,
   batchPatch: { lastResult: { ok: true } } as Record<string, unknown>,
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
@@ -172,7 +172,7 @@ beforeEach(() => {
   });
   state.files.clear(); state.exists.clear(); state.entries = []; state.readError = undefined;
   state.fileText = "{}"; state.packageVersion = "1.4.0"; state.installed = [];
-  state.batchResult = { compacted: 1, unchanged: 0, failures: 0, compactedProjects: ["/good"] };
+  state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] };
   state.batchError = undefined;
   state.batchPatch = { lastResult: { ok: true } };
   state.importPatch = { lastResult: { ok: true } };
@@ -359,7 +359,7 @@ describe("runCli lifecycle and connector boundaries", () => {
     state.restartDaemon.mockResolvedValueOnce({ connected: true, restarted: false, spawned: false, pid: undefined });
     await expect(actions.get("daemon/restart")!({})).rejects.toThrow("exit:0");
 
-    state.batchResult = { compacted: 0, unchanged: 0, failures: 1, compactedProjects: [] };
+    state.batchResult = { compacted: 0, unchanged: 0, skipped: 0, failures: 1, compactedProjects: [] };
     state.batchPatch = {};
     await expect(actions.get("lcm/compact")!({})).resolves.toBeUndefined();
     expect(process.exitCode).toBe(1);
@@ -384,7 +384,7 @@ describe("runCli lifecycle and connector boundaries", () => {
     state.mapRemove.mockReturnValueOnce({ hash: "hash", removed: true });
     await expect(mapActions.get("remove")!("/new", {})).resolves.toBeUndefined();
 
-    state.batchResult = { compacted: 1, unchanged: 0, failures: 0, compactedProjects: ["/good"] };
+    state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] };
     state.post.mockResolvedValueOnce({ processed: 1, promoted: 1 });
     await expect(actions.get("lcm/compact")!({ promote: true })).resolves.toBeUndefined();
 
