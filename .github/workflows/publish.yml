@@ -643,8 +643,9 @@ jobs:
           IS_BETA: ${{ needs.preflight.outputs.is_beta }}
         run: |
           set -Eeuo pipefail
-          shopt -s nullglob
-          packages=(release-artifact/*.tgz)
+          mapfile -d '' -t packages < <(
+            find release-artifact -type f -name '*.tgz' -print0
+          )
           if [[ "${#packages[@]}" -ne 1 ]]; then
             echo "::error::Expected exactly one verified npm artifact, found ${#packages[@]}"
             exit 1

@@ -70,9 +70,15 @@ export function planPrereleaseTransition(channel, state) {
   return ["pre", "exit"];
 }
 
-function executeChecked(command, args, options) {
-  const result = spawnSync(command, args, { ...options, stdio: "inherit" });
+export function executeChecked(command, args, options, spawn = spawnSync) {
+  const result = spawn(command, args, { ...options, stdio: "inherit" });
   if (result.error) throw result.error;
+  if (result.signal) {
+    throw new Error(
+      `${command} ${args.join(" ")} was terminated by signal ${result.signal}; ` +
+        "check system resource limits and retry",
+    );
+  }
   if (result.status !== 0) {
     throw new Error(`${command} ${args.join(" ")} exited with status ${result.status}`);
   }

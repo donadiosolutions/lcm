@@ -323,7 +323,8 @@ describe("release workflows", () => {
     const publish = publishWorkflow.jobs.publish.steps.find(
       (step) => step.name === "Publish to npm",
     );
-    expect(publish?.run).toContain('packages=(release-artifact/*.tgz)');
+    expect(publish?.run).toContain("mapfile -d '' -t packages");
+    expect(publish?.run).toContain("find release-artifact -type f -name '*.tgz' -print0");
     expect(publish?.run).toContain('"${#packages[@]}" -ne 1');
     expect(publish?.run).toContain('npm publish "${packages[0]}"');
   });

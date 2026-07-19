@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  executeChecked,
   planPrereleaseTransition,
   readPrereleaseState,
   runVersionPackages,
@@ -109,5 +110,19 @@ describe("version-packages", () => {
       "/repo/node_modules/@changesets/cli/bin.js",
       "version",
     ]);
+  });
+
+  it("reports signal-terminated commands before the status fallback", () => {
+    const spawn = vi.fn(() => ({ error: undefined, signal: "SIGTERM", status: null }));
+
+    expect(() =>
+      executeChecked("node", ["changeset", "version"], { cwd: "/repo" }, spawn),
+    ).toThrow(
+      "node changeset version was terminated by signal SIGTERM; check system resource limits and retry",
+    );
+    expect(spawn).toHaveBeenCalledWith("node", ["changeset", "version"], {
+      cwd: "/repo",
+      stdio: "inherit",
+    });
   });
 });
