@@ -9,21 +9,39 @@ on:
       - reopened
       - synchronize
       - ready_for_review
+      - edited
   merge_group:
     types:
       - checks_requested
+  status:
+  check_run:
+    types:
+      - created
+      - rerequested
+      - completed
 
 permissions:
   checks: read
+  pull-requests: read
   statuses: write
 
 concurrency:
-  group: external-admission-${{ github.event_name == 'pull_request_target' && format('pr-{0}', github.event.pull_request.number) || format('merge-group-{0}', github.ref) }}
+  group: external-admission-${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.event_name == 'status' && github.event.sha || github.event_name == 'check_run' && github.event.check_run.head_sha || github.sha }}
   cancel-in-progress: true
 
 jobs:
   external-admission:
     name: external-admission
+    if: >-
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'pull_request_target' && !github.event.pull_request.draft) ||
+      (github.event_name == 'status' && github.event.context == 'CodeRabbit' &&
+        github.event.creator.id == 136622811 && github.event.creator.login == 'coderabbitai[bot]') ||
+      (github.event_name == 'check_run' &&
+        ((github.event.check_run.name == 'codecov/patch' && github.event.check_run.app.id == 254 &&
+          github.event.check_run.app.slug == 'codecov') ||
+        (github.event.check_run.name == 'DCO' && github.event.check_run.app.id == 1861 &&
+          github.event.check_run.app.slug == 'dco')))
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -33,21 +51,72 @@ jobs:
     steps:
       - name: Accept previously admitted merge group
         if: ${{ github.event_name == 'merge_group' }}
-        run: |
-          # Every PR was admitted only after all three providers succeeded on
-          # its exact head SHA. They do not report on synthetic merge commits.
-          echo "External providers passed before merge-queue admission."
-
-      - name: Wait for external admission checks
-        if: ${{ github.event_name == 'pull_request_target' && !github.event.pull_request.draft }}
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           set -Eeuo pipefail
 
           if [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Invalid merge-group SHA." >&2
+            exit 1
+          fi
+
+          # Every PR was admitted only after all three providers succeeded on
+          # its exact head SHA. They do not report on synthetic merge commits.
+          echo "External providers passed before merge-queue admission."
+          gh api --method POST \
+            "repos/$REPOSITORY/statuses/$HEAD_SHA" \
+            -f state=success \
+            -f context=external-admission \
+            -f description="Providers passed before merge-queue admission" \
+            -f target_url="$RUN_URL" >/dev/null
+
+      - name: Wait for external admission checks
+        if: ${{ github.event_name != 'merge_group' }}
+        env:
+          EVENT_HEAD_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.event_name == 'status' && github.event.sha || github.event.check_run.head_sha }}
+          EVENT_PR_NUMBER: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || '' }}
+        run: |
+          set -Eeuo pipefail
+
+          HEAD_SHA="$EVENT_HEAD_SHA"
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
             echo "Invalid pull request head SHA." >&2
             exit 1
+          fi
+
+          if [[ -n "$EVENT_PR_NUMBER" ]]; then
+            PR_NUMBER="$EVENT_PR_NUMBER"
+          else
+            matching_prs="$(gh api \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/$REPOSITORY/commits/$HEAD_SHA/pulls?per_page=100")"
+            PR_NUMBER="$(jq -r --arg sha "$HEAD_SHA" '
+              [.[]
+                | select(.state == "open")
+                | select(.draft == false)
+                | select(.base.ref == "main")
+                | select(.head.sha == $sha)]
+              | if length == 1 then .[0].number else empty end
+            ' <<<"$matching_prs")"
+
+            if [[ -z "$PR_NUMBER" ]]; then
+              echo "Provider result does not identify exactly one eligible pull request; ignoring it."
+              exit 0
+            fi
+          fi
+
+          pull_request="$(gh api \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/$REPOSITORY/pulls/$PR_NUMBER")"
+          if ! jq -e --arg sha "$HEAD_SHA" '
+            .state == "open" and
+            .draft == false and
+            .base.ref == "main" and
+            .head.sha == $sha
+          ' <<<"$pull_request" >/dev/null; then
+            echo "Pull request is no longer an eligible main-branch admission candidate; ignoring it."
+            exit 0
           fi
 
           post_admission_status() {
@@ -65,11 +134,12 @@ jobs:
           # shellcheck disable=SC2329
           admission_failed() {
             local exit_code=$?
-            trap - EXIT INT TERM
+            trap - EXIT
             if (( exit_code != 0 )); then
               post_admission_status failure \
                 "External admission failed; inspect the workflow run" || true
             fi
+            trap - INT TERM
             exit "$exit_code"
           }
 

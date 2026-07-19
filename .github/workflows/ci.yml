@@ -51,31 +51,6 @@ jobs:
             test-report.junit.xml
           if-no-files-found: warn
 
-      - name: Upload coverage to Codecov
-        if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository)) }}
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: coverage/lcov.info
-          disable_search: true
-          version: v11.2.6
-          fail_ci_if_error: true
-
-      - name: Upload test results to Codecov
-        if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository)) }}
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: test-report.junit.xml
-          disable_search: true
-          report_type: test_results
-          version: v11.2.6
-          fail_ci_if_error: true
-
-      - name: Clean Codecov uploader files
-        if: ${{ !cancelled() }}
-        run: rm -f codecov codecov.SHA256SUM codecov.SHA256SUM.sig
-
       - name: Build
         run: npm run build
 
@@ -90,3 +65,45 @@ jobs:
             exit 1
           fi
           echo "✅ Workspace is clean"
+
+  codecov:
+    needs: ci
+    if: ${{ github.event_name != 'merge_group' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      id-token: write
+    steps:
+      - name: Download Vitest reports
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$REPOSITORY" \
+            --name vitest-reports \
+            --dir .
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          use_oidc: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+          files: coverage/lcov.info
+          disable_search: true
+          version: v11.2.6
+          fail_ci_if_error: true
+
+      - name: Upload test results to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          use_oidc: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+          files: test-report.junit.xml
+          disable_search: true
+          report_type: test_results
+          version: v11.2.6
+          fail_ci_if_error: true
+
+      - name: Clean Codecov uploader files
+        if: ${{ !cancelled() }}
+        run: rm -f codecov codecov.SHA256SUM codecov.SHA256SUM.sig
