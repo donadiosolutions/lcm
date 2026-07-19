@@ -1,0 +1,149 @@
+name: External admission
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+  merge_group:
+    types:
+      - checks_requested
+
+permissions:
+  checks: read
+  contents: read
+  statuses: write
+
+concurrency:
+  group: external-admission-${{ github.event_name == 'pull_request_target' && format('pr-{0}', github.event.pull_request.number) || format('merge-group-{0}', github.ref) }}
+  cancel-in-progress: true
+
+jobs:
+  external-admission:
+    name: external-admission
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Accept previously admitted merge group
+        if: ${{ github.event_name == 'merge_group' }}
+        run: |
+          # Every PR was admitted only after all three providers succeeded on
+          # its exact head SHA. They do not report on synthetic merge commits.
+          echo "External providers passed before merge-queue admission."
+
+      - name: Wait for external admission checks
+        if: ${{ github.event_name == 'pull_request_target' && !github.event.pull_request.draft }}
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Invalid pull request head SHA." >&2
+            exit 1
+          fi
+
+          post_admission_status() {
+            local state="$1"
+            local description="$2"
+            gh api --method POST \
+              "repos/$REPOSITORY/statuses/$HEAD_SHA" \
+              -f state="$state" \
+              -f context="external-admission" \
+              -f description="$description" \
+              -f target_url="$RUN_URL" >/dev/null
+          }
+
+          # Invoked indirectly by the EXIT trap.
+          # shellcheck disable=SC2329
+          admission_failed() {
+            local exit_code=$?
+            trap - EXIT
+            if (( exit_code != 0 )); then
+              post_admission_status failure \
+                "External admission failed; inspect the workflow run" || true
+            fi
+            exit "$exit_code"
+          }
+          trap admission_failed EXIT
+
+          post_admission_status pending \
+            "Waiting for CodeRabbit, Codecov patch, and DCO"
+
+          deadline=$((SECONDS + 1200))
+          while (( SECONDS < deadline )); do
+            commit_statuses="$(gh api \
+              "repos/$REPOSITORY/commits/$HEAD_SHA/statuses?per_page=100")"
+            check_runs="$(gh api \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?filter=latest&per_page=100")"
+
+            coderabbit_state="$(jq -r '
+              [.[]
+                | select(.context == "CodeRabbit")
+                | select(.creator.id == 136622811)
+                | select(.creator.login == "coderabbitai[bot]")]
+              | sort_by(.id)
+              | last
+              | .state // "missing"
+            ' <<<"$commit_statuses")"
+            codecov_state="$(jq -r '
+              [.check_runs[]
+                | select(.name == "codecov/patch")
+                | select(.app.id == 254)
+                | select(.app.slug == "codecov")]
+              | sort_by(.id)
+              | last
+              | if . == null then "missing"
+                elif .status != "completed" then .status
+                else .conclusion // "missing"
+                end
+            ' <<<"$check_runs")"
+            dco_state="$(jq -r '
+              [.check_runs[]
+                | select(.name == "DCO")
+                | select(.app.id == 1861)
+                | select(.app.slug == "dco")]
+              | sort_by(.id)
+              | last
+              | if . == null then "missing"
+                elif .status != "completed" then .status
+                else .conclusion // "missing"
+                end
+            ' <<<"$check_runs")"
+
+            echo "CodeRabbit=$coderabbit_state Codecov=$codecov_state DCO=$dco_state"
+
+            for provider_state in \
+              "$coderabbit_state" "$codecov_state" "$dco_state"; do
+              case "$provider_state" in
+                success | missing | pending | queued | in_progress | requested | waiting)
+                  ;;
+                *)
+                  echo "External provider reported terminal state: $provider_state" >&2
+                  exit 1
+                  ;;
+              esac
+            done
+
+            if [[ "$coderabbit_state" == success && \
+              "$codecov_state" == success && "$dco_state" == success ]]; then
+              post_admission_status success \
+                "CodeRabbit, Codecov patch, and DCO passed"
+              trap - EXIT
+              exit 0
+            fi
+
+            sleep 15
+          done
+
+          echo "Timed out waiting for external admission checks." >&2
+          exit 1
