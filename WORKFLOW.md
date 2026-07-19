@@ -121,25 +121,60 @@ the Codecov result already verified on the exact PR head.
      gh pr checks "$pr_number" --repo donadiosolutions/lcm >&2 || true
    }
 
+   show_merge_group_checks() {
+     local merge_group_sha=$1
+
+     if [[ -z "$merge_group_sha" ]]; then
+       echo "No synthetic merge-group SHA was observed for this queue attempt." >&2
+       return
+     fi
+
+     echo "Check runs for synthetic merge-group commit $merge_group_sha:" >&2
+     gh api \
+       -H 'Accept: application/vnd.github+json' \
+       "repos/donadiosolutions/lcm/commits/${merge_group_sha}/check-runs?per_page=100" \
+       --jq '.check_runs[] |
+         [.name, "status=" + .status, "conclusion=" + (.conclusion // "pending"),
+          "app=" + (.app.slug // "unknown"), (.details_url // "no-details-url")] |
+         @tsv' >&2 || true
+   }
+
+   show_queue_diagnostics() {
+     local pr_number=$1
+     local merge_group_sha=$2
+     show_pr_checks "$pr_number"
+     show_merge_group_checks "$merge_group_sha"
+   }
+
+   pr_is_merged() {
+     local pr_number=$1
+     [[ $(gh pr view "$pr_number" --repo donadiosolutions/lcm --json state --jq .state 2>/dev/null) == MERGED ]]
+   }
+
    query_merge_queue_entry() {
      local pr_number=$1
      gh api graphql \
        -f query='query($owner: String!, $name: String!, $number: Int!) {
          repository(owner: $owner, name: $name) {
-           pullRequest(number: $number) { mergeQueueEntry { position state } }
+           pullRequest(number: $number) {
+             mergeQueueEntry { position state headCommit { oid } }
+           }
          }
        }' \
        -f owner=donadiosolutions \
        -f name=lcm \
        -F number="$pr_number" \
        --jq '.data.repository.pullRequest.mergeQueueEntry |
-         if . == null then "" else [.position, .state] | @tsv end'
+         if . == null then ""
+         else [.position, .state, .headCommit.oid] | @tsv
+         end'
    }
 
    wait_for_queued_pr() {
      local pr_number=$1
      local admission_deadline=$((SECONDS + 65 * 60))
-     local current_queue_position deadline queue_entry queue_position queue_state state
+     local current_merge_group_sha current_queue_position deadline merge_group_sha=""
+     local queue_entry queue_position queue_state state
 
      # mergeQueueEntry can be temporarily absent while auto-merge waits for
      # required checks or GitHub propagates the newly queued entry.
@@ -150,31 +185,37 @@ the Codecov result already verified on the exact PR head.
          OPEN) ;;
          *)
            echo "PR #$pr_number entered unexpected state before queue admission: $state" >&2
-           show_pr_checks "$pr_number"
+           show_queue_diagnostics "$pr_number" "$merge_group_sha"
            return 1
            ;;
        esac
 
        if ! queue_entry=$(query_merge_queue_entry "$pr_number"); then
+         if pr_is_merged "$pr_number"; then return; fi
          echo "Could not query the merge-queue entry for PR #$pr_number." >&2
-         show_pr_checks "$pr_number"
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
          return 1
        fi
-       IFS=$'\t' read -r queue_position queue_state <<<"$queue_entry"
+       IFS=$'\t' read -r queue_position queue_state current_merge_group_sha <<<"$queue_entry"
+       if [[ -n "$current_merge_group_sha" ]]; then
+         merge_group_sha=$current_merge_group_sha
+       fi
 
        if [[ "$queue_state" == UNMERGEABLE ]]; then
+         if pr_is_merged "$pr_number"; then return; fi
          echo "PR #$pr_number became unmergeable before queue admission completed; inspect failed checks and requeue it:" >&2
-         show_pr_checks "$pr_number"
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
          return 1
        fi
 
-       if [[ "$queue_position" =~ ^[1-9][0-9]*$ ]]; then
+       if [[ "$queue_position" =~ ^[1-9][0-9]*$ && -n "$merge_group_sha" ]]; then
          break
        fi
 
        if ((SECONDS >= admission_deadline)); then
+         if pr_is_merged "$pr_number"; then return; fi
          echo "PR #$pr_number did not enter the merge queue within 65 minutes; inspect required checks and auto-merge state:" >&2
-         show_pr_checks "$pr_number"
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
          return 1
        fi
        sleep 15
@@ -191,33 +232,40 @@ the Codecov result already verified on the exact PR head.
            ;;
          *)
            echo "PR #$pr_number entered unexpected state while queued: $state" >&2
-           show_pr_checks "$pr_number"
+           show_queue_diagnostics "$pr_number" "$merge_group_sha"
            return 1
            ;;
        esac
 
        if ! queue_entry=$(query_merge_queue_entry "$pr_number"); then
+         if pr_is_merged "$pr_number"; then return; fi
          echo "Could not query the merge-queue entry for PR #$pr_number." >&2
-         show_pr_checks "$pr_number"
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
          return 1
        fi
-       IFS=$'\t' read -r current_queue_position queue_state <<<"$queue_entry"
+       IFS=$'\t' read -r current_queue_position queue_state current_merge_group_sha <<<"$queue_entry"
+       if [[ -n "$current_merge_group_sha" ]]; then
+         merge_group_sha=$current_merge_group_sha
+       fi
 
        if [[ -z "$current_queue_position" ]]; then
+         if pr_is_merged "$pr_number"; then return; fi
          echo "PR #$pr_number is still open but is no longer in the merge queue; inspect failed checks and requeue it:" >&2
-         show_pr_checks "$pr_number"
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
          return 1
        fi
 
        if [[ "$queue_state" == UNMERGEABLE ]]; then
+         if pr_is_merged "$pr_number"; then return; fi
          echo "PR #$pr_number became unmergeable at queue position $current_queue_position; inspect failed checks and requeue it:" >&2
-         show_pr_checks "$pr_number"
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
          return 1
        fi
 
        if ((SECONDS >= deadline)); then
+         if pr_is_merged "$pr_number"; then return; fi
          echo "PR #$pr_number did not merge within its position-$queue_position allowance of $((queue_position * 65)) minutes; inspect failed checks and requeue it:" >&2
-         show_pr_checks "$pr_number"
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
          return 1
        fi
        sleep 15
