@@ -162,6 +162,7 @@ describe("doctor service coverage", () => {
   it.each([
     [JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", result: { tools: Array(7).fill({}) } }), "pass", "7/7"],
     [JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: Array(6).fill({}) } }), "warn", "6/7"],
+    [`not-json\n${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: Array(3).fill({}) } })}\n{ "id" : 2, "result" : { "tools" : [ {}, {}, {}, {}, {}, {}, {} ] } }`, "pass", "7/7"],
     ["not-json tools/list", "warn", "0/7"],
     ["ordinary output", "warn", "0/7"],
     [JSON.stringify({ id: 2, tools: [] }), "warn", "0/7"],
@@ -261,19 +262,44 @@ describe("doctor service coverage", () => {
     expect(child.kill).not.toHaveBeenCalled();
   });
 
-  it("uses buffered handshake output when stdin errors", async () => {
+  it("drains late handshake output after stdin errors", async () => {
     vi.useFakeTimers();
     mocks.ensureDaemon.mockResolvedValue({ connected: true });
     mocks.mcpSetup = (child) => {
       setTimeout(() => {
-        child.stdout.emit("data", Buffer.from(JSON.stringify({ id: 2, method: "tools/list", result: { tools: Array(7).fill({}) } })));
+        child.kill.mockImplementationOnce(() => { child.signalCode = "SIGTERM"; });
         child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
+        setTimeout(() => {
+          child.stdout.emit("data", Buffer.from(JSON.stringify({ id: 2, method: "tools/list", result: { tools: Array(7).fill({}) } })));
+          child.emit("close", null, "SIGTERM");
+        }, 1);
       }, 1);
     };
 
     const results = await runWithHandshake(healthyDeps());
     expect(results.find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({ status: "pass", message: "lcm: 7/7 tools" });
     expect(mocks.mcpChild?.stdin.end).not.toHaveBeenCalled();
+    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(7000);
+    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
+  });
+
+  it("drains late handshake output after stdout errors", async () => {
+    vi.useFakeTimers();
+    mocks.ensureDaemon.mockResolvedValue({ connected: true });
+    mocks.mcpSetup = (child) => {
+      setTimeout(() => {
+        child.kill.mockImplementationOnce(() => { child.signalCode = "SIGTERM"; });
+        child.stdout.emit("error", new Error("stdout failed"));
+        setTimeout(() => {
+          child.stdout.emit("data", Buffer.from(JSON.stringify({ id: 2, result: { tools: Array(7).fill({}) } })));
+          child.emit("close", null, "SIGTERM");
+        }, 1);
+      }, 1);
+    };
+
+    const results = await runWithHandshake(healthyDeps());
+    expect(results.find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({ status: "pass", message: "lcm: 7/7 tools" });
     expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(7000);
     expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
@@ -292,6 +318,28 @@ describe("doctor service coverage", () => {
     expect(child.kill).toHaveBeenCalledOnce();
     expect(child.stdin.write).toHaveBeenCalledOnce();
     expect(child.stdin.end).not.toHaveBeenCalled();
+  });
+
+  it("uses the watchdog when a child never closes after stdin failure", async () => {
+    vi.useFakeTimers();
+    mocks.ensureDaemon.mockResolvedValue({ connected: true });
+    mocks.mcpSetup = (child) => {
+      child.kill.mockImplementationOnce(() => true);
+      setTimeout(() => { child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" })); }, 1);
+    };
+
+    const promise = runDoctor(healthyDeps());
+    await vi.advanceTimersByTimeAsync(5999);
+    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
+    expect(mocks.mcpChild?.stdin.write).toHaveBeenCalledOnce();
+    expect(mocks.mcpChild?.stdin.end).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({
+      status: "warn",
+      message: "lcm: 0/7 tools",
+    });
+    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
   });
 
   it.each(["destroyed", "unwritable"])("settles without writing when stdin is initially %s", async (state) => {

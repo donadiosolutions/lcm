@@ -217,15 +217,15 @@ function testMcpHandshake(): Promise<CheckResult> {
     const child = spawn(process.execPath, [binPath, "mcp"], { stdio: ["pipe", "pipe", "ignore"] });
     let stdout = "";
     let finished = false;
+    let stopRequested = false;
     const timers = new Set<ReturnType<typeof setTimeout>>();
 
     const resultFromOutput = (): CheckResult => {
-      const lines = stdout.trim().split("\n");
-      const toolsLine = lines.find((l) => l.includes('"tools/list"') || (l.includes('"tools"') && l.includes('"id":2')));
-      if (toolsLine) {
+      for (const line of stdout.split(/\r?\n/)) {
         try {
-          const parsed = JSON.parse(toolsLine);
-          const count = parsed.result?.tools?.length ?? 0;
+          const parsed = JSON.parse(line) as { id?: unknown; result?: { tools?: unknown } };
+          if (parsed.id !== 2 || !Array.isArray(parsed.result?.tools)) continue;
+          const count = parsed.result.tools.length;
           return { name: "mcp-handshake-lcm", category: "MCP Servers", status: count === 7 ? "pass" : "warn", message: `lcm: ${count}/7 tools` };
         } catch {}
       }
@@ -242,24 +242,25 @@ function testMcpHandshake(): Promise<CheckResult> {
 
     const childIsLive = (): boolean => child.exitCode === null && child.signalCode === null;
     const stopChild = (): void => {
-      if (!childIsLive()) return;
+      if (stopRequested || !childIsLive()) return;
+      stopRequested = true;
       try { child.kill(); } catch {}
-    };
-    const stopChildAndFinish = (result: CheckResult): void => {
-      stopChild();
-      finish(result);
     };
     const finishForPipeFailure = (): void => {
       if (finished || !childIsLive()) return;
-      stopChildAndFinish(resultFromOutput());
+      // Killing can synchronously emit close. Otherwise keep the watchdog
+      // active so any stdout produced during shutdown can still be collected.
+      stopChild();
     };
     const stdinIsWritable = (): boolean => !finished
+      && !stopRequested
       && childIsLive()
       && child.stdin.writable
       && !child.stdin.destroyed
       && !child.stdin.writableEnded;
 
     child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stdout.on("error", finishForPipeFailure);
     child.on("close", () => { finish(resultFromOutput()); });
     child.on("error", () => {
       finish({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "Could not spawn MCP process" });
