@@ -41,7 +41,7 @@ jobs:
         run: npm ci
 
       - name: Run update-gitleaks-patterns
-        run: npx tsx scripts/update-gitleaks-patterns.ts
+        run: node --experimental-strip-types scripts/update-gitleaks-patterns.ts
 
       - name: Check for changes
         id: diff
@@ -95,15 +95,21 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin "$BRANCH:refs/remotes/origin/$BRANCH" || true
 
-          if git rev-parse --verify "refs/remotes/origin/$BRANCH" >/dev/null 2>&1 &&
-             git diff --quiet "origin/$BRANCH" -- src/generated-patterns.ts "$CHANGESET"; then
-            echo "Existing branch $BRANCH already contains the generated pattern update."
-          else
-            git checkout -B "$BRANCH"
-            git add src/generated-patterns.ts "$CHANGESET"
-            git commit -s -m "chore(security): sync gitleaks patterns → ${RULE_COUNT} rules"
-            git push -u origin "$BRANCH" --force-with-lease
+          GENERATED_COPY="$RUNNER_TEMP/generated-patterns.ts"
+          cp src/generated-patterns.ts "$GENERATED_COPY"
+          git restore src/generated-patterns.ts
+          git checkout -B "$BRANCH" origin/main
+          cp "$GENERATED_COPY" src/generated-patterns.ts
+          UNEXPECTED=$(git status --short | grep -vE '^( M src/generated-patterns\.ts|\?\? \.changeset/gitleaks-patterns-[0-9]+\.md)$' || true)
+          if [[ -n "$UNEXPECTED" ]]; then
+            echo "::error::Pattern update produced changes outside the allowlist"
+            printf '%s\n' "$UNEXPECTED"
+            exit 1
           fi
+
+          git add src/generated-patterns.ts "$CHANGESET"
+          git commit -s -m "chore(security): sync gitleaks patterns → ${RULE_COUNT} rules"
+          git push -u origin "$BRANCH" --force-with-lease
 
           PR_NUMBER=$(gh pr list \
             --repo "${{ github.repository }}" \

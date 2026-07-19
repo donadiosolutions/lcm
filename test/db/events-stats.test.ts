@@ -179,7 +179,15 @@ describe("collectEventStats", () => {
 
     expect(sidecars[0].file).toBe("b.db");
     expect(sidecars[0].scanSkipped).toBeUndefined();
-    expect(sidecars.slice(1).every(sidecar => sidecar.scanSkipped)).toBe(true);
+    expect(sidecars).toHaveLength(2);
+    expect(sidecars[1].scanSkipped).toContain("2 sidecars");
+  });
+
+  it("bounds truncation reporting to one summary regardless of skipped file count", () => {
+    for (let i = 0; i < 100; i++) writeFileSync(join(tempDir, `placeholder-${i}.db`), "");
+    const sidecars = collectEventSidecars({ maxDbs: 0, pruneOrphanSidecars: false });
+    expect(sidecars).toHaveLength(1);
+    expect(sidecars[0].scanSkipped).toContain("100 sidecars");
   });
 
   it("prunes empty orphan sidecars by default", () => {

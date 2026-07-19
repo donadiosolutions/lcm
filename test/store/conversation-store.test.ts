@@ -402,6 +402,26 @@ describe("ConversationStore — withTransaction", () => {
     // Message should not exist after rollback
     expect(await store.getMessageCount(conv.conversationId)).toBe(0);
   });
+
+  it("serializes async transactions sharing a database handle", async () => {
+    const db = makeDb();
+    const firstStore = makeStore(db);
+    const secondStore = makeStore(db);
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const first = firstStore.withTransaction(async () => {
+      order.push("first-start");
+      await gate;
+      order.push("first-end");
+    });
+    const second = secondStore.withTransaction(() => { order.push("second"); });
+    await Promise.resolve();
+    expect(order).toEqual(["first-start"]);
+    release();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first-start", "first-end", "second"]);
+  });
 });
 
 describe("ConversationStore — persistence boundaries", () => {

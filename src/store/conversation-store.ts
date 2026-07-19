@@ -150,6 +150,8 @@ interface MaxSeqRow {
   max_seq: number;
 }
 
+const transactionQueues = new WeakMap<DatabaseSync, Promise<void>>();
+
 // ── Row mappers ───────────────────────────────────────────────────────────────
 
 function toConversationRecord(row: ConversationRow): ConversationRecord {
@@ -217,14 +219,25 @@ export class ConversationStore {
   // ── Transaction helpers ──────────────────────────────────────────────────
 
   async withTransaction<T>(operation: () => Promise<T> | T): Promise<T> {
-    this.db.exec("BEGIN IMMEDIATE");
+    const previous = transactionQueues.get(this.db) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    const queued = previous.then(() => current);
+    transactionQueues.set(this.db, queued);
+    await previous;
     try {
-      const result = await operation();
-      this.db.exec("COMMIT");
-      return result;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const result = await operation();
+        this.db.exec("COMMIT");
+        return result;
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+    } finally {
+      release();
+      if (transactionQueues.get(this.db) === queued) transactionQueues.delete(this.db);
     }
   }
 

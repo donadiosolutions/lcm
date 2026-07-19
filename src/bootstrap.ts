@@ -42,7 +42,9 @@ function defaultDeps(): EnsureCoreDeps {
   };
 }
 
-export async function ensureCore(deps: EnsureCoreDeps = defaultDeps()): Promise<void> {
+export type VerifiedCoreEndpoint = { connected: boolean; port: number };
+
+export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): Promise<VerifiedCoreEndpoint> {
   if (deps.configPath === defaultConfigPath()) {
     migrateLegacyHomeIfNeeded();
   }
@@ -71,12 +73,17 @@ export async function ensureCore(deps: EnsureCoreDeps = defaultDeps()): Promise<
 
   // 3. Start daemon if not running
   const config = loadDaemonConfig(deps.configPath);
-  await deps.ensureDaemon({
+  const result = await deps.ensureDaemon({
     port: config.daemon.port,
     pidFilePath: join(dirname(deps.configPath), "daemon.pid"),
     spawnTimeoutMs: 5000,
     enforceUserManagerParent: true,
   });
+  return { connected: result.connected, port: config.daemon.port };
+}
+
+export async function ensureCore(deps: EnsureCoreDeps = defaultDeps()): Promise<boolean> {
+  return (await ensureCoreEndpoint(deps)).connected;
 }
 
 export interface BootstrapDeps extends EnsureCoreDeps {
@@ -95,15 +102,17 @@ function defaultBootstrapDeps(): BootstrapDeps {
 export async function ensureBootstrapped(
   sessionId: string,
   deps: BootstrapDeps = defaultBootstrapDeps(),
-): Promise<void> {
+): Promise<boolean> {
   const safeId = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
   const flagDir = lcmTmpDir();
   mkdirSync(flagDir, { recursive: true });
   const flagPath = join(flagDir, `bootstrapped-${safeId}.flag`);
   try {
-    if (deps.flagExists(flagPath)) return;
+    if (deps.flagExists(flagPath)) return true;
   } catch {}
 
-  await ensureCore(deps);
+  const connected = await ensureCore(deps);
+  if (!connected) return false;
   try { deps.writeFlag(flagPath); } catch {}
+  return true;
 }

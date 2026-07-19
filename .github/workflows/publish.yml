@@ -145,6 +145,12 @@ jobs:
         if: steps.check.outputs.valid_release == 'true'
         run: npm run build
 
+      - name: Verify committed plugin bundles
+        if: steps.check.outputs.valid_release == 'true'
+        run: |
+          npm run check:plugin-bundles
+          git diff --exit-code -- lcm.mjs mcp.mjs
+
       - name: Publish to npm
         if: steps.check.outputs.valid_release == 'true' && steps.check.outputs.publish_package == 'true'
         run: npm publish --access public

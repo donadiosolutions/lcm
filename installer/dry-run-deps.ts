@@ -25,6 +25,10 @@ export class DryRunServiceDeps implements ServiceDeps, TeardownDeps {
     console.log(`[dry-run] would write: ${path}`);
   }
 
+  copyFileSync(source: PathLike, destination: PathLike): void {
+    console.log(`[dry-run] would copy: ${source} -> ${destination}`);
+  }
+
   mkdirSync(path: string, _opts?: any): void {
     if (!realExistsSync(path)) {
       console.log(`[dry-run] would create: ${path}`);

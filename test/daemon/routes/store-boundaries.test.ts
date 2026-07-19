@@ -83,7 +83,7 @@ describe("store persistence boundaries", () => {
       metadata: { projectId: "p", sessionId: "s", depth: 4 },
     }));
     expect(mocks.forProject).toHaveBeenCalledTimes(2);
-    expect(mocks.insert).toHaveBeenLastCalledWith(expect.objectContaining({ tags: ["tag"], projectId: "p", sessionId: "s", depth: 4 }));
+    expect(mocks.insert).toHaveBeenLastCalledWith(expect.objectContaining({ tags: ["scrubbed:tag"], projectId: "p", sessionId: "s", depth: 4 }));
   });
 
   it("handles absent pattern files and evicts the oldest scrubber at capacity", async () => {

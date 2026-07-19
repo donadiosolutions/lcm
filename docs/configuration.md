@@ -14,6 +14,11 @@ lcm install
 
 `lcm install` is the Claude Code setup path. It writes config, registers hooks, installs slash commands, registers MCP, and verifies the daemon.
 
+The plugin's hook and MCP entrypoints are committed, reproducible bundles. They
+never run `npm install`, package lifecycle scripts, or a TypeScript build from
+the plugin cache. Install the npm package explicitly when you want the global
+`lcm` command; plugin hooks themselves use the reviewed bundled entrypoints.
+
 When the setup wizard's **Custom server** summarizer is selected, both the
 OpenAI-compatible server URL and model name are required. The wizard retries an
 empty value once. If the retry is also empty, it falls back to the native CLI
@@ -146,6 +151,7 @@ The actual summary size depends on the LLM's output; these values are guidelines
 Prompt-time recall now has a second budget layer after `/prompt-search` ranking.
 
 - `restoration.promptSearchMaxResults` still controls how many top-ranked results the route aims to consider first.
+- Setting `restoration.promptSearchMaxResults` to `0` disables prompt-memory recall completely, regardless of `maxInjectedMemoryItems`.
 - `restoration.promptSnippetLength` still controls the per-result snippet size before final emission.
 - `restoration.maxInjectedMemoryItems` caps how many deduped hints can survive into the final `<memory-context>` block.
 - `restoration.dedupMinPrefix` dedupes identical or near-identical hints by normalized prefix before emission.
@@ -164,17 +170,24 @@ In practice, the hook asks the daemon for ranked candidates, the daemon dedupes 
 
 ## Daemon safety
 
-The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon requests to loopback HTTP origins and known daemon routes, so a malformed config or caller cannot redirect daemon traffic to another host.
+The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon requests to loopback HTTP origins and known daemon routes, so a malformed config or caller cannot redirect daemon traffic to another host. Before sending a bearer token or request body, lifecycle checks require the PID file, `/health` PID and installed version, and exact `127.0.0.1` listener ownership to agree. An occupied port with missing or unverifiable identity is rejected rather than trusted. SessionSnapshot skips ingestion when bootstrap cannot verify that identity. PostToolUse also ignores payload-provided daemon ports and performs no network I/O.
 
 Use `lcm daemon start` to start or validate the managed background daemon. Use
 `lcm daemon restart` after configuration changes; it validates the new
 configuration before stopping the managed process, then starts the daemon with
-the updated settings. On Linux, lcm prefers the current user's `systemd --user`
+the updated settings. Because restart fails closed unless the running daemon
+owns the configured listener, stop the daemon before changing `daemon.port`,
+then start it again after saving the new port. On Linux, lcm prefers the current user's `systemd --user`
 manager so the daemon remains a direct child of the user manager instead of
 being orphaned under PID 1. `lcm daemon start --detach` is kept as a compatibility
 alias for the same managed start behavior. Use `lcm daemon start --foreground`
 only when you want the daemon to stay attached to the current terminal for
 debugging.
+
+The managed systemd service receives a fixed system executable path rather than
+the launching shell's `PATH`. Put provider configuration in LCM settings or the
+documented `LCM_*` environment variables instead of relying on executables from
+a project-local or shell-specific path.
 
 `lcm doctor` verifies daemon health and, on Linux, repairs a healthy daemon that is not parented by the current user's systemd manager by restarting it through the managed start path. If the user systemd manager is unavailable, lcm falls back to the older detached spawn behavior and reports that the parent invariant is not satisfied.
 
@@ -193,6 +206,14 @@ managed `mcpServers.lcm` entry instead of crashing. Other fields are preserved
 when the settings root is a valid JSON object.
 
 Hook error fallback logs write to `~/.lcm/logs/events.log`.
+
+## Local filesystem protection
+
+LCM keeps `~/.lcm` and its project, event, and temporary directories accessible only to the current user (`0700`). Configuration, metadata, database, token, map, backup, and lock files use private file permissions (`0600`). Existing LCM roots are tightened during startup and installation.
+
+Session restore locks use a SHA-256 digest of the agent session ID under `~/.lcm/tmp`; session IDs are never used as path components. LCM reads restored `AGENTS.md` and `CLAUDE.md` instructions only from regular, non-symlink files inside their expected roots, with a combined 1 MiB limit. Unsafe instruction files are skipped.
+
+Project-local transcript paths remain supported for normal working directories. A working directory equal to the filesystem root does not authorize every file on the machine; provider-managed Claude and Codex transcript directories remain available in that case.
 
 ## Project path aliases
 

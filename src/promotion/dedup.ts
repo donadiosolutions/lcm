@@ -52,8 +52,6 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
       store.archive(duplicates[i].id);
     }
 
-    // Insert incoming as archived for recoverability of complementary info
-    store.archive(store.insert({ content, tags, projectId, sessionId, depth, confidence }));
   });
 
   return canonical.id;

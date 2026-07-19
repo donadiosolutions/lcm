@@ -13,6 +13,7 @@ const state = vi.hoisted(() => ({
   compactResult: { actionTaken: false, tokensBefore: 10, tokensAfter: 10 } as Record<string, unknown>,
   existingMeta: false,
   metaText: "{}",
+  metaError: undefined as unknown,
 }));
 
 vi.mock("../../../src/daemon/config.js", async (importOriginal) => {
@@ -49,7 +50,14 @@ vi.mock("../../../src/daemon/project.js", () => ({
 }));
 
 vi.mock("../../../src/daemon/project-queue.js", () => ({ enqueue: (_id: string, work: () => unknown) => work() }));
-vi.mock("../../../src/db/connection.js", () => ({ getLcmConnection: () => ({}), closeLcmConnection: vi.fn() }));
+vi.mock("../../../src/db/connection.js", () => ({
+  getLcmConnection: () => ({}),
+  closeLcmConnection: vi.fn(),
+  withYieldingLcmConnectionLock: (
+    _path: string,
+    work: (lock: { yieldWhile: (operation: () => Promise<unknown>) => Promise<unknown> }) => unknown,
+  ) => work({ yieldWhile: (operation) => operation() }),
+}));
 vi.mock("../../../src/db/migration.js", () => ({ runLcmMigrations: vi.fn() }));
 vi.mock("../../../src/db/redaction-stats.js", () => ({ upsertRedactionCounts: vi.fn() }));
 vi.mock("../../../src/transcript-provider.js", () => ({
@@ -81,7 +89,10 @@ vi.mock("../../../src/compaction.js", () => ({
 vi.mock("node:fs", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:fs")>()),
   existsSync: () => state.existingMeta,
-  readFileSync: () => state.metaText,
+  readFileSync: () => {
+    if (state.metaError !== undefined) throw state.metaError;
+    return state.metaText;
+  },
   writeFileSync: vi.fn(),
 }));
 
@@ -122,6 +133,7 @@ describe("compact route coverage", () => {
     state.compactResult = { actionTaken: false, tokensBefore: 10, tokensAfter: 10 };
     state.existingMeta = false;
     state.metaText = "{}";
+    state.metaError = undefined;
   });
 
   it("formats million-token and zero-input compactions", () => {
@@ -186,6 +198,12 @@ describe("compact route coverage", () => {
     state.existingMeta = true;
     state.metaText = "not json";
     const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp", transcript_path: "/tmp/transcript.jsonl" }), value);
+    expect(body.summary).toBe("No compaction needed.");
+  });
+
+  it("initializes metadata when the metadata file is absent", async () => {
+    state.metaError = Object.assign(new Error("missing"), { code: "ENOENT" });
+    const body = await call(JSON.stringify({ session_id: "missing-meta", cwd: "/tmp" }));
     expect(body.summary).toBe("No compaction needed.");
   });
 

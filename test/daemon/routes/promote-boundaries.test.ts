@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   dedup: vi.fn(async () => undefined),
   validate: vi.fn((cwd: string) => cwd),
   send: vi.fn(),
+  scrub: vi.fn((text: string) => text),
 }));
 
 vi.mock("node:fs", async (importOriginal) => ({
@@ -37,6 +38,9 @@ vi.mock("../../../src/db/promoted.js", () => ({ PromotedStore: class { listConte
 vi.mock("../../../src/promotion/detector.js", () => ({ shouldPromote: mocks.shouldPromote }));
 vi.mock("../../../src/promotion/dedup.js", () => ({ deduplicateAndInsert: mocks.dedup }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
+vi.mock("../../../src/scrub.js", () => ({
+  ScrubEngine: { forProject: async () => ({ scrub: mocks.scrub }) },
+}));
 
 import { createPromoteHandler } from "../../../src/daemon/routes/promote.js";
 
@@ -55,6 +59,22 @@ describe("promote persistence boundaries", () => {
     mocks.shouldPromote.mockReturnValue({ promote: false, tags: [], confidence: 0 });
     mocks.dedup.mockResolvedValue(undefined);
     mocks.validate.mockImplementation((cwd: string) => cwd);
+    mocks.scrub.mockImplementation((text: string) => text);
+  });
+
+  it("compares stored prefixes with the same scrubbed content used for insertion", async () => {
+    mocks.conversations.mockResolvedValueOnce([{ conversationId: 1, sessionId: "s" }]);
+    mocks.summaries.mockResolvedValueOnce([
+      { content: "token=secret", depth: 1, tokenCount: 1, sourceMessageTokenCount: 3 },
+    ]);
+    mocks.scrub.mockReturnValueOnce("token=[REDACTED]");
+    mocks.prefixes.mockReturnValueOnce(["token=[REDACTED]"]);
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
+
+    expect(mocks.shouldPromote).not.toHaveBeenCalled();
+    expect(mocks.dedup).not.toHaveBeenCalled();
+    expect(mocks.scrub).toHaveBeenCalledOnce();
   });
 
   it("validates cwd and missing databases", async () => {
@@ -102,7 +122,7 @@ describe("promote persistence boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { processed: 2, promoted: 1, conversations: 1 });
     expect(mocks.write).toHaveBeenCalledOnce();
 
-    mocks.exists.mockReturnValueOnce(true).mockReturnValueOnce(false);
+    mocks.exists.mockReturnValueOnce(true);
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
     expect(mocks.write).toHaveBeenCalledTimes(2);
     mocks.read.mockImplementationOnce(() => { throw new Error("meta failed"); });

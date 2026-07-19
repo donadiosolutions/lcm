@@ -35,11 +35,25 @@ export type SearchResult = {
   rank: number;
 };
 
+export function parsePromotedTags(serialized: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(serialized);
+    return Array.isArray(parsed) && parsed.every((tag) => typeof tag === "string")
+      ? parsed
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 export class PromotedStore {
   constructor(private db: DatabaseSync) {}
 
   insert(params: InsertParams): string {
     const id = randomUUID();
+    if (params.tags && (!Array.isArray(params.tags) || !params.tags.every((tag) => typeof tag === "string"))) {
+      throw new TypeError("tags must be an array of strings");
+    }
     const tags = JSON.stringify(params.tags ?? []);
 
     this.db.prepare(
@@ -100,7 +114,7 @@ export class PromotedStore {
     let results = rows.map((r) => ({
       id: r.id,
       content: r.content,
-      tags: JSON.parse(r.tags) as string[],
+      tags: parsePromotedTags(r.tags),
       projectId: r.project_id,
       sessionId: r.session_id,
       confidence: r.confidence,
@@ -133,7 +147,7 @@ export class PromotedStore {
 
     if (opts?.tags && opts.tags.length > 0) {
       rows = rows.filter((r) => {
-        const rowTags = JSON.parse(r.tags) as string[];
+        const rowTags = parsePromotedTags(r.tags);
         return opts.tags!.every((t) => rowTags.includes(t));
       });
     }

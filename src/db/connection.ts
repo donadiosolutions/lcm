@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "fs";
-import { dirname } from "path";
+import { chmodSync, lstatSync } from "node:fs";
+import { dirname } from "node:path";
+import { ensurePrivateDirectory, PRIVATE_FILE_MODE } from "../security-files.js";
 
 type ConnectionEntry = {
   db: DatabaseSync;
@@ -8,6 +9,78 @@ type ConnectionEntry = {
 };
 
 const _connections = new Map<string, ConnectionEntry>();
+const _connectionLocks = new Map<string, Promise<void>>();
+
+export async function withLcmConnectionLock<T>(
+  dbPath: string,
+  operation: () => Promise<T> | T,
+): Promise<T> {
+  const previous = _connectionLocks.get(dbPath) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const queued = previous.then(() => current);
+  _connectionLocks.set(dbPath, queued);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (_connectionLocks.get(dbPath) === queued) _connectionLocks.delete(dbPath);
+  }
+}
+
+export interface YieldingLcmConnectionLock {
+  /** Run slow non-database work without blocking queued users of this database. */
+  yieldWhile<T>(operation: () => Promise<T>): Promise<T>;
+}
+
+/**
+ * Serialize database work while allowing the owner to yield around slow work
+ * that does not touch the connection, such as an external summarizer call.
+ */
+export async function withYieldingLcmConnectionLock<T>(
+  dbPath: string,
+  operation: (lock: YieldingLcmConnectionLock) => Promise<T>,
+): Promise<T> {
+  let releaseCurrent: (() => void) | undefined;
+  let queuedCurrent: Promise<void> | undefined;
+
+  const acquire = async (): Promise<void> => {
+    const previous = _connectionLocks.get(dbPath) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    const queued = previous.then(() => current);
+    _connectionLocks.set(dbPath, queued);
+    await previous;
+    releaseCurrent = release;
+    queuedCurrent = queued;
+  };
+
+  const release = (): void => {
+    releaseCurrent?.();
+    if (queuedCurrent && _connectionLocks.get(dbPath) === queuedCurrent) {
+      _connectionLocks.delete(dbPath);
+    }
+    releaseCurrent = undefined;
+    queuedCurrent = undefined;
+  };
+
+  await acquire();
+  try {
+    return await operation({
+      yieldWhile: async <U>(slowOperation: () => Promise<U>): Promise<U> => {
+        release();
+        try {
+          return await slowOperation();
+        } finally {
+          await acquire();
+        }
+      },
+    });
+  } finally {
+    release();
+  }
+}
 
 function isConnectionHealthy(db: DatabaseSync): boolean {
   try {
@@ -42,11 +115,27 @@ export function getLcmConnection(dbPath: string): DatabaseSync {
     _connections.delete(dbPath);
   }
 
-  // Ensure parent directory exists
-  mkdirSync(dirname(dbPath), { recursive: true });
+  const isInMemory = dbPath === ":memory:";
+  if (!isInMemory) {
+    // Filesystem hardening applies only to persistent database paths. SQLite's
+    // special :memory: target has no parent directory or file to secure.
+    ensurePrivateDirectory(dirname(dbPath));
+    try {
+      const stat = lstatSync(dbPath);
+      if (stat.isSymbolicLink()) {
+        throw new Error(`refusing to open a symlink database path: ${dbPath}`);
+      }
+      if (!stat.isFile()) {
+        throw new Error(`database path is not a regular file: ${dbPath}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
 
   const db = new DatabaseSync(dbPath);
   try {
+    if (!isInMemory) chmodSync(dbPath, PRIVATE_FILE_MODE);
     // Enable WAL mode for better concurrent read performance
     db.exec("PRAGMA journal_mode = WAL");
     // Wait up to 5 seconds on busy instead of failing immediately

@@ -2,7 +2,6 @@
 import { extractPostToolEvents } from "./extractors.js";
 import { EventsDb } from "./events-db.js";
 import { eventsDbPath } from "../db/events-path.js";
-import { firePromoteEventsNotifyRequest } from "./session-end.js";
 import { safeLogError } from "./hook-errors.js";
 import { ensureProjectDir } from "../daemon/project.js";
 
@@ -13,22 +12,16 @@ interface PostToolHookInput {
   tool_response?: unknown;
   tool_output?: unknown;
   cwd?: unknown;
-  daemon_port?: unknown;
 }
 
 function resolveHookCwd(inputCwd: unknown): string {
-  const cwd = typeof inputCwd === "string" ? inputCwd.trim() : "";
+  const cwd = typeof inputCwd === "string" ? inputCwd : "";
   const envCwd = typeof process.env.CLAUDE_PROJECT_DIR === "string"
-    ? process.env.CLAUDE_PROJECT_DIR.trim()
+    ? process.env.CLAUDE_PROJECT_DIR
     : "";
-  if (cwd.length > 0) return cwd;
-  if (envCwd.length > 0) return envCwd;
+  if (cwd.trim().length > 0) return cwd;
+  if (envCwd.trim().length > 0) return envCwd;
   return process.cwd();
-}
-
-function normalizeHookPort(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isInteger(value)) return undefined;
-  return value >= 1 && value <= 65535 ? value : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -42,7 +35,7 @@ function normalizeToolOutput(value: unknown): { isError?: boolean } | undefined 
 
 export async function handlePostToolUse(
   stdin: string,
-  port?: number,
+  _port?: number,
 ): Promise<{ exitCode: number; stdout: string }> {
   let cwd: string | undefined;
   try {
@@ -51,16 +44,18 @@ export async function handlePostToolUse(
 
     if (typeof tool_name !== "string" || typeof session_id !== "string") return { exitCode: 0, stdout: "" };
 
-    const events = extractPostToolEvents({
+    const extractedEvents = extractPostToolEvents({
       tool_name,
       tool_input: isRecord(tool_input) ? tool_input : {},
       tool_response,
       tool_output: normalizeToolOutput(tool_output),
     });
-    if (events.length === 0) return { exitCode: 0, stdout: "" };
+    if (extractedEvents.length === 0) return { exitCode: 0, stdout: "" };
 
     const resolvedCwd = resolveHookCwd(input.cwd);
     cwd = resolvedCwd;
+    const { scrubExtractedEvents } = await import("./event-scrubbing.js");
+    const events = await scrubExtractedEvents(extractedEvents, resolvedCwd);
     ensureProjectDir(resolvedCwd);
     const dbPath = eventsDbPath(resolvedCwd);
     const db = new EventsDb(dbPath);
@@ -70,13 +65,9 @@ export async function handlePostToolUse(
         db.insertEvent(session_id, event, "PostToolUse");
       }
 
-      const daemonPort = normalizeHookPort(input.daemon_port) ?? port ?? 3737;
-      const priority = Math.min(...events.map(e => e.priority));
-      firePromoteEventsNotifyRequest(daemonPort, {
-        cwd: resolvedCwd,
-        priority,
-        sourceHook: "PostToolUse",
-      });
+      // PostToolUse payloads are untrusted. Persist events locally and let the
+      // daemon's bounded background scan process them; never use a payload port
+      // for a token-bearing request.
     } finally {
       db.close();
     }

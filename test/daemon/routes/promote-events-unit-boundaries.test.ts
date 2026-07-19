@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   validate: vi.fn((cwd: string) => cwd),
   log: vi.fn(),
   send: vi.fn(),
+  scrub: vi.fn((text: string) => text),
 }));
 
 vi.mock("../../../src/hooks/events-db.js", () => ({
@@ -38,6 +39,9 @@ vi.mock("../../../src/db/connection.js", () => ({ getLcmConnection: mocks.getCon
 vi.mock("../../../src/db/migration.js", () => ({ runLcmMigrations: mocks.migrate }));
 vi.mock("../../../src/hooks/hook-errors.js", () => ({ safeLogError: mocks.log }));
 vi.mock("../../../src/db/event-sidecars.js", () => ({ collectEventSidecars: mocks.collect }));
+vi.mock("../../../src/scrub.js", () => ({
+  ScrubEngine: { forProject: async () => ({ scrub: mocks.scrub }) },
+}));
 
 import {
   createPromoteAllEventsHandler,
@@ -73,6 +77,7 @@ describe("promote-events unit boundaries", () => {
     mocks.storeSearch.mockReturnValue([]);
     mocks.dedup.mockResolvedValue("id");
     mocks.validate.mockImplementation((cwd: string) => cwd);
+    mocks.scrub.mockImplementation((text: string) => text);
   });
 
   it("returns a generic global error when sidecar collection throws", async () => {
@@ -115,6 +120,7 @@ describe("promote-events unit boundaries", () => {
       incomplete: true,
       message: "stopped after maximum promotion batches",
     });
+    expect(mocks.scrub).toHaveBeenCalledTimes(10_000);
   });
 
   it("covers correlation tiers, reinforcement, existing matches, defaults, and event errors", async () => {

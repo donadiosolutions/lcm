@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { packageRootFor } from "../runtime-root.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -9,14 +10,13 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  * PKG_VERSION works correctly in both production (dist/src/daemon/) and
  * dev/test (src/daemon/) environments.
  *
- * Returns `undefined` when the version cannot be determined, so that callers
- * like ensureDaemon({ expectedVersion }) skip the version check rather than
- * restarting the daemon based on a stale "0.0.0" fallback.
+ * Returns `undefined` when the version cannot be determined. Security-sensitive
+ * lifecycle callers treat that as unverifiable and fail closed before sending
+ * daemon credentials.
  */
 export const PKG_VERSION: string | undefined = (() => {
   const candidates = [
-    // Production / installed: dist/src/daemon → 3 levels up = package root
-    join(__dirname, "..", "..", "..", "package.json"),
+    join(packageRootFor(import.meta.url, 3), "package.json"),
     // Dev / vitest: src/daemon → 2 levels up = package root
     join(__dirname, "..", "..", "package.json"),
   ];

@@ -22,6 +22,12 @@ describe("isSafeTranscriptPath", () => {
     expect(isSafeTranscriptPath(join(cwd, "transcript.jsonl"), cwd)).toBeTruthy();
   });
 
+  it("does not let a filesystem-root cwd authorize arbitrary files", () => {
+    expect(isSafeTranscriptPath("/etc/passwd", "/")).toBe(false);
+    const providerTranscript = join(homedir(), ".codex", "sessions", "session.jsonl");
+    expect(isSafeTranscriptPath(providerTranscript, "/")).toBeTruthy();
+  });
+
   it("rejects paths outside allowed bases", () => {
     expect(isSafeTranscriptPath("/etc/passwd", cwd)).toBe(false);
     expect(isSafeTranscriptPath(join(homedir(), ".ssh", "id_rsa"), cwd)).toBe(false);

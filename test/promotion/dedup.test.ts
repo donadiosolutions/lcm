@@ -149,7 +149,7 @@ describe("deduplicateAndInsert", () => {
     expect(results[0].confidence).toBe(0.9);
   });
 
-  it("archives incoming entry alongside canonical for recoverability", async () => {
+  it("does not persist repeated incoming duplicates", async () => {
     const db = makeDb();
     const store = new PromotedStore(db);
 
@@ -176,12 +176,12 @@ describe("deduplicateAndInsert", () => {
     const results = store.search("PostgreSQL", 10);
     expect(results.length).toBe(1);
 
-    // Both rows exist in DB: canonical (active) + incoming (archived)
+    // Only the canonical row exists; repeated promotion cannot grow archived rows.
     const rows = db
       .prepare("SELECT archived_at FROM promoted WHERE project_id = ? ORDER BY rowid ASC")
       .all("p1") as Array<{ archived_at: string | null }>;
-    expect(rows.length).toBe(2);
-    expect(rows.filter((r) => r.archived_at !== null).length).toBe(1);
+    expect(rows.length).toBe(1);
+    expect(rows.filter((r) => r.archived_at !== null)).toHaveLength(0);
   });
 
   it("upgrades confidence when incoming is higher than canonical", async () => {

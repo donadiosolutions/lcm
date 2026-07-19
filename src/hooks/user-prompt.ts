@@ -13,12 +13,12 @@ type PromptSearchResponse = {
 };
 
 function resolveHookCwd(inputCwd: unknown): string {
-  const cwd = typeof inputCwd === "string" ? inputCwd.trim() : "";
+  const cwd = typeof inputCwd === "string" ? inputCwd : "";
   const envCwd = typeof process.env.CLAUDE_PROJECT_DIR === "string"
-    ? process.env.CLAUDE_PROJECT_DIR.trim()
+    ? process.env.CLAUDE_PROJECT_DIR
     : "";
-  if (cwd.length > 0) return cwd;
-  if (envCwd.length > 0) return envCwd;
+  if (cwd.trim().length > 0) return cwd;
+  if (envCwd.trim().length > 0) return envCwd;
   return process.cwd();
 }
 
@@ -69,7 +69,8 @@ export async function handleUserPromptSubmit(
       const { ensureProjectDir } = await import("../daemon/project.js");
 
       const prompt = String(input.prompt);
-      const events = extractUserPromptEvents(prompt);
+      const { scrubExtractedEvents } = await import("./event-scrubbing.js");
+      const events = await scrubExtractedEvents(extractUserPromptEvents(prompt), cwd);
 
       if (events.length > 0 && input.session_id && typeof input.session_id === "string") {
         ensureProjectDir(cwd);

@@ -1,10 +1,14 @@
 import { resolve, isAbsolute } from "node:path";
-import { statSync, realpathSync } from "node:fs";
+import { statSync } from "node:fs";
 import { sanitizeError } from "./safe-error.js";
 
 /**
- * Canonicalize and validate a cwd parameter from a daemon route.
- * Ensures consistent project ID hashing regardless of path formatting.
+ * Normalize and validate a cwd parameter from a daemon route.
+ *
+ * Preserve the caller's lexical path after validation so an explicitly mapped
+ * project alias remains distinguishable from the canonical directory it may
+ * currently reference. Project identity resolution performs its own canonical
+ * fallback for paths that are not aliases.
  */
 export function validateCwd(cwd: string): string {
   if (!cwd || typeof cwd !== "string") {
@@ -27,10 +31,5 @@ export function validateCwd(cwd: string): string {
     const msg = err instanceof Error ? err.message : "filesystem error";
     throw new Error(sanitizeError(msg));
   }
-  // Resolve symlinks so /tmp and /private/tmp map to the same project ID on macOS.
-  try {
-    return realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
+  return resolved;
 }

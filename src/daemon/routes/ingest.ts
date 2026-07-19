@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { getLcmConnection, closeLcmConnection } from "../../db/connection.js";
+import { getLcmConnection, closeLcmConnection, withLcmConnectionLock } from "../../db/connection.js";
 import type { DaemonConfig } from "../config.js";
 import { projectPaths, ensureProjectDir, isSafeTranscriptPath } from "../project.js";
 import { sendJson } from "../server.js";
@@ -12,6 +12,7 @@ import type { ParsedMessage } from "../../transcript.js";
 import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
+import { safeLogError } from "../../hooks/hook-errors.js";
 
 function isParsedMessage(value: unknown): value is ParsedMessage {
   if (!value || typeof value !== "object") return false;
@@ -74,15 +75,16 @@ export function createIngestHandler(config: DaemonConfig): RouteHandler {
       paths.dir,
     );
 
-    const db = getLcmConnection(dbPath);
-    try {
+    await withLcmConnectionLock(dbPath, async () => {
+      const db = getLcmConnection(dbPath);
+      try {
       runLcmMigrations(db);
 
       // Check if session is already fully ingested in session_ingest_log — using the same
       // db connection to avoid double-open overhead and lock contention.
       try {
-        const row = db.prepare("SELECT 1 FROM session_ingest_log WHERE session_id = ?").get(session_id);
-        if (row) {
+        const row = db.prepare("SELECT message_count FROM session_ingest_log WHERE session_id = ?").get(session_id) as { message_count: number } | undefined;
+        if (row && parsed.length <= row.message_count) {
           // Session already fully ingested — skip
           sendJson(res, 200, { ingested: 0, totalTokens: 0 });
           return;
@@ -129,8 +131,10 @@ export function createIngestHandler(config: DaemonConfig): RouteHandler {
       try {
         const metaPath = paths.metaPath;
         let meta: Record<string, unknown> = {};
-        if (existsSync(metaPath)) {
+        try {
           meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
         meta.cwd = paths.canonical;
         meta.lastIngest = new Date().toISOString();
@@ -151,10 +155,12 @@ export function createIngestHandler(config: DaemonConfig): RouteHandler {
         totalTokens,
         ...(totalRedacted > 0 ? { redacted: totalRedacted, redactedCategories: redactionCategories } : {}),
       });
-    } catch (err) {
-      sendJson(res, 500, { error: err instanceof Error ? err.message : "ingest failed" });
-    } finally {
-      closeLcmConnection(dbPath);
-    }
+      } catch (err) {
+        safeLogError("ingest", err, { cwd, sessionId: session_id });
+        sendJson(res, 500, { error: "ingest failed", code: "INGEST_FAILED" });
+      } finally {
+        closeLcmConnection(dbPath);
+      }
+    });
   };
 }

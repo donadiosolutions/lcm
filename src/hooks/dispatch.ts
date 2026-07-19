@@ -8,17 +8,6 @@ export function isHookCommand(cmd: string): cmd is HookCommand {
   return (HOOK_COMMANDS as readonly string[]).includes(cmd);
 }
 
-function daemonPortFromHookPayload(stdinText: string): number | undefined {
-  try {
-    const parsed = JSON.parse(stdinText || "{}") as { daemon_port?: unknown };
-    const value = parsed.daemon_port;
-    if (typeof value !== "number" || !Number.isInteger(value)) return undefined;
-    return value >= 1 && value <= 65535 ? value : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function hookClientFromPayload(stdinText: string): string | undefined {
   try {
     const parsed = JSON.parse(stdinText || "{}") as { client?: unknown };
@@ -32,20 +21,11 @@ export async function dispatchHook(
   command: HookCommand,
   stdinText: string,
 ): Promise<{ exitCode: number; stdout: string }> {
+  let verifiedSnapshotPort: number | undefined;
   // Early return for post-tool — runs on EVERY tool call, must skip bootstrap for performance
   if (command === "post-tool") {
     const { handlePostToolUse } = await import("./post-tool.js");
-    const payloadPort = daemonPortFromHookPayload(stdinText);
-    if (payloadPort !== undefined) {
-      return handlePostToolUse(stdinText, payloadPort);
-    }
-    try {
-      const { loadDaemonConfig } = await import("../daemon/config.js");
-      const config = loadDaemonConfig(defaultConfigPath());
-      return handlePostToolUse(stdinText, config.daemon?.port ?? 3737);
-    } catch {
-      return handlePostToolUse(stdinText);
-    }
+    return handlePostToolUse(stdinText);
   }
 
   // Skip bootstrap for compact — the daemon is already running by the time
@@ -56,10 +36,22 @@ export async function dispatchHook(
     try {
       const { session_id } = JSON.parse(stdinText || "{}");
       if (session_id) {
-        const { ensureBootstrapped } = await import("../bootstrap.js");
-        await ensureBootstrapped(session_id);
+        const { ensureBootstrapped, ensureCoreEndpoint } = await import("../bootstrap.js");
+        // Session snapshots contain transcript paths and payload data, so they
+        // reverify the current endpoint even when this session has a bootstrap
+        // flag from an earlier healthy daemon.
+        const endpoint = command === "session-snapshot" ? await ensureCoreEndpoint() : undefined;
+        const verified = endpoint?.connected ?? await ensureBootstrapped(session_id);
+        if (command === "session-snapshot" && !verified) {
+          return { exitCode: 0, stdout: "" };
+        }
+        if (command === "session-snapshot") verifiedSnapshotPort = endpoint!.port;
       }
-    } catch {} // bootstrap failure must not block hooks
+    } catch {
+      // Most hooks retain their existing best-effort behavior, but snapshots
+      // must never send transcript data or credentials to an unverified port.
+      if (command === "session-snapshot") return { exitCode: 0, stdout: "" };
+    }
   }
 
   const hookClient = hookClientFromPayload(stdinText) ?? process.env.LCM_CLIENT;
@@ -90,7 +82,9 @@ export async function dispatchHook(
     }
     case "session-snapshot": {
       const { handleSessionSnapshot } = await import("./session-snapshot.js");
-      return handleSessionSnapshot(stdinText);
+      return verifiedSnapshotPort === undefined
+        ? handleSessionSnapshot(stdinText)
+        : handleSessionSnapshot(stdinText, { verifiedPort: verifiedSnapshotPort });
     }
     case "user-prompt": {
       const { handleUserPromptSubmit } = await import("./user-prompt.js");

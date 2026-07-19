@@ -121,6 +121,12 @@ describe("handleDaemonRequest", () => {
 });
 
 describe("startMcpServer", () => {
+  it("refuses to register MCP handlers when daemon identity is unverified", async () => {
+    ensureDaemonMcpMock.mockResolvedValueOnce({ connected: false, port: 9999, spawned: false });
+    const { startMcpServer } = await import("../../src/mcp/server.js");
+    await expect(startMcpServer()).rejects.toThrow("daemon endpoint identity could not be verified");
+  });
+
   it("passes PKG_VERSION as expectedVersion to ensureDaemon", async () => {
     const { startMcpServer } = await import("../../src/mcp/server.js");
 

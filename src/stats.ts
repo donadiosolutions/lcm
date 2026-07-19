@@ -8,6 +8,7 @@ import { RecallStore, type RecallStats } from "./db/recall.js";
 import { PromotedStore } from "./db/promoted.js";
 import { loadDaemonConfig } from "./daemon/config.js";
 import { configPath as defaultConfigPath, projectsDir as lcmProjectsDir } from "./runtime-paths.js";
+import { sanitizeTerminalText } from "./terminal-sanitize.js";
 
 export type { RecallStats };
 
@@ -287,7 +288,8 @@ export function printStats(stats: OverallStats, verbose: boolean): void {
       console.log();
       console.log(`    ${dim}Top recalled memories:${reset}`);
       for (const m of rc.topRecalled) {
-        const preview = m.content.length > 60 ? m.content.slice(0, 60) + "…" : m.content;
+        const safeContent = sanitizeTerminalText(m.content);
+        const preview = safeContent.length > 60 ? safeContent.slice(0, 60) + "…" : safeContent;
         console.log(`    ${dim}×${m.actCount}${reset}  ${preview}`);
       }
     }

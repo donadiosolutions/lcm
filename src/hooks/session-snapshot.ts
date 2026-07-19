@@ -10,6 +10,7 @@ export interface SnapshotDeps {
   writeFileSync: (path: string, data: string) => void;
   snapshotIntervalSec: number;
   post: (path: string, body: Record<string, unknown>) => Promise<unknown>;
+  verifiedPort?: number;
 }
 
 function defaultStatSync(path: string): { mtimeMs: number } | null {
@@ -67,7 +68,7 @@ export async function handleSessionSnapshot(
       const { loadDaemonConfig } = await import("../daemon/config.js");
       const { readFileSync: _readFileSync } = await import("node:fs");
       const config = loadDaemonConfig(defaultConfigPath());
-      const port = normalizeDaemonPort(config.daemon?.port ?? 3737);
+      const port = deps?.verifiedPort ?? normalizeDaemonPort(config.daemon?.port ?? 3737);
 
       // Read token from token file if available (silent fallback if not found)
       let token: string | null = null;
@@ -100,7 +101,7 @@ export async function handleSessionSnapshot(
         const minTokens = config.compaction.autoCompactMinTokens;
         if (!disableCompact && ingestResult.totalTokens >= minTokens) {
           const { fireCompactRequest } = await import("./session-end.js");
-          fireCompactRequest(normalizeDaemonPort(config.daemon?.port ?? 3737), {
+          fireCompactRequest(deps?.verifiedPort ?? normalizeDaemonPort(config.daemon?.port ?? 3737), {
             session_id,
             cwd,
             skip_ingest: true,
@@ -124,7 +125,7 @@ export async function handleSessionSnapshot(
     try {
       const { loadDaemonConfig: _loadConfig } = await import("../daemon/config.js");
       const _config = _loadConfig(defaultConfigPath());
-      const port = normalizeDaemonPort(_config.daemon?.port ?? 3737);
+      const port = deps?.verifiedPort ?? normalizeDaemonPort(_config.daemon?.port ?? 3737);
       const { firePromoteEventsRequest } = await import("./session-end.js");
       firePromoteEventsRequest(port, { cwd: input.cwd });
     } catch {

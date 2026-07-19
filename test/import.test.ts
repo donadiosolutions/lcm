@@ -327,7 +327,7 @@ describe("importSessions", () => {
     await expect(importSessions(client, { cwd: "/coverage/nonexistent/default-claude-project" })).resolves.toMatchObject({ imported: 0 });
   });
 
-  it("skips sessions recorded in the local ingest log and closes the database", async () => {
+  it("defers completion decisions to the daemon so grown transcripts can resume", async () => {
     const claudeProjectsDir = makeTmpDir();
     const lcmDir = makeTmpDir();
     const cwd = "/already/imported";
@@ -345,13 +345,13 @@ describe("importSessions", () => {
     db.close();
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     const onProgress = vi.fn();
-    const client = makeMockClient(async () => ({ ingested: 1, totalTokens: 1 }));
+    const client = makeMockClient(async () => ({ ingested: 0, totalTokens: 0 }));
     const result = await importSessions(client, {
       cwd, _claudeProjectsDir: claudeProjectsDir, _lcmDir: lcmDir, verbose: true, onProgress,
     });
-    expect(client.post).not.toHaveBeenCalled();
+    expect(client.post).toHaveBeenCalledWith("/ingest", expect.objectContaining({ session_id: sessionId }));
     expect(result.skippedEmpty).toBe(1);
-    expect(log).toHaveBeenCalledWith(expect.stringContaining("already fully ingested"));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("empty or already ingested"));
     expect(onProgress).toHaveBeenCalled();
   });
 
@@ -369,7 +369,7 @@ describe("importSessions", () => {
     db.exec("PRAGMA foreign_keys = ON");
     db.exec("CREATE TABLE session_ingest_log (session_id TEXT PRIMARY KEY); INSERT INTO session_ingest_log VALUES ('recorded')");
     db.close();
-    const result = await importSessions(makeMockClient(async () => ({})), {
+    const result = await importSessions(makeMockClient(async () => ({ ingested: 0, totalTokens: 0 })), {
       cwd, _claudeProjectsDir: claudeProjectsDir, _lcmDir: lcmDir,
     });
     expect(result.skippedEmpty).toBe(1);
@@ -955,7 +955,7 @@ describe("importSessions — provider: codex", () => {
       ].join("\n"),
     );
 
-    const calls: { path: string; body: any }[] = [];
+    const calls: Array<{ path: string; body: unknown }> = [];
     const client = makeMockClient(async (path, body) => {
       calls.push({ path, body });
       if (path === "/compact") return { summary: "ok", tokensBefore: 100, tokensAfter: 10 };
@@ -968,8 +968,70 @@ describe("importSessions — provider: codex", () => {
       _codexDir: codexDir,
     });
 
-    expect(calls.find(c => c.path === "/ingest")?.body.client).toBe("codex");
-    expect(calls.find(c => c.path === "/compact")?.body.client).toBe("codex");
+    expect((calls.find(c => c.path === "/ingest")?.body as { client: string }).client).toBe("codex");
+    expect((calls.find(c => c.path === "/compact")?.body as { client: string }).client).toBe("codex");
+  });
+
+  it("keeps replay summaries isolated by project and client", async () => {
+    type CompactRequest = {
+      session_id: string;
+      cwd: string;
+      client: "claude" | "codex";
+      previous_summary?: string;
+    };
+    const claudeProjectsDir = makeTmpDir();
+    const codexDir = makeTmpDir();
+    const projectA = makeTmpDir();
+    const projectB = makeTmpDir();
+    const aliasParent = makeTmpDir();
+    const projectAAlias = join(aliasParent, "project-a-alias");
+    symlinkSync(projectA, projectAAlias, "dir");
+    const archivedDir = join(codexDir, "archived_sessions");
+    mkdirSync(archivedDir, { recursive: true });
+    const claudeProjectDir = join(claudeProjectsDir, cwdToProjectHash(projectA));
+    mkdirSync(claudeProjectDir, { recursive: true });
+    const claudeSessions = ["claude-1", "claude-2"];
+    claudeSessions.forEach((id, index) => {
+      const path = join(claudeProjectDir, `${id}.jsonl`);
+      writeFileSync(path, "");
+      const time = new Date(1_699_999_900_000 + index * 1_000);
+      utimesSync(path, time, time);
+    });
+    const sessions = [
+      ["a1", projectA],
+      ["b1", projectB],
+      ["c1", projectAAlias],
+    ] as const;
+    sessions.forEach(([id, cwd], index) => {
+      const path = join(archivedDir, `${id}.jsonl`);
+      writeFileSync(path, makeCodexSessionMetaLine(id, cwd));
+      const time = new Date(1_700_000_000_000 + index * 1_000);
+      utimesSync(path, time, time);
+    });
+    const compacts: CompactRequest[] = [];
+    const client = makeMockClient(async (path, body) => {
+      if (path === "/compact") {
+        const request = body as CompactRequest;
+        compacts.push(request);
+        return { latestSummaryContent: `summary-${request.session_id}` };
+      }
+      return { ingested: 1, totalTokens: 1 };
+    });
+    await importSessions(client, {
+      provider: "all",
+      cwd: projectA,
+      replay: true,
+      _claudeProjectsDir: claudeProjectsDir,
+      _codexDir: codexDir,
+    });
+
+    const compact = (clientName: CompactRequest["client"], sessionId: string) =>
+      compacts.find((request) => request.client === clientName && request.session_id === sessionId);
+    expect(compact("claude", "claude-1")).not.toHaveProperty("previous_summary");
+    expect(compact("claude", "claude-2")?.previous_summary).toBe("summary-claude-1");
+    expect(compact("codex", "a1")).not.toHaveProperty("previous_summary");
+    expect(compact("codex", "b1")).not.toHaveProperty("previous_summary");
+    expect(compact("codex", "c1")?.previous_summary).toBe("summary-a1");
   });
 
   it("provider all imports from both Claude and Codex", async () => {

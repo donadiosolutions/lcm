@@ -83,6 +83,10 @@ If `lcm` is not on PATH, first try to install it by running:
 LEGACY_SLUG="$(printf '%s-%s' lossless claude)"
 LCM_PLUGIN_SLUG="lcm"
 LCM_DIR=$(ls -d ~/.claude/plugins/cache/*/"$LCM_PLUGIN_SLUG"/*/ ~/.claude/plugins/cache/"$LCM_PLUGIN_SLUG"/lcm/*/ ~/.claude/plugins/cache/*/"$LEGACY_SLUG"/*/ ~/.claude/plugins/cache/"$LEGACY_SLUG"/lcm/*/ 2>/dev/null | sort -V | tail -1)
+[ -n "$LCM_DIR" ] && [ -f "${LCM_DIR}lcm.mjs" ] || {
+  echo "LCM plugin bundle not found; reinstall the lcm plugin before continuing." >&2
+  exit 1
+}
 node "${LCM_DIR}lcm.mjs" install
 ```
 
@@ -91,7 +95,12 @@ If install succeeds, `lcm` should now be available on PATH. If it is still not a
 ```bash
 LEGACY_SLUG="$(printf '%s-%s' lossless claude)"
 LCM_PLUGIN_SLUG="lcm"
-node "$(ls -d ~/.claude/plugins/cache/*/"$LCM_PLUGIN_SLUG"/*/ ~/.claude/plugins/cache/"$LCM_PLUGIN_SLUG"/lcm/*/ ~/.claude/plugins/cache/*/"$LEGACY_SLUG"/*/ ~/.claude/plugins/cache/"$LEGACY_SLUG"/lcm/*/ 2>/dev/null | sort -V | tail -1)lcm.mjs"
+LCM_DIR=$(ls -d ~/.claude/plugins/cache/*/"$LCM_PLUGIN_SLUG"/*/ ~/.claude/plugins/cache/"$LCM_PLUGIN_SLUG"/lcm/*/ ~/.claude/plugins/cache/*/"$LEGACY_SLUG"/*/ ~/.claude/plugins/cache/"$LEGACY_SLUG"/lcm/*/ 2>/dev/null | sort -V | tail -1)
+[ -n "$LCM_DIR" ] && [ -f "${LCM_DIR}lcm.mjs" ] || {
+  echo "LCM plugin bundle not found; reinstall the lcm plugin before continuing." >&2
+  exit 1
+}
+node "${LCM_DIR}lcm.mjs"
 ```
 
 ## Error Self-Healing

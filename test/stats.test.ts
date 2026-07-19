@@ -223,6 +223,22 @@ describe("printStats", () => {
     expect(out).toContain("×3");
   });
 
+  it("renders recalled memory as a single terminal-safe line", () => {
+    const out = captureLog(() => printStats({
+      ...baseStats,
+      recallStats: {
+        memoriesSurfaced: 1,
+        memoriesActedUpon: 1,
+        recallPrecision: 100,
+        topRecalled: [{ id: "unsafe", content: "safe\nspoof\r\x1b]52;c;YQ==\x07\x1b[31mred\x1b[0m\u202eevil", actCount: 1 }],
+      },
+    }, false));
+    expect(out).toContain("safe spoof red evil");
+    expect(out).not.toContain("\x1b]52");
+    expect(out).not.toContain("\x1b[31m");
+    expect(out).not.toContain("\u202e");
+  });
+
   it("shows Recall section when memoriesActedUpon > 0 even if surfaced is 0", () => {
     const out = captureLog(() => printStats({
       ...baseStats,

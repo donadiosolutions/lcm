@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect } from "vitest";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -54,6 +54,7 @@ describe("runtime paths", () => {
       from: legacyLcmHomeDir(home),
       to: lcmHomeDir(home),
     });
+    expect(statSync(lcmHomeDir(home)).mode & 0o777).toBe(0o700);
   });
 
   it("migrates an existing legacy home when the new home is absent", () => {

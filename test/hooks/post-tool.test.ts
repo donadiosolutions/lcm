@@ -1,10 +1,12 @@
 // test/hooks/post-tool.test.ts
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { handlePostToolUse } from "../../src/hooks/post-tool.js";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { projectMetaPath } from "../../src/daemon/project.js";
+import { eventsDbPath } from "../../src/db/events-path.js";
+import { EventsDb } from "../../src/hooks/events-db.js";
 
 // Mock eventsDbPath to use temp directory
 vi.mock("../../src/db/events-path.js", () => ({
@@ -12,17 +14,26 @@ vi.mock("../../src/db/events-path.js", () => ({
   eventsDir: () => process.env.TEST_EVENTS_DIR!,
 }));
 
-vi.mock("../../src/hooks/session-end.js", () => ({
-  firePromoteEventsNotifyRequest: vi.fn(),
-}));
-
-import { firePromoteEventsNotifyRequest } from "../../src/hooks/session-end.js";
-
 describe("handlePostToolUse", () => {
   let dir: string;
   let homeDir: string;
   let extraDirs: string[];
   let originalHome: string | undefined;
+
+  function expectPersistedDecision(inputCwd: string): void {
+    const db = new EventsDb(eventsDbPath(inputCwd));
+    try {
+      expect(db.getUnprocessed()).toEqual([
+        expect.objectContaining({
+          session_id: "test-session",
+          data: expect.stringContaining("Use SQLite?"),
+          source_hook: "PostToolUse",
+        }),
+      ]);
+    } finally {
+      db.close();
+    }
+  }
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "post-tool-test-"));
@@ -31,7 +42,6 @@ describe("handlePostToolUse", () => {
     process.env.HOME = homeDir;
     extraDirs = [];
     process.env.TEST_EVENTS_DIR = dir;
-    vi.mocked(firePromoteEventsNotifyRequest).mockClear();
   });
 
   afterEach(() => {
@@ -105,14 +115,16 @@ describe("handlePostToolUse", () => {
     expect(JSON.parse(readFileSync(projectMetaPath(envCwd), "utf-8")).cwd).toBe(envCwd);
   });
 
-  it("trims the selected cwd before writing project metadata", async () => {
-    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-input-cwd-"));
-    extraDirs.push(inputCwd);
+  it("preserves surrounding whitespace in the selected cwd", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "post-tool-input-cwd-"));
+    const inputCwd = join(parent, " project ");
+    mkdirSync(inputCwd);
+    extraDirs.push(parent);
 
     const stdin = JSON.stringify({
       session_id: "test-session",
       tool_name: "Read",
-      cwd: `  ${inputCwd}  `,
+      cwd: inputCwd,
       tool_input: { file_path: join(inputCwd, "src/main.ts") },
     });
     const result = await handlePostToolUse(stdin);
@@ -122,7 +134,7 @@ describe("handlePostToolUse", () => {
     expect(JSON.parse(readFileSync(projectMetaPath(inputCwd), "utf-8")).cwd).toBe(inputCwd);
   });
 
-  it("notifies daemon after captured passive events", async () => {
+  it("persists captured passive events without trusting a payload daemon port", async () => {
     const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-notify-cwd-"));
     extraDirs.push(inputCwd);
 
@@ -135,14 +147,10 @@ describe("handlePostToolUse", () => {
       tool_response: "yes",
     }));
 
-    expect(firePromoteEventsNotifyRequest).toHaveBeenCalledWith(4567, expect.objectContaining({
-      cwd: inputCwd,
-      priority: 1,
-      sourceHook: "PostToolUse",
-    }));
+    expectPersistedDecision(inputCwd);
   });
 
-  it("ignores invalid daemon_port values", async () => {
+  it("ignores daemon_port values even when a caller also supplies a port", async () => {
     const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-invalid-port-cwd-"));
     extraDirs.push(inputCwd);
 
@@ -155,11 +163,7 @@ describe("handlePostToolUse", () => {
       tool_response: "yes",
     }), 4568);
 
-    expect(firePromoteEventsNotifyRequest).toHaveBeenCalledWith(4568, expect.objectContaining({
-      cwd: inputCwd,
-      priority: 1,
-      sourceHook: "PostToolUse",
-    }));
+    expectPersistedDecision(inputCwd);
   });
 
   it("ignores a non-boolean tool output error marker", async () => {

@@ -35,12 +35,13 @@ vi.mock("../../src/daemon/config.js", () => ({
   loadDaemonConfig: vi.fn().mockReturnValue({ daemon: { port: 3737 } }),
 }));
 vi.mock("../../src/bootstrap.js", () => ({
-  ensureBootstrapped: vi.fn().mockResolvedValue(undefined),
+  ensureBootstrapped: vi.fn().mockResolvedValue(true),
+  ensureCoreEndpoint: vi.fn().mockResolvedValue({ connected: true, port: 3737 }),
 }));
 
 import { validateAndFixHooks } from "../../src/hooks/auto-heal.js";
 import { dispatchHook, isHookCommand } from "../../src/hooks/dispatch.js";
-import { ensureBootstrapped } from "../../src/bootstrap.js";
+import { ensureBootstrapped, ensureCoreEndpoint } from "../../src/bootstrap.js";
 
 describe("HOOK_COMMANDS", () => {
   it("has an entry for every REQUIRED_HOOKS event", () => {
@@ -151,6 +152,37 @@ describe("dispatchHook", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  it("retains best-effort dispatch for non-snapshot hooks when bootstrap is unverified", async () => {
+    vi.mocked(ensureBootstrapped).mockResolvedValueOnce(false);
+    vi.mocked(handleSessionStart).mockClear();
+    await dispatchHook("restore", JSON.stringify({ session_id: "s1" }));
+    expect(handleSessionStart).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, "throw"] as const)("does not dispatch snapshots when bootstrap verification is %s", async (mode) => {
+    vi.mocked(handleSessionSnapshot).mockClear();
+    if (mode === "throw") vi.mocked(ensureCoreEndpoint).mockRejectedValueOnce(new Error("bootstrap failed"));
+    else vi.mocked(ensureCoreEndpoint).mockResolvedValueOnce({ connected: false, port: 3737 });
+    await expect(dispatchHook("session-snapshot", JSON.stringify({ session_id: "s1" }))).resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(handleSessionSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("reverifies snapshot identity even when the session was already bootstrapped", async () => {
+    vi.mocked(ensureBootstrapped).mockClear();
+    vi.mocked(ensureCoreEndpoint).mockClear();
+    await dispatchHook("session-snapshot", JSON.stringify({ session_id: "s1" }));
+    expect(ensureCoreEndpoint).toHaveBeenCalledOnce();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+  });
+
+  it("binds snapshot dispatch to the verified port when configuration changes afterward", async () => {
+    vi.mocked(ensureCoreEndpoint).mockResolvedValueOnce({ connected: true, port: 3737 });
+    vi.mocked(loadDaemonConfig).mockReturnValueOnce(configWithDaemon({ port: 9999 }));
+    vi.mocked(handleSessionSnapshot).mockClear();
+    await dispatchHook("session-snapshot", JSON.stringify({ session_id: "s1" }));
+    expect(handleSessionSnapshot).toHaveBeenCalledWith(expect.any(String), { verifiedPort: 3737 });
+  });
+
   it("routes post-tool without calling ensureBootstrapped", async () => {
     vi.mocked(loadDaemonConfig).mockReturnValueOnce(configWithDaemon({ port: 4545 }));
     vi.mocked(handlePostToolUse).mockClear();
@@ -162,11 +194,11 @@ describe("dispatchHook", () => {
     }));
     expect(result.exitCode).toBe(0);
     expect(handlePostToolUse).toHaveBeenCalledTimes(1);
-    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String), 4545);
+    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String));
     expect(ensureBootstrapped).not.toHaveBeenCalled();
   });
 
-  it("uses daemon_port from post-tool payload without loading config", async () => {
+  it("ignores daemon_port from post-tool payload without loading config", async () => {
     vi.mocked(handlePostToolUse).mockClear();
     vi.mocked(loadDaemonConfig).mockClear();
 
@@ -177,7 +209,7 @@ describe("dispatchHook", () => {
       tool_input: { file_path: "/test.ts" },
     }));
 
-    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String), 4546);
+    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String));
     expect(loadDaemonConfig).not.toHaveBeenCalled();
   });
 
@@ -189,18 +221,19 @@ describe("dispatchHook", () => {
   it.each([0, 65536, 1.5, "4545"])("rejects invalid payload port %j", async (daemon_port) => {
     vi.mocked(handlePostToolUse).mockClear();
     await dispatchHook("post-tool", JSON.stringify({ daemon_port }));
-    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String), 3737);
+    expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String));
   });
 
   it("uses config fallback for malformed post-tool JSON", async () => {
     await dispatchHook("post-tool", "not json");
-    expect(handlePostToolUse).toHaveBeenCalledWith("not json", 3737);
+    expect(handlePostToolUse).toHaveBeenCalledWith("not json");
   });
 
-  it("uses the handler default when post-tool config loading fails", async () => {
-    vi.mocked(loadDaemonConfig).mockImplementationOnce(() => { throw new Error("bad config"); });
+  it("does not load daemon config for post-tool dispatch", async () => {
+    vi.mocked(loadDaemonConfig).mockClear();
     await dispatchHook("post-tool", "{}");
     expect(handlePostToolUse).toHaveBeenCalledWith("{}");
+    expect(loadDaemonConfig).not.toHaveBeenCalled();
   });
 
   it("skips bootstrap when the payload has no session or malformed JSON", async () => {
@@ -237,6 +270,6 @@ describe("dispatchHook", () => {
     expect(handlePostToolUse).toHaveBeenCalled();
     vi.mocked(loadDaemonConfig).mockReturnValueOnce({} as unknown as ReturnType<typeof loadDaemonConfig>);
     await dispatchHook("post-tool", "{}");
-    expect(handlePostToolUse).toHaveBeenCalledWith("{}", 3737);
+    expect(handlePostToolUse).toHaveBeenCalledWith("{}");
   });
 });
