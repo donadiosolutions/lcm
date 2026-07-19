@@ -146,7 +146,6 @@ export function buildClassificationSchema(config, expectedIssueNumbers) {
               const property = {
                 type: "array",
                 minItems: cardinality.min,
-                uniqueItems: true,
                 items: valid[group].length > 0
                   ? { type: "string", enum: [...valid[group]] }
                   : { type: "string" },
