@@ -76,7 +76,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Retry and backoff duration accounting must use a monotonic clock so wall-clock corrections cannot shorten or extend a wait.
 - Normalize non-finite delay values before entering timer loops; security-sensitive timer scheduling must keep user-derived values out of `setTimeout` durations by using literal constants only.
 - Reject executable directories containing the platform PATH delimiter before composing a restricted child-process `PATH`; otherwise one trusted path can inject additional search directories or the current directory.
-- Managed-daemon executable search paths may trust exact absolute launcher/runtime directories outside the current project plus explicit global-install or bundled-runtime anchors; never add `npx`, any `node_modules` directory, the current project or its checkout ancestors, or ambient `PATH` entries.
+- Managed-daemon executable search paths must reject project containment before recognizing global-install or bundled-runtime anchors; a project-local `.codex`, `.claude`, or package-manager-shaped directory is untrusted. Never add `npx`, any `node_modules` directory, the current project or its checkout ancestors, or ambient `PATH` entries.
 - Diagnostics for a reused managed daemon must inspect that verified process's effective environment before using a deterministic startup fallback. Never reuse a PID from the initial health probe when lifecycle validation fails or throws.
 
 ### GitHub Actions and CodeQL

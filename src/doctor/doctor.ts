@@ -192,8 +192,7 @@ function daemonProcessPath(deps: DoctorDeps, pid: number | undefined): string | 
   try {
     const environment = deps.readFileSync(`/proc/${pid}/environ`, "latin1");
     const pathEntry = environment.split("\0").find((entry) => entry.startsWith("PATH="));
-    const value = pathEntry?.slice("PATH=".length);
-    return value ? value : undefined;
+    return pathEntry === undefined ? undefined : pathEntry.slice("PATH=".length);
   } catch {
     return undefined;
   }
@@ -542,10 +541,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         try {
           const res = await deps.fetch(`http://127.0.0.1:${config.port}/health`);
           if (res.ok) {
-            const h = (await res.json()) as { status?: string; version?: string; pid?: number };
+            const h = (await res.json()) as { status?: string; version?: string };
             postRestartOk = h.status === "ok";
             postRestartVersion = h.version;
-            if (postRestartOk && h.pid !== undefined) daemonPid = h.pid;
           }
         } catch { /* non-fatal */ }
       }

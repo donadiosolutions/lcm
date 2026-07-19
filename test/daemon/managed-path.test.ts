@@ -58,19 +58,31 @@ describe("managed daemon executable path", () => {
     )).toBe(`/home/alice/.volta/bin:${SYSTEMD_DAEMON_PATH}`);
   });
 
-  it("preserves Volta and asdf global bins when invoked from the user home", () => {
+  it("preserves canonical home-global bins while rejecting project-local lookalikes", () => {
     expect(managedDaemonPath(
       "/home/alice/.volta/bin/node",
       ["/home/alice/.volta/bin/lcm", "daemon", "start"],
+      "/home/alice",
       "/home/alice",
     )).toBe(`/home/alice/.volta/bin:${SYSTEMD_DAEMON_PATH}`);
     expect(managedDaemonPath(
       "/home/alice/.asdf/installs/nodejs/24.4.1/bin/node",
       ["/home/alice/.asdf/shims/lcm", "daemon", "start"],
       "/home/alice",
+      "/home/alice",
     )).toBe(
       `/home/alice/.asdf/shims:/home/alice/.asdf/installs/nodejs/24.4.1/bin:${SYSTEMD_DAEMON_PATH}`,
     );
+    expect(managedDaemonPath(
+      "/usr/bin/node",
+      ["/work/project/.codex/plugins/cache/lcm/1.4.0/lcm.mjs", "daemon", "start"],
+      "/work/project",
+    )).toBe(SYSTEMD_DAEMON_PATH);
+    expect(managedDaemonPath(
+      "/usr/bin/node",
+      ["/work/project/.claude/plugins/cache/lcm/1.4.0/lcm.mjs", "daemon", "start"],
+      "/work/project/packages/app",
+    )).toBe(SYSTEMD_DAEMON_PATH);
   });
 
   it("preserves a user-owned global npm prefix", () => {

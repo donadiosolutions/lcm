@@ -1,4 +1,5 @@
 import { delimiter, dirname, isAbsolute, relative, sep } from "node:path";
+import { homedir } from "node:os";
 
 export const SYSTEMD_DAEMON_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -12,26 +13,38 @@ function isWithin(directory: string, root: string): boolean {
   return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
 }
 
-function isKnownGlobalOrBundledDir(directory: string): boolean {
-  if (SYSTEMD_DAEMON_PATH.split(":").includes(directory)) return true;
-  if (/(?:^|\/)\.nvm\/versions\/node\/[^/]+\/bin$/.test(directory)) return true;
-  if (/(?:^|\/)\.npm-packages\/bin$/.test(directory)) return true;
-  if (/(?:^|\/)\.volta\/bin$/.test(directory)) return true;
-  if (/(?:^|\/)\.asdf\/(?:shims|installs\/nodejs\/[^/]+\/bin)$/.test(directory)) return true;
-  if (/(?:^|\/)codex-desktop\/resources\/node-runtime\/bin$/.test(directory)) return true;
-  return /(?:^|\/)\.(?:codex|claude)\/plugins\/cache\//.test(directory);
+function homeScopedInstallationRoot(directory: string): string | undefined {
+  const match = /^(.*)\/(?:\.nvm|\.npm-packages|\.volta|\.asdf|\.codex|\.claude)(?:\/|$)/.exec(directory);
+  return match?.[1] || undefined;
 }
 
-function isTrustedInstallationDir(directory: string, workingDirectory: string): boolean {
+function isTrustedInstallationDir(
+  directory: string,
+  workingDirectory: string,
+  homeDirectory: string,
+): boolean {
   if (/(?:^|\/)node_modules(?:\/|$)/.test(directory)) return false;
-  return isKnownGlobalOrBundledDir(directory)
-    || (!isWithin(directory, workingDirectory) && !isWithin(workingDirectory, directory));
+  const installationRoot = homeScopedInstallationRoot(directory);
+  if (installationRoot && isWithin(workingDirectory, installationRoot)) {
+    // The real per-user installation root remains trusted even when a command
+    // is run from $HOME. Lookalike caches rooted in a checkout do not.
+    if (relative(homeDirectory, installationRoot) !== "") return false;
+  }
+  // Project containment wins over recognizable install layouts. A checkout can
+  // contain attacker-controlled .codex/.claude caches or package-manager paths
+  // whose names would otherwise look like approved global trust anchors.
+  if (
+    (isWithin(directory, workingDirectory) || isWithin(workingDirectory, directory))
+    && relative(homeDirectory, installationRoot ?? directory) !== ""
+  ) return false;
+  return true;
 }
 
 function trustedExecutableDirs(
   spawnCommand: string,
   spawnArgs: readonly string[],
   workingDirectory: string,
+  homeDirectory: string,
 ): TrustedExecutableDir[] {
   const firstArg = spawnArgs[0];
   const executables: Array<{ path: string; entrypoint: boolean }> = [];
@@ -44,7 +57,7 @@ function trustedExecutableDirs(
   return executables
     .map(({ path, entrypoint }) => ({ directory: dirname(path), entrypoint }))
     .filter(({ directory }) =>
-      !directory.includes(delimiter) && isTrustedInstallationDir(directory, workingDirectory)
+      !directory.includes(delimiter) && isTrustedInstallationDir(directory, workingDirectory, homeDirectory)
     );
 }
 
@@ -53,9 +66,10 @@ export function managedDaemonPath(
   spawnCommand: string,
   spawnArgs: readonly string[],
   workingDirectory = process.cwd(),
+  homeDirectory = homedir(),
 ): string {
   const systemDirs = SYSTEMD_DAEMON_PATH.split(":");
-  const trustedDirs = trustedExecutableDirs(spawnCommand, spawnArgs, workingDirectory)
+  const trustedDirs = trustedExecutableDirs(spawnCommand, spawnArgs, workingDirectory, homeDirectory)
     .filter(({ directory, entrypoint }) => entrypoint || !systemDirs.includes(directory))
     .map(({ directory }) => directory);
   return [...new Set([...trustedDirs, ...systemDirs])].join(":");

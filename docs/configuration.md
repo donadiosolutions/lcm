@@ -190,7 +190,10 @@ The managed systemd service receives a trusted executable path rather than the
 launching shell's `PATH`. It prepends the exact absolute launcher and runtime
 directories to a fixed set of system directories when those directories are
 outside the current project. Known global Node installations and bundled Codex
-or Claude plugin-cache/runtime directories remain valid trust anchors. LCM
+or Claude plugin-cache/runtime directories remain valid trust anchors only when
+they are also outside the current project containment boundary. Canonical
+per-user installations remain trusted when the command runs directly from the
+user's home directory; similarly named directories rooted in a checkout do not. LCM
 rejects trust anchors containing the platform's `PATH` delimiter, all
 `node_modules` paths (including `npx` and `node_modules/.bin` launchers), the
 current project directory or its checkout ancestors when invoked from a
