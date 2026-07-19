@@ -8,6 +8,7 @@ import { DaemonClient } from "./daemon/client.js";
 import { projectsDir as lcmProjectsDir } from "./runtime-paths.js";
 import { normalizeProjectPath, projectMapPathsForHash } from "./project-map.js";
 import type { LlmApiMode, LlmInvocationRequestPolicy, LlmReasoningEffort, LlmRetryPolicy } from "./daemon/config.js";
+import { MANUAL_COMPACT_FRESH_TAIL_COUNT } from "./compaction.js";
 
 export interface UncompactedConversation {
   projectDir: string;
@@ -99,14 +100,19 @@ export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?:
           FROM messages GROUP BY conversation_id
         ) m ON m.conversation_id = c.conversation_id
         LEFT JOIN (
+          SELECT conversation_id, COUNT(*) as raw_context_count
+          FROM context_items WHERE item_type = 'message' GROUP BY conversation_id
+        ) ci ON ci.conversation_id = c.conversation_id
+        LEFT JOIN (
           SELECT conversation_id, COUNT(*) as sum_count
           FROM summaries GROUP BY conversation_id
         ) s ON s.conversation_id = c.conversation_id
         WHERE COALESCE(m.msg_count, 0) > 0
+          AND COALESCE(ci.raw_context_count, 0) > ?
           AND (? OR COALESCE(s.sum_count, 0) = 0)
           AND COALESCE(m.raw_tokens, 0) >= ?
         ORDER BY COALESCE(m.raw_tokens, 0) DESC
-        `).all(replay ? 1 : 0, minTokens) as { conversation_id: number; session_id: string; messages: number; tokens: number; summaries: number }[];
+        `).all(MANUAL_COMPACT_FRESH_TAIL_COUNT, replay ? 1 : 0, minTokens) as { conversation_id: number; session_id: string; messages: number; tokens: number; summaries: number }[];
 
         for (const row of rows) {
           results.push({
@@ -141,13 +147,13 @@ export async function batchCompact(opts: {
   requestPolicy?: LlmInvocationRequestPolicy;
   /** Called with state patches as each session is processed — used by the ninja renderer */
   onProgress?: (patch: Partial<ProgressState>) => void;
-}): Promise<{ compacted: number; failures: number }> {
+}): Promise<{ compacted: number; unchanged: number; failures: number; compactedProjects: string[] }> {
   const conversations = findUncompacted(opts.minTokens, opts.dryRun, opts.cwd, opts.replay);
   const onProgress = opts.onProgress;
 
   if (conversations.length === 0) {
     console.log("Nothing to compact — all sessions are up to date.");
-    return { compacted: 0, failures: 0 };
+    return { compacted: 0, unchanged: 0, failures: 0, compactedProjects: [] };
   }
 
   const totalTokens = conversations.reduce((s, c) => s + c.tokens, 0);
@@ -157,11 +163,13 @@ export async function batchCompact(opts: {
   onProgress?.({ total: conversations.length });
 
   let compacted = 0;
+  let unchanged = 0;
   let doneCount = 0;
   let messagesIn = 0;
   let tokensIn = 0;
   let tokensOut = 0;
   const progressErrors: { sessionId: string; message: string }[] = [];
+  const compactedProjects = new Set<string>();
   const client = new DaemonClient(`http://127.0.0.1:${opts.port}`, opts.tokenPath);
 
   for (const conv of conversations) {
@@ -181,6 +189,7 @@ export async function batchCompact(opts: {
       const data = await client.post<{
         summary?: string;
         skipped?: boolean;
+        actionTaken?: boolean;
         tokensBefore?: number;
         tokensAfter?: number;
         providerLabel?: string;
@@ -213,6 +222,14 @@ export async function batchCompact(opts: {
           current: undefined,
           lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore: conv.tokens, elapsed: Date.now() - sessionStart },
         });
+      } else if (data.actionTaken === false) {
+        unchanged++;
+        console.log(" unchanged (no compaction needed)");
+        onProgress?.({
+          completed: doneCount,
+          current: undefined,
+          lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore: conv.tokens, tokensAfter: conv.tokens, provider: formatLlmDiagnostic(data), elapsed: Date.now() - sessionStart },
+        });
       } else {
         const tokensBefore = data.tokensBefore ?? conv.tokens;
         const tokensAfter = data.tokensAfter ?? 0;
@@ -223,6 +240,7 @@ export async function batchCompact(opts: {
           console.log(" done");
         }
         compacted++;
+        compactedProjects.add(normalizeProjectPath(conv.cwd));
         messagesIn += conv.messages;
         tokensIn += tokensBefore;
         tokensOut += tokensAfter;
@@ -266,5 +284,5 @@ export async function batchCompact(opts: {
     }
   }
 
-  return { compacted, failures: progressErrors.length };
+  return { compacted, unchanged, failures: progressErrors.length, compactedProjects: [...compactedProjects] };
 }

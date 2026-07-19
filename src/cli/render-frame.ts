@@ -143,7 +143,9 @@ export function renderFrame(
 
   // Line 3: current or last session detail
   let line3 = '';
-  if (state.current) {
+  if (state.currentProject) {
+    line3 = `  ● ${state.currentProject}  processing...`;
+  } else if (state.current) {
     const elapsed = fmtElapsed(now - state.current.startedAt);
     line3 = `  ● ${state.current.sessionId}  ${state.current.messages} msgs  processing...  ${elapsed}`;
   } else if (state.lastResult) {

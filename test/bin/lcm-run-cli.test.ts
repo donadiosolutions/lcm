@@ -25,7 +25,7 @@ const state = vi.hoisted(() => ({
   installed: [] as Array<{ agentId: string; type: string; path: string }>,
   installResult: { path: "/connector", requiresRestart: false } as Record<string, unknown>,
   removeResult: true,
-  batchResult: { compacted: 1, failures: 0 },
+  batchResult: { compacted: 1, unchanged: 0, failures: 0, compactedProjects: ["/project"] },
   importResult: { imported: 1, skipped: 0 },
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
   provider: "openai",
@@ -95,7 +95,9 @@ vi.mock("../../src/batch-compact.js", () => ({ batchCompact: vi.fn(async (option
   options.onProgress?.(state.batchProgressLast ? { lastResult: { ok: true } } : {});
   return state.batchResult;
 }) }));
-vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((value: Record<string, unknown>) => ({ ...value })) }));
+vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((value: Record<string, unknown>) => ({
+  total: 0, completed: 0, errors: [], tokensIn: 0, tokensOut: 0, messagesIn: 0, ...value,
+})) }));
 vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
   start = vi.fn(); stop = vi.fn(); sessionDone = vi.fn(); printSummary = vi.fn();
 } }));
@@ -175,6 +177,7 @@ beforeEach(() => {
   state.importProgressLast = true;
   state.sensitiveStdout = "sensitive";
   state.packageVersion = "1.4.0";
+  state.batchResult = { compacted: 1, unchanged: 0, failures: 0, compactedProjects: ["/project"] };
 });
 
 afterEach(() => {
@@ -564,9 +567,15 @@ describe("runCli failure and alternate presentation branches", () => {
     }
   });
 
-  it("keeps best-effort promotion and export failures non-fatal", async () => {
+  it("fails compact when automatic promotion fails while keeping explicit promote best-effort", async () => {
     state.post.mockRejectedValueOnce(new Error("promote failed"));
     expect(await invoke(["compact"])).toBeUndefined();
+    expect(process.exitCode).toBe(1);
+    process.exitCode = undefined;
+    state.post.mockRejectedValueOnce("promote failed");
+    expect(await invoke(["compact"])).toBeUndefined();
+    expect(process.exitCode).toBe(1);
+    process.exitCode = undefined;
     state.post.mockRejectedValueOnce("promote failed");
     expect(await invoke(["promote", "--verbose"])).toBeUndefined();
     state.exportError = new Error("export failed");

@@ -18,7 +18,7 @@ import { runLcmMigrations } from "../../db/migration.js";
 import { upsertRedactionCounts } from "../../db/redaction-stats.js";
 import { ConversationStore } from "../../store/conversation-store.js";
 import { SummaryStore } from "../../store/summary-store.js";
-import { CompactionEngine } from "../../compaction.js";
+import { CompactionEngine, MANUAL_COMPACT_FRESH_TAIL_COUNT } from "../../compaction.js";
 import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
 import { ScrubEngine } from "../../scrub.js";
 import {
@@ -263,7 +263,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
     // Guard must be checked and set synchronously (before any await) to prevent
     // concurrent requests from racing through the has() check before add() runs.
     if (compactingNow.has(session_id)) {
-      sendJson(res, 200, { skipped: true, summary: "Compaction already in progress for this session." });
+      sendJson(res, 200, { skipped: true, actionTaken: false, summary: "Compaction already in progress for this session." });
       return;
     }
     compactingNow.add(session_id);
@@ -286,6 +286,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
       );
       if (!summarize) {
         sendJson(res, 200, {
+          actionTaken: false,
           summary: "Summarization disabled — no summarizer configured.",
           providerId: effectiveProvider,
           providerLabel,
@@ -351,6 +352,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
 
           if (tokenCount === 0) {
             return {
+              actionTaken: false,
               summary: "No messages to compact.",
               providerId: effectiveProvider,
               providerLabel,
@@ -364,7 +366,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
 
           const engine = new CompactionEngine(conversationStore, summaryStore, {
             contextThreshold: 0.75,
-            freshTailCount: 8,
+            freshTailCount: MANUAL_COMPACT_FRESH_TAIL_COUNT,
             leafMinFanout: 3,
             condensedMinFanout: 2,
             condensedMinFanoutHard: 1,
@@ -429,6 +431,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
           }
 
           return {
+            actionTaken: compactResult.actionTaken,
             summary: summaryMsg,
             latestSummaryContent,
             tokensBefore: compactResult.tokensBefore,
