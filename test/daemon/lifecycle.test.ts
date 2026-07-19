@@ -462,7 +462,7 @@ describe("ensureDaemon", () => {
           "--user",
           "--collect",
           "--no-block",
-          "--setenv=PATH=/opt/lcm-test/bin:/usr/bin",
+          "--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
           "--setenv=LCM_SUMMARY_PROVIDER=anthropic",
           "--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_SUMMARY_API_KEY",
           "node",
@@ -478,6 +478,7 @@ describe("ensureDaemon", () => {
       expect(joinedArgs).not.toContain("sk-test");
       expect(joinedArgs).not.toContain("sk-lcm-test");
       expect(systemdArgs).not.toContain("--setenv=UNRELATED_DAEMON_VALUE=ignored");
+      expect(systemdArgs).not.toContain("--setenv=PATH=/opt/lcm-test/bin:/usr/bin");
       const credentialArgs = systemdArgs.filter((arg) => arg.startsWith("--property=LoadCredential="));
       expect(credentialArgs).toEqual([
         expect.stringContaining("ANTHROPIC_API_KEY:"),

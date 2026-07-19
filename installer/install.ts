@@ -2,11 +2,11 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, copyFi
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { ensureCore } from "../src/bootstrap.js";
 import { lcmHomeDir } from "../src/runtime-paths.js";
 import { legacyLcmSlug } from "../src/legacy-names.js";
 import { atomicWritePrivateFile } from "../src/security-files.js";
+import { packageRootFor } from "../src/runtime-root.js";
 export { REQUIRED_HOOKS, mergeClaudeSettings } from "../src/installer/settings.js";
 
 export interface ServiceDeps {
@@ -211,7 +211,7 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
 
   // Clear plugin cache entries for previous versions so stale/corrupted installs don't persist.
   try {
-    const pkgJsonPath = join(dirname(fileURLToPath(import.meta.url)), "../..", "package.json");
+    const pkgJsonPath = join(packageRootFor(import.meta.url, 2), "package.json");
     const pkgVersion = (JSON.parse(deps.readFileSync(pkgJsonPath, "utf-8")) as { version: string }).version;
     const cacheDir = join(homedir(), ".claude", "plugins", "cache", legacyLcmSlug(), "lcm");
     if (deps.existsSync(cacheDir)) {
@@ -282,7 +282,7 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   console.log(`Updated ${settingsPath}`);
 
   // 4. Install slash commands to ~/.claude/commands/
-  const commandsSrc = deps.commandsSourceDir ?? join(dirname(fileURLToPath(import.meta.url)), "../..", ".claude-plugin", "commands");
+  const commandsSrc = deps.commandsSourceDir ?? join(packageRootFor(import.meta.url, 2), ".claude-plugin", "commands");
   const commandsDst = join(homedir(), ".claude", "commands");
   if (deps.existsSync(commandsSrc)) {
     deps.mkdirSync(commandsDst, { recursive: true });

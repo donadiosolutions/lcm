@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command, Option } from "commander";
+import { packageRootFor } from "../src/runtime-root.js";
 import { DaemonClient } from "../src/daemon/client.js";
 import {
   ConfigValidationError,
@@ -526,9 +527,8 @@ async function createDaemonClientOrExit(): Promise<DaemonClient> {
 export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
   migrateLegacyHomeIfNeeded();
   const { readFileSync } = await import("node:fs");
-  const { join, dirname } = await import("node:path");
-  const { fileURLToPath } = await import("node:url");
-  const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "package.json");
+  const { join } = await import("node:path");
+  const pkgPath = join(packageRootFor(import.meta.url, 2), "package.json");
   const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
 
   const program = new Command();

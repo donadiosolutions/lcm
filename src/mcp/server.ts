@@ -1,14 +1,14 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { homedir } from "node:os";
 import { DaemonClient } from "../daemon/client.js";
 import { loadDaemonConfig } from "../daemon/config.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
 import { configPath as defaultConfigPath, daemonPidPath } from "../runtime-paths.js";
 import { PKG_VERSION } from "../daemon/version.js";
+import { packageRootFor } from "../runtime-root.js";
 import { lcmGrepTool } from "./tools/lcm-grep.js";
 import { lcmExpandTool } from "./tools/lcm-expand.js";
 import { lcmDescribeTool } from "./tools/lcm-describe.js";
@@ -204,7 +204,7 @@ export async function startMcpServer(): Promise<void> {
   const port = config.daemon.port;
   const pidFilePath = daemonPidPath();
 
-  const lcmBin = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "lcm.mjs");
+  const lcmBin = join(packageRootFor(import.meta.url, 3), "lcm.mjs");
   const daemon = await ensureDaemon({
     port, pidFilePath, spawnTimeoutMs: 10000,
     expectedVersion: PKG_VERSION,

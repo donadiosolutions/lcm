@@ -82,7 +82,7 @@ describe("lifecycle procfs and parent warnings", () => {
     expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: false, pid: 42, reason: "dead-pid" })).toContain("PID 42 is not running");
     expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: true, reason: "wrong-parent" })).toBe("daemon parent invariant is not verified");
     expect(__lifecycleTestUtils.systemdDaemonSetenvArgs({ PATH: "/bin", LCM_MODE: "x", OTHER: "y", OPENAI_API_KEY: "secret", EMPTY: undefined }, [])).toEqual([
-      "--setenv=LCM_MODE=x", "--setenv=PATH=/bin",
+      "--setenv=LCM_MODE=x", "--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     ]);
     expect(__lifecycleTestUtils.systemdDaemonSetenvArgs({ PATH: "/bin" }, ["OPENAI_API_KEY"])).toContain("--setenv=LCM_SYSTEMD_CRED_IDS=OPENAI_API_KEY");
     expect(__lifecycleTestUtils.systemdRunProcessEnv({ PATH: "/bin", TOKEN: "secret", SAFE: "yes" })).toEqual({ PATH: "/bin", SAFE: "yes" });

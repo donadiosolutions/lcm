@@ -14,6 +14,11 @@ lcm install
 
 `lcm install` is the Claude Code setup path. It writes config, registers hooks, installs slash commands, registers MCP, and verifies the daemon.
 
+The plugin's hook and MCP entrypoints are committed, reproducible bundles. They
+never run `npm install`, package lifecycle scripts, or a TypeScript build from
+the plugin cache. Install the npm package explicitly when you want the global
+`lcm` command; plugin hooks themselves use the reviewed bundled entrypoints.
+
 When the setup wizard's **Custom server** summarizer is selected, both the
 OpenAI-compatible server URL and model name are required. The wizard retries an
 empty value once. If the retry is also empty, it falls back to the native CLI
@@ -178,6 +183,11 @@ being orphaned under PID 1. `lcm daemon start --detach` is kept as a compatibili
 alias for the same managed start behavior. Use `lcm daemon start --foreground`
 only when you want the daemon to stay attached to the current terminal for
 debugging.
+
+The managed systemd service receives a fixed system executable path rather than
+the launching shell's `PATH`. Put provider configuration in LCM settings or the
+documented `LCM_*` environment variables instead of relying on executables from
+a project-local or shell-specific path.
 
 `lcm doctor` verifies daemon health and, on Linux, repairs a healthy daemon that is not parented by the current user's systemd manager by restarting it through the managed start path. If the user systemd manager is unavailable, lcm falls back to the older detached spawn behavior and reports that the parent invariant is not satisfied.
 

@@ -22,14 +22,14 @@ const req = http.request(
         const parsed = JSON.parse(body);
         console.log(`Hints: ${parsed.hints?.length ?? 0}`);
         if (parsed.hints?.length > 0) {
-          parsed.hints.forEach((h, i) => console.log(`  ${i + 1}. ${h.slice(0, 120)}`));
+          parsed.hints.forEach((h, i) => console.log(`  ${i + 1}. ${String(h).replace(/[\r\n]/g, " ").slice(0, 120)}`));
         }
       } catch {
-        console.log(`Raw: ${body}`);
+        console.log(`Raw: ${body.replace(/[\r\n]/g, " ")}`);
       }
     });
   }
 );
-req.on("error", (e) => console.log(`Error: ${e.message}`));
+req.on("error", () => console.log("Request failed"));
 req.write(data);
 req.end();
