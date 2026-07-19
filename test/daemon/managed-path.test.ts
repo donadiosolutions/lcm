@@ -10,14 +10,14 @@ describe("managed daemon executable path", () => {
 
     expect(managedDaemonPath(
       "/usr/bin/node",
-      ["/opt/lcm/plugin/lcm.mjs", "daemon", "start", "--foreground"],
-    )).toBe(`/opt/lcm/plugin:${SYSTEMD_DAEMON_PATH}`);
+      ["/home/alice/.codex/plugins/cache/lcm/1.4.0/lcm.mjs", "daemon", "start", "--foreground"],
+    )).toBe(`/home/alice/.codex/plugins/cache/lcm/1.4.0:${SYSTEMD_DAEMON_PATH}`);
 
     expect(managedDaemonPath(
       "/home/alice/.nvm/versions/node/v25.9.0/bin/node",
-      ["/home/alice/.cache/lcm/plugin/lcm.mjs", "daemon", "start", "--foreground"],
+      ["/home/alice/.claude/plugins/cache/lcm/1.4.0/lcm.mjs", "daemon", "start", "--foreground"],
     )).toBe(
-      `/home/alice/.cache/lcm/plugin:/home/alice/.nvm/versions/node/v25.9.0/bin:${SYSTEMD_DAEMON_PATH}`,
+      `/home/alice/.claude/plugins/cache/lcm/1.4.0:/home/alice/.nvm/versions/node/v25.9.0/bin:${SYSTEMD_DAEMON_PATH}`,
     );
   });
 
@@ -32,6 +32,56 @@ describe("managed daemon executable path", () => {
     expect(managedDaemonPath("lcm", ["daemon", "start"])).toBe(SYSTEMD_DAEMON_PATH);
     expect(managedDaemonPath("node", ["/opt/lcm/lcm.mjs", "daemon", "start"]))
       .toBe(`/opt/lcm:${SYSTEMD_DAEMON_PATH}`);
+  });
+
+  it("excludes project-local entrypoint directories", () => {
+    expect(managedDaemonPath(
+      "/usr/bin/node",
+      ["/work/project/node_modules/.bin/lcm", "daemon", "start"],
+    )).toBe(SYSTEMD_DAEMON_PATH);
+    expect(managedDaemonPath("/work/project/bin/lcm", ["daemon", "start"], "/work/project"))
+      .toBe(SYSTEMD_DAEMON_PATH);
+    expect(managedDaemonPath("/tmp/npx-123/node_modules/.bin/lcm", ["daemon", "start"]))
+      .toBe(SYSTEMD_DAEMON_PATH);
+  });
+
+  it("preserves global prefixes outside the current project", () => {
+    expect(managedDaemonPath(
+      "/home/alice/.volta/bin/node",
+      ["/home/alice/.volta/bin/lcm", "daemon", "start"],
+      "/work/project",
+    )).toBe(`/home/alice/.volta/bin:${SYSTEMD_DAEMON_PATH}`);
+  });
+
+  it("preserves Volta and asdf global bins when invoked from the user home", () => {
+    expect(managedDaemonPath(
+      "/home/alice/.volta/bin/node",
+      ["/home/alice/.volta/bin/lcm", "daemon", "start"],
+      "/home/alice",
+    )).toBe(`/home/alice/.volta/bin:${SYSTEMD_DAEMON_PATH}`);
+    expect(managedDaemonPath(
+      "/home/alice/.asdf/installs/nodejs/24.4.1/bin/node",
+      ["/home/alice/.asdf/shims/lcm", "daemon", "start"],
+      "/home/alice",
+    )).toBe(
+      `/home/alice/.asdf/shims:/home/alice/.asdf/installs/nodejs/24.4.1/bin:${SYSTEMD_DAEMON_PATH}`,
+    );
+  });
+
+  it("preserves a user-owned global npm prefix", () => {
+    expect(managedDaemonPath(
+      "/home/alice/.npm-packages/bin/node",
+      ["/home/alice/.npm-packages/bin/lcm", "daemon", "start"],
+    )).toBe(`/home/alice/.npm-packages/bin:${SYSTEMD_DAEMON_PATH}`);
+  });
+
+  it("preserves the bundled Codex Node runtime beside a plugin entrypoint", () => {
+    expect(managedDaemonPath(
+      "/opt/codex-desktop/resources/node-runtime/bin/node",
+      ["/home/alice/.codex/plugins/cache/lcm/1.4.0/lcm.mjs", "daemon", "start"],
+    )).toBe(
+      `/home/alice/.codex/plugins/cache/lcm/1.4.0:/opt/codex-desktop/resources/node-runtime/bin:${SYSTEMD_DAEMON_PATH}`,
+    );
   });
 
   it("rejects trusted executable directories containing the PATH delimiter", () => {

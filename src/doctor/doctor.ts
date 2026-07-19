@@ -185,23 +185,38 @@ function checkProjectMap(results: CheckResult[], deps: DoctorDeps): void {
   });
 }
 
-function checkBinary(deps: DoctorDeps, command: string): boolean {
-  const opts = deps.platform === "linux"
-    ? { env: { PATH: deps.managedDaemonPath ?? managedDaemonPath(process.execPath, [process.argv[1]]) } }
-    : {};
-  return deps.spawnSync("sh", ["-c", `command -v ${command}`], opts).status === 0;
+function daemonProcessPath(deps: DoctorDeps, pid: number | undefined): string | undefined {
+  if (deps.platform !== "linux" || typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+    return undefined;
+  }
+  try {
+    const environment = deps.readFileSync(`/proc/${pid}/environ`, "latin1");
+    const pathEntry = environment.split("\0").find((entry) => entry.startsWith("PATH="));
+    const value = pathEntry?.slice("PATH=".length);
+    return value ? value : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-function addClaudeProcessChecks(results: CheckResult[], deps: DoctorDeps): void {
-  if (checkBinary(deps, "claude")) {
+function checkBinary(deps: DoctorDeps, command: string, daemonPath: string): boolean {
+  const onLinux = deps.platform === "linux";
+  const opts = onLinux
+    ? { env: { PATH: daemonPath } }
+    : {};
+  return deps.spawnSync(onLinux ? "/bin/sh" : "sh", ["-c", `command -v ${command}`], opts).status === 0;
+}
+
+function addClaudeProcessChecks(results: CheckResult[], deps: DoctorDeps, daemonPath: string): void {
+  if (checkBinary(deps, "claude", daemonPath)) {
     results.push({ name: "claude-process", category: "Summarizer", status: "pass", message: deps.platform === "linux" ? "claude CLI found on managed daemon PATH" : "claude CLI found" });
   } else {
     results.push({ name: "claude-process", category: "Summarizer", status: "fail", message: `${deps.platform === "linux" ? "claude CLI not found on managed daemon PATH" : "claude CLI not found"}\n     Fix: npm install -g @anthropic-ai/claude-code alongside lcm` });
   }
 }
 
-function addCodexProcessChecks(results: CheckResult[], deps: DoctorDeps): void {
-  if (checkBinary(deps, "codex")) {
+function addCodexProcessChecks(results: CheckResult[], deps: DoctorDeps, daemonPath: string): void {
+  if (checkBinary(deps, "codex", daemonPath)) {
     results.push({ name: "codex-process", category: "Summarizer", status: "pass", message: deps.platform === "linux" ? "codex CLI found on managed daemon PATH" : "codex CLI found" });
   } else {
     results.push({ name: "codex-process", category: "Summarizer", status: "fail", message: `${deps.platform === "linux" ? "codex CLI not found on managed daemon PATH" : "codex CLI not found"}\n     Fix: npm install -g @openai/codex alongside lcm` });
@@ -425,12 +440,14 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   // ── Daemon ──
   let daemonHealthy = false;
   let daemonVersion: string | undefined;
+  let daemonPid: number | undefined;
   try {
     const res = await deps.fetch(`http://127.0.0.1:${config.port}/health`);
     if (res.ok) {
-      const h = (await res.json()) as { status?: string; version?: string };
+      const h = (await res.json()) as { status?: string; version?: string; pid?: number };
       daemonHealthy = h.status === "ok";
       daemonVersion = h.version;
+      daemonPid = h.pid;
     }
   } catch {}
 
@@ -447,6 +464,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         expectedVersion: pkgVersion,
         enforceUserManagerParent: true,
       });
+      if (ensureResult.connected) daemonPid = ensureResult.pid ?? daemonPid;
 
       let postRestartVersion: string | undefined;
       let postRestartOk = false;
@@ -454,9 +472,10 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         try {
           const res = await deps.fetch(`http://127.0.0.1:${config.port}/health`);
           if (res.ok) {
-            const h = (await res.json()) as { status?: string; version?: string };
+            const h = (await res.json()) as { status?: string; version?: string; pid?: number };
             postRestartOk = h.status === "ok";
             postRestartVersion = h.version;
+            if (h.pid !== undefined) daemonPid = h.pid;
           }
         } catch { /* non-fatal */ }
       }
@@ -535,6 +554,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         enforceUserManagerParent: true,
       });
       if (ensureResult.connected) {
+        daemonPid = ensureResult.pid;
         const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
         results.push({ name: "daemon", category: "Daemon", status: "warn", message: `localhost:${config.port} — started${warning}`, fixApplied: true });
         daemonHealthy = true;
@@ -658,13 +678,16 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   }
 
   // ── Summarizer (conditional) ──
+  const effectiveDaemonPath = deps.managedDaemonPath
+    ?? daemonProcessPath(deps, daemonPid)
+    ?? managedDaemonPath(process.execPath, [process.argv[1]], deps.cwd);
   if (config.summarizer === "auto") {
-    addClaudeProcessChecks(results, deps);
-    addCodexProcessChecks(results, deps);
+    addClaudeProcessChecks(results, deps, effectiveDaemonPath);
+    addCodexProcessChecks(results, deps, effectiveDaemonPath);
   } else if (config.summarizer === "claude-process") {
-    addClaudeProcessChecks(results, deps);
+    addClaudeProcessChecks(results, deps, effectiveDaemonPath);
   } else if (config.summarizer === "codex-process") {
-    addCodexProcessChecks(results, deps);
+    addCodexProcessChecks(results, deps, effectiveDaemonPath);
   } else if (config.summarizer === "anthropic") {
     if (process.env.ANTHROPIC_API_KEY) {
       results.push({ name: "anthropic-key", category: "Summarizer", status: "pass", message: "ANTHROPIC_API_KEY set" });

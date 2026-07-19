@@ -68,6 +68,7 @@ function makeDeps(options: {
   claudeMd?: string;
   lcmMd?: string;
   managedDaemonPath?: string;
+  procEnviron?: string;
 } = {}): DoctorDeps {
   const health = [...(options.health ?? [{ ok: false }])];
   return {
@@ -80,6 +81,7 @@ function makeDeps(options: {
       if (path.endsWith("package.json")) return JSON.stringify(options.pkg ?? { version: "1.2.3" });
       if (path.endsWith("CLAUDE.md")) return options.claudeMd ?? "<!-- lcm:start -->\n@lcm.md\n<!-- lcm:end -->";
       if (path.endsWith("lcm.md")) return options.lcmMd ?? LCM_MD_CONTENT;
+      if (path.startsWith("/proc/")) return options.procEnviron ?? "";
       return "{}";
     },
     writeFileSync: () => { if (options.writeError) throw options.writeError; },
@@ -263,7 +265,7 @@ describe("doctor service coverage", () => {
 
   it("checks Linux process providers against the managed daemon PATH", async () => {
     mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
-      if (cmd === "sh" && args[1]?.includes("command -v codex")) {
+      if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
         const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
         return { status: path?.startsWith("/trusted/lcm/bin:") ? 0 : 1, stdout: "", stderr: "" };
       }
@@ -287,6 +289,67 @@ describe("doctor service coverage", () => {
       status: "fail",
       message: expect.stringContaining("codex CLI not found on managed daemon PATH"),
     });
+  });
+
+  it("checks providers against the reused daemon process PATH", async () => {
+    mocks.ensureDaemon.mockResolvedValue({ connected: true, pid: 4242 });
+    mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
+      if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
+        const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
+        return { status: path === "/daemon/runtime/bin:/usr/bin" ? 0 : 1, stdout: "", stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    const results = await runDoctor(makeDeps({
+      config: { llm: { provider: "codex-process" } },
+      procEnviron: "HOME=/isolated\0PATH=/daemon/runtime/bin:/usr/bin\0LANG=C\0",
+      health: [
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 4242 }) },
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 4242 }) },
+      ],
+    }));
+
+    expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
+  });
+
+  it.each([
+    [undefined, "HOME=/isolated\0", false],
+    [0, "HOME=/isolated\0", false],
+    [1.5, "HOME=/isolated\0", false],
+    [4242, "HOME=/isolated\0", false],
+    [4242, "PATH=\0", false],
+    [4242, "", true],
+  ] as const)("uses the deterministic managed path when daemon environment pid=%s is unavailable", async (
+    pid,
+    procEnviron,
+    readFails,
+  ) => {
+    mocks.ensureDaemon.mockResolvedValue({ connected: true, pid });
+    mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
+      if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
+        const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
+        return {
+          status: path?.endsWith("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            && !path.startsWith("/daemon/runtime/bin:") ? 0 : 1,
+          stdout: "",
+          stderr: "",
+        };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    const results = await runDoctor(makeDeps({
+      config: { llm: { provider: "codex-process" } },
+      procEnviron,
+      readError: (path) => readFails && path === "/proc/4242/environ" ? new Error("proc hidden") : undefined,
+      health: [
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid }) },
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid }) },
+      ],
+    }));
+
+    expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
   });
 
   it("covers anthropic key states and valid/invalid project patterns", async () => {
