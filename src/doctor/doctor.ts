@@ -266,6 +266,7 @@ function testMcpHandshake(): Promise<CheckResult> {
     child.stdout.on("error", stopChildForPipeFailure);
     child.on("close", () => { finish(resultFromOutput()); });
     child.on("error", () => {
+      if (stopRequested) return;
       finish({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "Could not spawn MCP process" });
     });
     child.stdin.on("error", stopChildForPipeFailure);

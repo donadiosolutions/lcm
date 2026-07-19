@@ -348,6 +348,43 @@ describe("doctor service coverage", () => {
     expect(mocks.mcpChild?.kill).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps the watchdog active when a stopped child later emits an error", async () => {
+    vi.useFakeTimers();
+    mocks.ensureDaemon.mockResolvedValue({ connected: true });
+    mocks.mcpSetup = (child) => {
+      child.kill.mockImplementation(() => true);
+      setTimeout(() => {
+        child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
+        setTimeout(() => { child.emit("error", new Error("termination failed")); }, 1);
+      }, 1);
+    };
+
+    const settled = vi.fn();
+    const promise = runDoctor(healthyDeps());
+    void promise.then(settled);
+    await vi.advanceTimersByTimeAsync(2);
+    const child = mocks.mcpChild!;
+
+    expect(settled).not.toHaveBeenCalled();
+    expect(child.kill).toHaveBeenCalledOnce();
+    expect(child.stdin.write).toHaveBeenCalledOnce();
+    expect(child.stdin.end).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(5997);
+    expect(settled).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({
+      status: "warn",
+      message: "lcm: 0/7 tools",
+    });
+    expect(child.kill).toHaveBeenCalledTimes(2);
+    expect(child.stdout.destroy).toHaveBeenCalledOnce();
+    expect(child.unref).toHaveBeenCalledOnce();
+    expect(child.stdin.write).toHaveBeenCalledOnce();
+    expect(child.stdin.end).not.toHaveBeenCalled();
+  });
+
   it.each(["returns-false", "throws"] as const)("retries a failed child stop at timeout when kill %s", async (failure) => {
     vi.useFakeTimers();
     mocks.ensureDaemon.mockResolvedValue({ connected: true });
