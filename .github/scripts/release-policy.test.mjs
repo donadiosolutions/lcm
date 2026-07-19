@@ -111,6 +111,13 @@ test("parses changesets and detects invalid package bumps", () => {
   });
   assert.throws(() => parseChangesetDocument("missing"), /YAML frontmatter/u);
   assert.throws(() => parseChangesetDocument("---\n[]\n---\nsummary"), /package-to-bump/u);
+  assert.throws(
+    () =>
+      parseChangesetDocument(
+        '---\nbase: &b patch\n"@donadiosolutions/lcm": *b\n---\nAliased bump.\n',
+      ),
+    /aliases exceeded maxAliases/u,
+  );
   assert.throws(() => parseChangesetDocument(changeset("alpha")), /Unsupported changeset bump/u);
   assert.throws(() => parseChangesetDocument(changeset("patch", "")), /must not be empty/u);
 });
@@ -175,19 +182,47 @@ test("categorizes and deduplicates PRs while preserving every included PR", () =
 test("maps release commits to merged main PRs and rejects direct commits", () => {
   const first = "a".repeat(40);
   const second = "b".repeat(40);
+  const third = "c".repeat(40);
   const firstPr = pr(1, [], { merge_commit_sha: first });
   const secondPr = pr(2, [], { merge_commit_sha: second });
+  const singleFallbackPr = pr(3, [], { merge_commit_sha: "d".repeat(40) });
   const associations = new Map([
     [first, [firstPr]],
     [second, [secondPr, firstPr]],
+    [third, [singleFallbackPr]],
   ]);
   assert.deepEqual(
-    associateCommitsWithPullRequests([first, second], associations).map(({ number }) => number),
-    [1, 2],
+    associateCommitsWithPullRequests([first, second, third], associations).map(
+      ({ number }) => number,
+    ),
+    [1, 2, 3],
   );
   assert.throws(
     () => associateCommitsWithPullRequests(["c".repeat(40)], new Map()),
     /no PR found/u,
+  );
+});
+
+test("rejects ambiguous commit associations without an exact merge SHA match", () => {
+  const commit = "e".repeat(40);
+  const associations = new Map([
+    [
+      commit,
+      [
+        pr(12, [], { merge_commit_sha: "f".repeat(40) }),
+        pr(34, [], { merge_commit_sha: "1".repeat(40) }),
+      ],
+    ],
+  ]);
+
+  assert.throws(
+    () => associateCommitsWithPullRequests([commit], associations),
+    (error) => {
+      assert.match(error.message, new RegExp(commit, "u"));
+      assert.match(error.message, /#12, #34/u);
+      assert.match(error.message, /ambiguous merged main PR associations/u);
+      return true;
+    },
   );
 });
 

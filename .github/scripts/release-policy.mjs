@@ -106,7 +106,7 @@ export function parseChangesetDocument(content, packageName = PACKAGE_NAME) {
 
   let frontmatter;
   try {
-    frontmatter = loadYaml(match[1]);
+    frontmatter = loadYaml(match[1], { maxAliases: 0 });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Invalid changeset frontmatter: ${message}`, { cause: error });
@@ -227,9 +227,19 @@ export function associateCommitsWithPullRequests(commits, associations) {
       (pr) => pr.merged_at && pr.base?.ref === "main",
     );
     const exact = candidates.filter((pr) => pr.merge_commit_sha?.toLowerCase() === sha);
-    const matches = exact.length > 0 ? exact : candidates;
-    if (matches.length === 0) missing.push(commit);
-    else selected.push(...matches);
+    if (exact.length > 0) {
+      selected.push(...exact);
+    } else if (candidates.length === 1) {
+      selected.push(candidates[0]);
+    } else if (candidates.length === 0) {
+      missing.push(commit);
+    } else {
+      const candidateNumbers = candidates.map(({ number }) => `#${number}`).join(", ");
+      throw new Error(
+        `Release commit ${commit} has ambiguous merged main PR associations ` +
+          `(${candidateNumbers}); none has a matching merge commit SHA`,
+      );
+    }
   }
   if (missing.length > 0) {
     throw new Error(
