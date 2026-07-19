@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { parseReleaseTag } from "./release-tag-policy.mjs";
 
 export const PACKAGE_NAME = "@donadiosolutions/lcm";
+export const NPM_QUERY_TIMEOUT_MS = 60_000;
 
 function compareReleaseVersions(left, right) {
   const a = parseReleaseTag(left.startsWith("v") ? left : `v${left}`);
@@ -16,7 +17,11 @@ function compareReleaseVersions(left, right) {
 }
 
 function defaultRunNpm(args) {
-  return spawnSync("npm", args, { encoding: "utf8" });
+  return spawnSync("npm", args, {
+    encoding: "utf8",
+    timeout: NPM_QUERY_TIMEOUT_MS,
+    killSignal: "SIGTERM",
+  });
 }
 
 function npmView(args, label, runNpm, { allowEmpty = false } = {}) {
@@ -28,9 +33,17 @@ function npmView(args, label, runNpm, { allowEmpty = false } = {}) {
     throw new Error(`Unable to query npm for ${label}: ${message}`, { cause: error });
   }
   if (result.error) {
+    if (result.error.code === "ETIMEDOUT") {
+      throw new Error(`npm query timed out after ${NPM_QUERY_TIMEOUT_MS}ms for ${label}`, {
+        cause: result.error,
+      });
+    }
     throw new Error(`Unable to query npm for ${label}: ${result.error.message}`, {
       cause: result.error,
     });
+  }
+  if (result.signal) {
+    throw new Error(`npm query for ${label} terminated by signal ${result.signal}`);
   }
 
   const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
@@ -56,13 +69,39 @@ function parseJsonResult(result, label, fallback) {
 
 export function assertReleaseCanAdvanceDistTag({ version, distTags = {}, alreadyPublished = false }) {
   const target = parseReleaseTag(`v${version}`);
-  const tagName = target.isBeta ? "beta" : "latest";
-  const current = distTags[tagName];
-  if (current === undefined) return;
+  const boundaries = target.isBeta
+    ? [
+        ["beta", true],
+        ["latest", false],
+      ]
+    : [["latest", false]];
 
-  const comparison = compareReleaseVersions(target.version, current);
-  if (comparison < 0 || (comparison === 0 && !alreadyPublished)) {
-    throw new Error(`Refusing to move npm ${tagName} from ${current} to ${version}`);
+  for (const [tagName, expectedBeta] of boundaries) {
+    const current = distTags[tagName];
+    if (current === undefined) continue;
+    if (typeof current !== "string") {
+      throw new Error(`npm ${tagName} dist-tag must contain a canonical version string`);
+    }
+
+    let parsedCurrent;
+    try {
+      parsedCurrent = parseReleaseTag(`v${current}`);
+    } catch (error) {
+      throw new Error(`npm ${tagName} points to unsupported version ${JSON.stringify(current)}`, {
+        cause: error,
+      });
+    }
+    if (parsedCurrent.isBeta !== expectedBeta) {
+      throw new Error(
+        `npm ${tagName} must point to a ${expectedBeta ? "beta" : "stable"} version, found ${current}`,
+      );
+    }
+
+    const comparison = compareReleaseVersions(target.version, parsedCurrent.version);
+    const samePublishedVersion = comparison === 0 && alreadyPublished;
+    if (comparison < 0 || (comparison === 0 && !samePublishedVersion)) {
+      throw new Error(`Refusing to move npm ${tagName} from ${current} to ${version}`);
+    }
   }
 }
 

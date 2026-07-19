@@ -55,6 +55,12 @@ Beta packages publish to the `beta` npm dist-tag. Stable packages publish to
 version. Publishing a beta therefore never changes what users receive from an
 unqualified `npm install @donadiosolutions/lcm`.
 
+Before publishing a beta, the workflow requires it to advance both the current
+`beta` dist-tag and the stable `latest` boundary. This prevents a beta for an
+older or already-stable version from moving the prerelease channel backward.
+Malformed `beta` or `latest` values fail closed. Registry reads have a 60-second
+process timeout and terminate the npm subprocess with `SIGTERM` when exceeded.
+
 ## Release-note ranges
 
 Beta notes compare with the latest published release in the same `MAJOR.MINOR`
@@ -68,8 +74,17 @@ Changesets appear under Breaking changes; otherwise `enhancement` and `bug` PR
 labels select Features and Fixes. All remaining PRs appear under Extra notes.
 The workflow fails instead of substituting commit hashes when a commit has no PR.
 
-Release publication runs are ordered. A later release waits for earlier active
-runs and fails closed behind an earlier failed run unless that release was
-withdrawn to draft or the failed run is rerun successfully. Version-package
-runs use the same ordered-wait model so manual channel transitions are not lost
-behind a newer automatic run.
+Release publication runs use GitHub's native `queue: max` concurrency mode: up
+to 100 runs wait in one global FIFO queue, so different release tags cannot race
+npm dist-tag validation and mutation. Once a queued run starts, it fails closed
+behind an earlier failed run for another tag unless that run succeeds on retry
+or its release was withdrawn to draft. A republished restored draft ignores its
+own tag's earlier failed attempt. Version-package runs use a separate native
+FIFO queue and block behind any failed manual beta/stable transition until that
+transition run succeeds on retry, preventing later automatic work from silently
+overtaking it.
+
+The version workflow grants no token permissions by default. Its sole job gets
+only the permissions it needs: Actions read access for the prior-failure guard,
+contents and pull-request write access for the GitHub-API Changesets commit and
+PR, and issues write access for the `no-release-notes` label.

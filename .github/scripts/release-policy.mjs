@@ -4,6 +4,7 @@ import { PACKAGE_NAME } from "./npm-release-policy.mjs";
 import { parseReleaseTag } from "./release-tag-policy.mjs";
 
 export {
+  NPM_QUERY_TIMEOUT_MS,
   PACKAGE_NAME,
   assertNpmDistTags,
   assertReleaseCanAdvanceDistTag,

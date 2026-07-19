@@ -381,6 +381,10 @@ describe("manual release helper step 8", () => {
       releaseVersion: "9.9.9",
       distTags: '{"latest":"10.0.0"}',
     },
+    {
+      releaseVersion: "9.9.9-beta.0",
+      distTags: '{"latest":"9.9.9","beta":"9.9.8-beta.1"}',
+    },
   ])(
     "rejects stale npm channel ordering before repository mutation for $releaseVersion",
     ({ releaseVersion, distTags }: { releaseVersion: string; distTags: string }) => {

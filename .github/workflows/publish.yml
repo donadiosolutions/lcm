@@ -10,8 +10,8 @@ on:
 permissions: {}
 
 concurrency:
-  group: publish-${{ github.event.release.tag_name || github.ref_name }}
-  cancel-in-progress: false
+  group: publish-package
+  queue: max
 
 jobs:
   draft:
@@ -310,63 +310,51 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Wait for earlier release publications
-        timeout-minutes: 65
+      - name: Enforce earlier publication success
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         with:
           script: |
             const currentRunId = Number(context.runId);
             if (!Number.isSafeInteger(currentRunId)) {
               throw new Error(`Invalid workflow run id ${context.runId}`);
             }
-            const timeoutMs = 60 * 60 * 1000;
-            const pollMs = 15 * 1000;
-            const startedAt = performance.now();
-            for (;;) {
-              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
-                ...context.repo,
-                workflow_id: "publish.yml",
-                event: "release",
-                per_page: 100,
-              });
-              const earlierRuns = runs.filter((run) => run.id < currentRunId);
-              const earlierActiveRuns = earlierRuns
-                .filter((run) => run.status !== "completed")
-                .sort((left, right) => left.id - right.id);
-              const failedRuns = earlierRuns.filter(
-                (run) => run.status === "completed" && run.conclusion !== "success",
-              );
-              const blockingFailures = [];
-              for (const run of failedRuns) {
-                try {
-                  const { data: release } = await github.rest.repos.getReleaseByTag({
-                    ...context.repo,
-                    tag: run.head_branch,
-                  });
-                  if (release.draft) {
-                    core.warning(`Ignoring withdrawn draft from failed release run ${run.id}`);
-                    continue;
-                  }
-                } catch (error) {
-                  core.warning(`Could not prove failed release run ${run.id} was withdrawn: ${error.message}`);
+            const currentTag = process.env.RELEASE_TAG;
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              ...context.repo,
+              workflow_id: "publish.yml",
+              event: "release",
+              status: "completed",
+              per_page: 100,
+            });
+            const failedRuns = runs.filter(
+              (run) => run.id < currentRunId && run.conclusion !== "success",
+            );
+            const blockingFailures = [];
+            for (const run of failedRuns) {
+              if (run.head_branch === currentTag) {
+                core.warning(`Ignoring failed earlier attempt ${run.id} for retry tag ${currentTag}`);
+                continue;
+              }
+              try {
+                const { data: release } = await github.rest.repos.getReleaseByTag({
+                  ...context.repo,
+                  tag: run.head_branch,
+                });
+                if (release.draft) {
+                  core.warning(`Ignoring withdrawn draft from failed release run ${run.id}`);
+                  continue;
                 }
-                blockingFailures.push(run);
+              } catch (error) {
+                core.warning(`Could not prove failed release run ${run.id} was withdrawn: ${error.message}`);
               }
-              if (blockingFailures.length > 0) {
-                throw new Error(
-                  `Earlier release runs failed and must be rerun successfully or withdrawn to draft: ${blockingFailures.map((run) => `${run.id} (${run.conclusion})`).join(", ")}`,
-                );
-              }
-              if (earlierActiveRuns.length === 0) break;
-              if (performance.now() - startedAt >= timeoutMs) {
-                throw new Error(
-                  `Timed out waiting for earlier release runs: ${earlierActiveRuns.map((run) => run.id).join(", ")}`,
-                );
-              }
-              core.info(
-                `Waiting for earlier release runs: ${earlierActiveRuns.map((run) => `${run.id} (${run.status})`).join(", ")}`,
+              blockingFailures.push(run);
+            }
+            if (blockingFailures.length > 0) {
+              throw new Error(
+                `Earlier release runs for other tags failed and must be rerun successfully or withdrawn to draft: ${blockingFailures.map((run) => `${run.id} (${run.head_branch ?? "unknown tag"}/${run.conclusion})`).join(", ")}`,
               );
-              await new Promise((resolve) => setTimeout(resolve, pollMs));
             }
 
       - name: Verify signed annotated release tag

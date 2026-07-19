@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { assertVerifiedReleaseTag } from "./release-tag-policy.mjs";
 import {
+  NPM_QUERY_TIMEOUT_MS,
   RELEASE_DRAFT_MARKER,
   assertActionCreatedReleaseBody,
   assertNpmDistTags,
@@ -484,6 +485,7 @@ test("renders tag-bound Highlights and omits empty release sections", () => {
 });
 
 test("queries npm release state with E404-only missing-package handling", () => {
+  assert.equal(NPM_QUERY_TIMEOUT_MS, 60_000);
   /** @type {string[][]} */
   const calls = [];
   /** @type {Array<{ status: number, stdout: string, stderr: string }>} */
@@ -535,6 +537,25 @@ test("queries npm release state with E404-only missing-package handling", () => 
         runNpm: () => ({ status: 1, stdout: "", stderr: "npm error code E401" }),
       }),
     /Unable to query npm.*E401/su,
+  );
+  const timeoutError = Object.assign(new Error("spawnSync npm ETIMEDOUT"), {
+    code: "ETIMEDOUT",
+  });
+  assert.throws(
+    () =>
+      checkNpmReleaseState({
+        version: "1.5.0-beta.0",
+        runNpm: () => ({ error: timeoutError, status: null, signal: "SIGTERM" }),
+      }),
+    /timed out after 60000ms/u,
+  );
+  assert.throws(
+    () =>
+      checkNpmReleaseState({
+        version: "1.5.0-beta.0",
+        runNpm: () => ({ status: null, signal: "SIGKILL", stdout: "", stderr: "" }),
+      }),
+    /terminated by signal SIGKILL/u,
   );
   const distTagFailure = [
     { status: 1, stdout: "", stderr: "npm error code E404" },
@@ -608,6 +629,38 @@ test("enforces monotonic npm channels and a stable latest dist-tag", () => {
         distTags: { beta: "1.5.0-beta.2" },
       }),
     /Refusing to move npm beta/u,
+  );
+  assert.throws(
+    () =>
+      assertReleaseCanAdvanceDistTag({
+        version: "1.5.0-beta.2",
+        distTags: { beta: "1.5.0-beta.1", latest: "1.5.0" },
+      }),
+    /Refusing to move npm latest/u,
+  );
+  assert.throws(
+    () =>
+      assertReleaseCanAdvanceDistTag({
+        version: "1.5.0-beta.2",
+        distTags: { beta: "1.5.0-beta.1", latest: "not-semver" },
+      }),
+    /npm latest points to unsupported version/u,
+  );
+  assert.throws(
+    () =>
+      assertReleaseCanAdvanceDistTag({
+        version: "1.5.0-beta.2",
+        distTags: { beta: "1.4.1", latest: "1.4.1" },
+      }),
+    /npm beta must point to a beta version/u,
+  );
+  assert.throws(
+    () =>
+      assertReleaseCanAdvanceDistTag({
+        version: "1.5.0-beta.2",
+        distTags: { beta: "1.5.0-beta.1", latest: "1.4.1-beta.0" },
+      }),
+    /npm latest must point to a stable version/u,
   );
   assert.doesNotThrow(() =>
     assertReleaseCanAdvanceDistTag({

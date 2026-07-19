@@ -34,7 +34,8 @@ interface VersionWorkflow {
     push: { branches: string[] };
     workflow_dispatch: { inputs: { channel: { options: string[] } } };
   };
-  permissions: Record<string, string>;
+  permissions: Record<string, never>;
+  concurrency: { group: string; queue: "max" };
   jobs: { version: WorkflowJob };
 }
 
@@ -44,7 +45,7 @@ interface PublishWorkflow {
     release: { types: string[] };
     workflow_dispatch?: never;
   };
-  concurrency: { group: string; "cancel-in-progress": boolean };
+  concurrency: { group: string; queue: "max" };
   jobs: {
     draft: WorkflowJob;
     preflight: WorkflowJob;
@@ -73,22 +74,31 @@ describe("release workflows", () => {
   it("uses an ordered, main-based Changesets workflow with explicit beta transitions", () => {
     expect(versionWorkflow.on.push.branches).toEqual(["main"]);
     expect(versionWorkflow.on.workflow_dispatch.inputs.channel.options).toEqual(["beta", "stable"]);
-    expect(versionWorkflow).not.toHaveProperty("concurrency");
-    expect(versionWorkflow.permissions.actions).toBe("read");
+    expect(versionWorkflow.permissions).toEqual({});
+    expect(versionWorkflow.concurrency).toEqual({
+      group: "version-packages-main",
+      queue: "max",
+    });
     expect(versionWorkflow.jobs.version["runs-on"]).toBe("ubuntu-latest");
+    expect(versionWorkflow.jobs.version.permissions).toEqual({
+      actions: "read",
+      contents: "write",
+      issues: "write",
+      "pull-requests": "write",
+    });
     const versionQueue = versionWorkflow.jobs.version.steps.find(
-      (step) => step.name === "Wait for earlier version runs",
+      (step) => step.name === "Enforce earlier manual transition success",
     );
     expect(versionQueue?.uses).toBe(
       "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
     );
-    expect(versionQueue?.["timeout-minutes"]).toBe(65);
     expect(versionQueue?.with?.script).toContain('workflow_id: "version-pr.yml"');
+    expect(versionQueue?.with?.script).toContain('event: "workflow_dispatch"');
+    expect(versionQueue?.with?.script).toContain('status: "completed"');
     expect(versionQueue?.with?.script).toContain('run.id < currentRunId');
-    expect(versionQueue?.with?.script).toContain('["push", "workflow_dispatch"].includes(run.event)');
-    expect(versionQueue?.with?.script).toContain(
-      ".sort((left, right) => left.id - right.id)",
-    );
+    expect(versionQueue?.with?.script).toContain('run.conclusion !== "success"');
+    expect(versionQueue?.with?.script).toContain("must be rerun successfully");
+    expect(versionQueue?.with?.script).not.toContain("setTimeout");
     const changesets = versionWorkflow.jobs.version.steps.find((step) => step.id === "changesets");
     expect(changesets?.with).toMatchObject({
       branch: "main",
@@ -118,8 +128,8 @@ describe("release workflows", () => {
     expect(publishWorkflow.jobs.publish["runs-on"]).toBe("ubuntu-latest");
     expect(publishWorkflow.jobs["restore-draft"]["runs-on"]).toBe("ubuntu-latest");
     expect(publishWorkflow.concurrency).toEqual({
-      group: "publish-${{ github.event.release.tag_name || github.ref_name }}",
-      "cancel-in-progress": false,
+      group: "publish-package",
+      queue: "max",
     });
     expect(publishWorkflow.jobs.draft.permissions).toEqual({
       contents: "write",
@@ -140,28 +150,20 @@ describe("release workflows", () => {
     expect(publishWorkflow.jobs.publish.environment).toBe("npm-publish");
     expect(publishWorkflow.jobs.publish.concurrency).toBeUndefined();
     const publicationQueue = publishWorkflow.jobs.preflight.steps.find(
-      (step: WorkflowStep): boolean => step.name === "Wait for earlier release publications",
+      (step: WorkflowStep): boolean => step.name === "Enforce earlier publication success",
     );
     expect(publicationQueue?.uses).toBe(
       "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
     );
-    expect(publicationQueue?.["timeout-minutes"]).toBe(65);
     expect(publicationQueue?.with?.script).toContain('workflow_id: "publish.yml"');
     expect(publicationQueue?.with?.script).toContain('event: "release"');
-    expect(publicationQueue?.with?.script).toContain(
-      "const earlierRuns = runs.filter((run) => run.id < currentRunId)",
-    );
-    expect(publicationQueue?.with?.script).toContain(
-      ".sort((left, right) => left.id - right.id)",
-    );
-    expect(publicationQueue?.with?.script).toContain(
-      "if (earlierActiveRuns.length === 0) break",
-    );
+    expect(publicationQueue?.with?.script).toContain('status: "completed"');
     expect(publicationQueue?.with?.script).toContain("run.conclusion !== \"success\"");
+    expect(publicationQueue?.with?.script).toContain("run.head_branch === currentTag");
+    expect(publicationQueue?.with?.script).toContain("for retry tag");
     expect(publicationQueue?.with?.script).toContain("if (release.draft)");
-    expect(publicationQueue?.with?.script).toContain("must be rerun successfully or withdrawn to draft");
-    expect(publicationQueue?.with?.script).toContain("setTimeout(resolve, pollMs)");
-    expect(publicationQueue?.with?.script).toContain("const timeoutMs = 60 * 60 * 1000");
+    expect(publicationQueue?.with?.script).toContain("for other tags failed");
+    expect(publicationQueue?.with?.script).not.toContain("setTimeout");
 
     const restore = publishWorkflow.jobs["restore-draft"];
     expect(restore.if).toContain("needs.preflight.result == 'failure'");

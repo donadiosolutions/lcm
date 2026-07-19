@@ -119,6 +119,12 @@ verification succeed with the trusted public key.
 
 The repo-side files are not enough by themselves. A maintainer still needs to configure npm trusted publishing for this GitHub repository/workflow pair.
 
+The version workflow keeps the repository-wide default token at no permissions
+and grants write access only to its version job. That job needs `contents: write`
+for GitHub-API version commits, `pull-requests: write` for the Changesets PR,
+`issues: write` for its `no-release-notes` label, and `actions: read` for the
+failed-manual-transition guard.
+
 Recommended external setup:
 
 1. Configure npm trusted publishing for this package:
@@ -144,7 +150,9 @@ When configuring npm trusted publishing, register the GitHub workflow using the 
 For recovery, rerun a failed tag-triggered draft run with its original event
 payload. When publication preflight or a last-moment guard restores a release to
 draft, fix the failure and manually publish the draft again; an earlier failed
-release run must either be rerun successfully or remain withdrawn as a draft
-before later releases proceed. If npm publication itself may have started,
+release run for another tag must either be rerun successfully or remain
+withdrawn as a draft before later releases proceed. An earlier failed attempt
+for the same tag is treated as the history of that republished draft and does
+not block its retry. If npm publication itself may have started,
 inspect npm and the workflow run before changing GitHub state. There is no
 manual dispatch path that can bypass the GitHub draft-to-published transition.

@@ -91,6 +91,7 @@ to npm.
 | Draft exists but npm already has the version | Publication bypassed the required manual draft transition | Stop and audit the release; never move or overwrite the tag |
 | Published release returns to draft | Trusted preflight or a last-moment tag/npm guard failed | Fix the workflow failure, then publish the restored draft manually again |
 | Earlier failed publication blocks a later release | The earlier release is still public and its run has not succeeded | Rerun the earlier event successfully, or withdraw its release to draft before retrying the later release |
+| Republished restored draft has an earlier failed run for the same tag | Expected retry history | The same-tag failure is ignored; native FIFO concurrency still prevents overlap with every other release run |
 
 ## Scripts
 
