@@ -12,6 +12,13 @@ describe("managed daemon executable path", () => {
       "/usr/bin/node",
       ["/opt/lcm/plugin/lcm.mjs", "daemon", "start", "--foreground"],
     )).toBe(`/opt/lcm/plugin:${SYSTEMD_DAEMON_PATH}`);
+
+    expect(managedDaemonPath(
+      "/home/alice/.nvm/versions/node/v25.9.0/bin/node",
+      ["/home/alice/.cache/lcm/plugin/lcm.mjs", "daemon", "start", "--foreground"],
+    )).toBe(
+      `/home/alice/.cache/lcm/plugin:/home/alice/.nvm/versions/node/v25.9.0/bin:${SYSTEMD_DAEMON_PATH}`,
+    );
   });
 
   it("uses an absolute directly executed LCM command and deduplicates system directories", () => {
@@ -23,5 +30,19 @@ describe("managed daemon executable path", () => {
     expect(managedDaemonPath("node", ["lcm", "daemon", "start"])).toBe(SYSTEMD_DAEMON_PATH);
     expect(managedDaemonPath("/usr/bin/node", [])).toBe(SYSTEMD_DAEMON_PATH);
     expect(managedDaemonPath("lcm", ["daemon", "start"])).toBe(SYSTEMD_DAEMON_PATH);
+    expect(managedDaemonPath("node", ["/opt/lcm/lcm.mjs", "daemon", "start"]))
+      .toBe(`/opt/lcm:${SYSTEMD_DAEMON_PATH}`);
+  });
+
+  it("rejects trusted executable directories containing the PATH delimiter", () => {
+    expect(managedDaemonPath(
+      "/opt/node:shadow/bin/node",
+      ["/opt/lcm:shadow/lcm.mjs", "daemon", "start"],
+    )).toBe(SYSTEMD_DAEMON_PATH);
+
+    expect(managedDaemonPath(
+      "/home/alice/.nvm/versions/node/v25.9.0/bin/node",
+      ["/opt/lcm:shadow/lcm.mjs", "daemon", "start"],
+    )).toBe(`/home/alice/.nvm/versions/node/v25.9.0/bin:${SYSTEMD_DAEMON_PATH}`);
   });
 });

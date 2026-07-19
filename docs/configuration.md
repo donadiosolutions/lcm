@@ -188,7 +188,12 @@ debugging.
 
 The managed systemd service receives a trusted executable path rather than the
 launching shell's `PATH`. It prepends the directory containing the exact LCM
-entrypoint that systemd executes to a fixed set of system directories. This
+entrypoint that systemd executes to a fixed set of system directories. Bundled
+plugin launches also include the directory of the exact absolute Node runtime
+that executes that entrypoint, allowing a globally installed provider beside
+Node to remain discoverable. These already-selected executable locations are
+the trust anchors even when an entrypoint is a package-manager symlink; any
+anchor directory containing the platform's `PATH` delimiter is rejected. This
 allows globally co-installed `lcm`, `claude`, and `codex` commands to work while
 excluding the current directory, project-local binaries, and other arbitrary
 shell-specific path entries. Put provider configuration in LCM settings or the

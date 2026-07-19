@@ -75,6 +75,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - When a provider supports no values for an optional control, say the control is unsupported; do not render an empty set as `Valid values: none`.
 - Retry and backoff duration accounting must use a monotonic clock so wall-clock corrections cannot shorten or extend a wait.
 - Normalize non-finite delay values before entering timer loops; security-sensitive timer scheduling must keep user-derived values out of `setTimeout` durations by using literal constants only.
+- Reject executable directories containing the platform PATH delimiter before composing a restricted child-process `PATH`; otherwise one trusted path can inject additional search directories or the current directory.
 
 ### GitHub Actions and CodeQL
 
