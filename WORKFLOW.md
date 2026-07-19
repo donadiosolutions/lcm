@@ -46,25 +46,26 @@ The manual release helper performs step 4 idempotently: it pushes or fetches a v
 
 ### CI Triggers
 
-| Workflow | Trigger | Purpose |
-|----------|---------|---------|
-| `ci.yml` | Push to main and release + all PRs + merge groups (`checks_requested`) | Type-check, test, build |
-| `codeql.yml` | Push to main + all PRs + merge groups (`checks_requested`) | Required CodeQL analysis and SARIF upload |
-| `version-pr.yml` | Push to main | Auto-create version PR from changesets |
-| `publish.yml` | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag | Publish npm + create GitHub release |
+| Workflow              | Trigger                                                                   | Purpose                                                     |
+| --------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `ci.yml`              | Push to main and release + all PRs + merge groups (`checks_requested`)    | Type-check, test, build                                     |
+| `codeql.yml`          | Push to main + all PRs + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                   |
+| `codeql-extended.yml` | Scheduled + manual dispatch + all PRs + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload |
+| `version-pr.yml`      | Push to main                                                              | Auto-create version PR from changesets                      |
+| `publish.yml`         | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag                 | Publish npm + create GitHub release                         |
 
 ## Defaults (predefined answers for brainstorming)
 
-| Question | Default Answer |
-|----------|---------------|
-| Spec location | PR or issue body unless the user asks for a tracked document |
-| Visual companion | No (CLI project, no visual questions) |
+| Question                | Default Answer                                                 |
+| ----------------------- | -------------------------------------------------------------- |
+| Spec location           | PR or issue body unless the user asks for a tracked document   |
+| Visual companion        | No (CLI project, no visual questions)                          |
 | Implementation approach | Parallel tracks — breaking changes isolated from additive work |
-| Registry/config format | TypeScript (type-safe, compile-time checks) |
-| Install behavior | Auto-write files (match ByteRover (brv) UX) |
-| State tracking | Filesystem scan (no state files) |
-| Release strategy | Parallel tracks with separate PRs |
-| PR review | Copilot via reviewers list, not @copilot tag |
+| Registry/config format  | TypeScript (type-safe, compile-time checks)                    |
+| Install behavior        | Auto-write files (match ByteRover (brv) UX)                    |
+| State tracking          | Filesystem scan (no state files)                               |
+| Release strategy        | Parallel tracks with separate PRs                              |
+| PR review               | Copilot via reviewers list, not @copilot tag                   |
 
 ## Phase 1: Design (Opus, max effort)
 
@@ -132,6 +133,7 @@ gh pr edit {n} --repo {owner}/{repo} --add-reviewer copilot-pull-request-reviewe
 The REST `requested_reviewers` endpoint returns **422** for bot reviewers ("Reviews may only be requested from collaborators"). `gh pr edit` uses the GraphQL API internally and handles bot reviewers correctly. Confirmed working on PR #56.
 
 **Methods that do NOT work:**
+
 - `gh api -X POST .../requested_reviewers -f 'reviewers[]=copilot-pull-request-reviewer'` — 422 for bots
 - Empty commits — Copilot does not reliably trigger on diffs with no substantive changes
 - Tagging `@copilot` in comments — opens a new PR instead of reviewing
