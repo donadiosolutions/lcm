@@ -18,7 +18,7 @@ This document is a living record. **Update it whenever you learn something:**
 
 ## Branch Strategy
 
-```
+```text
 feature/docs branches → main (default, protected)
 ```
 
@@ -46,13 +46,13 @@ The manual release helper performs step 4 idempotently: it pushes or fetches a v
 
 ### CI Triggers
 
-| Workflow              | Trigger                                                                   | Purpose                                                     |
-| --------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `ci.yml`              | Push to main and release + all PRs + merge groups (`checks_requested`)    | Type-check, test, build                                     |
-| `codeql.yml`          | Push to main + all PRs + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                   |
-| `codeql-extended.yml` | Scheduled + manual dispatch + all PRs + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload |
-| `version-pr.yml`      | Push to main                                                              | Auto-create version PR from changesets                      |
-| `publish.yml`         | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag                 | Publish npm + create GitHub release                         |
+| Workflow              | Trigger                                                                              | Purpose                                                     |
+| --------------------- | ------------------------------------------------------------------------------------ | ----------------------------------------------------------- |
+| `ci.yml`              | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, build                                     |
+| `codeql.yml`          | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                   |
+| `codeql-extended.yml` | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload |
+| `version-pr.yml`      | Push to main                                                                         | Auto-create version PR from changesets                      |
+| `publish.yml`         | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag                            | Publish npm + create GitHub release                         |
 
 ## Defaults (predefined answers for brainstorming)
 
