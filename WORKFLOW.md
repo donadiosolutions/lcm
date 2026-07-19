@@ -35,9 +35,13 @@ commits. Authenticated provider `status` and `check_run` events drive
 `external-admission.yml`; pull-request lifecycle events do not start this
 write-capable workflow. On a non-draft PR, the handlers require authenticated
 results from CodeRabbit, `codecov/patch`, and DCO on the PR's exact head SHA.
-Provider reruns revalidate that SHA and replace a stale successful admission
-with a pending or failed result until all three providers pass again. Draft PRs
-are not eligible for admission.
+Every authenticated provider event with a valid commit SHA replaces any stale
+successful admission with `pending` before the PR-association lookup. This is
+necessary because GitHub may omit closed unmerged PRs from a commit's PR
+associations. The handler admits only one open, non-draft, main-targeting PR at
+the exact event SHA and repeats that validation immediately before publishing
+success; a closed, draft, ineligible, unassociated, or ambiguous commit remains
+pending.
 
 After PR-head admission, the separate
 `external-admission-merge-group.yml` workflow runs a permissionless Actions
