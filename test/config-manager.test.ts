@@ -439,13 +439,15 @@ describe("setConfigValue", () => {
       apiKey: "shared-api-key",
       baseUrl: "http://localhost:11435/v1",
     });
-    for (const key of ["apiMode", "requestTimeoutMs", "retry"]) {
+    for (const key of ["apiMode", "retry"]) {
       expect(stored.llm).not.toHaveProperty(key);
     }
     if (expectedProvider === "claude-process" || expectedProvider === "codex-process") {
       expect(stored.llm.reasoningEffort).toBe("high");
+      expect(stored.llm.requestTimeoutMs).toBe(30_000);
     } else {
       expect(stored.llm).not.toHaveProperty("reasoningEffort");
+      expect(stored.llm).not.toHaveProperty("requestTimeoutMs");
     }
   });
 

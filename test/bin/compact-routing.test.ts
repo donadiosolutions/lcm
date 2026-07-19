@@ -101,10 +101,12 @@ describe("compact command --hook routing", () => {
     });
   });
 
-  it("rejects timeout and retry overrides for process providers", () => {
+  it("accepts timeout overrides and rejects retry overrides for process providers", () => {
     const config = parseDaemonConfig(JSON.stringify({ llm: { provider: "codex-process" } }));
-    expect(() => resolveCompactRequestPolicyOverride(config, { timeoutMs: "1000" }))
-      .toThrow("require llm.provider=\"openai\"");
+    expect(resolveCompactRequestPolicyOverride(config, { timeoutMs: "1000" }))
+      .toMatchObject({ requestTimeoutMs: 1000 });
+    expect(() => resolveCompactRequestPolicyOverride(config, { retryMaxAttempts: "2" }))
+      .toThrow("retry overrides require llm.provider=\"openai\"");
   });
 });
 

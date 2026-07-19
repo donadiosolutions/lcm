@@ -28,7 +28,7 @@ describe("ensureCore", () => {
     expect(configWrite).toBeDefined();
     const stored = JSON.parse(configWrite![1]) as { llm: Record<string, unknown> };
     expect(stored.llm.provider).toBe("auto");
-    expect(stored.llm).not.toHaveProperty("requestTimeoutMs");
+    expect(stored.llm.requestTimeoutMs).toBe(DEFAULT_LLM_REQUEST_TIMEOUT_MS);
     expect(stored.llm).not.toHaveProperty("retry");
 
     const effective = parseDaemonConfig(configWrite![1], {}, {});

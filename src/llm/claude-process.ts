@@ -1,6 +1,6 @@
 import { spawn as defaultSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
-import type { ClaudeProcessReasoningEffort } from "../daemon/config.js";
+import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, type ClaudeProcessReasoningEffort } from "../daemon/config.js";
 import { createProcessCompatibilityError } from "./process-utils.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
@@ -10,8 +10,6 @@ import {
 } from "../summarize.js";
 
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
-const TIMEOUT_MS = 120_000;
-
 type ClaudeProcessDeps = {
   model?: string;
   reasoningEffort?: ClaudeProcessReasoningEffort;
@@ -39,7 +37,7 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
   const reasoningEffort = opts.reasoningEffort;
   const fastMode = opts.fastMode;
   const spawn = opts.spawn ?? defaultSpawn;
-  const timeoutMs = opts.timeoutMs ?? TIMEOUT_MS;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_LLM_REQUEST_TIMEOUT_MS;
 
   return async function summarize(text: string, aggressive?: boolean, ctx: SummarizeContext = {}): Promise<string> {
     const estimatedInputTokens = Math.ceil(text.length / 4);

@@ -204,8 +204,12 @@ describe("runCli map boundaries", () => {
     const config = state.loadConfig();
     expect(resolveCompactRequestPolicyOverride(config as never, { timeoutMs: "250" })).toMatchObject({ requestTimeoutMs: 250 });
     expect(resolveCompactRequestPolicyOverride(config as never, { retryMaxAttempts: "2" })).toMatchObject({ retry: { maxAttempts: 2 } });
+    expect(resolveCompactRequestPolicyOverride({ ...config, llm: { ...config.llm, provider: "claude-process" } } as never, { timeoutMs: "250" }))
+      .toMatchObject({ requestTimeoutMs: 250 });
     expect(() => resolveCompactRequestPolicyOverride({ ...config, llm: { ...config.llm, provider: "claude-process" } } as never, { retryMaxAttempts: "2" }))
-      .toThrow("timeout and retry overrides require");
+      .toThrow("retry overrides require");
+    expect(() => resolveCompactRequestPolicyOverride({ ...config, llm: { ...config.llm, provider: "disabled" } } as never, { timeoutMs: "250" }))
+      .toThrow("timeout overrides require");
     expect(compactFailureExitCode(0)).toBeUndefined();
     expect(compactFailureExitCode(2)).toBe(1);
     expect(resolveManualCompactProvider("auto")).toBe("claude-process");

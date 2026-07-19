@@ -1054,13 +1054,16 @@ describe("strict LLM configuration validation", () => {
     }))).toThrow(expected as string);
   });
 
-  it("rejects explicitly configured request policies for non-OpenAI providers", () => {
-    expect(() => parseDaemonConfig(JSON.stringify({
+  it("accepts process timeouts while rejecting unsupported request policies", () => {
+    expect(parseDaemonConfig(JSON.stringify({
       llm: { provider: "claude-process", requestTimeoutMs: 10_000 },
-    }))).toThrow('only valid when llm.provider is "openai"');
+    })).llm.requestTimeoutMs).toBe(10_000);
     expect(() => parseDaemonConfig(JSON.stringify({
       llm: { provider: "codex-process", retry: { maxAttempts: 2 } },
     }))).toThrow('only valid when llm.provider is "openai"');
+    expect(() => parseDaemonConfig(JSON.stringify({
+      llm: { provider: "anthropic", model: "m", apiKey: "key", requestTimeoutMs: 10_000 },
+    }))).toThrow('only valid when llm.provider is "auto", "openai", "claude-process", or "codex-process"');
   });
 
   it("exports a pure partial request policy resolver for CLI and route callers", () => {

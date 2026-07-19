@@ -13,6 +13,7 @@ import {
   reasoningEffortsForProvider,
   resolveLlmRequestPolicy,
   supportsFastMode,
+  supportsRequestTimeout,
   type DaemonConfig,
   type LlmProvider,
   type LlmRequestPolicy,
@@ -114,10 +115,16 @@ export function resolveCompactRequestPolicyOverride(
   const hasRetryOverride = Object.values(retry).some((value) => value !== undefined);
   const hasOverride = requestTimeoutMs !== undefined || hasRetryOverride;
   if (!hasOverride) return undefined;
-  if (config.llm.provider !== "openai") {
+  if (requestTimeoutMs !== undefined && !supportsRequestTimeout(config.llm.provider)) {
     throw new ConfigValidationError(
       "compact",
-      "timeout and retry overrides require llm.provider=\"openai\"",
+      "timeout overrides require llm.provider=\"auto\", \"openai\", \"claude-process\", or \"codex-process\"",
+    );
+  }
+  if (hasRetryOverride && config.llm.provider !== "openai") {
+    throw new ConfigValidationError(
+      "compact",
+      "retry overrides require llm.provider=\"openai\"",
     );
   }
   return resolveLlmRequestPolicy(
