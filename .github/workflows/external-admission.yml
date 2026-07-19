@@ -30,7 +30,7 @@ concurrency:
     external-admission-${{
       github.event_name == 'pull_request_target' && github.event.pull_request.head.sha ||
       github.event_name == 'status' && github.event.context == 'CodeRabbit' &&
-        github.event.creator.id == 136622811 && github.event.creator.login == 'coderabbitai[bot]' &&
+        github.actor_id == '136622811' && github.actor == 'coderabbitai[bot]' &&
         github.event.sha ||
       github.event_name == 'check_run' &&
         ((github.event.check_run.name == 'codecov/patch' && github.event.check_run.app.id == 254 &&
@@ -51,7 +51,7 @@ jobs:
     if: >-
       (github.event_name == 'pull_request_target' && !github.event.pull_request.draft) ||
       (github.event_name == 'status' && github.event.context == 'CodeRabbit' &&
-        github.event.creator.id == 136622811 && github.event.creator.login == 'coderabbitai[bot]') ||
+        github.actor_id == '136622811' && github.actor == 'coderabbitai[bot]') ||
       (github.event_name == 'check_run' &&
         ((github.event.check_run.name == 'codecov/patch' && github.event.check_run.app.id == 254 &&
           github.event.check_run.app.slug == 'codecov') ||
