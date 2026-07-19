@@ -188,7 +188,7 @@ export async function handleDaemonRequest(
         .finally(() => { restartInFlight.delete(opts.port); });
       restartInFlight.set(opts.port, p);
     }
-    await restartInFlight.get(opts.port)!.catch(() => { /* non-fatal */ });
+    await restartInFlight.get(opts.port)!;
     try {
       result = await client.post(route, body);
     } catch (retryErr) {

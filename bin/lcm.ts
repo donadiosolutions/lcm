@@ -143,7 +143,7 @@ function withHookClient(stdinText: string, client: unknown): string {
   return withHookOverrides(stdinText, client, undefined);
 }
 
-async function withCustomHelp(cmd: Command, commandName: string): Promise<void> {
+async function withCustomHelp(cmd: Command, commandName: string): Promise<never> {
   const { printHelp } = await import("../src/cli-help.js");
   printHelp(commandName);
   exit(0);
@@ -565,7 +565,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
     .option("--foreground", "Run in the foreground for debugging")
     .option("-h, --help", "Show help")
     .action(async (opts: DaemonStartOptions) => {
-      if (opts.help) { await withCustomHelp(daemonCmd, "daemon"); return; }
+      if (opts.help) await withCustomHelp(daemonCmd, "daemon");
       if (!opts.foreground) {
         const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
         const { loadDaemonConfig } = await import("../src/daemon/config.js");
@@ -623,7 +623,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
     .description("Restart the managed context daemon and reload configuration")
     .option("-h, --help", "Show help")
     .action(async (opts: { help?: boolean }) => {
-      if (opts.help) { await withCustomHelp(daemonCmd, "daemon"); return; }
+      if (opts.help) await withCustomHelp(daemonCmd, "daemon");
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
       const { restartDaemon } = await import("../src/daemon/lifecycle.js");
       const config = loadDaemonConfig(defaultConfigPath());
@@ -647,7 +647,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       exit(0);
     });
   daemonCmd.action(async (opts: DaemonRootOptions) => {
-    if (opts.help) { await withCustomHelp(daemonCmd, "daemon"); return; }
+    if (opts.help) await withCustomHelp(daemonCmd, "daemon");
   });
   program.addCommand(daemonCmd);
 
@@ -660,7 +660,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
     .option("--effective", "Include defaults and environment-variable overrides")
     .option("-h, --help", "Show help")
     .action(async (path: string, opts: { effective?: boolean; help?: boolean }) => {
-      if (opts.help) { await withCustomHelp(configCmd, "config"); return; }
+      if (opts.help) await withCustomHelp(configCmd, "config");
       try {
         const { formatConfigValue, getConfigValue } = await import("../src/config-manager.js");
         console.log(formatConfigValue(getConfigValue({
@@ -680,7 +680,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
     .option("--json", "Parse value as JSON")
     .option("-h, --help", "Show help")
     .action(async (path: string, value: string, opts: { json?: boolean; help?: boolean }) => {
-      if (opts.help) { await withCustomHelp(configCmd, "config"); return; }
+      if (opts.help) await withCustomHelp(configCmd, "config");
       try {
         const { formatConfigValue, normalizeConfigPath, setConfigValue } = await import("../src/config-manager.js");
         const stored = setConfigValue({

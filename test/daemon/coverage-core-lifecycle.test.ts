@@ -47,11 +47,12 @@ describe("lifecycle procfs and parent warnings", () => {
         "TCP 127.0.0.2:3333 0.0.0.0:0 LISTENING 42",
         "TCP 127.0.0.1:invalid 0.0.0.0:0 LISTENING 42",
         "TCP 127.0.0.1:3737 0.0.0.0:0 LISTENING 42",
+        "TCP 127.0.0.1:4545 0.0.0.0:0 LISTENING 42",
         "TCP 127.0.0.1:4545 0.0.0.0:0 LISTENING 99",
       ].join("\n"),
     }));
     const trustedNetstat = "C:\\Windows\\System32\\netstat.exe";
-    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", win32Netstat as never, "/proc", undefined, trustedNetstat)).toEqual([3737]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", win32Netstat as never, "/proc", undefined, trustedNetstat)).toEqual([3737, 4545]);
     expect(win32Netstat).toHaveBeenCalledWith(trustedNetstat, ["-ano", "-p", "tcp"], expect.any(Object));
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", win32Netstat as never, "/proc", 3737, trustedNetstat)).toEqual([3737]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", vi.fn(() => ({ status: 1, stdout: "" })) as never, "/proc", undefined, trustedNetstat)).toEqual([]);
@@ -64,15 +65,17 @@ describe("lifecycle procfs and parent warnings", () => {
     mkdirSync(join(linuxRoot, "42", "fd"), { recursive: true });
     mkdirSync(join(linuxRoot, "net"), { recursive: true });
     symlinkSync("socket:[12345]", join(linuxRoot, "42", "fd", "7"));
+    symlinkSync("socket:[67890]", join(linuxRoot, "42", "fd", "8"));
     writeFileSync(join(linuxRoot, "net", "tcp"), [
       "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
       "   0: 0100007F:0AAA 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 99999 1 0000000000000001 100 0 0 10 0",
       "   1: 0200007F:0D05 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000002 100 0 0 10 0",
       "   2: 0100007F:     00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000003 100 0 0 10 0",
       "   3: 0100007F:0E99 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000004 100 0 0 10 0",
+      "   4: 0100007F:11C1 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 67890 1 0000000000000005 100 0 0 10 0",
       "",
     ].join("\n"));
-    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot)).toEqual([3737]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot)).toEqual([3737, 4545]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 2730)).toEqual([]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 3333)).toEqual([]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 3737)).toEqual([3737]);

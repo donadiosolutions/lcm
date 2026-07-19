@@ -99,6 +99,9 @@ describe("handleSessionEnd", () => {
       path: "/promote-events/notify",
       headers: expect.objectContaining({ Authorization: "Bearer secret-token" }),
     }));
+    const errorHandler = mockHttpReq.on.mock.calls.find(([event]) => event === "error")?.[1] as ((error: Error) => void) | undefined;
+    expect(errorHandler).toBeTypeOf("function");
+    expect(() => errorHandler!(new Error("connection refused"))).not.toThrow();
   });
 
   it("fires compact via http.request when totalTokens exceeds threshold", async () => {
