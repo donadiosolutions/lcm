@@ -98,9 +98,11 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 Manual batch discovery applies the same eight-message fresh-tail boundary before
 calling the daemon. A conversation with no raw messages outside that boundary is
 already up to date, even when its protected messages exceed the batch token
-threshold. After a batch sweep, LCM promotes only projects where the daemon
-actually created a summary; daemon no-ops are reported as unchanged and do not
-trigger project-wide promotion scans.
+threshold. When the daemon reports `actionTaken`, LCM promotes only projects
+where it actually created a summary; explicit daemon no-ops are reported as
+unchanged and do not trigger promotion. Older daemons that omit `actionTaken`
+retain legacy success semantics, so a successful no-op response may still
+trigger promotion for that project.
 
 **Budget-targeted (`compactUntilUnder`):**
 - Runs up to `maxRounds` (default 10) of full sweeps
