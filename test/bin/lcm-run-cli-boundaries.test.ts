@@ -31,6 +31,7 @@ const state = vi.hoisted(() => ({
   removeConnector: vi.fn(() => true),
   installed: [] as Array<{ agentId: string; type: string; path: string }>,
   batchResult: { compacted: 1, unchanged: 0, failures: 0, compactedProjects: ["/good"] },
+  batchError: undefined as unknown,
   batchPatch: { lastResult: { ok: true } } as Record<string, unknown>,
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
   importResult: { imported: 1, skipped: 0 },
@@ -84,7 +85,8 @@ vi.mock("../../src/config-manager.js", () => ({
   getConfigValue: vi.fn(() => "value"), formatConfigValue: vi.fn((value: unknown) => String(value)),
   normalizeConfigPath: vi.fn((path: string) => path), setConfigValue: vi.fn(() => "stored"),
 }));
-vi.mock("../../src/batch-compact.js", () => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void }) => {
+vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void }): Promise<typeof state.batchResult> => {
+  if (state.batchError !== undefined) throw state.batchError;
   opts.onProgress?.(state.batchPatch); return state.batchResult;
 }) }));
 vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((value: Record<string, unknown>) => ({
@@ -171,6 +173,7 @@ beforeEach(() => {
   state.files.clear(); state.exists.clear(); state.entries = []; state.readError = undefined;
   state.fileText = "{}"; state.packageVersion = "1.4.0"; state.installed = [];
   state.batchResult = { compacted: 1, unchanged: 0, failures: 0, compactedProjects: ["/good"] };
+  state.batchError = undefined;
   state.batchPatch = { lastResult: { ok: true } };
   state.importPatch = { lastResult: { ok: true } };
   state.health.mockResolvedValue(true);
@@ -425,6 +428,15 @@ describe("runCli lifecycle and connector boundaries", () => {
 });
 
 describe("runCli scanning and portable knowledge boundaries", () => {
+  it("stops the compact renderer when batch compaction rejects", async (): Promise<void> => {
+    state.batchError = new Error("batch failed");
+
+    expect((await invoke(["compact"]))?.message).toBe("batch failed");
+    expect(state.renderer.start).toHaveBeenCalledOnce();
+    expect(state.renderer.stop).toHaveBeenCalledOnce();
+    expect(state.renderer.printSummary).not.toHaveBeenCalled();
+  });
+
   it("covers compact TTY summary and fatal targeted promotion failure", async () => {
     Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
     state.entries = [

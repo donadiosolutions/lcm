@@ -317,10 +317,15 @@ describe("batch compaction discovery", () => {
     expect(findUncompacted(100, true)).toHaveLength(0);
 
     const replayDb = new DatabaseSync(paths.dbPath);
-    replayDb.prepare(
-      "UPDATE context_items SET item_type = 'summary', message_id = NULL, summary_id = ? WHERE conversation_id = ? AND ordinal = 0",
-    ).run("summary-1", 1);
-    replayDb.close();
+    try {
+      replayDb.exec("PRAGMA journal_mode = WAL");
+      replayDb.exec("PRAGMA foreign_keys = ON");
+      replayDb.prepare(
+        "UPDATE context_items SET item_type = 'summary', message_id = NULL, summary_id = ? WHERE conversation_id = ? AND ordinal = 0",
+      ).run("summary-1", 1);
+    } finally {
+      replayDb.close();
+    }
     expect(findUncompacted(100, true, cwd, true)).toEqual([]);
 
     writeFileSync(projectMapPath(), "{");
@@ -336,7 +341,7 @@ describe("batch compaction discovery", () => {
       failures: 0,
       compactedProjects: [],
     });
-    expect(log).toHaveBeenCalledWith("Nothing to compact — all sessions are up to date.");
+    expect(log).toHaveBeenCalledWith("Nothing to compact — no sessions are currently eligible.");
 
     const cwd = makeDir("compact-boundary-outcomes");
     const paths = projectPaths(cwd);

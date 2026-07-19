@@ -62,6 +62,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 
 ### Error handling
 
+- Any started CLI renderer must be stopped in a `finally` block so failures cannot leave its render loop active.
 - Route handlers must catch errors and return structured JSON: `{ error: string, code?: string }`.
 - Flag `res.send(e.message)` or unstructured error responses that leak stack traces.
 - Unhandled promise rejections in route handlers are bugs — flag missing `try/catch` in `async` handlers.

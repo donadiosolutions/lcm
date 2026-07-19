@@ -233,7 +233,7 @@ describe("compact route coverage", () => {
     expect(body.latestSummaryContent).toBe("latest");
   });
 
-  it("returns actionTaken when compaction creates a summary", async () => {
+  it("returns actionTaken when compaction creates a summary", async (): Promise<void> => {
     state.compactResult = { actionTaken: true, tokensBefore: 100, tokensAfter: 10, createdSummaryId: "sum-1" };
     state.summaries = [{ summaryId: "sum-1", content: "created", depth: 0 }];
     const body = await call(JSON.stringify({ session_id: "compacted", cwd: "/tmp" }));

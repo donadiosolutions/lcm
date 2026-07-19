@@ -152,7 +152,7 @@ export async function batchCompact(opts: {
   const onProgress = opts.onProgress;
 
   if (conversations.length === 0) {
-    console.log("Nothing to compact — all sessions are up to date.");
+    console.log("Nothing to compact — no sessions are currently eligible.");
     return { compacted: 0, unchanged: 0, failures: 0, compactedProjects: [] };
   }
 

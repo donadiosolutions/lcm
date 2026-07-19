@@ -91,7 +91,7 @@ vi.mock("../../src/daemon/lifecycle.js", () => ({ ensureDaemon: state.ensureDaem
 vi.mock("../../src/cli-help.js", () => ({ printHelp: state.printHelp }));
 vi.mock("../../src/hooks/dispatch.js", () => ({ dispatchHook: state.dispatchHook }));
 vi.mock("../../src/mcp/server.js", () => ({ startMcpServer: vi.fn(async () => undefined) }));
-vi.mock("../../src/batch-compact.js", () => ({ batchCompact: vi.fn(async (options: { onProgress?: (patch: unknown) => void }) => {
+vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (options: { onProgress?: (patch: unknown) => void }): Promise<typeof state.batchResult> => {
   options.onProgress?.(state.batchProgressLast ? { lastResult: { ok: true } } : {});
   return state.batchResult;
 }) }));

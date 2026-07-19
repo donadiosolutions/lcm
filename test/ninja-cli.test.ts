@@ -160,7 +160,7 @@ describe("renderFrame — TTY non-verbose mode", () => {
     expect(output).toContain("processing...");
   });
 
-  it("shows the current project during a multi-project phase", () => {
+  it("shows the current project during a multi-project phase", (): void => {
     const state = makeProgressState({ phases: [{ name: "Promote", status: "active" }] });
     state.currentProject = "/workspace/project";
     const output = renderFrame(state, ttyOpts, 0);

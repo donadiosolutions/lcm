@@ -27,6 +27,7 @@ import {
   migrateLegacyHomeIfNeeded,
   projectsDir as lcmProjectsDir,
 } from "../src/runtime-paths.js";
+import type { ProgressState } from "../src/cli/progress-state.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -791,46 +792,51 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         const compactRenderer = new NinjaRenderer({ state: compactState, renderOpts });
         compactRenderer.start();
 
-        const { compacted, failures, compactedProjects } = await batchCompact({
-          minTokens, dryRun, port, cwd, replay, verbose, tokenPath, reasoningEffort, fastMode, requestPolicy,
-          onProgress: (patch) => {
-            Object.assign(compactState, patch);
-            if (patch.lastResult) compactRenderer.sessionDone();
-          },
-        });
-
-        compactState.phases[0].status = "done";
-
-        // Auto-promote after a successful compact: new summaries are prime promotion candidates.
-        let promotionFailures = 0;
+        let totalFailures = 0;
         let totalPromoted = 0;
-        if (compacted > 0 && !noPromote) {
-          compactState.phases[1]!.status = "active";
-          for (const promoteCwd of compactedProjects) {
-            compactState.currentProject = promoteCwd;
-            if (!isTTY || verbose) console.log(`  promoting: ${promoteCwd}...`);
-            try {
-              const result = await client.post<{ processed: number; promoted: number }>("/promote", {
-                cwd: promoteCwd,
-                dry_run: dryRun,
-              });
-              totalPromoted += result.promoted;
-            } catch (error) {
-              promotionFailures++;
-              const message = error instanceof Error ? error.message : "request failed";
-              compactState.errors.push({ sessionId: `promote:${promoteCwd}`, message });
-              console.error(`  promotion failed for ${promoteCwd}: ${message}`);
+        try {
+          const { compacted, failures, compactedProjects } = await batchCompact({
+            minTokens, dryRun, port, cwd, replay, verbose, tokenPath, reasoningEffort, fastMode, requestPolicy,
+            onProgress: (patch: Partial<ProgressState>): void => {
+              Object.assign(compactState, patch);
+              if (patch.lastResult) compactRenderer.sessionDone();
+            },
+          });
+
+          compactState.phases[0].status = "done";
+
+          // Auto-promote after a successful compact: new summaries are prime promotion candidates.
+          let promotionFailures = 0;
+          if (compacted > 0 && !noPromote) {
+            compactState.phases[1]!.status = "active";
+            for (const promoteCwd of compactedProjects) {
+              compactState.currentProject = promoteCwd;
+              if (!isTTY || verbose) console.log(`  promoting: ${promoteCwd}...`);
+              try {
+                const result = await client.post<{ processed: number; promoted: number }>("/promote", {
+                  cwd: promoteCwd,
+                  dry_run: dryRun,
+                });
+                totalPromoted += result.promoted;
+              } catch (error) {
+                promotionFailures++;
+                const message = error instanceof Error ? error.message : "request failed";
+                compactState.errors.push({ sessionId: `promote:${promoteCwd}`, message });
+                console.error(`  promotion failed for ${promoteCwd}: ${message}`);
+              }
             }
+            compactState.currentProject = undefined;
           }
-          compactState.currentProject = undefined;
+          if (!noPromote) compactState.phases[1]!.status = "done";
+          totalFailures = failures + promotionFailures;
+        } finally {
+          compactRenderer.stop();
         }
-        if (!noPromote) compactState.phases[1]!.status = "done";
-        compactRenderer.stop();
         if (isTTY) compactRenderer.printSummary();
         if (totalPromoted > 0) {
           console.log(`  → ${totalPromoted} insight${totalPromoted !== 1 ? "s" : ""} promoted`);
         }
-        process.exitCode = compactFailureExitCode(failures + promotionFailures);
+        process.exitCode = compactFailureExitCode(totalFailures);
         return;
       }
       // Piped stdin — hook dispatch (PreCompact hook invocation)
