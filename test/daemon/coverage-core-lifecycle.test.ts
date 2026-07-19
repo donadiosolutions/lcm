@@ -286,6 +286,8 @@ describe("lifecycle spawn and restart failure boundaries", () => {
 
     const errored = await ensureDaemon({
       port: 7, pidFilePath: join(dir, "error.pid"), spawnTimeoutMs: 1,
+      enforceUserManagerParent: false,
+      _monotonicNowOverride: (): number => 0,
       _fetchOverride: vi.fn().mockRejectedValue(new Error("down")),
       _spawnOverride: vi.fn(() => { throw new Error("spawn error"); }) as never, _skipHealthWait: true,
     });

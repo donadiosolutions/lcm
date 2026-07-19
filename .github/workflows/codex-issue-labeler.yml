@@ -1,0 +1,348 @@
+name: Codex issue labeler
+
+on:
+  issues:
+    types: [opened]
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'issues' && github.run_id || 'processor' }}
+  cancel-in-progress: false
+
+env:
+  QUEUE_LABEL: needs-codex-triage
+
+jobs:
+  enqueue:
+    if: ${{ github.event_name == 'issues' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout trusted workflow code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Queue issue for Codex triage
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        with:
+          script: |
+            const { join } = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const policyUrl = pathToFileURL(
+              join(process.env.GITHUB_WORKSPACE, ".github/scripts/issue-label-policy.mjs"),
+            ).href;
+            const { loadManagedLabelConfig } = await import(policyUrl);
+            const config = await loadManagedLabelConfig(
+              join(
+                process.env.GITHUB_WORKSPACE,
+                ".github/codex/managed-issue-labels.json",
+              ),
+            );
+
+            const label = process.env.QUEUE_LABEL;
+            const issueNumber = Number(process.env.ISSUE_NUMBER);
+            const defaultPriority = "p3-low";
+            if (!config.priorities.includes(defaultPriority)) {
+              throw new Error(
+                `Default priority ${defaultPriority} is not configured as a managed priority`,
+              );
+            }
+
+            try {
+              await github.rest.issues.getLabel({
+                ...context.repo,
+                name: defaultPriority,
+              });
+            } catch (error) {
+              if (error.status === 404) {
+                throw new Error(
+                  `Default priority ${defaultPriority} does not exist in the repository`,
+                );
+              }
+              throw error;
+            }
+
+            try {
+              await github.rest.issues.getLabel({
+                ...context.repo,
+                name: label,
+              });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              try {
+                await github.rest.issues.createLabel({
+                  ...context.repo,
+                  name: label,
+                  color: "D4C5F9",
+                  description: "Queued for automated Codex issue triage",
+                });
+              } catch (createError) {
+                if (createError.status !== 422) throw createError;
+              }
+            }
+
+            const { data: issue } = await github.rest.issues.get({
+              ...context.repo,
+              issue_number: issueNumber,
+            });
+            const currentLabels = issue.labels.map((currentLabel) =>
+              typeof currentLabel === "string" ? currentLabel : currentLabel.name,
+            );
+            const hasPriority = currentLabels.some((currentLabel) =>
+              config.priorities.includes(currentLabel),
+            );
+            const labels = hasPriority ? [label] : [label, defaultPriority];
+
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: issueNumber,
+              labels,
+            });
+
+  collect:
+    if: ${{ github.event_name != 'issues' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      has_work: ${{ steps.collect.outputs.has_work }}
+      issue_numbers: ${{ steps.collect.outputs.issue_numbers }}
+      prompt: ${{ steps.collect.outputs.prompt }}
+      schema: ${{ steps.collect.outputs.schema }}
+    steps:
+      - name: Checkout trusted workflow code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Collect queued issues and label catalog
+        id: collect
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { join } = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const policyUrl = pathToFileURL(
+              join(process.env.GITHUB_WORKSPACE, ".github/scripts/issue-label-policy.mjs"),
+            ).href;
+            const {
+              buildClassificationPrompt,
+              buildOutputSchema,
+              loadManagedLabelConfig,
+            } = await import(policyUrl);
+
+            const configPath = join(
+              process.env.GITHUB_WORKSPACE,
+              ".github/codex/managed-issue-labels.json",
+            );
+            const config = await loadManagedLabelConfig(configPath);
+            const managedNames = Object.values(config).flat();
+
+            const repositoryLabels = await github.paginate(
+              github.rest.issues.listLabelsForRepo,
+              { ...context.repo, per_page: 100 },
+            );
+            const repositoryLabelMap = new Map(
+              repositoryLabels.map((label) => [label.name, label]),
+            );
+            const missingLabels = managedNames.filter(
+              (name) => !repositoryLabelMap.has(name),
+            );
+            if (missingLabels.length > 0) {
+              throw new Error(
+                `Managed labels do not exist in the repository: ${missingLabels.join(", ")}`,
+              );
+            }
+
+            const issues = [];
+            const pages = github.paginate.iterator(
+              github.rest.issues.listForRepo,
+              {
+                ...context.repo,
+                state: "all",
+                labels: process.env.QUEUE_LABEL,
+                sort: "created",
+                direction: "asc",
+                per_page: 100,
+              },
+            );
+            for await (const { data: page } of pages) {
+              for (const issue of page) {
+                if (issue.pull_request) continue;
+                issues.push({
+                  number: issue.number,
+                  title: issue.title,
+                  body: issue.body ?? "",
+                });
+                if (issues.length === 10) break;
+              }
+              if (issues.length === 10) break;
+            }
+
+            if (issues.length === 0) {
+              core.info("No queued issues found.");
+              core.setOutput("has_work", "false");
+              core.setOutput("issue_numbers", "[]");
+              return;
+            }
+
+            const descriptions = Object.fromEntries(
+              managedNames.map((name) => [
+                name,
+                repositoryLabelMap.get(name).description ?? "",
+              ]),
+            );
+            const issueNumbers = issues.map((issue) => issue.number);
+            core.setOutput("has_work", "true");
+            core.setOutput("issue_numbers", JSON.stringify(issueNumbers));
+            core.setOutput(
+              "prompt",
+              buildClassificationPrompt(config, descriptions, issues),
+            );
+            core.setOutput(
+              "schema",
+              JSON.stringify(buildOutputSchema(config, issueNumbers)),
+            );
+            core.info(`Prepared ${issues.length} issue(s) for classification.`);
+
+  classify:
+    needs: collect
+    if: ${{ needs.collect.outputs.has_work == 'true' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      result: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - name: Classify issues with Codex
+        id: codex
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.10
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: ${{ needs.collect.outputs.prompt }}
+          output-schema: ${{ needs.collect.outputs.schema }}
+          codex-version: 0.144.6
+          model: gpt-5.6-luna
+          effort: low
+          permission-profile: ":read-only"
+          safety-strategy: drop-sudo
+
+  apply:
+    needs: [collect, classify]
+    if: ${{ needs.collect.outputs.has_work == 'true' && needs.classify.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout trusted workflow code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Validate and apply classifications
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CLASSIFICATION_RESULT: ${{ needs.classify.outputs.result }}
+          EXPECTED_ISSUE_NUMBERS: ${{ needs.collect.outputs.issue_numbers }}
+        with:
+          script: |
+            const { join } = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const policyUrl = pathToFileURL(
+              join(process.env.GITHUB_WORKSPACE, ".github/scripts/issue-label-policy.mjs"),
+            ).href;
+            const {
+              computeLabelChanges,
+              includesLabelIgnoreCase,
+              loadManagedLabelConfig,
+              removeIssueLabelIfPresent,
+              validateClassificationResult,
+            } = await import(policyUrl);
+
+            const config = await loadManagedLabelConfig(
+              join(
+                process.env.GITHUB_WORKSPACE,
+                ".github/codex/managed-issue-labels.json",
+              ),
+            );
+            const expectedIssueNumbers = JSON.parse(
+              process.env.EXPECTED_ISSUE_NUMBERS,
+            );
+            const classifications = validateClassificationResult(
+              process.env.CLASSIFICATION_RESULT,
+              config,
+              expectedIssueNumbers,
+            );
+
+            const failures = [];
+            for (const classification of classifications) {
+              const issueNumber = classification.issueNumber;
+              try {
+                const { data: issue } = await github.rest.issues.get({
+                  ...context.repo,
+                  issue_number: issueNumber,
+                });
+                const currentLabels = issue.labels.map((label) =>
+                  typeof label === "string" ? label : label.name,
+                );
+
+                if (!includesLabelIgnoreCase(currentLabels, process.env.QUEUE_LABEL)) {
+                  core.info(
+                    `Skipping #${issueNumber}: it is no longer queued for Codex triage.`,
+                  );
+                  continue;
+                }
+
+                const { add, remove } = computeLabelChanges(
+                  currentLabels,
+                  classification,
+                  config,
+                );
+
+                if (add.length > 0) {
+                  await github.rest.issues.addLabels({
+                    ...context.repo,
+                    issue_number: issueNumber,
+                    labels: add,
+                  });
+                }
+                for (const label of remove) {
+                  await removeIssueLabelIfPresent(
+                    github,
+                    context.repo,
+                    issueNumber,
+                    label,
+                  );
+                }
+
+                await removeIssueLabelIfPresent(
+                  github,
+                  context.repo,
+                  issueNumber,
+                  process.env.QUEUE_LABEL,
+                );
+                core.info(
+                  `Reconciled #${issueNumber}: added [${add.join(", ")}], removed [${remove.join(", ")}].`,
+                );
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                failures.push(`#${issueNumber}: ${message}`);
+                core.error(`Failed to reconcile #${issueNumber}: ${message}`);
+              }
+            }
+
+            if (failures.length > 0) {
+              core.setFailed(
+                `Failed to reconcile ${failures.length} issue(s): ${failures.join("; ")}`,
+              );
+            }

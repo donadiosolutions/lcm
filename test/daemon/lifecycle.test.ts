@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it, vi, type TestContext } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureDaemon, findUserSystemdPid, readProcessParentPid, restartDaemon } from "../../src/daemon/lifecycle.js";
 
 const tempDirs: string[] = [];
@@ -411,20 +411,19 @@ describe("ensureDaemon", () => {
     expect(killMock).not.toHaveBeenCalled();
   });
 
-  it("starts via user systemd when parent enforcement is requested on Linux", async (context: TestContext): Promise<void> => {
+  it("starts via user systemd when parent enforcement is requested on Linux", async (): Promise<void> => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-systemd-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
     const runtimeBaseDir = userRuntimeBaseDir();
-    if (runtimeBaseDir === undefined) {
-      context.skip();
-      return;
+    let oldCredentialDir: string | undefined;
+    if (runtimeBaseDir !== undefined) {
+      oldCredentialDir = mkdtempSync(join(runtimeBaseDir, "lcm-systemd-credentials-old-"));
+      tempDirs.push(oldCredentialDir);
+      writeFileSync(join(oldCredentialDir, "ANTHROPIC_API_KEY"), "old");
+      const oldDate = new Date(Date.now() - 20 * 60 * 1000);
+      utimesSync(oldCredentialDir, oldDate, oldDate);
     }
-    const oldCredentialDir = mkdtempSync(join(runtimeBaseDir, "lcm-systemd-credentials-old-"));
-    tempDirs.push(oldCredentialDir);
-    writeFileSync(join(oldCredentialDir, "ANTHROPIC_API_KEY"), "old");
-    const oldDate = new Date(Date.now() - 20 * 60 * 1000);
-    utimesSync(oldCredentialDir, oldDate, oldDate);
     const spawnSyncMock = vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" });
     const spawnMock = vi.fn();
     const originalProvider = process.env.LCM_SUMMARY_PROVIDER;
@@ -434,8 +433,13 @@ describe("ensureDaemon", () => {
     const originalUnrelated = process.env.UNRELATED_DAEMON_VALUE;
     const originalPath = process.env.PATH;
     process.env.LCM_SUMMARY_PROVIDER = "anthropic";
-    process.env.LCM_SUMMARY_API_KEY = "sk-lcm-test";
-    process.env.ANTHROPIC_API_KEY = "sk-test";
+    if (runtimeBaseDir === undefined) {
+      delete process.env.LCM_SUMMARY_API_KEY;
+      delete process.env.ANTHROPIC_API_KEY;
+    } else {
+      process.env.LCM_SUMMARY_API_KEY = "sk-lcm-test";
+      process.env.ANTHROPIC_API_KEY = "sk-test";
+    }
     delete process.env.OPENAI_API_KEY;
     process.env.UNRELATED_DAEMON_VALUE = "ignored";
     process.env.PATH = "/opt/lcm-test/bin:/usr/bin";
@@ -456,15 +460,20 @@ describe("ensureDaemon", () => {
 
       expect(result.startMethod).toBe("systemd-user");
       expect(spawnMock).not.toHaveBeenCalled();
+      const expectedEnvironment = [
+        "--setenv=PATH=/path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--setenv=LCM_SUMMARY_PROVIDER=anthropic",
+      ];
+      if (runtimeBaseDir !== undefined) {
+        expectedEnvironment.push("--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_SUMMARY_API_KEY");
+      }
       expect(spawnSyncMock).toHaveBeenCalledWith(
         "systemd-run",
         expect.arrayContaining([
           "--user",
           "--collect",
           "--no-block",
-          "--setenv=PATH=/path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-          "--setenv=LCM_SUMMARY_PROVIDER=anthropic",
-          "--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_SUMMARY_API_KEY",
+          ...expectedEnvironment,
           "node",
           "/path/lcm.js",
           "daemon",
@@ -474,13 +483,18 @@ describe("ensureDaemon", () => {
         expect.objectContaining({ encoding: "utf-8", timeout: 100 }),
       );
       const systemdArgs = spawnSyncMock.mock.calls[0][1] as string[];
+      if (runtimeBaseDir === undefined) {
+        expect(systemdArgs).not.toContain(
+          "--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_SUMMARY_API_KEY",
+        );
+      }
       const joinedArgs = systemdArgs.join("\n");
       expect(joinedArgs).not.toContain("sk-test");
       expect(joinedArgs).not.toContain("sk-lcm-test");
       expect(systemdArgs).not.toContain("--setenv=UNRELATED_DAEMON_VALUE=ignored");
       expect(systemdArgs).not.toContain("--setenv=PATH=/opt/lcm-test/bin:/usr/bin");
       const credentialArgs = systemdArgs.filter((arg) => arg.startsWith("--property=LoadCredential="));
-      expect(credentialArgs).toEqual([
+      expect(credentialArgs).toEqual(runtimeBaseDir === undefined ? [] : [
         expect.stringContaining("ANTHROPIC_API_KEY:"),
         expect.stringContaining("LCM_SUMMARY_API_KEY:"),
       ]);
@@ -489,7 +503,7 @@ describe("ensureDaemon", () => {
         expect(existsSync(credentialPath)).toBe(false);
         expect(existsSync(dirname(credentialPath))).toBe(false);
       }
-      expect(existsSync(oldCredentialDir)).toBe(false);
+      if (oldCredentialDir !== undefined) expect(existsSync(oldCredentialDir)).toBe(false);
     } finally {
       if (originalProvider === undefined) delete process.env.LCM_SUMMARY_PROVIDER;
       else process.env.LCM_SUMMARY_PROVIDER = originalProvider;

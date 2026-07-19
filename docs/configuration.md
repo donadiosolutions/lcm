@@ -206,6 +206,11 @@ used for a new managed daemon.
 
 `lcm doctor` verifies daemon health and, on Linux, repairs a healthy daemon that is not parented by the current user's systemd manager by restarting it through the managed start path. If the user systemd manager is unavailable, lcm falls back to the older detached spawn behavior and reports that the parent invariant is not satisfied.
 
+The MCP handshake check is time-bounded. If its helper process exits early,
+stops accepting input, or encounters a pipe error, `lcm doctor` reports the
+diagnostic as a warning and continues instead of waiting indefinitely or
+crashing.
+
 Stored `daemon.port` values must be integers from `1` through `65535`; this includes values written with `lcm config set`. Port `0` is reserved for internal runtime overrides used by tests to request ephemeral binding and is not a valid `config.json` value because lifecycle commands must be able to reconnect to the configured port. `daemon.idleTimeoutMs` must be an integer from `0` through `86400000` milliseconds; `0` disables the idle timer.
 
 Legacy `compaction.promotionThresholds.mergeMaxEntries` values are migrated to

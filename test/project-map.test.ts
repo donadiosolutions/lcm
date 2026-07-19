@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -601,6 +601,8 @@ describe("project map", () => {
     const hash = projectId(canonical);
     addProjectAlias(alias, { canonical });
     writeFileSync(projectMapPath(), "{not-json");
+    const changedAt = new Date(Date.now() + 1_000);
+    utimesSync(projectMapPath(), changedAt, changedAt);
 
     expect(reloadProjectMapCache({ reformat: true })).toBe(false);
     expect(projectId(alias)).toBe(hash);
