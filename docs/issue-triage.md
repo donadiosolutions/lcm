@@ -1,9 +1,9 @@
 # Automated issue triage
 
 New issues are queued for automated classification by the Codex issue labeler.
-The labeler runs every five minutes, processes the ten oldest queued issues, and
-reconciles the labels it owns with the issue's title and body. Labels owned by
-people or other workflows are preserved.
+The labeler runs every five minutes, processes the ten queued issues with the
+oldest creation timestamps, and reconciles the labels it owns with the issue's
+title and body. Labels owned by people or other workflows are preserved.
 
 ## Add a managed label
 

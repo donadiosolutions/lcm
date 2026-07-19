@@ -67,6 +67,10 @@ test("rejects duplicate and cross-group labels", () => {
     () => validateManagedLabelConfig({ ...config, topics: ["bug"] }),
     /appears in both categories and topics/,
   );
+  assert.throws(
+    () => validateManagedLabelConfig({ ...config, topics: ["needs-codex-triage"] }),
+    /reserved for workflow operation/,
+  );
 });
 
 test("derives a strict schema from configuration and expected issues", () => {
@@ -82,6 +86,25 @@ test("derives a strict schema from configuration and expected issues", () => {
   assert.equal(schema.properties.issues.minItems, 2);
   assert.throws(() => buildClassificationSchema(config, [42, 42]), /duplicated/);
   assert.throws(() => buildClassificationSchema(config, [0]), /positive integer/);
+});
+
+test("builds empty-array-only schemas for empty optional groups", () => {
+  const emptyOptionalGroups = { ...config, topics: [], projects: [] };
+  const properties = buildClassificationSchema(
+    emptyOptionalGroups,
+    [42],
+  ).properties.issues.items.properties;
+  assert.deepEqual(properties.topics, {
+    type: "array",
+    minItems: 0,
+    maxItems: 0,
+    uniqueItems: true,
+    items: { type: "string" },
+  });
+  assert.deepEqual(properties.projects, properties.topics);
+  assert.doesNotThrow(() => parseAndValidateClassification({
+    issues: [{ ...validResult.issues[0], topics: [], projects: [] }],
+  }, emptyOptionalGroups, [42]));
 });
 
 test("builds an injection-resistant prompt with descriptions and bounded issue text", () => {
@@ -137,9 +160,9 @@ test("rejects unknown, duplicate, missing category, and incorrect priority label
   );
   assert.throws(() => classify({ topics: ["unknown"] }), /unmanaged label/);
   assert.throws(() => classify({ topics: ["security", "security"] }), /duplicate label/);
-  assert.throws(() => classify({ categories: [] }), /at least one category/);
-  assert.throws(() => classify({ priorities: [] }), /exactly one priority/);
-  assert.throws(() => classify({ priorities: ["p1-high", "p3-low"] }), /exactly one priority/);
+  assert.throws(() => classify({ categories: [] }), /at least 1 categories/);
+  assert.throws(() => classify({ priorities: [] }), /at least 1 priorities/);
+  assert.throws(() => classify({ priorities: ["p1-high", "p3-low"] }), /at most 1 priorities/);
 });
 
 test("reconciles managed labels while preserving unmanaged labels", () => {

@@ -60,6 +60,20 @@ jobs:
             try {
               await github.rest.issues.getLabel({
                 ...context.repo,
+                name: defaultPriority,
+              });
+            } catch (error) {
+              if (error.status === 404) {
+                throw new Error(
+                  `Default priority ${defaultPriority} does not exist in the repository`,
+                );
+              }
+              throw error;
+            }
+
+            try {
+              await github.rest.issues.getLabel({
+                ...context.repo,
                 name: label,
               });
             } catch (error) {
@@ -248,8 +262,8 @@ jobs:
               join(process.env.GITHUB_WORKSPACE, ".github/scripts/issue-label-policy.mjs"),
             ).href;
             const {
+              computeLabelChanges,
               loadManagedLabelConfig,
-              reconcileLabels,
               removeIssueLabelIfPresent,
               validateClassificationResult,
             } = await import(policyUrl);
@@ -288,16 +302,10 @@ jobs:
                   continue;
                 }
 
-                const finalLabels = reconcileLabels(
+                const { add, remove } = computeLabelChanges(
                   currentLabels,
                   classification,
                   config,
-                );
-                const currentSet = new Set(currentLabels);
-                const finalSet = new Set(finalLabels);
-                const add = finalLabels.filter((label) => !currentSet.has(label));
-                const remove = currentLabels.filter(
-                  (label) => !finalSet.has(label),
                 );
 
                 if (add.length > 0) {
@@ -326,8 +334,9 @@ jobs:
                   `Reconciled #${issueNumber}: added [${add.join(", ")}], removed [${remove.join(", ")}].`,
                 );
               } catch (error) {
-                failures.push(`#${issueNumber}: ${error.message}`);
-                core.error(`Failed to reconcile #${issueNumber}: ${error.message}`);
+                const message = error instanceof Error ? error.message : String(error);
+                failures.push(`#${issueNumber}: ${message}`);
+                core.error(`Failed to reconcile #${issueNumber}: ${message}`);
               }
             }
 
