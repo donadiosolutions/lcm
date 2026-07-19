@@ -78,6 +78,28 @@ describe("handleSessionStart", () => {
     expect(client.post).not.toHaveBeenCalled();
   });
 
+  it.each([null, "primitive", [["array-input"]]])("fails open for non-object hook input", async (input) => {
+    const client = { post: vi.fn() };
+
+    await expect(handleSessionStart(JSON.stringify(input), client)).resolves.toEqual({
+      exitCode: 0,
+      stdout: "",
+    });
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
+  });
+
+  it("fails open for a non-string cwd", async () => {
+    const client = { post: vi.fn() };
+
+    await expect(handleSessionStart(JSON.stringify({ session_id: "valid", cwd: { path: "/proj" } }), client)).resolves.toEqual({
+      exitCode: 0,
+      stdout: "",
+    });
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
+  });
+
   it("includes learned-insights block when insights returned from daemon", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const client = {

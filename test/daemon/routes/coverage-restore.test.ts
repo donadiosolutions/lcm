@@ -139,6 +139,20 @@ describe("restore route coverage", () => {
     expect(state.instructionPaths.some((path) => path.startsWith(oversizedCwd))).toBe(false);
   });
 
+  it("skips filesystem work when framing exactly consumes the remaining budget", async () => {
+    const suffix = "/AGENTS.md";
+    const exactCwd = `/${"x".repeat(1024 * 1024 - Buffer.byteLength(`/${suffix}`) - 3)}`;
+    const body = await call(JSON.stringify({
+      session_id: "exact-instruction-label",
+      cwd: exactCwd,
+      source: "startup",
+      client: "codex",
+    }));
+
+    expect(body).toEqual({ context: "orientation" });
+    expect(state.instructionPaths).not.toContain(`${exactCwd}${suffix}`);
+  });
+
   it.each([
     [new Error("bad cwd"), "bad cwd"],
     ["bad cwd", "invalid cwd"],

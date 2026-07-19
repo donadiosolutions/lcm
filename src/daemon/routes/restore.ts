@@ -76,7 +76,7 @@ function readSessionInstructionFiles(cwd: string, client: TranscriptClient): str
   let remainingBytes = MAX_SESSION_INSTRUCTIONS_BYTES;
   for (const { label, path, allowedRoot } of paths) {
     const overheadBytes = 2 + Buffer.byteLength(label, "utf-8") + 1 + (parts.length > 0 ? 2 : 0);
-    if (overheadBytes > remainingBytes) continue;
+    if (overheadBytes >= remainingBytes) continue;
     try {
       const content = readBoundedRegularFile(path, {
         allowedRoot,

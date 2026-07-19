@@ -102,9 +102,19 @@ function tryAcquireSessionLock(
 export const tryAcquireSessionLockForTesting = tryAcquireSessionLock;
 export const sessionLockPathForTesting = sessionLockPath;
 
+type RestoreHookInput = Record<string, unknown> & {
+  session_id?: string;
+  cwd?: string;
+};
+
 export async function handleSessionStart(stdin: string, client: Pick<DaemonClient, "post">, port?: number): Promise<{ exitCode: number; stdout: string }> {
-  const input = JSON.parse(stdin || "{}");
-  if (input.session_id != null && typeof input.session_id !== "string") {
+  const parsed: unknown = JSON.parse(stdin || "{}");
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { exitCode: 0, stdout: "" };
+  }
+  const input = parsed as RestoreHookInput;
+  if ((input.session_id != null && typeof input.session_id !== "string")
+    || (input.cwd != null && typeof input.cwd !== "string")) {
     return { exitCode: 0, stdout: "" };
   }
   const sessionId = input.session_id ?? "";
