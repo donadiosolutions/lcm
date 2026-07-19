@@ -13,6 +13,7 @@ const state = vi.hoisted(() => ({
   compactResult: { actionTaken: false, tokensBefore: 10, tokensAfter: 10 } as Record<string, unknown>,
   existingMeta: false,
   metaText: "{}",
+  metaError: undefined as unknown,
 }));
 
 vi.mock("../../../src/daemon/config.js", async (importOriginal) => {
@@ -88,7 +89,10 @@ vi.mock("../../../src/compaction.js", () => ({
 vi.mock("node:fs", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:fs")>()),
   existsSync: () => state.existingMeta,
-  readFileSync: () => state.metaText,
+  readFileSync: () => {
+    if (state.metaError !== undefined) throw state.metaError;
+    return state.metaText;
+  },
   writeFileSync: vi.fn(),
 }));
 
@@ -129,6 +133,7 @@ describe("compact route coverage", () => {
     state.compactResult = { actionTaken: false, tokensBefore: 10, tokensAfter: 10 };
     state.existingMeta = false;
     state.metaText = "{}";
+    state.metaError = undefined;
   });
 
   it("formats million-token and zero-input compactions", () => {
@@ -193,6 +198,12 @@ describe("compact route coverage", () => {
     state.existingMeta = true;
     state.metaText = "not json";
     const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp", transcript_path: "/tmp/transcript.jsonl" }), value);
+    expect(body.summary).toBe("No compaction needed.");
+  });
+
+  it("initializes metadata when the metadata file is absent", async () => {
+    state.metaError = Object.assign(new Error("missing"), { code: "ENOENT" });
+    const body = await call(JSON.stringify({ session_id: "missing-meta", cwd: "/tmp" }));
     expect(body.summary).toBe("No compaction needed.");
   });
 

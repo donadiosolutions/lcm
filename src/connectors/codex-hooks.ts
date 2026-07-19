@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 
 export const CODEX_HOOKS_PATH = "~/.codex/hooks.json";
@@ -109,7 +109,6 @@ function normalizeHooksConfig(value: unknown): CodexHooksConfig {
 }
 
 function readHooksConfig(path: string): CodexHooksConfig {
-  if (!existsSync(path)) return { hooks: {} };
   try {
     return normalizeHooksConfig(JSON.parse(readFileSync(path, "utf-8")));
   } catch {
@@ -164,7 +163,12 @@ function hasNonHookKeys(config: CodexHooksConfig): boolean {
 
 export function enableCodexHooksFeature(configPath: string): void {
   mkdirSync(dirname(configPath), { recursive: true });
-  const existing = existsSync(configPath) ? readFileSync(configPath, "utf-8") : "";
+  let existing = "";
+  try {
+    existing = readFileSync(configPath, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   const updated = setCodexHooksFeature(existing);
   if (updated !== existing) {
     writeFileSync(configPath, updated);
@@ -234,7 +238,6 @@ export function installCodexHooks(hooksPath: string, configPath: string): void {
 }
 
 export function removeCodexHooks(hooksPath: string): boolean {
-  if (!existsSync(hooksPath)) return false;
   const { config, removed } = stripLcmHooks(readHooksConfig(hooksPath));
   if (!removed) return false;
 
@@ -248,7 +251,6 @@ export function removeCodexHooks(hooksPath: string): boolean {
 }
 
 export function hasCodexHooks(hooksPath: string): boolean {
-  if (!existsSync(hooksPath)) return false;
   const config = readHooksConfig(hooksPath);
   return Object.values(config.hooks).some((groups) =>
     Array.isArray(groups) &&

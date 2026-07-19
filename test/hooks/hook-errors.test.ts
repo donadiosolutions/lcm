@@ -1,6 +1,6 @@
 // test/hooks/hook-errors.test.ts
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -41,6 +41,7 @@ describe("safeLogError", () => {
 
   it("Layer 1: writes to sidecar DB when cwd is valid", () => {
     const cwd = join(tempDir, "project");
+    mkdirSync(cwd);
     safeLogError("PostToolUse", new Error("test error"), { cwd, sessionId: "s1" });
 
     const db = new EventsDb(eventsDbPath(cwd));
@@ -59,6 +60,13 @@ describe("safeLogError", () => {
     expect(existsSync(logPath)).toBe(true);
     const content = readFileSync(logPath, "utf-8");
     expect(content).toContain("no cwd");
+  });
+
+  it("does not persist project state for a nonexistent diagnostic cwd", () => {
+    const cwd = join(tempDir, "missing-project");
+    safeLogError("PostToolUse", new Error("invalid cwd"), { cwd });
+    expect(existsSync(eventsDbPath(cwd))).toBe(false);
+    expect(readFileSync(join(tempDir, "events.log"), "utf-8")).toContain("invalid cwd");
   });
 
   it("stringifies non-Error failures in the fallback log", () => {

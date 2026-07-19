@@ -153,6 +153,27 @@ async function pickSummarizer(deps: ServiceDeps): Promise<SummarizerConfig> {
 const LCM_BLOCK_START = "<!-- lcm:start -->";
 const LCM_BLOCK_END = "<!-- lcm:end -->";
 
+function findLcmMdBlock(content: string): { start: number; end: number } | undefined {
+  const startMarker = /^\s*<!--\s*lcm:start\s*-->\s*$/;
+  const endMarker = /^\s*<!--\s*lcm:end\s*-->\s*$/;
+  let blockStart: number | undefined;
+  let offset = 0;
+
+  while (offset < content.length) {
+    const newline = content.indexOf("\n", offset);
+    const lineEnd = newline === -1 ? content.length : newline;
+    const line = content.slice(offset, lineEnd).replace(/\r$/, "");
+    if (blockStart === undefined) {
+      if (startMarker.test(line)) blockStart = offset;
+    } else if (endMarker.test(line)) {
+      return { start: blockStart, end: newline === -1 ? content.length : newline + 1 };
+    }
+    if (newline === -1) break;
+    offset = newline + 1;
+  }
+  return undefined;
+}
+
 export function ensureLcmMd(
   deps: Pick<ServiceDeps, "readFileSync" | "writeFileSync" | "existsSync" | "mkdirSync">,
   lcmMdContent: string,
@@ -186,11 +207,11 @@ export function ensureLcmMd(
   }
 
   const block = `${LCM_BLOCK_START}\n<!-- Claude Code include: @lcm.md -->\n${LCM_BLOCK_END}`;
-  const blockRegex = /[ \t]*<!--\s*lcm:start\s*-->[\s\S]*?<!--\s*lcm:end\s*-->\s*/;
+  const blockRange = findLcmMdBlock(existing);
 
-  if (blockRegex.test(existing)) {
+  if (blockRange) {
     // Block exists — replace it in case content changed
-    const updated = existing.replace(blockRegex, block + "\n");
+    const updated = existing.slice(0, blockRange.start) + block + "\n" + existing.slice(blockRange.end);
     if (updated !== existing) {
       deps.writeFileSync(claudeMdPath, updated);
       claudeMdPatched = true;

@@ -131,8 +131,10 @@ export function createIngestHandler(config: DaemonConfig): RouteHandler {
       try {
         const metaPath = paths.metaPath;
         let meta: Record<string, unknown> = {};
-        if (existsSync(metaPath)) {
+        try {
           meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
         meta.cwd = paths.canonical;
         meta.lastIngest = new Date().toISOString();

@@ -331,7 +331,7 @@ describe("handleUserPromptSubmit", () => {
     delete process.env.CLAUDE_PROJECT_DIR;
   });
 
-  it("trims cwd before sidecar writes and prompt search", async () => {
+  it("preserves cwd whitespace for sidecar writes and prompt search", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const mockClose = vi.fn();
     MockEventsDb.mockImplementation(function () {
@@ -350,14 +350,14 @@ describe("handleUserPromptSubmit", () => {
     };
 
     await handleUserPromptSubmit(
-      JSON.stringify({ prompt: "we decided to use SQLite", cwd: "  /trimmed-project  ", session_id: "s1" }),
+      JSON.stringify({ prompt: "we decided to use SQLite", cwd: "  /distinct-project  ", session_id: "s1" }),
       asDaemonClient(mockClient),
     );
 
-    expect(mockEnsureProjectDir).toHaveBeenCalledWith("/trimmed-project");
-    expect(mockEventsDbPath).toHaveBeenCalledWith("/trimmed-project");
+    expect(mockEnsureProjectDir).toHaveBeenCalledWith("  /distinct-project  ");
+    expect(mockEventsDbPath).toHaveBeenCalledWith("  /distinct-project  ");
     expect(mockClient.post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({
-      cwd: "/trimmed-project",
+      cwd: "  /distinct-project  ",
     }));
   });
 

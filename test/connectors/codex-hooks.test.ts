@@ -41,6 +41,11 @@ describe("Codex hook configuration boundaries", () => {
     expect(readFileSync(configPath, "utf-8")).toBe(first);
   });
 
+  it("does not treat non-missing config read failures as an absent file", () => {
+    mkdirSync(configPath);
+    expect(() => enableCodexHooksFeature(configPath)).toThrow();
+  });
+
   it("normalizes malformed hook files while installing", () => {
     writeFileSync(hooksPath, "not json");
     installCodexHooks(hooksPath, configPath);

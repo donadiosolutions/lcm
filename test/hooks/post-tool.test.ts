@@ -1,7 +1,7 @@
 // test/hooks/post-tool.test.ts
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { handlePostToolUse } from "../../src/hooks/post-tool.js";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { projectMetaPath } from "../../src/daemon/project.js";
@@ -115,14 +115,16 @@ describe("handlePostToolUse", () => {
     expect(JSON.parse(readFileSync(projectMetaPath(envCwd), "utf-8")).cwd).toBe(envCwd);
   });
 
-  it("trims the selected cwd before writing project metadata", async () => {
-    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-input-cwd-"));
-    extraDirs.push(inputCwd);
+  it("preserves surrounding whitespace in the selected cwd", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "post-tool-input-cwd-"));
+    const inputCwd = join(parent, " project ");
+    mkdirSync(inputCwd);
+    extraDirs.push(parent);
 
     const stdin = JSON.stringify({
       session_id: "test-session",
       tool_name: "Read",
-      cwd: `  ${inputCwd}  `,
+      cwd: inputCwd,
       tool_input: { file_path: join(inputCwd, "src/main.ts") },
     });
     const result = await handlePostToolUse(stdin);

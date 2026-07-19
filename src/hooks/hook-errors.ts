@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { lcmPath } from "../runtime-paths.js";
 import { ensureProjectDir } from "../daemon/project.js";
+import { validateCwd } from "../daemon/validate-cwd.js";
 
 function isUnderDir(candidate: string, base: string): boolean {
   const resolvedCandidate = resolve(candidate);
@@ -56,10 +57,18 @@ export function safeLogError(
   opts: { cwd?: string; sessionId?: string },
 ): void {
   // Layer 1: Sidecar DB (skip if cwd missing or circuit open)
-  if (opts.cwd && !dbCircuitOpen) {
+  let validatedCwd: string | undefined;
+  if (opts.cwd) {
     try {
-      ensureProjectDir(opts.cwd);
-      const db = new EventsDb(eventsDbPath(opts.cwd));
+      validatedCwd = validateCwd(opts.cwd);
+    } catch {
+      // Invalid diagnostic context must not create persistent project state.
+    }
+  }
+  if (validatedCwd && !dbCircuitOpen) {
+    try {
+      ensureProjectDir(validatedCwd);
+      const db = new EventsDb(eventsDbPath(validatedCwd));
       try {
         db.logHookError(hook, error, opts.sessionId);
       } finally {

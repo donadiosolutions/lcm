@@ -866,6 +866,33 @@ describe("Passive Learning checks", () => {
     expect(project?.message).toContain("/tmp/lcm-events/skipped.db");
   });
 
+  it("sanitizes untrusted sidecar diagnostics before terminal display", async () => {
+    mockCollectDetailedEventStats.mockReturnValue({
+      captured: 0,
+      unprocessed: 0,
+      errors: 1,
+      lastCapture: null,
+      projects: [{
+        file: "bad\x1b[31m.db",
+        projectId: "bad",
+        metadataMissing: false,
+        captured: 0,
+        unprocessed: 0,
+        lastCapture: null,
+        path: "/tmp/bad\npath.db",
+        scanError: "failure\x1b]52;c;YQ==\x07",
+      }],
+      recentErrors: [{ created_at: "now", hook: "hook\rspoof", error: "error\x1b[2J" }],
+    });
+    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }), true);
+    const output = results.map(result => `${result.name}\n${result.message}`).join("\n");
+    expect(output).toContain("bad.db");
+    expect(output).toContain("bad path.db");
+    expect(output).toContain("hook spoof: error");
+    expect(output).not.toContain("\x1b");
+    expect(output).not.toContain("\r");
+  });
+
   it("passes staleness when last capture is recent", async () => {
     const now = new Date();
     const recentCapture = now.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
