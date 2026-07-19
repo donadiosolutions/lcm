@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { chmodSync } from "node:fs";
+import { chmodSync, lstatSync } from "node:fs";
 import { dirname } from "node:path";
 import { ensurePrivateDirectory, PRIVATE_FILE_MODE } from "../security-files.js";
 
@@ -45,6 +45,13 @@ export function getLcmConnection(dbPath: string): DatabaseSync {
 
   // Ensure parent directory exists
   ensurePrivateDirectory(dirname(dbPath));
+  try {
+    if (lstatSync(dbPath).isSymbolicLink()) {
+      throw new Error(`refusing to open a symlink database path: ${dbPath}`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
 
   const db = new DatabaseSync(dbPath);
   try {

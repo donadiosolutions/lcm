@@ -261,6 +261,43 @@ describe("install", () => {
     );
   });
 
+  it("rejects stale config symlink leaves before reading or writing them", async () => {
+    const deps = makeDeps({
+      lstatSync: vi.fn(() => ({ isSymbolicLink: () => true }) as never),
+    });
+
+    await expect(install(deps)).rejects.toThrow("symlink config path");
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("uses the atomic private writer when creating the production config", async () => {
+    const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+    const atomicWritePrivateFile = vi.fn();
+    const deps = makeDeps({
+      lstatSync: vi.fn(() => { throw missing; }),
+      atomicWritePrivateFile,
+    });
+
+    await install(deps);
+
+    expect(atomicWritePrivateFile).toHaveBeenCalledWith(
+      expect.stringContaining("config.json"),
+      expect.stringContaining('"provider": "auto"'),
+    );
+  });
+
+  it("accepts an existing regular config leaf", async () => {
+    const atomicWritePrivateFile = vi.fn();
+    const deps = makeDeps({
+      lstatSync: vi.fn(() => ({ isSymbolicLink: () => false }) as never),
+      existsSync: vi.fn((path: string) => path.endsWith("config.json")),
+      atomicWritePrivateFile,
+    });
+
+    await expect(install(deps)).resolves.not.toThrow();
+    expect(atomicWritePrivateFile).not.toHaveBeenCalled();
+  });
+
   it("fails installation when the LCM data root cannot be secured", async () => {
     const deps = makeDeps({
       chmodSync: vi.fn(() => { throw new Error("chmod failed"); }),

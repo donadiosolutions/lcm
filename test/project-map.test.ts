@@ -108,6 +108,22 @@ describe("project map", () => {
     expect((statSync(result.backupPath!).mode & 0o777)).toBe(0o600);
   });
 
+  it("preserves the first backup when multiple writes share a timestamp", () => {
+    const canonical = makeDir("canonical-exclusive-backup");
+    const firstAlias = makeDir("first-exclusive-alias");
+    const secondAlias = makeDir("second-exclusive-alias");
+    projectId(canonical);
+    vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+
+    const first = addProjectAlias(firstAlias, { canonical });
+    const firstBackup = readFileSync(first.backupPath!, "utf-8");
+    const second = addProjectAlias(secondAlias, { canonical });
+
+    expect(second.backupPath).toBe(first.backupPath);
+    expect(readFileSync(second.backupPath!, "utf-8")).toBe(firstBackup);
+    expect(firstBackup).not.toContain(firstAlias);
+  });
+
   it("keeps an alias identity stable when its path is later replaced by a symlink", () => {
     const canonical = makeDir("stable-alias-canonical");
     const alias = makeDir("stable-alias");

@@ -8,14 +8,14 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, sep } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 
 export const PRIVATE_DIRECTORY_MODE = 0o700;
 export const PRIVATE_FILE_MODE = 0o600;
@@ -33,12 +33,29 @@ function isContainedPath(root: string, candidate: string): boolean {
 export type BoundedFileOptions = {
   allowedRoot: string;
   maxBytes: number;
+  /** @internal Deterministic race seam for descriptor-bound tests. */
+  _afterStatForTesting?: () => void;
 };
 
 export type BoundedFileResult = {
   content: string;
   mtimeMs: number;
 };
+
+function readDescriptorBounded(fd: number, maxBytes: number): string {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1));
+  while (total <= maxBytes) {
+    const remaining = maxBytes + 1 - total;
+    const bytesRead = readSync(fd, buffer, 0, Math.min(buffer.length, remaining), null);
+    if (bytesRead === 0) break;
+    chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+    total += bytesRead;
+  }
+  if (total > maxBytes) throw new Error("file exceeds the configured size limit");
+  return Buffer.concat(chunks, total).toString("utf-8");
+}
 
 /** Read a bounded regular file and its metadata from one descriptor. */
 export function readBoundedRegularFileWithStat(path: string, options: BoundedFileOptions): BoundedFileResult {
@@ -57,7 +74,8 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
     const stat = fstatSync(fd);
     if (!stat.isFile()) throw new Error("path is not a regular file");
     if (stat.size > options.maxBytes) throw new Error("file exceeds the configured size limit");
-    return { content: readFileSync(fd, "utf-8"), mtimeMs: stat.mtimeMs };
+    options._afterStatForTesting?.();
+    return { content: readDescriptorBounded(fd, options.maxBytes), mtimeMs: stat.mtimeMs };
   } finally {
     closeSync(fd);
   }
@@ -72,7 +90,7 @@ export function readBoundedRegularFile(path: string, options: BoundedFileOptions
 export function atomicWritePrivateFile(path: string, content: string): void {
   const directory = dirname(path);
   ensurePrivateDirectory(directory);
-  const tempPath = `${directory}/.${basename(path)}.${randomBytes(12).toString("hex")}.tmp`;
+  const tempPath = join(directory, `.${basename(path)}.${randomBytes(12).toString("hex")}.tmp`);
   try {
     const fd = openSync(tempPath, "wx", PRIVATE_FILE_MODE);
     try {
@@ -85,6 +103,47 @@ export function atomicWritePrivateFile(path: string, content: string): void {
     chmodSync(path, PRIVATE_FILE_MODE);
   } finally {
     rmSync(tempPath, { force: true });
+  }
+}
+
+/** Create a private file only when the final destination does not already exist. */
+type ExclusiveWriteDeps = {
+  open: typeof openSync;
+  write: typeof writeFileSync;
+  sync: typeof fsyncSync;
+  close: typeof closeSync;
+  unlink: typeof unlinkSync;
+};
+
+export function writePrivateFileExclusive(
+  path: string,
+  content: string,
+  deps?: ExclusiveWriteDeps,
+): boolean {
+  const io = deps ?? {
+    open: openSync,
+    write: writeFileSync,
+    sync: fsyncSync,
+    close: closeSync,
+    unlink: unlinkSync,
+  };
+  ensurePrivateDirectory(dirname(path));
+  let fd: number | undefined;
+  try {
+    fd = io.open(path, "wx", PRIVATE_FILE_MODE);
+    io.write(fd, content, "utf-8");
+    io.sync(fd);
+    io.close(fd);
+    fd = undefined;
+    return true;
+  } catch (error) {
+    const created = fd !== undefined;
+    if (fd !== undefined) {
+      try { io.close(fd); } catch { /* preserve the original failure */ }
+      try { io.unlink(path); } catch { /* preserve the original failure */ }
+    }
+    if (!created && (error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
   }
 }
 

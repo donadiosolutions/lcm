@@ -6,17 +6,19 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  appendFileSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   atomicWritePrivateFile,
   deleteRegularFile,
   ensurePrivateDirectory,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
+  writePrivateFileExclusive,
 } from "../src/security-files.js";
 
 const roots: string[] = [];
@@ -68,6 +70,18 @@ describe("private filesystem primitives", () => {
     });
   });
 
+  it("enforces the byte limit when a file grows after descriptor metadata is read", () => {
+    const root = makeRoot();
+    const path = join(root, "growing");
+    writeFileSync(path, "123");
+
+    expect(() => readBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 3,
+      _afterStatForTesting: () => appendFileSync(path, "4"),
+    })).toThrow("size limit");
+  });
+
   it("rejects symlinks, directories, escaped parents, oversized files, and invalid limits", () => {
     const root = makeRoot();
     const outside = makeRoot();
@@ -116,5 +130,48 @@ describe("private filesystem primitives", () => {
 
     expect(statSync(root).mode & 0o777).toBe(0o700);
     expect(statSync(file).mode & 0o777).toBe(0o600);
+  });
+
+  it("creates final destinations exclusively without replacing the first writer", () => {
+    const root = makeRoot();
+    const path = join(root, "exclusive");
+
+    expect(writePrivateFileExclusive(path, "first")).toBe(true);
+    expect(writePrivateFileExclusive(path, "second")).toBe(false);
+    expect(readFileSync(path, "utf-8")).toBe("first");
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+
+  it("removes an exclusively created destination when initialization fails", () => {
+    const root = makeRoot();
+    const path = join(root, "partial-exclusive");
+    const failure = new Error("write failed");
+    const deps = {
+      open: vi.fn(() => 23),
+      write: vi.fn(() => { throw failure; }),
+      sync: vi.fn(),
+      close: vi.fn(),
+      unlink: vi.fn(),
+    };
+
+    expect(() => writePrivateFileExclusive(path, "content", deps as never)).toThrow(failure);
+    expect(deps.close).toHaveBeenCalledWith(23);
+    expect(deps.unlink).toHaveBeenCalledWith(path);
+  });
+
+  it("propagates exclusive-open failures other than an existing destination", () => {
+    const root = makeRoot();
+    const path = join(root, "denied-exclusive");
+    const denied = Object.assign(new Error("denied"), { code: "EACCES" });
+    const deps = {
+      open: vi.fn(() => { throw denied; }),
+      write: vi.fn(),
+      sync: vi.fn(),
+      close: vi.fn(),
+      unlink: vi.fn(),
+    };
+
+    expect(() => writePrivateFileExclusive(path, "content", deps as never)).toThrow(denied);
+    expect(deps.unlink).not.toHaveBeenCalled();
   });
 });

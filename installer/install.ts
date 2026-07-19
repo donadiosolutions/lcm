@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, copyFileSync, rmSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, copyFileSync, rmSync, chmodSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { ensureCore } from "../src/bootstrap.js";
 import { lcmHomeDir } from "../src/runtime-paths.js";
 import { legacyLcmSlug } from "../src/legacy-names.js";
+import { atomicWritePrivateFile } from "../src/security-files.js";
 export { REQUIRED_HOOKS, mergeClaudeSettings } from "../src/installer/settings.js";
 
 export interface ServiceDeps {
@@ -15,6 +16,8 @@ export interface ServiceDeps {
   mkdirSync: (path: string, opts?: any) => void;
   existsSync: (path: string) => boolean;
   chmodSync?: (path: string, mode: number) => void;
+  lstatSync?: typeof lstatSync;
+  atomicWritePrivateFile?: typeof atomicWritePrivateFile;
   readdirSync?: typeof readdirSync;
   copyFileSync?: typeof copyFileSync;
   rmSync?: typeof rmSync;
@@ -38,7 +41,20 @@ async function readlinePrompt(question: string): Promise<string> {
 
 export { readlinePrompt as _readlinePromptForTesting };
 
-const defaultDeps: ServiceDeps = { spawnSync: spawnSync as any, readFileSync: (path, encoding) => readFileSync(path, encoding as BufferEncoding) as string, writeFileSync, mkdirSync, existsSync, chmodSync: chmodSync, promptUser: readlinePrompt };
+const defaultDeps: ServiceDeps = { spawnSync: spawnSync as any, readFileSync: (path, encoding) => readFileSync(path, encoding as BufferEncoding) as string, writeFileSync, mkdirSync, existsSync, chmodSync: chmodSync, lstatSync, atomicWritePrivateFile, promptUser: readlinePrompt };
+
+function safeConfigExists(deps: ServiceDeps, path: string): boolean {
+  if (!deps.lstatSync) return deps.existsSync(path);
+  try {
+    if (deps.lstatSync(path).isSymbolicLink()) {
+      throw new Error(`refusing to use a symlink config path: ${path}`);
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
 
 export interface ResolveBinaryDeps {
   spawnSync: (cmd: string, args: string[], opts?: object) => { status: number | null; stdout: string | Buffer };
@@ -214,13 +230,15 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   // 1-3. Core setup (config + settings cleanup + daemon)
   // ensureCore handles: creating config.json, merging settings.json hooks, and starting daemon
   // For install, we inject summarizer config into the default config if creating fresh
-  if (!deps.existsSync(configPath)) {
+  if (!safeConfigExists(deps, configPath)) {
     const summarizerConfig = await pickSummarizer(deps);
     const { daemonConfigForPersistence, loadDaemonConfig } = await import("../src/daemon/config.js");
     const defaults = loadDaemonConfig("/nonexistent");
     defaults.llm = { ...defaults.llm, ...summarizerConfig };
     deps.mkdirSync(dirname(configPath), { recursive: true });
-    deps.writeFileSync(configPath, JSON.stringify(daemonConfigForPersistence(defaults), null, 2));
+    const serialized = JSON.stringify(daemonConfigForPersistence(defaults), null, 2);
+    if (deps.atomicWritePrivateFile) deps.atomicWritePrivateFile(configPath, serialized);
+    else deps.writeFileSync(configPath, serialized);
     try { deps.chmodSync?.(configPath, 0o600); } catch { /* best-effort */ }
     console.log(`Created ${configPath}`);
   }

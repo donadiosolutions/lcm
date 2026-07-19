@@ -2,7 +2,7 @@
  * Extended connection pool tests covering the untested `isLcmConnectionOpen` export.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -48,6 +48,19 @@ describe("isLcmConnectionOpen", () => {
     } finally {
       close.mockRestore();
     }
+  });
+
+  it("rejects database symlink leaves without modifying their targets", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-symlink-test-"));
+    tempDirs.push(tempDir);
+    const victim = join(tempDir, "victim.sqlite");
+    const dbPath = join(tempDir, "linked.sqlite");
+    writeFileSync(victim, "preserve");
+    symlinkSync(victim, dbPath);
+
+    expect(() => getLcmConnection(dbPath)).toThrow("symlink database path");
+    expect(readFileSync(victim, "utf-8")).toBe("preserve");
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
   });
 
   it("ignores a path-specific close for an unknown connection", () => {

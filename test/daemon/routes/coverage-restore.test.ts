@@ -119,6 +119,17 @@ describe("restore route coverage", () => {
     expect(await call("")).toEqual({ context: "orientation" });
   });
 
+  it("bounds instruction framing before reading files with oversized labels", async () => {
+    const oversizedCwd = `/${"x".repeat(1024 * 1024)}`;
+    const body = await call(JSON.stringify({
+      session_id: "oversized-instruction-label",
+      cwd: oversizedCwd,
+      source: "startup",
+      client: "codex",
+    }));
+    expect(body).toEqual({ context: "orientation" });
+  });
+
   it.each([
     [new Error("bad cwd"), "bad cwd"],
     ["bad cwd", "invalid cwd"],

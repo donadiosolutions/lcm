@@ -149,6 +149,8 @@ chmod 700 "$CONFIG_DIR"
 
 node - "$PROVIDER" "$MODEL" "$API_KEY" "$BASE_URL" "$CONFIG_FILE" <<'NODE'
 const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 const [provider, model, apiKey, baseUrl, configFile] = process.argv.slice(2);
 
 const llm = { provider };
@@ -156,23 +158,56 @@ if (model)   llm.model   = model;
 if (apiKey)  llm.apiKey  = apiKey;
 if (baseUrl) llm.baseUrl = baseUrl;
 
-// If config doesn't exist, write a fresh file.
-if (!fs.existsSync(configFile)) {
-  const out = JSON.stringify({ llm }, null, 2) + '\n';
-  fs.writeFileSync(configFile, out, { mode: 0o600 });
-  fs.chmodSync(configFile, 0o600);
+function atomicWritePrivateFile(file, content) {
+  const temp = path.join(path.dirname(file), `.${path.basename(file)}.${crypto.randomBytes(12).toString('hex')}.tmp`);
+  let fd;
+  try {
+    fd = fs.openSync(temp, 'wx', 0o600);
+    fs.writeFileSync(fd, content, 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(temp, file);
+    fs.chmodSync(file, 0o600);
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch (_) {}
+    fs.rmSync(temp, { force: true });
+  }
+}
+
+let configExists = false;
+try {
+  const stat = fs.lstatSync(configFile);
+  if (stat.isSymbolicLink()) throw new Error(`refusing to use symlink config path: ${configFile}`);
+  if (!stat.isFile()) throw new Error(`config path is not a regular file: ${configFile}`);
+  configExists = true;
+} catch (err) {
+  if (err.code !== 'ENOENT') {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// If config doesn't exist, atomically write a fresh file.
+if (!configExists) {
+  atomicWritePrivateFile(configFile, JSON.stringify({ llm }, null, 2) + '\n');
   process.exit(0);
 }
 
 // Load existing config. Fail loudly on parse errors to prevent data loss.
 let raw;
+let configFd;
 try {
-  raw = fs.readFileSync(configFile, 'utf8');
+  configFd = fs.openSync(configFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  if (!fs.fstatSync(configFd).isFile()) throw new Error('config path is not a regular file');
+  raw = fs.readFileSync(configFd, 'utf8');
   JSON.parse(raw); // validate
 } catch (err) {
   console.error(`Error: Failed to parse existing config at ${configFile}.`);
   console.error('The file contains invalid JSON. Fix or remove it, then re-run setup.');
   process.exit(1);
+} finally {
+  if (configFd !== undefined) fs.closeSync(configFd);
 }
 
 // Parse the existing config, set the llm block, and write back.
@@ -187,9 +222,7 @@ if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
 }
 const config = { ...parsed, llm };
 const newRaw = JSON.stringify(config, null, 2) + '\n';
-fs.writeFileSync(configFile, newRaw, { mode: 0o600 });
-// Explicitly tighten permissions even if the file already existed.
-fs.chmodSync(configFile, 0o600);
+atomicWritePrivateFile(configFile, newRaw);
 NODE
 
 if [ -t 0 ]; then

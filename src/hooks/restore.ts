@@ -41,49 +41,71 @@ const defaultSessionLockDeps: SessionLockDeps = {
   },
 };
 
+function createLockFile(path: string, deps: SessionLockDeps): void {
+  let fd: number | undefined;
+  try {
+    fd = deps.open(path, "wx", PRIVATE_FILE_MODE);
+    deps.write(fd, process.pid.toString(), "utf-8");
+    deps.close(fd);
+    fd = undefined;
+  } catch (error) {
+    if (fd !== undefined) {
+      try { deps.close(fd); } catch { /* preserve the initialization failure */ }
+      try { deps.delete(path); } catch { /* preserve the initialization failure */ }
+    }
+    throw error;
+  }
+}
+
 /** Returns true if lock was acquired, false if another live process holds it. */
-export function tryAcquireSessionLockForTesting(
+function tryAcquireSessionLock(
   sessionId: string,
   deps: SessionLockDeps = defaultSessionLockDeps,
 ): boolean {
   const lockDir = tmpDir();
   ensurePrivateDirectory(lockDir);
   const lockPath = sessionLockPath(sessionId);
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const fd = deps.open(lockPath, "wx", PRIVATE_FILE_MODE);
-      try {
-        deps.write(fd, process.pid.toString(), "utf-8");
-      } finally {
-        deps.close(fd);
-      }
-      return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
-      // Lock exists — check if the owner process is still alive.
-      try {
-        const ownerPid = parseInt(deps.read(lockPath, {
-          allowedRoot: lockDir,
-          maxBytes: 32,
-        }).trim(), 10);
-        if (isNaN(ownerPid)) return false;
-        if (deps.isProcessAlive(ownerPid)) return false; // owner alive, genuine dedup
-        // Owner dead — remove only a regular file, then retry once with wx.
-        deps.delete(lockPath);
-      } catch {
-        return false;
-      }
-    }
+  try {
+    createLockFile(lockPath, deps);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
   }
-  return false;
+
+  const reclaimPath = `${lockPath}.reclaim`;
+  try {
+    createLockFile(reclaimPath, deps);
+  } catch {
+    return false;
+  }
+  try {
+    const ownerPid = parseInt(deps.read(lockPath, {
+      allowedRoot: lockDir,
+      maxBytes: 32,
+    }).trim(), 10);
+    if (isNaN(ownerPid)) return false;
+    if (deps.isProcessAlive(ownerPid)) return false;
+    deps.delete(lockPath);
+    try {
+      createLockFile(lockPath, deps);
+      return true;
+    } catch {
+      return false;
+    }
+  } catch {
+    return false;
+  } finally {
+    try { deps.delete(reclaimPath); } catch { /* a failed cleanup safely blocks later reclaimers */ }
+  }
 }
 
+export const tryAcquireSessionLockForTesting = tryAcquireSessionLock;
 export const sessionLockPathForTesting = sessionLockPath;
 
-export async function handleSessionStart(stdin: string, client: DaemonClient, port?: number): Promise<{ exitCode: number; stdout: string }> {
+export async function handleSessionStart(stdin: string, client: Pick<DaemonClient, "post">, port?: number): Promise<{ exitCode: number; stdout: string }> {
   const input = JSON.parse(stdin || "{}");
   const sessionId = input.session_id ?? "";
-  if (sessionId && !tryAcquireSessionLockForTesting(sessionId)) {
+  if (sessionId && !tryAcquireSessionLock(sessionId)) {
     return { exitCode: 0, stdout: "" };
   }
 
