@@ -201,6 +201,32 @@ describe("batch compaction discovery", () => {
     }));
   });
 
+  it("sends a process-provider timeout without an implicit retry override", async () => {
+    const cwd = makeDir("compact-process-timeout-only");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }, null, 2) + "\n");
+    seedConversations(paths.dbPath);
+    const post = vi.spyOn(DaemonClient.prototype, "post")
+      .mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      requestPolicy: { requestTimeoutMs: 300_000 },
+    });
+
+    expect(post).toHaveBeenCalled();
+    for (const [, body] of post.mock.calls) {
+      expect(body).toMatchObject({ request_timeout_ms: 300_000 });
+      expect(body).not.toHaveProperty("retry");
+    }
+  });
+
   it("handles absent, malformed, summarized, and replay discovery entries", () => {
     expect(findUncompacted(100, true)).toEqual([]);
 
@@ -345,7 +371,9 @@ describe("formatLlmDiagnostic", () => {
       providerLabel: "Codex (process)",
       reasoningEffort: null,
       fastMode: false,
-    })).toBe("Codex (process) · reasoning=default · fast=off");
+      requestTimeoutMs: 600_000,
+      retry: null,
+    })).toBe("Codex (process) · reasoning=default · fast=off · timeout=600000ms");
 
     expect(formatLlmDiagnostic({
       providerLabel: "Claude (process)",

@@ -15,8 +15,8 @@ import {
   supportsFastMode,
   supportsRequestTimeout,
   type DaemonConfig,
+  type LlmInvocationRequestPolicy,
   type LlmProvider,
-  type LlmRequestPolicy,
   type LlmReasoningEffort,
 } from "../src/daemon/config.js";
 import {
@@ -47,7 +47,7 @@ export function withHookOverrides(
   stdinText: string,
   client: unknown,
   reasoningEffort: LlmReasoningEffort | undefined,
-  requestPolicy?: LlmRequestPolicy,
+  requestPolicy?: LlmInvocationRequestPolicy,
   fastMode?: boolean,
 ): string {
   try {
@@ -60,12 +60,12 @@ export function withHookOverrides(
       ...(fastMode !== undefined ? { fast_mode: fastMode } : {}),
       ...(requestPolicy ? {
         request_timeout_ms: requestPolicy.requestTimeoutMs,
-        retry: {
+        ...(requestPolicy.retry ? { retry: {
           max_attempts: requestPolicy.retry.maxAttempts,
           initial_delay_ms: requestPolicy.retry.initialDelayMs,
           max_delay_ms: requestPolicy.retry.maxDelayMs,
           multiplier: requestPolicy.retry.multiplier,
-        },
+        } } : {}),
       } : {}),
     });
   } catch {
@@ -104,7 +104,7 @@ function numericOption(value: string | undefined): number | undefined {
 export function resolveCompactRequestPolicyOverride(
   config: DaemonConfig,
   options: CompactRequestPolicyOptions,
-): LlmRequestPolicy | undefined {
+): LlmInvocationRequestPolicy | undefined {
   const requestTimeoutMs = numericOption(options.timeoutMs);
   const retry = {
     maxAttempts: numericOption(options.retryMaxAttempts),
@@ -127,7 +127,7 @@ export function resolveCompactRequestPolicyOverride(
       "retry overrides require llm.provider=\"openai\"",
     );
   }
-  return resolveLlmRequestPolicy(
+  const effectivePolicy = resolveLlmRequestPolicy(
     { requestTimeoutMs: config.llm.requestTimeoutMs, retry: config.llm.retry },
     {
       requestTimeoutMs,
@@ -135,6 +135,9 @@ export function resolveCompactRequestPolicyOverride(
     },
     "compact",
   );
+  return config.llm.provider === "openai"
+    ? effectivePolicy
+    : { requestTimeoutMs: effectivePolicy.requestTimeoutMs };
 }
 
 export function compactFailureExitCode(failures: number): 1 | undefined {

@@ -5,6 +5,7 @@ import {
   LLM_REASONING_EFFORTS,
   reasoningEffortsForProvider,
   resolveLlmRequestPolicy,
+  supportsRequestTimeout,
   type DaemonConfig,
   type LlmReasoningEffort,
   type LlmRequestPolicy,
@@ -237,13 +238,16 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
       return;
     }
     const effectiveFastMode = processProvider ? input.fast_mode ?? config.llm.fastMode ?? false : undefined;
-    const hasRequestPolicyOverride = input.request_timeout_ms !== undefined || input.retry !== undefined;
-    if (hasRequestPolicyOverride && effectiveProvider !== "openai") {
-      sendJson(res, 400, { error: "request_timeout_ms and retry require llm.provider=\"openai\"" });
+    if (input.request_timeout_ms !== undefined && !supportsRequestTimeout(effectiveProvider)) {
+      sendJson(res, 400, { error: "request_timeout_ms is not supported by the effective provider" });
+      return;
+    }
+    if (input.retry !== undefined && effectiveProvider !== "openai") {
+      sendJson(res, 400, { error: "retry requires llm.provider=\"openai\"" });
       return;
     }
     let effectiveRequestPolicy: LlmRequestPolicy | undefined;
-    if (effectiveProvider === "openai") {
+    if (supportsRequestTimeout(effectiveProvider)) {
       try {
         effectiveRequestPolicy = resolveCompactRequestPolicy(config, input);
       } catch (error) {
@@ -253,6 +257,8 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
         return;
       }
     }
+    const effectiveRequestTimeoutMs = effectiveRequestPolicy?.requestTimeoutMs ?? null;
+    const effectiveRetry = effectiveProvider === "openai" ? effectiveRequestPolicy!.retry : null;
 
     // Guard must be checked and set synchronously (before any await) to prevent
     // concurrent requests from racing through the has() check before add() runs.
@@ -286,8 +292,8 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
           apiMode,
           reasoningEffort: effectiveReasoningEffort ?? null,
           fastMode: effectiveFastMode ?? null,
-          requestTimeoutMs: effectiveRequestPolicy?.requestTimeoutMs ?? null,
-          retry: effectiveRequestPolicy?.retry ?? null,
+          requestTimeoutMs: effectiveRequestTimeoutMs,
+          retry: effectiveRetry,
         });
         return;
       }
@@ -351,8 +357,8 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
               apiMode,
               reasoningEffort: effectiveReasoningEffort ?? null,
               fastMode: effectiveFastMode ?? null,
-              requestTimeoutMs: effectiveRequestPolicy?.requestTimeoutMs ?? null,
-              retry: effectiveRequestPolicy?.retry ?? null,
+              requestTimeoutMs: effectiveRequestTimeoutMs,
+              retry: effectiveRetry,
             };
           }
 
@@ -432,8 +438,8 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
             apiMode,
             reasoningEffort: effectiveReasoningEffort ?? null,
             fastMode: effectiveFastMode ?? null,
-            requestTimeoutMs: effectiveRequestPolicy?.requestTimeoutMs ?? null,
-            retry: effectiveRequestPolicy?.retry ?? null,
+            requestTimeoutMs: effectiveRequestTimeoutMs,
+            retry: effectiveRetry,
           };
         } finally {
           closeLcmConnection(dbPath);

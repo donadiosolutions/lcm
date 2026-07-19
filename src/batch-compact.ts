@@ -7,7 +7,7 @@ import type { ProgressState } from "./cli/progress-state.js";
 import { DaemonClient } from "./daemon/client.js";
 import { projectsDir as lcmProjectsDir } from "./runtime-paths.js";
 import { normalizeProjectPath, projectMapPathsForHash } from "./project-map.js";
-import type { LlmApiMode, LlmReasoningEffort, LlmRequestPolicy, LlmRetryPolicy } from "./daemon/config.js";
+import type { LlmApiMode, LlmInvocationRequestPolicy, LlmReasoningEffort, LlmRetryPolicy } from "./daemon/config.js";
 
 export interface UncompactedConversation {
   projectDir: string;
@@ -138,7 +138,7 @@ export async function batchCompact(opts: {
   tokenPath?: string;
   reasoningEffort?: LlmReasoningEffort;
   fastMode?: boolean;
-  requestPolicy?: LlmRequestPolicy;
+  requestPolicy?: LlmInvocationRequestPolicy;
   /** Called with state patches as each session is processed — used by the ninja renderer */
   onProgress?: (patch: Partial<ProgressState>) => void;
 }): Promise<{ compacted: number; failures: number }> {
@@ -197,12 +197,12 @@ export async function batchCompact(opts: {
         reasoning_effort: opts.reasoningEffort,
         fast_mode: opts.fastMode,
         request_timeout_ms: opts.requestPolicy?.requestTimeoutMs,
-        retry: opts.requestPolicy ? {
+        ...(opts.requestPolicy?.retry ? { retry: {
           max_attempts: opts.requestPolicy.retry.maxAttempts,
           initial_delay_ms: opts.requestPolicy.retry.initialDelayMs,
           max_delay_ms: opts.requestPolicy.retry.maxDelayMs,
           multiplier: opts.requestPolicy.retry.multiplier,
-        } : undefined,
+        } } : {}),
       });
 
       doneCount++;

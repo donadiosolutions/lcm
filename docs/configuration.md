@@ -398,6 +398,12 @@ internal retries and applies this one bounded exponential-backoff policy, so
 configured attempt counts remain exact. Process providers do not retry because
 relaunching a CLI process could duplicate expensive work.
 
+With `llm.provider` set to `auto`, the timeout follows the effective process
+provider: manual batch compaction resolves to Claude, while Claude and Codex
+hooks resolve to their matching process provider. A one-invocation
+`--timeout-ms` value is forwarded after that resolution, so it applies to the
+actual Claude or Codex subprocess without enabling OpenAI retry behavior.
+
 The timeout must be an integer from `1` through `3600000` milliseconds.
 `maxAttempts` must be an integer from `1` through `10`; both delay values must
 be integers from `0` through `600000` milliseconds; and `multiplier` must be a

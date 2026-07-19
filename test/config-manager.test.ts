@@ -402,6 +402,7 @@ describe("setConfigValue", () => {
 
   it.each([
     ["anthropic", "anthropic"],
+    ["auto", "auto"],
     ["claude", "claude-process"],
     ["codex", "codex-process"],
     ["disabled", "disabled"],
@@ -442,7 +443,7 @@ describe("setConfigValue", () => {
     for (const key of ["apiMode", "retry"]) {
       expect(stored.llm).not.toHaveProperty(key);
     }
-    if (expectedProvider === "claude-process" || expectedProvider === "codex-process") {
+    if (expectedProvider === "auto" || expectedProvider === "claude-process" || expectedProvider === "codex-process") {
       expect(stored.llm.reasoningEffort).toBe("high");
       expect(stored.llm.requestTimeoutMs).toBe(30_000);
     } else {

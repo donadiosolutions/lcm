@@ -62,6 +62,11 @@ export interface LlmRequestPolicy {
   retry: LlmRetryPolicy;
 }
 
+export interface LlmInvocationRequestPolicy {
+  requestTimeoutMs: number;
+  retry?: LlmRetryPolicy;
+}
+
 export interface LlmRequestPolicyOverride {
   requestTimeoutMs?: unknown;
   retry?: unknown;

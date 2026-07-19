@@ -144,6 +144,20 @@ describe("withHookOverrides", () => {
     });
   });
 
+  it("forwards a process-provider timeout without an implicit retry override", () => {
+    expect(JSON.parse(withHookOverrides(
+      JSON.stringify({ session_id: "session-1", cwd: "/tmp/project" }),
+      "codex",
+      undefined,
+      { requestTimeoutMs: 300000 },
+    ))).toEqual({
+      session_id: "session-1",
+      cwd: "/tmp/project",
+      client: "codex",
+      request_timeout_ms: 300000,
+    });
+  });
+
   it("preserves an explicit false fast-mode override", () => {
     expect(JSON.parse(withHookOverrides("{}", "claude", undefined, undefined, false))).toEqual({
       client: "claude",
