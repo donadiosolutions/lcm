@@ -111,14 +111,25 @@ the Codecov result already verified on the exact PR head.
 5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
 6. Run review loop (see Copilot Review Loop below)
 7. Once Copilot has no issues (max 3 rounds — see Review Loop), queue the PR with `gh pr merge <number> --repo donadiosolutions/lcm --auto --squash`
-8. Wait for the queued PR to land before starting implementation:
+8. Wait up to 65 minutes for the queued PR to land before starting implementation. This allows five minutes beyond the merge queue's 60-minute check timeout and fails with check diagnostics if GitHub removes or rejects the still-open PR:
+
    ```bash
+   pr_number=<number>
+   deadline=$((SECONDS + 65 * 60))
+
    while :; do
-     state=$(gh pr view <number> --repo donadiosolutions/lcm --json state --jq .state)
+     state=$(gh pr view "$pr_number" --repo donadiosolutions/lcm --json state --jq .state)
      case "$state" in
        MERGED) break ;;
-       OPEN) sleep 15 ;;
-       *) echo "spec PR entered unexpected state: $state" >&2; exit 1 ;;
+       OPEN)
+         if ((SECONDS >= deadline)); then
+           echo "PR #$pr_number did not merge within 65 minutes; resolve failed checks and requeue it:" >&2
+           gh pr checks "$pr_number" --repo donadiosolutions/lcm >&2
+           exit 1
+         fi
+         sleep 15
+         ;;
+       *) echo "PR #$pr_number entered unexpected state: $state" >&2; exit 1 ;;
      esac
    done
    ```
@@ -145,6 +156,7 @@ the Codecov result already verified on the exact PR head.
 2. Request Copilot review (add to reviewers list)
 3. Run review loop (see below)
 4. Once Copilot review has no remaining inline comments, queue the PR with `gh pr merge <number> --repo donadiosolutions/lcm --auto --squash`
+5. Wait for the implementation PR to land by repeating the bounded 65-minute merge wait from Phase 2, using the implementation PR number. Do not begin post-merge validation or dependent work until it reports `MERGED`.
 
 ## Copilot Interaction
 
