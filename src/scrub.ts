@@ -68,6 +68,8 @@ export const NATIVE_PATTERNS: string[] = [
   "dp\\.pt\\.[a-z0-9]{43}",
   // Database connection strings with embedded credentials
   "(?:postgres|mysql|mongodb|redis|rediss)://[^\\s:@/]+:[^\\s@/]+@[^\\s/]+",
+  // Redis permits password-only URLs with an empty username.
+  "rediss?://:[^\\s@/]+@[^\\s/]+",
   // JSON Web Tokens (three base64url segments separated by dots)
   "eyJ[A-Za-z0-9_-]+\\.eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+",
 ];

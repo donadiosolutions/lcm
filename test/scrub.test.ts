@@ -97,6 +97,8 @@ describe("ScrubEngine — built-in patterns", () => {
     expect(engine.scrub("DATABASE_URL=postgres://admin:s3cret@db.example.com:5432/mydb")).toContain("[REDACTED]");
     expect(engine.scrub("MONGO=mongodb://root:pass@mongo:27017/app")).toContain("[REDACTED]");
     expect(engine.scrub("REDIS=redis://default:hunter2@redis.example.com:6379")).toContain("[REDACTED]");
+    expect(engine.scrub("REDIS=redis://:hunter2@redis.example.com:6379/0")).toContain("[REDACTED]");
+    expect(engine.scrub("REDISS=rediss://:hunter2@redis.example.com:6379/0")).toContain("[REDACTED]");
   });
 
   it("redacts JWTs (eyJ... three-segment tokens)", () => {

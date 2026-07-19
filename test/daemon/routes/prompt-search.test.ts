@@ -8,6 +8,7 @@ import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import { PromotedStore } from "../../../src/db/promoted.js";
 import { projectDbPath } from "../../../src/daemon/project.js";
+import { closeLcmConnection, getLcmConnection } from "../../../src/db/connection.js";
 
 // ---------------------------------------------------------------------------
 // Base scoring math — mirrors the pre-feedback score in prompt-search.
@@ -162,10 +163,13 @@ describe("POST /prompt-search", () => {
     tempDirs.push(tempDir);
     const dbPath = projectDbPath(tempDir);
     mkdirSync(dirname(dbPath), { recursive: true });
-    const db = new DatabaseSync(dbPath);
-    runLcmMigrations(db);
-    new PromotedStore(db).insert({ content: "Always use SQLite", projectId: "p1" });
-    db.close();
+    const db = getLcmConnection(dbPath);
+    try {
+      runLcmMigrations(db);
+      new PromotedStore(db).insert({ content: "Always use SQLite", projectId: "p1" });
+    } finally {
+      closeLcmConnection(dbPath);
+    }
 
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;

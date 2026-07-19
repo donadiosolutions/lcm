@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   scrubCounts: vi.fn((content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 })),
   forProject: vi.fn(async () => ({ scrubWithCounts: mocks.scrubCounts })),
   send: vi.fn(),
+  logError: vi.fn(),
 }));
 
 const db = {
@@ -59,6 +60,7 @@ vi.mock("../../../src/transcript-provider.js", () => ({
 }));
 vi.mock("../../../src/scrub.js", () => ({ ScrubEngine: { forProject: mocks.forProject } }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
+vi.mock("../../../src/hooks/hook-errors.js", () => ({ safeLogError: mocks.logError }));
 
 import { createIngestHandler } from "../../../src/daemon/routes/ingest.js";
 
@@ -160,14 +162,16 @@ describe("ingest persistence boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
   });
 
-  it("returns typed and untyped persistence failures and releases connections", async () => {
+  it("returns a stable error without disclosing persistence details and releases connections", async () => {
     const handler = createIngestHandler(config);
-    mocks.getConversation.mockRejectedValueOnce(new Error("ingest broke"));
+    const failure = new Error("database password=hunter2");
+    mocks.getConversation.mockRejectedValueOnce(failure);
     await handler({} as never, response, JSON.stringify({ session_id: "error", cwd: "/ok", messages: [validMessage] }));
-    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest broke" });
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed", code: "INGEST_FAILED" });
+    expect(mocks.logError).toHaveBeenLastCalledWith("ingest", failure, { cwd: "/ok", sessionId: "error" });
     mocks.getConversation.mockRejectedValueOnce("failure");
     await handler({} as never, response, JSON.stringify({ session_id: "error-two", cwd: "/ok", messages: [validMessage] }));
-    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed" });
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed", code: "INGEST_FAILED" });
     expect(mocks.closeConnection).toHaveBeenCalledTimes(2);
   });
 });

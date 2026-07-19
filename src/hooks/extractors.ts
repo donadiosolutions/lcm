@@ -189,6 +189,13 @@ export function normalizePromptWithChannels(prompt: string): { text: string; fro
       parts.push(prompt.slice(cursor));
       break;
     }
+    const nameEnd = open + "<channel".length;
+    const next = prompt[nameEnd];
+    if (next !== undefined && next !== ">" && !/\s/u.test(next)) {
+      parts.push(prompt.slice(cursor, nameEnd));
+      cursor = nameEnd;
+      continue;
+    }
     const openEnd = prompt.indexOf(">", open + 8);
     if (openEnd < 0) {
       parts.push(prompt.slice(cursor));

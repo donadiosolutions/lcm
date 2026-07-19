@@ -12,6 +12,7 @@ import type { ParsedMessage } from "../../transcript.js";
 import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
+import { safeLogError } from "../../hooks/hook-errors.js";
 
 function isParsedMessage(value: unknown): value is ParsedMessage {
   if (!value || typeof value !== "object") return false;
@@ -153,7 +154,8 @@ export function createIngestHandler(config: DaemonConfig): RouteHandler {
         ...(totalRedacted > 0 ? { redacted: totalRedacted, redactedCategories: redactionCategories } : {}),
       });
       } catch (err) {
-        sendJson(res, 500, { error: err instanceof Error ? err.message : "ingest failed" });
+        safeLogError("ingest", err, { cwd, sessionId: session_id });
+        sendJson(res, 500, { error: "ingest failed", code: "INGEST_FAILED" });
       } finally {
         closeLcmConnection(dbPath);
       }

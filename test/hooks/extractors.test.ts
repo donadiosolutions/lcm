@@ -348,6 +348,12 @@ describe("normalizePromptWithChannels", () => {
       fromChannel: false,
     });
   });
+
+  it.each(["channeling", "channel-extra"])('preserves malformed tag name "%s"', (tagName) => {
+    const raw = `<${tagName}>always use TypeScript</channel>`;
+    expect(normalizePromptWithChannels(raw)).toEqual({ text: raw, fromChannel: false });
+    expect(extractUserPromptEvents(raw).every((event) => !event.tags?.includes("source:telegram"))).toBe(true);
+  });
 });
 
 describe("extractUserPromptEvents — Telegram channel wrapping", () => {

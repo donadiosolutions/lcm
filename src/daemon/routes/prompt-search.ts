@@ -289,8 +289,7 @@ export function createPromptSearchHandler(config: DaemonConfig): RouteHandler {
         resurfaceMargin,
       );
 
-      // Pass the full filtered list (not sliced to maxResults) so the budget
-      // selector can choose the best-fitting subset after dedup and truncation.
+      // Cap ranked results before selecting the best-fitting subset for the byte budget.
       const selection = selectMemoryHintsWithinBudget(
         filtered.slice(0, maxResults).map((result) => ({
           id: result.id,

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createDaemon } from "../../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { projectDbPath } from "../../../src/daemon/project.js";
+import { closeLcmConnection, getLcmConnection } from "../../../src/db/connection.js";
 
 const tempDirs: string[] = [];
 
@@ -137,12 +138,13 @@ describe("POST /store", () => {
         body: JSON.stringify({ text: "valid", tags: [`token:${secret}`], cwd: tempDir }),
       });
       expect(valid.status).toBe(200);
-      const db = new DatabaseSync(projectDbPath(tempDir));
+      const dbPath = projectDbPath(tempDir);
+      const db = getLcmConnection(dbPath);
       try {
         const row = db.prepare("SELECT tags FROM promoted LIMIT 1").get() as { tags: string };
         expect(row.tags).toContain("[REDACTED]");
         expect(row.tags).not.toContain(secret);
-      } finally { db.close(); }
+      } finally { closeLcmConnection(dbPath); }
     } finally { await daemon.stop(); }
   });
 });

@@ -226,10 +226,10 @@ export async function importKnowledge(
   // Ensure project dir + DB exist
   mkdirSync(projDir, { recursive: true });
 
-  const db = getLcmConnection(dbPath);
   const globalPatterns = opts._globalPatterns
     ?? loadDaemonConfig(configPath()).security.sensitivePatterns;
   const scrubber = await ScrubEngine.forProject(globalPatterns, projDir);
+  const db = getLcmConnection(dbPath);
 
   let imported = 0;
   let skipped = 0;
