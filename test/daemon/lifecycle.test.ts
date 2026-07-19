@@ -483,6 +483,11 @@ describe("ensureDaemon", () => {
         expect.objectContaining({ encoding: "utf-8", timeout: 100 }),
       );
       const systemdArgs = spawnSyncMock.mock.calls[0][1] as string[];
+      if (runtimeBaseDir === undefined) {
+        expect(systemdArgs).not.toContain(
+          "--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_SUMMARY_API_KEY",
+        );
+      }
       const joinedArgs = systemdArgs.join("\n");
       expect(joinedArgs).not.toContain("sk-test");
       expect(joinedArgs).not.toContain("sk-lcm-test");
