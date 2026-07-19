@@ -14,16 +14,37 @@ This document is a living record. **Update it whenever you learn something:**
 
 **When to update:** At the end of every feature cycle (after the implementation PR merges), review this doc against what actually happened. If reality diverged from the doc, fix the doc — not reality.
 
-**How to update:** Create a `docs/<topic>` branch, push, get Copilot review, merge to main. Same flow as any other docs change.
+**How to update:** Create a `docs/TOPIC` branch, push, get Copilot review, then set `PR_NUMBER` to the pull request number and queue it for main with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`. Same flow as any other docs change.
 
 ## Branch Strategy
 
-```
+```text
 feature/docs branches → main (default, protected)
 ```
 
-- **`main`** — Default branch. All PRs target main. Protected: PRs required, no force push. Pushing a matching `vX.Y.Z` tag triggers the publish workflow.
-- **Feature branches** — `feat/<topic>`, `docs/<topic>`, `fix/<topic>`. Always branch from main.
+- **`main`** — Default branch. All PRs target main. Protected: PRs and the merge queue are required; no force push. Pushing a matching `vX.Y.Z` tag triggers the publish workflow.
+- **Feature branches** — `feat/TOPIC`, `docs/TOPIC`, `fix/TOPIC`. Always branch from main and use an isolated worktree for each concurrent change.
+
+Independent changes may be developed in parallel on isolated branches and worktrees, but the required merge queue serializes landings into `main`. Dependent work must wait for its upstream PR to merge, then fetch and rebase onto the new `main` before it is queued.
+
+The merge queue uses squash merging and an `ALLGREEN` grouping strategy. It builds one entry at a time, with both the minimum and maximum merge-group size set to one, no minimum wait, and a 60-minute check-response timeout. Routine administrator bypasses are prohibited; the existing bypass is reserved for documented emergencies.
+
+The required `external-admission` status separates pull-request admission from
+merge-group validation for providers that do not report on synthetic queue
+commits. On a non-draft PR, the trusted `pull_request_target`, `status`, and
+`check_run` handlers in `external-admission.yml` require authenticated results
+from CodeRabbit, `codecov/patch`, and DCO on the PR's exact head SHA. Provider
+reruns revalidate that SHA and replace a stale successful admission with a
+pending or failed result until all three providers pass again. Draft PRs are not
+eligible for admission.
+
+After PR-head admission, the separate
+`external-admission-merge-group.yml` workflow runs a permissionless Actions
+check named `external-admission` on each synthetic `merge_group` commit. It does
+not publish a commit status. This exception applies only to the three external
+providers, which cannot report on that commit: CI, both default CodeQL
+analyses, the security-extended CodeQL analysis, and both Socket checks still
+run against the synthetic commit before it may merge.
 
 ### Release Flow
 
@@ -42,24 +63,34 @@ The manual release helper performs step 4 idempotently: it pushes or fetches a v
 
 ### CI Triggers
 
-| Workflow | Trigger | Purpose |
-|----------|---------|---------|
-| `ci.yml` | Push to main + all PRs | Type-check, test, build |
-| `version-pr.yml` | Push to main | Auto-create version PR from changesets |
-| `publish.yml` | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag | Publish npm + create GitHub release |
+| Workflow                             | Trigger                                                                              | Purpose                                                                                 |
+| ------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
+| `external-admission.yml`             | Non-draft PR lifecycle + authenticated CodeRabbit status and Codecov/DCO check runs  | Require all three external providers on the exact eligible PR head                      |
+| `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
+| `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
+| `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
+| `version-pr.yml`                     | Push to main                                                                         | Auto-create version PR from changesets                                                  |
+| `publish.yml`                        | Semver tag pushes (`vX.Y.Z`) + manual dispatch from a tag                            | Publish npm + create GitHub release                                                     |
+
+The CI workflow keeps coverage reporting in a separate no-checkout job that
+consumes the fixed test artifact. Codecov uses OIDC for pushes and same-repository
+PRs, including Dependabot PRs; fork PRs use Codecov's tokenless upload path. The
+reporting job is skipped for `merge_group`, where `external-admission` represents
+the Codecov result already verified on the exact PR head.
 
 ## Defaults (predefined answers for brainstorming)
 
-| Question | Default Answer |
-|----------|---------------|
-| Spec location | PR or issue body unless the user asks for a tracked document |
-| Visual companion | No (CLI project, no visual questions) |
+| Question                | Default Answer                                                 |
+| ----------------------- | -------------------------------------------------------------- |
+| Spec location           | PR or issue body unless the user asks for a tracked document   |
+| Visual companion        | No (CLI project, no visual questions)                          |
 | Implementation approach | Parallel tracks — breaking changes isolated from additive work |
-| Registry/config format | TypeScript (type-safe, compile-time checks) |
-| Install behavior | Auto-write files (match ByteRover (brv) UX) |
-| State tracking | Filesystem scan (no state files) |
-| Release strategy | Parallel tracks with separate PRs |
-| PR review | Copilot via reviewers list, not @copilot tag |
+| Registry/config format  | TypeScript (type-safe, compile-time checks)                    |
+| Install behavior        | Auto-write files (match ByteRover (brv) UX)                    |
+| State tracking          | Filesystem scan (no state files)                               |
+| Release strategy        | Parallel tracks with separate PRs                              |
+| PR review               | Copilot via reviewers list, not @copilot tag                   |
 
 ## Phase 1: Design (Opus, max effort)
 
@@ -73,20 +104,183 @@ The manual release helper performs step 4 idempotently: it pushes or fetches a v
 
 ## Phase 2: Spec Review via PR
 
-1. **Sync first:** `git pull --ff-only origin main` before branching — stale local bases cause Copilot to review unrelated code
-2. Create `docs/<topic>` branch from main
+1. **Sync first:** `git checkout main && git pull --ff-only origin main` before branching — stale local bases cause Copilot to review unrelated code
+2. Create a `docs/TOPIC` branch from main
 3. Ensure only documentation files are in the diff — specs, plans, workflow docs
 4. Push and open PR
 5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
 6. Run review loop (see Copilot Review Loop below)
-7. Merge once Copilot has no issues (max 3 rounds — see Review Loop)
+7. Once Copilot has no issues (max 3 rounds — see Review Loop), set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
+8. Wait for the queued PR to land before starting implementation. Allow up to 65 minutes for GitHub to admit the PR and then 65 minutes for each position in the serialized queue: a PR entering at position 1 gets 65 minutes, while a PR entering at position N gets `N * 65` minutes so every entry ahead can consume the queue's 60-minute check timeout without taking time from this PR. Both waits are finite and fail with check diagnostics if GitHub never admits, removes, or rejects the still-open PR:
+
+   ```bash
+   PR_NUMBER=123
+
+   show_pr_checks() {
+     local pr_number=$1
+     gh pr checks "$pr_number" --repo donadiosolutions/lcm >&2 || true
+   }
+
+   show_merge_group_checks() {
+     local merge_group_sha=$1
+
+     if [[ -z "$merge_group_sha" ]]; then
+       echo "No synthetic merge-group SHA was observed for this queue attempt." >&2
+       return
+     fi
+
+     echo "Check runs for synthetic merge-group commit $merge_group_sha:" >&2
+     gh api \
+       -H 'Accept: application/vnd.github+json' \
+       "repos/donadiosolutions/lcm/commits/${merge_group_sha}/check-runs?per_page=100" \
+       --jq '.check_runs[] |
+         [.name, "status=" + .status, "conclusion=" + (.conclusion // "pending"),
+          "app=" + (.app.slug // "unknown"), (.details_url // "no-details-url")] |
+         @tsv' >&2 || true
+   }
+
+   show_queue_diagnostics() {
+     local pr_number=$1
+     local merge_group_sha=$2
+     show_pr_checks "$pr_number"
+     show_merge_group_checks "$merge_group_sha"
+   }
+
+   pr_is_merged() {
+     local pr_number=$1
+     [[ $(gh pr view "$pr_number" --repo donadiosolutions/lcm --json state --jq .state 2>/dev/null) == MERGED ]]
+   }
+
+   query_merge_queue_entry() {
+     local pr_number=$1
+     gh api graphql \
+       -f query='query($owner: String!, $name: String!, $number: Int!) {
+         repository(owner: $owner, name: $name) {
+           pullRequest(number: $number) {
+             mergeQueueEntry { position state headCommit { oid } }
+           }
+         }
+       }' \
+       -f owner=donadiosolutions \
+       -f name=lcm \
+       -F number="$pr_number" \
+       --jq '.data.repository.pullRequest.mergeQueueEntry |
+         if . == null then ""
+         else [.position, .state, .headCommit.oid] | @tsv
+         end'
+   }
+
+   wait_for_queued_pr() {
+     local pr_number=$1
+     local admission_deadline=$((SECONDS + 65 * 60))
+     local current_merge_group_sha current_queue_position deadline merge_group_sha=""
+     local queue_entry queue_position queue_state state
+
+     # mergeQueueEntry can be temporarily absent while auto-merge waits for
+     # required checks or GitHub propagates the newly queued entry.
+     while :; do
+       state=$(gh pr view "$pr_number" --repo donadiosolutions/lcm --json state --jq .state)
+       case "$state" in
+         MERGED) return ;;
+         OPEN) ;;
+         *)
+           echo "PR #$pr_number entered unexpected state before queue admission: $state" >&2
+           show_queue_diagnostics "$pr_number" "$merge_group_sha"
+           return 1
+           ;;
+       esac
+
+       if ! queue_entry=$(query_merge_queue_entry "$pr_number"); then
+         if pr_is_merged "$pr_number"; then return; fi
+         echo "Could not query the merge-queue entry for PR #$pr_number." >&2
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
+         return 1
+       fi
+       IFS=$'\t' read -r queue_position queue_state current_merge_group_sha <<<"$queue_entry"
+       if [[ -n "$current_merge_group_sha" ]]; then
+         merge_group_sha=$current_merge_group_sha
+       fi
+
+       if [[ "$queue_state" == UNMERGEABLE ]]; then
+         if pr_is_merged "$pr_number"; then return; fi
+         echo "PR #$pr_number became unmergeable before queue admission completed; inspect failed checks and requeue it:" >&2
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
+         return 1
+       fi
+
+       if [[ "$queue_position" =~ ^[1-9][0-9]*$ && -n "$merge_group_sha" ]]; then
+         break
+       fi
+
+       if ((SECONDS >= admission_deadline)); then
+         if pr_is_merged "$pr_number"; then return; fi
+         echo "PR #$pr_number did not enter the merge queue within 65 minutes; inspect required checks and auto-merge state:" >&2
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
+         return 1
+       fi
+       sleep 15
+     done
+
+     deadline=$((SECONDS + queue_position * 65 * 60))
+     echo "PR #$pr_number entered the merge queue at position $queue_position; waiting up to $((queue_position * 65)) minutes." >&2
+
+     while :; do
+       state=$(gh pr view "$pr_number" --repo donadiosolutions/lcm --json state --jq .state)
+       case "$state" in
+         MERGED) return ;;
+         OPEN)
+           ;;
+         *)
+           echo "PR #$pr_number entered unexpected state while queued: $state" >&2
+           show_queue_diagnostics "$pr_number" "$merge_group_sha"
+           return 1
+           ;;
+       esac
+
+       if ! queue_entry=$(query_merge_queue_entry "$pr_number"); then
+         if pr_is_merged "$pr_number"; then return; fi
+         echo "Could not query the merge-queue entry for PR #$pr_number." >&2
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
+         return 1
+       fi
+       IFS=$'\t' read -r current_queue_position queue_state current_merge_group_sha <<<"$queue_entry"
+       if [[ -n "$current_merge_group_sha" ]]; then
+         merge_group_sha=$current_merge_group_sha
+       fi
+
+       if [[ -z "$current_queue_position" ]]; then
+         if pr_is_merged "$pr_number"; then return; fi
+         echo "PR #$pr_number is still open but is no longer in the merge queue; inspect failed checks and requeue it:" >&2
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
+         return 1
+       fi
+
+       if [[ "$queue_state" == UNMERGEABLE ]]; then
+         if pr_is_merged "$pr_number"; then return; fi
+         echo "PR #$pr_number became unmergeable at queue position $current_queue_position; inspect failed checks and requeue it:" >&2
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
+         return 1
+       fi
+
+       if ((SECONDS >= deadline)); then
+         if pr_is_merged "$pr_number"; then return; fi
+         echo "PR #$pr_number did not merge within its position-$queue_position allowance of $((queue_position * 65)) minutes; inspect failed checks and requeue it:" >&2
+         show_queue_diagnostics "$pr_number" "$merge_group_sha"
+         return 1
+       fi
+       sleep 15
+     done
+   }
+
+   wait_for_queued_pr "$PR_NUMBER"
+   ```
 
 ## Phase 3: Implementation (Sonnet subagents)
 
-1. **Sync first:** `git pull origin main` to get latest (including merged specs)
+1. **Sync first:** `git checkout main && git pull --ff-only origin main` to get latest (including merged specs)
 2. Dispatch `model: sonnet` subagents with `isolation: worktree` for each task in the plan
 3. **Independent tasks** → launch in parallel (e.g., PR A: delete files, PR D: add new module)
-4. **Sequential tasks** → launch one at a time; after merging upstream PR, rebase downstream branch: `git fetch origin main && git rebase origin/main`
+4. **Sequential tasks** → launch the dependent branch only after the upstream PR lands through the queue, then branch from the updated `main`. If a downstream branch already exists on the old upstream tip, enter its isolated worktree, set `OLD_UPSTREAM_TIP` to that commit, and replay only its downstream commits with `git fetch origin main && git rebase --onto origin/main "${OLD_UPSTREAM_TIP}"`. Omitting the branch argument rebases the already checked-out downstream branch without asking Git to check it out in another worktree.
 5. Each subagent: implement code + tests, run `npm test`, commit (do NOT push)
 6. After subagent completes: review the diff, push, open PR, request Copilot review
 
@@ -102,7 +296,8 @@ The manual release helper performs step 4 idempotently: it pushes or fetches a v
 1. Push implementation branch, open PR
 2. Request Copilot review (add to reviewers list)
 3. Run review loop (see below)
-4. Merge once Copilot review has no remaining inline comments
+4. Once Copilot review has no remaining inline comments, set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
+5. Wait for the implementation PR to land by calling `wait_for_queued_pr "$PR_NUMBER"` from Phase 2 with the implementation PR number. Do not begin post-merge validation or dependent work until it reports `MERGED`.
 
 ## Copilot Interaction
 
@@ -127,6 +322,7 @@ gh pr edit {n} --repo {owner}/{repo} --add-reviewer copilot-pull-request-reviewe
 The REST `requested_reviewers` endpoint returns **422** for bot reviewers ("Reviews may only be requested from collaborators"). `gh pr edit` uses the GraphQL API internally and handles bot reviewers correctly. Confirmed working on PR #56.
 
 **Methods that do NOT work:**
+
 - `gh api -X POST .../requested_reviewers -f 'reviewers[]=copilot-pull-request-reviewer'` — 422 for bots
 - Empty commits — Copilot does not reliably trigger on diffs with no substantive changes
 - Tagging `@copilot` in comments — opens a new PR instead of reviewing
@@ -161,7 +357,7 @@ gh api repos/{owner}/{repo}/pulls/{n}/comments \
 ### Copilot Review Loop
 
 1. Request review (POST to requested_reviewers)
-2. Launch ONE background command: `sleep 180 && <check review count + comments>`
+2. Launch one background polling command that sleeps for 180 seconds before checking the review count and comments
 3. When notified, check latest review state and new comments
 4. If comments found:
    a. **Batch ALL fixes** into a single commit (do not fix-push-review one at a time)
@@ -176,5 +372,5 @@ gh api repos/{owner}/{repo}/pulls/{n}/comments \
 - **@copilot in comments**: Opens a new PR instead of triggering review. Always use the reviewers API.
 - **REST API 422 for Copilot bot**: The `requested_reviewers` REST endpoint rejects bot slugs. Use `gh pr edit --add-reviewer` instead.
 - **Empty commits don't trigger Copilot**: Copilot only reviews on substantive diffs. Use `gh pr edit` re-request instead.
-- **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Use `git checkout -B <clean-branch> origin/main && git cherry-pick <docs-commits>`.
-- **Sequential PR chains**: After merging PR A, rebase PR B onto updated main before pushing: `git fetch origin main && git rebase origin/main`.
+- **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Set `CLEAN_BRANCH` to the new branch name and `DOCS_COMMIT_SHA` to the documentation commit, then use `git checkout -B "${CLEAN_BRANCH}" origin/main && git cherry-pick "${DOCS_COMMIT_SHA}"`.
+- **Sequential PR chains**: Create PR B from updated `main` only after PR A lands. If PR B already contains commits based on PR A's old tip, enter PR B's isolated worktree, set `OLD_PR_A_TIP` to that commit, and replay only its own commits with `git fetch origin main && git rebase --onto origin/main "${OLD_PR_A_TIP}"`. Omit the branch argument so Git rebases the branch already checked out in that worktree instead of attempting a conflicting cross-worktree checkout.
