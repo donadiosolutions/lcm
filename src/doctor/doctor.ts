@@ -447,7 +447,6 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       const h = (await res.json()) as { status?: string; version?: string; pid?: number };
       daemonHealthy = h.status === "ok";
       daemonVersion = h.version;
-      daemonPid = h.pid;
     }
   } catch {}
 
@@ -464,7 +463,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         expectedVersion: pkgVersion,
         enforceUserManagerParent: true,
       });
-      if (ensureResult.connected) daemonPid = ensureResult.pid ?? daemonPid;
+      if (ensureResult.connected) daemonPid = ensureResult.pid;
 
       let postRestartVersion: string | undefined;
       let postRestartOk = false;
@@ -475,7 +474,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
             const h = (await res.json()) as { status?: string; version?: string; pid?: number };
             postRestartOk = h.status === "ok";
             postRestartVersion = h.version;
-            if (h.pid !== undefined) daemonPid = h.pid;
+            if (postRestartOk && h.pid !== undefined) daemonPid = h.pid;
           }
         } catch { /* non-fatal */ }
       }

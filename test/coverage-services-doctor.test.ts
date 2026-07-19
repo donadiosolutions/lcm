@@ -69,11 +69,13 @@ function makeDeps(options: {
   lcmMd?: string;
   managedDaemonPath?: string;
   procEnviron?: string;
+  readPaths?: string[];
 } = {}): DoctorDeps {
   const health = [...(options.health ?? [{ ok: false }])];
   return {
     existsSync: options.exists ?? (() => true),
     readFileSync: (path: string) => {
+      options.readPaths?.push(path);
       const readError = options.readError?.(path);
       if (readError) throw readError;
       if (path.endsWith("config.json")) return options.configText ?? JSON.stringify(options.config ?? {});
@@ -312,6 +314,35 @@ describe("doctor service coverage", () => {
 
     expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
   });
+
+  it.each(["disconnected", "throws"] as const)(
+    "does not inspect the initial health PID when daemon validation %s",
+    async (failure) => {
+      const readPaths: string[] = [];
+      if (failure === "disconnected") {
+        mocks.ensureDaemon.mockResolvedValue({ connected: false });
+      } else {
+        mocks.ensureDaemon.mockRejectedValue(new Error("validation failed"));
+      }
+      mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
+        if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
+          const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
+          return { status: path?.includes("/stale/bin") ? 1 : 0, stdout: "", stderr: "" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      });
+
+      const results = await runDoctor(makeDeps({
+        config: { llm: { provider: "codex-process" } },
+        health: [{ ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 4242 }) }],
+        procEnviron: "PATH=/stale/bin\0",
+        readPaths,
+      }));
+
+      expect(readPaths).not.toContain("/proc/4242/environ");
+      expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
+    },
+  );
 
   it.each([
     [undefined, "HOME=/isolated\0", false],

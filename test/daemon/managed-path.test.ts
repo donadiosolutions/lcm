@@ -43,6 +43,11 @@ describe("managed daemon executable path", () => {
       .toBe(SYSTEMD_DAEMON_PATH);
     expect(managedDaemonPath("/tmp/npx-123/node_modules/.bin/lcm", ["daemon", "start"]))
       .toBe(SYSTEMD_DAEMON_PATH);
+    expect(managedDaemonPath(
+      "/usr/bin/node",
+      ["/work/project/lcm.mjs", "daemon", "start"],
+      "/work/project/packages/app",
+    )).toBe(SYSTEMD_DAEMON_PATH);
   });
 
   it("preserves global prefixes outside the current project", () => {

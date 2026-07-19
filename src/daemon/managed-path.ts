@@ -24,7 +24,8 @@ function isKnownGlobalOrBundledDir(directory: string): boolean {
 
 function isTrustedInstallationDir(directory: string, workingDirectory: string): boolean {
   if (/(?:^|\/)node_modules(?:\/|$)/.test(directory)) return false;
-  return isKnownGlobalOrBundledDir(directory) || !isWithin(directory, workingDirectory);
+  return isKnownGlobalOrBundledDir(directory)
+    || (!isWithin(directory, workingDirectory) && !isWithin(workingDirectory, directory));
 }
 
 function trustedExecutableDirs(

@@ -193,7 +193,8 @@ outside the current project. Known global Node installations and bundled Codex
 or Claude plugin-cache/runtime directories remain valid trust anchors. LCM
 rejects trust anchors containing the platform's `PATH` delimiter, all
 `node_modules` paths (including `npx` and `node_modules/.bin` launchers), the
-current project directory, and other project-local or shell-specific entries.
+current project directory or its checkout ancestors when invoked from a
+subdirectory, and other project-local or shell-specific entries.
 If no trusted absolute entrypoint is available, the service uses only the fixed
 system directories. Put provider configuration in LCM settings or the
 documented `LCM_*` environment variables.
