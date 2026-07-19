@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createDaemon } from "../../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { projectDbPath } from "../../../src/daemon/project.js";
+import { closeLcmConnection, getLcmConnection } from "../../../src/db/connection.js";
 
 const tempDirs: string[] = [];
 
@@ -115,5 +116,35 @@ describe("POST /store", () => {
     } finally {
       await daemon.stop();
     }
+  });
+
+  it("rejects malformed tags and scrubs secrets in valid tags", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-store-tags-"));
+    tempDirs.push(tempDir);
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    const daemon = await createDaemon(config);
+    const port = daemon.address().port;
+    try {
+      const malformed = await fetch(`http://127.0.0.1:${port}/store`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "valid", tags: { bad: "tag" }, cwd: tempDir }),
+      });
+      expect(malformed.status).toBe(400);
+
+      const secret = `sk-${"a".repeat(24)}`;
+      const valid = await fetch(`http://127.0.0.1:${port}/store`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "valid", tags: [`token:${secret}`], cwd: tempDir }),
+      });
+      expect(valid.status).toBe(200);
+      const dbPath = projectDbPath(tempDir);
+      const db = getLcmConnection(dbPath);
+      try {
+        const row = db.prepare("SELECT tags FROM promoted LIMIT 1").get() as { tags: string };
+        expect(row.tags).toContain("[REDACTED]");
+        expect(row.tags).not.toContain(secret);
+      } finally { closeLcmConnection(dbPath); }
+    } finally { await daemon.stop(); }
   });
 });

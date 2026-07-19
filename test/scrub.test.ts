@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import {
   getGitleaksSyncDate,
+  normalizeGitleaksRegex,
   ScrubEngine,
 } from "../src/scrub.js";
 
@@ -96,6 +97,8 @@ describe("ScrubEngine — built-in patterns", () => {
     expect(engine.scrub("DATABASE_URL=postgres://admin:s3cret@db.example.com:5432/mydb")).toContain("[REDACTED]");
     expect(engine.scrub("MONGO=mongodb://root:pass@mongo:27017/app")).toContain("[REDACTED]");
     expect(engine.scrub("REDIS=redis://default:hunter2@redis.example.com:6379")).toContain("[REDACTED]");
+    expect(engine.scrub("REDIS=redis://:hunter2@redis.example.com:6379/0")).toContain("[REDACTED]");
+    expect(engine.scrub("REDISS=rediss://:hunter2@redis.example.com:6379/0")).toContain("[REDACTED]");
   });
 
   it("redacts JWTs (eyJ... three-segment tokens)", () => {
@@ -105,6 +108,34 @@ describe("ScrubEngine — built-in patterns", () => {
 
   it("does not redact partial JWT-like strings without dots", () => {
     expect(engine.scrub("eyJhbGciOiJIUzI1NiJ9")).not.toContain("[REDACTED]");
+  });
+});
+
+describe("Gitleaks RE2 normalization", () => {
+  it("converts POSIX classes, end anchors, and scoped case flags", () => {
+    expect(normalizeGitleaksRegex("pat[[:alnum:]]+\\z", "")).toEqual({
+      source: "pat[A-Za-z0-9]+$",
+      flags: "",
+    });
+    const scoped = normalizeGitleaksRegex("(?i:token)-(?-i:ABC)", "");
+    expect(scoped).toEqual({ source: "(?:token)-(?:ABC)", flags: "i" });
+    expect(new RegExp(scoped.source, scoped.flags).test("TOKEN-abc")).toBe(true);
+
+    const dotall = normalizeGitleaksRegex("start(?s:.){1,3}end", "");
+    expect(dotall).toEqual({ source: "start[\\s\\S]{1,3}end", flags: "" });
+    expect(new RegExp(dotall.source).test("start\nend")).toBe(true);
+  });
+
+  it("redacts multiline Kubernetes Secret YAML from bundled Gitleaks rules", () => {
+    const yaml = "kind: Secret\nmetadata:\n  name: example\ndata:\n  api-key: c2VjcmV0MTIzNA==";
+    expect(new ScrubEngine([], []).scrub(yaml)).toContain("[REDACTED]");
+  });
+
+  it("redacts long database URLs without catastrophic backtracking", () => {
+    const engine = new ScrubEngine([], []);
+    const secret = `postgres://user:${"p".repeat(20_000)}@db.example/app`;
+    expect(engine.scrub(secret)).toBe("[REDACTED]/app");
+    expect(engine.scrub(`postgres://user:${"p".repeat(20_000)}`)).toContain("postgres://");
   });
 });
 

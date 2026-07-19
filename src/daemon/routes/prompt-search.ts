@@ -225,6 +225,11 @@ export function createPromptSearchHandler(config: DaemonConfig): RouteHandler {
       return;
     }
 
+    if (config.restoration.promptSearchMaxResults === 0) {
+      sendJson(res, 200, { hints: [], ids: [] });
+      return;
+    }
+
     const dbPath = projectDbPath(validatedCwd);
     if (!existsSync(dbPath)) {
       sendJson(res, 200, { hints: [] });
@@ -258,8 +263,7 @@ export function createPromptSearchHandler(config: DaemonConfig): RouteHandler {
       const stalePenalty = config.restoration.stalePenalty;
       const allowStaleOnStrongMatch = config.restoration.allowStaleOnStrongMatch;
 
-      const targetHintCount = Math.max(maxResults, maxInjectedMemoryItems);
-      const candidateLimit = Math.max(targetHintCount * CANDIDATE_LIMIT_MULTIPLIER, MIN_CANDIDATE_LIMIT);
+      const candidateLimit = Math.max(maxResults * CANDIDATE_LIMIT_MULTIPLIER, MIN_CANDIDATE_LIMIT);
       const results = store.search(query, candidateLimit);
       const recallStore = new RecallStore(db);
 
@@ -285,10 +289,9 @@ export function createPromptSearchHandler(config: DaemonConfig): RouteHandler {
         resurfaceMargin,
       );
 
-      // Pass the full filtered list (not sliced to maxResults) so the budget
-      // selector can choose the best-fitting subset after dedup and truncation.
+      // Cap ranked results before selecting the best-fitting subset for the byte budget.
       const selection = selectMemoryHintsWithinBudget(
-        filtered.map((result) => ({
+        filtered.slice(0, maxResults).map((result) => ({
           id: result.id,
           hint: result.content.length > snippetLength
             ? result.content.slice(0, snippetLength) + "..."

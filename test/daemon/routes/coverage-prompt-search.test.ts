@@ -227,11 +227,6 @@ describe("prompt-search route coverage", () => {
       "defensive-denominator",
       "invalid-surfaced",
       "created-a",
-      "created-z",
-      "confidence-high",
-      "confidence-low",
-      "base-high",
-      "boosted-base-low",
     ]);
     expect(debugBody.debug.candidates.map(({ id, baseScore, finalScore, usageBoost }) => ({ id, baseScore, finalScore, usageBoost })))
       .toEqual([

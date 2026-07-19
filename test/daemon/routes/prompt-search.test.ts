@@ -8,6 +8,7 @@ import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import { PromotedStore } from "../../../src/db/promoted.js";
 import { projectDbPath } from "../../../src/daemon/project.js";
+import { closeLcmConnection, getLcmConnection } from "../../../src/db/connection.js";
 
 // ---------------------------------------------------------------------------
 // Base scoring math — mirrors the pre-feedback score in prompt-search.
@@ -157,6 +158,32 @@ afterEach(async () => {
 });
 
 describe("POST /prompt-search", () => {
+  it("treats promptSearchMaxResults zero as an absolute disable", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-disabled-"));
+    tempDirs.push(tempDir);
+    const dbPath = projectDbPath(tempDir);
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const db = getLcmConnection(dbPath);
+    try {
+      runLcmMigrations(db);
+      new PromotedStore(db).insert({ content: "Always use SQLite", projectId: "p1" });
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    config.restoration.promptSearchMaxResults = 0;
+    config.restoration.maxInjectedMemoryItems = 10;
+    const daemon = await createDaemon(config);
+    try {
+      const res = await fetch(`http://127.0.0.1:${daemon.address().port}/prompt-search`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "SQLite", cwd: tempDir }),
+      });
+      expect(await res.json()).toEqual({ hints: [], ids: [] });
+    } finally { await daemon.stop(); }
+  });
   it("returns hints for matching promoted entries", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-"));
     tempDirs.push(tempDir);

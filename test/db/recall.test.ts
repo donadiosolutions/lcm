@@ -318,4 +318,18 @@ describe("RecallStore.getFeedback", () => {
       lastSurfacedAt: null,
     });
   });
+
+  it("ignores malformed legacy tag JSON without disabling recall", () => {
+    const db = makeDb();
+    const recall = new RecallStore(db);
+    db.prepare(
+      `INSERT INTO promoted (id, content, tags, source_summary_id, project_id, session_id, depth, confidence)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run("bad", "legacy", '{"a":"signal:memory_used","b":"memory_id:target"}', null, "p1", null, 0, 1);
+    expect(recall.getFeedback(["target"]).get("target")).toEqual({
+      usageCount: 0,
+      surfacingCount: 0,
+      lastSurfacedAt: null,
+    });
+  });
 });

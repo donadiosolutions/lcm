@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
 import { daemonPidPath } from "../runtime-paths.js";
+import { fenceContent } from "../daemon/content-fence.js";
 
 export async function handlePreCompact(stdin: string, client: DaemonClient, port?: number): Promise<{ exitCode: number; stdout: string }> {
   const daemonPort = port ?? 3737;
@@ -37,7 +38,7 @@ export async function handlePreCompact(stdin: string, client: DaemonClient, port
       const truncated = result.latestSummaryContent.length > 2000
         ? result.latestSummaryContent.slice(0, 2000) + "\n[truncated]"
         : result.latestSummaryContent;
-      parts.push(truncated);
+      parts.push(fenceContent(truncated, "compaction-summary"));
     }
 
     return { exitCode: 0, stdout: parts.join("\n\n") };

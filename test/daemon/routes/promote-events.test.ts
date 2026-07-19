@@ -140,6 +140,20 @@ describe("promote-events route", () => {
     expect(call.tags).toContain("source:passive-capture");
   });
 
+  it("scrubs legacy sidecar secrets before promotion", async () => {
+    const secret = `sk-${"a".repeat(24)}`;
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "decision", category: "decision", data: `always use ${secret}`, priority: 1 }, "UserPromptSubmit");
+    edb.close();
+    setupProjectDb(dir).close();
+    const handler = createPromoteEventsHandler(makeConfig());
+    const { res } = mockRes();
+    await handler(request, res, JSON.stringify({ cwd: dir }));
+    const call = vi.mocked(deduplicateAndInsert).mock.calls[0][0];
+    expect(call.content).toContain("[REDACTED]");
+    expect(call.content).not.toContain(secret);
+  });
+
   it("correlates error→fix pairs within session", async () => {
     const edb = new EventsDb(sidecarPath);
     edb.insertEvent("s1", { type: "error_tool", category: "error", data: "Bash error: npm install", priority: 1 }, "PostToolUse");

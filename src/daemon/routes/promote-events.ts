@@ -5,11 +5,13 @@ import { deduplicateAndInsert } from "../../promotion/dedup.js";
 import { sendJson, type RouteHandler } from "../server.js";
 import { validateCwd } from "../validate-cwd.js";
 import { projectId, projectDbPath } from "../project.js";
+import { dirname } from "node:path";
 import { getLcmConnection, closeLcmConnection } from "../../db/connection.js";
 import { runLcmMigrations } from "../../db/migration.js";
 import type { DaemonConfig } from "../config.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
 import { collectEventSidecars } from "../../db/event-sidecars.js";
+import { ScrubEngine } from "../../scrub.js";
 
 const AUTO_TAGS: Record<string, string> = {
   decision: "type:preference",
@@ -297,9 +299,19 @@ async function drainEventsForCwdUnlocked(
     dbOpened = true;
     runLcmMigrations(db);
     const store = new PromotedStore(db);
-
+    const scrubber = await ScrubEngine.forProject(
+      config.security.sensitivePatterns,
+      dirname(dbPath),
+    );
     for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
-      const batchResult = await promoteEventsBatch(config, cwd, edb, store);
+      const batchResult = await promoteEventsBatch(
+        config,
+        cwd,
+        edb,
+        store,
+        scrubber,
+        new Map(),
+      );
       if (batchResult.message === "no unprocessed events") {
         result.message = result.batches === 0
           ? "no unprocessed events"
@@ -356,7 +368,11 @@ async function promoteEventsForCwdUnlocked(
     dbOpened = true;
     runLcmMigrations(db);
     const store = new PromotedStore(db);
-    return await promoteEventsBatch(config, cwd, edb, store);
+    const scrubber = await ScrubEngine.forProject(
+      config.security.sensitivePatterns,
+      dirname(dbPath),
+    );
+    return await promoteEventsBatch(config, cwd, edb, store, scrubber, new Map());
   } finally {
     try {
       if (dbOpened) closeLcmConnection(dbPath);
@@ -371,6 +387,8 @@ async function promoteEventsBatch(
   cwd: string,
   edb: EventsDb,
   store: PromotedStore,
+  scrubber: ScrubEngine,
+  scrubCache: Map<string, string>,
 ): Promise<PromoteResult> {
   const result: PromoteResult = { promoted: 0, skipped: 0, correlated: 0, errors: 0 };
 
@@ -383,7 +401,6 @@ async function promoteEventsBatch(
   correlateErrors(events);
 
   const pid = projectId(cwd);
-
       const thresholds = config.compaction.promotionThresholds;
       const eventConf = thresholds.eventConfidence ?? {
         decision: 0.5, plan: 0.7, errorFix: 0.4, batch: 0.3, pattern: 0.2,
@@ -412,6 +429,11 @@ async function promoteEventsBatch(
 
       for (const event of events) {
         try {
+          let scrubbedData = scrubCache.get(event.data);
+          if (scrubbedData === undefined) {
+            scrubbedData = scrubber.scrub(event.data);
+            scrubCache.set(event.data, scrubbedData);
+          }
           const autoTag = (event as EventRow & { auto_tag?: string }).auto_tag;
           const tag = autoTag ?? AUTO_TAGS[event.category] ?? `category:${event.category}`;
           const reinforcement = getPatternReinforcement(event);
@@ -443,7 +465,7 @@ async function promoteEventsBatch(
             // enough repeated passive evidence to bootstrap a new memory.
             confidence = eventConf.pattern ?? 0.2;
             if (!reinforced) {
-              const existing = store.search(event.data, 1, undefined, pid);
+              const existing = store.search(scrubbedData, 1, undefined, pid);
               if (existing.length === 0) {
                 processedIds.push(event.event_id);
                 result.skipped++;
@@ -466,7 +488,7 @@ async function promoteEventsBatch(
           // Promote via existing dedup pipeline
           await deduplicateAndInsert({
             store,
-            content: event.data,
+            content: scrubbedData,
             tags: [
               tag,
               "source:passive-capture",

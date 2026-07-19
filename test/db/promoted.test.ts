@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { getLcmConnection, closeLcmConnection } from "../../src/db/connection.js";
 import { runLcmMigrations } from "../../src/db/migration.js";
-import { PromotedStore } from "../../src/db/promoted.js";
+import { parsePromotedTags, PromotedStore } from "../../src/db/promoted.js";
 
 const tempDirs: string[] = [];
 
@@ -132,5 +132,18 @@ describe("PromotedStore", () => {
     const results = store.search("React", 10);
     expect(results.length).toBe(1);
     expect(results[0].content).toContain("Active");
+  });
+
+  it("defensively parses malformed tags and rejects invalid inserts", () => {
+    expect(parsePromotedTags("not json")).toEqual([]);
+    expect(parsePromotedTags('{"tag":"value"}')).toEqual([]);
+    expect(parsePromotedTags('["valid", 1]')).toEqual([]);
+    expect(parsePromotedTags('["valid"]')).toEqual(["valid"]);
+
+    const store = new PromotedStore(makeDb());
+    expect(() => store.insert({ content: "bad", projectId: "p", tags: { bad: true } } as never))
+      .toThrow("tags must be an array of strings");
+    expect(() => store.insert({ content: "bad", projectId: "p", tags: ["valid", 1] } as never))
+      .toThrow("tags must be an array of strings");
   });
 });

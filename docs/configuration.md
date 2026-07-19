@@ -146,6 +146,7 @@ The actual summary size depends on the LLM's output; these values are guidelines
 Prompt-time recall now has a second budget layer after `/prompt-search` ranking.
 
 - `restoration.promptSearchMaxResults` still controls how many top-ranked results the route aims to consider first.
+- Setting `restoration.promptSearchMaxResults` to `0` disables prompt-memory recall completely, regardless of `maxInjectedMemoryItems`.
 - `restoration.promptSnippetLength` still controls the per-result snippet size before final emission.
 - `restoration.maxInjectedMemoryItems` caps how many deduped hints can survive into the final `<memory-context>` block.
 - `restoration.dedupMinPrefix` dedupes identical or near-identical hints by normalized prefix before emission.

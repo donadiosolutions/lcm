@@ -76,7 +76,7 @@ export function buildMemoryContext(hints: string[], ids: string[] = []): string 
   const idsComment = ids.length > 0
     ? `\n<!-- surfaced-memory-ids: ${ids.join(",")} -->`
     : "";
-  return `<memory-context>\n${MEMORY_CONTEXT_INTRO}\n${snippets}${idsComment}\n</memory-context>`;
+  return fenceContent(`${MEMORY_CONTEXT_INTRO}\n${snippets}${idsComment}`, "memory-context");
 }
 
 export function selectMemoryHintsWithinBudget(
@@ -149,3 +149,4 @@ export function selectMemoryHintsWithinBudget(
     droppedForBudget,
   };
 }
+import { fenceContent } from "../daemon/content-fence.js";

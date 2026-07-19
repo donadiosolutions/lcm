@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { getLcmConnection, closeLcmConnection } from "../../db/connection.js";
+import { getLcmConnection, closeLcmConnection, withYieldingLcmConnectionLock } from "../../db/connection.js";
 import {
   ConfigValidationError,
   LLM_REASONING_EFFORTS,
@@ -293,7 +293,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
       }
       const paths = projectPaths(cwd);
       const pid = paths.id;
-      const result = await enqueue(pid, async () => {
+      const result = await enqueue(pid, async () => withYieldingLcmConnectionLock(paths.dbPath, async (connectionLock) => {
         const dbPath = paths.dbPath;
         ensureProjectDir(cwd);
 
@@ -372,7 +372,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
           const compactResult = await engine.compact({
             conversationId: conversation.conversationId,
             tokenBudget: 200_000,
-            summarize,
+            summarize: (...args) => connectionLock.yieldWhile(() => summarize(...args)),
             force: true,
             previousSummaryContent: validatedPreviousSummary,
           });
@@ -436,7 +436,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
         } finally {
           closeLcmConnection(dbPath);
         }
-      }); // end enqueue
+      })); // end connection lock and enqueue
 
       sendJson(res, 200, result);
     } catch (err) {

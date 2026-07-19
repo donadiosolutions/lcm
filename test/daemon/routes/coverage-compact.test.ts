@@ -49,7 +49,14 @@ vi.mock("../../../src/daemon/project.js", () => ({
 }));
 
 vi.mock("../../../src/daemon/project-queue.js", () => ({ enqueue: (_id: string, work: () => unknown) => work() }));
-vi.mock("../../../src/db/connection.js", () => ({ getLcmConnection: () => ({}), closeLcmConnection: vi.fn() }));
+vi.mock("../../../src/db/connection.js", () => ({
+  getLcmConnection: () => ({}),
+  closeLcmConnection: vi.fn(),
+  withYieldingLcmConnectionLock: (
+    _path: string,
+    work: (lock: { yieldWhile: (operation: () => Promise<unknown>) => Promise<unknown> }) => unknown,
+  ) => work({ yieldWhile: (operation) => operation() }),
+}));
 vi.mock("../../../src/db/migration.js", () => ({ runLcmMigrations: vi.fn() }));
 vi.mock("../../../src/db/redaction-stats.js", () => ({ upsertRedactionCounts: vi.fn() }));
 vi.mock("../../../src/transcript-provider.js", () => ({

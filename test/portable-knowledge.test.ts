@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { PromotedStore } from "../src/db/promoted.js";
@@ -15,6 +15,8 @@ import {
 } from "../src/portable-knowledge.js";
 import { addProjectAlias, clearProjectMapCache } from "../src/project-map.js";
 import { lcmHomeDir } from "../src/runtime-paths.js";
+import { isLcmConnectionOpen } from "../src/db/connection.js";
+import { ScrubEngine } from "../src/scrub.js";
 
 const tempDirs: string[] = [];
 const originalHome = process.env.HOME;
@@ -35,6 +37,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true });
   clearProjectMapCache();
   if (tempHome) rmSync(tempHome, { recursive: true, force: true });
@@ -150,6 +153,20 @@ describe("portable-knowledge — export", () => {
 
     const doc: ExportDocument = JSON.parse(readFileSync(outFile, "utf-8"));
     expect(doc.entries[0].content).not.toContain("sk-abcdefghijklmnopqrstuvwxyz123456");
+  });
+
+  it("applies global patterns to exported content and tags", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const outFile = join(makeTempDir(), "global-scrubbed.json");
+    seedProject(baseDir, cwd, [{ content: "private GLOBAL-1234", tags: ["token:GLOBAL-1234"] }]);
+    await exportKnowledge(cwd, {
+      output: outFile,
+      _lcmBaseDir: baseDir,
+      _globalPatterns: ["GLOBAL-[0-9]{4}"],
+    });
+    const doc: ExportDocument = JSON.parse(readFileSync(outFile, "utf-8"));
+    expect(doc.entries[0]).toMatchObject({ content: "private [REDACTED]", tags: ["[REDACTED]"] });
   });
 
   it("exports canonical project knowledge when invoked from an alias", async () => {
@@ -341,6 +358,20 @@ describe("portable-knowledge — import", () => {
     await expect(importKnowledge(cwd, doc, { _lcmBaseDir: baseDir })).rejects.toThrow(
       /Unsupported export version/,
     );
+  });
+
+  it("does not acquire a pooled connection when scrubber setup fails", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const projDir = join(baseDir, "projects", toProjectId(cwd));
+    const dbPath = join(projDir, "db.sqlite");
+    const setupFailure = new Error("scrubber setup failed");
+    vi.spyOn(ScrubEngine, "forProject").mockRejectedValueOnce(setupFailure);
+
+    await expect(importKnowledge(cwd, makeDoc([]), { _lcmBaseDir: baseDir }))
+      .rejects.toBe(setupFailure);
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    expect(existsSync(dbPath)).toBe(false);
   });
 
   it("overrides confidence when option is provided", async () => {

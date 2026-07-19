@@ -35,6 +35,16 @@ When using an external summarizer, only the text being summarized is sent — no
 
 Long Context Manager (LCM) scrubs secrets from message content **before writing to SQLite** and **before sending to the summarizer**. Redaction happens at both write points to ensure secrets are never persisted or transmitted.
 
+The same redaction boundary applies to passive hook events, promoted memories,
+manual-store content and tags, and portable exports/imports. It combines the
+bundled Gitleaks rules, built-in patterns, global `security.sensitivePatterns`,
+and the project's `sensitive-patterns.txt`. Previously captured passive events
+are scrubbed again before promotion.
+
+Memory restored into an agent prompt is wrapped in a content fence. Closing
+fence tags embedded in summaries, learned insights, or prompt-search hints are
+escaped so stored text cannot create a sibling instruction block.
+
 ### Built-in patterns
 
 These patterns are always active, regardless of configuration:
