@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, copyFileSync, rmSync, chmodSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { ensureCore } from "../src/bootstrap.js";
 import { lcmHomeDir } from "../src/runtime-paths.js";
@@ -10,7 +10,7 @@ import { atomicWritePrivateFile } from "../src/security-files.js";
 export { REQUIRED_HOOKS, mergeClaudeSettings } from "../src/installer/settings.js";
 
 export interface ServiceDeps {
-  spawnSync: (cmd: string, args: string[], opts?: any) => SpawnSyncReturns<string>;
+  spawnSync: (cmd: string, args: string[], opts?: SpawnSyncOptionsWithStringEncoding) => SpawnSyncReturns<string>;
   readFileSync: (path: string, encoding: string) => string;
   writeFileSync: (path: string, data: string) => void;
   mkdirSync: (path: string, opts?: any) => void;
@@ -41,14 +41,16 @@ async function readlinePrompt(question: string): Promise<string> {
 
 export { readlinePrompt as _readlinePromptForTesting };
 
-const defaultDeps: ServiceDeps = { spawnSync: spawnSync as any, readFileSync: (path, encoding) => readFileSync(path, encoding as BufferEncoding) as string, writeFileSync, mkdirSync, existsSync, chmodSync: chmodSync, lstatSync, atomicWritePrivateFile, promptUser: readlinePrompt };
+const defaultDeps: ServiceDeps = { spawnSync: (cmd, args, opts) => spawnSync(cmd, args, { encoding: "utf-8", ...opts }), readFileSync: (path, encoding) => readFileSync(path, encoding as BufferEncoding) as string, writeFileSync, mkdirSync, existsSync, chmodSync: chmodSync, lstatSync, atomicWritePrivateFile, promptUser: readlinePrompt };
 
 function safeConfigExists(deps: ServiceDeps, path: string): boolean {
   if (!deps.lstatSync) return deps.existsSync(path);
   try {
-    if (deps.lstatSync(path).isSymbolicLink()) {
+    const stat = deps.lstatSync(path);
+    if (stat.isSymbolicLink()) {
       throw new Error(`refusing to use a symlink config path: ${path}`);
     }
+    if (!stat.isFile()) throw new Error(`config path is not a regular file: ${path}`);
     return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
@@ -57,7 +59,7 @@ function safeConfigExists(deps: ServiceDeps, path: string): boolean {
 }
 
 export interface ResolveBinaryDeps {
-  spawnSync: (cmd: string, args: string[], opts?: object) => { status: number | null; stdout: string | Buffer };
+  spawnSync: (cmd: string, args: string[], opts?: SpawnSyncOptionsWithStringEncoding) => { status: number | null; stdout: string | Buffer };
   existsSync: (path: string) => boolean;
 }
 

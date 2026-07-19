@@ -10,6 +10,7 @@ const state = vi.hoisted(() => ({
   promoted: [] as SearchResult[],
   passive: [] as SearchResult[],
   closed: [] as string[],
+  instructionPaths: [] as string[],
 }));
 
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({
@@ -22,6 +23,12 @@ vi.mock("../../../src/daemon/validate-cwd.js", () => ({
 vi.mock("../../../src/daemon/project.js", () => ({ projectDbPath: (cwd: string) => `${cwd}/lcm.db` }));
 vi.mock("../../../src/daemon/orientation.js", () => ({ buildOrientationPrompt: () => "orientation" }));
 vi.mock("../../../src/daemon/content-fence.js", () => ({ fenceContent: (content: string, label: string) => `<${label}>${content}</${label}>` }));
+vi.mock("../../../src/security-files.js", () => ({
+  readBoundedRegularFile: (path: string) => {
+    state.instructionPaths.push(path);
+    throw Object.assign(new Error("missing"), { code: "ENOENT" });
+  },
+}));
 vi.mock("../../../src/daemon/routes/compact.js", () => ({
   justCompactedMap: new Map<string, number>(),
   JUST_COMPACTED_TTL_MS: 30_000,
@@ -112,6 +119,7 @@ describe("restore route coverage", () => {
     state.promoted = [];
     state.passive = [];
     state.closed = [];
+    state.instructionPaths = [];
     justCompactedMap.clear();
   });
 
@@ -128,6 +136,7 @@ describe("restore route coverage", () => {
       client: "codex",
     }));
     expect(body).toEqual({ context: "orientation" });
+    expect(state.instructionPaths.some((path) => path.startsWith(oversizedCwd))).toBe(false);
   });
 
   it.each([

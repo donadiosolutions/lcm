@@ -57,7 +57,7 @@ function createLockFile(path: string, deps: SessionLockDeps): void {
   }
 }
 
-/** Returns true if lock was acquired, false if another live process holds it. */
+/** Returns true if acquired; false when ownership or safe reclamation cannot be verified. */
 function tryAcquireSessionLock(
   sessionId: string,
   deps: SessionLockDeps = defaultSessionLockDeps,

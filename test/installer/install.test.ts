@@ -263,10 +263,19 @@ describe("install", () => {
 
   it("rejects stale config symlink leaves before reading or writing them", async () => {
     const deps = makeDeps({
-      lstatSync: vi.fn(() => ({ isSymbolicLink: () => true }) as never),
+      lstatSync: vi.fn(() => ({ isSymbolicLink: () => true, isFile: () => false }) as never),
     });
 
     await expect(install(deps)).rejects.toThrow("symlink config path");
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-regular config leaves before reading or writing them", async () => {
+    const deps = makeDeps({
+      lstatSync: vi.fn(() => ({ isSymbolicLink: () => false, isFile: () => false }) as never),
+    });
+
+    await expect(install(deps)).rejects.toThrow("not a regular file");
     expect(deps.writeFileSync).not.toHaveBeenCalled();
   });
 
@@ -289,7 +298,7 @@ describe("install", () => {
   it("accepts an existing regular config leaf", async () => {
     const atomicWritePrivateFile = vi.fn();
     const deps = makeDeps({
-      lstatSync: vi.fn(() => ({ isSymbolicLink: () => false }) as never),
+      lstatSync: vi.fn(() => ({ isSymbolicLink: () => false, isFile: () => true }) as never),
       existsSync: vi.fn((path: string) => path.endsWith("config.json")),
       atomicWritePrivateFile,
     });

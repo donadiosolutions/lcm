@@ -425,11 +425,12 @@ export function addProjectAlias(alias: string, opts: { canonical?: string; hash?
     throw new Error(`alias is already mapped to ${target.hash}: ${normalizedAlias}`);
   }
   if (existingOwners.size > 0) {
+    const canonicalAlias = normalizeProjectPath(normalizedAlias);
     const adoptableOwners = [...existingOwners].filter((ownerHash) => {
       const entry = target.map[ownerHash];
       return entry
-        && ownerHash === hashProjectPath(normalizedAlias)
-        && resolve(entry.canonical) === normalizedAlias
+        && ownerHash === hashProjectPath(canonicalAlias)
+        && normalizeProjectPath(entry.canonical) === canonicalAlias
         && entry.aliases.length === 0;
     });
     if (existingOwners.size === 1 && adoptableOwners.length === 1) {

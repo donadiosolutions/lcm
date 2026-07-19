@@ -304,13 +304,12 @@ describe("handleSessionStart", () => {
 
   it("releases the reclamation guard when replacement loses a race", () => {
     const exists = Object.assign(new Error("exists"), { code: "EEXIST" });
-    const denied = Object.assign(new Error("denied"), { code: "EACCES" });
     const lockPath = sessionLockPathForTesting("lost-reclaim-race");
     const deps = {
       open: vi.fn()
         .mockImplementationOnce(() => { throw exists; })
         .mockReturnValueOnce(20)
-        .mockImplementationOnce(() => { throw denied; }),
+        .mockImplementationOnce(() => { throw exists; }),
       write: vi.fn(),
       close: vi.fn(),
       read: vi.fn(() => "9999999"),

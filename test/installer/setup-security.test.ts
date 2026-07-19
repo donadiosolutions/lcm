@@ -37,4 +37,27 @@ describe("setup config leaf security", () => {
     expect(result.stderr).toContain("refusing to use symlink config path");
     if (kind === "existing") expect(readFileSync(victim, "utf-8")).toBe('{"preserve":true}\n');
   });
+
+  it("rejects an oversized existing config before parsing it", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-setup-security-"));
+    roots.push(root);
+    const home = join(root, "home");
+    const bin = join(root, "bin");
+    const configDir = join(home, ".lcm");
+    mkdirSync(configDir, { recursive: true });
+    mkdirSync(bin);
+    const fakeLcm = join(bin, "lcm");
+    writeFileSync(fakeLcm, "#!/usr/bin/env bash\nexit 0\n");
+    chmodSync(fakeLcm, 0o755);
+    writeFileSync(join(configDir, "config.json"), `{"padding":"${"x".repeat(1024 * 1024)}"}\n`);
+
+    const result = spawnSync("bash", [join(process.cwd(), "installer", "setup.sh")], {
+      encoding: "utf-8",
+      input: "",
+      env: { ...process.env, HOME: home, USERPROFILE: home, PATH: `${bin}:${process.env.PATH ?? ""}` },
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Failed to parse existing config");
+  });
 });

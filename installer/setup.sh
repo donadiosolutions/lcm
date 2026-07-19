@@ -200,7 +200,18 @@ let configFd;
 try {
   configFd = fs.openSync(configFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
   if (!fs.fstatSync(configFd).isFile()) throw new Error('config path is not a regular file');
-  raw = fs.readFileSync(configFd, 'utf8');
+  const maxConfigBytes = 1024 * 1024;
+  const chunks = [];
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let total = 0;
+  while (total <= maxConfigBytes) {
+    const bytesRead = fs.readSync(configFd, buffer, 0, Math.min(buffer.length, maxConfigBytes + 1 - total), null);
+    if (bytesRead === 0) break;
+    chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+    total += bytesRead;
+  }
+  if (total > maxConfigBytes) throw new Error('config file exceeds 1 MiB');
+  raw = Buffer.concat(chunks, total).toString('utf8');
   JSON.parse(raw); // validate
 } catch (err) {
   console.error(`Error: Failed to parse existing config at ${configFile}.`);
