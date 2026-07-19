@@ -12,10 +12,15 @@ type FakeStdin = EventEmitter & {
   writableEnded: boolean;
 };
 
+type FakeStdout = EventEmitter & {
+  destroy: ReturnType<typeof vi.fn>;
+};
+
 type FakeChild = EventEmitter & {
-  stdout: EventEmitter;
+  stdout: FakeStdout;
   stdin: FakeStdin;
   kill: ReturnType<typeof vi.fn>;
+  unref: ReturnType<typeof vi.fn>;
   exitCode: number | null;
   signalCode: NodeJS.Signals | null;
 };
@@ -41,7 +46,7 @@ vi.mock("node:child_process", () => ({
   spawnSync: (...args: unknown[]) => mocks.spawnSync(...args),
   spawn: vi.fn().mockImplementation(() => {
     const child = new EventEmitter() as FakeChild;
-    child.stdout = new EventEmitter();
+    child.stdout = Object.assign(new EventEmitter(), { destroy: vi.fn() });
     child.stdin = Object.assign(new EventEmitter(), {
       write: vi.fn(),
       end: vi.fn(() => { child.stdin.writableEnded = true; }),
@@ -51,6 +56,7 @@ vi.mock("node:child_process", () => ({
     });
     child.exitCode = null;
     child.signalCode = null;
+    child.unref = vi.fn();
     child.kill = vi.fn(() => {
       child.signalCode = "SIGTERM";
       child.emit("close", null, "SIGTERM");
@@ -339,7 +345,44 @@ describe("doctor service coverage", () => {
       status: "warn",
       message: "lcm: 0/7 tools",
     });
-    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
+    expect(mocks.mcpChild?.kill).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["returns-false", "throws"] as const)("retries a failed child stop at timeout when kill %s", async (failure) => {
+    vi.useFakeTimers();
+    mocks.ensureDaemon.mockResolvedValue({ connected: true });
+    mocks.mcpSetup = (child) => {
+      child.kill = vi.fn(() => {
+        if (failure === "throws") throw new Error("kill failed");
+        return false;
+      });
+      if (failure === "throws") {
+        child.stdout.destroy.mockImplementation(() => { throw new Error("destroy failed"); });
+        child.unref.mockImplementation(() => { throw new Error("unref failed"); });
+      }
+      setTimeout(() => {
+        child.stdout.emit("data", Buffer.from(JSON.stringify({ id: 2, result: { tools: Array(7).fill({}) } })));
+        child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
+        child.stdout.emit("error", new Error("duplicate pipe failure"));
+        child.stdin.emit("close");
+      }, 1);
+    };
+
+    const promise = runDoctor(healthyDeps());
+    await vi.advanceTimersByTimeAsync(1000);
+    const child = mocks.mcpChild!;
+    expect(child.kill).toHaveBeenCalledOnce();
+    expect(child.stdin.write).toHaveBeenCalledOnce();
+    expect(child.stdin.end).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({
+      status: "pass",
+      message: "lcm: 7/7 tools",
+    });
+    expect(child.kill).toHaveBeenCalledTimes(2);
+    expect(child.stdout.destroy).toHaveBeenCalledOnce();
+    expect(child.unref).toHaveBeenCalledOnce();
   });
 
   it.each(["destroyed", "unwritable"])("settles without writing when stdin is initially %s", async (state) => {

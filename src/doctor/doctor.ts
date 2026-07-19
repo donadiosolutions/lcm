@@ -218,6 +218,7 @@ function testMcpHandshake(): Promise<CheckResult> {
     let stdout = "";
     let finished = false;
     let stopRequested = false;
+    let killAttempted = false;
     const timers = new Set<ReturnType<typeof setTimeout>>();
 
     const resultFromOutput = (): CheckResult => {
@@ -241,13 +242,15 @@ function testMcpHandshake(): Promise<CheckResult> {
     };
 
     const childIsLive = (): boolean => child.exitCode === null && child.signalCode === null;
-    const stopChild = (): void => {
-      if (stopRequested || !childIsLive()) return;
+    const stopChild = (retry = false): boolean => {
       stopRequested = true;
-      try { child.kill(); } catch {}
+      if (!childIsLive()) return true;
+      if (killAttempted && !retry) return false;
+      killAttempted = true;
+      try { return child.kill(); } catch { return false; }
     };
-    const finishForPipeFailure = (): void => {
-      if (finished || !childIsLive()) return;
+    const stopChildForPipeFailure = (): void => {
+      if (finished) return;
       // Killing can synchronously emit close. Otherwise keep the watchdog
       // active so any stdout produced during shutdown can still be collected.
       stopChild();
@@ -260,52 +263,56 @@ function testMcpHandshake(): Promise<CheckResult> {
       && !child.stdin.writableEnded;
 
     child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.stdout.on("error", finishForPipeFailure);
+    child.stdout.on("error", stopChildForPipeFailure);
     child.on("close", () => { finish(resultFromOutput()); });
     child.on("error", () => {
       finish({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "Could not spawn MCP process" });
     });
-    child.stdin.on("error", finishForPipeFailure);
+    child.stdin.on("error", stopChildForPipeFailure);
     child.stdin.on("close", () => {
-      if (!child.stdin.writableEnded) finishForPipeFailure();
+      if (!child.stdin.writableEnded) stopChildForPipeFailure();
     });
 
     timers.add(setTimeout(() => {
-      stopChild();
+      stopChild(true);
+      if (childIsLive()) {
+        try { child.stdout.destroy(); } catch {}
+        try { child.unref(); } catch {}
+      }
       finish(resultFromOutput());
     }, 6000));
 
     // Send initialize, wait 300ms, then send tools/list, then close stdin after 500ms
     if (!stdinIsWritable()) {
-      finishForPipeFailure();
+      stopChildForPipeFailure();
       return;
     }
     timers.add(setTimeout(() => {
       if (!stdinIsWritable()) {
-        finishForPipeFailure();
+        stopChildForPipeFailure();
         return;
       }
       timers.add(setTimeout(() => {
         if (!stdinIsWritable()) {
-          finishForPipeFailure();
+          stopChildForPipeFailure();
           return;
         }
         try {
           child.stdin.end();
         } catch {
-          finishForPipeFailure();
+          stopChildForPipeFailure();
         }
       }, 500));
       try {
         child.stdin.write(listMsg + "\n");
       } catch {
-        finishForPipeFailure();
+        stopChildForPipeFailure();
       }
     }, 300));
     try {
       child.stdin.write(initMsg + "\n");
     } catch {
-      finishForPipeFailure();
+      stopChildForPipeFailure();
     }
   });
 }
