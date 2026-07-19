@@ -55,6 +55,10 @@ Every other included PR appears under **Extra notes**. Do not combine
    - To finish a beta series, manually run `Version Packages` with
      `channel=stable`. Changesets exits beta mode and replaces the prerelease
      with the corresponding stable version.
+   - A manual choice is stored on the open `changeset-release/main` PR as
+     `release-channel:beta` or `release-channel:stable`. Later `main` pushes
+     keep using that channel while Changesets updates the same PR. Multiple
+     matching PRs or conflicting channel labels stop the workflow.
 3. Review and merge the generated version PR.
 4. Create and push a signed annotated tag at that exact merge commit. Supported
    forms are `vX.Y.Z` and `vX.Y.Z-beta.N`; alpha, RC, other prerelease labels,
@@ -126,6 +130,11 @@ and grants write access only to its version job. That job needs `contents: write
 for GitHub-API version commits, `pull-requests: write` for the Changesets PR,
 `issues: write` for its `no-release-notes` label, and `actions: read` for the
 failed-manual-transition guard.
+
+The version PR labeler creates the internal channel labels idempotently, keeps
+only the resolved beta or stable label, and also applies `no-release-notes`.
+After the PR merges or closes, normal pushes no longer find a persisted label;
+`auto` then follows the committed `.changeset/pre.json` state.
 
 Recommended external setup:
 

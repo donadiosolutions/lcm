@@ -55,6 +55,58 @@ jobs:
               );
             }
 
+      - name: Resolve release channel
+        id: channel
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_CHANNEL: ${{ inputs.channel }}
+        with:
+          script: |
+            const channelLabels = new Map([
+              ["release-channel:beta", "beta"],
+              ["release-channel:stable", "stable"],
+            ]);
+            const eventName = process.env.EVENT_NAME;
+            let channel;
+
+            if (eventName === "workflow_dispatch") {
+              channel = process.env.REQUESTED_CHANNEL;
+              if (!["beta", "stable"].includes(channel)) {
+                throw new Error(`Manual version run has invalid channel ${JSON.stringify(channel)}`);
+              }
+            } else if (eventName === "push") {
+              const pulls = await github.paginate(github.rest.pulls.list, {
+                ...context.repo,
+                state: "open",
+                base: "main",
+                head: `${context.repo.owner}:changeset-release/main`,
+                per_page: 100,
+              });
+              if (pulls.length > 1) {
+                throw new Error(
+                  `Expected at most one open changeset-release/main PR, found ${pulls.length}`,
+                );
+              }
+
+              const persisted = new Set(
+                (pulls[0]?.labels ?? [])
+                  .map((label) => label?.name?.toLowerCase())
+                  .filter((name) => channelLabels.has(name)),
+              );
+              if (persisted.size > 1) {
+                throw new Error(
+                  `Version PR #${pulls[0].number} has conflicting release-channel labels`,
+                );
+              }
+              channel = persisted.size === 1 ? channelLabels.get([...persisted][0]) : "auto";
+            } else {
+              throw new Error(`Unsupported version workflow event ${eventName}`);
+            }
+
+            core.setOutput("channel", channel);
+            core.info(`Resolved release channel ${channel}`);
+
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -83,39 +135,84 @@ jobs:
           createGithubReleases: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LCM_RELEASE_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || 'auto' }}
+          LCM_RELEASE_CHANNEL: ${{ steps.channel.outputs.channel }}
 
-      - name: Exclude version PR from release notes
+      - name: Apply version PR policy labels
         if: ${{ steps.changesets.outputs.pullRequestNumber != '' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PR_NUMBER: ${{ steps.changesets.outputs.pullRequestNumber }}
+          RELEASE_CHANNEL: ${{ steps.channel.outputs.channel }}
         with:
           script: |
             const issue_number = Number(process.env.PR_NUMBER);
             if (!Number.isSafeInteger(issue_number) || issue_number <= 0) {
               throw new Error(`Invalid Changesets PR number: ${process.env.PR_NUMBER}`);
             }
+            const channel = process.env.RELEASE_CHANNEL;
+            if (!["auto", "beta", "stable"].includes(channel)) {
+              throw new Error(`Invalid resolved release channel ${JSON.stringify(channel)}`);
+            }
 
-            const name = "no-release-notes";
-            try {
-              await github.rest.issues.getLabel({ ...context.repo, name });
-            } catch (error) {
-              if (error.status !== 404) throw error;
-              try {
-                await github.rest.issues.createLabel({
-                  ...context.repo,
-                  name,
+            const definitions = new Map([
+              [
+                "no-release-notes",
+                {
                   color: "ededed",
                   description: "Exclude this pull request from generated release notes",
-                });
-              } catch (createError) {
-                if (createError.status !== 422) throw createError;
+                },
+              ],
+              [
+                "release-channel:beta",
+                {
+                  color: "fbca04",
+                  description: "Persist the beta Changesets version-PR channel",
+                },
+              ],
+              [
+                "release-channel:stable",
+                {
+                  color: "0e8a16",
+                  description: "Persist the stable Changesets version-PR channel",
+                },
+              ],
+            ]);
+            const desired = ["no-release-notes"];
+            if (channel !== "auto") desired.push(`release-channel:${channel}`);
+
+            for (const name of desired) {
+              try {
+                await github.rest.issues.getLabel({ ...context.repo, name });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                try {
+                  await github.rest.issues.createLabel({
+                    ...context.repo,
+                    name,
+                    ...definitions.get(name),
+                  });
+                } catch (createError) {
+                  if (createError.status !== 422) throw createError;
+                }
               }
             }
 
             await github.rest.issues.addLabels({
               ...context.repo,
               issue_number,
-              labels: [name],
+              labels: desired,
             });
+
+            if (channel !== "auto") {
+              const opposite =
+                channel === "beta" ? "release-channel:stable" : "release-channel:beta";
+              try {
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number,
+                  name: opposite,
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }

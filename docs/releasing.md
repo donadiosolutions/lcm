@@ -20,6 +20,15 @@ subsequent Changesets increment it automatically. To produce the stable version,
 run the same workflow with the `stable` channel and merge the updated version
 PR. A stable transition is accepted only while beta mode is active.
 
+A manual channel choice is persisted on the open `changeset-release/main`
+version PR as exactly one internal `release-channel:beta` or
+`release-channel:stable` label. Later pushes to `main` reuse that label when the
+Changesets action updates the same PR, so unrelated changes cannot reset the
+manual choice to automatic mode. Multiple open version PRs or conflicting
+channel labels fail closed. When the version PR merges or closes, the lookup no
+longer finds it and automatic runs again follow the prerelease state committed
+in `.changeset/pre.json`.
+
 ## Draft and publication gate
 
 Push a signed annotated tag at the exact version-PR merge commit. The tag
@@ -83,6 +92,11 @@ ignores its own tag's earlier failed attempt. Version-package runs use a
 separate native FIFO queue and block behind any failed manual beta/stable
 transition until that transition run succeeds on retry, preventing later
 automatic work from silently overtaking it.
+
+Each publication workflow run stores its direct event tag in the strict
+`release-tag:TAG` run name. Completed-run recovery policy reads only that stored
+name; it does not infer a tag from a branch or commit SHA. A failed historical
+run without a canonical stored tag therefore fails closed.
 
 The version workflow grants no token permissions by default. Its sole job gets
 only the permissions it needs: Actions read access for the prior-failure guard,

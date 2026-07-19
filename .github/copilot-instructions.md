@@ -93,6 +93,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Grant `security-events: write` only on the CodeQL analysis job that uploads SARIF; job-level permissions must restate every required read permission because they replace workflow defaults.
 - Follow least privilege in workflow `permissions`; omit `packages: read` unless a step actually reads packages.
 - Set `persist-credentials: false` on checkout steps in read-only workflows.
+- Release-run recovery must read the canonical event tag from the workflow's strict `run-name`; do not infer historical tags from `head_branch`, a commit SHA, or another mutable/ref-derived field.
+- Persist manual Changesets beta/stable intent on the single open `changeset-release/main` PR with exactly one internal release-channel label, and fail closed on duplicate PRs or conflicting channel labels.
 - When replacing a generated workflow, update README badges and links to the new workflow filename.
 - Production-path allowlists must cover shipped executable plugin scripts such as `.claude-plugin/`, not only the primary source directories.
 

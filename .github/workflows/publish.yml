@@ -1,4 +1,5 @@
 name: Publish Package
+run-name: release-tag:${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
 
 on:
   push:
@@ -323,6 +324,20 @@ jobs:
               throw new Error(`Invalid workflow run id ${context.runId}`);
             }
             const currentTag = process.env.RELEASE_TAG;
+            const canonicalTagPattern = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*))?$/;
+            const storedRunNamePattern = new RegExp(`^release-tag:(${canonicalTagPattern.source.slice(1, -1)})$`);
+            if (!canonicalTagPattern.test(currentTag)) {
+              throw new Error(`Current release event has unsupported tag ${currentTag}`);
+            }
+            const storedTag = (run, required) => {
+              const match = storedRunNamePattern.exec(run.display_title ?? "");
+              if (!match && required) {
+                throw new Error(
+                  `Failed release run ${run.id} has no canonical tag in its stored run name`,
+                );
+              }
+              return match?.[1];
+            };
             const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
               ...context.repo,
               workflow_id: "publish.yml",
@@ -330,34 +345,34 @@ jobs:
               status: "completed",
               per_page: 100,
             });
-            const failedRuns = runs.filter(
-              (run) => run.id < currentRunId && run.conclusion !== "success",
-            );
-            const successfulRuns = runs.filter(
-              (run) => run.id < currentRunId && run.conclusion === "success",
-            );
+            const failedRuns = runs
+              .filter((run) => run.id < currentRunId && run.conclusion !== "success")
+              .map((run) => ({ ...run, releaseTag: storedTag(run, true) }));
+            const successfulRuns = runs
+              .filter((run) => run.id < currentRunId && run.conclusion === "success")
+              .flatMap((run) => {
+                const releaseTag = storedTag(run, false);
+                return releaseTag ? [{ ...run, releaseTag }] : [];
+              });
             const blockingFailures = [];
             for (const run of failedRuns) {
-              if (run.head_branch === currentTag) {
+              if (run.releaseTag === currentTag) {
                 core.warning(`Ignoring failed earlier attempt ${run.id} for retry tag ${currentTag}`);
                 continue;
               }
-              const supersedingRun =
-                typeof run.head_branch === "string" &&
-                successfulRuns.find(
-                  (candidate) =>
-                    candidate.head_branch === run.head_branch && candidate.id > run.id,
-                );
+              const supersedingRun = successfulRuns.find(
+                (candidate) => candidate.releaseTag === run.releaseTag && candidate.id > run.id,
+              );
               if (supersedingRun) {
                 core.warning(
-                  `Ignoring failed release run ${run.id}; later run ${supersedingRun.id} succeeded for ${run.head_branch}`,
+                  `Ignoring failed release run ${run.id}; later run ${supersedingRun.id} succeeded for ${run.releaseTag}`,
                 );
                 continue;
               }
               try {
                 const { data: release } = await github.rest.repos.getReleaseByTag({
                   ...context.repo,
-                  tag: run.head_branch,
+                  tag: run.releaseTag,
                 });
                 if (release.draft) {
                   core.warning(`Ignoring withdrawn draft from failed release run ${run.id}`);
@@ -370,7 +385,7 @@ jobs:
             }
             if (blockingFailures.length > 0) {
               throw new Error(
-                `Earlier release runs for other tags failed and must be rerun successfully or withdrawn to draft: ${blockingFailures.map((run) => `${run.id} (${run.head_branch ?? "unknown tag"}/${run.conclusion})`).join(", ")}`,
+                `Earlier release runs for other tags failed and must be rerun successfully or withdrawn to draft: ${blockingFailures.map((run) => `${run.id} (${run.releaseTag}/${run.conclusion})`).join(", ")}`,
               );
             }
 

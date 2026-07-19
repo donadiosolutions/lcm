@@ -69,6 +69,9 @@ to npm.
   draft, and a maintainer must publish that draft to trigger npm
 - **npm dist-tags are channel-safe**: beta releases update `beta`; stable releases
   update `latest`, which must remain the highest stable version
+- **Changesets channel intent lives on the open version PR**: manual beta or
+  stable runs apply one internal release-channel label that later main pushes
+  reuse until the PR merges or closes
 - **The helper checks npm channel ordering before mutation**: stale beta or
   stable requests stop before pulling, branching, committing, or tagging
 - **GitHub publication is not transactional with npm**: GitHub briefly makes a

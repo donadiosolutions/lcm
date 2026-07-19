@@ -40,6 +40,7 @@ interface VersionWorkflow {
 }
 
 interface PublishWorkflow {
+  "run-name": string;
   on: {
     push: { tags: string[] };
     release: { types: string[] };
@@ -102,6 +103,29 @@ describe("release workflows", () => {
     expect(versionQueue?.with?.script).toContain('run.conclusion !== "success"');
     expect(versionQueue?.with?.script).toContain("must be rerun successfully");
     expect(versionQueue?.with?.script).not.toContain("setTimeout");
+    const channel = versionWorkflow.jobs.version.steps.find(
+      (step) => step.name === "Resolve release channel",
+    );
+    expect(channel?.id).toBe("channel");
+    expect(channel?.uses).toBe(
+      "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
+    );
+    expect(channel?.env).toMatchObject({
+      EVENT_NAME: "${{ github.event_name }}",
+      REQUESTED_CHANNEL: "${{ inputs.channel }}",
+    });
+    expect(channel?.with?.script).toContain('eventName === "workflow_dispatch"');
+    expect(channel?.with?.script).toContain('eventName === "push"');
+    expect(channel?.with?.script).toContain("github.rest.pulls.list");
+    expect(channel?.with?.script).toContain('state: "open"');
+    expect(channel?.with?.script).toContain('base: "main"');
+    expect(channel?.with?.script).toContain('head: `${context.repo.owner}:changeset-release/main`');
+    expect(channel?.with?.script).toContain("if (pulls.length > 1)");
+    expect(channel?.with?.script).toContain('"release-channel:beta"');
+    expect(channel?.with?.script).toContain('"release-channel:stable"');
+    expect(channel?.with?.script).toContain("if (persisted.size > 1)");
+    expect(channel?.with?.script).toContain(': "auto"');
+    expect(channel?.with?.script).toContain('core.setOutput("channel", channel)');
     const changesets = versionWorkflow.jobs.version.steps.find((step) => step.id === "changesets");
     expect(changesets?.with).toMatchObject({
       branch: "main",
@@ -109,18 +133,35 @@ describe("release workflows", () => {
       version: "npm run version-packages",
       createGithubReleases: false,
     });
-    expect(changesets?.env?.LCM_RELEASE_CHANNEL).toContain("inputs.channel");
-    const releaseNoteExclusion = versionWorkflow.jobs.version.steps.find(
-      (step) => step.name === "Exclude version PR from release notes",
+    expect(changesets?.env?.LCM_RELEASE_CHANNEL).toBe("${{ steps.channel.outputs.channel }}");
+    expect(versionWorkflow.jobs.version.steps.indexOf(channel!)).toBeLessThan(
+      versionWorkflow.jobs.version.steps.indexOf(changesets!),
     );
-    expect(releaseNoteExclusion?.with?.script).toContain('const name = "no-release-notes"');
-    expect(releaseNoteExclusion?.with?.script).toContain("labels: [name]");
-    expect(releaseNoteExclusion?.with?.script).not.toContain('"chore"');
-    expect(releaseNoteExclusion?.with?.script).not.toContain('"release-workflow"');
+    const releasePolicyLabels = versionWorkflow.jobs.version.steps.find(
+      (step) => step.name === "Apply version PR policy labels",
+    );
+    expect(releasePolicyLabels?.env).toMatchObject({
+      PR_NUMBER: "${{ steps.changesets.outputs.pullRequestNumber }}",
+      RELEASE_CHANNEL: "${{ steps.channel.outputs.channel }}",
+    });
+    expect(releasePolicyLabels?.with?.script).toContain('"no-release-notes"');
+    expect(releasePolicyLabels?.with?.script).toContain('"release-channel:beta"');
+    expect(releasePolicyLabels?.with?.script).toContain('"release-channel:stable"');
+    expect(releasePolicyLabels?.with?.script).toContain("github.rest.issues.getLabel");
+    expect(releasePolicyLabels?.with?.script).toContain("github.rest.issues.createLabel");
+    expect(releasePolicyLabels?.with?.script).toContain("createError.status !== 422");
+    expect(releasePolicyLabels?.with?.script).toContain("labels: desired");
+    expect(releasePolicyLabels?.with?.script).toContain("github.rest.issues.removeLabel");
+    expect(releasePolicyLabels?.with?.script).toContain('if (error.status !== 404) throw error');
+    expect(releasePolicyLabels?.with?.script).not.toContain('"chore"');
+    expect(releasePolicyLabels?.with?.script).not.toContain('"release-workflow"');
   });
 
   it("separates tag-driven drafts from manually published npm releases", () => {
     expect(publishWorkflow.on.push.tags).toEqual(["v*.*.*"]);
+    expect(publishWorkflow["run-name"]).toBe(
+      "release-tag:${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}",
+    );
     expect(publishWorkflow.on.release.types).toEqual(["published"]);
     expect(publishWorkflow.on).not.toHaveProperty("workflow_dispatch");
     expect(publishWorkflow.jobs.draft.if).toContain("github.event_name == 'push'");
@@ -166,11 +207,16 @@ describe("release workflows", () => {
     expect(publicationQueue?.with?.script).toContain('status: "completed"');
     expect(publicationQueue?.with?.script).toContain("run.conclusion !== \"success\"");
     expect(publicationQueue?.with?.script).toContain('run.conclusion === "success"');
+    expect(publicationQueue?.with?.script).toContain("run.display_title");
+    expect(publicationQueue?.with?.script).toContain("^release-tag:");
+    expect(publicationQueue?.with?.script).toContain("has no canonical tag in its stored run name");
     expect(publicationQueue?.with?.script).toContain(
-      "candidate.head_branch === run.head_branch && candidate.id > run.id",
+      "candidate.releaseTag === run.releaseTag && candidate.id > run.id",
     );
     expect(publicationQueue?.with?.script).toContain("later run ${supersedingRun.id} succeeded");
-    expect(publicationQueue?.with?.script).toContain("run.head_branch === currentTag");
+    expect(publicationQueue?.with?.script).toContain("run.releaseTag === currentTag");
+    expect(publicationQueue?.with?.script).toContain("tag: run.releaseTag");
+    expect(publicationQueue?.with?.script).not.toContain("head_branch");
     expect(publicationQueue?.with?.script).toContain("for retry tag");
     expect(publicationQueue?.with?.script).toContain("if (release.draft)");
     expect(publicationQueue?.with?.script).toContain("for other tags failed");
