@@ -32,6 +32,19 @@ describe("renderFrame — non-TTY mode", () => {
     expect(output).toMatch(/\n$/);
   });
 
+  it("counts failed sessions as processed in non-TTY output", () => {
+    const state = makeProgressState({ total: 2 });
+    state.errors.push({ sessionId: "failed-session", message: "provider unavailable" });
+    state.lastResult = {
+      sessionId: "failed-session",
+      messages: 10,
+      tokensBefore: 1_000,
+      elapsed: 100,
+    };
+
+    expect(renderFrame(state, nonTTY)).toContain("[1/2]");
+  });
+
   it("shows token reduction when tokensAfter < tokensBefore", () => {
     const state = makeProgressState({ total: 3 });
     state.completed = 1;
@@ -106,6 +119,18 @@ describe("renderFrame — TTY non-verbose mode", () => {
     const state = makeProgressState({ total: 5, dryRun: true });
     const output = renderFrame(state, ttyOpts, 0);
     expect(output).toContain("[dry-run]");
+  });
+
+  it("reaches full live progress when every session failed", () => {
+    const state = makeProgressState({ total: 2 });
+    state.errors.push({ sessionId: "failed-session", message: "provider unavailable" });
+    state.errors.push({ sessionId: "also-failed", message: "request timed out" });
+
+    const output = renderFrame(state, ttyOpts, 0);
+
+    expect(output).toContain("2/2");
+    expect(output).toContain("[██████████████████████] 100%");
+    expect(output).toContain("2 failed");
   });
 
   it("shows phase bar when phases are provided", () => {
