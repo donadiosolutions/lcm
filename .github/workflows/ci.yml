@@ -41,6 +41,9 @@ jobs:
       - name: Run tests
         run: npm run test:ci
 
+      - name: Test issue label policy
+        run: node --test .github/scripts/issue-label-policy.test.mjs
+
       - name: Upload Vitest reports
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
