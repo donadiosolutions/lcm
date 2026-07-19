@@ -15,7 +15,6 @@ on:
 
 permissions:
   checks: read
-  contents: read
   statuses: write
 
 concurrency:
@@ -66,14 +65,28 @@ jobs:
           # shellcheck disable=SC2329
           admission_failed() {
             local exit_code=$?
-            trap - EXIT
+            trap - EXIT INT TERM
             if (( exit_code != 0 )); then
               post_admission_status failure \
                 "External admission failed; inspect the workflow run" || true
             fi
             exit "$exit_code"
           }
+
+          # GitHub cancels an obsolete concurrency-group run with INT, followed
+          # by TERM if needed. Do not let its EXIT trap publish a failure after
+          # the replacement run has published a newer status for the same SHA.
+          # shellcheck disable=SC2329
+          admission_cancelled() {
+            local signal_name="$1"
+            local exit_code="$2"
+            trap - EXIT INT TERM
+            echo "Run cancelled by $signal_name; leaving admission status unchanged."
+            exit "$exit_code"
+          }
           trap admission_failed EXIT
+          trap 'admission_cancelled INT 130' INT
+          trap 'admission_cancelled TERM 143' TERM
 
           post_admission_status pending \
             "Waiting for CodeRabbit, Codecov patch, and DCO"
@@ -138,7 +151,7 @@ jobs:
               "$codecov_state" == success && "$dco_state" == success ]]; then
               post_admission_status success \
                 "CodeRabbit, Codecov patch, and DCO passed"
-              trap - EXIT
+              trap - EXIT INT TERM
               exit 0
             fi
 
