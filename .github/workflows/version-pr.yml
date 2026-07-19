@@ -4,10 +4,24 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Enter beta prerelease mode or exit an active beta for a stable release.
+        required: true
+        type: choice
+        options:
+          - beta
+          - stable
 
 permissions:
   contents: write
+  issues: write
   pull-requests: write
+
+concurrency:
+  group: version-packages-main
+  cancel-in-progress: false
 
 jobs:
   version:
@@ -16,7 +30,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: main
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -28,11 +44,50 @@ jobs:
         run: npm ci
 
       - name: Open or update release PR
+        id: changesets
         uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1
         with:
+          branch: main
           commit: "chore: version packages"
+          commitMode: github-api
           title: "chore: version packages"
           version: npm run version-packages
           createGithubReleases: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LCM_RELEASE_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || 'auto' }}
+
+      - name: Exclude version PR from release notes
+        if: ${{ steps.changesets.outputs.pullRequestNumber != '' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR_NUMBER: ${{ steps.changesets.outputs.pullRequestNumber }}
+        with:
+          script: |
+            const issue_number = Number(process.env.PR_NUMBER);
+            if (!Number.isSafeInteger(issue_number) || issue_number <= 0) {
+              throw new Error(`Invalid Changesets PR number: ${process.env.PR_NUMBER}`);
+            }
+
+            const name = "no-release-notes";
+            try {
+              await github.rest.issues.getLabel({ ...context.repo, name });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              try {
+                await github.rest.issues.createLabel({
+                  ...context.repo,
+                  name,
+                  color: "ededed",
+                  description: "Exclude this pull request from generated release notes",
+                });
+              } catch (createError) {
+                if (createError.status !== 422) throw createError;
+              }
+            }
+
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number,
+              labels: [name, "chore", "release-workflow"],
+            });

@@ -27,6 +27,9 @@ interface HarnessOptions {
   preTagNpmError?: string;
   preTagNpmVersion?: string;
   publishMaxWait?: string;
+  releaseDraft?: boolean;
+  releasePrerelease?: boolean;
+  releaseTag?: string;
   remoteTagState?: string;
   runId?: string;
   realSleep?: boolean;
@@ -197,6 +200,10 @@ if [[ "$1" == "run" && "$2" == "view" ]]; then
   printf 'success\n'
   exit 0
 fi
+if [[ "$1" == "release" && "$2" == "view" ]]; then
+  printf '%s\t%s\t%s\n' "$FAKE_RELEASE_DRAFT" "$FAKE_RELEASE_PRERELEASE" "$FAKE_RELEASE_TAG"
+  exit 0
+fi
 
 printf 'unexpected fake gh invocation: %s\n' "$*" >&2
 exit 99
@@ -220,8 +227,12 @@ if [[ "$1" == "view" ]]; then
     printf 'npm ERR! code E404\n' >&2
     exit 1
   fi
-  printf '%s\n' "$FAKE_NPM_VERSION"
-  exit 0
+  if [[ -n "$FAKE_NPM_VERSION" ]]; then
+    printf '%s\n' "$FAKE_NPM_VERSION"
+    exit 0
+  fi
+  printf 'npm ERR! code E404\n' >&2
+  exit 1
 fi
 exit 99
 `);
@@ -250,7 +261,7 @@ exit 0
         FAKE_MERGED_PACKAGE_VERSION: options.mergedPackageVersion ?? releaseVersion,
         FAKE_MERGED_PLUGIN_VERSION: options.mergedPluginVersion ?? releaseVersion,
         FAKE_MERGED_MARKETPLACE_VERSION: options.mergedMarketplaceVersion ?? releaseVersion,
-        FAKE_NPM_VERSION: options.npmVersion ?? version,
+        FAKE_NPM_VERSION: options.npmVersion ?? "",
         FAKE_NPM_PRETAG_CHECKED: npmPreTagChecked,
         FAKE_ORIGIN_URL: options.originUrl ?? "git@github.com:donadiosolutions/lcm.git",
         FAKE_ORIGIN_PUSH_URLS: `${(options.originPushUrls ?? [options.originUrl ?? "git@github.com:donadiosolutions/lcm.git"]).join("\n")}\n`,
@@ -259,6 +270,11 @@ exit 0
         FAKE_PRETAG_NPM_VERSION: options.preTagNpmVersion ?? "",
         FAKE_REMOTE_TAG_STATE: remoteTagState,
         FAKE_REAL_SLEEP: String(options.realSleep ?? false),
+        FAKE_RELEASE_DRAFT: String(options.releaseDraft ?? true),
+        FAKE_RELEASE_PRERELEASE: String(
+          options.releasePrerelease ?? releaseVersion.includes("-beta."),
+        ),
+        FAKE_RELEASE_TAG: options.releaseTag ?? releaseTag,
         FAKE_REPO_ROOT: root,
         FAKE_RUN_ID: options.runId ?? "9001",
         FAKE_TAG: releaseTag,
@@ -309,7 +325,8 @@ describe("manual release helper step 8", () => {
     expect(result.calls).toContain(`git|push|origin|refs/tags/${tag}`);
     expect(result.calls.filter((call: string) => call.startsWith(`git|ls-remote|--tags|origin|refs/tags/${tag}`))).toHaveLength(3);
     expect(result.calls).toContain(`git|rev-parse|refs/tags/${tag}^{commit}`);
-    expect(result.stdout).toContain(`published to npm from signed tag ${tag}`);
+    expect(result.stdout).toContain(`Draft GitHub release ${tag} is ready`);
+    expect(result.stdout).toContain("Publish the draft manually in GitHub to trigger npm publication");
   });
 
   it("finds the tag-triggered publish run by tag and head SHA without filtering main", () => {
@@ -321,6 +338,16 @@ describe("manual release helper step 8", () => {
     expect(runListCall).toContain("|--json|databaseId,headSha,headBranch|");
     expect(runListCall).toContain(`.headSha == "${mergeSha}" and .headBranch == "${tag}"`);
     expect(runListCall).not.toContain("|--branch|main|");
+  });
+
+  it("accepts beta versions and verifies a draft GitHub prerelease", () => {
+    const betaVersion = "10.0.0-beta.0";
+    const betaTag = `v${betaVersion}`;
+    const result = runRelease({ version: betaVersion });
+
+    expect(result.status).toBe(0);
+    expect(result.calls).toContain(`git|tag|-s|-a|${betaTag}|${mergeSha}|-m|Release ${betaTag}`);
+    expect(result.stdout).toContain(`Draft GitHub release ${betaTag} is ready`);
   });
 
   it("fetches and reuses a matching signed remote tag without pushing it again", () => {
@@ -588,13 +615,13 @@ describe("manual release helper step 8", () => {
     expect(result.stderr).toContain(`not found after 2s`);
   });
 
-  it.each(["1.2.3-beta.1", "1.2.3+build.1"])(
+  it.each(["1.2.3-alpha.1", "1.2.3-rc.1", "1.2.3+build.1"])(
     "rejects unsupported release version %s before repository access",
     (releaseVersion: string) => {
       const result = runRelease({ version: releaseVersion });
 
       expect(result.status).toBe(1);
-      expect(result.stdout).toContain("prerelease and build metadata versions are not supported");
+      expect(result.stdout).toContain("other prerelease and build metadata versions are not supported");
       expect(result.calls).toEqual([]);
     },
   );
@@ -632,11 +659,35 @@ describe("manual release helper step 8", () => {
     expect(result.stderr).toContain(`git tag ${tag} does not resolve to merge commit ${mergeSha}`);
   });
 
-  it("retains npm publication verification after a successful workflow", () => {
-    const result = runRelease({ npmVersion: "" });
+  it("fails when npm was published before the draft release was manually finalized", () => {
+    const result = runRelease({ npmVersion: version });
 
     expect(result.status).toBe(1);
     expect(result.calls).toContain(`npm|view|@donadiosolutions/lcm@${version}|version`);
-    expect(result.stderr).toContain(`publish.yml succeeded but @donadiosolutions/lcm@${version} was not found on npm`);
+    expect(result.stderr).toContain(`${version} was published before the GitHub draft was manually finalized`);
+  });
+
+  it("fails when the tag workflow does not leave a draft release", () => {
+    const result = runRelease({ releaseDraft: false });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`GitHub release ${tag} is not a draft`);
+  });
+
+  it("fails when the GitHub prerelease flag does not match the beta version", () => {
+    const result = runRelease({
+      version: "10.0.0-beta.0",
+      releasePrerelease: false,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("prerelease flag is false, expected true");
+  });
+
+  it("fails when the draft release points at another tag", () => {
+    const result = runRelease({ releaseTag: "v9.9.8" });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`GitHub draft release tag is v9.9.8, expected ${tag}`);
   });
 });

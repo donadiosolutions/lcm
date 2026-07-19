@@ -41,8 +41,8 @@ jobs:
       - name: Run tests
         run: npm run test:ci
 
-      - name: Test issue label policy
-        run: node --test .github/scripts/issue-label-policy.test.mjs
+      - name: Test GitHub policy modules
+        run: node --test .github/scripts/*.test.mjs
 
       - name: Upload Vitest reports
         if: ${{ !cancelled() }}

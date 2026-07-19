@@ -1,0 +1,95 @@
+import { readFileSync } from "node:fs";
+import { load as loadYaml } from "js-yaml";
+import { describe, expect, it } from "vitest";
+
+const versionSource = readFileSync(new URL("../.github/workflows/version-pr.yml", import.meta.url), "utf8");
+const publishSource = readFileSync(new URL("../.github/workflows/publish.yml", import.meta.url), "utf8");
+const versionWorkflow = loadYaml(versionSource) as any;
+const publishWorkflow = loadYaml(publishSource) as any;
+const highlightsSchema = JSON.parse(
+  readFileSync(new URL("../.github/codex/release-highlights.schema.json", import.meta.url), "utf8"),
+);
+
+describe("release workflows", () => {
+  it("uses a serialized, main-based Changesets workflow with explicit beta transitions", () => {
+    expect(versionWorkflow.on.push.branches).toEqual(["main"]);
+    expect(versionWorkflow.on.workflow_dispatch.inputs.channel.options).toEqual(["beta", "stable"]);
+    expect(versionWorkflow.concurrency).toEqual({
+      group: "version-packages-main",
+      "cancel-in-progress": false,
+    });
+    expect(versionWorkflow.jobs.version["runs-on"]).toBe("ubuntu-latest");
+    const changesets = versionWorkflow.jobs.version.steps.find(
+      (step: any) => step.id === "changesets",
+    );
+    expect(changesets.with).toMatchObject({
+      branch: "main",
+      commitMode: "github-api",
+      version: "npm run version-packages",
+      createGithubReleases: false,
+    });
+    expect(changesets.env.LCM_RELEASE_CHANNEL).toContain("inputs.channel");
+    expect(versionSource).toContain('name = "no-release-notes"');
+  });
+
+  it("separates tag-driven drafts from manually published npm releases", () => {
+    expect(publishWorkflow.on.push.tags).toEqual(["v*.*.*"]);
+    expect(publishWorkflow.on.release.types).toEqual(["published"]);
+    expect(publishWorkflow.on).not.toHaveProperty("workflow_dispatch");
+    expect(publishWorkflow.jobs.draft.if).toContain("github.event_name == 'push'");
+    expect(publishWorkflow.jobs.publish.if).toContain("github.event_name == 'release'");
+    expect(publishWorkflow.jobs.draft["runs-on"]).toBe("ubuntu-latest");
+    expect(publishWorkflow.jobs.publish["runs-on"]).toBe("ubuntu-latest");
+    expect(publishWorkflow.jobs.publish.permissions).toEqual({
+      contents: "read",
+      "id-token": "write",
+    });
+    expect(publishWorkflow.jobs.publish.environment).toBe("npm-publish");
+  });
+
+  it("uses pinned Codex with the requested model, effort, and strict structured output", () => {
+    const codex = publishWorkflow.jobs.draft.steps.find(
+      (step: any) => step.name === "Generate Highlights with Codex",
+    );
+    expect(codex.uses).toBe(
+      "openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56",
+    );
+    expect(codex.with).toMatchObject({
+      "openai-api-key": "${{ secrets.OPENAI_API_KEY }}",
+      "codex-version": "0.144.6",
+      model: "gpt-5.6-terra",
+      effort: "high",
+      "permission-profile": ":read-only",
+      "safety-strategy": "drop-sudo",
+    });
+    expect(highlightsSchema).toMatchObject({
+      type: "object",
+      required: ["highlights"],
+      additionalProperties: false,
+    });
+    expect(highlightsSchema.properties.highlights).toMatchObject({
+      type: "array",
+      minItems: 1,
+      maxItems: 5,
+    });
+  });
+
+  it("pins every third-party action used by the release workflows", () => {
+    for (const workflow of [versionWorkflow, publishWorkflow]) {
+      for (const job of Object.values(workflow.jobs) as any[]) {
+        for (const step of job.steps) {
+          if (step.uses) expect(step.uses).toMatch(/^[^@]+@[0-9a-f]{40}$/u);
+        }
+      }
+    }
+  });
+
+  it("publishes beta and stable versions to explicit npm dist-tags", () => {
+    expect(publishSource).toContain("npm publish --access public --tag beta");
+    expect(publishSource).toContain("npm publish --access public --tag latest");
+    expect(publishSource).toContain("assertReleaseCanAdvanceDistTag");
+    expect(publishSource).toContain("assertNpmDistTags");
+    expect(publishSource).toContain("assertActionCreatedReleaseBody");
+    expect(publishSource.match(/npm run test:ci/gu)).toHaveLength(2);
+  });
+});

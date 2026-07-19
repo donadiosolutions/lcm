@@ -17,12 +17,13 @@ Run `.agents/skills/lcm-release/scripts/release.sh` from the repo root:
 bash .agents/skills/lcm-release/scripts/release.sh <version>
 # e.g.
 bash .agents/skills/lcm-release/scripts/release.sh 0.4.2
+bash .agents/skills/lcm-release/scripts/release.sh 0.5.0-beta.0
 ```
 
 **Resuming after a failure** — pass `--from-step N` to skip already-completed steps:
 
 ```bash
-bash .agents/skills/lcm-release/scripts/release.sh 0.4.2 --from-step 8  # create/verify tag and re-watch publish.yml
+bash .agents/skills/lcm-release/scripts/release.sh 0.4.2 --from-step 8  # create/verify tag and re-watch draft creation
 ```
 
 The script handles everything end-to-end:
@@ -37,7 +38,11 @@ The script handles everything end-to-end:
 | 5 | Open PR targeting `main` |
 | 6 | Wait for CI (skips gracefully if no CI configured) |
 | 7 | Merge with `--merge` (preserves commit SHA on main) |
-| 8 | Create or verify the signed annotated `vX.Y.Z` tag at the exact merge commit, push it if absent, then wait for the tag-triggered `publish.yml` run |
+| 8 | Create or verify the signed annotated stable or `beta.N` tag at the exact merge commit, push it if absent, wait for `publish.yml` to create the draft GitHub release, and verify npm is still unpublished |
+
+After step 8 succeeds, review the draft on GitHub and publish it manually. The
+`release: published` workflow event is the only path that publishes the package
+to npm.
 
 ## Prerequisites
 
@@ -45,7 +50,10 @@ The script handles everything end-to-end:
 - `gh` CLI is authenticated
 - Git tag signing is configured with an available signing key and agent, and
   local signed-tag verification succeeds with the trusted public key
-- You have a stable `MAJOR.MINOR.PATCH` version that is higher than any existing tag/npm release; prerelease and build-metadata versions are not supported by `publish.yml`
+- You have either a canonical stable `MAJOR.MINOR.PATCH` or beta
+  `MAJOR.MINOR.PATCH-beta.N` version that is higher than the corresponding npm
+  dist-tag; alpha, RC, other prerelease identifiers, and build metadata are not
+  supported
 
 ## Key invariants
 
@@ -56,7 +64,11 @@ The script handles everything end-to-end:
 - **Use `--merge`** (not squash) so the version bump SHA is preserved on main
 - **All 3 version files must match**: `package.json`, `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`
   - Note: marketplace.json stores version at `.plugins[0].version`, not root
-- **CHANGELOG.md must include the release version block** before `publish.yml` publishes to npm
+- **CHANGELOG.md must include the release version block** before `publish.yml` creates the draft
+- **The tag-triggered run never publishes npm**; it must leave an action-created
+  draft, and a maintainer must publish that draft to trigger npm
+- **npm dist-tags are channel-safe**: beta releases update `beta`; stable releases
+  update `latest`, which must remain the highest stable version
 
 ## Failure modes
 
@@ -67,10 +79,11 @@ The script handles everything end-to-end:
 | Local or remote tag targets another commit | The version was already tagged from different history | Stop; never move or overwrite the tag, and choose a higher version if it is public |
 | Existing tag is lightweight, unsigned, or differs between local and origin | The tag does not satisfy the release-signing invariant | Stop and inspect it manually; never overwrite a public release tag |
 | Merge commit is not reachable from `origin/main` | The wrong PR/SHA was selected or main has not updated | Verify the merged release PR before retrying step 8 |
-| publish.yml conclusion is `skipped` | Tag or npm version exists (race) | Pick a higher version; start over |
+| publish.yml conclusion is `skipped` | The tag-triggered draft job did not run | Inspect the tag and existing draft before retrying step 8 |
 | `PUBLISH_MAX_WAIT` is invalid | The override is not a non-negative integer number of seconds within Bash's signed arithmetic range | Set it to `0` or a positive whole number no greater than `9223372036854775807`; the default is `900` |
 | main diverged from origin/main | Local branch was manually changed or cherry-picked | Reconcile local `main` with `origin/main`, then rerun |
-| publish.yml conclusion is not `success` | Build/test/publish failed | Check the run URL printed by the script |
+| publish.yml conclusion is not `success` | Validation, tests, Highlights generation, or draft creation failed | Check the run URL printed by the script |
+| Draft exists but npm already has the version | Publication bypassed the required manual draft transition | Stop and audit the release; never move or overwrite the tag |
 
 ## Scripts
 

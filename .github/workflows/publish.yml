@@ -4,57 +4,48 @@ on:
   push:
     tags:
       - 'v*.*.*'
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: Semver tag to publish, for example v1.2.3. Leave blank to use the selected ref.
-        required: false
-        type: string
+  release:
+    types: [published]
 
-permissions:
-  contents: write
-  id-token: write
+permissions: {}
 
 concurrency:
-  group: publish-${{ github.ref }}
+  group: publish-${{ github.event_name }}-${{ github.event.release.tag_name || github.ref }}
   cancel-in-progress: false
 
 jobs:
-  publish:
-    # npm trusted publishing generates provenance automatically and only accepts
-    # provenance from GitHub-hosted runners.
+  draft:
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
-    environment: npm-publish
+    permissions:
+      contents: write
     steps:
-      - name: Checkout
+      - name: Checkout release tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ github.ref }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org/
 
-      - name: Check release tag and package version
-        id: check
+      - name: Validate release tag
+        id: release
         env:
-          REQUESTED_REF: ${{ inputs.ref || github.ref_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          set -Eeuo pipefail
+          tag="$RELEASE_TAG"
           version="$(node -p "require('./package.json').version")"
-          name="$(node -p "require('./package.json').name")"
-          tag="${REQUESTED_REF#refs/tags/}"
 
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Ref '$REQUESTED_REF' is not an exact release tag like v1.2.3 — skipping publish"
-            printf 'valid_release=false\n' >> "$GITHUB_OUTPUT"
-            exit 0
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.(0|[1-9][0-9]*))?$ ]]; then
+            echo "::error::Unsupported release tag '$tag'; expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-beta.N"
+            exit 1
           fi
-
-          tag_version="${tag#v}"
-          if [[ "$version" != "$tag_version" ]]; then
+          if [[ "$version" != "${tag#v}" ]]; then
             echo "::error::package.json version $version does not match release tag $tag"
             exit 1
           fi
@@ -65,21 +56,284 @@ jobs:
             exit 1
           fi
 
-          {
-            printf 'version=%s\n' "$version"
-            printf 'tag=%s\n' "$tag"
-            printf 'valid_release=true\n'
-          } >> "$GITHUB_OUTPUT"
-
-          if npm view "$name@$version" version >/dev/null 2>&1; then
-            echo "Package $name@$version already published to npm — skipping npm publish"
-            printf 'publish_package=false\n' >> "$GITHUB_OUTPUT"
-          else
-            printf 'publish_package=true\n' >> "$GITHUB_OUTPUT"
+          changelog_block="$(awk -v version="$version" '
+            $0 == "## " version || $0 == "## [" version "]" ||
+            index($0, "## " version " ") == 1 || index($0, "## [" version "] ") == 1 {
+              found=1
+              next
+            }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md)"
+          if [[ -z "$(printf '%s' "$changelog_block" | tr -d '[:space:]')" ]]; then
+            echo "::error::No changelog block found for version $version in CHANGELOG.md"
+            exit 1
           fi
 
+          {
+            printf 'tag=%s\n' "$tag"
+            printf 'version=%s\n' "$version"
+            if [[ "$version" == *-beta.* ]]; then
+              printf 'is_beta=true\n'
+            else
+              printf 'is_beta=false\n'
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Run complete coverage suite
+        run: npm run test:ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify committed plugin bundles
+        run: |
+          npm run check:plugin-bundles
+          git diff --exit-code -- lcm.mjs mcp.mjs
+
+      - name: Collect release pull requests
+        id: notes
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        with:
+          script: |
+            const { spawnSync } = await import("node:child_process");
+            const { writeFileSync } = await import("node:fs");
+            const { join } = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const policyUrl = pathToFileURL(
+              join(process.env.GITHUB_WORKSPACE, ".github/scripts/release-policy.mjs"),
+            ).href;
+            const {
+              buildHighlightsPrompt,
+              categorizeReleasePullRequests,
+              collectReleasePullRequests,
+              parseReleaseTag,
+              selectPreviousRelease,
+            } = await import(policyUrl);
+
+            const targetTag = process.env.RELEASE_TAG;
+            parseReleaseTag(targetTag);
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              { ...context.repo, per_page: 100 },
+            );
+            const ancestorTags = new Set();
+            for (const release of releases) {
+              if (release.tag_name === targetTag) continue;
+              try {
+                parseReleaseTag(release.tag_name);
+              } catch {
+                continue;
+              }
+              const result = spawnSync(
+                "git",
+                ["merge-base", "--is-ancestor", release.tag_name, targetTag],
+                { stdio: "ignore" },
+              );
+              if (result.error) throw result.error;
+              if (result.status === 0) ancestorTags.add(release.tag_name);
+              else if (result.status !== 1) {
+                throw new Error(
+                  `Unable to compare release tag ${release.tag_name} with ${targetTag}`,
+                );
+              }
+            }
+
+            const previous = selectPreviousRelease(targetTag, releases, { ancestorTags });
+            const entries = await collectReleasePullRequests({
+              github,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              baseTag: previous.tag_name,
+              targetTag,
+              cwd: process.env.GITHUB_WORKSPACE,
+            });
+            const categorized = categorizeReleasePullRequests(entries);
+            const prompt = buildHighlightsPrompt({
+              targetTag,
+              baseTag: previous.tag_name,
+              categorized,
+            });
+            writeFileSync("release-highlights-prompt.md", prompt, "utf8");
+            writeFileSync(
+              "release-data.json",
+              JSON.stringify({ targetTag, baseTag: previous.tag_name, categorized }),
+              "utf8",
+            );
+            core.setOutput("base_tag", previous.tag_name);
+            core.info(`Prepared release notes for ${previous.tag_name}..${targetTag}`);
+
+      - name: Generate Highlights with Codex
+        id: highlights
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.10
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: release-highlights-prompt.md
+          output-schema-file: .github/codex/release-highlights.schema.json
+          codex-version: 0.144.6
+          model: gpt-5.6-terra
+          effort: high
+          permission-profile: ":read-only"
+          safety-strategy: drop-sudo
+
+      - name: Create or update draft GitHub release
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          HIGHLIGHTS_RESULT: ${{ steps.highlights.outputs.final-message }}
+          IS_BETA: ${{ steps.release.outputs.is_beta }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        with:
+          script: |
+            const { readFileSync } = await import("node:fs");
+            const { join } = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const policyUrl = pathToFileURL(
+              join(process.env.GITHUB_WORKSPACE, ".github/scripts/release-policy.mjs"),
+            ).href;
+            const { parseHighlightsResult, renderReleaseNotes } = await import(policyUrl);
+
+            const releaseData = JSON.parse(readFileSync("release-data.json", "utf8"));
+            const highlights = parseHighlightsResult(process.env.HIGHLIGHTS_RESULT);
+            const body = renderReleaseNotes({
+              highlights,
+              categorized: releaseData.categorized,
+            });
+            const tag_name = process.env.RELEASE_TAG;
+            const prerelease = process.env.IS_BETA === "true";
+
+            let existing;
+            try {
+              ({ data: existing } = await github.rest.repos.getReleaseByTag({
+                ...context.repo,
+                tag: tag_name,
+              }));
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
+            if (existing) {
+              if (!existing.draft) {
+                throw new Error(`Refusing to replace published release ${tag_name}`);
+              }
+              await github.rest.repos.updateRelease({
+                ...context.repo,
+                release_id: existing.id,
+                name: tag_name,
+                body,
+                draft: true,
+                prerelease,
+              });
+              core.info(`Updated draft release ${tag_name}`);
+            } else {
+              await github.rest.repos.createRelease({
+                ...context.repo,
+                tag_name,
+                name: tag_name,
+                body,
+                draft: true,
+                prerelease,
+              });
+              core.info(`Created draft release ${tag_name}`);
+            }
+
+  publish:
+    if: ${{ github.event_name == 'release' }}
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout published release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+
+      - name: Validate published release
+        id: release
+        env:
+          RELEASE_DRAFT: ${{ github.event.release.draft }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -Eeuo pipefail
+          tag="$RELEASE_TAG"
+          version="$(node -p "require('./package.json').version")"
+
+          if [[ "$RELEASE_DRAFT" != "false" ]]; then
+            echo "::error::release published event unexpectedly refers to a draft"
+            exit 1
+          fi
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.(0|[1-9][0-9]*))?$ ]]; then
+            echo "::error::Unsupported release tag '$tag'"
+            exit 1
+          fi
+          if [[ "$version" != "${tag#v}" ]]; then
+            echo "::error::package.json version $version does not match release tag $tag"
+            exit 1
+          fi
+
+          is_beta=false
+          [[ "$version" == *-beta.* ]] && is_beta=true
+          if [[ "$RELEASE_PRERELEASE" != "$is_beta" ]]; then
+            echo "::error::GitHub prerelease flag $RELEASE_PRERELEASE does not match $tag"
+            exit 1
+          fi
+
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::release tag $tag must point to a commit reachable from origin/main"
+            exit 1
+          fi
+
+          changelog_block="$(awk -v version="$version" '
+            $0 == "## " version || $0 == "## [" version "]" ||
+            index($0, "## " version " ") == 1 || index($0, "## [" version "] ") == 1 {
+              found=1
+              next
+            }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md)"
+          if [[ -z "$(printf '%s' "$changelog_block" | tr -d '[:space:]')" ]]; then
+            echo "::error::No changelog block found for version $version in CHANGELOG.md"
+            exit 1
+          fi
+
+          {
+            printf 'version=%s\n' "$version"
+            printf 'is_beta=%s\n' "$is_beta"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify draft workflow marker and Highlights
+        env:
+          RELEASE_BODY: ${{ github.event.release.body }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { assertActionCreatedReleaseBody } from "./.github/scripts/release-policy.mjs";
+          assertActionCreatedReleaseBody(process.env.RELEASE_BODY);
+          NODE
+
       - name: Verify trusted publishing prerequisites
-        if: steps.check.outputs.valid_release == 'true'
         run: |
           node --version
           npm --version
@@ -101,70 +355,84 @@ jobs:
           assertAtLeast('npm', cp.execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim(), '11.5.1');
           NODE
 
-      - name: Prepare GitHub release notes
-        if: steps.check.outputs.valid_release == 'true'
-        run: |
-          VERSION="${{ steps.check.outputs.version }}"
-          # Get the top version block from CHANGELOG.md. Changesets may write
-          # headings as either "## 1.2.3" or "## [1.2.3]".
-          CHANGELOG_BLOCK=$(awk -v version="$VERSION" '
-            $0 == "## " version || $0 == "## [" version "]" ||
-            index($0, "## " version " ") == 1 || index($0, "## [" version "] ") == 1 {
-              found=1
-              next
-            }
-            found && /^## / { exit }
-            found { print }
-          ' CHANGELOG.md)
-          if [[ -z "$(printf '%s' "$CHANGELOG_BLOCK" | tr -d '[:space:]')" ]]; then
-            echo "::error::No changelog block found for version $VERSION in CHANGELOG.md"
-            exit 1
-          fi
-          # Build enriched notes before publishing so release-note failures stop the package publish.
-          NPM_BADGE="📦 **npm:** \`npm install @donadiosolutions/lcm@${VERSION}\`"
-          {
-            printf '%s\n\n' "$NPM_BADGE"
-            printf '%s\n\n' '---'
-            printf '%s\n\n' '## Changelog'
-            printf '%s\n\n' "$CHANGELOG_BLOCK"
-            printf '%s\n\n' '---'
-            printf '%s\n' '🔖 [Full Changelog](https://github.com/donadiosolutions/lcm/blob/main/CHANGELOG.md)'
-          } > release-notes.md
-
-      - name: Install dependencies
-        if: steps.check.outputs.valid_release == 'true'
-        run: npm ci
-
       - name: Type-check
-        if: steps.check.outputs.valid_release == 'true'
         run: npm run typecheck
 
-      - name: Run tests
-        if: steps.check.outputs.valid_release == 'true'
-        run: npm test
+      - name: Run complete coverage suite
+        run: npm run test:ci
 
       - name: Build
-        if: steps.check.outputs.valid_release == 'true'
         run: npm run build
 
       - name: Verify committed plugin bundles
-        if: steps.check.outputs.valid_release == 'true'
         run: |
           npm run check:plugin-bundles
           git diff --exit-code -- lcm.mjs mcp.mjs
 
-      - name: Publish to npm
-        if: steps.check.outputs.valid_release == 'true' && steps.check.outputs.publish_package == 'true'
-        run: npm publish --access public
-
-      - name: Create or update GitHub release
-        if: steps.check.outputs.valid_release == 'true'
+      - name: Check npm publication state
+        id: npm
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
-          TAG="${{ steps.check.outputs.tag }}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md
+          set -Eeuo pipefail
+          name="$(node -p "require('./package.json').name")"
+          version="$RELEASE_VERSION"
+          status=0
+          output="$(npm view "$name@$version" version 2>&1)" || status=$?
+          if [[ "$status" -eq 0 ]]; then
+            if [[ "$output" != "$version" ]]; then
+              echo "::error::npm returned unexpected version '$output' for $name@$version"
+              exit 1
+            fi
+            already_published=true
+          elif printf '%s\n' "$output" | grep -qiE 'E404|404 Not Found'; then
+            already_published=false
           else
-            gh release create "$TAG" --title "$TAG" --notes-file release-notes.md --verify-tag
+            printf '%s\n' "$output" >&2
+            echo "::error::Unable to query npm for $name@$version"
+            exit 1
           fi
+
+          dist_tags="$(npm view "$name" dist-tags --json)"
+          DIST_TAGS="$dist_tags" ALREADY_PUBLISHED="$already_published" node --input-type=module <<'NODE'
+          import { assertReleaseCanAdvanceDistTag } from "./.github/scripts/release-policy.mjs";
+          assertReleaseCanAdvanceDistTag({
+            version: process.env.RELEASE_VERSION,
+            distTags: JSON.parse(process.env.DIST_TAGS),
+            alreadyPublished: process.env.ALREADY_PUBLISHED === "true",
+          });
+          NODE
+          printf 'already_published=%s\n' "$already_published" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to npm
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
+        env:
+          IS_BETA: ${{ steps.release.outputs.is_beta }}
+        run: |
+          if [[ "$IS_BETA" == "true" ]]; then
+            npm publish --access public --tag beta
+          else
+            npm publish --access public --tag latest
+          fi
+
+      - name: Verify npm package and dist-tags
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          name="$(node -p "require('./package.json').name")"
+          published="$(npm view "$name@$RELEASE_VERSION" version)"
+          if [[ "$published" != "$RELEASE_VERSION" ]]; then
+            echo "::error::$name@$RELEASE_VERSION was not published"
+            exit 1
+          fi
+          versions="$(npm view "$name" versions --json)"
+          dist_tags="$(npm view "$name" dist-tags --json)"
+          VERSIONS="$versions" DIST_TAGS="$dist_tags" node --input-type=module <<'NODE'
+          import { assertNpmDistTags } from "./.github/scripts/release-policy.mjs";
+          assertNpmDistTags({
+            version: process.env.RELEASE_VERSION,
+            versions: JSON.parse(process.env.VERSIONS),
+            distTags: JSON.parse(process.env.DIST_TAGS),
+          });
+          NODE

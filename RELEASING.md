@@ -35,21 +35,43 @@ Maintainers own release metadata.
 The practical rule is simple: if the change should appear in npm release notes,
 make sure a maintainer gets a `.changeset/*.md` file onto `main`.
 
+Release notes list merged pull requests rather than Changesets commit hashes.
+PRs containing a major package Changeset appear under **Breaking changes**;
+otherwise the `enhancement` and `bug` labels select **Features** and **Fixes**.
+Every other included PR appears under **Extra notes**. Do not combine
+`enhancement` and `bug` on one PR. Generated version PRs are labeled
+`no-release-notes` automatically.
+
 ## Release flow
 
-1. Merge releasable PRs to `main`
-2. Let the `Version Packages` workflow open or update the release PR
-3. Review the generated version bump and `CHANGELOG.md`
-4. Merge the release PR to `main`
-5. Create and push the matching signed annotated semver release tag, for example
-   `vX.Y.Z`, at the exact release PR merge commit
-6. Let the `Publish Package` workflow run automatically from that tag
-7. Approve the workflow if a protected GitHub Environment is configured
-8. Let the workflow:
-   - install dependencies
-   - run tests
-   - publish to npm
-   - create or update the GitHub release for the tag
+1. Merge releasable PRs to `main`.
+2. Prepare the version PR:
+   - For a normal stable release, let the `Version Packages` workflow open or
+     update it automatically.
+   - To start a beta series, manually run `Version Packages` with
+     `channel=beta`. Changesets enters beta mode and starts at `beta.0`.
+   - Further Changesets merged while beta mode is active update the version PR
+     to the next `beta.N` automatically.
+   - To finish a beta series, manually run `Version Packages` with
+     `channel=stable`. Changesets exits beta mode and replaces the prerelease
+     with the corresponding stable version.
+3. Review and merge the generated version PR.
+4. Create and push a signed annotated tag at that exact merge commit. Supported
+   forms are `vX.Y.Z` and `vX.Y.Z-beta.N`; alpha, RC, other prerelease labels,
+   build metadata, and numeric leading zeros are rejected.
+5. Let the tag-triggered `Publish Package` run type-check, run the complete
+   coverage suite, build, generate Codex Highlights, and create the GitHub
+   release as a draft. It does not publish npm.
+6. Review the draft without removing its workflow marker or Highlights section,
+   then manually publish it in GitHub.
+7. The resulting `release: published` event repeats validation and tests, then
+   publishes npm. Betas use `--tag beta`; stable releases use `--tag latest`.
+
+For beta notes, the previous published release in the same `MAJOR.MINOR` series
+is the comparison base, falling back to the latest stable release for the first
+beta in a series. Stable notes always compare with the latest published stable
+release, so a stable release following betas contains the complete change list
+since the prior stable release. Drafts never establish a comparison boundary.
 
 For an explicitly requested manual release created by the release helper, the
 helper also owns recovery of the tag step. The command below looks up the merged
@@ -67,11 +89,13 @@ remote-only tag; when both copies exist, their tag objects and peeled commits
 must match. A conflicting, lightweight, or invalidly signed tag causes the
 helper to stop; it never moves or overwrites a release tag. The helper then
 selects the tag-triggered `publish.yml` run by tag name and merge commit SHA
-without assuming `main` still points at that commit.
+without assuming `main` still points at that commit. It verifies the draft and
+GitHub prerelease flag, confirms npm is still unpublished, and stops so a
+maintainer can publish the draft manually.
 
-Manual helper versions must use stable `MAJOR.MINOR.PATCH` form because the
-publish workflow does not accept prerelease or build-metadata tags. The
-publication-run wait defaults to 900 seconds; override it with
+Manual helper versions may use stable `MAJOR.MINOR.PATCH` or beta
+`MAJOR.MINOR.PATCH-beta.N` form. Other prerelease identifiers and build metadata
+remain unsupported. The draft-run wait defaults to 900 seconds; override it with
 `PUBLISH_MAX_WAIT=<non-negative integer seconds>` when needed.
 
 Before running the manual helper, configure Git tag signing with an available
@@ -98,12 +122,12 @@ Recommended external setup:
        --file publish.yml \
        --env npm-publish
      ```
-2. Optionally add required reviewers to the GitHub Environment named `npm-publish`
-3. Confirm the repository label taxonomy used by `.github/release.yml`
+2. Keep the repository `OPENAI_API_KEY` secret configured. Draft release
+   Highlights use the same secret as the Codex issue-labeling workflow.
+3. Optionally add required reviewers to the GitHub Environment named `npm-publish`
 
 When configuring npm trusted publishing, register the GitHub workflow using the exact workflow filename in this repo: `.github/workflows/publish.yml`.
 
-The publish workflow also supports manual dispatch for recovery from a specific
-`vX.Y.Z` tag. It will not publish from branch refs, and it fails if the tag
-version does not match `package.json` or the tagged commit is not reachable from
-`origin/main`.
+For recovery, rerun the failed tag-triggered draft run or the failed
+`release: published` run with its original event payload. There is no manual
+dispatch path that can bypass the GitHub draft-to-published transition.

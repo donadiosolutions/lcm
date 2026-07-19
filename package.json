@@ -48,7 +48,7 @@
     "test": "vitest run --dir test",
     "test:ci": "vitest run --dir test --coverage --coverage.reporter=lcov --coverage.reporter=text --reporter=default --reporter=junit --outputFile=test-report.junit.xml",
     "typecheck": "tsc --noEmit",
-    "version-packages": "changeset version && node scripts/sync-plugin-version.mjs"
+    "version-packages": "node scripts/version-packages.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
