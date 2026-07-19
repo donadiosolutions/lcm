@@ -67,11 +67,14 @@ jobs:
           echo "✅ Workspace is clean"
 
   codecov:
+    name: Codecov upload
     needs: ci
     if: ${{ github.event_name != 'merge_group' }}
     runs-on: ubuntu-latest
     permissions:
+      # Download the fixed report artifact produced by this workflow run.
       actions: read
+      # Enable Codecov OIDC authentication without a repository secret.
       id-token: write
     steps:
       - name: Download Vitest reports
