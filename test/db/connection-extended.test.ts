@@ -2,7 +2,7 @@
  * Extended connection pool tests covering the untested `isLcmConnectionOpen` export.
  */
 
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -69,6 +69,16 @@ describe("isLcmConnectionOpen", () => {
 
     expect(() => getLcmConnection(dbPath)).toThrow("symlink database path");
     expect(readFileSync(victim, "utf-8")).toBe("preserve");
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+  });
+
+  it("rejects an existing non-regular database leaf", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-nonregular-test-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "directory.sqlite");
+    mkdirSync(dbPath);
+
+    expect(() => getLcmConnection(dbPath)).toThrow("not a regular file");
     expect(isLcmConnectionOpen(dbPath)).toBe(false);
   });
 

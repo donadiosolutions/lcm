@@ -144,10 +144,12 @@ function createBackupIfNeeded(path: string, homeDir?: string): string | undefine
   const backupDir = oldMapsDir(homeDir);
   ensurePrivateDirectory(backupDir);
   const backupPath = join(backupDir, `map-${Math.floor(Date.now() / 1000)}.json`);
-  writePrivateFileExclusive(backupPath, readBoundedRegularFile(path, {
-    allowedRoot: dirname(path),
-    maxBytes: MAX_PROJECT_MAP_BYTES,
-  }));
+  if (!existsSync(backupPath)) {
+    writePrivateFileExclusive(backupPath, readBoundedRegularFile(path, {
+      allowedRoot: dirname(path),
+      maxBytes: MAX_PROJECT_MAP_BYTES,
+    }));
+  }
   return backupPath;
 }
 

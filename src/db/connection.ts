@@ -49,8 +49,12 @@ export function getLcmConnection(dbPath: string): DatabaseSync {
     // special :memory: target has no parent directory or file to secure.
     ensurePrivateDirectory(dirname(dbPath));
     try {
-      if (lstatSync(dbPath).isSymbolicLink()) {
+      const stat = lstatSync(dbPath);
+      if (stat.isSymbolicLink()) {
         throw new Error(`refusing to open a symlink database path: ${dbPath}`);
+      }
+      if (!stat.isFile()) {
+        throw new Error(`database path is not a regular file: ${dbPath}`);
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
