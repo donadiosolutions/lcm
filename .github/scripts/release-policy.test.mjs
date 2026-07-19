@@ -137,7 +137,7 @@ test("parses changesets and detects invalid package bumps", () => {
       parseChangesetDocument(
         '---\nbase: &b patch\n"@donadiosolutions/lcm": *b\n---\nAliased bump.\n',
       ),
-    /aliases exceeded maxAliases/u,
+    /Invalid changeset frontmatter/u,
   );
   assert.throws(() => parseChangesetDocument(changeset("alpha")), /Unsupported changeset bump/u);
   assert.throws(() => parseChangesetDocument(changeset("patch", "")), /must not be empty/u);
