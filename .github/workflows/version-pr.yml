@@ -89,5 +89,5 @@ jobs:
             await github.rest.issues.addLabels({
               ...context.repo,
               issue_number,
-              labels: [name, "chore", "release-workflow"],
+              labels: [name],
             });

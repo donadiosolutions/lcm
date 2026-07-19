@@ -70,7 +70,13 @@ describe("release workflows", () => {
       createGithubReleases: false,
     });
     expect(changesets?.env?.LCM_RELEASE_CHANNEL).toContain("inputs.channel");
-    expect(versionSource).toContain('name = "no-release-notes"');
+    const releaseNoteExclusion = versionWorkflow.jobs.version.steps.find(
+      (step) => step.name === "Exclude version PR from release notes",
+    );
+    expect(releaseNoteExclusion?.with?.script).toContain('const name = "no-release-notes"');
+    expect(releaseNoteExclusion?.with?.script).toContain("labels: [name]");
+    expect(releaseNoteExclusion?.with?.script).not.toContain('"chore"');
+    expect(releaseNoteExclusion?.with?.script).not.toContain('"release-workflow"');
   });
 
   it("separates tag-driven drafts from manually published npm releases", () => {
