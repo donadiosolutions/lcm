@@ -1,4 +1,3 @@
-import { ChildProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +9,9 @@ const dirs: string[] = [];
 type EnsureDaemonOptions = Parameters<typeof ensureDaemon>[0];
 type MonotonicNowOverride = NonNullable<EnsureDaemonOptions["_monotonicNowOverride"]>;
 type SpawnOverride = NonNullable<EnsureDaemonOptions["_spawnOverride"]>;
+type SpawnChildDouble = Pick<ReturnType<SpawnOverride>, "pid" | "unref"> & {
+  once: (event: "error", callback: (error: Error) => void) => SpawnChildDouble;
+};
 type SpawnSyncOverride = NonNullable<EnsureDaemonOptions["_spawnSyncOverride"]>;
 afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const temp = () => { const d = mkdtempSync(join(tmpdir(), "lcm-core-life-")); dirs.push(d); return d; };
@@ -302,20 +304,20 @@ describe("lifecycle spawn and restart failure boundaries", () => {
 
   it("combines systemd and detached errors after health wait expires", async () => {
     const dir = temp();
-    const child: ChildProcess = Object.assign(new ChildProcess(), {
+    const child: SpawnChildDouble = {
       pid: undefined,
       unref: vi.fn((): void => {}),
-      once: vi.fn((_event: string, callback: (error: Error) => void): ChildProcess => {
+      once: vi.fn((_event: "error", callback: (error: Error) => void): SpawnChildDouble => {
         callback(new Error("async spawn"));
         return child;
       }),
-    });
+    };
     const spawnSync: SpawnSyncOverride = vi.fn();
     vi.mocked(spawnSync).mockReturnValue({
       pid: 0, output: [null, null, null], stdout: "", stderr: "", status: 1, signal: null,
     });
     const spawn: SpawnOverride = vi.fn();
-    vi.mocked(spawn).mockReturnValue(child);
+    vi.mocked(spawn).mockReturnValue(child as ReturnType<SpawnOverride>);
     const monotonicNow: MonotonicNowOverride = vi.fn()
       .mockReturnValueOnce(0)
       .mockReturnValueOnce(0)
