@@ -104,7 +104,10 @@ unchanged and do not trigger promotion. Older daemons that omit `actionTaken`
 retain legacy success semantics, so a successful no-op response may still
 trigger promotion for that project. Replay mode also admits conversations with
 no leaf work outside the fresh tail when their existing in-context summaries
-meet the manual condensation fanout and token thresholds.
+meet the manual condensation fanout and token thresholds. If an automatic
+promotion request fails after compaction, the command identifies the affected
+project and exits with status 1 so automation does not mistake the partial run
+for complete success.
 
 **Budget-targeted (`compactUntilUnder`):**
 - Runs up to `maxRounds` (default 10) of full sweeps
