@@ -210,6 +210,8 @@ describe("doctor service coverage", () => {
     expect(child.stdin.end).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(child.stdin.end).toHaveBeenCalledOnce();
+    child.stdin.emit("close");
+    expect(child.kill).not.toHaveBeenCalled();
 
     child.stdout.emit("data", Buffer.from(JSON.stringify({ id: 2, method: "tools/list", result: { tools: Array(7).fill({}) } })));
     child.exitCode = 0;
@@ -272,7 +274,24 @@ describe("doctor service coverage", () => {
     const results = await runWithHandshake(healthyDeps());
     expect(results.find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({ status: "pass", message: "lcm: 7/7 tools" });
     expect(mocks.mcpChild?.stdin.end).not.toHaveBeenCalled();
-    expect(mocks.mcpChild?.kill).not.toHaveBeenCalled();
+    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(7000);
+    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
+  });
+
+  it("stops a live child when stdin closes unexpectedly", async () => {
+    vi.useFakeTimers();
+    mocks.ensureDaemon.mockResolvedValue({ connected: true });
+    mocks.mcpSetup = (child) => {
+      setTimeout(() => { child.stdin.emit("close"); }, 1);
+    };
+
+    const results = await runWithHandshake(healthyDeps());
+    const child = mocks.mcpChild!;
+    expect(results.find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({ status: "warn", message: "lcm: 0/7 tools" });
+    expect(child.kill).toHaveBeenCalledOnce();
+    expect(child.stdin.write).toHaveBeenCalledOnce();
+    expect(child.stdin.end).not.toHaveBeenCalled();
   });
 
   it.each(["destroyed", "unwritable"])("settles without writing when stdin is initially %s", async (state) => {
@@ -287,6 +306,7 @@ describe("doctor service coverage", () => {
     expect(results.find((result) => result.name === "mcp-handshake-lcm")?.message).toContain("0/7");
     expect(mocks.mcpChild?.stdin.write).not.toHaveBeenCalled();
     expect(mocks.mcpChild?.stdin.end).not.toHaveBeenCalled();
+    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
   });
 
   it("settles when the child exits before close and cancels delayed stdin work", async () => {
@@ -321,7 +341,7 @@ describe("doctor service coverage", () => {
       message: "lcm: 0/7 tools",
     });
     expect(child.stdin.end).not.toHaveBeenCalled();
-    expect(child.kill).not.toHaveBeenCalled();
+    expect(child.kill).toHaveBeenCalledOnce();
   });
 
   it.each(["initialize", "tools-list", "stdin-end"])("contains a synchronous %s stream failure", async (stage) => {
@@ -335,7 +355,7 @@ describe("doctor service coverage", () => {
 
     const results = await runWithHandshake(healthyDeps());
     expect(results.find((result) => result.name === "mcp-handshake-lcm")?.message).toContain("0/7");
-    expect(mocks.mcpChild?.kill).not.toHaveBeenCalled();
+    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
   });
 
   it("contains synchronous or asynchronous MCP handshake failures", async () => {
