@@ -12,6 +12,7 @@ import {
   managedLabelNames,
   parseAndValidateClassification,
   reconcileLabels,
+  removeIssueLabelIfPresent,
   validateClassificationResult,
   validateManagedLabelConfig,
 } from "./issue-label-policy.mjs";
@@ -170,4 +171,36 @@ test("one added list entry flows through prompt, schema, validator, and reconcil
     remove: ["security"],
     final: ["bug", "performance", "p1-high"],
   });
+});
+
+test("removes issue labels idempotently when concurrent removal returns 404", async () => {
+  const calls = [];
+  const github = {
+    rest: {
+      issues: {
+        removeLabel: async (parameters) => {
+          calls.push(parameters);
+          if (parameters.name === "already-removed") {
+            throw Object.assign(new Error("Not Found"), { status: 404 });
+          }
+          if (parameters.name === "server-error") {
+            throw Object.assign(new Error("Server Error"), { status: 500 });
+          }
+        },
+      },
+    },
+  };
+  const repo = { owner: "example", repo: "repository" };
+
+  await removeIssueLabelIfPresent(github, repo, 42, "managed-label");
+  await removeIssueLabelIfPresent(github, repo, 42, "already-removed");
+  await assert.rejects(
+    removeIssueLabelIfPresent(github, repo, 42, "server-error"),
+    /Server Error/,
+  );
+  assert.deepEqual(calls, [
+    { ...repo, issue_number: 42, name: "managed-label" },
+    { ...repo, issue_number: 42, name: "already-removed" },
+    { ...repo, issue_number: 42, name: "server-error" },
+  ]);
 });

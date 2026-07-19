@@ -280,3 +280,20 @@ export function computeLabelChanges(currentLabels, classification, config) {
 export function reconcileLabels(currentLabels, classification, config) {
   return computeLabelChanges(currentLabels, classification, config).final;
 }
+
+export async function removeIssueLabelIfPresent(
+  github,
+  repo,
+  issueNumber,
+  label,
+) {
+  try {
+    await github.rest.issues.removeLabel({
+      ...repo,
+      issue_number: issueNumber,
+      name: label,
+    });
+  } catch (error) {
+    if (error.status !== 404) throw error;
+  }
+}

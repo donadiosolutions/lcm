@@ -205,8 +205,7 @@ jobs:
     needs: collect
     if: ${{ needs.collect.outputs.has_work == 'true' }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    permissions: {}
     outputs:
       result: ${{ steps.codex.outputs.final-message }}
     steps:
@@ -251,6 +250,7 @@ jobs:
             const {
               loadManagedLabelConfig,
               reconcileLabels,
+              removeIssueLabelIfPresent,
               validateClassificationResult,
             } = await import(policyUrl);
 
@@ -308,22 +308,20 @@ jobs:
                   });
                 }
                 for (const label of remove) {
-                  await github.rest.issues.removeLabel({
-                    ...context.repo,
-                    issue_number: issueNumber,
-                    name: label,
-                  });
+                  await removeIssueLabelIfPresent(
+                    github,
+                    context.repo,
+                    issueNumber,
+                    label,
+                  );
                 }
 
-                try {
-                  await github.rest.issues.removeLabel({
-                    ...context.repo,
-                    issue_number: issueNumber,
-                    name: process.env.QUEUE_LABEL,
-                  });
-                } catch (error) {
-                  if (error.status !== 404) throw error;
-                }
+                await removeIssueLabelIfPresent(
+                  github,
+                  context.repo,
+                  issueNumber,
+                  process.env.QUEUE_LABEL,
+                );
                 core.info(
                   `Reconciled #${issueNumber}: added [${add.join(", ")}], removed [${remove.join(", ")}].`,
                 );
