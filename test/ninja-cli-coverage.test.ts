@@ -91,7 +91,7 @@ describe("renderFrame coverage boundaries", () => {
 
   it("renders a narrow terminal without a progress bar and with an uncolored failure", () => {
     const state = makeProgressState({ total: 2 });
-    state.errors.push({ sessionId: "bad", message: "failed" });
+    state.phaseErrors.push({ phase: "Promote", target: "/project", message: "failed" });
     const output = renderFrame(state, opts({ width: 20 }), 0);
     expect(output).toContain("1 failed");
     expect(output).not.toContain("[");
@@ -151,8 +151,13 @@ describe("printSummary", () => {
   it("prints full phases, compression, DAG, promoted memories, and errors", () => {
     const state = completedState({
       phases: [{ name: "Import", status: "done" }, { name: "Compact", status: "done" }],
+      total: 3,
       completed: 2,
       errors: [{ sessionId: "broken", message: "network failed" }],
+      phaseErrors: [
+        { phase: "Promote", message: "daemon unavailable" },
+        { phase: "Promote", target: "/project", message: "request failed" },
+      ],
       messagesIn: 1_234,
       tokensIn: 1_000_000,
       tokensOut: 1_000,
@@ -161,23 +166,27 @@ describe("printSummary", () => {
     });
     printSummary(state, opts());
     const output = writes.join("");
-    expect(output).toContain("● Import  →  ● Compact          Done ✓");
-    expect(output).toContain("[██████████████████████] 67%  1,234 msgs  ~1.0M → ~1.0k tokens, 1000.0×");
-    expect(output).toContain("Sessions     3 processed");
-    expect(output).toContain("DAG nodes    10  (+2 new)");
-    expect(output).toContain("DAG depth    3");
-    expect(output).toContain("Memories     4 promoted");
-    expect(output).toContain("Total time   2.5s");
-    expect(output).toContain("Failed       1");
+    expect(output).toContain("● Import  →  ● Compact          Failed ✗");
+    expect(output).toContain("[██████████████████████] 100%  1,234 msgs  ~1.0M → ~1.0k tokens, 1000.0×");
+    expect(output).toContain("Sessions      3 processed");
+    expect(output).toContain("DAG nodes     10  (+2 new)");
+    expect(output).toContain("DAG depth     3");
+    expect(output).toContain("Memories      4 promoted");
+    expect(output).toContain("Total time    2.5s");
+    expect(output).toContain("Failed        1");
+    expect(output).toContain("Phase failed  2");
     expect(output).toContain("broken: network failed");
+    expect(output).toContain("Promote: daemon unavailable");
+    expect(output).toContain("Promote (/project): request failed");
   });
 
   it("prints an empty narrow summary with a 100 percent default", () => {
-    const state = makeProgressState({});
+    const state = makeProgressState({ phases: [{ name: "Compact", status: "done" }] });
     state.startedAt = NOW.getTime();
     printSummary(state, opts({ width: 40 }));
     const output = writes.join("");
     expect(output).toContain("[████████████████████] 100%");
+    expect(output).toContain("● Compact          Done ✓");
     expect(output).toContain("Sessions    0 processed");
     expect(output).toContain("Total time  0.0s");
     expect(output).not.toContain("Compression");

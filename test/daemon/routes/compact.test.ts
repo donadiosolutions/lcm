@@ -279,6 +279,7 @@ describe("createCompactHandler — summarizer branching", () => {
     expect(createAnthropicSummarizer).not.toHaveBeenCalled();
     expect(createOpenAISummarizer).not.toHaveBeenCalled();
     expect(getBody().summary).toContain("disabled");
+    expect(getBody().actionTaken).toBe(false);
   });
 
   it("auto + client=claude resolves to claude-process", async () => {
@@ -651,6 +652,7 @@ describe("POST /compact", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toHaveProperty("summary");
+    expect(body).toHaveProperty("actionTaken", false);
     expect(typeof body.summary).toBe("string");
   });
 
@@ -871,6 +873,7 @@ describe("POST /compact with disabled provider", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.summary).toContain("disabled");
+    expect(body.actionTaken).toBe(false);
   });
 });
 

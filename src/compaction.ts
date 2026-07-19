@@ -54,6 +54,9 @@ export interface CompactionConfig {
   scrubber?: ScrubEngine;
 }
 
+/** Raw messages retained during an explicit manual compaction sweep. */
+export const MANUAL_COMPACT_FRESH_TAIL_COUNT = 8;
+
 type CompactionLevel = "normal" | "aggressive" | "fallback";
 type CompactionPass = "leaf" | "condensed";
 type CompactionSummarizeOptions = {

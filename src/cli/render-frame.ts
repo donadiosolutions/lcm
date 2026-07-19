@@ -78,12 +78,13 @@ export function renderFrame(
   prevLines = 3,
 ): string {
   const { isTTY, color, width } = opts;
+  const processed = state.completed + state.errors.length;
 
   if (!isTTY) {
     // Non-TTY: emit one line per completed session (called by caller when a session finishes)
     const last = state.lastResult;
     if (!last) return '';
-    const counter = `[${state.completed}/${state.total}]`;
+    const counter = `[${processed}/${state.total}]`;
     const tokens =
       last.tokensAfter !== undefined && last.tokensAfter < last.tokensBefore
         ? `${fmtTokens(last.tokensBefore)} → ${fmtTokens(last.tokensAfter)}`
@@ -115,8 +116,8 @@ export function renderFrame(
 
   // Line 1: phase bar + progress counter + failures
   const phaseBar = renderPhaseBar(state);
-  const counter = state.total > 0 ? `${state.completed}/${state.total}` : '';
-  const failCount = state.errors.length;
+  const counter = state.total > 0 ? `${processed}/${state.total}` : '';
+  const failCount = state.errors.length + state.phaseErrors.length;
   const failStr = failCount > 0
     ? (color ? `  ${RED}${failCount} failed${RESET}` : `  ${failCount} failed`)
     : '';
@@ -126,8 +127,8 @@ export function renderFrame(
 
   // Line 2: progress bar + running totals
   const barWidth = effectiveWidth < 60 ? 0 : 22;
-  const pct = state.total > 0 ? Math.round((state.completed / state.total) * 100) : 0;
-  const barStr = barWidth > 0 ? renderBar(state.completed, state.total, barWidth) + ' ' : '';
+  const pct = state.total > 0 ? Math.round((processed / state.total) * 100) : 0;
+  const barStr = barWidth > 0 ? renderBar(processed, state.total, barWidth) + ' ' : '';
   const pctStr = `${pct}%`;
   const msgs = state.messagesIn > 0 ? `  ${state.messagesIn.toLocaleString()} msgs` : '';
   let tokenFlow = '';
@@ -143,7 +144,9 @@ export function renderFrame(
 
   // Line 3: current or last session detail
   let line3 = '';
-  if (state.current) {
+  if (state.currentProject) {
+    line3 = `  ● ${state.currentProject}  processing...`;
+  } else if (state.current) {
     const elapsed = fmtElapsed(now - state.current.startedAt);
     line3 = `  ● ${state.current.sessionId}  ${state.current.messages} msgs  processing...  ${elapsed}`;
   } else if (state.lastResult) {

@@ -10,6 +10,7 @@ const verboseTTY: RenderOpts = { isTTY: true, width: 80, color: false, verbose: 
 describe("renderFrame — non-TTY mode", () => {
   it("returns empty string when no lastResult", () => {
     const state = makeProgressState({ total: 5 });
+    expect(state.phaseErrors).toEqual([]);
     expect(renderFrame(state, nonTTY)).toBe("");
   });
 
@@ -29,6 +30,19 @@ describe("renderFrame — non-TTY mode", () => {
     expect(output).toContain("~5.0k");
     expect(output).toContain("1.3s");
     expect(output).toMatch(/\n$/);
+  });
+
+  it("counts failed sessions as processed in non-TTY output", () => {
+    const state = makeProgressState({ total: 2 });
+    state.errors.push({ sessionId: "failed-session", message: "provider unavailable" });
+    state.lastResult = {
+      sessionId: "failed-session",
+      messages: 10,
+      tokensBefore: 1_000,
+      elapsed: 100,
+    };
+
+    expect(renderFrame(state, nonTTY)).toContain("[1/2]");
   });
 
   it("shows token reduction when tokensAfter < tokensBefore", () => {
@@ -107,6 +121,20 @@ describe("renderFrame — TTY non-verbose mode", () => {
     expect(output).toContain("[dry-run]");
   });
 
+  it("reaches full live progress when every session failed", () => {
+    const state = makeProgressState({ total: 2 });
+    state.errors.push({ sessionId: "failed-session", message: "provider unavailable" });
+    state.errors.push({ sessionId: "also-failed", message: "request timed out" });
+    state.phaseErrors.push({ phase: "Promote", target: "/one", message: "daemon unavailable" });
+    state.phaseErrors.push({ phase: "Promote", target: "/two", message: "request failed" });
+
+    const output = renderFrame(state, ttyOpts, 0);
+
+    expect(output).toContain("2/2");
+    expect(output).toContain("[██████████████████████] 100%");
+    expect(output).toContain("4 failed");
+  });
+
   it("shows phase bar when phases are provided", () => {
     const state = makeProgressState({
       phases: [{ name: "Import", status: "active" }],
@@ -158,6 +186,13 @@ describe("renderFrame — TTY non-verbose mode", () => {
     const output = renderFrame(state, ttyOpts, 0);
     expect(output).toContain("agent-processing");
     expect(output).toContain("processing...");
+  });
+
+  it("shows the current project during a multi-project phase", (): void => {
+    const state = makeProgressState({ phases: [{ name: "Promote", status: "active" }] });
+    state.currentProject = "/workspace/project";
+    const output = renderFrame(state, ttyOpts, 0);
+    expect(output).toContain("/workspace/project  processing...");
   });
 
   it("includes cursor-up codes when prevLines > 0", () => {

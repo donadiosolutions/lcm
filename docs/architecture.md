@@ -95,6 +95,20 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 - Phase 2: Repeatedly runs condensation passes starting from the shallowest eligible depth
 - Each pass checks for progress; stops if no tokens were saved
 
+Manual batch discovery applies the same eight-message fresh-tail boundary before
+calling the daemon. A conversation with no raw messages outside that boundary is
+already up to date, even when its protected messages exceed the batch token
+threshold. When the daemon reports `actionTaken`, LCM promotes only projects
+where it actually created a summary; explicit daemon no-ops are reported as
+unchanged and do not trigger promotion. Older daemons that omit `actionTaken`
+retain legacy success semantics, so a successful no-op response may still
+trigger promotion for that project. Replay mode also admits conversations with
+no leaf work outside the fresh tail when their existing in-context summaries
+meet the manual condensation fanout and token thresholds. If an automatic
+promotion request fails after compaction, the command identifies the affected
+project and exits with status 1 so automation does not mistake the partial run
+for complete success.
+
 **Budget-targeted (`compactUntilUnder`):**
 - Runs up to `maxRounds` (default 10) of full sweeps
 - Stops when context is under the target token count

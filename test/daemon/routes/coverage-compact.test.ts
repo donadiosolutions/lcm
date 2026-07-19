@@ -84,6 +84,7 @@ vi.mock("../../../src/store/summary-store.js", () => ({
   },
 }));
 vi.mock("../../../src/compaction.js", () => ({
+  MANUAL_COMPACT_FRESH_TAIL_COUNT: 8,
   CompactionEngine: class { compact = async () => state.compactResult; },
 }));
 vi.mock("node:fs", async (importOriginal) => ({
@@ -205,7 +206,7 @@ describe("compact route coverage", () => {
     await vi.waitFor(() => expect(state.summarizerGate).toBeDefined());
     const second = response();
     await handler({} as never, second.res, JSON.stringify({ session_id: "same", cwd: "/tmp" }));
-    expect(second.json()).toEqual({ skipped: true, summary: "Compaction already in progress for this session." });
+    expect(second.json()).toEqual({ skipped: true, actionTaken: false, summary: "Compaction already in progress for this session." });
     release();
     await firstCall;
   });
@@ -217,6 +218,7 @@ describe("compact route coverage", () => {
     state.metaText = "not json";
     const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp", transcript_path: "/tmp/transcript.jsonl" }), value);
     expect(body.summary).toBe("No compaction needed.");
+    expect(body.actionTaken).toBe(false);
   });
 
   it("initializes metadata when the metadata file is absent", async () => {
@@ -229,6 +231,14 @@ describe("compact route coverage", () => {
     state.summaries = [{ content: "older", depth: 1 }, { content: "latest", depth: 2 }];
     const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp" }));
     expect(body.latestSummaryContent).toBe("latest");
+  });
+
+  it("returns actionTaken when compaction creates a summary", async (): Promise<void> => {
+    state.compactResult = { actionTaken: true, tokensBefore: 100, tokensAfter: 10, createdSummaryId: "sum-1" };
+    state.summaries = [{ summaryId: "sum-1", content: "created", depth: 0 }];
+    const body = await call(JSON.stringify({ session_id: "compacted", cwd: "/tmp" }));
+    expect(body.actionTaken).toBe(true);
+    expect(body.summary).toContain("compaction complete");
   });
 
   it("uses the non-Error internal-failure fallback", async () => {

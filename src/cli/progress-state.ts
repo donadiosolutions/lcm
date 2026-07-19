@@ -10,6 +10,12 @@ export interface ProgressError {
   message: string;
 }
 
+export interface ProgressPhaseError {
+  phase: string;
+  target?: string;
+  message: string;
+}
+
 export interface ProgressCurrentSession {
   sessionId: string;
   messages: number;
@@ -46,6 +52,8 @@ export interface ProgressState {
   completed: number;
   /** Failed sessions — derived from errors.length to avoid drift */
   errors: ProgressError[];
+  /** Phase-level failures that must not affect session totals. */
+  phaseErrors: ProgressPhaseError[];
 
   /** Running metrics */
   tokensIn: number;
@@ -79,6 +87,7 @@ export function makeProgressState(opts: {
     total: opts.total ?? 0,
     completed: 0,
     errors: [],
+    phaseErrors: [],
     tokensIn: 0,
     tokensOut: 0,
     messagesIn: 0,

@@ -23,7 +23,7 @@ function renderBar(barWidth: number): string {
 /** Print the compact (non-verbose) summary table to stdout. */
 export function printSummary(state: ProgressState, opts: RenderOpts): void {
   const elapsed = (Date.now() - state.startedAt) / 1_000;
-  const total = state.completed + state.errors.length;
+  const processed = state.completed + state.errors.length;
   const width = Math.max(opts.width, 40);
 
   // Phase bar (only if there are phases)
@@ -31,13 +31,17 @@ export function printSummary(state: ProgressState, opts: RenderOpts): void {
     const phaseBar = state.phases
       .map(p => `● ${p.name}`)
       .join('  →  ');
-    const doneLabel = state.aborted ? 'Aborted' : 'Done ✓';
+    const doneLabel = state.aborted
+      ? 'Aborted'
+      : state.errors.length > 0 || state.phaseErrors.length > 0
+        ? 'Failed ✗'
+        : 'Done ✓';
     process.stdout.write(`\n  ${phaseBar}          ${doneLabel}\n`);
   }
 
   // Progress bar
   const barWidth = width < 60 ? 20 : 22;
-  const pct = total > 0 ? Math.round((state.completed / total) * 100) : 100;
+  const pct = state.total > 0 ? Math.round((processed / state.total) * 100) : 100;
   let tokenFlowStr = '';
   if (state.tokensIn > 0) {
     if (state.tokensOut > 0 && state.tokensOut < state.tokensIn) {
@@ -56,7 +60,7 @@ export function printSummary(state: ProgressState, opts: RenderOpts): void {
 
   const rows: [string, string][] = [];
 
-  rows.push(['Sessions', `${total} processed`]);
+  rows.push(['Sessions', `${processed} processed`]);
 
   if (state.tokensIn > 0 && state.tokensOut > 0 && state.tokensOut < state.tokensIn) {
     rows.push(['Compression', fmtRatio(state.tokensIn, state.tokensOut)]);
@@ -75,6 +79,9 @@ export function printSummary(state: ProgressState, opts: RenderOpts): void {
   if (state.errors.length > 0) {
     rows.push(['Failed', String(state.errors.length)]);
   }
+  if (state.phaseErrors.length > 0) {
+    rows.push(['Phase failed', String(state.phaseErrors.length)]);
+  }
 
   const labelWidth = Math.max(...rows.map(([l]) => l.length));
   for (const [label, value] of rows) {
@@ -88,6 +95,12 @@ export function printSummary(state: ProgressState, opts: RenderOpts): void {
     process.stdout.write('\n  Failed:\n');
     for (const { sessionId, message } of state.errors) {
       process.stdout.write(`    ${sessionId}: ${message}\n`);
+    }
+  }
+  if (state.phaseErrors.length > 0) {
+    process.stdout.write('\n  Phase failures:\n');
+    for (const { phase, target, message } of state.phaseErrors) {
+      process.stdout.write(`    ${phase}${target ? ` (${target})` : ''}: ${message}\n`);
     }
   }
 

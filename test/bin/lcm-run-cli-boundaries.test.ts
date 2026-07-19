@@ -30,12 +30,14 @@ const state = vi.hoisted(() => ({
   installConnector: vi.fn(() => ({ path: "/hook", requiresRestart: false })),
   removeConnector: vi.fn(() => true),
   installed: [] as Array<{ agentId: string; type: string; path: string }>,
-  batchResult: { compacted: 1, failures: 0 },
+  batchResult: { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] },
+  batchError: undefined as unknown,
   batchPatch: { lastResult: { ok: true } } as Record<string, unknown>,
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
   importResult: { imported: 1, skipped: 0 },
   importPatch: { lastResult: { ok: true } } as Record<string, unknown>,
   renderer: { start: vi.fn(), stop: vi.fn(), sessionDone: vi.fn(), printSummary: vi.fn() },
+  progressState: undefined as undefined | Record<string, unknown>,
   writeFile: vi.fn(), unlink: vi.fn(), mkdir: vi.fn(),
   dispatchHook: vi.fn(async () => ({ stdout: "", exitCode: 0 })),
 }));
@@ -84,10 +86,17 @@ vi.mock("../../src/config-manager.js", () => ({
   getConfigValue: vi.fn(() => "value"), formatConfigValue: vi.fn((value: unknown) => String(value)),
   normalizeConfigPath: vi.fn((path: string) => path), setConfigValue: vi.fn(() => "stored"),
 }));
-vi.mock("../../src/batch-compact.js", () => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void }) => {
+vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void }): Promise<typeof state.batchResult> => {
+  if (state.batchError !== undefined) throw state.batchError;
   opts.onProgress?.(state.batchPatch); return state.batchResult;
 }) }));
-vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((value: Record<string, unknown>) => ({ ...value })) }));
+vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((value: Record<string, unknown>) => {
+  const progressState = {
+    total: 0, completed: 0, errors: [], phaseErrors: [], tokensIn: 0, tokensOut: 0, messagesIn: 0, ...value,
+  };
+  state.progressState = progressState;
+  return progressState;
+}) }));
 vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
   start = state.renderer.start; stop = state.renderer.stop;
   sessionDone = state.renderer.sessionDone; printSummary = state.renderer.printSummary;
@@ -167,7 +176,9 @@ beforeEach(() => {
     compaction: { autoCompactMinTokens: 1 },
   });
   state.files.clear(); state.exists.clear(); state.entries = []; state.readError = undefined;
-  state.fileText = "{}"; state.packageVersion = "1.4.0"; state.installed = []; state.batchResult = { compacted: 1, failures: 0 };
+  state.fileText = "{}"; state.packageVersion = "1.4.0"; state.installed = [];
+  state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] };
+  state.batchError = undefined;
   state.batchPatch = { lastResult: { ok: true } };
   state.importPatch = { lastResult: { ok: true } };
   state.health.mockResolvedValue(true);
@@ -353,7 +364,7 @@ describe("runCli lifecycle and connector boundaries", () => {
     state.restartDaemon.mockResolvedValueOnce({ connected: true, restarted: false, spawned: false, pid: undefined });
     await expect(actions.get("daemon/restart")!({})).rejects.toThrow("exit:0");
 
-    state.batchResult = { compacted: 0, failures: 1 };
+    state.batchResult = { compacted: 0, unchanged: 0, skipped: 0, failures: 1, compactedProjects: [] };
     state.batchPatch = {};
     await expect(actions.get("lcm/compact")!({})).resolves.toBeUndefined();
     expect(process.exitCode).toBe(1);
@@ -378,7 +389,7 @@ describe("runCli lifecycle and connector boundaries", () => {
     state.mapRemove.mockReturnValueOnce({ hash: "hash", removed: true });
     await expect(mapActions.get("remove")!("/new", {})).resolves.toBeUndefined();
 
-    state.batchResult = { compacted: 1, failures: 0 };
+    state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] };
     state.post.mockResolvedValueOnce({ processed: 1, promoted: 1 });
     await expect(actions.get("lcm/compact")!({ promote: true })).resolves.toBeUndefined();
 
@@ -422,7 +433,16 @@ describe("runCli lifecycle and connector boundaries", () => {
 });
 
 describe("runCli scanning and portable knowledge boundaries", () => {
-  it("covers compact TTY summary and all-project best-effort promotion", async () => {
+  it("stops the compact renderer when batch compaction rejects", async (): Promise<void> => {
+    state.batchError = new Error("batch failed");
+
+    expect((await invoke(["compact"]))?.message).toBe("batch failed");
+    expect(state.renderer.start).toHaveBeenCalledOnce();
+    expect(state.renderer.stop).toHaveBeenCalledOnce();
+    expect(state.renderer.printSummary).not.toHaveBeenCalled();
+  });
+
+  it("covers compact TTY summary and fatal targeted promotion failure", async () => {
     Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
     state.entries = [
       { name: "file", isDirectory: () => false },
@@ -438,6 +458,12 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     state.post.mockRejectedValueOnce(new Error("best effort"));
     expect(await invoke(["compact", "--all"])).toBeUndefined();
     expect(state.renderer.printSummary).toHaveBeenCalled();
+    expect(state.post).toHaveBeenCalledWith("/promote", { cwd: "/good", dry_run: false });
+    expect(process.exitCode).toBe(1);
+    expect(state.progressState?.errors).toEqual([]);
+    expect(state.progressState?.phaseErrors).toEqual([
+      { phase: "Promote", target: "/good", message: "best effort" },
+    ]);
   });
 
   it("covers TTY all-provider import directory filtering", async () => {

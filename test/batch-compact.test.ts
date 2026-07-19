@@ -22,16 +22,25 @@ function makeDir(name: string): string {
   return path;
 }
 
-function seedConversation(dbPath: string): void {
+function insertMessages(db: DatabaseSync, conversationId: number, count = 9, totalTokens = 250): void {
+  for (let seq = 1; seq <= count; seq++) {
+    const result = db.prepare(
+      "INSERT INTO messages (conversation_id, seq, role, content, token_count) VALUES (?, ?, ?, ?, ?)",
+    ).run(conversationId, seq, "user", `hello ${conversationId}-${seq}`, seq === 1 ? totalTokens - count + 1 : 1);
+    db.prepare(
+      "INSERT INTO context_items (conversation_id, ordinal, item_type, message_id) VALUES (?, ?, 'message', ?)",
+    ).run(conversationId, seq - 1, Number(result.lastInsertRowid));
+  }
+}
+
+function seedConversation(dbPath: string, messageCount = 9): void {
   const db = new DatabaseSync(dbPath);
   try {
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA foreign_keys = ON");
     runLcmMigrations(db);
     db.prepare("INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)").run(1, "session-1");
-    db.prepare(
-      "INSERT INTO messages (conversation_id, seq, role, content, token_count) VALUES (?, ?, ?, ?, ?)",
-    ).run(1, 1, "user", "hello", 250);
+    insertMessages(db, 1, messageCount);
   } finally {
     db.close();
   }
@@ -43,9 +52,7 @@ function seedConversations(dbPath: string): void {
     runLcmMigrations(db);
     for (const id of [1, 2]) {
       db.prepare("INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)").run(id, `session-${id}`);
-      db.prepare(
-        "INSERT INTO messages (conversation_id, seq, role, content, token_count) VALUES (?, ?, ?, ?, ?)",
-      ).run(id, 1, "user", `hello ${id}`, 250);
+      insertMessages(db, id);
     }
   } finally {
     closeLcmConnection(dbPath);
@@ -111,6 +118,25 @@ describe("batch compaction discovery", () => {
     expect(findUncompacted(100, true, unrelated)).toEqual([]);
   });
 
+  it("requires at least one raw message outside the manual fresh tail", () => {
+    const protectedCwd = makeDir("compact-protected-tail");
+    const protectedPaths = projectPaths(protectedCwd);
+    ensureProjectDir(protectedCwd);
+    writeFileSync(protectedPaths.metaPath, JSON.stringify({ cwd: protectedPaths.canonical }));
+    seedConversation(protectedPaths.dbPath, 8);
+
+    const eligibleCwd = makeDir("compact-outside-tail");
+    const eligiblePaths = projectPaths(eligibleCwd);
+    ensureProjectDir(eligibleCwd);
+    writeFileSync(eligiblePaths.metaPath, JSON.stringify({ cwd: eligiblePaths.canonical }));
+    seedConversation(eligiblePaths.dbPath, 9);
+
+    expect(findUncompacted(100, true, protectedCwd)).toEqual([]);
+    expect(findUncompacted(100, true, eligibleCwd)).toEqual([
+      expect.objectContaining({ cwd: eligiblePaths.canonical, messages: 9 }),
+    ]);
+  });
+
   it("falls back to canonical comparison for legacy symlink metadata", () => {
     const canonical = makeDir("compact-legacy-canonical");
     const legacyLink = join(homedir(), "compact-legacy-link");
@@ -134,16 +160,20 @@ describe("batch compaction discovery", () => {
       .mockResolvedValueOnce({ tokensBefore: 250, tokensAfter: 50 });
     vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Partial<ProgressState>> = [];
 
     const result = await batchCompact({
       minTokens: 100,
       dryRun: false,
       port: 3737,
       cwd,
+      onProgress: patch => progress.push(patch),
     });
 
-    expect(result).toEqual({ compacted: 1, failures: 1 });
+    expect(result).toEqual({ compacted: 1, unchanged: 0, skipped: 0, failures: 1, compactedProjects: [paths.canonical] });
     expect(post).toHaveBeenCalledTimes(2);
+    expect(progress.find(patch => patch.errors)).toMatchObject({ completed: 0, current: undefined });
+    expect(progress.at(-1)).toMatchObject({ completed: 1, current: undefined });
   });
 
   it("counts each successful session once and falls back to discovered input tokens", async () => {
@@ -153,7 +183,7 @@ describe("batch compaction discovery", () => {
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }, null, 2) + "\n");
     seedConversations(paths.dbPath);
     const post = vi.spyOn(DaemonClient.prototype, "post")
-      .mockResolvedValueOnce({ tokensAfter: 60 })
+      .mockResolvedValueOnce({})
       .mockResolvedValueOnce({ tokensBefore: 300, tokensAfter: 30 });
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
@@ -173,12 +203,12 @@ describe("batch compaction discovery", () => {
       onProgress: patch => progress.push(patch),
     });
 
-    expect(result).toEqual({ compacted: 2, failures: 0 });
+    expect(result).toEqual({ compacted: 2, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [paths.canonical] });
     expect(progress.at(-1)).toMatchObject({
       completed: 2,
-      messagesIn: 2,
+      messagesIn: 18,
       tokensIn: 550,
-      tokensOut: 90,
+      tokensOut: 280,
       lastResult: {
         sessionId: "session-2",
         tokensBefore: 300,
@@ -186,9 +216,10 @@ describe("batch compaction discovery", () => {
       },
     });
     expect(log).toHaveBeenCalledWith(expect.stringContaining(
-      "2 sessions compacted, 0.6k → 0.1k tokens (84% reduction, 0.5k freed)",
+      "2 sessions compacted, 0.6k → 0.3k tokens (49% reduction, 0.3k freed)",
     ));
-    expect(log).toHaveBeenCalledWith(" done  (0.3k → 0.1k tokens, 76% reduction)");
+    expect(log).toHaveBeenCalledWith(" done  (0.3k → 0.3k tokens, 0% reduction)");
+    expect(log).toHaveBeenCalledWith(" done  (0.3k → 0.0k tokens, 90% reduction)");
     expect(post).toHaveBeenNthCalledWith(1, "/compact", expect.objectContaining({
       fast_mode: false,
       request_timeout_ms: 120_000,
@@ -199,6 +230,64 @@ describe("batch compaction discovery", () => {
         multiplier: 2,
       },
     }));
+  });
+
+  it("reports daemon no-ops as unchanged and excludes them from promotion projects", async () => {
+    const cwd = makeDir("compact-noop-accounting");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversations(paths.dbPath);
+    vi.spyOn(DaemonClient.prototype, "post")
+      .mockResolvedValueOnce({
+        actionTaken: false,
+        summary: "Summarization disabled — no summarizer configured.",
+        tokensBefore: 125,
+        tokensAfter: 120,
+      })
+      .mockResolvedValueOnce({ actionTaken: true, tokensBefore: 250, tokensAfter: 50 });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      onProgress: patch => progress.push(patch),
+    });
+
+    expect(result).toEqual({ compacted: 1, unchanged: 1, skipped: 0, failures: 0, compactedProjects: [paths.canonical] });
+    expect(log).toHaveBeenCalledWith(" unchanged (Summarization disabled — no summarizer configured.)");
+    expect(progress.find(patch => patch.lastResult?.sessionId === "session-1")?.lastResult).toMatchObject({
+      tokensBefore: 125,
+      tokensAfter: 120,
+    });
+  });
+
+  it("falls back to stored tokens and a generic message for metadata-free daemon no-ops", async () => {
+    const cwd = makeDir("compact-noop-fallbacks");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ actionTaken: false });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      onProgress: patch => progress.push(patch),
+    });
+
+    expect(result).toEqual({ compacted: 0, unchanged: 1, skipped: 0, failures: 0, compactedProjects: [] });
+    expect(log).toHaveBeenCalledWith(" unchanged (No compaction needed.)");
+    expect(progress.at(-1)?.lastResult).toMatchObject({ tokensBefore: 250, tokensAfter: 250 });
   });
 
   it("sends a process-provider timeout without an implicit retry override", async () => {
@@ -272,6 +361,89 @@ describe("batch compaction discovery", () => {
     expect(findUncompacted(100, false, cwd, true)).toHaveLength(1);
     expect(findUncompacted(100, true)).toHaveLength(0);
 
+    const replayDb = new DatabaseSync(paths.dbPath);
+    try {
+      replayDb.exec("PRAGMA journal_mode = WAL");
+      replayDb.exec("PRAGMA foreign_keys = ON");
+      replayDb.prepare(
+        "UPDATE context_items SET item_type = 'summary', message_id = NULL, summary_id = ? WHERE conversation_id = ? AND ordinal = 0",
+      ).run("summary-1", 1);
+    } finally {
+      replayDb.close();
+    }
+    expect(findUncompacted(100, true, cwd, true)).toEqual([]);
+
+    const condensationDb = new DatabaseSync(paths.dbPath);
+    try {
+      condensationDb.exec("PRAGMA journal_mode = WAL");
+      condensationDb.exec("PRAGMA foreign_keys = ON");
+      condensationDb.exec("BEGIN");
+      const insertSummary = condensationDb.prepare(
+        "INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, depth, file_ids) VALUES (?, ?, ?, ?, ?, ?, '[]')",
+      );
+      insertSummary.run("summary-2", 1, "leaf", "summary", 1_000, 0);
+      insertSummary.run("summary-3", 1, "leaf", "x".repeat(4_000), 0, 0);
+      const replaceMessage = condensationDb.prepare(
+        "UPDATE context_items SET item_type = 'summary', message_id = NULL, summary_id = ? WHERE conversation_id = ? AND ordinal = ?",
+      );
+      replaceMessage.run("summary-2", 1, 1);
+      replaceMessage.run("summary-3", 1, 2);
+      condensationDb.exec("COMMIT");
+    } finally {
+      condensationDb.close();
+    }
+    expect(findUncompacted(100, true, cwd, true)).toHaveLength(1);
+
+    const interruptedRunDb = new DatabaseSync(paths.dbPath);
+    try {
+      interruptedRunDb.exec("PRAGMA journal_mode = WAL");
+      interruptedRunDb.exec("PRAGMA foreign_keys = ON");
+      interruptedRunDb.prepare("UPDATE summaries SET depth = CASE summary_id WHEN 'summary-1' THEN 1 ELSE 0 END WHERE conversation_id = ?").run(1);
+    } finally {
+      interruptedRunDb.close();
+    }
+    expect(findUncompacted(100, true, cwd, true)).toEqual([]);
+
+    const chunkLimitDb = new DatabaseSync(paths.dbPath);
+    try {
+      chunkLimitDb.exec("PRAGMA journal_mode = WAL");
+      chunkLimitDb.exec("PRAGMA foreign_keys = ON");
+      chunkLimitDb.prepare("UPDATE summaries SET depth = 0, token_count = CASE summary_id WHEN 'summary-1' THEN 15000 WHEN 'summary-2' THEN 6000 ELSE 1000 END WHERE conversation_id = ?").run(1);
+    } finally {
+      chunkLimitDb.close();
+    }
+    expect(findUncompacted(100, true, cwd, true)).toEqual([]);
+
+    const fullChunkDb = new DatabaseSync(paths.dbPath);
+    try {
+      fullChunkDb.exec("PRAGMA journal_mode = WAL");
+      fullChunkDb.exec("PRAGMA foreign_keys = ON");
+      fullChunkDb.prepare("UPDATE summaries SET token_count = CASE summary_id WHEN 'summary-1' THEN 20000 ELSE 1000 END WHERE conversation_id = ?").run(1);
+    } finally {
+      fullChunkDb.close();
+    }
+    expect(findUncompacted(100, true, cwd, true)).toEqual([]);
+
+    const condensedDb = new DatabaseSync(paths.dbPath);
+    try {
+      condensedDb.exec("PRAGMA journal_mode = WAL");
+      condensedDb.exec("PRAGMA foreign_keys = ON");
+      condensedDb.prepare("UPDATE summaries SET depth = 1, token_count = 1000 WHERE conversation_id = ?").run(1);
+    } finally {
+      condensedDb.close();
+    }
+    expect(findUncompacted(100, true, cwd, true)).toHaveLength(1);
+
+    const summaryOnlyDb = new DatabaseSync(paths.dbPath);
+    try {
+      summaryOnlyDb.exec("PRAGMA journal_mode = WAL");
+      summaryOnlyDb.exec("PRAGMA foreign_keys = ON");
+      summaryOnlyDb.prepare("DELETE FROM context_items WHERE conversation_id = ? AND item_type = 'message'").run(1);
+    } finally {
+      summaryOnlyDb.close();
+    }
+    expect(findUncompacted(100, true, cwd, true)).toHaveLength(1);
+
     writeFileSync(projectMapPath(), "{");
     clearProjectMapCache();
     expect(findUncompacted(100, true, "/unmapped", true)).toEqual([]);
@@ -281,9 +453,12 @@ describe("batch compaction discovery", () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737 })).toEqual({
       compacted: 0,
+      unchanged: 0,
+      skipped: 0,
       failures: 0,
+      compactedProjects: [],
     });
-    expect(log).toHaveBeenCalledWith("Nothing to compact — all sessions are up to date.");
+    expect(log).toHaveBeenCalledWith("Nothing to compact — no sessions are currently eligible.");
 
     const cwd = makeDir("compact-boundary-outcomes");
     const paths = projectPaths(cwd);
@@ -298,7 +473,7 @@ describe("batch compaction discovery", () => {
       port: 3737,
       cwd,
       onProgress: patch => progress.push(patch),
-    })).toEqual({ compacted: 0, failures: 0 });
+    })).toEqual({ compacted: 0, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [] });
     expect(progress).toContainEqual({ total: 2 });
     expect(progress.at(-1)).toEqual({ completed: 2 });
     expect(log).toHaveBeenCalledWith(expect.stringContaining("Found 2 uncompacted conversations"));
@@ -314,7 +489,7 @@ describe("batch compaction discovery", () => {
       port: 3737,
       cwd,
       onProgress: patch => progress.push(patch),
-    })).toEqual({ compacted: 0, failures: 1 });
+    })).toEqual({ compacted: 0, unchanged: 0, skipped: 1, failures: 1, compactedProjects: [] });
     expect(post).toHaveBeenCalledTimes(2);
     expect(log).toHaveBeenCalledWith(" skipped (already in progress)");
     expect(log).toHaveBeenCalledWith(" FAILED (unknown error)");
@@ -333,7 +508,10 @@ describe("batch compaction discovery", () => {
 
     expect(await batchCompact({ minTokens: 100, dryRun: false, port: 3737, cwd })).toEqual({
       compacted: 1,
+      unchanged: 0,
+      skipped: 0,
       failures: 0,
+      compactedProjects: [paths.canonical],
     });
     expect(log).toHaveBeenCalledWith(expect.stringContaining("Found 1 uncompacted conversation ("));
     expect(log).toHaveBeenCalledWith(" done");
