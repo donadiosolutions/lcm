@@ -93,6 +93,7 @@ function healthStorageBackendMatches(
 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const STORAGE_BACKEND_AUTH_WARNING = "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated; verify the local daemon token and retry";
 const userSystemdPidCache = new Map<string, { pid: number | null; expiresAt: number }>();
 
 function sleep(ms: number): Promise<void> {
@@ -846,7 +847,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       hasAccess,
     );
     if (mismatchRepair === "blocked") {
-      return { connected: false, port: opts.port, spawned: false };
+      return { connected: false, port: opts.port, spawned: false, warning: STORAGE_BACKEND_AUTH_WARNING };
     }
     if (mismatchRepair === "none") {
       if (hasAccess) {
@@ -900,7 +901,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
             retryHasAccess,
           );
           if (mismatchRepair === "blocked") {
-            return { connected: false, port: opts.port, spawned: false };
+            return { connected: false, port: opts.port, spawned: false, warning: STORAGE_BACKEND_AUTH_WARNING };
           }
           repairedMismatch = mismatchRepair === "terminated";
           if (mismatchRepair === "none" && retryHasAccess) {

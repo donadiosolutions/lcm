@@ -317,7 +317,11 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: (): number[] => [19999],
     });
 
-    expect(result.connected).toBe(false);
+    expect(result).toMatchObject({
+      connected: false,
+      spawned: false,
+      warning: "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated; verify the local daemon token and retry",
+    });
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/stats/pool"))).toBe(true);
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
@@ -362,7 +366,11 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: (): number[] => [19999],
     });
 
-    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(result).toMatchObject({
+      connected: false,
+      spawned: false,
+      warning: "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated; verify the local daemon token and retry",
+    });
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
     expect(readFileSync(pidFile, "utf-8")).toBe("201");
@@ -397,7 +405,11 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: (): number[] => [19999],
     });
 
-    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(result).toMatchObject({
+      connected: false,
+      spawned: false,
+      warning: "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated; verify the local daemon token and retry",
+    });
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
     expect(readFileSync(pidFile, "utf-8")).toBe("200");
@@ -478,7 +490,11 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: (): number[] => [19999],
     });
 
-    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(result).toMatchObject({
+      connected: false,
+      spawned: false,
+      warning: "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated; verify the local daemon token and retry",
+    });
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
