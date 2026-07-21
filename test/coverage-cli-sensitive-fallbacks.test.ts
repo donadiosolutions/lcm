@@ -1,13 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  loadConfig: vi.fn(() => ({})),
+  loadConfig: vi.fn(() => ({
+    daemonPort: 3737,
+    storage: { backend: "sqlite" as const },
+    security: { sensitivePatterns: [] as string[] },
+  })),
   loadProjectPatterns: vi.fn(async () => [] as string[]),
   readSyncDate: vi.fn(() => "2026-07-18" as string | null),
   scrub: vi.fn((value: string) => value),
 }));
 
-vi.mock("../src/daemon/config.js", () => ({ loadDaemonConfig: mocks.loadConfig }));
+vi.mock("../src/config-projection.js", () => ({ loadStoredConfigProjection: mocks.loadConfig }));
 vi.mock("../src/daemon/project.js", () => ({ projectDir: (cwd: string): string => cwd }));
 vi.mock("../src/generated-patterns.js", () => ({ GITLEAKS_PATTERNS: [] }));
 vi.mock("../src/runtime-paths.js", () => ({
