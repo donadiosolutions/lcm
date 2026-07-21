@@ -4,7 +4,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { isLcmConnectionOpen } from "../../src/db/connection.js";
-import { SQLiteLocalHookOutboxFactory } from "../../src/storage/local-hook-outbox.js";
+import {
+  type LocalHookOutboxRepository,
+  SQLiteLocalHookOutboxFactory,
+} from "../../src/storage/local-hook-outbox.js";
 
 describe("SQLiteLocalHookOutboxFactory", () => {
   const directories: string[] = [];
@@ -19,6 +22,52 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-local-outbox-"));
     directories.push(directory);
     return join(directory, `${name}.db`);
+  }
+
+  function retainedOperations(
+    repository: LocalHookOutboxRepository,
+  ): Array<{ operation: string; run: () => Promise<unknown> }> {
+    return [
+      {
+        operation: "insertEvent",
+        run: () => repository.insertEvent(
+          "closed-session",
+          { type: "choice", category: "decision", data: "secret", priority: 1 },
+          "PostToolUse",
+        ),
+      },
+      { operation: "getUnprocessed", run: () => repository.getUnprocessed() },
+      { operation: "markProcessed", run: () => repository.markProcessed([1]) },
+      { operation: "pruneProcessed", run: () => repository.pruneProcessed(7) },
+      { operation: "setPrevEventId", run: () => repository.setPrevEventId(2, 1) },
+      {
+        operation: "getPatternReinforcement",
+        run: () => repository.getPatternReinforcement("choice", "decision", "secret"),
+      },
+      {
+        operation: "logHookError",
+        run: () => repository.logHookError("PostToolUse", new Error("secret")),
+      },
+      { operation: "getHealthStats", run: () => repository.getHealthStats() },
+      { operation: "getRecentErrors", run: () => repository.getRecentErrors() },
+      { operation: "pruneUnprocessed", run: () => repository.pruneUnprocessed() },
+      { operation: "pruneErrorLog", run: () => repository.pruneErrorLog() },
+    ];
+  }
+
+  async function expectRetainedOperationsClosed(repository: LocalHookOutboxRepository): Promise<void> {
+    for (const { operation, run } of retainedOperations(repository)) {
+      await expect(run()).rejects.toMatchObject({
+        name: "StorageOperationError",
+        code: "STORAGE_CLOSED",
+        backend: "sqlite",
+        projectId: undefined,
+        domain: "passive-events",
+        operation,
+        retryable: false,
+        message: "sqlite storage is closed",
+      });
+    }
   }
 
   it("adapts every outbox operation while preserving ordering and maintenance semantics", async () => {
@@ -98,6 +147,32 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     expect(isLcmConnectionOpen(firstPath)).toBe(false);
     expect(isLcmConnectionOpen(secondPath)).toBe(false);
     await factory.close();
-    await expect(factory.open(pathFor("late"))).rejects.toThrow("local hook outbox factory is closed");
+    await expect(factory.open(pathFor("late"))).rejects.toMatchObject({
+      code: "STORAGE_CLOSED",
+      backend: "sqlite",
+      domain: "passive-events",
+      operation: "open",
+    });
+  });
+
+  it("rejects every operation through a retained reference after repository close", async () => {
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const repository = await factory.open(pathFor("repository-close"));
+
+    await repository.close();
+    await repository.close();
+
+    await expectRetainedOperationsClosed(repository);
+    await factory.close();
+  });
+
+  it("rejects every operation through a retained reference after factory close", async () => {
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const repository = await factory.open(pathFor("factory-close"));
+
+    await factory.close();
+    await factory.close();
+
+    await expectRetainedOperationsClosed(repository);
   });
 });

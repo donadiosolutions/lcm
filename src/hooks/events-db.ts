@@ -70,7 +70,7 @@ export class EventsDb {
     // instances so that high-frequency hooks (PostToolUse fires 50-200x/session)
     // reuse the same underlying connection instead of opening/closing each time.
     this.db = getLcmConnection(dbPath);
-    if (options.busyTimeoutMs !== undefined) {
+    if (options.busyTimeoutMs !== undefined && Number.isFinite(options.busyTimeoutMs)) {
       this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(options.busyTimeoutMs))}`);
     }
     if (!_migratedPaths.has(dbPath)) {

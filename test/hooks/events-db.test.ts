@@ -35,6 +35,42 @@ describe("EventsDb", () => {
     db.close();
   });
 
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    "ignores a non-finite busy timeout (%s)",
+    (busyTimeoutMs) => {
+      const execSpy = vi.spyOn(DatabaseSync.prototype, "exec");
+      let db: EventsDb | undefined;
+      try {
+        db = new EventsDb(dbPath, { busyTimeoutMs });
+        const busyTimeoutPragmas = execSpy.mock.calls
+          .map(([sql]) => sql)
+          .filter((sql) => sql.startsWith("PRAGMA busy_timeout"));
+        expect(busyTimeoutPragmas).toEqual(["PRAGMA busy_timeout = 5000"]);
+      } finally {
+        db?.close();
+        execSpy.mockRestore();
+      }
+    },
+  );
+
+  it.each([
+    [-12.9, "PRAGMA busy_timeout = 0"],
+    [12.9, "PRAGMA busy_timeout = 12"],
+  ])("clamps and truncates a finite busy timeout (%s)", (busyTimeoutMs, expectedPragma) => {
+    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec");
+    let db: EventsDb | undefined;
+    try {
+      db = new EventsDb(dbPath, { busyTimeoutMs });
+      const busyTimeoutPragmas = execSpy.mock.calls
+        .map(([sql]) => sql)
+        .filter((sql) => sql.startsWith("PRAGMA busy_timeout"));
+      expect(busyTimeoutPragmas).toEqual(["PRAGMA busy_timeout = 5000", expectedPragma]);
+    } finally {
+      db?.close();
+      execSpy.mockRestore();
+    }
+  });
+
   it("inserts and retrieves events", () => {
     const db = new EventsDb(dbPath);
     db.insertEvent("session-1", {

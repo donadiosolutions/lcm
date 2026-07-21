@@ -1,4 +1,5 @@
 import { EventsDb } from "../hooks/events-db.js";
+import { StorageOperationError } from "./errors.js";
 
 export interface LocalHookEvent {
   type: string;
@@ -87,7 +88,13 @@ export class SQLiteLocalHookOutboxFactory {
     options: LocalHookOutboxOpenOptions = {},
   ): Promise<LocalHookOutboxRepository> {
     if (this.closed) {
-      throw new Error("local hook outbox factory is closed");
+      throw new StorageOperationError(
+        "STORAGE_CLOSED",
+        "sqlite",
+        undefined,
+        "passive-events",
+        "open",
+      );
     }
 
     let repository: SQLiteLocalHookOutboxRepository;
@@ -117,22 +124,27 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
   ) {}
 
   async insertEvent(sessionId: string, event: LocalHookEvent, sourceHook: string): Promise<number> {
+    this.assertOpen("insertEvent");
     return this.database.insertEvent(sessionId, event, sourceHook);
   }
 
   async getUnprocessed(limit?: number): Promise<LocalHookEventRow[]> {
+    this.assertOpen("getUnprocessed");
     return this.database.getUnprocessed(limit);
   }
 
   async markProcessed(eventIds: number[]): Promise<void> {
+    this.assertOpen("markProcessed");
     this.database.markProcessed(eventIds);
   }
 
   async pruneProcessed(olderThanDays: number): Promise<number> {
+    this.assertOpen("pruneProcessed");
     return this.database.pruneProcessed(olderThanDays);
   }
 
   async setPrevEventId(eventId: number, prevEventId: number): Promise<void> {
+    this.assertOpen("setPrevEventId");
     this.database.setPrevEventId(eventId, prevEventId);
   }
 
@@ -142,26 +154,32 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     data: string,
     maxAgeDays?: number,
   ): Promise<PatternReinforcementStats> {
+    this.assertOpen("getPatternReinforcement");
     return this.database.getPatternReinforcement(type, category, data, maxAgeDays);
   }
 
   async logHookError(hook: string, error: unknown, sessionId?: string): Promise<void> {
+    this.assertOpen("logHookError");
     this.database.logHookError(hook, error, sessionId);
   }
 
   async getHealthStats(): Promise<LocalHookOutboxHealth> {
+    this.assertOpen("getHealthStats");
     return this.database.getHealthStats();
   }
 
   async getRecentErrors(options?: LocalHookErrorQuery): Promise<LocalHookErrorRecord[]> {
+    this.assertOpen("getRecentErrors");
     return this.database.getRecentErrors(options);
   }
 
   async pruneUnprocessed(maxRows?: number, maxAgeDays?: number): Promise<{ pruned: number }> {
+    this.assertOpen("pruneUnprocessed");
     return this.database.pruneUnprocessed(maxRows, maxAgeDays);
   }
 
   async pruneErrorLog(olderThanDays?: number): Promise<number> {
+    this.assertOpen("pruneErrorLog");
     return this.database.pruneErrorLog(olderThanDays);
   }
 
@@ -170,5 +188,16 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     this.closed = true;
     this.database.close();
     this.onClose();
+  }
+
+  private assertOpen(operation: string): void {
+    if (!this.closed) return;
+    throw new StorageOperationError(
+      "STORAGE_CLOSED",
+      "sqlite",
+      undefined,
+      "passive-events",
+      operation,
+    );
   }
 }

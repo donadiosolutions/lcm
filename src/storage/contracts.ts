@@ -36,6 +36,7 @@ export type StorageDomain =
   | "redaction-admin"
   | "lexical-search"
   | "coordination"
+  | "passive-events"
   | "transaction";
 
 export interface StorageCapabilities {
