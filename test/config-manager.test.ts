@@ -226,8 +226,8 @@ describe("getConfigValue", () => {
       path: "storage",
       effective: true,
       env: {
-        LCM_POSTGRES_URL: "postgresql://effective-user:effective-password@db.example.com/lcm",
-        LCM_POSTGRES_CA_FILE: caPath,
+        LCM_POSTGRES_URL: " \npostgresql://effective-user:effective-password@db.example.com/lcm\t ",
+        LCM_POSTGRES_CA_FILE: ` \n${caPath}\t `,
       },
     });
     expect(storage).toMatchObject({
@@ -239,8 +239,8 @@ describe("getConfigValue", () => {
       path: "storage.postgresql.url",
       effective: true,
       env: {
-        LCM_POSTGRES_URL: "postgresql://effective-user:effective-password@db.example.com/lcm",
-        LCM_POSTGRES_CA_FILE: caPath,
+        LCM_POSTGRES_URL: " \npostgresql://effective-user:effective-password@db.example.com/lcm\t ",
+        LCM_POSTGRES_CA_FILE: ` \n${caPath}\t `,
       },
     })).toBe("[REDACTED]");
     expect(JSON.stringify(storage)).not.toContain("effective-password");

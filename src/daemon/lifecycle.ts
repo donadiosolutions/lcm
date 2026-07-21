@@ -93,7 +93,7 @@ function healthStorageBackendMatches(
 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
-const STORAGE_BACKEND_AUTH_WARNING = "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated; verify the local daemon token and retry";
+const STORAGE_BACKEND_AUTH_WARNING = "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
 const userSystemdPidCache = new Map<string, { pid: number | null; expiresAt: number }>();
 
 function sleep(ms: number): Promise<void> {
@@ -742,6 +742,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (authenticatedPid === undefined || !endpointIdentityMatches(health)) return false;
     if (!isLikelyLcmDaemonProcess(authenticatedPid, procRoot)) return false;
     await terminatePid(authenticatedPid, { isAlive, killProcess, sleepFn });
+    if (isAlive(authenticatedPid)) return false;
     const currentPid = readPidFile(opts.pidFilePath);
     if (currentPid === authenticatedPid) cleanStalePid(opts.pidFilePath);
     return currentPid === null || currentPid === authenticatedPid;
@@ -756,13 +757,13 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     hasAccess: boolean,
   ): Promise<"none" | "terminated" | "blocked"> {
     if (!identityMatches) return "none";
-    if (!versionMatches) {
-      await terminatePidFileProcess();
-      return "terminated";
+    if (!storageBackendMatches) {
+      if (!hasAccess) return "blocked";
+      return await terminateAuthenticatedDaemon(health) ? "terminated" : "blocked";
     }
-    if (storageBackendMatches) return "none";
-    if (!hasAccess) return "blocked";
-    return await terminateAuthenticatedDaemon(health) ? "terminated" : "blocked";
+    if (versionMatches) return "none";
+    await terminatePidFileProcess();
+    return "terminated";
   }
 
   async function daemonResult(
@@ -836,7 +837,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const identityMatches = endpointIdentityMatches(health);
     const versionMatches = healthVersionMatches(health, expectedVersion);
     const storageBackendMatches = healthStorageBackendMatches(health, expectedStorageBackend);
-    const hasAccess = identityMatches && versionMatches && initialAccessDeadline
+    const hasAccess = identityMatches && (versionMatches || !storageBackendMatches) && initialAccessDeadline
       ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, initialAccessDeadline)
       : false;
     const mismatchRepair = await repairMismatchedDaemon(
@@ -890,7 +891,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           const retryIdentityMatches = endpointIdentityMatches(retry);
           const retryVersionMatches = healthVersionMatches(retry, expectedVersion);
           const retryStorageBackendMatches = healthStorageBackendMatches(retry, expectedStorageBackend);
-          const retryHasAccess = retryIdentityMatches && retryVersionMatches && retryAccessDeadline
+          const retryHasAccess = retryIdentityMatches && (retryVersionMatches || !retryStorageBackendMatches) && retryAccessDeadline
             ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, retryAccessDeadline)
             : false;
           const mismatchRepair = await repairMismatchedDaemon(

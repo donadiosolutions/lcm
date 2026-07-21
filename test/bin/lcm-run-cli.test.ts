@@ -16,7 +16,7 @@ const state = vi.hoisted(() => ({
   dispatchHook: vi.fn(async () => ({ stdout: "hook-output", exitCode: 0 })),
   loadConfig: vi.fn(() => ({
     daemon: state.daemonPort === undefined ? undefined : { port: state.daemonPort },
-    storage: { backend: "sqlite" },
+    storage: { backend: state.storageBackend },
     llm: {
       provider: state.provider, apiMode: "responses", requestTimeoutMs: 1000,
       retry: { maxAttempts: 2, initialDelayMs: 1, maxDelayMs: 2, multiplier: 2 },
@@ -52,6 +52,7 @@ const state = vi.hoisted(() => ({
   importProgressLast: true,
   sensitiveStdout: "sensitive",
   packageVersion: "1.4.0" as unknown,
+  storageBackend: "sqlite" as "sqlite" | "postgresql",
 }));
 
 const fakeStdin = vi.hoisted(() => ({
@@ -179,6 +180,7 @@ beforeEach(() => {
   state.importProgressLast = true;
   state.sensitiveStdout = "sensitive";
   state.packageVersion = "1.4.0";
+  state.storageBackend = "sqlite";
   state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/project"] };
 });
 
@@ -364,6 +366,17 @@ describe("runCli orchestration actions", () => {
     await expect(runCli(["node", "lcm", "stats"])).rejects.toBeInstanceOf(StorageBackendUnavailableError);
   });
 
+  it.each(["start", "restart"])("refuses daemon %s before lifecycle mutation when the effective backend is unavailable", async (action) => {
+    state.loadConfig.mockReturnValueOnce({ daemon: { port: 3737 }, storage: { backend: "postgresql" } });
+
+    await expect(runCli(["node", "lcm", "daemon", action])).rejects.toMatchObject({
+      name: "StorageBackendUnavailableError",
+      message: expect.stringContaining("use storage.backend \"sqlite\""),
+    });
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.restartDaemon).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["restore"], ["session-end", "--client", "codex"], ["user-prompt"], ["post-tool"],
     ["session-snapshot"], ["compact", "--hook", "--client", "claude"],
@@ -406,6 +419,16 @@ describe("runCli orchestration actions", () => {
     state.fileText = JSON.stringify({ version: 1, entries: [{ id: "one" }] });
     expect((await invoke(["import-knowledge", "input.json", "--dry-run"]))?.message).toBe("exit:0");
     expect(await invoke(["import-knowledge", "input.json", "--confidence", "0.5"])).toBeUndefined();
+  });
+
+  it("rejects portable CLI operations before dispatch when PostgreSQL is selected", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    state.storageBackend = "postgresql";
+
+    expect(await invoke(["export", "--all"])).toBeInstanceOf(StorageBackendUnavailableError);
+    expect(await invoke(["import-knowledge", "input.json"])).toBeInstanceOf(StorageBackendUnavailableError);
+    expect(portable.exportKnowledge).not.toHaveBeenCalled();
+    expect(portable.importKnowledge).not.toHaveBeenCalled();
   });
 });
 

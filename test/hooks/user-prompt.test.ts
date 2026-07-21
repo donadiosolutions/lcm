@@ -154,6 +154,48 @@ describe("handleUserPromptSubmit", () => {
     expect(result.stdout).toContain("<learning-instruction>");
   });
 
+  it("queues local events before checking an unavailable PostgreSQL daemon", async () => {
+    const order: string[] = [];
+    const mockInsertEvent = vi.fn(() => { order.push("insert"); });
+    const mockClose = vi.fn(() => { order.push("close"); });
+    MockEventsDb.mockImplementation(function () {
+      return eventsDbFixture({
+        insertEvent: mockInsertEvent,
+        getHealthStats: vi.fn().mockReturnValue({ unprocessed: 1 }),
+        close: mockClose,
+      });
+    });
+    mockExtractUserPromptEvents.mockReturnValue([
+      { type: "decision", category: "decision", data: "use PostgreSQL", priority: 1 },
+    ]);
+    mockEnsureDaemon.mockImplementation(async () => {
+      order.push("ensure");
+      return { connected: false, port: 3737, spawned: false };
+    });
+    const client = { post: vi.fn() };
+
+    const result = await handleUserPromptSubmit(
+      JSON.stringify({ prompt: "we decided to use PostgreSQL", cwd: "/proj", session_id: "s1" }),
+      asDaemonClient(client),
+      3737,
+      "postgresql",
+    );
+
+    expect(order).toEqual(["insert", "close", "ensure"]);
+    expect(mockInsertEvent).toHaveBeenCalledWith(
+      "s1",
+      { type: "decision", category: "decision", data: "use PostgreSQL", priority: 1 },
+      "UserPromptSubmit",
+    );
+    expect(mockClose).toHaveBeenCalled();
+    expect(mockEnsureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+      expectedStorageBackend: "postgresql",
+    }));
+    expect(firePromoteEventsNotifyRequest).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
+    expect(result).toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+  });
+
   it("returns learning-instruction when prompt is missing", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const client = {
@@ -257,9 +299,13 @@ describe("handleUserPromptSubmit", () => {
   });
 
   it("extracts decision events to sidecar before prompt-search", async () => {
-    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
-    const mockInsertEvent = vi.fn();
-    const mockClose = vi.fn();
+    const order: string[] = [];
+    mockEnsureDaemon.mockImplementation(async () => {
+      order.push("ensure");
+      return { connected: true, port: 3737, spawned: false };
+    });
+    const mockInsertEvent = vi.fn(() => { order.push("insert"); });
+    const mockClose = vi.fn(() => { order.push("close"); });
     MockEventsDb.mockImplementation(function () {
       return eventsDbFixture({
         insertEvent: mockInsertEvent,
@@ -270,9 +316,13 @@ describe("handleUserPromptSubmit", () => {
     mockExtractUserPromptEvents.mockReturnValue([
       { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
     ]);
+    vi.mocked(firePromoteEventsNotifyRequest).mockImplementation(() => { order.push("notify"); });
     const mockClient = {
       health: vi.fn(),
-      post: vi.fn().mockResolvedValue({ hints: ["some hint"] }),
+      post: vi.fn().mockImplementation(async () => {
+        order.push("search");
+        return { hints: ["some hint"] };
+      }),
     };
 
     const result = await handleUserPromptSubmit(
@@ -281,6 +331,7 @@ describe("handleUserPromptSubmit", () => {
     );
 
     expect(result.exitCode).toBe(0);
+    expect(order).toEqual(["insert", "close", "ensure", "notify", "search"]);
     expect(mockExtractUserPromptEvents).toHaveBeenCalledWith("we decided to use SQLite");
     expect(mockInsertEvent).toHaveBeenCalledWith(
       "s1",

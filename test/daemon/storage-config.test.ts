@@ -143,6 +143,27 @@ describe("storage configuration", () => {
     });
   });
 
+  it("trims PostgreSQL environment and credential secrets before validation and use", () => {
+    const trustedCa = caFile("trusted-ca");
+    const config = parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
+      LCM_POSTGRES_URL: " \npostgresql://trim-user:trim-secret@db.example.com/lcm\t ",
+      LCM_POSTGRES_CA_FILE: ` \n${trustedCa}\t `,
+    });
+
+    expect(config.storage).toEqual({
+      backend: "postgresql",
+      postgresql: {
+        poolMax: 5,
+        connectionTimeoutMs: 10_000,
+        idleTimeoutMs: 30_000,
+        statementTimeoutMs: 60_000,
+        url: "postgresql://trim-user:trim-secret@db.example.com/lcm",
+        caFile: trustedCa,
+      },
+    });
+    expect(JSON.stringify(daemonConfigForPersistence(config)).toLowerCase()).not.toContain("trim-secret");
+  });
+
   it.each([
     [{ backend: 3 }, "storage.backend"],
     [{ backend: "mysql" }, "storage.backend"],

@@ -645,7 +645,7 @@ describe("runDoctor configuration validation", () => {
     expect(config?.message).toContain("[REDACTED]");
     for (const secret of secrets) expect(JSON.stringify(results)).not.toContain(secret);
     expect(stack?.status).toBe("pass");
-    expect(stack?.message).toContain("Storage: sqlite");
+    expect(stack?.message).toContain("Storage: unavailable");
     expect(stack?.message).toContain("Summarizer: unavailable");
     expect(results.some((result) => result.name === "secret-detection")).toBe(true);
   });
@@ -664,56 +664,45 @@ describe("runDoctor configuration validation", () => {
 
     expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
     expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:4545/health");
-    expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({ port: 4545 }));
+    expect(ensureDaemon).not.toHaveBeenCalled();
     expect(results.find((result) => result.name === "daemon")?.message).toContain("localhost:4545");
   });
 
-  it("recovers the PostgreSQL backend identity when another config field is invalid", async () => {
-    await runDoctor(minimalDeps({
-      readFileSync: (path: string) => {
-        if (path.endsWith("config.json")) {
-          return JSON.stringify({ storage: { backend: "postgresql" }, llm: { provider: "invalid" } });
-        }
-        return minimalDeps().readFileSync(path);
-      },
-    }));
+  it("does not transition a healthy SQLite daemon from an invalid PostgreSQL config", async () => {
+    const previousUrl = process.env.LCM_POSTGRES_URL;
+    const previousCaFile = process.env.LCM_POSTGRES_CA_FILE;
+    delete process.env.LCM_POSTGRES_URL;
+    delete process.env.LCM_POSTGRES_CA_FILE;
+    try {
+      const fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242 }),
+      });
+      const results = await runDoctor(minimalDeps({
+        fetch,
+        readFileSync: (path: string) => {
+          if (path.endsWith("config.json")) {
+            return JSON.stringify({ storage: { backend: "postgresql" } });
+          }
+          return minimalDeps().readFileSync(path);
+        },
+      }));
 
-    expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
-      expectedStorageBackend: "postgresql",
-    }));
-  });
-
-  it("recovers an explicit SQLite backend identity when another config field is invalid", async () => {
-    await runDoctor(minimalDeps({
-      readFileSync: (path: string) => {
-        if (path.endsWith("config.json")) {
-          return JSON.stringify({ storage: { backend: "sqlite" }, llm: { provider: "invalid" } });
-        }
-        return minimalDeps().readFileSync(path);
-      },
-    }));
-
-    expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
-      expectedStorageBackend: "sqlite",
-    }));
-  });
-
-  it.each([
-    "null",
-    "[]",
-    JSON.stringify({ storage: null }),
-    JSON.stringify({ storage: [] }),
-    JSON.stringify({ storage: "postgresql" }),
-  ])("falls back to SQLite identity for invalid config shape %s", async (content) => {
-    await runDoctor(minimalDeps({
-      readFileSync: (path: string) => path.endsWith("config.json")
-        ? content
-        : minimalDeps().readFileSync(path),
-    }));
-
-    expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
-      expectedStorageBackend: "sqlite",
-    }));
+      expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
+      expect(results.find((result) => result.name === "stack")?.message).toContain("Storage: unavailable");
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "warn",
+        fixApplied: false,
+      });
+      expect(results.find((result) => result.name === "daemon")?.message).toContain("repair skipped because config is invalid");
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(ensureDaemon).not.toHaveBeenCalled();
+    } finally {
+      if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = previousUrl;
+      if (previousCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = previousCaFile;
+    }
   });
 
   it.each([0, 65536, 4545.5, "4545"])(
@@ -731,7 +720,7 @@ describe("runDoctor configuration validation", () => {
       }));
 
       expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3737/health");
-      expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({ port: 3737 }));
+      expect(ensureDaemon).not.toHaveBeenCalled();
     },
   );
 

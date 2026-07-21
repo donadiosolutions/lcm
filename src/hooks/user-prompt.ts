@@ -13,6 +13,13 @@ type PromptSearchResponse = {
   ids?: string[];
 };
 
+type PromoteEventsNotification = {
+  cwd: string;
+  priority: number;
+  pendingCount: number;
+  sourceHook: "UserPromptSubmit";
+};
+
 function resolveHookCwd(inputCwd: unknown): string {
   const cwd = typeof inputCwd === "string" ? inputCwd : "";
   const envCwd = typeof process.env.CLAUDE_PROJECT_DIR === "string"
@@ -47,22 +54,13 @@ export async function handleUserPromptSubmit(
   expectedStorageBackend: StorageBackend = "sqlite",
 ): Promise<{ exitCode: number; stdout: string }> {
   const daemonPort = port ?? 3737;
-  const pidFilePath = daemonPidPath();
-  const { connected } = await ensureDaemon({
-    port: daemonPort,
-    pidFilePath,
-    spawnTimeoutMs: 5000,
-    expectedStorageBackend,
-    enforceUserManagerParent: true,
-  });
-  if (!connected) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
-
   try {
     const input = JSON.parse(stdin || "{}");
     if (!input.prompt || typeof input.prompt !== "string" || !input.prompt.trim()) {
       return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
     }
     const cwd = resolveHookCwd(input.cwd);
+    let notification: PromoteEventsNotification | undefined;
 
     // Sidecar event extraction — must happen before prompt-search, must never throw
     try {
@@ -84,12 +82,12 @@ export async function handleUserPromptSubmit(
           }
           const priority = Math.min(...events.map(event => event.priority));
           const pendingCount = db.getHealthStats().unprocessed;
-          firePromoteEventsNotifyRequest(daemonPort, {
+          notification = {
             cwd,
             priority,
             pendingCount,
             sourceHook: "UserPromptSubmit",
-          });
+          };
         } finally {
           db.close();
         }
@@ -99,6 +97,26 @@ export async function handleUserPromptSubmit(
         cwd: input.cwd ?? process.env.CLAUDE_PROJECT_DIR,
         sessionId: input.session_id,
       });
+    }
+
+    const { connected } = await ensureDaemon({
+      port: daemonPort,
+      pidFilePath: daemonPidPath(),
+      spawnTimeoutMs: 5000,
+      expectedStorageBackend,
+      enforceUserManagerParent: true,
+    });
+    if (!connected) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+
+    if (notification) {
+      try {
+        firePromoteEventsNotifyRequest(daemonPort, notification);
+      } catch (e) {
+        safeLogError("UserPromptSubmit", e, {
+          cwd,
+          sessionId: input.session_id,
+        });
+      }
     }
 
     const result = await client.post<PromptSearchResponse>("/prompt-search", {

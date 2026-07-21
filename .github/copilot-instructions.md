@@ -72,6 +72,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - When disabling a provider feature that also selects a related tier or mode, explicitly reset both process-local settings so global configuration cannot remain partially active.
 - Keep shared process-adapter error sanitization, metadata bounding, and compatibility formatting in one helper rather than duplicating it across providers.
 - Validation errors must report resolved effective values; do not hard-code the required value as though it were the current configuration.
+- When an environment or credential secret is validated after trimming whitespace, return and propagate that canonical trimmed value rather than the original raw string.
 - Treat a successful child-process exit with empty output as an empty-output failure, not a CLI rejection.
 - Registry subprocess failures must expose only bounded, allowlisted summaries; never include raw registry values, stdout, stderr, thrown messages, or causes in user-facing errors.
 - When a provider supports no values for an optional control, say the control is unsupported; do not render an empty set as `Valid values: none`.
@@ -80,11 +81,15 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Reject executable directories containing the platform PATH delimiter before composing a restricted child-process `PATH`; otherwise one trusted path can inject additional search directories or the current directory.
 - Managed-daemon executable search paths must reject project containment before recognizing global-install or bundled-runtime anchors; a project-local `.codex`, `.claude`, or package-manager-shaped directory is untrusted. Never add `npx`, any `node_modules` directory, the current project or its checkout ancestors, or ambient `PATH` entries.
 - Diagnostics for a reused managed daemon must inspect that verified process's effective environment before using a deterministic startup fallback. Never reuse a PID from the initial health probe when lifecycle validation fails or throws.
-- Authenticate the managed daemon token and verify access before terminating a process whose storage backend does not match the requested backend. Bind that authentication to the exact PID ultimately signaled by revalidating the PID file and endpoint identity immediately before termination. Never kill a process based only on its PID, health response, or reported backend.
+- Parent daemon start and restart flows must select and validate the storage backend before signaling an existing process or spawning a replacement.
+- Authenticate the managed daemon token before every transition involving a storage-backend mismatch, including combined version-and-backend mismatches. Bind authentication to the exact PID ultimately signaled by revalidating the PID file and endpoint identity immediately before termination; never kill based only on a PID, health response, or reported backend.
+- Authenticated termination succeeds only after confirming that the process died. If termination or death confirmation fails, preserve its PID state and do not spawn a replacement.
+- Doctor configuration-validation failures are observational: report them without repairing or transitioning the daemon using a recovered, unvalidated backend value.
 - Fail-closed daemon lifecycle results must include a sanitized, actionable warning that identifies the blocked transition without exposing tokens, credentials, or raw endpoint details.
 - PostgreSQL connection URLs must be hierarchical and include a non-empty hostname; reject opaque forms even when the platform URL parser accepts them.
 - Configuration and CA-file preflight must accept only bounded regular files. Reject directories, FIFOs, devices, and oversized files before reading them.
-- Staged unsupported storage backends must fail closed on every daemon path, including stats and diagnostic paths that can bypass normal connection creation; never fall back silently to SQLite.
+- Staged unsupported storage backends must be selected and fail closed before any legacy SQLite read, write, or enumeration, including portable import/export, stats, and diagnostic paths; never fall back silently to SQLite.
+- SQLite hook-outbox capture and persistence must complete before daemon-readiness checks; token-bearing or other network notification and daemon-dependent work must remain after verified daemon readiness.
 
 ### GitHub Actions and CodeQL
 

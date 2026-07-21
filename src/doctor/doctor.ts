@@ -51,7 +51,7 @@ function defaultDeps(): DoctorDeps {
 
 interface DoctorConfig {
   port: number;
-  storageBackend: "sqlite" | "postgresql";
+  storageBackend: "sqlite" | "postgresql" | "unavailable";
   summarizer: string;
   apiMode?: string;
   reasoningEffort?: string;
@@ -104,18 +104,6 @@ function recoverConfiguredPort(content: string): number {
   }
 }
 
-function recoverConfiguredStorageBackend(content: string): "sqlite" | "postgresql" {
-  try {
-    const parsed = JSON.parse(content) as unknown;
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return "sqlite";
-    const storage = (parsed as Record<string, unknown>).storage;
-    if (storage === null || typeof storage !== "object" || Array.isArray(storage)) return "sqlite";
-    return (storage as Record<string, unknown>).backend === "postgresql" ? "postgresql" : "sqlite";
-  } catch {
-    return "sqlite";
-  }
-}
-
 function loadConfig(deps: DoctorDeps): DoctorConfig {
   const resolvedConfigPath = configPath(deps.homedir);
   if (!deps.existsSync(resolvedConfigPath)) {
@@ -142,7 +130,7 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
       : new ConfigValidationError("$", error instanceof Error ? error.message : String(error));
     return {
       port: typeof content === "string" ? recoverConfiguredPort(content) : DEFAULT_DAEMON_PORT,
-      storageBackend: typeof content === "string" ? recoverConfiguredStorageBackend(content) : "sqlite",
+      storageBackend: "unavailable",
       summarizer: "disabled",
       validationError,
     };
@@ -535,7 +523,19 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     }
   } catch {}
 
-  if (daemonHealthy) {
+  if (config.validationError || config.storageBackend === "unavailable") {
+    results.push(daemonHealthy
+      ? {
+          name: "daemon", category: "Daemon", status: "warn",
+          message: `localhost:${config.port} (up) — automatic validation and repair skipped because config is invalid`,
+          fixApplied: false,
+        }
+      : {
+          name: "daemon", category: "Daemon", status: "fail",
+          message: `localhost:${config.port} not responding — automatic start skipped because config is invalid\n     Fix: correct config.json, then run: lcm daemon start`,
+          fixApplied: false,
+        });
+  } else if (daemonHealthy) {
     const pidFilePath = daemonPidPath(deps.homedir);
     const versionMismatch = Boolean(pkgVersion && daemonVersion !== pkgVersion);
     const daemonVersionLabel = daemonVersion ? `v${daemonVersion}` : "unknown version";

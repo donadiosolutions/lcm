@@ -861,7 +861,7 @@ function requiredPostgreSqlSecret(
   if (typeof value !== "string" || value.trim() === "") {
     throw new ConfigValidationError(envName, `must be a non-empty string when storage.backend is "postgresql"`);
   }
-  return value;
+  return value.trim();
 }
 
 /** Resolve backend selection, environment-only secrets, bounds, and PostgreSQL TLS preflight. */
