@@ -1148,7 +1148,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       const { selectStorageBackend } = await import("../src/storage/backend.js");
       selectStorageBackend(loadDaemonConfig(defaultConfigPath()).storage);
       const { collectStats, printStats } = await import("../src/stats.js");
-      printStats(collectStats(), verbose);
+      printStats(await collectStats(), verbose);
     });
 
   // ─── doctor ────────────────────────────────────────────────────────────────

@@ -72,7 +72,7 @@ vi.mock("../src/db/migration.js", () => ({
   runLcmMigrations: (db: FakeDatabaseState): void => mocks.migrate(db),
 }));
 vi.mock("../src/db/events-stats.js", () => ({
-  collectEventStats: (maxDbs: number): { captured: number; unprocessed: number; errors: number } => {
+  collectEventStats: async (maxDbs: number): Promise<{ captured: number; unprocessed: number; errors: number }> => {
     mocks.collectEvents(maxDbs);
     if (mocks.eventsFail) throw new Error("event db broken");
     return { captured: 9, unprocessed: 2, errors: 1 };
@@ -127,13 +127,13 @@ describe("stats service coverage", () => {
     expect([formatRatio(10, 2), formatRatio(0, 2), formatRatio(2, 0)]).toEqual(["5.0", "–", "–"]);
   });
 
-  it("returns the empty aggregate when the projects directory is absent", () => {
+  it("returns the empty aggregate when the projects directory is absent", async () => {
     mocks.baseExists = false;
-    expect(collectStats()).toMatchObject({ projects: 0, messages: 0, staleCount: 0 });
+    expect(await collectStats()).toMatchObject({ projects: 0, messages: 0, staleCount: 0 });
     expect(mocks.collectEvents).not.toHaveBeenCalled();
   });
 
-  it("aggregates valid projects while skipping directories, missing databases, empty projects, and corrupt databases", () => {
+  it("aggregates valid projects while skipping directories, missing databases, empty projects, and corrupt databases", async () => {
     mocks.entries = [
       { name: "file", directory: false, dbExists: false },
       { name: "missing", directory: true, dbExists: false },
@@ -170,7 +170,7 @@ describe("stats service coverage", () => {
       ] });
     mocks.findStale.mockReturnValueOnce([1, 2]).mockImplementationOnce(() => { throw new Error("stale query"); });
 
-    const result = collectStats();
+    const result = await collectStats();
     expect(result).toMatchObject({
       projects: 2, conversations: 3, compactedConversations: 2, messages: 5, summaries: 3,
       maxDepth: 3, rawTokens: 100, summaryTokens: 10, ratio: 10, promotedCount: 4, staleCount: 0,
@@ -182,7 +182,7 @@ describe("stats service coverage", () => {
     expect(mocks.close).toHaveBeenCalledTimes(4);
   });
 
-  it("uses config and event fallbacks and produces a null global recall ratio", () => {
+  it("uses config and event fallbacks and produces a null global recall ratio", async () => {
     mocks.configFails = true;
     mocks.eventsFail = true;
     mocks.entries = [{ name: "one", directory: true, dbExists: true }];
@@ -190,7 +190,7 @@ describe("stats service coverage", () => {
       messages: 1, messageTokens: 1, summaries: 0, summaryTokens: 0, maxDepth: 0, promoted: 0,
       redactions: [], conversations: [{ conversation_id: 1, messages: 1, summaries: 0, max_depth: 0, raw_tokens: 1, summary_tokens: 0 }],
     });
-    const result = collectStats();
+    const result = await collectStats();
     expect(result).toMatchObject({ ratio: 0, eventsCaptured: 0, recallStats: { recallPrecision: null } });
     expect(mocks.findStale).toHaveBeenCalledWith(expect.objectContaining({ staleAfterDays: 90, staleSurfacingWithoutUseLimit: 5 }));
   });

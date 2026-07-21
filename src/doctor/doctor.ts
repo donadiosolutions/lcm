@@ -370,13 +370,15 @@ function formatTimeAgo(date: Date): string {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-function checkPassiveLearning(
+async function checkPassiveLearning(
   results: CheckResult[],
   options: Required<DoctorRunOptions>,
   daemonHealthy: boolean,
-): void {
+): Promise<void> {
   const statsOptions = { timeoutMs: 2000, maxDbs: options.eventsMaxDbs, pruneOrphanSidecars: true };
-  const stats = options.verbose ? collectDetailedEventStats(statsOptions) : collectEventStats(statsOptions);
+  const stats = options.verbose
+    ? await collectDetailedEventStats(statsOptions)
+    : await collectEventStats(statsOptions);
 
   if ((stats.prunedSidecars ?? 0) > 0) {
     results.push({
@@ -893,7 +895,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   // ── Passive Learning ──
   // The hooks check above always reports pass or warn, so passive-learning
   // diagnostics are always applicable by the time this point is reached.
-  checkPassiveLearning(results, options, daemonHealthy);
+  await checkPassiveLearning(results, options, daemonHealthy);
 
   return results;
 }

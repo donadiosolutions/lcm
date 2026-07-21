@@ -340,7 +340,7 @@ export function printStats(stats: OverallStats, verbose: boolean): void {
   console.log();
 }
 
-export function collectStats(): OverallStats {
+export async function collectStats(): Promise<OverallStats> {
   const baseDir = lcmProjectsDir();
 
   const emptyRecallStats: RecallStats = {
@@ -422,7 +422,7 @@ export function collectStats(): OverallStats {
   let eventsUnprocessed = 0;
   let eventsErrors = 0;
   try {
-    const eventStats = collectEventStats(2000);
+    const eventStats = await collectEventStats(2000);
     eventsCaptured = eventStats.captured;
     eventsUnprocessed = eventStats.unprocessed;
     eventsErrors = eventStats.errors;

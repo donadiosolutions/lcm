@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 
 let mockEventsDir: string;
 let mockProjectsDir: string;
@@ -44,15 +45,15 @@ describe("collectEventStats", () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it("returns zeros when no sidecar DBs exist", () => {
-    const stats = collectEventStats();
+  it("returns zeros when no sidecar DBs exist", async () => {
+    const stats = await collectEventStats();
     expect(stats.captured).toBe(0);
     expect(stats.unprocessed).toBe(0);
     expect(stats.errors).toBe(0);
     expect(stats.lastCapture).toBeNull();
   });
 
-  it("aggregates across multiple sidecar DBs", () => {
+  it("aggregates across multiple sidecar DBs", async () => {
     const db1 = new EventsDb(join(tempDir, "project1.db"));
     db1.insertEvent("s1", { type: "decision", category: "decision", data: "d1", priority: 1 }, "PostToolUse");
     db1.insertEvent("s1", { type: "file", category: "pattern", data: "f1", priority: 3 }, "PostToolUse");
@@ -63,44 +64,44 @@ describe("collectEventStats", () => {
     db2.insertEvent("s2", { type: "git", category: "workflow", data: "g1", priority: 2 }, "PostToolUse");
     db2.close();
 
-    const stats = collectEventStats();
+    const stats = await collectEventStats();
     expect(stats.captured).toBe(3);
     expect(stats.unprocessed).toBe(3);
     expect(stats.errors).toBe(1);
   });
 
-  it("skips non-.db files in events directory", () => {
+  it("skips non-.db files in events directory", async () => {
     const { writeFileSync } = require("node:fs");
     writeFileSync(join(tempDir, "not-a-db.txt"), "hello");
 
-    const stats = collectEventStats();
+    const stats = await collectEventStats();
     expect(stats.captured).toBe(0);
   });
 
-  it("handles corrupt DB gracefully", () => {
+  it("handles corrupt DB gracefully", async () => {
     const { writeFileSync } = require("node:fs");
     writeFileSync(join(tempDir, "corrupt.db"), "not a sqlite database");
 
-    const stats = collectEventStats();
+    const stats = await collectEventStats();
     expect(stats.captured).toBe(0);
     expect(stats.errors).toBe(0);
     expect(stats.scanErrors).toBe(1);
   });
 
-  it("respects timeout budget", () => {
+  it("respects timeout budget", async () => {
     const db = new EventsDb(join(tempDir, "timeout.db"));
     db.close();
-    const stats = collectEventStats(0);
+    const stats = await collectEventStats(0);
     expect(stats.captured).toBe(0);
     expect(stats.scanSkipped).toBe(1);
   });
 
-  it("returns no sidecars when the events directory cannot be read", () => {
+  it("returns no sidecars when the events directory cannot be read", async () => {
     mockEventsDir = join(tempDir, "missing-events-dir");
-    expect(collectEventSidecars()).toEqual([]);
+    expect(await collectEventSidecars()).toEqual([]);
   });
 
-  it("loads valid project metadata and ignores invalid or empty metadata", () => {
+  it("loads valid project metadata and ignores invalid or empty metadata", async () => {
     for (const [projectId, metadata] of [
       ["valid-meta", JSON.stringify({ cwd: "/workspace/project" })],
       ["invalid-meta", "not-json"],
@@ -115,14 +116,14 @@ describe("collectEventStats", () => {
       writeFileSync(join(projectDir, "meta.json"), metadata);
     }
 
-    const sidecars = collectEventSidecars({ pruneOrphanSidecars: false });
+    const sidecars = await collectEventSidecars({ pruneOrphanSidecars: false });
     expect(sidecars.find((entry) => entry.projectId === "valid-meta")?.cwd).toBe("/workspace/project");
     for (const projectId of ["invalid-meta", "empty-meta", "typed-meta"]) {
       expect(sidecars.find((entry) => entry.projectId === projectId)?.cwd).toBeUndefined();
     }
   });
 
-  it("preserves fresh and malformed-date processed orphan sidecars", () => {
+  it("preserves fresh and malformed-date processed orphan sidecars", async () => {
     for (const [file, createdAt] of [
       ["fresh.db", "datetime('now')"],
       ["invalid-date.db", "'invalid'"],
@@ -133,23 +134,25 @@ describe("collectEventStats", () => {
       db.insertEvent("s", { type: "decision", category: "decision", data: file, priority: 1 }, "PostToolUse");
       const events = db.getUnprocessed();
       db.markProcessed(events.map((event) => event.event_id));
-      db.raw().exec(`UPDATE events SET created_at = ${createdAt}`);
       db.close();
+      const raw = new DatabaseSync(path);
+      raw.exec(`UPDATE events SET created_at = ${createdAt}`);
+      raw.close();
     }
 
-    const sidecars = collectEventSidecars({ pruneOrphanSidecars: true });
+    const sidecars = await collectEventSidecars({ pruneOrphanSidecars: true });
     expect(sidecars.find((entry) => entry.file === "fresh.db")?.pruned).toBeUndefined();
     expect(sidecars.find((entry) => entry.file === "invalid-date.db")?.pruned).toBeUndefined();
     expect(sidecars.find((entry) => entry.file === "null-date.db")?.pruned).toBeUndefined();
   });
 
-  it("normalizes non-Error sidecar scan failures", () => {
+  it("normalizes non-Error sidecar scan failures", async () => {
     writeFileSync(join(tempDir, "string-error.db"), "trigger");
-    expect(collectEventSidecars({ pruneOrphanSidecars: false })[0].scanError)
+    expect((await collectEventSidecars({ pruneOrphanSidecars: false }))[0].scanError)
       .toBe("failed to scan sidecar");
   });
 
-  it("surfaces sidecars skipped by scan limits", () => {
+  it("surfaces sidecars skipped by scan limits", async () => {
     const db1 = new EventsDb(join(tempDir, "project1.db"));
     db1.insertEvent("s1", { type: "decision", category: "decision", data: "d1", priority: 1 }, "PostToolUse");
     db1.close();
@@ -158,24 +161,24 @@ describe("collectEventStats", () => {
     db2.insertEvent("s2", { type: "decision", category: "decision", data: "d2", priority: 1 }, "PostToolUse");
     db2.close();
 
-    const sidecars = collectEventSidecars({ maxDbs: 1 });
+    const sidecars = await collectEventSidecars({ maxDbs: 1 });
     expect(sidecars).toHaveLength(2);
     expect(sidecars.some((sidecar) => sidecar.scanSkipped === undefined)).toBe(true);
     expect(sidecars.some((sidecar) => (sidecar.scanSkipped ?? "").includes("maxDbs"))).toBe(true);
 
-    const stats = collectEventStats({ maxDbs: 1 });
+    const stats = await collectEventStats({ maxDbs: 1 });
     expect(stats.scanSkipped).toBe(1);
     expect(stats.scanErrors).toBe(0);
   });
 
-  it("can start scans from a rotated sidecar index", () => {
+  it("can start scans from a rotated sidecar index", async () => {
     for (const file of ["a.db", "b.db", "c.db"]) {
       const db = new EventsDb(join(tempDir, file));
       db.insertEvent("s1", { type: "decision", category: "decision", data: file, priority: 1 }, "PostToolUse");
       db.close();
     }
 
-    const sidecars = collectEventSidecars({ maxDbs: 1, startIndex: 1, pruneOrphanSidecars: false });
+    const sidecars = await collectEventSidecars({ maxDbs: 1, startIndex: 1, pruneOrphanSidecars: false });
 
     expect(sidecars[0].file).toBe("b.db");
     expect(sidecars[0].scanSkipped).toBeUndefined();
@@ -183,19 +186,19 @@ describe("collectEventStats", () => {
     expect(sidecars[1].scanSkipped).toContain("2 sidecars");
   });
 
-  it("bounds truncation reporting to one summary regardless of skipped file count", () => {
+  it("bounds truncation reporting to one summary regardless of skipped file count", async () => {
     for (let i = 0; i < 100; i++) writeFileSync(join(tempDir, `placeholder-${i}.db`), "");
-    const sidecars = collectEventSidecars({ maxDbs: 0, pruneOrphanSidecars: false });
+    const sidecars = await collectEventSidecars({ maxDbs: 0, pruneOrphanSidecars: false });
     expect(sidecars).toHaveLength(1);
     expect(sidecars[0].scanSkipped).toContain("100 sidecars");
   });
 
-  it("prunes empty orphan sidecars by default", () => {
+  it("prunes empty orphan sidecars by default", async () => {
     const sidecarPath = join(tempDir, `orphan-empty-${Date.now()}.db`);
     const db = new EventsDb(sidecarPath);
     db.close();
 
-    const sidecars = collectEventSidecars();
+    const sidecars = await collectEventSidecars();
     const pruned = sidecars.find((sidecar) => sidecar.path === sidecarPath);
 
     expect(pruned?.pruned).toBe(true);
@@ -203,21 +206,23 @@ describe("collectEventStats", () => {
     expect(existsSync(sidecarPath)).toBe(false);
   });
 
-  it("prunes stale processed orphan sidecars but preserves queued orphan sidecars", () => {
+  it("prunes stale processed orphan sidecars but preserves queued orphan sidecars", async () => {
     const stalePath = join(tempDir, `orphan-stale-${Date.now()}.db`);
     const staleDb = new EventsDb(stalePath);
     staleDb.insertEvent("s1", { type: "decision", category: "decision", data: "old", priority: 1 }, "PostToolUse");
     const staleEvents = staleDb.getUnprocessed();
     staleDb.markProcessed(staleEvents.map((event) => event.event_id));
-    staleDb.raw().exec("UPDATE events SET created_at = datetime('now', '-31 days')");
     staleDb.close();
+    const raw = new DatabaseSync(stalePath);
+    raw.exec("UPDATE events SET created_at = datetime('now', '-31 days')");
+    raw.close();
 
     const queuedPath = join(tempDir, `orphan-queued-${Date.now()}.db`);
     const queuedDb = new EventsDb(queuedPath);
     queuedDb.insertEvent("s1", { type: "decision", category: "decision", data: "queued", priority: 1 }, "PostToolUse");
     queuedDb.close();
 
-    const sidecars = collectEventSidecars({ pruneOrphanSidecars: true });
+    const sidecars = await collectEventSidecars({ pruneOrphanSidecars: true });
     const pruned = sidecars.find((sidecar) => sidecar.path === stalePath);
     const queued = sidecars.find((sidecar) => sidecar.path === queuedPath);
 
@@ -229,13 +234,13 @@ describe("collectEventStats", () => {
     expect(existsSync(queuedPath)).toBe(true);
   });
 
-  it("preserves orphan sidecars with recent hook errors", () => {
+  it("preserves orphan sidecars with recent hook errors", async () => {
     const sidecarPath = join(tempDir, `orphan-errors-${Date.now()}.db`);
     const db = new EventsDb(sidecarPath);
     db.logHookError("PostToolUse", new Error("recent failure"));
     db.close();
 
-    const sidecars = collectEventSidecars({ pruneOrphanSidecars: true });
+    const sidecars = await collectEventSidecars({ pruneOrphanSidecars: true });
     const preserved = sidecars.find((sidecar) => sidecar.path === sidecarPath);
 
     expect(preserved?.pruned).toBeUndefined();
@@ -243,11 +248,11 @@ describe("collectEventStats", () => {
     expect(existsSync(sidecarPath)).toBe(true);
   });
 
-  it("includes scan failures in detailed project stats", () => {
+  it("includes scan failures in detailed project stats", async () => {
     const { writeFileSync } = require("node:fs");
     writeFileSync(join(tempDir, "corrupt.db"), "not a sqlite database");
 
-    const stats = collectDetailedEventStats();
+    const stats = await collectDetailedEventStats();
     expect(stats.errors).toBe(0);
     expect(stats.scanErrors).toBe(1);
     expect(stats.projects).toHaveLength(1);
@@ -255,13 +260,13 @@ describe("collectEventStats", () => {
     expect(stats.projects[0].path).toContain("corrupt.db");
   });
 
-  it("includes recent errors from healthy sidecars in detailed stats", () => {
+  it("includes recent errors from healthy sidecars in detailed stats", async () => {
     const db = new EventsDb(join(tempDir, "detailed.db"));
     db.insertEvent("s", { type: "decision", category: "decision", data: "d", priority: 1 }, "PostToolUse");
     db.logHookError("PostToolUse", new Error("detailed failure"));
     db.close();
 
-    const stats = collectDetailedEventStats({ pruneOrphanSidecars: false });
+    const stats = await collectDetailedEventStats({ pruneOrphanSidecars: false });
     expect(stats.recentErrors.some((entry) => entry.error.includes("detailed failure"))).toBe(true);
   });
 });

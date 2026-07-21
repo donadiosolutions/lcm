@@ -349,7 +349,10 @@ configuration and verified-TLS prerequisites for an explicit remote-primary
 PostgreSQL selection. PostgreSQL repositories land in #82, so selecting
 `postgresql` currently fails before daemon startup instead of falling back to
 SQLite. Connection credentials stay out of JSON and effective configuration
-output. See [storage backend configuration](docs/configuration.md#storage-backend).
+output. See [storage backend configuration](docs/configuration.md#storage-backend)
+for operators and the [storage repository architecture](docs/architecture.md#storage-repository-architecture)
+for repository ownership, lifetimes, transactions, and the local-outbox
+boundary.
 
 ## Development
 

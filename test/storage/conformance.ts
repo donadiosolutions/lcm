@@ -1,0 +1,370 @@
+import { expect, it } from "vitest";
+import type { ProjectStorage, StorageBackendFactory } from "../../src/storage/contracts.js";
+import { StorageOperationError } from "../../src/storage/errors.js";
+import { createRetrievalEngine, RetrievalEngine } from "../../src/retrieval.js";
+import { deduplicateAndInsert } from "../../src/promotion/dedup.js";
+import type { ProjectIdentity } from "../../src/project-map.js";
+
+export interface StorageContractHarness {
+  factory: StorageBackendFactory;
+  identity(label: string): ProjectIdentity;
+  open(label: string): Promise<ProjectStorage>;
+}
+
+export function defineCoreStorageConformance(
+  createHarness: () => StorageContractHarness,
+): void {
+  it("round-trips every core repository domain with stable ordering", async () => {
+    const harness = createHarness();
+    const storage = await harness.open("core");
+    expect(createRetrievalEngine(storage)).toBeInstanceOf(RetrievalEngine);
+    const first = await storage.conversations.createConversation({ sessionId: "session-a", title: "A" });
+    const second = await storage.conversations.createConversation({ sessionId: "session-b" });
+    expect((await storage.conversations.listConversations()).map((row) => row.conversationId)).toEqual([
+      first.conversationId,
+      second.conversationId,
+    ]);
+    expect(await storage.conversations.getConversation(first.conversationId)).toMatchObject({ title: "A" });
+    expect(await storage.conversations.getConversation(999_999)).toBeNull();
+    expect(await storage.conversations.getConversationBySessionId("session-a")).toMatchObject({ sessionId: "session-a" });
+    expect(await storage.conversations.getConversationBySessionId("missing")).toBeNull();
+    expect((await storage.conversations.getOrCreateConversation("session-a")).conversationId).toBe(first.conversationId);
+    expect((await storage.conversations.getOrCreateConversation("session-c", "C")).title).toBe("C");
+    await storage.conversations.markConversationBootstrapped(first.conversationId);
+    expect((await storage.conversations.getConversation(first.conversationId))?.bootstrappedAt).toBeInstanceOf(Date);
+
+    const messages = await storage.conversations.createMessagesBulk([
+      { conversationId: first.conversationId, seq: 0, role: "user", content: "alpha needle", tokenCount: 2 },
+      { conversationId: first.conversationId, seq: 1, role: "assistant", content: "beta needle", tokenCount: 3 },
+    ]);
+    const third = await storage.conversations.createMessage({
+      conversationId: first.conversationId,
+      seq: 2,
+      role: "tool",
+      content: "gamma",
+      tokenCount: 4,
+    });
+    expect(await storage.conversations.createMessagesBulk([])).toEqual([]);
+    expect((await storage.conversations.getMessages(first.conversationId)).map((row) => row.seq)).toEqual([0, 1, 2]);
+    expect((await storage.conversations.getMessages(first.conversationId, { afterSeq: 0, limit: 1 }))[0]?.seq).toBe(1);
+    expect((await storage.conversations.getLastMessage(first.conversationId))?.messageId).toBe(third.messageId);
+    expect(await storage.conversations.getLastMessage(second.conversationId)).toBeNull();
+    expect(await storage.conversations.hasMessage(first.conversationId, "user", "alpha needle")).toBe(true);
+    expect(await storage.conversations.countMessagesByIdentity(first.conversationId, "user", "alpha needle")).toBe(1);
+    expect((await storage.conversations.getMessageById(messages[0].messageId))?.seq).toBe(0);
+    expect(await storage.conversations.getMessageById(999_999)).toBeNull();
+    await storage.conversations.createMessageParts(messages[0].messageId, [{
+      sessionId: "session-a",
+      partType: "text",
+      ordinal: 0,
+      textContent: "alpha",
+      metadata: "{}",
+    }]);
+    await storage.conversations.createMessageParts(messages[0].messageId, []);
+    expect(await storage.conversations.getMessageParts(messages[0].messageId)).toMatchObject([{ ordinal: 0, textContent: "alpha" }]);
+    expect(await storage.conversations.getMessageCount(first.conversationId)).toBe(3);
+    expect(await storage.conversations.getMaxSeq(first.conversationId)).toBe(2);
+
+    await storage.context.appendContextMessages(first.conversationId, messages.map((row) => row.messageId));
+    await storage.context.appendContextMessage(first.conversationId, third.messageId);
+    await storage.context.appendContextMessages(first.conversationId, []);
+    const leaf = await storage.summaries.insertSummary({
+      summaryId: "leaf-1",
+      conversationId: first.conversationId,
+      kind: "leaf",
+      content: "leaf needle",
+      tokenCount: 5,
+      earliestAt: new Date("2026-01-01T00:00:00Z"),
+      latestAt: new Date("2026-01-02T00:00:00Z"),
+    });
+    const parent = await storage.summaries.insertSummary({
+      summaryId: "parent-1",
+      conversationId: first.conversationId,
+      kind: "condensed",
+      content: "parent",
+      tokenCount: 6,
+    });
+    await storage.summaries.linkSummaryToMessages(leaf.summaryId, messages.map((row) => row.messageId));
+    await storage.summaries.linkSummaryToMessages(leaf.summaryId, []);
+    await storage.summaries.linkSummaryToParents(leaf.summaryId, [parent.summaryId]);
+    await storage.summaries.linkSummaryToParents(parent.summaryId, []);
+    expect(await storage.summaries.getSummary("missing")).toBeNull();
+    expect(await storage.summaries.getSummariesByConversation(first.conversationId)).toHaveLength(2);
+    expect(await storage.summaries.listRecentSummaries(1)).toHaveLength(1);
+    expect((await storage.summaries.listRecentSummariesForSession("session-a", 5)).map((row) => row.depth)).toEqual([1, 0]);
+    expect(await storage.summaries.listRecentSummariesForSession("missing", 5)).toEqual([]);
+    expect(await storage.summaries.getSummaryMessages(leaf.summaryId)).toEqual(messages.map((row) => row.messageId));
+    expect((await storage.summaries.getSummaryChildren(parent.summaryId))[0]?.summaryId).toBe(leaf.summaryId);
+    expect((await storage.summaries.getSummaryParents(leaf.summaryId))[0]?.summaryId).toBe(parent.summaryId);
+    expect((await storage.summaries.getSummarySubtree(parent.summaryId)).map((row) => row.summaryId)).toEqual(["parent-1", "leaf-1"]);
+    await storage.context.appendContextSummary(first.conversationId, leaf.summaryId);
+    expect(await storage.context.getDistinctDepthsInContext(first.conversationId)).toEqual([0]);
+    expect(await storage.context.getDistinctDepthsInContext(first.conversationId, { maxOrdinalExclusive: Infinity })).toEqual([0]);
+    expect(await storage.context.getContextTokenCount(first.conversationId)).toBe(14);
+    expect((await storage.context.getContextItems(first.conversationId)).map((row) => row.ordinal)).toEqual([0, 1, 2, 3]);
+    await storage.context.replaceContextRangeWithSummary({
+      conversationId: first.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 2,
+      summaryId: parent.summaryId,
+    });
+    expect((await storage.context.getContextItems(first.conversationId)).map((row) => row.ordinal)).toEqual([0, 1]);
+
+    const file = await storage.largeFiles.insertLargeFile({
+      fileId: "file-1",
+      conversationId: first.conversationId,
+      fileName: "a.txt",
+      storageUri: "local:a",
+    });
+    expect(file.fileName).toBe("a.txt");
+    expect(await storage.largeFiles.getLargeFile("missing")).toBeNull();
+    expect(await storage.largeFiles.getLargeFilesByConversation(first.conversationId)).toHaveLength(1);
+
+    const memoryId = await storage.promotedMemory.insert({
+      content: "durable needle",
+      tags: ["architecture"],
+      sourceProjectId: "source-a",
+      sessionId: "session-a",
+      ...({ projectId: "caller-controlled" } as object),
+    } as Parameters<typeof storage.promotedMemory.insert>[0]);
+    expect(await storage.promotedMemory.getById(memoryId)).toMatchObject({
+      tags: ["architecture"],
+      projectId: "source-a",
+    });
+    expect(await storage.promotedMemory.getById("missing")).toBeNull();
+    expect(await storage.promotedMemory.getAll({
+      sourceProjectId: "source-a",
+      tags: ["architecture"],
+      ...({ projectId: "caller-controlled" } as object),
+    })).toHaveLength(1);
+    expect(await storage.promotedMemory.getAll({ sourceProjectId: "missing" })).toEqual([]);
+    expect(await storage.promotedMemory.listContentPrefixes(5)).toEqual(["durable needle"]);
+    await storage.promotedMemory.update(memoryId, { content: "updated needle", confidence: 0.8, tags: ["updated"] });
+    expect(await storage.promotedMemory.findStale({
+      staleAfterDays: -1,
+      staleSurfacingWithoutUseLimit: 2,
+      sourceProjectId: "source-a",
+    })).toHaveLength(1);
+    expect(await storage.promotedMemory.findStale({
+      staleAfterDays: -1,
+      staleSurfacingWithoutUseLimit: 2,
+      sourceProjectId: "missing",
+    })).toEqual([]);
+    await storage.promotedMemory.archive(memoryId);
+    expect(await storage.promotedMemory.getAll()).toEqual([]);
+    await storage.promotedMemory.revive(memoryId);
+    expect(await storage.promotedMemory.getAll()).toHaveLength(1);
+    await storage.transaction(async (tx) => {
+      await tx.promotedMemory.archive(memoryId);
+      await tx.promotedMemory.revive(memoryId);
+      await tx.context.replaceContextRangeWithSummary({
+        conversationId: first.conversationId,
+        startOrdinal: 0,
+        endOrdinal: 1,
+        summaryId: leaf.summaryId,
+      });
+    });
+
+    await storage.recall.logSurfacing([memoryId], "session-a");
+    await storage.recall.logSurfacing([], null);
+    expect((await storage.recall.getFeedback([memoryId])).get(memoryId)?.surfacingCount).toBe(1);
+    expect((await storage.recall.getStats()).memoriesSurfaced).toBe(1);
+    await storage.redactionAdmin.upsertCounts({ gitleaks: 1, builtIn: 1, global: 1, project: 1 });
+    await storage.redactionAdmin.upsertCounts({ gitleaks: 0, builtIn: 0, global: 0, project: 0 });
+    await storage.coordination.recordSessionIngest("session-a", 3);
+    expect(await storage.coordination.getSessionIngest("session-a")).toMatchObject({ messageCount: 3 });
+    expect(await storage.coordination.getSessionIngest("missing")).toBeNull();
+    expect(await storage.coordination.getSessionInstructions(2, 1)).toBeNull();
+    await storage.coordination.upsertSessionInstructions(1, "legacy", "hash-1");
+    expect(await storage.coordination.getSessionInstructions(2, 1)).toMatchObject({
+      id: 1,
+      content: "legacy",
+      contentHash: "hash-1",
+    });
+    await storage.coordination.upsertSessionInstructions(2, "current", "hash-2");
+    expect(await storage.coordination.getSessionInstructions(2)).toMatchObject({ id: 2, content: "current" });
+    await storage.coordination.deleteSessionInstructions(2);
+    expect(await storage.coordination.getSessionInstructions(2)).toBeNull();
+
+    expect(await storage.lexicalSearch.searchMessages({ query: "needle", mode: "full_text" })).not.toEqual([]);
+    expect(await storage.lexicalSearch.searchMessages({ query: "alpha", mode: "regex" })).not.toEqual([]);
+    expect(await storage.lexicalSearch.searchSummaries({ query: "needle", mode: "full_text" })).not.toEqual([]);
+    expect(await storage.lexicalSearch.searchSummaries({ query: "leaf", mode: "regex" })).not.toEqual([]);
+    expect(await storage.lexicalSearch.searchPromoted("updated", 5)).toHaveLength(1);
+    expect(await storage.lexicalSearch.searchPromoted("updated", 5, undefined, "source-a")).toHaveLength(1);
+    expect(await storage.lexicalSearch.searchPromoted("updated", 5, undefined, "missing")).toEqual([]);
+
+    expect(await storage.conversations.deleteMessages([messages[0].messageId, third.messageId])).toBe(1);
+    expect(await storage.conversations.deleteMessages([])).toBe(0);
+    await storage.promotedMemory.deleteById(memoryId);
+    expect(await storage.promotedMemory.getById(memoryId)).toBeNull();
+    await storage.close();
+    await harness.factory.close();
+  });
+
+  it("commits, rolls back, rejects nested and escaped scopes, and serializes FIFO", async () => {
+    const harness = createHarness();
+    const storage = await harness.open("transactions");
+    await storage.transaction(async (tx) => {
+      const conversation = await tx.conversations.createConversation({ sessionId: "committed" });
+      await tx.conversations.createMessage({ conversationId: conversation.conversationId, seq: 0, role: "user", content: "ok", tokenCount: 1 });
+    });
+    expect(await storage.conversations.getConversationBySessionId("committed")).not.toBeNull();
+
+    await expect(storage.transaction(async (tx) => {
+      const conversation = await tx.conversations.createConversation({ sessionId: "rolled-back" });
+      await tx.conversations.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "invalid" as "user",
+        content: "contains /secret/path and postgresql://user:pass@example.test/db",
+        tokenCount: 1,
+      });
+    })).rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED", domain: "conversations" });
+    expect(await storage.conversations.getConversationBySessionId("rolled-back")).toBeNull();
+
+    const contextConversation = await storage.conversations.createConversation({ sessionId: "context-rollback" });
+    const contextMessage = await storage.conversations.createMessage({
+      conversationId: contextConversation.conversationId,
+      seq: 0,
+      role: "user",
+      content: "preserved context",
+      tokenCount: 2,
+    });
+    await storage.context.appendContextMessage(contextConversation.conversationId, contextMessage.messageId);
+    await expect(storage.transaction(async (tx) => tx.context.replaceContextRangeWithSummary({
+      conversationId: contextConversation.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 0,
+      summaryId: "missing-summary",
+    }))).rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED", domain: "context" });
+    expect(await storage.context.getContextItems(contextConversation.conversationId))
+      .toMatchObject([{ messageId: contextMessage.messageId, ordinal: 0 }]);
+
+    await expect(storage.context.appendContextMessage(999_999, 999_999))
+      .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED", domain: "context" });
+    await expect(storage.largeFiles.insertLargeFile({
+      fileId: "missing-conversation",
+      conversationId: 999_999,
+      fileName: "missing.txt",
+      storageUri: "local:missing",
+    })).rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED", domain: "large-files" });
+
+    await expect(storage.transaction(async () => storage.transaction(async () => undefined)))
+      .rejects.toMatchObject({ code: "STORAGE_NESTED_TRANSACTION" });
+    const otherProject = await harness.open("transactions-other");
+    await expect(storage.transaction(async (tx) => {
+      await tx.conversations.createConversation({ sessionId: "cross-project-outer" });
+      await otherProject.transaction(async (otherTx) => {
+        await otherTx.conversations.createConversation({ sessionId: "cross-project-inner" });
+      });
+    })).rejects.toMatchObject({ code: "STORAGE_NESTED_TRANSACTION" });
+    expect(await storage.conversations.getConversationBySessionId("cross-project-outer")).toBeNull();
+    expect(await otherProject.conversations.getConversationBySessionId("cross-project-inner")).toBeNull();
+    await otherProject.close();
+    await expect(storage.transaction(async () => storage.conversations.listConversations()))
+      .rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+    await expect(storage.transaction(async () => storage.close()))
+      .rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+    expect(await storage.health()).toMatchObject({ status: "healthy" });
+
+    let escaped!: Parameters<Parameters<ProjectStorage["transaction"]>[0]>[0];
+    await storage.transaction(async (tx) => { escaped = tx; });
+    await expect(escaped.conversations.listConversations())
+      .rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+
+    let release!: () => void;
+    let entered!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+    const order: string[] = [];
+    const first = storage.transaction(async (tx) => {
+      order.push("first-enter");
+      entered();
+      await releasePromise;
+      await tx.conversations.createConversation({ sessionId: "fifo-1" });
+      order.push("first-exit");
+    });
+    await enteredPromise;
+    const second = storage.transaction(async (tx) => {
+      order.push("second-enter");
+      await tx.conversations.createConversation({ sessionId: "fifo-2" });
+    });
+    const ordinary = storage.conversations.listConversations().then(() => { order.push("ordinary"); });
+    await Promise.resolve();
+    expect(order).toEqual(["first-enter"]);
+    release();
+    await Promise.all([first, second, ordinary]);
+    expect(order).toEqual(["first-enter", "first-exit", "second-enter", "ordinary"]);
+
+    let releaseOpen!: () => void;
+    let transactionEntered!: () => void;
+    const openRelease = new Promise<void>((resolve) => { releaseOpen = resolve; });
+    const transactionStarted = new Promise<void>((resolve) => { transactionEntered = resolve; });
+    const rollingBack = storage.transaction(async (tx) => {
+      await tx.conversations.createConversation({ sessionId: "open-during-transaction" });
+      transactionEntered();
+      await openRelease;
+      throw new Error("rollback before queued open");
+    });
+    await transactionStarted;
+    let secondScopeOpened = false;
+    const secondScopePromise = harness.open("transactions").then((opened) => {
+      secondScopeOpened = true;
+      return opened;
+    });
+    await Promise.resolve();
+    expect(secondScopeOpened).toBe(false);
+    releaseOpen();
+    await expect(rollingBack).rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
+    const secondScope = await secondScopePromise;
+    expect(await secondScope.conversations.getConversationBySessionId("open-during-transaction")).toBeNull();
+    await secondScope.close();
+
+    const concurrent = {
+      transaction: storage.transaction.bind(storage),
+      content: "concurrent transaction deduplication",
+      tags: ["concurrency"],
+      depth: 0,
+      confidence: 0.8,
+      thresholds: { dedupBm25Threshold: 0.000001, dedupCandidateLimit: 10 },
+    };
+    const [firstId, secondId] = await Promise.all([
+      deduplicateAndInsert(concurrent),
+      deduplicateAndInsert(concurrent),
+    ]);
+    expect(secondId).toBe(firstId);
+    expect(await storage.promotedMemory.getAll({ tags: ["concurrency"] })).toHaveLength(1);
+    await storage.close();
+    await harness.factory.close();
+  });
+
+  it("isolates projects and implements health and idempotent lifecycle", async () => {
+    const harness = createHarness();
+    const firstIdentity = harness.identity("one");
+    expect(await harness.factory.projectExists(firstIdentity)).toBe(false);
+    const first = await harness.open("one");
+    expect(await harness.factory.projectExists(firstIdentity)).toBe(true);
+    const second = await harness.open("two");
+    const firstAgain = await harness.open("one");
+    await first.conversations.createConversation({ sessionId: "same" });
+    expect(await second.conversations.getConversationBySessionId("same")).toBeNull();
+    expect(await harness.factory.health()).toMatchObject({ status: "healthy", backend: "sqlite" });
+    expect(await first.health()).toMatchObject({ status: "healthy", projectId: first.projectId });
+    const closeA = first.close();
+    const closeB = first.close();
+    expect(closeA).toBe(closeB);
+    await closeA;
+    expect(await first.health()).toMatchObject({ status: "closed" });
+    await expect(first.conversations.listConversations()).rejects.toMatchObject({ code: "STORAGE_CLOSED" });
+    expect(await firstAgain.conversations.getConversationBySessionId("same")).not.toBeNull();
+    await firstAgain.close();
+    await second.close();
+    const factoryCloseA = harness.factory.close();
+    const factoryCloseB = harness.factory.close();
+    expect(factoryCloseA).toBe(factoryCloseB);
+    await factoryCloseA;
+    expect(await harness.factory.health()).toMatchObject({ status: "closed" });
+    await expect(harness.open("three")).rejects.toBeInstanceOf(StorageOperationError);
+  });
+}

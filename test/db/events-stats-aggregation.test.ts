@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EventSidecarSummary } from "../../src/db/event-sidecars.js";
 
-const sidecarMock = vi.hoisted(() => vi.fn<() => EventSidecarSummary[]>());
+const sidecarMock = vi.hoisted(() => vi.fn<() => Promise<EventSidecarSummary[]>>());
 
 vi.mock("../../src/db/event-sidecars.js", () => ({
   collectEventSidecars: sidecarMock,
@@ -26,8 +26,8 @@ function sidecar(overrides: Partial<EventSidecarSummary>): EventSidecarSummary {
 describe("event stats aggregation boundaries", () => {
   beforeEach(() => sidecarMock.mockReset());
 
-  it("aggregates pruned, skipped, failed, orphaned, and healthy sidecars", () => {
-    sidecarMock.mockReturnValue([
+  it("aggregates pruned, skipped, failed, orphaned, and healthy sidecars", async () => {
+    sidecarMock.mockResolvedValue([
       sidecar({ file: "pruned.db", pruned: true }),
       sidecar({ file: "skipped.db", scanSkipped: "budget" }),
       sidecar({ file: "failed.db", captured: 2, unprocessed: 1, metadataMissing: true, scanError: "bad", lastCapture: "2025-01-01" }),
@@ -35,7 +35,7 @@ describe("event stats aggregation boundaries", () => {
       sidecar({ file: "older.db", captured: 1, lastCapture: "2024-01-01" }),
     ]);
 
-    expect(collectEventStats(123)).toEqual({
+    expect(await collectEventStats(123)).toEqual({
       captured: 6,
       unprocessed: 2,
       errors: 4,
@@ -50,13 +50,13 @@ describe("event stats aggregation boundaries", () => {
     expect(sidecarMock).toHaveBeenCalledWith({ timeoutMs: 123 });
   });
 
-  it("builds detailed projects and globally sorts and limits recent errors", () => {
+  it("builds detailed projects and globally sorts and limits recent errors", async () => {
     const errors = Array.from({ length: 7 }, (_, index) => ({
       created_at: `2026-01-0${index + 1}`,
       hook: `hook-${index}`,
       error: `error-${index}`,
     }));
-    sidecarMock.mockReturnValue([
+    sidecarMock.mockResolvedValue([
       sidecar({ file: "pruned.db", pruned: true, pruneReason: "empty" }),
       sidecar({ file: "skipped.db", scanSkipped: "timeout" }),
       sidecar({ file: "failed.db", metadataMissing: true, unprocessed: 1, scanError: "bad", recentErrors: errors.slice(0, 4), lastCapture: "2025-01-01" }),
@@ -64,7 +64,7 @@ describe("event stats aggregation boundaries", () => {
       sidecar({ file: "empty-errors.db", recentErrors: undefined }),
     ]);
 
-    const result = collectDetailedEventStats({ maxDbs: 9 });
+    const result = await collectDetailedEventStats({ maxDbs: 9 });
     expect(result).toMatchObject({
       captured: 3,
       unprocessed: 2,

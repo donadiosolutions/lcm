@@ -1,16 +1,13 @@
-import { existsSync } from "node:fs";
-import { projectDbPath } from "../project.js";
+import type { DaemonConfig } from "../config.js";
+import { projectIdentity } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
-import { runLcmMigrations } from "../../db/migration.js";
-import { ConversationStore } from "../../store/conversation-store.js";
-import { SummaryStore } from "../../store/summary-store.js";
-import { RetrievalEngine } from "../../retrieval.js";
-import { PromotedStore } from "../../db/promoted.js";
+import { createRetrievalEngine } from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
-import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
+import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
+import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
 
-export function createSearchHandler(): RouteHandler {
+export function createSearchHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body) => {
     const input = JSON.parse(body || "{}");
     const { query, limit = 5, layers, tags } = input;
@@ -36,18 +33,17 @@ export function createSearchHandler(): RouteHandler {
     let promoted: unknown[] = [];
 
     if (cwd) {
-      const dbPath = projectDbPath(cwd);
-      if (existsSync(dbPath)) {
-        const db = getLcmConnection(dbPath);
-        try {
-          runLcmMigrations(db);
+      let project: ProjectStorage | undefined;
+      let ownedFactory: StorageBackendFactory | undefined;
+      try {
+        const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        project = await openExistingProject(factory, projectIdentity(cwd)) ?? undefined;
+        if (project) {
 
           // Episodic: FTS5 search across messages + summaries
           if (activeLayers.includes("episodic")) {
             try {
-              const convStore = new ConversationStore(db);
-              const summStore = new SummaryStore(db);
-              const engine = new RetrievalEngine(convStore, summStore);
+              const engine = createRetrievalEngine(project);
               const result = await engine.grep({ query, mode: "full_text", scope: "both" });
               const allMatches = [...result.messages, ...result.summaries];
               const episodicMatches = filterTags
@@ -63,14 +59,13 @@ export function createSearchHandler(): RouteHandler {
           // Promoted: FTS5 search across promoted memories
           if (activeLayers.includes("promoted")) {
             try {
-              const promotedStore = new PromotedStore(db);
-              promoted = promotedStore.search(query, limit, filterTags);
+              promoted = await project.lexicalSearch.searchPromoted(query, limit, filterTags);
             } catch { /* non-fatal */ }
           }
-        } catch { /* non-fatal */ }
-        finally {
-          closeLcmConnection(dbPath);
         }
+      } catch { /* non-fatal */ }
+      finally {
+        await closeRouteStorage(project, ownedFactory);
       }
     }
 

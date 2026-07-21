@@ -189,6 +189,61 @@ describe("PassiveEventProcessor", () => {
     expect(deps.clearTimeout).toHaveBeenCalledTimes(2);
     expect(deps.clearInterval).toHaveBeenCalledTimes(1);
   });
+
+  it("passes the daemon-owned storage factory to background promotion", async () => {
+    const { deps } = timerDeps();
+    const storageFactory = { backend: "sqlite" } as never;
+    const promoteEventsForCwd = vi.fn().mockResolvedValue({
+      promoted: 0,
+      skipped: 0,
+      correlated: 0,
+      errors: 0,
+      message: "no unprocessed events",
+    });
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      storageFactory,
+      promoteEventsForCwd: promoteEventsForCwd as never,
+    });
+
+    processor.notify({ cwd: "/tmp", priority: 1 });
+    await processor.flushOnce();
+
+    expect(promoteEventsForCwd).toHaveBeenCalledWith(
+      expect.any(Object),
+      "/tmp",
+      undefined,
+      storageFactory,
+    );
+  });
+
+  it("waits for an in-flight drain before completing shutdown", async () => {
+    const { deps } = timerDeps();
+    let releasePromotion: ((value: unknown) => void) | undefined;
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const promoteEventsForCwd = vi.fn().mockImplementation(() => {
+      markStarted?.();
+      return new Promise((resolve) => { releasePromotion = resolve; });
+    });
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      promoteEventsForCwd: promoteEventsForCwd as never,
+    });
+
+    processor.notify({ cwd: "/tmp", priority: 1 });
+    const drain = processor.flushOnce();
+    await started;
+    let shutdownComplete = false;
+    const shutdown = processor.stopAndWait().then(() => { shutdownComplete = true; });
+    await Promise.resolve();
+    expect(shutdownComplete).toBe(false);
+
+    releasePromotion?.({ promoted: 0, skipped: 0, correlated: 0, errors: 0 });
+    await Promise.all([drain, shutdown]);
+    expect(shutdownComplete).toBe(true);
+    await expect(processor.stopAndWait()).resolves.toBeUndefined();
+  });
 });
 
 describe("createPromoteEventsNotifyHandler", () => {

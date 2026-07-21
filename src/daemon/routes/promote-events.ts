@@ -1,17 +1,22 @@
-import { EventsDb, type EventRow, type PatternReinforcementStats } from "../../hooks/events-db.js";
+import type { EventRow, PatternReinforcementStats } from "../../hooks/events-db.js";
 import { eventsDbPath } from "../../db/events-path.js";
-import { PromotedStore } from "../../db/promoted.js";
 import { deduplicateAndInsert } from "../../promotion/dedup.js";
 import { sendJson, type RouteHandler } from "../server.js";
 import { validateCwd } from "../validate-cwd.js";
-import { projectId, projectDbPath } from "../project.js";
-import { dirname } from "node:path";
-import { getLcmConnection, closeLcmConnection } from "../../db/connection.js";
-import { runLcmMigrations } from "../../db/migration.js";
+import { projectDir, projectIdentity } from "../project.js";
 import type { DaemonConfig } from "../config.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
 import { collectEventSidecars } from "../../db/event-sidecars.js";
 import { ScrubEngine } from "../../scrub.js";
+import {
+  SQLiteLocalHookOutboxFactory,
+  type LocalHookOutboxRepository,
+} from "../../storage/local-hook-outbox.js";
+import {
+  createStorageBackendFactory,
+  type ProjectStorage,
+  type StorageBackendFactory,
+} from "../../storage/index.js";
 
 const AUTO_TAGS: Record<string, string> = {
   decision: "type:preference",
@@ -30,6 +35,26 @@ const MIN_REINFORCED_PATTERN_SESSIONS = 2;
 const AUTO_PROMOTABLE_PATTERN_CATEGORIES = new Set(["file", "mcp", "skill", "subagent"]);
 const EMPTY_REINFORCEMENT: PatternReinforcementStats = { totalCount: 0, distinctSessions: 0 };
 const sidecarPromotionLocks = new Map<string, Promise<void>>();
+
+async function settleClose(resource: { close(): Promise<void> | void } | undefined): Promise<void> {
+  try {
+    await resource?.close();
+  } catch {
+    // Cleanup is best-effort and must never replace the promotion result or primary failure.
+  }
+}
+
+async function closePromotionResources(
+  project: ProjectStorage | undefined,
+  outboxFactory: SQLiteLocalHookOutboxFactory,
+  ownedFactory: StorageBackendFactory | undefined,
+): Promise<void> {
+  await Promise.all([
+    settleClose(project),
+    settleClose(outboxFactory),
+    settleClose(ownedFactory),
+  ]);
+}
 
 export interface PromoteResult {
   promoted: number;
@@ -121,7 +146,10 @@ async function withSidecarPromotionLock<T>(sidecarPath: string, fn: () => Promis
   }
 }
 
-export function createPromoteEventsHandler(config: DaemonConfig): RouteHandler {
+export function createPromoteEventsHandler(
+  config: DaemonConfig,
+  storageFactory?: StorageBackendFactory,
+): RouteHandler {
   return async (_req, res, body) => {
     const input = JSON.parse(body || "{}");
 
@@ -135,26 +163,29 @@ export function createPromoteEventsHandler(config: DaemonConfig): RouteHandler {
       cwd = validateCwd(input.cwd);
     } catch (err) {
       // Log the detailed error server-side and return a generic message to the client
-      safeLogError("promote-events", err, {});
+      await safeLogError("promote-events", err, {});
       sendJson(res, 400, { error: "cwd is invalid" });
       return;
     }
 
     try {
       const result = input.drain === true
-        ? await drainEventsForCwd(config, cwd)
-        : await promoteEventsForCwd(config, cwd);
+        ? await drainEventsForCwd(config, cwd, undefined, storageFactory)
+        : await promoteEventsForCwd(config, cwd, undefined, storageFactory);
       sendJson(res, 200, result);
     } catch (error) {
       // Log detailed failure but avoid exposing internal error/stack info to the client
-      safeLogError("promote-events", error, { cwd });
+      await safeLogError("promote-events", error, { cwd });
       sendJson(res, 500, { error: "failed to promote events" });
       return;
     }
   };
 }
 
-export function createPromoteAllEventsHandler(config: DaemonConfig): RouteHandler {
+export function createPromoteAllEventsHandler(
+  config: DaemonConfig,
+  storageFactory?: StorageBackendFactory,
+): RouteHandler {
   return async (_req, res) => {
     try {
       const result: PromoteAllResult = {
@@ -170,7 +201,7 @@ export function createPromoteAllEventsHandler(config: DaemonConfig): RouteHandle
         projects: [],
       };
 
-      const sidecars = collectEventSidecars({ timeoutMs: 30_000, maxDbs: Number.MAX_SAFE_INTEGER });
+      const sidecars = await collectEventSidecars({ timeoutMs: 30_000, maxDbs: Number.MAX_SAFE_INTEGER });
       result.scanned = sidecars.length;
       result.sidecarsWithUnprocessed = sidecars.filter(sidecar => sidecar.unprocessed > 0).length;
 
@@ -229,7 +260,7 @@ export function createPromoteAllEventsHandler(config: DaemonConfig): RouteHandle
         }
 
         try {
-          const projectResult = await drainEventsForCwd(config, sidecar.cwd, sidecar.path);
+          const projectResult = await drainEventsForCwd(config, sidecar.cwd, sidecar.path, storageFactory);
           result.promoted += projectResult.promoted;
           result.skipped += projectResult.skipped;
           result.correlated += projectResult.correlated;
@@ -245,7 +276,7 @@ export function createPromoteAllEventsHandler(config: DaemonConfig): RouteHandle
         } catch (error) {
           result.errors++;
           result.failedProjects++;
-          safeLogError("promote-events", error, { cwd: sidecar.cwd });
+          await safeLogError("promote-events", error, { cwd: sidecar.cwd });
           result.projects.push({
             projectId: sidecar.projectId,
             cwd: sidecar.cwd,
@@ -262,7 +293,7 @@ export function createPromoteAllEventsHandler(config: DaemonConfig): RouteHandle
 
       sendJson(res, 200, result);
     } catch (error) {
-      safeLogError("promote-events", error, {});
+      await safeLogError("promote-events", error, {});
       sendJson(res, 500, { error: "failed to promote events" });
     }
   };
@@ -272,16 +303,19 @@ export async function drainEventsForCwd(
   config: DaemonConfig,
   cwd: string,
   sidecarPathOverride?: string,
+  storageFactory?: StorageBackendFactory,
 ): Promise<PromoteResult & { batches: number; incomplete?: boolean }> {
   cwd = validateCwd(cwd);
   const sidecarPath = sidecarPathOverride ?? eventsDbPath(cwd);
-  return withSidecarPromotionLock(sidecarPath, () => drainEventsForCwdUnlocked(config, cwd, sidecarPath));
+  return withSidecarPromotionLock(sidecarPath, () =>
+    drainEventsForCwdUnlocked(config, cwd, sidecarPath, storageFactory));
 }
 
 async function drainEventsForCwdUnlocked(
   config: DaemonConfig,
   cwd: string,
   sidecarPath: string,
+  storageFactory?: StorageBackendFactory,
 ): Promise<PromoteResult & { batches: number; incomplete?: boolean }> {
   const result: PromoteResult & { batches: number; incomplete?: boolean } = {
     promoted: 0,
@@ -291,24 +325,23 @@ async function drainEventsForCwdUnlocked(
     batches: 0,
   };
 
-  const edb = new EventsDb(sidecarPath);
-  const dbPath = projectDbPath(cwd);
-  let dbOpened = false;
+  const outboxFactory = new SQLiteLocalHookOutboxFactory();
+  let project: ProjectStorage | undefined;
+  let ownedFactory: StorageBackendFactory | undefined;
   try {
-    const db = getLcmConnection(dbPath);
-    dbOpened = true;
-    runLcmMigrations(db);
-    const store = new PromotedStore(db);
+    const edb = await outboxFactory.open(sidecarPath);
+    const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+    project = await factory.openProject(projectIdentity(cwd));
     const scrubber = await ScrubEngine.forProject(
       config.security.sensitivePatterns,
-      dirname(dbPath),
+      projectDir(cwd),
     );
     for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
       const batchResult = await promoteEventsBatch(
         config,
         cwd,
         edb,
-        store,
+        project,
         scrubber,
         new Map(),
       );
@@ -333,11 +366,7 @@ async function drainEventsForCwdUnlocked(
       }
     }
   } finally {
-    try {
-      if (dbOpened) closeLcmConnection(dbPath);
-    } finally {
-      edb.close();
-    }
+    await closePromotionResources(project, outboxFactory, ownedFactory);
   }
 
   result.incomplete = true;
@@ -349,50 +378,48 @@ export async function promoteEventsForCwd(
   config: DaemonConfig,
   cwd: string,
   sidecarPathOverride?: string,
+  storageFactory?: StorageBackendFactory,
 ): Promise<PromoteResult> {
   cwd = validateCwd(cwd);
   const sidecarPath = sidecarPathOverride ?? eventsDbPath(cwd);
-  return withSidecarPromotionLock(sidecarPath, () => promoteEventsForCwdUnlocked(config, cwd, sidecarPath));
+  return withSidecarPromotionLock(sidecarPath, () =>
+    promoteEventsForCwdUnlocked(config, cwd, sidecarPath, storageFactory));
 }
 
 async function promoteEventsForCwdUnlocked(
   config: DaemonConfig,
   cwd: string,
   sidecarPath: string,
+  storageFactory?: StorageBackendFactory,
 ): Promise<PromoteResult> {
-  const edb = new EventsDb(sidecarPath);
-  const dbPath = projectDbPath(cwd);
-  let dbOpened = false;
+  const outboxFactory = new SQLiteLocalHookOutboxFactory();
+  let project: ProjectStorage | undefined;
+  let ownedFactory: StorageBackendFactory | undefined;
   try {
-    const db = getLcmConnection(dbPath);
-    dbOpened = true;
-    runLcmMigrations(db);
-    const store = new PromotedStore(db);
+    const edb = await outboxFactory.open(sidecarPath);
+    const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+    project = await factory.openProject(projectIdentity(cwd));
     const scrubber = await ScrubEngine.forProject(
       config.security.sensitivePatterns,
-      dirname(dbPath),
+      projectDir(cwd),
     );
-    return await promoteEventsBatch(config, cwd, edb, store, scrubber, new Map());
+    return await promoteEventsBatch(config, cwd, edb, project, scrubber, new Map());
   } finally {
-    try {
-      if (dbOpened) closeLcmConnection(dbPath);
-    } finally {
-      edb.close();
-    }
+    await closePromotionResources(project, outboxFactory, ownedFactory);
   }
 }
 
 async function promoteEventsBatch(
   config: DaemonConfig,
   cwd: string,
-  edb: EventsDb,
-  store: PromotedStore,
+  edb: LocalHookOutboxRepository,
+  project: ProjectStorage,
   scrubber: ScrubEngine,
   scrubCache: Map<string, string>,
 ): Promise<PromoteResult> {
   const result: PromoteResult = { promoted: 0, skipped: 0, correlated: 0, errors: 0 };
 
-  const events = edb.getUnprocessed();
+  const events = await edb.getUnprocessed();
   if (events.length === 0) {
     return { ...result, message: "no unprocessed events" };
   }
@@ -400,13 +427,12 @@ async function promoteEventsBatch(
   // Correlate error→fix pairs
   correlateErrors(events);
 
-  const pid = projectId(cwd);
       const thresholds = config.compaction.promotionThresholds;
       const eventConf = thresholds.eventConfidence ?? {
         decision: 0.5, plan: 0.7, errorFix: 0.4, batch: 0.3, pattern: 0.2,
       };
       const reinforcementCache = new Map<string, PatternReinforcementStats>();
-      const getPatternReinforcement = (event: EventRow): PatternReinforcementStats => {
+      const getPatternReinforcement = async (event: EventRow): Promise<PatternReinforcementStats> => {
         if (event.priority !== 3 || !AUTO_PROMOTABLE_PATTERN_CATEGORIES.has(event.category)) {
           return EMPTY_REINFORCEMENT;
         }
@@ -415,7 +441,7 @@ async function promoteEventsBatch(
         const cached = reinforcementCache.get(key);
         if (cached) return cached;
 
-        const stats = edb.getPatternReinforcement(
+        const stats = await edb.getPatternReinforcement(
           event.type,
           event.category,
           event.data,
@@ -436,7 +462,7 @@ async function promoteEventsBatch(
           }
           const autoTag = (event as EventRow & { auto_tag?: string }).auto_tag;
           const tag = autoTag ?? AUTO_TAGS[event.category] ?? `category:${event.category}`;
-          const reinforcement = getPatternReinforcement(event);
+          const reinforcement = await getPatternReinforcement(event);
           const reinforced = isReinforcedPattern(reinforcement);
           let confidence: number;
           let newEntryConfidence: number | undefined;
@@ -465,7 +491,12 @@ async function promoteEventsBatch(
             // enough repeated passive evidence to bootstrap a new memory.
             confidence = eventConf.pattern ?? 0.2;
             if (!reinforced) {
-              const existing = store.search(scrubbedData, 1, undefined, pid);
+              const existing = await project.lexicalSearch.searchPromoted(
+                scrubbedData,
+                1,
+                undefined,
+                project.projectId,
+              );
               if (existing.length === 0) {
                 processedIds.push(event.event_id);
                 result.skipped++;
@@ -482,12 +513,12 @@ async function promoteEventsBatch(
           // Set correlation chain
           const correlatedErrorId = (event as EventRow & { _correlatedErrorId?: number })._correlatedErrorId;
           if (correlatedErrorId) {
-            edb.setPrevEventId(event.event_id, correlatedErrorId);
+            await edb.setPrevEventId(event.event_id, correlatedErrorId);
           }
 
           // Promote via existing dedup pipeline
           await deduplicateAndInsert({
-            store,
+            transaction: (callback) => project.transaction(callback),
             content: scrubbedData,
             tags: [
               tag,
@@ -495,7 +526,7 @@ async function promoteEventsBatch(
               `hook:${event.source_hook}`,
               ...(reinforced ? ["signal:reinforced"] : []),
             ],
-            projectId: pid,
+            sourceProjectId: project.projectId,
             sessionId: event.session_id,
             depth: 0,
             confidence,
@@ -510,13 +541,13 @@ async function promoteEventsBatch(
           result.promoted++;
         } catch (error) {
           result.errors++;
-          safeLogError("promote-events", error, { cwd, sessionId: event.session_id });
+          await safeLogError("promote-events", error, { cwd, sessionId: event.session_id });
           // Do not add to processedIds — transient errors (DB busy, dedup failure) should
           // allow the event to be retried on next promotion pass rather than being silently dropped.
         }
       }
 
-      edb.markProcessed(processedIds);
+      await edb.markProcessed(processedIds);
 
   return result;
 }

@@ -54,6 +54,35 @@ vi.mock("../../../src/store/conversation-store.js", () => ({
 vi.mock("../../../src/store/summary-store.js", () => ({
   SummaryStore: class { appendContextMessages = mocks.append; getContextTokenCount = mocks.tokens; },
 }));
+vi.mock("../../../src/storage/index.js", () => ({
+  createStorageBackendFactory: () => ({
+    openProject: async () => {
+      mocks.getConnection();
+      const repositories = {
+        conversations: {
+          getOrCreateConversation: mocks.getConversation,
+          getMessageCount: mocks.getCount,
+          createMessagesBulk: mocks.createBulk,
+        },
+        context: { appendContextMessages: mocks.append, getContextTokenCount: mocks.tokens },
+        coordination: {
+          getSessionIngest: async (sessionId: string) => {
+            const row = mocks.sessionGet(sessionId);
+            return row ? { sessionId, messageCount: row.message_count, completedAt: "now" } : null;
+          },
+        },
+        redactionAdmin: { upsertCounts: vi.fn(async () => undefined) },
+      };
+      return {
+        ...repositories,
+        transaction: (operation: (value: typeof repositories) => Promise<unknown>) =>
+          mocks.transaction(() => operation(repositories)),
+        close: async () => { mocks.closeConnection(); },
+      };
+    },
+    close: async () => undefined,
+  }),
+}));
 vi.mock("../../../src/transcript-provider.js", () => ({
   normalizeTranscriptClient: mocks.normalize,
   parseTranscriptForClient: mocks.parse,
@@ -131,15 +160,18 @@ describe("ingest persistence boundaries", () => {
     expect(mocks.normalize.mock.calls.map((call) => call[0])).toEqual(["codex", "codex", undefined]);
   });
 
-  it("skips completed and already stored sessions and tolerates missing log tables", async () => {
+  it("skips completed sessions and rolls back when coordination lookup fails", async () => {
     const handler = createIngestHandler(config);
     mocks.sessionGet.mockReturnValueOnce({ message_count: 1 });
     await handler({} as never, response, JSON.stringify({ session_id: "complete", cwd: "/ok", messages: [validMessage] }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 0, totalTokens: 0 });
-    mocks.sessionGet.mockImplementationOnce(() => { throw new Error("table missing"); });
-    mocks.getCount.mockResolvedValueOnce(1);
-    await handler({} as never, response, JSON.stringify({ session_id: "stored", cwd: "/ok", messages: [validMessage] }));
-    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 0, totalTokens: 0 });
+    const failure = new Error("coordination failed");
+    mocks.sessionGet.mockImplementationOnce(() => { throw failure; });
+    await handler({} as never, response, JSON.stringify({ session_id: "failed", cwd: "/ok", messages: [validMessage] }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed", code: "INGEST_FAILED" });
+    expect(mocks.getConversation).not.toHaveBeenCalled();
+    expect(mocks.createBulk).not.toHaveBeenCalled();
+    expect(mocks.logError).toHaveBeenLastCalledWith("ingest", failure, { cwd: "/ok", sessionId: "failed" });
   });
 
   it("reports every redaction category and tolerates metadata write failures", async () => {

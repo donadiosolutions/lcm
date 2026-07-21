@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { RetrievalEngine } from "../src/retrieval.js";
+import { createRetrievalEngine, RetrievalEngine } from "../src/retrieval.js";
 import type { ConversationStore, MessageRecord } from "../src/store/conversation-store.js";
 import type { SummaryRecord, SummaryStore } from "../src/store/summary-store.js";
 
@@ -73,6 +73,55 @@ function stores(overrides: StoreOverrides = {}): StoreFixture {
 }
 
 describe("RetrievalEngine describe", () => {
+  it("adapts backend-neutral message and large-file repositories", async () => {
+    const leaf = summary("sum_leaf");
+    const file = {
+      fileId: "file_adapter",
+      conversationId: 1,
+      fileName: null,
+      mimeType: null,
+      byteSize: null,
+      storageUri: "memory://adapter",
+      explorationSummary: null,
+      createdAt: now,
+    };
+    const messageRecord = {
+      messageId: 7,
+      conversationId: 1,
+      seq: 0,
+      role: "user" as const,
+      content: "adapter message",
+      tokenCount: 2,
+      createdAt: now,
+    };
+    const repositories = {
+      conversations: { getMessageById: vi.fn(async () => messageRecord) },
+      summaries: {
+        getSummary: vi.fn(async () => leaf),
+        getSummaryChildren: vi.fn(async () => []),
+        getSummaryMessages: vi.fn(async () => [messageRecord.messageId]),
+        getSummaryParents: vi.fn(async () => []),
+        getSummarySubtree: vi.fn(async () => []),
+      },
+      largeFiles: { getLargeFile: vi.fn(async () => file) },
+      lexicalSearch: {
+        searchMessages: vi.fn(async () => []),
+        searchSummaries: vi.fn(async () => []),
+      },
+    } as never;
+    const engine = createRetrievalEngine(repositories);
+    await expect(engine.describe(file.fileId)).resolves.toMatchObject({
+      file: { storageUri: file.storageUri },
+    });
+    await expect(engine.expand({ summaryId: leaf.summaryId, includeMessages: true }))
+      .resolves.toMatchObject({ messages: [{ messageId: messageRecord.messageId }] });
+    await expect(engine.describe(leaf.summaryId)).resolves.toMatchObject({
+      summary: { messageIds: [messageRecord.messageId] },
+    });
+    await expect(engine.grep({ query: "adapter", mode: "full_text", scope: "both" }))
+      .resolves.toMatchObject({ totalMatches: 0 });
+  });
+
   it("rejects unknown IDs and returns null for missing records", async () => {
     const { engine } = stores();
     await expect(engine.describe("other")).resolves.toBeNull();

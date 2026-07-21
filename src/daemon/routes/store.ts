@@ -1,14 +1,17 @@
 import { statSync } from "node:fs";
-import { projectDbPath, projectDir } from "../project.js";
+import { projectDir, projectIdentity } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { DaemonConfig } from "../config.js";
 import { sanitizeError } from "../safe-error.js";
-import { runLcmMigrations } from "../../db/migration.js";
-import { PromotedStore } from "../../db/promoted.js";
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
-import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
+import {
+  createStorageBackendFactory,
+  type ProjectStorage,
+  type StorageBackendFactory,
+} from "../../storage/index.js";
+import { closeRouteStorage } from "./storage-lifecycle.js";
 
 /** Cache entry for a per-project ScrubEngine. */
 interface ScrubCacheEntry {
@@ -37,7 +40,10 @@ async function getScrubEngine(config: DaemonConfig, projDir: string): Promise<Sc
   return engine;
 }
 
-export function createStoreHandler(config: DaemonConfig): RouteHandler {
+export function createStoreHandler(
+  config: DaemonConfig,
+  storageFactory?: StorageBackendFactory,
+): RouteHandler {
   return async (_req, res, body) => {
     const input = JSON.parse(body || "{}");
     const { text, tags = [], metadata = {} } = input;
@@ -69,18 +75,16 @@ export function createStoreHandler(config: DaemonConfig): RouteHandler {
     const scrubbedText = scrubber.scrub(text);
     const scrubbedTags = tags.map((tag: string) => scrubber.scrub(tag));
 
-    const dbPath = projectDbPath(projectPath);
-    let db: ReturnType<typeof getLcmConnection> | undefined;
+    let project: ProjectStorage | undefined;
+    let ownedFactory: StorageBackendFactory | undefined;
     try {
-      db = getLcmConnection(dbPath);
-      // Core: write to SQLite promoted table
-      runLcmMigrations(db);
-      const store = new PromotedStore(db);
+      const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+      project = await factory.openProject(projectIdentity(projectPath));
 
-      const id = store.insert({
+      const id = await project.promotedMemory.insert({
         content: scrubbedText,
         tags: scrubbedTags,
-        projectId: metadata.projectId ?? "manual",
+        sourceProjectId: metadata.projectId ?? "manual",
         sessionId: metadata.sessionId ?? "manual",
         depth: metadata.depth ?? 0,
         confidence: 1.0,
@@ -90,7 +94,7 @@ export function createStoreHandler(config: DaemonConfig): RouteHandler {
     } catch (err) {
       sendJson(res, 500, { error: sanitizeError(err instanceof Error ? err.message : "store failed") });
     } finally {
-      if (db) closeLcmConnection(dbPath);
+      await closeRouteStorage(project, ownedFactory);
     }
   };
 }

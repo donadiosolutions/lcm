@@ -367,6 +367,36 @@ export class SummaryStore {
     return rows.map(toSummaryRecord);
   }
 
+  async listRecentSummaries(limit: number): Promise<SummaryRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
+                earliest_at, latest_at, descendant_count, descendant_token_count,
+                source_message_token_count, created_at
+         FROM summaries
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(limit) as unknown as SummaryRow[];
+    return rows.map(toSummaryRecord);
+  }
+
+  async listRecentSummariesForSession(sessionId: string, limit: number): Promise<SummaryRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
+                s.file_ids, s.earliest_at, s.latest_at, s.descendant_count,
+                s.descendant_token_count, s.source_message_token_count, s.created_at
+         FROM summaries s
+         JOIN conversations c ON s.conversation_id = c.conversation_id
+         WHERE c.session_id = ?
+         ORDER BY s.depth DESC, s.created_at DESC
+         LIMIT ?`,
+      )
+      .all(sessionId, limit) as unknown as SummaryRow[];
+    return rows.map(toSummaryRecord);
+  }
+
   // ── Lineage ───────────────────────────────────────────────────────────────
 
   async linkSummaryToMessages(summaryId: string, messageIds: number[]): Promise<void> {
@@ -617,7 +647,8 @@ export class SummaryStore {
   }): Promise<void> {
     const { conversationId, startOrdinal, endOrdinal, summaryId } = input;
 
-    this.db.exec("BEGIN");
+    const ownsTransaction = !this.db.isTransaction;
+    if (ownsTransaction) this.db.exec("BEGIN");
     try {
       // 1. Delete context items in the range [startOrdinal, endOrdinal]
       this.db
@@ -661,9 +692,9 @@ export class SummaryStore {
         updateStmt.run(i, conversationId, -(i + 1));
       }
 
-      this.db.exec("COMMIT");
+      if (ownsTransaction) this.db.exec("COMMIT");
     } catch (err) {
-      this.db.exec("ROLLBACK");
+      if (ownsTransaction) this.db.exec("ROLLBACK");
       throw err;
     }
   }

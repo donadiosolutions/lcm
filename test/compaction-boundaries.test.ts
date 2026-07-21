@@ -58,7 +58,6 @@ function fixture(configOverrides: Partial<CompactionConfig> = {}) {
     getMaxSeq: vi.fn(async () => 0),
     createMessage: vi.fn(async () => ({ messageId: 99 })),
     createMessageParts: vi.fn(async () => undefined),
-    withTransaction: vi.fn(async (callback: () => Promise<void>) => callback()),
   };
   const summaries = {
     getContextTokenCount: vi.fn(async () => 0),
@@ -70,14 +69,26 @@ function fixture(configOverrides: Partial<CompactionConfig> = {}) {
     linkSummaryToParents: vi.fn(async () => undefined),
     replaceContextRangeWithSummary: vi.fn(async () => undefined),
   };
+  const transaction = vi.fn(
+    async (callback: (repositories: {
+      conversations: typeof conversations;
+      summaries: typeof summaries;
+      context: typeof summaries;
+    }) => Promise<unknown>) => callback({ conversations, summaries, context: summaries }),
+  );
   const cfg = config(configOverrides);
   return {
     conversations,
     summaries,
+    transaction,
     cfg,
     engine: new CompactionEngine(
-      conversations as unknown as ConversationStore,
-      summaries as unknown as SummaryStore,
+      {
+        conversations,
+        summaries,
+        context: summaries,
+        transaction,
+      } as never,
       cfg,
     ),
   };
@@ -350,7 +361,7 @@ describe("summarization escalation", () => {
 
 describe("leaf and condensed persistence passes", () => {
   it("persists leaf messages, timestamps, file IDs, context range, and aggregate tokens", async () => {
-    const { engine, conversations, summaries } = fixture();
+    const { engine, conversations, summaries, transaction } = fixture();
     const first = { ...message(1, -2, "first file_AABBCCDDEEFF0011"), createdAt: new Date(now.getTime() - 1000) };
     const second = { ...message(2, 3, "second file_aabbccddeeff0011"), createdAt: now };
     conversations.getMessageById.mockImplementation(async (id) => id === 1 ? first : id === 2 ? second : null);
@@ -364,6 +375,7 @@ describe("leaf and condensed persistence passes", () => {
     }));
     expect(summaries.linkSummaryToMessages).toHaveBeenCalledWith(result.summaryId, [1, 2]);
     expect(summaries.replaceContextRangeWithSummary).toHaveBeenCalledWith(expect.objectContaining({ startOrdinal: 0, endOrdinal: 3 }));
+    expect(transaction).toHaveBeenCalledOnce();
   });
 
   it("persists an empty leaf selection through deterministic fallback metadata", async () => {
@@ -375,7 +387,7 @@ describe("leaf and condensed persistence passes", () => {
   });
 
   it("persists condensed lineage, time range, files, and valid/invalid descendant metrics", async () => {
-    const { engine, summaries } = fixture();
+    const { engine, summaries, transaction } = fixture();
     const a = {
       ...summary("a", 0, -2), content: "a file_AABBCCDDEEFF0011", fileIds: ["file_existing"],
       earliestAt: new Date(now.getTime() - 2000), latestAt: null,
@@ -398,6 +410,7 @@ describe("leaf and condensed persistence passes", () => {
     }));
     expect(summaries.linkSummaryToParents).toHaveBeenCalledWith(result.summaryId, ["a", "b"]);
     expect(summaries.replaceContextRangeWithSummary).toHaveBeenCalledWith(expect.objectContaining({ startOrdinal: 0, endOrdinal: 3 }));
+    expect(transaction).toHaveBeenCalledOnce();
   });
 
   it("persists empty higher-depth condensation metadata", async () => {
@@ -407,6 +420,68 @@ describe("leaf and condensed persistence passes", () => {
       depth: 3, earliestAt: undefined, latestAt: undefined,
       descendantCount: 0, descendantTokenCount: 0, sourceMessageTokenCount: 0,
     }));
+  });
+
+  it("rolls back the complete leaf DAG write when context replacement fails", async () => {
+    const { engine, conversations, summaries, transaction } = fixture();
+    const persisted = new Set<string>();
+    conversations.getMessageById.mockResolvedValue(message(1, 1, "source"));
+    transaction.mockImplementationOnce(async (callback) => {
+      try {
+        return await callback({
+          conversations,
+          summaries: {
+            ...summaries,
+            insertSummary: async (input: { summaryId: string }) => { persisted.add(input.summaryId); },
+          },
+          context: {
+            ...summaries,
+            replaceContextRangeWithSummary: async () => { throw new Error("replace failed"); },
+          },
+        } as never);
+      } catch (error) {
+        persisted.clear();
+        throw error;
+      }
+    });
+
+    await expect(call<Promise<object>>(engine, "leafPass", 1, [item(0, "message", 1)], async () => "summary"))
+      .rejects.toThrow("replace failed");
+    expect(persisted).toEqual(new Set());
+  });
+
+  it("rolls back the complete condensed DAG write when lineage replacement fails", async () => {
+    const { engine, conversations, summaries, transaction } = fixture();
+    const persisted = new Set<string>();
+    summaries.getSummary.mockResolvedValue(summary("parent"));
+    transaction.mockImplementationOnce(async (callback) => {
+      try {
+        return await callback({
+          conversations,
+          summaries: {
+            ...summaries,
+            insertSummary: async (input: { summaryId: string }) => { persisted.add(input.summaryId); },
+          },
+          context: {
+            ...summaries,
+            replaceContextRangeWithSummary: async () => { throw new Error("replace failed"); },
+          },
+        } as never);
+      } catch (error) {
+        persisted.clear();
+        throw error;
+      }
+    });
+
+    await expect(call<Promise<object>>(
+      engine,
+      "condensedPass",
+      1,
+      [item(0, "summary", "parent")],
+      0,
+      async () => "summary",
+    )).rejects.toThrow("replace failed");
+    expect(persisted).toEqual(new Set());
   });
 });
 
@@ -440,9 +515,9 @@ describe("durable compaction events", () => {
   });
 
   it("writes a condensed-only event and swallows transaction failures", async () => {
-    const { engine, conversations } = fixture();
+    const { engine, conversations, transaction } = fixture();
     conversations.getConversation.mockResolvedValue({ conversationId: 1, sessionId: "session" } as never);
-    conversations.withTransaction.mockRejectedValueOnce(new Error("write failed"));
+    transaction.mockRejectedValueOnce(new Error("write failed"));
     await expect(call<Promise<void>>(engine, "persistCompactionEvents", {
       ...base, leafResult: null, condenseResult: { summaryId: "condensed", level: "fallback" },
     })).resolves.toBeUndefined();

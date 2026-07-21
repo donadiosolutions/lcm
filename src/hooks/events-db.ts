@@ -2,9 +2,17 @@
 import type { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import type { ExtractedEvent } from "./extractors.js";
 import { getLcmConnection, closeLcmConnection, isLcmConnectionOpen } from "../db/connection.js";
 import { sanitizeError } from "../daemon/safe-error.js";
+import type {
+  LocalHookErrorQuery,
+  LocalHookErrorRecord,
+  LocalHookEvent,
+  LocalHookEventRow,
+  LocalHookOutboxHealth,
+  LocalHookOutboxOpenOptions,
+  PatternReinforcementStats,
+} from "../storage/local-hook-outbox.js";
 
 /**
  * Tracks which db paths have already had migrations applied in this process.
@@ -14,32 +22,9 @@ import { sanitizeError } from "../daemon/safe-error.js";
  */
 const _migratedPaths = new Set<string>();
 
-export interface EventRow {
-  event_id: number;
-  session_id: string;
-  seq: number;
-  type: string;
-  category: string;
-  data: string;
-  priority: number;
-  source_hook: string;
-  prev_event_id: number | null;
-  processed_at: string | null;
-  created_at: string;
-}
-
-export interface HealthStats {
-  totalEvents: number;
-  unprocessed: number;
-  errors: number;
-  lastCapture: string | null;
-  lastError: string | null;
-}
-
-export interface PatternReinforcementStats {
-  totalCount: number;
-  distinctSessions: number;
-}
+export type EventRow = LocalHookEventRow;
+export type HealthStats = LocalHookOutboxHealth;
+export type { PatternReinforcementStats } from "../storage/local-hook-outbox.js";
 
 const SCHEMA_VERSION = 3;
 export const EVENTS_UNPROCESSED_BATCH_LIMIT = 500;
@@ -75,8 +60,9 @@ CREATE INDEX IF NOT EXISTS idx_error_log_created ON error_log(created_at);
 export class EventsDb {
   private db: DatabaseSync;
   private dbPath: string;
+  private closed = false;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, options: LocalHookOutboxOpenOptions = {}) {
     mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
     this.dbPath = dbPath;
     // getLcmConnection returns the pooled (or newly-opened) DatabaseSync handle
@@ -84,6 +70,9 @@ export class EventsDb {
     // instances so that high-frequency hooks (PostToolUse fires 50-200x/session)
     // reuse the same underlying connection instead of opening/closing each time.
     this.db = getLcmConnection(dbPath);
+    if (options.busyTimeoutMs !== undefined) {
+      this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(options.busyTimeoutMs))}`);
+    }
     if (!_migratedPaths.has(dbPath)) {
       try {
         this.migrate();
@@ -170,7 +159,7 @@ export class EventsDb {
     }
   }
 
-  insertEvent(sessionId: string, event: ExtractedEvent, sourceHook: string): number {
+  insertEvent(sessionId: string, event: LocalHookEvent, sourceHook: string): number {
     const stmt = this.db.prepare(`
       INSERT INTO events (session_id, seq, type, category, data, priority, source_hook)
       VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?),
@@ -251,6 +240,13 @@ export class EventsDb {
     };
   }
 
+  getRecentErrors(options: LocalHookErrorQuery = {}): LocalHookErrorRecord[] {
+    const where = options.includeMaintenance ? "" : "WHERE hook NOT LIKE 'maintenance:%'";
+    return this.db.prepare(
+      `SELECT created_at, hook, error, session_id FROM error_log ${where} ORDER BY id DESC LIMIT ?`,
+    ).all(options.limit ?? 5) as unknown as LocalHookErrorRecord[];
+  }
+
   pruneUnprocessed(maxRows = 10_000, maxAgeDays = 30): { pruned: number } {
     let pruned = 0;
     this.db.exec("BEGIN");
@@ -315,12 +311,9 @@ export class EventsDb {
     return Number(result.changes);
   }
 
-  /** Expose raw DB for testing only. */
-  raw(): DatabaseSync {
-    return this.db;
-  }
-
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     // Decrement pool ref-count. The underlying connection stays open as long as
     // other callers hold a reference — it is only closed when refs reach 0.
     closeLcmConnection(this.dbPath);

@@ -11,6 +11,11 @@ const state = vi.hoisted(() => ({
   passive: [] as SearchResult[],
   closed: [] as string[],
   instructionPaths: [] as string[],
+  instructionContent: undefined as string | undefined,
+  instructionRow: null as null | { id: number; content: string; contentHash: string; updatedAt: string },
+  instructionUpserts: [] as Array<{ id: number; content: string; hash: string }>,
+  openCount: 0,
+  projectExistsCount: 0,
 }));
 
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({
@@ -20,12 +25,16 @@ vi.mock("../../../src/daemon/validate-cwd.js", () => ({
   },
 }));
 
-vi.mock("../../../src/daemon/project.js", () => ({ projectDbPath: (cwd: string) => `${cwd}/lcm.db` }));
+vi.mock("../../../src/daemon/project.js", () => ({
+  projectDbPath: (cwd: string) => `${cwd}/lcm.db`,
+  projectIdentity: (cwd: string) => ({ id: "pid", canonical: cwd }),
+}));
 vi.mock("../../../src/daemon/orientation.js", () => ({ buildOrientationPrompt: () => "orientation" }));
 vi.mock("../../../src/daemon/content-fence.js", () => ({ fenceContent: (content: string, label: string) => `<${label}>${content}</${label}>` }));
 vi.mock("../../../src/security-files.js", () => ({
   readBoundedRegularFile: (path: string) => {
     state.instructionPaths.push(path);
+    if (state.instructionContent !== undefined) return state.instructionContent;
     throw Object.assign(new Error("missing"), { code: "ENOENT" });
   },
 }));
@@ -65,6 +74,36 @@ vi.mock("../../../src/db/promoted.js", () => ({
   PromotedStore: class {
     search(query: string) { return query === "source passive capture" ? state.passive : state.promoted; }
   },
+}));
+vi.mock("../../../src/storage/index.js", () => ({
+  createStorageBackendFactory: () => ({
+    projectExists: async () => {
+      state.projectExistsCount += 1;
+      return state.existsSequence.shift() ?? state.exists;
+    },
+    openProject: async () => {
+      state.openCount += 1;
+      if (state.migrationError !== undefined) throw state.migrationError;
+      return {
+        summaries: {
+          listRecentSummariesForSession: async () => state.rows,
+        },
+        lexicalSearch: {
+          searchPromoted: async (query: string) =>
+            query === "source passive capture" ? state.passive : state.promoted,
+        },
+        coordination: {
+          getSessionInstructions: async () => state.instructionRow,
+          upsertSessionInstructions: async (id: number, content: string, hash: string) => {
+            state.instructionUpserts.push({ id, content, hash });
+          },
+          deleteSessionInstructions: async () => undefined,
+        },
+        close: async () => { state.closed.push("project"); },
+      };
+    },
+    close: async () => { state.closed.push("factory"); },
+  }),
 }));
 
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
@@ -120,6 +159,11 @@ describe("restore route coverage", () => {
     state.passive = [];
     state.closed = [];
     state.instructionPaths = [];
+    state.instructionContent = undefined;
+    state.instructionRow = null;
+    state.instructionUpserts = [];
+    state.openCount = 0;
+    state.projectExistsCount = 0;
     justCompactedMap.clear();
   });
 
@@ -166,6 +210,30 @@ describe("restore route coverage", () => {
     expect(await call(JSON.stringify({ session_id: "old" }))).toEqual({ context: "orientation" });
   });
 
+  it("restores persisted instructions after compaction", async () => {
+    state.instructionRow = { id: 1, content: "persisted rules", contentHash: "hash", updatedAt: "now" };
+    expect(await call(JSON.stringify({ session_id: "s", cwd: "/tmp", source: "compact" })))
+      .toEqual({ context: "orientation\n\n<project-instructions>\npersisted rules\n</project-instructions>" });
+  });
+
+  it("captures changed instruction files through coordination repositories", async () => {
+    state.instructionContent = "new rules";
+    const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp", client: "claude" }));
+    expect(body.context).toContain("new rules");
+    expect(state.instructionUpserts).toHaveLength(1);
+    expect(state.instructionUpserts[0]?.id).toBe(1);
+    expect(state.instructionUpserts[0]?.content).toContain("new rules");
+    const currentHash = state.instructionUpserts[0]!.hash;
+
+    state.instructionRow = { id: 1, content: "old rules", contentHash: "old", updatedAt: "now" };
+    await call(JSON.stringify({ session_id: "s", cwd: "/tmp", client: "claude" }));
+    expect(state.instructionUpserts).toHaveLength(2);
+
+    state.instructionRow = { id: 1, content: "new rules", contentHash: currentHash, updatedAt: "now" };
+    await call(JSON.stringify({ session_id: "s", cwd: "/tmp", client: "claude" }));
+    expect(state.instructionUpserts).toHaveLength(2);
+  });
+
   it("fences recent summaries and applies default insight thresholds", async () => {
     state.rows = [{ content: "first" }, { content: "second" }];
     state.promoted = [promoted("project")];
@@ -182,13 +250,25 @@ describe("restore route coverage", () => {
     state.exists = false;
     const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp", source: "compact" }));
     expect(body).toEqual({ context: "orientation" });
-    expect(state.closed).toEqual([]);
+    expect(state.closed).toEqual(["factory"]);
   });
 
-  it("skips a vanished database during passive insight lookup", async () => {
+  it("creates project storage during startup restoration", async () => {
+    state.exists = false;
+    const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp" }));
+    expect(body).toEqual({ context: "orientation" });
+    expect(state.openCount).toBe(1);
+    expect(state.projectExistsCount).toBe(0);
+    expect(state.closed).toEqual(["project", "factory"]);
+  });
+
+  it("reuses one opened project throughout startup restoration", async () => {
     state.existsSequence = [true, false];
     const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp" }));
     expect(body).toEqual({ context: "orientation" });
+    expect(state.openCount).toBe(1);
+    expect(state.projectExistsCount).toBe(0);
+    expect(state.existsSequence).toEqual([true, false]);
   });
 
   it("tolerates database failures in restoration phases", async () => {

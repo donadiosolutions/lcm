@@ -5,6 +5,7 @@ import { safeLogError } from "../hooks/hook-errors.js";
 import { EVENTS_UNPROCESSED_BATCH_LIMIT } from "../hooks/events-db.js";
 import { collectEventSidecars } from "../db/event-sidecars.js";
 import { promoteEventsForCwd, type PromoteResult } from "./routes/promote-events.js";
+import type { StorageBackendFactory } from "../storage/index.js";
 
 export const PASSIVE_EVENT_PROCESSOR_DEFAULTS = {
   priorityDelayMs: 250,
@@ -25,6 +26,7 @@ export interface PassiveEventNotification {
 
 interface PassiveEventProcessorDeps {
   promoteEventsForCwd?: typeof promoteEventsForCwd;
+  storageFactory?: StorageBackendFactory;
   collectEventSidecars?: typeof collectEventSidecars;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
@@ -52,13 +54,18 @@ export class PassiveEventProcessor {
   private sweepTimer: TimeoutHandle | null = null;
   private sweepInterval: IntervalHandle | null = null;
   private sweepStartIndex = 0;
+  private readonly drainWaiters = new Set<() => void>();
 
   constructor(
     private readonly config: DaemonConfig,
     private readonly defaults = PASSIVE_EVENT_PROCESSOR_DEFAULTS,
     deps: PassiveEventProcessorDeps = {},
   ) {
-    this.promoteOneBatch = deps.promoteEventsForCwd ?? promoteEventsForCwd;
+    const promoteOneBatch = deps.promoteEventsForCwd ?? promoteEventsForCwd;
+    this.promoteOneBatch = deps.storageFactory
+      ? (config, cwd, sidecarPath) =>
+          promoteOneBatch(config, cwd, sidecarPath, deps.storageFactory)
+      : promoteOneBatch;
     this.scanSidecars = deps.collectEventSidecars ?? collectEventSidecars;
     this.setTimer = deps.setTimeout ?? setTimeout;
     this.clearTimer = deps.clearTimeout ?? clearTimeout;
@@ -71,7 +78,9 @@ export class PassiveEventProcessor {
     if (this.stopped) return;
     this.scheduleSweep(0);
     this.sweepInterval = this.setRepeating(() => {
-      void this.runSweep().catch(error => this.logError("passive-event-processor", error, {}));
+      void this.runSweep().catch(async error => {
+        await this.logError("passive-event-processor", error, {});
+      });
     }, this.defaults.sweepIntervalMs);
     this.unref(this.sweepInterval);
   }
@@ -92,6 +101,14 @@ export class PassiveEventProcessor {
       this.clearRepeating(this.sweepInterval);
       this.sweepInterval = null;
     }
+  }
+
+  async stopAndWait(): Promise<void> {
+    this.stop();
+    if (!this.draining) return;
+    await new Promise<void>((resolve) => {
+      this.drainWaiters.add(resolve);
+    });
   }
 
   notify(input: PassiveEventNotification): void {
@@ -119,7 +136,7 @@ export class PassiveEventProcessor {
     }
     this.draining = true;
     try {
-      const sidecars = this.scanSidecars({
+      const sidecars = await this.scanSidecars({
         timeoutMs: this.defaults.sweepScanTimeoutMs,
         maxDbs: this.defaults.sweepMaxSidecars,
         startIndex: this.sweepStartIndex,
@@ -135,16 +152,11 @@ export class PassiveEventProcessor {
         try {
           await this.promoteOneBatch(this.config, sidecar.cwd, sidecar.path);
         } catch (error) {
-          this.logError("passive-event-processor", error, { cwd: sidecar.cwd });
+          await this.logError("passive-event-processor", error, { cwd: sidecar.cwd });
         }
       }
     } finally {
-      this.draining = false;
-      if (!this.stopped && this.queuedProjects.size > 0) {
-        for (const cwd of this.queuedProjects) {
-          this.scheduleProject(cwd, this.defaults.debounceMs);
-        }
-      }
+      this.finishDrain();
     }
   }
 
@@ -158,7 +170,9 @@ export class PassiveEventProcessor {
     const timer = this.setTimer(() => {
       this.debounceTimers.delete(cwd);
       this.debounceDeadlines.delete(cwd);
-      void this.drainQueuedProjects().catch(error => this.logError("passive-event-processor", error, { cwd }));
+      void this.drainQueuedProjects().catch(async error => {
+        await this.logError("passive-event-processor", error, { cwd });
+      });
     }, delayMs);
     this.unref(timer);
     this.debounceTimers.set(cwd, timer);
@@ -169,7 +183,9 @@ export class PassiveEventProcessor {
     if (this.sweepTimer) this.clearTimer(this.sweepTimer);
     this.sweepTimer = this.setTimer(() => {
       this.sweepTimer = null;
-      void this.runSweep().catch(error => this.logError("passive-event-processor", error, {}));
+      void this.runSweep().catch(async error => {
+        await this.logError("passive-event-processor", error, {});
+      });
     }, delayMs);
     this.unref(this.sweepTimer);
   }
@@ -190,12 +206,7 @@ export class PassiveEventProcessor {
         await this.processProject(cwd);
       }
     } finally {
-      this.draining = false;
-      if (!this.stopped && this.queuedProjects.size > 0) {
-        for (const cwd of this.queuedProjects) {
-          this.scheduleProject(cwd, this.defaults.debounceMs);
-        }
-      }
+      this.finishDrain();
     }
   }
 
@@ -206,7 +217,7 @@ export class PassiveEventProcessor {
       try {
         result = await this.promoteOneBatch(this.config, cwd);
       } catch (error) {
-        this.logError("passive-event-processor", error, { cwd });
+        await this.logError("passive-event-processor", error, { cwd });
         return;
       }
       if (result.message === "no unprocessed events") return;
@@ -218,6 +229,17 @@ export class PassiveEventProcessor {
     if (remaining && !this.stopped) {
       this.queuedProjects.add(cwd);
     }
+  }
+
+  private finishDrain(): void {
+    this.draining = false;
+    if (!this.stopped && this.queuedProjects.size > 0) {
+      for (const cwd of this.queuedProjects) {
+        this.scheduleProject(cwd, this.defaults.debounceMs);
+      }
+    }
+    for (const resolve of this.drainWaiters) resolve();
+    this.drainWaiters.clear();
   }
 
   private unref(handle: { unref?: () => unknown } | null): void {
@@ -258,7 +280,7 @@ export function createPromoteEventsNotifyHandler(processor: PassiveEventProcesso
       });
       sendJson(res, 200, { queued: true });
     } catch (error) {
-      safeLogError("promote-events-notify", error, { cwd });
+      await safeLogError("promote-events-notify", error, { cwd });
       sendJson(res, 400, { error: "cwd is invalid" });
     }
   };

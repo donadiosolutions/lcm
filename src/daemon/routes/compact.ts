@@ -1,5 +1,4 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { getLcmConnection, closeLcmConnection, withYieldingLcmConnectionLock } from "../../db/connection.js";
 import {
   ConfigValidationError,
   LLM_REASONING_EFFORTS,
@@ -14,10 +13,6 @@ import { projectPaths, ensureProjectDir, isSafeTranscriptPath } from "../project
 import { enqueue } from "../project-queue.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
-import { runLcmMigrations } from "../../db/migration.js";
-import { upsertRedactionCounts } from "../../db/redaction-stats.js";
-import { ConversationStore } from "../../store/conversation-store.js";
-import { SummaryStore } from "../../store/summary-store.js";
 import { CompactionEngine, MANUAL_COMPACT_FRESH_TAIL_COUNT } from "../../compaction.js";
 import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
 import { ScrubEngine } from "../../scrub.js";
@@ -28,6 +23,8 @@ import {
   type EffectiveProvider,
 } from "../summarizer.js";
 import { validateCwd } from "../validate-cwd.js";
+import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
+import { closeRouteStorage } from "./storage-lifecycle.js";
 
 interface CompactRequestBody {
   session_id: string;
@@ -166,11 +163,12 @@ export const JUST_COMPACTED_TTL_MS = 30_000;
 const compactingNow = new Set<string>();
 
 
-export function createCompactHandler(config: DaemonConfig): RouteHandler {
+export function createCompactHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   const getSummarizer = makeSummarizerCache(config);
 
   return async (_req, res, body) => {
     let parsed: unknown;
+    let ownedFactory: StorageBackendFactory | undefined;
     try {
       parsed = JSON.parse(body || "{}");
     } catch {
@@ -300,8 +298,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
       }
       const paths = projectPaths(cwd);
       const pid = paths.id;
-      const result = await enqueue(pid, async () => withYieldingLcmConnectionLock(paths.dbPath, async (connectionLock) => {
-        const dbPath = paths.dbPath;
+      const result = await enqueue(pid, async () => {
         ensureProjectDir(cwd);
 
         const scrubber = await ScrubEngine.forProject(
@@ -309,19 +306,17 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
           paths.dir,
         );
 
-        const db = getLcmConnection(dbPath);
+        const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        let project: ProjectStorage | undefined;
         try {
-          runLcmMigrations(db);
-
-          const conversationStore = new ConversationStore(db);
-          const summaryStore = new SummaryStore(db);
-          const conversation = await conversationStore.getOrCreateConversation(session_id);
+          project = await factory.openProject(paths);
+          const conversation = await project.conversations.getOrCreateConversation(session_id);
 
           // Ingest new messages from the transcript into the DB.
           const safeTranscriptPath = transcript_path ? isSafeTranscriptPath(transcript_path, cwd) : false;
           if (!skip_ingest && safeTranscriptPath && existsSync(safeTranscriptPath)) {
             const parsed = parseTranscriptForClient(safeTranscriptPath, normalizeTranscriptClient(client));
-            const storedCount = await conversationStore.getMessageCount(conversation.conversationId);
+            const storedCount = await project.conversations.getMessageCount(conversation.conversationId);
             const newMessages = parsed.slice(storedCount);
             if (newMessages.length > 0) {
               const ingestCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
@@ -339,16 +334,19 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
                   tokenCount: m.tokenCount,
                 };
               });
-              await conversationStore.withTransaction(async () => {
-                const records = await conversationStore.createMessagesBulk(inputs);
-                upsertRedactionCounts(db, pid, ingestCounts);
-                await summaryStore.appendContextMessages(conversation.conversationId, records.map((r) => r.messageId));
+              await project.transaction(async (repositories) => {
+                const records = await repositories.conversations.createMessagesBulk(inputs);
+                await repositories.redactionAdmin.upsertCounts(ingestCounts);
+                await repositories.context.appendContextMessages(
+                  conversation.conversationId,
+                  records.map((record) => record.messageId),
+                );
               });
             }
           }
 
           // Check if there's anything to compact
-          const tokenCount = await summaryStore.getContextTokenCount(conversation.conversationId);
+          const tokenCount = await project.context.getContextTokenCount(conversation.conversationId);
 
           if (tokenCount === 0) {
             return {
@@ -364,7 +362,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
             };
           }
 
-          const engine = new CompactionEngine(conversationStore, summaryStore, {
+          const engine = new CompactionEngine(project, {
             contextThreshold: 0.75,
             freshTailCount: MANUAL_COMPACT_FRESH_TAIL_COUNT,
             leafMinFanout: 3,
@@ -380,14 +378,14 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
           const compactResult = await engine.compact({
             conversationId: conversation.conversationId,
             tokenBudget: 200_000,
-            summarize: (...args) => connectionLock.yieldWhile(() => summarize(...args)),
+            summarize,
             force: true,
             previousSummaryContent: validatedPreviousSummary,
           });
 
           // Gather stats for the compaction message (always, regardless of actionTaken)
-          const allSummaries = await summaryStore.getSummariesByConversation(conversation.conversationId);
-          const finalMsgCount = await conversationStore.getMessageCount(conversation.conversationId);
+          const allSummaries = await project.summaries.getSummariesByConversation(conversation.conversationId);
+          const finalMsgCount = await project.conversations.getMessageCount(conversation.conversationId);
           const maxDepth = allSummaries.length > 0 ? Math.max(...allSummaries.map((s) => s.depth)) : 0;
 
           // Promotion is now handled by the standalone /promote route
@@ -423,7 +421,7 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
 
           let latestSummaryContent: string | undefined;
           if (compactResult.createdSummaryId) {
-            const summaryRecord = await summaryStore.getSummary(compactResult.createdSummaryId);
+            const summaryRecord = await project.summaries.getSummary(compactResult.createdSummaryId);
             latestSummaryContent = summaryRecord?.content;
           } else if (allSummaries.length > 0) {
             // Fall back to the most recent existing summary when no new summary was created
@@ -445,14 +443,15 @@ export function createCompactHandler(config: DaemonConfig): RouteHandler {
             retry: effectiveRetry,
           };
         } finally {
-          closeLcmConnection(dbPath);
+          await closeRouteStorage(project, undefined);
         }
-      })); // end connection lock and enqueue
+      });
 
       sendJson(res, 200, result);
     } catch (err) {
       sendJson(res, 500, { error: err instanceof Error ? err.message : "compact failed" });
     } finally {
+      await closeRouteStorage(undefined, ownedFactory);
       compactingNow.delete(session_id);
     }
   };

@@ -9,6 +9,22 @@ import type {
   SummarySearchResult,
   LargeFileRecord,
 } from "./store/summary-store.js";
+import type { ProjectRepositories } from "./storage/contracts.js";
+
+type RetrievalConversationStore = Pick<
+  ConversationStore,
+  "getMessageById" | "searchMessages"
+>;
+type RetrievalSummaryStore = Pick<
+  SummaryStore,
+  | "getLargeFile"
+  | "getSummary"
+  | "getSummaryChildren"
+  | "getSummaryMessages"
+  | "getSummaryParents"
+  | "getSummarySubtree"
+  | "searchSummaries"
+>;
 
 // ── Public interfaces ────────────────────────────────────────────────────────
 
@@ -118,8 +134,8 @@ function estimateTokens(content: string): number {
 
 export class RetrievalEngine {
   constructor(
-    private conversationStore: ConversationStore,
-    private summaryStore: SummaryStore,
+    private conversationStore: RetrievalConversationStore,
+    private summaryStore: RetrievalSummaryStore,
   ) {}
 
   // ── describe ─────────────────────────────────────────────────────────────
@@ -346,4 +362,23 @@ export class RetrievalEngine {
       }
     }
   }
+}
+
+/** Compose the split backend-neutral repositories into the legacy retrieval engine. */
+export function createRetrievalEngine(repositories: ProjectRepositories): RetrievalEngine {
+  return new RetrievalEngine(
+    {
+      getMessageById: (id) => repositories.conversations.getMessageById(id),
+      searchMessages: (input) => repositories.lexicalSearch.searchMessages(input),
+    },
+    {
+      getLargeFile: (id) => repositories.largeFiles.getLargeFile(id),
+      getSummary: (id) => repositories.summaries.getSummary(id),
+      getSummaryChildren: (id) => repositories.summaries.getSummaryChildren(id),
+      getSummaryMessages: (id) => repositories.summaries.getSummaryMessages(id),
+      getSummaryParents: (id) => repositories.summaries.getSummaryParents(id),
+      getSummarySubtree: (id) => repositories.summaries.getSummarySubtree(id),
+      searchSummaries: (input) => repositories.lexicalSearch.searchSummaries(input),
+    },
+  );
 }

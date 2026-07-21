@@ -1,8 +1,8 @@
 import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { EventsDb } from "../hooks/events-db.js";
 import { eventsDir } from "./events-path.js";
 import { projectsDir } from "../runtime-paths.js";
+import { SQLiteLocalHookOutboxFactory } from "../storage/local-hook-outbox.js";
 
 export interface EventSidecarSummary {
   file: string;
@@ -115,7 +115,7 @@ function pruneSidecarFiles(path: string): void {
   }
 }
 
-export function collectEventSidecars(options: EventSidecarScanOptions = {}): EventSidecarSummary[] {
+export async function collectEventSidecars(options: EventSidecarScanOptions = {}): Promise<EventSidecarSummary[]> {
   const dir = eventsDir();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxDbs = options.maxDbs ?? DEFAULT_MAX_DBS;
@@ -158,16 +158,18 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
 
     const projectId = file.slice(0, -".db".length);
     try {
-      const db = new EventsDb(path);
-      db.raw().exec("PRAGMA busy_timeout = 500");
+      const outboxFactory = new SQLiteLocalHookOutboxFactory();
+      const db = await outboxFactory.open(path, { busyTimeoutMs: 500 });
       let summary: EventSidecarSummary;
       try {
-        const stats = db.getHealthStats();
+        const stats = await db.getHealthStats();
         const cwd = readCwdForProject(projectId);
         const recentErrors = options.includeRecentErrors
-          ? db.raw().prepare(
-            "SELECT created_at, hook, error FROM error_log WHERE hook NOT LIKE 'maintenance:%' ORDER BY id DESC LIMIT 5"
-          ).all() as Array<{ created_at: string; hook: string; error: string }>
+          ? (await db.getRecentErrors({ limit: 5 })).map(({ created_at, hook, error }) => ({
+            created_at,
+            hook,
+            error,
+          }))
           : undefined;
         summary = {
           file,
@@ -182,7 +184,7 @@ export function collectEventSidecars(options: EventSidecarScanOptions = {}): Eve
           recentErrors,
         };
       } finally {
-        db.close();
+        await outboxFactory.close();
       }
       const pruneReason = pruneOrphans ? orphanPruneReason(summary, pruneOlderThanDays) : undefined;
       if (pruneReason) {

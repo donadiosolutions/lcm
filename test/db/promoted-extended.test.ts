@@ -30,12 +30,12 @@ afterEach(() => {
   }
 });
 
-function makeDb() {
+function makeDb(fts5Available = true) {
   const tempDir = mkdtempSync(join(tmpdir(), "lcm-promoted-ext-"));
   tempDirs.push(tempDir);
   const dbPath = join(tempDir, "test.db");
   const db = getLcmConnection(dbPath);
-  runLcmMigrations(db);
+  runLcmMigrations(db, { fts5Available });
   return db;
 }
 
@@ -92,6 +92,61 @@ describe("PromotedStore extended", () => {
     ]);
   });
 
+  it("counts repeated usage signals for a stale candidate", () => {
+    const db = makeDb();
+    const store = new PromotedStore(db);
+    const staleId = store.insert({ content: "used stale", projectId: "project" });
+    for (const content of ["first usage", "second usage"]) {
+      store.insert({
+        content,
+        tags: ["signal:memory_used", `memory_id:${staleId}`],
+        projectId: "project",
+      });
+    }
+    db.prepare("UPDATE promoted SET created_at = ? WHERE id = ?").run("2020-01-01 00:00:00", staleId);
+
+    expect(store.findStale({ staleAfterDays: 1, staleSurfacingWithoutUseLimit: 2 }))
+      .not.toEqual(expect.arrayContaining([expect.objectContaining({ id: staleId })]));
+  });
+
+  it("handles empty and surfaced-without-use stale candidate sets", () => {
+    const db = makeDb();
+    const store = new PromotedStore(db);
+    expect(store.findStale({ staleAfterDays: 1, staleSurfacingWithoutUseLimit: 2 })).toEqual([]);
+
+    const staleId = store.insert({ content: "surfaced stale", projectId: "project" });
+    db.prepare("UPDATE promoted SET created_at = ? WHERE id = ?").run("2020-01-01 00:00:00", staleId);
+    db.prepare("INSERT INTO recall_surfacing (memory_id, session_id) VALUES (?, ?)").run(staleId, "s1");
+    db.prepare("INSERT INTO recall_surfacing (memory_id, session_id) VALUES (?, ?)").run(staleId, "s2");
+    expect(store.findStale({ staleAfterDays: 1, staleSurfacingWithoutUseLimit: 2 }))
+      .toMatchObject([{ id: staleId, surfacingCount: 2, usageCount: 0 }]);
+  });
+
+  it("supports every mutation and search filter without native FTS", () => {
+    const db = makeDb(false);
+    const store = new PromotedStore(db, false);
+    const first = store.insert({ content: "Fallback needle", tags: ["keep"], projectId: "p1" });
+    const second = store.insert({ content: "Other needle", projectId: "p2" });
+
+    expect(store.search("needle", 10)).toHaveLength(2);
+    expect(store.search("needle", 10, ["keep"], "p1")).toMatchObject([{ id: first, rank: 0 }]);
+    expect(store.search("_%", 10)).toEqual([]);
+
+    store.update(first, { content: "Changed fallback" });
+    store.update(first, { content: "Changed again", tags: ["new"], confidence: 0.7 });
+    store.update(first, { confidence: 0.8 });
+    store.update(first, { tags: ["final"] });
+    expect(store.getById(first)).toMatchObject({ content: "Changed again", confidence: 0.8 });
+
+    store.archive(first);
+    expect(store.search("changed", 10)).toEqual([]);
+    store.revive(first);
+    expect(store.search("changed", 10, ["final"])).toHaveLength(1);
+    store.deleteById(first);
+    store.deleteById(second);
+    expect(store.getAll()).toEqual([]);
+  });
+
   it("rolls back revive when the promoted row update fails", () => {
     const execCalls: string[] = [];
     const db = {
@@ -105,6 +160,22 @@ describe("PromotedStore extended", () => {
     } as unknown as DatabaseSync;
     expect(() => new PromotedStore(db).revive("id")).toThrow("update failed");
     expect(execCalls).toEqual(["BEGIN", "ROLLBACK"]);
+  });
+
+  it("leaves rollback to the owning transaction when revive fails in a transaction", () => {
+    const execCalls: string[] = [];
+    const db = {
+      isTransaction: true,
+      exec: (sql: string) => execCalls.push(sql),
+      prepare: (sql: string) => ({
+        get: () => ({ rowid: 1, content: "content", tags: "[]" }),
+        run: () => {
+          if (sql.startsWith("UPDATE promoted")) throw new Error("update failed");
+        },
+      }),
+    } as unknown as DatabaseSync;
+    expect(() => new PromotedStore(db).revive("id")).toThrow("update failed");
+    expect(execCalls).toEqual([]);
   });
 
   // ── getById ──────────────────────────────────────────────────────────────

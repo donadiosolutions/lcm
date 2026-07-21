@@ -52,6 +52,7 @@ function mockReq(): IncomingMessage {
 function makeConfig(provider: DaemonConfig["llm"]["provider"]): DaemonConfig {
   return {
     version: 1,
+    storage: { backend: "sqlite" },
     daemon: { port: 3737, socketPath: "/tmp/test.sock", logLevel: "info", logMaxSizeMB: 10, logRetentionDays: 7, idleTimeoutMs: 1800000 },
     compaction: {
       leafTokens: 1000, maxDepth: 5, autoCompactMinTokens: 10000,

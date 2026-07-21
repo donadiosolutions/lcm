@@ -47,7 +47,10 @@ export function parsePromotedTags(serialized: string): string[] {
 }
 
 export class PromotedStore {
-  constructor(private db: DatabaseSync) {}
+  constructor(
+    private db: DatabaseSync,
+    private readonly fts5Available = true,
+  ) {}
 
   insert(params: InsertParams): string {
     const id = randomUUID();
@@ -70,9 +73,10 @@ export class PromotedStore {
       params.confidence ?? 1.0,
     );
 
-    // Sync to FTS5
-    const row = this.db.prepare("SELECT rowid FROM promoted WHERE id = ?").get(id) as { rowid: number } | undefined;
-    if (row) {
+    // Sync to FTS5 when the runtime provides it. Search has a SQL fallback.
+    if (this.fts5Available) {
+      const row = this.db.prepare("SELECT rowid FROM promoted WHERE id = ?").get(id) as { rowid: number } | undefined;
+      if (!row) return id;
       this.db.prepare(
         "INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)"
       ).run(row.rowid, params.content, tags);
@@ -86,14 +90,18 @@ export class PromotedStore {
   }
 
   search(query: string, limit: number, filterTags?: string[], projectId?: string): SearchResult[] {
-    const sanitized = query
+    const terms = query
       .replace(/[^\w\s]/g, " ")
       .split(/\s+/)
-      .filter(Boolean)
-      .map((t) => `"${t}"`)
-      .join(" OR ");
+      .filter(Boolean);
 
-    if (!sanitized) return [];
+    if (terms.length === 0) return [];
+
+    if (!this.fts5Available) {
+      return this.searchWithoutFts(terms, limit, filterTags, projectId);
+    }
+
+    const sanitized = terms.map((term) => `"${term}"`).join(" OR ");
 
     const projectFilter = projectId ? "AND p.project_id = ?" : "";
     const queryParams: (string | number)[] = [sanitized];
@@ -163,7 +171,9 @@ export class PromotedStore {
   }
 
   archive(id: string): void {
-    const row = this.db.prepare("SELECT rowid FROM promoted WHERE id = ?").get(id) as { rowid: number } | undefined;
+    const row = this.fts5Available
+      ? this.db.prepare("SELECT rowid FROM promoted WHERE id = ?").get(id) as { rowid: number } | undefined
+      : undefined;
     this.db.prepare("UPDATE promoted SET archived_at = datetime('now') WHERE id = ?").run(id);
     if (row) {
       this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
@@ -171,7 +181,9 @@ export class PromotedStore {
   }
 
   deleteById(id: string): void {
-    const row = this.db.prepare("SELECT rowid FROM promoted WHERE id = ?").get(id) as { rowid: number } | undefined;
+    const row = this.fts5Available
+      ? this.db.prepare("SELECT rowid FROM promoted WHERE id = ?").get(id) as { rowid: number } | undefined
+      : undefined;
     if (row) {
       this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
     }
@@ -186,6 +198,12 @@ export class PromotedStore {
 
     if (fields.content !== undefined) {
       const newTags = fields.tags !== undefined ? JSON.stringify(fields.tags) : row.tags;
+      if (!this.fts5Available) {
+        this.db.prepare(
+          "UPDATE promoted SET content = ?, confidence = COALESCE(?, confidence), tags = ? WHERE id = ?"
+        ).run(fields.content, fields.confidence ?? null, newTags, id);
+        return;
+      }
       this.withUpdateSavepoint(() => {
         this.db.prepare(
           "UPDATE promoted SET content = ?, confidence = COALESCE(?, confidence), tags = ? WHERE id = ?"
@@ -203,6 +221,10 @@ export class PromotedStore {
       }
       if (fields.tags !== undefined) {
         const newTags = JSON.stringify(fields.tags);
+        if (!this.fts5Available) {
+          this.db.prepare("UPDATE promoted SET tags = ? WHERE id = ?").run(newTags, id);
+          return;
+        }
         this.withUpdateSavepoint(() => {
           this.db.prepare("UPDATE promoted SET tags = ? WHERE id = ?").run(newTags, id);
           this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
@@ -306,8 +328,14 @@ export class PromotedStore {
       | undefined;
     if (!row) return;
 
+    if (!this.fts5Available) {
+      this.db.prepare("UPDATE promoted SET archived_at = NULL WHERE id = ?").run(id);
+      return;
+    }
+
     // Wrap in transaction so the row and FTS stay in sync
-    this.db.exec("BEGIN");
+    const ownsTransaction = !this.db.isTransaction;
+    if (ownsTransaction) this.db.exec("BEGIN");
     try {
       this.db.prepare("UPDATE promoted SET archived_at = NULL WHERE id = ?").run(id);
       // Re-add to FTS — ignore if already present
@@ -316,9 +344,9 @@ export class PromotedStore {
           row.rowid, row.content, row.tags
         );
       } catch { /* already in FTS — non-fatal */ }
-      this.db.exec("COMMIT");
+      if (ownsTransaction) this.db.exec("COMMIT");
     } catch (err) {
-      this.db.exec("ROLLBACK");
+      if (ownsTransaction) this.db.exec("ROLLBACK");
       throw err;
     }
   }
@@ -332,5 +360,42 @@ export class PromotedStore {
       this.db.exec("ROLLBACK");
       throw err;
     }
+  }
+
+  private searchWithoutFts(
+    terms: string[],
+    limit: number,
+    filterTags?: string[],
+    projectId?: string,
+  ): SearchResult[] {
+    const escapeLike = (term: string): string => term.replace(/[\\%_]/g, "\\$&");
+    const termClauses = terms.map(() => "(LOWER(content) LIKE ? ESCAPE '\\' OR LOWER(tags) LIKE ? ESCAPE '\\')");
+    const params: Array<string | number> = [];
+    for (const term of terms) {
+      const pattern = `%${escapeLike(term.toLowerCase())}%`;
+      params.push(pattern, pattern);
+    }
+    let sql = `SELECT * FROM promoted WHERE archived_at IS NULL AND (${termClauses.join(" OR ")})`;
+    if (projectId) {
+      sql += " AND project_id = ?";
+      params.push(projectId);
+    }
+    sql += " ORDER BY confidence DESC, created_at ASC LIMIT ?";
+    params.push(limit);
+
+    let results = (this.db.prepare(sql).all(...params) as PromotedRow[]).map((row) => ({
+      id: row.id,
+      content: row.content,
+      tags: parsePromotedTags(row.tags),
+      projectId: row.project_id,
+      sessionId: row.session_id,
+      confidence: row.confidence,
+      createdAt: row.created_at,
+      rank: 0,
+    }));
+    if (filterTags && filterTags.length > 0) {
+      results = results.filter((result) => filterTags.every((tag) => result.tags.includes(tag)));
+    }
+    return results;
   }
 }

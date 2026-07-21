@@ -13,6 +13,7 @@ const state = vi.hoisted(() => ({
   feedback: new Map<string, RecallFeedback>(),
   logError: undefined as unknown,
   closed: [] as string[],
+  factoryClosed: 0,
 }));
 
 vi.mock("node:fs", async (importOriginal) => ({
@@ -29,35 +30,32 @@ vi.mock("../../../src/daemon/validate-cwd.js", () => ({
 
 vi.mock("../../../src/daemon/project.js", () => ({
   projectDbPath: (cwd: string) => `${cwd}/memory.db`,
+  projectIdentity: (cwd: string) => ({ id: cwd, canonical: cwd }),
 }));
 
-vi.mock("../../../src/db/connection.js", () => ({
-  getLcmConnection: () => {
-    if (state.connectionError !== undefined) throw state.connectionError;
-    return {};
-  },
-  closeLcmConnection: (path: string) => state.closed.push(path),
-}));
-
-vi.mock("../../../src/db/migration.js", () => ({
-  runLcmMigrations: () => {
-    if (state.migrationError !== undefined) throw state.migrationError;
-  },
-}));
-
-vi.mock("../../../src/db/promoted.js", () => ({
-  PromotedStore: class {
-    search() { return state.searchResults; }
-  },
-}));
-
-vi.mock("../../../src/db/recall.js", () => ({
-  RecallStore: class {
-    getFeedback() { return state.feedback; }
-    logSurfacing() {
-      if (state.logError !== undefined) throw state.logError;
-    }
-  },
+vi.mock("../../../src/storage/index.js", () => ({
+  createStorageBackendFactory: () => ({
+    projectExists: async () => state.exists,
+    openProject: async () => {
+      if (state.connectionError !== undefined) throw state.connectionError;
+      return {
+        lexicalSearch: {
+          searchPromoted: async () => {
+            if (state.migrationError !== undefined) throw state.migrationError;
+            return state.searchResults;
+          },
+        },
+        recall: {
+          getFeedback: async () => state.feedback,
+          logSurfacing: async () => {
+            if (state.logError !== undefined) throw state.logError;
+          },
+        },
+        close: async () => { state.closed.push("project"); },
+      };
+    },
+    close: async () => { state.factoryClosed += 1; },
+  }),
 }));
 
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
@@ -125,11 +123,15 @@ function config(): DaemonConfig {
   return value;
 }
 
-async function call(body: string, mutate?: (value: DaemonConfig) => void): Promise<PromptSearchResponse> {
+async function call(
+  body: string,
+  mutate?: (value: DaemonConfig) => void,
+  factory?: Parameters<typeof createPromptSearchHandler>[1],
+): Promise<PromptSearchResponse> {
   const value = config();
   mutate?.(value);
   const output = response();
-  await createPromptSearchHandler(value)({} as never, output.res, body);
+  await createPromptSearchHandler(value, factory)({} as never, output.res, body);
   return output.json();
 }
 
@@ -143,6 +145,7 @@ describe("prompt-search route coverage", () => {
     state.feedback = new Map();
     state.logError = undefined;
     state.closed = [];
+    state.factoryClosed = 0;
   });
 
   afterEach(() => {
@@ -172,6 +175,14 @@ describe("prompt-search route coverage", () => {
     expect(await call(JSON.stringify({ query: "q", cwd: "/tmp" }))).toEqual({ hints: [] });
   });
 
+  it("honors the disabled prompt-search limit before opening storage", async () => {
+    expect(await call(
+      JSON.stringify({ query: "q", cwd: "/tmp" }),
+      (value) => { value.restoration.promptSearchMaxResults = 0; },
+    )).toEqual({ hints: [], ids: [] });
+    expect(state.closed).toEqual([]);
+  });
+
   it("returns no suggestions without opening a missing database", async () => {
     state.exists = false;
     expect(await call(JSON.stringify({ query: "q", cwd: "/tmp" }))).toEqual({ hints: [] });
@@ -181,13 +192,33 @@ describe("prompt-search route coverage", () => {
   it("closes an opened database after an internal failure", async () => {
     state.migrationError = new Error("migration failed");
     expect(await call(JSON.stringify({ query: "q", cwd: "/tmp" }))).toEqual({ hints: [] });
-    expect(state.closed).toHaveLength(1);
+    expect(state.closed).toEqual(["project"]);
+    expect(state.factoryClosed).toBe(1);
   });
 
   it("does not close a database when opening it fails", async () => {
     state.connectionError = new Error("open failed");
     expect(await call(JSON.stringify({ query: "q", cwd: "/tmp" }))).toEqual({ hints: [] });
     expect(state.closed).toEqual([]);
+    expect(state.factoryClosed).toBe(1);
+  });
+
+  it("keeps an injected process-lifetime factory open", async () => {
+    const close = vi.fn(async () => undefined);
+    const projectClose = vi.fn(async () => undefined);
+    const factory = {
+      projectExists: vi.fn(async () => true),
+      openProject: vi.fn(async () => ({
+        lexicalSearch: { searchPromoted: vi.fn(async () => []) },
+        recall: { getFeedback: vi.fn(async () => new Map()), logSurfacing: vi.fn(async () => undefined) },
+        close: projectClose,
+      })),
+      close,
+    } as never;
+    expect(await call(JSON.stringify({ query: "q", cwd: "/tmp" }), undefined, factory))
+      .toEqual({ hints: [], ids: [] });
+    expect(projectClose).toHaveBeenCalledOnce();
+    expect(close).not.toHaveBeenCalled();
   });
 
   it("ranks ties through every comparator and scoring boundary", async () => {
@@ -239,6 +270,25 @@ describe("prompt-search route coverage", () => {
         { id: "base-high", baseScore: 2, finalScore: 2, usageBoost: 1 },
         { id: "boosted-base-low", baseScore: 1, finalScore: 2, usageBoost: 2 },
       ]);
+  });
+
+  it("applies cross-session affinity to a memory from another session", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    state.searchResults = [result({ id: "other", sessionId: "other-session", rank: -2 })];
+    const body = await call(
+      JSON.stringify({ query: "q", cwd: "/tmp", session_id: "current", debug: true }),
+      (value) => { value.restoration.crossSessionAffinity = 0.7; },
+    );
+    expect(body.debug?.candidates[0]?.baseScore).toBe(1.4);
+  });
+
+  it("truncates a memory hint longer than the configured snippet", async () => {
+    state.searchResults = [result({ content: "abcdefgh" })];
+    expect(await call(
+      JSON.stringify({ query: "q", cwd: "/tmp" }),
+      (value) => { value.restoration.promptSnippetLength = 4; },
+    )).toMatchObject({ hints: ["abcd..."] });
   });
 
   it("keeps a best cooled result and tolerates surfacing-log failures", async () => {

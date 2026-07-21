@@ -1,13 +1,17 @@
-import { existsSync } from "node:fs";
 import type { DaemonConfig } from "../config.js";
-import { projectDbPath } from "../project.js";
+import { projectIdentity } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
-import { runLcmMigrations } from "../../db/migration.js";
 import { validateCwd } from "../validate-cwd.js";
-import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
+import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
+import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
 
-export function createRecentHandler(_config: DaemonConfig): RouteHandler {
+function sqliteTimestamp(date: Date): string {
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+export function createRecentHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body) => {
     const input = JSON.parse(body || "{}");
     const { limit = 5 } = input;
@@ -25,26 +29,28 @@ export function createRecentHandler(_config: DaemonConfig): RouteHandler {
       return;
     }
 
+    let project: ProjectStorage | undefined;
+    let ownedFactory: StorageBackendFactory | undefined;
     try {
-      const dbPath = projectDbPath(cwd);
-      if (!existsSync(dbPath)) {
+      const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+      project = await openExistingProject(factory, projectIdentity(cwd)) ?? undefined;
+      if (!project) {
         sendJson(res, 200, { summaries: [] });
         return;
       }
-      try {
-        const db = getLcmConnection(dbPath);
-        runLcmMigrations(db);
-        const rows = db.prepare(
-          `SELECT s.summary_id, s.content, s.depth, s.token_count, s.created_at
-           FROM summaries s
-           ORDER BY s.created_at DESC LIMIT ?`
-        ).all(limit) as Array<Record<string, unknown>>;
-        sendJson(res, 200, { summaries: rows });
-      } finally {
-        closeLcmConnection(dbPath);
-      }
+      const summaries = await project.summaries.listRecentSummaries(limit);
+      const rows = summaries.map((summary) => ({
+        summary_id: summary.summaryId,
+        content: summary.content,
+        depth: summary.depth,
+        token_count: summary.tokenCount,
+        created_at: sqliteTimestamp(summary.createdAt),
+      }));
+      sendJson(res, 200, { summaries: rows });
     } catch {
       sendJson(res, 200, { summaries: [] });
+    } finally {
+      await closeRouteStorage(project, ownedFactory);
     }
   };
 }

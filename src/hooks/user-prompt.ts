@@ -66,7 +66,7 @@ export async function handleUserPromptSubmit(
     // Sidecar event extraction — must happen before prompt-search, must never throw
     try {
       const { extractUserPromptEvents } = await import("./extractors.js");
-      const { EventsDb } = await import("./events-db.js");
+      const { SQLiteLocalHookOutboxFactory } = await import("../storage/local-hook-outbox.js");
       const { eventsDbPath } = await import("../db/events-path.js");
       const { ensureProjectDir } = await import("../daemon/project.js");
 
@@ -76,13 +76,14 @@ export async function handleUserPromptSubmit(
 
       if (events.length > 0 && input.session_id && typeof input.session_id === "string") {
         ensureProjectDir(cwd);
-        const db = new EventsDb(eventsDbPath(cwd));
+        const outboxFactory = new SQLiteLocalHookOutboxFactory();
+        const db = await outboxFactory.open(eventsDbPath(cwd));
         try {
           for (const event of events) {
-            db.insertEvent(input.session_id, event, "UserPromptSubmit");
+            await db.insertEvent(input.session_id, event, "UserPromptSubmit");
           }
           const priority = Math.min(...events.map(event => event.priority));
-          const pendingCount = db.getHealthStats().unprocessed;
+          const pendingCount = (await db.getHealthStats()).unprocessed;
           notification = {
             cwd,
             priority,
@@ -90,11 +91,11 @@ export async function handleUserPromptSubmit(
             sourceHook: "UserPromptSubmit",
           };
         } finally {
-          db.close();
+          await outboxFactory.close();
         }
       }
     } catch (e) {
-      safeLogError("UserPromptSubmit", e, {
+      await safeLogError("UserPromptSubmit", e, {
         cwd: input.cwd ?? process.env.CLAUDE_PROJECT_DIR,
         sessionId: input.session_id,
       });
@@ -114,7 +115,7 @@ export async function handleUserPromptSubmit(
       try {
         firePromoteEventsNotifyRequest(daemonPort, notification);
       } catch (e) {
-        safeLogError("UserPromptSubmit", e, {
+        await safeLogError("UserPromptSubmit", e, {
           cwd,
           sessionId: input.session_id,
         });

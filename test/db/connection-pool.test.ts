@@ -8,12 +8,13 @@
  *  - The underlying connection is only closed when the last holder calls close()
  *  - After full eviction, the migration cache is cleared so the next open re-migrates
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { EventsDb, _resetMigratedPathsForTesting } from "../../src/hooks/events-db.js";
-import { getLcmConnection, closeLcmConnection, isLcmConnectionOpen } from "../../src/db/connection.js";
+import { DatabaseSync } from "node:sqlite";
+import { closeLcmConnection, getPoolStats, isLcmConnectionOpen } from "../../src/db/connection.js";
 
 describe("EventsDb connection pooling (issue #131)", () => {
   let tempDir: string;
@@ -38,8 +39,9 @@ describe("EventsDb connection pooling (issue #131)", () => {
     const a = new EventsDb(dbPath);
     const b = new EventsDb(dbPath);
 
-    // Both instances expose the same underlying db object (identity equality).
-    expect(a.raw()).toBe(b.raw());
+    expect(getPoolStats().connections).toEqual([
+      { path: dbPath, refs: 2, status: "active" },
+    ]);
 
     b.close();
     a.close();
@@ -67,21 +69,25 @@ describe("EventsDb connection pooling (issue #131)", () => {
 
     db.close();
     expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    db.close();
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
   });
 
   it("migration runs only once per connection lifetime even with multiple EventsDb instances", () => {
     // Open the first EventsDb which triggers migration (schema creation / schema_version checks).
     // Subsequent opens for the same path should not re-run the migration on the same connection.
     const a = new EventsDb(dbPath);
-    const rawDb = a.raw();
 
     // Patch exec to detect re-migration: if schema creation SQL runs again, that's a bug.
     const execCalls: string[] = [];
-    const origExec = rawDb.exec.bind(rawDb);
-    rawDb.exec = (sql: string) => {
+    const originalExec = DatabaseSync.prototype.exec;
+    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
       execCalls.push(sql);
-      return origExec(sql);
-    };
+      return originalExec.call(this, sql);
+    });
 
     // Second open: migration should NOT run again (path is in _migratedPaths).
     const b = new EventsDb(dbPath);
@@ -89,6 +95,7 @@ describe("EventsDb connection pooling (issue #131)", () => {
     // No CREATE TABLE calls should have happened from the second constructor.
     const createTableCalls = execCalls.filter(s => s.includes("CREATE TABLE"));
     expect(createTableCalls).toHaveLength(0);
+    execSpy.mockRestore();
 
     b.close();
     a.close();
@@ -113,7 +120,9 @@ describe("EventsDb connection pooling (issue #131)", () => {
     const a = new EventsDb(dbPath);
     const b = new EventsDb(dbPath2);
 
-    expect(a.raw()).not.toBe(b.raw());
+    expect(getPoolStats().connections.map((entry) => entry.path).sort()).toEqual(
+      [dbPath, dbPath2].sort(),
+    );
     expect(isLcmConnectionOpen(dbPath)).toBe(true);
     expect(isLcmConnectionOpen(dbPath2)).toBe(true);
 

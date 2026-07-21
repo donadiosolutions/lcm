@@ -6,6 +6,15 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 
+function withSqlite<T>(path: string, operation: (db: DatabaseSync) => T): T {
+  const db = new DatabaseSync(path);
+  try {
+    return operation(db);
+  } finally {
+    db.close();
+  }
+}
+
 describe("EventsDb", () => {
   let dir: string;
   let dbPath: string;
@@ -81,8 +90,7 @@ describe("EventsDb", () => {
     const second = db.insertEvent("s1", { type: "b", category: "file", data: "y", priority: 3 }, "PostToolUse");
     db.markProcessed([]);
     db.setPrevEventId(second, first);
-    const row = db.raw().prepare("SELECT prev_event_id FROM events WHERE event_id = ?").get(second) as { prev_event_id: number };
-    expect(row.prev_event_id).toBe(first);
+    expect(db.getUnprocessed().find((event) => event.event_id === second)?.prev_event_id).toBe(first);
     db.close();
   });
 
@@ -104,9 +112,9 @@ describe("EventsDb", () => {
     db.markProcessed([events[0].event_id]);
 
     // Manually backdate the processed_at to 10 days ago
-    db.raw().exec(
+    withSqlite(dbPath, (raw) => raw.exec(
       `UPDATE events SET processed_at = datetime('now', '-10 days') WHERE event_id = ${events[0].event_id}`
-    );
+    ));
 
     const pruned = db.pruneProcessed(7);
     expect(pruned).toBe(1);
@@ -153,7 +161,7 @@ describe("EventsDb", () => {
       rawDb.close();
 
       const recovered = new EventsDb(dbPath);
-      expect((recovered.raw().prepare("SELECT version FROM schema_version").get() as { version: number }).version)
+      expect(withSqlite(dbPath, (raw) => (raw.prepare("SELECT version FROM schema_version").get() as { version: number }).version))
         .toBe(3);
       recovered.close();
     });
@@ -171,7 +179,7 @@ describe("EventsDb", () => {
       `);
       rawDb.close();
       const db = new EventsDb(dbPath);
-      expect((db.raw().prepare("SELECT version FROM schema_version").get() as any).version).toBe(3);
+      expect(withSqlite(dbPath, (raw) => (raw.prepare("SELECT version FROM schema_version").get() as { version: number }).version)).toBe(3);
       db.close();
     });
 
@@ -189,7 +197,7 @@ describe("EventsDb", () => {
       `);
       rawDb.close();
       const db = new EventsDb(dbPath);
-      expect(db.raw().prepare("SELECT name FROM sqlite_master WHERE name='idx_events_pattern_lookup'").get()).toBeDefined();
+      expect(withSqlite(dbPath, (raw) => raw.prepare("SELECT name FROM sqlite_master WHERE name='idx_events_pattern_lookup'").get())).toBeDefined();
       db.close();
     });
 
@@ -202,7 +210,7 @@ describe("EventsDb", () => {
       rawDb.close();
 
       const db = new EventsDb(dbPath);
-      expect((db.raw().prepare("SELECT version FROM schema_version").get() as { version: number }).version)
+      expect(withSqlite(dbPath, (raw) => (raw.prepare("SELECT version FROM schema_version").get() as { version: number }).version))
         .toBe(3);
       db.close();
     });
@@ -251,15 +259,15 @@ describe("EventsDb", () => {
 
       // Now open with EventsDb — should migrate to the latest schema.
       const db = new EventsDb(dbPath);
-      const tableRow = db.raw().prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='error_log'"
-      ).get();
-      const indexRow = db.raw().prepare(
-        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_events_pattern_lookup'"
-      ).get();
+      const tableRow = withSqlite(dbPath, (raw) => raw.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='error_log'",
+      ).get());
+      const indexRow = withSqlite(dbPath, (raw) => raw.prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_events_pattern_lookup'",
+      ).get());
       expect(tableRow).toBeDefined();
       expect(indexRow).toBeDefined();
-      const versionRow = db.raw().prepare("SELECT version FROM schema_version").get() as { version: number };
+      const versionRow = withSqlite(dbPath, (raw) => raw.prepare("SELECT version FROM schema_version").get()) as { version: number };
       expect(versionRow.version).toBe(3);
       db.close();
     });
@@ -267,9 +275,7 @@ describe("EventsDb", () => {
     it("logHookError inserts into error_log", () => {
       const db = new EventsDb(dbPath);
       db.logHookError("PostToolUse", new Error("something went wrong"), "session-abc");
-      const row = db.raw().prepare("SELECT * FROM error_log").get() as {
-        id: number; hook: string; error: string; session_id: string | null; created_at: string;
-      };
+      const row = db.getRecentErrors({ includeMaintenance: true })[0];
       expect(row).toBeDefined();
       expect(row.hook).toBe("PostToolUse");
       expect(row.error).toBe("something went wrong");
@@ -280,7 +286,7 @@ describe("EventsDb", () => {
     it("logHookError handles non-Error values", () => {
       const db = new EventsDb(dbPath);
       db.logHookError("PreToolUse", "raw string error");
-      const row = db.raw().prepare("SELECT * FROM error_log").get() as { error: string; session_id: string | null };
+      const row = db.getRecentErrors({ includeMaintenance: true })[0];
       expect(row.error).toBe("raw string error");
       expect(row.session_id).toBeNull();
       db.close();
@@ -339,7 +345,7 @@ describe("EventsDb", () => {
     it("prunes old unprocessed rows and no-ops when nothing qualifies", () => {
       const db = new EventsDb(dbPath);
       db.insertEvent("s1", { type: "a", category: "file", data: "old", priority: 3 }, "PostToolUse");
-      db.raw().exec("UPDATE events SET created_at = datetime('now', '-31 days')");
+      withSqlite(dbPath, (raw) => raw.exec("UPDATE events SET created_at = datetime('now', '-31 days')"));
       expect(db.pruneUnprocessed(10, 30)).toEqual({ pruned: 1 });
       expect(db.pruneUnprocessed(10, 30)).toEqual({ pruned: 0 });
       db.close();
@@ -348,12 +354,12 @@ describe("EventsDb", () => {
     it("rolls back a failed unprocessed prune", () => {
       const db = new EventsDb(dbPath);
       db.insertEvent("s1", { type: "a", category: "file", data: "old", priority: 3 }, "PostToolUse");
-      db.raw().exec(`
+      withSqlite(dbPath, (raw) => raw.exec(`
         UPDATE events SET created_at = datetime('now', '-31 days');
         CREATE TRIGGER reject_event_delete BEFORE DELETE ON events BEGIN
           SELECT RAISE(ABORT, 'delete rejected');
         END;
-      `);
+      `));
       expect(() => db.pruneUnprocessed(10, 30)).toThrow("delete rejected");
       expect(db.getUnprocessed()).toHaveLength(1);
       db.close();
@@ -366,7 +372,9 @@ describe("EventsDb", () => {
       }
       db.pruneUnprocessed(3, 9999);
 
-      const logRow = db.raw().prepare("SELECT error FROM error_log WHERE hook = 'maintenance:pruneUnprocessed'").get() as { error: string } | undefined;
+      const logRow = db.getRecentErrors({ includeMaintenance: true }).find(
+        (entry) => entry.hook === "maintenance:pruneUnprocessed",
+      );
       expect(logRow).toBeDefined();
       expect(logRow!.error).toContain("pruned");
       db.close();
@@ -388,15 +396,14 @@ describe("EventsDb", () => {
       const db = new EventsDb(dbPath);
       db.logHookError("PostToolUse", new Error("old error"), "s1");
       // Backdate the entry
-      db.raw().exec("UPDATE error_log SET created_at = datetime('now', '-31 days')");
+      withSqlite(dbPath, (raw) => raw.exec("UPDATE error_log SET created_at = datetime('now', '-31 days')"));
       // Add a recent entry
       db.logHookError("PostToolUse", new Error("recent error"), "s1");
 
       const pruned = db.pruneErrorLog(30);
       expect(pruned).toBe(1);
 
-      const remaining = db.raw().prepare("SELECT COUNT(*) as c FROM error_log").get() as { c: number };
-      expect(remaining.c).toBe(1);
+      expect(db.getRecentErrors({ includeMaintenance: true, limit: 10 })).toHaveLength(1);
       db.close();
     });
   });

@@ -243,6 +243,11 @@ PostgreSQL is remote-primary: once repository support is enabled, an outage is
 reported rather than silently switching the authoritative store to SQLite.
 Hook capture remains local through the SQLite outbox so events can be queued
 during daemon or database downtime and promoted after service recovery.
+The outbox is not a cache, dual-write target, offline read replica, or fallback
+for project-memory reads. See the
+[storage repository architecture](architecture.md#storage-repository-architecture)
+for backend ownership, transaction, capability, health, and adapter-extension
+contracts.
 
 ## Daemon safety
 

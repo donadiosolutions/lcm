@@ -11,6 +11,9 @@ const mocks = vi.hoisted(() => ({
   validate: vi.fn((cwd: string) => cwd),
   migrate: vi.fn(),
   send: vi.fn(),
+  openProject: vi.fn(),
+  projectClose: vi.fn(async () => undefined),
+  factoryClose: vi.fn(async () => undefined),
 }));
 
 vi.mock("node:fs", async (importOriginal) => ({
@@ -22,8 +25,8 @@ vi.mock("../../../src/db/connection.js", () => ({
   closeLcmConnection: mocks.close,
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
-  projectDbPath: (cwd: string) => `${cwd}/lcm.db`,
   projectDir: (cwd: string) => `${cwd}/project`,
+  projectIdentity: (cwd: string) => ({ id: "pid", canonical: cwd }),
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/db/migration.js", () => ({ runLcmMigrations: mocks.migrate }));
@@ -31,6 +34,12 @@ vi.mock("../../../src/db/promoted.js", () => ({ PromotedStore: class { insert = 
 vi.mock("../../../src/scrub.js", () => ({ ScrubEngine: { forProject: mocks.forProject } }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
 vi.mock("../../../src/daemon/safe-error.js", () => ({ sanitizeError: (message: string) => message }));
+vi.mock("../../../src/storage/index.js", () => ({
+  createStorageBackendFactory: () => ({
+    openProject: mocks.openProject,
+    close: mocks.factoryClose,
+  }),
+}));
 
 import { createStoreHandler } from "../../../src/daemon/routes/store.js";
 
@@ -46,12 +55,20 @@ describe("store persistence boundaries", () => {
     mocks.forProject.mockImplementation(async () => ({ scrub: mocks.scrub }));
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.getConnection.mockReturnValue({});
+    mocks.openProject.mockResolvedValue({
+      promotedMemory: { insert: mocks.insert },
+      close: mocks.projectClose,
+    });
   });
 
   it("validates text, path sources, and typed cwd failures", async () => {
     const handler = createStoreHandler(config);
     await handler({} as never, response, "");
     expect(mocks.send).toHaveBeenLastCalledWith(response, 400, { error: "text is required" });
+    await handler({} as never, response, JSON.stringify({ text: "value", tags: "invalid" }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 400, { error: "tags must be an array of strings" });
+    await handler({} as never, response, JSON.stringify({ text: "value", tags: [1] }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 400, { error: "tags must be an array of strings" });
     await handler({} as never, response, JSON.stringify({ text: "value" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 400, { error: "cwd or metadata.projectPath is required" });
     mocks.validate.mockImplementationOnce(() => { throw new Error("bad cwd"); });
@@ -68,7 +85,7 @@ describe("store persistence boundaries", () => {
     expect(mocks.insert).toHaveBeenLastCalledWith({
       content: "scrubbed:one",
       tags: [],
-      projectId: "manual",
+      sourceProjectId: "manual",
       sessionId: "manual",
       depth: 0,
       confidence: 1,
@@ -83,7 +100,8 @@ describe("store persistence boundaries", () => {
       metadata: { projectId: "p", sessionId: "s", depth: 4 },
     }));
     expect(mocks.forProject).toHaveBeenCalledTimes(2);
-    expect(mocks.insert).toHaveBeenLastCalledWith(expect.objectContaining({ tags: ["scrubbed:tag"], projectId: "p", sessionId: "s", depth: 4 }));
+    expect(mocks.insert).toHaveBeenLastCalledWith(expect.objectContaining({ tags: ["scrubbed:tag"], sessionId: "s", depth: 4 }));
+    expect(mocks.insert.mock.calls.at(-1)?.[0]).toMatchObject({ sourceProjectId: "p" });
   });
 
   it("handles absent pattern files and evicts the oldest scrubber at capacity", async () => {
@@ -105,16 +123,36 @@ describe("store persistence boundaries", () => {
     mocks.insert.mockImplementationOnce(() => { throw "failure"; });
     await handler({} as never, response, JSON.stringify({ text: "value", cwd: "/error-two" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "store failed" });
-    expect(mocks.close).toHaveBeenCalledTimes(2);
+    expect(mocks.projectClose).toHaveBeenCalledTimes(2);
+    expect(mocks.factoryClose).toHaveBeenCalledTimes(2);
   });
 
   it("returns a structured error without closing when acquisition fails", async () => {
     const handler = createStoreHandler(config);
-    mocks.getConnection.mockImplementationOnce(() => { throw new Error("open failed"); });
+    mocks.openProject.mockRejectedValueOnce(new Error("open failed"));
 
     await handler({} as never, response, JSON.stringify({ text: "value", cwd: "/open-error" }));
 
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "open failed" });
-    expect(mocks.close).not.toHaveBeenCalled();
+    expect(mocks.projectClose).not.toHaveBeenCalled();
+    expect(mocks.factoryClose).toHaveBeenCalledOnce();
+  });
+
+  it("uses an injected factory without taking ownership of it", async () => {
+    const injected = { openProject: mocks.openProject, close: mocks.factoryClose } as never;
+    const handler = createStoreHandler(config, injected);
+    await handler({} as never, response, JSON.stringify({ text: "value", cwd: "/injected" }));
+    expect(mocks.insert).toHaveBeenCalledOnce();
+    expect(mocks.projectClose).toHaveBeenCalledOnce();
+    expect(mocks.factoryClose).not.toHaveBeenCalled();
+  });
+
+  it("keeps the successful response when project and factory cleanup reject", async () => {
+    mocks.projectClose.mockRejectedValueOnce(new Error("project close failed"));
+    mocks.factoryClose.mockRejectedValueOnce(new Error("factory close failed"));
+    const sendsBefore = mocks.send.mock.calls.length;
+    await createStoreHandler(config)({} as never, response, JSON.stringify({ text: "value", cwd: "/close-error" }));
+    expect(mocks.send).toHaveBeenCalledTimes(sendsBefore + 1);
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { stored: true, id: "stored-id" });
   });
 });
