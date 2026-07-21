@@ -342,6 +342,25 @@ describe("runCli daemon-backed and utility actions", () => {
   });
 
   it.each([
+    ["search", "q"],
+    ["grep", "q"],
+    ["describe", "node"],
+    ["expand", "node"],
+    ["store", "memory"],
+    ["status"],
+    ["stats", "--pool"],
+    ["events", "promote"],
+  ])("rejects daemon-backed command %# before lifecycle mutation when PostgreSQL is selected", async (...args) => {
+    state.storageBackend = "postgresql";
+
+    await expect(runCli(["node", "lcm", ...args])).rejects.toBeInstanceOf(StorageBackendUnavailableError);
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.health).not.toHaveBeenCalled();
+    expect(state.get).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ["config", "get", "llm.provider", "--effective"], ["config", "set", "llm.provider", "openai", "--json"],
     ["status"], ["status", "--json"], ["stats"], ["stats", "--pool"], ["stats", "--pool", "--json"],
     ["diagnose"], ["diagnose", "--all", "--verbose", "--json"], ["sensitive", "list"],
@@ -429,6 +448,19 @@ describe("runCli orchestration actions", () => {
     expect(await invoke(["import-knowledge", "input.json"])).toBeInstanceOf(StorageBackendUnavailableError);
     expect(portable.exportKnowledge).not.toHaveBeenCalled();
     expect(portable.importKnowledge).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["compact", "--dry-run"],
+    ["import", "--dry-run"],
+    ["promote", "--dry-run"],
+  ])("rejects direct daemon command %# before lifecycle or daemon network activity", async (...args) => {
+    state.storageBackend = "postgresql";
+
+    expect(await invoke(args)).toBeInstanceOf(StorageBackendUnavailableError);
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+    expect(state.get).not.toHaveBeenCalled();
   });
 });
 

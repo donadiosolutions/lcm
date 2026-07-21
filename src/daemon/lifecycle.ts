@@ -96,6 +96,83 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const STORAGE_BACKEND_AUTH_WARNING = "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
 const userSystemdPidCache = new Map<string, { pid: number | null; expiresAt: number }>();
 
+type ProcessDiagnosticSource =
+  | "credential setup error"
+  | "systemd start exception"
+  | "systemd stderr"
+  | "systemd stdout"
+  | "systemd process error"
+  | "detached spawn error";
+
+const PROCESS_ERROR_CODES = new Set([
+  "E2BIG", "EACCES", "EADDRINUSE", "EAGAIN", "ECONNREFUSED", "ECONNRESET",
+  "EEXIST", "EHOSTUNREACH", "EINTR", "EINVAL", "EIO", "EISDIR", "EMFILE",
+  "ENETUNREACH", "ENOENT", "ENOMEM", "ENOSPC", "ENOTDIR", "ENOTEMPTY",
+  "ENOTFOUND", "ENOTSUP", "EPERM", "EPIPE", "ESRCH", "ETIMEDOUT",
+]);
+const PROCESS_ERROR_CLASSIFICATIONS = new Map<string, string>([
+  ["EACCES", "permission denied"], ["EPERM", "permission denied"],
+  ["ENOENT", "executable or resource unavailable"], ["ENOTDIR", "executable or resource unavailable"],
+  ["ETIMEDOUT", "operation timed out"],
+  ["ECONNREFUSED", "service unavailable"], ["ECONNRESET", "service unavailable"],
+  ["EHOSTUNREACH", "service unavailable"], ["ENETUNREACH", "service unavailable"],
+  ["ENOMEM", "local resource limit reached"], ["ENOSPC", "local resource limit reached"],
+  ["EMFILE", "local resource limit reached"],
+  ["EINVAL", "invalid process invocation"], ["E2BIG", "invalid process invocation"],
+]);
+const PROCESS_TEXT_CLASSIFICATIONS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/\b(?:permission denied|access denied)\b/i, "permission denied"],
+  [/\b(?:not found|no such|no medium)\b/i, "executable or resource unavailable"],
+  [/\b(?:timed out|timeout)\b/i, "operation timed out"],
+  [/\b(?:connection refused|unreachable)\b/i, "service unavailable"],
+];
+const PROCESS_SIGNALS = new Set([
+  "SIGABRT", "SIGALRM", "SIGBUS", "SIGCHLD", "SIGCONT", "SIGFPE", "SIGHUP",
+  "SIGILL", "SIGINT", "SIGKILL", "SIGPIPE", "SIGQUIT", "SIGSEGV", "SIGSTOP",
+  "SIGTERM", "SIGTRAP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGUSR1",
+  "SIGUSR2", "SIGXCPU", "SIGXFSZ",
+]);
+
+/** Summarize untrusted process output without reproducing any of its text. */
+function summarizeProcessDiagnostic(source: ProcessDiagnosticSource, value: unknown): string {
+  let text = "";
+  let suppliedCode: unknown;
+  try {
+    if (value instanceof Error) {
+      text = value.message.slice(0, 4096);
+      suppliedCode = (value as NodeJS.ErrnoException).code;
+    } else if (typeof value === "string") {
+      text = value.slice(0, 4096);
+    }
+  } catch {
+    // Hostile Error subclasses must not escape diagnostic handling.
+  }
+  // Normalize controls only for classification. No portion of this text is returned.
+  text = text
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, " ")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+
+  const normalizedCode = typeof suppliedCode === "string" ? suppliedCode.toUpperCase() : "";
+  const textCode = text.toUpperCase().match(/\bE[A-Z0-9_]{2,31}\b/g)
+    ?.find((candidate) => PROCESS_ERROR_CODES.has(candidate));
+  const code = PROCESS_ERROR_CODES.has(normalizedCode) ? normalizedCode : textCode;
+
+  const classification = code
+    ? PROCESS_ERROR_CLASSIFICATIONS.get(code) ?? "process reported a failure"
+    : PROCESS_TEXT_CLASSIFICATIONS.find(([pattern]) => pattern.test(text))?.[1]
+      ?? "process reported a failure";
+
+  return `${source}: ${classification}${code ? `; code ${code}` : ""}`;
+}
+
+function summarizeProcessExit(status: unknown, signal: unknown): string {
+  if (typeof signal === "string" && PROCESS_SIGNALS.has(signal)) return `signal ${signal}`;
+  if (typeof status === "number" && Number.isInteger(status) && status >= 0 && status <= 255) {
+    return `exit status ${status}`;
+  }
+  return "process exit unavailable";
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -500,11 +577,11 @@ function startViaDetachedSpawn(
       env: { ...process.env },
     }) as ChildProcess;
   } catch (err) {
-    errorMessage = err instanceof Error ? err.message : String(err);
+    errorMessage = summarizeProcessDiagnostic("detached spawn error", err);
     return { getWarning: () => `detached spawn failed (${errorMessage})` };
   }
   child.once("error", (err) => {
-    errorMessage = err.message;
+    errorMessage = summarizeProcessDiagnostic("detached spawn error", err);
   });
   child.unref();
 
@@ -635,7 +712,7 @@ function startViaUserSystemd(
   try {
     credentials = systemdDaemonCredentialArgs(process.env);
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
+    const detail = summarizeProcessDiagnostic("credential setup error", err);
     return {
       ok: false,
       warning: `user systemd credential setup failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
@@ -656,7 +733,7 @@ function startViaUserSystemd(
     ], { encoding: "utf-8", env: systemdRunProcessEnv(process.env), timeout: Math.max(1, opts.spawnTimeoutMs) });
   } catch (err) {
     credentials.cleanup?.();
-    const detail = err instanceof Error ? err.message : String(err);
+    const detail = summarizeProcessDiagnostic("systemd start exception", err);
     return {
       ok: false,
       warning: `user systemd start failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
@@ -664,11 +741,16 @@ function startViaUserSystemd(
   }
 
   if (result.status === 0) return { ok: true, cleanup: credentials.cleanup };
-  const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
-  const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
-  const error = result.error instanceof Error ? result.error.message : "";
-  const signal = result.signal ? `signal ${result.signal}` : "";
-  const detail = stderr || stdout || error || signal || `exit status ${result.status ?? "unknown"}`;
+  const stderr = typeof result.stderr === "string" && result.stderr.length > 0
+    ? summarizeProcessDiagnostic("systemd stderr", result.stderr)
+    : "";
+  const stdout = typeof result.stdout === "string" && result.stdout.length > 0
+    ? summarizeProcessDiagnostic("systemd stdout", result.stdout)
+    : "";
+  const error = result.error instanceof Error
+    ? summarizeProcessDiagnostic("systemd process error", result.error)
+    : "";
+  const detail = stderr || stdout || error || summarizeProcessExit(result.status, result.signal);
   return {
     ok: false,
     warning: `user systemd start failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,

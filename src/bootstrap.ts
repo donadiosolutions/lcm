@@ -8,6 +8,7 @@ import {
   migrateLegacyHomeIfNeeded,
   tmpDir as lcmTmpDir,
 } from "./runtime-paths.js";
+import { selectStorageBackend } from "./storage/backend.js";
 
 export interface EnsureCoreDeps {
   configPath: string;
@@ -74,6 +75,7 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
 
   // 3. Start daemon if not running
   const config = loadDaemonConfig(deps.configPath);
+  selectStorageBackend(config.storage);
   const result = await deps.ensureDaemon({
     port: config.daemon.port,
     pidFilePath: join(dirname(deps.configPath), "daemon.pid"),

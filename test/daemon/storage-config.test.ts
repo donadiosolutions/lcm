@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   daemonConfigForPersistence,
@@ -162,6 +162,20 @@ describe("storage configuration", () => {
       },
     });
     expect(JSON.stringify(daemonConfigForPersistence(config)).toLowerCase()).not.toContain("trim-secret");
+  });
+
+  it("returns the canonical CA path established by the validated file preflight", () => {
+    const trustedCa = caFile("trusted-ca");
+    const nestedDirectory = join(dirname(trustedCa), "nested");
+    mkdirSync(nestedDirectory);
+    const pathWithParentSegment = `${nestedDirectory}${sep}..${sep}ca.crt`;
+
+    const storage = resolveStorageConfig({ backend: "postgresql" }, postgresEnv(pathWithParentSegment));
+
+    expect(storage).toMatchObject({
+      backend: "postgresql",
+      postgresql: { caFile: realpathSync(trustedCa) },
+    });
   });
 
   it.each([

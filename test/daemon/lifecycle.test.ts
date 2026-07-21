@@ -953,6 +953,141 @@ describe("ensureDaemon", () => {
     expect(spawnMock).toHaveBeenCalled();
   });
 
+  it.each([
+    ["stderr", { status: 1, stdout: "", stderr: "" }],
+    ["stdout", { status: 1, stdout: "", stderr: "" }],
+    ["error", { status: null, stdout: "", stderr: "", error: new Error("") }],
+  ] as const)("sanitizes and bounds raw systemd %s diagnostics", async (field, baseResult) => {
+    const tempDir = mkdtempSync(join(tmpdir(), `lcm-lifecycle-systemd-${field}-`));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const rawDetail = [
+      "Authorization: Bearer systemd-bearer-secret",
+      "Authorization: Basic systemd-basic-secret",
+      "opaque-systemd-token-value",
+      "postgresql://user:systemd-url-secret@example.com/db?sslmode=disable",
+      `\u001b[31mENOENT\n${"x".repeat(800)}`,
+    ].join("\n");
+    const systemdResult = {
+      ...baseResult,
+      [field]: field === "error" ? new Error(rawDetail) : rawDetail,
+    };
+    const spawnSyncMock = vi.fn().mockReturnValue(systemdResult);
+    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(12345));
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      spawnCommand: "node",
+      spawnArgs: ["/path/lcm.js", "daemon", "start", "--foreground"],
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _skipHealthWait: true,
+      _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+    });
+
+    expect(result.warning).not.toContain("systemd-bearer-secret");
+    expect(result.warning).not.toContain("systemd-basic-secret");
+    expect(result.warning).not.toContain("opaque-systemd-token-value");
+    expect(result.warning).not.toContain("systemd-url-secret");
+    expect(result.warning).not.toContain("Authorization");
+    expect(result.warning).not.toContain("sslmode");
+    expect(result.warning).not.toContain("\u001b");
+    expect(result.warning).not.toContain("\n");
+    expect(result.warning).toContain("executable or resource unavailable");
+    expect(result.warning).toContain("code ENOENT");
+    expect(result.warning!.length).toBeLessThan(300);
+  });
+
+  it("sanitizes a detached-spawn error before displaying it", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-detached-sanitize-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const rawDetail = [
+      "Authorization: Bearer detached-bearer-secret",
+      "Authorization: Basic detached-basic-secret",
+      "opaque-detached-token-value",
+      "https://user:detached-url-secret@example.com/path?token=secret",
+      `\u001b[31mEACCES\n${"x".repeat(800)}`,
+    ].join("\n");
+    const child: SpawnChildMock = {
+      pid: undefined,
+      unref: vi.fn(),
+      once: vi.fn((_event: string, handler: (err: Error) => void) => {
+        handler(new Error(rawDetail));
+        return child;
+      }),
+    };
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      spawnCommand: "missing-lcm",
+      spawnArgs: ["daemon", "start"],
+      _skipHealthWait: true,
+      _spawnOverride: vi.fn().mockReturnValue(child) as unknown as SpawnOverride,
+    });
+
+    expect(result.warning).not.toContain("detached-bearer-secret");
+    expect(result.warning).not.toContain("detached-basic-secret");
+    expect(result.warning).not.toContain("opaque-detached-token-value");
+    expect(result.warning).not.toContain("detached-url-secret");
+    expect(result.warning).not.toContain("Authorization");
+    expect(result.warning).not.toContain("token=secret");
+    expect(result.warning).not.toContain("\u001b");
+    expect(result.warning).not.toContain("\n");
+    expect(result.warning).toContain("permission denied");
+    expect(result.warning).toContain("code EACCES");
+    expect(result.warning!.length).toBeLessThan(160);
+  });
+
+  it("allows a recognized detached-spawn error code but suppresses its message", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-detached-code-"));
+    tempDirs.push(tempDir);
+    const error = new Error("Authorization: Bearer code-path-secret") as NodeJS.ErrnoException;
+    error.code = "EADDRINUSE";
+    const child: SpawnChildMock = {
+      pid: undefined,
+      unref: vi.fn(),
+      once: vi.fn((_event: string, handler: (err: Error) => void) => {
+        handler(error);
+        return child;
+      }),
+    };
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: join(tempDir, "daemon.pid"),
+      spawnTimeoutMs: 100,
+      _skipHealthWait: true,
+      _spawnOverride: vi.fn().mockReturnValue(child) as unknown as SpawnOverride,
+    });
+
+    expect(result.warning).toContain("process reported a failure; code EADDRINUSE");
+    expect(result.warning).not.toContain("code-path-secret");
+  });
+
+  it("suppresses non-string detached-spawn failures", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-detached-object-"));
+    tempDirs.push(tempDir);
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: join(tempDir, "daemon.pid"),
+      spawnTimeoutMs: 100,
+      _skipHealthWait: true,
+      _spawnOverride: vi.fn(() => {
+        throw { authorization: "Bearer object-secret" };
+      }) as unknown as SpawnOverride,
+    });
+
+    expect(result.warning).toContain("detached spawn error: process reported a failure");
+    expect(result.warning).not.toContain("object-secret");
+  });
+
   it("surfaces detached spawn errors without throwing", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-spawn-error-"));
     tempDirs.push(tempDir);
@@ -978,7 +1113,7 @@ describe("ensureDaemon", () => {
     });
 
     expect(result.connected).toBe(false);
-    expect(result.warning).toContain("detached spawn failed (spawn ENOENT)");
+    expect(result.warning).toContain("detached spawn failed (detached spawn error: executable or resource unavailable; code ENOENT)");
     expect(child.once).toHaveBeenCalledWith("error", expect.any(Function));
     expect(child.unref).toHaveBeenCalled();
   });

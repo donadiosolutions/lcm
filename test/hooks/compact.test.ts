@@ -15,6 +15,19 @@ function mockDaemonClient(post: ReturnType<typeof vi.fn>): DaemonClient {
 }
 
 describe("handlePreCompact", () => {
+  it("rejects PostgreSQL before lifecycle or daemon network activity", async () => {
+    const post = vi.fn();
+    await expect(handlePreCompact("{}", mockDaemonClient(post), 3737, {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://db.example/lcm", caFile: "/secure/ca.pem", poolMax: 5,
+        connectionTimeoutMs: 10_000, idleTimeoutMs: 30_000, statementTimeoutMs: 60_000,
+      },
+    })).rejects.toThrow("postgresql storage backend is not available");
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+  });
+
   it("returns exitCode 0 and summary when daemon healthy", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const client = mockDaemonClient(vi.fn().mockResolvedValue({ summary: "Compacted 500 tokens" }));

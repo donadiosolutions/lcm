@@ -69,11 +69,16 @@ import { handleSessionEnd } from "../../src/hooks/session-end.js";
 import { handleUserPromptSubmit } from "../../src/hooks/user-prompt.js";
 import { handleSessionSnapshot } from "../../src/hooks/session-snapshot.js";
 import { handlePostToolUse } from "../../src/hooks/post-tool.js";
-import { loadDaemonConfig } from "../../src/daemon/config.js";
+import { loadDaemonConfig, type ResolvedStorageConfig } from "../../src/daemon/config.js";
 
-function configWithDaemon(daemon: { port?: number }): ReturnType<typeof loadDaemonConfig> {
+const sqliteStorage: ResolvedStorageConfig = { backend: "sqlite" };
+
+function configWithDaemon(
+  daemon: { port?: number },
+  storage: ResolvedStorageConfig = sqliteStorage,
+): ReturnType<typeof loadDaemonConfig> {
   // Dispatch reads the daemon port and resolved storage backend.
-  return { daemon, storage: { backend: "sqlite" } } as unknown as ReturnType<typeof loadDaemonConfig>;
+  return { daemon, storage } as unknown as ReturnType<typeof loadDaemonConfig>;
 }
 
 describe("dispatchHook", () => {
@@ -98,7 +103,7 @@ describe("dispatchHook", () => {
       JSON.stringify({ client: "codex" }),
       expect.anything(),
       expect.any(Number),
-      "sqlite",
+      sqliteStorage,
     );
   });
 
@@ -113,7 +118,7 @@ describe("dispatchHook", () => {
       vi.mocked(handler).mockClear();
       await dispatchHook(cmd, '{"test":true}');
       expect(handler).toHaveBeenCalledTimes(1);
-      expect(handler).toHaveBeenCalledWith('{"test":true}', expect.anything(), expect.any(Number), "sqlite");
+      expect(handler).toHaveBeenCalledWith('{"test":true}', expect.anything(), expect.any(Number), sqliteStorage);
     }
 
     // session-snapshot takes only (stdinText, deps?) — no client/port
@@ -123,11 +128,47 @@ describe("dispatchHook", () => {
     expect(handleSessionSnapshot).toHaveBeenCalledWith('{"test":true}');
   });
 
+  it("propagates the configured PostgreSQL backend to every backend-aware handler", async () => {
+    const postgresqlStorage: ResolvedStorageConfig = {
+      backend: "postgresql",
+      postgresql: {
+        poolMax: 7,
+        connectionTimeoutMs: 12_000,
+        idleTimeoutMs: 34_000,
+        statementTimeoutMs: 56_000,
+        url: "postgresql://test.example.com/lcm",
+        caFile: "/test/ca.crt",
+      },
+    };
+    const mapping = [
+      ["compact", handlePreCompact],
+      ["restore", handleSessionStart],
+      ["session-end", handleSessionEnd],
+      ["user-prompt", handleUserPromptSubmit],
+    ] as const;
+    vi.mocked(loadDaemonConfig).mockReturnValue(configWithDaemon({ port: 3737 }, postgresqlStorage));
+
+    try {
+      for (const [cmd, handler] of mapping) {
+        vi.mocked(handler).mockClear();
+        await dispatchHook(cmd, '{"test":true}');
+        expect(handler).toHaveBeenCalledWith(
+          '{"test":true}',
+          expect.anything(),
+          3737,
+          postgresqlStorage,
+        );
+      }
+    } finally {
+      vi.mocked(loadDaemonConfig).mockReturnValue(configWithDaemon({ port: 3737 }));
+    }
+  });
+
   it("passes configured port to handlers", async () => {
     vi.mocked(loadDaemonConfig).mockReturnValue(configWithDaemon({ port: 9999 }));
     vi.mocked(handlePreCompact).mockClear();
     await dispatchHook("compact", "{}");
-    expect(handlePreCompact).toHaveBeenCalledWith("{}", expect.anything(), 9999, "sqlite");
+    expect(handlePreCompact).toHaveBeenCalledWith("{}", expect.anything(), 9999, sqliteStorage);
     // Reset to default
     vi.mocked(loadDaemonConfig).mockReturnValue(configWithDaemon({ port: 3737 }));
   });
@@ -144,6 +185,16 @@ describe("dispatchHook", () => {
     vi.mocked(ensureBootstrapped).mockClear();
     await dispatchHook("compact", JSON.stringify({ session_id: "test-sess-123" }));
     expect(ensureBootstrapped).not.toHaveBeenCalled();
+  });
+
+  it("lets UserPromptSubmit persist its outbox before daemon bootstrap", async () => {
+    vi.mocked(handleUserPromptSubmit).mockResolvedValue({ exitCode: 0, stdout: "" });
+    vi.mocked(handleUserPromptSubmit).mockClear();
+    vi.mocked(ensureBootstrapped).mockClear();
+    await dispatchHook("user-prompt", JSON.stringify({ session_id: "test-sess-123", prompt: "remember this" }));
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(handleUserPromptSubmit).toHaveBeenCalledOnce();
   });
 
   it("does not block hooks if ensureBootstrapped throws", async () => {
@@ -266,7 +317,7 @@ describe("dispatchHook", () => {
   it("handles empty hook payloads and a config without a daemon port", async () => {
     vi.mocked(loadDaemonConfig).mockReturnValueOnce(configWithDaemon({}));
     await dispatchHook("restore", "");
-    expect(handleSessionStart).toHaveBeenCalledWith("", expect.anything(), 3737, "sqlite");
+    expect(handleSessionStart).toHaveBeenCalledWith("", expect.anything(), 3737, sqliteStorage);
     await dispatchHook("post-tool", "");
     expect(handlePostToolUse).toHaveBeenCalled();
     vi.mocked(loadDaemonConfig).mockReturnValueOnce({} as unknown as ReturnType<typeof loadDaemonConfig>);

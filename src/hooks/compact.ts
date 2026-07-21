@@ -5,21 +5,23 @@ import { homedir } from "node:os";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
 import { daemonPidPath } from "../runtime-paths.js";
 import { fenceContent } from "../daemon/content-fence.js";
-import type { StorageBackend } from "../daemon/config.js";
+import type { ResolvedStorageConfig } from "../daemon/config.js";
+import { selectStorageBackend } from "../storage/backend.js";
 
 export async function handlePreCompact(
   stdin: string,
   client: DaemonClient,
   port?: number,
-  expectedStorageBackend: StorageBackend = "sqlite",
+  storage: ResolvedStorageConfig = { backend: "sqlite" },
 ): Promise<{ exitCode: number; stdout: string }> {
+  selectStorageBackend(storage);
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
   const { connected } = await ensureDaemon({
     port: daemonPort,
     pidFilePath,
     spawnTimeoutMs: 5000,
-    expectedStorageBackend,
+    expectedStorageBackend: storage.backend,
     enforceUserManagerParent: true,
   });
   if (!connected) return { exitCode: 0, stdout: "" };

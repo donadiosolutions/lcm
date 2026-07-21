@@ -13,6 +13,10 @@ export type DaemonHealth = {
   pid: number;
 };
 
+type DaemonHealthResponse = Omit<DaemonHealth, "storageBackend"> & {
+  storageBackend?: StorageBackend;
+};
+
 export class DaemonClient {
   private token: string | null = null;
   private tokenLoaded = false;
@@ -34,9 +38,11 @@ export class DaemonClient {
 
   async health(): Promise<DaemonHealth | null> {
     try {
-      return await daemonJsonRequest<DaemonHealth>(this.port, "/health", {
+      const health = await daemonJsonRequest<DaemonHealthResponse>(this.port, "/health", {
         method: "GET",
       });
+      // Daemons predating backend identity were necessarily SQLite-only.
+      return { ...health, storageBackend: health.storageBackend ?? "sqlite" };
     } catch { return null; }
   }
 

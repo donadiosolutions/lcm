@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { EnsureCoreDeps } from "../src/bootstrap.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../src/daemon/config.js";
 
@@ -74,6 +77,37 @@ describe("ensureCore", () => {
     expect(deps.ensureDaemon).toHaveBeenCalledWith(
       expect.objectContaining({ expectedStorageBackend: "sqlite", enforceUserManagerParent: true }),
     );
+  });
+
+  it("rejects PostgreSQL before invoking the daemon lifecycle", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-bootstrap-postgres-"));
+    const configPath = join(dir, "config.json");
+    const caFile = join(dir, "ca.pem");
+    writeFileSync(configPath, JSON.stringify({ storage: { backend: "postgresql" } }));
+    writeFileSync(caFile, "test-ca");
+    const previousUrl = process.env.LCM_POSTGRES_URL;
+    const previousCa = process.env.LCM_POSTGRES_CA_FILE;
+    process.env.LCM_POSTGRES_URL = "postgresql://db.example/lcm";
+    process.env.LCM_POSTGRES_CA_FILE = caFile;
+    const deps = makeDeps({
+      configPath,
+      existsSync: vi.fn().mockReturnValue(true),
+      readFileSync: vi.fn().mockImplementation((path: string) => path === configPath
+        ? JSON.stringify({ storage: { backend: "postgresql" } })
+        : "{}"),
+    });
+
+    try {
+      const { ensureCoreEndpoint } = await import("../src/bootstrap.js");
+      await expect(ensureCoreEndpoint(deps)).rejects.toThrow("postgresql storage backend is not available");
+      expect(deps.ensureDaemon).not.toHaveBeenCalled();
+    } finally {
+      if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = previousUrl;
+      if (previousCa === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = previousCa;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("calls chmodSync(0o600) on config.json after creation", async () => {

@@ -67,6 +67,8 @@ vi.mock("../src/doctor/doctor.js", () => ({ runDoctor: mocks.runDoctor, formatRe
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { getMcpToolDefinitions, handleDaemonRequest, startMcpServer } from "../src/mcp/server.js";
 
+const SQLITE_STORAGE = { backend: "sqlite" as const };
+
 async function call(name: string, args?: unknown): Promise<Required<Pick<McpHandlerResult, "content">> & McpHandlerResult> {
   const result = await mocks.handlers.get(CallToolRequestSchema)!({ params: { name, arguments: args } });
   if (!result.content) throw new Error(`MCP tool ${name} returned no content`);
@@ -207,7 +209,7 @@ describe("MCP service coverage", () => {
     mocks.ensureDaemon.mockImplementationOnce(() => new Promise((resolve) => { release = () => resolve({}); }));
     const clientA = { post: vi.fn().mockRejectedValueOnce(new TypeError("offline")).mockResolvedValue({ a: 1 }) };
     const clientB = { post: vi.fn().mockRejectedValueOnce(new TypeError("offline")).mockResolvedValue({ b: 2 }) };
-    const opts = { port: 9876, pidFilePath: "/tmp/pid", spawnArgs: ["daemon", "start"], _ensureDaemon: mocks.ensureDaemon };
+    const opts = { port: 9876, pidFilePath: "/tmp/pid", storage: SQLITE_STORAGE, spawnArgs: ["daemon", "start"], _ensureDaemon: mocks.ensureDaemon };
     const first = handleDaemonRequest(clientA, "/search", {}, opts);
     const second = handleDaemonRequest(clientB, "/search", {}, opts);
     await vi.waitFor(() => expect(mocks.ensureDaemon).toHaveBeenCalledOnce());
@@ -222,28 +224,28 @@ describe("MCP service coverage", () => {
     for (const [index, spawnArgs] of variants.entries()) {
       const ensure = vi.fn().mockResolvedValue({});
       const client = { post: vi.fn().mockRejectedValueOnce(new TypeError("offline")).mockResolvedValue({}) };
-      await handleDaemonRequest(client, "/search", {}, { port: 20_000 + index, pidFilePath: "/tmp/pid", spawnArgs, _ensureDaemon: ensure });
+      await handleDaemonRequest(client, "/search", {}, { port: 20_000 + index, pidFilePath: "/tmp/pid", storage: SQLITE_STORAGE, spawnArgs, _ensureDaemon: ensure });
     }
   });
 
   it("stringifies non-Error request failures on initial and retry attempts", async () => {
     const direct = { post: vi.fn().mockRejectedValue("direct") };
-    expect((await handleDaemonRequest(direct, "/x", {}, { port: 1, pidFilePath: "x" })).content[0].text).toContain("direct");
+    expect((await handleDaemonRequest(direct, "/x", {}, { port: 1, pidFilePath: "x", storage: SQLITE_STORAGE })).content[0].text).toContain("direct");
 
     const retried = { post: vi.fn().mockRejectedValueOnce(new TypeError("offline")).mockRejectedValueOnce("retry") };
     expect((await handleDaemonRequest(retried, "/x", {}, {
-      port: 2, pidFilePath: "x", _ensureDaemon: vi.fn().mockResolvedValue({}),
+      port: 2, pidFilePath: "x", storage: SQLITE_STORAGE, _ensureDaemon: vi.fn().mockResolvedValue({}),
     })).content[0].text).toContain("retry");
   });
 
   it("formats Error failures, uses default restart, tolerates restart failure, and falls back to cwd", async () => {
     const direct = { post: vi.fn().mockRejectedValue(new Error("direct error")) };
-    expect((await handleDaemonRequest(direct, "/x", {}, { port: 11, pidFilePath: "x" })).content[0].text)
+    expect((await handleDaemonRequest(direct, "/x", {}, { port: 11, pidFilePath: "x", storage: SQLITE_STORAGE })).content[0].text)
       .toContain("direct error");
 
     const retried = { post: vi.fn().mockRejectedValueOnce(new TypeError("offline")).mockRejectedValueOnce(new Error("retry error")) };
     expect((await handleDaemonRequest(retried, "/x", {}, {
-      port: 12, pidFilePath: "x", _ensureDaemon: vi.fn().mockRejectedValue(new Error("spawn error")),
+      port: 12, pidFilePath: "x", storage: SQLITE_STORAGE, _ensureDaemon: vi.fn().mockRejectedValue(new Error("spawn error")),
     })).content[0].text).toContain("retry error");
 
     const previousPwd = process.env.PWD;

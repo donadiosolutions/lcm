@@ -906,9 +906,10 @@ export function resolveStorageConfig(
   if (!isAbsolute(caFile)) {
     throw new ConfigValidationError("LCM_POSTGRES_CA_FILE", `must be an absolute path, received ${JSON.stringify(caFile)}`);
   }
+  let resolvedCaFile: string;
   let caContents: string;
   try {
-    const resolvedCaFile = realpathSync(caFile);
+    resolvedCaFile = realpathSync(caFile);
     caContents = readBoundedRegularFile(resolvedCaFile, {
       allowedRoot: dirname(resolvedCaFile),
       maxBytes: POSTGRESQL_CA_FILE_MAX_BYTES,
@@ -931,7 +932,7 @@ export function resolveStorageConfig(
       idleTimeoutMs: (postgresql.idleTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.idleTimeoutMs) as number,
       statementTimeoutMs: (postgresql.statementTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.statementTimeoutMs) as number,
       url,
-      caFile,
+      caFile: resolvedCaFile,
     },
   };
 }

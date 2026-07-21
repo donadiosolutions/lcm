@@ -226,7 +226,9 @@ lcm daemon restart
 The URL must use the `postgresql:` scheme. Do not add `ssl`, `sslmode`,
 `sslcert`, `sslkey`, `sslrootcert`, or other `ssl*` query parameters; LCM owns
 TLS configuration and uses the required CA file for certificate verification.
-The CA path must be absolute and point to a readable, non-empty file.
+The CA path must be absolute and resolve to a readable, non-empty regular file
+no larger than 1 MiB (1,048,576 bytes). Directories, FIFOs, device nodes, and
+other non-regular files are rejected before LCM reads certificate contents.
 
 For DigitalOcean Managed PostgreSQL 18 Standard Edition, download the cluster
 CA certificate from the database's **Connection Details** page, save it in a

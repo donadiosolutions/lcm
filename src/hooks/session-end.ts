@@ -1,6 +1,6 @@
 import type { DaemonClient } from "../daemon/client.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
-import { loadDaemonConfig, type StorageBackend } from "../daemon/config.js";
+import { loadDaemonConfig, type ResolvedStorageConfig } from "../daemon/config.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { request } from "node:http";
@@ -8,6 +8,7 @@ import { Buffer } from "node:buffer";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
 import { configPath as defaultConfigPath, daemonPidPath, daemonTokenPath } from "../runtime-paths.js";
 import { readAuthToken } from "../daemon/auth.js";
+import { selectStorageBackend } from "../storage/backend.js";
 
 function getDaemonToken(): string | null {
   return readAuthToken(daemonTokenPath());
@@ -87,15 +88,16 @@ export async function handleSessionEnd(
   stdin: string,
   client: DaemonClient,
   port?: number,
-  expectedStorageBackend: StorageBackend = "sqlite",
+  storage: ResolvedStorageConfig = { backend: "sqlite" },
 ): Promise<{ exitCode: number; stdout: string }> {
+  selectStorageBackend(storage);
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
   const { connected } = await ensureDaemon({
     port: daemonPort,
     pidFilePath,
     spawnTimeoutMs: 5000,
-    expectedStorageBackend,
+    expectedStorageBackend: storage.backend,
     enforceUserManagerParent: true,
   });
   if (!connected) return { exitCode: 0, stdout: "" };

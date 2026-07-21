@@ -65,6 +65,21 @@ describe("handleSessionEnd", () => {
     vi.mocked(loadDaemonConfig).mockReturnValue(defaultConfig);
   });
 
+  it("rejects PostgreSQL before lifecycle or daemon network activity", async () => {
+    const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
+    const client = createMockClient({ ingested: 1 });
+    await expect(handleSessionEnd("{}", client, 3737, {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://db.example/lcm", caFile: "/secure/ca.pem", poolMax: 5,
+        connectionTimeoutMs: 10_000, idleTimeoutMs: 30_000, statementTimeoutMs: 60_000,
+      },
+    })).rejects.toThrow("postgresql storage backend is not available");
+    expect(ensureDaemon).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
+    expect(mockHttpReq.end).not.toHaveBeenCalled();
+  });
+
   it("calls /ingest with parsed stdin", async () => {
     const client = createMockClient({ ingested: 5, totalTokens: 500 });
     const stdin = JSON.stringify({ session_id: "s1", cwd: "/tmp" });

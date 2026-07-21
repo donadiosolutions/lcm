@@ -705,6 +705,49 @@ describe("runDoctor configuration validation", () => {
     }
   });
 
+  it("reports a valid PostgreSQL selection unavailable without daemon network or lifecycle activity", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-doctor-postgres-"));
+    const caFile = join(dir, "ca.pem");
+    writeFileSync(caFile, "test-ca");
+    const previousUrl = process.env.LCM_POSTGRES_URL;
+    const previousCaFile = process.env.LCM_POSTGRES_CA_FILE;
+    process.env.LCM_POSTGRES_URL = "postgresql://db.example/lcm";
+    process.env.LCM_POSTGRES_CA_FILE = caFile;
+    const fetch = vi.fn();
+    try {
+      for (const provider of ["auto", "openai"] as const) {
+        const results = await runDoctor(minimalDeps({
+          fetch,
+          readFileSync: (path: string) => {
+            if (path.endsWith("config.json")) {
+              return JSON.stringify({
+                storage: { backend: "postgresql" },
+                llm: provider === "openai"
+                  ? { provider, model: "gpt-5", baseUrl: "http://127.0.0.1:1234/v1" }
+                  : { provider },
+              });
+            }
+            return minimalDeps().readFileSync(path);
+          },
+        }));
+
+        const configResult = results.find((result) => result.name === "config");
+        expect(configResult, configResult?.message).toMatchObject({ status: "pass" });
+        expect(results.find((result) => result.name === "stack")?.message).toContain("Storage: unavailable");
+        expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "fail", fixApplied: false });
+        expect(results.find((result) => result.name === "daemon")?.message).toContain("postgresql storage backend is not available");
+      }
+      expect(fetch).not.toHaveBeenCalled();
+      expect(ensureDaemon).not.toHaveBeenCalled();
+    } finally {
+      if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = previousUrl;
+      if (previousCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = previousCaFile;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each([0, 65536, 4545.5, "4545"])(
     "does not use invalid daemon port %j while reporting config errors",
     async (port) => {

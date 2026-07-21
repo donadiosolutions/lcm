@@ -105,8 +105,10 @@ export class EventsDb {
     ).get() as { name: string } | undefined;
 
     if (!row) {
-      this.db.exec(SCHEMA_SQL);
-      this.db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(SCHEMA_VERSION);
+      this.runMigrationTransaction(() => {
+        this.db.exec(SCHEMA_SQL);
+        this.db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(SCHEMA_VERSION);
+      });
       return;
     }
 
@@ -114,27 +116,28 @@ export class EventsDb {
 
     // Handle empty schema_version table (table exists but has no rows)
     if (!versionRow) {
-      this.db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(SCHEMA_VERSION);
-      // Ensure latest tables and indexes exist even in this edge case.
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS error_log (
-          id         INTEGER PRIMARY KEY AUTOINCREMENT,
-          hook       TEXT NOT NULL,
-          error      TEXT NOT NULL,
-          session_id TEXT,
-          created_at TEXT DEFAULT (datetime('now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_error_log_created ON error_log(created_at);
-        CREATE INDEX IF NOT EXISTS idx_events_pattern_lookup ON events(type, category, data, created_at);
-      `);
+      this.runMigrationTransaction(() => {
+        this.db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(SCHEMA_VERSION);
+        // Ensure latest tables and indexes exist even in this edge case.
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS error_log (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            hook       TEXT NOT NULL,
+            error      TEXT NOT NULL,
+            session_id TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+          );
+          CREATE INDEX IF NOT EXISTS idx_error_log_created ON error_log(created_at);
+          CREATE INDEX IF NOT EXISTS idx_events_pattern_lookup ON events(type, category, data, created_at);
+        `);
+      });
       return;
     }
 
     const currentVersion = versionRow.version;
 
     if (currentVersion < SCHEMA_VERSION) {
-      this.db.exec("BEGIN EXCLUSIVE");
-      try {
+      this.runMigrationTransaction(() => {
         if (currentVersion < 2) {
           this.db.exec(`
             CREATE TABLE IF NOT EXISTS error_log (
@@ -151,12 +154,19 @@ export class EventsDb {
           "CREATE INDEX IF NOT EXISTS idx_events_pattern_lookup ON events(type, category, data, created_at)"
         );
         this.db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
-        this.db.exec("COMMIT");
-      } catch (e) {
-        try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
-        const message = sanitizeError(e instanceof Error ? e.message : String(e));
-        throw new Error(message);
-      }
+      });
+    }
+  }
+
+  private runMigrationTransaction(migration: () => void): void {
+    this.db.exec("BEGIN EXCLUSIVE");
+    try {
+      migration();
+      this.db.exec("COMMIT");
+    } catch (e) {
+      try { this.db.exec("ROLLBACK"); } catch { /* preserve the migration failure */ }
+      const message = sanitizeError(e instanceof Error ? e.message : String(e));
+      throw new Error(message);
     }
   }
 

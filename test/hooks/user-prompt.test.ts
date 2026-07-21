@@ -149,9 +149,13 @@ describe("handleUserPromptSubmit", () => {
   it("returns learning-instruction when daemon unreachable", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: false, port: 3737, spawned: false });
     const client = { health: vi.fn(), post: vi.fn() };
-    const result = await handleUserPromptSubmit("{}", asDaemonClient(client));
+    const result = await handleUserPromptSubmit(
+      JSON.stringify({ prompt: "remember this", cwd: "/proj", session_id: "s1" }),
+      asDaemonClient(client),
+    );
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("<learning-instruction>");
+    expect(client.post).not.toHaveBeenCalled();
   });
 
   it("queues local events before checking an unavailable PostgreSQL daemon", async () => {
@@ -178,19 +182,27 @@ describe("handleUserPromptSubmit", () => {
       JSON.stringify({ prompt: "we decided to use PostgreSQL", cwd: "/proj", session_id: "s1" }),
       asDaemonClient(client),
       3737,
-      "postgresql",
+      {
+        backend: "postgresql",
+        postgresql: {
+          url: "postgresql://db.example/lcm",
+          caFile: "/secure/ca.pem",
+          poolMax: 5,
+          connectionTimeoutMs: 10_000,
+          idleTimeoutMs: 30_000,
+          statementTimeoutMs: 60_000,
+        },
+      },
     );
 
-    expect(order).toEqual(["insert", "close", "ensure"]);
+    expect(order).toEqual(["insert", "close"]);
     expect(mockInsertEvent).toHaveBeenCalledWith(
       "s1",
       { type: "decision", category: "decision", data: "use PostgreSQL", priority: 1 },
       "UserPromptSubmit",
     );
     expect(mockClose).toHaveBeenCalled();
-    expect(mockEnsureDaemon).toHaveBeenCalledWith(expect.objectContaining({
-      expectedStorageBackend: "postgresql",
-    }));
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
     expect(firePromoteEventsNotifyRequest).not.toHaveBeenCalled();
     expect(client.post).not.toHaveBeenCalled();
     expect(result).toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });

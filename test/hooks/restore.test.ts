@@ -44,6 +44,19 @@ describe("handleSessionStart", () => {
     }
   });
 
+  it("rejects PostgreSQL before lifecycle or daemon network activity", async () => {
+    const post = vi.fn();
+    await expect(handleSessionStart("{}", { post }, 3737, {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://db.example/lcm", caFile: "/secure/ca.pem", poolMax: 5,
+        connectionTimeoutMs: 10_000, idleTimeoutMs: 30_000, statementTimeoutMs: 60_000,
+      },
+    })).rejects.toThrow("postgresql storage backend is not available");
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+  });
+
   it("outputs context and exits 0 on success", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const client = {

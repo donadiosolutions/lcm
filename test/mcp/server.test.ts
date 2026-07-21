@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { getMcpToolDefinitions, handleDaemonRequest } from "../../src/mcp/server.js";
+import { loadDaemonConfig } from "../../src/daemon/config.js";
 
 const ensureDaemonMcpMock = vi.hoisted(() => vi.fn().mockResolvedValue({ connected: true, port: 9999, spawned: false }));
 
@@ -65,6 +66,7 @@ describe("handleDaemonRequest", () => {
   const opts = {
     port: 9999,
     pidFilePath: "/tmp/test-daemon.pid",
+    storage: { backend: "sqlite" as const },
     _ensureDaemon: ensureDaemonMock,
   };
 
@@ -121,6 +123,24 @@ describe("handleDaemonRequest", () => {
 });
 
 describe("startMcpServer", () => {
+  it("rejects PostgreSQL before lifecycle or MCP transport activity", async () => {
+    ensureDaemonMcpMock.mockClear();
+    vi.mocked(loadDaemonConfig).mockReturnValueOnce({
+      daemon: { port: 9999 },
+      storage: {
+        backend: "postgresql",
+        postgresql: {
+          url: "postgresql://db.example/lcm", caFile: "/secure/ca.pem", poolMax: 5,
+          connectionTimeoutMs: 10_000, idleTimeoutMs: 30_000, statementTimeoutMs: 60_000,
+        },
+      },
+    } as never);
+    const { startMcpServer } = await import("../../src/mcp/server.js");
+
+    await expect(startMcpServer()).rejects.toThrow("postgresql storage backend is not available");
+    expect(ensureDaemonMcpMock).not.toHaveBeenCalled();
+  });
+
   it("refuses to register MCP handlers when daemon identity is unverified", async () => {
     ensureDaemonMcpMock.mockResolvedValueOnce({ connected: false, port: 9999, spawned: false });
     const { startMcpServer } = await import("../../src/mcp/server.js");
@@ -164,7 +184,7 @@ describe("startMcpServer", () => {
 });
 
 describe("handleDaemonRequest spawn opts propagation", () => {
-  it("threads spawnCommand/spawnArgs/version/backend into ensureDaemon on auto-restart", async () => {
+  it("rejects PostgreSQL before auto-restart lifecycle and network activity", async () => {
     const ensureDaemonSpy = vi.fn().mockResolvedValue({ connected: true, port: 9999, spawned: true });
     const optsWithSpawn = {
       port: 9999,
@@ -172,7 +192,17 @@ describe("handleDaemonRequest spawn opts propagation", () => {
       spawnCommand: "/usr/local/bin/node",
       spawnArgs: ["/path/to/lcm.mjs", "daemon", "start"],
       expectedVersion: "1.2.3",
-      expectedStorageBackend: "postgresql" as const,
+      storage: {
+        backend: "postgresql" as const,
+        postgresql: {
+          url: "postgresql://db.example/lcm",
+          caFile: "/secure/ca.pem",
+          poolMax: 5,
+          connectionTimeoutMs: 10_000,
+          idleTimeoutMs: 30_000,
+          statementTimeoutMs: 60_000,
+        },
+      },
       _ensureDaemon: ensureDaemonSpy,
     };
 
@@ -182,17 +212,11 @@ describe("handleDaemonRequest spawn opts propagation", () => {
         .mockResolvedValueOnce({ result: "ok" }),
     };
 
-    await handleDaemonRequest(client, "/search", { q: "foo" }, optsWithSpawn);
+    await expect(handleDaemonRequest(client, "/search", { q: "foo" }, optsWithSpawn))
+      .rejects.toThrow("postgresql storage backend is not available");
 
-    expect(ensureDaemonSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        spawnCommand: "/usr/local/bin/node",
-        spawnArgs: ["/path/to/lcm.mjs", "daemon", "start", "--foreground"],
-        expectedVersion: "1.2.3",
-        expectedStorageBackend: "postgresql",
-        enforceUserManagerParent: true,
-      }),
-    );
+    expect(ensureDaemonSpy).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
   });
 
   it("passes undefined spawn opts when not provided (backwards compat)", async () => {
@@ -200,6 +224,7 @@ describe("handleDaemonRequest spawn opts propagation", () => {
     const optsMinimal = {
       port: 9999,
       pidFilePath: "/tmp/test-daemon.pid",
+      storage: { backend: "sqlite" as const },
       _ensureDaemon: ensureDaemonSpy,
     };
 

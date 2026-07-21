@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { openSync, closeSync, writeFileSync } from "node:fs";
 import { daemonPidPath, tmpDir } from "../runtime-paths.js";
 import { fenceContent } from "../daemon/content-fence.js";
-import type { StorageBackend } from "../daemon/config.js";
+import type { ResolvedStorageConfig } from "../daemon/config.js";
+import { selectStorageBackend } from "../storage/backend.js";
 import {
   deleteRegularFile,
   ensurePrivateDirectory,
@@ -113,7 +114,7 @@ export async function handleSessionStart(
   stdin: string,
   client: Pick<DaemonClient, "post">,
   port?: number,
-  expectedStorageBackend: StorageBackend = "sqlite",
+  storage: ResolvedStorageConfig = { backend: "sqlite" },
 ): Promise<{ exitCode: number; stdout: string }> {
   const parsed: unknown = JSON.parse(stdin || "{}");
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -129,13 +130,14 @@ export async function handleSessionStart(
     return { exitCode: 0, stdout: "" };
   }
 
+  selectStorageBackend(storage);
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
   const { connected } = await ensureDaemon({
     port: daemonPort,
     pidFilePath,
     spawnTimeoutMs: 5000,
-    expectedStorageBackend,
+    expectedStorageBackend: storage.backend,
     enforceUserManagerParent: true,
   });
   if (!connected) return { exitCode: 0, stdout: "" };
