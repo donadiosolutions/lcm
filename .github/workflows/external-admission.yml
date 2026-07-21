@@ -4,7 +4,6 @@ on:
   # Provider result events intentionally restart exact-SHA admission after a
   # rerun, revoking stale success. Irrelevant events create skipped runs, but
   # identity-qualified concurrency groups keep that noise from the evaluator.
-  status:
   check_run:
     types:
       - created
@@ -19,16 +18,11 @@ permissions:
 concurrency:
   group: >-
     external-admission-${{
-      github.event_name == 'status' && github.event.context == 'CodeRabbit' &&
-        github.actor_id == '136622811' && github.actor == 'coderabbitai[bot]' &&
-        github.event.sha ||
       github.event_name == 'check_run' &&
         ((github.event.check_run.name == 'codecov/patch' && github.event.check_run.app.id == 254 &&
           github.event.check_run.app.slug == 'codecov') ||
         (github.event.check_run.name == 'DCO' && github.event.check_run.app.id == 1861 &&
           github.event.check_run.app.slug == 'dco')) && github.event.check_run.head_sha ||
-      github.event_name == 'status' &&
-        format('status-{0}-{1}-{2}', github.event.sha, github.event.creator.id, github.event.context) ||
       github.event_name == 'check_run' &&
         format('check-run-{0}-{1}-{2}', github.event.check_run.head_sha,
           github.event.check_run.app.id, github.event.check_run.name)
@@ -39,13 +33,11 @@ jobs:
   external-admission-evaluator:
     name: external-admission-evaluator
     if: >-
-      (github.event_name == 'status' && github.event.context == 'CodeRabbit' &&
-        github.actor_id == '136622811' && github.actor == 'coderabbitai[bot]') ||
-      (github.event_name == 'check_run' &&
+      github.event_name == 'check_run' &&
         ((github.event.check_run.name == 'codecov/patch' && github.event.check_run.app.id == 254 &&
           github.event.check_run.app.slug == 'codecov') ||
         (github.event.check_run.name == 'DCO' && github.event.check_run.app.id == 1861 &&
-          github.event.check_run.app.slug == 'dco')))
+          github.event.check_run.app.slug == 'dco'))
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -55,7 +47,7 @@ jobs:
     steps:
       - name: Wait for external admission checks
         env:
-          EVENT_HEAD_SHA: ${{ github.event_name == 'status' && github.event.sha || github.event.check_run.head_sha }}
+          EVENT_HEAD_SHA: ${{ github.event.check_run.head_sha }}
         run: |
           set -Eeuo pipefail
 
@@ -153,25 +145,14 @@ jobs:
           fi
 
           post_admission_status pending \
-            "Waiting for CodeRabbit, Codecov patch, and DCO"
+            "Waiting for Codecov patch and DCO"
 
           deadline=$((SECONDS + 1200))
           while (( SECONDS < deadline )); do
-            commit_statuses="$(gh api \
-              "repos/$REPOSITORY/commits/$HEAD_SHA/statuses?per_page=100")"
             check_runs="$(gh api \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?filter=latest&per_page=100")"
 
-            coderabbit_state="$(jq -r '
-              [.[]
-                | select(.context == "CodeRabbit")
-                | select(.creator.id == 136622811)
-                | select(.creator.login == "coderabbitai[bot]")]
-              | sort_by(.id)
-              | last
-              | .state // "missing"
-            ' <<<"$commit_statuses")"
             codecov_state="$(jq -r '
               [.check_runs[]
                 | select(.name == "codecov/patch")
@@ -197,10 +178,10 @@ jobs:
                 end
             ' <<<"$check_runs")"
 
-            echo "CodeRabbit=$coderabbit_state Codecov=$codecov_state DCO=$dco_state"
+            echo "Codecov=$codecov_state DCO=$dco_state"
 
             for provider_state in \
-              "$coderabbit_state" "$codecov_state" "$dco_state"; do
+              "$codecov_state" "$dco_state"; do
               case "$provider_state" in
                 success | missing | pending | queued | in_progress | requested | waiting)
                   ;;
@@ -211,8 +192,7 @@ jobs:
               esac
             done
 
-            if [[ "$coderabbit_state" == success && \
-              "$codecov_state" == success && "$dco_state" == success ]]; then
+            if [[ "$codecov_state" == success && "$dco_state" == success ]]; then
               current_matching_prs="$(fetch_associated_pull_requests)"
               current_pr_number="$(resolve_eligible_pr_number <<<"$current_matching_prs")"
               if [[ "$current_pr_number" != "$PR_NUMBER" ]]; then
@@ -235,7 +215,7 @@ jobs:
               fi
 
               post_admission_status success \
-                "CodeRabbit, Codecov patch, and DCO passed"
+                "Codecov patch and DCO passed"
               trap - EXIT INT TERM
               exit 0
             fi
