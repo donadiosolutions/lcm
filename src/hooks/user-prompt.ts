@@ -6,6 +6,7 @@ import { safeLogError } from "./hook-errors.js";
 import { buildMemoryContext } from "./memory-context.js";
 import { daemonPidPath } from "../runtime-paths.js";
 import { firePromoteEventsNotifyRequest } from "./session-end.js";
+import type { StorageBackend } from "../daemon/config.js";
 
 type PromptSearchResponse = {
   hints: string[];
@@ -43,6 +44,7 @@ export async function handleUserPromptSubmit(
   stdin: string,
   client: DaemonClient,
   port?: number,
+  expectedStorageBackend: StorageBackend = "sqlite",
 ): Promise<{ exitCode: number; stdout: string }> {
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
@@ -50,6 +52,7 @@ export async function handleUserPromptSubmit(
     port: daemonPort,
     pidFilePath,
     spawnTimeoutMs: 5000,
+    expectedStorageBackend,
     enforceUserManagerParent: true,
   });
   if (!connected) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };

@@ -70,15 +70,15 @@ export async function dispatchHook(
   switch (command) {
     case "compact": {
       const { handlePreCompact } = await import("./compact.js");
-      return handlePreCompact(stdinText, client, port);
+      return handlePreCompact(stdinText, client, port, config.storage.backend);
     }
     case "restore": {
       const { handleSessionStart } = await import("./restore.js");
-      return handleSessionStart(stdinText, client, port);
+      return handleSessionStart(stdinText, client, port, config.storage.backend);
     }
     case "session-end": {
       const { handleSessionEnd } = await import("./session-end.js");
-      return handleSessionEnd(stdinText, client, port);
+      return handleSessionEnd(stdinText, client, port, config.storage.backend);
     }
     case "session-snapshot": {
       const { handleSessionSnapshot } = await import("./session-snapshot.js");
@@ -88,7 +88,7 @@ export async function dispatchHook(
     }
     case "user-prompt": {
       const { handleUserPromptSubmit } = await import("./user-prompt.js");
-      return handleUserPromptSubmit(stdinText, client, port);
+      return handleUserPromptSubmit(stdinText, client, port, config.storage.backend);
     }
     default:
       throw new Error(`Unknown hook command: ${command}`);

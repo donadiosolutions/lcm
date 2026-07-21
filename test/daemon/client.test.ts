@@ -14,7 +14,7 @@ describe("DaemonClient", () => {
   it("checks health", async () => {
     daemon = await createDaemon(loadDaemonConfig("/x", { daemon: { port: 0 } }));
     const client = new DaemonClient(`http://127.0.0.1:${daemon.address().port}`);
-    expect((await client.health())?.status).toBe("ok");
+    expect(await client.health()).toMatchObject({ status: "ok", storageBackend: "sqlite" });
   });
 
   it("returns null when daemon not running", async () => {

@@ -342,6 +342,15 @@ credential-bearing URLs, or credentials.
 See [`docs/configuration.md`](docs/configuration.md) for the complete JSON example,
 provider requirements, and deeper operational guidance.
 
+## Storage backend
+
+SQLite remains the zero-configuration storage backend. LCM also validates the
+configuration and verified-TLS prerequisites for an explicit remote-primary
+PostgreSQL selection. PostgreSQL repositories land in #82, so selecting
+`postgresql` currently fails before daemon startup instead of falling back to
+SQLite. Connection credentials stay out of JSON and effective configuration
+output. See [storage backend configuration](docs/configuration.md#storage-backend).
+
 ## Development
 
 ```bash
@@ -365,6 +374,7 @@ src/
   llm/                        summarizer backends
   mcp/                        MCP server + tool definitions
   store/                      conversation and summary persistence
+  storage/                    backend selection and repository architecture
 installer/
   install.ts                  setup wizard
   uninstall.ts                cleanup
@@ -383,7 +393,9 @@ Add project-specific patterns with `lcm sensitive add "MY_PATTERN"`. See [docs/p
 ## Technical Notes
 
 - Claude Code integration is hook-first.
-- The daemon is shared; the memory backend is client-agnostic.
+- The daemon is shared; the memory backend is client-agnostic. SQLite remains
+  the default, with secure PostgreSQL configuration staged for repository
+  support.
 - The repo carries the original lossless-claw lineage; the current runtime is Claude Code oriented.
 
 ## Acknowledgments

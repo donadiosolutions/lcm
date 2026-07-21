@@ -15,6 +15,7 @@ const state = vi.hoisted(() => ({
   dispatchHook: vi.fn(async () => ({ stdout: "hook-output", exitCode: 0 })),
   loadConfig: vi.fn(() => ({
     daemon: state.daemonPort === undefined ? undefined : { port: state.daemonPort },
+    storage: { backend: "sqlite" },
     llm: {
       provider: state.provider, apiMode: "responses", requestTimeoutMs: 1000,
       retry: { maxAttempts: 2, initialDelayMs: 1, maxDelayMs: 2, multiplier: 2 },

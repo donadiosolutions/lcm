@@ -523,6 +523,7 @@ async function createDaemonClientOrExit(): Promise<DaemonClient> {
     port,
     pidFilePath,
     spawnTimeoutMs: 5000,
+    expectedStorageBackend: config.storage.backend,
     enforceUserManagerParent: true,
   });
 
@@ -587,6 +588,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
           pidFilePath: daemonPidPath(),
           spawnTimeoutMs: 10000,
           expectedVersion: typeof pkg.version === "string" ? pkg.version : undefined,
+          expectedStorageBackend: config.storage.backend,
           enforceUserManagerParent: true,
         });
         if (!result.connected) {
@@ -644,6 +646,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         pidFilePath: daemonPidPath(),
         spawnTimeoutMs: 10000,
         expectedVersion: typeof pkg.version === "string" ? pkg.version : undefined,
+        expectedStorageBackend: config.storage.backend,
         enforceUserManagerParent: true,
         validateBeforeRestart: () => { loadDaemonConfig(defaultConfigPath()); },
       });
@@ -769,6 +772,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
           port,
           pidFilePath,
           spawnTimeoutMs: 10000,
+          expectedStorageBackend: config.storage.backend,
           enforceUserManagerParent: true,
         });
         if (!connected) {
@@ -1490,6 +1494,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         port,
         pidFilePath,
         spawnTimeoutMs: 5000,
+        expectedStorageBackend: config.storage.backend,
         enforceUserManagerParent: true,
       });
       if (!connected) { console.error("  Daemon not available"); exit(1); }
@@ -1584,6 +1589,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         port,
         pidFilePath,
         spawnTimeoutMs: 5000,
+        expectedStorageBackend: config.storage.backend,
         enforceUserManagerParent: true,
       });
       if (!connected) {

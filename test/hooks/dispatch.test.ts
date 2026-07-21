@@ -32,7 +32,7 @@ vi.mock("../../src/daemon/client.js", () => ({
   }),
 }));
 vi.mock("../../src/daemon/config.js", () => ({
-  loadDaemonConfig: vi.fn().mockReturnValue({ daemon: { port: 3737 } }),
+  loadDaemonConfig: vi.fn().mockReturnValue({ daemon: { port: 3737 }, storage: { backend: "sqlite" } }),
 }));
 vi.mock("../../src/bootstrap.js", () => ({
   ensureBootstrapped: vi.fn().mockResolvedValue(true),
@@ -72,8 +72,8 @@ import { handlePostToolUse } from "../../src/hooks/post-tool.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 
 function configWithDaemon(daemon: { port?: number }): ReturnType<typeof loadDaemonConfig> {
-  // Dispatch only reads daemon.port; the typed fixture intentionally omits unrelated config sections.
-  return { daemon } as unknown as ReturnType<typeof loadDaemonConfig>;
+  // Dispatch reads the daemon port and resolved storage backend.
+  return { daemon, storage: { backend: "sqlite" } } as unknown as ReturnType<typeof loadDaemonConfig>;
 }
 
 describe("dispatchHook", () => {
@@ -98,6 +98,7 @@ describe("dispatchHook", () => {
       JSON.stringify({ client: "codex" }),
       expect.anything(),
       expect.any(Number),
+      "sqlite",
     );
   });
 
@@ -112,7 +113,7 @@ describe("dispatchHook", () => {
       vi.mocked(handler).mockClear();
       await dispatchHook(cmd, '{"test":true}');
       expect(handler).toHaveBeenCalledTimes(1);
-      expect(handler).toHaveBeenCalledWith('{"test":true}', expect.anything(), expect.any(Number));
+      expect(handler).toHaveBeenCalledWith('{"test":true}', expect.anything(), expect.any(Number), "sqlite");
     }
 
     // session-snapshot takes only (stdinText, deps?) — no client/port
@@ -126,7 +127,7 @@ describe("dispatchHook", () => {
     vi.mocked(loadDaemonConfig).mockReturnValue(configWithDaemon({ port: 9999 }));
     vi.mocked(handlePreCompact).mockClear();
     await dispatchHook("compact", "{}");
-    expect(handlePreCompact).toHaveBeenCalledWith("{}", expect.anything(), 9999);
+    expect(handlePreCompact).toHaveBeenCalledWith("{}", expect.anything(), 9999, "sqlite");
     // Reset to default
     vi.mocked(loadDaemonConfig).mockReturnValue(configWithDaemon({ port: 3737 }));
   });
@@ -265,7 +266,7 @@ describe("dispatchHook", () => {
   it("handles empty hook payloads and a config without a daemon port", async () => {
     vi.mocked(loadDaemonConfig).mockReturnValueOnce(configWithDaemon({}));
     await dispatchHook("restore", "");
-    expect(handleSessionStart).toHaveBeenCalledWith("", expect.anything(), 3737);
+    expect(handleSessionStart).toHaveBeenCalledWith("", expect.anything(), 3737, "sqlite");
     await dispatchHook("post-tool", "");
     expect(handlePostToolUse).toHaveBeenCalled();
     vi.mocked(loadDaemonConfig).mockReturnValueOnce({} as unknown as ReturnType<typeof loadDaemonConfig>);

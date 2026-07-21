@@ -2,6 +2,24 @@
 
 This document describes how Long Context Manager (LCM) works internally — the data model, compaction lifecycle, context assembly, and expansion system.
 
+## Storage selection
+
+The daemon resolves one storage backend before opening its listener. SQLite is
+the default and preserves the existing per-project database layout. PostgreSQL
+is an explicit remote-primary selection whose production connection URL comes
+from `LCM_POSTGRES_URL`; verified TLS uses the required
+`LCM_POSTGRES_CA_FILE`. Trusted runtime overrides remain available to tests and
+embedded callers and take precedence over the environment.
+Configuration parsing, effective CLI output, doctor, daemon startup, and storage
+construction share the same discriminated resolved configuration. This prevents
+different entry points from applying different precedence or validation rules.
+
+PostgreSQL repository support is intentionally staged for #82. In this release,
+a valid PostgreSQL selection passes secret and TLS preflight and then fails with
+an explicit unavailable-backend error before the daemon listens. The local
+SQLite hook outbox is not a general cache and remains local even when PostgreSQL
+becomes the authoritative project-memory backend.
+
 ## Data model
 
 ### Conversations and messages

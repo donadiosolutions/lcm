@@ -21,6 +21,7 @@ export interface EnsureCoreDeps {
     port: number;
     pidFilePath: string;
     spawnTimeoutMs: number;
+    expectedStorageBackend?: "sqlite" | "postgresql";
     enforceUserManagerParent?: boolean;
   }) => Promise<{ connected: boolean }>;
 }
@@ -77,6 +78,7 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
     port: config.daemon.port,
     pidFilePath: join(dirname(deps.configPath), "daemon.pid"),
     spawnTimeoutMs: 5000,
+    expectedStorageBackend: config.storage.backend,
     enforceUserManagerParent: true,
   });
   return { connected: result.connected, port: config.daemon.port };

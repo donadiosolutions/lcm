@@ -4,7 +4,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { DaemonClient } from "../daemon/client.js";
-import { loadDaemonConfig } from "../daemon/config.js";
+import { loadDaemonConfig, type StorageBackend } from "../daemon/config.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
 import { configPath as defaultConfigPath, daemonPidPath } from "../runtime-paths.js";
 import { PKG_VERSION } from "../daemon/version.js";
@@ -135,6 +135,7 @@ export type DaemonRequestOpts = {
   spawnCommand?: string;
   spawnArgs?: string[];
   expectedVersion?: string;
+  expectedStorageBackend?: StorageBackend;
   _ensureDaemon?: typeof ensureDaemon;
 };
 
@@ -180,6 +181,7 @@ export async function handleDaemonRequest(
       const p = ensure({
         port: opts.port, pidFilePath: opts.pidFilePath, spawnTimeoutMs: 10000,
         expectedVersion: opts.expectedVersion,
+        expectedStorageBackend: opts.expectedStorageBackend,
         spawnCommand: opts.spawnCommand,
         spawnArgs: foregroundDaemonStartArgs(opts.spawnArgs),
         enforceUserManagerParent: true,
@@ -208,6 +210,7 @@ export async function startMcpServer(): Promise<void> {
   const daemon = await ensureDaemon({
     port, pidFilePath, spawnTimeoutMs: 10000,
     expectedVersion: PKG_VERSION,
+    expectedStorageBackend: config.storage.backend,
     spawnCommand: process.execPath,
     spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
     enforceUserManagerParent: true,
@@ -258,6 +261,7 @@ export async function startMcpServer(): Promise<void> {
       spawnCommand: process.execPath,
       spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
       expectedVersion: PKG_VERSION,
+      expectedStorageBackend: config.storage.backend,
     });
   });
 

@@ -304,7 +304,7 @@ describe("runDoctor daemon version mismatch", () => {
     const daemonResult = results.find((r) => r.name === "daemon");
 
     expect(vi.mocked(ensureDaemon)).toHaveBeenCalledWith(
-      expect.objectContaining({ expectedVersion: pkgVersion }),
+      expect.objectContaining({ expectedVersion: pkgVersion, expectedStorageBackend: "sqlite" }),
     );
     expect(daemonResult?.fixApplied).toBe(true);
     expect(daemonResult?.message).toContain("restarted");
@@ -472,6 +472,7 @@ describe("runDoctor summarizer modes", () => {
     });
 
     expect(results.find((result) => result.name === "stack")?.message).toContain("Summarizer: auto");
+    expect(results.find((result) => result.name === "stack")?.message).toContain("Storage: sqlite");
     expect(results.find((result) => result.name === "stack")?.message).toContain("reasoning effort: default");
     expect(results.find((result) => result.name === "stack")?.message).toContain("fast mode: off");
     expect(results.some((result) => result.name === "claude-process")).toBe(true);
@@ -644,6 +645,7 @@ describe("runDoctor configuration validation", () => {
     expect(config?.message).toContain("[REDACTED]");
     for (const secret of secrets) expect(JSON.stringify(results)).not.toContain(secret);
     expect(stack?.status).toBe("pass");
+    expect(stack?.message).toContain("Storage: sqlite");
     expect(stack?.message).toContain("Summarizer: unavailable");
     expect(results.some((result) => result.name === "secret-detection")).toBe(true);
   });
@@ -664,6 +666,54 @@ describe("runDoctor configuration validation", () => {
     expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:4545/health");
     expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({ port: 4545 }));
     expect(results.find((result) => result.name === "daemon")?.message).toContain("localhost:4545");
+  });
+
+  it("recovers the PostgreSQL backend identity when another config field is invalid", async () => {
+    await runDoctor(minimalDeps({
+      readFileSync: (path: string) => {
+        if (path.endsWith("config.json")) {
+          return JSON.stringify({ storage: { backend: "postgresql" }, llm: { provider: "invalid" } });
+        }
+        return minimalDeps().readFileSync(path);
+      },
+    }));
+
+    expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+      expectedStorageBackend: "postgresql",
+    }));
+  });
+
+  it("recovers an explicit SQLite backend identity when another config field is invalid", async () => {
+    await runDoctor(minimalDeps({
+      readFileSync: (path: string) => {
+        if (path.endsWith("config.json")) {
+          return JSON.stringify({ storage: { backend: "sqlite" }, llm: { provider: "invalid" } });
+        }
+        return minimalDeps().readFileSync(path);
+      },
+    }));
+
+    expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+      expectedStorageBackend: "sqlite",
+    }));
+  });
+
+  it.each([
+    "null",
+    "[]",
+    JSON.stringify({ storage: null }),
+    JSON.stringify({ storage: [] }),
+    JSON.stringify({ storage: "postgresql" }),
+  ])("falls back to SQLite identity for invalid config shape %s", async (content) => {
+    await runDoctor(minimalDeps({
+      readFileSync: (path: string) => path.endsWith("config.json")
+        ? content
+        : minimalDeps().readFileSync(path),
+    }));
+
+    expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+      expectedStorageBackend: "sqlite",
+    }));
   });
 
   it.each([0, 65536, 4545.5, "4545"])(

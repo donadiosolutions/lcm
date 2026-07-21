@@ -1,6 +1,6 @@
 import type { DaemonClient } from "../daemon/client.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
-import { loadDaemonConfig } from "../daemon/config.js";
+import { loadDaemonConfig, type StorageBackend } from "../daemon/config.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { request } from "node:http";
@@ -87,6 +87,7 @@ export async function handleSessionEnd(
   stdin: string,
   client: DaemonClient,
   port?: number,
+  expectedStorageBackend: StorageBackend = "sqlite",
 ): Promise<{ exitCode: number; stdout: string }> {
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
@@ -94,6 +95,7 @@ export async function handleSessionEnd(
     port: daemonPort,
     pidFilePath,
     spawnTimeoutMs: 5000,
+    expectedStorageBackend,
     enforceUserManagerParent: true,
   });
   if (!connected) return { exitCode: 0, stdout: "" };

@@ -49,7 +49,9 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
   StdioServerTransport: vi.fn().mockImplementation(function () { return {}; }),
 }));
 vi.mock("../src/daemon/lifecycle.js", () => ({ ensureDaemon: mocks.ensureDaemon }));
-vi.mock("../src/daemon/config.js", () => ({ loadDaemonConfig: () => ({ daemon: { port: 4321 } }) }));
+vi.mock("../src/daemon/config.js", () => ({
+  loadDaemonConfig: () => ({ daemon: { port: 4321 }, storage: { backend: "sqlite" } }),
+}));
 vi.mock("../src/daemon/client.js", () => ({
   DaemonClient: vi.fn().mockImplementation(function () { return { post: mocks.post }; }),
 }));

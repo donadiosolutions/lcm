@@ -82,6 +82,38 @@ export const DEFAULT_LLM_RETRY_POLICY: Readonly<LlmRetryPolicy> = Object.freeze(
 
 export const DEFAULT_DAEMON_PORT = 3737;
 
+export const STORAGE_BACKENDS = ["sqlite", "postgresql"] as const;
+export type StorageBackend = typeof STORAGE_BACKENDS[number];
+
+export interface PostgreSqlStorageSettings {
+  poolMax: number;
+  connectionTimeoutMs: number;
+  idleTimeoutMs: number;
+  statementTimeoutMs: number;
+}
+
+export interface StoredStorageConfig {
+  backend: StorageBackend;
+  postgresql?: Partial<PostgreSqlStorageSettings>;
+}
+
+export type ResolvedStorageConfig =
+  | { backend: "sqlite" }
+  | {
+    backend: "postgresql";
+    postgresql: PostgreSqlStorageSettings & {
+      url: string;
+      caFile: string;
+    };
+  };
+
+export const DEFAULT_POSTGRESQL_STORAGE_SETTINGS: Readonly<PostgreSqlStorageSettings> = Object.freeze({
+  poolMax: 5,
+  connectionTimeoutMs: 10_000,
+  idleTimeoutMs: 30_000,
+  statementTimeoutMs: 60_000,
+});
+
 export interface SecurityConfig {
   /** User-defined global regex patterns (plain strings, no /.../ delimiters). */
   sensitivePatterns: string[];
@@ -95,6 +127,7 @@ export interface SecurityConfig {
 
 export type DaemonConfig = {
   version: number;
+  storage: ResolvedStorageConfig;
   daemon: { port: number; socketPath: string; logLevel: string; logMaxSizeMB: number; logRetentionDays: number; idleTimeoutMs: number };
   compaction: {
     leafTokens: number; maxDepth: number; autoCompactMinTokens: number;
@@ -138,8 +171,14 @@ export type DaemonConfig = {
   hooks: { snapshotIntervalSec: number; disableAutoCompact: boolean };
 };
 
-const DEFAULTS: DaemonConfig = {
+type DaemonConfigDefaults = Omit<DaemonConfig, "storage"> & { storage: StoredStorageConfig };
+
+const DEFAULTS: DaemonConfigDefaults = {
   version: 1,
+  storage: {
+    backend: "sqlite",
+    postgresql: { ...DEFAULT_POSTGRESQL_STORAGE_SETTINGS },
+  },
   daemon: { port: DEFAULT_DAEMON_PORT, socketPath: lcmPath("daemon.sock"), logLevel: "info", logMaxSizeMB: 10, logRetentionDays: 7, idleTimeoutMs: 1800000 },
   compaction: {
     leafTokens: 1000, maxDepth: 5, autoCompactMinTokens: 10000,
@@ -200,7 +239,12 @@ const DEFAULTS: DaemonConfig = {
 };
 
 const DENIED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-const SYSTEMD_CREDENTIAL_ENV_NAMES = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "LCM_SUMMARY_API_KEY"] as const;
+const SYSTEMD_CREDENTIAL_ENV_NAMES = [
+  "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY",
+  "LCM_SUMMARY_API_KEY",
+  "LCM_POSTGRES_URL",
+] as const;
 type SystemdCredentialEnvName = typeof SYSTEMD_CREDENTIAL_ENV_NAMES[number];
 const SYSTEMD_CREDENTIAL_ENV_NAME_SET = new Set<SystemdCredentialEnvName>(SYSTEMD_CREDENTIAL_ENV_NAMES);
 
@@ -246,6 +290,8 @@ function credentialFileName(name: SystemdCredentialEnvName): string {
       return "OPENAI_API_KEY";
     case "LCM_SUMMARY_API_KEY":
       return "LCM_SUMMARY_API_KEY";
+    case "LCM_POSTGRES_URL":
+      return "LCM_POSTGRES_URL";
   }
 }
 
@@ -312,6 +358,9 @@ const LLM_KEYS = new Set([
   "requestTimeoutMs", "retry",
 ]);
 const CONFIG_EXAMPLE = JSON.stringify({
+  storage: {
+    backend: "sqlite",
+  },
   llm: {
     provider: "openai",
     model: "gpt-5",
@@ -493,6 +542,55 @@ const RESTORATION_KEYS = new Set([
 const SUMMARIZER_KEYS = new Set(["mock"]);
 const SECURITY_KEYS = new Set(["sensitivePatterns", "notify_on_filter"]);
 const HOOK_KEYS = new Set(["snapshotIntervalSec", "disableAutoCompact"]);
+const STORAGE_KEYS = new Set(["backend", "postgresql"]);
+const POSTGRESQL_STORAGE_KEYS = new Set([
+  "poolMax",
+  "connectionTimeoutMs",
+  "idleTimeoutMs",
+  "statementTimeoutMs",
+]);
+const POSTGRESQL_STORAGE_OVERRIDE_KEYS = new Set([
+  ...POSTGRESQL_STORAGE_KEYS,
+  "url",
+  "caFile",
+]);
+
+function validateStorageSection(value: unknown, allowRuntimeSecrets: boolean): void {
+  const storage = validateObject("storage", value);
+  rejectUnknownKeys(storage, "storage", STORAGE_KEYS);
+  if (storage.backend !== undefined) {
+    if (typeof storage.backend !== "string") invalidType("storage.backend", storage.backend, "a string");
+    if (!(STORAGE_BACKENDS as readonly string[]).includes(storage.backend)) {
+      throw new ConfigValidationError(
+        "storage.backend",
+        `received ${displayValue("storage.backend", storage.backend)}; valid choices: ${STORAGE_BACKENDS.join(", ")}`,
+      );
+    }
+  }
+  if (storage.postgresql === undefined) return;
+  const postgresql = validateObject("storage.postgresql", storage.postgresql);
+  for (const secretKey of ["url", "caFile"] as const) {
+    if (!allowRuntimeSecrets && postgresql[secretKey] !== undefined) {
+      throw new ConfigValidationError(
+        `storage.postgresql.${secretKey}`,
+        `must not be stored in config.json; use ${secretKey === "url" ? "LCM_POSTGRES_URL" : "LCM_POSTGRES_CA_FILE"}`,
+      );
+    }
+  }
+  rejectUnknownKeys(
+    postgresql,
+    "storage.postgresql",
+    allowRuntimeSecrets ? POSTGRESQL_STORAGE_OVERRIDE_KEYS : POSTGRESQL_STORAGE_KEYS,
+  );
+  validateOptionalInteger(postgresql, "poolMax", "storage.postgresql", 1, 100);
+  validateOptionalInteger(postgresql, "connectionTimeoutMs", "storage.postgresql", 1, 600_000);
+  validateOptionalInteger(postgresql, "idleTimeoutMs", "storage.postgresql", 0, 3_600_000);
+  validateOptionalInteger(postgresql, "statementTimeoutMs", "storage.postgresql", 1, 3_600_000);
+  if (allowRuntimeSecrets) {
+    validateOptionalString(postgresql, "url", "storage.postgresql");
+    validateOptionalString(postgresql, "caFile", "storage.postgresql");
+  }
+}
 
 function validateDaemonSection(value: unknown, allowEphemeralPort: boolean): void {
   const daemon = validateObject("daemon", value);
@@ -582,9 +680,10 @@ function validateRestorationSection(value: unknown): void {
 /** Validate every known non-LLM configuration leaf while preserving extension keys. */
 function validateKnownConfigSections(
   config: Record<string, unknown>,
-  options: { allowEphemeralDaemonPort?: boolean } = {},
+  options: { allowEphemeralDaemonPort?: boolean; allowStorageSecrets?: boolean } = {},
 ): void {
   if (config.version !== undefined) validateBoundedInteger("version", config.version, 1, Number.MAX_SAFE_INTEGER);
+  if (config.storage !== undefined) validateStorageSection(config.storage, options.allowStorageSecrets === true);
   if (config.daemon !== undefined) validateDaemonSection(config.daemon, options.allowEphemeralDaemonPort === true);
   if (config.compaction !== undefined) validateCompactionSection(config.compaction);
   if (config.restoration !== undefined) validateRestorationSection(config.restoration);
@@ -751,6 +850,75 @@ export function parseStoredConfig(content: string): Record<string, unknown> {
   return parseConfigRoot(content);
 }
 
+function requiredPostgreSqlSecret(
+  value: unknown,
+  envName: "LCM_POSTGRES_URL" | "LCM_POSTGRES_CA_FILE",
+): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new ConfigValidationError(envName, `must be a non-empty string when storage.backend is "postgresql"`);
+  }
+  return value;
+}
+
+/** Resolve backend selection, environment-only secrets, bounds, and PostgreSQL TLS preflight. */
+export function resolveStorageConfig(
+  value: unknown,
+  env: Record<string, string | undefined> = {},
+): ResolvedStorageConfig {
+  validateStorageSection(value, true);
+  const storage = value as Record<string, unknown>;
+  const backend = (storage.backend ?? "sqlite") as StorageBackend;
+  if (backend === "sqlite") return { backend: "sqlite" };
+
+  const postgresql = (storage.postgresql ?? {}) as Record<string, unknown>;
+  const urlValue = postgresql.url ?? env.LCM_POSTGRES_URL;
+  const caFileValue = postgresql.caFile ?? env.LCM_POSTGRES_CA_FILE;
+  const url = requiredPostgreSqlSecret(urlValue, "LCM_POSTGRES_URL");
+  const caFile = requiredPostgreSqlSecret(caFileValue, "LCM_POSTGRES_CA_FILE");
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    throw new ConfigValidationError("LCM_POSTGRES_URL", "must be an absolute postgresql: URL");
+  }
+  if (parsedUrl.protocol !== "postgresql:") {
+    throw new ConfigValidationError("LCM_POSTGRES_URL", "must use the postgresql: scheme");
+  }
+  const forbiddenTlsParameter = [...parsedUrl.searchParams.keys()]
+    .find((key) => key.toLowerCase().startsWith("ssl"));
+  if (forbiddenTlsParameter !== undefined) {
+    throw new ConfigValidationError(
+      "LCM_POSTGRES_URL",
+      `must not contain TLS parameter ${JSON.stringify(forbiddenTlsParameter)}; LCM enforces verified TLS with LCM_POSTGRES_CA_FILE`,
+    );
+  }
+  if (!isAbsolute(caFile)) {
+    throw new ConfigValidationError("LCM_POSTGRES_CA_FILE", `must be an absolute path, received ${JSON.stringify(caFile)}`);
+  }
+  let caContents: Buffer;
+  try {
+    caContents = readFileSync(caFile);
+  } catch {
+    throw new ConfigValidationError("LCM_POSTGRES_CA_FILE", `cannot read ${JSON.stringify(caFile)}`);
+  }
+  if (caContents.length === 0) {
+    throw new ConfigValidationError("LCM_POSTGRES_CA_FILE", `must not be empty: ${JSON.stringify(caFile)}`);
+  }
+
+  return {
+    backend: "postgresql",
+    postgresql: {
+      poolMax: (postgresql.poolMax ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.poolMax) as number,
+      connectionTimeoutMs: (postgresql.connectionTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.connectionTimeoutMs) as number,
+      idleTimeoutMs: (postgresql.idleTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.idleTimeoutMs) as number,
+      statementTimeoutMs: (postgresql.statementTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.statementTimeoutMs) as number,
+      url,
+      caFile,
+    },
+  };
+}
+
 /**
  * Convert effective daemon configuration back to a safe persisted document.
  * Request timeout defaults remain effective at runtime but are explicit only
@@ -758,6 +926,17 @@ export function parseStoredConfig(content: string): Record<string, unknown> {
  */
 export function daemonConfigForPersistence(config: DaemonConfig): Record<string, unknown> {
   const stored = structuredClone(config) as unknown as Record<string, unknown>;
+  stored.storage = config.storage.backend === "sqlite"
+    ? { backend: "sqlite" }
+    : {
+      backend: "postgresql",
+      postgresql: {
+        poolMax: config.storage.postgresql.poolMax,
+        connectionTimeoutMs: config.storage.postgresql.connectionTimeoutMs,
+        idleTimeoutMs: config.storage.postgresql.idleTimeoutMs,
+        statementTimeoutMs: config.storage.postgresql.statementTimeoutMs,
+      },
+    };
   const llm = stored.llm as Record<string, unknown>;
   if (!supportsRequestTimeout(config.llm.provider)) {
     delete llm.requestTimeoutMs;
@@ -882,7 +1061,7 @@ function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: Readonl
   }
 }
 
-/** Parse, merge, resolve, and validate daemon configuration without filesystem access. */
+/** Parse, merge, resolve, and validate daemon configuration, including selected-backend preflight. */
 export function parseDaemonConfig(
   content: string,
   overrides: unknown = {},
@@ -898,7 +1077,10 @@ export function parseDaemonConfig(
   const normalizedOverrides = { ...(overrides as Record<string, unknown>) };
   // Port 0 is an internal runtime/testing escape hatch for ephemeral binding.
   // Persisted configuration must always name a reconnectable TCP port.
-  validateKnownConfigSections(normalizedOverrides, { allowEphemeralDaemonPort: true });
+  validateKnownConfigSections(normalizedOverrides, {
+    allowEphemeralDaemonPort: true,
+    allowStorageSecrets: true,
+  });
   const overrideLlm = validateLlmObject(normalizedOverrides.llm, providerOverride);
   if (overrideLlm !== undefined) normalizedOverrides.llm = overrideLlm;
   const migratedOverrides = migrateLegacyConfig(normalizedOverrides);
@@ -922,7 +1104,9 @@ export function parseDaemonConfig(
   // Always merge untrusted sources into a trusted target so DENIED_KEYS filtering
   // applies before any untrusted key reaches the result object.
   const withFile = deepMerge(structuredClone(DEFAULTS) as Record<string, unknown>, fileConfig);
-  const merged = deepMerge(withFile, migratedOverrides) as DaemonConfig;
+  const mergedRecord = deepMerge(withFile, migratedOverrides);
+  mergedRecord.storage = resolveStorageConfig(mergedRecord.storage, env);
+  const merged = mergedRecord as DaemonConfig;
   const effectivePolicy = resolveLlmRequestPolicy(
     { requestTimeoutMs: DEFAULT_LLM_REQUEST_TIMEOUT_MS, retry: { ...DEFAULT_LLM_RETRY_POLICY } },
     { requestTimeoutMs: merged.llm.requestTimeoutMs, retry: merged.llm.retry },

@@ -42,6 +42,7 @@ describe("daemon server", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.status).toBe("ok");
+    expect(body.storageBackend).toBe("sqlite");
     expect(typeof body.uptime).toBe("number");
   });
 
@@ -52,9 +53,10 @@ describe("daemon server", () => {
     const port = daemon.address().port;
     try {
       const res = await fetch(`http://127.0.0.1:${port}/health`);
-      const data = await res.json() as { status: string; version: string; uptime: number; pid: number };
+      const data = await res.json() as { status: string; version: string; storageBackend: string; uptime: number; pid: number };
       expect(data.version).toMatch(/^\d+\.\d+\.\d+$/);
       expect(data.status).toBe("ok");
+      expect(data.storageBackend).toBe("sqlite");
       expect(data.pid).toBe(process.pid);
     } finally {
       await daemon.stop();

@@ -7,7 +7,7 @@ vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: ensureDaemonMcpMock,
 }));
 vi.mock("../../src/daemon/config.js", () => ({
-  loadDaemonConfig: vi.fn().mockReturnValue({ daemon: { port: 9999 } }),
+  loadDaemonConfig: vi.fn().mockReturnValue({ daemon: { port: 9999 }, storage: { backend: "sqlite" } }),
 }));
 vi.mock("@modelcontextprotocol/sdk/server/index.js", () => ({
   Server: vi.fn().mockImplementation(function () {
@@ -136,6 +136,7 @@ describe("startMcpServer", () => {
     expect(ensureDaemonMcpMock).toHaveBeenCalledWith(
       expect.objectContaining({
         expectedVersion: "9.9.9-test",
+        expectedStorageBackend: "sqlite",
         enforceUserManagerParent: true,
       }),
     );
@@ -163,7 +164,7 @@ describe("startMcpServer", () => {
 });
 
 describe("handleDaemonRequest spawn opts propagation", () => {
-  it("threads spawnCommand/spawnArgs/expectedVersion into ensureDaemon on auto-restart", async () => {
+  it("threads spawnCommand/spawnArgs/version/backend into ensureDaemon on auto-restart", async () => {
     const ensureDaemonSpy = vi.fn().mockResolvedValue({ connected: true, port: 9999, spawned: true });
     const optsWithSpawn = {
       port: 9999,
@@ -171,6 +172,7 @@ describe("handleDaemonRequest spawn opts propagation", () => {
       spawnCommand: "/usr/local/bin/node",
       spawnArgs: ["/path/to/lcm.mjs", "daemon", "start"],
       expectedVersion: "1.2.3",
+      expectedStorageBackend: "postgresql" as const,
       _ensureDaemon: ensureDaemonSpy,
     };
 
@@ -187,6 +189,7 @@ describe("handleDaemonRequest spawn opts propagation", () => {
         spawnCommand: "/usr/local/bin/node",
         spawnArgs: ["/path/to/lcm.mjs", "daemon", "start", "--foreground"],
         expectedVersion: "1.2.3",
+        expectedStorageBackend: "postgresql",
         enforceUserManagerParent: true,
       }),
     );

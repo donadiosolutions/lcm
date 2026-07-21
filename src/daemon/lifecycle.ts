@@ -5,6 +5,7 @@ import { join, dirname, win32 } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
 import { managedDaemonPath, SYSTEMD_DAEMON_PATH } from "./managed-path.js";
 import { PKG_VERSION } from "./version.js";
+import type { StorageBackend } from "./config.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
@@ -21,6 +22,7 @@ export type EnsureDaemonOptions = {
   pidFilePath: string;
   spawnTimeoutMs: number;
   expectedVersion?: string;
+  expectedStorageBackend?: StorageBackend;
   enforceUserManagerParent?: boolean;
   spawnCommand?: string;
   spawnArgs?: string[];
@@ -69,6 +71,7 @@ export type RestartDaemonResult = EnsureDaemonResult & {
 type HealthResponse = {
   status: string;
   version?: string;
+  storageBackend?: StorageBackend;
   uptime?: number;
   pid?: number;
 };
@@ -78,6 +81,14 @@ function healthVersionMatches(health: HealthResponse | null, expectedVersion: st
     && expectedVersion.length > 0
     && typeof health?.version === "string"
     && health.version === expectedVersion;
+}
+
+function healthStorageBackendMatches(
+  health: HealthResponse | null,
+  expectedStorageBackend: StorageBackend,
+): boolean {
+  // Daemons predating backend identity were necessarily SQLite-only.
+  return (health?.storageBackend ?? "sqlite") === expectedStorageBackend;
 }
 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
@@ -505,7 +516,7 @@ function startViaDetachedSpawn(
 }
 
 const SYSTEMD_PROVIDER_SECRET_ENV_NAMES = new Set(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
-const SYSTEMD_LCM_SECRET_ENV_NAMES = new Set(["LCM_SUMMARY_API_KEY"]);
+const SYSTEMD_LCM_SECRET_ENV_NAMES = new Set(["LCM_SUMMARY_API_KEY", "LCM_POSTGRES_URL"]);
 const SYSTEMD_SECRET_ENV_PATTERN = /(?:API_)?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/;
 const SYSTEMD_CREDENTIAL_DIR_PREFIX = "lcm-systemd-credentials-";
 const SYSTEMD_CREDENTIAL_SOURCE_MAX_AGE_MS = 10 * 60 * 1000;
@@ -542,7 +553,11 @@ function systemdDaemonSetenvArgs(
   executablePath = SYSTEMD_DAEMON_PATH,
 ): string[] {
   const args = Object.entries(env)
-    .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && !SYSTEMD_SECRET_ENV_PATTERN.test(name))
+    .filter(([name, value]) => (
+      shouldPropagateDaemonEnv(name, value)
+      && !isSecretDaemonEnvName(name)
+      && !SYSTEMD_SECRET_ENV_PATTERN.test(name)
+    ))
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, value]) => `--setenv=${name}=${value}`);
   args.push(`--setenv=PATH=${executablePath}`);
@@ -555,7 +570,7 @@ function systemdDaemonSetenvArgs(
 function systemdRunProcessEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = { ...env };
   for (const name of Object.keys(result)) {
-    if (SYSTEMD_SECRET_ENV_PATTERN.test(name)) delete result[name];
+    if (isSecretDaemonEnvName(name) || SYSTEMD_SECRET_ENV_PATTERN.test(name)) delete result[name];
   }
   return result;
 }
@@ -678,6 +693,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   });
   const enforceParent = opts.enforceUserManagerParent === true && platform === "linux";
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
+  const expectedStorageBackend = opts.expectedStorageBackend ?? "sqlite";
   let restartedForParent = false;
 
   if (typeof expectedVersion !== "string" || expectedVersion.length === 0) {
@@ -730,6 +746,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   ): Promise<EnsureDaemonResult | null> {
     if (health === null || !endpointIdentityMatches(health)) return null;
     if (!healthVersionMatches(health, expectedVersion)) return null;
+    if (!healthStorageBackendMatches(health, expectedStorageBackend)) return null;
     if (!access.alreadyVerified) {
       const accessTimeoutMs = access.deadline - monotonicNow();
       if (accessTimeoutMs <= 0) return null;
@@ -789,10 +806,11 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const initialAccessDeadline = remainingRequestDeadline();
     const identityMatches = endpointIdentityMatches(health);
     const versionMatches = healthVersionMatches(health, expectedVersion);
-    const hasAccess = identityMatches && versionMatches && initialAccessDeadline
+    const storageBackendMatches = healthStorageBackendMatches(health, expectedStorageBackend);
+    const hasAccess = identityMatches && versionMatches && storageBackendMatches && initialAccessDeadline
       ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, initialAccessDeadline)
       : false;
-    if (identityMatches && !versionMatches) {
+    if (identityMatches && (!versionMatches || !storageBackendMatches)) {
       await terminatePidFileProcess();
     } else if (hasAccess) {
       const accepted = await daemonResult(health, false, "existing", { alreadyVerified: true });
@@ -833,10 +851,11 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           const retryAccessDeadline = remainingRequestDeadline();
           const retryIdentityMatches = endpointIdentityMatches(retry);
           const retryVersionMatches = healthVersionMatches(retry, expectedVersion);
-          const retryHasAccess = retryIdentityMatches && retryVersionMatches && retryAccessDeadline
+          const retryStorageBackendMatches = healthStorageBackendMatches(retry, expectedStorageBackend);
+          const retryHasAccess = retryIdentityMatches && retryVersionMatches && retryStorageBackendMatches && retryAccessDeadline
             ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, retryAccessDeadline)
             : false;
-          if (retryIdentityMatches && !retryVersionMatches) {
+          if (retryIdentityMatches && (!retryVersionMatches || !retryStorageBackendMatches)) {
             await terminatePidFileProcess();
           } else if (retryHasAccess) {
             const accepted = await daemonResult(retry, false, "existing", { alreadyVerified: true });
@@ -961,6 +980,9 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     const health = await checkDaemonHealth(port, fetchFn, healthDeadline);
     if (health?.status !== "ok" || health.pid !== pid) return false;
     if (!healthVersionMatches(health, expectedVersion)) return false;
+    // The current daemon may legitimately use a different backend during a
+    // configured transition. Authenticate it independently; ensureOptions
+    // applies expectedStorageBackend to the replacement below.
     const accessDeadline = remainingVerificationDeadline();
     if (!accessDeadline || !await checkDaemonAccess(port, tokenPath, fetchFn, accessDeadline)) return false;
     return true;
@@ -1013,6 +1035,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
 export const __lifecycleTestUtils = {
   findListeningTcpPorts,
   healthVersionMatches,
+  healthStorageBackendMatches,
   inspectDaemonParent,
   parentInvariantWarning,
   resolveWindowsNetstatPath,

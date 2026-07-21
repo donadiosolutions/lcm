@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { openSync, closeSync, writeFileSync } from "node:fs";
 import { daemonPidPath, tmpDir } from "../runtime-paths.js";
 import { fenceContent } from "../daemon/content-fence.js";
+import type { StorageBackend } from "../daemon/config.js";
 import {
   deleteRegularFile,
   ensurePrivateDirectory,
@@ -108,7 +109,12 @@ type RestoreHookInput = Record<string, unknown> & {
   cwd?: string;
 };
 
-export async function handleSessionStart(stdin: string, client: Pick<DaemonClient, "post">, port?: number): Promise<{ exitCode: number; stdout: string }> {
+export async function handleSessionStart(
+  stdin: string,
+  client: Pick<DaemonClient, "post">,
+  port?: number,
+  expectedStorageBackend: StorageBackend = "sqlite",
+): Promise<{ exitCode: number; stdout: string }> {
   const parsed: unknown = JSON.parse(stdin || "{}");
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     return { exitCode: 0, stdout: "" };
@@ -129,6 +135,7 @@ export async function handleSessionStart(stdin: string, client: Pick<DaemonClien
     port: daemonPort,
     pidFilePath,
     spawnTimeoutMs: 5000,
+    expectedStorageBackend,
     enforceUserManagerParent: true,
   });
   if (!connected) return { exitCode: 0, stdout: "" };

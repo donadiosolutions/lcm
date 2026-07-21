@@ -231,6 +231,54 @@ describe("ensureDaemon", () => {
     expect(mockFetch.mock.calls.filter(([url]: [unknown, ...unknown[]]): boolean => String(url).endsWith("/stats/pool"))).toHaveLength(1);
   });
 
+  it("rejects a healthy same-version SQLite daemon when effective configuration selects PostgreSQL", async (): Promise<void> => {
+    const { parseDaemonConfig } = await import("../../src/daemon/config.js");
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-storage-mismatch-"));
+    tempDirs.push(tempDir);
+    const procRoot = join(tempDir, "proc");
+    mkdirSync(procRoot);
+    const pidFile = join(tempDir, "daemon.pid");
+    const caFile = join(tempDir, "postgres-ca.crt");
+    writeFileSync(pidFile, "200");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    writeFileSync(caFile, "trusted-ca");
+    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    const effectiveConfig = parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
+      LCM_POSTGRES_URL: "postgresql://user:secret@db.example.com/lcm",
+      LCM_POSTGRES_CA_FILE: caFile,
+    });
+    const fetchMock = vi.fn(async (url: string): Promise<Response> => {
+      if (url.endsWith("/health")) {
+        return {
+          ok: true,
+          json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 200 }),
+        } as Response;
+      }
+      return { ok: true, json: async () => ({}) } as Response;
+    });
+    const killMock = vi.fn();
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      expectedStorageBackend: effectiveConfig.storage.backend,
+      _skipSpawn: true,
+      _fetchOverride: fetchMock as FetchOverride,
+      _killOverride: killMock,
+      _sleepOverride: async (): Promise<void> => {},
+      _isProcessAliveOverride: (): boolean => true,
+      _procRoot: procRoot,
+      _listeningPortsOverride: (): number[] => [19999],
+    });
+
+    expect(result.connected).toBe(false);
+    expect(killMock).toHaveBeenCalledWith(200, "SIGTERM");
+    expect(killMock).toHaveBeenCalledWith(200, "SIGKILL");
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/stats/pool"))).toBe(false);
+  });
+
   it("terminates a PID-file daemon when retry health reports the wrong version", async (): Promise<void> => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-retry-version-"));
     tempDirs.push(tempDir);
@@ -430,16 +478,21 @@ describe("ensureDaemon", () => {
     const originalSummaryApiKey = process.env.LCM_SUMMARY_API_KEY;
     const originalApiKey = process.env.ANTHROPIC_API_KEY;
     const originalOpenAiApiKey = process.env.OPENAI_API_KEY;
+    const originalPostgresUrl = process.env.LCM_POSTGRES_URL;
+    const originalPostgresCaFile = process.env.LCM_POSTGRES_CA_FILE;
     const originalUnrelated = process.env.UNRELATED_DAEMON_VALUE;
     const originalPath = process.env.PATH;
     process.env.LCM_SUMMARY_PROVIDER = "anthropic";
     if (runtimeBaseDir === undefined) {
       delete process.env.LCM_SUMMARY_API_KEY;
       delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.LCM_POSTGRES_URL;
     } else {
       process.env.LCM_SUMMARY_API_KEY = "sk-lcm-test";
       process.env.ANTHROPIC_API_KEY = "sk-test";
+      process.env.LCM_POSTGRES_URL = "postgresql://user:postgres-secret@db.example.com/lcm";
     }
+    process.env.LCM_POSTGRES_CA_FILE = "/etc/ssl/certs/postgres-ca.crt";
     delete process.env.OPENAI_API_KEY;
     process.env.UNRELATED_DAEMON_VALUE = "ignored";
     process.env.PATH = "/opt/lcm-test/bin:/usr/bin";
@@ -462,10 +515,11 @@ describe("ensureDaemon", () => {
       expect(spawnMock).not.toHaveBeenCalled();
       const expectedEnvironment = [
         "--setenv=PATH=/path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--setenv=LCM_POSTGRES_CA_FILE=/etc/ssl/certs/postgres-ca.crt",
         "--setenv=LCM_SUMMARY_PROVIDER=anthropic",
       ];
       if (runtimeBaseDir !== undefined) {
-        expectedEnvironment.push("--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_SUMMARY_API_KEY");
+        expectedEnvironment.push("--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_POSTGRES_URL,LCM_SUMMARY_API_KEY");
       }
       expect(spawnSyncMock).toHaveBeenCalledWith(
         "systemd-run",
@@ -485,17 +539,19 @@ describe("ensureDaemon", () => {
       const systemdArgs = spawnSyncMock.mock.calls[0][1] as string[];
       if (runtimeBaseDir === undefined) {
         expect(systemdArgs).not.toContain(
-          "--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_SUMMARY_API_KEY",
+          "--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_POSTGRES_URL,LCM_SUMMARY_API_KEY",
         );
       }
       const joinedArgs = systemdArgs.join("\n");
       expect(joinedArgs).not.toContain("sk-test");
       expect(joinedArgs).not.toContain("sk-lcm-test");
+      expect(joinedArgs).not.toContain("postgres-secret");
       expect(systemdArgs).not.toContain("--setenv=UNRELATED_DAEMON_VALUE=ignored");
       expect(systemdArgs).not.toContain("--setenv=PATH=/opt/lcm-test/bin:/usr/bin");
       const credentialArgs = systemdArgs.filter((arg) => arg.startsWith("--property=LoadCredential="));
       expect(credentialArgs).toEqual(runtimeBaseDir === undefined ? [] : [
         expect.stringContaining("ANTHROPIC_API_KEY:"),
+        expect.stringContaining("LCM_POSTGRES_URL:"),
         expect.stringContaining("LCM_SUMMARY_API_KEY:"),
       ]);
       for (const arg of credentialArgs) {
@@ -513,6 +569,10 @@ describe("ensureDaemon", () => {
       else process.env.ANTHROPIC_API_KEY = originalApiKey;
       if (originalOpenAiApiKey === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = originalOpenAiApiKey;
+      if (originalPostgresUrl === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = originalPostgresUrl;
+      if (originalPostgresCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = originalPostgresCaFile;
       if (originalUnrelated === undefined) delete process.env.UNRELATED_DAEMON_VALUE;
       else process.env.UNRELATED_DAEMON_VALUE = originalUnrelated;
       if (originalPath === undefined) delete process.env.PATH;
@@ -987,6 +1047,37 @@ describe("ensureDaemon", () => {
 
     // Must NOT connect to the daemon that answered with wrong version
     expect(result.connected).toBe(false);
+  });
+
+  it("does not connect when health wait returns a daemon with a mismatched storage backend", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-health-storage-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce({ ok: false } as Response)
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 4242, uptime: 100 }),
+      } as Response);
+    const spawnMock = vi.fn().mockImplementation(() => {
+      writeFileSync(pidFile, "4242");
+      return makeSpawnChild(4242);
+    });
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 600,
+      expectedVersion: "1.2.3",
+      expectedStorageBackend: "postgresql",
+      _fetchOverride: mockFetch as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: (): number[] => [19999],
+    });
+
+    expect(result.connected).toBe(false);
+    expect(spawnMock).toHaveBeenCalledOnce();
   });
 
   it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2_147_483_648])(
@@ -1556,6 +1647,53 @@ describe("restartDaemon", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(killMock).not.toHaveBeenCalled();
     expect(ensureMock).not.toHaveBeenCalled();
+  });
+
+  it("stops an authenticated old backend and starts the replacement with the target backend", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-storage-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "4242");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    let alive = true;
+    const fetchMock = vi.fn().mockImplementation(async (url: string, init?: RequestInit): Promise<Response> => {
+      if (url.endsWith("/health")) {
+        return {
+          ok: true,
+          json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 4242 }),
+        } as Response;
+      }
+      expect(init?.headers).toEqual({ Authorization: "Bearer local-token" });
+      return { ok: true, json: async () => ({ totalConnections: 0 }) } as Response;
+    });
+    const killMock = vi.fn(() => { alive = false; });
+    const ensureMock = vi.fn(async (options: EnsureDaemonOptions) => ({
+      connected: true,
+      port: options.port,
+      spawned: true,
+    }));
+
+    const result = await restartDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      expectedStorageBackend: "postgresql",
+      _platform: "darwin",
+      _fetchOverride: fetchMock as FetchOverride,
+      _listeningPortsOverride: (): number[] => [19999],
+      _isProcessAliveOverride: () => alive,
+      _killOverride: killMock,
+      _sleepOverride: async () => {},
+      _ensureDaemonOverride: ensureMock,
+    });
+
+    expect(result).toMatchObject({ connected: true, restarted: true, stoppedPid: 4242 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(killMock).toHaveBeenCalledWith(4242, "SIGTERM");
+    expect(ensureMock).toHaveBeenCalledWith(expect.objectContaining({
+      expectedStorageBackend: "postgresql",
+    }));
   });
 
   it("refuses a non-Linux restart when protected-route authentication fails", async () => {

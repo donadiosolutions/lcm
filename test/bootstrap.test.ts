@@ -72,7 +72,7 @@ describe("ensureCore", () => {
     const { ensureCore } = await import("../src/bootstrap.js");
     await ensureCore(deps);
     expect(deps.ensureDaemon).toHaveBeenCalledWith(
-      expect.objectContaining({ enforceUserManagerParent: true }),
+      expect.objectContaining({ expectedStorageBackend: "sqlite", enforceUserManagerParent: true }),
     );
   });
 

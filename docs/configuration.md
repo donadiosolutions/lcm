@@ -170,9 +170,81 @@ In practice, the hook asks the daemon for ranked candidates, the daemon dedupes 
 - Smaller chunks create summaries more frequently from less material.
 - This also affects the condensed minimum input threshold (10% of this value).
 
+## Storage backend
+
+LCM uses SQLite by default. Existing installations and configurations that do
+not contain a `storage` object continue to use the per-project databases under
+`~/.lcm/projects/` without any additional setup:
+
+```json
+{
+  "storage": {
+    "backend": "sqlite"
+  }
+}
+```
+
+The PostgreSQL configuration foundation is available for validating a future
+remote-primary deployment. PostgreSQL repository support lands in #82; until
+then, a valid `postgresql` selection fails before the daemon listens with an
+explicit backend-unavailable error. LCM never falls back to SQLite after an
+explicit PostgreSQL selection.
+
+Store only non-secret pool and timeout settings in `~/.lcm/config.json`:
+
+```json
+{
+  "storage": {
+    "backend": "postgresql",
+    "postgresql": {
+      "poolMax": 5,
+      "connectionTimeoutMs": 10000,
+      "idleTimeoutMs": 30000,
+      "statementTimeoutMs": 60000
+    }
+  }
+}
+```
+
+| Setting | Default | Valid range |
+| --- | ---: | ---: |
+| `poolMax` | `5` | `1`-`100` |
+| `connectionTimeoutMs` | `10000` | `1`-`600000` |
+| `idleTimeoutMs` | `30000` | `0`-`3600000` |
+| `statementTimeoutMs` | `60000` | `1`-`3600000` |
+
+Supply the connection URL and CA certificate path through the environment. LCM
+rejects `url` and `caFile` keys in JSON so credentials cannot be persisted by
+configuration commands:
+
+```bash
+export LCM_POSTGRES_URL='postgresql://USER:PASSWORD@HOST:25060/DATABASE'
+export LCM_POSTGRES_CA_FILE='/absolute/path/to/ca-certificate.crt'
+lcm daemon restart
+```
+
+The URL must use the `postgresql:` scheme. Do not add `ssl`, `sslmode`,
+`sslcert`, `sslkey`, `sslrootcert`, or other `ssl*` query parameters; LCM owns
+TLS configuration and uses the required CA file for certificate verification.
+The CA path must be absolute and point to a readable, non-empty file.
+
+For DigitalOcean Managed PostgreSQL 18 Standard Edition, download the cluster
+CA certificate from the database's **Connection Details** page, save it in a
+private user-readable location, and use the displayed connection string without
+its TLS query parameters. Restart the daemon after changing the backend, URL,
+CA file, pool size, or timeouts. On Linux, the managed user-systemd launch sends
+`LCM_POSTGRES_URL` through `LoadCredential`; the non-secret CA pathname is
+propagated as a normal environment value. `lcm config get storage --effective`
+shows the CA path and tuning values but replaces the URL with `[REDACTED]`.
+
+PostgreSQL is remote-primary: once repository support is enabled, an outage is
+reported rather than silently switching the authoritative store to SQLite.
+Hook capture remains local through the SQLite outbox so events can be queued
+during daemon or database downtime and promoted after service recovery.
+
 ## Daemon safety
 
-The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon requests to loopback HTTP origins and known daemon routes, so a malformed config or caller cannot redirect daemon traffic to another host. Before sending a bearer token or request body, lifecycle checks require the PID file, `/health` PID and installed version, and exact `127.0.0.1` listener ownership to agree. An occupied port with missing or unverifiable identity is rejected rather than trusted. SessionSnapshot skips ingestion when bootstrap cannot verify that identity. PostToolUse also ignores payload-provided daemon ports and performs no network I/O.
+The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon requests to loopback HTTP origins and known daemon routes, so a malformed config or caller cannot redirect daemon traffic to another host. Before admitting a daemon for ordinary use, lifecycle checks require the PID file, `/health` PID, installed version, active storage backend, authenticated access, and exact `127.0.0.1` listener ownership to agree. An occupied port with missing or unverifiable identity is rejected rather than trusted. Daemons that predate backend identity are recognized as SQLite-only, so selecting PostgreSQL cannot silently reuse an existing SQLite process. During an explicit restart, the running daemon is authenticated by PID, installed version, listener ownership, and its local token without requiring it to already use the newly selected backend; the replacement must match the new backend. SessionSnapshot skips ingestion when bootstrap cannot verify daemon identity. PostToolUse also ignores payload-provided daemon ports and performs no network I/O.
 
 Use `lcm daemon start` to start or validate the managed background daemon. Use
 `lcm daemon restart` after configuration changes; it validates the new

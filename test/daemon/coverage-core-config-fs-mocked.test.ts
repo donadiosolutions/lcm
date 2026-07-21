@@ -18,6 +18,7 @@ beforeEach(() => {
   fsMocks.realpathSync.mockImplementation((path: string) => path);
   fsMocks.readFileSync.mockImplementation((path: string) => {
     if (path.endsWith("LCM_SUMMARY_API_KEY")) return "summary-key\n";
+    if (path.endsWith("LCM_POSTGRES_URL")) return "postgresql://credential\n";
     throw new Error(`missing credential: ${path}`);
   });
 });
@@ -38,10 +39,11 @@ describe("portable systemd credential configuration", () => {
 
     const resolved = resolveDaemonConfigEnv({
       CREDENTIALS_DIRECTORY: credentialDir,
-      LCM_SYSTEMD_CRED_IDS: "BAD, ANTHROPIC_API_KEY, LCM_SUMMARY_API_KEY, OPENAI_API_KEY",
+      LCM_SYSTEMD_CRED_IDS: "BAD, ANTHROPIC_API_KEY, LCM_POSTGRES_URL, LCM_SUMMARY_API_KEY, OPENAI_API_KEY",
     });
 
     expect(resolved.LCM_SUMMARY_API_KEY).toBe("summary-key");
+    expect(resolved.LCM_POSTGRES_URL).toBe("postgresql://credential");
     expect(resolved.ANTHROPIC_API_KEY).toBeUndefined();
     expect(resolved.OPENAI_API_KEY).toBeUndefined();
   });

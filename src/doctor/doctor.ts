@@ -51,6 +51,7 @@ function defaultDeps(): DoctorDeps {
 
 interface DoctorConfig {
   port: number;
+  storageBackend: "sqlite" | "postgresql";
   summarizer: string;
   apiMode?: string;
   reasoningEffort?: string;
@@ -103,10 +104,22 @@ function recoverConfiguredPort(content: string): number {
   }
 }
 
+function recoverConfiguredStorageBackend(content: string): "sqlite" | "postgresql" {
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return "sqlite";
+    const storage = (parsed as Record<string, unknown>).storage;
+    if (storage === null || typeof storage !== "object" || Array.isArray(storage)) return "sqlite";
+    return (storage as Record<string, unknown>).backend === "postgresql" ? "postgresql" : "sqlite";
+  } catch {
+    return "sqlite";
+  }
+}
+
 function loadConfig(deps: DoctorDeps): DoctorConfig {
   const resolvedConfigPath = configPath(deps.homedir);
   if (!deps.existsSync(resolvedConfigPath)) {
-    return { port: DEFAULT_DAEMON_PORT, summarizer: "disabled" };
+    return { port: DEFAULT_DAEMON_PORT, storageBackend: "sqlite", summarizer: "disabled" };
   }
 
   let content: string | undefined;
@@ -115,6 +128,7 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
     const config = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
     return {
       port: config.daemon.port,
+      storageBackend: config.storage.backend,
       summarizer: config.llm.provider,
       apiMode: config.llm.apiMode,
       reasoningEffort: config.llm.reasoningEffort,
@@ -128,6 +142,7 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
       : new ConfigValidationError("$", error instanceof Error ? error.message : String(error));
     return {
       port: typeof content === "string" ? recoverConfiguredPort(content) : DEFAULT_DAEMON_PORT,
+      storageBackend: typeof content === "string" ? recoverConfiguredStorageBackend(content) : "sqlite",
       summarizer: "disabled",
       validationError,
     };
@@ -472,14 +487,14 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     name: "stack",
     category: "Stack",
     status: "pass",
-    message: config.validationError
+    message: `Storage: ${config.storageBackend}; ` + (config.validationError
       ? `Summarizer: unavailable (${config.validationError.name}: ${config.validationError.message})`
       : config.summarizer === "auto"
       ? `Summarizer: auto (Claude->claude-process, Codex->codex-process); reasoning effort: ${config.reasoningEffort ?? "default"}; fast mode: ${config.fastMode ? "on" : "off"}`
       : `Summarizer: ${config.summarizer}${config.apiMode ? `; API mode: ${config.apiMode}` : ""}${config.reasoningEffort && config.summarizer !== "claude-process" && config.summarizer !== "codex-process" ? `; reasoning effort: ${config.reasoningEffort}` : ""}` +
         `${config.summarizer === "claude-process" || config.summarizer === "codex-process" ? `; reasoning effort: ${config.reasoningEffort ?? "default"}; fast mode: ${config.fastMode ? "on" : "off"}` : ""}` +
         `${config.requestTimeoutMs !== undefined ? `; timeout: ${config.requestTimeoutMs}ms` : ""}` +
-        `${config.retry ? `; retry: ${config.retry.maxAttempts} attempts, ${config.retry.initialDelayMs}-${config.retry.maxDelayMs}ms x${config.retry.multiplier}` : ""}`,
+        `${config.retry ? `; retry: ${config.retry.maxAttempts} attempts, ${config.retry.initialDelayMs}-${config.retry.maxDelayMs}ms x${config.retry.multiplier}` : ""}`),
   });
 
   // ── 1. Binary version ──
@@ -531,6 +546,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         pidFilePath,
         spawnTimeoutMs: 10000,
         expectedVersion: pkgVersion,
+        expectedStorageBackend: config.storageBackend,
         enforceUserManagerParent: true,
       });
       if (ensureResult.connected) daemonPid = ensureResult.pid;
@@ -619,6 +635,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         pidFilePath: daemonPidPath(deps.homedir),
         spawnTimeoutMs: 10000,
         expectedVersion: pkgVersion,
+        expectedStorageBackend: config.storageBackend,
         enforceUserManagerParent: true,
       });
       if (ensureResult.connected) {
