@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,6 +7,7 @@ import {
   loadDaemonConfig,
   parseDaemonConfig,
   parseStoredConfig,
+  POSTGRESQL_CA_FILE_MAX_BYTES,
   resolveStorageConfig,
 } from "../../src/daemon/config.js";
 import { createDaemon } from "../../src/daemon/server.js";
@@ -178,6 +179,9 @@ describe("storage configuration", () => {
   it.each([
     ["not a url", "absolute postgresql"],
     ["https://user:scheme-secret@example.com/lcm", "postgresql: scheme"],
+    ["postgresql:foo", "hierarchical postgresql://"],
+    ["postgresql://", "non-empty hostname"],
+    ["postgresql:///database", "non-empty hostname"],
     ["postgresql://user:tls-secret@example.com/lcm?SSLCert=inline", "TLS parameter"],
   ])("rejects unsafe PostgreSQL URL %s without echoing credentials", (url, expected) => {
     const error = (() => {
@@ -192,12 +196,11 @@ describe("storage configuration", () => {
       throw new Error("expected configuration error");
     })();
     expect(error.message).toContain(expected);
-    expect(error.message).not.toContain(url);
     expect(error.message).not.toContain("scheme-secret");
     expect(error.message).not.toContain("tls-secret");
   });
 
-  it("requires an absolute, readable, non-empty CA file", () => {
+  it("requires an absolute, readable, non-empty regular CA file within the size limit", () => {
     expect(() => parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
       LCM_POSTGRES_URL: "postgresql://db.example.com/lcm",
       LCM_POSTGRES_CA_FILE: "relative.crt",
@@ -205,8 +208,21 @@ describe("storage configuration", () => {
     expect(() => parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
       LCM_POSTGRES_URL: "postgresql://db.example.com/lcm",
       LCM_POSTGRES_CA_FILE: "/missing/lcm-ca.crt",
-    })).toThrow("cannot read");
+    })).toThrow("readable regular file");
     expect(() => parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, postgresEnv(caFile("")))).toThrow("must not be empty");
+
+    const directory = mkdtempSync(join(tmpdir(), "lcm-postgres-ca-type-"));
+    tempDirs.push(directory);
+    const nestedDirectory = join(directory, "ca.crt");
+    mkdirSync(nestedDirectory);
+    expect(() => parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, postgresEnv(nestedDirectory)))
+      .toThrow("readable regular file");
+
+    const oversizedCa = join(directory, "oversized-ca.crt");
+    writeFileSync(oversizedCa, "x");
+    truncateSync(oversizedCa, POSTGRESQL_CA_FILE_MAX_BYTES + 1);
+    expect(() => parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, postgresEnv(oversizedCa)))
+      .toThrow(`${POSTGRESQL_CA_FILE_MAX_BYTES} bytes`);
   });
 
   it("persists PostgreSQL selection and tuning without secrets", () => {

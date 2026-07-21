@@ -80,6 +80,10 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Reject executable directories containing the platform PATH delimiter before composing a restricted child-process `PATH`; otherwise one trusted path can inject additional search directories or the current directory.
 - Managed-daemon executable search paths must reject project containment before recognizing global-install or bundled-runtime anchors; a project-local `.codex`, `.claude`, or package-manager-shaped directory is untrusted. Never add `npx`, any `node_modules` directory, the current project or its checkout ancestors, or ambient `PATH` entries.
 - Diagnostics for a reused managed daemon must inspect that verified process's effective environment before using a deterministic startup fallback. Never reuse a PID from the initial health probe when lifecycle validation fails or throws.
+- Authenticate the managed daemon token and verify access before terminating a process whose storage backend does not match the requested backend. Bind that authentication to the exact PID ultimately signaled by revalidating the PID file and endpoint identity immediately before termination. Never kill a process based only on its PID, health response, or reported backend.
+- PostgreSQL connection URLs must be hierarchical and include a non-empty hostname; reject opaque forms even when the platform URL parser accepts them.
+- Configuration and CA-file preflight must accept only bounded regular files. Reject directories, FIFOs, devices, and oversized files before reading them.
+- Staged unsupported storage backends must fail closed on every daemon path, including stats and diagnostic paths that can bypass normal connection creation; never fall back silently to SQLite.
 
 ### GitHub Actions and CodeQL
 

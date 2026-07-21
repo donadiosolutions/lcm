@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfigValidationError } from "../../src/daemon/config.js";
+import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
 
 const state = vi.hoisted(() => ({
   exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
@@ -357,6 +358,12 @@ describe("runCli daemon-backed and utility actions", () => {
 });
 
 describe("runCli orchestration actions", () => {
+  it("refuses normal stats when the effective backend is unavailable", async () => {
+    state.loadConfig.mockReturnValueOnce({ storage: { backend: "postgresql" } });
+
+    await expect(runCli(["node", "lcm", "stats"])).rejects.toBeInstanceOf(StorageBackendUnavailableError);
+  });
+
   it.each([
     ["restore"], ["session-end", "--client", "codex"], ["user-prompt"], ["post-tool"],
     ["session-snapshot"], ["compact", "--hook", "--client", "claude"],

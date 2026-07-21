@@ -736,6 +736,34 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     cleanStalePid(opts.pidFilePath);
   }
 
+  async function terminateAuthenticatedDaemon(health: HealthResponse): Promise<boolean> {
+    const authenticatedPid = health.pid;
+    if (authenticatedPid === undefined || !endpointIdentityMatches(health)) return false;
+    if (!isLikelyLcmDaemonProcess(authenticatedPid, procRoot)) return false;
+    await terminatePid(authenticatedPid, { isAlive, killProcess, sleepFn });
+    const currentPid = readPidFile(opts.pidFilePath);
+    if (currentPid === authenticatedPid) cleanStalePid(opts.pidFilePath);
+    return currentPid === null || currentPid === authenticatedPid;
+  }
+
+  /** Stop backend transitions only after local-token access; retain legacy version-repair behavior. */
+  async function repairMismatchedDaemon(
+    health: HealthResponse,
+    identityMatches: boolean,
+    versionMatches: boolean,
+    storageBackendMatches: boolean,
+    hasAccess: boolean,
+  ): Promise<"none" | "terminated" | "blocked"> {
+    if (!identityMatches) return "none";
+    if (!versionMatches) {
+      await terminatePidFileProcess();
+      return "terminated";
+    }
+    if (storageBackendMatches) return "none";
+    if (!hasAccess) return "blocked";
+    return await terminateAuthenticatedDaemon(health) ? "terminated" : "blocked";
+  }
+
   async function daemonResult(
     health: HealthResponse | null,
     spawned: boolean,
@@ -807,37 +835,46 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const identityMatches = endpointIdentityMatches(health);
     const versionMatches = healthVersionMatches(health, expectedVersion);
     const storageBackendMatches = healthStorageBackendMatches(health, expectedStorageBackend);
-    const hasAccess = identityMatches && versionMatches && storageBackendMatches && initialAccessDeadline
+    const hasAccess = identityMatches && versionMatches && initialAccessDeadline
       ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, initialAccessDeadline)
       : false;
-    if (identityMatches && (!versionMatches || !storageBackendMatches)) {
-      await terminatePidFileProcess();
-    } else if (hasAccess) {
-      const accepted = await daemonResult(health, false, "existing", { alreadyVerified: true });
-      if (accepted) return accepted;
-      // A null result here can only be the verified wrong-parent case: health,
-      // access, and version were already accepted, while unavailable identity
-      // metadata returns a connected result with a warning.
-      const parent = inspectParent();
-      // Revalidate the authenticated endpoint and PID immediately before a
-      // signal; concurrent lifecycle operations may have replaced either.
-      if (endpointIdentityMatches(health)
-        && parent.available
-        && parent.pid !== undefined
-        && health.pid !== undefined
-        && parent.pid === health.pid
-        && isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
-        await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
-        restartedForParent = true;
+    const mismatchRepair = await repairMismatchedDaemon(
+      health,
+      identityMatches,
+      versionMatches,
+      storageBackendMatches,
+      hasAccess,
+    );
+    if (mismatchRepair === "blocked") {
+      return { connected: false, port: opts.port, spawned: false };
+    }
+    if (mismatchRepair === "none") {
+      if (hasAccess) {
+        const accepted = await daemonResult(health, false, "existing", { alreadyVerified: true });
+        if (accepted) return accepted;
+        // A null result here can only be the verified wrong-parent case: health,
+        // access, and version were already accepted, while unavailable identity
+        // metadata returns a connected result with a warning.
+        const parent = inspectParent();
+        // Revalidate the authenticated endpoint and PID immediately before a
+        // signal; concurrent lifecycle operations may have replaced either.
+        if (endpointIdentityMatches(health)
+          && parent.available
+          && parent.pid !== undefined
+          && health.pid !== undefined
+          && parent.pid === health.pid
+          && isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
+          await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
+          restartedForParent = true;
+        }
       }
-      cleanStalePid(opts.pidFilePath);
-    } else {
       cleanStalePid(opts.pidFilePath);
     }
   }
 
   // Step 2: Check PID file for stale process
   if (existsSync(opts.pidFilePath)) {
+    let repairedMismatch = false;
     try {
       const pid = parseInt(readFileSync(opts.pidFilePath, "utf-8").trim(), 10);
       if (!isNaN(pid) && isAlive(pid)) {
@@ -852,19 +889,28 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           const retryIdentityMatches = endpointIdentityMatches(retry);
           const retryVersionMatches = healthVersionMatches(retry, expectedVersion);
           const retryStorageBackendMatches = healthStorageBackendMatches(retry, expectedStorageBackend);
-          const retryHasAccess = retryIdentityMatches && retryVersionMatches && retryStorageBackendMatches && retryAccessDeadline
+          const retryHasAccess = retryIdentityMatches && retryVersionMatches && retryAccessDeadline
             ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, retryAccessDeadline)
             : false;
-          if (retryIdentityMatches && (!retryVersionMatches || !retryStorageBackendMatches)) {
-            await terminatePidFileProcess();
-          } else if (retryHasAccess) {
+          const mismatchRepair = await repairMismatchedDaemon(
+            retry,
+            retryIdentityMatches,
+            retryVersionMatches,
+            retryStorageBackendMatches,
+            retryHasAccess,
+          );
+          if (mismatchRepair === "blocked") {
+            return { connected: false, port: opts.port, spawned: false };
+          }
+          repairedMismatch = mismatchRepair === "terminated";
+          if (mismatchRepair === "none" && retryHasAccess) {
             const accepted = await daemonResult(retry, false, "existing", { alreadyVerified: true });
             if (accepted) {
               return accepted;
             }
           }
         }
-        if (enforceParent) {
+        if (enforceParent && !repairedMismatch) {
           const parent = inspectParent();
           if (parent.available && parent.pid !== undefined) {
             if (isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
@@ -875,7 +921,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         }
       }
     } catch { /* ignore */ }
-    cleanStalePid(opts.pidFilePath);
+    if (!repairedMismatch) cleanStalePid(opts.pidFilePath);
   }
 
   // Step 3: Spawn daemon (unless skipped for testing)

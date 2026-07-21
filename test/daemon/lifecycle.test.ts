@@ -247,13 +247,14 @@ describe("ensureDaemon", () => {
       LCM_POSTGRES_URL: "postgresql://user:secret@db.example.com/lcm",
       LCM_POSTGRES_CA_FILE: caFile,
     });
-    const fetchMock = vi.fn(async (url: string): Promise<Response> => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
       if (url.endsWith("/health")) {
         return {
           ok: true,
           json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 200 }),
         } as Response;
       }
+      expect(init?.headers).toEqual({ Authorization: "Bearer local-token" });
       return { ok: true, json: async () => ({}) } as Response;
     });
     const killMock = vi.fn();
@@ -276,7 +277,212 @@ describe("ensureDaemon", () => {
     expect(result.connected).toBe(false);
     expect(killMock).toHaveBeenCalledWith(200, "SIGTERM");
     expect(killMock).toHaveBeenCalledWith(200, "SIGKILL");
-    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/stats/pool"))).toBe(false);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/stats/pool"))).toBe(true);
+  });
+
+  it("does not terminate a backend-mismatched daemon when local-token authentication fails", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-storage-mismatch-auth-"));
+    tempDirs.push(tempDir);
+    const procRoot = join(tempDir, "proc");
+    mkdirSync(procRoot);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "200");
+    writeFileSync(join(tempDir, "daemon.token"), "wrong-token");
+    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+      if (url.endsWith("/health")) {
+        return {
+          ok: true,
+          json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 200 }),
+        } as Response;
+      }
+      expect(init?.headers).toEqual({ Authorization: "Bearer wrong-token" });
+      return { ok: false, status: 401, json: async () => ({ error: "unauthorized" }) } as Response;
+    });
+    const killMock = vi.fn();
+    const spawnMock = vi.fn();
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      expectedStorageBackend: "postgresql",
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+      _killOverride: killMock,
+      _sleepOverride: async (): Promise<void> => {},
+      _isProcessAliveOverride: (): boolean => true,
+      _procRoot: procRoot,
+      _listeningPortsOverride: (): number[] => [19999],
+    });
+
+    expect(result.connected).toBe(false);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/stats/pool"))).toBe(true);
+    expect(killMock).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(readFileSync(pidFile, "utf-8")).toBe("200");
+  });
+
+  it("does not terminate a replacement PID installed during backend-mismatch authentication", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-storage-mismatch-race-"));
+    tempDirs.push(tempDir);
+    const procRoot = join(tempDir, "proc");
+    mkdirSync(procRoot);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "200");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 201, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    const fetchMock = vi.fn(async (url: string): Promise<Response> => {
+      if (url.endsWith("/health")) {
+        return {
+          ok: true,
+          json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 200 }),
+        } as Response;
+      }
+      writeFileSync(pidFile, "201");
+      return { ok: true, json: async () => ({ totalConnections: 0 }) } as Response;
+    });
+    const killMock = vi.fn();
+    const spawnMock = vi.fn();
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      expectedStorageBackend: "postgresql",
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+      _killOverride: killMock,
+      _sleepOverride: async (): Promise<void> => {},
+      _isProcessAliveOverride: (): boolean => true,
+      _procRoot: procRoot,
+      _listeningPortsOverride: (): number[] => [19999],
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(killMock).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(readFileSync(pidFile, "utf-8")).toBe("201");
+  });
+
+  it("does not terminate a backend-mismatched listener whose PID is not an LCM daemon", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-storage-mismatch-process-"));
+    tempDirs.push(tempDir);
+    const procRoot = join(tempDir, "proc");
+    mkdirSync(procRoot);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "200");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node unrelated-server.js");
+    const fetchMock = vi.fn(async (url: string): Promise<Response> => url.endsWith("/health")
+      ? { ok: true, json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 200 }) } as Response
+      : { ok: true, json: async () => ({ totalConnections: 0 }) } as Response);
+    const killMock = vi.fn();
+    const spawnMock = vi.fn();
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      expectedStorageBackend: "postgresql",
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+      _killOverride: killMock,
+      _isProcessAliveOverride: (): boolean => true,
+      _procRoot: procRoot,
+      _listeningPortsOverride: (): number[] => [19999],
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(killMock).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(readFileSync(pidFile, "utf-8")).toBe("200");
+  });
+
+  it("signals only the authenticated PID when the PID file changes during termination", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-storage-mismatch-signal-race-"));
+    tempDirs.push(tempDir);
+    const procRoot = join(tempDir, "proc");
+    mkdirSync(procRoot);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "200");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 201, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    const fetchMock = vi.fn(async (url: string): Promise<Response> => url.endsWith("/health")
+      ? { ok: true, json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 200 }) } as Response
+      : { ok: true, json: async () => ({ totalConnections: 0 }) } as Response);
+    const killMock = vi.fn((pid: number): void => {
+      expect(pid).toBe(200);
+      writeFileSync(pidFile, "201");
+    });
+    const spawnMock = vi.fn();
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      expectedStorageBackend: "postgresql",
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+      _killOverride: killMock,
+      _sleepOverride: async (): Promise<void> => {},
+      _isProcessAliveOverride: (): boolean => true,
+      _procRoot: procRoot,
+      _listeningPortsOverride: (): number[] => [19999],
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(killMock).toHaveBeenCalled();
+    expect(killMock.mock.calls.every(([pid]) => pid === 200)).toBe(true);
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(readFileSync(pidFile, "utf-8")).toBe("201");
+  });
+
+  it("preserves a live PID when retry authentication rejects a backend mismatch", async (): Promise<void> => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-storage-mismatch-retry-auth-"));
+    tempDirs.push(tempDir);
+    const procRoot = join(tempDir, "proc");
+    mkdirSync(procRoot);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "200");
+    writeFileSync(join(tempDir, "daemon.token"), "wrong-token");
+    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 200 }),
+      } as Response)
+      .mockResolvedValueOnce({ ok: false, status: 401 } as Response);
+    const killMock = vi.fn();
+    const spawnMock = vi.fn();
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      expectedStorageBackend: "postgresql",
+      _fetchOverride: fetchMock as FetchOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+      _killOverride: killMock,
+      _sleepOverride: async (): Promise<void> => {},
+      _isProcessAliveOverride: (): boolean => true,
+      _procRoot: procRoot,
+      _listeningPortsOverride: (): number[] => [19999],
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(killMock).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(readFileSync(pidFile, "utf-8")).toBe("200");
   });
 
   it("terminates a PID-file daemon when retry health reports the wrong version", async (): Promise<void> => {

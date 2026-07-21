@@ -30,6 +30,7 @@ const mocks = vi.hoisted(() => {
     collectStats: vi.fn(),
     runDoctor: vi.fn(),
     formatResultsPlain: vi.fn(),
+    storageBackend: "sqlite" as "sqlite" | "postgresql",
   };
 });
 
@@ -50,7 +51,7 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
 }));
 vi.mock("../src/daemon/lifecycle.js", () => ({ ensureDaemon: mocks.ensureDaemon }));
 vi.mock("../src/daemon/config.js", () => ({
-  loadDaemonConfig: () => ({ daemon: { port: 4321 }, storage: { backend: "sqlite" } }),
+  loadDaemonConfig: () => ({ daemon: { port: 4321 }, storage: { backend: mocks.storageBackend } }),
 }));
 vi.mock("../src/daemon/client.js", () => ({
   DaemonClient: vi.fn().mockImplementation(function () { return { post: mocks.post }; }),
@@ -78,6 +79,7 @@ describe("MCP service coverage", () => {
     mocks.handlers.clear();
     mocks.ensureDaemon.mockResolvedValue({ connected: true, port: 4321, spawned: false });
     mocks.post.mockResolvedValue({ ok: true });
+    mocks.storageBackend = "sqlite";
     await startMcpServer();
   });
 
@@ -142,6 +144,16 @@ describe("MCP service coverage", () => {
     expect(result.content[0].text).toContain("## Per Conversation");
     expect(result.content[0].text).toContain("6 total");
     expect(result.content[0].text).not.toContain("ignored");
+  });
+
+  it("refuses local stats when the effective backend is unavailable", async () => {
+    mocks.storageBackend = "postgresql";
+
+    await expect(call("lcm_stats")).resolves.toMatchObject({
+      isError: true,
+      content: [{ text: expect.stringContaining("postgresql storage backend is not available") }],
+    });
+    expect(mocks.collectStats).not.toHaveBeenCalled();
   });
 
   it("formats zero-token, zero-ratio, empty-detail and zero-redaction stats branches", async () => {

@@ -29,6 +29,8 @@ const TOOL_ROUTES: Record<string, string> = {
 
 const LOCAL_TOOLS: Record<string, (args: Record<string, unknown>) => Promise<string>> = {
   lcm_stats: async (args) => {
+    const { selectStorageBackend } = await import("../storage/backend.js");
+    selectStorageBackend(loadDaemonConfig(defaultConfigPath()).storage);
     const { collectStats, formatNumber } = await import("../stats.js");
     const stats = collectStats();
     const verbose = args.verbose === true;

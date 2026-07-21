@@ -1,6 +1,7 @@
 import { readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
+import { readBoundedRegularFile } from "../security-files.js";
 import { sanitizeUrlForDisplay } from "../url-display.js";
 
 export { sanitizeUrlForDisplay } from "../url-display.js";
@@ -84,6 +85,9 @@ export const DEFAULT_DAEMON_PORT = 3737;
 
 export const STORAGE_BACKENDS = ["sqlite", "postgresql"] as const;
 export type StorageBackend = typeof STORAGE_BACKENDS[number];
+
+/** Maximum accepted PostgreSQL CA bundle size (1 MiB). */
+export const POSTGRESQL_CA_FILE_MAX_BYTES = 1024 * 1024;
 
 export interface PostgreSqlStorageSettings {
   poolMax: number;
@@ -885,6 +889,12 @@ export function resolveStorageConfig(
   if (parsedUrl.protocol !== "postgresql:") {
     throw new ConfigValidationError("LCM_POSTGRES_URL", "must use the postgresql: scheme");
   }
+  if (!url.toLowerCase().startsWith("postgresql://") || parsedUrl.hostname === "") {
+    throw new ConfigValidationError(
+      "LCM_POSTGRES_URL",
+      "must use hierarchical postgresql:// form with a non-empty hostname",
+    );
+  }
   const forbiddenTlsParameter = [...parsedUrl.searchParams.keys()]
     .find((key) => key.toLowerCase().startsWith("ssl"));
   if (forbiddenTlsParameter !== undefined) {
@@ -896,13 +906,20 @@ export function resolveStorageConfig(
   if (!isAbsolute(caFile)) {
     throw new ConfigValidationError("LCM_POSTGRES_CA_FILE", `must be an absolute path, received ${JSON.stringify(caFile)}`);
   }
-  let caContents: Buffer;
+  let caContents: string;
   try {
-    caContents = readFileSync(caFile);
+    const resolvedCaFile = realpathSync(caFile);
+    caContents = readBoundedRegularFile(resolvedCaFile, {
+      allowedRoot: dirname(resolvedCaFile),
+      maxBytes: POSTGRESQL_CA_FILE_MAX_BYTES,
+    });
   } catch {
-    throw new ConfigValidationError("LCM_POSTGRES_CA_FILE", `cannot read ${JSON.stringify(caFile)}`);
+    throw new ConfigValidationError(
+      "LCM_POSTGRES_CA_FILE",
+      `must resolve to a readable regular file no larger than ${POSTGRESQL_CA_FILE_MAX_BYTES} bytes: ${JSON.stringify(caFile)}`,
+    );
   }
-  if (caContents.length === 0) {
+  if (Buffer.byteLength(caContents) === 0) {
     throw new ConfigValidationError("LCM_POSTGRES_CA_FILE", `must not be empty: ${JSON.stringify(caFile)}`);
   }
 
