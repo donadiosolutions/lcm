@@ -6,12 +6,22 @@ import { homedir } from "node:os";
 import { NATIVE_PATTERNS, ScrubEngine, readGitleaksSyncDate } from "./scrub.js";
 import { GITLEAKS_PATTERNS } from "./generated-patterns.js";
 import { projectDir } from "./daemon/project.js";
-import { loadDaemonConfig } from "./daemon/config.js";
+import { loadStoredConfigProjection } from "./config-projection.js";
+import { selectStorageBackend } from "./storage/backend.js";
 import { validateRegex } from "./store/regex-safety.js";
 import { configPath as runtimeConfigPath, projectsDir as runtimeProjectsDir } from "./runtime-paths.js";
 
 function defaultConfigPath(): string {
   return runtimeConfigPath();
+}
+
+function loadGlobalUserPatterns(configPath: string): string[] {
+  try {
+    return loadStoredConfigProjection(configPath).security.sensitivePatterns;
+  } catch {
+    // Pattern inspection remains available when persisted configuration is invalid.
+    return [];
+  }
 }
 
 export async function handleSensitive(
@@ -36,7 +46,7 @@ export async function handleSensitive(
       return sensitiveTest(argv.slice(1), cwd, resolvedConfigPath);
     }
     case "purge": {
-      return sensitivePurge(argv.slice(1), cwd);
+      return sensitivePurge(argv.slice(1), cwd, resolvedConfigPath);
     }
     default: {
       return {
@@ -52,13 +62,7 @@ async function sensitiveList(
   cwd: string,
   configPath: string,
 ): Promise<{ exitCode: number; stdout: string }> {
-  let globalUserPatterns: string[] = [];
-  try {
-    const config = loadDaemonConfig(configPath);
-    globalUserPatterns = config.security?.sensitivePatterns ?? [];
-  } catch {
-    // config may not exist yet
-  }
+  const globalUserPatterns = loadGlobalUserPatterns(configPath);
 
   const patternsFile = join(projectDir(cwd), "sensitive-patterns.txt");
   const projectPatterns = await ScrubEngine.loadProjectPatterns(patternsFile);
@@ -230,13 +234,7 @@ async function sensitiveTest(
     };
   }
 
-  let globalUserPatterns: string[] = [];
-  try {
-    const config = loadDaemonConfig(configPath);
-    globalUserPatterns = config.security?.sensitivePatterns ?? [];
-  } catch {
-    // config may not exist yet
-  }
+  const globalUserPatterns = loadGlobalUserPatterns(configPath);
   const patternsFile = join(projectDir(cwd), "sensitive-patterns.txt");
   const engine = await ScrubEngine.forProject(globalUserPatterns, projectDir(cwd));
 
@@ -302,6 +300,7 @@ async function sensitiveTest(
 async function sensitivePurge(
   args: string[],
   cwd: string,
+  configPath: string,
 ): Promise<{ exitCode: number; stdout: string }> {
   const hasYes = args.includes("--yes");
   const purgeAll = args.includes("--all");
@@ -315,6 +314,8 @@ async function sensitivePurge(
         "  lcm sensitive purge --all --yes      (all projects)\n",
     };
   }
+
+  selectStorageBackend(loadStoredConfigProjection(configPath).storage);
 
   if (purgeAll) {
     const allProjectsDir = runtimeProjectsDir();

@@ -44,6 +44,23 @@ describe("handleSessionStart", () => {
     }
   });
 
+  it("treats an unavailable PostgreSQL backend as a benign hook miss", async () => {
+    const post = vi.fn();
+    await expect(handleSessionStart("{}", { post }, 3737, {
+      backend: "postgresql",
+    })).resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("fails open when daemon admission throws", async () => {
+    mockEnsureDaemon.mockRejectedValueOnce(new Error("admission failed"));
+    await expect(handleSessionStart("{}", { post: vi.fn() })).resolves.toEqual({
+      exitCode: 0,
+      stdout: "",
+    });
+  });
+
   it("outputs context and exits 0 on success", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const client = {

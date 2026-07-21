@@ -8,6 +8,7 @@ import {
   migrateLegacyHomeIfNeeded,
   tmpDir as lcmTmpDir,
 } from "./runtime-paths.js";
+import { selectStorageBackend } from "./storage/backend.js";
 
 export interface EnsureCoreDeps {
   configPath: string;
@@ -21,6 +22,7 @@ export interface EnsureCoreDeps {
     port: number;
     pidFilePath: string;
     spawnTimeoutMs: number;
+    expectedStorageBackend?: "sqlite" | "postgresql";
     enforceUserManagerParent?: boolean;
   }) => Promise<{ connected: boolean }>;
 }
@@ -73,10 +75,12 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
 
   // 3. Start daemon if not running
   const config = loadDaemonConfig(deps.configPath);
+  selectStorageBackend(config.storage);
   const result = await deps.ensureDaemon({
     port: config.daemon.port,
     pidFilePath: join(dirname(deps.configPath), "daemon.pid"),
     spawnTimeoutMs: 5000,
+    expectedStorageBackend: config.storage.backend,
     enforceUserManagerParent: true,
   });
   return { connected: result.connected, port: config.daemon.port };

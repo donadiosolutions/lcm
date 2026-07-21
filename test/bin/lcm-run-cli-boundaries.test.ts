@@ -11,6 +11,7 @@ const state = vi.hoisted(() => ({
   health: vi.fn(async () => true),
   loadConfig: vi.fn(() => ({
     daemon: { port: 3737 },
+    storage: { backend: "sqlite" },
     llm: {
       provider: "openai", apiMode: "responses", requestTimeoutMs: 1000,
       retry: { maxAttempts: 2, initialDelayMs: 1, maxDelayMs: 2, multiplier: 2 },
@@ -172,6 +173,7 @@ beforeEach(() => {
   state.restartDaemon.mockResolvedValue({ connected: true, restarted: true, spawned: false, pid: 42 });
   state.loadConfig.mockReturnValue({
     daemon: { port: 3737 },
+    storage: { backend: "sqlite" },
     llm: { provider: "openai", apiMode: "responses", requestTimeoutMs: 1000, retry: { maxAttempts: 2, initialDelayMs: 1, maxDelayMs: 2, multiplier: 2 } },
     compaction: { autoCompactMinTokens: 1 },
   });
@@ -354,6 +356,7 @@ describe("runCli lifecycle and connector boundaries", () => {
     const actions = await captureRunCliActions();
     state.loadConfig.mockReturnValue({
       daemon: undefined,
+      storage: { backend: "sqlite" },
       llm: { provider: "auto", apiMode: "responses", requestTimeoutMs: 1000, retry: { maxAttempts: 2, initialDelayMs: 1, maxDelayMs: 2, multiplier: 2 } },
       compaction: { autoCompactMinTokens: 1 },
     });

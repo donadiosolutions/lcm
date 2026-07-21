@@ -30,6 +30,8 @@ const mocks = vi.hoisted(() => {
     collectStats: vi.fn(),
     runDoctor: vi.fn(),
     formatResultsPlain: vi.fn(),
+    storageBackend: "sqlite" as "sqlite" | "postgresql",
+    configError: undefined as unknown,
   };
 });
 
@@ -49,7 +51,12 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
   StdioServerTransport: vi.fn().mockImplementation(function () { return {}; }),
 }));
 vi.mock("../src/daemon/lifecycle.js", () => ({ ensureDaemon: mocks.ensureDaemon }));
-vi.mock("../src/daemon/config.js", () => ({ loadDaemonConfig: () => ({ daemon: { port: 4321 } }) }));
+vi.mock("../src/daemon/config.js", () => ({
+  loadDaemonConfig: () => {
+    if (mocks.configError !== undefined) throw mocks.configError;
+    return { daemon: { port: 4321 }, storage: { backend: mocks.storageBackend } };
+  },
+}));
 vi.mock("../src/daemon/client.js", () => ({
   DaemonClient: vi.fn().mockImplementation(function () { return { post: mocks.post }; }),
 }));
@@ -64,6 +71,8 @@ vi.mock("../src/doctor/doctor.js", () => ({ runDoctor: mocks.runDoctor, formatRe
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { getMcpToolDefinitions, handleDaemonRequest, startMcpServer } from "../src/mcp/server.js";
 
+const SQLITE_STORAGE = { backend: "sqlite" as const };
+
 async function call(name: string, args?: unknown): Promise<Required<Pick<McpHandlerResult, "content">> & McpHandlerResult> {
   const result = await mocks.handlers.get(CallToolRequestSchema)!({ params: { name, arguments: args } });
   if (!result.content) throw new Error(`MCP tool ${name} returned no content`);
@@ -76,6 +85,8 @@ describe("MCP service coverage", () => {
     mocks.handlers.clear();
     mocks.ensureDaemon.mockResolvedValue({ connected: true, port: 4321, spawned: false });
     mocks.post.mockResolvedValue({ ok: true });
+    mocks.storageBackend = "sqlite";
+    mocks.configError = undefined;
     await startMcpServer();
   });
 
@@ -115,6 +126,30 @@ describe("MCP service coverage", () => {
     }
   });
 
+  it("reloads and preflights storage before every routed daemon call", async () => {
+    await expect(call("lcm_search", { query: "sqlite" })).resolves.not.toMatchObject({ isError: true });
+    expect(mocks.post).toHaveBeenCalledOnce();
+
+    mocks.storageBackend = "postgresql";
+    await expect(call("lcm_search", { query: "postgresql" })).resolves.toMatchObject({
+      isError: true,
+      content: [{ text: expect.stringContaining("postgresql storage backend is not available") }],
+    });
+    expect(mocks.post).toHaveBeenCalledOnce();
+    expect(mocks.ensureDaemon).toHaveBeenCalledOnce();
+  });
+
+  it("returns a structured error when per-call config resolution fails", async () => {
+    mocks.configError = new Error("LCM_POSTGRES_URL is required");
+
+    await expect(call("lcm_search", { query: "unavailable" })).resolves.toMatchObject({
+      isError: true,
+      content: [{ text: "lcm error: LCM_POSTGRES_URL is required" }],
+    });
+    expect(mocks.post).not.toHaveBeenCalled();
+    expect(mocks.ensureDaemon).toHaveBeenCalledOnce();
+  });
+
   it("formats all local stats branches", async () => {
     mocks.collectStats.mockReturnValue({
       projects: 2,
@@ -140,6 +175,16 @@ describe("MCP service coverage", () => {
     expect(result.content[0].text).toContain("## Per Conversation");
     expect(result.content[0].text).toContain("6 total");
     expect(result.content[0].text).not.toContain("ignored");
+  });
+
+  it("refuses local stats when the effective backend is unavailable", async () => {
+    mocks.storageBackend = "postgresql";
+
+    await expect(call("lcm_stats")).resolves.toMatchObject({
+      isError: true,
+      content: [{ text: expect.stringContaining("postgresql storage backend is not available") }],
+    });
+    expect(mocks.collectStats).not.toHaveBeenCalled();
   });
 
   it("formats zero-token, zero-ratio, empty-detail and zero-redaction stats branches", async () => {
@@ -193,7 +238,7 @@ describe("MCP service coverage", () => {
     mocks.ensureDaemon.mockImplementationOnce(() => new Promise((resolve) => { release = () => resolve({}); }));
     const clientA = { post: vi.fn().mockRejectedValueOnce(new TypeError("offline")).mockResolvedValue({ a: 1 }) };
     const clientB = { post: vi.fn().mockRejectedValueOnce(new TypeError("offline")).mockResolvedValue({ b: 2 }) };
-    const opts = { port: 9876, pidFilePath: "/tmp/pid", spawnArgs: ["daemon", "start"], _ensureDaemon: mocks.ensureDaemon };
+    const opts = { port: 9876, pidFilePath: "/tmp/pid", storage: SQLITE_STORAGE, spawnArgs: ["daemon", "start"], _ensureDaemon: mocks.ensureDaemon };
     const first = handleDaemonRequest(clientA, "/search", {}, opts);
     const second = handleDaemonRequest(clientB, "/search", {}, opts);
     await vi.waitFor(() => expect(mocks.ensureDaemon).toHaveBeenCalledOnce());
@@ -208,28 +253,28 @@ describe("MCP service coverage", () => {
     for (const [index, spawnArgs] of variants.entries()) {
       const ensure = vi.fn().mockResolvedValue({});
       const client = { post: vi.fn().mockRejectedValueOnce(new TypeError("offline")).mockResolvedValue({}) };
-      await handleDaemonRequest(client, "/search", {}, { port: 20_000 + index, pidFilePath: "/tmp/pid", spawnArgs, _ensureDaemon: ensure });
+      await handleDaemonRequest(client, "/search", {}, { port: 20_000 + index, pidFilePath: "/tmp/pid", storage: SQLITE_STORAGE, spawnArgs, _ensureDaemon: ensure });
     }
   });
 
   it("stringifies non-Error request failures on initial and retry attempts", async () => {
     const direct = { post: vi.fn().mockRejectedValue("direct") };
-    expect((await handleDaemonRequest(direct, "/x", {}, { port: 1, pidFilePath: "x" })).content[0].text).toContain("direct");
+    expect((await handleDaemonRequest(direct, "/x", {}, { port: 1, pidFilePath: "x", storage: SQLITE_STORAGE })).content[0].text).toContain("direct");
 
     const retried = { post: vi.fn().mockRejectedValueOnce(new TypeError("offline")).mockRejectedValueOnce("retry") };
     expect((await handleDaemonRequest(retried, "/x", {}, {
-      port: 2, pidFilePath: "x", _ensureDaemon: vi.fn().mockResolvedValue({}),
+      port: 2, pidFilePath: "x", storage: SQLITE_STORAGE, _ensureDaemon: vi.fn().mockResolvedValue({}),
     })).content[0].text).toContain("retry");
   });
 
   it("formats Error failures, uses default restart, tolerates restart failure, and falls back to cwd", async () => {
     const direct = { post: vi.fn().mockRejectedValue(new Error("direct error")) };
-    expect((await handleDaemonRequest(direct, "/x", {}, { port: 11, pidFilePath: "x" })).content[0].text)
+    expect((await handleDaemonRequest(direct, "/x", {}, { port: 11, pidFilePath: "x", storage: SQLITE_STORAGE })).content[0].text)
       .toContain("direct error");
 
     const retried = { post: vi.fn().mockRejectedValueOnce(new TypeError("offline")).mockRejectedValueOnce(new Error("retry error")) };
     expect((await handleDaemonRequest(retried, "/x", {}, {
-      port: 12, pidFilePath: "x", _ensureDaemon: vi.fn().mockRejectedValue(new Error("spawn error")),
+      port: 12, pidFilePath: "x", storage: SQLITE_STORAGE, _ensureDaemon: vi.fn().mockRejectedValue(new Error("spawn error")),
     })).content[0].text).toContain("retry error");
 
     const previousPwd = process.env.PWD;

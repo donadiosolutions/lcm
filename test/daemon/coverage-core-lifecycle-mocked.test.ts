@@ -54,7 +54,7 @@ describe("mocked systemd credential boundaries", () => {
     Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
     try {
       const result = await ensureDaemon(base());
-      expect(result.warning).toContain("current user id is unavailable");
+      expect(result.warning).toContain("credential setup error: process reported a failure");
     } finally {
       if (descriptor) Object.defineProperty(process, "getuid", descriptor);
     }
@@ -64,7 +64,7 @@ describe("mocked systemd credential boundaries", () => {
     process.env.ANTHROPIC_API_KEY = "secret";
     fs.stat.mockReturnValue({ isDirectory: () => false, mtimeMs: 0 });
     const result = await ensureDaemon(base());
-    expect(result.warning).toContain("is not a directory");
+    expect(result.warning).toContain("credential setup error: process reported a failure");
   });
 
   it("cleans a partially created credential directory after write failure", async () => {
@@ -78,7 +78,7 @@ describe("mocked systemd credential boundaries", () => {
       if (path.includes("lcm-systemd-credentials-test")) throw "write failed";
     });
     const result = await ensureDaemon(base());
-    expect(result.warning).toContain("write failed");
+    expect(result.warning).toContain("credential setup error: process reported a failure");
     expect(fs.rm).toHaveBeenCalledWith("/run/user/1000/lcm-systemd-credentials-test", { recursive: true, force: true });
   });
 
@@ -86,7 +86,7 @@ describe("mocked systemd credential boundaries", () => {
     process.env.ANTHROPIC_API_KEY = "secret";
     fs.mkdtemp.mockImplementation(() => { throw new Error("mkdir failed"); });
     const result = await ensureDaemon(base());
-    expect(result.warning).toContain("mkdir failed");
+    expect(result.warning).toContain("credential setup error: process reported a failure");
     expect(fs.rm).not.toHaveBeenCalledWith("/run/user/1000/lcm-systemd-credentials-test", expect.anything());
   });
 
@@ -130,7 +130,7 @@ describe("mocked systemd credential boundaries", () => {
       ...base(),
       _spawnSyncOverride: vi.fn(() => { throw new Error("systemd error"); }) as never,
     });
-    expect(result.warning).toContain("systemd error");
+    expect(result.warning).toContain("systemd start exception: process reported a failure");
   });
 
   it("does not terminate when a verified retry PID changes identity before signaling", async () => {

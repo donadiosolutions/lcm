@@ -28,10 +28,10 @@ export async function dispatchHook(
     return handlePostToolUse(stdinText);
   }
 
-  // Skip bootstrap for compact — the daemon is already running by the time
-  // PreCompact fires (SessionStart ensures it). Skipping saves ~5s of
-  // ensureDaemon timeout budget under the hook runner's tight deadline.
-  if (command !== "compact") {
+  // Skip bootstrap for compact because SessionStart already ensured the daemon.
+  // UserPromptSubmit owns its ordering: persist the local SQLite outbox first,
+  // then preflight storage and ensure the daemon from inside its handler.
+  if (command !== "compact" && command !== "user-prompt") {
     // Lazy bootstrap: create config + start daemon on first hook fire per session
     try {
       const { session_id } = JSON.parse(stdinText || "{}");
@@ -60,25 +60,25 @@ export async function dispatchHook(
   }
 
   const { DaemonClient } = await import("../daemon/client.js");
-  const { loadDaemonConfig } = await import("../daemon/config.js");
+  const { loadHookConfig } = await import("./config.js");
   const { join } = await import("node:path");
   const { homedir } = await import("node:os");
-  const config = loadDaemonConfig(defaultConfigPath());
-  const port = config.daemon?.port ?? 3737;
+  const config = loadHookConfig(defaultConfigPath());
+  const port = config.daemonPort;
   const client = new DaemonClient(`http://127.0.0.1:${port}`);
 
   switch (command) {
     case "compact": {
       const { handlePreCompact } = await import("./compact.js");
-      return handlePreCompact(stdinText, client, port);
+      return handlePreCompact(stdinText, client, port, config.storage);
     }
     case "restore": {
       const { handleSessionStart } = await import("./restore.js");
-      return handleSessionStart(stdinText, client, port);
+      return handleSessionStart(stdinText, client, port, config.storage);
     }
     case "session-end": {
       const { handleSessionEnd } = await import("./session-end.js");
-      return handleSessionEnd(stdinText, client, port);
+      return handleSessionEnd(stdinText, client, port, config.storage);
     }
     case "session-snapshot": {
       const { handleSessionSnapshot } = await import("./session-snapshot.js");
@@ -88,7 +88,7 @@ export async function dispatchHook(
     }
     case "user-prompt": {
       const { handleUserPromptSubmit } = await import("./user-prompt.js");
-      return handleUserPromptSubmit(stdinText, client, port);
+      return handleUserPromptSubmit(stdinText, client, port, config.storage);
     }
     default:
       throw new Error(`Unknown hook command: ${command}`);

@@ -4,7 +4,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { DaemonClient } from "../daemon/client.js";
-import { loadDaemonConfig } from "../daemon/config.js";
+import { loadDaemonConfig, type ResolvedStorageConfig } from "../daemon/config.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
 import { configPath as defaultConfigPath, daemonPidPath } from "../runtime-paths.js";
 import { PKG_VERSION } from "../daemon/version.js";
@@ -16,6 +16,7 @@ import { lcmSearchTool } from "./tools/lcm-search.js";
 import { lcmStoreTool } from "./tools/lcm-store.js";
 import { lcmStatsTool } from "./tools/lcm-stats.js";
 import { lcmDoctorTool } from "./tools/lcm-doctor.js";
+import { selectStorageBackend } from "../storage/backend.js";
 
 const TOOLS = [lcmGrepTool, lcmExpandTool, lcmDescribeTool, lcmSearchTool, lcmStoreTool, lcmStatsTool, lcmDoctorTool];
 
@@ -29,6 +30,7 @@ const TOOL_ROUTES: Record<string, string> = {
 
 const LOCAL_TOOLS: Record<string, (args: Record<string, unknown>) => Promise<string>> = {
   lcm_stats: async (args) => {
+    selectStorageBackend(loadDaemonConfig(defaultConfigPath()).storage);
     const { collectStats, formatNumber } = await import("../stats.js");
     const stats = collectStats();
     const verbose = args.verbose === true;
@@ -132,6 +134,7 @@ export function getMcpToolDefinitions() { return TOOLS; }
 export type DaemonRequestOpts = {
   port: number;
   pidFilePath: string;
+  storage: ResolvedStorageConfig;
   spawnCommand?: string;
   spawnArgs?: string[];
   expectedVersion?: string;
@@ -141,6 +144,10 @@ export type DaemonRequestOpts = {
 /** Returns true if the error is a network/connection failure (not a daemon HTTP error). */
 function isNetworkError(err: unknown): boolean {
   return err instanceof TypeError;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /**
@@ -164,14 +171,18 @@ export async function handleDaemonRequest(
   body: Record<string, unknown>,
   opts: DaemonRequestOpts,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
+  try {
+    selectStorageBackend(opts.storage);
+  } catch (err) {
+    return { content: [{ type: "text", text: `lcm error: ${errorMessage(err)}` }], isError: true };
+  }
   let result: unknown;
   try {
     result = await client.post(route, body);
   } catch (err) {
     // Only retry on network/connection errors, not daemon HTTP errors (4xx/5xx)
     if (!isNetworkError(err)) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { content: [{ type: "text", text: `lcm error: ${msg}` }], isError: true };
+      return { content: [{ type: "text", text: `lcm error: ${errorMessage(err)}` }], isError: true };
     }
     // Daemon crashed — attempt auto-restart then retry once.
     // Coalesce concurrent restart attempts so only one ensureDaemon() runs per port.
@@ -180,6 +191,7 @@ export async function handleDaemonRequest(
       const p = ensure({
         port: opts.port, pidFilePath: opts.pidFilePath, spawnTimeoutMs: 10000,
         expectedVersion: opts.expectedVersion,
+        expectedStorageBackend: opts.storage.backend,
         spawnCommand: opts.spawnCommand,
         spawnArgs: foregroundDaemonStartArgs(opts.spawnArgs),
         enforceUserManagerParent: true,
@@ -192,8 +204,7 @@ export async function handleDaemonRequest(
     try {
       result = await client.post(route, body);
     } catch (retryErr) {
-      const msg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-      return { content: [{ type: "text", text: `lcm daemon unavailable: ${msg}` }], isError: true };
+      return { content: [{ type: "text", text: `lcm daemon unavailable: ${errorMessage(retryErr)}` }], isError: true };
     }
   }
   return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -201,6 +212,7 @@ export async function handleDaemonRequest(
 
 export async function startMcpServer(): Promise<void> {
   const config = loadDaemonConfig(defaultConfigPath());
+  selectStorageBackend(config.storage);
   const port = config.daemon.port;
   const pidFilePath = daemonPidPath();
 
@@ -208,6 +220,7 @@ export async function startMcpServer(): Promise<void> {
   const daemon = await ensureDaemon({
     port, pidFilePath, spawnTimeoutMs: 10000,
     expectedVersion: PKG_VERSION,
+    expectedStorageBackend: config.storage.backend,
     spawnCommand: process.execPath,
     spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
     enforceUserManagerParent: true,
@@ -253,11 +266,18 @@ export async function startMcpServer(): Promise<void> {
     const route = TOOL_ROUTES[req.params.name];
     if (!route) return { content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }], isError: true };
     const body = { ...filteredArgs, cwd: process.env.PWD ?? process.cwd() };
+    let requestConfig: ReturnType<typeof loadDaemonConfig>;
+    try {
+      requestConfig = loadDaemonConfig(defaultConfigPath());
+    } catch (err) {
+      return { content: [{ type: "text", text: `lcm error: ${errorMessage(err)}` }], isError: true };
+    }
     return handleDaemonRequest(client, route, body, {
       port, pidFilePath,
       spawnCommand: process.execPath,
       spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
       expectedVersion: PKG_VERSION,
+      storage: requestConfig.storage,
     });
   });
 

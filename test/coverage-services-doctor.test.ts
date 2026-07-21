@@ -600,11 +600,19 @@ describe("doctor service coverage", () => {
     [JSON.stringify({ daemon: { port: 1.5 } }), 3737],
     [JSON.stringify({ daemon: { port: 0 } }), 3737],
     [JSON.stringify({ daemon: { port: 65536 } }), 3737],
+    [JSON.stringify({ daemon: { port: 4545 }, storage: { backend: "invalid" } }), 4545],
     ["{bad", 3737],
-  ])("recovers malformed config port from %s", async (configText, expectedPort) => {
-    const results = await runDoctor(makeDeps({ configText }));
+  ])("observes but does not repair from malformed config %s", async (configText, expectedPort) => {
+    const deps = makeDeps({ configText });
+    const results = await runDoctor(deps);
     expect(results.find((result) => result.name === "config")?.status).toBe("fail");
-    expect(mocks.ensureDaemon).toHaveBeenLastCalledWith(expect.objectContaining({ port: expectedPort }));
+    expect(results.find((result) => result.name === "daemon")).toMatchObject({
+      status: "fail",
+      fixApplied: false,
+      message: expect.stringContaining("automatic start skipped because config is invalid"),
+    });
+    expect(deps.fetch).toHaveBeenCalledWith(`http://127.0.0.1:${expectedPort}/health`);
+    expect(mocks.ensureDaemon).not.toHaveBeenCalled();
   });
 
   it("wraps Error and non-Error config read failures and package failures", async () => {

@@ -85,6 +85,8 @@ describe("config manager paths and values", () => {
       list: [{ access_token: "[REDACTED]", value: 1 }],
     });
     expect(maskConfigSecrets("one", ["llm", "apiKey"])).toBe("[REDACTED]");
+    expect(maskConfigSecrets("postgresql://user:password@db.example.com/lcm", ["storage", "postgresql", "url"]))
+      .toBe("[REDACTED]");
   });
 
   it("sanitizes credentials and private URL components in direct and nested baseUrl values", () => {
@@ -213,6 +215,35 @@ describe("getConfigValue", () => {
     const output = JSON.stringify(object);
     for (const secret of [...secrets, "effective-api-key"]) expect(output).not.toContain(secret);
     expect(output).toContain("REDACTED");
+  });
+
+  it("redacts the PostgreSQL URL but preserves non-secret effective storage values", () => {
+    const { directory, configPath } = makeConfig({ storage: { backend: "postgresql" } });
+    const caPath = join(directory, "postgres-ca.crt");
+    writeFileSync(caPath, "trusted-ca");
+    const storage = getConfigValue({
+      configPath,
+      path: "storage",
+      effective: true,
+      env: {
+        LCM_POSTGRES_URL: " \npostgresql://effective-user:effective-password@db.example.com/lcm\t ",
+        LCM_POSTGRES_CA_FILE: ` \n${caPath}\t `,
+      },
+    });
+    expect(storage).toMatchObject({
+      backend: "postgresql",
+      postgresql: { url: "[REDACTED]", caFile: caPath, poolMax: 5 },
+    });
+    expect(getConfigValue({
+      configPath,
+      path: "storage.postgresql.url",
+      effective: true,
+      env: {
+        LCM_POSTGRES_URL: " \npostgresql://effective-user:effective-password@db.example.com/lcm\t ",
+        LCM_POSTGRES_CA_FILE: ` \n${caPath}\t `,
+      },
+    })).toBe("[REDACTED]");
+    expect(JSON.stringify(storage)).not.toContain("effective-password");
   });
 
   it("masks sensitive extension fields in whole-object reads", () => {

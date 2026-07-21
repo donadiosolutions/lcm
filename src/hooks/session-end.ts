@@ -8,6 +8,8 @@ import { Buffer } from "node:buffer";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
 import { configPath as defaultConfigPath, daemonPidPath, daemonTokenPath } from "../runtime-paths.js";
 import { readAuthToken } from "../daemon/auth.js";
+import type { StorageBackendSelection } from "../storage/backend.js";
+import { selectStorageBackend } from "../storage/backend.js";
 
 function getDaemonToken(): string | null {
   return readAuthToken(daemonTokenPath());
@@ -87,15 +89,23 @@ export async function handleSessionEnd(
   stdin: string,
   client: DaemonClient,
   port?: number,
+  storage: StorageBackendSelection = { backend: "sqlite" },
 ): Promise<{ exitCode: number; stdout: string }> {
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
-  const { connected } = await ensureDaemon({
-    port: daemonPort,
-    pidFilePath,
-    spawnTimeoutMs: 5000,
-    enforceUserManagerParent: true,
-  });
+  let connected: boolean;
+  try {
+    selectStorageBackend(storage);
+    ({ connected } = await ensureDaemon({
+      port: daemonPort,
+      pidFilePath,
+      spawnTimeoutMs: 5000,
+      expectedStorageBackend: storage.backend,
+      enforceUserManagerParent: true,
+    }));
+  } catch {
+    return { exitCode: 0, stdout: "" };
+  }
   if (!connected) return { exitCode: 0, stdout: "" };
 
   try {
