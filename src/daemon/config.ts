@@ -910,6 +910,10 @@ export function resolveStorageConfig(
   let caContents: string;
   try {
     resolvedCaFile = realpathSync(caFile);
+    // A user-selected absolute CA file has no narrower application-owned trust
+    // root. dirname(...) only satisfies the generic reader contract; safety
+    // comes from the canonical path plus its descriptor-bound no-follow,
+    // regular-file, identity, and size checks.
     caContents = readBoundedRegularFile(resolvedCaFile, {
       allowedRoot: dirname(resolvedCaFile),
       maxBytes: POSTGRESQL_CA_FILE_MAX_BYTES,

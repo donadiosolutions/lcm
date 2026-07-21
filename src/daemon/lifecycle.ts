@@ -819,15 +819,26 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     cleanStalePid(opts.pidFilePath);
   }
 
-  async function terminateAuthenticatedDaemon(health: HealthResponse): Promise<boolean> {
+  type MismatchRepair =
+    | { outcome: "none" }
+    | { outcome: "terminated" }
+    | { outcome: "replacement"; pid: number }
+    | { outcome: "blocked" };
+
+  async function terminateAuthenticatedDaemon(health: HealthResponse): Promise<MismatchRepair> {
     const authenticatedPid = health.pid;
-    if (authenticatedPid === undefined || !endpointIdentityMatches(health)) return false;
-    if (!isLikelyLcmDaemonProcess(authenticatedPid, procRoot)) return false;
+    if (authenticatedPid === undefined || !endpointIdentityMatches(health)) return { outcome: "blocked" };
+    if (!isLikelyLcmDaemonProcess(authenticatedPid, procRoot)) return { outcome: "blocked" };
     await terminatePid(authenticatedPid, { isAlive, killProcess, sleepFn });
-    if (isAlive(authenticatedPid)) return false;
+    if (isAlive(authenticatedPid)) return { outcome: "blocked" };
     const currentPid = readPidFile(opts.pidFilePath);
-    if (currentPid === authenticatedPid) cleanStalePid(opts.pidFilePath);
-    return currentPid === null || currentPid === authenticatedPid;
+    if (currentPid === authenticatedPid) {
+      cleanStalePid(opts.pidFilePath);
+      return { outcome: "terminated" };
+    }
+    return currentPid === null
+      ? { outcome: "terminated" }
+      : { outcome: "replacement", pid: currentPid };
   }
 
   /** Stop backend transitions only after local-token access; retain legacy version-repair behavior. */
@@ -837,15 +848,15 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     versionMatches: boolean,
     storageBackendMatches: boolean,
     hasAccess: boolean,
-  ): Promise<"none" | "terminated" | "blocked"> {
-    if (!identityMatches) return "none";
+  ): Promise<MismatchRepair> {
+    if (!identityMatches) return { outcome: "none" };
     if (!storageBackendMatches) {
-      if (!hasAccess) return "blocked";
-      return await terminateAuthenticatedDaemon(health) ? "terminated" : "blocked";
+      if (!hasAccess) return { outcome: "blocked" };
+      return terminateAuthenticatedDaemon(health);
     }
-    if (versionMatches) return "none";
+    if (versionMatches) return { outcome: "none" };
     await terminatePidFileProcess();
-    return "terminated";
+    return { outcome: "terminated" };
   }
 
   async function daemonResult(
@@ -909,6 +920,27 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     };
   }
 
+  async function waitForConcurrentReplacement(pid: number): Promise<EnsureDaemonResult> {
+    while (readPidFile(opts.pidFilePath) === pid && isAlive(pid)) {
+      const healthDeadline = remainingRequestDeadline();
+      if (!healthDeadline) break;
+      const replacementHealth = await checkDaemonHealth(opts.port, fetchFn, healthDeadline);
+      const accepted = await daemonResult(
+        replacementHealth,
+        false,
+        "existing",
+        { alreadyVerified: false, deadline },
+      );
+      if (accepted) return accepted;
+      const remainingMs = deadline - monotonicNow();
+      if (remainingMs <= 0) break;
+      await sleepFn(Math.min(300, remainingMs));
+    }
+    return { connected: false, port: opts.port, spawned: false };
+  }
+
+  let concurrentReplacementPid: number | undefined;
+
   // Step 1: Check if daemon is already running via health check
   const initialHealthDeadline = remainingRequestDeadline();
   const health = initialHealthDeadline
@@ -929,10 +961,13 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       storageBackendMatches,
       hasAccess,
     );
-    if (mismatchRepair === "blocked") {
+    if (mismatchRepair.outcome === "blocked") {
       return { connected: false, port: opts.port, spawned: false, warning: STORAGE_BACKEND_AUTH_WARNING };
     }
-    if (mismatchRepair === "none") {
+    if (mismatchRepair.outcome === "replacement") {
+      concurrentReplacementPid = mismatchRepair.pid;
+    }
+    if (mismatchRepair.outcome === "none") {
       if (hasAccess) {
         const accepted = await daemonResult(health, false, "existing", { alreadyVerified: true });
         if (accepted) return accepted;
@@ -957,6 +992,9 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   // Step 2: Check PID file for stale process
+  if (concurrentReplacementPid !== undefined) {
+    return waitForConcurrentReplacement(concurrentReplacementPid);
+  }
   if (existsSync(opts.pidFilePath)) {
     let repairedMismatch = false;
     try {
@@ -983,11 +1021,14 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
             retryStorageBackendMatches,
             retryHasAccess,
           );
-          if (mismatchRepair === "blocked") {
+          if (mismatchRepair.outcome === "blocked") {
             return { connected: false, port: opts.port, spawned: false, warning: STORAGE_BACKEND_AUTH_WARNING };
           }
-          repairedMismatch = mismatchRepair === "terminated";
-          if (mismatchRepair === "none" && retryHasAccess) {
+          if (mismatchRepair.outcome === "replacement") {
+            return waitForConcurrentReplacement(mismatchRepair.pid);
+          }
+          repairedMismatch = mismatchRepair.outcome === "terminated";
+          if (mismatchRepair.outcome === "none" && retryHasAccess) {
             const accepted = await daemonResult(retry, false, "existing", { alreadyVerified: true });
             if (accepted) {
               return accepted;
