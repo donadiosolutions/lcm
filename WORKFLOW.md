@@ -14,7 +14,7 @@ This document is a living record. **Update it whenever you learn something:**
 
 **When to update:** At the end of every feature cycle (after the implementation PR merges), review this doc against what actually happened. If reality diverged from the doc, fix the doc — not reality.
 
-**How to update:** Create a `docs/TOPIC` branch, push, get Copilot review, then set `PR_NUMBER` to the pull request number and queue it for main with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`. Same flow as any other docs change.
+**How to update:** Create a `docs/TOPIC` branch, push, complete the Copilot review loop, and require a merge-ready Greptile report covering the exact current head. Then set `PR_NUMBER` to the pull request number and queue it for main with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`. Same flow as any other docs change.
 
 ## Branch Strategy
 
@@ -31,10 +31,10 @@ The merge queue uses squash merging and an `ALLGREEN` grouping strategy. It buil
 
 The required `external-admission` status separates pull-request admission from
 merge-group validation for providers that do not report on synthetic queue
-commits. Authenticated provider `status` and `check_run` events drive
+commits. Authenticated provider `check_run` events drive
 `external-admission.yml`; pull-request lifecycle events do not start this
 write-capable workflow. On a non-draft PR, the handlers require authenticated
-results from CodeRabbit, `codecov/patch`, and DCO on the PR's exact head SHA.
+results from `codecov/patch` and DCO on the PR's exact head SHA.
 Every authenticated provider event with a valid commit SHA replaces any stale
 successful admission with `pending` before the PR-association lookup. This is
 necessary because GitHub may omit closed unmerged PRs from a commit's PR
@@ -46,10 +46,17 @@ pending.
 After PR-head admission, the separate
 `external-admission-merge-group.yml` workflow runs a permissionless Actions
 check named `external-admission` on each synthetic `merge_group` commit. It does
-not publish a commit status. This exception applies only to the three external
+not publish a commit status. This exception applies only to those two external
 providers, which cannot report on that commit: CI, both default CodeQL
 analyses, the security-extended CodeQL analysis, and both Socket checks still
 run against the synthetic commit before it may merge.
+
+Automated review reports are evaluated separately from the machine admission
+status. Greptile is currently the source of truth for review readiness and must
+cover the PR's exact head before it enters the merge queue. CodeRabbit reports
+are informational and best-effort. Neither reviewer is encoded as a required
+status or hardcoded into the admission workflow or branch ruleset while the
+project evaluates its long-term review provider.
 
 ### Release Flow
 
@@ -71,7 +78,7 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 | Workflow                             | Trigger                                                                              | Purpose                                                                                 |
 | ------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
-| `external-admission.yml`             | Authenticated CodeRabbit status and Codecov/DCO check runs                           | Require all three external providers on the exact eligible PR head                      |
+| `external-admission.yml`             | Authenticated Codecov/DCO check runs                                                 | Require both external providers on the exact eligible PR head                           |
 | `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
 | `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
 | `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
@@ -95,7 +102,7 @@ the Codecov result already verified on the exact PR head.
 | Install behavior        | Auto-write files (match ByteRover (brv) UX)                    |
 | State tracking          | Filesystem scan (no state files)                               |
 | Release strategy        | Parallel tracks with separate PRs                              |
-| PR review               | Copilot via reviewers list, not @copilot tag                   |
+| PR review               | Greptile report on the exact head; CodeRabbit is informational |
 
 ## Phase 1: Design (Opus, max effort)
 
@@ -115,7 +122,7 @@ the Codecov result already verified on the exact PR head.
 4. Push and open PR
 5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
 6. Run review loop (see Copilot Review Loop below)
-7. Once Copilot has no issues (max 3 rounds — see Review Loop), set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
+7. Once the Copilot loop is complete (max 3 rounds — see Review Loop) and Greptile reports the exact current head as merge-ready, set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
 8. Wait for the queued PR to land before starting implementation. Allow up to 65 minutes for GitHub to admit the PR and then 65 minutes for each position in the serialized queue: a PR entering at position 1 gets 65 minutes, while a PR entering at position N gets `N * 65` minutes so every entry ahead can consume the queue's 60-minute check timeout without taking time from this PR. Both waits are finite and fail with check diagnostics if GitHub never admits, removes, or rejects the still-open PR:
 
    ```bash
@@ -296,12 +303,12 @@ the Codecov result already verified on the exact PR head.
 3. Fix any issues found
 4. Ensure changeset file exists if user-facing changes
 
-## Phase 5: Implementation PR + Copilot Review
+## Phase 5: Implementation PR + Automated Review
 
 1. Push implementation branch, open PR
 2. Request Copilot review (add to reviewers list)
 3. Run review loop (see below)
-4. Once Copilot review has no remaining inline comments, set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
+4. Once the Copilot loop is complete and Greptile reports the exact current head as merge-ready, set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
 5. Wait for the implementation PR to land by calling `wait_for_queued_pr "$PR_NUMBER"` from Phase 2 with the implementation PR number. Do not begin post-merge validation or dependent work until it reports `MERGED`.
 
 ## Copilot Interaction
@@ -368,7 +375,7 @@ gh api repos/{owner}/{repo}/pulls/{n}/comments \
    a. **Batch ALL fixes** into a single commit (do not fix-push-review one at a time)
    b. Push once
    c. Re-trigger review (DELETE + POST)
-5. **Max 3 rounds.** After round 3, if remaining comments are minor nits (1-2 editorial suggestions), merge. Do not chase zero comments indefinitely.
+5. **Max 3 rounds.** After round 3, stop the Copilot loop if only minor nits remain. Do not chase zero Copilot comments indefinitely; Greptile readiness on the exact current head is still required before merge.
 6. Review is "clean" when: 0 new comments, or only context-specific nits that Copilot can't understand (e.g., Agent conventions)
 
 ### Common Pitfalls

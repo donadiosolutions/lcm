@@ -28,6 +28,6 @@ jobs:
             exit 1
           fi
 
-          # Every PR was admitted only after all three providers succeeded on
-          # its exact head SHA. They do not report on synthetic merge commits.
+          # Every PR was admitted only after both external providers succeeded
+          # on its exact head SHA. They do not report on synthetic merge commits.
           echo "External providers passed before merge-queue admission."

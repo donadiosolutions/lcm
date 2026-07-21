@@ -101,7 +101,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 
 - When a workflow checks out a verified commit SHA, use `HEAD` for ancestry checks against that checkout instead of assuming its tag ref was fetched.
 - Required CI and CodeQL workflows that validate synthetic merge-queue commits must retain the `merge_group` trigger with the `checks_requested` activity type. This requirement does not apply to the provider-driven `external-admission.yml`; `external-admission-merge-group.yml` handles synthetic admission.
-- Keep `external-admission.yml` limited to provider `status` and `check_run` events; never add a pull-request lifecycle trigger to this write-capable workflow. Authenticate CodeRabbit by creator ID, login, and status context, and authenticate `codecov/patch` and DCO by application ID, slug, and check name. Require all three successes on the exact head SHA of an open, non-draft PR targeting `main`.
+- Keep `external-admission.yml` limited to provider `check_run` events; never add a pull-request lifecycle trigger to this write-capable workflow. Authenticate `codecov/patch` and DCO by application ID, slug, and check name. Require both successes on the exact head SHA of an open, non-draft PR targeting `main`.
 - Every authenticated provider event with a valid commit SHA must publish a non-success external-admission status before PR association or eligibility lookup, because GitHub may omit closed unmerged PRs from a commit's PR associations. Paginate and flatten every page of commit-associated PRs before deciding uniqueness. Admit only one open, non-draft, main-targeting PR at the exact event SHA, and repeat that complete validation immediately before publishing success; missing or ambiguous associations remain non-successful.
 - Keep `external-admission-merge-group.yml` limited to its `merge_group` / `checks_requested` trigger and permissionless Actions job named `external-admission`; it does not publish a commit status. CI, all required CodeQL categories, and both Socket checks must still validate the synthetic commit.
 - Keep Codecov reporting in the separate no-checkout CI job. It must use OIDC for pushes and same-repository PRs (including Dependabot), use tokenless uploads for fork PRs, consume only the fixed CI artifact, and remain skipped for `merge_group`.
@@ -115,6 +115,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Persist manual Changesets beta/stable intent on the single open `changeset-release/main` PR with exactly one internal release-channel label, and fail closed on duplicate PRs or conflicting channel labels.
 - When replacing a generated workflow, update README badges and links to the new workflow filename.
 - Production-path allowlists must cover shipped executable plugin scripts such as `.claude-plugin/`, not only the primary source directories.
+- Keep automated reviewer selection out of required status checks and external-admission authentication. The current review provider is a process-level choice; CodeRabbit is informational, while external admission authenticates only Codecov patch and DCO.
 
 ## What to skip
 
