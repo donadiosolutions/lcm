@@ -32,6 +32,7 @@ export type SearchResult = {
   sessionId: string | null;
   confidence: number;
   createdAt: string;
+  /** Negative relevance score (more negative is stronger); zero marks an unranked fallback match. */
   rank: number;
 };
 

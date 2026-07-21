@@ -52,6 +52,35 @@ function dedupDeps(db: ReturnType<typeof makeDb>, store: PromotedStore) {
 }
 
 describe("deduplicateAndInsert", () => {
+  it("converges exact unranked fallback matches without merging partial lexical matches", async () => {
+    const db = makeDb();
+    const store = new PromotedStore(db, false);
+    const shared = {
+      ...dedupDeps(db, store),
+      tags: ["decision"],
+      depth: 2,
+      confidence: 0.7,
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+    };
+
+    const first = await deduplicateAndInsert({
+      ...shared,
+      content: "Use PostgreSQL for durable storage",
+    });
+    const repeated = await deduplicateAndInsert({
+      ...shared,
+      content: "Use PostgreSQL for durable storage",
+    });
+    const partial = await deduplicateAndInsert({
+      ...shared,
+      content: "Use PostgreSQL for analytics storage",
+    });
+
+    expect(repeated).toBe(first);
+    expect(partial).not.toBe(first);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM promoted").get()).toEqual({ count: 2 });
+  });
+
   it("supports the structural legacy bridge for deferred SQLite callers", async () => {
     const db = makeDb();
     const store = new PromotedStore(db);

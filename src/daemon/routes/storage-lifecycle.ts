@@ -1,3 +1,6 @@
+import type { ProjectIdentity } from "../../project-map.js";
+import type { ProjectStorage, StorageBackendFactory } from "../../storage/index.js";
+
 interface AsyncClosable {
   close(): Promise<void>;
 }
@@ -30,5 +33,3 @@ export async function openExistingProject(
   if (!await factory.projectExists(identity)) return null;
   return factory.openProject(identity);
 }
-import type { ProjectIdentity } from "../../project-map.js";
-import type { ProjectStorage, StorageBackendFactory } from "../../storage/index.js";

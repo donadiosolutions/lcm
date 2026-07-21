@@ -32,6 +32,17 @@ type DedupParams = {
   thresholds: DedupThresholds;
 } & ((DedupRepositories & { sourceProjectId?: string }) | { store: LegacyDedupStore; projectId: string });
 
+function isDuplicateCandidate(
+  candidate: { content: string; rank: number },
+  content: string,
+  bm25Threshold: number,
+): boolean {
+  // Unranked lexical fallbacks may return broad partial matches. Only exact
+  // content identity is strong enough to deduplicate without a relevance score.
+  if (candidate.rank === 0) return candidate.content === content;
+  return candidate.rank <= -bm25Threshold;
+}
+
 export async function deduplicateAndInsert(params: DedupParams): Promise<string> {
   const {
     content,
@@ -55,7 +66,7 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
         params.sourceProjectId,
       );
       const duplicates = candidates.filter(
-        (candidate) => candidate.rank <= -thresholds.dedupBm25Threshold,
+        (candidate) => isDuplicateCandidate(candidate, content, thresholds.dedupBm25Threshold),
       );
 
       if (duplicates.length === 0) {
@@ -93,9 +104,9 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
     params.projectId,
   );
 
-  // Filter to entries above BM25 threshold (rank is negative; more negative = better match)
+  // Ranked matches must clear the BM25 threshold; unranked fallbacks require exact content.
   const duplicates = candidates.filter(
-    (c) => c.rank <= -thresholds.dedupBm25Threshold,
+    (candidate) => isDuplicateCandidate(candidate, content, thresholds.dedupBm25Threshold),
   );
 
   if (duplicates.length === 0) {
