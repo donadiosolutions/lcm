@@ -32,7 +32,7 @@ Retrieve relevant context across all past sessions using full-text search.
 
 ```bash
 lcm search "how was auth implemented"
-lcm search "compaction architecture" --tags decision,architecture
+lcm search "compaction architecture" --tag decision --tag architecture
 lcm search "JWT token" --layers episodic
 ```
 
@@ -84,8 +84,8 @@ Persist knowledge for retrieval in future sessions.
 - It's general knowledge, not project-specific
 
 ```bash
-lcm store "Auth uses JWT with 24h expiry. Tokens stored in httpOnly cookies." --tags decision,auth
-lcm store "SessionEnd hook only fires on graceful /exit, not on crash or terminal close" --tags finding,hooks
+lcm store "Auth uses JWT with 24h expiry. Tokens stored in httpOnly cookies." --tag decision --tag auth
+lcm store "SessionEnd hook only fires on graceful /exit, not on crash or terminal close" --tag finding --tag hooks
 ```
 
 ### 5. Check System Health
