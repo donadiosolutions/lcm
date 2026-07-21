@@ -15,17 +15,21 @@ function mockDaemonClient(post: ReturnType<typeof vi.fn>): DaemonClient {
 }
 
 describe("handlePreCompact", () => {
-  it("rejects PostgreSQL before lifecycle or daemon network activity", async () => {
+  it("treats an unavailable PostgreSQL backend as a benign hook miss", async () => {
     const post = vi.fn();
     await expect(handlePreCompact("{}", mockDaemonClient(post), 3737, {
       backend: "postgresql",
-      postgresql: {
-        url: "postgresql://db.example/lcm", caFile: "/secure/ca.pem", poolMax: 5,
-        connectionTimeoutMs: 10_000, idleTimeoutMs: 30_000, statementTimeoutMs: 60_000,
-      },
-    })).rejects.toThrow("postgresql storage backend is not available");
+    })).resolves.toEqual({ exitCode: 0, stdout: "" });
     expect(mockEnsureDaemon).not.toHaveBeenCalled();
     expect(post).not.toHaveBeenCalled();
+  });
+
+  it("fails open when daemon admission throws", async () => {
+    mockEnsureDaemon.mockRejectedValueOnce(new Error("admission failed"));
+    await expect(handlePreCompact("{}", mockDaemonClient(vi.fn()))).resolves.toEqual({
+      exitCode: 0,
+      stdout: "",
+    });
   });
 
   it("returns exitCode 0 and summary when daemon healthy", async () => {

@@ -1,7 +1,7 @@
 // test/hooks/post-tool.test.ts
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { handlePostToolUse } from "../../src/hooks/post-tool.js";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { projectMetaPath } from "../../src/daemon/project.js";
@@ -148,6 +148,32 @@ describe("handlePostToolUse", () => {
     }));
 
     expectPersistedDecision(inputCwd);
+  });
+
+  it("uses persisted scrub patterns when PostgreSQL secrets are not staged yet", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-postgresql-cwd-"));
+    extraDirs.push(inputCwd);
+    const configDir = join(homeDir, ".lcm");
+    mkdirSync(configDir);
+    writeFileSync(join(configDir, "config.json"), JSON.stringify({
+      storage: { backend: "postgresql" },
+      security: { sensitivePatterns: ["SQLite"] },
+    }));
+
+    await handlePostToolUse(JSON.stringify({
+      session_id: "test-session",
+      tool_name: "AskUserQuestion",
+      cwd: inputCwd,
+      tool_input: { question: "Use SQLite?" },
+      tool_response: "yes",
+    }));
+
+    const db = new EventsDb(eventsDbPath(inputCwd));
+    try {
+      expect(db.getUnprocessed()[0]?.data).toContain("Use [REDACTED]?");
+    } finally {
+      db.close();
+    }
   });
 
   it("ignores daemon_port values even when a caller also supplies a port", async () => {

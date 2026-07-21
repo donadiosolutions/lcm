@@ -213,7 +213,10 @@ describe("handleDaemonRequest spawn opts propagation", () => {
     };
 
     await expect(handleDaemonRequest(client, "/search", { q: "foo" }, optsWithSpawn))
-      .rejects.toThrow("postgresql storage backend is not available");
+      .resolves.toMatchObject({
+        isError: true,
+        content: [{ text: expect.stringContaining("postgresql storage backend is not available") }],
+      });
 
     expect(ensureDaemonSpy).not.toHaveBeenCalled();
     expect(client.post).not.toHaveBeenCalled();

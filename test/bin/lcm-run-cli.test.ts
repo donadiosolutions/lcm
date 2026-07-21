@@ -202,13 +202,16 @@ describe("runCli registration and help dispatch", () => {
     expect(() => resolveCompactRequestPolicyOverride(state.loadConfig() as never, { timeoutMs: " " })).toThrow();
     const genericError = new Error("boom");
     const configError = new ConfigValidationError("cli", "invalid");
+    const backendError = new StorageBackendUnavailableError("postgresql");
     expect(() => handleCliError(genericError)).toThrow("exit:1");
     expect(() => handleCliError(configError)).toThrow("exit:1");
+    expect(() => handleCliError(backendError)).toThrow("exit:1");
     expect(() => writeCliOutput("out")).not.toThrow();
     expect(() => writeCliError("err")).not.toThrow();
-    expect(consoleError).toHaveBeenCalledTimes(2);
+    expect(consoleError).toHaveBeenCalledTimes(3);
     expect(consoleError).toHaveBeenNthCalledWith(1, genericError);
     expect(consoleError).toHaveBeenNthCalledWith(2, configError.message);
+    expect(consoleError).toHaveBeenNthCalledWith(3, backendError.message);
     expect(stdout).toHaveBeenCalledWith("out");
     expect(stderr).toHaveBeenCalledWith("err");
     const runner = vi.fn(async () => undefined);

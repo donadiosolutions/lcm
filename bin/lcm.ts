@@ -28,6 +28,7 @@ import {
   projectsDir as lcmProjectsDir,
 } from "../src/runtime-paths.js";
 import type { ProgressState } from "../src/cli/progress-state.js";
+import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -1854,7 +1855,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
 
 /** @internal Top-level rejection handler kept separate for deterministic tests. */
 export function handleCliError(err: unknown): never {
-  console.error(err instanceof ConfigValidationError ? err.message : err);
+  console.error(err instanceof ConfigValidationError || err instanceof StorageBackendUnavailableError ? err.message : err);
   return exit(1);
 }
 

@@ -1,6 +1,6 @@
 import type { ExtractedEvent } from "./extractors.js";
 import { statSync } from "node:fs";
-import { loadDaemonConfig } from "../daemon/config.js";
+import { loadHookConfig } from "./config.js";
 import { projectDir } from "../daemon/project.js";
 import { configPath } from "../runtime-paths.js";
 import { ScrubEngine } from "../scrub.js";
@@ -60,7 +60,7 @@ export async function scrubExtractedEvents(
   globalPatterns?: string[],
 ): Promise<ExtractedEvent[]> {
   const patterns = globalPatterns
-    ?? loadDaemonConfig(configPath()).security.sensitivePatterns;
+    ?? loadHookConfig(configPath()).security.sensitivePatterns;
   const scrubber = await getScrubber(patterns, projectDir(cwd));
   return events.map((event) => ({
     ...event,

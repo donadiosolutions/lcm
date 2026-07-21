@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => {
     runDoctor: vi.fn(),
     formatResultsPlain: vi.fn(),
     storageBackend: "sqlite" as "sqlite" | "postgresql",
+    configError: undefined as unknown,
   };
 });
 
@@ -51,7 +52,10 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
 }));
 vi.mock("../src/daemon/lifecycle.js", () => ({ ensureDaemon: mocks.ensureDaemon }));
 vi.mock("../src/daemon/config.js", () => ({
-  loadDaemonConfig: () => ({ daemon: { port: 4321 }, storage: { backend: mocks.storageBackend } }),
+  loadDaemonConfig: () => {
+    if (mocks.configError !== undefined) throw mocks.configError;
+    return { daemon: { port: 4321 }, storage: { backend: mocks.storageBackend } };
+  },
 }));
 vi.mock("../src/daemon/client.js", () => ({
   DaemonClient: vi.fn().mockImplementation(function () { return { post: mocks.post }; }),
@@ -82,6 +86,7 @@ describe("MCP service coverage", () => {
     mocks.ensureDaemon.mockResolvedValue({ connected: true, port: 4321, spawned: false });
     mocks.post.mockResolvedValue({ ok: true });
     mocks.storageBackend = "sqlite";
+    mocks.configError = undefined;
     await startMcpServer();
   });
 
@@ -119,6 +124,30 @@ describe("MCP service coverage", () => {
       if (previousPwd === undefined) delete process.env.PWD;
       else process.env.PWD = previousPwd;
     }
+  });
+
+  it("reloads and preflights storage before every routed daemon call", async () => {
+    await expect(call("lcm_search", { query: "sqlite" })).resolves.not.toMatchObject({ isError: true });
+    expect(mocks.post).toHaveBeenCalledOnce();
+
+    mocks.storageBackend = "postgresql";
+    await expect(call("lcm_search", { query: "postgresql" })).resolves.toMatchObject({
+      isError: true,
+      content: [{ text: expect.stringContaining("postgresql storage backend is not available") }],
+    });
+    expect(mocks.post).toHaveBeenCalledOnce();
+    expect(mocks.ensureDaemon).toHaveBeenCalledOnce();
+  });
+
+  it("returns a structured error when per-call config resolution fails", async () => {
+    mocks.configError = new Error("LCM_POSTGRES_URL is required");
+
+    await expect(call("lcm_search", { query: "unavailable" })).resolves.toMatchObject({
+      isError: true,
+      content: [{ text: "lcm error: LCM_POSTGRES_URL is required" }],
+    });
+    expect(mocks.post).not.toHaveBeenCalled();
+    expect(mocks.ensureDaemon).toHaveBeenCalledOnce();
   });
 
   it("formats all local stats branches", async () => {

@@ -184,14 +184,6 @@ describe("handleUserPromptSubmit", () => {
       3737,
       {
         backend: "postgresql",
-        postgresql: {
-          url: "postgresql://db.example/lcm",
-          caFile: "/secure/ca.pem",
-          poolMax: 5,
-          connectionTimeoutMs: 10_000,
-          idleTimeoutMs: 30_000,
-          statementTimeoutMs: 60_000,
-        },
       },
     );
 

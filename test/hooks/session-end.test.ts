@@ -65,19 +65,24 @@ describe("handleSessionEnd", () => {
     vi.mocked(loadDaemonConfig).mockReturnValue(defaultConfig);
   });
 
-  it("rejects PostgreSQL before lifecycle or daemon network activity", async () => {
+  it("treats an unavailable PostgreSQL backend as a benign hook miss", async () => {
     const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
     const client = createMockClient({ ingested: 1 });
     await expect(handleSessionEnd("{}", client, 3737, {
       backend: "postgresql",
-      postgresql: {
-        url: "postgresql://db.example/lcm", caFile: "/secure/ca.pem", poolMax: 5,
-        connectionTimeoutMs: 10_000, idleTimeoutMs: 30_000, statementTimeoutMs: 60_000,
-      },
-    })).rejects.toThrow("postgresql storage backend is not available");
+    })).resolves.toEqual({ exitCode: 0, stdout: "" });
     expect(ensureDaemon).not.toHaveBeenCalled();
     expect(client.post).not.toHaveBeenCalled();
     expect(mockHttpReq.end).not.toHaveBeenCalled();
+  });
+
+  it("fails open when daemon admission throws", async () => {
+    const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(new Error("admission failed"));
+    await expect(handleSessionEnd("{}", createMockClient({ ingested: 1 }))).resolves.toEqual({
+      exitCode: 0,
+      stdout: "",
+    });
   });
 
   it("calls /ingest with parsed stdin", async () => {

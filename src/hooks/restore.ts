@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { openSync, closeSync, writeFileSync } from "node:fs";
 import { daemonPidPath, tmpDir } from "../runtime-paths.js";
 import { fenceContent } from "../daemon/content-fence.js";
-import type { ResolvedStorageConfig } from "../daemon/config.js";
+import type { StorageBackendSelection } from "../storage/backend.js";
 import { selectStorageBackend } from "../storage/backend.js";
 import {
   deleteRegularFile,
@@ -114,7 +114,7 @@ export async function handleSessionStart(
   stdin: string,
   client: Pick<DaemonClient, "post">,
   port?: number,
-  storage: ResolvedStorageConfig = { backend: "sqlite" },
+  storage: StorageBackendSelection = { backend: "sqlite" },
 ): Promise<{ exitCode: number; stdout: string }> {
   const parsed: unknown = JSON.parse(stdin || "{}");
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -125,21 +125,31 @@ export async function handleSessionStart(
     || (input.cwd != null && typeof input.cwd !== "string")) {
     return { exitCode: 0, stdout: "" };
   }
+  const daemonPort = port ?? 3737;
+  const pidFilePath = daemonPidPath();
+  let connected: boolean;
+  try {
+    selectStorageBackend(storage);
+  } catch {
+    return { exitCode: 0, stdout: "" };
+  }
+
   const sessionId = input.session_id ?? "";
   if (sessionId && !tryAcquireSessionLock(sessionId)) {
     return { exitCode: 0, stdout: "" };
   }
 
-  selectStorageBackend(storage);
-  const daemonPort = port ?? 3737;
-  const pidFilePath = daemonPidPath();
-  const { connected } = await ensureDaemon({
-    port: daemonPort,
-    pidFilePath,
-    spawnTimeoutMs: 5000,
-    expectedStorageBackend: storage.backend,
-    enforceUserManagerParent: true,
-  });
+  try {
+    ({ connected } = await ensureDaemon({
+      port: daemonPort,
+      pidFilePath,
+      spawnTimeoutMs: 5000,
+      expectedStorageBackend: storage.backend,
+      enforceUserManagerParent: true,
+    }));
+  } catch {
+    return { exitCode: 0, stdout: "" };
+  }
   if (!connected) return { exitCode: 0, stdout: "" };
 
   try {

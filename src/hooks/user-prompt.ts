@@ -6,7 +6,7 @@ import { safeLogError } from "./hook-errors.js";
 import { buildMemoryContext } from "./memory-context.js";
 import { daemonPidPath } from "../runtime-paths.js";
 import { firePromoteEventsNotifyRequest } from "./session-end.js";
-import type { ResolvedStorageConfig } from "../daemon/config.js";
+import type { StorageBackendSelection } from "../storage/backend.js";
 import { selectStorageBackend } from "../storage/backend.js";
 
 type PromptSearchResponse = {
@@ -52,7 +52,7 @@ export async function handleUserPromptSubmit(
   stdin: string,
   client: DaemonClient,
   port?: number,
-  storage: ResolvedStorageConfig = { backend: "sqlite" },
+  storage: StorageBackendSelection = { backend: "sqlite" },
 ): Promise<{ exitCode: number; stdout: string }> {
   const daemonPort = port ?? 3737;
   try {

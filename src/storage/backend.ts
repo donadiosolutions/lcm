@@ -1,4 +1,6 @@
-import type { ResolvedStorageConfig } from "../daemon/config.js";
+import type { StorageBackend } from "../daemon/config.js";
+
+export type StorageBackendSelection = { backend: StorageBackend };
 
 export type SelectedStorageBackend = { backend: "sqlite" };
 
@@ -9,8 +11,8 @@ export class StorageBackendUnavailableError extends Error {
   }
 }
 
-/** Select the configured implementation only after configuration and TLS preflight succeed. */
-export function selectStorageBackend(config: ResolvedStorageConfig): SelectedStorageBackend {
+/** Select the configured implementation after the caller's required preflight. */
+export function selectStorageBackend(config: StorageBackendSelection): SelectedStorageBackend {
   if (config.backend === "postgresql") throw new StorageBackendUnavailableError(config.backend);
   return { backend: "sqlite" };
 }

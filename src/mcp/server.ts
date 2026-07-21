@@ -30,7 +30,6 @@ const TOOL_ROUTES: Record<string, string> = {
 
 const LOCAL_TOOLS: Record<string, (args: Record<string, unknown>) => Promise<string>> = {
   lcm_stats: async (args) => {
-    const { selectStorageBackend } = await import("../storage/backend.js");
     selectStorageBackend(loadDaemonConfig(defaultConfigPath()).storage);
     const { collectStats, formatNumber } = await import("../stats.js");
     const stats = collectStats();
@@ -147,6 +146,10 @@ function isNetworkError(err: unknown): boolean {
   return err instanceof TypeError;
 }
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 /**
  * One restart attempt per port at a time — concurrent network failures share the same
  * restart promise instead of each spawning a separate daemon process.
@@ -168,15 +171,18 @@ export async function handleDaemonRequest(
   body: Record<string, unknown>,
   opts: DaemonRequestOpts,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
-  selectStorageBackend(opts.storage);
+  try {
+    selectStorageBackend(opts.storage);
+  } catch (err) {
+    return { content: [{ type: "text", text: `lcm error: ${errorMessage(err)}` }], isError: true };
+  }
   let result: unknown;
   try {
     result = await client.post(route, body);
   } catch (err) {
     // Only retry on network/connection errors, not daemon HTTP errors (4xx/5xx)
     if (!isNetworkError(err)) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { content: [{ type: "text", text: `lcm error: ${msg}` }], isError: true };
+      return { content: [{ type: "text", text: `lcm error: ${errorMessage(err)}` }], isError: true };
     }
     // Daemon crashed — attempt auto-restart then retry once.
     // Coalesce concurrent restart attempts so only one ensureDaemon() runs per port.
@@ -198,8 +204,7 @@ export async function handleDaemonRequest(
     try {
       result = await client.post(route, body);
     } catch (retryErr) {
-      const msg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-      return { content: [{ type: "text", text: `lcm daemon unavailable: ${msg}` }], isError: true };
+      return { content: [{ type: "text", text: `lcm daemon unavailable: ${errorMessage(retryErr)}` }], isError: true };
     }
   }
   return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -261,12 +266,18 @@ export async function startMcpServer(): Promise<void> {
     const route = TOOL_ROUTES[req.params.name];
     if (!route) return { content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }], isError: true };
     const body = { ...filteredArgs, cwd: process.env.PWD ?? process.cwd() };
+    let requestConfig: ReturnType<typeof loadDaemonConfig>;
+    try {
+      requestConfig = loadDaemonConfig(defaultConfigPath());
+    } catch (err) {
+      return { content: [{ type: "text", text: `lcm error: ${errorMessage(err)}` }], isError: true };
+    }
     return handleDaemonRequest(client, route, body, {
       port, pidFilePath,
       spawnCommand: process.execPath,
       spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
       expectedVersion: PKG_VERSION,
-      storage: config.storage,
+      storage: requestConfig.storage,
     });
   });
 
