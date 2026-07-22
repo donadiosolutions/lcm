@@ -158,13 +158,65 @@ describe("PostgreSQL runtime", () => {
     });
     await expect(queryFailure.runtime.transaction(
       (transaction) => transaction.query({ text: "SELECT broken" }, {
-        domain: "transaction",
+        projectId: "query-project",
+        domain: "sessions",
         operation: "queryFailure",
       }),
       { domain: "transaction", operation: "outerQueryFailure" },
-    )).rejects.toMatchObject({ operation: "outerQueryFailure" });
+    )).rejects.toMatchObject({
+      projectId: "query-project",
+      domain: "sessions",
+      operation: "queryFailure",
+    });
     expect(queryFailure.query).toHaveBeenCalledWith("ROLLBACK");
     expect(queryFailure.release).toHaveBeenCalledWith(false);
+  });
+
+  it("rolls back and rejects when a callback catches a transaction query failure", async () => {
+    const f = fixtures((input) => {
+      if (typeof input === "string") return result([]);
+      throw Object.assign(new Error("constraint secret"), { code: "23505" });
+    });
+    await expect(f.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "INSERT INTO values_table VALUES ($1)", values: [1] }, {
+        projectId: "query-project",
+        domain: "sessions",
+        operation: "caughtFailure",
+      }).catch(() => undefined);
+      return "must not resolve";
+    }, { projectId: "outer-project", domain: "transaction", operation: "caughtFailureOuter" }))
+      .rejects.toMatchObject({
+        code: "STORAGE_OPERATION_FAILED",
+        projectId: "query-project",
+        domain: "sessions",
+        operation: "caughtFailure",
+        retryable: false,
+      });
+    expect(f.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(f.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(f.release).toHaveBeenCalledWith(false);
+  });
+
+  it("rejects and does not commit when the transaction signal aborts after the callback", async () => {
+    const controller = new AbortController();
+    const f = fixtures((input) => typeof input === "string" ? result([]) : result([{ value: 1 }]));
+    await expect(f.runtime.transaction(async () => {
+      await Promise.resolve();
+      controller.abort();
+      return "must not resolve";
+    }, {
+      projectId: "project",
+      domain: "transaction",
+      operation: "abortBeforeCommit",
+      signal: controller.signal,
+    })).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      projectId: "project",
+      operation: "abortBeforeCommit",
+    });
+    expect(f.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).toHaveBeenCalledWith(true);
   });
 
   it("destroys transaction clients after rollback failure or abort", async () => {
@@ -204,7 +256,7 @@ describe("PostgreSQL runtime", () => {
         domain: "transaction", operation: "disconnect",
       }),
       { domain: "transaction", operation: "outerDisconnect" },
-    )).rejects.toMatchObject({ operation: "outerDisconnect", retryable: true });
+    )).rejects.toMatchObject({ operation: "disconnect", retryable: true });
     expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
     expect(f.release).toHaveBeenCalledWith(true);
   });
@@ -305,7 +357,7 @@ describe("PostgreSQL runtime", () => {
       void withoutProject.catch(() => undefined);
       return failed;
     }, { projectId: "outer-project", domain: "transaction", operation: "queueFailure" }))
-      .rejects.toMatchObject({ operation: "queueFailure" });
+      .rejects.toMatchObject({ operation: "failed" });
 
     await expect(withProject).rejects.toMatchObject({
       code: "STORAGE_TRANSACTION_SCOPE", projectId: "queued-project", operation: "queuedWithProject",
@@ -341,7 +393,7 @@ describe("PostgreSQL runtime", () => {
       target?.callback(Object.assign(new Error("cancelled"), { code: "57014" }));
       return query;
     }, { domain: "transaction", operation: "outerTransaction" });
-    await expect(pending).rejects.toMatchObject({ operation: "outerTransaction" });
+    await expect(pending).rejects.toMatchObject({ operation: "queryLocalAbort" });
     expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
     expect(f.release).toHaveBeenCalledWith(true);
   });

@@ -233,6 +233,48 @@ async function waitForContainerSentinel(names, runId, dockerRunner = docker) {
   throw lastError ?? new Error("PostgreSQL harness sentinel readiness timed out");
 }
 
+export function harnessErrorDetails(error) {
+  if (error instanceof AggregateError) {
+    return [error.message, ...error.errors.map((nested) => harnessErrorDetails(nested))].join("\n");
+  }
+  return String(error?.stderr ?? error?.message ?? error);
+}
+
+export async function cleanupHarnessResources(context, dependencies = {}) {
+  const { names, runId, directory, sentinelReady } = context;
+  const removeResource = dependencies.removeResource
+    ?? ((type, name) => removeLabeled(type, name, runId));
+  const verifySentinel = dependencies.verifySentinel
+    ?? (() => verifyContainerSentinel(names, runId));
+  const removeDirectory = dependencies.removeDirectory
+    ?? ((path) => rmSync(path, { recursive: true, force: true }));
+  const failures = [];
+  const attempt = async (operation) => {
+    try {
+      await operation();
+      return true;
+    } catch (error) {
+      failures.push(error);
+      return false;
+    }
+  };
+
+  try {
+    await attempt(() => removeResource("container", names.runner));
+    const containerOwned = !sentinelReady || await attempt(verifySentinel);
+    if (containerOwned) await attempt(() => removeResource("container", names.container));
+    await attempt(() => removeResource("volume", names.volume));
+    await attempt(() => removeResource("network", names.network));
+  } finally {
+    await attempt(() => removeDirectory(directory));
+  }
+
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, "PostgreSQL harness cleanup failed");
+  }
+}
+
 async function runTests(context, ci, setupDocker = docker) {
   const env = { ...process.env, ...context.environment };
   for (const key of Object.keys(env)) {
@@ -290,14 +332,12 @@ export async function runHarness(options = {}) {
   let cleanupPromise;
   let sentinelReady = false;
   const cleanup = () => {
-    cleanupPromise ??= (async () => {
-      await removeLabeled("container", names.runner, runId).catch(() => undefined);
-      if (sentinelReady) await verifyContainerSentinel(names, runId);
-      await removeLabeled("container", names.container, runId);
-      await removeLabeled("volume", names.volume, runId);
-      await removeLabeled("network", names.network, runId);
-      rmSync(directory, { recursive: true, force: true });
-    })();
+    cleanupPromise ??= cleanupHarnessResources({ names, runId, directory, sentinelReady })
+      .catch((error) => {
+        const details = sanitizeHarnessText(harnessErrorDetails(error), secrets);
+        process.stderr.write(`PostgreSQL harness cleanup failed: ${details}\n`);
+        throw error;
+      });
     return cleanupPromise;
   };
   let teardownPromise;
@@ -386,7 +426,7 @@ export async function runHarness(options = {}) {
       throw Object.assign(error, { stderr: `${error?.stderr ?? ""}\n${logs.stdout}\n${logs.stderr}` });
     }
   } catch (error) {
-    const details = sanitizeHarnessText(error?.stderr ?? error?.message ?? error, secrets);
+    const details = sanitizeHarnessText(harnessErrorDetails(error), secrets);
     process.stderr.write(`PostgreSQL harness failed: ${details}\n`);
     throw error;
   } finally {

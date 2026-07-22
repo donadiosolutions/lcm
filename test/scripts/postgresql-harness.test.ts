@@ -5,8 +5,10 @@ import {
   NODE_IMAGE,
   POSTGRES_IMAGE,
   RUN_LABEL,
+  cleanupHarnessResources,
   createProcessLifecycle,
   createRunNames,
+  harnessErrorDetails,
   isMissingDockerObjectError,
   removeLabeled,
   runProcess,
@@ -157,5 +159,123 @@ describe("PostgreSQL harness utilities", () => {
   it("pins migration SQL to LF for stable checksums across Git configurations", () => {
     const attributes = readFileSync(new URL("../../.gitattributes", import.meta.url), "utf8");
     expect(attributes.split(/\r?\n/u)).toContain("src/storage/postgresql/migrations/*.sql text eol=lf");
+  });
+
+  it("cleans every owned resource and the secret directory in order", async () => {
+    const names = createRunNames("a".repeat(32));
+    const events: string[] = [];
+
+    await expect(cleanupHarnessResources({
+      names,
+      runId: "a".repeat(32),
+      directory: "/private/harness",
+      sentinelReady: true,
+    }, {
+      removeResource: (type: string, name: string) => { events.push(`remove:${type}:${name}`); },
+      verifySentinel: () => { events.push("verify:sentinel"); },
+      removeDirectory: (path: string) => { events.push(`directory:${path}`); },
+    })).resolves.toBeUndefined();
+
+    expect(events).toEqual([
+      `remove:container:${names.runner}`,
+      "verify:sentinel",
+      `remove:container:${names.container}`,
+      `remove:volume:${names.volume}`,
+      `remove:network:${names.network}`,
+      "directory:/private/harness",
+    ]);
+  });
+
+  it("skips sentinel verification before initialization completes", async () => {
+    const names = createRunNames("a".repeat(32));
+    const verifySentinel = vi.fn();
+    const removeResource = vi.fn();
+
+    await cleanupHarnessResources({
+      names,
+      runId: "a".repeat(32),
+      directory: "/private/harness",
+      sentinelReady: false,
+    }, { removeResource, verifySentinel, removeDirectory: vi.fn() });
+
+    expect(verifySentinel).not.toHaveBeenCalled();
+    expect(removeResource).toHaveBeenCalledWith("container", names.container);
+  });
+
+  it("preserves a single sentinel failure while continuing independent cleanup", async () => {
+    const names = createRunNames("a".repeat(32));
+    const sentinelFailure = new Error("sentinel failed");
+    const removeResource = vi.fn();
+    const removeDirectory = vi.fn();
+
+    await expect(cleanupHarnessResources({
+      names,
+      runId: "a".repeat(32),
+      directory: "/private/harness",
+      sentinelReady: true,
+    }, {
+      removeResource,
+      verifySentinel: () => { throw sentinelFailure; },
+      removeDirectory,
+    })).rejects.toBe(sentinelFailure);
+
+    expect(removeResource).not.toHaveBeenCalledWith("container", names.container);
+    expect(removeResource).toHaveBeenCalledWith("volume", names.volume);
+    expect(removeResource).toHaveBeenCalledWith("network", names.network);
+    expect(removeDirectory).toHaveBeenCalledWith("/private/harness");
+  });
+
+  it("aggregates independent cleanup failures and always removes the secret directory", async () => {
+    const names = createRunNames("a".repeat(32));
+    const runnerFailure = new Error("runner inspect failed");
+    const volumeFailure = new Error("volume remove failed");
+    const directoryFailure = new Error("directory remove failed");
+    const attempts: string[] = [];
+    const removeResource = vi.fn((type: string, name: string) => {
+      attempts.push(`${type}:${name}`);
+      if (name === names.runner) throw runnerFailure;
+      if (name === names.volume) throw volumeFailure;
+    });
+    const removeDirectory = vi.fn(() => { throw directoryFailure; });
+
+    const failure = await cleanupHarnessResources({
+      names,
+      runId: "a".repeat(32),
+      directory: "/private/harness",
+      sentinelReady: true,
+    }, { removeResource, verifySentinel: vi.fn(), removeDirectory }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([runnerFailure, volumeFailure, directoryFailure]);
+    expect(harnessErrorDetails(failure)).toBe([
+      "PostgreSQL harness cleanup failed",
+      "runner inspect failed",
+      "volume remove failed",
+      "directory remove failed",
+    ].join("\n"));
+    expect(attempts).toEqual([
+      `container:${names.runner}`,
+      `container:${names.container}`,
+      `volume:${names.volume}`,
+      `network:${names.network}`,
+    ]);
+    expect(removeDirectory).toHaveBeenCalledWith("/private/harness");
+  });
+
+  it("expands aggregate cleanup diagnostics before redacting signal-safe output", () => {
+    const privatePath = "/private/harness-secret";
+    const password = "database-password";
+    const dockerFailure = Object.assign(new Error("docker failed"), {
+      stderr: `permission denied reading ${privatePath} with ${password}`,
+    });
+    const aggregate = new AggregateError([dockerFailure, new Error(`remove ${privatePath} failed`)], "cleanup failed");
+
+    const sanitized = sanitizeHarnessText(harnessErrorDetails(aggregate), [privatePath, password]);
+
+    expect(sanitized).toContain("cleanup failed");
+    expect(sanitized).toContain("permission denied");
+    expect(sanitized).toContain("[REDACTED]");
+    expect(sanitized).not.toContain(privatePath);
+    expect(sanitized).not.toContain(password);
   });
 });

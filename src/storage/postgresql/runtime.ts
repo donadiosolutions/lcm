@@ -110,6 +110,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       await client.query("BEGIN");
       let transactionActive = true;
       let transactionFailed = false;
+      let transactionFailure: StorageOperationError | undefined;
       let queryQueue = Promise.resolve();
       const transaction: PostgreSqlQueryExecutor = {
         query: async <R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
@@ -141,7 +142,9 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
             } catch (error) {
               transactionFailed = true;
               if (effectiveOptions.signal?.aborted || isPostgreSqlConnectionError(error)) destroy = true;
-              throw error;
+              const normalized = normalizePostgreSqlError(error, effectiveOptions);
+              transactionFailure ??= normalized;
+              throw normalized;
             }
           });
           queryQueue = execute.then(() => undefined, () => undefined);
@@ -153,6 +156,11 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
         result = await callback(transaction);
       } finally {
         transactionActive = false;
+      }
+      if (transactionFailure) throw transactionFailure;
+      if (options.signal?.aborted) {
+        destroy = true;
+        throw aborted(options);
       }
       await client.query("COMMIT");
       this.poolFailed = false;
