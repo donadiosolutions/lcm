@@ -235,6 +235,10 @@ jobs:
           effort: low
           permission-profile: ":read-only"
           safety-strategy: drop-sudo
+          # Scheduled runs inherit the actor that last changed the workflow.
+          # Merge-queued changes therefore run as this GitHub-owned account,
+          # which has no repository collaborator record for the action to check.
+          allow-users: github-merge-queue
 
   apply:
     needs: [collect, classify]
