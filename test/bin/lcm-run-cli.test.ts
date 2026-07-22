@@ -23,6 +23,12 @@ const state = vi.hoisted(() => ({
     },
     compaction: { autoCompactMinTokens: 100 },
   })),
+  loadPolicyConfig: vi.fn(() => ({
+    llm: {
+      provider: state.provider, requestTimeoutMs: 1000,
+      retry: { maxAttempts: 2, initialDelayMs: 1, maxDelayMs: 2, multiplier: 2 },
+    },
+  })),
   fileText: JSON.stringify({ version: "1.4.0", entries: [] }),
   installed: [] as Array<{ agentId: string; type: string; path: string }>,
   installResult: { path: "/connector", requiresRestart: false } as Record<string, unknown>,
@@ -89,6 +95,10 @@ vi.mock("../../src/daemon/client.js", () => ({
 vi.mock("../../src/daemon/config.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/daemon/config.js")>()),
   loadDaemonConfig: state.loadConfig,
+}));
+vi.mock("../../src/config-projection.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/config-projection.js")>()),
+  loadStoredLlmRequestPolicyConfig: state.loadPolicyConfig,
 }));
 vi.mock("../../src/daemon/lifecycle.js", () => ({ ensureDaemon: state.ensureDaemon, restartDaemon: state.restartDaemon }));
 vi.mock("../../src/cli-help.js", () => ({ printHelp: state.printHelp }));
@@ -404,6 +414,30 @@ describe("runCli orchestration actions", () => {
     ["session-snapshot"], ["compact", "--hook", "--client", "claude"],
   ])("dispatches hook action %#", async (...args) => {
     expect((await invoke(args))?.message).toBe("exit:0");
+  });
+
+  it("dispatches PreCompact without resolving PostgreSQL storage secrets", async () => {
+    state.storageBackend = "postgresql";
+    const loadConfig = state.loadConfig.getMockImplementation()!;
+    state.loadConfig.mockImplementation(() => {
+      throw new ConfigValidationError("LCM_POSTGRES_URL", "must be set");
+    });
+
+    try {
+      expect((await invoke(["compact", "--hook"]))?.message).toBe("exit:0");
+      expect(state.loadConfig).not.toHaveBeenCalled();
+      expect(state.loadPolicyConfig).not.toHaveBeenCalled();
+
+      expect((await invoke(["compact", "--hook", "--timeout-ms", "2000"]))?.message).toBe("exit:0");
+      expect(state.loadConfig).not.toHaveBeenCalled();
+      expect(state.loadPolicyConfig).toHaveBeenCalledOnce();
+      expect(state.loadPolicyConfig).toHaveBeenLastCalledWith("/lcm/config.json");
+      expect(JSON.parse(state.dispatchHook.mock.calls.at(-1)![1])).toMatchObject({
+        request_timeout_ms: 2000,
+      });
+    } finally {
+      state.loadConfig.mockImplementation(loadConfig);
+    }
   });
 
   it.each([

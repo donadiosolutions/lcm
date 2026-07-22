@@ -14,9 +14,9 @@ import {
   resolveLlmRequestPolicy,
   supportsFastMode,
   supportsRequestTimeout,
-  type DaemonConfig,
   type LlmInvocationRequestPolicy,
   type LlmProvider,
+  type LlmRequestPolicyConfig,
   type LlmReasoningEffort,
 } from "../src/daemon/config.js";
 import {
@@ -102,9 +102,17 @@ function numericOption(value: string | undefined): number | undefined {
   return Number(value);
 }
 
+function hasCompactRequestPolicyOverride(options: CompactRequestPolicyOptions): boolean {
+  return options.timeoutMs !== undefined
+    || options.retryMaxAttempts !== undefined
+    || options.retryInitialDelayMs !== undefined
+    || options.retryMaxDelayMs !== undefined
+    || options.retryMultiplier !== undefined;
+}
+
 /** Validate and resolve one-invocation timeout/retry flags over loaded config. */
 export function resolveCompactRequestPolicyOverride(
-  config: DaemonConfig,
+  config: LlmRequestPolicyConfig,
   options: CompactRequestPolicyOptions,
 ): LlmInvocationRequestPolicy | undefined {
   const requestTimeoutMs = numericOption(options.timeoutMs);
@@ -854,8 +862,14 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       }
       // Piped stdin — hook dispatch (PreCompact hook invocation)
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
-      const { loadDaemonConfig } = await import("../src/daemon/config.js");
-      const requestPolicy = resolveCompactRequestPolicyOverride(loadDaemonConfig(defaultConfigPath()), opts);
+      let requestPolicy: LlmInvocationRequestPolicy | undefined;
+      if (hasCompactRequestPolicyOverride(opts)) {
+        const { loadStoredLlmRequestPolicyConfig } = await import("../src/config-projection.js");
+        requestPolicy = resolveCompactRequestPolicyOverride(
+          loadStoredLlmRequestPolicyConfig(defaultConfigPath()),
+          opts,
+        );
+      }
       const input = withHookOverrides(await readStdin(), opts.client, reasoningEffort, requestPolicy, fastMode);
       const r = await dispatchHook("compact", input);
       if (r.stdout) stdout.write(r.stdout);

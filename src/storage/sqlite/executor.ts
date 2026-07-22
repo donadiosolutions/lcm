@@ -11,10 +11,14 @@ type TransactionContext = {
 const transactionContext = new AsyncLocalStorage<TransactionContext>();
 const executors = new WeakMap<DatabaseSync, SqliteExecutor>();
 
-export function sqliteExecutorFor(db: DatabaseSync, projectId: string): SqliteExecutor {
+export function sqliteExecutorFor(
+  db: DatabaseSync,
+  projectId: string,
+  onPoison: () => void,
+): SqliteExecutor {
   const existing = executors.get(db);
   if (existing) return existing;
-  const executor = new SqliteExecutor(db, projectId);
+  const executor = new SqliteExecutor(db, projectId, onPoison);
   executors.set(db, executor);
   return executor;
 }
@@ -22,11 +26,19 @@ export function sqliteExecutorFor(db: DatabaseSync, projectId: string): SqliteEx
 export class SqliteExecutor {
   private tail: Promise<void> = Promise.resolve();
   private readonly activeTokens = new Set<symbol>();
+  private poisoned = false;
 
   constructor(
     private readonly db: DatabaseSync,
     readonly projectId: string,
+    private readonly onPoison?: () => void,
   ) {}
+
+  poison(): void {
+    if (this.poisoned) return;
+    this.poisoned = true;
+    this.onPoison?.();
+  }
 
   async run<T>(domain: StorageDomain, operation: string, callback: () => T | Promise<T>): Promise<T> {
     const active = transactionContext.getStore();
@@ -39,6 +51,7 @@ export class SqliteExecutor {
         operation,
       );
     }
+    this.assertUsable(domain, operation);
     return this.enqueue(domain, operation, callback);
   }
 
@@ -58,6 +71,7 @@ export class SqliteExecutor {
         operation,
       );
     }
+    this.assertUsable(domain, operation);
     try {
       return await callback();
     } catch (error) {
@@ -81,6 +95,7 @@ export class SqliteExecutor {
         "transaction",
       );
     }
+    this.assertUsable("transaction", "transaction");
 
     return this.enqueue("transaction", "transaction", async () => {
       const token = Symbol("sqlite-transaction");
@@ -97,7 +112,9 @@ export class SqliteExecutor {
         try {
           this.db.exec("ROLLBACK");
         } catch {
-          // Preserve the original, already-sanitized transaction failure.
+          // Preserve the original, already-sanitized transaction failure, but
+          // permanently fence and evict the handle left in an unknown state.
+          this.poison();
         }
         throw error;
       } finally {
@@ -106,10 +123,39 @@ export class SqliteExecutor {
     });
   }
 
+  async runCleanup<T>(
+    domain: StorageDomain,
+    operation: string,
+    callback: () => T | Promise<T>,
+  ): Promise<T> {
+    if (transactionContext.getStore()) {
+      throw new StorageOperationError(
+        "STORAGE_TRANSACTION_SCOPE",
+        "sqlite",
+        this.projectId,
+        domain,
+        operation,
+      );
+    }
+    return this.enqueue(domain, operation, callback, true);
+  }
+
+  private assertUsable(domain: StorageDomain, operation: string): void {
+    if (!this.poisoned) return;
+    throw new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "sqlite",
+      this.projectId,
+      domain,
+      operation,
+    );
+  }
+
   private async enqueue<T>(
     domain: StorageDomain,
     operation: string,
     callback: () => T | Promise<T>,
+    allowPoisoned = false,
   ): Promise<T> {
     const previous = this.tail;
     let release!: () => void;
@@ -117,6 +163,9 @@ export class SqliteExecutor {
     this.tail = previous.then((): Promise<void> => current);
     await previous;
     try {
+      // Re-check after waiting: a readiness probe ahead of this operation may
+      // have poisoned and evicted the shared handle while this call was queued.
+      if (!allowPoisoned) this.assertUsable(domain, operation);
       return await callback();
     } catch (error) {
       throw normalizeStorageError(error, {

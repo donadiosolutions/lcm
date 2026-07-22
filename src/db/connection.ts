@@ -266,12 +266,22 @@ export function isLcmConnectionOpen(dbPath: string): boolean {
   return _connections.has(dbPath);
 }
 
-export function closeLcmConnection(dbPath?: string): void {
+/** Force-evict exactly the expected pooled handle, regardless of its reference count. */
+export function invalidateLcmConnection(dbPath: string, expectedDb: DatabaseSync): boolean {
+  const entry = _connections.get(dbPath);
+  if (!entry || entry.db !== expectedDb) return false;
+  _connections.delete(dbPath);
+  forceCloseConnection(entry);
+  return true;
+}
+
+export function closeLcmConnection(dbPath?: string, expectedDb?: DatabaseSync): void {
   if (typeof dbPath === "string" && dbPath.trim()) {
     const entry = _connections.get(dbPath);
     if (!entry) {
       return;
     }
+    if (expectedDb && entry.db !== expectedDb) return;
     entry.refs = Math.max(0, entry.refs - 1);
     if (entry.refs === 0) {
       forceCloseConnection(entry);

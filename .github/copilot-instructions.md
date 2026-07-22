@@ -58,8 +58,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Any operation that modifies more than one table must be wrapped in `BEGIN`/`COMMIT`.
 - Flag multi-table writes without transactions — they risk partial writes on crash.
 - Keep checkpoint/count reads, slices derived from those checkpoints, and their inserts in the same repository transaction; otherwise concurrent ingestion can invalidate sequence allocation before the write begins.
-- Transaction context is global across SQLite project executors: reject nested transactions and ordinary repository calls on any project while a transaction callback is active, preventing lock inversion and partial cross-project commits.
-- Backend health must apply the same integrity and write-readiness probe to active project scopes and databases retained from completed request scopes; never infer health from `SELECT 1` or an empty active-project set. SQLite timestamps produced by `CURRENT_TIMESTAMP` are timezone-free UTC and must be parsed and formatted explicitly as UTC.
+- Transaction context is global across SQLite project executors: reject nested transactions and ordinary repository calls on any project while a transaction callback is active, preventing lock inversion and partial cross-project commits. These transaction-contract errors take precedence over poisoned-handle errors. If transaction rollback fails, preserve the original sanitized operation error while poisoning queued access and evicting the exact pooled handle generation.
+- Backend health must apply the same integrity and write-readiness probe to active project scopes and databases retained from completed request scopes; never infer health from `SELECT 1`, `BEGIN IMMEDIATE` alone, or an empty active-project set. Prove SQLite writability with rollbacked main-schema DDL using a unique quoted internal table name, always roll back after `BEGIN`, and leave no probe object behind. If rollback fails, poison queued access and evict the exact pooled handle generation; stale scope releases must not decrement a replacement generation. SQLite timestamps produced by `CURRENT_TIMESTAMP` are timezone-free UTC and must be parsed and formatted explicitly as UTC.
 
 ### Migration safety
 
@@ -71,6 +71,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 
 ### Error handling
 
+- Installed best-effort hook wrappers must use secret-free stored-configuration projections and must not resolve remote-backend credentials before the handler's fail-open boundary. Manual CLI, daemon, and MCP paths must continue using fully resolved, fail-closed configuration.
 - Any started CLI renderer must be stopped in a `finally` block so failures cannot leave its render loop active.
 - Route handlers must catch errors and return structured JSON: `{ error: string, code?: string }`.
 - Flag `res.send(e.message)` or unstructured error responses that leak stack traces.

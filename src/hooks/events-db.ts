@@ -99,7 +99,7 @@ export class EventsDb {
       try {
         this.addBusyTimeoutOverride(Math.max(0, Math.trunc(options.busyTimeoutMs)));
       } catch (e) {
-        closeLcmConnection(dbPath);
+        closeLcmConnection(dbPath, this.db);
         const message = sanitizeError(e instanceof Error ? e.message : String(e));
         throw new Error(message);
       }
@@ -111,7 +111,7 @@ export class EventsDb {
         // Migration failed — release the pooled connection so the ref-count
         // doesn't leak. The constructor will re-throw, so callers see the error.
         try { this.removeBusyTimeoutOverride(); } catch { /* preserve the migration failure */ }
-        closeLcmConnection(dbPath);
+        closeLcmConnection(dbPath, this.db);
         const message = sanitizeError(e instanceof Error ? e.message : String(e));
         throw new Error(message);
       }
@@ -388,7 +388,7 @@ export class EventsDb {
     // other callers hold a reference — it is only closed when refs reach 0.
     try { this.removeBusyTimeoutOverride(); } catch { /* timeout restoration is best-effort */ }
     try {
-      closeLcmConnection(this.dbPath);
+      closeLcmConnection(this.dbPath, this.db);
     } finally {
       // If the connection was fully evicted from the pool, invalidate the
       // migration cache so the next open re-runs migrations on a fresh handle.
