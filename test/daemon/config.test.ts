@@ -16,6 +16,7 @@ import {
   OPENAI_REASONING_EFFORTS,
   loadDaemonConfig,
   parseDaemonConfig,
+  parseLlmRequestPolicyConfig,
   parseStoredConfig,
   resolveLlmRequestPolicy,
   deepMerge,
@@ -1064,6 +1065,62 @@ describe("strict LLM configuration validation", () => {
     expect(() => parseDaemonConfig(JSON.stringify({
       llm: { provider: "anthropic", model: "m", apiKey: "key", requestTimeoutMs: 10_000 },
     }))).toThrow('only valid when llm.provider is "auto", "openai", "claude-process", or "codex-process"');
+  });
+
+  it.each([
+    [{ provider: "auto", requestTimeoutMs: 10_000 }, {}],
+    [{ provider: "claude-process", requestTimeoutMs: 20_000 }, {}],
+    [{ provider: "codex-process", requestTimeoutMs: 30_000 }, {}],
+    [{
+      provider: "openai",
+      model: "local-model",
+      baseUrl: "http://localhost/v1",
+      requestTimeoutMs: 40_000,
+      retry: { maxAttempts: 4, initialDelayMs: 0 },
+    }, {}],
+    [{
+      provider: "openai",
+      model: "local-model",
+      baseUrl: "http://localhost/v1",
+      retry: { maxAttempts: 5 },
+    }, { LCM_SUMMARY_PROVIDER: "codex" }],
+    [{
+      provider: "codex-process",
+      model: "local-model",
+      baseUrl: "http://localhost/v1",
+      retry: { maxAttempts: 6 },
+    }, { LCM_SUMMARY_PROVIDER: "openai-compatible", LCM_SUMMARY_MODEL: "env-model" }],
+    [{
+      provider: "anthropic",
+      model: "model",
+      apiKey: "key",
+      requestTimeoutMs: 50_000,
+    }, { LCM_SUMMARY_PROVIDER: "disabled" }],
+  ] as const)("keeps secret-free request-policy projection parity for valid combination %#", (llm, env) => {
+    const content = JSON.stringify({ storage: { backend: "postgresql" }, llm });
+    const daemon = parseDaemonConfig(content, {}, {
+      ...env,
+      LCM_POSTGRES_URL: "postgresql://localhost/database",
+      LCM_POSTGRES_CA_FILE: import.meta.filename,
+    });
+
+    expect(parseLlmRequestPolicyConfig(content, env).llm).toEqual({
+      provider: daemon.llm.provider,
+      requestTimeoutMs: daemon.llm.requestTimeoutMs,
+      retry: daemon.llm.retry,
+    });
+  });
+
+  it.each([
+    [{ provider: "auto", retry: { maxAttempts: 2 } }, {}, "llm.retry"],
+    [{ provider: "claude-process", retry: { maxAttempts: 2 } }, {}, "llm.retry"],
+    [{ provider: "codex-process", retry: { maxAttempts: 2 } }, {}, "llm.retry"],
+    [{ provider: "anthropic", model: "model", apiKey: "key", requestTimeoutMs: 10_000 }, {}, "llm.requestTimeoutMs"],
+    [{ provider: "disabled", requestTimeoutMs: 10_000 }, {}, "llm.requestTimeoutMs"],
+  ] as const)("keeps secret-free request-policy projection parity for invalid combination %#", (llm, env, path) => {
+    const content = JSON.stringify({ llm });
+    expect(() => parseDaemonConfig(content, {}, env)).toThrow(path);
+    expect(() => parseLlmRequestPolicyConfig(content, env)).toThrow(path);
   });
 
   it("exports a pure partial request policy resolver for CLI and route callers", () => {

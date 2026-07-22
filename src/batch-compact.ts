@@ -197,7 +197,7 @@ export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?:
           });
         }
       } finally {
-        closeLcmConnection(dbPath);
+        closeLcmConnection(dbPath, db);
       }
     } catch { /* skip corrupt databases */ }
   }

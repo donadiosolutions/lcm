@@ -9,7 +9,7 @@ import type {
 } from "../contracts.js";
 import { normalizeStorageError, StorageOperationError } from "../errors.js";
 import { SqliteExecutor } from "./executor.js";
-import { assertSqliteReady } from "./health.js";
+import { assertSqliteReady, SqliteReadinessRollbackError } from "./health.js";
 import {
   createSqliteRepositories,
   createSqliteRepositoryStores,
@@ -83,7 +83,14 @@ export class SqliteProjectStorage implements ProjectStorage {
     }
     try {
       await this.executor.run("factory", "health", () => {
-        assertSqliteReady(this.stores.db, this.projectId);
+        try {
+          assertSqliteReady(this.stores.db, this.projectId);
+        } catch (error) {
+          if (error instanceof SqliteReadinessRollbackError) {
+            this.executor.poison();
+          }
+          throw error;
+        }
       });
       return { status: "healthy", backend: "sqlite", projectId: this.projectId };
     } catch (error) {
@@ -106,7 +113,7 @@ export class SqliteProjectStorage implements ProjectStorage {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
     const attempt = this.executor
-      .run("factory", "close", () => closeLcmConnection(this.dbPath))
+      .runCleanup("factory", "close", () => closeLcmConnection(this.dbPath, this.stores.db))
       .then((): void => this.onClose(this));
     this.closePromise = attempt.catch((error: unknown): never => {
       this.closed = false;

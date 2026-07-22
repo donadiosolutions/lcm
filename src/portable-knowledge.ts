@@ -153,7 +153,7 @@ export async function exportKnowledge(
       };
     });
   } finally {
-    closeLcmConnection(dbPath);
+    closeLcmConnection(dbPath, db);
   }
 
   const doc: ExportDocument = {
@@ -265,7 +265,7 @@ export async function importKnowledge(
       }
     }
   } finally {
-    closeLcmConnection(dbPath);
+    closeLcmConnection(dbPath, db);
   }
 
   // Write meta.json if it doesn't already exist so this project is visible

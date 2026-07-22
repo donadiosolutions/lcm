@@ -68,6 +68,10 @@ export interface LlmInvocationRequestPolicy {
   retry?: LlmRetryPolicy;
 }
 
+export interface LlmRequestPolicyConfig {
+  llm: LlmRequestPolicy & { provider: LlmProvider };
+}
+
 export interface LlmRequestPolicyOverride {
   requestTimeoutMs?: unknown;
   retry?: unknown;
@@ -854,6 +858,61 @@ export function parseStoredConfig(content: string): Record<string, unknown> {
   return parseConfigRoot(content);
 }
 
+function normalizeProviderOverrideRequestPolicyKeys(
+  explicitlyConfigured: Set<string>,
+  providerOverride: LlmProvider | undefined,
+): void {
+  if (providerOverride === undefined || providerOverride === "openai") return;
+  explicitlyConfigured.delete("retry");
+  if (!supportsRequestTimeout(providerOverride)) {
+    explicitlyConfigured.delete("requestTimeoutMs");
+  }
+}
+
+function validateResolvedLlmRequestPolicy(
+  provider: LlmProvider,
+  explicitlyConfigured: ReadonlySet<string>,
+): void {
+  if (explicitlyConfigured.has("requestTimeoutMs") && !supportsRequestTimeout(provider)) {
+    throw new ConfigValidationError(
+      "llm.requestTimeoutMs",
+      `is only valid when llm.provider is "auto", "openai", "claude-process", or "codex-process"`,
+    );
+  }
+  if (explicitlyConfigured.has("retry") && provider !== "openai") {
+    throw new ConfigValidationError(
+      "llm.retry",
+      `is only valid when llm.provider is "openai"`,
+    );
+  }
+}
+
+/** Resolve only the stored LLM request-policy fields needed by hook wrappers. */
+export function parseLlmRequestPolicyConfig(
+  content: string,
+  env: Record<string, string | undefined> = {},
+): LlmRequestPolicyConfig {
+  const providerOverride = env.LCM_SUMMARY_PROVIDER
+    ? validateProviderChoice("LCM_SUMMARY_PROVIDER", env.LCM_SUMMARY_PROVIDER)
+    : undefined;
+  const stored = parseConfigRoot(content, providerOverride);
+  const llm = stored.llm as Partial<DaemonConfig["llm"]> | undefined;
+  const explicitlyConfigured = new Set(Object.keys(llm ?? {}));
+  normalizeProviderOverrideRequestPolicyKeys(explicitlyConfigured, providerOverride);
+  const provider = providerOverride ?? llm?.provider ?? "auto";
+  validateResolvedLlmRequestPolicy(provider, explicitlyConfigured);
+  const policy = resolveLlmRequestPolicy(
+    { requestTimeoutMs: DEFAULT_LLM_REQUEST_TIMEOUT_MS, retry: { ...DEFAULT_LLM_RETRY_POLICY } },
+    { requestTimeoutMs: llm?.requestTimeoutMs, retry: llm?.retry },
+  );
+  return {
+    llm: {
+      provider,
+      ...policy,
+    },
+  };
+}
+
 function requiredPostgreSqlSecret(
   value: unknown,
   envName: "LCM_POSTGRES_URL" | "LCM_POSTGRES_CA_FILE",
@@ -1047,19 +1106,8 @@ function validateResolvedLlm(merged: DaemonConfig, explicitlyConfigured: Readonl
         `is only valid when llm.provider is "openai"`,
       );
     }
-    if (explicitlyConfigured.has("requestTimeoutMs") && !supportsRequestTimeout(llm.provider)) {
-      throw new ConfigValidationError(
-        "llm.requestTimeoutMs",
-        `is only valid when llm.provider is "auto", "openai", "claude-process", or "codex-process"`,
-      );
-    }
-    if (explicitlyConfigured.has("retry")) {
-      throw new ConfigValidationError(
-        "llm.retry",
-        `is only valid when llm.provider is "openai"`,
-      );
-    }
   }
+  validateResolvedLlmRequestPolicy(llm.provider, explicitlyConfigured);
 
   if (explicitlyConfigured.has("reasoningEffort") && llm.reasoningEffort !== undefined) {
     const validEfforts = reasoningEffortsForProvider(llm.provider, llm.apiMode);
@@ -1157,11 +1205,8 @@ export function parseDaemonConfig(
     if (providerOverride !== "openai") {
       delete merged.llm.apiMode;
       explicitLlmKeys.delete("apiMode");
-      explicitLlmKeys.delete("retry");
-      if (!supportsRequestTimeout(providerOverride)) {
-        explicitLlmKeys.delete("requestTimeoutMs");
-      }
     }
+    normalizeProviderOverrideRequestPolicyKeys(explicitLlmKeys, providerOverride);
     const transitioningToOpenAI = providerOverride === "openai"
       && fileModelProvider !== undefined
       && fileModelProvider !== providerOverride;

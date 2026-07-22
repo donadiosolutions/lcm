@@ -4,6 +4,7 @@ import {
   getExistingLcmConnection,
   getLcmConnection,
   closeLcmConnection,
+  invalidateLcmConnection,
   inspectExistingLcmDatabasePath,
 } from "../../db/connection.js";
 import { getLcmDbFeatures, type LcmDbFeatures } from "../../db/features.js";
@@ -17,7 +18,7 @@ import type {
 import { sqliteStorageCapabilities } from "../capabilities.js";
 import { normalizeStorageError, StorageOperationError } from "../errors.js";
 import { sqliteExecutorFor } from "./executor.js";
-import { assertSqliteReady } from "./health.js";
+import { assertSqliteReady, SqliteReadinessRollbackError } from "./health.js";
 import { SqliteProjectStorage } from "./project-storage.js";
 
 export class SqliteStorageBackendFactory implements StorageBackendFactory {
@@ -77,7 +78,11 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
         ? getLcmConnection(paths.dbPath)
         : getExistingLcmConnection(paths.dbPath) ?? undefined;
       if (!db) return null;
-      const executor = sqliteExecutorFor(db, paths.id);
+      const executor = sqliteExecutorFor(
+        db,
+        paths.id,
+        () => { invalidateLcmConnection(paths.dbPath, db!); },
+      );
       let features: LcmDbFeatures;
       try {
         features = await executor.run("factory", operation, () => {
@@ -107,7 +112,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       this.knownProjects.set(`${paths.id}\0${paths.dbPath}`, { id: paths.id, dbPath: paths.dbPath });
       return storage;
     } catch (error) {
-      if (db && dbPath) closeLcmConnection(dbPath);
+      if (db && dbPath) closeLcmConnection(dbPath, db);
       throw normalizeStorageError(
         error,
         { backend: "sqlite", projectId: identity.id, domain: "factory", operation },
@@ -153,8 +158,20 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
           "health",
         );
       }
-      await sqliteExecutorFor(db, project.id).run("factory", "health", () => {
-        assertSqliteReady(db!, project.id);
+      const executor = sqliteExecutorFor(
+        db,
+        project.id,
+        () => { invalidateLcmConnection(project.dbPath, db!); },
+      );
+      await executor.run("factory", "health", () => {
+        try {
+          assertSqliteReady(db!, project.id);
+        } catch (error) {
+          if (error instanceof SqliteReadinessRollbackError) {
+            executor.poison();
+          }
+          throw error;
+        }
       });
       return { status: "healthy", backend: "sqlite", projectId: project.id };
     } catch (error) {
@@ -170,7 +187,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
         }),
       };
     } finally {
-      if (db) closeLcmConnection(project.dbPath);
+      if (db) closeLcmConnection(project.dbPath, db);
     }
   }
 

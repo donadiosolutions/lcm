@@ -8,7 +8,8 @@ import { createStorageBackendFactory } from "../../src/storage/factory.js";
 import { normalizeStorageError, StorageOperationError } from "../../src/storage/errors.js";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import { SqliteExecutor } from "../../src/storage/sqlite/executor.js";
-import { closeLcmConnection, isLcmConnectionOpen } from "../../src/db/connection.js";
+import { assertSqliteReady } from "../../src/storage/sqlite/health.js";
+import { closeLcmConnection, getPoolStats, isLcmConnectionOpen } from "../../src/db/connection.js";
 import { createTemporaryDirectory } from "../fixtures/runtime.js";
 import { defineCoreStorageConformance, type StorageContractHarness } from "./conformance.js";
 
@@ -240,6 +241,56 @@ describe("SQLite storage backend conformance", () => {
       prepareSpy.mockRestore();
     }
 
+    const originalExec = DatabaseSync.prototype.exec;
+    const writeExecSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      if (sql.startsWith("CREATE TABLE main.\"__lcm_storage_health_probe_")) {
+        throw new Error("readonly /secret/idle-health.db postgresql://user:pass@example.test/lcm");
+      }
+      return originalExec.call(this, sql);
+    });
+    try {
+      const health = await factory.health();
+      expect(health).toMatchObject({ status: "unavailable", backend: "sqlite" });
+      expect(JSON.stringify(health)).not.toContain("secret");
+      expect(JSON.stringify(health)).not.toContain("user:pass");
+    } finally {
+      writeExecSpy.mockRestore();
+    }
+
+    const rollbackExecSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      if (sql === "ROLLBACK") {
+        throw new Error("rollback failed /secret/idle-health.db");
+      }
+      return originalExec.call(this, sql);
+    });
+    try {
+      const health = await factory.health();
+      expect(health).toMatchObject({ status: "unavailable", backend: "sqlite" });
+      expect(JSON.stringify(health)).not.toContain("secret");
+    } finally {
+      rollbackExecSpy.mockRestore();
+    }
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+
+    expect(await factory.health()).toMatchObject({ status: "healthy", backend: "sqlite" });
+    const inspection = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const row = inspection.prepare(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE name LIKE '__lcm_storage_health_probe_%'",
+      ).get() as {
+        count: number;
+      };
+      expect(row.count).toBe(0);
+    } finally {
+      inspection.close();
+    }
+
     rmSync(dbPath);
     expect(await factory.health()).toMatchObject({ status: "unavailable", backend: "sqlite" });
     writeFileSync(dbPath, "not a SQLite database");
@@ -277,12 +328,12 @@ describe("SQLite storage backend conformance", () => {
     }
 
     const originalExec = DatabaseSync.prototype.exec;
-    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+    const writeExecSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
       this: DatabaseSync,
       sql: string,
     ) {
-      if (sql === "BEGIN IMMEDIATE") {
-        throw new Error("write unavailable /secret/active-health.db postgresql://user:pass@example.test/lcm");
+      if (sql.startsWith("CREATE TABLE main.\"__lcm_storage_health_probe_")) {
+        throw new Error("readonly /secret/active-health.db postgresql://user:pass@example.test/lcm");
       }
       return originalExec.call(this, sql);
     });
@@ -292,7 +343,7 @@ describe("SQLite storage backend conformance", () => {
       expect(JSON.stringify(health)).not.toContain("secret");
       expect(JSON.stringify(health)).not.toContain("user:pass");
     } finally {
-      execSpy.mockRestore();
+      writeExecSpy.mockRestore();
     }
 
     let markEntered!: () => void;
@@ -316,6 +367,237 @@ describe("SQLite storage backend conformance", () => {
     await expect(serializedHealth).resolves.toMatchObject({ status: "healthy", backend: "sqlite" });
 
     await factory.close();
+  });
+
+  it("poisons and evicts a shared handle when readiness rollback fails", async () => {
+    const root = createTemporaryDirectory("lcm-storage-health-rollback-failure-");
+    const identity = projectIdentity(root);
+    const dbPath = join(root, "rollback-failure.db");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath }),
+    });
+    const storage = await factory.openProject(identity);
+    const shared = await factory.openProject(identity);
+    expect(getPoolStats().connections.find((entry) => entry.path === dbPath))
+      .toMatchObject({ path: dbPath, refs: 2 });
+
+    let markEntered!: () => void;
+    let releaseTransaction!: () => void;
+    const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+    const release = new Promise<void>((resolve) => { releaseTransaction = resolve; });
+    const transaction = storage.transaction(async () => {
+      markEntered();
+      await release;
+    });
+    await entered;
+
+    const originalExec = DatabaseSync.prototype.exec;
+    const rollbackExecSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      if (sql === "ROLLBACK") {
+        throw new Error("rollback failed /secret/active-health.db");
+      }
+      return originalExec.call(this, sql);
+    });
+    const health = storage.health();
+    const queuedOperation = shared.conversations.listConversations();
+    const queuedAssertion = expect(queuedOperation).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      domain: "conversations",
+    });
+    try {
+      releaseTransaction();
+      await transaction;
+      const healthResult = await health;
+      expect(healthResult).toMatchObject({ status: "unavailable", backend: "sqlite" });
+      expect(JSON.stringify(healthResult)).not.toContain("secret");
+      await queuedAssertion;
+    } finally {
+      rollbackExecSpy.mockRestore();
+    }
+
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    await expect(storage.conversations.listConversations()).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+    });
+    await expect(shared.conversations.listConversations()).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+    });
+    await expect(storage.transaction(async () => undefined)).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      domain: "transaction",
+    });
+    expect(await factory.health()).toMatchObject({ status: "unavailable", backend: "sqlite" });
+
+    const replacement = await factory.openProject(identity);
+    expect(getPoolStats().connections.find((entry) => entry.path === dbPath))
+      .toMatchObject({ path: dbPath, refs: 1 });
+    const firstClose = storage.close();
+    expect(storage.close()).toBe(firstClose);
+    const sharedClose = shared.close();
+    expect(shared.close()).toBe(sharedClose);
+    await Promise.all([firstClose, sharedClose]);
+    expect(getPoolStats().connections.find((entry) => entry.path === dbPath))
+      .toMatchObject({ path: dbPath, refs: 1 });
+
+    await replacement.conversations.createConversation({ sessionId: "replacement" });
+    expect(await replacement.conversations.listConversations()).toHaveLength(1);
+    const inspection = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      expect(inspection.prepare(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE name LIKE '__lcm_storage_health_probe_%'",
+      ).get()).toMatchObject({ count: 0 });
+    } finally {
+      inspection.close();
+    }
+
+    await replacement.close();
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    await factory.close();
+  });
+
+  it("poisons and evicts a shared handle when transaction rollback fails", async () => {
+    const root = createTemporaryDirectory("lcm-storage-transaction-rollback-failure-");
+    const identity = projectIdentity(root);
+    const dbPath = join(root, "rollback-failure.db");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath }),
+    });
+    const storage = await factory.openProject(identity);
+    const shared = await factory.openProject(identity);
+    const conversation = await storage.conversations.createConversation({ sessionId: "preserved" });
+    expect(getPoolStats().connections.find((entry) => entry.path === dbPath))
+      .toMatchObject({ path: dbPath, refs: 2 });
+
+    let markEntered!: () => void;
+    let releaseTransaction!: () => void;
+    const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+    const release = new Promise<void>((resolve) => { releaseTransaction = resolve; });
+    const originalExec = DatabaseSync.prototype.exec;
+    const rollbackExecSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      if (sql === "ROLLBACK") {
+        throw new Error("rollback failed /secret/transaction.db");
+      }
+      return originalExec.call(this, sql);
+    });
+    const transaction = storage.transaction(async (tx) => {
+      markEntered();
+      await release;
+      await tx.conversations.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "invalid" as "user",
+        content: "driver failure /secret/message postgresql://user:pass@example.test/lcm",
+        tokenCount: 1,
+      });
+    });
+    const transactionResult = transaction.catch((error: unknown) => error);
+    await entered;
+    const queuedOperation = shared.conversations.listConversations();
+    const queuedAssertion = expect(queuedOperation).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      domain: "conversations",
+    });
+    try {
+      releaseTransaction();
+      const transactionError = await transactionResult;
+      expect(transactionError).toMatchObject({
+        code: "STORAGE_OPERATION_FAILED",
+        domain: "conversations",
+      });
+      expect(JSON.stringify(transactionError)).not.toContain("secret");
+      expect(JSON.stringify(transactionError)).not.toContain("user:pass");
+      await queuedAssertion;
+    } finally {
+      rollbackExecSpy.mockRestore();
+    }
+
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    await expect(storage.conversations.listConversations()).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+    });
+    await expect(shared.conversations.listConversations()).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+    });
+
+    const replacement = await factory.openProject(identity);
+    expect(getPoolStats().connections.find((entry) => entry.path === dbPath))
+      .toMatchObject({ path: dbPath, refs: 1 });
+    const firstClose = storage.close();
+    expect(storage.close()).toBe(firstClose);
+    const sharedClose = shared.close();
+    expect(shared.close()).toBe(sharedClose);
+    await Promise.all([firstClose, sharedClose]);
+    expect(getPoolStats().connections.find((entry) => entry.path === dbPath))
+      .toMatchObject({ path: dbPath, refs: 1 });
+
+    expect(await replacement.conversations.getMessages(conversation.conversationId)).toEqual([]);
+    await replacement.conversations.createConversation({ sessionId: "replacement" });
+    expect(await replacement.conversations.listConversations()).toHaveLength(2);
+    await replacement.close();
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    await factory.close();
+  });
+
+  it("rejects a real read-only SQLite connection without leaving probe schema objects", async () => {
+    const root = createTemporaryDirectory("lcm-storage-readonly-health-");
+    const identity = projectIdentity(root);
+    const dbPath = join(root, "readonly-health.db");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath }),
+    });
+    const storage = await factory.openProject(identity);
+    await storage.close();
+    await factory.close();
+
+    const readOnly = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      // SQLite admits the write transaction on a read-only connection; the
+      // main-schema DDL is the operation that proves writability.
+      readOnly.exec("BEGIN IMMEDIATE");
+      expect(readOnly.isTransaction).toBe(true);
+      readOnly.exec("ROLLBACK");
+      expect(() => assertSqliteReady(readOnly, identity.id)).toThrow("readonly");
+      expect(readOnly.isTransaction).toBe(false);
+      const row = readOnly.prepare(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE name LIKE '__lcm_storage_health_probe_%'",
+      ).get() as {
+        count: number;
+      };
+      expect(row.count).toBe(0);
+    } finally {
+      readOnly.close();
+    }
+  });
+
+  it("detects a full database after BEGIN succeeds and rolls back probe DDL", () => {
+    const root = createTemporaryDirectory("lcm-storage-full-health-");
+    const dbPath = join(root, "full-health.db");
+    const database = new DatabaseSync(dbPath);
+    try {
+      database.exec("PRAGMA journal_mode = DELETE; CREATE TABLE application_data (value TEXT); VACUUM");
+      const pageCountRow = database.prepare("PRAGMA page_count").get() as Record<string, number>;
+      const pageCount = Object.values(pageCountRow)[0];
+      database.prepare(`PRAGMA max_page_count = ${pageCount}`).get();
+
+      database.exec("BEGIN IMMEDIATE");
+      expect(database.isTransaction).toBe(true);
+      database.exec("ROLLBACK");
+      expect(() => assertSqliteReady(database, "full-project")).toThrow("full");
+      expect(database.isTransaction).toBe(false);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM application_data").get())
+        .toMatchObject({ count: 0 });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE name LIKE '__lcm_storage_health_probe_%'",
+      ).get()).toMatchObject({ count: 0 });
+    } finally {
+      database.close();
+    }
   });
 
   it("uses the production per-project resolver", async () => {
@@ -507,7 +789,7 @@ describe("SQLite storage backend conformance", () => {
     await factory.close();
   });
 
-  it("preserves scoped failures when rollback itself fails", async () => {
+  it("preserves scoped failures and poisons the executor when rollback itself fails", async () => {
     const calls: string[] = [];
     const database = {
       exec: (sql: string): void => {
@@ -526,5 +808,40 @@ describe("SQLite storage backend conformance", () => {
       domain: "conversations",
     });
     expect(calls).toEqual(["BEGIN IMMEDIATE", "ROLLBACK"]);
+    await expect(executor.run("conversations", "listConversations", () => undefined))
+      .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
+    executor.poison();
+  });
+
+  it("prioritizes transaction-scope contracts over a poisoned executor", async () => {
+    const liveDatabase = { exec: vi.fn() } as unknown as DatabaseSync;
+    const poisonedDatabase = { exec: vi.fn() } as unknown as DatabaseSync;
+    const live = new SqliteExecutor(liveDatabase, "live-project");
+    const poisoned = new SqliteExecutor(poisonedDatabase, "poisoned-project");
+    poisoned.poison();
+
+    await live.transaction(async () => {
+      await expect(poisoned.run("conversations", "listConversations", () => undefined))
+        .rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+      await expect(poisoned.transaction(async () => undefined))
+        .rejects.toMatchObject({ code: "STORAGE_NESTED_TRANSACTION" });
+      await expect(poisoned.runScoped(
+        Symbol("invalid"),
+        "conversations",
+        "listConversations",
+        () => undefined,
+      )).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+    });
+
+    await expect(poisoned.runScoped(
+      Symbol("escaped"),
+      "conversations",
+      "listConversations",
+      () => undefined,
+    )).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+    await expect(poisoned.run("conversations", "listConversations", () => undefined))
+      .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
+    await expect(poisoned.transaction(async () => undefined))
+      .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
   });
 });

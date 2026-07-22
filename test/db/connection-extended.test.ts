@@ -21,6 +21,7 @@ import {
   getLcmConnection,
   getPoolStats,
   closeLcmConnection,
+  invalidateLcmConnection,
   isLcmConnectionOpen,
 } from "../../src/db/connection.js";
 
@@ -256,6 +257,35 @@ describe("isLcmConnectionOpen", () => {
 
   it("ignores a path-specific close for an unknown connection", () => {
     expect(() => closeLcmConnection("/tmp/lcm-never-opened.sqlite")).not.toThrow();
+  });
+
+  it("invalidates only the expected pooled generation and ignores stale releases", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-invalidate-test-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "test.sqlite");
+    const first = getLcmConnection(dbPath);
+    const shared = getLcmConnection(dbPath);
+    const unrelated = new DatabaseSync(":memory:");
+
+    expect(invalidateLcmConnection(join(tempDir, "missing.sqlite"), first)).toBe(false);
+    expect(invalidateLcmConnection(dbPath, unrelated)).toBe(false);
+    expect(getPoolStats().connections).toMatchObject([{ path: dbPath, refs: 2 }]);
+    unrelated.close();
+
+    expect(invalidateLcmConnection(dbPath, first)).toBe(true);
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    expect(() => first.prepare("SELECT 1")).toThrow();
+    expect(() => shared.prepare("SELECT 1")).toThrow();
+    expect(invalidateLcmConnection(dbPath, first)).toBe(false);
+
+    const replacement = getLcmConnection(dbPath);
+    expect(getPoolStats().connections).toMatchObject([{ path: dbPath, refs: 1 }]);
+    closeLcmConnection(dbPath, first);
+    closeLcmConnection(dbPath, shared);
+    expect(getPoolStats().connections).toMatchObject([{ path: dbPath, refs: 1 }]);
+    expect(replacement.prepare("SELECT 1 AS value").get()).toEqual({ value: 1 });
+    closeLcmConnection(dbPath, replacement);
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
   });
 
   it("returns false when no connection has been opened for the path", () => {

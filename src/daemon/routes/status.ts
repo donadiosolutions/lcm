@@ -58,7 +58,7 @@ export function createStatusHandler(config: DaemonConfig, startTime: number, act
           summaryCount = 0;
           promotedCount = 0;
         } finally {
-          closeLcmConnection(dbPath);
+          closeLcmConnection(dbPath, db);
         }
       }
 
