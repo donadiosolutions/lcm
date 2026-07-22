@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 type FakeStdin = EventEmitter & {
   write: ReturnType<typeof vi.fn>;
   end: ReturnType<typeof vi.fn>;
+  destroy: ReturnType<typeof vi.fn>;
   writable: boolean;
   destroyed: boolean;
   writableEnded: boolean;
@@ -50,6 +51,7 @@ vi.mock("node:child_process", () => ({
     child.stdin = Object.assign(new EventEmitter(), {
       write: vi.fn(),
       end: vi.fn(() => { child.stdin.writableEnded = true; }),
+      destroy: vi.fn(() => { child.stdin.destroyed = true; }),
       writable: true,
       destroyed: false,
       writableEnded: false,
@@ -559,7 +561,7 @@ describe("doctor service coverage", () => {
     expect(mocks.mcpChild?.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
   });
 
-  it("does not settle timeout cleanup until a child with failed signals closes", async () => {
+  it("bounds cleanup when both child signals fail without a close event", async () => {
     vi.useFakeTimers();
     mocks.ensureDaemon.mockResolvedValue({ connected: true });
     mocks.mcpSetup = (child) => {
@@ -575,10 +577,78 @@ describe("doctor service coverage", () => {
     expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
     expect(settled).not.toHaveBeenCalled();
 
-    child.signalCode = "SIGKILL";
-    child.emit("close", null, "SIGKILL");
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(249);
+    expect(settled).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
     expect((await promise).find((result) => result.name === "mcp-handshake-lcm")?.status).toBe("warn");
+    expect(child.stdin.destroy).toHaveBeenCalledOnce();
+    expect(child.stdout.destroy).toHaveBeenCalledOnce();
+    expect(child.unref).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])("bounds post-SIGKILL cleanup when teardown throws=%s", async (teardownThrows) => {
+    vi.useFakeTimers();
+    mocks.ensureDaemon.mockResolvedValue({ connected: true });
+    mocks.mcpSetup = (child) => {
+      child.kill = vi.fn(() => true);
+      if (teardownThrows) {
+        child.stdin.destroy.mockImplementation(() => { throw new Error("stdin destroy failed"); });
+        child.stdout.destroy.mockImplementation(() => { throw new Error("stdout destroy failed"); });
+        child.unref.mockImplementation(() => { throw new Error("unref failed"); });
+      }
+    };
+
+    const settled = vi.fn();
+    const promise = runDoctor(healthyDeps());
+    void promise.then(settled);
+    await vi.advanceTimersByTimeAsync(6249);
+
+    const child = mocks.mcpChild!;
+    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM"]);
+    expect(settled).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(settled).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(249);
+    expect(settled).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")?.status).toBe("warn");
+    expect(child.stdin.destroy).toHaveBeenCalledOnce();
+    expect(child.stdout.destroy).toHaveBeenCalledOnce();
+    expect(child.unref).toHaveBeenCalledOnce();
+  });
+
+  it("does not abandon a child that closes during the post-SIGKILL grace", async () => {
+    vi.useFakeTimers();
+    mocks.ensureDaemon.mockResolvedValue({ connected: true });
+    mocks.mcpSetup = (child) => {
+      child.kill = vi.fn((signal: NodeJS.Signals) => {
+        if (signal === "SIGKILL") {
+          setTimeout(() => {
+            child.signalCode = signal;
+            child.emit("close", null, signal);
+          }, 100);
+        }
+        return true;
+      });
+    };
+
+    const settled = vi.fn();
+    const promise = runDoctor(healthyDeps());
+    void promise.then(settled);
+    await vi.advanceTimersByTimeAsync(6349);
+
+    const child = mocks.mcpChild!;
+    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(settled).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")?.status).toBe("warn");
+    expect(child.stdin.destroy).not.toHaveBeenCalled();
+    expect(child.stdout.destroy).not.toHaveBeenCalled();
+    expect(child.unref).not.toHaveBeenCalled();
   });
 
   it("handles a child exit racing the timeout signal", async () => {

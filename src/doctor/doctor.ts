@@ -304,14 +304,22 @@ function testMcpHandshake(): Promise<CheckResult> {
       ]);
       clearTimeout(timer);
     };
+    const abandonChild = (): void => {
+      try { child.stdin.destroy(); } catch {}
+      try { child.stdout.destroy(); } catch {}
+      try { child.unref(); } catch {}
+    };
     const stopChild = (): Promise<void> => {
       stopRequested = true;
       if (!childIsLive()) return Promise.resolve();
       termination ??= (async () => {
         const termSent = signalChild("SIGTERM");
         if (termSent && childIsLive()) await waitForClose(250);
-        if (childIsLive()) signalChild("SIGKILL");
-        if (childIsLive()) await childClosed;
+        if (childIsLive()) {
+          signalChild("SIGKILL");
+          await waitForClose(250);
+        }
+        if (childIsLive()) abandonChild();
       })();
       return termination;
     };
