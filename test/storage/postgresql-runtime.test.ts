@@ -197,6 +197,121 @@ describe("PostgreSQL runtime", () => {
     expect(f.release).toHaveBeenCalledWith(false);
   });
 
+  it("drains successful unawaited queries and fences retained executors before committing", async () => {
+    let finishQuery!: (value: QueryResult<QueryResultRow>) => void;
+    const queryResult = new Promise<QueryResult<QueryResultRow>>((resolve) => { finishQuery = resolve; });
+    const f = fixtures((input) => typeof input === "string" ? result([]) : queryResult);
+    let retained!: PostgreSqlQueryExecutor;
+    const pending = f.runtime.transaction(async (transaction) => {
+      retained = transaction;
+      void transaction.query({ text: "UPDATE values_table SET value = 2" }, {
+        domain: "sessions",
+        operation: "unawaitedSuccess",
+      });
+      return "committed";
+    }, { projectId: "outer-project", domain: "transaction", operation: "drainSuccess" });
+
+    await vi.waitFor(() => expect(f.query).toHaveBeenCalledWith({ text: "UPDATE values_table SET value = 2" }));
+    expect(f.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(f.release).not.toHaveBeenCalled();
+    await expect(retained.query({ text: "SELECT 1" }, {
+      projectId: "retained-project",
+      domain: "sessions",
+      operation: "duringDrain",
+    })).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE",
+      projectId: "retained-project",
+      operation: "duringDrain",
+    });
+
+    finishQuery(result([]));
+    await expect(pending).resolves.toBe("committed");
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      { text: "UPDATE values_table SET value = 2" },
+      "COMMIT",
+    ]);
+    expect(f.release).toHaveBeenCalledWith(false);
+  });
+
+  it("drains unawaited queries before preserving a callback failure and rolling back", async () => {
+    let finishQuery!: (value: QueryResult<QueryResultRow>) => void;
+    const queryResult = new Promise<QueryResult<QueryResultRow>>((resolve) => { finishQuery = resolve; });
+    const f = fixtures((input) => typeof input === "string" ? result([]) : queryResult);
+    const pending = f.runtime.transaction(async (transaction) => {
+      void transaction.query({ text: "UPDATE values_table SET value = 3" }, {
+        domain: "sessions",
+        operation: "unawaitedBeforeCallbackFailure",
+      });
+      throw new Error("callback secret");
+    }, { domain: "transaction", operation: "callbackFailureAfterDrain" });
+
+    await vi.waitFor(() => expect(f.query).toHaveBeenCalledWith({ text: "UPDATE values_table SET value = 3" }));
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).not.toHaveBeenCalled();
+    finishQuery(result([]));
+
+    await expect(pending).rejects.toMatchObject({ operation: "callbackFailureAfterDrain" });
+    expect(f.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(f.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(f.release).toHaveBeenCalledWith(false);
+  });
+
+  it("prefers an unawaited query failure over a concurrent callback failure", async () => {
+    let failQuery!: (error: Error) => void;
+    const queryResult = new Promise<QueryResult<QueryResultRow>>((_resolve, reject) => { failQuery = reject; });
+    const f = fixtures((input) => typeof input === "string" ? result([]) : queryResult);
+    const pending = f.runtime.transaction(async (transaction) => {
+      void transaction.query({ text: "INSERT INTO values_table VALUES (4)" }, {
+        projectId: "query-project",
+        domain: "sessions",
+        operation: "unawaitedFailure",
+      }).catch(() => undefined);
+      throw new Error("callback secret");
+    }, { projectId: "outer-project", domain: "transaction", operation: "callbackFailure" });
+
+    await vi.waitFor(() => expect(f.query).toHaveBeenCalledWith({ text: "INSERT INTO values_table VALUES (4)" }));
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    failQuery(Object.assign(new Error("constraint secret"), { code: "23505" }));
+
+    await expect(pending).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      projectId: "query-project",
+      domain: "sessions",
+      operation: "unawaitedFailure",
+      retryable: false,
+    });
+    expect(f.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(f.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(f.release).toHaveBeenCalledWith(false);
+  });
+
+  it("destroys the client when an unawaited query disconnects after the callback fails", async () => {
+    let failQuery!: (error: Error) => void;
+    const queryResult = new Promise<QueryResult<QueryResultRow>>((_resolve, reject) => { failQuery = reject; });
+    const f = fixtures((input) => typeof input === "string" ? result([]) : queryResult);
+    const pending = f.runtime.transaction(async (transaction) => {
+      void transaction.query({ text: "UPDATE values_table SET value = 5" }, {
+        domain: "sessions",
+        operation: "unawaitedDisconnect",
+      }).catch(() => undefined);
+      throw new Error("callback secret");
+    }, { domain: "transaction", operation: "callbackFailure" });
+
+    await vi.waitFor(() => expect(f.query).toHaveBeenCalledWith({ text: "UPDATE values_table SET value = 5" }));
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).not.toHaveBeenCalled();
+    failQuery(Object.assign(new Error("connection secret"), { code: "08006" }));
+
+    await expect(pending).rejects.toMatchObject({
+      operation: "unawaitedDisconnect",
+      retryable: true,
+    });
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
   it("rejects and does not commit when the transaction signal aborts after the callback", async () => {
     const controller = new AbortController();
     const f = fixtures((input) => typeof input === "string" ? result([]) : result([{ value: 1 }]));

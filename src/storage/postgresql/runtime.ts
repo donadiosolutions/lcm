@@ -108,7 +108,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
         throw aborted(options);
       }
       await client.query("BEGIN");
-      let transactionActive = true;
+      let acceptingQueries = true;
       let transactionFailed = false;
       let transactionFailure: StorageOperationError | undefined;
       let queryQueue = Promise.resolve();
@@ -117,7 +117,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
           config: QueryConfig<I>,
           queryOptions: PostgreSqlQueryOptions,
         ) => {
-          if (!transactionActive || transactionFailed) {
+          if (!acceptingQueries || transactionFailed) {
             throw new StorageOperationError(
               "STORAGE_TRANSACTION_SCOPE",
               "postgresql",
@@ -127,7 +127,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
             );
           }
           const execute = queryQueue.then(async () => {
-            if (!transactionActive || transactionFailed) {
+            if (transactionFailed) {
               throw new StorageOperationError(
                 "STORAGE_TRANSACTION_SCOPE",
                 "postgresql",
@@ -151,20 +151,25 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
           return execute;
         },
       };
-      let result: T;
+      let callbackOutcome!: { readonly succeeded: true; readonly result: T }
+        | { readonly succeeded: false; readonly error: unknown };
       try {
-        result = await callback(transaction);
+        callbackOutcome = { succeeded: true, result: await callback(transaction) };
+      } catch (error) {
+        callbackOutcome = { succeeded: false, error };
       } finally {
-        transactionActive = false;
+        acceptingQueries = false;
       }
+      await queryQueue;
       if (transactionFailure) throw transactionFailure;
+      if (!callbackOutcome.succeeded) throw callbackOutcome.error;
       if (options.signal?.aborted) {
         destroy = true;
         throw aborted(options);
       }
       await client.query("COMMIT");
       this.poolFailed = false;
-      return result;
+      return callbackOutcome.result;
     } catch (error) {
       if (options.signal?.aborted === true || isPostgreSqlConnectionError(error)) destroy = true;
       if (client && !destroy && options.signal?.aborted !== true) {
