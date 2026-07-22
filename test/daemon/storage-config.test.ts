@@ -164,6 +164,20 @@ describe("storage configuration", () => {
     expect(JSON.stringify(daemonConfigForPersistence(config)).toLowerCase()).not.toContain("trim-secret");
   });
 
+  it("accepts encoded PostgreSQL credentials and one decoded database path segment", () => {
+    const trustedCa = caFile("trusted-ca");
+    const encodedUrl = "postgresql://encoded%20user:encoded%2Fpassword@db.example.com/lcm%20database";
+    const config = parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
+      LCM_POSTGRES_URL: encodedUrl,
+      LCM_POSTGRES_CA_FILE: trustedCa,
+    });
+
+    expect(config.storage).toMatchObject({
+      backend: "postgresql",
+      postgresql: { url: encodedUrl },
+    });
+  });
+
   it("returns the canonical CA path established by the validated file preflight", () => {
     const trustedCa = caFile("trusted-ca");
     const nestedDirectory = join(dirname(trustedCa), "nested");
@@ -249,13 +263,77 @@ describe("storage configuration", () => {
     }
   });
 
+  it.each([
+    {
+      label: "missing username",
+      url: "postgresql://:missing-username-secret@db.example.com/lcm",
+      forbidden: "missing-username-secret",
+    },
+    {
+      label: "missing password",
+      url: "postgresql://missing-password-user@db.example.com/lcm",
+      forbidden: "missing-password-user",
+    },
+    {
+      label: "missing database path",
+      url: "postgresql://user:missing-database-secret@db.example.com",
+      forbidden: "missing-database-secret",
+    },
+    {
+      label: "empty database path",
+      url: "postgresql://user:empty-database-secret@db.example.com/",
+      forbidden: "empty-database-secret",
+    },
+    {
+      label: "nested database path",
+      url: "postgresql://user:nested-database-secret@db.example.com/lcm/nested",
+      forbidden: "nested-database-secret",
+    },
+    {
+      label: "encoded nested database path",
+      url: "postgresql://user:encoded-nested-secret@db.example.com/lcm%2Fnested",
+      forbidden: "encoded-nested-secret",
+    },
+    {
+      label: "invalid username encoding",
+      url: "postgresql://invalid%E0%A4%A:invalid-username-secret@db.example.com/lcm",
+      forbidden: "invalid-username-secret",
+    },
+    {
+      label: "invalid password encoding",
+      url: "postgresql://user:invalid%E0%A4%A@db.example.com/lcm",
+      forbidden: "invalid%E0%A4%A",
+    },
+    {
+      label: "invalid database encoding",
+      url: "postgresql://user:invalid-encoding-secret@db.example.com/%E0%A4%A",
+      forbidden: "invalid-encoding-secret",
+    },
+  ])("rejects PostgreSQL URL with $label without echoing credentials", ({ url, forbidden }) => {
+    const error = (() => {
+      try {
+        parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
+          LCM_POSTGRES_URL: url,
+          LCM_POSTGRES_CA_FILE: caFile(),
+        });
+      } catch (caught) {
+        return caught as Error;
+      }
+      throw new Error("expected configuration error");
+    })();
+    expect(error.message).toContain(
+      "explicit non-empty username and password and exactly one non-empty decoded database path segment",
+    );
+    expect(error.message).not.toContain(forbidden);
+  });
+
   it("requires an absolute, readable, non-empty regular CA file within the size limit", () => {
     expect(() => parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
-      LCM_POSTGRES_URL: "postgresql://db.example.com/lcm",
+      LCM_POSTGRES_URL: "postgresql://user:password@db.example.com/lcm",
       LCM_POSTGRES_CA_FILE: "relative.crt",
     })).toThrow("absolute path");
     expect(() => parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
-      LCM_POSTGRES_URL: "postgresql://db.example.com/lcm",
+      LCM_POSTGRES_URL: "postgresql://user:password@db.example.com/lcm",
       LCM_POSTGRES_CA_FILE: "/missing/lcm-ca.crt",
     })).toThrow("readable regular file");
     expect(() => parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, postgresEnv(caFile("")))).toThrow("must not be empty");

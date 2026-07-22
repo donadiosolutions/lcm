@@ -966,6 +966,25 @@ export function resolveStorageConfig(
       "must not contain a URL fragment; provide only the PostgreSQL server, credentials, port, and database",
     );
   }
+  let database: string;
+  let username: string;
+  let password: string;
+  try {
+    database = decodeURIComponent(parsedUrl.pathname.slice(1));
+    username = decodeURIComponent(parsedUrl.username);
+    password = decodeURIComponent(parsedUrl.password);
+  } catch {
+    throw new ConfigValidationError(
+      "LCM_POSTGRES_URL",
+      "must include an explicit non-empty username and password and exactly one non-empty decoded database path segment",
+    );
+  }
+  if (username === "" || password === "" || database === "" || database.includes("/")) {
+    throw new ConfigValidationError(
+      "LCM_POSTGRES_URL",
+      "must include an explicit non-empty username and password and exactly one non-empty decoded database path segment",
+    );
+  }
   if (!isAbsolute(caFile)) {
     throw new ConfigValidationError("LCM_POSTGRES_CA_FILE", `must be an absolute path, received ${JSON.stringify(caFile)}`);
   }
