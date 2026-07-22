@@ -77,9 +77,9 @@ describe("external admission workflow", () => {
     expect(setupNode?.with).toEqual({ "node-version": 22 });
   });
 
-  it("starts only for Codecov or DCO and polls CI without triggering on merge groups", () => {
+  it("starts only for Greptile or DCO and polls CI without triggering on merge groups", () => {
     for (const identity of [
-      ["codecov/patch", "254", "codecov"],
+      ["Greptile Review", "867647", "greptile-apps"],
       ["DCO", "1861", "dco"],
     ]) {
       for (const value of identity) expect(job.if).toContain(value);
@@ -88,7 +88,7 @@ describe("external admission workflow", () => {
     expect(job.if).not.toContain("github-actions");
     expect(source).toContain("CI is polled but never starts this evaluator");
     expect(policySource).toContain('name: "ci", appId: 15368, appSlug: "github-actions"');
-    expect(source).not.toMatch(/CodeRabbit|Greptile|copilot-pull-request-reviewer/iu);
+    expect(source).not.toMatch(/CodeRabbit|copilot-pull-request-reviewer/iu);
   });
 
   it("paginates every collection and repeats exact pull-request eligibility", () => {
@@ -111,7 +111,7 @@ describe("external admission workflow", () => {
     expect(policySource).toContain("pull request file audit count does not match changed_files");
   });
 
-  it("requires authenticated Codecov for coverable or trust-sensitive paths", () => {
+  it("requires authenticated Greptile for coverable or trust-sensitive paths", () => {
     expect(policySource).toContain("file.previous_filename");
     expect(policySource).toMatch(/bin\|installer\|src/u);
     expect(policySource).toContain("[cm]?ts|tsx");
@@ -119,7 +119,7 @@ describe("external admission workflow", () => {
     expect(policySource).toMatch(/package\(\?:-lock\)\?/u);
     expect(policySource).toContain("vitest");
     expect(policySource).toContain("tsconfig");
-    expect(source).toContain('waiting_description="Waiting for Codecov patch and DCO"');
+    expect(source).toContain('waiting_description="Waiting for Greptile review and DCO"');
   });
 
   it("validates successful neutral CI against exact Actions run metadata", () => {
