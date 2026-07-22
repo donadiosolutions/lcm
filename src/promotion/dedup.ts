@@ -37,9 +37,9 @@ function isDuplicateCandidate(
   content: string,
   bm25Threshold: number,
 ): boolean {
-  // Unranked lexical fallbacks may return broad partial matches. Only exact
-  // content identity is strong enough to deduplicate without a relevance score.
-  if (candidate.rank === 0) return candidate.content === content;
+  // Fallback ranks are non-negative and may represent broad partial matches.
+  // Only exact content identity is strong enough to deduplicate without BM25.
+  if (candidate.rank >= 0) return candidate.content === content;
   return candidate.rank <= -bm25Threshold;
 }
 
@@ -114,8 +114,7 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
     return params.store.insert({ ...input, projectId: params.projectId });
   }
 
-  // Structural convergence: pick best BM25 match as canonical
-  // (duplicates is sorted by rank — most negative rank = best match = duplicates[0])
+  // Structural convergence: use the backend's first ordered duplicate as canonical.
   const canonical = duplicates[0];
   // Use max confidence across all matched duplicates + incoming to avoid losing strong signals
   const refreshedConfidence = Math.max(confidence, ...duplicates.map((d) => d.confidence));

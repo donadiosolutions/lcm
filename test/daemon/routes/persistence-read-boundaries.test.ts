@@ -80,7 +80,13 @@ const response = {
 } as unknown as ServerResponse;
 
 function injectedFactory(): never {
-  return { projectExists: mocks.projectExists, openProject: mocks.openProject, close: mocks.factoryClose } as never;
+  return {
+    projectExists: mocks.projectExists,
+    openExistingProject: async (identity: unknown) =>
+      await mocks.projectExists() ? mocks.openProject(identity) : null,
+    openProject: mocks.openProject,
+    close: mocks.factoryClose,
+  } as never;
 }
 
 async function invoke(
@@ -122,7 +128,7 @@ describe("persistence read route boundaries", () => {
       close: mocks.projectClose,
     };
     mocks.openProject.mockResolvedValue(project);
-    mocks.createFactory.mockReturnValue({ projectExists: mocks.projectExists, openProject: mocks.openProject, close: mocks.factoryClose });
+    mocks.createFactory.mockImplementation(() => injectedFactory());
   });
 
   it("covers describe validation, absence, success, and typed failures", async () => {
@@ -228,12 +234,20 @@ describe("persistence read route boundaries", () => {
     mocks.projectExists.mockResolvedValueOnce(false);
     await invoke(handler, { cwd: "/missing" });
     expectLast(200, { summaries: [] });
-    mocks.recentSummaries.mockResolvedValueOnce([{
-      summaryId: "s", content: "summary", depth: 1, tokenCount: 2,
-      createdAt: new Date(2025, 0, 2, 3, 4, 5),
-    }]);
-    await invoke(handler, { cwd: "/ok", limit: 2 });
-    expectLast(200, { summaries: [{ summary_id: "s", content: "summary", depth: 1, token_count: 2, created_at: "2025-01-02 03:04:05" }] });
+    const previousTimezone = process.env.TZ;
+    process.env.TZ = "America/New_York";
+    try {
+      mocks.recentSummaries.mockResolvedValueOnce([{
+        summaryId: "s", content: "summary", depth: 1, tokenCount: 2,
+        // SummaryStore parses SQLite's timezone-free timestamp as local time.
+        createdAt: new Date("2025-01-02 03:04:05"),
+      }]);
+      await invoke(handler, { cwd: "/ok", limit: 2 });
+      expectLast(200, { summaries: [{ summary_id: "s", content: "summary", depth: 1, token_count: 2, created_at: "2025-01-02 03:04:05" }] });
+    } finally {
+      if (previousTimezone === undefined) delete process.env.TZ;
+      else process.env.TZ = previousTimezone;
+    }
     expect(mocks.recentSummaries).toHaveBeenLastCalledWith(2);
     await invoke(handler, { cwd: "/ok" });
     expect(mocks.recentSummaries).toHaveBeenLastCalledWith(5);

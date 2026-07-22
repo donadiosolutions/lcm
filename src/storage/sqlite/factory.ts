@@ -1,7 +1,11 @@
 import type { ProjectIdentity } from "../../project-map.js";
 import { existsSync } from "node:fs";
 import { projectPaths, ensureProjectDir } from "../../daemon/project.js";
-import { getLcmConnection, closeLcmConnection } from "../../db/connection.js";
+import {
+  getExistingLcmConnection,
+  getLcmConnection,
+  closeLcmConnection,
+} from "../../db/connection.js";
 import { getLcmDbFeatures, type LcmDbFeatures } from "../../db/features.js";
 import { runLcmMigrations } from "../../db/migration.js";
 import type {
@@ -44,7 +48,19 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
   }
 
   async openProject(identity: ProjectIdentity): Promise<ProjectStorage> {
-    this.assertOpen(identity, "openProject");
+    return (await this.openResolvedProject(identity, "openProject", true))!;
+  }
+
+  async openExistingProject(identity: ProjectIdentity): Promise<ProjectStorage | null> {
+    return this.openResolvedProject(identity, "openExistingProject", false);
+  }
+
+  private async openResolvedProject(
+    identity: ProjectIdentity,
+    operation: "openProject" | "openExistingProject",
+    createIfMissing: boolean,
+  ): Promise<ProjectStorage | null> {
+    this.assertOpen(identity, operation);
     let finishOpen!: () => void;
     const pendingOpen = new Promise<void>((resolve): void => { finishOpen = resolve; });
     this.pendingOpens.add(pendingOpen);
@@ -52,14 +68,17 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
     let db: ReturnType<typeof getLcmConnection> | undefined;
     try {
       const paths = this.resolveProject(identity);
-      this.assertIdentity(identity, paths.id, "openProject");
-      if (!this.options.resolveProject) ensureProjectDir(identity.canonical);
+      this.assertIdentity(identity, paths.id, operation);
+      if (createIfMissing && !this.options.resolveProject) ensureProjectDir(identity.canonical);
       dbPath = paths.dbPath;
-      db = getLcmConnection(paths.dbPath);
+      db = createIfMissing
+        ? getLcmConnection(paths.dbPath)
+        : getExistingLcmConnection(paths.dbPath) ?? undefined;
+      if (!db) return null;
       const executor = sqliteExecutorFor(db, paths.id);
       let features: LcmDbFeatures;
       try {
-        features = await executor.run("factory", "openProject", () => {
+        features = await executor.run("factory", operation, () => {
           const detected = (this.options.detectFeatures ?? getLcmDbFeatures)(db!);
           runLcmMigrations(db!, detected);
           return detected;
@@ -70,10 +89,10 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
           "sqlite",
           identity.id,
           "factory",
-          "openProject",
+          operation,
         );
       }
-      this.assertOpen(identity, "openProject");
+      this.assertOpen(identity, operation);
       const storage = new SqliteProjectStorage(
         paths.id,
         paths.dbPath,
@@ -88,7 +107,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       if (db && dbPath) closeLcmConnection(dbPath);
       throw normalizeStorageError(
         error,
-        { backend: "sqlite", projectId: identity.id, domain: "factory", operation: "openProject" },
+        { backend: "sqlite", projectId: identity.id, domain: "factory", operation },
         "STORAGE_INITIALIZATION_FAILED",
       );
     } finally {
@@ -98,7 +117,15 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
   }
 
   async health(): Promise<StorageHealth> {
-    return { status: this.closed ? "closed" : "healthy", backend: "sqlite" };
+    if (this.closed) return { status: "closed", backend: "sqlite" };
+    const projectHealth = await Promise.all([...this.projects].map((project) => project.health()));
+    const unavailable = projectHealth.find((health) => health.status === "unavailable");
+    if (!unavailable) return { status: "healthy", backend: "sqlite" };
+    return {
+      status: "unavailable",
+      backend: "sqlite",
+      error: unavailable.error,
+    };
   }
 
   close(): Promise<void> {

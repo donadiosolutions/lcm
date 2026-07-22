@@ -104,6 +104,7 @@ describe("printStats", () => {
     }, false));
     expect(out).toContain("Compression");
     expect(out).toContain("compressed");
+    expect(out).toContain("2 of 5 conversations");
   });
 
   it("prints compression ratio and token counts", () => {

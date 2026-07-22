@@ -22,6 +22,7 @@ vi.mock("../../src/db/events-path.js", async () => {
 import { safeLogError, _resetCircuitBreaker, _setLogPathForTesting } from "../../src/hooks/hook-errors.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
 import { eventsDbPath } from "../../src/db/events-path.js";
+import { MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH } from "../../src/hooks/hook-error-diagnostic.js";
 import { lcmPath } from "../../src/runtime-paths.js";
 
 describe("safeLogError", () => {
@@ -82,6 +83,20 @@ describe("safeLogError", () => {
     expect(content).toContain("db fail");
     expect(content).toContain("PostToolUse");
     expect(content).toContain("/dev/null/impossible");
+  });
+
+  it("sanitizes and bounds errors written by the fallback log", async () => {
+    const secret = `postgresql://alice:hunter2@db.example.test/lcm?sslmode=disable password=hunter2 ${"x".repeat(
+      MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH + 100,
+    )}\u001b[31m`;
+    await safeLogError("PostToolUse", new Error(secret), {});
+
+    const record = JSON.parse(readFileSync(join(tempDir, "events.log"), "utf-8")) as { error: string };
+    expect(record.error).not.toContain("alice");
+    expect(record.error).not.toContain("hunter2");
+    expect(record.error).not.toContain("sslmode");
+    expect(record.error).not.toContain("\u001b");
+    expect(record.error.length).toBe(MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH);
   });
 
   it("circuit breaker: skips DB after first failure", async () => {

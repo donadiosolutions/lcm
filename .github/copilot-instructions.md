@@ -48,6 +48,10 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Flag PRs adding routes without tests.
 - Never delete legacy parsing fallbacks or defensive handling for non-`Error` thrown values merely to satisfy coverage. Cover those branches with deterministic failure injection while preserving compatibility behavior.
 
+### Search ranking compatibility
+
+- Fallback lexical-search ranks and sentinel scores must remain compatible with every consumer, including deduplication thresholds, prompt-search minimum scores, and result ordering. Require regressions that both surface relevant fallback matches and prevent false deduplication merges, while preserving native FTS ranking behavior unchanged.
+
 ### SQLite transaction safety
 
 - Any operation that modifies more than one table must be wrapped in `BEGIN`/`COMMIT`.

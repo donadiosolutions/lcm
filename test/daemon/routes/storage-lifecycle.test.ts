@@ -6,28 +6,29 @@ describe("route storage cleanup", () => {
     await expect(closeRouteStorage(undefined, undefined)).resolves.toBeUndefined();
   });
 
-  it("attempts both closes and suppresses both rejections", async () => {
+  it("attempts every synchronous or asynchronous close and suppresses failures", async () => {
     const projectClose = vi.fn(async () => { throw new Error("project close failed"); });
+    const outboxClose = vi.fn(() => { throw new Error("outbox close failed"); });
     const factoryClose = vi.fn(async () => { throw new Error("factory close failed"); });
     await expect(closeRouteStorage(
       { close: projectClose },
+      { close: outboxClose },
       { close: factoryClose },
     )).resolves.toBeUndefined();
     expect(projectClose).toHaveBeenCalledOnce();
+    expect(outboxClose).toHaveBeenCalledOnce();
     expect(factoryClose).toHaveBeenCalledOnce();
   });
 
-  it("opens only projects reported by the selected backend", async () => {
+  it("delegates atomic existing-project opens to the selected backend", async () => {
     const identity = { id: "project", canonical: "/project" } as never;
     const project = { close: vi.fn() } as never;
     const factory = {
-      projectExists: vi.fn(async () => false),
-      openProject: vi.fn(async () => project),
+      openExistingProject: vi.fn(async () => null as typeof project | null),
     } as never;
     await expect(openExistingProject(factory, identity)).resolves.toBeNull();
-    expect(factory.openProject).not.toHaveBeenCalled();
-    factory.projectExists.mockResolvedValueOnce(true);
+    factory.openExistingProject.mockResolvedValueOnce(project);
     await expect(openExistingProject(factory, identity)).resolves.toBe(project);
-    expect(factory.openProject).toHaveBeenCalledWith(identity);
+    expect(factory.openExistingProject).toHaveBeenCalledWith(identity);
   });
 });

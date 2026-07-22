@@ -1,17 +1,39 @@
 // test/hooks/events-db.test.ts
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { EventsDb, _resetMigratedPathsForTesting, type EventRow, type HealthStats } from "../../src/hooks/events-db.js";
+import {
+  EventsDb,
+  MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH,
+  _resetMigratedPathsForTesting,
+  type EventRow,
+  type HealthStats,
+} from "../../src/hooks/events-db.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
+import {
+  closeLcmConnection,
+  getLcmConnection,
+  isLcmConnectionOpen,
+} from "../../src/db/connection.js";
 
 function withSqlite<T>(path: string, operation: (db: DatabaseSync) => T): T {
   const db = new DatabaseSync(path);
   try {
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA foreign_keys = ON");
     return operation(db);
   } finally {
     db.close();
+  }
+}
+
+function getPooledBusyTimeout(path: string): number {
+  const db = getLcmConnection(path);
+  try {
+    return (db.prepare("PRAGMA busy_timeout").get() as { timeout: number }).timeout;
+  } finally {
+    closeLcmConnection(path);
   }
 }
 
@@ -68,6 +90,89 @@ describe("EventsDb", () => {
     } finally {
       db?.close();
       execSpy.mockRestore();
+    }
+  });
+
+  it("restores the exact pooled baseline after the final override closes", () => {
+    const keeper = new EventsDb(dbPath);
+    const pooled = getLcmConnection(dbPath);
+    pooled.exec("PRAGMA busy_timeout = 900");
+    closeLcmConnection(dbPath);
+
+    const scoped = new EventsDb(dbPath, { busyTimeoutMs: 500 });
+    expect(getPooledBusyTimeout(dbPath)).toBe(500);
+    scoped.close();
+    scoped.close();
+    expect(getPooledBusyTimeout(dbPath)).toBe(900);
+    keeper.close();
+  });
+
+  it("keeps the newest active override across out-of-order closes", () => {
+    const keeper = new EventsDb(dbPath);
+    const first = new EventsDb(dbPath, { busyTimeoutMs: 250 });
+    const second = new EventsDb(dbPath, { busyTimeoutMs: 750 });
+    expect(getPooledBusyTimeout(dbPath)).toBe(750);
+
+    first.close();
+    expect(getPooledBusyTimeout(dbPath)).toBe(750);
+    second.close();
+    expect(getPooledBusyTimeout(dbPath)).toBe(5_000);
+    keeper.close();
+  });
+
+  it("restores the previous active override when the newest owner closes first", () => {
+    const keeper = new EventsDb(dbPath);
+    const first = new EventsDb(dbPath, { busyTimeoutMs: 250 });
+    const second = new EventsDb(dbPath, { busyTimeoutMs: 750 });
+
+    second.close();
+    expect(getPooledBusyTimeout(dbPath)).toBe(250);
+    first.close();
+    expect(getPooledBusyTimeout(dbPath)).toBe(5_000);
+    keeper.close();
+  });
+
+  it.each([new Error("timeout rejected"), "plain timeout rejection"])(
+    "releases the pooled connection when applying an override fails",
+    (failure) => {
+      const originalExec = DatabaseSync.prototype.exec;
+      const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+        this: DatabaseSync,
+        sql: string,
+      ) {
+        if (sql === "PRAGMA busy_timeout = 250") throw failure;
+        return originalExec.call(this, sql);
+      });
+      try {
+        expect(() => new EventsDb(dbPath, { busyTimeoutMs: 250 })).toThrow(
+          failure instanceof Error ? failure.message : failure,
+        );
+        expect(isLcmConnectionOpen(dbPath)).toBe(false);
+      } finally {
+        execSpy.mockRestore();
+      }
+    },
+  );
+
+  it("preserves an active override when a newer override cannot be applied", () => {
+    const keeper = new EventsDb(dbPath);
+    const active = new EventsDb(dbPath, { busyTimeoutMs: 250 });
+    const originalExec = DatabaseSync.prototype.exec;
+    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      if (sql === "PRAGMA busy_timeout = 750") throw new Error("new override rejected");
+      return originalExec.call(this, sql);
+    });
+    try {
+      expect(() => new EventsDb(dbPath, { busyTimeoutMs: 750 })).toThrow("new override rejected");
+      expect(getPooledBusyTimeout(dbPath)).toBe(250);
+    } finally {
+      execSpy.mockRestore();
+      active.close();
+      expect(getPooledBusyTimeout(dbPath)).toBe(5_000);
+      keeper.close();
     }
   });
 
@@ -183,7 +288,8 @@ describe("EventsDb", () => {
       });
 
       try {
-        expect(() => new EventsDb(dbPath)).toThrow("injected schema-version failure");
+        expect(() => new EventsDb(dbPath, { busyTimeoutMs: 250 }))
+          .toThrow("injected schema-version failure");
       } finally {
         prepareSpy.mockRestore();
       }
@@ -325,6 +431,45 @@ describe("EventsDb", () => {
       const row = db.getRecentErrors({ includeMaintenance: true })[0];
       expect(row.error).toBe("raw string error");
       expect(row.session_id).toBeNull();
+      db.close();
+    });
+
+    it("sanitizes and bounds hook errors both when writing and reading legacy rows", () => {
+      const db = new EventsDb(dbPath);
+      const unsafe = `failed at /Users/alice/private.txt password=hunter2 \u001b[31m${"x".repeat(
+        MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH + 100,
+      )}`;
+      db.logHookError("PostToolUse", new Error(unsafe));
+
+      const persisted = withSqlite(dbPath, (raw) => raw.prepare(
+        "SELECT error FROM error_log WHERE hook = 'PostToolUse'",
+      ).get()) as { error: string };
+      expect(persisted.error).not.toContain("/Users/alice");
+      expect(persisted.error).not.toContain("hunter2");
+      expect(persisted.error).not.toContain("\u001b");
+      expect(persisted.error.length).toBe(MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH);
+
+      withSqlite(dbPath, (raw) => raw.prepare(
+        "INSERT INTO error_log (hook, error, session_id) VALUES (?, ?, NULL)",
+      ).run("legacy", unsafe));
+      const legacy = db.getRecentErrors({ includeMaintenance: true, limit: 1 })[0];
+      expect(legacy.hook).toBe("legacy");
+      expect(legacy.error).not.toContain("/Users/alice");
+      expect(legacy.error).not.toContain("hunter2");
+      expect(legacy.error).not.toContain("\u001b");
+      expect(legacy.error.length).toBe(MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH);
+      db.close();
+    });
+
+    it("normalizes recent-error limits to a bounded non-negative integer", () => {
+      const db = new EventsDb(dbPath);
+      for (let i = 0; i < 105; i++) db.logHookError("PostToolUse", `failure ${i}`);
+
+      expect(db.getRecentErrors({ limit: -1 })).toEqual([]);
+      expect(db.getRecentErrors({ limit: 2.9 })).toHaveLength(2);
+      expect(db.getRecentErrors({ limit: Number.NaN })).toHaveLength(5);
+      expect(db.getRecentErrors({ limit: Number.POSITIVE_INFINITY })).toHaveLength(5);
+      expect(db.getRecentErrors({ limit: 1_000 })).toHaveLength(100);
       db.close();
     });
 

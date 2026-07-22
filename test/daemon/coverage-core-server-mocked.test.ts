@@ -21,6 +21,7 @@ state.createFactory.mockImplementation(() => ({
   backend: "sqlite",
   capabilities: {},
   projectExists: vi.fn().mockResolvedValue(false),
+  openExistingProject: vi.fn().mockResolvedValue(null),
   openProject: vi.fn(),
   health: vi.fn(async () => state.health),
   close: state.closeFactory,
@@ -103,6 +104,73 @@ afterEach(() => {
 });
 
 describe("mocked server states unavailable from Node HTTP", () => {
+  it("waits for an active periodic ingest scan before closing storage", async () => {
+    let intervalHandler: (() => Promise<void>) | undefined;
+    const realSetInterval = globalThis.setInterval;
+    const interval = { unref: vi.fn() } as unknown as NodeJS.Timeout;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 10 * 60 * 1000) {
+        intervalHandler = handler as () => Promise<void>;
+        return interval;
+      }
+      return realSetInterval(handler, timeout, ...args);
+    }) as typeof setInterval);
+    vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
+    let releaseScan!: () => void;
+    const scanGate = new Promise<void>((resolve) => { releaseScan = resolve; });
+    const daemon = await createDaemon(
+      loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }),
+      { _scanForTranscripts: () => scanGate },
+    );
+
+    const firstScan = intervalHandler?.();
+    expect(intervalHandler?.()).toBe(firstScan);
+    let stopSettled = false;
+    const stopping = daemon.stop().then(() => { stopSettled = true; });
+    await Promise.resolve();
+    expect(stopSettled).toBe(false);
+    expect(state.closeFactory).not.toHaveBeenCalled();
+    releaseScan();
+    await stopping;
+    expect(state.closeFactory).toHaveBeenCalledOnce();
+  });
+
+  it("contains synchronous and asynchronous periodic scan failures", async () => {
+    let intervalHandler: (() => Promise<void>) | undefined;
+    const realSetInterval = globalThis.setInterval;
+    const interval = { unref: vi.fn() } as unknown as NodeJS.Timeout;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 10 * 60 * 1000) {
+        intervalHandler = handler as () => Promise<void>;
+        return interval;
+      }
+      return realSetInterval(handler, timeout, ...args);
+    }) as typeof setInterval);
+    vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
+    const scan = vi.fn<() => Promise<void>>()
+      .mockImplementationOnce(() => { throw new Error("synchronous scan failure"); })
+      .mockRejectedValueOnce(new Error("asynchronous scan failure"));
+    const daemon = await createDaemon(
+      loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }),
+      { _scanForTranscripts: scan },
+    );
+
+    await expect(intervalHandler?.()).resolves.toBeUndefined();
+    await expect(intervalHandler?.()).resolves.toBeUndefined();
+    expect(scan).toHaveBeenCalledTimes(2);
+    await daemon.stop();
+  });
+
+  it("always reaches storage cleanup when earlier stop steps fail", async () => {
+    const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }));
+    vi.spyOn(globalThis, "clearInterval").mockImplementation(() => { throw new Error("interval close failed"); });
+    state.closeWatcher.mockImplementationOnce(() => { throw new Error("watcher close failed"); });
+    state.stopProcessor.mockImplementationOnce(() => { throw new Error("processor stop failed"); });
+
+    await expect(daemon.stop()).resolves.toBeUndefined();
+    expect(state.closeFactory).toHaveBeenCalledOnce();
+  });
+
   it("uses the first value of an authorization header array", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-server-array-auth-"));
     const tokenPath = join(dir, "token"); ensureAuthToken(tokenPath);

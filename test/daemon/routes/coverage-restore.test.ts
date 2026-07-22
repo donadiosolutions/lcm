@@ -76,12 +76,12 @@ vi.mock("../../../src/db/promoted.js", () => ({
   },
 }));
 vi.mock("../../../src/storage/index.js", () => ({
-  createStorageBackendFactory: () => ({
-    projectExists: async () => {
+  createStorageBackendFactory: () => {
+    const projectExists = async () => {
       state.projectExistsCount += 1;
       return state.existsSequence.shift() ?? state.exists;
-    },
-    openProject: async () => {
+    };
+    const openProject = async () => {
       state.openCount += 1;
       if (state.migrationError !== undefined) throw state.migrationError;
       return {
@@ -101,9 +101,14 @@ vi.mock("../../../src/storage/index.js", () => ({
         },
         close: async () => { state.closed.push("project"); },
       };
-    },
-    close: async () => { state.closed.push("factory"); },
-  }),
+    };
+    return {
+      projectExists,
+      openExistingProject: async () => await projectExists() ? openProject() : null,
+      openProject,
+      close: async () => { state.closed.push("factory"); },
+    };
+  },
 }));
 
 import { loadDaemonConfig } from "../../../src/daemon/config.js";

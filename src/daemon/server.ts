@@ -44,6 +44,8 @@ export type DaemonOptions = {
   _setTimeout?: typeof setTimeout;
   /** @internal Deterministic idle-timer seams for lifecycle tests. */
   _clearTimeout?: typeof clearTimeout;
+  /** @internal Deterministic periodic-ingest seam for lifecycle tests. */
+  _scanForTranscripts?: () => Promise<void>;
 };
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -131,6 +133,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   let constructedProcessor: PassiveEventProcessor | undefined;
   let constructedWatcher: ReturnType<typeof watchProjectMap> | undefined;
   let constructedIngestInterval: ReturnType<typeof setInterval> | undefined;
+  let constructedIngestScan: Promise<void> | undefined;
   let startupCleanupStarted = false;
   try {
   const routes = new Map<string, RouteHandler>();
@@ -251,7 +254,22 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }
   };
 
-  const ingestInterval = setInterval(scanForTranscripts, INGEST_INTERVAL_MS);
+  let activeIngestScan: Promise<void> | undefined;
+  const runTranscriptScan = (): Promise<void> => {
+    if (activeIngestScan) return activeIngestScan;
+    const scan = Promise.resolve()
+      .then(() => (options?._scanForTranscripts ?? scanForTranscripts)())
+      .catch(() => undefined)
+      .finally(() => {
+        activeIngestScan = undefined;
+        constructedIngestScan = undefined;
+      });
+    activeIngestScan = scan;
+    constructedIngestScan = scan;
+    return scan;
+  };
+
+  const ingestInterval = setInterval(runTranscriptScan, INGEST_INTERVAL_MS);
   constructedIngestInterval = ingestInterval;
   ingestInterval.unref(); // don't prevent process exit
 
@@ -290,6 +308,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const cleanupStartupFailure = async (): Promise<void> => {
     startupCleanupStarted = true;
     await settleCleanup(() => clearInterval(ingestInterval));
+    await settleCleanup(() => activeIngestScan);
     await settleCleanup(() => projectMapWatcher.close());
     await settleCleanup(() => passiveEventProcessor.stopAndWait());
     await settleCleanup(() => { idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout); });
@@ -324,14 +343,15 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       resolve({
         address: () => addr,
         stop: async () => {
-          clearInterval(ingestInterval);
-          projectMapWatcher.close();
-          await passiveEventProcessor.stopAndWait();
-          idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout);
+          await settleCleanup(() => clearInterval(ingestInterval));
+          await settleCleanup(() => activeIngestScan);
+          await settleCleanup(() => projectMapWatcher.close());
+          await settleCleanup(() => passiveEventProcessor.stopAndWait());
+          await settleCleanup(() => { idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout); });
           if (proxyManager) {
-            try { await proxyManager.stop(); } catch { /* non-fatal */ }
+            await settleCleanup(() => proxyManager.stop());
           }
-          await new Promise<void>((r) => server.close(() => r()));
+          await settleCleanup(() => new Promise<void>((r) => server.close(() => r())));
           await storageFactory.close();
         },
         registerRoute: (method, path, handler) => routes.set(`${method} ${path}`, handler),
@@ -350,6 +370,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       const ingestInterval = constructedIngestInterval;
       await settleCleanup(() => clearInterval(ingestInterval));
     }
+    await settleCleanup(() => constructedIngestScan);
     if (constructedWatcher) {
       const watcher = constructedWatcher;
       await settleCleanup(() => watcher.close());

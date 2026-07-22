@@ -17,6 +17,7 @@ import {
   type ProjectStorage,
   type StorageBackendFactory,
 } from "../../storage/index.js";
+import { closeRouteStorage } from "./storage-lifecycle.js";
 
 const AUTO_TAGS: Record<string, string> = {
   decision: "type:preference",
@@ -35,26 +36,6 @@ const MIN_REINFORCED_PATTERN_SESSIONS = 2;
 const AUTO_PROMOTABLE_PATTERN_CATEGORIES = new Set(["file", "mcp", "skill", "subagent"]);
 const EMPTY_REINFORCEMENT: PatternReinforcementStats = { totalCount: 0, distinctSessions: 0 };
 const sidecarPromotionLocks = new Map<string, Promise<void>>();
-
-async function settleClose(resource: { close(): Promise<void> | void } | undefined): Promise<void> {
-  try {
-    await resource?.close();
-  } catch {
-    // Cleanup is best-effort and must never replace the promotion result or primary failure.
-  }
-}
-
-async function closePromotionResources(
-  project: ProjectStorage | undefined,
-  outboxFactory: SQLiteLocalHookOutboxFactory,
-  ownedFactory: StorageBackendFactory | undefined,
-): Promise<void> {
-  await Promise.all([
-    settleClose(project),
-    settleClose(outboxFactory),
-    settleClose(ownedFactory),
-  ]);
-}
 
 export interface PromoteResult {
   promoted: number;
@@ -366,7 +347,7 @@ async function drainEventsForCwdUnlocked(
       }
     }
   } finally {
-    await closePromotionResources(project, outboxFactory, ownedFactory);
+    await closeRouteStorage(project, outboxFactory, ownedFactory);
   }
 
   result.incomplete = true;
@@ -405,7 +386,7 @@ async function promoteEventsForCwdUnlocked(
     );
     return await promoteEventsBatch(config, cwd, edb, project, scrubber, new Map());
   } finally {
-    await closePromotionResources(project, outboxFactory, ownedFactory);
+    await closeRouteStorage(project, outboxFactory, ownedFactory);
   }
 }
 

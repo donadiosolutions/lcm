@@ -8,6 +8,7 @@ import { lcmPath } from "../runtime-paths.js";
 import { ensureProjectDir } from "../daemon/project.js";
 import { validateCwd } from "../daemon/validate-cwd.js";
 import { SQLiteLocalHookOutboxFactory } from "../storage/local-hook-outbox.js";
+import { sanitizeHookErrorDiagnostic } from "./hook-error-diagnostic.js";
 
 function isUnderDir(candidate: string, base: string): boolean {
   const resolvedCandidate = resolve(candidate);
@@ -88,7 +89,7 @@ export async function safeLogError(
     appendFileSync(logPath, JSON.stringify({
       ts: new Date().toISOString(),
       hook,
-      error: error instanceof Error ? error.message : String(error),
+      error: sanitizeHookErrorDiagnostic(error),
       session_id: opts.sessionId,
       cwd: opts.cwd,
     }) + "\n");

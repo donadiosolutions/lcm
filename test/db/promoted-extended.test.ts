@@ -51,8 +51,10 @@ describe("PromotedStore extended", () => {
     } as unknown as DatabaseSync;
     const store = new PromotedStore(db);
 
-    expect(store.insert({ content: "orphan", projectId: "project" })).toBeTypeOf("string");
+    expect(() => store.insert({ content: "orphan", projectId: "project" }))
+      .toThrow("inserted promoted row is unavailable");
     store.archive("missing");
+    store.deleteById("missing");
     store.revive("missing");
 
     expect(calls.some((call) => call.startsWith("UPDATE promoted SET archived_at"))).toBe(true);
@@ -129,8 +131,17 @@ describe("PromotedStore extended", () => {
     const second = store.insert({ content: "Other needle", projectId: "p2" });
 
     expect(store.search("needle", 10)).toHaveLength(2);
-    expect(store.search("needle", 10, ["keep"], "p1")).toMatchObject([{ id: first, rank: 0 }]);
+    expect(store.search("needle", 10, ["keep"], "p1")).toMatchObject([{ id: first, rank: 4 }]);
     expect(store.search("_%", 10)).toEqual([]);
+
+    const strongest = store.insert({
+      content: "fallback needle with complete coverage",
+      projectId: "p1",
+      confidence: 0.1,
+    });
+    const ranked = store.search("fallback needle coverage", 10, undefined, "p1");
+    expect(ranked[0]).toMatchObject({ id: strongest, rank: 12 });
+    expect(ranked.at(-1)?.rank).toBeLessThan(ranked[0].rank);
 
     store.update(first, { content: "Changed fallback" });
     store.update(first, { content: "Changed again", tags: ["new"], confidence: 0.7 });
@@ -144,6 +155,7 @@ describe("PromotedStore extended", () => {
     expect(store.search("changed", 10, ["final"])).toHaveLength(1);
     store.deleteById(first);
     store.deleteById(second);
+    store.deleteById(strongest);
     expect(store.getAll()).toEqual([]);
   });
 
@@ -159,10 +171,14 @@ describe("PromotedStore extended", () => {
       }),
     } as unknown as DatabaseSync;
     expect(() => new PromotedStore(db).revive("id")).toThrow("update failed");
-    expect(execCalls).toEqual(["BEGIN", "ROLLBACK"]);
+    expect(execCalls).toEqual([
+      "SAVEPOINT promoted_fts_sync",
+      "ROLLBACK TO SAVEPOINT promoted_fts_sync",
+      "RELEASE SAVEPOINT promoted_fts_sync",
+    ]);
   });
 
-  it("leaves rollback to the owning transaction when revive fails in a transaction", () => {
+  it("uses a composable savepoint when revive fails in an outer transaction", () => {
     const execCalls: string[] = [];
     const db = {
       isTransaction: true,
@@ -175,7 +191,11 @@ describe("PromotedStore extended", () => {
       }),
     } as unknown as DatabaseSync;
     expect(() => new PromotedStore(db).revive("id")).toThrow("update failed");
-    expect(execCalls).toEqual([]);
+    expect(execCalls).toEqual([
+      "SAVEPOINT promoted_fts_sync",
+      "ROLLBACK TO SAVEPOINT promoted_fts_sync",
+      "RELEASE SAVEPOINT promoted_fts_sync",
+    ]);
   });
 
   // ── getById ──────────────────────────────────────────────────────────────
@@ -386,6 +406,38 @@ describe("PromotedStore extended", () => {
 
     expect(() => store.update(id, { content: "partial update", tags: ["new"] })).toThrow();
     expect(store.getById(id)).toMatchObject({ content: "original content", tags: '["old"]' });
+  });
+
+  it("atomically rolls back base and FTS mirror write failures", () => {
+    const insertDb = makeDb();
+    const insertStore = new PromotedStore(insertDb);
+    insertDb.exec("DROP TABLE promoted_fts");
+    expect(() => insertStore.insert({ content: "failed insert", projectId: "p1" })).toThrow();
+    expect(insertDb.prepare("SELECT COUNT(*) AS count FROM promoted").get()).toEqual({ count: 0 });
+
+    const archiveDb = makeDb();
+    const archiveStore = new PromotedStore(archiveDb);
+    const archiveId = archiveStore.insert({ content: "failed archive", projectId: "p1" });
+    archiveDb.exec("DROP TABLE promoted_fts");
+    expect(() => archiveStore.archive(archiveId)).toThrow();
+    expect(archiveStore.getById(archiveId)?.archived_at).toBeNull();
+
+    const reviveDb = makeDb();
+    const reviveStore = new PromotedStore(reviveDb);
+    const reviveId = reviveStore.insert({ content: "failed revive", projectId: "p1" });
+    reviveStore.archive(reviveId);
+    reviveDb.exec("DROP TABLE promoted_fts");
+    expect(() => reviveStore.revive(reviveId)).toThrow();
+    expect(reviveStore.getById(reviveId)?.archived_at).not.toBeNull();
+
+    const deleteDb = makeDb();
+    const deleteStore = new PromotedStore(deleteDb);
+    const deleteId = deleteStore.insert({ content: "failed delete", projectId: "p1" });
+    deleteDb.exec(`CREATE TRIGGER reject_promoted_delete BEFORE DELETE ON promoted
+      BEGIN SELECT RAISE(ABORT, 'delete rejected'); END`);
+    expect(() => deleteStore.deleteById(deleteId)).toThrow("delete rejected");
+    expect(deleteStore.getById(deleteId)).not.toBeNull();
+    expect(deleteStore.search("failed delete", 10)).toMatchObject([{ id: deleteId }]);
   });
 
   // ── deleteById ───────────────────────────────────────────────────────────

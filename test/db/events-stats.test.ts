@@ -136,6 +136,8 @@ describe("collectEventStats", () => {
       db.markProcessed(events.map((event) => event.event_id));
       db.close();
       const raw = new DatabaseSync(path);
+      raw.exec("PRAGMA journal_mode = WAL");
+      raw.exec("PRAGMA foreign_keys = ON");
       raw.exec(`UPDATE events SET created_at = ${createdAt}`);
       raw.close();
     }
@@ -214,6 +216,8 @@ describe("collectEventStats", () => {
     staleDb.markProcessed(staleEvents.map((event) => event.event_id));
     staleDb.close();
     const raw = new DatabaseSync(stalePath);
+    raw.exec("PRAGMA journal_mode = WAL");
+    raw.exec("PRAGMA foreign_keys = ON");
     raw.exec("UPDATE events SET created_at = datetime('now', '-31 days')");
     raw.close();
 

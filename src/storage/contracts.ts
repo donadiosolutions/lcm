@@ -195,6 +195,8 @@ export interface StorageBackendFactory {
   readonly backend: StorageBackendName;
   readonly capabilities: StorageCapabilities;
   projectExists(identity: ProjectIdentity): Promise<boolean>;
+  /** Open an already-present project without creating backend state. */
+  openExistingProject(identity: ProjectIdentity): Promise<ProjectStorage | null>;
   openProject(identity: ProjectIdentity): Promise<ProjectStorage>;
   health(): Promise<StorageHealth>;
   close(): Promise<void>;

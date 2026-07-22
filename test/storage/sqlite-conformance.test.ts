@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { projectIdentity } from "../../src/daemon/project.js";
@@ -120,6 +121,7 @@ describe("SQLite storage backend conformance", () => {
     });
     for (const operation of [
       factory.projectExists(identity),
+      factory.openExistingProject(identity),
       factory.openProject(identity),
     ]) {
       const error = await operation.catch((reason: unknown) => reason);
@@ -157,8 +159,28 @@ describe("SQLite storage backend conformance", () => {
     const storage = await healthFactory.openProject(projectIdentity(root));
     closeLcmConnection(dbPath);
     expect(await storage.health()).toMatchObject({ status: "unavailable" });
+    expect(await healthFactory.health()).toMatchObject({ status: "unavailable" });
     await storage.close();
     await healthFactory.close();
+  });
+
+  it("opens existing projects without creating missing database files", async () => {
+    const root = createTemporaryDirectory("lcm-storage-open-existing-");
+    const identity = projectIdentity(root);
+    const dbPath = join(root, "existing.db");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath }),
+    });
+
+    await expect(factory.openExistingProject(identity)).resolves.toBeNull();
+    expect(existsSync(dbPath)).toBe(false);
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    const created = await factory.openProject(identity);
+    await created.close();
+    const existing = await factory.openExistingProject(identity);
+    expect(existing).not.toBeNull();
+    await existing?.close();
+    await factory.close();
   });
 
   it("uses the production per-project resolver", async () => {
@@ -216,7 +238,8 @@ describe("SQLite storage backend conformance", () => {
     });
     expect(await storage.lexicalSearch.searchMessages({ query: "needle", mode: "full_text" })).toHaveLength(1);
     expect(await storage.lexicalSearch.searchSummaries({ query: "needle", mode: "full_text" })).toHaveLength(1);
-    expect(await storage.lexicalSearch.searchPromoted("needle", 5, ["fallback"])).toHaveLength(1);
+    expect(await storage.lexicalSearch.searchPromoted("needle", 5, ["fallback"]))
+      .toMatchObject([{ id: memoryId, rank: 4 }]);
     expect(await storage.lexicalSearch.searchPromoted("_%", 5)).toEqual([]);
     await storage.promotedMemory.update(memoryId, { tags: ["updated"] });
     await storage.promotedMemory.update(memoryId, { content: "changed fallback", confidence: 0.8 });
@@ -264,6 +287,32 @@ describe("SQLite storage backend conformance", () => {
     await closing;
     expect(await first.health()).toMatchObject({ status: "closed" });
     expect(isLcmConnectionOpen(dbPath)).toBe(false);
+  });
+
+  it("stays healthy while a normally closing project drains queued work", async () => {
+    const root = createTemporaryDirectory("lcm-storage-health-during-close-");
+    const identity = projectIdentity(root);
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath: join(root, "health-close.db") }),
+    });
+    const storage = await factory.openProject(identity);
+    let releaseTransaction!: () => void;
+    let markEntered!: () => void;
+    const releasePromise = new Promise<void>((resolve) => { releaseTransaction = resolve; });
+    const enteredPromise = new Promise<void>((resolve) => { markEntered = resolve; });
+    const transaction = storage.transaction(async () => {
+      markEntered();
+      await releasePromise;
+    });
+    await enteredPromise;
+
+    const closing = storage.close();
+    expect(await storage.health()).toMatchObject({ status: "closed" });
+    expect(await factory.health()).toMatchObject({ status: "healthy" });
+    releaseTransaction();
+    await transaction;
+    await closing;
+    await factory.close();
   });
 
   it("preserves scoped failures when rollback itself fails", async () => {

@@ -48,7 +48,13 @@ vi.mock("../../../src/scrub.js", () => ({
   ScrubEngine: { forProject: async () => ({ scrub: mocks.scrub }) },
 }));
 vi.mock("../../../src/storage/index.js", () => ({
-  createStorageBackendFactory: () => ({ projectExists: mocks.projectExists, openProject: mocks.openProject, close: mocks.factoryClose }),
+  createStorageBackendFactory: () => ({
+    projectExists: mocks.projectExists,
+    openExistingProject: async (identity: unknown) =>
+      await mocks.projectExists() ? mocks.openProject(identity) : null,
+    openProject: mocks.openProject,
+    close: mocks.factoryClose,
+  }),
 }));
 
 import { createPromoteHandler } from "../../../src/daemon/routes/promote.js";
@@ -88,7 +94,13 @@ describe("promote persistence boundaries", () => {
     mocks.scrub.mockReturnValueOnce("token=[REDACTED]");
     mocks.prefixes.mockReturnValueOnce(["token=[REDACTED]"]);
 
-    const injected = { projectExists: mocks.projectExists, openProject: mocks.openProject, close: mocks.factoryClose } as never;
+    const injected = {
+      projectExists: mocks.projectExists,
+      openExistingProject: async (identity: unknown) =>
+        await mocks.projectExists() ? mocks.openProject(identity) : null,
+      openProject: mocks.openProject,
+      close: mocks.factoryClose,
+    } as never;
     await createPromoteHandler(config, injected)({} as never, response, JSON.stringify({ cwd: "/ok" }));
 
     expect(mocks.shouldPromote).not.toHaveBeenCalled();

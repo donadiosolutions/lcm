@@ -221,7 +221,7 @@ describe("createPromoteHandler", () => {
     const db = setupDb(tempDir);
     db.close();
 
-    vi.spyOn(dbConnection, "getLcmConnection").mockImplementationOnce(() => {
+    vi.spyOn(dbConnection, "getExistingLcmConnection").mockImplementationOnce(() => {
       throw new Error("connection refused");
     });
     const closeSpy = vi.spyOn(dbConnection, "closeLcmConnection");

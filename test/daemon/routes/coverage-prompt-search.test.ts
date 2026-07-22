@@ -34,9 +34,8 @@ vi.mock("../../../src/daemon/project.js", () => ({
 }));
 
 vi.mock("../../../src/storage/index.js", () => ({
-  createStorageBackendFactory: () => ({
-    projectExists: async () => state.exists,
-    openProject: async () => {
+  createStorageBackendFactory: () => {
+    const openProject = async () => {
       if (state.connectionError !== undefined) throw state.connectionError;
       return {
         lexicalSearch: {
@@ -53,9 +52,14 @@ vi.mock("../../../src/storage/index.js", () => ({
         },
         close: async () => { state.closed.push("project"); },
       };
-    },
-    close: async () => { state.factoryClosed += 1; },
-  }),
+    };
+    return {
+      projectExists: async () => state.exists,
+      openExistingProject: async () => state.exists ? openProject() : null,
+      openProject,
+      close: async () => { state.factoryClosed += 1; },
+    };
+  },
 }));
 
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
@@ -206,13 +210,15 @@ describe("prompt-search route coverage", () => {
   it("keeps an injected process-lifetime factory open", async () => {
     const close = vi.fn(async () => undefined);
     const projectClose = vi.fn(async () => undefined);
+    const project = {
+      lexicalSearch: { searchPromoted: vi.fn(async () => []) },
+      recall: { getFeedback: vi.fn(async () => new Map()), logSurfacing: vi.fn(async () => undefined) },
+      close: projectClose,
+    };
     const factory = {
       projectExists: vi.fn(async () => true),
-      openProject: vi.fn(async () => ({
-        lexicalSearch: { searchPromoted: vi.fn(async () => []) },
-        recall: { getFeedback: vi.fn(async () => new Map()), logSurfacing: vi.fn(async () => undefined) },
-        close: projectClose,
-      })),
+      openExistingProject: vi.fn(async () => project),
+      openProject: vi.fn(async () => project),
       close,
     } as never;
     expect(await call(JSON.stringify({ query: "q", cwd: "/tmp" }), undefined, factory))

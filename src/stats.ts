@@ -221,7 +221,7 @@ export function printStats(stats: OverallStats, verbose: boolean): void {
     const ratioStr = stats.ratio > 0 ? stats.ratio.toFixed(1) + "x" : "–";
     const barColor = stats.ratio > 10 ? green : cyan;
 
-    const compactedStr = `${stats.compactedConversations} of ${stats.projects} projects`;
+    const compactedStr = `${stats.compactedConversations} of ${stats.conversations} conversations`;
     const tokensStr = `${rawStr} → ${sumStr}`;
 
     const compRows: [string, string][] = [

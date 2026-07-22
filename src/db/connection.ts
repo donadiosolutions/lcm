@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, lstatSync } from "node:fs";
 import { dirname } from "node:path";
+import { pathToFileURL } from "node:url";
 import { ensurePrivateDirectory, PRIVATE_FILE_MODE } from "../security-files.js";
 
 type ConnectionEntry = {
@@ -99,7 +100,7 @@ function forceCloseConnection(entry: ConnectionEntry): void {
   }
 }
 
-export function getLcmConnection(dbPath: string): DatabaseSync {
+function getPooledLcmConnection(dbPath: string): DatabaseSync | undefined {
   // No TOCTOU race here: Node.js is single-threaded and this function is
   // synchronous. There is no await/yield between the health check and the
   // refs increment, so no other caller can interleave and close the connection
@@ -115,25 +116,44 @@ export function getLcmConnection(dbPath: string): DatabaseSync {
     _connections.delete(dbPath);
   }
 
-  const isInMemory = dbPath === ":memory:";
-  if (!isInMemory) {
-    // Filesystem hardening applies only to persistent database paths. SQLite's
-    // special :memory: target has no parent directory or file to secure.
-    ensurePrivateDirectory(dirname(dbPath));
-    try {
-      const stat = lstatSync(dbPath);
-      if (stat.isSymbolicLink()) {
-        throw new Error(`refusing to open a symlink database path: ${dbPath}`);
-      }
-      if (!stat.isFile()) {
-        throw new Error(`database path is not a regular file: ${dbPath}`);
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  }
+  return undefined;
+}
 
-  const db = new DatabaseSync(dbPath);
+function validatePersistentDatabasePath(dbPath: string, createIfMissing: boolean): boolean {
+  if (createIfMissing) ensurePrivateDirectory(dirname(dbPath));
+  try {
+    const stat = lstatSync(dbPath);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`refusing to open a symlink database path: ${dbPath}`);
+    }
+    if (!stat.isFile()) {
+      throw new Error(`database path is not a regular file: ${dbPath}`);
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return createIfMissing;
+  }
+}
+
+function openLcmConnection(dbPath: string, createIfMissing: boolean): DatabaseSync | null {
+  const pooled = getPooledLcmConnection(dbPath);
+  if (pooled) return pooled;
+
+  const isInMemory = dbPath === ":memory:";
+  if (isInMemory && !createIfMissing) return null;
+  if (!isInMemory && !validatePersistentDatabasePath(dbPath, createIfMissing)) return null;
+
+  // SQLite's URI mode=rw opens an existing database read/write but atomically
+  // refuses to create it if another process removes it after the lstat above.
+  const location = createIfMissing || isInMemory
+    ? dbPath
+    : (() => {
+      const url = pathToFileURL(dbPath);
+      url.searchParams.set("mode", "rw");
+      return url;
+    })();
+  const db = new DatabaseSync(location);
   try {
     if (!isInMemory) chmodSync(dbPath, PRIVATE_FILE_MODE);
     // Enable WAL mode for better concurrent read performance
@@ -149,6 +169,15 @@ export function getLcmConnection(dbPath: string): DatabaseSync {
 
   _connections.set(dbPath, { db, refs: 1 });
   return db;
+}
+
+export function getLcmConnection(dbPath: string): DatabaseSync {
+  return openLcmConnection(dbPath, true)!;
+}
+
+/** Open an existing pooled or on-disk database without creating backend state. */
+export function getExistingLcmConnection(dbPath: string): DatabaseSync | null {
+  return openLcmConnection(dbPath, false);
 }
 
 export interface PoolStats {

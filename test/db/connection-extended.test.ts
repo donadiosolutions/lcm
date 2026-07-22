@@ -8,7 +8,9 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import {
+  getExistingLcmConnection,
   getLcmConnection,
+  getPoolStats,
   closeLcmConnection,
   isLcmConnectionOpen,
 } from "../../src/db/connection.js";
@@ -23,6 +25,36 @@ afterEach(() => {
 });
 
 describe("isLcmConnectionOpen", () => {
+  it("opens existing databases read/write without creating missing state", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-existing-test-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "existing # project.sqlite");
+    const missingPath = join(tempDir, "missing", "project.sqlite");
+
+    expect(getExistingLcmConnection(":memory:")).toBeNull();
+    expect(getExistingLcmConnection(missingPath)).toBeNull();
+    expect(isLcmConnectionOpen(missingPath)).toBe(false);
+
+    const created = getLcmConnection(dbPath);
+    created.exec("CREATE TABLE durable (value TEXT)");
+    closeLcmConnection(dbPath);
+
+    const existing = getExistingLcmConnection(dbPath);
+    expect(existing).not.toBeNull();
+    existing?.prepare("INSERT INTO durable (value) VALUES (?)").run("available");
+    expect(existing?.prepare("SELECT value FROM durable").get()).toEqual({ value: "available" });
+  });
+
+  it("shares an already-pooled database with non-creating opens", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-existing-pool-test-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "pooled.sqlite");
+    const created = getLcmConnection(dbPath);
+
+    expect(getExistingLcmConnection(dbPath)).toBe(created);
+    expect(getPoolStats().connections).toMatchObject([{ path: dbPath, refs: 2 }]);
+  });
+
   it("opens SQLite's in-memory target without filesystem permission work", () => {
     const db = getLcmConnection(":memory:");
 

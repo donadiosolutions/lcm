@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
+// A fresh one-term fallback match clears the default prompt-search minimum of
+// two while still leaving room for recency, affinity, and feedback penalties.
+const FALLBACK_TERM_SCORE = 4;
+
 export type PromotedRow = {
   id: string;
   content: string;
@@ -32,7 +36,7 @@ export type SearchResult = {
   sessionId: string | null;
   confidence: number;
   createdAt: string;
-  /** Negative relevance score (more negative is stronger); zero marks an unranked fallback match. */
+  /** Native ranks are negative; fallback ranks are positive. Larger absolute values are stronger. */
   rank: number;
 };
 
@@ -60,28 +64,37 @@ export class PromotedStore {
     }
     const tags = JSON.stringify(params.tags ?? []);
 
-    this.db.prepare(
-      `INSERT INTO promoted (id, content, tags, source_summary_id, project_id, session_id, depth, confidence)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      id,
-      params.content,
-      tags,
-      params.sourceSummaryId ?? null,
-      params.projectId,
-      params.sessionId ?? null,
-      params.depth ?? 0,
-      params.confidence ?? 1.0,
-    );
+    const insertRow = (): void => {
+      this.db.prepare(
+        `INSERT INTO promoted (id, content, tags, source_summary_id, project_id, session_id, depth, confidence)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        id,
+        params.content,
+        tags,
+        params.sourceSummaryId ?? null,
+        params.projectId,
+        params.sessionId ?? null,
+        params.depth ?? 0,
+        params.confidence ?? 1.0,
+      );
+    };
 
-    // Sync to FTS5 when the runtime provides it. Search has a SQL fallback.
-    if (this.fts5Available) {
+    if (!this.fts5Available) {
+      insertRow();
+      return id;
+    }
+
+    // Keep the authoritative row and its FTS mirror atomic, including when an
+    // outer repository transaction already owns the connection.
+    this.withFtsSavepoint(() => {
+      insertRow();
       const row = this.db.prepare("SELECT rowid FROM promoted WHERE id = ?").get(id) as { rowid: number } | undefined;
-      if (!row) return id;
+      if (!row) throw new Error("inserted promoted row is unavailable");
       this.db.prepare(
         "INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)"
       ).run(row.rowid, params.content, tags);
-    }
+    });
 
     return id;
   }
@@ -172,23 +185,31 @@ export class PromotedStore {
   }
 
   archive(id: string): void {
-    const row = this.fts5Available
-      ? this.db.prepare("SELECT rowid FROM promoted WHERE id = ?").get(id) as { rowid: number } | undefined
-      : undefined;
-    this.db.prepare("UPDATE promoted SET archived_at = datetime('now') WHERE id = ?").run(id);
-    if (row) {
-      this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
+    if (!this.fts5Available) {
+      this.db.prepare("UPDATE promoted SET archived_at = datetime('now') WHERE id = ?").run(id);
+      return;
     }
+    this.withFtsSavepoint(() => {
+      const row = this.db.prepare("SELECT rowid FROM promoted WHERE id = ?").get(id) as
+        | { rowid: number }
+        | undefined;
+      this.db.prepare("UPDATE promoted SET archived_at = datetime('now') WHERE id = ?").run(id);
+      if (row) this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
+    });
   }
 
   deleteById(id: string): void {
-    const row = this.fts5Available
-      ? this.db.prepare("SELECT rowid FROM promoted WHERE id = ?").get(id) as { rowid: number } | undefined
-      : undefined;
-    if (row) {
-      this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
+    if (!this.fts5Available) {
+      this.db.prepare("DELETE FROM promoted WHERE id = ?").run(id);
+      return;
     }
-    this.db.prepare("DELETE FROM promoted WHERE id = ?").run(id);
+    this.withFtsSavepoint(() => {
+      const row = this.db.prepare("SELECT rowid FROM promoted WHERE id = ?").get(id) as
+        | { rowid: number }
+        | undefined;
+      if (row) this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
+      this.db.prepare("DELETE FROM promoted WHERE id = ?").run(id);
+    });
   }
 
   update(id: string, fields: { content?: string; confidence?: number; tags?: string[] }): void {
@@ -205,7 +226,7 @@ export class PromotedStore {
         ).run(fields.content, fields.confidence ?? null, newTags, id);
         return;
       }
-      this.withUpdateSavepoint(() => {
+      this.withFtsSavepoint(() => {
         this.db.prepare(
           "UPDATE promoted SET content = ?, confidence = COALESCE(?, confidence), tags = ? WHERE id = ?"
         ).run(fields.content!, fields.confidence ?? null, newTags, id);
@@ -226,7 +247,7 @@ export class PromotedStore {
           this.db.prepare("UPDATE promoted SET tags = ? WHERE id = ?").run(newTags, id);
           return;
         }
-        this.withUpdateSavepoint(() => {
+        this.withFtsSavepoint(() => {
           this.db.prepare("UPDATE promoted SET tags = ? WHERE id = ?").run(newTags, id);
           this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
           this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
@@ -239,14 +260,14 @@ export class PromotedStore {
     }
   }
 
-  private withUpdateSavepoint(operation: () => void): void {
-    this.db.exec("SAVEPOINT promoted_update");
+  private withFtsSavepoint(operation: () => void): void {
+    this.db.exec("SAVEPOINT promoted_fts_sync");
     try {
       operation();
-      this.db.exec("RELEASE SAVEPOINT promoted_update");
+      this.db.exec("RELEASE SAVEPOINT promoted_fts_sync");
     } catch (error) {
-      this.db.exec("ROLLBACK TO SAVEPOINT promoted_update");
-      this.db.exec("RELEASE SAVEPOINT promoted_update");
+      this.db.exec("ROLLBACK TO SAVEPOINT promoted_fts_sync");
+      this.db.exec("RELEASE SAVEPOINT promoted_fts_sync");
       throw error;
     }
   }
@@ -334,22 +355,15 @@ export class PromotedStore {
       return;
     }
 
-    // Wrap in transaction so the row and FTS stay in sync
-    const ownsTransaction = !this.db.isTransaction;
-    if (ownsTransaction) this.db.exec("BEGIN");
-    try {
+    this.withFtsSavepoint(() => {
       this.db.prepare("UPDATE promoted SET archived_at = NULL WHERE id = ?").run(id);
-      // Re-add to FTS — ignore if already present
-      try {
-        this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
-          row.rowid, row.content, row.tags
-        );
-      } catch { /* already in FTS — non-fatal */ }
-      if (ownsTransaction) this.db.exec("COMMIT");
-    } catch (err) {
-      if (ownsTransaction) this.db.exec("ROLLBACK");
-      throw err;
-    }
+      // Delete first so a stale or already-present mirror is replaced without
+      // hiding unrelated SQLite failures behind a broad duplicate catch.
+      this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
+      this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
+        row.rowid, row.content, row.tags,
+      );
+    });
   }
 
   transaction(fn: () => void): void {
@@ -370,21 +384,25 @@ export class PromotedStore {
     projectId?: string,
   ): SearchResult[] {
     const escapeLike = (term: string): string => term.replace(/[\\%_]/g, "\\$&");
-    const termClauses = terms.map(() => "(LOWER(content) LIKE ? ESCAPE '\\' OR LOWER(tags) LIKE ? ESCAPE '\\')");
-    const params: Array<string | number> = [];
-    for (const term of terms) {
-      const pattern = `%${escapeLike(term.toLowerCase())}%`;
-      params.push(pattern, pattern);
-    }
-    let sql = `SELECT * FROM promoted WHERE archived_at IS NULL AND (${termClauses.join(" OR ")})`;
+    const uniqueTerms = [...new Set(terms.map((term) => term.toLowerCase()))];
+    const patterns = uniqueTerms.map((term) => `%${escapeLike(term)}%`);
+    const matchClause = "(LOWER(content) LIKE ? ESCAPE '\\' OR LOWER(tags) LIKE ? ESCAPE '\\')";
+    const termClauses = uniqueTerms.map(() => matchClause);
+    const scoreClauses = uniqueTerms.map(() => `CASE WHEN ${matchClause} THEN 1 ELSE 0 END`);
+    const params: Array<string | number> = [
+      ...patterns.flatMap((pattern) => [pattern, pattern]),
+      ...patterns.flatMap((pattern) => [pattern, pattern]),
+    ];
+    let sql = `SELECT *, (${scoreClauses.join(" + ")}) AS matched_terms
+      FROM promoted WHERE archived_at IS NULL AND (${termClauses.join(" OR ")})`;
     if (projectId) {
       sql += " AND project_id = ?";
       params.push(projectId);
     }
-    sql += " ORDER BY confidence DESC, created_at ASC LIMIT ?";
+    sql += " ORDER BY matched_terms DESC, confidence DESC, created_at ASC LIMIT ?";
     params.push(limit);
 
-    let results = (this.db.prepare(sql).all(...params) as PromotedRow[]).map((row) => ({
+    let results = (this.db.prepare(sql).all(...params) as Array<PromotedRow & { matched_terms: number }>).map((row) => ({
       id: row.id,
       content: row.content,
       tags: parsePromotedTags(row.tags),
@@ -392,7 +410,7 @@ export class PromotedStore {
       sessionId: row.session_id,
       confidence: row.confidence,
       createdAt: row.created_at,
-      rank: 0,
+      rank: FALLBACK_TERM_SCORE * row.matched_terms * (row.matched_terms / uniqueTerms.length),
     }));
     if (filterTags && filterTags.length > 0) {
       results = results.filter((result) => filterTags.every((tag) => result.tags.includes(tag)));

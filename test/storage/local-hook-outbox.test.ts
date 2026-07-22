@@ -118,6 +118,8 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     await repository.markProcessed([]);
     await repository.markProcessed([secondSession]);
     const raw = new DatabaseSync(path);
+    raw.exec("PRAGMA journal_mode = WAL");
+    raw.exec("PRAGMA foreign_keys = ON");
     raw.exec(`
       UPDATE events SET processed_at = datetime('now', '-10 days') WHERE event_id = ${secondSession};
       UPDATE events SET created_at = datetime('now', '-31 days') WHERE event_id = ${firstSession};
