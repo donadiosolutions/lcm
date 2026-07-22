@@ -265,7 +265,21 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
 
   private async acquire(context: PostgreSqlOperationContext & { signal?: AbortSignal }): Promise<PoolClient> {
     if (context.signal?.aborted) throw aborted(context);
-    return this.pool.connect();
+    let client: PoolClient;
+    try {
+      client = await this.pool.connect();
+    } catch (error) {
+      if (context.signal?.aborted) throw aborted(context);
+      throw error;
+    }
+    if (context.signal?.aborted) {
+      try {
+        client.release(true);
+      } finally {
+        throw aborted(context);
+      }
+    }
+    return client;
   }
 
   private async queryClient<

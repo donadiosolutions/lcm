@@ -493,6 +493,25 @@ describe("PostgreSQL runtime", () => {
     expect(f.release).toHaveBeenCalledWith(true);
   });
 
+  it("destroys a transaction client when its signal aborts after acquisition returns", async () => {
+    let abortChecks = 0;
+    const signal = {
+      get aborted() {
+        abortChecks += 1;
+        return abortChecks >= 3;
+      },
+    } as AbortSignal;
+    const callback = vi.fn(async () => undefined);
+    const f = fixtures();
+
+    await expect(f.runtime.transaction(callback, {
+      domain: "transaction", operation: "abortAfterAcquire", signal,
+    })).rejects.toMatchObject({ operation: "abortAfterAcquire", retryable: false });
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.query).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
   it("fences retained transaction executors after the callback settles", async () => {
     const f = fixtures((input) => typeof input === "string" ? result([]) : result([{ value: 1 }]));
     let retained!: PostgreSqlQueryExecutor;
@@ -684,17 +703,41 @@ describe("PostgreSQL runtime", () => {
     expect(f.dependencies.createClient).not.toHaveBeenCalled();
   });
 
-  it("rejects when a signal aborts immediately after pool acquisition", async () => {
+  it("returns a non-retryable abort when acquisition rejects after the signal aborts", async () => {
     const controller = new AbortController();
     const f = fixtures();
-    f.connect.mockImplementationOnce(async () => {
-      controller.abort();
-      return f.poolClient;
+    let rejectConnect!: (reason?: unknown) => void;
+    f.connect.mockReturnValueOnce(new Promise<PoolClient>((_resolve, reject) => {
+      rejectConnect = reject;
+    }));
+    const query = f.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory", operation: "abortDuringRejectedAcquire", signal: controller.signal,
     });
-    await expect(f.runtime.query({ text: "SELECT 1" }, {
+    const expectation = expect(query).rejects.toMatchObject({
+      operation: "abortDuringRejectedAcquire", retryable: false,
+    });
+    controller.abort();
+    rejectConnect(Object.assign(new Error("timeout exceeded when trying to connect"), { code: "ETIMEDOUT" }));
+    await expectation;
+    expect(f.release).not.toHaveBeenCalled();
+  });
+
+  it("destroys a client acquired after its pending signal aborts", async () => {
+    const controller = new AbortController();
+    const f = fixtures();
+    let resolveConnect!: (client: PoolClient) => void;
+    f.connect.mockReturnValueOnce(new Promise<PoolClient>((resolve) => {
+      resolveConnect = resolve;
+    }));
+    const query = f.runtime.query({ text: "SELECT 1" }, {
       domain: "factory", operation: "abortAfterAcquire", signal: controller.signal,
-    })).rejects.toMatchObject({ operation: "abortAfterAcquire" });
+    });
+    const expectation = expect(query).rejects.toMatchObject({ operation: "abortAfterAcquire", retryable: false });
+    controller.abort();
+    resolveConnect(f.poolClient);
+    await expectation;
     expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.query).not.toHaveBeenCalled();
   });
 
   it("rejects without starting the target query when aborted during backend PID lookup", async () => {
@@ -814,7 +857,7 @@ describe("PostgreSQL runtime", () => {
   it("cancels defensively when abort state changes without event delivery", async () => {
     let abortChecks = 0;
     const signal = {
-      get aborted() { abortChecks += 1; return abortChecks >= 5; },
+      get aborted() { abortChecks += 1; return abortChecks >= 6; },
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
     } as unknown as AbortSignal;
