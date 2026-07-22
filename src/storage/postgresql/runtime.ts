@@ -8,7 +8,7 @@ import type {
   PostgreSqlRuntimeHealth,
 } from "./contracts.js";
 import { buildPostgreSqlClientConfig } from "./client-config.js";
-import { normalizePostgreSqlError } from "./errors.js";
+import { isPostgreSqlConnectionError, normalizePostgreSqlError } from "./errors.js";
 
 export interface PostgreSqlRuntimeDependencies {
   readonly createPool: (config: PoolConfig) => Pool;
@@ -87,7 +87,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       this.poolFailed = false;
       return result;
     } catch (error) {
-      destroy = options.signal?.aborted === true;
+      destroy = options.signal?.aborted === true || isPostgreSqlConnectionError(error);
       throw normalizePostgreSqlError(error, options);
     } finally {
       client?.release(destroy);
@@ -109,12 +109,14 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       }
       await client.query("BEGIN");
       let transactionActive = true;
+      let transactionFailed = false;
+      let queryQueue = Promise.resolve();
       const transaction: PostgreSqlQueryExecutor = {
         query: async <R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
           config: QueryConfig<I>,
           queryOptions: PostgreSqlQueryOptions,
         ) => {
-          if (!transactionActive) {
+          if (!transactionActive || transactionFailed) {
             throw new StorageOperationError(
               "STORAGE_TRANSACTION_SCOPE",
               "postgresql",
@@ -123,13 +125,27 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
               queryOptions.operation,
             );
           }
-          const effectiveOptions = { ...queryOptions, signal: queryOptions.signal ?? options.signal };
-          try {
-            return await this.queryClient<R, I>(client!, config, effectiveOptions);
-          } catch (error) {
-            if (effectiveOptions.signal?.aborted) destroy = true;
-            throw error;
-          }
+          const execute = queryQueue.then(async () => {
+            if (!transactionActive || transactionFailed) {
+              throw new StorageOperationError(
+                "STORAGE_TRANSACTION_SCOPE",
+                "postgresql",
+                queryOptions.projectId ?? options.projectId,
+                queryOptions.domain,
+                queryOptions.operation,
+              );
+            }
+            const effectiveOptions = { ...queryOptions, signal: queryOptions.signal ?? options.signal };
+            try {
+              return await this.queryClient<R, I>(client!, config, effectiveOptions);
+            } catch (error) {
+              transactionFailed = true;
+              if (effectiveOptions.signal?.aborted || isPostgreSqlConnectionError(error)) destroy = true;
+              throw error;
+            }
+          });
+          queryQueue = execute.then(() => undefined, () => undefined);
+          return execute;
         },
       };
       let result: T;
@@ -142,6 +158,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       this.poolFailed = false;
       return result;
     } catch (error) {
+      if (options.signal?.aborted === true || isPostgreSqlConnectionError(error)) destroy = true;
       if (client && !destroy && options.signal?.aborted !== true) {
         try {
           await client.query("ROLLBACK");
@@ -149,7 +166,6 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
           destroy = true;
         }
       }
-      if (options.signal?.aborted) destroy = true;
       throw normalizePostgreSqlError(error, options);
     } finally {
       client?.release(destroy);

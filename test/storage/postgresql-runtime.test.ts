@@ -116,6 +116,24 @@ describe("PostgreSQL runtime", () => {
     expect(failed.connect).toHaveBeenCalledTimes(1);
   });
 
+  it("destroys clients after connection failures but retains them after ordinary SQL errors", async () => {
+    const disconnected = fixtures(() => {
+      throw Object.assign(new Error("connection secret"), { code: "ECONNRESET" });
+    });
+    await expect(disconnected.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory", operation: "disconnect",
+    })).rejects.toMatchObject({ operation: "disconnect", retryable: true });
+    expect(disconnected.release).toHaveBeenCalledWith(true);
+
+    const constraint = fixtures(() => {
+      throw Object.assign(new Error("constraint secret"), { code: "23505" });
+    });
+    await expect(constraint.runtime.query({ text: "INSERT INTO values_table VALUES ($1)", values: [1] }, {
+      domain: "factory", operation: "constraint",
+    })).rejects.toMatchObject({ operation: "constraint", retryable: false });
+    expect(constraint.release).toHaveBeenCalledWith(false);
+  });
+
   it("commits successful transactions and rolls back failed transactions", async () => {
     const f = fixtures((input) => typeof input === "string" ? result([]) : result([{ value: 2 }]));
     await expect(f.runtime.transaction(async (transaction) => {
@@ -176,6 +194,54 @@ describe("PostgreSQL runtime", () => {
     expect(acquisition.release).not.toHaveBeenCalled();
   });
 
+  it("destroys transaction clients after connection-level failures without attempting rollback", async () => {
+    const f = fixtures((input) => {
+      if (input === "BEGIN") return result([]);
+      throw Object.assign(new Error("connection secret"), { code: "08006" });
+    });
+    await expect(f.runtime.transaction(
+      (transaction) => transaction.query({ text: "SELECT 1" }, {
+        domain: "transaction", operation: "disconnect",
+      }),
+      { domain: "transaction", operation: "outerDisconnect" },
+    )).rejects.toMatchObject({ operation: "outerDisconnect", retryable: true });
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("serializes abort-aware transaction queries so a queued abort cannot cancel its sibling", async () => {
+    let firstTarget: QueryWithCallback | undefined;
+    const firstSignal = new AbortController();
+    const queuedSignal = new AbortController();
+    const f = fixtures((input) => {
+      if (input === "BEGIN") return result([]);
+      if (typeof input === "object" && input !== null && "text" in input && !("callback" in input)) {
+        return result([{ pid: 101 }]);
+      }
+      firstTarget = input as QueryWithCallback;
+      return firstTarget;
+    });
+    const pending = f.runtime.transaction(async (transaction) => {
+      const first = transaction.query({ text: "UPDATE first_table SET value = 1" }, {
+        domain: "transaction", operation: "first", signal: firstSignal.signal,
+      });
+      const queued = transaction.query({ text: "UPDATE second_table SET value = 2" }, {
+        domain: "transaction", operation: "queued", signal: queuedSignal.signal,
+      });
+      await vi.waitFor(() => expect(firstTarget).toBeDefined());
+      queuedSignal.abort();
+      await Promise.resolve();
+      expect(f.cancelQuery).not.toHaveBeenCalled();
+      expect(f.query).not.toHaveBeenCalledWith(expect.objectContaining({ text: "UPDATE second_table SET value = 2" }));
+      firstTarget?.callback(null, result([]));
+      return Promise.all([first, queued]);
+    }, { domain: "transaction", operation: "concurrent" });
+
+    await expect(pending).rejects.toMatchObject({ operation: "queued" });
+    expect(f.cancelQuery).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
   it("destroys a transaction client when its signal aborts during acquisition", async () => {
     const controller = new AbortController();
     const callback = vi.fn(async () => undefined);
@@ -216,6 +282,40 @@ describe("PostgreSQL runtime", () => {
       projectId: "outer-project",
     });
     expect(f.query.mock.calls.map(([input]) => input)).toEqual(["BEGIN", "COMMIT"]);
+  });
+
+  it("fences queries queued behind a failed transaction query before they execute", async () => {
+    const f = fixtures((input) => {
+      if (typeof input === "string") return result([]);
+      throw Object.assign(new Error("constraint secret"), { code: "23505" });
+    });
+    let withProject!: Promise<unknown>;
+    let withoutProject!: Promise<unknown>;
+    await expect(f.runtime.transaction(async (transaction) => {
+      const failed = transaction.query({ text: "INSERT INTO first_table VALUES (1)" }, {
+        domain: "transaction", operation: "failed",
+      });
+      withProject = transaction.query({ text: "SELECT 1" }, {
+        projectId: "queued-project", domain: "sessions", operation: "queuedWithProject",
+      });
+      withoutProject = transaction.query({ text: "SELECT 2" }, {
+        domain: "transaction", operation: "queuedWithoutProject",
+      });
+      void withProject.catch(() => undefined);
+      void withoutProject.catch(() => undefined);
+      return failed;
+    }, { projectId: "outer-project", domain: "transaction", operation: "queueFailure" }))
+      .rejects.toMatchObject({ operation: "queueFailure" });
+
+    await expect(withProject).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE", projectId: "queued-project", operation: "queuedWithProject",
+    });
+    await expect(withoutProject).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE", projectId: "outer-project", operation: "queuedWithoutProject",
+    });
+    expect(f.query).not.toHaveBeenCalledWith(expect.objectContaining({ text: "SELECT 1" }));
+    expect(f.query).not.toHaveBeenCalledWith(expect.objectContaining({ text: "SELECT 2" }));
+    expect(f.release).toHaveBeenCalledWith(false);
   });
 
   it("destroys a transaction client after a query-local abort", async () => {

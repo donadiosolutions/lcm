@@ -146,24 +146,36 @@ function generatedUrl(user, password, host, port, database) {
   return `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/${database}`;
 }
 
-async function inspectLabels(type, name) {
-  const result = await docker([type, "inspect", name]);
+async function inspectLabels(type, name, dockerRunner = docker) {
+  const result = await dockerRunner([type, "inspect", name]);
   const record = JSON.parse(result.stdout)[0];
   return type === "container" ? record?.Config?.Labels ?? {} : record?.Labels ?? {};
 }
 
-async function removeLabeled(type, name, runId) {
+export function isMissingDockerObjectError(error, type, name) {
+  if (error?.code !== 1 || String(error?.stdout ?? "").trim() !== "[]") return false;
+  if (type !== "container" && type !== "network" && type !== "volume") return false;
+  const expected = type === "container"
+    ? `Error response from daemon: No such container: ${name}`
+    : type === "network"
+      ? `Error response from daemon: network ${name} not found`
+      : `Error response from daemon: get ${name}: no such volume`;
+  return String(error?.stderr ?? "").trim() === expected;
+}
+
+export async function removeLabeled(type, name, runId, dockerRunner = docker) {
   let labels;
   try {
-    labels = await inspectLabels(type, name);
-  } catch {
-    return;
+    labels = await inspectLabels(type, name, dockerRunner);
+  } catch (error) {
+    if (isMissingDockerObjectError(error, type, name)) return;
+    throw error;
   }
   if (labels[RUN_LABEL] !== runId) throw new Error(`refusing to remove unlabeled ${type}`);
   const args = type === "container"
     ? ["container", "rm", "--force", name]
     : [type, "rm", name];
-  await docker(args);
+  await dockerRunner(args);
 }
 
 async function waitForPostgreSql(container, database, dockerRunner = docker) {

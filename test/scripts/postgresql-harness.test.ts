@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { describe, expect, it, vi } from "vitest";
 import {
   MAX_CAPTURED_OUTPUT_BYTES,
   NODE_IMAGE,
@@ -6,6 +7,8 @@ import {
   RUN_LABEL,
   createProcessLifecycle,
   createRunNames,
+  isMissingDockerObjectError,
+  removeLabeled,
   runProcess,
   sanitizeHarnessText,
   validateRunNames,
@@ -106,5 +109,53 @@ describe("PostgreSQL harness utilities", () => {
     expect(resourceExists).toBe(true);
     await expect(lifecycle.run("docker", ["volume", "create"]))
       .rejects.toThrow("setup is stopping");
+  });
+
+  it.each([
+    ["container", "Error response from daemon: No such container: owned-resource"],
+    ["network", "Error response from daemon: network owned-resource not found"],
+    ["volume", "Error response from daemon: get owned-resource: no such volume"],
+  ])("ignores only an exact missing %s inspection", async (type, stderr) => {
+    const missing = Object.assign(new Error("docker failed"), { code: 1, stdout: "[]\n", stderr: `${stderr}\n` });
+    const dockerRunner = vi.fn().mockRejectedValue(missing);
+
+    expect(isMissingDockerObjectError(missing, type, "owned-resource")).toBe(true);
+    await expect(removeLabeled(type, "owned-resource", "a".repeat(32), dockerRunner)).resolves.toBeUndefined();
+    expect(dockerRunner).toHaveBeenCalledOnce();
+  });
+
+  it("propagates inspection failures that do not prove absence", async () => {
+    const secret = "cleanup-secret";
+    const failure = Object.assign(new Error("docker failed"), {
+      code: 1,
+      stdout: "",
+      stderr: `permission denied for ${secret}`,
+    });
+    const dockerRunner = vi.fn().mockRejectedValue(failure);
+
+    expect(isMissingDockerObjectError(failure, "container", "owned-resource")).toBe(false);
+    expect(isMissingDockerObjectError(failure, "image", "owned-resource")).toBe(false);
+    await expect(removeLabeled("container", "owned-resource", "a".repeat(32), dockerRunner)).rejects.toBe(failure);
+    expect(sanitizeHarnessText(failure.stderr, [secret])).toBe("permission denied for [REDACTED]");
+  });
+
+  it("requires an ownership label before issuing an exact removal", async () => {
+    const runId = "a".repeat(32);
+    const dockerRunner = vi.fn()
+      .mockResolvedValueOnce({ stdout: JSON.stringify([{ Config: { Labels: { [RUN_LABEL]: runId } } }]), stderr: "" })
+      .mockResolvedValueOnce({ stdout: "", stderr: "" });
+
+    await expect(removeLabeled("container", "owned-resource", runId, dockerRunner)).resolves.toBeUndefined();
+    expect(dockerRunner).toHaveBeenNthCalledWith(1, ["container", "inspect", "owned-resource"]);
+    expect(dockerRunner).toHaveBeenNthCalledWith(2, ["container", "rm", "--force", "owned-resource"]);
+
+    const unlabeledRunner = vi.fn().mockResolvedValue({ stdout: JSON.stringify([{ Config: { Labels: {} } }]), stderr: "" });
+    await expect(removeLabeled("container", "owned-resource", runId, unlabeledRunner))
+      .rejects.toThrow("refusing to remove unlabeled container");
+  });
+
+  it("pins migration SQL to LF for stable checksums across Git configurations", () => {
+    const attributes = readFileSync(new URL("../../.gitattributes", import.meta.url), "utf8");
+    expect(attributes.split(/\r?\n/u)).toContain("src/storage/postgresql/migrations/*.sql text eol=lf");
   });
 });

@@ -1,7 +1,11 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
-import { RUN_LABEL } from "../../scripts/postgresql-harness.mjs";
+import {
+  RUN_LABEL,
+  removeLabeled,
+  sanitizeHarnessText,
+} from "../../scripts/postgresql-harness.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -68,4 +72,22 @@ async function expectNoResources(runId: string): Promise<void> {
 describe("PostgreSQL harness signal teardown", () => {
   it("cleans every labeled resource on SIGINT", () => runSignalProbe("SIGINT"), 45_000);
   it("cleans every labeled resource on SIGTERM", () => runSignalProbe("SIGTERM"), 45_000);
+
+  it("propagates and sanitizes a real Docker inspection failure", async () => {
+    const unavailableSocket = "/tmp/lcm-postgresql-harness-unavailable-cleanup.sock";
+    const dockerRunner = async (args: string[]): Promise<{ stdout: string; stderr: string }> => {
+      const { stdout, stderr } = await execFileAsync("docker", ["--host", `unix://${unavailableSocket}`, ...args]);
+      return { stdout, stderr };
+    };
+    const failure = await removeLabeled(
+      "container",
+      "lcm-pg-unreachable-daemon",
+      "a".repeat(32),
+      dockerRunner,
+    ).catch((error: unknown) => error) as { code: number; stderr: string };
+
+    expect(failure.code).not.toBe(0);
+    expect(failure.stderr).toContain(unavailableSocket);
+    expect(sanitizeHarnessText(failure.stderr, [unavailableSocket])).not.toContain(unavailableSocket);
+  });
 });

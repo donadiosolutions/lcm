@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { StorageOperationError } from "../../src/storage/errors.js";
 import {
+  isPostgreSqlConnectionError,
   isRetryablePostgreSqlError,
   normalizePostgreSqlError,
 } from "../../src/storage/postgresql/errors.js";
@@ -34,6 +35,25 @@ describe("PostgreSQL error normalization", () => {
     "timeout expired",
   ])("classifies pg driver failure %s as retryable without SQLSTATE", (message) => {
     expect(isRetryablePostgreSqlError(new Error(message))).toBe(true);
+  });
+
+  it.each([
+    { code: "08006", message: "private" },
+    { code: "57P01", message: "private" },
+    { code: "ECONNRESET", message: "private" },
+    { message: "Connection terminated unexpectedly" },
+  ])("identifies connection-level failure %#", ({ code, message }) => {
+    expect(isPostgreSqlConnectionError(Object.assign(new Error(message), { code }))).toBe(true);
+  });
+
+  it.each([
+    { code: "40001", message: "serialization failure" },
+    { code: "40P01", message: "deadlock" },
+    { code: "53300", message: "too many connections" },
+    { code: "23505", message: "unique violation" },
+    { code: "080000", message: "malformed SQLSTATE" },
+  ])("does not identify ordinary SQL or malformed failure %# as connection-level", ({ code, message }) => {
+    expect(isPostgreSqlConnectionError(Object.assign(new Error(message), { code }))).toBe(false);
   });
 
   it.each([
