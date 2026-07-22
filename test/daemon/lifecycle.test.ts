@@ -2,7 +2,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, w
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ensureAuthToken } from "../../src/daemon/auth.js";
+import { loadDaemonConfig, parseDaemonConfig } from "../../src/daemon/config.js";
 import { ensureDaemon, findUserSystemdPid, readProcessParentPid, restartDaemon } from "../../src/daemon/lifecycle.js";
+import { createDaemon } from "../../src/daemon/server.js";
 
 const tempDirs: string[] = [];
 type EnsureDaemonOptions = Parameters<typeof ensureDaemon>[0];
@@ -101,9 +104,6 @@ describe("ensureDaemon", () => {
   });
 
   it("connects to existing healthy daemon", async () => {
-    const { createDaemon } = await import("../../src/daemon/server.js");
-    const { loadDaemonConfig } = await import("../../src/daemon/config.js");
-    const { ensureAuthToken } = await import("../../src/daemon/auth.js");
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
@@ -129,7 +129,7 @@ describe("ensureDaemon", () => {
     } finally {
       await daemon.stop();
     }
-  });
+  }, 10_000);
 
   it("does not connect when health passes but authenticated routes reject the local token", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-auth-"));
@@ -234,7 +234,6 @@ describe("ensureDaemon", () => {
   it.each([false, true])(
     "rejects a healthy same-version SQLite daemon when PostgreSQL is selected (process removes PID file: %s)",
     async (processRemovesPidFile): Promise<void> => {
-    const { parseDaemonConfig } = await import("../../src/daemon/config.js");
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-storage-mismatch-"));
     tempDirs.push(tempDir);
     const procRoot = join(tempDir, "proc");
@@ -1623,8 +1622,6 @@ describe("ensureDaemon", () => {
   });
 
   it("detects version mismatch and returns not connected when spawn skipped", async () => {
-    const { createDaemon } = await import("../../src/daemon/server.js");
-    const { loadDaemonConfig } = await import("../../src/daemon/config.js");
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
     config.daemon.idleTimeoutMs = 0;

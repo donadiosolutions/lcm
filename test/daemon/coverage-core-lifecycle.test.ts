@@ -156,6 +156,7 @@ describe("lifecycle procfs and parent warnings", () => {
       expectedVersion: "1",
       _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(20) as never,
       _isProcessAliveOverride: () => alive, _listeningPortsOverride: () => [1], _skipSpawn: true,
+      _monotonicNowOverride: (): number => 0,
     });
     expect(result.connected).toBe(connected);
     if (warning) expect(result.warning).toContain(warning);
