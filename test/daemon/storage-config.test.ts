@@ -12,6 +12,7 @@ import {
 } from "../../src/daemon/config.js";
 import { createDaemon } from "../../src/daemon/server.js";
 import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
+import { parsePostgreSqlUrl } from "../../src/storage/postgresql/client-config.js";
 
 const tempDirs: string[] = [];
 
@@ -178,6 +179,20 @@ describe("storage configuration", () => {
     });
   });
 
+  it.each([
+    { label: "implicit default", url: "postgresql://user:password@db.example.com/lcm", port: 5432 },
+    { label: "minimum explicit", url: "postgresql://user:password@db.example.com:1/lcm", port: 1 },
+    { label: "maximum explicit", url: "postgresql://user:password@db.example.com:65535/lcm", port: 65_535 },
+  ])("accepts the same PostgreSQL port boundary as the runtime parser: $label", ({ url, port }) => {
+    const storage = resolveStorageConfig({ backend: "postgresql" }, {
+      LCM_POSTGRES_URL: url,
+      LCM_POSTGRES_CA_FILE: caFile(),
+    });
+
+    expect(storage).toMatchObject({ backend: "postgresql", postgresql: { url } });
+    expect(parsePostgreSqlUrl(url).port).toBe(port);
+  });
+
   it("returns the canonical CA path established by the validated file preflight", () => {
     const trustedCa = caFile("trusted-ca");
     const nestedDirectory = join(dirname(trustedCa), "nested");
@@ -261,6 +276,44 @@ describe("storage configuration", () => {
     ]) {
       expect(error.message).not.toContain(secret);
     }
+  });
+
+  it.each([
+    {
+      label: "zero",
+      url: "postgresql://user:zero-port-secret@db.example.com:0/lcm",
+      expected: "PostgreSQL port from 1 through 65535",
+    },
+    {
+      label: "overflow",
+      url: "postgresql://user:overflow-port-secret@db.example.com:65536/lcm",
+      expected: "absolute postgresql: URL",
+    },
+    {
+      label: "malformed",
+      url: "postgresql://user:malformed-port-secret@db.example.com:12x/lcm",
+      expected: "absolute postgresql: URL",
+    },
+  ])("rejects the same invalid PostgreSQL port as the runtime parser: $label", ({ url, expected }) => {
+    const daemonError = (() => {
+      try {
+        resolveStorageConfig({ backend: "postgresql" }, {
+          LCM_POSTGRES_URL: url,
+          LCM_POSTGRES_CA_FILE: caFile(),
+        });
+      } catch (caught) {
+        return caught as Error;
+      }
+      throw new Error("expected configuration error");
+    })();
+
+    expect(daemonError.message).toContain("LCM_POSTGRES_URL");
+    expect(daemonError.message).toContain(expected);
+    expect(daemonError.message).not.toContain("port-secret");
+    expect(() => parsePostgreSqlUrl(url)).toThrowError(expect.objectContaining({
+      code: "STORAGE_INITIALIZATION_FAILED",
+      operation: "configure",
+    }));
   });
 
   it.each([

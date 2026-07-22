@@ -954,6 +954,13 @@ export function resolveStorageConfig(
       "must use hierarchical postgresql:// form with a non-empty hostname",
     );
   }
+  const port = parsedUrl.port === "" ? 5432 : Number(parsedUrl.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new ConfigValidationError(
+      "LCM_POSTGRES_URL",
+      "must use a PostgreSQL port from 1 through 65535",
+    );
+  }
   if (hasUrlQueryComponent(url)) {
     throw new ConfigValidationError(
       "LCM_POSTGRES_URL",
