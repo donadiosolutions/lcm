@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { QueryResultRow } from "pg";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations.js";
+import { normalizePostgreSqlError } from "../../src/storage/postgresql/errors.js";
 import type {
   PostgreSqlConnectionSettings,
   PostgreSqlTestDatabaseLease,
@@ -141,40 +142,11 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
   const databaseAdmin = runtimeFor(adminUrl);
   const migrator = runtimeFor(migratorUrl);
   const runtime = runtimeFor(runtimeUrl);
-  try {
-    for (const extension of ["pg_trgm", "unaccent", "pgcrypto", "pg_stat_statements"] as const) {
-      await databaseAdmin.query({ text: `CREATE EXTENSION ${extension}` }, {
-        domain: "factory",
-        operation: "createTestExtension",
-      });
-    }
-    await databaseAdmin.query({
-      text: `CREATE TABLE public.__lcm_test_run_sentinel (
-               run_id text PRIMARY KEY,
-               database_name text NOT NULL,
-               runtime_role text NOT NULL CHECK (runtime_role = 'lcm_test_runtime')
-             )`,
-    }, { domain: "factory", operation: "createTestSentinel" });
-    await databaseAdmin.query({
-      text: `INSERT INTO public.__lcm_test_run_sentinel (run_id, database_name, runtime_role)
-             VALUES ($1, $2, 'lcm_test_runtime')`,
-      values: [env.LCM_TEST_POSTGRES_RUN_ID, name],
-    }, { domain: "factory", operation: "writeTestSentinel" });
-    await databaseAdmin.query({
-      text: `REVOKE ALL ON public.__lcm_test_run_sentinel FROM PUBLIC;
-             GRANT SELECT ON public.__lcm_test_run_sentinel TO lcm_test_migrator, lcm_test_runtime`,
-    }, { domain: "factory", operation: "protectTestSentinel" });
-    await runPostgreSqlMigrations(migrator);
-    await migrator.query({
-      text: `GRANT USAGE ON SCHEMA lcm TO lcm_test_runtime;
-             GRANT SELECT ON lcm.schema_migrations TO lcm_test_runtime`,
-    }, { domain: "factory", operation: "grantRuntimeBaseline" });
-  } catch (error) {
-    await Promise.allSettled([databaseAdmin.close(), migrator.close(), runtime.close()]);
-    throw error;
-  }
-  await databaseAdmin.close();
-
+  let databaseAdminClosePromise: Promise<void> | undefined;
+  const closeDatabaseAdmin = (): Promise<void> => {
+    databaseAdminClosePromise ??= databaseAdmin.close();
+    return databaseAdminClosePromise;
+  };
   let dropPromise: Promise<void> | undefined;
   const dropDatabase = async (): Promise<void> => {
     await Promise.allSettled([migrator.close(), runtime.close()]);
@@ -214,6 +186,46 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
       await control.close();
     }
   };
+  const dropOwnedDatabase = (): Promise<void> => {
+    dropPromise ??= dropDatabase().catch((error: unknown) => {
+      dropPromise = undefined;
+      throw error;
+    });
+    return dropPromise;
+  };
+  try {
+    for (const extension of ["pg_trgm", "unaccent", "pgcrypto", "pg_stat_statements"] as const) {
+      await databaseAdmin.query({ text: `CREATE EXTENSION ${extension}` }, {
+        domain: "factory",
+        operation: "createTestExtension",
+      });
+    }
+    await databaseAdmin.query({
+      text: `CREATE TABLE public.__lcm_test_run_sentinel (
+               run_id text PRIMARY KEY,
+               database_name text NOT NULL,
+               runtime_role text NOT NULL CHECK (runtime_role = 'lcm_test_runtime')
+             )`,
+    }, { domain: "factory", operation: "createTestSentinel" });
+    await databaseAdmin.query({
+      text: `INSERT INTO public.__lcm_test_run_sentinel (run_id, database_name, runtime_role)
+             VALUES ($1, $2, 'lcm_test_runtime')`,
+      values: [env.LCM_TEST_POSTGRES_RUN_ID, name],
+    }, { domain: "factory", operation: "writeTestSentinel" });
+    await databaseAdmin.query({
+      text: `REVOKE ALL ON public.__lcm_test_run_sentinel FROM PUBLIC;
+             GRANT SELECT ON public.__lcm_test_run_sentinel TO lcm_test_migrator, lcm_test_runtime`,
+    }, { domain: "factory", operation: "protectTestSentinel" });
+    await runPostgreSqlMigrations(migrator);
+    await migrator.query({
+      text: `GRANT USAGE ON SCHEMA lcm TO lcm_test_runtime;
+             GRANT SELECT ON lcm.schema_migrations TO lcm_test_runtime`,
+    }, { domain: "factory", operation: "grantRuntimeBaseline" });
+    await closeDatabaseAdmin();
+  } catch (error) {
+    await Promise.allSettled([closeDatabaseAdmin(), dropOwnedDatabase()]);
+    throw normalizePostgreSqlError(error, { domain: "factory", operation: "createTestDatabase" });
+  }
   return {
     name,
     sentinel: {
@@ -227,11 +239,7 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
     migrator,
     runtime,
     drop(): Promise<void> {
-      dropPromise ??= dropDatabase().catch((error: unknown) => {
-        dropPromise = undefined;
-        throw error;
-      });
-      return dropPromise;
+      return dropOwnedDatabase();
     },
   };
 }

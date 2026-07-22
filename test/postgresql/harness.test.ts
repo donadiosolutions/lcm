@@ -17,8 +17,11 @@ function deferred(): Deferred {
 }
 
 const mocks = vi.hoisted(() => ({
+  closeAttempts: [] as string[],
+  databaseAdminCloseFailure: undefined as Error | undefined,
   dropAttempts: 0,
   dropGate: undefined as Deferred | undefined,
+  events: [] as string[],
   operations: [] as string[],
   runMigrations: vi.fn(async () => ({ applied: [] })),
 }));
@@ -31,14 +34,29 @@ vi.mock("../../src/storage/postgresql/runtime.js", () => ({
   PostgreSqlRuntime: vi.fn(function PostgreSqlRuntime(
     settings: { url: string },
   ) {
+    const url = new URL(settings.url);
+    const instance = `${url.username}@${url.pathname.slice(1)}`;
     return {
-      close: vi.fn(async () => undefined),
+      close: vi.fn(async () => {
+        mocks.closeAttempts.push(instance);
+        mocks.events.push(`close:${instance}`);
+        if (
+          mocks.databaseAdminCloseFailure
+          && url.username === "admin"
+          && url.pathname !== "/lcm_control"
+        ) {
+          const failure = mocks.databaseAdminCloseFailure;
+          mocks.databaseAdminCloseFailure = undefined;
+          throw failure;
+        }
+      }),
       query: vi.fn(async (
         _query: unknown,
         context: { operation?: string } = {},
       ) => {
         const operation = context.operation ?? "unknown";
         mocks.operations.push(operation);
+        mocks.events.push(`query:${operation}`);
         if (operation === "verifyDropSentinel") {
           const databaseName = new URL(settings.url).pathname.slice(1);
           return {
@@ -80,8 +98,11 @@ const ENVIRONMENT = {
 
 beforeEach(() => {
   for (const [key, value] of Object.entries(ENVIRONMENT)) vi.stubEnv(key, value);
+  mocks.closeAttempts.length = 0;
+  mocks.databaseAdminCloseFailure = undefined;
   mocks.dropAttempts = 0;
   mocks.dropGate = undefined;
+  mocks.events.length = 0;
   mocks.operations.length = 0;
   mocks.runMigrations.mockClear();
 });
@@ -91,6 +112,37 @@ afterEach(() => {
 });
 
 describe("PostgreSQL test database lease", () => {
+  it("drops the owned database when the database admin close fails", async () => {
+    const secret = "postgresql://admin:close-secret@postgres/private";
+    mocks.databaseAdminCloseFailure = new Error(`injected close failure ${secret}`);
+
+    const failure = await createPostgreSqlTestDatabase("close-failure").catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "StorageOperationError",
+      backend: "postgresql",
+      domain: "factory",
+      operation: "createTestDatabase",
+    });
+    expect(String(failure)).not.toContain(secret);
+    expect(mocks.dropAttempts).toBe(1);
+    expect(mocks.operations.filter((operation) => operation === "verifyDropSentinel")).toHaveLength(1);
+    expect(mocks.operations.filter((operation) => operation === "drainTestDatabase")).toHaveLength(1);
+    expect(mocks.closeAttempts.filter((instance) => instance.startsWith("admin@lcm_t_"))).toHaveLength(2);
+    expect(mocks.closeAttempts.filter((instance) => instance.startsWith("migrator@lcm_t_"))).toHaveLength(1);
+    expect(mocks.closeAttempts.filter((instance) => instance.startsWith("runtime@lcm_t_"))).toHaveLength(1);
+    expect(mocks.closeAttempts.filter((instance) => instance === "admin@lcm_control")).toHaveLength(2);
+
+    const databaseAdminClose = mocks.events.findIndex((event) => event.startsWith("close:admin@lcm_t_"));
+    const migratorClose = mocks.events.findIndex((event) => event.startsWith("close:migrator@lcm_t_"));
+    const sentinelGuard = mocks.events.indexOf("query:verifyDropSentinel");
+    const databaseDrop = mocks.events.indexOf("query:dropTestDatabase");
+    expect(databaseAdminClose).toBeGreaterThanOrEqual(0);
+    expect(migratorClose).toBeGreaterThan(databaseAdminClose);
+    expect(sentinelGuard).toBeGreaterThan(migratorClose);
+    expect(databaseDrop).toBeGreaterThan(sentinelGuard);
+  });
+
   it("shares one in-flight and completed drop across concurrent callers", async () => {
     const database = await createPostgreSqlTestDatabase("concurrent-drop");
     const gate = deferred();
