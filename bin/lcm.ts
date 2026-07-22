@@ -28,6 +28,7 @@ import {
   projectsDir as lcmProjectsDir,
 } from "../src/runtime-paths.js";
 import type { ProgressState } from "../src/cli/progress-state.js";
+import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -513,9 +514,11 @@ export function writeCliError(value: string): void {
 async function createDaemonClientOrExit(): Promise<DaemonClient> {
   const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
   const { loadDaemonConfig } = await import("../src/daemon/config.js");
+  const { selectStorageBackend } = await import("../src/storage/backend.js");
 
   migrateLegacyHomeIfNeeded();
   const config = loadDaemonConfig(defaultConfigPath());
+  selectStorageBackend(config.storage);
   const port = config.daemon?.port ?? 3737;
   const pidFilePath = daemonPidPath();
   const tokenPath = daemonTokenPath();
@@ -523,6 +526,7 @@ async function createDaemonClientOrExit(): Promise<DaemonClient> {
     port,
     pidFilePath,
     spawnTimeoutMs: 5000,
+    expectedStorageBackend: config.storage.backend,
     enforceUserManagerParent: true,
   });
 
@@ -580,13 +584,16 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       if (!opts.foreground) {
         const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
         const { loadDaemonConfig } = await import("../src/daemon/config.js");
+        const { selectStorageBackend } = await import("../src/storage/backend.js");
         const config = loadDaemonConfig(defaultConfigPath());
+        selectStorageBackend(config.storage);
         const port = config.daemon?.port ?? 3737;
         const result = await ensureDaemon({
           port,
           pidFilePath: daemonPidPath(),
           spawnTimeoutMs: 10000,
           expectedVersion: typeof pkg.version === "string" ? pkg.version : undefined,
+          expectedStorageBackend: config.storage.backend,
           enforceUserManagerParent: true,
         });
         if (!result.connected) {
@@ -637,13 +644,16 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       if (opts.help) await withCustomHelp(daemonCmd, "daemon");
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
       const { restartDaemon } = await import("../src/daemon/lifecycle.js");
+      const { selectStorageBackend } = await import("../src/storage/backend.js");
       const config = loadDaemonConfig(defaultConfigPath());
+      selectStorageBackend(config.storage);
       const port = config.daemon?.port ?? 3737;
       const result = await restartDaemon({
         port,
         pidFilePath: daemonPidPath(),
         spawnTimeoutMs: 10000,
         expectedVersion: typeof pkg.version === "string" ? pkg.version : undefined,
+        expectedStorageBackend: config.storage.backend,
         enforceUserManagerParent: true,
         validateBeforeRestart: () => { loadDaemonConfig(defaultConfigPath()); },
       });
@@ -751,7 +761,9 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         const { batchCompact } = await import("../src/batch-compact.js");
         const { loadDaemonConfig } = await import("../src/daemon/config.js");
         const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
+        const { selectStorageBackend } = await import("../src/storage/backend.js");
         const config = loadDaemonConfig(defaultConfigPath());
+        selectStorageBackend(config.storage);
         const requestPolicy = resolveCompactRequestPolicyOverride(config, opts);
         const effectiveProvider = resolveManualCompactProvider(config.llm.provider);
         const supportedEfforts = reasoningEffortsForProvider(effectiveProvider, config.llm.apiMode);
@@ -769,6 +781,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
           port,
           pidFilePath,
           spawnTimeoutMs: 10000,
+          expectedStorageBackend: config.storage.backend,
           enforceUserManagerParent: true,
         });
         if (!connected) {
@@ -1131,6 +1144,9 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       }
 
       const verbose: boolean = opts.verbose ?? false;
+      const { loadDaemonConfig } = await import("../src/daemon/config.js");
+      const { selectStorageBackend } = await import("../src/storage/backend.js");
+      selectStorageBackend(loadDaemonConfig(defaultConfigPath()).storage);
       const { collectStats, printStats } = await import("../src/stats.js");
       printStats(collectStats(), verbose);
     });
@@ -1460,6 +1476,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
       const { DaemonClient } = await import("../src/daemon/client.js");
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
+      const { selectStorageBackend } = await import("../src/storage/backend.js");
       const { NinjaRenderer } = await import("../src/cli/pipeline-runner.js");
       const { makeProgressState } = await import("../src/cli/progress-state.js");
       const { join } = await import("node:path");
@@ -1484,12 +1501,14 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       }
 
       const config = loadDaemonConfig(defaultConfigPath());
+      selectStorageBackend(config.storage);
       const port = config.daemon?.port ?? 3737;
       const pidFilePath = daemonPidPath();
       const { connected } = await ensureDaemon({
         port,
         pidFilePath,
         spawnTimeoutMs: 5000,
+        expectedStorageBackend: config.storage.backend,
         enforceUserManagerParent: true,
       });
       if (!connected) { console.error("  Daemon not available"); exit(1); }
@@ -1574,16 +1593,19 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
 
       const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
+      const { selectStorageBackend } = await import("../src/storage/backend.js");
       const { join } = await import("node:path");
       const { homedir } = await import("node:os");
 
       const config = loadDaemonConfig(defaultConfigPath());
+      selectStorageBackend(config.storage);
       const port = config.daemon?.port ?? 3737;
       const pidFilePath = daemonPidPath();
       const { connected } = await ensureDaemon({
         port,
         pidFilePath,
         spawnTimeoutMs: 5000,
+        expectedStorageBackend: config.storage.backend,
         enforceUserManagerParent: true,
       });
       if (!connected) {
@@ -1676,6 +1698,9 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         printHelp("export"); exit(0);
       }
 
+      const { loadDaemonConfig } = await import("../src/daemon/config.js");
+      const { selectStorageBackend } = await import("../src/storage/backend.js");
+      selectStorageBackend(loadDaemonConfig(defaultConfigPath()).storage);
       const { exportKnowledge } = await import("../src/portable-knowledge.js");
       const { homedir } = await import("node:os");
       const { join } = await import("node:path");
@@ -1745,6 +1770,9 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         printHelp("import-knowledge"); exit(0);
       }
 
+      const { loadDaemonConfig } = await import("../src/daemon/config.js");
+      const { selectStorageBackend } = await import("../src/storage/backend.js");
+      selectStorageBackend(loadDaemonConfig(defaultConfigPath()).storage);
       const { importKnowledge } = await import("../src/portable-knowledge.js");
       const { readFileSync } = await import("node:fs");
 
@@ -1827,7 +1855,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
 
 /** @internal Top-level rejection handler kept separate for deterministic tests. */
 export function handleCliError(err: unknown): never {
-  console.error(err instanceof ConfigValidationError ? err.message : err);
+  console.error(err instanceof ConfigValidationError || err instanceof StorageBackendUnavailableError ? err.message : err);
   return exit(1);
 }
 

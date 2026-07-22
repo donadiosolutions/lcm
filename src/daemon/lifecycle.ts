@@ -5,6 +5,7 @@ import { join, dirname, win32 } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
 import { managedDaemonPath, SYSTEMD_DAEMON_PATH } from "./managed-path.js";
 import { PKG_VERSION } from "./version.js";
+import type { StorageBackend } from "./config.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
@@ -21,6 +22,7 @@ export type EnsureDaemonOptions = {
   pidFilePath: string;
   spawnTimeoutMs: number;
   expectedVersion?: string;
+  expectedStorageBackend?: StorageBackend;
   enforceUserManagerParent?: boolean;
   spawnCommand?: string;
   spawnArgs?: string[];
@@ -69,6 +71,7 @@ export type RestartDaemonResult = EnsureDaemonResult & {
 type HealthResponse = {
   status: string;
   version?: string;
+  storageBackend?: StorageBackend;
   uptime?: number;
   pid?: number;
 };
@@ -80,9 +83,95 @@ function healthVersionMatches(health: HealthResponse | null, expectedVersion: st
     && health.version === expectedVersion;
 }
 
+function healthStorageBackendMatches(
+  health: HealthResponse | null,
+  expectedStorageBackend: StorageBackend,
+): boolean {
+  // Daemons predating backend identity were necessarily SQLite-only.
+  return (health?.storageBackend ?? "sqlite") === expectedStorageBackend;
+}
+
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const STORAGE_BACKEND_AUTH_WARNING = "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
 const userSystemdPidCache = new Map<string, { pid: number | null; expiresAt: number }>();
+
+type ProcessDiagnosticSource =
+  | "credential setup error"
+  | "systemd start exception"
+  | "systemd stderr"
+  | "systemd stdout"
+  | "systemd process error"
+  | "detached spawn error";
+
+const PROCESS_ERROR_CODES = new Set([
+  "E2BIG", "EACCES", "EADDRINUSE", "EAGAIN", "ECONNREFUSED", "ECONNRESET",
+  "EEXIST", "EHOSTUNREACH", "EINTR", "EINVAL", "EIO", "EISDIR", "EMFILE",
+  "ENETUNREACH", "ENOENT", "ENOMEM", "ENOSPC", "ENOTDIR", "ENOTEMPTY",
+  "ENOTFOUND", "ENOTSUP", "EPERM", "EPIPE", "ESRCH", "ETIMEDOUT",
+]);
+const PROCESS_ERROR_CLASSIFICATIONS = new Map<string, string>([
+  ["EACCES", "permission denied"], ["EPERM", "permission denied"],
+  ["ENOENT", "executable or resource unavailable"], ["ENOTDIR", "executable or resource unavailable"],
+  ["ETIMEDOUT", "operation timed out"],
+  ["ECONNREFUSED", "service unavailable"], ["ECONNRESET", "service unavailable"],
+  ["EHOSTUNREACH", "service unavailable"], ["ENETUNREACH", "service unavailable"],
+  ["ENOMEM", "local resource limit reached"], ["ENOSPC", "local resource limit reached"],
+  ["EMFILE", "local resource limit reached"],
+  ["EINVAL", "invalid process invocation"], ["E2BIG", "invalid process invocation"],
+]);
+const PROCESS_TEXT_CLASSIFICATIONS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/\b(?:permission denied|access denied)\b/i, "permission denied"],
+  [/\b(?:not found|no such|no medium)\b/i, "executable or resource unavailable"],
+  [/\b(?:timed out|timeout)\b/i, "operation timed out"],
+  [/\b(?:connection refused|unreachable)\b/i, "service unavailable"],
+];
+const PROCESS_SIGNALS = new Set([
+  "SIGABRT", "SIGALRM", "SIGBUS", "SIGCHLD", "SIGCONT", "SIGFPE", "SIGHUP",
+  "SIGILL", "SIGINT", "SIGKILL", "SIGPIPE", "SIGQUIT", "SIGSEGV", "SIGSTOP",
+  "SIGTERM", "SIGTRAP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGUSR1",
+  "SIGUSR2", "SIGXCPU", "SIGXFSZ",
+]);
+
+/** Summarize untrusted process output without reproducing any of its text. */
+function summarizeProcessDiagnostic(source: ProcessDiagnosticSource, value: unknown): string {
+  let text = "";
+  let suppliedCode: unknown;
+  try {
+    if (value instanceof Error) {
+      text = value.message.slice(0, 4096);
+      suppliedCode = (value as NodeJS.ErrnoException).code;
+    } else if (typeof value === "string") {
+      text = value.slice(0, 4096);
+    }
+  } catch {
+    // Hostile Error subclasses must not escape diagnostic handling.
+  }
+  // Normalize controls only for classification. No portion of this text is returned.
+  text = text
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, " ")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+
+  const normalizedCode = typeof suppliedCode === "string" ? suppliedCode.toUpperCase() : "";
+  const textCode = text.toUpperCase().match(/\bE[A-Z0-9_]{2,31}\b/g)
+    ?.find((candidate) => PROCESS_ERROR_CODES.has(candidate));
+  const code = PROCESS_ERROR_CODES.has(normalizedCode) ? normalizedCode : textCode;
+
+  const classification = code
+    ? PROCESS_ERROR_CLASSIFICATIONS.get(code) ?? "process reported a failure"
+    : PROCESS_TEXT_CLASSIFICATIONS.find(([pattern]) => pattern.test(text))?.[1]
+      ?? "process reported a failure";
+
+  return `${source}: ${classification}${code ? `; code ${code}` : ""}`;
+}
+
+function summarizeProcessExit(status: unknown, signal: unknown): string {
+  if (typeof signal === "string" && PROCESS_SIGNALS.has(signal)) return `signal ${signal}`;
+  if (typeof status === "number" && Number.isInteger(status) && status >= 0 && status <= 255) {
+    return `exit status ${status}`;
+  }
+  return "process exit unavailable";
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -488,11 +577,11 @@ function startViaDetachedSpawn(
       env: { ...process.env },
     }) as ChildProcess;
   } catch (err) {
-    errorMessage = err instanceof Error ? err.message : String(err);
+    errorMessage = summarizeProcessDiagnostic("detached spawn error", err);
     return { getWarning: () => `detached spawn failed (${errorMessage})` };
   }
   child.once("error", (err) => {
-    errorMessage = err.message;
+    errorMessage = summarizeProcessDiagnostic("detached spawn error", err);
   });
   child.unref();
 
@@ -505,7 +594,7 @@ function startViaDetachedSpawn(
 }
 
 const SYSTEMD_PROVIDER_SECRET_ENV_NAMES = new Set(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
-const SYSTEMD_LCM_SECRET_ENV_NAMES = new Set(["LCM_SUMMARY_API_KEY"]);
+const SYSTEMD_LCM_SECRET_ENV_NAMES = new Set(["LCM_SUMMARY_API_KEY", "LCM_POSTGRES_URL"]);
 const SYSTEMD_SECRET_ENV_PATTERN = /(?:API_)?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/;
 const SYSTEMD_CREDENTIAL_DIR_PREFIX = "lcm-systemd-credentials-";
 const SYSTEMD_CREDENTIAL_SOURCE_MAX_AGE_MS = 10 * 60 * 1000;
@@ -542,7 +631,11 @@ function systemdDaemonSetenvArgs(
   executablePath = SYSTEMD_DAEMON_PATH,
 ): string[] {
   const args = Object.entries(env)
-    .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && !SYSTEMD_SECRET_ENV_PATTERN.test(name))
+    .filter(([name, value]) => (
+      shouldPropagateDaemonEnv(name, value)
+      && !isSecretDaemonEnvName(name)
+      && !SYSTEMD_SECRET_ENV_PATTERN.test(name)
+    ))
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, value]) => `--setenv=${name}=${value}`);
   args.push(`--setenv=PATH=${executablePath}`);
@@ -555,7 +648,7 @@ function systemdDaemonSetenvArgs(
 function systemdRunProcessEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = { ...env };
   for (const name of Object.keys(result)) {
-    if (SYSTEMD_SECRET_ENV_PATTERN.test(name)) delete result[name];
+    if (isSecretDaemonEnvName(name) || SYSTEMD_SECRET_ENV_PATTERN.test(name)) delete result[name];
   }
   return result;
 }
@@ -619,7 +712,7 @@ function startViaUserSystemd(
   try {
     credentials = systemdDaemonCredentialArgs(process.env);
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
+    const detail = summarizeProcessDiagnostic("credential setup error", err);
     return {
       ok: false,
       warning: `user systemd credential setup failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
@@ -640,7 +733,7 @@ function startViaUserSystemd(
     ], { encoding: "utf-8", env: systemdRunProcessEnv(process.env), timeout: Math.max(1, opts.spawnTimeoutMs) });
   } catch (err) {
     credentials.cleanup?.();
-    const detail = err instanceof Error ? err.message : String(err);
+    const detail = summarizeProcessDiagnostic("systemd start exception", err);
     return {
       ok: false,
       warning: `user systemd start failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
@@ -648,11 +741,16 @@ function startViaUserSystemd(
   }
 
   if (result.status === 0) return { ok: true, cleanup: credentials.cleanup };
-  const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
-  const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
-  const error = result.error instanceof Error ? result.error.message : "";
-  const signal = result.signal ? `signal ${result.signal}` : "";
-  const detail = stderr || stdout || error || signal || `exit status ${result.status ?? "unknown"}`;
+  const stderr = typeof result.stderr === "string" && result.stderr.length > 0
+    ? summarizeProcessDiagnostic("systemd stderr", result.stderr)
+    : "";
+  const stdout = typeof result.stdout === "string" && result.stdout.length > 0
+    ? summarizeProcessDiagnostic("systemd stdout", result.stdout)
+    : "";
+  const error = result.error instanceof Error
+    ? summarizeProcessDiagnostic("systemd process error", result.error)
+    : "";
+  const detail = stderr || stdout || error || summarizeProcessExit(result.status, result.signal);
   return {
     ok: false,
     warning: `user systemd start failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
@@ -678,6 +776,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   });
   const enforceParent = opts.enforceUserManagerParent === true && platform === "linux";
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
+  const expectedStorageBackend = opts.expectedStorageBackend ?? "sqlite";
   let restartedForParent = false;
 
   if (typeof expectedVersion !== "string" || expectedVersion.length === 0) {
@@ -720,6 +819,46 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     cleanStalePid(opts.pidFilePath);
   }
 
+  type MismatchRepair =
+    | { outcome: "none" }
+    | { outcome: "terminated" }
+    | { outcome: "replacement"; pid: number }
+    | { outcome: "blocked" };
+
+  async function terminateAuthenticatedDaemon(health: HealthResponse): Promise<MismatchRepair> {
+    const authenticatedPid = health.pid;
+    if (authenticatedPid === undefined || !endpointIdentityMatches(health)) return { outcome: "blocked" };
+    if (!isLikelyLcmDaemonProcess(authenticatedPid, procRoot)) return { outcome: "blocked" };
+    await terminatePid(authenticatedPid, { isAlive, killProcess, sleepFn });
+    if (isAlive(authenticatedPid)) return { outcome: "blocked" };
+    const currentPid = readPidFile(opts.pidFilePath);
+    if (currentPid === authenticatedPid) {
+      cleanStalePid(opts.pidFilePath);
+      return { outcome: "terminated" };
+    }
+    return currentPid === null
+      ? { outcome: "terminated" }
+      : { outcome: "replacement", pid: currentPid };
+  }
+
+  /** Stop backend transitions only after local-token access; retain legacy version-repair behavior. */
+  async function repairMismatchedDaemon(
+    health: HealthResponse,
+    identityMatches: boolean,
+    versionMatches: boolean,
+    storageBackendMatches: boolean,
+    hasAccess: boolean,
+  ): Promise<MismatchRepair> {
+    if (!identityMatches) return { outcome: "none" };
+    if (!storageBackendMatches) {
+      if (!hasAccess) return { outcome: "blocked" };
+      return terminateAuthenticatedDaemon(health);
+    }
+    if (versionMatches) return { outcome: "none" };
+    await terminatePidFileProcess();
+    return { outcome: "terminated" };
+  }
+
   async function daemonResult(
     health: HealthResponse | null,
     spawned: boolean,
@@ -730,6 +869,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   ): Promise<EnsureDaemonResult | null> {
     if (health === null || !endpointIdentityMatches(health)) return null;
     if (!healthVersionMatches(health, expectedVersion)) return null;
+    if (!healthStorageBackendMatches(health, expectedStorageBackend)) return null;
     if (!access.alreadyVerified) {
       const accessTimeoutMs = access.deadline - monotonicNow();
       if (accessTimeoutMs <= 0) return null;
@@ -780,6 +920,27 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     };
   }
 
+  async function waitForConcurrentReplacement(pid: number): Promise<EnsureDaemonResult> {
+    while (readPidFile(opts.pidFilePath) === pid && isAlive(pid)) {
+      const healthDeadline = remainingRequestDeadline();
+      if (!healthDeadline) break;
+      const replacementHealth = await checkDaemonHealth(opts.port, fetchFn, healthDeadline);
+      const accepted = await daemonResult(
+        replacementHealth,
+        false,
+        "existing",
+        { alreadyVerified: false, deadline },
+      );
+      if (accepted) return accepted;
+      const remainingMs = deadline - monotonicNow();
+      if (remainingMs <= 0) break;
+      await sleepFn(Math.min(300, remainingMs));
+    }
+    return { connected: false, port: opts.port, spawned: false };
+  }
+
+  let concurrentReplacementPid: number | undefined;
+
   // Step 1: Check if daemon is already running via health check
   const initialHealthDeadline = remainingRequestDeadline();
   const health = initialHealthDeadline
@@ -789,37 +950,53 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const initialAccessDeadline = remainingRequestDeadline();
     const identityMatches = endpointIdentityMatches(health);
     const versionMatches = healthVersionMatches(health, expectedVersion);
-    const hasAccess = identityMatches && versionMatches && initialAccessDeadline
+    const storageBackendMatches = healthStorageBackendMatches(health, expectedStorageBackend);
+    const hasAccess = identityMatches && (versionMatches || !storageBackendMatches) && initialAccessDeadline
       ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, initialAccessDeadline)
       : false;
-    if (identityMatches && !versionMatches) {
-      await terminatePidFileProcess();
-    } else if (hasAccess) {
-      const accepted = await daemonResult(health, false, "existing", { alreadyVerified: true });
-      if (accepted) return accepted;
-      // A null result here can only be the verified wrong-parent case: health,
-      // access, and version were already accepted, while unavailable identity
-      // metadata returns a connected result with a warning.
-      const parent = inspectParent();
-      // Revalidate the authenticated endpoint and PID immediately before a
-      // signal; concurrent lifecycle operations may have replaced either.
-      if (endpointIdentityMatches(health)
-        && parent.available
-        && parent.pid !== undefined
-        && health.pid !== undefined
-        && parent.pid === health.pid
-        && isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
-        await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
-        restartedForParent = true;
+    const mismatchRepair = await repairMismatchedDaemon(
+      health,
+      identityMatches,
+      versionMatches,
+      storageBackendMatches,
+      hasAccess,
+    );
+    if (mismatchRepair.outcome === "blocked") {
+      return { connected: false, port: opts.port, spawned: false, warning: STORAGE_BACKEND_AUTH_WARNING };
+    }
+    if (mismatchRepair.outcome === "replacement") {
+      concurrentReplacementPid = mismatchRepair.pid;
+    }
+    if (mismatchRepair.outcome === "none") {
+      if (hasAccess) {
+        const accepted = await daemonResult(health, false, "existing", { alreadyVerified: true });
+        if (accepted) return accepted;
+        // A null result here can only be the verified wrong-parent case: health,
+        // access, and version were already accepted, while unavailable identity
+        // metadata returns a connected result with a warning.
+        const parent = inspectParent();
+        // Revalidate the authenticated endpoint and PID immediately before a
+        // signal; concurrent lifecycle operations may have replaced either.
+        if (endpointIdentityMatches(health)
+          && parent.available
+          && parent.pid !== undefined
+          && health.pid !== undefined
+          && parent.pid === health.pid
+          && isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
+          await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
+          restartedForParent = true;
+        }
       }
-      cleanStalePid(opts.pidFilePath);
-    } else {
       cleanStalePid(opts.pidFilePath);
     }
   }
 
   // Step 2: Check PID file for stale process
+  if (concurrentReplacementPid !== undefined) {
+    return waitForConcurrentReplacement(concurrentReplacementPid);
+  }
   if (existsSync(opts.pidFilePath)) {
+    let repairedMismatch = false;
     try {
       const pid = parseInt(readFileSync(opts.pidFilePath, "utf-8").trim(), 10);
       if (!isNaN(pid) && isAlive(pid)) {
@@ -833,19 +1010,32 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           const retryAccessDeadline = remainingRequestDeadline();
           const retryIdentityMatches = endpointIdentityMatches(retry);
           const retryVersionMatches = healthVersionMatches(retry, expectedVersion);
-          const retryHasAccess = retryIdentityMatches && retryVersionMatches && retryAccessDeadline
+          const retryStorageBackendMatches = healthStorageBackendMatches(retry, expectedStorageBackend);
+          const retryHasAccess = retryIdentityMatches && (retryVersionMatches || !retryStorageBackendMatches) && retryAccessDeadline
             ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, retryAccessDeadline)
             : false;
-          if (retryIdentityMatches && !retryVersionMatches) {
-            await terminatePidFileProcess();
-          } else if (retryHasAccess) {
+          const mismatchRepair = await repairMismatchedDaemon(
+            retry,
+            retryIdentityMatches,
+            retryVersionMatches,
+            retryStorageBackendMatches,
+            retryHasAccess,
+          );
+          if (mismatchRepair.outcome === "blocked") {
+            return { connected: false, port: opts.port, spawned: false, warning: STORAGE_BACKEND_AUTH_WARNING };
+          }
+          if (mismatchRepair.outcome === "replacement") {
+            return waitForConcurrentReplacement(mismatchRepair.pid);
+          }
+          repairedMismatch = mismatchRepair.outcome === "terminated";
+          if (mismatchRepair.outcome === "none" && retryHasAccess) {
             const accepted = await daemonResult(retry, false, "existing", { alreadyVerified: true });
             if (accepted) {
               return accepted;
             }
           }
         }
-        if (enforceParent) {
+        if (enforceParent && !repairedMismatch) {
           const parent = inspectParent();
           if (parent.available && parent.pid !== undefined) {
             if (isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
@@ -856,7 +1046,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         }
       }
     } catch { /* ignore */ }
-    cleanStalePid(opts.pidFilePath);
+    if (!repairedMismatch) cleanStalePid(opts.pidFilePath);
   }
 
   // Step 3: Spawn daemon (unless skipped for testing)
@@ -961,6 +1151,9 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     const health = await checkDaemonHealth(port, fetchFn, healthDeadline);
     if (health?.status !== "ok" || health.pid !== pid) return false;
     if (!healthVersionMatches(health, expectedVersion)) return false;
+    // The current daemon may legitimately use a different backend during a
+    // configured transition. Authenticate it independently; ensureOptions
+    // applies expectedStorageBackend to the replacement below.
     const accessDeadline = remainingVerificationDeadline();
     if (!accessDeadline || !await checkDaemonAccess(port, tokenPath, fetchFn, accessDeadline)) return false;
     return true;
@@ -1013,6 +1206,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
 export const __lifecycleTestUtils = {
   findListeningTcpPorts,
   healthVersionMatches,
+  healthStorageBackendMatches,
   inspectDaemonParent,
   parentInvariantWarning,
   resolveWindowsNetstatPath,

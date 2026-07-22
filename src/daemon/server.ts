@@ -26,6 +26,7 @@ import { PKG_VERSION } from "./version.js";
 import { normalizeDaemonPort, normalizeIdleTimeoutMs } from "./http-url.js";
 import { projectsDir as lcmProjectsDir } from "../runtime-paths.js";
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
+import { selectStorageBackend } from "../storage/backend.js";
 export { PKG_VERSION };
 
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse, body: string) => Promise<void>;
@@ -97,6 +98,7 @@ function clearIdleTimer(timer: ReturnType<typeof setTimeout> | null, clearTimer:
 }
 
 export async function createDaemon(config: DaemonConfig, options?: DaemonOptions): Promise<DaemonInstance> {
+  selectStorageBackend(config.storage);
   const hasSetTimeoutOverride = options?._setTimeout !== undefined;
   const hasClearTimeoutOverride = options?._clearTimeout !== undefined;
   if (hasSetTimeoutOverride !== hasClearTimeoutOverride) {
@@ -131,7 +133,13 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   }
 
   routes.set("GET /health", async (_req, res) =>
-    sendJson(res, 200, { status: "ok", version: PKG_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000), pid: process.pid }));
+    sendJson(res, 200, {
+      status: "ok",
+      version: PKG_VERSION,
+      storageBackend: config.storage.backend,
+      uptime: Math.floor((Date.now() - startTime) / 1000),
+      pid: process.pid,
+    }));
   routes.set("POST /compact", createCompactHandler(config));
   routes.set("POST /promote", createPromoteHandler(config));
   routes.set("POST /restore", createRestoreHandler(config));

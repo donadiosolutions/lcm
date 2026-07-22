@@ -1,9 +1,10 @@
 // test/hooks/events-db.test.ts
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EventsDb, _resetMigratedPathsForTesting, type EventRow, type HealthStats } from "../../src/hooks/events-db.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 
 describe("EventsDb", () => {
   let dir: string;
@@ -125,6 +126,38 @@ describe("EventsDb", () => {
   });
 
   describe("Schema migrations — error_log + pattern lookup index", () => {
+    it("atomically rolls back initial schema DDL when version insertion fails", () => {
+      const originalPrepare = DatabaseSync.prototype.prepare;
+      const prepareSpy = vi.spyOn(DatabaseSync.prototype, "prepare").mockImplementation(function (
+        this: DatabaseSync,
+        sql: string,
+      ) {
+        if (sql === "INSERT INTO schema_version (version) VALUES (?)") {
+          throw new Error("injected schema-version failure");
+        }
+        return originalPrepare.call(this, sql);
+      });
+
+      try {
+        expect(() => new EventsDb(dbPath)).toThrow("injected schema-version failure");
+      } finally {
+        prepareSpy.mockRestore();
+      }
+
+      const rawDb = new DatabaseSync(dbPath);
+      const applicationObjects = rawDb.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE name IN ('schema_version', 'events', 'error_log', 'idx_events_unprocessed')
+      `).all();
+      expect(applicationObjects).toEqual([]);
+      rawDb.close();
+
+      const recovered = new EventsDb(dbPath);
+      expect((recovered.raw().prepare("SELECT version FROM schema_version").get() as { version: number }).version)
+        .toBe(3);
+      recovered.close();
+    });
+
     it("repairs an empty schema-version table", () => {
       const { DatabaseSync } = require("node:sqlite");
       const rawDb = new DatabaseSync(dbPath);
@@ -157,6 +190,20 @@ describe("EventsDb", () => {
       rawDb.close();
       const db = new EventsDb(dbPath);
       expect(db.raw().prepare("SELECT name FROM sqlite_master WHERE name='idx_events_pattern_lookup'").get()).toBeDefined();
+      db.close();
+    });
+
+    it("leaves an already-current schema version unchanged", () => {
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.exec(`
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version VALUES (3);
+      `);
+      rawDb.close();
+
+      const db = new EventsDb(dbPath);
+      expect((db.raw().prepare("SELECT version FROM schema_version").get() as { version: number }).version)
+        .toBe(3);
       db.close();
     });
 

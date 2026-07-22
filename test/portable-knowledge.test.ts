@@ -17,6 +17,7 @@ import { addProjectAlias, clearProjectMapCache } from "../src/project-map.js";
 import { lcmHomeDir } from "../src/runtime-paths.js";
 import { isLcmConnectionOpen } from "../src/db/connection.js";
 import { ScrubEngine } from "../src/scrub.js";
+import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 
 const tempDirs: string[] = [];
 const originalHome = process.env.HOME;
@@ -38,6 +39,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true });
   clearProjectMapCache();
   if (tempHome) rmSync(tempHome, { recursive: true, force: true });
@@ -91,6 +93,39 @@ function seedProject(
 
   return { projDir, projId, dbPath };
 }
+
+function configurePostgreSqlBackend(): void {
+  const home = lcmHomeDir();
+  mkdirSync(home, { recursive: true });
+  const caPath = join(home, "postgres-ca.crt");
+  writeFileSync(caPath, "trusted-ca");
+  writeFileSync(join(home, "config.json"), JSON.stringify({ storage: { backend: "postgresql" } }));
+  vi.stubEnv("LCM_POSTGRES_URL", "postgresql://user:password@db.example.com/lcm");
+  vi.stubEnv("LCM_POSTGRES_CA_FILE", caPath);
+}
+
+it("fails closed before portable export or import can access SQLite under PostgreSQL", async () => {
+  configurePostgreSqlBackend();
+  const baseDir = makeTempDir();
+  const cwd = makeTempDir();
+  const projectDir = join(baseDir, "projects", toProjectId(cwd));
+  const output = join(baseDir, "export.json");
+  const doc: ExportDocument = {
+    version: EXPORT_VERSION,
+    exportedAt: new Date().toISOString(),
+    projectCwd: cwd,
+    entries: [],
+  };
+
+  await expect(exportKnowledge(cwd, { output, skipScrub: true, _lcmBaseDir: baseDir }))
+    .rejects.toBeInstanceOf(StorageBackendUnavailableError);
+  await expect(importKnowledge(cwd, doc, { _lcmBaseDir: baseDir }))
+    .rejects.toBeInstanceOf(StorageBackendUnavailableError);
+
+  expect(existsSync(output)).toBe(false);
+  expect(existsSync(projectDir)).toBe(false);
+  expect(isLcmConnectionOpen(join(projectDir, "db.sqlite"))).toBe(false);
+});
 
 // ─── Export tests ────────────────────────────────────────────────────────────
 

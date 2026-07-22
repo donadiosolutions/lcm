@@ -3,6 +3,19 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { daemonJsonRequest, daemonPortFromLoopbackUrl, normalizeDaemonPath } from "./http-url.js";
 import { daemonTokenPath } from "../runtime-paths.js";
+import type { StorageBackend } from "./config.js";
+
+export type DaemonHealth = {
+  status: string;
+  version: string;
+  storageBackend: StorageBackend;
+  uptime: number;
+  pid: number;
+};
+
+type DaemonHealthResponse = Omit<DaemonHealth, "storageBackend"> & {
+  storageBackend?: StorageBackend;
+};
 
 export class DaemonClient {
   private token: string | null = null;
@@ -23,11 +36,13 @@ export class DaemonClient {
     return this.token;
   }
 
-  async health(): Promise<{ status: string; uptime: number } | null> {
+  async health(): Promise<DaemonHealth | null> {
     try {
-      return await daemonJsonRequest<{ status: string; uptime: number }>(this.port, "/health", {
+      const health = await daemonJsonRequest<DaemonHealthResponse>(this.port, "/health", {
         method: "GET",
       });
+      // Daemons predating backend identity were necessarily SQLite-only.
+      return { ...health, storageBackend: health.storageBackend ?? "sqlite" };
     } catch { return null; }
   }
 

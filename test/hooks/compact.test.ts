@@ -15,6 +15,23 @@ function mockDaemonClient(post: ReturnType<typeof vi.fn>): DaemonClient {
 }
 
 describe("handlePreCompact", () => {
+  it("treats an unavailable PostgreSQL backend as a benign hook miss", async () => {
+    const post = vi.fn();
+    await expect(handlePreCompact("{}", mockDaemonClient(post), 3737, {
+      backend: "postgresql",
+    })).resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("fails open when daemon admission throws", async () => {
+    mockEnsureDaemon.mockRejectedValueOnce(new Error("admission failed"));
+    await expect(handlePreCompact("{}", mockDaemonClient(vi.fn()))).resolves.toEqual({
+      exitCode: 0,
+      stdout: "",
+    });
+  });
+
   it("returns exitCode 0 and summary when daemon healthy", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const client = mockDaemonClient(vi.fn().mockResolvedValue({ summary: "Compacted 500 tokens" }));

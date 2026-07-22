@@ -39,6 +39,8 @@ vi.mock("../src/runtime-paths.js", async (): Promise<typeof import("../src/runti
 import { handleSensitive } from "../src/sensitive.js";
 import { NATIVE_PATTERNS } from "../src/scrub.js";
 import { GITLEAKS_PATTERNS } from "../src/generated-patterns.js";
+import { StorageBackendUnavailableError } from "../src/storage/backend.js";
+import { ConfigValidationError } from "../src/daemon/config.js";
 
 describe("lcm sensitive", () => {
   let tempBase: string;
@@ -93,6 +95,27 @@ describe("lcm sensitive", () => {
     const r = await handleSensitive(["list"], cwd, configPath);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("[user]      CORP_TOKEN_.*");
+  });
+
+  it("list: loads persisted global patterns for PostgreSQL without runtime secrets", async () => {
+    writeFileSync(configPath, JSON.stringify({
+      storage: { backend: "postgresql" },
+      security: { sensitivePatterns: ["POSTGRES_SECRET_.*"] },
+    }));
+
+    const r = await handleSensitive(["list"], cwd, configPath);
+
+    expect(r).toMatchObject({ exitCode: 0 });
+    expect(r.stdout).toContain("[user]      POSTGRES_SECRET_.*");
+  });
+
+  it("list: preserves the empty-pattern fallback for invalid persisted configuration", async () => {
+    writeFileSync(configPath, JSON.stringify({ storage: { backend: "invalid" } }));
+
+    const r = await handleSensitive(["list"], cwd, configPath);
+
+    expect(r).toMatchObject({ exitCode: 0 });
+    expect(r.stdout).toContain("Global patterns (config.json):\n  (none)");
   });
 
   // --- add ---
@@ -234,6 +257,19 @@ describe("lcm sensitive", () => {
     expect(r.stdout).toContain("[project]");
   });
 
+  it("test: scrubs with persisted global patterns for PostgreSQL without runtime secrets", async () => {
+    writeFileSync(configPath, JSON.stringify({
+      storage: { backend: "postgresql" },
+      security: { sensitivePatterns: ["POSTGRES_SECRET_[A-Z]+"] },
+    }));
+
+    const r = await handleSensitive(["test", "value=POSTGRES_SECRET_ALPHA"], cwd, configPath);
+
+    expect(r).toMatchObject({ exitCode: 0 });
+    expect(r.stdout).toContain("[global]  POSTGRES_SECRET_[A-Z]+");
+    expect(r.stdout).toContain("Redacted: value=[REDACTED]");
+  });
+
   // --- purge ---
 
   it("purge: requires --yes — exits 1 without it", async () => {
@@ -269,6 +305,50 @@ describe("lcm sensitive", () => {
       exitCode: 0,
       stdout: "No project data to purge.\n",
     });
+  });
+
+  it.each([
+    ["current project", [] as string[]],
+    ["all projects", ["--all"]],
+  ])("purge --yes: rejects PostgreSQL before deleting %s data", async (_label, extraArgs) => {
+    writeFileSync(configPath, JSON.stringify({ storage: { backend: "postgresql" } }));
+    const allProjects = join(tempBase, "all-projects");
+    if (extraArgs.includes("--all")) {
+      mkdirSync(allProjects, { recursive: true });
+      writeFileSync(join(allProjects, "data"), "value");
+    } else {
+      writeFileSync(join(pDir, "data"), "value");
+    }
+
+    await expect(handleSensitive(["purge", ...extraArgs, "--yes"], cwd, configPath))
+      .rejects.toBeInstanceOf(StorageBackendUnavailableError);
+    expect(existsSync(extraArgs.includes("--all") ? allProjects : pDir)).toBe(true);
+  });
+
+  it.each([
+    ["malformed JSON", "{"],
+    ["an unknown backend", JSON.stringify({ storage: { backend: "unknown" } })],
+    ["a forbidden PostgreSQL URL", JSON.stringify({
+      storage: {
+        backend: "postgresql",
+        postgresql: { url: "postgresql://user:secret@localhost/lcm" },
+      },
+    })],
+  ])("purge --yes: preserves all targets when config contains %s", async (_label, content) => {
+    writeFileSync(configPath, content);
+    writeFileSync(join(pDir, "data"), "current");
+    const allProjects = join(tempBase, "all-projects");
+    mkdirSync(allProjects, { recursive: true });
+    writeFileSync(join(allProjects, "data"), "all");
+
+    for (const extraArgs of [[], ["--all"]]) {
+      await expect(handleSensitive(["purge", ...extraArgs, "--yes"], cwd, configPath))
+        .rejects.toBeInstanceOf(ConfigValidationError);
+      expect(existsSync(pDir)).toBe(true);
+      expect(existsSync(allProjects)).toBe(true);
+      expect(readFileSync(join(pDir, "data"), "utf8")).toBe("current");
+      expect(readFileSync(join(allProjects, "data"), "utf8")).toBe("all");
+    }
   });
 
   it("uses the isolated default config path when none is supplied", async (): Promise<void> => {

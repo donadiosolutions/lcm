@@ -65,6 +65,26 @@ describe("handleSessionEnd", () => {
     vi.mocked(loadDaemonConfig).mockReturnValue(defaultConfig);
   });
 
+  it("treats an unavailable PostgreSQL backend as a benign hook miss", async () => {
+    const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
+    const client = createMockClient({ ingested: 1 });
+    await expect(handleSessionEnd("{}", client, 3737, {
+      backend: "postgresql",
+    })).resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(ensureDaemon).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
+    expect(mockHttpReq.end).not.toHaveBeenCalled();
+  });
+
+  it("fails open when daemon admission throws", async () => {
+    const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(new Error("admission failed"));
+    await expect(handleSessionEnd("{}", createMockClient({ ingested: 1 }))).resolves.toEqual({
+      exitCode: 0,
+      stdout: "",
+    });
+  });
+
   it("calls /ingest with parsed stdin", async () => {
     const client = createMockClient({ ingested: 5, totalTokens: 500 });
     const stdin = JSON.stringify({ session_id: "s1", cwd: "/tmp" });

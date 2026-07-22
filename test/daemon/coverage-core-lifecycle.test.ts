@@ -29,6 +29,9 @@ describe("lifecycle procfs and parent warnings", () => {
     expect(__lifecycleTestUtils.healthVersionMatches(null, undefined)).toBe(false);
     expect(__lifecycleTestUtils.healthVersionMatches({ status: "ok", version: "" }, "")).toBe(false);
     expect(__lifecycleTestUtils.healthVersionMatches({ status: "ok", version: "1" }, "1")).toBe(true);
+    expect(__lifecycleTestUtils.healthStorageBackendMatches(null, "sqlite")).toBe(true);
+    expect(__lifecycleTestUtils.healthStorageBackendMatches({ status: "ok" }, "postgresql")).toBe(false);
+    expect(__lifecycleTestUtils.healthStorageBackendMatches({ status: "ok", storageBackend: "postgresql" }, "postgresql")).toBe(true);
     expect(__lifecycleTestUtils.resolveWindowsNetstatPath(undefined, undefined)).toBeNull();
     expect(__lifecycleTestUtils.resolveWindowsNetstatPath("C:\\project", "relative", () => true)).toBeNull();
     const windowsFileExists = vi.fn((path: string) => path.startsWith("D:\\"));
@@ -91,11 +94,11 @@ describe("lifecycle procfs and parent warnings", () => {
     expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: false, reason: "missing-pid" })).toContain("PID file missing");
     expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: false, pid: 42, reason: "dead-pid" })).toContain("PID 42 is not running");
     expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: true, reason: "wrong-parent" })).toBe("daemon parent invariant is not verified");
-    expect(__lifecycleTestUtils.systemdDaemonSetenvArgs({ PATH: "/bin", LCM_MODE: "x", OTHER: "y", OPENAI_API_KEY: "secret", EMPTY: undefined }, [])).toEqual([
+    expect(__lifecycleTestUtils.systemdDaemonSetenvArgs({ PATH: "/bin", LCM_MODE: "x", LCM_POSTGRES_URL: "secret", OTHER: "y", OPENAI_API_KEY: "secret", EMPTY: undefined }, [])).toEqual([
       "--setenv=LCM_MODE=x", "--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     ]);
     expect(__lifecycleTestUtils.systemdDaemonSetenvArgs({ PATH: "/bin" }, ["OPENAI_API_KEY"])).toContain("--setenv=LCM_SYSTEMD_CRED_IDS=OPENAI_API_KEY");
-    expect(__lifecycleTestUtils.systemdRunProcessEnv({ PATH: "/bin", TOKEN: "secret", SAFE: "yes" })).toEqual({ PATH: "/bin", SAFE: "yes" });
+    expect(__lifecycleTestUtils.systemdRunProcessEnv({ PATH: "/bin", TOKEN: "secret", LCM_POSTGRES_URL: "secret", SAFE: "yes" })).toEqual({ PATH: "/bin", SAFE: "yes" });
   });
 
   it("covers malformed status fields, command reads, directory filtering, and cache hits", () => {
@@ -192,12 +195,13 @@ describe("lifecycle spawn and restart failure boundaries", () => {
   });
 
   it.each([
-    [{ status: 1, stderr: "stderr", stdout: "", error: undefined, signal: null }, "stderr"],
-    [{ status: 1, stderr: Buffer.from("x"), stdout: "stdout", error: undefined, signal: null }, "stdout"],
-    [{ status: 1, stderr: undefined, stdout: undefined, error: new Error("error"), signal: null }, "error"],
-    [{ status: 1, stderr: undefined, stdout: undefined, error: undefined, signal: "SIGTERM" }, "signal SIGTERM"],
-    [{ status: null, stderr: undefined, stdout: undefined, error: undefined, signal: null }, "exit status unknown"],
-  ])("reports systemd-run detail from %#", async (spawnResult, detail) => {
+    [{ status: 1, stderr: "stderr", stdout: "", error: undefined, signal: null }, "systemd stderr", undefined],
+    [{ status: 1, stderr: Buffer.from("x"), stdout: "stdout", error: undefined, signal: null }, "systemd stdout", undefined],
+    [{ status: 1, stderr: undefined, stdout: undefined, error: new Error("error"), signal: null }, "systemd process error", undefined],
+    [{ status: 1, stderr: undefined, stdout: undefined, error: undefined, signal: "SIGTERM" }, "signal SIGTERM", undefined],
+    [{ status: 9, stderr: undefined, stdout: undefined, error: undefined, signal: "SIGTERM Bearer signal-secret" }, "exit status 9", "signal-secret"],
+    [{ status: null, stderr: undefined, stdout: undefined, error: undefined, signal: null }, "process exit unavailable", undefined],
+  ])("reports systemd-run detail from %#", async (spawnResult, detail, absent) => {
     const dir = temp();
     const result = await ensureDaemon({
       port: 3, pidFilePath: join(dir, "daemon.pid"), spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
@@ -206,6 +210,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
       _monotonicNowOverride: (): number => 0,
     });
     expect(result.warning).toContain(detail);
+    if (absent) expect(result.warning).not.toContain(absent);
   });
 
   it("skips systemd-run when the initial health check consumes the startup deadline", async () => {
@@ -333,7 +338,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({ connected: false, spawned: true, startMethod: "detached-spawn" });
     expect(result.warning).toContain("exit status 1");
-    expect(result.warning).toContain("async spawn");
+    expect(result.warning).toContain("detached spawn error");
   });
 
   it("uses restart default proc, listener, and ensure implementations", async () => {

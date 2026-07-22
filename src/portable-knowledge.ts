@@ -28,6 +28,7 @@ import { lcmHomeDir } from "./runtime-paths.js";
 import { resolveProjectIdentity } from "./project-map.js";
 import { loadDaemonConfig } from "./daemon/config.js";
 import { configPath } from "./runtime-paths.js";
+import { selectStorageBackend } from "./storage/backend.js";
 
 export const EXPORT_VERSION = 1;
 
@@ -104,6 +105,8 @@ export async function exportKnowledge(
   cwd: string,
   opts: ExportOptions = {},
 ): Promise<ExportResult> {
+  const config = loadDaemonConfig(configPath());
+  selectStorageBackend(config.storage);
   const baseDir = opts._lcmBaseDir ?? defaultBaseDir();
   const project = resolvePortableProject(cwd, baseDir);
   const dbPath = project.dbPath;
@@ -129,7 +132,7 @@ export async function exportKnowledge(
     let scrubber: ScrubEngine | null = null;
     if (!opts.skipScrub) {
       const globalPatterns = opts._globalPatterns
-        ?? loadDaemonConfig(configPath()).security.sensitivePatterns;
+        ?? config.security.sensitivePatterns;
       scrubber = await ScrubEngine.forProject(globalPatterns, project.dir);
     }
 
@@ -205,6 +208,8 @@ export async function importKnowledge(
   doc: ExportDocument,
   opts: ImportOptions = {},
 ): Promise<ImportResult> {
+  const config = loadDaemonConfig(configPath());
+  selectStorageBackend(config.storage);
   if (doc.version !== EXPORT_VERSION) {
     throw new Error(`Unsupported export version: ${doc.version} (expected ${EXPORT_VERSION})`);
   }
@@ -227,7 +232,7 @@ export async function importKnowledge(
   mkdirSync(projDir, { recursive: true });
 
   const globalPatterns = opts._globalPatterns
-    ?? loadDaemonConfig(configPath()).security.sensitivePatterns;
+    ?? config.security.sensitivePatterns;
   const scrubber = await ScrubEngine.forProject(globalPatterns, projDir);
   const db = getLcmConnection(dbPath);
 

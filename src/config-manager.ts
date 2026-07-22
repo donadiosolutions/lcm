@@ -108,7 +108,7 @@ function valueAtPath(root: unknown, segments: readonly string[], path: string): 
 }
 
 function isSecretPath(segments: readonly string[]): boolean {
-  return segments.some(isSensitiveKey);
+  return segments.some(isSensitiveKey) || segments.join(".") === "storage.postgresql.url";
 }
 
 /** Recursively redact secret-like keys. The supplied path protects scalar secret reads too. */

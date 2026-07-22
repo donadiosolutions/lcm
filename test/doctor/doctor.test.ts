@@ -304,7 +304,7 @@ describe("runDoctor daemon version mismatch", () => {
     const daemonResult = results.find((r) => r.name === "daemon");
 
     expect(vi.mocked(ensureDaemon)).toHaveBeenCalledWith(
-      expect.objectContaining({ expectedVersion: pkgVersion }),
+      expect.objectContaining({ expectedVersion: pkgVersion, expectedStorageBackend: "sqlite" }),
     );
     expect(daemonResult?.fixApplied).toBe(true);
     expect(daemonResult?.message).toContain("restarted");
@@ -472,6 +472,7 @@ describe("runDoctor summarizer modes", () => {
     });
 
     expect(results.find((result) => result.name === "stack")?.message).toContain("Summarizer: auto");
+    expect(results.find((result) => result.name === "stack")?.message).toContain("Storage: sqlite");
     expect(results.find((result) => result.name === "stack")?.message).toContain("reasoning effort: default");
     expect(results.find((result) => result.name === "stack")?.message).toContain("fast mode: off");
     expect(results.some((result) => result.name === "claude-process")).toBe(true);
@@ -644,6 +645,7 @@ describe("runDoctor configuration validation", () => {
     expect(config?.message).toContain("[REDACTED]");
     for (const secret of secrets) expect(JSON.stringify(results)).not.toContain(secret);
     expect(stack?.status).toBe("pass");
+    expect(stack?.message).toContain("Storage: unavailable");
     expect(stack?.message).toContain("Summarizer: unavailable");
     expect(results.some((result) => result.name === "secret-detection")).toBe(true);
   });
@@ -662,8 +664,88 @@ describe("runDoctor configuration validation", () => {
 
     expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
     expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:4545/health");
-    expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({ port: 4545 }));
+    expect(ensureDaemon).not.toHaveBeenCalled();
     expect(results.find((result) => result.name === "daemon")?.message).toContain("localhost:4545");
+  });
+
+  it("does not transition a healthy SQLite daemon from an invalid PostgreSQL config", async () => {
+    const previousUrl = process.env.LCM_POSTGRES_URL;
+    const previousCaFile = process.env.LCM_POSTGRES_CA_FILE;
+    delete process.env.LCM_POSTGRES_URL;
+    delete process.env.LCM_POSTGRES_CA_FILE;
+    try {
+      const fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242 }),
+      });
+      const results = await runDoctor(minimalDeps({
+        fetch,
+        readFileSync: (path: string) => {
+          if (path.endsWith("config.json")) {
+            return JSON.stringify({ storage: { backend: "postgresql" } });
+          }
+          return minimalDeps().readFileSync(path);
+        },
+      }));
+
+      expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
+      expect(results.find((result) => result.name === "stack")?.message).toContain("Storage: unavailable");
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "warn",
+        fixApplied: false,
+      });
+      expect(results.find((result) => result.name === "daemon")?.message).toContain("repair skipped because config is invalid");
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(ensureDaemon).not.toHaveBeenCalled();
+    } finally {
+      if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = previousUrl;
+      if (previousCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = previousCaFile;
+    }
+  });
+
+  it("reports a valid PostgreSQL selection unavailable without daemon network or lifecycle activity", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-doctor-postgres-"));
+    const caFile = join(dir, "ca.pem");
+    writeFileSync(caFile, "test-ca");
+    const previousUrl = process.env.LCM_POSTGRES_URL;
+    const previousCaFile = process.env.LCM_POSTGRES_CA_FILE;
+    process.env.LCM_POSTGRES_URL = "postgresql://db.example/lcm";
+    process.env.LCM_POSTGRES_CA_FILE = caFile;
+    const fetch = vi.fn();
+    try {
+      for (const provider of ["auto", "openai"] as const) {
+        const results = await runDoctor(minimalDeps({
+          fetch,
+          readFileSync: (path: string) => {
+            if (path.endsWith("config.json")) {
+              return JSON.stringify({
+                storage: { backend: "postgresql" },
+                llm: provider === "openai"
+                  ? { provider, model: "gpt-5", baseUrl: "http://127.0.0.1:1234/v1" }
+                  : { provider },
+              });
+            }
+            return minimalDeps().readFileSync(path);
+          },
+        }));
+
+        const configResult = results.find((result) => result.name === "config");
+        expect(configResult, configResult?.message).toMatchObject({ status: "pass" });
+        expect(results.find((result) => result.name === "stack")?.message).toContain("Storage: unavailable");
+        expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "fail", fixApplied: false });
+        expect(results.find((result) => result.name === "daemon")?.message).toContain("postgresql storage backend is not available");
+      }
+      expect(fetch).not.toHaveBeenCalled();
+      expect(ensureDaemon).not.toHaveBeenCalled();
+    } finally {
+      if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = previousUrl;
+      if (previousCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = previousCaFile;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it.each([0, 65536, 4545.5, "4545"])(
@@ -681,7 +763,7 @@ describe("runDoctor configuration validation", () => {
       }));
 
       expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3737/health");
-      expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({ port: 3737 }));
+      expect(ensureDaemon).not.toHaveBeenCalled();
     },
   );
 

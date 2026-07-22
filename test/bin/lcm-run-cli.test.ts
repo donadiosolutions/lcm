@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfigValidationError } from "../../src/daemon/config.js";
+import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
 
 const state = vi.hoisted(() => ({
   exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
@@ -15,6 +16,7 @@ const state = vi.hoisted(() => ({
   dispatchHook: vi.fn(async () => ({ stdout: "hook-output", exitCode: 0 })),
   loadConfig: vi.fn(() => ({
     daemon: state.daemonPort === undefined ? undefined : { port: state.daemonPort },
+    storage: { backend: state.storageBackend },
     llm: {
       provider: state.provider, apiMode: "responses", requestTimeoutMs: 1000,
       retry: { maxAttempts: 2, initialDelayMs: 1, maxDelayMs: 2, multiplier: 2 },
@@ -50,6 +52,7 @@ const state = vi.hoisted(() => ({
   importProgressLast: true,
   sensitiveStdout: "sensitive",
   packageVersion: "1.4.0" as unknown,
+  storageBackend: "sqlite" as "sqlite" | "postgresql",
 }));
 
 const fakeStdin = vi.hoisted(() => ({
@@ -177,6 +180,7 @@ beforeEach(() => {
   state.importProgressLast = true;
   state.sensitiveStdout = "sensitive";
   state.packageVersion = "1.4.0";
+  state.storageBackend = "sqlite";
   state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/project"] };
 });
 
@@ -198,13 +202,16 @@ describe("runCli registration and help dispatch", () => {
     expect(() => resolveCompactRequestPolicyOverride(state.loadConfig() as never, { timeoutMs: " " })).toThrow();
     const genericError = new Error("boom");
     const configError = new ConfigValidationError("cli", "invalid");
+    const backendError = new StorageBackendUnavailableError("postgresql");
     expect(() => handleCliError(genericError)).toThrow("exit:1");
     expect(() => handleCliError(configError)).toThrow("exit:1");
+    expect(() => handleCliError(backendError)).toThrow("exit:1");
     expect(() => writeCliOutput("out")).not.toThrow();
     expect(() => writeCliError("err")).not.toThrow();
-    expect(consoleError).toHaveBeenCalledTimes(2);
+    expect(consoleError).toHaveBeenCalledTimes(3);
     expect(consoleError).toHaveBeenNthCalledWith(1, genericError);
     expect(consoleError).toHaveBeenNthCalledWith(2, configError.message);
+    expect(consoleError).toHaveBeenNthCalledWith(3, backendError.message);
     expect(stdout).toHaveBeenCalledWith("out");
     expect(stderr).toHaveBeenCalledWith("err");
     const runner = vi.fn(async () => undefined);
@@ -338,6 +345,25 @@ describe("runCli daemon-backed and utility actions", () => {
   });
 
   it.each([
+    ["search", "q"],
+    ["grep", "q"],
+    ["describe", "node"],
+    ["expand", "node"],
+    ["store", "memory"],
+    ["status"],
+    ["stats", "--pool"],
+    ["events", "promote"],
+  ])("rejects daemon-backed command %# before lifecycle mutation when PostgreSQL is selected", async (...args) => {
+    state.storageBackend = "postgresql";
+
+    await expect(runCli(["node", "lcm", ...args])).rejects.toBeInstanceOf(StorageBackendUnavailableError);
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.health).not.toHaveBeenCalled();
+    expect(state.get).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ["config", "get", "llm.provider", "--effective"], ["config", "set", "llm.provider", "openai", "--json"],
     ["status"], ["status", "--json"], ["stats"], ["stats", "--pool"], ["stats", "--pool", "--json"],
     ["diagnose"], ["diagnose", "--all", "--verbose", "--json"], ["sensitive", "list"],
@@ -356,6 +382,23 @@ describe("runCli daemon-backed and utility actions", () => {
 });
 
 describe("runCli orchestration actions", () => {
+  it("refuses normal stats when the effective backend is unavailable", async () => {
+    state.loadConfig.mockReturnValueOnce({ storage: { backend: "postgresql" } });
+
+    await expect(runCli(["node", "lcm", "stats"])).rejects.toBeInstanceOf(StorageBackendUnavailableError);
+  });
+
+  it.each(["start", "restart"])("refuses daemon %s before lifecycle mutation when the effective backend is unavailable", async (action) => {
+    state.loadConfig.mockReturnValueOnce({ daemon: { port: 3737 }, storage: { backend: "postgresql" } });
+
+    await expect(runCli(["node", "lcm", "daemon", action])).rejects.toMatchObject({
+      name: "StorageBackendUnavailableError",
+      message: expect.stringContaining("use storage.backend \"sqlite\""),
+    });
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.restartDaemon).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["restore"], ["session-end", "--client", "codex"], ["user-prompt"], ["post-tool"],
     ["session-snapshot"], ["compact", "--hook", "--client", "claude"],
@@ -398,6 +441,29 @@ describe("runCli orchestration actions", () => {
     state.fileText = JSON.stringify({ version: 1, entries: [{ id: "one" }] });
     expect((await invoke(["import-knowledge", "input.json", "--dry-run"]))?.message).toBe("exit:0");
     expect(await invoke(["import-knowledge", "input.json", "--confidence", "0.5"])).toBeUndefined();
+  });
+
+  it("rejects portable CLI operations before dispatch when PostgreSQL is selected", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    state.storageBackend = "postgresql";
+
+    expect(await invoke(["export", "--all"])).toBeInstanceOf(StorageBackendUnavailableError);
+    expect(await invoke(["import-knowledge", "input.json"])).toBeInstanceOf(StorageBackendUnavailableError);
+    expect(portable.exportKnowledge).not.toHaveBeenCalled();
+    expect(portable.importKnowledge).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["compact", "--dry-run"],
+    ["import", "--dry-run"],
+    ["promote", "--dry-run"],
+  ])("rejects direct daemon command %# before lifecycle or daemon network activity", async (...args) => {
+    state.storageBackend = "postgresql";
+
+    expect(await invoke(args)).toBeInstanceOf(StorageBackendUnavailableError);
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+    expect(state.get).not.toHaveBeenCalled();
   });
 });
 
