@@ -51,20 +51,37 @@ export function runProcess(command, args, options = {}) {
     const child = spawnProcess(command, args, {
       cwd: options.cwd,
       env: options.env,
-      stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
+      stdio: ["ignore", "pipe", "pipe"],
     });
     const maxCapturedOutputBytes = MAX_CAPTURED_OUTPUT_BYTES;
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let settled = false;
     const appendTail = (current, chunk) => {
       const next = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      if (next.length >= maxCapturedOutputBytes) return next.subarray(-maxCapturedOutputBytes);
-      if (current.length + next.length <= maxCapturedOutputBytes) return Buffer.concat([current, next]);
-      return Buffer.concat([current.subarray(current.length + next.length - maxCapturedOutputBytes), next]);
+      if (next.length >= maxCapturedOutputBytes) {
+        return { value: next.subarray(-maxCapturedOutputBytes), truncated: current.length > 0 || next.length > maxCapturedOutputBytes };
+      }
+      if (current.length + next.length <= maxCapturedOutputBytes) {
+        return { value: Buffer.concat([current, next]), truncated: false };
+      }
+      return {
+        value: Buffer.concat([current.subarray(current.length + next.length - maxCapturedOutputBytes), next]),
+        truncated: true,
+      };
     };
-    child.stdout?.on("data", (chunk) => { stdout = appendTail(stdout, chunk); });
-    child.stderr?.on("data", (chunk) => { stderr = appendTail(stderr, chunk); });
+    child.stdout?.on("data", (chunk) => {
+      const appended = appendTail(stdout, chunk);
+      stdout = appended.value;
+      stdoutTruncated ||= appended.truncated;
+    });
+    child.stderr?.on("data", (chunk) => {
+      const appended = appendTail(stderr, chunk);
+      stderr = appended.value;
+      stderrTruncated ||= appended.truncated;
+    });
     const settle = (operation) => {
       if (settled) return;
       settled = true;
@@ -74,15 +91,63 @@ export function runProcess(command, args, options = {}) {
     child.once("close", (code, signal) => settle(() => {
       const capturedStdout = stdout.toString("utf8");
       const capturedStderr = stderr.toString("utf8");
-      if (code === 0) resolve({ stdout: capturedStdout.trim(), stderr: capturedStderr.trim() });
+      if (code === 0) {
+        resolve({
+          stdout: capturedStdout.trim(),
+          stderr: capturedStderr.trim(),
+          stdoutTruncated,
+          stderrTruncated,
+        });
+      }
       else reject(Object.assign(new Error(`${command} failed`), {
         code,
         signal,
         stdout: capturedStdout,
         stderr: capturedStderr,
+        stdoutTruncated,
+        stderrTruncated,
       }));
     }));
   });
+}
+
+function sanitizedCapturedOutput(result, secrets) {
+  if (result?.stdoutTruncated || result?.stderrTruncated) {
+    throw new Error("PostgreSQL harness child output exceeded the safe capture limit");
+  }
+  const stdout = sanitizeHarnessText(result?.stdout ?? "", secrets);
+  const stderr = sanitizeHarnessText(result?.stderr ?? "", secrets);
+  if (Buffer.byteLength(stdout) > MAX_CAPTURED_OUTPUT_BYTES
+    || Buffer.byteLength(stderr) > MAX_CAPTURED_OUTPUT_BYTES) {
+    throw new Error("PostgreSQL harness sanitized output exceeded the safe capture limit");
+  }
+  return { stdout, stderr };
+}
+
+function surfaceCapturedOutput(output, streams) {
+  if (output.stdout) streams.stdout.write(`${output.stdout}\n`);
+  if (output.stderr) streams.stderr.write(`${output.stderr}\n`);
+}
+
+export async function runSanitizedProcess(command, args, options = {}) {
+  const {
+    secrets = [],
+    processRunner = runProcess,
+    stdout = process.stdout,
+    stderr = process.stderr,
+    ...processOptions
+  } = options;
+  try {
+    const result = await processRunner(command, args, processOptions);
+    const output = sanitizedCapturedOutput(result, secrets);
+    surfaceCapturedOutput(output, { stdout, stderr });
+    return output;
+  } catch (error) {
+    const output = sanitizedCapturedOutput(error, secrets);
+    surfaceCapturedOutput(output, { stdout, stderr });
+    if (error && typeof error === "object") Object.assign(error, output);
+    throw error;
+  }
 }
 
 export function createProcessLifecycle(processRunner = runProcess) {
@@ -295,21 +360,22 @@ export async function cleanupHarnessResources(context, dependencies = {}) {
 
 async function runTests(context, ci, setupDocker = docker) {
   const env = { ...process.env, ...context.environment };
+  const secrets = context.secrets ?? [];
   for (const key of Object.keys(env)) {
     if (key.startsWith("PG") || key === "LCM_POSTGRES_URL" || key === "LCM_POSTGRES_CA_FILE") delete env[key];
   }
   if (!ci) {
-    return runProcess(process.execPath, [
+    return runSanitizedProcess(process.execPath, [
       join(repositoryRoot, "node_modules", "vitest", "vitest.mjs"),
       "run", "--config", join(repositoryRoot, "vitest.postgresql.config.ts"),
-    ], { cwd: repositoryRoot, env, stdio: "inherit" });
+    ], { cwd: repositoryRoot, env, secrets });
   }
 
-  await runProcess(process.execPath, [
+  await runSanitizedProcess(process.execPath, [
     join(repositoryRoot, "node_modules", "vitest", "vitest.mjs"),
     "run", "--config", join(repositoryRoot, "vitest.postgresql.config.ts"),
     join(repositoryRoot, "test", "postgresql", "signal.integration.ts"),
-  ], { cwd: repositoryRoot, env, stdio: "inherit" });
+  ], { cwd: repositoryRoot, env, secrets });
   const envFile = join(context.directory, "runner.env");
   writeFileSync(envFile, Object.entries({
     ...context.environment,
@@ -328,7 +394,10 @@ async function runTests(context, ci, setupDocker = docker) {
     "--configLoader", "runner",
     "--config", "/workspace/vitest.postgresql.config.ts",
   ]);
-  await docker(["start", "--attach", context.names.runner], { stdio: "inherit" });
+  await runSanitizedProcess("docker", ["start", "--attach", context.names.runner], {
+    processRunner: (_command, args, processOptions) => docker(args, processOptions),
+    secrets,
+  });
 }
 
 export async function runHarness(options = {}) {
@@ -438,7 +507,7 @@ export async function runHarness(options = {}) {
     };
     try {
       if (options.runTests) await options.runTests({ runId, names, directory, environment }, ci);
-      else await runTests({ runId, names, directory, environment }, ci, setupDocker);
+      else await runTests({ runId, names, directory, environment, secrets }, ci, setupDocker);
     } catch (error) {
       const logs = await docker(["logs", names.container]).catch(() => ({ stdout: "", stderr: "" }));
       throw Object.assign(error, { stderr: `${error?.stderr ?? ""}\n${logs.stdout}\n${logs.stderr}` });

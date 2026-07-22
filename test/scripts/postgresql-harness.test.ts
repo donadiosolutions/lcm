@@ -13,6 +13,7 @@ import {
   isMissingDockerObjectError,
   removeLabeled,
   runProcess,
+  runSanitizedProcess,
   sanitizeHarnessText,
   validateRunNames,
 } from "../../scripts/postgresql-harness.mjs";
@@ -71,7 +72,12 @@ describe("PostgreSQL harness utilities", () => {
 
   it("captures bounded child output and rejects failed or missing commands", async () => {
     await expect(runProcess(process.execPath, ["-e", "process.stdout.write(' ok '); process.stderr.write(' note ')"]))
-      .resolves.toEqual({ stdout: "ok", stderr: "note" });
+      .resolves.toEqual({
+        stdout: "ok",
+        stderr: "note",
+        stdoutTruncated: false,
+        stderrTruncated: false,
+      });
     await expect(runProcess(process.execPath, ["-e", "process.stderr.write('failed'); process.exit(7)"]))
       .rejects.toMatchObject({ code: 7, stderr: "failed" });
     const oversizedTail = "tail-diagnostic";
@@ -112,8 +118,30 @@ describe("PostgreSQL harness utilities", () => {
     await expect(operation).resolves.toEqual({
       stdout: "before-exit final-stdout",
       stderr: "final-stderr",
+      stdoutTruncated: false,
+      stderrTruncated: false,
     });
     expect(spawnProcess).toHaveBeenCalledWith("docker", ["inspect", "owned"], {
+      cwd: undefined,
+      env: undefined,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  });
+
+  it("always captures child output even when inherited stdio is requested", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+    });
+    const spawnProcess = vi.fn(() => child);
+    const operation = runProcess("docker", ["start", "--attach", "owned"], {
+      spawnProcess,
+      stdio: "inherit",
+    });
+    child.emit("close", 0, null);
+
+    await expect(operation).resolves.toMatchObject({ stdout: "", stderr: "" });
+    expect(spawnProcess).toHaveBeenCalledWith("docker", ["start", "--attach", "owned"], {
       cwd: undefined,
       env: undefined,
       stdio: ["ignore", "pipe", "pipe"],
@@ -153,6 +181,113 @@ describe("PostgreSQL harness utilities", () => {
     expect(Buffer.byteLength(error.stderr)).toBe(MAX_CAPTURED_OUTPUT_BYTES);
     expect(error.stdout.endsWith("stdout-tail")).toBe(true);
     expect(error.stderr.endsWith("stderr-tail")).toBe(true);
+    expect(error).toMatchObject({ stdoutTruncated: true, stderrTruncated: true });
+  });
+
+  it("redacts successful and failed child output before surfacing it", async () => {
+    const secret = "run-scoped-password";
+    const privatePath = "/private/harness-secret";
+    const stdout = { write: vi.fn() };
+    const stderr = { write: vi.fn() };
+    const successRunner = vi.fn().mockResolvedValue({
+      stdout: `connected with ${secret}`,
+      stderr: `certificate at ${privatePath}`,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    });
+
+    await expect(runSanitizedProcess("node", ["vitest.mjs"], {
+      processRunner: successRunner,
+      secrets: [secret, privatePath],
+      stdout,
+      stderr,
+    })).resolves.toEqual({
+      stdout: "connected with [REDACTED]",
+      stderr: "certificate at [REDACTED]",
+    });
+    expect(stdout.write).toHaveBeenCalledWith("connected with [REDACTED]\n");
+    expect(stderr.write).toHaveBeenCalledWith("certificate at [REDACTED]\n");
+
+    const failure = Object.assign(new Error("docker failed"), {
+      stdout: `runner used ${secret}`,
+      stderr: `postgresql://user:${secret}@database.test/lcm`,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    });
+    const failureRunner = vi.fn().mockRejectedValue(failure);
+    await expect(runSanitizedProcess("docker", ["start", "--attach", "runner"], {
+      processRunner: failureRunner,
+      secrets: [secret],
+      stdout,
+      stderr,
+    })).rejects.toBe(failure);
+    expect(failure).toMatchObject({
+      stdout: "runner used [REDACTED]",
+      stderr: "postgresql://[REDACTED]",
+    });
+    expect(stdout.write).toHaveBeenLastCalledWith("runner used [REDACTED]\n");
+    expect(stderr.write).toHaveBeenLastCalledWith("postgresql://[REDACTED]\n");
+    expect(stdout.write.mock.calls.flat().join(" ")).not.toContain(secret);
+    expect(stderr.write.mock.calls.flat().join(" ")).not.toContain(secret);
+  });
+
+  it("fails closed without surfacing truncated or expanded sanitized output", async () => {
+    const stdout = { write: vi.fn() };
+    const stderr = { write: vi.fn() };
+    const truncatedRunner = vi.fn().mockResolvedValue({
+      stdout: "unsafe-tail",
+      stderr: "",
+      stdoutTruncated: true,
+      stderrTruncated: false,
+    });
+
+    await expect(runSanitizedProcess("node", ["vitest.mjs"], {
+      processRunner: truncatedRunner,
+      stdout,
+      stderr,
+    })).rejects.toThrow("safe capture limit");
+    expect(stdout.write).not.toHaveBeenCalled();
+    expect(stderr.write).not.toHaveBeenCalled();
+
+    const expandedRunner = vi.fn().mockResolvedValue({
+      stdout: "x".repeat(MAX_CAPTURED_OUTPUT_BYTES),
+      stderr: "",
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    });
+    await expect(runSanitizedProcess("docker", ["start", "--attach", "runner"], {
+      processRunner: expandedRunner,
+      secrets: ["x"],
+      stdout,
+      stderr,
+    })).rejects.toThrow("sanitized output exceeded");
+    expect(stdout.write).not.toHaveBeenCalled();
+    expect(stderr.write).not.toHaveBeenCalled();
+  });
+
+  it("captures attached runner output and propagates output-stream errors", async () => {
+    const processRunner = vi.fn().mockResolvedValue({
+      stdout: "attached runner passed",
+      stderr: "",
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    });
+    const writeFailure = new Error("output stream unavailable");
+    const stdout = { write: vi.fn(() => { throw writeFailure; }) };
+    const stderr = { write: vi.fn() };
+
+    await expect(runSanitizedProcess("docker", ["start", "--attach", "lcm-pg-runner"], {
+      processRunner,
+      stdout,
+      stderr,
+    })).rejects.toBe(writeFailure);
+    expect(processRunner).toHaveBeenCalledWith(
+      "docker",
+      ["start", "--attach", "lcm-pg-runner"],
+      {},
+    );
+    expect(stdout.write).toHaveBeenCalledWith("attached runner passed\n");
+    expect(stderr.write).not.toHaveBeenCalled();
   });
 
   it("quiesces in-flight setup before cleanup and rejects later setup", async () => {
