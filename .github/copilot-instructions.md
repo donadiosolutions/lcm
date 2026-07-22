@@ -59,7 +59,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Flag multi-table writes without transactions — they risk partial writes on crash.
 - Keep checkpoint/count reads, slices derived from those checkpoints, and their inserts in the same repository transaction; otherwise concurrent ingestion can invalidate sequence allocation before the write begins.
 - Transaction context is global across SQLite project executors: reject nested transactions and ordinary repository calls on any project while a transaction callback is active, preventing lock inversion and partial cross-project commits.
-- Backend health must probe databases retained from completed request scopes, not infer health from an empty active-project set. SQLite timestamps produced by `CURRENT_TIMESTAMP` are timezone-free UTC and must be parsed and formatted explicitly as UTC.
+- Backend health must apply the same integrity and write-readiness probe to active project scopes and databases retained from completed request scopes; never infer health from `SELECT 1` or an empty active-project set. SQLite timestamps produced by `CURRENT_TIMESTAMP` are timezone-free UTC and must be parsed and formatted explicitly as UTC.
 
 ### Migration safety
 

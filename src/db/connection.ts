@@ -7,7 +7,20 @@ import { ensurePrivateDirectory, PRIVATE_FILE_MODE } from "../security-files.js"
 type ConnectionEntry = {
   db: DatabaseSync;
   refs: number;
+  fileIdentity: DatabaseFileIdentity | null;
 };
+
+type DatabaseFileIdentity = {
+  device: number;
+  inode: number;
+};
+
+function sameDatabaseFileIdentity(
+  left: DatabaseFileIdentity,
+  right: DatabaseFileIdentity,
+): boolean {
+  return left.device === right.device && left.inode === right.inode;
+}
 
 const _connections = new Map<string, ConnectionEntry>();
 const _connectionLocks = new Map<string, Promise<void>>();
@@ -119,8 +132,8 @@ function getPooledLcmConnection(dbPath: string): DatabaseSync | undefined {
   return undefined;
 }
 
-function validatePersistentDatabasePath(dbPath: string, createIfMissing: boolean): boolean {
-  if (createIfMissing) ensurePrivateDirectory(dirname(dbPath));
+/** Inspect an existing database leaf without following symlinks. */
+export function inspectExistingLcmDatabasePath(dbPath: string): DatabaseFileIdentity | null {
   try {
     const stat = lstatSync(dbPath);
     if (stat.isSymbolicLink()) {
@@ -129,20 +142,49 @@ function validatePersistentDatabasePath(dbPath: string, createIfMissing: boolean
     if (!stat.isFile()) {
       throw new Error(`database path is not a regular file: ${dbPath}`);
     }
-    return true;
+    return { device: stat.dev, inode: stat.ino };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    return createIfMissing;
+    return null;
   }
 }
 
+function preparePersistentDatabasePath(dbPath: string): void {
+  ensurePrivateDirectory(dirname(dbPath));
+  // Validate any existing leaf. A missing leaf is expected for create-capable
+  // opens and will be created atomically by SQLite.
+  inspectExistingLcmDatabasePath(dbPath);
+}
+
 function openLcmConnection(dbPath: string, createIfMissing: boolean): DatabaseSync | null {
+  const isInMemory = dbPath === ":memory:";
+  // Persistent callers must validate the current filesystem leaf before a
+  // pooled handle can be reused. An unlinked/rotated database may remain fully
+  // usable through SQLite while no longer representing the requested path.
+  const expectedIdentity = !isInMemory
+    ? inspectExistingLcmDatabasePath(dbPath)
+    : undefined;
+  if (!createIfMissing && (isInMemory || expectedIdentity === null)) return null;
+  const pooledEntry = _connections.get(dbPath);
+  if (
+    !isInMemory
+    && pooledEntry
+    && (
+      !expectedIdentity
+      || !pooledEntry.fileIdentity
+      || !sameDatabaseFileIdentity(pooledEntry.fileIdentity, expectedIdentity)
+    )
+  ) {
+    if (createIfMissing) {
+      throw new Error("pooled database path no longer matches the requested file");
+    }
+    return null;
+  }
+
   const pooled = getPooledLcmConnection(dbPath);
   if (pooled) return pooled;
 
-  const isInMemory = dbPath === ":memory:";
-  if (isInMemory && !createIfMissing) return null;
-  if (!isInMemory && !validatePersistentDatabasePath(dbPath, createIfMissing)) return null;
+  if (!isInMemory && createIfMissing) preparePersistentDatabasePath(dbPath);
 
   // SQLite's URI mode=rw opens an existing database read/write but atomically
   // refuses to create it if another process removes it after the lstat above.
@@ -154,6 +196,7 @@ function openLcmConnection(dbPath: string, createIfMissing: boolean): DatabaseSy
       return url;
     })();
   const db = new DatabaseSync(location);
+  let fileIdentity: DatabaseFileIdentity | null = null;
   try {
     if (!isInMemory) chmodSync(dbPath, PRIVATE_FILE_MODE);
     // Enable WAL mode for better concurrent read performance
@@ -162,12 +205,19 @@ function openLcmConnection(dbPath: string, createIfMissing: boolean): DatabaseSy
     db.exec("PRAGMA busy_timeout = 5000");
     // Enable foreign key enforcement
     db.exec("PRAGMA foreign_keys = ON");
+    fileIdentity = isInMemory ? null : inspectExistingLcmDatabasePath(dbPath);
+    if (!isInMemory && !fileIdentity) {
+      throw new Error("database path disappeared while opening");
+    }
+    if (expectedIdentity && fileIdentity && !sameDatabaseFileIdentity(expectedIdentity, fileIdentity)) {
+      throw new Error("database path changed while opening");
+    }
   } catch (error) {
-    forceCloseConnection({ db, refs: 0 });
+    forceCloseConnection({ db, refs: 0, fileIdentity });
     throw error;
   }
 
-  _connections.set(dbPath, { db, refs: 1 });
+  _connections.set(dbPath, { db, refs: 1, fileIdentity });
   return db;
 }
 

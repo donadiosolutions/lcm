@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { projectIdentity } from "../../src/daemon/project.js";
@@ -183,6 +183,36 @@ describe("SQLite storage backend conformance", () => {
     await factory.close();
   });
 
+  it("reports project existence only for regular non-symlink database leaves", async () => {
+    const root = createTemporaryDirectory("lcm-storage-project-exists-");
+    const identity = projectIdentity(root);
+    const dbPath = join(root, "project.db");
+    const victimPath = join(root, "victim.db");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath }),
+    });
+
+    expect(await factory.projectExists(identity)).toBe(false);
+    mkdirSync(dbPath);
+    await expect(factory.projectExists(identity)).rejects.toMatchObject({
+      code: "STORAGE_INITIALIZATION_FAILED",
+      operation: "projectExists",
+    });
+    rmSync(dbPath, { recursive: true });
+    writeFileSync(victimPath, "preserve");
+    symlinkSync(victimPath, dbPath);
+    await expect(factory.projectExists(identity)).rejects.toMatchObject({
+      code: "STORAGE_INITIALIZATION_FAILED",
+      operation: "projectExists",
+    });
+    rmSync(dbPath);
+
+    const project = await factory.openProject(identity);
+    expect(await factory.projectExists(identity)).toBe(true);
+    await project.close();
+    await factory.close();
+  });
+
   it("probes known project databases after their request scope closes", async () => {
     const root = createTemporaryDirectory("lcm-storage-idle-health-");
     const identity = projectIdentity(root);
@@ -214,6 +244,77 @@ describe("SQLite storage backend conformance", () => {
     expect(await factory.health()).toMatchObject({ status: "unavailable", backend: "sqlite" });
     writeFileSync(dbPath, "not a SQLite database");
     expect(await factory.health()).toMatchObject({ status: "unavailable", backend: "sqlite" });
+    await factory.close();
+  });
+
+  it("probes active projects for integrity and serialized write readiness", async () => {
+    const root = createTemporaryDirectory("lcm-storage-active-health-");
+    const identity = projectIdentity(root);
+    const dbPath = join(root, "active-health.db");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath }),
+    });
+    const storage = await factory.openProject(identity);
+    expect(await storage.health()).toMatchObject({ status: "healthy", backend: "sqlite" });
+
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    const prepareSpy = vi.spyOn(DatabaseSync.prototype, "prepare").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      if (sql === "PRAGMA quick_check(1)") {
+        return { all: () => [{ quick_check: "corrupt /secret/active-health.db" }] } as never;
+      }
+      return originalPrepare.call(this, sql);
+    });
+    try {
+      const health = await storage.health();
+      expect(health).toMatchObject({ status: "unavailable", backend: "sqlite" });
+      expect(JSON.stringify(health)).not.toContain("secret");
+      expect(await factory.health()).toMatchObject({ status: "unavailable", backend: "sqlite" });
+    } finally {
+      prepareSpy.mockRestore();
+    }
+
+    const originalExec = DatabaseSync.prototype.exec;
+    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      if (sql === "BEGIN IMMEDIATE") {
+        throw new Error("write unavailable /secret/active-health.db postgresql://user:pass@example.test/lcm");
+      }
+      return originalExec.call(this, sql);
+    });
+    try {
+      const health = await storage.health();
+      expect(health).toMatchObject({ status: "unavailable", backend: "sqlite" });
+      expect(JSON.stringify(health)).not.toContain("secret");
+      expect(JSON.stringify(health)).not.toContain("user:pass");
+    } finally {
+      execSpy.mockRestore();
+    }
+
+    let markEntered!: () => void;
+    let releaseTransaction!: () => void;
+    const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+    const release = new Promise<void>((resolve) => { releaseTransaction = resolve; });
+    const transaction = storage.transaction(async () => {
+      markEntered();
+      await release;
+    });
+    await entered;
+    let healthSettled = false;
+    const serializedHealth = storage.health().then((health) => {
+      healthSettled = true;
+      return health;
+    });
+    await Promise.resolve();
+    expect(healthSettled).toBe(false);
+    releaseTransaction();
+    await transaction;
+    await expect(serializedHealth).resolves.toMatchObject({ status: "healthy", backend: "sqlite" });
+
     await factory.close();
   });
 

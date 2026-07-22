@@ -1,10 +1,10 @@
 import type { ProjectIdentity } from "../../project-map.js";
-import { existsSync } from "node:fs";
 import { projectPaths, ensureProjectDir } from "../../daemon/project.js";
 import {
   getExistingLcmConnection,
   getLcmConnection,
   closeLcmConnection,
+  inspectExistingLcmDatabasePath,
 } from "../../db/connection.js";
 import { getLcmDbFeatures, type LcmDbFeatures } from "../../db/features.js";
 import { runLcmMigrations } from "../../db/migration.js";
@@ -17,6 +17,7 @@ import type {
 import { sqliteStorageCapabilities } from "../capabilities.js";
 import { normalizeStorageError, StorageOperationError } from "../errors.js";
 import { sqliteExecutorFor } from "./executor.js";
+import { assertSqliteReady } from "./health.js";
 import { SqliteProjectStorage } from "./project-storage.js";
 
 export class SqliteStorageBackendFactory implements StorageBackendFactory {
@@ -38,7 +39,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
     try {
       const paths = this.resolveProject(identity);
       this.assertIdentity(identity, paths.id, "projectExists");
-      return existsSync(paths.dbPath);
+      return inspectExistingLcmDatabasePath(paths.dbPath) !== null;
     } catch (error) {
       throw normalizeStorageError(
         error,
@@ -153,18 +154,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
         );
       }
       await sqliteExecutorFor(db, project.id).run("factory", "health", () => {
-        const integrity = db!.prepare("PRAGMA quick_check(1)").all() as Array<Record<string, unknown>>;
-        if (integrity.map((row) => Object.values(row)[0]).join("\n") !== "ok") {
-          throw new StorageOperationError(
-            "STORAGE_OPERATION_FAILED",
-            "sqlite",
-            project.id,
-            "factory",
-            "health",
-          );
-        }
-        db!.exec("BEGIN IMMEDIATE");
-        db!.exec("ROLLBACK");
+        assertSqliteReady(db!, project.id);
       });
       return { status: "healthy", backend: "sqlite", projectId: project.id };
     } catch (error) {

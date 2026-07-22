@@ -9,6 +9,7 @@ import type {
 } from "../contracts.js";
 import { normalizeStorageError, StorageOperationError } from "../errors.js";
 import { SqliteExecutor } from "./executor.js";
+import { assertSqliteReady } from "./health.js";
 import {
   createSqliteRepositories,
   createSqliteRepositoryStores,
@@ -82,7 +83,7 @@ export class SqliteProjectStorage implements ProjectStorage {
     }
     try {
       await this.executor.run("factory", "health", () => {
-        this.stores.db.prepare("SELECT 1").get();
+        assertSqliteReady(this.stores.db, this.projectId);
       });
       return { status: "healthy", backend: "sqlite", projectId: this.projectId };
     } catch (error) {
