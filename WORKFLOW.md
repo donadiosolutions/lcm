@@ -42,7 +42,7 @@ change to executable `.ts`, `.tsx`, `.mts`, or `.cts` TypeScript under `bin/`,
 `installer/`, or `src/`; trust-sensitive automation under `.github/actions/`,
 `.github/codeql/`, `.github/workflows/`, or `.github/scripts/`; or key coverage/build configuration (`package.json`, the
 lockfile, Vitest config, or TypeScript config) requires authenticated
-`codecov/patch` and DCO successes on the PR's exact head SHA. A diff with none
+`Greptile Review` and DCO successes on the PR's exact head SHA. A diff with none
 of those paths requires authenticated DCO and the exact-head `ci` check from
 the GitHub Actions app. CI is polled but does not trigger the evaluator because
 it also reports on synthetic merge-group commits, which are handled by the
@@ -62,7 +62,7 @@ checked out from the trusted workflow revision with persisted credentials
 disabled; it is never loaded from the untrusted PR head.
 
 Changes to the admission workflow or its policy are themselves trust-sensitive
-and therefore require Codecov after this policy is active. The PR that first
+and therefore require Greptile after this policy is active. The PR that first
 introduces this policy cannot use code that is not yet present on the default
 branch to admit itself. A maintainer must use the documented one-time bootstrap
 or emergency bypass for that rollout, inspect the exact head and successful CI
@@ -76,12 +76,10 @@ providers, which cannot report on that commit: CI, both default CodeQL
 analyses, the security-extended CodeQL analysis, and both Socket checks still
 run against the synthetic commit before it may merge.
 
-Automated review reports are evaluated separately from the machine admission
-status. Greptile is currently the source of truth for review readiness and must
-cover the PR's exact head before it enters the merge queue. CodeRabbit reports
-are informational and best-effort. Neither reviewer is encoded as a required
-status or hardcoded into the admission workflow or branch ruleset while the
-project evaluates its long-term review provider.
+Greptile is the authenticated review provider for coverable or trust-sensitive
+diffs and must report success on the exact PR head before external admission
+succeeds. CodeRabbit reports remain informational and best-effort and are not
+encoded as an admission requirement.
 
 ### Release Flow
 
@@ -103,7 +101,7 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 | Workflow                             | Trigger                                                                              | Purpose                                                                                 |
 | ------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
-| `external-admission.yml`             | Authenticated Codecov and DCO check runs                                               | Require Codecov+DCO for sensitive diffs or poll trusted CI+DCO for neutral diffs         |
+| `external-admission.yml`             | Authenticated Greptile and DCO check runs                                              | Require Greptile+DCO for sensitive diffs or poll trusted CI+DCO for neutral diffs        |
 | `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
 | `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
 | `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
@@ -113,8 +111,9 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 The CI workflow keeps coverage reporting in a separate no-checkout job that
 consumes the fixed test artifact. Codecov uses OIDC for pushes and same-repository
 PRs, including Dependabot PRs; fork PRs use Codecov's tokenless upload path. The
-reporting job is skipped for `merge_group`, where `external-admission` represents
-the Codecov result already verified on the exact PR head.
+reporting job is skipped for `merge_group`; the synthetic commit runs the full
+coverage suite in CI while its separate merge-group workflow supplies the
+required `external-admission` check.
 
 ## Defaults (predefined answers for brainstorming)
 

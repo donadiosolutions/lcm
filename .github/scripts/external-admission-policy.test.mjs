@@ -10,7 +10,7 @@ import {
   flattenPullRequestFilePages,
   isTrustedCiActionsRun,
   parseActionsRunId,
-  requiresCodecovForPath,
+  requiresGreptileForPath,
   runPolicyCommand,
 } from "./external-admission-policy.mjs";
 
@@ -52,7 +52,7 @@ test("classifies every coverable and trust-sensitive path family", () => {
     "tsconfig.json",
     "tsconfig.build.json",
   ]) {
-    assert.equal(requiresCodecovForPath(path), true, path);
+    assert.equal(requiresGreptileForPath(path), true, path);
   }
 });
 
@@ -69,7 +69,7 @@ test("keeps documentation, tests, and unrelated metadata coverage-neutral", () =
     "src/index.cjs",
     "nested/src/index.ts",
   ]) {
-    assert.equal(requiresCodecovForPath(path), false, path);
+    assert.equal(requiresGreptileForPath(path), false, path);
   }
 });
 
@@ -78,8 +78,8 @@ test("audits both current and previous rename paths without duplicates", () => {
     { filename: "docs/new.md", previous_filename: "src/old.ts" },
     { filename: "docs/new.md" },
   ], 2), {
-    classification: ADMISSION_CLASSIFICATIONS.codecovRequired,
-    codecovRequired: true,
+    classification: ADMISSION_CLASSIFICATIONS.greptileRequired,
+    greptileRequired: true,
     auditedPaths: ["docs/new.md", "src/old.ts"],
     matchedPaths: ["src/old.ts"],
   });
@@ -91,7 +91,7 @@ test("classifies a complete neutral file list", () => {
     { filename: "test/guide.test.ts", previous_filename: null },
   ], "2"), {
     classification: ADMISSION_CLASSIFICATIONS.coverageNeutral,
-    codecovRequired: false,
+    greptileRequired: false,
     auditedPaths: ["docs/guide.md", "test/guide.test.ts"],
     matchedPaths: [],
   });
@@ -108,7 +108,7 @@ test("rejects malformed or incomplete file audits", () => {
     () => classifyPullRequestFiles([{ filename: "docs/a.md", previous_filename: 1 }], 1),
     /previous_filename/u,
   );
-  assert.throws(() => requiresCodecovForPath(""), /non-empty string/u);
+  assert.throws(() => requiresGreptileForPath(""), /non-empty string/u);
 });
 
 test("requires an exact safe authoritative changed-files count", () => {
@@ -116,7 +116,7 @@ test("requires an exact safe authoritative changed-files count", () => {
     { length: 3_000 },
     (_, index) => ({ filename: `docs/file-${index}.md` }),
   );
-  assert.equal(classifyPullRequestFiles(cappedFileResponse, 3_000).codecovRequired, false);
+  assert.equal(classifyPullRequestFiles(cappedFileResponse, 3_000).greptileRequired, false);
   for (const mismatchedCount of [2_999, 3_001]) {
     assert.throws(
       () => classifyPullRequestFiles(cappedFileResponse, mismatchedCount),
@@ -163,14 +163,14 @@ test("flattens every check-run page and rejects malformed pages", () => {
   assert.throws(() => flattenCheckRunPages([{}]), /check_runs must be an array/u);
 });
 
-test("requires exact authenticated Codecov and DCO checks for sensitive diffs", () => {
+test("requires exact authenticated Greptile and DCO checks for sensitive diffs", () => {
   const evaluation = evaluateAdmissionChecks({
-    checkRuns: [check(CHECK_IDENTITIES.codecov), check(CHECK_IDENTITIES.dco, { id: 2 })],
+    checkRuns: [check(CHECK_IDENTITIES.greptile), check(CHECK_IDENTITIES.dco, { id: 2 })],
     headSha: HEAD_SHA,
-    codecovRequired: true,
+    greptileRequired: true,
     repository: REPOSITORY,
   });
-  assert.deepEqual(evaluation.requiredNames, ["codecov", "dco"]);
+  assert.deepEqual(evaluation.requiredNames, ["greptile", "dco"]);
   assert.equal(evaluation.ready, true);
   assert.equal(evaluation.ciRunId, undefined);
 });
@@ -179,7 +179,7 @@ test("requires exact authenticated CI and DCO checks for neutral diffs", () => {
   const evaluation = evaluateAdmissionChecks({
     checkRuns: [check(CHECK_IDENTITIES.ci), check(CHECK_IDENTITIES.dco, { id: 2 })],
     headSha: HEAD_SHA,
-    codecovRequired: false,
+    greptileRequired: false,
     repository: REPOSITORY,
   });
   assert.deepEqual(evaluation.requiredNames, ["ci", "dco"]);
@@ -198,7 +198,7 @@ test("ignores spoofed, wrong-head, and older authenticated check runs", () => {
       check(CHECK_IDENTITIES.dco, { id: 15 }),
     ],
     headSha: HEAD_SHA,
-    codecovRequired: false,
+    greptileRequired: false,
     repository: REPOSITORY,
   });
   assert.equal(evaluation.ready, true);
@@ -207,11 +207,11 @@ test("ignores spoofed, wrong-head, and older authenticated check runs", () => {
 test("distinguishes waiting checks from terminal failures", () => {
   const waiting = evaluateAdmissionChecks({
     checkRuns: [
-      check(CHECK_IDENTITIES.codecov, { status: "in_progress", conclusion: null }),
+      check(CHECK_IDENTITIES.greptile, { status: "in_progress", conclusion: null }),
       check(CHECK_IDENTITIES.dco, { id: 2 }),
     ],
     headSha: HEAD_SHA,
-    codecovRequired: true,
+    greptileRequired: true,
     repository: REPOSITORY,
   });
   assert.equal(waiting.ready, false);
@@ -219,15 +219,15 @@ test("distinguishes waiting checks from terminal failures", () => {
 
   const failed = evaluateAdmissionChecks({
     checkRuns: [
-      check(CHECK_IDENTITIES.codecov, { conclusion: "failure" }),
+      check(CHECK_IDENTITIES.greptile, { conclusion: "failure" }),
       check(CHECK_IDENTITIES.dco, { id: 2 }),
     ],
     headSha: HEAD_SHA,
-    codecovRequired: true,
+    greptileRequired: true,
     repository: REPOSITORY,
   });
   assert.equal(failed.ready, false);
-  assert.equal(failed.terminalFailure, "codecov");
+  assert.equal(failed.terminalFailure, "greptile");
 });
 
 test("rejects a successful CI check without a trusted Actions run URL", () => {
@@ -245,7 +245,7 @@ test("rejects a successful CI check without a trusted Actions run URL", () => {
         check(CHECK_IDENTITIES.dco, { id: 2 }),
       ],
       headSha: HEAD_SHA,
-      codecovRequired: false,
+      greptileRequired: false,
       repository: REPOSITORY,
     });
     assert.equal(evaluation.ready, false, String(detailsUrl));
@@ -271,9 +271,9 @@ test("parses a trusted positive Actions run id as digits without truncation", ()
 test("rejects unsafe or non-positive authenticated check IDs", () => {
   for (const id of [0, -1, Number.MAX_SAFE_INTEGER + 1, "0", "1.5", undefined]) {
     assert.throws(() => evaluateAdmissionChecks({
-      checkRuns: [check(CHECK_IDENTITIES.codecov, { id })],
+      checkRuns: [check(CHECK_IDENTITIES.greptile, { id })],
       headSha: HEAD_SHA,
-      codecovRequired: true,
+      greptileRequired: true,
       repository: REPOSITORY,
     }), /check run ID/u, String(id));
   }
@@ -321,7 +321,7 @@ test("exposes the complete policy through its deterministic CLI command seam", (
   const classification = JSON.parse(runPolicyCommand("classify-files", ["1"], JSON.stringify([
     [{ filename: "docs/new.md", previous_filename: "src/old.ts" }],
   ])));
-  assert.equal(classification.codecovRequired, true);
+  assert.equal(classification.greptileRequired, true);
 
   const evaluation = JSON.parse(runPolicyCommand("evaluate-checks", [
     HEAD_SHA,

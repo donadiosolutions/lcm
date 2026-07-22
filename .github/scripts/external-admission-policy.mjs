@@ -2,13 +2,17 @@ import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 export const CHECK_IDENTITIES = Object.freeze({
-  codecov: Object.freeze({ name: "codecov/patch", appId: 254, appSlug: "codecov" }),
+  greptile: Object.freeze({
+    name: "Greptile Review",
+    appId: 867647,
+    appSlug: "greptile-apps",
+  }),
   dco: Object.freeze({ name: "DCO", appId: 1861, appSlug: "dco" }),
   ci: Object.freeze({ name: "ci", appId: 15368, appSlug: "github-actions" }),
 });
 
 export const ADMISSION_CLASSIFICATIONS = Object.freeze({
-  codecovRequired: "codecov-required",
+  greptileRequired: "greptile-required",
   coverageNeutral: "no-coverable-or-trust-sensitive-files",
 });
 
@@ -21,7 +25,7 @@ const WAITING_CHECK_STATES = new Set([
   "waiting",
 ]);
 
-const CODECOV_REQUIRED_PATHS = [
+const GREPTILE_REQUIRED_PATHS = [
   /^(?:bin|installer|src)\/.+\.(?:[cm]?ts|tsx)$/u,
   /^\.github\/(?:actions|codeql|workflows|scripts)\/.+/u,
   /^package(?:-lock)?\.json$/u,
@@ -69,9 +73,9 @@ export function flattenCheckRunPages(pages) {
   });
 }
 
-export function requiresCodecovForPath(path) {
+export function requiresGreptileForPath(path) {
   requireNonEmptyString(path, "pull request path");
-  return CODECOV_REQUIRED_PATHS.some((pattern) => pattern.test(path));
+  return GREPTILE_REQUIRED_PATHS.some((pattern) => pattern.test(path));
 }
 
 export function classifyPullRequestFiles(files, expectedCount) {
@@ -102,13 +106,13 @@ export function classifyPullRequestFiles(files, expectedCount) {
   }
 
   const uniquePaths = [...new Set(auditedPaths)];
-  const matchedPaths = uniquePaths.filter(requiresCodecovForPath);
-  const codecovRequired = matchedPaths.length > 0;
+  const matchedPaths = uniquePaths.filter(requiresGreptileForPath);
+  const greptileRequired = matchedPaths.length > 0;
   return {
-    classification: codecovRequired
-      ? ADMISSION_CLASSIFICATIONS.codecovRequired
+    classification: greptileRequired
+      ? ADMISSION_CLASSIFICATIONS.greptileRequired
       : ADMISSION_CLASSIFICATIONS.coverageNeutral,
-    codecovRequired,
+    greptileRequired,
     auditedPaths: uniquePaths,
     matchedPaths,
   };
@@ -173,26 +177,26 @@ export function parseActionsRunId(detailsUrl, { repository, serverUrl = "https:/
 export function evaluateAdmissionChecks({
   checkRuns,
   headSha,
-  codecovRequired,
+  greptileRequired,
   repository,
   serverUrl = "https://github.com",
 }) {
   requireNonEmptyString(headSha, "head SHA");
   const checks = {
-    codecov: latestAuthenticatedCheck(checkRuns, CHECK_IDENTITIES.codecov, headSha),
+    greptile: latestAuthenticatedCheck(checkRuns, CHECK_IDENTITIES.greptile, headSha),
     dco: latestAuthenticatedCheck(checkRuns, CHECK_IDENTITIES.dco, headSha),
     ci: latestAuthenticatedCheck(checkRuns, CHECK_IDENTITIES.ci, headSha),
   };
   const states = Object.fromEntries(
     Object.entries(checks).map(([name, check]) => [name, checkState(check)]),
   );
-  const requiredNames = codecovRequired ? ["codecov", "dco"] : ["ci", "dco"];
+  const requiredNames = greptileRequired ? ["greptile", "dco"] : ["ci", "dco"];
   const terminalFailure = requiredNames.find((name) =>
     states[name] !== "success" && !WAITING_CHECK_STATES.has(states[name]));
 
   let ciRunId;
   let invalidCiRunUrl = false;
-  if (!codecovRequired && states.ci === "success") {
+  if (!greptileRequired && states.ci === "success") {
     ciRunId = parseActionsRunId(checks.ci?.details_url, { repository, serverUrl });
     invalidCiRunUrl = ciRunId === undefined;
   }
@@ -238,14 +242,14 @@ export function runPolicyCommand(command, args, input) {
     return JSON.stringify(classifyPullRequestFiles(flattenPullRequestFilePages(payload), args[0]));
   }
   if (command === "evaluate-checks" && args.length === 4) {
-    const [headSha, codecovRequired, repository, serverUrl] = args;
-    if (codecovRequired !== "true" && codecovRequired !== "false") {
-      throw new TypeError("codecov-required argument must be true or false");
+    const [headSha, greptileRequired, repository, serverUrl] = args;
+    if (greptileRequired !== "true" && greptileRequired !== "false") {
+      throw new TypeError("greptile-required argument must be true or false");
     }
     return JSON.stringify(evaluateAdmissionChecks({
       checkRuns: flattenCheckRunPages(payload),
       headSha,
-      codecovRequired: codecovRequired === "true",
+      greptileRequired: greptileRequired === "true",
       repository,
       serverUrl,
     }));
