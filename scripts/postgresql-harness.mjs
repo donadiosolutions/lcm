@@ -9,6 +9,7 @@ import { spawn } from "node:child_process";
 export const POSTGRES_IMAGE = "postgres:18.4-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296";
 export const NODE_IMAGE = "node:22.20.0-bookworm-slim@sha256:b21fe589dfbe5cc39365d0544b9be3f1f33f55f3c86c87a76ff65a02f8f5848e";
 export const RUN_LABEL = "com.donadiosolutions.lcm.postgresql-test-run";
+export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const initScript = join(repositoryRoot, "test", "postgresql", "init.sh");
@@ -51,14 +52,28 @@ export function runProcess(command, args, options = {}) {
       env: options.env,
       stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
     });
-    let stdout = "";
-    let stderr = "";
-    child.stdout?.on("data", (chunk) => { stdout += chunk; });
-    child.stderr?.on("data", (chunk) => { stderr += chunk; });
+    const maxCapturedOutputBytes = MAX_CAPTURED_OUTPUT_BYTES;
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    const appendTail = (current, chunk) => {
+      const next = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (next.length >= maxCapturedOutputBytes) return next.subarray(-maxCapturedOutputBytes);
+      if (current.length + next.length <= maxCapturedOutputBytes) return Buffer.concat([current, next]);
+      return Buffer.concat([current.subarray(current.length + next.length - maxCapturedOutputBytes), next]);
+    };
+    child.stdout?.on("data", (chunk) => { stdout = appendTail(stdout, chunk); });
+    child.stderr?.on("data", (chunk) => { stderr = appendTail(stderr, chunk); });
     child.once("error", reject);
     child.once("exit", (code, signal) => {
-      if (code === 0) resolve({ stdout: stdout.trim(), stderr: stderr.trim() });
-      else reject(Object.assign(new Error(`${command} failed`), { code, signal, stdout, stderr }));
+      const capturedStdout = stdout.toString("utf8");
+      const capturedStderr = stderr.toString("utf8");
+      if (code === 0) resolve({ stdout: capturedStdout.trim(), stderr: capturedStderr.trim() });
+      else reject(Object.assign(new Error(`${command} failed`), {
+        code,
+        signal,
+        stdout: capturedStdout,
+        stderr: capturedStderr,
+      }));
     });
   });
 }

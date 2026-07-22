@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_CAPTURED_OUTPUT_BYTES,
   NODE_IMAGE,
   POSTGRES_IMAGE,
   RUN_LABEL,
@@ -8,6 +9,7 @@ import {
   sanitizeHarnessText,
   validateRunNames,
 } from "../../scripts/postgresql-harness.mjs";
+import { postgresqlVitestCacheDir } from "../../vitest.postgresql.config.js";
 
 describe("PostgreSQL harness utilities", () => {
   it("uses exact digest-pinned images and a namespaced label", () => {
@@ -33,6 +35,20 @@ describe("PostgreSQL harness utilities", () => {
     expect(() => validateRunNames({ ...names, volume: "foreign-volume" }, runId)).toThrow("volume");
   });
 
+  it("isolates Vitest caches by validated harness run ID", () => {
+    const firstRunId = "a".repeat(32);
+    const secondRunId = "b".repeat(32);
+    const first = postgresqlVitestCacheDir({ LCM_TEST_POSTGRES_RUN_ID: firstRunId }, 11);
+    const second = postgresqlVitestCacheDir({ LCM_TEST_POSTGRES_RUN_ID: secondRunId }, 11);
+    const fallback = postgresqlVitestCacheDir({ LCM_TEST_POSTGRES_RUN_ID: "../../shared" }, 73);
+
+    expect(first).not.toBe(second);
+    expect(first).toMatch(new RegExp(`${firstRunId}$`, "u"));
+    expect(second).toMatch(new RegExp(`${secondRunId}$`, "u"));
+    expect(fallback).toMatch(/vitest-lcm-postgresql-cache\/process-73$/u);
+    expect(fallback).not.toContain("shared");
+  });
+
   it("redacts credentials, URLs, private paths, and PEM material", () => {
     const output = sanitizeHarnessText(
       "password-value /private/harness postgresql://user:pass@example.test/db\n-----BEGIN PRIVATE KEY-----\nprivate-key-material\n-----END PRIVATE KEY-----",
@@ -51,6 +67,18 @@ describe("PostgreSQL harness utilities", () => {
       .resolves.toEqual({ stdout: "ok", stderr: "note" });
     await expect(runProcess(process.execPath, ["-e", "process.stderr.write('failed'); process.exit(7)"]))
       .rejects.toMatchObject({ code: 7, stderr: "failed" });
+    const oversizedTail = "tail-diagnostic";
+    const oversized = `process.stdout.write('discarded-stdout-prefix' + 'x'.repeat(${MAX_CAPTURED_OUTPUT_BYTES + 256}) + '${oversizedTail}'); process.stderr.write('discarded-stderr-prefix' + 'y'.repeat(${MAX_CAPTURED_OUTPUT_BYTES + 256}) + '${oversizedTail}'); process.exit(9)`;
+    const error = await runProcess(process.execPath, ["-e", oversized]).catch((reason: unknown) => reason) as {
+      stdout: string;
+      stderr: string;
+    };
+    expect(Buffer.byteLength(error.stdout)).toBe(MAX_CAPTURED_OUTPUT_BYTES);
+    expect(Buffer.byteLength(error.stderr)).toBe(MAX_CAPTURED_OUTPUT_BYTES);
+    expect(error.stdout.endsWith(oversizedTail)).toBe(true);
+    expect(error.stderr.endsWith(oversizedTail)).toBe(true);
+    expect(error.stdout).not.toContain("discarded-stdout-prefix");
+    expect(error.stderr).not.toContain("discarded-stderr-prefix");
     await expect(runProcess("lcm-command-that-does-not-exist", []))
       .rejects.toBeInstanceOf(Error);
   });
