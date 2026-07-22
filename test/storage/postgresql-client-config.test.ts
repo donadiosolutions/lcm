@@ -50,6 +50,8 @@ describe("PostgreSQL client configuration", () => {
     });
     expect(parsePostgreSqlUrl("postgresql://user:password@[2001:db8::1]:5544/database"))
       .toMatchObject({ host: "2001:db8::1", port: 5544 });
+    expect(parsePostgreSqlUrl("postgresql://user:password@db.example/database%3Fname"))
+      .toMatchObject({ database: "database?name" });
   });
 
   it.each([
@@ -62,8 +64,11 @@ describe("PostgreSQL client configuration", () => {
     { label: "nested database path", url: "postgresql://user:password@db.example/a/b" },
     { label: "zero port", url: "postgresql://user:password@db.example:0/database" },
     { label: "oversized port", url: "postgresql://user:password@db.example:65536/database" },
+    { label: "empty query", url: "postgresql://user:password@db.example/database?" },
+    { label: "empty query before fragment", url: "postgresql://user:password@db.example/database?#override" },
     { label: "query override", url: "postgresql://user:password@db.example/database?sslmode=disable" },
     { label: "fragment override", url: "postgresql://user:password@db.example/database#override" },
+    { label: "question mark in fragment", url: "postgresql://user:password@db.example/database#override?not-a-query" },
     { label: "missing hostname", url: "postgresql://user:password@/database" },
     { label: "malformed encoding", url: "postgresql://user:password@db.example/%ZZ" },
   ])("rejects unsafe or incomplete URL: $label", ({ url }) => {

@@ -3,6 +3,7 @@ import { checkServerIdentity } from "node:tls";
 import type { ClientConfig } from "pg";
 import { POSTGRESQL_CA_FILE_MAX_BYTES } from "../../daemon/config.js";
 import { readBoundedRegularFile } from "../../security-files.js";
+import { hasUrlQueryComponent } from "../../url-display.js";
 import { StorageOperationError } from "../errors.js";
 import type { PostgreSqlConnectionSettings } from "./contracts.js";
 
@@ -61,7 +62,7 @@ export function parsePostgreSqlUrl(url: string): ParsedPostgreSqlUrl {
     || !Number.isInteger(port)
     || port < 1
     || port > 65_535
-    || [...parsed.searchParams.keys()].length > 0
+    || hasUrlQueryComponent(url)
     || parsed.hash !== ""
   ) {
     throw configurationError();

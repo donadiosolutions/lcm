@@ -217,9 +217,12 @@ describe("storage configuration", () => {
     { label: "non-hierarchical", url: "postgresql:foo", expected: "hierarchical postgresql://" },
     { label: "missing host", url: "postgresql://", expected: "non-empty hostname" },
     { label: "database without host", url: "postgresql:///database", expected: "non-empty hostname" },
+    { label: "empty query", url: "postgresql://user:empty-query-secret@example.com/lcm?", expected: "URL query parameters" },
+    { label: "empty query before fragment", url: "postgresql://user:empty-query-fragment-secret@example.com/lcm?#unsafe", expected: "URL query parameters" },
     { label: "TLS query override", url: "postgresql://user:tls-secret@example.com/lcm?SSLCert=inline", expected: "TLS parameter" },
     { label: "arbitrary query parameter", url: "postgresql://user:query-secret@example.com/lcm?application_name=unsafe", expected: "URL query parameters" },
     { label: "fragment", url: "postgresql://user:fragment-secret@example.com/lcm#unsafe", expected: "URL fragment" },
+    { label: "question mark in fragment", url: "postgresql://user:question-fragment-secret@example.com/lcm#unsafe?not-a-query", expected: "URL fragment" },
   ])("rejects unsafe PostgreSQL URL: $label without echoing credentials", ({ url, expected }) => {
     const error = (() => {
       try {
@@ -233,7 +236,15 @@ describe("storage configuration", () => {
       throw new Error("expected configuration error");
     })();
     expect(error.message).toContain(expected);
-    for (const secret of ["scheme-secret", "tls-secret", "query-secret", "fragment-secret"]) {
+    for (const secret of [
+      "scheme-secret",
+      "empty-query-secret",
+      "empty-query-fragment-secret",
+      "tls-secret",
+      "query-secret",
+      "fragment-secret",
+      "question-fragment-secret",
+    ]) {
       expect(error.message).not.toContain(secret);
     }
   });

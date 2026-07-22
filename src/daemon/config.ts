@@ -2,7 +2,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
 import { readBoundedRegularFile } from "../security-files.js";
-import { sanitizeUrlForDisplay } from "../url-display.js";
+import { hasUrlQueryComponent, sanitizeUrlForDisplay } from "../url-display.js";
 
 export { sanitizeUrlForDisplay } from "../url-display.js";
 
@@ -954,7 +954,7 @@ export function resolveStorageConfig(
       "must use hierarchical postgresql:// form with a non-empty hostname",
     );
   }
-  if ([...parsedUrl.searchParams.keys()].length > 0) {
+  if (hasUrlQueryComponent(url)) {
     throw new ConfigValidationError(
       "LCM_POSTGRES_URL",
       "must not contain URL query parameters, including TLS parameters; configure PostgreSQL behavior through LCM settings and LCM_POSTGRES_CA_FILE",
