@@ -256,14 +256,17 @@ FIXTURE
 
 ## Flow 15 — PreCompact Hook
 
-**Goal:** Verify the PreCompact hook returns exit code 2 to signal Claude to proceed.
+**Goal:** Verify successful summary output and fail-open deferral both preserve
+Claude's compaction by returning exit code 0.
 
 | Step | Command | Expected |
 |------|---------|----------|
-| 15.1 | `lcm hook pre-compact --cwd $LCME2E_DIR` | Exit code 2 (not 0 or 1) |
-| 15.2 | Output contains memory summary or context | Non-empty stdout |
+| 15.1 | Send a PreCompact JSON payload to `lcm compact --hook` with a healthy SQLite daemon | Exit 0 with non-empty summary stdout |
+| 15.2 | Inspect the successful output | Contains the generated memory summary or context |
+| 15.3 | Repeat in the isolated harness with unavailable PostgreSQL backend admission | Exit 0 with empty stdout; native compaction is not blocked |
 
-**Pass criteria:** Exit code is exactly 2, stdout is non-empty.
+**Pass criteria:** Both paths exit 0. Success returns summary output; fail-open
+deferral returns no output.
 
 ---
 

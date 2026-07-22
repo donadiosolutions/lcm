@@ -8,7 +8,7 @@ All hooks auto-heal: each validates that all 4 hooks are registered in `settings
 
 | Hook | Command | What it does |
 |------|---------|-------------|
-| PreCompact | `lcm compact --hook` | Intercepts compaction, runs LLM summarization into a DAG, returns the summary (exit 2 = replace native) |
+| PreCompact | `lcm compact --hook` | Best-effort DAG summarization; exits 0 with summary output on success or exits 0 without output when deferring |
 | SessionStart | `lcm restore` | Restores project context + recent summaries + promoted memories from prior sessions |
 | SessionEnd | `lcm session-end` | Ingests the session transcript into the database for future recall |
 | UserPromptSubmit | `lcm user-prompt` | Searches promoted memory for relevant context, surfaces it as `<memory-context>` hints |
@@ -25,7 +25,7 @@ SessionStart ──→ conversation ──→ UserPromptSubmit (each turn)
 
 1. **SessionStart**: daemon wakes, orientation + episodic + promoted context injected
 2. **UserPromptSubmit**: each user message triggers a background memory search — relevant context appears as hints
-3. **PreCompact**: when Claude's context window fills, Long Context Manager (LCM) intercepts and produces a DAG-based summary (nothing lost)
+3. **PreCompact**: when Claude's context window fills, Long Context Manager (LCM) requests a DAG-based summary without blocking Claude's native compaction; unavailable daemon or backend admission defers with no output
 4. **SessionEnd**: full transcript ingested into SQLite for future sessions
 
 ## MCP Tools
