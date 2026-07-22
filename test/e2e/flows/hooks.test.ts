@@ -2,13 +2,14 @@
  * E2E Flow Tests: Hooks (Flows 14, 15, 16)
  *
  * Flow 14: SessionEnd hook ingests messages
- * Flow 15: PreCompact hook returns exit 2 with summary
+ * Flow 15: PreCompact hook returns exit 0 with summary
  * Flow 16: Auto-heal validates hooks without throwing
  */
 
-import { beforeAll, afterAll, describe, expect, it } from "vitest";
+import { beforeAll, afterAll, describe, expect, it, vi } from "vitest";
 import { createHarness, type HarnessHandle } from "../harness.js";
 import { DaemonClient } from "../../../src/daemon/client.js";
+import { MANUAL_COMPACT_FRESH_TAIL_COUNT } from "../../../src/compaction.js";
 
 let handle: HarnessHandle | null = null;
 
@@ -41,19 +42,21 @@ describe("Flow 14: SessionEnd hook", { timeout: 60_000 }, () => {
 });
 
 describe("Flow 15: PreCompact hook", { timeout: 60_000 }, () => {
-  it("returns exit 2 with summary text", async () => {
+  it("returns exit 0 with a generated mock summary for SQLite", async () => {
     const h = handle!;
 
-    // First ingest some data so there is something to compact
+    // Keep enough messages outside the protected fresh tail to force a leaf summary.
+    const messageCount = MANUAL_COMPACT_FRESH_TAIL_COUNT + 4;
     await h.client.post("/ingest", {
       session_id: "e2e-precompact-test",
       cwd: h.tmpDir,
-      messages: [
-        { role: "user", content: "Hello, can you help me with my project?", tokenCount: 10 },
-        { role: "assistant", content: "Of course! I am happy to help you.", tokenCount: 10 },
-        { role: "user", content: "I need to design a database schema.", tokenCount: 10 },
-        { role: "assistant", content: "Let me walk you through a schema design.", tokenCount: 10 },
-      ],
+      messages: Array.from({ length: messageCount }, (_, index) => ({
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: index === 0
+          ? "Known E2E database design source phrase."
+          : `Deterministic PreCompact message ${index}.`,
+        tokenCount: 10,
+      })),
     });
 
     const client = new DaemonClient(`http://127.0.0.1:${h.daemonPort}`);
@@ -63,14 +66,56 @@ describe("Flow 15: PreCompact hook", { timeout: 60_000 }, () => {
       client: "claude",
     });
 
+    const lifecycle = await import("../../../src/daemon/lifecycle.js");
+    const ensureDaemon = vi.spyOn(lifecycle, "ensureDaemon").mockResolvedValue({
+      connected: true,
+      port: h.daemonPort,
+      spawned: false,
+    });
     const { handlePreCompact } = await import("../../../src/hooks/compact.js");
-    const result = await handlePreCompact(stdinData, client, h.daemonPort);
+    try {
+      const result = await handlePreCompact(
+        stdinData,
+        client,
+        h.daemonPort,
+        { backend: "sqlite" },
+      );
 
-    // exit 2 = replace native compaction; exit 0 = disabled provider (also acceptable)
-    expect([0, 2]).toContain(result.exitCode);
-    // When exit 2, stdout should contain summary text
-    if (result.exitCode === 2) {
-      expect(result.stdout).toBeTruthy();
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("lcm · compaction complete");
+      expect(result.stdout).toContain("<compaction-summary>");
+      expect(result.stdout).toContain("[Mock Summary");
+    } finally {
+      ensureDaemon.mockRestore();
+    }
+  });
+
+  it("returns exit 0 without output when PostgreSQL is unavailable", async () => {
+    const h = handle!;
+    const client = new DaemonClient(`http://127.0.0.1:${h.daemonPort}`);
+    const lifecycle = await import("../../../src/daemon/lifecycle.js");
+    const storageBackend = await import("../../../src/storage/backend.js");
+    const ensureDaemon = vi.spyOn(lifecycle, "ensureDaemon").mockResolvedValue({
+      connected: true,
+      port: h.daemonPort,
+      spawned: false,
+    });
+    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend");
+    const { handlePreCompact } = await import("../../../src/hooks/compact.js");
+
+    try {
+      await expect(handlePreCompact(
+        JSON.stringify({ session_id: "e2e-precompact-postgresql", cwd: h.tmpDir }),
+        client,
+        h.daemonPort,
+        { backend: "postgresql" },
+      )).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(selectStorageBackend).toHaveBeenCalledOnce();
+      expect(selectStorageBackend).toHaveBeenCalledWith({ backend: "postgresql" });
+      expect(ensureDaemon).not.toHaveBeenCalled();
+    } finally {
+      selectStorageBackend.mockRestore();
+      ensureDaemon.mockRestore();
     }
   });
 });

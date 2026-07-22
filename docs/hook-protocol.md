@@ -12,7 +12,23 @@ lcm <hook-command> < <stdin-json>
 
 **Command:** `lcm compact --hook`
 
-Invoked by Claude Code before it runs its built-in compaction. lcm intercepts the compaction, writes a DAG summary, and returns exit code `2` with the summary text on stdout. Exit code `0` means lcm deferred (daemon unavailable); exit code `2` means lcm handled the compaction.
+Invoked by Claude Code before it runs its built-in compaction. When the admitted
+daemon is available, lcm writes a DAG summary and may return summary text on
+stdout. The hook exits `0`, so Claude Code can continue its own compaction.
+
+The installed command has no timeout or retry overrides. Its wrapper does not
+resolve PostgreSQL connection credentials before entering the fail-open hook
+path. If the configured backend is unavailable, its runtime credentials are
+absent, or daemon admission fails, the hook exits `0` with no output and does
+not block Claude Code's compaction. A customized hook command with explicit
+`--timeout-ms` or `--retry-*` overrides reads only the secret-free LLM request
+policy projection needed to validate those flags; it still does not resolve
+PostgreSQL credentials before dispatch.
+
+This fail-open behavior is specific to the installed best-effort hook. Manual
+CLI operations, daemon startup and restart, and MCP request admission continue
+to resolve the full effective configuration and fail closed when required
+credentials or backend support are unavailable.
 
 **Stdin fields:**
 
@@ -22,7 +38,8 @@ Invoked by Claude Code before it runs its built-in compaction. lcm intercepts th
 | `cwd` | string | Working directory of the Claude Code session |
 | `hook_event_name` | string | `"PreCompact"` |
 
-**Response:** Exit code `2` + summary text on stdout (replaces Claude Code's built-in compaction), or exit code `0` to defer.
+**Response:** Exit code `0`, with summary text on stdout when lcm compaction
+succeeds or no output when lcm defers to Claude Code.
 
 ## SessionStart Hook
 

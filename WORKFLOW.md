@@ -33,15 +33,40 @@ The required `external-admission` status separates pull-request admission from
 merge-group validation for providers that do not report on synthetic queue
 commits. Authenticated provider `check_run` events drive
 `external-admission.yml`; pull-request lifecycle events do not start this
-write-capable workflow. On a non-draft PR, the handlers require authenticated
-results from `codecov/patch` and DCO on the PR's exact head SHA.
+write-capable workflow. The handler audits every paginated PR file record,
+including both `filename` and `previous_filename`, before selecting one of two
+admission paths. The flattened file records must exactly match the pull
+request's authoritative `changed_files` count, so GitHub's file-list cap or an
+incomplete page cannot silently produce a coverage-neutral classification. A
+change to executable `.ts`, `.tsx`, `.mts`, or `.cts` TypeScript under `bin/`,
+`installer/`, or `src/`; trust-sensitive automation under `.github/actions/`,
+`.github/codeql/`, `.github/workflows/`, or `.github/scripts/`; or key coverage/build configuration (`package.json`, the
+lockfile, Vitest config, or TypeScript config) requires authenticated
+`codecov/patch` and DCO successes on the PR's exact head SHA. A diff with none
+of those paths requires authenticated DCO and the exact-head `ci` check from
+the GitHub Actions app. CI is polled but does not trigger the evaluator because
+it also reports on synthetic merge-group commits, which are handled by the
+separate merge-group admission workflow. The neutral path resolves the check's Actions run
+and requires a successful `pull_request` run of `.github/workflows/ci.yml` for
+the same repository and head SHA.
 Every authenticated provider event with a valid commit SHA replaces any stale
 successful admission with `pending` before the PR-association lookup. This is
 necessary because GitHub may omit closed unmerged PRs from a commit's PR
 associations. The handler admits only one open, non-draft, main-targeting PR at
 the exact event SHA and repeats that validation immediately before publishing
-success; a closed, draft, ineligible, unassociated, or ambiguous commit remains
-pending.
+success, including fresh file classification, check evaluation, and neutral CI
+run validation; a closed, draft, ineligible, unassociated, or ambiguous commit remains
+pending. Commit-associated PRs, PR files, and check runs are all paginated and
+flattened before evaluation. The executable admission policy is sparsely
+checked out from the trusted workflow revision with persisted credentials
+disabled; it is never loaded from the untrusted PR head.
+
+Changes to the admission workflow or its policy are themselves trust-sensitive
+and therefore require Codecov after this policy is active. The PR that first
+introduces this policy cannot use code that is not yet present on the default
+branch to admit itself. A maintainer must use the documented one-time bootstrap
+or emergency bypass for that rollout, inspect the exact head and successful CI
+and DCO results manually, and then return to the normal no-bypass flow.
 
 After PR-head admission, the separate
 `external-admission-merge-group.yml` workflow runs a permissionless Actions
@@ -78,7 +103,7 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 | Workflow                             | Trigger                                                                              | Purpose                                                                                 |
 | ------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
-| `external-admission.yml`             | Authenticated Codecov/DCO check runs                                                 | Require both external providers on the exact eligible PR head                           |
+| `external-admission.yml`             | Authenticated Codecov and DCO check runs                                               | Require Codecov+DCO for sensitive diffs or poll trusted CI+DCO for neutral diffs         |
 | `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
 | `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
 | `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
