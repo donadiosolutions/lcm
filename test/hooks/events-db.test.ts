@@ -176,6 +176,35 @@ describe("EventsDb", () => {
     }
   });
 
+  it("completes close cleanup when busy-timeout restoration fails", () => {
+    const scoped = new EventsDb(dbPath, { busyTimeoutMs: 500 });
+    const originalExec = DatabaseSync.prototype.exec;
+    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      if (sql === "PRAGMA busy_timeout = 5000") throw new Error("unhealthy handle");
+      return originalExec.call(this, sql);
+    });
+    try {
+      expect(() => scoped.close()).not.toThrow();
+      expect(() => scoped.close()).not.toThrow();
+      expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    } finally {
+      execSpy.mockRestore();
+    }
+
+    rmSync(dbPath, { force: true });
+    const reopened = new EventsDb(dbPath);
+    reopened.insertEvent(
+      "clean-session",
+      { type: "choice", category: "decision", data: "reopened", priority: 1 },
+      "PostToolUse",
+    );
+    expect(reopened.getUnprocessed()).toHaveLength(1);
+    reopened.close();
+  });
+
   it("inserts and retrieves events", () => {
     const db = new EventsDb(dbPath);
     db.insertEvent("session-1", {

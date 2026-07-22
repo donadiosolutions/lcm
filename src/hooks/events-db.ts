@@ -380,15 +380,15 @@ export class EventsDb {
     this.closed = true;
     // Decrement pool ref-count. The underlying connection stays open as long as
     // other callers hold a reference — it is only closed when refs reach 0.
+    try { this.removeBusyTimeoutOverride(); } catch { /* timeout restoration is best-effort */ }
     try {
-      this.removeBusyTimeoutOverride();
-    } finally {
       closeLcmConnection(this.dbPath);
-    }
-    // If the connection was fully evicted from the pool, invalidate the
-    // migration-done cache so the next open re-runs migrations on a fresh handle.
-    if (!isLcmConnectionOpen(this.dbPath)) {
-      _migratedPaths.delete(this.dbPath);
+    } finally {
+      // If the connection was fully evicted from the pool, invalidate the
+      // migration cache so the next open re-runs migrations on a fresh handle.
+      if (!isLcmConnectionOpen(this.dbPath)) {
+        _migratedPaths.delete(this.dbPath);
+      }
     }
   }
 }
