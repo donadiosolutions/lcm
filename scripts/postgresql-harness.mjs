@@ -153,14 +153,25 @@ async function inspectLabels(type, name, dockerRunner = docker) {
 }
 
 export function isMissingDockerObjectError(error, type, name) {
-  if (error?.code !== 1 || String(error?.stdout ?? "").trim() !== "[]") return false;
+  if (typeof error?.code !== "number" || error.code === 0) return false;
   if (type !== "container" && type !== "network" && type !== "volume") return false;
+  const lines = String(error?.stderr ?? "")
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const diagnostic = lines.pop();
+  if (!diagnostic || lines.some((line) => !line.startsWith("WARNING:"))) return false;
+  const message = diagnostic.startsWith("Error response from daemon: ")
+    ? diagnostic.slice("Error response from daemon: ".length)
+    : diagnostic.startsWith("Error: ")
+      ? diagnostic.slice("Error: ".length)
+      : diagnostic;
   const expected = type === "container"
-    ? `Error response from daemon: No such container: ${name}`
+    ? `No such container: ${name}`
     : type === "network"
-      ? `Error response from daemon: network ${name} not found`
-      : `Error response from daemon: get ${name}: no such volume`;
-  return String(error?.stderr ?? "").trim() === expected;
+      ? `network ${name} not found`
+      : `get ${name}: no such volume`;
+  return message === expected;
 }
 
 export async function removeLabeled(type, name, runId, dockerRunner = docker) {

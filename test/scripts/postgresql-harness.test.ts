@@ -126,6 +126,16 @@ describe("PostgreSQL harness utilities", () => {
     expect(dockerRunner).toHaveBeenCalledOnce();
   });
 
+  it("recognizes verified absence across non-semantic Docker formatting changes", () => {
+    const missing = Object.assign(new Error("docker failed"), {
+      code: 125,
+      stdout: "",
+      stderr: "WARNING: daemon compatibility mode is enabled\r\nError: No such container: owned-resource\r\n",
+    });
+
+    expect(isMissingDockerObjectError(missing, "container", "owned-resource")).toBe(true);
+  });
+
   it("propagates inspection failures that do not prove absence", async () => {
     const secret = "cleanup-secret";
     const failure = Object.assign(new Error("docker failed"), {
@@ -137,6 +147,16 @@ describe("PostgreSQL harness utilities", () => {
 
     expect(isMissingDockerObjectError(failure, "container", "owned-resource")).toBe(false);
     expect(isMissingDockerObjectError(failure, "image", "owned-resource")).toBe(false);
+    expect(isMissingDockerObjectError({ ...failure, code: 0 }, "container", "owned-resource")).toBe(false);
+    expect(isMissingDockerObjectError({ ...failure, code: null }, "container", "owned-resource")).toBe(false);
+    expect(isMissingDockerObjectError({
+      ...failure,
+      stderr: "permission denied\nError response from daemon: No such container: owned-resource",
+    }, "container", "owned-resource")).toBe(false);
+    expect(isMissingDockerObjectError({
+      ...failure,
+      stderr: "Error response from daemon: No such container: owned-resource-extra",
+    }, "container", "owned-resource")).toBe(false);
     await expect(removeLabeled("container", "owned-resource", "a".repeat(32), dockerRunner)).rejects.toBe(failure);
     expect(sanitizeHarnessText(failure.stderr, [secret])).toBe("permission denied for [REDACTED]");
   });
