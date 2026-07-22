@@ -325,6 +325,61 @@ describe("SQLite storage backend conformance", () => {
     expect(isLcmConnectionOpen(dbPath)).toBe(false);
   });
 
+  it("settles repeated factory closes after every project close attempt", async () => {
+    const root = createTemporaryDirectory("lcm-storage-best-effort-close-");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath: join(root, `${project.id}.db`) }),
+    });
+    const failing = await factory.openProject(projectIdentity(join(root, "failing")));
+    const successful = await factory.openProject(projectIdentity(join(root, "successful")));
+
+    let enterFailing!: () => void;
+    let releaseFailing!: () => void;
+    let enterSuccessful!: () => void;
+    let releaseSuccessful!: () => void;
+    const failingEntered = new Promise<void>((resolve) => { enterFailing = resolve; });
+    const failingGate = new Promise<void>((resolve) => { releaseFailing = resolve; });
+    const successfulEntered = new Promise<void>((resolve) => { enterSuccessful = resolve; });
+    const successfulGate = new Promise<void>((resolve) => { releaseSuccessful = resolve; });
+    const originalSuccessfulClose = successful.close.bind(successful);
+    const failingClose = vi.spyOn(failing, "close").mockImplementation(async () => {
+      enterFailing();
+      await failingGate;
+      throw new Error("injected project close failure");
+    });
+    const successfulClose = vi.spyOn(successful, "close").mockImplementation(async () => {
+      enterSuccessful();
+      await successfulGate;
+      await originalSuccessfulClose();
+    });
+
+    const firstClose = factory.close();
+    const repeatedClose = factory.close();
+    expect(repeatedClose).toBe(firstClose);
+    await Promise.all([failingEntered, successfulEntered]);
+
+    let factorySettled = false;
+    void firstClose.then(() => { factorySettled = true; });
+    releaseFailing();
+    await Promise.resolve();
+    expect(factorySettled).toBe(false);
+    releaseSuccessful();
+    await expect(firstClose).resolves.toBeUndefined();
+    expect(factorySettled).toBe(true);
+    expect(failingClose).toHaveBeenCalledOnce();
+    expect(successfulClose).toHaveBeenCalledOnce();
+    expect(await factory.health()).toMatchObject({ status: "closed" });
+    await expect(factory.openProject(projectIdentity(join(root, "after-close"))))
+      .rejects.toMatchObject({ code: "STORAGE_CLOSED" });
+    await expect(factory.close()).resolves.toBeUndefined();
+    expect(failingClose).toHaveBeenCalledOnce();
+    expect(successfulClose).toHaveBeenCalledOnce();
+
+    failingClose.mockRestore();
+    successfulClose.mockRestore();
+    await failing.close();
+  });
+
   it("stays healthy while a normally closing project drains queued work", async () => {
     const root = createTemporaryDirectory("lcm-storage-health-during-close-");
     const identity = projectIdentity(root);

@@ -316,33 +316,35 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
           const safeTranscriptPath = transcript_path ? isSafeTranscriptPath(transcript_path, cwd) : false;
           if (!skip_ingest && safeTranscriptPath && existsSync(safeTranscriptPath)) {
             const parsed = parseTranscriptForClient(safeTranscriptPath, normalizeTranscriptClient(client));
-            const storedCount = await project.conversations.getMessageCount(conversation.conversationId);
-            const newMessages = parsed.slice(storedCount);
-            if (newMessages.length > 0) {
-              const ingestCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
-              const inputs = newMessages.map((m, i) => {
-                const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project } = scrubber.scrubWithCounts(m.content);
-                ingestCounts.gitleaks += gitleaks;
-                ingestCounts.builtIn += builtIn;
-                ingestCounts.global += globalCount;
-                ingestCounts.project += project;
-                return {
-                  conversationId: conversation.conversationId,
-                  seq: storedCount + i,
-                  role: m.role as "user" | "assistant" | "system",
-                  content: scrubbedContent,
-                  tokenCount: m.tokenCount,
-                };
-              });
-              await project.transaction(async (repositories) => {
+            await project.transaction(async (repositories) => {
+              const storedCount = await repositories.conversations.getMessageCount(
+                conversation.conversationId,
+              );
+              const newMessages = parsed.slice(storedCount);
+              if (newMessages.length > 0) {
+                const ingestCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
+                const inputs = newMessages.map((m, i) => {
+                  const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project } = scrubber.scrubWithCounts(m.content);
+                  ingestCounts.gitleaks += gitleaks;
+                  ingestCounts.builtIn += builtIn;
+                  ingestCounts.global += globalCount;
+                  ingestCounts.project += project;
+                  return {
+                    conversationId: conversation.conversationId,
+                    seq: storedCount + i,
+                    role: m.role as "user" | "assistant" | "system",
+                    content: scrubbedContent,
+                    tokenCount: m.tokenCount,
+                  };
+                });
                 const records = await repositories.conversations.createMessagesBulk(inputs);
                 await repositories.redactionAdmin.upsertCounts(ingestCounts);
                 await repositories.context.appendContextMessages(
                   conversation.conversationId,
                   records.map((record) => record.messageId),
                 );
-              });
-            }
+              }
+            });
           }
 
           // Check if there's anything to compact

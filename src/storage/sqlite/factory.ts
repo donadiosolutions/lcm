@@ -187,8 +187,10 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
-    this.closePromise = Promise.all([...this.pendingOpens])
-      .then(() => Promise.all([...this.projects].map((project) => project.close())))
+    this.closePromise = Promise.allSettled([...this.pendingOpens])
+      .then(() => Promise.allSettled(
+        [...this.projects].map(async (project) => project.close()),
+      ))
       .then(() => undefined);
     return this.closePromise;
   }
