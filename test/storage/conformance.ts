@@ -373,7 +373,7 @@ export function defineCoreStorageConformance(
     const firstAgain = await harness.open("one");
     await first.conversations.createConversation({ sessionId: "same" });
     expect(await second.conversations.getConversationBySessionId("same")).toBeNull();
-    expect(await harness.factory.health()).toMatchObject({ status: "healthy", backend: "sqlite" });
+    expect(await harness.factory.health()).toMatchObject({ status: "healthy", backend: harness.factory.backend });
     expect(await first.health()).toMatchObject({ status: "healthy", projectId: first.projectId });
     const closeA = first.close();
     const closeB = first.close();

@@ -1,0 +1,62 @@
+import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
+import type { StorageDomain, StorageHealth } from "../contracts.js";
+
+export interface PostgreSqlConnectionSettings {
+  readonly url: string;
+  readonly caFile: string;
+  readonly poolMax: number;
+  readonly connectionTimeoutMs: number;
+  readonly idleTimeoutMs: number;
+  readonly statementTimeoutMs: number;
+}
+
+export interface PostgreSqlOperationContext {
+  readonly domain: StorageDomain;
+  readonly operation: string;
+  readonly projectId?: string;
+}
+
+export interface PostgreSqlQueryOptions extends PostgreSqlOperationContext {
+  readonly signal?: AbortSignal;
+}
+
+export interface PostgreSqlQueryExecutor {
+  query<R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
+    config: QueryConfig<I>,
+    options: PostgreSqlQueryOptions,
+  ): Promise<QueryResult<R>>;
+}
+
+export interface PostgreSqlMigration {
+  readonly id: string;
+  readonly filename: string;
+  readonly sha256: string;
+  readonly sql: string;
+}
+
+export interface PostgreSqlMigrationResult {
+  readonly applied: readonly string[];
+  readonly current: readonly string[];
+}
+
+export interface PostgreSqlRuntimeHealth extends StorageHealth {
+  readonly backend: "postgresql";
+  readonly serverMajorVersion?: number;
+  readonly tls?: boolean;
+  readonly timezone?: string;
+  readonly role?: string;
+}
+
+export interface PostgreSqlTestDatabaseSentinel {
+  readonly runId: string;
+  readonly databaseName: string;
+  readonly expectedRole: string;
+}
+
+export interface PostgreSqlTestDatabaseLease {
+  readonly sentinel: PostgreSqlTestDatabaseSentinel;
+  readonly adminUrl: string;
+  readonly migratorUrl: string;
+  readonly runtimeUrl: string;
+  drop(): Promise<void>;
+}

@@ -12,6 +12,7 @@ import {
 } from "../../src/daemon/config.js";
 import { createDaemon } from "../../src/daemon/server.js";
 import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
+import { parsePostgreSqlUrl } from "../../src/storage/postgresql/client-config.js";
 
 const tempDirs: string[] = [];
 
@@ -164,6 +165,34 @@ describe("storage configuration", () => {
     expect(JSON.stringify(daemonConfigForPersistence(config)).toLowerCase()).not.toContain("trim-secret");
   });
 
+  it("accepts encoded PostgreSQL credentials and one decoded database path segment", () => {
+    const trustedCa = caFile("trusted-ca");
+    const encodedUrl = "postgresql://encoded%20user:encoded%2Fpassword@db.example.com/lcm%20database";
+    const config = parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
+      LCM_POSTGRES_URL: encodedUrl,
+      LCM_POSTGRES_CA_FILE: trustedCa,
+    });
+
+    expect(config.storage).toMatchObject({
+      backend: "postgresql",
+      postgresql: { url: encodedUrl },
+    });
+  });
+
+  it.each([
+    { label: "implicit default", url: "postgresql://user:password@db.example.com/lcm", port: 5432 },
+    { label: "minimum explicit", url: "postgresql://user:password@db.example.com:1/lcm", port: 1 },
+    { label: "maximum explicit", url: "postgresql://user:password@db.example.com:65535/lcm", port: 65_535 },
+  ])("accepts the same PostgreSQL port boundary as the runtime parser: $label", ({ url, port }) => {
+    const storage = resolveStorageConfig({ backend: "postgresql" }, {
+      LCM_POSTGRES_URL: url,
+      LCM_POSTGRES_CA_FILE: caFile(),
+    });
+
+    expect(storage).toMatchObject({ backend: "postgresql", postgresql: { url } });
+    expect(parsePostgreSqlUrl(url).port).toBe(port);
+  });
+
   it("returns the canonical CA path established by the validated file preflight", () => {
     const trustedCa = caFile("trusted-ca");
     const nestedDirectory = join(dirname(trustedCa), "nested");
@@ -212,13 +241,18 @@ describe("storage configuration", () => {
   });
 
   it.each([
-    ["not a url", "absolute postgresql"],
-    ["https://user:scheme-secret@example.com/lcm", "postgresql: scheme"],
-    ["postgresql:foo", "hierarchical postgresql://"],
-    ["postgresql://", "non-empty hostname"],
-    ["postgresql:///database", "non-empty hostname"],
-    ["postgresql://user:tls-secret@example.com/lcm?SSLCert=inline", "TLS parameter"],
-  ])("rejects unsafe PostgreSQL URL %s without echoing credentials", (url, expected) => {
+    { label: "non-URL", url: "not a url", expected: "absolute postgresql" },
+    { label: "wrong scheme", url: "https://user:scheme-secret@example.com/lcm", expected: "postgresql: scheme" },
+    { label: "non-hierarchical", url: "postgresql:foo", expected: "hierarchical postgresql://" },
+    { label: "missing host", url: "postgresql://", expected: "non-empty hostname" },
+    { label: "database without host", url: "postgresql:///database", expected: "non-empty hostname" },
+    { label: "empty query", url: "postgresql://user:empty-query-secret@example.com/lcm?", expected: "URL query parameters" },
+    { label: "empty query before fragment", url: "postgresql://user:empty-query-fragment-secret@example.com/lcm?#unsafe", expected: "URL query parameters" },
+    { label: "TLS query override", url: "postgresql://user:tls-secret@example.com/lcm?SSLCert=inline", expected: "TLS parameter" },
+    { label: "arbitrary query parameter", url: "postgresql://user:query-secret@example.com/lcm?application_name=unsafe", expected: "URL query parameters" },
+    { label: "fragment", url: "postgresql://user:fragment-secret@example.com/lcm#unsafe", expected: "URL fragment" },
+    { label: "question mark in fragment", url: "postgresql://user:question-fragment-secret@example.com/lcm#unsafe?not-a-query", expected: "URL fragment" },
+  ])("rejects unsafe PostgreSQL URL: $label without echoing credentials", ({ url, expected }) => {
     const error = (() => {
       try {
         parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
@@ -231,17 +265,128 @@ describe("storage configuration", () => {
       throw new Error("expected configuration error");
     })();
     expect(error.message).toContain(expected);
-    expect(error.message).not.toContain("scheme-secret");
-    expect(error.message).not.toContain("tls-secret");
+    for (const secret of [
+      "scheme-secret",
+      "empty-query-secret",
+      "empty-query-fragment-secret",
+      "tls-secret",
+      "query-secret",
+      "fragment-secret",
+      "question-fragment-secret",
+    ]) {
+      expect(error.message).not.toContain(secret);
+    }
+  });
+
+  it.each([
+    {
+      label: "zero",
+      url: "postgresql://user:zero-port-secret@db.example.com:0/lcm",
+      expected: "PostgreSQL port from 1 through 65535",
+    },
+    {
+      label: "overflow",
+      url: "postgresql://user:overflow-port-secret@db.example.com:65536/lcm",
+      expected: "absolute postgresql: URL",
+    },
+    {
+      label: "malformed",
+      url: "postgresql://user:malformed-port-secret@db.example.com:12x/lcm",
+      expected: "absolute postgresql: URL",
+    },
+  ])("rejects the same invalid PostgreSQL port as the runtime parser: $label", ({ url, expected }) => {
+    const daemonError = (() => {
+      try {
+        resolveStorageConfig({ backend: "postgresql" }, {
+          LCM_POSTGRES_URL: url,
+          LCM_POSTGRES_CA_FILE: caFile(),
+        });
+      } catch (caught) {
+        return caught as Error;
+      }
+      throw new Error("expected configuration error");
+    })();
+
+    expect(daemonError.message).toContain("LCM_POSTGRES_URL");
+    expect(daemonError.message).toContain(expected);
+    expect(daemonError.message).not.toContain("port-secret");
+    expect(() => parsePostgreSqlUrl(url)).toThrowError(expect.objectContaining({
+      code: "STORAGE_INITIALIZATION_FAILED",
+      operation: "configure",
+    }));
+  });
+
+  it.each([
+    {
+      label: "missing username",
+      url: "postgresql://:missing-username-secret@db.example.com/lcm",
+      forbidden: "missing-username-secret",
+    },
+    {
+      label: "missing password",
+      url: "postgresql://missing-password-user@db.example.com/lcm",
+      forbidden: "missing-password-user",
+    },
+    {
+      label: "missing database path",
+      url: "postgresql://user:missing-database-secret@db.example.com",
+      forbidden: "missing-database-secret",
+    },
+    {
+      label: "empty database path",
+      url: "postgresql://user:empty-database-secret@db.example.com/",
+      forbidden: "empty-database-secret",
+    },
+    {
+      label: "nested database path",
+      url: "postgresql://user:nested-database-secret@db.example.com/lcm/nested",
+      forbidden: "nested-database-secret",
+    },
+    {
+      label: "encoded nested database path",
+      url: "postgresql://user:encoded-nested-secret@db.example.com/lcm%2Fnested",
+      forbidden: "encoded-nested-secret",
+    },
+    {
+      label: "invalid username encoding",
+      url: "postgresql://invalid%E0%A4%A:invalid-username-secret@db.example.com/lcm",
+      forbidden: "invalid-username-secret",
+    },
+    {
+      label: "invalid password encoding",
+      url: "postgresql://user:invalid%E0%A4%A@db.example.com/lcm",
+      forbidden: "invalid%E0%A4%A",
+    },
+    {
+      label: "invalid database encoding",
+      url: "postgresql://user:invalid-encoding-secret@db.example.com/%E0%A4%A",
+      forbidden: "invalid-encoding-secret",
+    },
+  ])("rejects PostgreSQL URL with $label without echoing credentials", ({ url, forbidden }) => {
+    const error = (() => {
+      try {
+        parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
+          LCM_POSTGRES_URL: url,
+          LCM_POSTGRES_CA_FILE: caFile(),
+        });
+      } catch (caught) {
+        return caught as Error;
+      }
+      throw new Error("expected configuration error");
+    })();
+    expect(error.message).toContain(
+      "explicit non-empty username and password and exactly one non-empty decoded database path segment",
+    );
+    expect(error.message).not.toContain(forbidden);
   });
 
   it("requires an absolute, readable, non-empty regular CA file within the size limit", () => {
     expect(() => parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
-      LCM_POSTGRES_URL: "postgresql://db.example.com/lcm",
+      LCM_POSTGRES_URL: "postgresql://user:password@db.example.com/lcm",
       LCM_POSTGRES_CA_FILE: "relative.crt",
     })).toThrow("absolute path");
     expect(() => parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
-      LCM_POSTGRES_URL: "postgresql://db.example.com/lcm",
+      LCM_POSTGRES_URL: "postgresql://user:password@db.example.com/lcm",
       LCM_POSTGRES_CA_FILE: "/missing/lcm-ca.crt",
     })).toThrow("readable regular file");
     expect(() => parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, postgresEnv(caFile("")))).toThrow("must not be empty");

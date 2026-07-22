@@ -1100,7 +1100,7 @@ describe("strict LLM configuration validation", () => {
     const content = JSON.stringify({ storage: { backend: "postgresql" }, llm });
     const daemon = parseDaemonConfig(content, {}, {
       ...env,
-      LCM_POSTGRES_URL: "postgresql://localhost/database",
+      LCM_POSTGRES_URL: "postgresql://user:password@localhost/database",
       LCM_POSTGRES_CA_FILE: import.meta.filename,
     });
 

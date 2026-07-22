@@ -346,10 +346,11 @@ provider requirements, and deeper operational guidance.
 
 SQLite remains the zero-configuration storage backend. LCM also validates the
 configuration and verified-TLS prerequisites for an explicit remote-primary
-PostgreSQL selection. PostgreSQL repositories land in #82, so selecting
-`postgresql` currently fails before daemon startup instead of falling back to
-SQLite. Connection credentials stay out of JSON and effective configuration
-output. See [storage backend configuration](docs/configuration.md#storage-backend)
+PostgreSQL selection and includes an internal PostgreSQL 18 pool, migration
+runner, and isolated conformance harness. PostgreSQL domain repositories remain
+staged in #83-#92, so selecting `postgresql` currently fails before daemon
+startup instead of falling back to SQLite. Connection credentials stay out of
+JSON and effective configuration output. See [storage backend configuration](docs/configuration.md#storage-backend)
 for operators and the [storage repository architecture](docs/architecture.md#storage-repository-architecture)
 for repository ownership, lifetimes, transactions, and the local-outbox
 boundary.
@@ -361,7 +362,13 @@ npm install
 npm run build
 npx vitest
 npx tsc --noEmit
+npm run test:postgresql
 ```
+
+The PostgreSQL command owns an exact PostgreSQL 18 container and all temporary
+TLS, network, volume, credential, and database resources. See
+[PostgreSQL development](docs/postgresql-development.md) before changing its
+image digest, migrations, runtime, or cleanup guards.
 
 ### Repository layout
 

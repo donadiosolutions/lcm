@@ -74,7 +74,7 @@ describe("external admission workflow", () => {
     expect(setupNode?.uses).toBe(
       "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
     );
-    expect(setupNode?.with).toEqual({ "node-version": 22 });
+    expect(setupNode?.with).toEqual({ "node-version": "22.20.0" });
   });
 
   it("starts only for Greptile or DCO and polls CI without triggering on merge groups", () => {

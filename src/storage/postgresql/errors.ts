@@ -1,0 +1,72 @@
+import { StorageOperationError } from "../errors.js";
+import type { PostgreSqlOperationContext } from "./contracts.js";
+
+const RETRYABLE_SQLSTATES = new Set([
+  "40001",
+  "40P01",
+  "53300",
+]);
+
+const CONNECTION_TERMINATION_SQLSTATES = new Set([
+  "57P01",
+  "57P02",
+  "57P03",
+]);
+
+const RETRYABLE_TRANSPORT_CODES = new Set([
+  "EAI_AGAIN",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTDOWN",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "ENETRESET",
+  "ENETUNREACH",
+  "EPIPE",
+  "ETIMEDOUT",
+]);
+
+const RETRYABLE_DRIVER_MESSAGES = new Set([
+  "Connection terminated due to connection timeout",
+  "Connection terminated unexpectedly",
+  "timeout exceeded when trying to connect",
+  "timeout expired",
+]);
+
+type PostgreSqlDriverError = Error & { code?: unknown };
+
+export function isPostgreSqlConnectionError(error: unknown): boolean {
+  const candidate = error as PostgreSqlDriverError | undefined;
+  const code = candidate?.code;
+  if (typeof code === "string" && (
+    (code.length === 5 && code.startsWith("08"))
+    || CONNECTION_TERMINATION_SQLSTATES.has(code)
+    || RETRYABLE_TRANSPORT_CODES.has(code)
+  )) {
+    return true;
+  }
+  return error instanceof Error && RETRYABLE_DRIVER_MESSAGES.has(error.message);
+}
+
+export function isRetryablePostgreSqlError(error: unknown): boolean {
+  const code = (error as PostgreSqlDriverError | undefined)?.code;
+  return isPostgreSqlConnectionError(error)
+    || (typeof code === "string" && RETRYABLE_SQLSTATES.has(code));
+}
+
+export function normalizePostgreSqlError(
+  error: unknown,
+  context: PostgreSqlOperationContext,
+  code: "STORAGE_INITIALIZATION_FAILED" | "STORAGE_OPERATION_FAILED" = "STORAGE_OPERATION_FAILED",
+): StorageOperationError {
+  if (error instanceof StorageOperationError) return error;
+  return new StorageOperationError(
+    code,
+    "postgresql",
+    context.projectId,
+    context.domain,
+    context.operation,
+    { retryable: isRetryablePostgreSqlError(error) },
+  );
+}

@@ -102,6 +102,9 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Fail-closed daemon lifecycle results must include a sanitized, actionable warning that identifies the blocked transition without exposing tokens, credentials, or raw endpoint details.
 - Never reproduce raw child-process stdout, stderr, or thrown error text in daemon lifecycle warnings. Use an allowlist-only process summary containing safe classifications, recognized error codes, validated signals, or bounded numeric exit status.
 - PostgreSQL connection URLs must be hierarchical and include a non-empty hostname; reject opaque forms even when the platform URL parser accepts them.
+- Normalize bracketed IPv6 URL hostnames before passing them to PostgreSQL clients or TLS identity checks.
+- Abort-aware pooled PostgreSQL queries must recheck cancellation after asynchronous setup, await any in-flight backend cancellation before settlement, and destroy the target connection whenever abort was observed so a late cancel cannot hit a subsequent borrower.
+- Signal cleanup for resource-owning test harnesses must quiesce in-flight creation commands before inspecting labels or removing resources. Bound captured child output while retaining a useful diagnostic tail.
 - Configuration and CA-file preflight must accept only bounded regular files. Reject directories, FIFOs, devices, and oversized files before reading them.
 - Return and propagate the canonical path established by file preflight; do not validate a resolved path and then retain an unvalidated alias.
 - Dispatch tests must cover non-default storage-backend propagation through every backend-aware handler, while retaining the default SQLite cases.
@@ -119,6 +122,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Load executable admission policy only from the trusted workflow revision using the pinned checkout action, a minimal sparse checkout, and `persist-credentials: false`; never execute policy from the PR head. Admission workflow or policy changes cannot self-admit new logic that is not yet on the default branch, so their initial rollout requires an explicitly documented one-time maintainer bootstrap before returning to the normal no-bypass flow.
 - Keep `external-admission-merge-group.yml` limited to its `merge_group` / `checks_requested` trigger and permissionless Actions job named `external-admission`; it does not publish a commit status. CI, all required CodeQL categories, and both Socket checks must still validate the synthetic commit.
 - Keep Codecov reporting in the separate no-checkout CI job. It must use OIDC for pushes and same-repository PRs (including Dependabot), use tokenless uploads for fork PRs, consume only the fixed CI artifact, and remain skipped for `merge_group`.
+- Every newly added CI matrix or sibling test job must feed a stable required aggregate check; required admission must fail when any matrix leg fails or is skipped.
 - CodeQL SARIF upload remains required on merge groups using the pinned build-mode-none CodeQL actions.
 - Advanced CodeQL workflows require GitHub default setup to be disabled before they upload SARIF.
 - Keep CodeQL analysis enabled for fork pull requests, but set the analyze action's `upload` input to `never` for fork-origin pull requests and `always` for merge groups, same-repository pull requests, and pushes.

@@ -2,7 +2,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
 import { readBoundedRegularFile } from "../security-files.js";
-import { sanitizeUrlForDisplay } from "../url-display.js";
+import { hasUrlQueryComponent, sanitizeUrlForDisplay } from "../url-display.js";
 
 export { sanitizeUrlForDisplay } from "../url-display.js";
 
@@ -954,12 +954,42 @@ export function resolveStorageConfig(
       "must use hierarchical postgresql:// form with a non-empty hostname",
     );
   }
-  const forbiddenTlsParameter = [...parsedUrl.searchParams.keys()]
-    .find((key) => key.toLowerCase().startsWith("ssl"));
-  if (forbiddenTlsParameter !== undefined) {
+  const port = parsedUrl.port === "" ? 5432 : Number(parsedUrl.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new ConfigValidationError(
       "LCM_POSTGRES_URL",
-      `must not contain TLS parameter ${JSON.stringify(forbiddenTlsParameter)}; LCM enforces verified TLS with LCM_POSTGRES_CA_FILE`,
+      "must use a PostgreSQL port from 1 through 65535",
+    );
+  }
+  if (hasUrlQueryComponent(url)) {
+    throw new ConfigValidationError(
+      "LCM_POSTGRES_URL",
+      "must not contain URL query parameters, including TLS parameters; configure PostgreSQL behavior through LCM settings and LCM_POSTGRES_CA_FILE",
+    );
+  }
+  if (parsedUrl.hash !== "") {
+    throw new ConfigValidationError(
+      "LCM_POSTGRES_URL",
+      "must not contain a URL fragment; provide only the PostgreSQL server, credentials, port, and database",
+    );
+  }
+  let database: string;
+  let username: string;
+  let password: string;
+  try {
+    database = decodeURIComponent(parsedUrl.pathname.slice(1));
+    username = decodeURIComponent(parsedUrl.username);
+    password = decodeURIComponent(parsedUrl.password);
+  } catch {
+    throw new ConfigValidationError(
+      "LCM_POSTGRES_URL",
+      "must include an explicit non-empty username and password and exactly one non-empty decoded database path segment",
+    );
+  }
+  if (username === "" || password === "" || database === "" || database.includes("/")) {
+    throw new ConfigValidationError(
+      "LCM_POSTGRES_URL",
+      "must include an explicit non-empty username and password and exactly one non-empty decoded database path segment",
     );
   }
   if (!isAbsolute(caFile)) {

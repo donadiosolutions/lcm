@@ -1,0 +1,2 @@
+src/storage/postgresql/migrations/*.sql text eol=lf
+test/postgresql/init.sh text eol=lf

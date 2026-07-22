@@ -7,6 +7,13 @@ const EMBEDDED_URI_PATTERN = /(^|[^a-z\d+./-])((?:[a-z][a-z\d+.-]*:)?\/\/[^\s<>"
 const TRAILING_URI_PUNCTUATION_PATTERN = /[.,;!?]+$/;
 const CONNECTION_SECRET_ASSIGNMENT_PATTERN = /(\b(?:password|pwd|user(?:name|\s+id)?|uid|token|api[-_\s]?key|secret)\s*=\s*)(?:\{(?:[^}]|}})*\}|"[^"]*"|'[^']*'|[^;\s,]+)/gi;
 
+/** Detect a URL query delimiter, including the empty query that URL.search normalizes away. */
+export function hasUrlQueryComponent(value: string): boolean {
+  const queryIndex = value.indexOf("?");
+  const fragmentIndex = value.indexOf("#");
+  return queryIndex !== -1 && (fragmentIndex === -1 || queryIndex < fragmentIndex);
+}
+
 export function isUrlLikeKey(key: string | undefined): boolean {
   if (!key) return false;
   const normalized = key.replace(/[-_]/g, "").toLowerCase();

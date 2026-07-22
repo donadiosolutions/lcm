@@ -711,7 +711,7 @@ describe("runDoctor configuration validation", () => {
     writeFileSync(caFile, "test-ca");
     const previousUrl = process.env.LCM_POSTGRES_URL;
     const previousCaFile = process.env.LCM_POSTGRES_CA_FILE;
-    process.env.LCM_POSTGRES_URL = "postgresql://db.example/lcm";
+    process.env.LCM_POSTGRES_URL = "postgresql://user:password@db.example/lcm";
     process.env.LCM_POSTGRES_CA_FILE = caFile;
     const fetch = vi.fn();
     try {
