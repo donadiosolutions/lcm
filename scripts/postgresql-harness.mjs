@@ -47,7 +47,8 @@ export function sanitizeHarnessText(value, secrets) {
 
 export function runProcess(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const spawnProcess = options.spawnProcess ?? spawn;
+    const child = spawnProcess(command, args, {
       cwd: options.cwd,
       env: options.env,
       stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
@@ -55,6 +56,7 @@ export function runProcess(command, args, options = {}) {
     const maxCapturedOutputBytes = MAX_CAPTURED_OUTPUT_BYTES;
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
+    let settled = false;
     const appendTail = (current, chunk) => {
       const next = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       if (next.length >= maxCapturedOutputBytes) return next.subarray(-maxCapturedOutputBytes);
@@ -63,8 +65,13 @@ export function runProcess(command, args, options = {}) {
     };
     child.stdout?.on("data", (chunk) => { stdout = appendTail(stdout, chunk); });
     child.stderr?.on("data", (chunk) => { stderr = appendTail(stderr, chunk); });
-    child.once("error", reject);
-    child.once("exit", (code, signal) => {
+    const settle = (operation) => {
+      if (settled) return;
+      settled = true;
+      operation();
+    };
+    child.once("error", (error) => settle(() => reject(error)));
+    child.once("close", (code, signal) => settle(() => {
       const capturedStdout = stdout.toString("utf8");
       const capturedStderr = stderr.toString("utf8");
       if (code === 0) resolve({ stdout: capturedStdout.trim(), stderr: capturedStderr.trim() });
@@ -74,7 +81,7 @@ export function runProcess(command, args, options = {}) {
         stdout: capturedStdout,
         stderr: capturedStderr,
       }));
-    });
+    }));
   });
 }
 

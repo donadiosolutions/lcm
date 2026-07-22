@@ -101,6 +101,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     this.assertOpen(options);
     let client: PoolClient | undefined;
     let destroy = false;
+    let commitAttempted = false;
     try {
       client = await this.acquire(options);
       if (options.signal?.aborted) {
@@ -108,6 +109,10 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
         throw aborted(options);
       }
       await client.query("BEGIN");
+      if (options.signal?.aborted) {
+        destroy = true;
+        throw aborted(options);
+      }
       let acceptingQueries = true;
       let transactionFailed = false;
       let transactionFailure: StorageOperationError | undefined;
@@ -167,17 +172,29 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
         destroy = true;
         throw aborted(options);
       }
+      commitAttempted = true;
       await client.query("COMMIT");
       this.poolFailed = false;
       return callbackOutcome.result;
     } catch (error) {
-      if (options.signal?.aborted === true || isPostgreSqlConnectionError(error)) destroy = true;
+      const connectionFailure = isPostgreSqlConnectionError(error);
+      const commitOutcomeAmbiguous = commitAttempted && connectionFailure;
+      if (options.signal?.aborted === true || connectionFailure) destroy = true;
       if (client && !destroy && options.signal?.aborted !== true) {
         try {
           await client.query("ROLLBACK");
         } catch {
           destroy = true;
         }
+      }
+      if (commitOutcomeAmbiguous) {
+        throw new StorageOperationError(
+          "STORAGE_OPERATION_FAILED",
+          "postgresql",
+          options.projectId,
+          options.domain,
+          options.operation,
+        );
       }
       throw normalizePostgreSqlError(error, options);
     } finally {

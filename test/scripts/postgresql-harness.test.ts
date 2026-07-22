@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -86,7 +87,72 @@ describe("PostgreSQL harness utilities", () => {
     expect(error.stdout).not.toContain("discarded-stdout-prefix");
     expect(error.stderr).not.toContain("discarded-stderr-prefix");
     await expect(runProcess("lcm-command-that-does-not-exist", []))
-      .rejects.toBeInstanceOf(Error);
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("waits for close and captures output delivered after child exit", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+    });
+    const spawnProcess = vi.fn(() => child);
+    let settled = false;
+    const operation = runProcess("docker", ["inspect", "owned"], { spawnProcess });
+    void operation.finally(() => { settled = true; });
+
+    child.stdout.emit("data", "before-exit ");
+    child.emit("exit", 0, null);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    child.stdout.emit("data", Buffer.from("final-stdout"));
+    child.stderr.emit("data", " final-stderr ");
+    child.emit("close", 0, null);
+
+    await expect(operation).resolves.toEqual({
+      stdout: "before-exit final-stdout",
+      stderr: "final-stderr",
+    });
+    expect(spawnProcess).toHaveBeenCalledWith("docker", ["inspect", "owned"], {
+      cwd: undefined,
+      env: undefined,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  });
+
+  it("bounds stream tails and settles only once across error, close, and kill paths", async () => {
+    const failedChild = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+    });
+    const spawnFailure = new Error("spawn aborted");
+    const failed = runProcess("docker", ["start"], { spawnProcess: () => failedChild });
+    failedChild.emit("error", spawnFailure);
+    failedChild.emit("close", 0, null);
+    await expect(failed).rejects.toBe(spawnFailure);
+
+    const killedChild = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+    });
+    const killed = runProcess("docker", ["logs"], { spawnProcess: () => killedChild });
+    killedChild.stdout.emit("data", Buffer.alloc(MAX_CAPTURED_OUTPUT_BYTES + 8, "x"));
+    killedChild.stdout.emit("data", "stdout-tail");
+    killedChild.stderr.emit("data", Buffer.alloc(MAX_CAPTURED_OUTPUT_BYTES - 4, "y"));
+    killedChild.stderr.emit("data", "stderr-tail");
+    killedChild.emit("close", null, "SIGTERM");
+
+    const error = await killed.catch((reason: unknown) => reason) as {
+      code: number | null;
+      signal: string;
+      stdout: string;
+      stderr: string;
+    };
+    expect(error).toMatchObject({ code: null, signal: "SIGTERM" });
+    expect(Buffer.byteLength(error.stdout)).toBe(MAX_CAPTURED_OUTPUT_BYTES);
+    expect(Buffer.byteLength(error.stderr)).toBe(MAX_CAPTURED_OUTPUT_BYTES);
+    expect(error.stdout.endsWith("stdout-tail")).toBe(true);
+    expect(error.stderr.endsWith("stderr-tail")).toBe(true);
   });
 
   it("quiesces in-flight setup before cleanup and rejects later setup", async () => {

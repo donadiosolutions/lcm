@@ -172,6 +172,73 @@ describe("PostgreSQL runtime", () => {
     expect(queryFailure.release).toHaveBeenCalledWith(false);
   });
 
+  it("treats connection loss during COMMIT as non-retryable and destroys the client", async () => {
+    const f = fixtures((input) => {
+      if (input === "COMMIT") throw Object.assign(new Error("connection secret"), { code: "08006" });
+      return result([]);
+    });
+    await expect(f.runtime.transaction(async () => "unknown outcome", {
+      projectId: "project",
+      domain: "transaction",
+      operation: "ambiguousCommit",
+    })).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      projectId: "project",
+      domain: "transaction",
+      operation: "ambiguousCommit",
+      retryable: false,
+    });
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it.each([
+    ["serialization", "40001"],
+    ["deadlock", "40P01"],
+  ])("retains retryability for a definite %s failure during COMMIT", async (_failure, code) => {
+    const f = fixtures((input) => {
+      if (input === "COMMIT") throw Object.assign(new Error("database secret"), { code });
+      return result([]);
+    });
+    await expect(f.runtime.transaction(async () => "not committed", {
+      domain: "transaction",
+      operation: "definiteCommitFailure",
+    })).rejects.toMatchObject({
+      operation: "definiteCommitFailure",
+      retryable: true,
+    });
+    expect(f.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).toHaveBeenCalledWith(false);
+  });
+
+  it("destroys an aborted transaction after BEGIN without invoking its callback", async () => {
+    let finishBegin!: (value: QueryResult<QueryResultRow>) => void;
+    const beginResult = new Promise<QueryResult<QueryResultRow>>((resolve) => { finishBegin = resolve; });
+    const f = fixtures((input) => input === "BEGIN" ? beginResult : result([]));
+    const controller = new AbortController();
+    const callback = vi.fn(async () => "must not run");
+    const pending = f.runtime.transaction(callback, {
+      projectId: "project",
+      domain: "transaction",
+      operation: "abortAfterBegin",
+      signal: controller.signal,
+    });
+
+    await vi.waitFor(() => expect(f.query).toHaveBeenCalledWith("BEGIN"));
+    controller.abort();
+    finishBegin(result([]));
+
+    await expect(pending).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      projectId: "project",
+      operation: "abortAfterBegin",
+    });
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
   it("rolls back and rejects when a callback catches a transaction query failure", async () => {
     const f = fixtures((input) => {
       if (typeof input === "string") return result([]);
