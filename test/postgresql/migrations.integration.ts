@@ -92,18 +92,38 @@ describe("PostgreSQL migrations and database isolation", () => {
     }
   });
 
-  it("fails closed when the run sentinel no longer matches", async () => {
+  it("deduplicates concurrent and repeated database drops", async () => {
+    const database = await createPostgreSqlTestDatabase("drop-concurrency");
+
+    const first = database.drop();
+    const concurrent = database.drop();
+    expect(concurrent).toBe(first);
+    await expect(Promise.all([first, concurrent])).resolves.toEqual([undefined, undefined]);
+
+    const repeated = database.drop();
+    expect(repeated).toBe(first);
+    await expect(repeated).resolves.toBeUndefined();
+  });
+
+  it("deduplicates a failed guarded drop and permits a deliberate retry", async () => {
     const database = await createPostgreSqlTestDatabase("sentinel-guard");
     const admin = new PostgreSqlRuntime(settings(database.adminUrl));
     try {
       await admin.query({
         text: "UPDATE public.__lcm_test_run_sentinel SET run_id = 'mismatched'",
       }, { domain: "factory", operation: "corruptSentinel" });
-      await expect(database.drop()).rejects.toThrow("refusing to drop");
+      const failed = database.drop();
+      const concurrentFailure = database.drop();
+      expect(concurrentFailure).toBe(failed);
+      await expect(failed).rejects.toThrow("refusing to drop");
       await admin.query({
         text: "UPDATE public.__lcm_test_run_sentinel SET run_id = $1",
         values: [process.env.LCM_TEST_POSTGRES_RUN_ID],
       }, { domain: "factory", operation: "repairSentinel" });
+      const retry = database.drop();
+      expect(retry).not.toBe(failed);
+      expect(database.drop()).toBe(retry);
+      await expect(retry).resolves.toBeUndefined();
     } finally {
       await admin.close();
       await database.drop();

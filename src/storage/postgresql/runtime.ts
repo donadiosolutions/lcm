@@ -252,7 +252,6 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
     this.closePromise = this.pool.end().catch((error: unknown): never => {
-      this.closed = false;
       this.closePromise = undefined;
       throw normalizePostgreSqlError(error, { domain: "factory", operation: "close" });
     });

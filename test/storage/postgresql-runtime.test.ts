@@ -617,7 +617,7 @@ describe("PostgreSQL runtime", () => {
     await expect(healthy.runtime.health()).resolves.toEqual({ status: "closed", backend: "postgresql" });
   });
 
-  it("closes idempotently, restores state after close failure, and rejects closed operations", async () => {
+  it("closes idempotently and rejects closed operations", async () => {
     const f = fixtures();
     const first = f.runtime.close();
     expect(f.runtime.close()).toBe(first);
@@ -625,11 +625,44 @@ describe("PostgreSQL runtime", () => {
     await expect(f.runtime.query({ text: "SELECT 1" }, {
       projectId: "project", domain: "factory", operation: "afterClose",
     })).rejects.toMatchObject({ code: "STORAGE_CLOSED", projectId: "project" });
+    expect(f.runtime.close()).toBe(first);
+    expect(f.end).toHaveBeenCalledTimes(1);
+  });
 
+  it("remains closed after shutdown failure while allowing an idempotent close retry", async () => {
     const failing = fixtures();
-    failing.end.mockRejectedValueOnce(new Error("close secret"));
-    await expect(failing.runtime.close()).rejects.toMatchObject({ operation: "close" });
-    await expect(failing.runtime.close()).resolves.toBeUndefined();
+    let failInitialClose!: (error: Error) => void;
+    const initialEnd = new Promise<void>((_resolve, reject) => { failInitialClose = reject; });
+    failing.end.mockImplementationOnce(() => initialEnd);
+
+    const initialClose = failing.runtime.close();
+    expect(failing.runtime.close()).toBe(initialClose);
+    await expect(failing.runtime.query({ text: "SELECT 1" }, {
+      projectId: "project", domain: "factory", operation: "duringClose",
+    })).rejects.toMatchObject({
+      code: "STORAGE_CLOSED",
+      projectId: "project",
+      operation: "duringClose",
+    });
+    failInitialClose(new Error("close secret"));
+    await expect(initialClose).rejects.toMatchObject({ operation: "close" });
+
+    const callback = vi.fn(async () => undefined);
+    await expect(failing.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory", operation: "afterCloseFailure",
+    })).rejects.toMatchObject({ code: "STORAGE_CLOSED", operation: "afterCloseFailure" });
+    await expect(failing.runtime.transaction(callback, {
+      domain: "transaction", operation: "afterCloseFailure",
+    })).rejects.toMatchObject({ code: "STORAGE_CLOSED", operation: "afterCloseFailure" });
+    expect(callback).not.toHaveBeenCalled();
+    await expect(failing.runtime.health()).resolves.toEqual({ status: "closed", backend: "postgresql" });
+    expect(failing.connect).not.toHaveBeenCalled();
+
+    const retry = failing.runtime.close();
+    expect(retry).not.toBe(initialClose);
+    expect(failing.runtime.close()).toBe(retry);
+    await expect(retry).resolves.toBeUndefined();
+    expect(failing.runtime.close()).toBe(retry);
     expect(failing.end).toHaveBeenCalledTimes(2);
   });
 

@@ -175,7 +175,45 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
   }
   await databaseAdmin.close();
 
-  let dropped = false;
+  let dropPromise: Promise<void> | undefined;
+  const dropDatabase = async (): Promise<void> => {
+    await Promise.allSettled([migrator.close(), runtime.close()]);
+    const guard = runtimeFor(adminUrl);
+    try {
+      const result = await guard.query<GuardRow>({
+        text: `SELECT current_setting('server_version_num')::integer AS server_version_num,
+                      current_user AS role,
+                      sentinel.run_id,
+                      sentinel.database_name,
+                      sentinel.runtime_role
+               FROM public.__lcm_test_run_sentinel AS sentinel`,
+      }, { domain: "factory", operation: "verifyDropSentinel" });
+      const row = result.rows[0];
+      if (
+        !name.startsWith(`lcm_t_${env.LCM_TEST_POSTGRES_RUN_ID.slice(0, 12)}_`)
+        || Math.floor(row.server_version_num / 10_000) !== 18
+        || row.role !== "lcm_harness_admin"
+        || row.run_id !== env.LCM_TEST_POSTGRES_RUN_ID
+        || row.database_name !== name
+        || row.runtime_role !== "lcm_test_runtime"
+      ) throw new Error("refusing to drop an unowned PostgreSQL test database");
+    } finally {
+      await guard.close();
+    }
+    const control = runtimeFor(env.LCM_TEST_POSTGRES_ADMIN_URL);
+    try {
+      await control.query({
+        text: "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+        values: [name],
+      }, { domain: "factory", operation: "drainTestDatabase" });
+      await control.query({ text: `DROP DATABASE ${identifier}` }, {
+        domain: "factory",
+        operation: "dropTestDatabase",
+      });
+    } finally {
+      await control.close();
+    }
+  };
   return {
     name,
     sentinel: {
@@ -188,45 +226,12 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
     runtimeUrl,
     migrator,
     runtime,
-    async drop(): Promise<void> {
-      if (dropped) return;
-      await Promise.allSettled([migrator.close(), runtime.close()]);
-      const guard = runtimeFor(adminUrl);
-      try {
-        const result = await guard.query<GuardRow>({
-          text: `SELECT current_setting('server_version_num')::integer AS server_version_num,
-                        current_user AS role,
-                        sentinel.run_id,
-                        sentinel.database_name,
-                        sentinel.runtime_role
-                 FROM public.__lcm_test_run_sentinel AS sentinel`,
-        }, { domain: "factory", operation: "verifyDropSentinel" });
-        const row = result.rows[0];
-        if (
-          !name.startsWith(`lcm_t_${env.LCM_TEST_POSTGRES_RUN_ID.slice(0, 12)}_`)
-          || Math.floor(row.server_version_num / 10_000) !== 18
-          || row.role !== "lcm_harness_admin"
-          || row.run_id !== env.LCM_TEST_POSTGRES_RUN_ID
-          || row.database_name !== name
-          || row.runtime_role !== "lcm_test_runtime"
-        ) throw new Error("refusing to drop an unowned PostgreSQL test database");
-      } finally {
-        await guard.close();
-      }
-      const control = runtimeFor(env.LCM_TEST_POSTGRES_ADMIN_URL);
-      try {
-        await control.query({
-          text: "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
-          values: [name],
-        }, { domain: "factory", operation: "drainTestDatabase" });
-        await control.query({ text: `DROP DATABASE ${identifier}` }, {
-          domain: "factory",
-          operation: "dropTestDatabase",
-        });
-        dropped = true;
-      } finally {
-        await control.close();
-      }
+    drop(): Promise<void> {
+      dropPromise ??= dropDatabase().catch((error: unknown) => {
+        dropPromise = undefined;
+        throw error;
+      });
+      return dropPromise;
     },
   };
 }
