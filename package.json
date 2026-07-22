@@ -38,7 +38,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "postbuild": "mkdir -p dist/src/prompts && cp -r src/prompts/*.yaml dist/src/prompts/ && mkdir -p dist/src/connectors/templates && cp -r src/connectors/templates/. dist/src/connectors/templates/ && cp installer/setup.sh dist/installer/setup.sh && npm run build:plugin-bundles",
+    "postbuild": "mkdir -p dist/src/prompts && cp -r src/prompts/*.yaml dist/src/prompts/ && mkdir -p dist/src/connectors/templates && cp -r src/connectors/templates/. dist/src/connectors/templates/ && mkdir -p dist/src/storage/postgresql/migrations && cp src/storage/postgresql/migrations/*.sql dist/src/storage/postgresql/migrations/ && cp installer/setup.sh dist/installer/setup.sh && npm run build:plugin-bundles",
     "build:plugin-bundles": "node scripts/build-plugin-bundles.mjs",
     "check:plugin-bundles": "node scripts/build-plugin-bundles.mjs --check",
     "prepublishOnly": "npm run build",
@@ -47,6 +47,7 @@
     "release:verify": "npm test && npm pack --dry-run",
     "test": "vitest run --dir test",
     "test:ci": "vitest run --dir test --coverage --coverage.reporter=lcov --coverage.reporter=text --reporter=default --reporter=junit --outputFile=test-report.junit.xml",
+    "test:postgresql": "npm run build && node scripts/postgresql-harness.mjs",
     "typecheck": "tsc --noEmit",
     "version-packages": "node scripts/version-packages.mjs"
   },
@@ -55,6 +56,7 @@
     "@sinclair/typebox": "0.34.51",
     "commander": "15.0.0",
     "js-yaml": "5.2.1",
+    "pg": "8.22.0",
     "safe-regex": "^2.1.1"
   },
   "devDependencies": {
@@ -62,6 +64,7 @@
     "@changesets/cli": "^2.30.0",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "22.20.1",
+    "@types/pg": "8.20.0",
     "@types/safe-regex": "^1.1.6",
     "@vitest/coverage-v8": "4.1.10",
     "esbuild": "0.28.1",

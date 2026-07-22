@@ -212,13 +212,13 @@ describe("storage configuration", () => {
   });
 
   it.each([
-    ["not a url", "absolute postgresql"],
-    ["https://user:scheme-secret@example.com/lcm", "postgresql: scheme"],
-    ["postgresql:foo", "hierarchical postgresql://"],
-    ["postgresql://", "non-empty hostname"],
-    ["postgresql:///database", "non-empty hostname"],
-    ["postgresql://user:tls-secret@example.com/lcm?SSLCert=inline", "TLS parameter"],
-  ])("rejects unsafe PostgreSQL URL %s without echoing credentials", (url, expected) => {
+    { label: "non-URL", url: "not a url", expected: "absolute postgresql" },
+    { label: "wrong scheme", url: "https://user:scheme-secret@example.com/lcm", expected: "postgresql: scheme" },
+    { label: "non-hierarchical", url: "postgresql:foo", expected: "hierarchical postgresql://" },
+    { label: "missing host", url: "postgresql://", expected: "non-empty hostname" },
+    { label: "database without host", url: "postgresql:///database", expected: "non-empty hostname" },
+    { label: "TLS query override", url: "postgresql://user:tls-secret@example.com/lcm?SSLCert=inline", expected: "TLS parameter" },
+  ])("rejects unsafe PostgreSQL URL: $label without echoing credentials", ({ url, expected }) => {
     const error = (() => {
       try {
         parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {

@@ -184,11 +184,11 @@ not contain a `storage` object continue to use the per-project databases under
 }
 ```
 
-The PostgreSQL configuration foundation is available for validating a future
-remote-primary deployment. PostgreSQL repository support lands in #82; until
-then, a valid `postgresql` selection fails before the daemon listens with an
-explicit backend-unavailable error. LCM never falls back to SQLite after an
-explicit PostgreSQL selection.
+The PostgreSQL configuration and internal PostgreSQL 18 runtime foundation are
+available for development and adapter conformance. The domain repositories are
+still staged in #83-#92, so a valid `postgresql` selection continues to fail
+before the daemon listens with an explicit backend-unavailable error. LCM never
+falls back to SQLite after an explicit PostgreSQL selection.
 
 The installed no-override PreCompact command (`lcm compact --hook`) is a
 best-effort exception to that fail-closed admission path. Before dispatch, its
@@ -245,6 +245,9 @@ TLS configuration and uses the required CA file for certificate verification.
 The CA path must be absolute and resolve to a readable, non-empty regular file
 no larger than 1 MiB (1,048,576 bytes). Directories, FIFOs, device nodes, and
 other non-regular files are rejected before LCM reads certificate contents.
+The runtime also rejects any URL query parameter or fragment, requires explicit
+username, password, host, and database components, and does not consult `PG*`
+environment variables. The CA and URL are the only TLS and endpoint authority.
 
 For DigitalOcean Managed PostgreSQL 18 Standard Edition, download the cluster
 CA certificate from the database's **Connection Details** page, save it in a
@@ -264,6 +267,11 @@ for project-memory reads. See the
 [storage repository architecture](architecture.md#storage-repository-architecture)
 for backend ownership, transaction, capability, health, and adapter-extension
 contracts.
+
+Developers implementing a PostgreSQL repository should use the isolated
+container workflow in [PostgreSQL development](postgresql-development.md). It
+uses disposable credentials and databases and must not be pointed at a shared
+or production PostgreSQL cluster.
 
 ## Daemon safety
 

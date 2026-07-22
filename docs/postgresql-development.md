@@ -1,0 +1,135 @@
+# PostgreSQL development
+
+LCM's PostgreSQL runtime and migration foundation is internal until the domain
+adapters tracked by #83-#92 satisfy the shared storage contracts. SQLite remains
+the default, and the application factory deliberately rejects
+`storage.backend=postgresql` during this stage.
+
+## Run the conformance harness
+
+Docker and the runner-provided OpenSSL must be available. From a clean checkout
+with dependencies installed, run:
+
+```bash
+npm run test:postgresql
+```
+
+The same command runs locally and in CI. Locally it publishes a cryptographically
+random loopback port. In CI, Vitest runs in the digest-pinned Node image on the
+run's private Docker network, using a certificate hostname-valid network alias.
+The CI runner uses Vitest's on-the-fly config loader because the checked-out
+workspace and `node_modules` are mounted read-only.
+No fixed host port, reusable password, global Docker resource, or developer
+database is used.
+
+The harness never discovers an existing server. A developer-installed
+PostgreSQL instance, the default Unix socket, `localhost:5432`,
+`LCM_POSTGRES_URL`, and every `PG*` environment variable are invalid harness
+inputs and are never test targets.
+
+Each run creates random credentials, a labeled container, network, volume, TLS
+CA and server certificate, and a control database. PostgreSQL accepts host
+connections only over TLS with SCRAM authentication. The harness verifies major
+version 18, UTC, the server certificate and CA, least-privilege migrator and
+runtime roles, and the `pg_trgm`, `unaccent`, `pgcrypto`, and
+`pg_stat_statements` extensions. Every test or worker obtains a fresh database
+with a private sentinel recording the run ID, database name, and expected
+runtime role.
+
+Database drops and container cleanup fail closed. Before mutation, guards check
+the generated name prefix, PostgreSQL major version, current role, private
+sentinel, and Docker run label. SIGINT and SIGTERM use the same idempotent
+cleanup path. A failed guard can intentionally leave resources for inspection;
+never delete them by a broad name glob. Inspect the exact label first:
+
+```bash
+docker ps -a --filter label=com.donadiosolutions.lcm.postgresql-test-run
+docker network ls --filter label=com.donadiosolutions.lcm.postgresql-test-run
+docker volume ls --filter label=com.donadiosolutions.lcm.postgresql-test-run
+```
+
+## Add or change a migration
+
+Migration files live in `src/storage/postgresql/migrations/`, use an ordered
+four-digit prefix, and are copied to `dist` by `npm run build`. After changing a
+file, calculate its SHA-256 digest and update the explicit manifest in
+`src/storage/postgresql/migrations.ts`. Never edit an already released
+migration: checksum drift is rejected. Add a new migration instead.
+
+Exercise at least the empty, repeated, concurrent, rollback, unknown-history,
+out-of-order, and checksum-drift paths. Migration SQL and the ledger insertion
+must remain in the same transaction under the database-scoped advisory lock.
+
+If startup reports unknown, out-of-order, or checksum-drifted history, stop and
+compare the packaged manifest with `lcm.schema_migrations`. Do not edit the
+ledger, replace a released migration, or skip the check. Restore the expected
+artifact or database from a known-good backup, then retry. A failed pending
+migration rolls back its SQL and ledger insert together and can be retried only
+after its underlying SQL or schema prerequisite is corrected in a new
+migration.
+
+## Managed-service operation
+
+For DigitalOcean Managed PostgreSQL 18 Standard Edition, use separate login
+roles for migration and runtime work. The migrator owns LCM schemas and applies
+the ordered migration set; the runtime role receives only the object privileges
+needed by repositories. Keep extension installation with the cluster
+administrator because `pg_stat_statements` and other extensions may exceed the
+migrator's privileges.
+
+Size `poolMax` against the cluster connection limit after reserving capacity for
+administration, migrations, monitoring, and other services. Multiply the value
+by the maximum number of simultaneously running LCM daemon processes; do not
+treat it as a host-wide total. `connectionTimeoutMs` bounds pool acquisition and
+new connections, `idleTimeoutMs` retires unused pooled clients, and
+`statementTimeoutMs` also supplies the idle-in-transaction session bound. Keep
+all three finite and below upstream load-balancer or maintenance timeouts so LCM
+fails with a sanitized storage error first.
+
+To rotate the managed CA, download the replacement from DigitalOcean's
+Connection Details page, write it atomically to a new private regular file,
+update `LCM_POSTGRES_CA_FILE`, and restart LCM. Confirm health before removing
+the old file. Never append server certificates, client keys, or connection URL
+parameters to bypass CA or hostname verification.
+
+## Refresh container images
+
+The PostgreSQL and CI-only Node references in
+`scripts/postgresql-harness.mjs` must include an exact tag and immutable
+`sha256` digest. To refresh one:
+
+1. Select the exact upstream patch tag (`18.x-bookworm` for PostgreSQL or the
+   approved exact Node release).
+2. Pull that exact tag and inspect its repository digest for the CI runner's
+   architecture with Docker. Do not copy a mutable-tag-only reference.
+3. Review upstream release and security notes and confirm the image still
+   provides the expected entrypoint, OpenSSL compatibility, extensions, and
+   Debian base.
+4. Replace both tag and full digest in the harness, update the image assertions,
+   and run `npm run test:postgresql` locally and through both CI matrix jobs.
+5. Confirm the reports and failure output contain no connection URL, password,
+   SQL parameter, CA or private-key material, or temporary secret path.
+
+The PostgreSQL entrypoint sources initialization scripts as the `postgres` user.
+The harness therefore starts through a root wrapper that copies host-owned
+`0600` secrets and the server key into a private PostgreSQL-owned runtime
+directory before invoking the official entrypoint. Removing that wrapper causes
+permission failures and must not be worked around by weakening host file modes.
+
+## Troubleshooting
+
+- `permission denied` below `/run/lcm-harness`: retain the root copy wrapper and
+  PostgreSQL-owned `0700` runtime directory; do not make credentials world
+  readable.
+- certificate hostname errors: local URLs must use `127.0.0.1`; CI URLs must use
+  the run-specific network alias included in the certificate SAN. Do not disable
+  hostname or CA verification.
+- `pg_stat_statements` creation denied: extensions are installed by the harness
+  administrator before migrations; the migrator is intentionally not a
+  superuser.
+- cleanup refusal: inspect the exact run label and sentinel. A refusal indicates
+  ownership cannot be proven; preserve the resources until the mismatch is
+  understood.
+- pool exhaustion or idle-transaction disconnects: acquisition, statement, and
+  idle-transaction bounds are deliberate. Keep tests shorter than their
+  transaction idle timeout unless the timeout itself is under test.

@@ -14,11 +14,14 @@ Configuration parsing, effective CLI output, doctor, daemon startup, and storage
 construction share the same discriminated resolved configuration. This prevents
 different entry points from applying different precedence or validation rules.
 
-PostgreSQL repository support is intentionally staged for #82. In this release,
-a valid PostgreSQL selection passes secret and TLS preflight and then fails with
-an explicit unavailable-backend error before the daemon listens. The local
-SQLite hook outbox is not a general cache and remains local even when PostgreSQL
-becomes the authoritative project-memory backend.
+The internal PostgreSQL 18 runtime now provides a bounded `pg` pool, verified
+CA and hostname validation, sanitized SQLSTATE errors, abort cancellation, and
+transactional migrations. It is intentionally not constructed by the
+application storage factory yet: a valid PostgreSQL selection still fails with
+an explicit unavailable-backend error before the daemon listens. The domain
+adapters tracked by #83-#92 must implement the shared repository contracts and
+pass conformance before PostgreSQL can become authoritative. The local SQLite
+hook outbox is not a general cache and remains local after that activation.
 
 ## Storage repository architecture
 
@@ -29,10 +32,31 @@ SQL connection, statement, transaction object, placeholder syntax, or other
 backend-specific primitive.
 
 SQLite is the authoritative implementation of these contracts and remains the
-zero-configuration default. The repository boundary is preparation for later
-PostgreSQL work; it does not enable PostgreSQL by itself. Until the PostgreSQL
-adapter and its rollout gates land in later issues, selecting `postgresql`
-continues to fail explicitly rather than falling back to SQLite.
+zero-configuration default. The reusable conformance suite is backend-neutral,
+while SQLite remains its only production adapter today. The PostgreSQL runtime,
+migration runner, and isolated test-database lease are shared foundations; they
+do not enable PostgreSQL by themselves. Until all PostgreSQL domain adapters and
+rollout gates land, selecting `postgresql` continues to fail explicitly rather
+than falling back to SQLite.
+
+### PostgreSQL runtime and migrations
+
+One internal runtime owns one `pg` pool. It receives only the already-resolved
+LCM settings: an explicit URL, CA file, pool bound, and acquisition, idle, SQL
+statement, and idle-transaction timeouts. The URL cannot contain query or
+fragment overrides, so `PG*` variables and connection-string TLS switches
+cannot weaken the configured CA, hostname verification, UTC session, or
+application identity. Queries accept parameter arrays without copying SQL or
+values into public errors. Aborted active queries are cancelled by a bounded,
+one-shot TLS client using the checked-out backend PID; an uncertain target
+connection is destroyed rather than returned to the pool.
+
+Ordered SQL files are packaged in `dist` and checked against an explicit
+SHA-256 manifest before execution. The runner takes a database-scoped
+transaction advisory lock, validates the complete `lcm.schema_migrations`
+history, and rejects unknown, out-of-order, or checksum-drifted entries. Pending
+SQL and its ledger row commit together, making empty, repeated, concurrent, and
+failed runs deterministic.
 
 ### Ownership and domain grouping
 
