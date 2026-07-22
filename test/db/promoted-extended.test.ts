@@ -159,6 +159,37 @@ describe("PromotedStore extended", () => {
     expect(store.getAll()).toEqual([]);
   });
 
+  it("matches fallback search terms only at lexical token boundaries", () => {
+    const db = makeDb(false);
+    const store = new PromotedStore(db, false);
+    const falseSubstringIds = [
+      store.insert({ content: "database architecture", projectId: "p1" }),
+      store.insert({ content: "ongoing migration", projectId: "p1" }),
+      store.insert({ content: "unrelated", tags: ["database", "ongoing"], projectId: "p1" }),
+      store.insert({ content: "go_live uses a_value", projectId: "p1" }),
+    ];
+    const aBoundary = store.insert({ content: "choose a cache", projectId: "p1" });
+    const goBoundary = store.insert({ content: "ready to go-live", projectId: "p1" });
+    const goAtEnd = store.insert({ content: "ready set go", projectId: "p1" });
+    const exactGo = store.insert({ content: "go", projectId: "p1" });
+    const tagBoundaries = store.insert({ content: "unrelated", tags: ["a", "go"], projectId: "p1" });
+
+    const aResults = store.search("a", 20, undefined, "p1");
+    expect(aResults.map(({ id }) => id)).toEqual(expect.arrayContaining([aBoundary, tagBoundaries]));
+    expect(aResults).toHaveLength(2);
+
+    const goResults = store.search("go", 20, undefined, "p1");
+    expect(goResults.map(({ id }) => id)).toEqual(
+      expect.arrayContaining([goBoundary, goAtEnd, exactGo, tagBoundaries]),
+    );
+    expect(goResults).toHaveLength(4);
+
+    const combined = store.search("a go", 20, undefined, "p1");
+    expect(combined[0]).toMatchObject({ id: tagBoundaries, rank: 8 });
+    expect(combined.slice(1).map(({ rank }) => rank).every((rank) => rank === 2)).toBe(true);
+    expect(combined.map(({ id }) => id).some((id) => falseSubstringIds.includes(id))).toBe(false);
+  });
+
   it("rolls back revive when the promoted row update fails", () => {
     const execCalls: string[] = [];
     const db = {

@@ -197,6 +197,18 @@ describe("ConversationStore — message operations", () => {
     expect(await store.getMessageCount(conversationId)).toBe(2);
   });
 
+  it("getMessageCountBySessionId counts messages across split conversations", async () => {
+    await store.createMessage({ conversationId, seq: 1, role: "user", content: "first", tokenCount: 1 });
+    const split = await store.createConversation({ sessionId: "msg-sess" });
+    await store.createMessage({ conversationId: split.conversationId, seq: 1, role: "assistant", content: "second", tokenCount: 1 });
+    await store.createMessage({ conversationId: split.conversationId, seq: 2, role: "user", content: "third", tokenCount: 1 });
+    const unrelated = await store.createConversation({ sessionId: "other-session" });
+    await store.createMessage({ conversationId: unrelated.conversationId, seq: 1, role: "user", content: "ignored", tokenCount: 1 });
+
+    expect(await store.getMessageCountBySessionId("msg-sess")).toBe(3);
+    expect(await store.getMessageCountBySessionId("missing-session")).toBe(0);
+  });
+
   it("createMessagesBulk inserts all messages and returns records", async () => {
     const records = await store.createMessagesBulk([
       { conversationId, seq: 10, role: "user", content: "bulk1", tokenCount: 1 },
@@ -432,6 +444,7 @@ describe("ConversationStore — persistence boundaries", () => {
     const store = makeStore(db);
     await expect(store.countMessagesByIdentity(1, "user", "missing")).resolves.toBe(0);
     await expect(store.getMessageCount(1)).resolves.toBe(0);
+    await expect(store.getMessageCountBySessionId("missing")).resolves.toBe(0);
     await expect(store.getMaxSeq(1)).resolves.toBe(0);
   });
 

@@ -35,11 +35,7 @@ vi.mock("../../../src/storage/index.js", () => ({
         throw error;
       }
       const conversations = {
-        getConversationBySessionId: async () => {
-          const row = mocks.storedGet();
-          return row ? { conversationId: 1 } : null;
-        },
-        getMessageCount: async () => mocks.storedGet()?.message_count ?? 0,
+        getMessageCountBySessionId: async () => mocks.storedGet()?.message_count ?? 0,
       };
       const coordination = { recordSessionIngest: mocks.run };
       const repositories = { conversations, coordination };

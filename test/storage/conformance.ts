@@ -63,6 +63,16 @@ export function defineCoreStorageConformance(
     await storage.conversations.createMessageParts(messages[0].messageId, []);
     expect(await storage.conversations.getMessageParts(messages[0].messageId)).toMatchObject([{ ordinal: 0, textContent: "alpha" }]);
     expect(await storage.conversations.getMessageCount(first.conversationId)).toBe(3);
+    const split = await storage.conversations.createConversation({ sessionId: "session-a", title: "split" });
+    await storage.conversations.createMessage({
+      conversationId: split.conversationId,
+      seq: 0,
+      role: "user",
+      content: "split message",
+      tokenCount: 2,
+    });
+    expect(await storage.conversations.getMessageCountBySessionId("session-a")).toBe(4);
+    expect(await storage.conversations.getMessageCountBySessionId("missing")).toBe(0);
     expect(await storage.conversations.getMaxSeq(first.conversationId)).toBe(2);
 
     await storage.context.appendContextMessages(first.conversationId, messages.map((row) => row.messageId));

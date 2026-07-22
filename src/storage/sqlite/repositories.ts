@@ -81,6 +81,7 @@ export function createSqliteRepositories(
       createMessageParts: (id, parts) => invoke("conversations", "createMessageParts", () => conversations.createMessageParts(id, parts)),
       getMessageParts: (id) => invoke("conversations", "getMessageParts", () => conversations.getMessageParts(id)),
       getMessageCount: (id) => invoke("conversations", "getMessageCount", () => conversations.getMessageCount(id)),
+      getMessageCountBySessionId: (sessionId) => invoke("conversations", "getMessageCountBySessionId", () => conversations.getMessageCountBySessionId(sessionId)),
       getMaxSeq: (id) => invoke("conversations", "getMaxSeq", () => conversations.getMaxSeq(id)),
       deleteMessages: (ids) => invoke("conversations", "deleteMessages", () => conversations.deleteMessages(ids)),
     },

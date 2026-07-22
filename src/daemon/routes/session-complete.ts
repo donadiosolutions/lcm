@@ -27,10 +27,7 @@ export function createSessionCompleteHandler(config: DaemonConfig, storageFactor
       const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
       project = await factory.openProject(projectIdentity(cwd));
       await project.transaction(async (repositories) => {
-        const conversation = await repositories.conversations.getConversationBySessionId(session_id);
-        const messageCount = conversation
-          ? await repositories.conversations.getMessageCount(conversation.conversationId)
-          : 0;
+        const messageCount = await repositories.conversations.getMessageCountBySessionId(session_id);
         await repositories.coordination.recordSessionIngest(session_id, messageCount);
       });
       sendJson(res, 200, { recorded: true });

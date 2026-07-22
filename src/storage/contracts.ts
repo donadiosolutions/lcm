@@ -72,6 +72,7 @@ export interface ConversationRepository {
   createMessageParts(messageId: MessageId, parts: CreateMessagePartInput[]): Promise<void>;
   getMessageParts(messageId: MessageId): Promise<MessagePartRecord[]>;
   getMessageCount(conversationId: ConversationId): Promise<number>;
+  getMessageCountBySessionId(sessionId: string): Promise<number>;
   getMaxSeq(conversationId: ConversationId): Promise<number>;
   deleteMessages(messageIds: MessageId[]): Promise<number>;
 }

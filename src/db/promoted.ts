@@ -383,23 +383,33 @@ export class PromotedStore {
     filterTags?: string[],
     projectId?: string,
   ): SearchResult[] {
-    const escapeLike = (term: string): string => term.replace(/[\\%_]/g, "\\$&");
     const uniqueTerms = [...new Set(terms.map((term) => term.toLowerCase()))];
-    const patterns = uniqueTerms.map((term) => `%${escapeLike(term)}%`);
-    const matchClause = "(LOWER(content) LIKE ? ESCAPE '\\' OR LOWER(tags) LIKE ? ESCAPE '\\')";
-    const termClauses = uniqueTerms.map(() => matchClause);
-    const scoreClauses = uniqueTerms.map(() => `CASE WHEN ${matchClause} THEN 1 ELSE 0 END`);
-    const params: Array<string | number> = [
-      ...patterns.flatMap((pattern) => [pattern, pattern]),
-      ...patterns.flatMap((pattern) => [pattern, pattern]),
-    ];
+    // The public tokenizer emits ASCII word terms. Mirror those boundaries in
+    // the fallback while reusing numbered parameters for filtering and score.
+    const params: Array<string | number> = uniqueTerms.flatMap((term) => [
+      term,
+      `${term}[^a-z0-9_]*`,
+      `*[^a-z0-9_]${term}`,
+      `*[^a-z0-9_]${term}[^a-z0-9_]*`,
+    ]);
+    const matchClause = (termIndex: number): string => {
+      const firstParameter = termIndex * 4 + 1;
+      const columnMatch = (column: string): string =>
+        `LOWER(${column}) = ?${firstParameter}
+          OR LOWER(${column}) GLOB ?${firstParameter + 1}
+          OR LOWER(${column}) GLOB ?${firstParameter + 2}
+          OR LOWER(${column}) GLOB ?${firstParameter + 3}`;
+      return `((${columnMatch("content")}) OR (${columnMatch("tags")}))`;
+    };
+    const termClauses = uniqueTerms.map((_term, index) => matchClause(index));
+    const scoreClauses = uniqueTerms.map((_term, index) => `CASE WHEN ${matchClause(index)} THEN 1 ELSE 0 END`);
     let sql = `SELECT *, (${scoreClauses.join(" + ")}) AS matched_terms
       FROM promoted WHERE archived_at IS NULL AND (${termClauses.join(" OR ")})`;
     if (projectId) {
-      sql += " AND project_id = ?";
+      sql += ` AND project_id = ?${params.length + 1}`;
       params.push(projectId);
     }
-    sql += " ORDER BY matched_terms DESC, confidence DESC, created_at ASC LIMIT ?";
+    sql += ` ORDER BY matched_terms DESC, confidence DESC, created_at ASC LIMIT ?${params.length + 1}`;
     params.push(limit);
 
     let results = (this.db.prepare(sql).all(...params) as Array<PromotedRow & { matched_terms: number }>).map((row) => ({
