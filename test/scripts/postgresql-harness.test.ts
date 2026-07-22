@@ -242,9 +242,11 @@ describe("PostgreSQL harness utilities", () => {
       .rejects.toThrow("refusing to remove unlabeled container");
   });
 
-  it("pins migration SQL to LF for stable checksums across Git configurations", () => {
+  it("pins container-mounted and checksummed PostgreSQL files to LF", () => {
     const attributes = readFileSync(new URL("../../.gitattributes", import.meta.url), "utf8");
-    expect(attributes.split(/\r?\n/u)).toContain("src/storage/postgresql/migrations/*.sql text eol=lf");
+    const rules = attributes.split(/\r?\n/u);
+    expect(rules).toContain("src/storage/postgresql/migrations/*.sql text eol=lf");
+    expect(rules).toContain("test/postgresql/init.sh text eol=lf");
   });
 
   it("cleans every owned resource and the secret directory in order", async () => {
