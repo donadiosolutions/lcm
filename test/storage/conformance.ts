@@ -271,6 +271,20 @@ export function defineCoreStorageConformance(
     })).rejects.toMatchObject({ code: "STORAGE_NESTED_TRANSACTION" });
     expect(await storage.conversations.getConversationBySessionId("cross-project-outer")).toBeNull();
     expect(await otherProject.conversations.getConversationBySessionId("cross-project-inner")).toBeNull();
+    await Promise.all([
+      expect(storage.transaction(async (tx) => {
+        await tx.conversations.createConversation({ sessionId: "cross-project-call-a" });
+        await otherProject.conversations.createConversation({ sessionId: "cross-project-call-b" });
+      })).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" }),
+      expect(otherProject.transaction(async (tx) => {
+        await tx.conversations.createConversation({ sessionId: "cross-project-call-c" });
+        await storage.conversations.createConversation({ sessionId: "cross-project-call-d" });
+      })).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" }),
+    ]);
+    expect(await storage.conversations.getConversationBySessionId("cross-project-call-a")).toBeNull();
+    expect(await storage.conversations.getConversationBySessionId("cross-project-call-d")).toBeNull();
+    expect(await otherProject.conversations.getConversationBySessionId("cross-project-call-b")).toBeNull();
+    expect(await otherProject.conversations.getConversationBySessionId("cross-project-call-c")).toBeNull();
     await otherProject.close();
     await expect(storage.transaction(async () => storage.conversations.listConversations()))
       .rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });

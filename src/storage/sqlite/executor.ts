@@ -30,7 +30,7 @@ export class SqliteExecutor {
 
   async run<T>(domain: StorageDomain, operation: string, callback: () => T | Promise<T>): Promise<T> {
     const active = transactionContext.getStore();
-    if (active?.executor === this) {
+    if (active) {
       throw new StorageOperationError(
         "STORAGE_TRANSACTION_SCOPE",
         "sqlite",

@@ -42,6 +42,31 @@ async function makeConversation(db: DatabaseSync): Promise<number> {
 // ── insertSummary / getSummary ────────────────────────────────────────────────
 
 describe("SummaryStore — insertSummary / getSummary", () => {
+  it("parses timezone-free SQLite timestamps as UTC across DST gaps", async () => {
+    const previousTimezone = process.env.TZ;
+    process.env.TZ = "America/New_York";
+    try {
+      const db = makeDb();
+      const store = makeStore(db);
+      const convId = await makeConversation(db);
+      await store.insertSummary({
+        summaryId: "dst-gap",
+        conversationId: convId,
+        kind: "leaf",
+        content: "DST gap",
+        tokenCount: 2,
+      });
+      db.prepare("UPDATE summaries SET created_at = ? WHERE summary_id = ?")
+        .run("2024-03-10 02:30:00", "dst-gap");
+
+      const [summary] = await store.listRecentSummaries(1);
+      expect(summary.createdAt.toISOString()).toBe("2024-03-10T02:30:00.000Z");
+    } finally {
+      if (previousTimezone === undefined) delete process.env.TZ;
+      else process.env.TZ = previousTimezone;
+    }
+  });
+
   it("round-trips a leaf summary with required fields", async () => {
     const db = makeDb();
     const store = makeStore(db);

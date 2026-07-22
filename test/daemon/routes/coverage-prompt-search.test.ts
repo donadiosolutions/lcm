@@ -3,6 +3,8 @@ import type { ServerResponse } from "node:http";
 import type { SearchResult } from "../../../src/db/promoted.js";
 import type { RecallFeedback } from "../../../src/db/recall.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
+import type { ProjectStorage, StorageBackendFactory } from "../../../src/storage/index.js";
+import { makeMockStorageFactory } from "./mock-storage-factory.js";
 
 const state = vi.hoisted(() => ({
   exists: true,
@@ -215,12 +217,11 @@ describe("prompt-search route coverage", () => {
       recall: { getFeedback: vi.fn(async () => new Map()), logSurfacing: vi.fn(async () => undefined) },
       close: projectClose,
     };
-    const factory = {
+    const factory: StorageBackendFactory = makeMockStorageFactory({
       projectExists: vi.fn(async () => true),
-      openExistingProject: vi.fn(async () => project),
-      openProject: vi.fn(async () => project),
+      openProject: vi.fn(async () => project as unknown as ProjectStorage),
       close,
-    } as never;
+    });
     expect(await call(JSON.stringify({ query: "q", cwd: "/tmp" }), undefined, factory))
       .toEqual({ hints: [], ids: [] });
     expect(projectClose).toHaveBeenCalledOnce();

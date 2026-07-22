@@ -51,11 +51,14 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 ### Search ranking compatibility
 
 - Fallback lexical-search ranks and sentinel scores must remain compatible with every consumer, including deduplication thresholds, prompt-search minimum scores, and result ordering. Require regressions that both surface relevant fallback matches and prevent false deduplication merges, while preserving native FTS ranking behavior unchanged.
+- Apply exact fallback-search filters before the caller's result limit; filtering an already-limited candidate set can hide lower-ranked qualifying rows.
 
 ### SQLite transaction safety
 
 - Any operation that modifies more than one table must be wrapped in `BEGIN`/`COMMIT`.
 - Flag multi-table writes without transactions — they risk partial writes on crash.
+- Transaction context is global across SQLite project executors: reject nested transactions and ordinary repository calls on any project while a transaction callback is active, preventing lock inversion and partial cross-project commits.
+- Backend health must probe databases retained from completed request scopes, not infer health from an empty active-project set. SQLite timestamps produced by `CURRENT_TIMESTAMP` are timezone-free UTC and must be parsed and formatted explicitly as UTC.
 
 ### Migration safety
 

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { makeMockStorageFactory } from "./mock-storage-factory.js";
 
 const mocks = vi.hoisted(() => ({
   existsFile: vi.fn(() => true),
@@ -44,13 +45,11 @@ describe("review-stale persistence boundaries", () => {
       promotedMemory: { getById: mocks.getById, archive: mocks.archive, revive: mocks.revive, findStale: mocks.findStale },
       close: mocks.projectClose,
     });
-    mocks.createFactory.mockReturnValue({
+    mocks.createFactory.mockReturnValue(makeMockStorageFactory({
       projectExists: mocks.projectExists,
-      openExistingProject: async (identity: unknown) =>
-        await mocks.projectExists() ? mocks.openProject(identity) : null,
       openProject: mocks.openProject,
       close: mocks.factoryClose,
-    });
+    }));
     mocks.validate.mockImplementation((cwd: string) => cwd);
   });
 
@@ -106,13 +105,11 @@ describe("review-stale persistence boundaries", () => {
       sourceProjectId: "p",
     });
     const closeCount = mocks.factoryClose.mock.calls.length;
-    await createReviewStaleHandler(config, {
+    await createReviewStaleHandler(config, makeMockStorageFactory({
       projectExists: mocks.projectExists,
-      openExistingProject: async (identity: unknown) =>
-        await mocks.projectExists() ? mocks.openProject(identity) : null,
       openProject: mocks.openProject,
       close: mocks.factoryClose,
-    } as never)({} as never, response, JSON.stringify({ cwd: "/ok" }));
+    }))({} as never, response, JSON.stringify({ cwd: "/ok" }));
     expect(mocks.factoryClose).toHaveBeenCalledTimes(closeCount);
   });
 

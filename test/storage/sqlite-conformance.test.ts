@@ -1,7 +1,7 @@
 import { join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { projectIdentity } from "../../src/daemon/project.js";
 import { sqliteStorageCapabilities, requireStorageCapability } from "../../src/storage/capabilities.js";
 import { createStorageBackendFactory } from "../../src/storage/factory.js";
@@ -183,6 +183,40 @@ describe("SQLite storage backend conformance", () => {
     await factory.close();
   });
 
+  it("probes known project databases after their request scope closes", async () => {
+    const root = createTemporaryDirectory("lcm-storage-idle-health-");
+    const identity = projectIdentity(root);
+    const dbPath = join(root, "idle-health.db");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath }),
+    });
+    const storage = await factory.openProject(identity);
+    await storage.close();
+    expect(await factory.health()).toMatchObject({ status: "healthy" });
+
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    const prepareSpy = vi.spyOn(DatabaseSync.prototype, "prepare").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      if (sql === "PRAGMA quick_check(1)") {
+        return { all: () => [{ quick_check: "corrupt" }] } as never;
+      }
+      return originalPrepare.call(this, sql);
+    });
+    try {
+      expect(await factory.health()).toMatchObject({ status: "unavailable", backend: "sqlite" });
+    } finally {
+      prepareSpy.mockRestore();
+    }
+
+    rmSync(dbPath);
+    expect(await factory.health()).toMatchObject({ status: "unavailable", backend: "sqlite" });
+    writeFileSync(dbPath, "not a SQLite database");
+    expect(await factory.health()).toMatchObject({ status: "unavailable", backend: "sqlite" });
+    await factory.close();
+  });
+
   it("uses the production per-project resolver", async () => {
     const fakeHome = createTemporaryDirectory("lcm-storage-home-");
     const project = createTemporaryDirectory("lcm-storage-project-");
@@ -277,6 +311,7 @@ describe("SQLite storage backend conformance", () => {
       () => { pendingSettled = true; },
       () => { pendingSettled = true; },
     );
+    const healthDuringPendingOpen = factory.health();
     const closing = factory.close();
     await Promise.resolve();
     expect(pendingSettled).toBe(false);
@@ -284,6 +319,7 @@ describe("SQLite storage backend conformance", () => {
     releaseTransaction();
     await transaction;
     await expect(pendingOpen).rejects.toMatchObject({ code: "STORAGE_CLOSED" });
+    await expect(healthDuringPendingOpen).resolves.toMatchObject({ status: "closed" });
     await closing;
     expect(await first.health()).toMatchObject({ status: "closed" });
     expect(isLcmConnectionOpen(dbPath)).toBe(false);

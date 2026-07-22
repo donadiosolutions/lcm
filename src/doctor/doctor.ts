@@ -260,7 +260,11 @@ function testMcpHandshake(): Promise<CheckResult> {
     let stdout = "";
     let finished = false;
     let stopRequested = false;
-    let killAttempted = false;
+    let termination: Promise<void> | undefined;
+    let recordChildClose!: () => void;
+    const childClosed = new Promise<void>((resolveChildClose) => {
+      recordChildClose = resolveChildClose;
+    });
     const timers = new Set<ReturnType<typeof setTimeout>>();
 
     const resultFromOutput = (): CheckResult => {
@@ -284,18 +288,36 @@ function testMcpHandshake(): Promise<CheckResult> {
     };
 
     const childIsLive = (): boolean => child.exitCode === null && child.signalCode === null;
-    const stopChild = (retry = false): boolean => {
-      stopRequested = true;
+    const signalChild = (signal: NodeJS.Signals): boolean => {
       if (!childIsLive()) return true;
-      if (killAttempted && !retry) return false;
-      killAttempted = true;
-      try { return child.kill(); } catch { return false; }
+      try { return child.kill(signal); } catch { return false; }
+    };
+    const waitForClose = async (timeoutMs: number): Promise<void> => {
+      let resolveTimeout!: () => void;
+      const timeout = new Promise<void>((resolve) => {
+        resolveTimeout = resolve;
+      });
+      const timer = setTimeout(resolveTimeout, timeoutMs);
+      await Promise.race([
+        childClosed,
+        timeout,
+      ]);
+      clearTimeout(timer);
+    };
+    const stopChild = (): Promise<void> => {
+      stopRequested = true;
+      if (!childIsLive()) return Promise.resolve();
+      termination ??= (async () => {
+        const termSent = signalChild("SIGTERM");
+        if (termSent && childIsLive()) await waitForClose(250);
+        if (childIsLive()) signalChild("SIGKILL");
+        if (childIsLive()) await childClosed;
+      })();
+      return termination;
     };
     const stopChildForPipeFailure = (): void => {
       if (finished) return;
-      // Killing can synchronously emit close. Otherwise keep the watchdog
-      // active so any stdout produced during shutdown can still be collected.
-      stopChild();
+      void stopChild();
     };
     const stdinIsWritable = (): boolean => !finished
       && !stopRequested
@@ -306,7 +328,10 @@ function testMcpHandshake(): Promise<CheckResult> {
 
     child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
     child.stdout.on("error", stopChildForPipeFailure);
-    child.on("close", () => { finish(resultFromOutput()); });
+    child.on("close", () => {
+      recordChildClose();
+      finish(resultFromOutput());
+    });
     child.on("error", () => {
       if (stopRequested) return;
       finish({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "Could not spawn MCP process" });
@@ -317,12 +342,13 @@ function testMcpHandshake(): Promise<CheckResult> {
     });
 
     timers.add(setTimeout(() => {
-      stopChild(true);
-      if (childIsLive()) {
-        try { child.stdout.destroy(); } catch {}
-        try { child.unref(); } catch {}
-      }
-      finish(resultFromOutput());
+      void (async () => {
+        try {
+          await stopChild();
+        } finally {
+          finish(resultFromOutput());
+        }
+      })();
     }, 6000));
 
     // Send initialize, wait 300ms, then send tools/list, then close stdin after 500ms

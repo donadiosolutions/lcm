@@ -164,6 +164,16 @@ interface LargeFileRow {
 
 // ── Row mappers ───────────────────────────────────────────────────────────────
 
+function parseStoredTimestamp(value: string): Date {
+  // SQLite's CURRENT_TIMESTAMP is UTC but omits a timezone designator. Parse
+  // that storage form explicitly as UTC so local DST gaps cannot normalize it
+  // to a different wall-clock value. Preserve already-qualified ISO inputs.
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(value)
+    ? `${value.replace(" ", "T")}Z`
+    : value;
+  return new Date(normalized);
+}
+
 function toSummaryRecord(row: SummaryRow): SummaryRecord {
   let fileIds: string[] = [];
   try {
@@ -179,8 +189,8 @@ function toSummaryRecord(row: SummaryRow): SummaryRecord {
     content: row.content,
     tokenCount: row.token_count,
     fileIds,
-    earliestAt: row.earliest_at ? new Date(row.earliest_at) : null,
-    latestAt: row.latest_at ? new Date(row.latest_at) : null,
+    earliestAt: row.earliest_at ? parseStoredTimestamp(row.earliest_at) : null,
+    latestAt: row.latest_at ? parseStoredTimestamp(row.latest_at) : null,
     descendantCount:
       typeof row.descendant_count === "number" &&
       Number.isFinite(row.descendant_count) &&
@@ -199,7 +209,7 @@ function toSummaryRecord(row: SummaryRow): SummaryRecord {
       row.source_message_token_count >= 0
         ? Math.floor(row.source_message_token_count)
         : 0,
-    createdAt: new Date(row.created_at),
+    createdAt: parseStoredTimestamp(row.created_at),
   };
 }
 
@@ -210,7 +220,7 @@ function toContextItemRecord(row: ContextItemRow): ContextItemRecord {
     itemType: row.item_type,
     messageId: row.message_id,
     summaryId: row.summary_id,
-    createdAt: new Date(row.created_at),
+    createdAt: parseStoredTimestamp(row.created_at),
   };
 }
 
@@ -220,7 +230,7 @@ function toSearchResult(row: SummarySearchRow): SummarySearchResult {
     conversationId: row.conversation_id,
     kind: row.kind,
     snippet: row.snippet,
-    createdAt: new Date(row.created_at),
+    createdAt: parseStoredTimestamp(row.created_at),
     rank: row.rank,
   };
 }
@@ -234,7 +244,7 @@ function toLargeFileRecord(row: LargeFileRow): LargeFileRecord {
     byteSize: row.byte_size,
     storageUri: row.storage_uri,
     explorationSummary: row.exploration_summary,
-    createdAt: new Date(row.created_at),
+    createdAt: parseStoredTimestamp(row.created_at),
   };
 }
 
@@ -839,7 +849,7 @@ export class SummaryStore {
       conversationId: row.conversation_id,
       kind: row.kind,
       snippet: createFallbackSnippet(row.content, plan.terms),
-      createdAt: new Date(row.created_at),
+      createdAt: parseStoredTimestamp(row.created_at),
       rank: 0,
     }));
   }
@@ -891,7 +901,7 @@ export class SummaryStore {
           conversationId: row.conversation_id,
           kind: row.kind,
           snippet: match[0],
-          createdAt: new Date(row.created_at),
+          createdAt: parseStoredTimestamp(row.created_at),
           rank: 0,
         });
       }

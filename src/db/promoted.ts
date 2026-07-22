@@ -409,8 +409,7 @@ export class PromotedStore {
       sql += ` AND project_id = ?${params.length + 1}`;
       params.push(projectId);
     }
-    sql += ` ORDER BY matched_terms DESC, confidence DESC, created_at ASC LIMIT ?${params.length + 1}`;
-    params.push(limit);
+    sql += " ORDER BY matched_terms DESC, confidence DESC, created_at ASC";
 
     let results = (this.db.prepare(sql).all(...params) as Array<PromotedRow & { matched_terms: number }>).map((row) => ({
       id: row.id,
@@ -425,6 +424,9 @@ export class PromotedStore {
     if (filterTags && filterTags.length > 0) {
       results = results.filter((result) => filterTags.every((tag) => result.tags.includes(tag)));
     }
-    return results;
+    // Apply exact decoded-tag filtering before the caller's limit. Applying
+    // LIMIT in SQL first can discard every qualifying tagged row when more
+    // highly ranked untagged matches precede it.
+    return limit < 0 ? results : results.slice(0, limit);
   }
 }

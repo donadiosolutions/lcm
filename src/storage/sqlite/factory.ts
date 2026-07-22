@@ -23,6 +23,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
   readonly backend = "sqlite" as const;
   readonly capabilities: StorageCapabilities = sqliteStorageCapabilities("unknown");
   private readonly projects = new Set<SqliteProjectStorage>();
+  private readonly knownProjects = new Map<string, { id: string; dbPath: string }>();
   private readonly pendingOpens = new Set<Promise<void>>();
   private closed = false;
   private closePromise: Promise<void> | undefined;
@@ -102,6 +103,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
         (closed): void => { this.projects.delete(closed); },
       );
       this.projects.add(storage);
+      this.knownProjects.set(`${paths.id}\0${paths.dbPath}`, { id: paths.id, dbPath: paths.dbPath });
       return storage;
     } catch (error) {
       if (db && dbPath) closeLcmConnection(dbPath);
@@ -118,7 +120,16 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
 
   async health(): Promise<StorageHealth> {
     if (this.closed) return { status: "closed", backend: "sqlite" };
-    const projectHealth = await Promise.all([...this.projects].map((project) => project.health()));
+    await Promise.all([...this.pendingOpens]);
+    if (this.closed) return { status: "closed", backend: "sqlite" };
+    const activeProjectIds = new Set([...this.projects].map((project) => project.projectId));
+    const idleProjects = [...this.knownProjects.values()].filter(
+      (project) => !activeProjectIds.has(project.id),
+    );
+    const projectHealth = await Promise.all([
+      ...[...this.projects].map((project) => project.health()),
+      ...idleProjects.map((project) => this.probeKnownProject(project)),
+    ]);
     const unavailable = projectHealth.find((health) => health.status === "unavailable");
     if (!unavailable) return { status: "healthy", backend: "sqlite" };
     return {
@@ -126,6 +137,51 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       backend: "sqlite",
       error: unavailable.error,
     };
+  }
+
+  private async probeKnownProject(project: { id: string; dbPath: string }): Promise<StorageHealth> {
+    let db: ReturnType<typeof getLcmConnection> | undefined;
+    try {
+      db = getExistingLcmConnection(project.dbPath) ?? undefined;
+      if (!db) {
+        throw new StorageOperationError(
+          "STORAGE_OPERATION_FAILED",
+          "sqlite",
+          project.id,
+          "factory",
+          "health",
+        );
+      }
+      await sqliteExecutorFor(db, project.id).run("factory", "health", () => {
+        const integrity = db!.prepare("PRAGMA quick_check(1)").all() as Array<Record<string, unknown>>;
+        if (integrity.map((row) => Object.values(row)[0]).join("\n") !== "ok") {
+          throw new StorageOperationError(
+            "STORAGE_OPERATION_FAILED",
+            "sqlite",
+            project.id,
+            "factory",
+            "health",
+          );
+        }
+        db!.exec("BEGIN IMMEDIATE");
+        db!.exec("ROLLBACK");
+      });
+      return { status: "healthy", backend: "sqlite", projectId: project.id };
+    } catch (error) {
+      return {
+        status: "unavailable",
+        backend: "sqlite",
+        projectId: project.id,
+        error: normalizeStorageError(error, {
+          backend: "sqlite",
+          projectId: project.id,
+          domain: "factory",
+          operation: "health",
+        }),
+      };
+    } finally {
+      if (db) closeLcmConnection(project.dbPath);
+    }
   }
 
   close(): Promise<void> {

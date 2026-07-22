@@ -86,7 +86,14 @@ describe("safeLogError", () => {
   });
 
   it("sanitizes and bounds errors written by the fallback log", async () => {
-    const secret = `postgresql://alice:hunter2@db.example.test/lcm?sslmode=disable password=hunter2 ${"x".repeat(
+    const credentials = [
+      "fallback-bearer-secret",
+      "sk-0123456789abcdefghijklmnop",
+      "ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+      "npm_0123456789abcdefghijklmnopqrstuvwxyz",
+      "fallback-api-key-secret",
+    ];
+    const secret = `postgresql://alice:hunter2@db.example.test/lcm?sslmode=disable password=hunter2 Authorization: Bearer ${credentials[0]} ${credentials.slice(1, 4).join(" ")} X-Api-Key: ${credentials[4]} ${"x".repeat(
       MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH + 100,
     )}\u001b[31m`;
     await safeLogError("PostToolUse", new Error(secret), {});
@@ -95,6 +102,7 @@ describe("safeLogError", () => {
     expect(record.error).not.toContain("alice");
     expect(record.error).not.toContain("hunter2");
     expect(record.error).not.toContain("sslmode");
+    for (const credential of credentials) expect(record.error).not.toContain(credential);
     expect(record.error).not.toContain("\u001b");
     expect(record.error.length).toBe(MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH);
   });

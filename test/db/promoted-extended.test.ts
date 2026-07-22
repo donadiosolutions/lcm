@@ -134,6 +134,23 @@ describe("PromotedStore extended", () => {
     expect(store.search("needle", 10, ["keep"], "p1")).toMatchObject([{ id: first, rank: 4 }]);
     expect(store.search("_%", 10)).toEqual([]);
 
+    const untaggedHigherRank = store.insert({
+      content: "Higher ranked needle",
+      tags: ["other"],
+      projectId: "p1",
+      confidence: 1,
+    });
+    const taggedAfterLimit = store.insert({
+      content: "Lower ranked needle",
+      tags: ["requested"],
+      projectId: "p1",
+      confidence: 0.01,
+    });
+    expect(store.search("needle", 1, ["requested"], "p1")).toMatchObject([
+      { id: taggedAfterLimit },
+    ]);
+    expect(store.search("needle", -1, undefined, "p1")).toHaveLength(3);
+
     const strongest = store.insert({
       content: "fallback needle with complete coverage",
       projectId: "p1",
@@ -156,6 +173,8 @@ describe("PromotedStore extended", () => {
     store.deleteById(first);
     store.deleteById(second);
     store.deleteById(strongest);
+    store.deleteById(untaggedHigherRank);
+    store.deleteById(taggedAfterLimit);
     expect(store.getAll()).toEqual([]);
   });
 

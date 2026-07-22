@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { makeMockStorageFactory } from "./mock-storage-factory.js";
 
 const mocks = vi.hoisted(() => ({
   exists: vi.fn(() => true),
@@ -22,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   factoryClose: vi.fn(async () => undefined),
   transaction: vi.fn(),
   projectExists: vi.fn(async () => true),
+  createFactory: vi.fn(),
 }));
 
 vi.mock("node:fs", async (importOriginal) => ({
@@ -47,15 +49,7 @@ vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.valid
 vi.mock("../../../src/scrub.js", () => ({
   ScrubEngine: { forProject: async () => ({ scrub: mocks.scrub }) },
 }));
-vi.mock("../../../src/storage/index.js", () => ({
-  createStorageBackendFactory: () => ({
-    projectExists: mocks.projectExists,
-    openExistingProject: async (identity: unknown) =>
-      await mocks.projectExists() ? mocks.openProject(identity) : null,
-    openProject: mocks.openProject,
-    close: mocks.factoryClose,
-  }),
-}));
+vi.mock("../../../src/storage/index.js", () => ({ createStorageBackendFactory: mocks.createFactory }));
 
 import { createPromoteHandler } from "../../../src/daemon/routes/promote.js";
 
@@ -76,6 +70,11 @@ describe("promote persistence boundaries", () => {
     mocks.dedup.mockResolvedValue(undefined);
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
+    mocks.createFactory.mockImplementation(() => makeMockStorageFactory({
+      projectExists: mocks.projectExists,
+      openProject: mocks.openProject,
+      close: mocks.factoryClose,
+    }));
     mocks.openProject.mockResolvedValue({
       conversations: { listConversations: mocks.conversations },
       summaries: { getSummariesByConversation: mocks.summaries },
@@ -94,13 +93,11 @@ describe("promote persistence boundaries", () => {
     mocks.scrub.mockReturnValueOnce("token=[REDACTED]");
     mocks.prefixes.mockReturnValueOnce(["token=[REDACTED]"]);
 
-    const injected = {
+    const injected = makeMockStorageFactory({
       projectExists: mocks.projectExists,
-      openExistingProject: async (identity: unknown) =>
-        await mocks.projectExists() ? mocks.openProject(identity) : null,
       openProject: mocks.openProject,
       close: mocks.factoryClose,
-    } as never;
+    });
     await createPromoteHandler(config, injected)({} as never, response, JSON.stringify({ cwd: "/ok" }));
 
     expect(mocks.shouldPromote).not.toHaveBeenCalled();

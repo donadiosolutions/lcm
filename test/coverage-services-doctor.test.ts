@@ -332,16 +332,22 @@ describe("doctor service coverage", () => {
     expect(child.stdin.end).not.toHaveBeenCalled();
   });
 
-  it("uses the watchdog when a child never closes after stdin failure", async () => {
+  it("escalates to SIGKILL when a child never closes after stdin failure", async () => {
     vi.useFakeTimers();
     mocks.ensureDaemon.mockResolvedValue({ connected: true });
     mocks.mcpSetup = (child) => {
-      child.kill.mockImplementationOnce(() => true);
+      child.kill.mockImplementation((signal: NodeJS.Signals) => {
+        if (signal === "SIGKILL") {
+          child.signalCode = signal;
+          child.emit("close", null, signal);
+        }
+        return true;
+      });
       setTimeout(() => { child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" })); }, 1);
     };
 
     const promise = runDoctor(healthyDeps());
-    await vi.advanceTimersByTimeAsync(5999);
+    await vi.advanceTimersByTimeAsync(250);
     expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
     expect(mocks.mcpChild?.stdin.write).toHaveBeenCalledOnce();
     expect(mocks.mcpChild?.stdin.end).not.toHaveBeenCalled();
@@ -351,14 +357,22 @@ describe("doctor service coverage", () => {
       status: "warn",
       message: "lcm: 0/7 tools",
     });
-    expect(mocks.mcpChild?.kill).toHaveBeenCalledTimes(2);
+    expect(mocks.mcpChild?.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
   });
 
-  it("keeps the watchdog active when a stopped child later emits an error", async () => {
+  it("serializes termination while ignoring child errors emitted during shutdown", async () => {
     vi.useFakeTimers();
     mocks.ensureDaemon.mockResolvedValue({ connected: true });
     mocks.mcpSetup = (child) => {
-      child.kill.mockImplementation(() => true);
+      child.kill.mockImplementation((signal: NodeJS.Signals) => {
+        if (signal === "SIGKILL") {
+          setTimeout(() => {
+            child.signalCode = signal;
+            child.emit("close", null, signal);
+          }, 1);
+        }
+        return true;
+      });
       setTimeout(() => {
         child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
         setTimeout(() => { child.emit("error", new Error("termination failed")); }, 1);
@@ -376,33 +390,35 @@ describe("doctor service coverage", () => {
     expect(child.stdin.write).toHaveBeenCalledOnce();
     expect(child.stdin.end).not.toHaveBeenCalled();
 
-    await vi.advanceTimersByTimeAsync(5997);
+    await vi.advanceTimersByTimeAsync(248);
     expect(settled).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(2);
 
     expect((await promise).find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({
       status: "warn",
       message: "lcm: 0/7 tools",
     });
     expect(child.kill).toHaveBeenCalledTimes(2);
-    expect(child.stdout.destroy).toHaveBeenCalledOnce();
-    expect(child.unref).toHaveBeenCalledOnce();
+    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
     expect(child.stdin.write).toHaveBeenCalledOnce();
     expect(child.stdin.end).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(child.kill).toHaveBeenCalledTimes(2);
   });
 
-  it.each(["returns-false", "throws"] as const)("retries a failed child stop at timeout when kill %s", async (failure) => {
+  it.each(["returns-false", "throws"] as const)("escalates a failed SIGTERM when kill %s", async (failure) => {
     vi.useFakeTimers();
     mocks.ensureDaemon.mockResolvedValue({ connected: true });
     mocks.mcpSetup = (child) => {
-      child.kill = vi.fn(() => {
-        if (failure === "throws") throw new Error("kill failed");
-        return false;
+      child.kill = vi.fn((signal: NodeJS.Signals) => {
+        if (signal === "SIGTERM") {
+          if (failure === "throws") throw new Error("kill failed");
+          return false;
+        }
+        child.signalCode = signal;
+        child.emit("close", null, signal);
+        return true;
       });
-      if (failure === "throws") {
-        child.stdout.destroy.mockImplementation(() => { throw new Error("destroy failed"); });
-        child.unref.mockImplementation(() => { throw new Error("unref failed"); });
-      }
       setTimeout(() => {
         child.stdout.emit("data", Buffer.from(JSON.stringify({ id: 2, result: { tools: Array(7).fill({}) } })));
         child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
@@ -414,18 +430,15 @@ describe("doctor service coverage", () => {
     const promise = runDoctor(healthyDeps());
     await vi.advanceTimersByTimeAsync(1000);
     const child = mocks.mcpChild!;
-    expect(child.kill).toHaveBeenCalledOnce();
+    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
     expect(child.stdin.write).toHaveBeenCalledOnce();
     expect(child.stdin.end).not.toHaveBeenCalled();
 
-    await vi.advanceTimersByTimeAsync(5000);
     expect((await promise).find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({
       status: "pass",
       message: "lcm: 7/7 tools",
     });
     expect(child.kill).toHaveBeenCalledTimes(2);
-    expect(child.stdout.destroy).toHaveBeenCalledOnce();
-    expect(child.unref).toHaveBeenCalledOnce();
   });
 
   it.each(["destroyed", "unwritable"])("settles without writing when stdin is initially %s", async (state) => {
@@ -527,18 +540,66 @@ describe("doctor service coverage", () => {
     });
   });
 
-  it.each([false, true])("settles a hung MCP handshake at timeout when kill throws=%s", async (killThrows) => {
+  it.each([false, true])("escalates a hung MCP handshake at timeout when SIGTERM throws=%s", async (killThrows) => {
     vi.useFakeTimers();
     mocks.ensureDaemon.mockResolvedValue({ connected: true });
     mocks.mcpSetup = (child) => {
-      child.kill = vi.fn(() => {
-        if (killThrows) throw new Error("kill failed");
+      child.kill = vi.fn((signal: NodeJS.Signals) => {
+        if (signal === "SIGTERM" && killThrows) throw new Error("kill failed");
+        if (signal === "SIGKILL") {
+          child.signalCode = signal;
+          child.emit("close", null, signal);
+        }
+        return true;
       });
     };
     const promise = runDoctor(healthyDeps());
-    await vi.advanceTimersByTimeAsync(6000);
+    await vi.advanceTimersByTimeAsync(6250);
     expect((await promise).find((result) => result.name === "mcp-handshake-lcm")?.status).toBe("warn");
-    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
+    expect(mocks.mcpChild?.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
+  it("does not settle timeout cleanup until a child with failed signals closes", async () => {
+    vi.useFakeTimers();
+    mocks.ensureDaemon.mockResolvedValue({ connected: true });
+    mocks.mcpSetup = (child) => {
+      child.kill = vi.fn(() => false);
+    };
+
+    const settled = vi.fn();
+    const promise = runDoctor(healthyDeps());
+    void promise.then(settled);
+    await vi.advanceTimersByTimeAsync(6000);
+
+    const child = mocks.mcpChild!;
+    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(settled).not.toHaveBeenCalled();
+
+    child.signalCode = "SIGKILL";
+    child.emit("close", null, "SIGKILL");
+    await vi.advanceTimersByTimeAsync(0);
+    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")?.status).toBe("warn");
+  });
+
+  it("handles a child exit racing the timeout signal", async () => {
+    vi.useFakeTimers();
+    mocks.ensureDaemon.mockResolvedValue({ connected: true });
+    mocks.mcpSetup = (child) => {
+      let exitCodeReads = 0;
+      Object.defineProperty(child, "exitCode", {
+        configurable: true,
+        get: () => exitCodeReads++ < 2 ? null : 0,
+      });
+      setTimeout(() => {
+        child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
+      }, 1);
+    };
+
+    const promise = runDoctor(healthyDeps());
+    await vi.advanceTimersByTimeAsync(6000);
+
+    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")?.status).toBe("warn");
+    expect(mocks.mcpChild?.kill).not.toHaveBeenCalled();
   });
 
   it("does not kill a child that exited without close before the process timeout", async () => {

@@ -76,20 +76,21 @@ describe("EventsDb", () => {
   );
 
   it.each([
-    [-12.9, "PRAGMA busy_timeout = 0"],
-    [12.9, "PRAGMA busy_timeout = 12"],
-  ])("clamps and truncates a finite busy timeout (%s)", (busyTimeoutMs, expectedPragma) => {
-    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec");
+    [-12.9, 0],
+    [12.9, 12],
+  ])("clamps and truncates a finite busy timeout (%s)", (busyTimeoutMs, expectedTimeout) => {
+    const keeper = new EventsDb(dbPath);
+    const pooled = getLcmConnection(dbPath);
+    pooled.exec("PRAGMA busy_timeout = 0");
+    closeLcmConnection(dbPath);
     let db: EventsDb | undefined;
     try {
       db = new EventsDb(dbPath, { busyTimeoutMs });
-      const busyTimeoutPragmas = execSpy.mock.calls
-        .map(([sql]) => sql)
-        .filter((sql) => sql.startsWith("PRAGMA busy_timeout"));
-      expect(busyTimeoutPragmas).toEqual(["PRAGMA busy_timeout = 5000", expectedPragma]);
+      expect(getPooledBusyTimeout(dbPath)).toBe(expectedTimeout);
     } finally {
       db?.close();
-      execSpy.mockRestore();
+      expect(getPooledBusyTimeout(dbPath)).toBe(0);
+      keeper.close();
     }
   });
 
@@ -99,22 +100,32 @@ describe("EventsDb", () => {
     pooled.exec("PRAGMA busy_timeout = 900");
     closeLcmConnection(dbPath);
 
-    const scoped = new EventsDb(dbPath, { busyTimeoutMs: 500 });
-    expect(getPooledBusyTimeout(dbPath)).toBe(500);
+    const scoped = new EventsDb(dbPath, { busyTimeoutMs: 1_200 });
+    expect(getPooledBusyTimeout(dbPath)).toBe(1_200);
     scoped.close();
     scoped.close();
     expect(getPooledBusyTimeout(dbPath)).toBe(900);
     keeper.close();
   });
 
-  it("keeps the newest active override across out-of-order closes", () => {
+  it("does not let a shorter override weaken the pooled baseline", () => {
     const keeper = new EventsDb(dbPath);
-    const first = new EventsDb(dbPath, { busyTimeoutMs: 250 });
-    const second = new EventsDb(dbPath, { busyTimeoutMs: 750 });
-    expect(getPooledBusyTimeout(dbPath)).toBe(750);
+    const scoped = new EventsDb(dbPath, { busyTimeoutMs: 250 });
+
+    expect(getPooledBusyTimeout(dbPath)).toBe(5_000);
+    scoped.close();
+    expect(getPooledBusyTimeout(dbPath)).toBe(5_000);
+    keeper.close();
+  });
+
+  it("keeps the strongest active override across out-of-order closes", () => {
+    const keeper = new EventsDb(dbPath);
+    const first = new EventsDb(dbPath, { busyTimeoutMs: 7_500 });
+    const second = new EventsDb(dbPath, { busyTimeoutMs: 6_250 });
+    expect(getPooledBusyTimeout(dbPath)).toBe(7_500);
 
     first.close();
-    expect(getPooledBusyTimeout(dbPath)).toBe(750);
+    expect(getPooledBusyTimeout(dbPath)).toBe(6_250);
     second.close();
     expect(getPooledBusyTimeout(dbPath)).toBe(5_000);
     keeper.close();
@@ -122,11 +133,11 @@ describe("EventsDb", () => {
 
   it("restores the previous active override when the newest owner closes first", () => {
     const keeper = new EventsDb(dbPath);
-    const first = new EventsDb(dbPath, { busyTimeoutMs: 250 });
-    const second = new EventsDb(dbPath, { busyTimeoutMs: 750 });
+    const first = new EventsDb(dbPath, { busyTimeoutMs: 6_250 });
+    const second = new EventsDb(dbPath, { busyTimeoutMs: 7_500 });
 
     second.close();
-    expect(getPooledBusyTimeout(dbPath)).toBe(250);
+    expect(getPooledBusyTimeout(dbPath)).toBe(6_250);
     first.close();
     expect(getPooledBusyTimeout(dbPath)).toBe(5_000);
     keeper.close();
@@ -140,11 +151,11 @@ describe("EventsDb", () => {
         this: DatabaseSync,
         sql: string,
       ) {
-        if (sql === "PRAGMA busy_timeout = 250") throw failure;
+        if (sql === "PRAGMA busy_timeout = 6250") throw failure;
         return originalExec.call(this, sql);
       });
       try {
-        expect(() => new EventsDb(dbPath, { busyTimeoutMs: 250 })).toThrow(
+        expect(() => new EventsDb(dbPath, { busyTimeoutMs: 6_250 })).toThrow(
           failure instanceof Error ? failure.message : failure,
         );
         expect(isLcmConnectionOpen(dbPath)).toBe(false);
@@ -156,18 +167,18 @@ describe("EventsDb", () => {
 
   it("preserves an active override when a newer override cannot be applied", () => {
     const keeper = new EventsDb(dbPath);
-    const active = new EventsDb(dbPath, { busyTimeoutMs: 250 });
+    const active = new EventsDb(dbPath, { busyTimeoutMs: 6_250 });
     const originalExec = DatabaseSync.prototype.exec;
     const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
       this: DatabaseSync,
       sql: string,
     ) {
-      if (sql === "PRAGMA busy_timeout = 750") throw new Error("new override rejected");
+      if (sql === "PRAGMA busy_timeout = 7500") throw new Error("new override rejected");
       return originalExec.call(this, sql);
     });
     try {
-      expect(() => new EventsDb(dbPath, { busyTimeoutMs: 750 })).toThrow("new override rejected");
-      expect(getPooledBusyTimeout(dbPath)).toBe(250);
+      expect(() => new EventsDb(dbPath, { busyTimeoutMs: 7_500 })).toThrow("new override rejected");
+      expect(getPooledBusyTimeout(dbPath)).toBe(6_250);
     } finally {
       execSpy.mockRestore();
       active.close();
@@ -465,7 +476,14 @@ describe("EventsDb", () => {
 
     it("sanitizes and bounds hook errors both when writing and reading legacy rows", () => {
       const db = new EventsDb(dbPath);
-      const unsafe = `failed at /Users/alice/private.txt password=hunter2 \u001b[31m${"x".repeat(
+      const secrets = [
+        "bearer-header-secret",
+        "sk-0123456789abcdefghijklmnop",
+        "ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+        "npm_0123456789abcdefghijklmnopqrstuvwxyz",
+        "header-api-key-secret",
+      ];
+      const unsafe = `failed at /Users/alice/private.txt password=hunter2 Authorization: Bearer ${secrets[0]} ${secrets.slice(1, 4).join(" ")} X-Api-Key: ${secrets[4]} \u001b[31m${"x".repeat(
         MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH + 100,
       )}`;
       db.logHookError("PostToolUse", new Error(unsafe));
@@ -475,6 +493,7 @@ describe("EventsDb", () => {
       ).get()) as { error: string };
       expect(persisted.error).not.toContain("/Users/alice");
       expect(persisted.error).not.toContain("hunter2");
+      for (const secret of secrets) expect(persisted.error).not.toContain(secret);
       expect(persisted.error).not.toContain("\u001b");
       expect(persisted.error.length).toBe(MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH);
 
@@ -485,6 +504,7 @@ describe("EventsDb", () => {
       expect(legacy.hook).toBe("legacy");
       expect(legacy.error).not.toContain("/Users/alice");
       expect(legacy.error).not.toContain("hunter2");
+      for (const secret of secrets) expect(legacy.error).not.toContain(secret);
       expect(legacy.error).not.toContain("\u001b");
       expect(legacy.error.length).toBe(MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH);
       db.close();

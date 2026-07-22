@@ -30,6 +30,14 @@ interface BusyTimeoutOverrideState {
 
 const _busyTimeoutOverrides = new Map<string, BusyTimeoutOverrideState>();
 
+function effectiveBusyTimeoutMs(state: BusyTimeoutOverrideState): number {
+  let effective = state.baselineMs;
+  for (const timeoutMs of state.overrides.values()) {
+    effective = Math.max(effective, timeoutMs);
+  }
+  return effective;
+}
+
 export type EventRow = LocalHookEventRow;
 export type HealthStats = LocalHookOutboxHealth;
 export type { PatternReinforcementStats } from "../storage/local-hook-outbox.js";
@@ -122,7 +130,7 @@ export class EventsDb {
     const overrideId = Symbol("busy-timeout-override");
     state.overrides.set(overrideId, timeoutMs);
     try {
-      this.db.exec(`PRAGMA busy_timeout = ${timeoutMs}`);
+      this.db.exec(`PRAGMA busy_timeout = ${effectiveBusyTimeoutMs(state)}`);
       this.busyTimeoutOverrideId = overrideId;
     } catch (error) {
       state.overrides.delete(overrideId);
@@ -139,10 +147,8 @@ export class EventsDb {
     const state = _busyTimeoutOverrides.get(this.dbPath)!;
     state.overrides.delete(overrideId);
 
-    let effectiveTimeoutMs = state.baselineMs;
-    for (const timeoutMs of state.overrides.values()) effectiveTimeoutMs = timeoutMs;
     try {
-      this.db.exec(`PRAGMA busy_timeout = ${effectiveTimeoutMs}`);
+      this.db.exec(`PRAGMA busy_timeout = ${effectiveBusyTimeoutMs(state)}`);
     } finally {
       if (state.overrides.size === 0) _busyTimeoutOverrides.delete(this.dbPath);
     }
