@@ -25,6 +25,14 @@ const WAITING_CHECK_STATES = new Set([
   "waiting",
 ]);
 
+const WAITING_CI_RUN_STATES = new Set([
+  "pending",
+  "queued",
+  "in_progress",
+  "requested",
+  "waiting",
+]);
+
 const GREPTILE_REQUIRED_PATHS = [
   /^(?:bin|installer|src)\/.+\.(?:[cm]?ts|tsx)$/u,
   /^\.github\/(?:actions|codeql|workflows|scripts)\/.+/u,
@@ -212,11 +220,11 @@ export function evaluateAdmissionChecks({
   };
 }
 
-export function isTrustedCiActionsRun(
+export function evaluateCiActionsRun(
   run,
   { runId, headSha, repository, workflowPath = ".github/workflows/ci.yml" },
 ) {
-  return run !== null
+  const trustedProvenance = run !== null
     && typeof run === "object"
     && (() => {
       try {
@@ -228,9 +236,23 @@ export function isTrustedCiActionsRun(
     && run.event === "pull_request"
     && run.path === workflowPath
     && run.head_sha === headSha
-    && run.status === "completed"
-    && run.conclusion === "success"
     && run.repository?.full_name === repository;
+
+  if (!trustedProvenance) {
+    return { state: "invalid", ready: false, terminalFailure: "ci-run-metadata" };
+  }
+
+  const state = run.status === "completed"
+    ? (typeof run.conclusion === "string" && run.conclusion.length > 0
+      ? run.conclusion
+      : "missing")
+    : (typeof run.status === "string" && run.status.length > 0 ? run.status : "missing");
+  const ready = run.status === "completed" && state === "success";
+  return {
+    state,
+    ready,
+    terminalFailure: ready || WAITING_CI_RUN_STATES.has(state) ? undefined : "ci-run",
+  };
 }
 
 export function runPolicyCommand(command, args, input) {
@@ -254,12 +276,9 @@ export function runPolicyCommand(command, args, input) {
       serverUrl,
     }));
   }
-  if (command === "validate-ci-run" && args.length === 3) {
+  if (command === "evaluate-ci-run" && args.length === 3) {
     const [runId, headSha, repository] = args;
-    if (!isTrustedCiActionsRun(payload, { runId, headSha, repository })) {
-      throw new TypeError("Actions run metadata is not trusted");
-    }
-    return "";
+    return JSON.stringify(evaluateCiActionsRun(payload, { runId, headSha, repository }));
   }
   throw new TypeError("unknown policy command or invalid arguments");
 }
