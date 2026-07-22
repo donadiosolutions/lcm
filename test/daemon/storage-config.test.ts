@@ -218,6 +218,8 @@ describe("storage configuration", () => {
     { label: "missing host", url: "postgresql://", expected: "non-empty hostname" },
     { label: "database without host", url: "postgresql:///database", expected: "non-empty hostname" },
     { label: "TLS query override", url: "postgresql://user:tls-secret@example.com/lcm?SSLCert=inline", expected: "TLS parameter" },
+    { label: "arbitrary query parameter", url: "postgresql://user:query-secret@example.com/lcm?application_name=unsafe", expected: "URL query parameters" },
+    { label: "fragment", url: "postgresql://user:fragment-secret@example.com/lcm#unsafe", expected: "URL fragment" },
   ])("rejects unsafe PostgreSQL URL: $label without echoing credentials", ({ url, expected }) => {
     const error = (() => {
       try {
@@ -231,8 +233,9 @@ describe("storage configuration", () => {
       throw new Error("expected configuration error");
     })();
     expect(error.message).toContain(expected);
-    expect(error.message).not.toContain("scheme-secret");
-    expect(error.message).not.toContain("tls-secret");
+    for (const secret of ["scheme-secret", "tls-secret", "query-secret", "fragment-secret"]) {
+      expect(error.message).not.toContain(secret);
+    }
   });
 
   it("requires an absolute, readable, non-empty regular CA file within the size limit", () => {

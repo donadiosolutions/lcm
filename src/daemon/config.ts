@@ -954,12 +954,16 @@ export function resolveStorageConfig(
       "must use hierarchical postgresql:// form with a non-empty hostname",
     );
   }
-  const forbiddenTlsParameter = [...parsedUrl.searchParams.keys()]
-    .find((key) => key.toLowerCase().startsWith("ssl"));
-  if (forbiddenTlsParameter !== undefined) {
+  if ([...parsedUrl.searchParams.keys()].length > 0) {
     throw new ConfigValidationError(
       "LCM_POSTGRES_URL",
-      `must not contain TLS parameter ${JSON.stringify(forbiddenTlsParameter)}; LCM enforces verified TLS with LCM_POSTGRES_CA_FILE`,
+      "must not contain URL query parameters, including TLS parameters; configure PostgreSQL behavior through LCM settings and LCM_POSTGRES_CA_FILE",
+    );
+  }
+  if (parsedUrl.hash !== "") {
+    throw new ConfigValidationError(
+      "LCM_POSTGRES_URL",
+      "must not contain a URL fragment; provide only the PostgreSQL server, credentials, port, and database",
     );
   }
   if (!isAbsolute(caFile)) {
