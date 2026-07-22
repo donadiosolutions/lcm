@@ -18,6 +18,7 @@ export function postgresqlVitestCacheDir(
 export default defineConfig({
   cacheDir: postgresqlVitestCacheDir(),
   test: {
+    setupFiles: ["test/setup/isolate-runtime-home.ts"],
     include: ["test/postgresql/**/*.integration.ts"],
     exclude: process.env.LCM_TEST_POSTGRES_INNER_CI === "true"
       ? ["test/postgresql/signal.integration.ts"]

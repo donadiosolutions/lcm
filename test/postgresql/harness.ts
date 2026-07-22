@@ -64,7 +64,7 @@ function safeIdentifier(value: string): string {
   return `"${value}"`;
 }
 
-function runtimeFor(url: string, overrides = {}): PostgreSqlRuntime {
+function runtimeFor(url: string, overrides: Parameters<typeof settings>[1] = {}): PostgreSqlRuntime {
   return new PostgreSqlRuntime(settings(url, overrides));
 }
 

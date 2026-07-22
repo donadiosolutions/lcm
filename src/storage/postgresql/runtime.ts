@@ -149,11 +149,17 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       }, { domain: "factory", operation: "health" });
       const row = result.rows[0];
       const serverMajorVersion = Math.floor(row.server_version_num / 10_000);
-      if (serverMajorVersion !== 18) {
+      const diagnostics = {
+        serverMajorVersion,
+        tls: row.tls,
+        timezone: row.timezone,
+        role: row.role,
+      };
+      if (serverMajorVersion !== 18 || row.tls !== true || row.timezone.toUpperCase() !== "UTC") {
         return {
           status: "unavailable",
           backend: "postgresql",
-          serverMajorVersion,
+          ...diagnostics,
           error: new StorageOperationError(
             "STORAGE_INITIALIZATION_FAILED",
             "postgresql",
@@ -163,22 +169,10 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
           ),
         };
       }
-      if (row.tls !== true || row.timezone.toUpperCase() !== "UTC") {
-        throw new StorageOperationError(
-          "STORAGE_INITIALIZATION_FAILED",
-          "postgresql",
-          undefined,
-          "factory",
-          "health",
-        );
-      }
       return {
         status: wasPoolFailed ? "degraded" : "healthy",
         backend: "postgresql",
-        serverMajorVersion,
-        tls: row.tls,
-        timezone: row.timezone,
-        role: row.role,
+        ...diagnostics,
       };
     } catch (error) {
       return {
@@ -234,6 +228,12 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       observeAbort();
     };
     signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      await ignoreCancellationFailure(cancellation!);
+      signal.removeEventListener("abort", onAbort);
+      throw abortCause();
+    }
 
     const queryOutcome = new Promise<QueryOutcome>((resolve) => {
       const query = new Query<R, I>(config, (error, result) => {

@@ -212,6 +212,9 @@ describe("PostgreSQL runtime", () => {
     await expect(wrongVersion.runtime.health()).resolves.toMatchObject({
       status: "unavailable",
       serverMajorVersion: 19,
+      tls: true,
+      timezone: "UTC",
+      role: "runtime",
       error: { code: "STORAGE_INITIALIZATION_FAILED" },
     });
 
@@ -220,7 +223,14 @@ describe("PostgreSQL runtime", () => {
       { ...healthyRow, timezone: "America/Sao_Paulo" },
     ]) {
       const invalid = fixtures(() => result([row]));
-      await expect(invalid.runtime.health()).resolves.toMatchObject({ status: "unavailable" });
+      await expect(invalid.runtime.health()).resolves.toMatchObject({
+        status: "unavailable",
+        serverMajorVersion: 18,
+        tls: row.tls,
+        timezone: row.timezone,
+        role: "runtime",
+        error: { code: "STORAGE_INITIALIZATION_FAILED" },
+      });
     }
     const unavailable = fixtures(() => { throw new Error("password secret"); });
     await expect(unavailable.runtime.health()).resolves.toMatchObject({ status: "unavailable" });
@@ -289,6 +299,29 @@ describe("PostgreSQL runtime", () => {
     })).rejects.toMatchObject({ operation: "abortDuringPidLookup" });
     expect(f.query).toHaveBeenCalledTimes(1);
     expect(f.dependencies.createClient).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("rejects when abort occurs between the PID check and listener registration", async () => {
+    let aborted = false;
+    const signal = {
+      get aborted() { return aborted; },
+      addEventListener: vi.fn(() => { aborted = true; }),
+      removeEventListener: vi.fn(),
+    } as unknown as AbortSignal;
+    const f = fixtures((input) => {
+      if (typeof input === "object" && input !== null && "text" in input && !("callback" in input)) {
+        return result([{ pid: 79 }]);
+      }
+      throw new Error("target query must not start");
+    });
+
+    await expect(f.runtime.query({ text: "SELECT pg_sleep(10)" }, {
+      domain: "factory", operation: "abortBeforeListener", signal,
+    })).rejects.toMatchObject({ operation: "abortBeforeListener" });
+    expect(f.cancelQuery).toHaveBeenCalledWith({ text: "SELECT pg_cancel_backend($1) AS cancelled", values: [79] });
+    expect(f.query).toHaveBeenCalledTimes(1);
+    expect(signal.removeEventListener).toHaveBeenCalled();
     expect(f.release).toHaveBeenCalledWith(true);
   });
 
@@ -369,7 +402,7 @@ describe("PostgreSQL runtime", () => {
   it("cancels defensively when abort state changes without event delivery", async () => {
     let abortChecks = 0;
     const signal = {
-      get aborted() { abortChecks += 1; return abortChecks >= 4; },
+      get aborted() { abortChecks += 1; return abortChecks >= 5; },
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
     } as unknown as AbortSignal;
