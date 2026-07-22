@@ -493,13 +493,15 @@ describe("PostgreSQL runtime", () => {
     expect(f.release).toHaveBeenCalledWith(true);
   });
 
-  it("destroys a transaction client when its signal aborts after acquisition returns", async () => {
+  it("destroys a transaction client when abort state changes as acquisition settles", async () => {
     let abortChecks = 0;
     const signal = {
       get aborted() {
         abortChecks += 1;
         return abortChecks >= 3;
       },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
     } as AbortSignal;
     const callback = vi.fn(async () => undefined);
     const f = fixtures();
@@ -507,6 +509,27 @@ describe("PostgreSQL runtime", () => {
     await expect(f.runtime.transaction(callback, {
       domain: "transaction", operation: "abortAfterAcquire", signal,
     })).rejects.toMatchObject({ operation: "abortAfterAcquire", retryable: false });
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.query).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("destroys a transaction client when abort state changes immediately after acquisition", async () => {
+    let abortChecks = 0;
+    const signal = {
+      get aborted() {
+        abortChecks += 1;
+        return abortChecks >= 4;
+      },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as AbortSignal;
+    const callback = vi.fn(async () => undefined);
+    const f = fixtures();
+
+    await expect(f.runtime.transaction(callback, {
+      domain: "transaction", operation: "abortImmediatelyAfterAcquire", signal,
+    })).rejects.toMatchObject({ operation: "abortImmediatelyAfterAcquire", retryable: false });
     expect(callback).not.toHaveBeenCalled();
     expect(f.query).not.toHaveBeenCalled();
     expect(f.release).toHaveBeenCalledWith(true);
@@ -596,6 +619,208 @@ describe("PostgreSQL runtime", () => {
     }, { domain: "transaction", operation: "outerTransaction" });
     await expect(pending).rejects.toMatchObject({ operation: "queryLocalAbort" });
     expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it.each(["transaction", "query"] as const)(
+    "cancels an active transaction query when its %s signal aborts with both signals present",
+    async (abortedSignal) => {
+      let target: QueryWithCallback | undefined;
+      const f = fixtures((input) => {
+        if (input === "BEGIN" || input === "ROLLBACK") return result([]);
+        if (typeof input === "object" && input !== null && "text" in input && !("callback" in input)) {
+          return result([{ pid: 89 }]);
+        }
+        target = input as QueryWithCallback;
+        return target;
+      });
+      const transactionController = new AbortController();
+      const queryController = new AbortController();
+      const removeTransactionListener = vi.spyOn(transactionController.signal, "removeEventListener");
+      const removeQueryListener = vi.spyOn(queryController.signal, "removeEventListener");
+      const pending = f.runtime.transaction(async (transaction) => {
+        const query = transaction.query({ text: "SELECT pg_sleep(10)" }, {
+          domain: "transaction",
+          operation: `${abortedSignal}SignalAbort`,
+          signal: queryController.signal,
+        });
+        await vi.waitFor(() => expect(target).toBeDefined());
+        if (abortedSignal === "transaction") transactionController.abort();
+        else queryController.abort();
+        await vi.waitFor(() => expect(f.cancelQuery).toHaveBeenCalled());
+        target?.callback(Object.assign(new Error("cancelled"), { code: "57014" }));
+        return query;
+      }, {
+        domain: "transaction",
+        operation: "outerCombinedSignals",
+        signal: transactionController.signal,
+      });
+
+      await expect(pending).rejects.toMatchObject({ operation: `${abortedSignal}SignalAbort` });
+      expect(f.cancelQuery).toHaveBeenCalledWith({
+        text: "SELECT pg_cancel_backend($1) AS cancelled",
+        values: [89],
+      });
+      expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+      expect(f.release).toHaveBeenCalledWith(true);
+      expect(removeTransactionListener).toHaveBeenCalled();
+      expect(removeQueryListener).toHaveBeenCalled();
+    },
+  );
+
+  it("removes composed listeners after a successful query and ignores later aborts", async () => {
+    const transactionController = new AbortController();
+    const queryController = new AbortController();
+    const addTransactionListener = vi.spyOn(transactionController.signal, "addEventListener");
+    const removeTransactionListener = vi.spyOn(transactionController.signal, "removeEventListener");
+    const addQueryListener = vi.spyOn(queryController.signal, "addEventListener");
+    const removeQueryListener = vi.spyOn(queryController.signal, "removeEventListener");
+    const f = fixtures((input) => {
+      if (typeof input === "string") return result([]);
+      if (typeof input === "object" && input !== null && "text" in input && !("callback" in input)) {
+        return result([{ pid: 90 }]);
+      }
+      const target = input as QueryWithCallback;
+      target.callback(null, result([{ value: 1 }]));
+      return target;
+    });
+
+    await expect(f.runtime.transaction(
+      (transaction) => transaction.query({ text: "SELECT 1" }, {
+        domain: "transaction", operation: "combinedSuccess", signal: queryController.signal,
+      }),
+      { domain: "transaction", operation: "outerCombinedSuccess", signal: transactionController.signal },
+    )).resolves.toMatchObject({ rows: [{ value: 1 }] });
+
+    expect(addQueryListener).toHaveBeenCalledOnce();
+    expect(removeQueryListener).toHaveBeenCalledOnce();
+    expect(addTransactionListener).toHaveBeenCalledTimes(2);
+    expect(removeTransactionListener).toHaveBeenCalledTimes(2);
+    transactionController.abort();
+    queryController.abort();
+    expect(f.dependencies.createClient).not.toHaveBeenCalled();
+  });
+
+  it("does not register composed listeners for an already-aborted query signal", async () => {
+    const transactionController = new AbortController();
+    const queryController = new AbortController();
+    queryController.abort();
+    const addQueryListener = vi.spyOn(queryController.signal, "addEventListener");
+    const removeQueryListener = vi.spyOn(queryController.signal, "removeEventListener");
+    const f = fixtures();
+
+    await expect(f.runtime.transaction(
+      (transaction) => transaction.query({ text: "SELECT 1" }, {
+        domain: "transaction", operation: "alreadyAbortedLocal", signal: queryController.signal,
+      }),
+      { domain: "transaction", operation: "outerActive", signal: transactionController.signal },
+    )).rejects.toMatchObject({ operation: "alreadyAbortedLocal", retryable: false });
+
+    expect(addQueryListener).not.toHaveBeenCalled();
+    expect(removeQueryListener).not.toHaveBeenCalled();
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual(["BEGIN"]);
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("observes an abort raced between composed-listener registration and the post-registration fence", async () => {
+    let localAborted = false;
+    const localSignal = {
+      get aborted() { return localAborted; },
+      addEventListener: vi.fn(() => { localAborted = true; }),
+      removeEventListener: vi.fn(),
+    } as unknown as AbortSignal;
+    const transactionController = new AbortController();
+    const f = fixtures();
+
+    await expect(f.runtime.transaction(
+      (transaction) => transaction.query({ text: "SELECT 1" }, {
+        domain: "transaction", operation: "composedRegistrationRace", signal: localSignal,
+      }),
+      { domain: "transaction", operation: "outerRace", signal: transactionController.signal },
+    )).rejects.toMatchObject({ operation: "composedRegistrationRace", retryable: false });
+
+    expect(localSignal.addEventListener).toHaveBeenCalledOnce();
+    expect(localSignal.removeEventListener).toHaveBeenCalledOnce();
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual(["BEGIN"]);
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("reuses one signal without adding composition listeners", async () => {
+    const controller = new AbortController();
+    const addListener = vi.spyOn(controller.signal, "addEventListener");
+    const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+    const f = fixtures((input) => {
+      if (typeof input === "string") return result([]);
+      if (typeof input === "object" && input !== null && "text" in input && !("callback" in input)) {
+        return result([{ pid: 92 }]);
+      }
+      const target = input as QueryWithCallback;
+      target.callback(null, result([]));
+      return target;
+    });
+
+    await expect(f.runtime.transaction(
+      (transaction) => transaction.query({ text: "SELECT 1" }, {
+        domain: "transaction", operation: "sameSignal", signal: controller.signal,
+      }),
+      { domain: "transaction", operation: "outerSameSignal", signal: controller.signal },
+    )).resolves.toMatchObject({ rows: [] });
+
+    expect(addListener).toHaveBeenCalledTimes(2);
+    expect(removeListener).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a pre-aborted query signal when a transaction signal is also present", async () => {
+    const transactionController = new AbortController();
+    const queryController = new AbortController();
+    queryController.abort();
+    const f = fixtures((input) => typeof input === "string" ? result([]) : result([{ pid: 90 }]));
+
+    await expect(f.runtime.transaction(
+      (transaction) => transaction.query({ text: "SELECT pg_sleep(10)" }, {
+        domain: "transaction",
+        operation: "preAbortedCombinedSignal",
+        signal: queryController.signal,
+      }),
+      {
+        domain: "transaction",
+        operation: "outerPreAbortedCombinedSignal",
+        signal: transactionController.signal,
+      },
+    )).rejects.toMatchObject({ operation: "preAbortedCombinedSignal", retryable: false });
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual(["BEGIN"]);
+    expect(f.cancelQuery).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("observes a query abort between combined-signal checks and listener registration", async () => {
+    let abortChecks = 0;
+    const querySignal = {
+      get aborted() {
+        abortChecks += 1;
+        return abortChecks >= 2;
+      },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as AbortSignal;
+    const transactionController = new AbortController();
+    const f = fixtures((input) => typeof input === "string" ? result([]) : result([{ pid: 92 }]));
+
+    await expect(f.runtime.transaction(
+      (transaction) => transaction.query({ text: "SELECT pg_sleep(10)" }, {
+        domain: "transaction",
+        operation: "combinedSignalRegistrationRace",
+        signal: querySignal,
+      }),
+      {
+        domain: "transaction",
+        operation: "outerCombinedSignalRegistrationRace",
+        signal: transactionController.signal,
+      },
+    )).rejects.toMatchObject({ operation: "combinedSignalRegistrationRace", retryable: false });
+    expect(querySignal.addEventListener).toHaveBeenCalled();
+    expect(querySignal.removeEventListener).toHaveBeenCalled();
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual(["BEGIN"]);
     expect(f.release).toHaveBeenCalledWith(true);
   });
 
@@ -703,7 +928,7 @@ describe("PostgreSQL runtime", () => {
     expect(f.dependencies.createClient).not.toHaveBeenCalled();
   });
 
-  it("returns a non-retryable abort when acquisition rejects after the signal aborts", async () => {
+  it("rejects promptly when acquisition is aborted and consumes a later rejection", async () => {
     const controller = new AbortController();
     const f = fixtures();
     let rejectConnect!: (reason?: unknown) => void;
@@ -717,12 +942,81 @@ describe("PostgreSQL runtime", () => {
       operation: "abortDuringRejectedAcquire", retryable: false,
     });
     controller.abort();
-    rejectConnect(Object.assign(new Error("timeout exceeded when trying to connect"), { code: "ETIMEDOUT" }));
     await expectation;
+
+    const unhandledRejection = vi.fn();
+    process.on("unhandledRejection", unhandledRejection);
+    try {
+      rejectConnect(Object.assign(new Error("timeout exceeded when trying to connect"), { code: "ETIMEDOUT" }));
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+      expect(unhandledRejection).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandledRejection);
+    }
     expect(f.release).not.toHaveBeenCalled();
   });
 
-  it("destroys a client acquired after its pending signal aborts", async () => {
+  it("preserves the original acquisition failure when a supplied signal remains active", async () => {
+    const controller = new AbortController();
+    const f = fixtures();
+    f.connect.mockRejectedValueOnce(Object.assign(new Error("connection secret"), { code: "08006" }));
+
+    await expect(f.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory",
+      operation: "signalledAcquireFailure",
+      signal: controller.signal,
+    })).rejects.toMatchObject({ operation: "signalledAcquireFailure", retryable: true });
+    expect(f.release).not.toHaveBeenCalled();
+  });
+
+  it("prefers abort when abort state changes as an acquisition failure settles", async () => {
+    let abortChecks = 0;
+    const signal = {
+      get aborted() {
+        abortChecks += 1;
+        return abortChecks >= 3;
+      },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as AbortSignal;
+    const f = fixtures();
+    f.connect.mockRejectedValueOnce(Object.assign(new Error("connection secret"), { code: "08006" }));
+
+    await expect(f.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory",
+      operation: "abortAsAcquireFails",
+      signal,
+    })).rejects.toMatchObject({ operation: "abortAsAcquireFails", retryable: false });
+    expect(f.release).not.toHaveBeenCalled();
+  });
+
+  it("observes abort state changing immediately after the acquisition listener is registered", async () => {
+    let abortChecks = 0;
+    const signal = {
+      get aborted() {
+        abortChecks += 1;
+        return abortChecks >= 2;
+      },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as AbortSignal;
+    const f = fixtures();
+    let resolveConnect!: (client: PoolClient) => void;
+    f.connect.mockReturnValueOnce(new Promise<PoolClient>((resolve) => {
+      resolveConnect = resolve;
+    }));
+
+    await expect(f.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory",
+      operation: "abortAfterAcquireListener",
+      signal,
+    })).rejects.toMatchObject({ operation: "abortAfterAcquireListener", retryable: false });
+    resolveConnect(f.poolClient);
+    await vi.waitFor(() => expect(f.release).toHaveBeenCalledWith(true));
+    expect(f.query).not.toHaveBeenCalled();
+  });
+
+  it("rejects promptly when acquisition is aborted and destroys a client acquired later", async () => {
     const controller = new AbortController();
     const f = fixtures();
     let resolveConnect!: (client: PoolClient) => void;
@@ -734,8 +1028,50 @@ describe("PostgreSQL runtime", () => {
     });
     const expectation = expect(query).rejects.toMatchObject({ operation: "abortAfterAcquire", retryable: false });
     controller.abort();
-    resolveConnect(f.poolClient);
     await expectation;
+    expect(f.release).not.toHaveBeenCalled();
+
+    resolveConnect(f.poolClient);
+    await vi.waitFor(() => expect(f.release).toHaveBeenCalledWith(true));
+    expect(f.query).not.toHaveBeenCalled();
+  });
+
+  it("consumes a release failure from a client acquired after abort", async () => {
+    const controller = new AbortController();
+    const f = fixtures();
+    let resolveConnect!: (client: PoolClient) => void;
+    f.connect.mockReturnValueOnce(new Promise<PoolClient>((resolve) => { resolveConnect = resolve; }));
+    f.release.mockImplementationOnce(() => { throw new Error("late release failed"); });
+    const query = f.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory", operation: "lateReleaseFailure", signal: controller.signal,
+    });
+
+    controller.abort();
+    await expect(query).rejects.toMatchObject({ operation: "lateReleaseFailure", retryable: false });
+    resolveConnect(f.poolClient);
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.query).not.toHaveBeenCalled();
+  });
+
+  it("contains a late client release failure after an acquisition abort", async () => {
+    const controller = new AbortController();
+    const f = fixtures();
+    let resolveConnect!: (client: PoolClient) => void;
+    f.connect.mockReturnValueOnce(new Promise<PoolClient>((resolve) => {
+      resolveConnect = resolve;
+    }));
+    f.release.mockImplementationOnce(() => { throw new Error("release secret"); });
+    const pending = f.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory",
+      operation: "lateReleaseFailure",
+      signal: controller.signal,
+    });
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ operation: "lateReleaseFailure", retryable: false });
+
+    resolveConnect(f.poolClient);
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
     expect(f.release).toHaveBeenCalledWith(true);
     expect(f.query).not.toHaveBeenCalled();
   });
@@ -759,9 +1095,13 @@ describe("PostgreSQL runtime", () => {
 
   it("rejects when abort occurs between the PID check and listener registration", async () => {
     let aborted = false;
+    let listenerRegistrations = 0;
     const signal = {
       get aborted() { return aborted; },
-      addEventListener: vi.fn(() => { aborted = true; }),
+      addEventListener: vi.fn(() => {
+        listenerRegistrations += 1;
+        if (listenerRegistrations === 2) aborted = true;
+      }),
       removeEventListener: vi.fn(),
     } as unknown as AbortSignal;
     const f = fixtures((input) => {
@@ -874,6 +1214,35 @@ describe("PostgreSQL runtime", () => {
       domain: "factory", operation: "missedAbortEvent", signal,
     })).rejects.toMatchObject({ operation: "missedAbortEvent" });
     expect(f.dependencies.createClient).toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("starts cancellation when abort state changes as the target query callback settles", async () => {
+    let aborted = false;
+    const signal = {
+      get aborted() { return aborted; },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as AbortSignal;
+    const f = fixtures((input) => {
+      if (typeof input === "object" && input !== null && "text" in input && !("callback" in input)) {
+        return result([{ pid: 78 }]);
+      }
+      const target = input as QueryWithCallback;
+      aborted = true;
+      target.callback(null, result([{ value: 1 }]));
+      return target;
+    });
+
+    await expect(f.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory",
+      operation: "callbackAbortStateRace",
+      signal,
+    })).rejects.toMatchObject({ operation: "callbackAbortStateRace", retryable: false });
+    expect(f.cancelQuery).toHaveBeenCalledWith({
+      text: "SELECT pg_cancel_backend($1) AS cancelled",
+      values: [78],
+    });
     expect(f.release).toHaveBeenCalledWith(true);
   });
 

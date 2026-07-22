@@ -46,6 +46,37 @@ function abortCause(): Error {
   return new Error("postgresql query aborted");
 }
 
+function combineAbortSignals(
+  querySignal: AbortSignal | undefined,
+  transactionSignal: AbortSignal | undefined,
+): { readonly signal: AbortSignal | undefined; readonly dispose: () => void } {
+  if (!querySignal) return { signal: transactionSignal, dispose: () => undefined };
+  if (!transactionSignal || querySignal === transactionSignal) {
+    return { signal: querySignal, dispose: () => undefined };
+  }
+
+  const controller = new AbortController();
+  let disposed = false;
+  const dispose = (): void => {
+    if (disposed) return;
+    disposed = true;
+    querySignal.removeEventListener("abort", onAbort);
+    transactionSignal.removeEventListener("abort", onAbort);
+  };
+  const onAbort = (): void => {
+    controller.abort();
+    dispose();
+  };
+  if (querySignal.aborted || transactionSignal.aborted) {
+    controller.abort();
+    return { signal: controller.signal, dispose: () => undefined };
+  }
+  querySignal.addEventListener("abort", onAbort, { once: true });
+  transactionSignal.addEventListener("abort", onAbort, { once: true });
+  if (querySignal.aborted || transactionSignal.aborted) onAbort();
+  return { signal: controller.signal, dispose };
+}
+
 async function ignoreCancellationFailure(cancellation: Promise<void>): Promise<void> {
   try {
     await cancellation;
@@ -141,7 +172,8 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
                 queryOptions.operation,
               );
             }
-            const effectiveOptions = { ...queryOptions, signal: queryOptions.signal ?? options.signal };
+            const combinedSignal = combineAbortSignals(queryOptions.signal, options.signal);
+            const effectiveOptions = { ...queryOptions, signal: combinedSignal.signal };
             try {
               return await this.queryClient<R, I>(client!, config, effectiveOptions);
             } catch (error) {
@@ -150,6 +182,8 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
               const normalized = normalizePostgreSqlError(error, effectiveOptions);
               transactionFailure ??= normalized;
               throw normalized;
+            } finally {
+              combinedSignal.dispose();
             }
           });
           queryQueue = execute.then(() => undefined, () => undefined);
@@ -264,22 +298,52 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
   }
 
   private async acquire(context: PostgreSqlOperationContext & { signal?: AbortSignal }): Promise<PoolClient> {
-    if (context.signal?.aborted) throw aborted(context);
-    let client: PoolClient;
-    try {
-      client = await this.pool.connect();
-    } catch (error) {
-      if (context.signal?.aborted) throw aborted(context);
-      throw error;
+    const signal = context.signal;
+    if (signal?.aborted) throw aborted(context);
+    if (!signal) return this.pool.connect();
+
+    type ConnectOutcome =
+      | { readonly kind: "connected"; readonly client: PoolClient }
+      | { readonly kind: "failed"; readonly error: unknown };
+    const connectOutcome: Promise<ConnectOutcome> = Promise.resolve()
+      .then(() => this.pool.connect())
+      .then(
+        (client) => ({ kind: "connected" as const, client }),
+        (error: unknown) => ({ kind: "failed" as const, error }),
+      );
+    let observeAbort!: () => void;
+    const abortOutcome = new Promise<{ readonly kind: "aborted" }>((resolve) => {
+      observeAbort = () => { resolve({ kind: "aborted" }); };
+    });
+    signal.addEventListener("abort", observeAbort, { once: true });
+    if (signal.aborted) observeAbort();
+
+    const outcome = await Promise.race([connectOutcome, abortOutcome]);
+    signal.removeEventListener("abort", observeAbort);
+    if (outcome.kind === "aborted") {
+      void connectOutcome.then((lateOutcome) => {
+        if (lateOutcome.kind !== "connected") return;
+        try {
+          lateOutcome.client.release(true);
+        } catch {
+          // The operation has already failed closed; a late client must never
+          // surface credentials or create an unhandled rejection.
+        }
+      });
+      throw aborted(context);
     }
-    if (context.signal?.aborted) {
+    if (outcome.kind === "failed") {
+      if (signal.aborted) throw aborted(context);
+      throw outcome.error;
+    }
+    if (signal.aborted) {
       try {
-        client.release(true);
+        outcome.client.release(true);
       } finally {
         throw aborted(context);
       }
     }
-    return client;
+    return outcome.client;
   }
 
   private async queryClient<
