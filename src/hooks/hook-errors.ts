@@ -1,5 +1,4 @@
 // src/hooks/hook-errors.ts
-import { EventsDb } from "./events-db.js";
 import { eventsDbPath } from "../db/events-path.js";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
@@ -8,6 +7,8 @@ import { homedir, tmpdir } from "node:os";
 import { lcmPath } from "../runtime-paths.js";
 import { ensureProjectDir } from "../daemon/project.js";
 import { validateCwd } from "../daemon/validate-cwd.js";
+import { SQLiteLocalHookOutboxFactory } from "../storage/local-hook-outbox.js";
+import { sanitizeHookErrorDiagnostic } from "./hook-error-diagnostic.js";
 
 function isUnderDir(candidate: string, base: string): boolean {
   const resolvedCandidate = resolve(candidate);
@@ -51,11 +52,11 @@ export function _resetCircuitBreaker(): void {
  * Layer 2: Flat file ~/.lcm/logs/events.log
  * Layer 3: Swallow silently — hooks must never crash
  */
-export function safeLogError(
+export async function safeLogError(
   hook: string,
   error: unknown,
   opts: { cwd?: string; sessionId?: string },
-): void {
+): Promise<void> {
   // Layer 1: Sidecar DB (skip if cwd missing or circuit open)
   let validatedCwd: string | undefined;
   if (opts.cwd) {
@@ -68,11 +69,12 @@ export function safeLogError(
   if (validatedCwd && !dbCircuitOpen) {
     try {
       ensureProjectDir(validatedCwd);
-      const db = new EventsDb(eventsDbPath(validatedCwd));
+      const outboxFactory = new SQLiteLocalHookOutboxFactory();
+      const db = await outboxFactory.open(eventsDbPath(validatedCwd));
       try {
-        db.logHookError(hook, error, opts.sessionId);
+        await db.logHookError(hook, error, opts.sessionId);
       } finally {
-        db.close();
+        await outboxFactory.close();
       }
       return;
     } catch {
@@ -87,7 +89,7 @@ export function safeLogError(
     appendFileSync(logPath, JSON.stringify({
       ts: new Date().toISOString(),
       hook,
-      error: error instanceof Error ? error.message : String(error),
+      error: sanitizeHookErrorDiagnostic(error),
       session_id: opts.sessionId,
       cwd: opts.cwd,
     }) + "\n");

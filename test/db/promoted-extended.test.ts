@@ -30,12 +30,12 @@ afterEach(() => {
   }
 });
 
-function makeDb() {
+function makeDb(fts5Available = true) {
   const tempDir = mkdtempSync(join(tmpdir(), "lcm-promoted-ext-"));
   tempDirs.push(tempDir);
   const dbPath = join(tempDir, "test.db");
   const db = getLcmConnection(dbPath);
-  runLcmMigrations(db);
+  runLcmMigrations(db, { fts5Available });
   return db;
 }
 
@@ -51,8 +51,10 @@ describe("PromotedStore extended", () => {
     } as unknown as DatabaseSync;
     const store = new PromotedStore(db);
 
-    expect(store.insert({ content: "orphan", projectId: "project" })).toBeTypeOf("string");
+    expect(() => store.insert({ content: "orphan", projectId: "project" }))
+      .toThrow("inserted promoted row is unavailable");
     store.archive("missing");
+    store.deleteById("missing");
     store.revive("missing");
 
     expect(calls.some((call) => call.startsWith("UPDATE promoted SET archived_at"))).toBe(true);
@@ -92,6 +94,121 @@ describe("PromotedStore extended", () => {
     ]);
   });
 
+  it("counts repeated usage signals for a stale candidate", () => {
+    const db = makeDb();
+    const store = new PromotedStore(db);
+    const staleId = store.insert({ content: "used stale", projectId: "project" });
+    for (const content of ["first usage", "second usage"]) {
+      store.insert({
+        content,
+        tags: ["signal:memory_used", `memory_id:${staleId}`],
+        projectId: "project",
+      });
+    }
+    db.prepare("UPDATE promoted SET created_at = ? WHERE id = ?").run("2020-01-01 00:00:00", staleId);
+
+    expect(store.findStale({ staleAfterDays: 1, staleSurfacingWithoutUseLimit: 2 }))
+      .not.toEqual(expect.arrayContaining([expect.objectContaining({ id: staleId })]));
+  });
+
+  it("handles empty and surfaced-without-use stale candidate sets", () => {
+    const db = makeDb();
+    const store = new PromotedStore(db);
+    expect(store.findStale({ staleAfterDays: 1, staleSurfacingWithoutUseLimit: 2 })).toEqual([]);
+
+    const staleId = store.insert({ content: "surfaced stale", projectId: "project" });
+    db.prepare("UPDATE promoted SET created_at = ? WHERE id = ?").run("2020-01-01 00:00:00", staleId);
+    db.prepare("INSERT INTO recall_surfacing (memory_id, session_id) VALUES (?, ?)").run(staleId, "s1");
+    db.prepare("INSERT INTO recall_surfacing (memory_id, session_id) VALUES (?, ?)").run(staleId, "s2");
+    expect(store.findStale({ staleAfterDays: 1, staleSurfacingWithoutUseLimit: 2 }))
+      .toMatchObject([{ id: staleId, surfacingCount: 2, usageCount: 0 }]);
+  });
+
+  it("supports every mutation and search filter without native FTS", () => {
+    const db = makeDb(false);
+    const store = new PromotedStore(db, false);
+    const first = store.insert({ content: "Fallback needle", tags: ["keep"], projectId: "p1" });
+    const second = store.insert({ content: "Other needle", projectId: "p2" });
+
+    expect(store.search("needle", 10)).toHaveLength(2);
+    expect(store.search("needle", 10, ["keep"], "p1")).toMatchObject([{ id: first, rank: 4 }]);
+    expect(store.search("_%", 10)).toEqual([]);
+
+    const untaggedHigherRank = store.insert({
+      content: "Higher ranked needle",
+      tags: ["other"],
+      projectId: "p1",
+      confidence: 1,
+    });
+    const taggedAfterLimit = store.insert({
+      content: "Lower ranked needle",
+      tags: ["requested"],
+      projectId: "p1",
+      confidence: 0.01,
+    });
+    expect(store.search("needle", 1, ["requested"], "p1")).toMatchObject([
+      { id: taggedAfterLimit },
+    ]);
+    expect(store.search("needle", -1, undefined, "p1")).toHaveLength(3);
+
+    const strongest = store.insert({
+      content: "fallback needle with complete coverage",
+      projectId: "p1",
+      confidence: 0.1,
+    });
+    const ranked = store.search("fallback needle coverage", 10, undefined, "p1");
+    expect(ranked[0]).toMatchObject({ id: strongest, rank: 12 });
+    expect(ranked.at(-1)?.rank).toBeLessThan(ranked[0].rank);
+
+    store.update(first, { content: "Changed fallback" });
+    store.update(first, { content: "Changed again", tags: ["new"], confidence: 0.7 });
+    store.update(first, { confidence: 0.8 });
+    store.update(first, { tags: ["final"] });
+    expect(store.getById(first)).toMatchObject({ content: "Changed again", confidence: 0.8 });
+
+    store.archive(first);
+    expect(store.search("changed", 10)).toEqual([]);
+    store.revive(first);
+    expect(store.search("changed", 10, ["final"])).toHaveLength(1);
+    store.deleteById(first);
+    store.deleteById(second);
+    store.deleteById(strongest);
+    store.deleteById(untaggedHigherRank);
+    store.deleteById(taggedAfterLimit);
+    expect(store.getAll()).toEqual([]);
+  });
+
+  it("matches fallback search terms only at lexical token boundaries", () => {
+    const db = makeDb(false);
+    const store = new PromotedStore(db, false);
+    const falseSubstringIds = [
+      store.insert({ content: "database architecture", projectId: "p1" }),
+      store.insert({ content: "ongoing migration", projectId: "p1" }),
+      store.insert({ content: "unrelated", tags: ["database", "ongoing"], projectId: "p1" }),
+      store.insert({ content: "go_live uses a_value", projectId: "p1" }),
+    ];
+    const aBoundary = store.insert({ content: "choose a cache", projectId: "p1" });
+    const goBoundary = store.insert({ content: "ready to go-live", projectId: "p1" });
+    const goAtEnd = store.insert({ content: "ready set go", projectId: "p1" });
+    const exactGo = store.insert({ content: "go", projectId: "p1" });
+    const tagBoundaries = store.insert({ content: "unrelated", tags: ["a", "go"], projectId: "p1" });
+
+    const aResults = store.search("a", 20, undefined, "p1");
+    expect(aResults.map(({ id }) => id)).toEqual(expect.arrayContaining([aBoundary, tagBoundaries]));
+    expect(aResults).toHaveLength(2);
+
+    const goResults = store.search("go", 20, undefined, "p1");
+    expect(goResults.map(({ id }) => id)).toEqual(
+      expect.arrayContaining([goBoundary, goAtEnd, exactGo, tagBoundaries]),
+    );
+    expect(goResults).toHaveLength(4);
+
+    const combined = store.search("a go", 20, undefined, "p1");
+    expect(combined[0]).toMatchObject({ id: tagBoundaries, rank: 8 });
+    expect(combined.slice(1).map(({ rank }) => rank).every((rank) => rank === 2)).toBe(true);
+    expect(combined.map(({ id }) => id).some((id) => falseSubstringIds.includes(id))).toBe(false);
+  });
+
   it("rolls back revive when the promoted row update fails", () => {
     const execCalls: string[] = [];
     const db = {
@@ -104,7 +221,31 @@ describe("PromotedStore extended", () => {
       }),
     } as unknown as DatabaseSync;
     expect(() => new PromotedStore(db).revive("id")).toThrow("update failed");
-    expect(execCalls).toEqual(["BEGIN", "ROLLBACK"]);
+    expect(execCalls).toEqual([
+      "SAVEPOINT promoted_fts_sync",
+      "ROLLBACK TO SAVEPOINT promoted_fts_sync",
+      "RELEASE SAVEPOINT promoted_fts_sync",
+    ]);
+  });
+
+  it("uses a composable savepoint when revive fails in an outer transaction", () => {
+    const execCalls: string[] = [];
+    const db = {
+      isTransaction: true,
+      exec: (sql: string) => execCalls.push(sql),
+      prepare: (sql: string) => ({
+        get: () => ({ rowid: 1, content: "content", tags: "[]" }),
+        run: () => {
+          if (sql.startsWith("UPDATE promoted")) throw new Error("update failed");
+        },
+      }),
+    } as unknown as DatabaseSync;
+    expect(() => new PromotedStore(db).revive("id")).toThrow("update failed");
+    expect(execCalls).toEqual([
+      "SAVEPOINT promoted_fts_sync",
+      "ROLLBACK TO SAVEPOINT promoted_fts_sync",
+      "RELEASE SAVEPOINT promoted_fts_sync",
+    ]);
   });
 
   // ── getById ──────────────────────────────────────────────────────────────
@@ -315,6 +456,38 @@ describe("PromotedStore extended", () => {
 
     expect(() => store.update(id, { content: "partial update", tags: ["new"] })).toThrow();
     expect(store.getById(id)).toMatchObject({ content: "original content", tags: '["old"]' });
+  });
+
+  it("atomically rolls back base and FTS mirror write failures", () => {
+    const insertDb = makeDb();
+    const insertStore = new PromotedStore(insertDb);
+    insertDb.exec("DROP TABLE promoted_fts");
+    expect(() => insertStore.insert({ content: "failed insert", projectId: "p1" })).toThrow();
+    expect(insertDb.prepare("SELECT COUNT(*) AS count FROM promoted").get()).toEqual({ count: 0 });
+
+    const archiveDb = makeDb();
+    const archiveStore = new PromotedStore(archiveDb);
+    const archiveId = archiveStore.insert({ content: "failed archive", projectId: "p1" });
+    archiveDb.exec("DROP TABLE promoted_fts");
+    expect(() => archiveStore.archive(archiveId)).toThrow();
+    expect(archiveStore.getById(archiveId)?.archived_at).toBeNull();
+
+    const reviveDb = makeDb();
+    const reviveStore = new PromotedStore(reviveDb);
+    const reviveId = reviveStore.insert({ content: "failed revive", projectId: "p1" });
+    reviveStore.archive(reviveId);
+    reviveDb.exec("DROP TABLE promoted_fts");
+    expect(() => reviveStore.revive(reviveId)).toThrow();
+    expect(reviveStore.getById(reviveId)?.archived_at).not.toBeNull();
+
+    const deleteDb = makeDb();
+    const deleteStore = new PromotedStore(deleteDb);
+    const deleteId = deleteStore.insert({ content: "failed delete", projectId: "p1" });
+    deleteDb.exec(`CREATE TRIGGER reject_promoted_delete BEFORE DELETE ON promoted
+      BEGIN SELECT RAISE(ABORT, 'delete rejected'); END`);
+    expect(() => deleteStore.deleteById(deleteId)).toThrow("delete rejected");
+    expect(deleteStore.getById(deleteId)).not.toBeNull();
+    expect(deleteStore.search("failed delete", 10)).toMatchObject([{ id: deleteId }]);
   });
 
   // ── deleteById ───────────────────────────────────────────────────────────

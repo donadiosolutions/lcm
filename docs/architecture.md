@@ -20,6 +20,139 @@ an explicit unavailable-backend error before the daemon listens. The local
 SQLite hook outbox is not a general cache and remains local even when PostgreSQL
 becomes the authoritative project-memory backend.
 
+## Storage repository architecture
+
+LCM's application code accesses project memory through asynchronous domain
+repositories. A repository describes what LCM needs to do—for example, create a
+message, traverse summary lineage, or record recall feedback—without exposing a
+SQL connection, statement, transaction object, placeholder syntax, or other
+backend-specific primitive.
+
+SQLite is the authoritative implementation of these contracts and remains the
+zero-configuration default. The repository boundary is preparation for later
+PostgreSQL work; it does not enable PostgreSQL by itself. Until the PostgreSQL
+adapter and its rollout gates land in later issues, selecting `postgresql`
+continues to fail explicitly rather than falling back to SQLite.
+
+### Ownership and domain grouping
+
+`StorageBackendFactory` owns resources shared by one configured backend, such as
+connection-pool policy. Opening a project returns a `ProjectStorage` scope whose
+repositories are bound to that project. Application code depends on these
+interfaces, while the SQLite adapter alone owns `DatabaseSync`, migrations,
+SQLite feature probes, FTS5 details, and connection pooling.
+
+The project scope groups operations by domain:
+
+| `ProjectStorage` repository | Responsibility |
+| --- | --- |
+| `conversations` | Conversation identity, message and message-part persistence, ordering, and deletion |
+| `summaries` | Summary records and DAG lineage |
+| `context` | Ordered context replacement, depth discovery, and token totals |
+| `largeFiles` | Large-file metadata and retrieval |
+| `promotedMemory` | Durable memory records, tags, confidence, archival, revival, and stale-candidate selection |
+| `recall` | Surfacing history, feedback, and recall statistics |
+| `lexicalSearch` | Backend-specific message, summary, and promoted-memory search with stable ordering, ranking, filtering, and fallback behavior |
+| `redactionAdmin` | Redaction counters and the bounded administrative operations needed by normal workflows |
+| `coordination` | Ingest checkpoints and other project-scoped workflow coordination |
+
+The caller that opens a `ProjectStorage` owns it and closes it in `finally`.
+Closing a project scope or factory is idempotent. Transaction-scoped
+repositories are borrowed only for their callback and must not be retained.
+Long-lived processes may retain a factory while opening short-lived project
+scopes for requests; short-lived commands close both scopes and the factory
+before exit. Closing one project scope must not invalidate another scope owned
+by a concurrent request.
+
+### Capabilities, health, and errors
+
+Capabilities are explicit data, not behavior inferred by probing a repository.
+Callers check them before requesting an optional operation. An unsupported
+capability fails with a typed, sanitized error instead of silently changing the
+algorithm or reaching into an adapter. Current capability data identifies
+transaction, lexical-search, regular-expression-search, and full-text-search
+support, plus whether coordination is local or distributed.
+
+Health checks report whether the selected backend can serve repository
+operations and identify the backend and affected domain. They do not return
+connection URLs, credentials, certificate contents, filesystem database paths,
+raw driver errors, SQL text, or bound values. Operation failures follow the same
+rule: useful diagnostics may name the backend, project identity, and repository
+domain, but secret-bearing and dialect-specific details remain inside the
+adapter and logs' existing safety boundaries.
+
+### Transactions
+
+Transactions are asynchronous callbacks on `ProjectStorage`:
+
+```ts
+await project.transaction(async (tx) => {
+  const messages = await tx.conversations.createMessagesBulk(inputs);
+  await tx.context.appendContextMessages(
+    conversationId,
+    messages.map((message) => message.messageId),
+  );
+  await tx.redactionAdmin.upsertCounts(counts);
+});
+```
+
+The callback receives repositories bound to one transaction. Returning from the
+callback commits atomically; throwing or rejecting rolls back the complete
+callback and rethrows a sanitized operation error. A callback must not use the
+non-transactional repositories from its outer `ProjectStorage` scope.
+
+Nested transactions are rejected immediately and explicitly. They are not
+implemented as savepoints, queued behind the outer transaction, or committed
+independently. Repository and transaction objects never expose SQL handles, so
+application code cannot accidentally bypass this boundary.
+
+### Adding a repository operation
+
+When a workflow needs a new persistence operation:
+
+1. Add the smallest backend-neutral method to the appropriate domain contract.
+   Describe inputs, outputs, ordering, idempotency, and transaction semantics;
+   do not encode SQL or driver concepts in its types.
+2. Implement it in the SQLite adapter while preserving current results, FTS
+   fallback, isolation, and error behavior.
+3. Add it to the reusable backend-conformance fixtures, including success,
+   failure, ordering, project isolation, transaction, and close behavior where
+   relevant.
+4. Implement the same contract in every enabled adapter. PostgreSQL operations
+   are added by the later PostgreSQL adapter issues before that backend is made
+   available.
+5. Route the consumer through `ProjectStorage` and await the operation. Keep the
+   project scope's ownership and close point visible at the composition layer.
+
+Do not add a generic query escape hatch to avoid updating an adapter. A missing
+contract operation is an architecture change that must be implemented and
+tested across adapters.
+
+### Staged integration boundary
+
+Issue #81 covers domain contracts, the SQLite adapter, transaction semantics,
+and repository-backed SQLite composition paths. Bespoke SQLite import/export,
+aggregate stats, status, connection-pool diagnostics, and administrative SQL
+remain deliberately outside this first migration. Issue #224 will route those
+surfaces through backend-neutral workflows after the PostgreSQL domains and
+conformance harness are complete. Their temporary SQLite implementation is not
+permission for new application code to bypass repositories.
+
+### Local hook outbox exception
+
+`LocalHookOutboxRepository` is an intentionally SQLite-only boundary. Hooks use
+it to capture passive events quickly even when the daemon or authoritative
+project backend is unavailable. A later daemon pass reads the outbox, promotes
+eligible events through the selected project's repositories, and marks local
+entries processed only according to the existing retry rules.
+
+The outbox is not a project-memory cache, a dual-write target, an offline read
+replica, or a fallback source for repository reads. PostgreSQL outages must
+remain visible to authoritative workflows; they do not authorize reads or
+writes against a hidden SQLite copy of project memory. The outbox owns only
+local event capture, retry, pruning, health, and error-log operations, and it
+does not expose its SQLite handle to callers.
+
 ## Data model
 
 ### Conversations and messages

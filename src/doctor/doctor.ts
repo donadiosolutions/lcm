@@ -260,7 +260,11 @@ function testMcpHandshake(): Promise<CheckResult> {
     let stdout = "";
     let finished = false;
     let stopRequested = false;
-    let killAttempted = false;
+    let termination: Promise<void> | undefined;
+    let recordChildClose!: () => void;
+    const childClosed = new Promise<void>((resolveChildClose) => {
+      recordChildClose = resolveChildClose;
+    });
     const timers = new Set<ReturnType<typeof setTimeout>>();
 
     const resultFromOutput = (): CheckResult => {
@@ -284,18 +288,44 @@ function testMcpHandshake(): Promise<CheckResult> {
     };
 
     const childIsLive = (): boolean => child.exitCode === null && child.signalCode === null;
-    const stopChild = (retry = false): boolean => {
-      stopRequested = true;
+    const signalChild = (signal: NodeJS.Signals): boolean => {
       if (!childIsLive()) return true;
-      if (killAttempted && !retry) return false;
-      killAttempted = true;
-      try { return child.kill(); } catch { return false; }
+      try { return child.kill(signal); } catch { return false; }
+    };
+    const waitForClose = async (timeoutMs: number): Promise<void> => {
+      let resolveTimeout!: () => void;
+      const timeout = new Promise<void>((resolve) => {
+        resolveTimeout = resolve;
+      });
+      const timer = setTimeout(resolveTimeout, timeoutMs);
+      await Promise.race([
+        childClosed,
+        timeout,
+      ]);
+      clearTimeout(timer);
+    };
+    const abandonChild = (): void => {
+      try { child.stdin.destroy(); } catch {}
+      try { child.stdout.destroy(); } catch {}
+      try { child.unref(); } catch {}
+    };
+    const stopChild = (): Promise<void> => {
+      stopRequested = true;
+      if (!childIsLive()) return Promise.resolve();
+      termination ??= (async () => {
+        const termSent = signalChild("SIGTERM");
+        if (termSent && childIsLive()) await waitForClose(250);
+        if (childIsLive()) {
+          signalChild("SIGKILL");
+          await waitForClose(250);
+        }
+        if (childIsLive()) abandonChild();
+      })();
+      return termination;
     };
     const stopChildForPipeFailure = (): void => {
       if (finished) return;
-      // Killing can synchronously emit close. Otherwise keep the watchdog
-      // active so any stdout produced during shutdown can still be collected.
-      stopChild();
+      void stopChild();
     };
     const stdinIsWritable = (): boolean => !finished
       && !stopRequested
@@ -306,7 +336,10 @@ function testMcpHandshake(): Promise<CheckResult> {
 
     child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
     child.stdout.on("error", stopChildForPipeFailure);
-    child.on("close", () => { finish(resultFromOutput()); });
+    child.on("close", () => {
+      recordChildClose();
+      finish(resultFromOutput());
+    });
     child.on("error", () => {
       if (stopRequested) return;
       finish({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "Could not spawn MCP process" });
@@ -317,12 +350,13 @@ function testMcpHandshake(): Promise<CheckResult> {
     });
 
     timers.add(setTimeout(() => {
-      stopChild(true);
-      if (childIsLive()) {
-        try { child.stdout.destroy(); } catch {}
-        try { child.unref(); } catch {}
-      }
-      finish(resultFromOutput());
+      void (async () => {
+        try {
+          await stopChild();
+        } finally {
+          finish(resultFromOutput());
+        }
+      })();
     }, 6000));
 
     // Send initialize, wait 300ms, then send tools/list, then close stdin after 500ms
@@ -370,13 +404,15 @@ function formatTimeAgo(date: Date): string {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-function checkPassiveLearning(
+async function checkPassiveLearning(
   results: CheckResult[],
   options: Required<DoctorRunOptions>,
   daemonHealthy: boolean,
-): void {
+): Promise<void> {
   const statsOptions = { timeoutMs: 2000, maxDbs: options.eventsMaxDbs, pruneOrphanSidecars: true };
-  const stats = options.verbose ? collectDetailedEventStats(statsOptions) : collectEventStats(statsOptions);
+  const stats = options.verbose
+    ? await collectDetailedEventStats(statsOptions)
+    : await collectEventStats(statsOptions);
 
   if ((stats.prunedSidecars ?? 0) > 0) {
     results.push({
@@ -893,7 +929,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   // ── Passive Learning ──
   // The hooks check above always reports pass or warn, so passive-learning
   // diagnostics are always applicable by the time this point is reached.
-  checkPassiveLearning(results, options, daemonHealthy);
+  await checkPassiveLearning(results, options, daemonHealthy);
 
   return results;
 }

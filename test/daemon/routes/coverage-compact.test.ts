@@ -83,6 +83,37 @@ vi.mock("../../../src/store/summary-store.js", () => ({
     getSummary = async () => ({ content: "created summary" });
   },
 }));
+vi.mock("../../../src/storage/index.js", () => ({
+  createStorageBackendFactory: () => ({
+    openProject: async () => {
+      const conversations = {
+        getOrCreateConversation: async () => ({ conversationId: "conversation" }),
+        getMessageCount: async () => 0,
+        createMessagesBulk: async () => [],
+      };
+      const summaries = {
+        getSummariesByConversation: async () => state.summaries,
+        getSummary: async () => ({ content: "created summary" }),
+      };
+      const context = {
+        appendContextMessages: async () => undefined,
+        getContextTokenCount: async () => state.tokenCount,
+      };
+      const repositories = {
+        conversations,
+        summaries,
+        context,
+        redactionAdmin: { upsertCounts: async () => undefined },
+      };
+      return {
+        ...repositories,
+        transaction: async (callback: (value: typeof repositories) => Promise<unknown>) => callback(repositories),
+        close: async () => undefined,
+      };
+    },
+    close: async () => undefined,
+  }),
+}));
 vi.mock("../../../src/compaction.js", () => ({
   MANUAL_COMPACT_FRESH_TAIL_COUNT: 8,
   CompactionEngine: class { compact = async () => state.compactResult; },

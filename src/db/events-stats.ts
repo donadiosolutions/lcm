@@ -44,7 +44,7 @@ function normalizeStatsOptions(options: EventStatsOptions = {}): EventSidecarSca
  * Used by both lcm doctor and lcm stats.
  * @param options Total scan options, or timeout in milliseconds for backward compatibility.
  */
-export function collectEventStats(options: EventStatsOptions = {}): EventStats {
+export async function collectEventStats(options: EventStatsOptions = {}): Promise<EventStats> {
   const scanOptions = normalizeStatsOptions(options);
   const result: EventStats = {
     captured: 0,
@@ -59,7 +59,7 @@ export function collectEventStats(options: EventStatsOptions = {}): EventStats {
     orphanedSidecarsWithUnprocessed: 0,
   };
 
-  for (const sidecar of collectEventSidecars(scanOptions)) {
+  for (const sidecar of await collectEventSidecars(scanOptions)) {
     result.sidecars = result.sidecars! + 1;
     if (sidecar.pruned) {
       result.prunedSidecars = result.prunedSidecars! + 1;
@@ -93,7 +93,7 @@ export function collectEventStats(options: EventStatsOptions = {}): EventStats {
 /**
  * Detailed scan for verbose doctor output — returns per-project breakdown + recent errors.
  */
-export function collectDetailedEventStats(options: EventStatsOptions = {}): DetailedEventStats {
+export async function collectDetailedEventStats(options: EventStatsOptions = {}): Promise<DetailedEventStats> {
   const scanOptions = normalizeStatsOptions(options);
   const result: DetailedEventStats = {
     captured: 0, unprocessed: 0, errors: 0, scanErrors: 0, scanSkipped: 0, prunedSidecars: 0, lastCapture: null,
@@ -101,7 +101,7 @@ export function collectDetailedEventStats(options: EventStatsOptions = {}): Deta
     projects: [], recentErrors: [],
   };
 
-  for (const sidecar of collectEventSidecars({ ...scanOptions, includeRecentErrors: true })) {
+  for (const sidecar of await collectEventSidecars({ ...scanOptions, includeRecentErrors: true })) {
     result.sidecars = result.sidecars! + 1;
     if (sidecar.pruned) {
       result.prunedSidecars = result.prunedSidecars! + 1;

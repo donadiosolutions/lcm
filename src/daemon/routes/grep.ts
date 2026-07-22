@@ -1,16 +1,13 @@
-import { existsSync } from "node:fs";
 import type { DaemonConfig } from "../config.js";
-import { projectDbPath } from "../project.js";
+import { projectIdentity } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
-import { runLcmMigrations } from "../../db/migration.js";
-import { ConversationStore } from "../../store/conversation-store.js";
-import { SummaryStore } from "../../store/summary-store.js";
-import { RetrievalEngine } from "../../retrieval.js";
+import { createRetrievalEngine } from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
-import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
+import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
+import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
 
-export function createGrepHandler(_config: DaemonConfig): RouteHandler {
+export function createGrepHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body) => {
     const input = JSON.parse(body || "{}");
     const { query, scope, mode, since } = input;
@@ -33,25 +30,22 @@ export function createGrepHandler(_config: DaemonConfig): RouteHandler {
       return;
     }
 
+    let project: ProjectStorage | undefined;
+    let ownedFactory: StorageBackendFactory | undefined;
     try {
-      const dbPath = projectDbPath(cwd);
-      if (!existsSync(dbPath)) {
+      const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+      project = await openExistingProject(factory, projectIdentity(cwd)) ?? undefined;
+      if (!project) {
         sendJson(res, 200, { matches: [] });
         return;
       }
-      try {
-        const db = getLcmConnection(dbPath);
-        runLcmMigrations(db);
-        const convStore = new ConversationStore(db);
-        const summStore = new SummaryStore(db);
-        const engine = new RetrievalEngine(convStore, summStore);
-        const result = await engine.grep({ query, mode: mode ?? "full_text", scope: scope ?? "both", since });
-        sendJson(res, 200, result);
-      } finally {
-        closeLcmConnection(dbPath);
-      }
+      const engine = createRetrievalEngine(project);
+      const result = await engine.grep({ query, mode: mode ?? "full_text", scope: scope ?? "both", since });
+      sendJson(res, 200, result);
     } catch (err) {
       sendJson(res, 200, { matches: [] });
+    } finally {
+      await closeRouteStorage(project, ownedFactory);
     }
   };
 }

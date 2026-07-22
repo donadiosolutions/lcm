@@ -7,9 +7,14 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { createDaemon, type DaemonInstance } from "../../../src/daemon/server.js";
 import { loadDaemonConfig, parseDaemonConfig } from "../../../src/daemon/config.js";
-import { projectDbPath, projectId } from "../../../src/daemon/project.js";
+import { projectDbPath, projectId, projectIdentity } from "../../../src/daemon/project.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import { ConversationStore } from "../../../src/store/conversation-store.js";
+import {
+  SqliteStorageBackendFactory,
+  type ProjectStorage,
+  type StorageBackendFactory,
+} from "../../../src/storage/index.js";
 
 // --- Summarizer branching unit tests ---
 
@@ -52,6 +57,7 @@ function mockReq(): IncomingMessage {
 function makeConfig(provider: DaemonConfig["llm"]["provider"]): DaemonConfig {
   return {
     version: 1,
+    storage: { backend: "sqlite" },
     daemon: { port: 3737, socketPath: "/tmp/test.sock", logLevel: "info", logMaxSizeMB: 10, logRetentionDays: 7, idleTimeoutMs: 1800000 },
     compaction: {
       leafTokens: 1000, maxDepth: 5, autoCompactMinTokens: 10000,
@@ -713,6 +719,88 @@ describe("POST /compact", () => {
 
     expect(compactRes.status).toBe(200);
     expect(await readMessageCount(tempDir, sessionId)).toBe(4);
+  });
+
+  it("keeps transcript checkpoints and inserts atomic with concurrent ingestion", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-compact-ingest-race-"));
+    tempDirs.push(tempDir);
+    const transcriptPath = join(tempDir, "session.jsonl");
+    const transcriptContents = ["race user", "race assistant", "race follow-up"];
+    writeFileSync(
+      transcriptPath,
+      [
+        JSON.stringify({ message: { role: "user", content: transcriptContents[0] } }),
+        JSON.stringify({ message: { role: "assistant", content: transcriptContents[1] } }),
+        JSON.stringify({ message: { role: "user", content: transcriptContents[2] } }),
+      ].join("\n"),
+    );
+
+    const sessionId = "compact-ingest-race";
+    const dbPath = join(tempDir, "race.db");
+    const baseFactory = new SqliteStorageBackendFactory({
+      resolveProject: (identity) => ({ id: identity.id, dbPath }),
+    });
+    const identity = projectIdentity(tempDir);
+    const concurrentProject = await baseFactory.openProject(identity);
+    const conversation = await concurrentProject.conversations.getOrCreateConversation(sessionId);
+    let injectedConcurrentIngest = false;
+
+    const wrapProject = (project: ProjectStorage): ProjectStorage => new Proxy(project, {
+      get(target, property) {
+        if (property === "transaction") {
+          return async <T>(callback: Parameters<ProjectStorage["transaction"]>[0]): Promise<T> => {
+            if (!injectedConcurrentIngest) {
+              injectedConcurrentIngest = true;
+              await concurrentProject.transaction(async (repositories) => {
+                const record = await repositories.conversations.createMessage({
+                  conversationId: conversation.conversationId,
+                  seq: 0,
+                  role: "user",
+                  content: transcriptContents[0],
+                  tokenCount: 2,
+                });
+                await repositories.context.appendContextMessage(
+                  conversation.conversationId,
+                  record.messageId,
+                );
+              });
+            }
+            return target.transaction(callback) as Promise<T>;
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const racingFactory: StorageBackendFactory = {
+      backend: baseFactory.backend,
+      capabilities: baseFactory.capabilities,
+      projectExists: (project) => baseFactory.projectExists(project),
+      openExistingProject: async (project) => {
+        const opened = await baseFactory.openExistingProject(project);
+        return opened ? wrapProject(opened) : null;
+      },
+      openProject: async (project) => wrapProject(await baseFactory.openProject(project)),
+      health: () => baseFactory.health(),
+      close: () => baseFactory.close(),
+    };
+
+    try {
+      const output = mockRes();
+      await createCompactHandler(makeConfig("openai"), racingFactory)(
+        mockReq(),
+        output.res,
+        JSON.stringify({ session_id: sessionId, cwd: tempDir, transcript_path: transcriptPath }),
+      );
+
+      expect(output.getBody()).toMatchObject({ actionTaken: false });
+      expect(injectedConcurrentIngest).toBe(true);
+      expect((await concurrentProject.conversations.getMessages(conversation.conversationId))
+        .map((message) => message.content)).toEqual(transcriptContents);
+    } finally {
+      await concurrentProject.close();
+      await baseFactory.close();
+    }
   });
 
   it("accepts previous_summary and returns latestSummaryContent", async () => {

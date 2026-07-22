@@ -32,7 +32,7 @@ const LOCAL_TOOLS: Record<string, (args: Record<string, unknown>) => Promise<str
   lcm_stats: async (args) => {
     selectStorageBackend(loadDaemonConfig(defaultConfigPath()).storage);
     const { collectStats, formatNumber } = await import("../stats.js");
-    const stats = collectStats();
+    const stats = await collectStats();
     const verbose = args.verbose === true;
     const lines: string[] = [];
 

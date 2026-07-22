@@ -8,12 +8,13 @@ const mocks = vi.hoisted(() => ({
   mark: vi.fn(),
   setPrev: vi.fn(),
   closeEvents: vi.fn(),
-  getConnection: vi.fn(() => ({})),
   collect: vi.fn(() => [] as unknown[]),
   storeSearch: vi.fn(() => [] as unknown[]),
   dedup: vi.fn(async () => "id"),
-  closeConnection: vi.fn(),
-  migrate: vi.fn(),
+  openProject: vi.fn(),
+  closeProject: vi.fn(),
+  closeFactory: vi.fn(),
+  transaction: vi.fn(async (callback: (repositories: unknown) => Promise<unknown>) => callback({})),
   validate: vi.fn((cwd: string) => cwd),
   log: vi.fn(),
   send: vi.fn(),
@@ -30,13 +31,16 @@ vi.mock("../../../src/hooks/events-db.js", () => ({
   },
 }));
 vi.mock("../../../src/db/events-path.js", () => ({ eventsDbPath: () => "/events.db" }));
-vi.mock("../../../src/db/promoted.js", () => ({ PromotedStore: class { search = mocks.storeSearch; } }));
 vi.mock("../../../src/promotion/dedup.js", () => ({ deduplicateAndInsert: mocks.dedup }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
-vi.mock("../../../src/daemon/project.js", () => ({ projectId: () => "pid", projectDbPath: () => "/project.db" }));
-vi.mock("../../../src/db/connection.js", () => ({ getLcmConnection: mocks.getConnection, closeLcmConnection: mocks.closeConnection }));
-vi.mock("../../../src/db/migration.js", () => ({ runLcmMigrations: mocks.migrate }));
+vi.mock("../../../src/daemon/project.js", () => ({
+  projectDir: () => "/project",
+  projectIdentity: () => ({ id: "pid", canonical: "/cwd" }),
+}));
+vi.mock("../../../src/storage/index.js", () => ({
+  createStorageBackendFactory: () => ({ openProject: mocks.openProject, close: mocks.closeFactory }),
+}));
 vi.mock("../../../src/hooks/hook-errors.js", () => ({ safeLogError: mocks.log }));
 vi.mock("../../../src/db/event-sidecars.js", () => ({ collectEventSidecars: mocks.collect }));
 vi.mock("../../../src/scrub.js", () => ({
@@ -45,6 +49,7 @@ vi.mock("../../../src/scrub.js", () => ({
 
 import {
   createPromoteAllEventsHandler,
+  createPromoteEventsHandler,
   drainEventsForCwd,
   promoteEventsForCwd,
 } from "../../../src/daemon/routes/promote-events.js";
@@ -67,17 +72,30 @@ function event(overrides: Partial<EventRow>): EventRow {
 
 const config = loadDaemonConfig("/tmp/promote-events-unit");
 
+function projectStorage() {
+  return {
+    projectId: "pid",
+    promotedMemory: {},
+    lexicalSearch: { searchPromoted: mocks.storeSearch },
+    transaction: mocks.transaction,
+    close: mocks.closeProject,
+  };
+}
+
 describe("promote-events unit boundaries", () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockClear();
     mocks.events.mockReturnValue([]);
     mocks.reinforcement.mockReturnValue({ totalCount: 0, distinctSessions: 0 });
     mocks.collect.mockReturnValue([]);
-    mocks.getConnection.mockReturnValue({});
+    mocks.openProject.mockResolvedValue(projectStorage());
     mocks.storeSearch.mockReturnValue([]);
     mocks.dedup.mockResolvedValue("id");
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
+    mocks.closeProject.mockResolvedValue(undefined);
+    mocks.closeFactory.mockResolvedValue(undefined);
+    mocks.closeEvents.mockImplementation(() => undefined);
   });
 
   it("returns a generic global error when sidecar collection throws", async () => {
@@ -88,7 +106,7 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "failed to promote events" });
   });
 
-  it("reports incomplete global drains and skips closing connections that never opened", async () => {
+  it("reports incomplete global drains and closes owned factories when projects fail to open", async () => {
     mocks.collect.mockReturnValueOnce([{
       projectId: "p", cwd: "/cwd", path: "/events.db", metadataMissing: false,
       captured: 1, unprocessed: 1, errors: 0, lastCapture: "2026", file: "p.db",
@@ -99,16 +117,60 @@ describe("promote-events unit boundaries", () => {
     await createPromoteAllEventsHandler(config)({} as never, response, "");
     expect(mocks.send.mock.calls.at(-1)?.[2]).toMatchObject({ failedProjects: 1, processedProjects: 1 });
 
-    mocks.getConnection.mockImplementationOnce(() => { throw new Error("open failed"); });
+    mocks.openProject.mockRejectedValueOnce(new Error("open failed"));
     await expect(drainEventsForCwd(config, "/cwd", "/events.db")).rejects.toThrow("open failed");
-    mocks.getConnection.mockImplementationOnce(() => { throw new Error("open failed"); });
+    mocks.openProject.mockRejectedValueOnce(new Error("open failed"));
     await expect(promoteEventsForCwd(config, "/cwd", "/events.db")).rejects.toThrow("open failed");
+    expect(mocks.closeFactory).toHaveBeenCalledTimes(3);
   });
 
   it("distinguishes an initially empty drain", async () => {
     mocks.events.mockReturnValueOnce([]);
     await expect(drainEventsForCwd(config, "/cwd", "/events.db"))
       .resolves.toMatchObject({ batches: 0, message: "no unprocessed events" });
+  });
+
+  it("uses but does not close an injected process storage factory", async () => {
+    const injectedFactory = { openProject: mocks.openProject, close: mocks.closeFactory } as never;
+    const response = {} as never;
+
+    await createPromoteEventsHandler(config, injectedFactory)(
+      {} as never,
+      response,
+      JSON.stringify({ cwd: "/cwd" }),
+    );
+
+    expect(mocks.openProject).toHaveBeenCalledWith({ id: "pid", canonical: "/cwd" });
+    expect(mocks.closeProject).toHaveBeenCalledOnce();
+    expect(mocks.closeFactory).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, expect.objectContaining({
+      message: "no unprocessed events",
+    }));
+  });
+
+  it("settles every cleanup failure without replacing a successful result", async () => {
+    mocks.closeProject.mockRejectedValueOnce(new Error("project close failed"));
+    mocks.closeEvents.mockImplementationOnce(() => { throw new Error("outbox close failed"); });
+    mocks.closeFactory.mockRejectedValueOnce(new Error("factory close failed"));
+
+    await expect(promoteEventsForCwd(config, "/cwd", "/events.db"))
+      .resolves.toMatchObject({ message: "no unprocessed events" });
+
+    expect(mocks.closeProject).toHaveBeenCalledOnce();
+    expect(mocks.closeEvents).toHaveBeenCalledOnce();
+    expect(mocks.closeFactory).toHaveBeenCalledOnce();
+  });
+
+  it("preserves the primary failure while settling partially constructed resources", async () => {
+    const primary = new Error("open failed");
+    mocks.openProject.mockRejectedValueOnce(primary);
+    mocks.closeEvents.mockImplementationOnce(() => { throw new Error("outbox close failed"); });
+    mocks.closeFactory.mockRejectedValueOnce(new Error("factory close failed"));
+
+    await expect(promoteEventsForCwd(config, "/cwd", "/events.db")).rejects.toBe(primary);
+    expect(mocks.closeProject).not.toHaveBeenCalled();
+    expect(mocks.closeEvents).toHaveBeenCalledOnce();
+    expect(mocks.closeFactory).toHaveBeenCalledOnce();
   });
 
   it("stops after the hard maximum when a sidecar never drains", async () => {
@@ -145,8 +207,12 @@ describe("promote-events unit boundaries", () => {
     mocks.storeSearch.mockImplementation((query: string) => query === "existing" ? [{ id: "match" }] : []);
     mocks.reinforcement.mockImplementation((_type: string, _category: string, data: string) =>
       data === "reinforced" ? { totalCount: 3, distinctSessions: 2 } : { totalCount: 0, distinctSessions: 0 });
-    mocks.dedup.mockImplementation(async (input: { content: string }) => {
+    mocks.dedup.mockImplementation(async (input: {
+      content: string;
+      transaction: (callback: () => Promise<void>) => Promise<void>;
+    }) => {
       if (input.content === "dedup-error") throw new Error("dedup failed");
+      await input.transaction(async () => undefined);
       return "id";
     });
     const defaults = structuredClone(config);
@@ -167,5 +233,34 @@ describe("promote-events unit boundaries", () => {
     expect(result).toMatchObject({ promoted: 7, skipped: 1, correlated: 2, errors: 1 });
     expect(mocks.setPrev).toHaveBeenCalledWith(2, 1);
     expect(mocks.mark).toHaveBeenCalledWith(expect.arrayContaining([1, 2, 3, 4, 5, 6, 8, 9]));
+  });
+
+  it("scopes tier 3 eligibility to the current project attribution", async () => {
+    mocks.events.mockReturnValueOnce([
+      event({ event_id: 1, category: "file", type: "file", data: "foreign-only", priority: 3 }),
+      event({ event_id: 2, category: "file", type: "file", data: "same-project", priority: 3 }),
+    ]);
+    mocks.storeSearch.mockImplementation(
+      (query: string, _limit: number, _tags: string[] | undefined, sourceProjectId: string | undefined) => {
+        if (query === "foreign-only") {
+          return sourceProjectId === undefined ? [{ id: "foreign" }] : [];
+        }
+        return sourceProjectId === "pid" ? [{ id: "same-project" }] : [];
+      },
+    );
+
+    await expect(promoteEventsForCwd(config, "/cwd", "/events.db")).resolves.toMatchObject({
+      promoted: 1,
+      skipped: 1,
+      errors: 0,
+    });
+    expect(mocks.storeSearch).toHaveBeenNthCalledWith(1, "foreign-only", 1, undefined, "pid");
+    expect(mocks.storeSearch).toHaveBeenNthCalledWith(2, "same-project", 1, undefined, "pid");
+    expect(mocks.dedup).toHaveBeenCalledOnce();
+    expect(mocks.dedup).toHaveBeenCalledWith(expect.objectContaining({
+      content: "same-project",
+      sourceProjectId: "pid",
+    }));
+    expect(mocks.mark).toHaveBeenCalledWith([1, 2]);
   });
 });

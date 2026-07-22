@@ -1,29 +1,22 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
 import type { DaemonConfig } from "../config.js";
-import { projectDbPath } from "../project.js";
+import { projectIdentity } from "../project.js";
 import { buildOrientationPrompt } from "../orientation.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
-import { runLcmMigrations } from "../../db/migration.js";
-import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
-import { PromotedStore } from "../../db/promoted.js";
 import { justCompactedMap, JUST_COMPACTED_TTL_MS } from "./compact.js";
 import { fenceContent } from "../content-fence.js";
 import { validateCwd } from "../validate-cwd.js";
 import { normalizeTranscriptClient, type TranscriptClient } from "../../transcript-provider.js";
 import { readBoundedRegularFile } from "../../security-files.js";
-
-type SessionInstructionsRow = {
-  content: string;
-  content_hash: string;
-  updated_at: string;
-};
-
-const SESSION_INSTRUCTION_CACHE_TABLE = "session_instruction_cache";
+import {
+  createStorageBackendFactory,
+  type ProjectStorage,
+  type StorageBackendFactory,
+} from "../../storage/index.js";
+import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
 const MAX_SESSION_INSTRUCTIONS_BYTES = 1024 * 1024;
 
 function sessionInstructionsId(client: TranscriptClient): number {
@@ -45,21 +38,6 @@ function codexInstructionPaths(cwd: string): InstructionPath[] {
     ...dirs.reverse().map((dir) => ({ label: `${dir}/AGENTS.md`, path: join(dir, "AGENTS.md"), allowedRoot: dir })),
     { label: `${cwd}/.codex/AGENTS.md`, path: join(cwd, ".codex", "AGENTS.md"), allowedRoot: cwd },
   ];
-}
-
-function readSessionInstructionsRow(
-  db: DatabaseSync,
-  instructionsId: number,
-  client: TranscriptClient,
-): SessionInstructionsRow | undefined {
-  const row = db
-    .prepare(`SELECT content, content_hash, updated_at FROM ${SESSION_INSTRUCTION_CACHE_TABLE} WHERE id = ?`)
-    .get(instructionsId) as SessionInstructionsRow | undefined;
-  if (row || client !== "claude") return row;
-
-  return db
-    .prepare(`SELECT content, content_hash, updated_at FROM session_instructions WHERE id = 1`)
-    .get() as SessionInstructionsRow | undefined;
 }
 
 function readSessionInstructionFiles(cwd: string, client: TranscriptClient): string {
@@ -93,8 +71,13 @@ function readSessionInstructionFiles(cwd: string, client: TranscriptClient): str
   return parts.join("\n\n");
 }
 
-export function createRestoreHandler(config: DaemonConfig): RouteHandler {
+export function createRestoreHandler(
+  config: DaemonConfig,
+  storageFactory?: StorageBackendFactory,
+): RouteHandler {
   return async (_req, res, body) => {
+    let project: ProjectStorage | undefined;
+    let ownedFactory: StorageBackendFactory | undefined;
     try {
       const input = JSON.parse(body || "{}");
       const { session_id, source } = input;
@@ -110,6 +93,17 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
         }
       }
       const orientation = buildOrientationPrompt();
+      const openProject = async (createIfMissing: boolean): Promise<ProjectStorage | null> => {
+        if (project) return project;
+        const factory = storageFactory
+          ?? ownedFactory
+          ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        const identity = projectIdentity(cwd!);
+        project = createIfMissing
+          ? await factory.openProject(identity)
+          : await openExistingProject(factory, identity) ?? undefined;
+        return project ?? null;
+      };
 
       // Post-compaction detection
       const isPostCompact =
@@ -119,21 +113,18 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
       // Query session_instructions for compact/resume paths
       let instructionsContext = "";
       if (cwd) {
-        const dbPath = projectDbPath(cwd);
-        if (existsSync(dbPath)) {
-          try {
-            const db = getLcmConnection(dbPath);
-            try {
-              runLcmMigrations(db);
-              const row = readSessionInstructionsRow(db, instructionsId, client);
-              if (row) {
-                instructionsContext = `<project-instructions>\n${row.content}\n</project-instructions>`;
-              }
-            } finally {
-              closeLcmConnection(dbPath);
+        try {
+          const storage = await openProject(!isPostCompact);
+          if (storage) {
+            const row = await storage.coordination.getSessionInstructions(
+              instructionsId,
+              client === "claude" ? 1 : undefined,
+            );
+            if (row) {
+              instructionsContext = `<project-instructions>\n${row.content}\n</project-instructions>`;
             }
-          } catch { /* non-fatal */ }
-        }
+          }
+        } catch { /* non-fatal */ }
       }
 
       if (isPostCompact) {
@@ -148,76 +139,60 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
       // Episodic: query recent summaries from project SQLite DB.
       // Also capture client-specific instruction files on startup.
       if (cwd) {
-        const dbPath = projectDbPath(cwd);
-        mkdirSync(dirname(dbPath), { recursive: true });
         try {
-          const db = getLcmConnection(dbPath);
+          // createIfMissing=true either opens a project or throws; it cannot
+          // produce the null used by post-compaction existence checks.
+          const storage = await openProject(true) as ProjectStorage;
+          const rows = await storage.summaries.listRecentSummariesForSession(
+            session_id,
+            config.restoration.recentSummaries,
+          );
+
+          if (rows.length > 0) {
+            episodicContext = fenceContent(
+              rows.map((r) => r.content).join("\n\n"),
+              "recent-session-context",
+            );
+          }
+
+          // Promoted: cross-session knowledge from SQLite
           try {
-            runLcmMigrations(db);
-
-            const rows = db.prepare(
-              `SELECT s.content FROM summaries s
-               JOIN conversations c ON s.conversation_id = c.conversation_id
-               WHERE c.session_id = ?
-               ORDER BY s.depth DESC, s.created_at DESC
-               LIMIT ?`,
-            ).all(session_id, config.restoration.recentSummaries) as Array<{ content: string }>;
-
-            if (rows.length > 0) {
-              episodicContext = fenceContent(
-                rows.map((r) => r.content).join("\n\n"),
-                "recent-session-context",
+            const maxAgeDays = config.restoration.restoreMaxPromotedAgeDays;
+            const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+            // Fetch more candidates than needed, then filter by age before capping.
+            // This prevents old memories from consuming the top-5 slots and leaving
+            // fewer results than available when newer memories exist.
+            const results = (await storage.lexicalSearch.searchPromoted(`project context ${cwd}`, 20))
+              .filter((r) => !r.createdAt || Date.parse(r.createdAt) >= cutoffMs)
+              .slice(0, 5);
+            if (results.length > 0) {
+              promotedContext = fenceContent(
+                results.map((r) => r.content).join("\n\n"),
+                "project-knowledge",
               );
             }
+          } catch { /* non-fatal */ }
 
-            // Promoted: cross-session knowledge from SQLite
-            try {
-              const promotedStore = new PromotedStore(db);
-              const maxAgeDays = config.restoration.restoreMaxPromotedAgeDays;
-              const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-              // Fetch more candidates than needed, then filter by age before capping.
-              // This prevents old memories from consuming the top-5 slots and leaving
-              // fewer results than available when newer memories exist.
-              const results = promotedStore
-                .search(`project context ${cwd}`, 20)
-                .filter((r) => !r.createdAt || Date.parse(r.createdAt) >= cutoffMs)
-                .slice(0, 5);
-              if (results.length > 0) {
-                promotedContext = fenceContent(
-                  results.map((r) => r.content).join("\n\n"),
-                  "project-knowledge",
+          // Capture instruction files and upsert into the client-specific row if changed.
+          try {
+            const instructionContent = readSessionInstructionFiles(cwd, client);
+            if (instructionContent) {
+              const hash = createHash("sha256").update(instructionContent).digest("hex");
+              const existing = await storage.coordination.getSessionInstructions(instructionsId);
+
+              if (!existing || existing.contentHash !== hash) {
+                await storage.coordination.upsertSessionInstructions(
+                  instructionsId,
+                  instructionContent,
+                  hash,
                 );
               }
-            } catch { /* non-fatal */ }
-
-            // Capture instruction files and upsert into the client-specific row if changed.
-            try {
-              const instructionContent = readSessionInstructionFiles(cwd, client);
-              if (instructionContent) {
-                const hash = createHash("sha256").update(instructionContent).digest("hex");
-                const existing = db
-                  .prepare(`SELECT content_hash FROM ${SESSION_INSTRUCTION_CACHE_TABLE} WHERE id = ?`)
-                  .get(instructionsId) as { content_hash: string } | undefined;
-
-                if (!existing || existing.content_hash !== hash) {
-                  db.prepare(
-                    `INSERT INTO ${SESSION_INSTRUCTION_CACHE_TABLE} (id, content, content_hash, updated_at)
-                     VALUES (?, ?, ?, datetime('now'))
-                     ON CONFLICT(id) DO UPDATE SET
-                       content = excluded.content,
-                       content_hash = excluded.content_hash,
-                       updated_at = excluded.updated_at`,
-                  ).run(instructionsId, instructionContent, hash);
-                }
-                instructionsContext = `<project-instructions>\n${instructionContent}\n</project-instructions>`;
-              } else {
-                db.prepare(`DELETE FROM ${SESSION_INSTRUCTION_CACHE_TABLE} WHERE id = ?`).run(instructionsId);
-                instructionsContext = "";
-              }
-            } catch { /* non-fatal */ }
-          } finally {
-            closeLcmConnection(dbPath);
-          }
+              instructionsContext = `<project-instructions>\n${instructionContent}\n</project-instructions>`;
+            } else {
+              await storage.coordination.deleteSessionInstructions(instructionsId);
+              instructionsContext = "";
+            }
+          } catch { /* non-fatal */ }
         } catch { /* non-fatal */ }
       }
 
@@ -225,25 +200,19 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
       let insights: Array<{ content: string; confidence: number; tags: string[] }> = [];
       if (cwd) {
         try {
-          const dbPath = projectDbPath(cwd);
-          if (existsSync(dbPath)) {
-            const insightsDb = getLcmConnection(dbPath);
-            try {
-              runLcmMigrations(insightsDb);
-              const insightsStore = new PromotedStore(insightsDb);
-              const thresholds = config.compaction.promotionThresholds;
-              const minConfidence = thresholds.eventConfidence?.pattern ?? 0.3;
-              const maxAgeDays = thresholds.insightsMaxAgeDays ?? 90;
-              const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-              insights = insightsStore
-                .search("source passive capture", 10, ["source:passive-capture"])
-                .filter((r) => r.confidence >= minConfidence && (!r.createdAt || Date.parse(r.createdAt) >= cutoffMs))
-                .slice(0, 5)
-                .map((r) => ({ content: r.content, confidence: r.confidence, tags: r.tags }));
-            } finally {
-              closeLcmConnection(dbPath);
-            }
-          }
+          const storage = await openProject(true) as ProjectStorage;
+          const thresholds = config.compaction.promotionThresholds;
+          const minConfidence = thresholds.eventConfidence?.pattern ?? 0.3;
+          const maxAgeDays = thresholds.insightsMaxAgeDays ?? 90;
+          const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+          insights = (await storage.lexicalSearch.searchPromoted(
+            "source passive capture",
+            10,
+            ["source:passive-capture"],
+          ))
+            .filter((r) => r.confidence >= minConfidence && (!r.createdAt || Date.parse(r.createdAt) >= cutoffMs))
+            .slice(0, 5)
+            .map((r) => ({ content: r.content, confidence: r.confidence, tags: r.tags }));
         } catch { /* non-fatal */ }
       }
 
@@ -255,6 +224,8 @@ export function createRestoreHandler(config: DaemonConfig): RouteHandler {
       sendJson(res, 200, responseBody);
     } catch (err) {
       sendJson(res, 500, { error: err instanceof Error ? err.message : "restore failed" });
+    } finally {
+      await closeRouteStorage(project, ownedFactory);
     }
   };
 }

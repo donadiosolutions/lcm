@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { makeMockStorageFactory } from "./mock-storage-factory.js";
 
 const mocks = vi.hoisted(() => ({
   exists: vi.fn(() => true),
@@ -17,6 +18,12 @@ const mocks = vi.hoisted(() => ({
   validate: vi.fn((cwd: string) => cwd),
   send: vi.fn(),
   scrub: vi.fn((text: string) => text),
+  openProject: vi.fn(),
+  projectClose: vi.fn(async () => undefined),
+  factoryClose: vi.fn(async () => undefined),
+  transaction: vi.fn(),
+  projectExists: vi.fn(async () => true),
+  createFactory: vi.fn(),
 }));
 
 vi.mock("node:fs", async (importOriginal) => ({
@@ -28,6 +35,7 @@ vi.mock("node:fs", async (importOriginal) => ({
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
   projectPaths: (cwd: string) => ({ id: "pid", dbPath: `${cwd}/lcm.db`, metaPath: `${cwd}/meta.json`, canonical: cwd }),
+  projectIdentity: (cwd: string) => ({ id: "pid", canonical: cwd }),
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/db/connection.js", () => ({ getLcmConnection: mocks.getConnection, closeLcmConnection: mocks.closeConnection }));
@@ -41,6 +49,7 @@ vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.valid
 vi.mock("../../../src/scrub.js", () => ({
   ScrubEngine: { forProject: async () => ({ scrub: mocks.scrub }) },
 }));
+vi.mock("../../../src/storage/index.js", () => ({ createStorageBackendFactory: mocks.createFactory }));
 
 import { createPromoteHandler } from "../../../src/daemon/routes/promote.js";
 
@@ -51,6 +60,7 @@ describe("promote persistence boundaries", () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockClear();
     mocks.exists.mockReturnValue(true);
+    mocks.projectExists.mockResolvedValue(true);
     mocks.read.mockReturnValue("{}");
     mocks.getConnection.mockReturnValue({});
     mocks.conversations.mockResolvedValue([]);
@@ -60,6 +70,19 @@ describe("promote persistence boundaries", () => {
     mocks.dedup.mockResolvedValue(undefined);
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
+    mocks.createFactory.mockImplementation(() => makeMockStorageFactory({
+      projectExists: mocks.projectExists,
+      openProject: mocks.openProject,
+      close: mocks.factoryClose,
+    }));
+    mocks.openProject.mockResolvedValue({
+      conversations: { listConversations: mocks.conversations },
+      summaries: { getSummariesByConversation: mocks.summaries },
+      promotedMemory: { listContentPrefixes: mocks.prefixes },
+      lexicalSearch: {},
+      transaction: mocks.transaction,
+      close: mocks.projectClose,
+    });
   });
 
   it("compares stored prefixes with the same scrubbed content used for insertion", async () => {
@@ -70,11 +93,17 @@ describe("promote persistence boundaries", () => {
     mocks.scrub.mockReturnValueOnce("token=[REDACTED]");
     mocks.prefixes.mockReturnValueOnce(["token=[REDACTED]"]);
 
-    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
+    const injected = makeMockStorageFactory({
+      projectExists: mocks.projectExists,
+      openProject: mocks.openProject,
+      close: mocks.factoryClose,
+    });
+    await createPromoteHandler(config, injected)({} as never, response, JSON.stringify({ cwd: "/ok" }));
 
     expect(mocks.shouldPromote).not.toHaveBeenCalled();
     expect(mocks.dedup).not.toHaveBeenCalled();
     expect(mocks.scrub).toHaveBeenCalledOnce();
+    expect(mocks.factoryClose).not.toHaveBeenCalled();
   });
 
   it("validates cwd and missing databases", async () => {
@@ -87,7 +116,7 @@ describe("promote persistence boundaries", () => {
     mocks.validate.mockImplementationOnce(() => { throw "failure"; });
     await handler({} as never, response, JSON.stringify({ cwd: "/bad" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 400, { error: "invalid cwd" });
-    mocks.exists.mockReturnValueOnce(false);
+    mocks.projectExists.mockResolvedValueOnce(false);
     await handler({} as never, response, JSON.stringify({ cwd: "/missing" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { processed: 0, promoted: 0 });
   });
@@ -132,12 +161,24 @@ describe("promote persistence boundaries", () => {
 
   it("normalizes typed and untyped failures and closes acquired connections", async () => {
     const handler = createPromoteHandler(config);
-    mocks.migrate.mockImplementationOnce(() => { throw new Error("migration failed"); });
+    mocks.openProject.mockRejectedValueOnce(new Error("migration failed"));
     await handler({} as never, response, JSON.stringify({ cwd: "/ok" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "migration failed" });
-    mocks.getConnection.mockImplementationOnce(() => { throw "failure"; });
+    mocks.openProject.mockRejectedValueOnce("failure");
     await handler({} as never, response, JSON.stringify({ cwd: "/ok" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "promote failed" });
-    expect(mocks.closeConnection).toHaveBeenCalledWith("/ok/lcm.db");
+    expect(mocks.projectClose).not.toHaveBeenCalled();
+    expect(mocks.factoryClose).toHaveBeenCalledTimes(2);
+  });
+
+  it("creates metadata when the file is absent", async () => {
+    mocks.read.mockImplementationOnce(() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); });
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
+    expect(mocks.write).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
   });
 });

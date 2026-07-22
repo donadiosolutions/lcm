@@ -526,6 +526,18 @@ export class ConversationStore {
     return row?.count ?? 0;
   }
 
+  async getMessageCountBySessionId(sessionId: string): Promise<number> {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(m.message_id) AS count
+         FROM conversations c
+         LEFT JOIN messages m ON m.conversation_id = c.conversation_id
+         WHERE c.session_id = ?`,
+      )
+      .get(sessionId) as unknown as CountRow;
+    return row?.count ?? 0;
+  }
+
   async getMaxSeq(conversationId: ConversationId): Promise<number> {
     const row = this.db
       .prepare(

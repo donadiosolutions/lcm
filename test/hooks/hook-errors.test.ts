@@ -22,6 +22,7 @@ vi.mock("../../src/db/events-path.js", async () => {
 import { safeLogError, _resetCircuitBreaker, _setLogPathForTesting } from "../../src/hooks/hook-errors.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
 import { eventsDbPath } from "../../src/db/events-path.js";
+import { MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH } from "../../src/hooks/hook-error-diagnostic.js";
 import { lcmPath } from "../../src/runtime-paths.js";
 
 describe("safeLogError", () => {
@@ -39,44 +40,42 @@ describe("safeLogError", () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it("Layer 1: writes to sidecar DB when cwd is valid", () => {
+  it("Layer 1: writes to sidecar DB when cwd is valid", async () => {
     const cwd = join(tempDir, "project");
     mkdirSync(cwd);
-    safeLogError("PostToolUse", new Error("test error"), { cwd, sessionId: "s1" });
+    await safeLogError("PostToolUse", new Error("test error"), { cwd, sessionId: "s1" });
 
     const db = new EventsDb(eventsDbPath(cwd));
-    const rows = db.raw().prepare("SELECT * FROM error_log").all() as Array<{
-      hook: string; error: string; session_id: string;
-    }>;
+    const rows = db.getRecentErrors({ includeMaintenance: true });
     expect(rows).toHaveLength(1);
     expect(rows[0].hook).toBe("PostToolUse");
     expect(rows[0].error).toBe("test error");
     db.close();
   });
 
-  it("Layer 1: skips DB when cwd is undefined, falls to Layer 2", () => {
-    safeLogError("PostToolUse", new Error("no cwd"), {});
+  it("Layer 1: skips DB when cwd is undefined, falls to Layer 2", async () => {
+    await safeLogError("PostToolUse", new Error("no cwd"), {});
     const logPath = join(tempDir, "events.log");
     expect(existsSync(logPath)).toBe(true);
     const content = readFileSync(logPath, "utf-8");
     expect(content).toContain("no cwd");
   });
 
-  it("does not persist project state for a nonexistent diagnostic cwd", () => {
+  it("does not persist project state for a nonexistent diagnostic cwd", async () => {
     const cwd = join(tempDir, "missing-project");
-    safeLogError("PostToolUse", new Error("invalid cwd"), { cwd });
+    await safeLogError("PostToolUse", new Error("invalid cwd"), { cwd });
     expect(existsSync(eventsDbPath(cwd))).toBe(false);
     expect(readFileSync(join(tempDir, "events.log"), "utf-8")).toContain("invalid cwd");
   });
 
-  it("stringifies non-Error failures in the fallback log", () => {
-    safeLogError("PostToolUse", "plain failure", {});
+  it("stringifies non-Error failures in the fallback log", async () => {
+    await safeLogError("PostToolUse", "plain failure", {});
     expect(readFileSync(join(tempDir, "events.log"), "utf-8")).toContain('"error":"plain failure"');
   });
 
-  it("Layer 2: writes to flat file when DB fails", () => {
+  it("Layer 2: writes to flat file when DB fails", async () => {
     const cwd = "/dev/null/impossible";
-    safeLogError("PostToolUse", new Error("db fail"), { cwd, sessionId: "s1" });
+    await safeLogError("PostToolUse", new Error("db fail"), { cwd, sessionId: "s1" });
 
     const testLogPath = join(tempDir, "events.log");
     expect(existsSync(testLogPath)).toBe(true);
@@ -86,43 +85,61 @@ describe("safeLogError", () => {
     expect(content).toContain("/dev/null/impossible");
   });
 
-  it("circuit breaker: skips DB after first failure", () => {
+  it("sanitizes and bounds errors written by the fallback log", async () => {
+    const credentials = [
+      "fallback-bearer-secret",
+      "sk-0123456789abcdefghijklmnop",
+      "ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+      "npm_0123456789abcdefghijklmnopqrstuvwxyz",
+      "fallback-api-key-secret",
+    ];
+    const secret = `postgresql://alice:hunter2@db.example.test/lcm?sslmode=disable password=hunter2 Authorization: Bearer ${credentials[0]} ${credentials.slice(1, 4).join(" ")} X-Api-Key: ${credentials[4]} ${"x".repeat(
+      MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH + 100,
+    )}\u001b[31m`;
+    await safeLogError("PostToolUse", new Error(secret), {});
+
+    const record = JSON.parse(readFileSync(join(tempDir, "events.log"), "utf-8")) as { error: string };
+    expect(record.error).not.toContain("alice");
+    expect(record.error).not.toContain("hunter2");
+    expect(record.error).not.toContain("sslmode");
+    for (const credential of credentials) expect(record.error).not.toContain(credential);
+    expect(record.error).not.toContain("\u001b");
+    expect(record.error.length).toBe(MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH);
+  });
+
+  it("circuit breaker: skips DB after first failure", async () => {
     const badCwd = "/dev/null/impossible";
-    safeLogError("PostToolUse", new Error("first"), { cwd: badCwd });
+    await safeLogError("PostToolUse", new Error("first"), { cwd: badCwd });
 
     const goodCwd = join(tempDir, "project2");
-    safeLogError("PostToolUse", new Error("second"), { cwd: goodCwd });
+    await safeLogError("PostToolUse", new Error("second"), { cwd: goodCwd });
 
     // Good CWD should NOT have a DB entry because circuit is open
     const dbPath = eventsDbPath(goodCwd);
     expect(existsSync(dbPath)).toBe(false);
   });
 
-  it("Layer 3: swallows silently when both DB and file fail", () => {
+  it("Layer 3: swallows silently when both DB and file fail", async () => {
     _setLogPathForTesting("/dev/null/impossible/events.log");
     
     try {
-      expect(() => {
-        safeLogError("PostToolUse", new Error("total fail"), {});
-      }).not.toThrow();
+      await expect(safeLogError("PostToolUse", new Error("total fail"), {})).resolves.toBeUndefined();
     } finally {
       _setLogPathForTesting(join(tempDir, "events.log"));
     }
   });
 
-  it("rejects log path overrides outside temp or LCM logs", () => {
+  it("rejects log path overrides outside temp or LCM logs", async () => {
     _setLogPathForTesting("/etc/lcm-events.log");
-    expect(() => {
-      safeLogError("PostToolUse", new Error("unsafe path"), {});
-    }).not.toThrow();
+    await expect(safeLogError("PostToolUse", new Error("unsafe path"), {})).resolves.toBeUndefined();
     expect(existsSync("/etc/lcm-events.log")).toBe(false);
   });
 
-  it("writes fallback events.log under the isolated test home by default", () => {
+  it("writes fallback events.log under the isolated test home by default", async () => {
     _setLogPathForTesting(undefined);
     _resetCircuitBreaker();
     try {
-      safeLogError("PostToolUse", new Error("sandbox fallback"), {});
+      await safeLogError("PostToolUse", new Error("sandbox fallback"), {});
 
       const logPath = lcmPath("logs", "events.log");
       expect(existsSync(logPath)).toBe(true);

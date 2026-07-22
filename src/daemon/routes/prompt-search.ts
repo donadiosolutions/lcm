@@ -1,15 +1,13 @@
-import { existsSync } from "node:fs";
-import type { DatabaseSync } from "node:sqlite";
 import type { DaemonConfig } from "../config.js";
-import { projectDbPath } from "../project.js";
+import { projectIdentity } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
-import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
-import { runLcmMigrations } from "../../db/migration.js";
-import { PromotedStore, type SearchResult } from "../../db/promoted.js";
-import { RecallStore, type RecallFeedback } from "../../db/recall.js";
+import type { SearchResult } from "../../db/promoted.js";
+import type { RecallFeedback } from "../../db/recall.js";
 import { selectMemoryHintsWithinBudget } from "../../hooks/memory-context.js";
 import { validateCwd } from "../validate-cwd.js";
+import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
+import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
 
 const CANDIDATE_LIMIT_MULTIPLIER = 5;
 const MIN_CANDIDATE_LIMIT = 10;
@@ -197,7 +195,7 @@ function validatePromptSearchInput(input: unknown): PromptSearchRequest {
   };
 }
 
-export function createPromptSearchHandler(config: DaemonConfig): RouteHandler {
+export function createPromptSearchHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body) => {
     let input: PromptSearchRequest;
     try {
@@ -230,20 +228,15 @@ export function createPromptSearchHandler(config: DaemonConfig): RouteHandler {
       return;
     }
 
-    const dbPath = projectDbPath(validatedCwd);
-    if (!existsSync(dbPath)) {
-      sendJson(res, 200, { hints: [] });
-      return;
-    }
-
-    let db: DatabaseSync | undefined;
-    let openedDbPath: string | null = null;
+    let project: ProjectStorage | undefined;
+    let ownedFactory: StorageBackendFactory | undefined;
     try {
-      db = getLcmConnection(dbPath);
-      openedDbPath = dbPath;
-      runLcmMigrations(db);
-
-      const store = new PromotedStore(db);
+      const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+      project = await openExistingProject(factory, projectIdentity(validatedCwd)) ?? undefined;
+      if (!project) {
+        sendJson(res, 200, { hints: [] });
+        return;
+      }
       const maxResults = config.restoration.promptSearchMaxResults;
       const minScore = config.restoration.promptSearchMinScore;
       const snippetLength = config.restoration.promptSnippetLength;
@@ -264,11 +257,10 @@ export function createPromptSearchHandler(config: DaemonConfig): RouteHandler {
       const allowStaleOnStrongMatch = config.restoration.allowStaleOnStrongMatch;
 
       const candidateLimit = Math.max(maxResults * CANDIDATE_LIMIT_MULTIPLIER, MIN_CANDIDATE_LIMIT);
-      const results = store.search(query, candidateLimit);
-      const recallStore = new RecallStore(db);
+      const results = await project.lexicalSearch.searchPromoted(query, candidateLimit);
 
       const now = Date.now();
-      const feedbackById = recallStore.getFeedback(results.map((result) => result.id));
+      const feedbackById = await project.recall.getFeedback(results.map((result) => result.id));
       const ranked = rankResults(results, feedbackById, {
           querySessionId: session_id,
           now,
@@ -336,7 +328,7 @@ export function createPromptSearchHandler(config: DaemonConfig): RouteHandler {
       // Log surfacing events (best-effort, never throws)
       try {
         if (logSurfacing) {
-          recallStore.logSurfacing(ids, session_id ?? null);
+          await project.recall.logSurfacing(ids, session_id ?? null);
         }
       } catch { /* non-fatal */ }
 
@@ -344,7 +336,7 @@ export function createPromptSearchHandler(config: DaemonConfig): RouteHandler {
     } catch {
       sendJson(res, 200, { hints: [] });
     } finally {
-      if (openedDbPath) closeLcmConnection(openedDbPath);
+      await closeRouteStorage(project, ownedFactory);
     }
   };
 }

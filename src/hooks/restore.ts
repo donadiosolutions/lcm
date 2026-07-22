@@ -156,21 +156,22 @@ export async function handleSessionStart(
 
     // SessionStart scavenge: prune old processed events and trigger promotion for unprocessed ones
     try {
-      const { EventsDb } = await import("./events-db.js");
+      const { SQLiteLocalHookOutboxFactory } = await import("../storage/local-hook-outbox.js");
       const { eventsDbPath } = await import("../db/events-path.js");
       const cwd = input.cwd ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
-      const eventsDb = new EventsDb(eventsDbPath(cwd));
+      const outboxFactory = new SQLiteLocalHookOutboxFactory();
+      const eventsDb = await outboxFactory.open(eventsDbPath(cwd));
       try {
-        eventsDb.pruneProcessed(7);
-        eventsDb.pruneUnprocessed(10_000, 30);
-        eventsDb.pruneErrorLog(30);
-        const unprocessed = eventsDb.getUnprocessed(1);
+        await eventsDb.pruneProcessed(7);
+        await eventsDb.pruneUnprocessed(10_000, 30);
+        await eventsDb.pruneErrorLog(30);
+        const unprocessed = await eventsDb.getUnprocessed(1);
         if (unprocessed.length > 0) {
           const { firePromoteEventsRequest } = await import("./session-end.js");
           firePromoteEventsRequest(daemonPort, { cwd });
         }
       } finally {
-        eventsDb.close();
+        await outboxFactory.close();
       }
     } catch {
       // Silent fail — scavenge is best-effort

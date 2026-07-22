@@ -33,6 +33,7 @@ import { deduplicateAndInsert } from "../../../src/promotion/dedup.js";
 function makeConfig(): DaemonConfig {
   return {
     version: 1,
+    storage: { backend: "sqlite" },
     daemon: { port: 3737, socketPath: "/tmp/test.sock", logLevel: "info", logMaxSizeMB: 10, logRetentionDays: 7, idleTimeoutMs: 1800000 },
     compaction: {
       leafTokens: 1000, maxDepth: 5, autoCompactMinTokens: 10000,
@@ -116,6 +117,15 @@ describe("promote-events route", () => {
   });
 
   it("promotes priority 1 events via deduplicateAndInsert", async () => {
+    let transactionRepositories: unknown;
+    vi.mocked(deduplicateAndInsert).mockImplementationOnce(async (input) => {
+      if (!("transaction" in input)) throw new Error("expected repository transaction");
+      return input.transaction(async (repositories) => {
+        transactionRepositories = repositories;
+        return "mock-id";
+      });
+    });
+
     // Seed sidecar with a decision event
     const edb = new EventsDb(sidecarPath);
     edb.insertEvent("s1", { type: "decision", category: "decision", data: "use SQLite", priority: 1 }, "PostToolUse");
@@ -135,6 +145,13 @@ describe("promote-events route", () => {
 
     // Verify it was called with decision confidence
     const call = vi.mocked(deduplicateAndInsert).mock.calls[0][0];
+    expect(call).not.toHaveProperty("promotedMemory");
+    expect(call).not.toHaveProperty("lexicalSearch");
+    expect(call.transaction).toEqual(expect.any(Function));
+    expect(transactionRepositories).toMatchObject({
+      promotedMemory: expect.any(Object),
+      lexicalSearch: expect.any(Object),
+    });
     expect(call.confidence).toBe(0.5);
     expect(call.tags).toContain("type:preference");
     expect(call.tags).toContain("source:passive-capture");

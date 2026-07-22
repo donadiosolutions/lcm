@@ -22,16 +22,111 @@ function makeDb() {
   return db;
 }
 
+function dedupDeps(db: ReturnType<typeof makeDb>, store: PromotedStore) {
+  const promotedMemory = {
+    insert: async (input: Omit<Parameters<PromotedStore["insert"]>[0], "projectId">) =>
+      store.insert({ ...input, projectId: "p1" }),
+    update: async (id: string, fields: Parameters<PromotedStore["update"]>[1]) => store.update(id, fields),
+    archive: async (id: string) => store.archive(id),
+  };
+  const lexicalSearch = {
+    searchPromoted: async (query: string, limit: number, tags?: string[]) =>
+      store.search(query, limit, tags, "p1"),
+  };
+  return {
+    transaction: async <T>(callback: (repositories: {
+      promotedMemory: typeof promotedMemory;
+      lexicalSearch: typeof lexicalSearch;
+    }) => Promise<T>): Promise<T> => {
+      db.exec("BEGIN");
+      try {
+        const result = await callback({ promotedMemory, lexicalSearch });
+        db.exec("COMMIT");
+        return result;
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+}
+
 describe("deduplicateAndInsert", () => {
+  it("converges exact unranked fallback matches without merging partial lexical matches", async () => {
+    const db = makeDb();
+    const store = new PromotedStore(db, false);
+    const shared = {
+      ...dedupDeps(db, store),
+      tags: ["decision"],
+      depth: 2,
+      confidence: 0.7,
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+    };
+
+    const first = await deduplicateAndInsert({
+      ...shared,
+      content: "Use PostgreSQL for durable storage",
+    });
+    const repeated = await deduplicateAndInsert({
+      ...shared,
+      content: "Use PostgreSQL for durable storage",
+    });
+    const partial = await deduplicateAndInsert({
+      ...shared,
+      content: "Use PostgreSQL for analytics storage",
+    });
+
+    expect(repeated).toBe(first);
+    expect(partial).not.toBe(first);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM promoted").get()).toEqual({ count: 2 });
+  });
+
+  it("supports the structural legacy bridge for deferred SQLite callers", async () => {
+    const db = makeDb();
+    const store = new PromotedStore(db);
+    const weaker = store.insert({
+      content: "PostgreSQL database architecture",
+      tags: ["old"],
+      projectId: "p1",
+      confidence: 0.5,
+    });
+    const stronger = store.insert({
+      content: "PostgreSQL database architecture decision",
+      tags: ["strong"],
+      projectId: "p1",
+      confidence: 0.8,
+    });
+    await deduplicateAndInsert({
+      store,
+      content: "PostgreSQL database architecture confirmed",
+      tags: ["incoming"],
+      projectId: "p1",
+      depth: 2,
+      confidence: 0.7,
+      thresholds: { dedupBm25Threshold: 0.000001, dedupCandidateLimit: 3 },
+    });
+    expect([store.getById(weaker), store.getById(stronger)].filter((row) => row?.archived_at)).toHaveLength(1);
+
+    const inserted = await deduplicateAndInsert({
+      store,
+      content: "Entirely unrelated local memory",
+      tags: ["new"],
+      projectId: "p2",
+      depth: 0,
+      confidence: 0.4,
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
+    });
+    expect(store.getById(inserted)).not.toBeNull();
+  });
+
   it("inserts new entry when no duplicates exist", async () => {
     const db = makeDb();
     const store = new PromotedStore(db);
 
     await deduplicateAndInsert({
-      store,
+      ...dedupDeps(db, store),
       content: "Decided to use PostgreSQL for the database",
       tags: ["decision"],
-      projectId: "p1",
       sessionId: "s1",
       depth: 2,
       confidence: 0.2,
@@ -56,10 +151,9 @@ describe("deduplicateAndInsert", () => {
     });
 
     await deduplicateAndInsert({
-      store,
+      ...dedupDeps(db, store),
       content: "Confirmed PostgreSQL as the database choice after benchmarks",
       tags: ["decision"],
-      projectId: "p1",
       sessionId: "s1",
       depth: 2,
       confidence: 0.2,
@@ -85,10 +179,9 @@ describe("deduplicateAndInsert", () => {
     });
 
     await deduplicateAndInsert({
-      store,
+      ...dedupDeps(db, store),
       content: "Confirmed PostgreSQL as the database choice after benchmarks",
       tags: ["decision"],
-      projectId: "p1",
       sessionId: "s1",
       depth: 2,
       confidence: 0.8,
@@ -128,10 +221,9 @@ describe("deduplicateAndInsert", () => {
     });
 
     await deduplicateAndInsert({
-      store,
+      ...dedupDeps(db, store),
       content: "Confirmed PostgreSQL as the database choice",
       tags: ["decision"],
-      projectId: "p1",
       sessionId: "s1",
       depth: 2,
       confidence: 0.6,
@@ -162,10 +254,9 @@ describe("deduplicateAndInsert", () => {
     });
 
     await deduplicateAndInsert({
-      store,
+      ...dedupDeps(db, store),
       content: "PostgreSQL confirmed after review process",
       tags: ["decision"],
-      projectId: "p1",
       sessionId: "s1",
       depth: 2,
       confidence: 0.7,
@@ -196,10 +287,9 @@ describe("deduplicateAndInsert", () => {
     });
 
     await deduplicateAndInsert({
-      store,
+      ...dedupDeps(db, store),
       content: "Confirmed PostgreSQL as the database choice after extensive benchmarks",
       tags: ["decision"],
-      projectId: "p1",
       sessionId: "s1",
       depth: 2,
       confidence: 0.95,

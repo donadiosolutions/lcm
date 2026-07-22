@@ -24,7 +24,6 @@ function makeMinimalStores(): { conversationStore: ConversationStore; summarySto
       messageId: 1, role: "user", content: "hello",
       createdAt: new Date(), fileIds: [],
     }),
-    withTransaction: vi.fn().mockImplementation((fn: () => Promise<void>) => fn()),
   } as unknown as ConversationStore;
 
   return { conversationStore, summaryStore };
@@ -42,7 +41,21 @@ describe("CompactionEngine.compact — previousSummaryContent seeding", () => {
       }
     );
 
-    const engine = new CompactionEngine(conversationStore, summaryStore, {
+    const storage = {
+      conversations: conversationStore,
+      summaries: summaryStore,
+      context: summaryStore,
+      transaction: async (callback: (repositories: {
+        conversations: ConversationStore;
+        summaries: SummaryStore;
+        context: SummaryStore;
+      }) => Promise<unknown>) => callback({
+        conversations: conversationStore,
+        summaries: summaryStore,
+        context: summaryStore,
+      }),
+    } as never;
+    const engine = new CompactionEngine(storage, {
       contextThreshold: 0.5,
       freshTailCount: 0,
       leafMinFanout: 1,
@@ -64,5 +77,8 @@ describe("CompactionEngine.compact — previousSummaryContent seeding", () => {
 
     expect(summarizeCalls.length).toBeGreaterThan(0);
     expect(summarizeCalls[0].previousSummary).toBe("prior context");
+    expect(summaryStore.insertSummary).toHaveBeenCalledOnce();
+    expect(summaryStore.linkSummaryToMessages).toHaveBeenCalledOnce();
+    expect(summaryStore.replaceContextRangeWithSummary).toHaveBeenCalledOnce();
   });
 });

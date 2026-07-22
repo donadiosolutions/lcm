@@ -1,21 +1,23 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { DaemonConfig } from "../config.js";
-import { projectPaths } from "../project.js";
+import { projectIdentity, projectPaths } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
-import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
-import { runLcmMigrations } from "../../db/migration.js";
-import { ConversationStore } from "../../store/conversation-store.js";
-import { SummaryStore } from "../../store/summary-store.js";
-import { PromotedStore } from "../../db/promoted.js";
 import { shouldPromote } from "../../promotion/detector.js";
 import { deduplicateAndInsert } from "../../promotion/dedup.js";
 import { validateCwd } from "../validate-cwd.js";
 import { ScrubEngine } from "../../scrub.js";
+import {
+  createStorageBackendFactory,
+  type ProjectStorage,
+  type StorageBackendFactory,
+} from "../../storage/index.js";
+import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
 
 export function createPromoteHandler(
   config: DaemonConfig,
+  storageFactory?: StorageBackendFactory,
 ): RouteHandler {
   return async (_req, res, body) => {
     const input = JSON.parse(body || "{}");
@@ -36,40 +38,37 @@ export function createPromoteHandler(
 
     const paths = projectPaths(cwd);
     const dbPath = paths.dbPath;
-    if (!existsSync(dbPath)) {
-      sendJson(res, 200, { processed: 0, promoted: 0 });
-      return;
-    }
 
     let processed = 0;
     let promoted = 0;
     let totalConversations = 0;
 
+    let project: ProjectStorage | undefined;
+    let ownedFactory: StorageBackendFactory | undefined;
     try {
-      const db = getLcmConnection(dbPath);
-      try {
-        runLcmMigrations(db);
+        const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        project = await openExistingProject(factory, projectIdentity(cwd)) ?? undefined;
+        if (!project) {
+          sendJson(res, 200, { processed: 0, promoted: 0 });
+          return;
+        }
         mkdirSync(dirname(dbPath), { recursive: true });
 
-        const convStore = new ConversationStore(db);
-        const summStore = new SummaryStore(db);
-        const pid = paths.id;
         const scrubber = await ScrubEngine.forProject(
           config.security.sensitivePatterns,
           dirname(dbPath),
         );
 
         // Get summary IDs that have already been promoted (to avoid re-promoting)
-        const promotedStore = new PromotedStore(db);
         const alreadyPromotedContent = new Set(
-          promotedStore.listContentPrefixes(10000).map((c) => c.slice(0, 100)),
+          (await project.promotedMemory.listContentPrefixes(10000)).map((c) => c.slice(0, 100)),
         );
 
-        const conversations = await convStore.listConversations();
+        const conversations = await project.conversations.listConversations();
         totalConversations = conversations.length;
 
         for (const conversation of conversations) {
-          const summaries = await summStore.getSummariesByConversation(conversation.conversationId);
+          const summaries = await project.summaries.getSummariesByConversation(conversation.conversationId);
 
           for (const summary of summaries) {
             const scrubbedContent = scrubber.scrub(summary.content);
@@ -96,10 +95,10 @@ export function createPromoteHandler(
             } else {
               try {
                 await deduplicateAndInsert({
-                  store: promotedStore,
+                  transaction: project.transaction.bind(project),
                   content: scrubbedContent,
                   tags: promotionResult.tags.map((tag) => scrubber.scrub(tag)),
-                  projectId: pid,
+                  sourceProjectId: paths.id,
                   sessionId: conversation.sessionId,
                   depth: summary.depth,
                   confidence: promotionResult.confidence,
@@ -130,12 +129,11 @@ export function createPromoteHandler(
             writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
           } catch { /* non-fatal */ }
         }
-      } finally {
-        closeLcmConnection(dbPath);
-      }
     } catch (err) {
       sendJson(res, 500, { error: err instanceof Error ? err.message : "promote failed" });
       return;
+    } finally {
+      await closeRouteStorage(project, ownedFactory);
     }
 
     sendJson(res, 200, { processed, promoted, conversations: totalConversations });

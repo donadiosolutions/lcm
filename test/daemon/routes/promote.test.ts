@@ -15,6 +15,7 @@ import * as dbConnection from "../../../src/db/connection.js";
 function makeConfig(): DaemonConfig {
   return {
     version: 1,
+    storage: { backend: "sqlite" },
     daemon: { port: 3737, socketPath: "/tmp/test.sock", logLevel: "info", logMaxSizeMB: 10, logRetentionDays: 7, idleTimeoutMs: 1800000 },
     compaction: {
       leafTokens: 1000, maxDepth: 5, autoCompactMinTokens: 10000,
@@ -220,7 +221,7 @@ describe("createPromoteHandler", () => {
     const db = setupDb(tempDir);
     db.close();
 
-    vi.spyOn(dbConnection, "getLcmConnection").mockImplementationOnce(() => {
+    vi.spyOn(dbConnection, "getExistingLcmConnection").mockImplementationOnce(() => {
       throw new Error("connection refused");
     });
     const closeSpy = vi.spyOn(dbConnection, "closeLcmConnection");
@@ -232,7 +233,7 @@ describe("createPromoteHandler", () => {
     await handler({} as any, res, JSON.stringify({ cwd: tempDir }));
 
     expect(res.writeHead).toHaveBeenCalledWith(500, expect.any(Object));
-    expect(getBody()).toEqual({ error: "connection refused" });
+    expect(getBody()).toEqual({ error: expect.stringContaining("storage initialization failed") });
     expect(closeSpy).not.toHaveBeenCalled();
   });
 });

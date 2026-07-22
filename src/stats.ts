@@ -221,7 +221,7 @@ export function printStats(stats: OverallStats, verbose: boolean): void {
     const ratioStr = stats.ratio > 0 ? stats.ratio.toFixed(1) + "x" : "–";
     const barColor = stats.ratio > 10 ? green : cyan;
 
-    const compactedStr = `${stats.compactedConversations} of ${stats.projects} projects`;
+    const compactedStr = `${stats.compactedConversations} of ${stats.conversations} conversations`;
     const tokensStr = `${rawStr} → ${sumStr}`;
 
     const compRows: [string, string][] = [
@@ -340,7 +340,7 @@ export function printStats(stats: OverallStats, verbose: boolean): void {
   console.log();
 }
 
-export function collectStats(): OverallStats {
+export async function collectStats(): Promise<OverallStats> {
   const baseDir = lcmProjectsDir();
 
   const emptyRecallStats: RecallStats = {
@@ -422,7 +422,7 @@ export function collectStats(): OverallStats {
   let eventsUnprocessed = 0;
   let eventsErrors = 0;
   try {
-    const eventStats = collectEventStats(2000);
+    const eventStats = await collectEventStats(2000);
     eventsCaptured = eventStats.captured;
     eventsUnprocessed = eventStats.unprocessed;
     eventsErrors = eventStats.errors;

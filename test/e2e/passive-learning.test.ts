@@ -412,7 +412,7 @@ describe("Passive Learning E2E", { timeout: 30_000 }, () => {
     const { safeLogError, _resetCircuitBreaker } = await import("../../src/hooks/hook-errors.js");
     _resetCircuitBreaker();
 
-    safeLogError("PostToolUse", new Error("test e2e error"), {
+    await safeLogError("PostToolUse", new Error("test e2e error"), {
       cwd: projectDir,
       sessionId: "e2e-error-test",
     });
@@ -445,14 +445,9 @@ describe("Passive Learning E2E", { timeout: 30_000 }, () => {
       expect(result.pruned).toBe(10);
       expect(db.getHealthStats().unprocessed).toBe(10);
 
-      // Verify prune was logged to error_log
-      // Note: getHealthStats() filters out pruneUnprocessed/pruneErrorLog maintenance errors
-      // to avoid noise in health stats, so we query the raw DB directly.
-      // The logging is synchronous within the same transaction, so no race condition.
-      const pruneLog = db.raw().prepare(
-        "SELECT COUNT(*) as c FROM error_log WHERE hook = 'maintenance:pruneUnprocessed'"
-      ).get() as { c: number };
-      expect(pruneLog.c).toBeGreaterThanOrEqual(1);
+      const pruneLogs = db.getRecentErrors({ includeMaintenance: true, limit: 100 })
+        .filter((entry) => entry.hook === "maintenance:pruneUnprocessed");
+      expect(pruneLogs.length).toBeGreaterThanOrEqual(1);
     } finally {
       db.close();
     }
@@ -474,7 +469,7 @@ describe("Passive Learning E2E", { timeout: 30_000 }, () => {
     }
 
     const { collectEventStats } = await import("../../src/db/events-stats.js");
-    const stats = collectEventStats();
+    const stats = await collectEventStats();
     expect(stats.captured).toBeGreaterThanOrEqual(1);
     expect(stats.errors).toBeGreaterThanOrEqual(1);
   });

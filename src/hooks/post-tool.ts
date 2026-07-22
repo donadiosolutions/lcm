@@ -1,9 +1,9 @@
 // src/hooks/post-tool.ts
 import { extractPostToolEvents } from "./extractors.js";
-import { EventsDb } from "./events-db.js";
 import { eventsDbPath } from "../db/events-path.js";
 import { safeLogError } from "./hook-errors.js";
 import { ensureProjectDir } from "../daemon/project.js";
+import { SQLiteLocalHookOutboxFactory } from "../storage/local-hook-outbox.js";
 
 interface PostToolHookInput {
   session_id?: unknown;
@@ -58,21 +58,22 @@ export async function handlePostToolUse(
     const events = await scrubExtractedEvents(extractedEvents, resolvedCwd);
     ensureProjectDir(resolvedCwd);
     const dbPath = eventsDbPath(resolvedCwd);
-    const db = new EventsDb(dbPath);
+    const outboxFactory = new SQLiteLocalHookOutboxFactory();
+    const db = await outboxFactory.open(dbPath);
 
     try {
       for (const event of events) {
-        db.insertEvent(session_id, event, "PostToolUse");
+        await db.insertEvent(session_id, event, "PostToolUse");
       }
 
       // PostToolUse payloads are untrusted. Persist events locally and let the
       // daemon's bounded background scan process them; never use a payload port
       // for a token-bearing request.
     } finally {
-      db.close();
+      await outboxFactory.close();
     }
   } catch (error) {
-    safeLogError("PostToolUse", error, { cwd });
+    await safeLogError("PostToolUse", error, { cwd });
   }
 
   return { exitCode: 0, stdout: "" };

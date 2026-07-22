@@ -18,7 +18,11 @@ import { createPromptSearchHandler } from "./routes/prompt-search.js";
 import { createStatusHandler } from "./routes/status.js";
 import { createSessionCompleteHandler } from "./routes/session-complete.js";
 import { createPromoteAllEventsHandler, createPromoteEventsHandler } from "./routes/promote-events.js";
-import { createPromoteEventsNotifyHandler, PassiveEventProcessor } from "./passive-event-processor.js";
+import {
+  createPromoteEventsNotifyHandler,
+  PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+  PassiveEventProcessor,
+} from "./passive-event-processor.js";
 import { createStatsHandler } from "./routes/stats.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
 import { createReviewStaleHandler } from "./routes/review-stale.js";
@@ -27,6 +31,7 @@ import { normalizeDaemonPort, normalizeIdleTimeoutMs } from "./http-url.js";
 import { projectsDir as lcmProjectsDir } from "../runtime-paths.js";
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
 import { selectStorageBackend } from "../storage/backend.js";
+import { createStorageBackendFactory } from "../storage/index.js";
 export { PKG_VERSION };
 
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse, body: string) => Promise<void>;
@@ -39,6 +44,8 @@ export type DaemonOptions = {
   _setTimeout?: typeof setTimeout;
   /** @internal Deterministic idle-timer seams for lifecycle tests. */
   _clearTimeout?: typeof clearTimeout;
+  /** @internal Deterministic periodic-ingest seam for lifecycle tests. */
+  _scanForTranscripts?: () => Promise<void>;
 };
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -97,6 +104,14 @@ function clearIdleTimer(timer: ReturnType<typeof setTimeout> | null, clearTimer:
   return null;
 }
 
+async function settleCleanup(callback: () => void | Promise<void>): Promise<void> {
+  try {
+    await callback();
+  } catch {
+    // Preserve the primary startup or request-lifecycle result.
+  }
+}
+
 export async function createDaemon(config: DaemonConfig, options?: DaemonOptions): Promise<DaemonInstance> {
   selectStorageBackend(config.storage);
   const hasSetTimeoutOverride = options?._setTimeout !== undefined;
@@ -114,6 +129,13 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   if (options?.tokenPath && serverToken === null) {
     throw new Error(`Auth token file specified but could not be read: ${options.tokenPath}`);
   }
+  const storageFactory = createStorageBackendFactory(config.storage);
+  let constructedProcessor: PassiveEventProcessor | undefined;
+  let constructedWatcher: ReturnType<typeof watchProjectMap> | undefined;
+  let constructedIngestInterval: ReturnType<typeof setInterval> | undefined;
+  let constructedIngestScan: Promise<void> | undefined;
+  let startupCleanupStarted = false;
+  try {
   const routes = new Map<string, RouteHandler>();
 
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -132,39 +154,54 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }, idleTimeoutMs);
   }
 
-  routes.set("GET /health", async (_req, res) =>
-    sendJson(res, 200, {
-      status: "ok",
+  routes.set("GET /health", async (_req, res) => {
+    const storageHealth = await storageFactory.health();
+    const healthy = storageHealth.status === "healthy";
+    sendJson(res, healthy ? 200 : 503, {
+      status: healthy ? "ok" : "unavailable",
       version: PKG_VERSION,
       storageBackend: config.storage.backend,
       uptime: Math.floor((Date.now() - startTime) / 1000),
       pid: process.pid,
-    }));
-  routes.set("POST /compact", createCompactHandler(config));
-  routes.set("POST /promote", createPromoteHandler(config));
-  routes.set("POST /restore", createRestoreHandler(config));
-  routes.set("POST /grep", createGrepHandler(config));
-  routes.set("POST /search", createSearchHandler());
-  routes.set("POST /expand", createExpandHandler(config));
-  routes.set("POST /describe", createDescribeHandler(config));
-  routes.set("POST /store", createStoreHandler(config));
-  routes.set("POST /recent", createRecentHandler(config));
-  routes.set("POST /ingest", createIngestHandler(config));
-  routes.set("POST /prompt-search", createPromptSearchHandler(config));
-  routes.set("POST /session-complete", createSessionCompleteHandler());
-  const passiveEventProcessor = new PassiveEventProcessor(config);
-  routes.set("POST /promote-events", createPromoteEventsHandler(config));
-  routes.set("POST /promote-events/all", createPromoteAllEventsHandler(config));
+      ...(healthy ? {} : {
+        storage: {
+          status: storageHealth.status,
+          ...(storageHealth.error ? { error: storageHealth.error.toJSON() } : {}),
+        },
+      }),
+    });
+  });
+  routes.set("POST /compact", createCompactHandler(config, storageFactory));
+  routes.set("POST /promote", createPromoteHandler(config, storageFactory));
+  routes.set("POST /restore", createRestoreHandler(config, storageFactory));
+  routes.set("POST /grep", createGrepHandler(config, storageFactory));
+  routes.set("POST /search", createSearchHandler(config, storageFactory));
+  routes.set("POST /expand", createExpandHandler(config, storageFactory));
+  routes.set("POST /describe", createDescribeHandler(config, storageFactory));
+  routes.set("POST /store", createStoreHandler(config, storageFactory));
+  routes.set("POST /recent", createRecentHandler(config, storageFactory));
+  routes.set("POST /ingest", createIngestHandler(config, storageFactory));
+  routes.set("POST /prompt-search", createPromptSearchHandler(config, storageFactory));
+  routes.set("POST /session-complete", createSessionCompleteHandler(config, storageFactory));
+  const passiveEventProcessor = new PassiveEventProcessor(
+    config,
+    PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+    { storageFactory },
+  );
+  constructedProcessor = passiveEventProcessor;
+  routes.set("POST /promote-events", createPromoteEventsHandler(config, storageFactory));
+  routes.set("POST /promote-events/all", createPromoteAllEventsHandler(config, storageFactory));
   routes.set("POST /promote-events/notify", createPromoteEventsNotifyHandler(passiveEventProcessor));
   routes.set("GET /stats", createStatsHandler());
   routes.set("GET /stats/pool", createPoolStatsHandler());
-  routes.set("POST /review-stale", createReviewStaleHandler(config));
+  routes.set("POST /review-stale", createReviewStaleHandler(config, storageFactory));
   // Status handler is registered after listen() when we know the actual port
   const projectMapWatcher = watchProjectMap();
+  constructedWatcher = projectMapWatcher;
 
   // Periodic transcript ingestion scan
   const INGEST_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
-  const ingestHandler = createIngestHandler(config);
+  const ingestHandler = createIngestHandler(config, storageFactory);
 
   const scanForTranscripts = async () => {
     try {
@@ -217,7 +254,23 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }
   };
 
-  const ingestInterval = setInterval(scanForTranscripts, INGEST_INTERVAL_MS);
+  let activeIngestScan: Promise<void> | undefined;
+  const runTranscriptScan = (): Promise<void> => {
+    if (activeIngestScan) return activeIngestScan;
+    const scan = Promise.resolve()
+      .then(() => (options?._scanForTranscripts ?? scanForTranscripts)())
+      .catch(() => undefined)
+      .finally(() => {
+        activeIngestScan = undefined;
+        constructedIngestScan = undefined;
+      });
+    activeIngestScan = scan;
+    constructedIngestScan = scan;
+    return scan;
+  };
+
+  const ingestInterval = setInterval(runTranscriptScan, INGEST_INTERVAL_MS);
+  constructedIngestInterval = ingestInterval;
   ingestInterval.unref(); // don't prevent process exit
 
   const server: Server = createServer(async (req, res) => {
@@ -253,27 +306,29 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   }
 
   const cleanupStartupFailure = async (): Promise<void> => {
-    clearInterval(ingestInterval);
-    projectMapWatcher.close();
-    passiveEventProcessor.stop();
-    idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout);
+    startupCleanupStarted = true;
+    await settleCleanup(() => clearInterval(ingestInterval));
+    await settleCleanup(() => activeIngestScan);
+    await settleCleanup(() => projectMapWatcher.close());
+    await settleCleanup(() => passiveEventProcessor.stopAndWait());
+    await settleCleanup(() => { idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout); });
     if (proxyManager) {
-      try { await proxyManager.stop(); } catch { /* non-fatal */ }
+      await settleCleanup(() => proxyManager.stop());
     }
+    await settleCleanup(() => storageFactory.close());
   };
 
-  return new Promise((resolve, reject) => {
+  return await new Promise((resolve, reject) => {
     let settled = false;
     const rejectStartup = (err: Error) => {
       if (settled) return;
       settled = true;
       cleanupStartupFailure()
-        .then(() => reject(err))
-        .catch(() => reject(err));
+        .then(() => reject(err));
     };
 
     server.once("error", rejectStartup);
-    server.listen(listenPort, "127.0.0.1", () => {
+    const onListening = () => {
       if (settled) return;
       settled = true;
       server.off("error", rejectStartup);
@@ -288,18 +343,43 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       resolve({
         address: () => addr,
         stop: async () => {
-          clearInterval(ingestInterval);
-          projectMapWatcher.close();
-          passiveEventProcessor.stop();
-          idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout);
+          await settleCleanup(() => clearInterval(ingestInterval));
+          await settleCleanup(() => activeIngestScan);
+          await settleCleanup(() => projectMapWatcher.close());
+          await settleCleanup(() => passiveEventProcessor.stopAndWait());
+          await settleCleanup(() => { idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout); });
           if (proxyManager) {
-            try { await proxyManager.stop(); } catch { /* non-fatal */ }
+            await settleCleanup(() => proxyManager.stop());
           }
-          return new Promise<void>((r) => server.close(() => r()));
+          await settleCleanup(() => new Promise<void>((r) => server.close(() => r())));
+          await storageFactory.close();
         },
         registerRoute: (method, path, handler) => routes.set(`${method} ${path}`, handler),
         get idleTriggered() { return idleTriggered; },
       });
-    });
+    };
+    try {
+      server.listen(listenPort, "127.0.0.1", onListening);
+    } catch (error) {
+      rejectStartup(error instanceof Error ? error : new Error("daemon listen failed"));
+    }
   });
+  } catch (error) {
+    if (startupCleanupStarted) throw error;
+    if (constructedIngestInterval) {
+      const ingestInterval = constructedIngestInterval;
+      await settleCleanup(() => clearInterval(ingestInterval));
+    }
+    await settleCleanup(() => constructedIngestScan);
+    if (constructedWatcher) {
+      const watcher = constructedWatcher;
+      await settleCleanup(() => watcher.close());
+    }
+    if (constructedProcessor) {
+      const processor = constructedProcessor;
+      await settleCleanup(() => processor.stopAndWait());
+    }
+    await settleCleanup(() => storageFactory.close());
+    throw error;
+  }
 }

@@ -2,9 +2,18 @@
 import type { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import type { ExtractedEvent } from "./extractors.js";
 import { getLcmConnection, closeLcmConnection, isLcmConnectionOpen } from "../db/connection.js";
 import { sanitizeError } from "../daemon/safe-error.js";
+import { sanitizeHookErrorDiagnostic } from "./hook-error-diagnostic.js";
+import type {
+  LocalHookErrorQuery,
+  LocalHookErrorRecord,
+  LocalHookEvent,
+  LocalHookEventRow,
+  LocalHookOutboxHealth,
+  LocalHookOutboxOpenOptions,
+  PatternReinforcementStats,
+} from "../storage/local-hook-outbox.js";
 
 /**
  * Tracks which db paths have already had migrations applied in this process.
@@ -14,35 +23,35 @@ import { sanitizeError } from "../daemon/safe-error.js";
  */
 const _migratedPaths = new Set<string>();
 
-export interface EventRow {
-  event_id: number;
-  session_id: string;
-  seq: number;
-  type: string;
-  category: string;
-  data: string;
-  priority: number;
-  source_hook: string;
-  prev_event_id: number | null;
-  processed_at: string | null;
-  created_at: string;
+interface BusyTimeoutOverrideState {
+  baselineMs: number;
+  overrides: Map<symbol, number>;
 }
 
-export interface HealthStats {
-  totalEvents: number;
-  unprocessed: number;
-  errors: number;
-  lastCapture: string | null;
-  lastError: string | null;
+const _busyTimeoutOverrides = new Map<string, BusyTimeoutOverrideState>();
+
+function effectiveBusyTimeoutMs(state: BusyTimeoutOverrideState): number {
+  let effective = state.baselineMs;
+  for (const timeoutMs of state.overrides.values()) {
+    effective = Math.max(effective, timeoutMs);
+  }
+  return effective;
 }
 
-export interface PatternReinforcementStats {
-  totalCount: number;
-  distinctSessions: number;
-}
+export type EventRow = LocalHookEventRow;
+export type HealthStats = LocalHookOutboxHealth;
+export type { PatternReinforcementStats } from "../storage/local-hook-outbox.js";
+export { MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH } from "./hook-error-diagnostic.js";
 
 const SCHEMA_VERSION = 3;
 export const EVENTS_UNPROCESSED_BATCH_LIMIT = 500;
+const DEFAULT_RECENT_ERROR_LIMIT = 5;
+const MAX_RECENT_ERROR_LIMIT = 100;
+
+function normalizeRecentErrorLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_RECENT_ERROR_LIMIT;
+  return Math.min(MAX_RECENT_ERROR_LIMIT, Math.max(0, Math.trunc(limit)));
+}
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -75,8 +84,10 @@ CREATE INDEX IF NOT EXISTS idx_error_log_created ON error_log(created_at);
 export class EventsDb {
   private db: DatabaseSync;
   private dbPath: string;
+  private closed = false;
+  private busyTimeoutOverrideId: symbol | undefined;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, options: LocalHookOutboxOpenOptions = {}) {
     mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
     this.dbPath = dbPath;
     // getLcmConnection returns the pooled (or newly-opened) DatabaseSync handle
@@ -84,17 +95,62 @@ export class EventsDb {
     // instances so that high-frequency hooks (PostToolUse fires 50-200x/session)
     // reuse the same underlying connection instead of opening/closing each time.
     this.db = getLcmConnection(dbPath);
+    if (options.busyTimeoutMs !== undefined && Number.isFinite(options.busyTimeoutMs)) {
+      try {
+        this.addBusyTimeoutOverride(Math.max(0, Math.trunc(options.busyTimeoutMs)));
+      } catch (e) {
+        closeLcmConnection(dbPath);
+        const message = sanitizeError(e instanceof Error ? e.message : String(e));
+        throw new Error(message);
+      }
+    }
     if (!_migratedPaths.has(dbPath)) {
       try {
         this.migrate();
       } catch (e) {
         // Migration failed — release the pooled connection so the ref-count
         // doesn't leak. The constructor will re-throw, so callers see the error.
+        try { this.removeBusyTimeoutOverride(); } catch { /* preserve the migration failure */ }
         closeLcmConnection(dbPath);
         const message = sanitizeError(e instanceof Error ? e.message : String(e));
         throw new Error(message);
       }
       _migratedPaths.add(dbPath);
+    }
+  }
+
+  private addBusyTimeoutOverride(timeoutMs: number): void {
+    let state = _busyTimeoutOverrides.get(this.dbPath);
+    if (!state) {
+      const baseline = this.db.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+      state = { baselineMs: baseline.timeout, overrides: new Map() };
+      _busyTimeoutOverrides.set(this.dbPath, state);
+    }
+
+    const overrideId = Symbol("busy-timeout-override");
+    state.overrides.set(overrideId, timeoutMs);
+    try {
+      this.db.exec(`PRAGMA busy_timeout = ${effectiveBusyTimeoutMs(state)}`);
+      this.busyTimeoutOverrideId = overrideId;
+    } catch (error) {
+      state.overrides.delete(overrideId);
+      if (state.overrides.size === 0) _busyTimeoutOverrides.delete(this.dbPath);
+      throw error;
+    }
+  }
+
+  private removeBusyTimeoutOverride(): void {
+    const overrideId = this.busyTimeoutOverrideId;
+    if (!overrideId) return;
+    this.busyTimeoutOverrideId = undefined;
+
+    const state = _busyTimeoutOverrides.get(this.dbPath)!;
+    state.overrides.delete(overrideId);
+
+    try {
+      this.db.exec(`PRAGMA busy_timeout = ${effectiveBusyTimeoutMs(state)}`);
+    } finally {
+      if (state.overrides.size === 0) _busyTimeoutOverrides.delete(this.dbPath);
     }
   }
 
@@ -170,7 +226,7 @@ export class EventsDb {
     }
   }
 
-  insertEvent(sessionId: string, event: ExtractedEvent, sourceHook: string): number {
+  insertEvent(sessionId: string, event: LocalHookEvent, sourceHook: string): number {
     const stmt = this.db.prepare(`
       INSERT INTO events (session_id, seq, type, category, data, priority, source_hook)
       VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?),
@@ -225,10 +281,9 @@ export class EventsDb {
   }
 
   logHookError(hook: string, error: unknown, sessionId?: string): void {
-    const msg = error instanceof Error ? error.message : String(error);
     this.db.prepare(
       "INSERT INTO error_log (hook, error, session_id) VALUES (?, ?, ?)"
-    ).run(hook, msg, sessionId ?? null);
+    ).run(hook, sanitizeHookErrorDiagnostic(error), sessionId ?? null);
   }
 
   getHealthStats(): HealthStats {
@@ -249,6 +304,17 @@ export class EventsDb {
       lastCapture: eventTotals.lastCapture,
       lastError: errorTotals.lastError,
     };
+  }
+
+  getRecentErrors(options: LocalHookErrorQuery = {}): LocalHookErrorRecord[] {
+    const where = options.includeMaintenance ? "" : "WHERE hook NOT LIKE 'maintenance:%'";
+    const rows = this.db.prepare(
+      `SELECT created_at, hook, error, session_id FROM error_log ${where} ORDER BY id DESC LIMIT ?`,
+    ).all(normalizeRecentErrorLimit(options.limit)) as unknown as LocalHookErrorRecord[];
+    return rows.map((row) => ({
+      ...row,
+      error: sanitizeHookErrorDiagnostic(row.error),
+    }));
   }
 
   pruneUnprocessed(maxRows = 10_000, maxAgeDays = 30): { pruned: number } {
@@ -315,19 +381,20 @@ export class EventsDb {
     return Number(result.changes);
   }
 
-  /** Expose raw DB for testing only. */
-  raw(): DatabaseSync {
-    return this.db;
-  }
-
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     // Decrement pool ref-count. The underlying connection stays open as long as
     // other callers hold a reference — it is only closed when refs reach 0.
-    closeLcmConnection(this.dbPath);
-    // If the connection was fully evicted from the pool, invalidate the
-    // migration-done cache so the next open re-runs migrations on a fresh handle.
-    if (!isLcmConnectionOpen(this.dbPath)) {
-      _migratedPaths.delete(this.dbPath);
+    try { this.removeBusyTimeoutOverride(); } catch { /* timeout restoration is best-effort */ }
+    try {
+      closeLcmConnection(this.dbPath);
+    } finally {
+      // If the connection was fully evicted from the pool, invalidate the
+      // migration cache so the next open re-runs migrations on a fresh handle.
+      if (!isLcmConnectionOpen(this.dbPath)) {
+        _migratedPaths.delete(this.dbPath);
+      }
     }
   }
 }

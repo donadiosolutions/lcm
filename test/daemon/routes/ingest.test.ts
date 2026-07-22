@@ -330,4 +330,66 @@ describe("POST /ingest", () => {
     });
     expect((await grown.json()).ingested).toBe(1);
   });
+
+  it("records completion across every conversation in a split legacy session", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-split-complete-"));
+    tempDirs.push(tempDir);
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const base = `http://127.0.0.1:${daemon.address().port}`;
+    const sessionId = "split-legacy-session";
+    const first = await fetch(`${base}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        cwd: tempDir,
+        messages: [{ role: "user", content: "first", tokenCount: 1 }],
+      }),
+    });
+    expect((await first.json()).ingested).toBe(1);
+
+    const dbPath = projectDbPath(tempDir);
+    const db = getLcmConnection(dbPath);
+    try {
+      const result = db.prepare("INSERT INTO conversations (session_id, title) VALUES (?, ?)").run(sessionId, "legacy split");
+      const splitConversationId = Number(result.lastInsertRowid);
+      db.prepare(
+        "INSERT INTO messages (conversation_id, seq, role, content, token_count) VALUES (?, ?, ?, ?, ?)",
+      ).run(splitConversationId, 0, "assistant", "second", 1);
+      db.prepare(
+        "INSERT INTO messages (conversation_id, seq, role, content, token_count) VALUES (?, ?, ?, ?, ?)",
+      ).run(splitConversationId, 1, "user", "third", 1);
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+
+    const completed = await fetch(`${base}/session-complete`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, cwd: tempDir }),
+    });
+    expect(completed.status).toBe(200);
+
+    const verificationDb = getLcmConnection(dbPath);
+    try {
+      const row = verificationDb.prepare(
+        "SELECT message_count FROM session_ingest_log WHERE session_id = ?",
+      ).get(sessionId) as { message_count: number };
+      expect(row.message_count).toBe(3);
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+
+    const repeated = await fetch(`${base}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        cwd: tempDir,
+        messages: [
+          { role: "user", content: "first", tokenCount: 1 },
+          { role: "assistant", content: "second", tokenCount: 1 },
+          { role: "user", content: "third", tokenCount: 1 },
+        ],
+      }),
+    });
+    expect(await repeated.json()).toEqual({ ingested: 0, totalTokens: 0 });
+  });
 });

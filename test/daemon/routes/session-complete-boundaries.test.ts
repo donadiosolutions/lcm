@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { loadDaemonConfig } from "../../../src/daemon/config.js";
 
 const mocks = vi.hoisted(() => ({
   ensure: vi.fn(),
@@ -18,14 +19,39 @@ vi.mock("../../../src/db/connection.js", () => ({
   withLcmConnectionLock: mocks.lock,
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
-  ensureProjectDir: mocks.ensure,
-  projectDbPath: (cwd: string) => `${cwd}/lcm.db`,
+  projectIdentity: (cwd: string) => ({ id: cwd, canonical: cwd }),
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/db/migration.js", () => ({ runLcmMigrations: mocks.migrate }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
+vi.mock("../../../src/storage/index.js", () => ({
+  createStorageBackendFactory: () => ({
+    openProject: async () => {
+      mocks.getConnection();
+      try {
+        mocks.migrate();
+      } catch (error) {
+        mocks.close();
+        throw error;
+      }
+      const conversations = {
+        getMessageCountBySessionId: async () => mocks.storedGet()?.message_count ?? 0,
+      };
+      const coordination = { recordSessionIngest: mocks.run };
+      const repositories = { conversations, coordination };
+      return {
+        ...repositories,
+        transaction: async (operation: (value: typeof repositories) => Promise<unknown>) => operation(repositories),
+        close: async () => { mocks.close(); },
+      };
+    },
+    close: async () => undefined,
+  }),
+}));
 
 import { createSessionCompleteHandler } from "../../../src/daemon/routes/session-complete.js";
+
+const config = loadDaemonConfig("/tmp/session-complete-boundaries");
 
 describe("session complete persistence boundaries", () => {
   beforeEach(() => {
@@ -39,7 +65,7 @@ describe("session complete persistence boundaries", () => {
   });
 
   it("validates required fields and cwd failures", async () => {
-    const handler = createSessionCompleteHandler();
+    const handler = createSessionCompleteHandler(config);
     await handler({} as never, {} as never, "");
     expect(mocks.send).toHaveBeenLastCalledWith(expect.anything(), 400, { error: "session_id and cwd required" });
     mocks.validate.mockImplementationOnce(() => { throw new Error("bad cwd"); });
@@ -51,10 +77,9 @@ describe("session complete persistence boundaries", () => {
   });
 
   it("upserts explicit and default message counts and always closes", async () => {
-    const handler = createSessionCompleteHandler();
+    const handler = createSessionCompleteHandler(config);
     const response = {} as never;
     await handler({} as never, response, JSON.stringify({ session_id: "s1", cwd: "/ok", message_count: 9 }));
-    expect(mocks.lock).toHaveBeenLastCalledWith("/ok/lcm.db", expect.any(Function));
     expect(mocks.run).toHaveBeenLastCalledWith("s1", 7);
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { recorded: true });
     await handler({} as never, response, JSON.stringify({ session_id: "s2", cwd: "/ok" }));
@@ -74,7 +99,7 @@ describe("session complete persistence boundaries", () => {
   });
 
   it("returns a structured error without closing when acquisition fails", async () => {
-    const handler = createSessionCompleteHandler();
+    const handler = createSessionCompleteHandler(config);
     const response = {} as never;
     mocks.getConnection.mockImplementationOnce(() => { throw new Error("open failed"); });
 

@@ -48,10 +48,18 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Flag PRs adding routes without tests.
 - Never delete legacy parsing fallbacks or defensive handling for non-`Error` thrown values merely to satisfy coverage. Cover those branches with deterministic failure injection while preserving compatibility behavior.
 
+### Search ranking compatibility
+
+- Fallback lexical-search ranks and sentinel scores must remain compatible with every consumer, including deduplication thresholds, prompt-search minimum scores, and result ordering. Require regressions that both surface relevant fallback matches and prevent false deduplication merges, while preserving native FTS ranking behavior unchanged.
+- Apply exact fallback-search filters before the caller's result limit; filtering an already-limited candidate set can hide lower-ranked qualifying rows.
+
 ### SQLite transaction safety
 
 - Any operation that modifies more than one table must be wrapped in `BEGIN`/`COMMIT`.
 - Flag multi-table writes without transactions — they risk partial writes on crash.
+- Keep checkpoint/count reads, slices derived from those checkpoints, and their inserts in the same repository transaction; otherwise concurrent ingestion can invalidate sequence allocation before the write begins.
+- Transaction context is global across SQLite project executors: reject nested transactions and ordinary repository calls on any project while a transaction callback is active, preventing lock inversion and partial cross-project commits.
+- Backend health must apply the same integrity and write-readiness probe to active project scopes and databases retained from completed request scopes; never infer health from `SELECT 1` or an empty active-project set. SQLite timestamps produced by `CURRENT_TIMESTAMP` are timezone-free UTC and must be parsed and formatted explicitly as UTC.
 
 ### Migration safety
 
@@ -67,6 +75,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Route handlers must catch errors and return structured JSON: `{ error: string, code?: string }`.
 - Flag `res.send(e.message)` or unstructured error responses that leak stack traces.
 - Unhandled promise rejections in route handlers are bugs — flag missing `try/catch` in `async` handlers.
+- Every operation on a closeable factory or repository must reject after close, including retained repository references closed through factory shutdown. Keep `close()` idempotent; best-effort restoration failures must never prevent pool/reference release or registry/cache cleanup. Assert sanitized, cause-free post-close errors and cleanup-failure behavior in tests.
 - User-facing child-process errors must not include raw stdout or stderr; use an allowlisted summary and bound all user-controlled metadata before interpolation.
 - Child-process timeout cleanup must guard `kill()` because the process can exit concurrently or the injected process implementation can throw.
 - Provider CLI option enums must match the provider's configuration schema, not broader model capability labels exposed elsewhere in the product.
@@ -78,7 +87,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Registry subprocess failures must expose only bounded, allowlisted summaries; never include raw registry values, stdout, stderr, thrown messages, or causes in user-facing errors.
 - When a provider supports no values for an optional control, say the control is unsupported; do not render an empty set as `Valid values: none`.
 - Retry and backoff duration accounting must use a monotonic clock so wall-clock corrections cannot shorten or extend a wait.
-- Normalize non-finite delay values before entering timer loops; security-sensitive timer scheduling must keep user-derived values out of `setTimeout` durations by using literal constants only.
+- Validate runtime numeric overrides with `Number.isFinite()` before timeout arithmetic or interpolation into SQL/PRAGMA statements. Invalid values must preserve the documented default; tests must cover `NaN`, positive and negative infinity, and any clamp/truncation behavior. Security-sensitive timer scheduling must keep user-derived values out of `setTimeout` durations by using literal constants only.
 - Reject executable directories containing the platform PATH delimiter before composing a restricted child-process `PATH`; otherwise one trusted path can inject additional search directories or the current directory.
 - Managed-daemon executable search paths must reject project containment before recognizing global-install or bundled-runtime anchors; a project-local `.codex`, `.claude`, or package-manager-shaped directory is untrusted. Never add `npx`, any `node_modules` directory, the current project or its checkout ancestors, or ambient `PATH` entries.
 - Diagnostics for a reused managed daemon must inspect that verified process's effective environment before using a deterministic startup fallback. Never reuse a PID from the initial health probe when lifecycle validation fails or throws.
