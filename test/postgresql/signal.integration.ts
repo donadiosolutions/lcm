@@ -36,6 +36,8 @@ async function runSignalProbe(signal: "SIGINT" | "SIGTERM"): Promise<void> {
     await ready;
     const completion = exited(child);
     child.kill(signal);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
     const exit = await completion;
     expect(exit).toEqual({ code: signal === "SIGINT" ? 130 : 143, signal: null });
     await expectNoResources(runId!);

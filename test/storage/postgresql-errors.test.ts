@@ -11,7 +11,39 @@ describe("PostgreSQL error normalization", () => {
     (code) => expect(isRetryablePostgreSqlError(Object.assign(new Error("driver secret"), { code }))).toBe(true),
   );
 
-  it.each([undefined, null, {}, { code: 123 }, { code: "23505" }])("does not retry unsafe value %#", (error) => {
+  it.each([
+    "EAI_AGAIN",
+    "ECONNABORTED",
+    "ECONNREFUSED",
+    "ECONNRESET",
+    "EHOSTDOWN",
+    "EHOSTUNREACH",
+    "ENETDOWN",
+    "ENETRESET",
+    "ENETUNREACH",
+    "EPIPE",
+    "ETIMEDOUT",
+  ])("classifies transient Node transport code %s as retryable", (code) => {
+    expect(isRetryablePostgreSqlError(Object.assign(new Error("transport secret"), { code }))).toBe(true);
+  });
+
+  it.each([
+    "Connection terminated due to connection timeout",
+    "Connection terminated unexpectedly",
+    "timeout exceeded when trying to connect",
+    "timeout expired",
+  ])("classifies pg driver failure %s as retryable without SQLSTATE", (message) => {
+    expect(isRetryablePostgreSqlError(new Error(message))).toBe(true);
+  });
+
+  it.each([
+    undefined,
+    null,
+    {},
+    { code: 123 },
+    { code: "23505" },
+    Object.assign(new Error("unknown timeout"), { code: "ENOTFOUND" }),
+  ])("does not retry unsafe value %#", (error) => {
     expect(isRetryablePostgreSqlError(error)).toBe(false);
   });
 

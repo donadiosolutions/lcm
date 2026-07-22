@@ -288,15 +288,33 @@ export async function runHarness(options = {}) {
     })();
     return cleanupPromise;
   };
+  let teardownPromise;
+  const teardown = () => {
+    teardownPromise ??= (async () => {
+      await processLifecycle.stop();
+      await cleanup();
+    })();
+    return teardownPromise;
+  };
+  let exitSignal;
+  let signalExitPromise;
+  const removeSignalHandlers = () => {
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigterm);
+  };
   const onSignal = (signal) => {
-    void processLifecycle.stop()
-      .then(cleanup)
-      .finally(() => process.exit(signal === "SIGINT" ? 130 : 143));
+    exitSignal ??= signal;
+    signalExitPromise ??= teardown()
+      .catch(() => undefined)
+      .then(() => {
+        removeSignalHandlers();
+        process.exit(exitSignal === "SIGINT" ? 130 : 143);
+      });
   };
   const onSigint = () => onSignal("SIGINT");
   const onSigterm = () => onSignal("SIGTERM");
-  process.once("SIGINT", onSigint);
-  process.once("SIGTERM", onSigterm);
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
 
   try {
     writeFileSync(join(directory, "run-id"), `${runId}\n`, { mode: 0o600 });
@@ -360,10 +378,11 @@ export async function runHarness(options = {}) {
     process.stderr.write(`PostgreSQL harness failed: ${details}\n`);
     throw error;
   } finally {
-    process.removeListener("SIGINT", onSigint);
-    process.removeListener("SIGTERM", onSigterm);
-    await processLifecycle.stop();
-    await cleanup();
+    try {
+      await teardown();
+    } finally {
+      if (!signalExitPromise) removeSignalHandlers();
+    }
   }
 }
 

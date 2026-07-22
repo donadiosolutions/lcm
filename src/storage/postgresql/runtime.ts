@@ -103,12 +103,26 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     let destroy = false;
     try {
       client = await this.acquire(options);
+      if (options.signal?.aborted) {
+        destroy = true;
+        throw aborted(options);
+      }
       await client.query("BEGIN");
+      let transactionActive = true;
       const transaction: PostgreSqlQueryExecutor = {
         query: async <R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
           config: QueryConfig<I>,
           queryOptions: PostgreSqlQueryOptions,
         ) => {
+          if (!transactionActive) {
+            throw new StorageOperationError(
+              "STORAGE_TRANSACTION_SCOPE",
+              "postgresql",
+              queryOptions.projectId ?? options.projectId,
+              queryOptions.domain,
+              queryOptions.operation,
+            );
+          }
           const effectiveOptions = { ...queryOptions, signal: queryOptions.signal ?? options.signal };
           try {
             return await this.queryClient<R, I>(client!, config, effectiveOptions);
@@ -118,7 +132,12 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
           }
         },
       };
-      const result = await callback(transaction);
+      let result: T;
+      try {
+        result = await callback(transaction);
+      } finally {
+        transactionActive = false;
+      }
       await client.query("COMMIT");
       this.poolFailed = false;
       return result;

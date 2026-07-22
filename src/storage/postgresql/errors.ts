@@ -17,11 +17,36 @@ const RETRYABLE_SQLSTATES = new Set([
   "57P03",
 ]);
 
+const RETRYABLE_TRANSPORT_CODES = new Set([
+  "EAI_AGAIN",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTDOWN",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "ENETRESET",
+  "ENETUNREACH",
+  "EPIPE",
+  "ETIMEDOUT",
+]);
+
+const RETRYABLE_DRIVER_MESSAGES = new Set([
+  "Connection terminated due to connection timeout",
+  "Connection terminated unexpectedly",
+  "timeout exceeded when trying to connect",
+  "timeout expired",
+]);
+
 type PostgreSqlDriverError = Error & { code?: unknown };
 
 export function isRetryablePostgreSqlError(error: unknown): boolean {
-  const code = (error as PostgreSqlDriverError | undefined)?.code;
-  return typeof code === "string" && RETRYABLE_SQLSTATES.has(code);
+  const candidate = error as PostgreSqlDriverError | undefined;
+  const code = candidate?.code;
+  if (typeof code === "string" && (RETRYABLE_SQLSTATES.has(code) || RETRYABLE_TRANSPORT_CODES.has(code))) {
+    return true;
+  }
+  return error instanceof Error && RETRYABLE_DRIVER_MESSAGES.has(error.message);
 }
 
 export function normalizePostgreSqlError(

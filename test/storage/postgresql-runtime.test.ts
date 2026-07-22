@@ -7,7 +7,10 @@ import type {
   QueryResultRow,
 } from "pg";
 import { describe, expect, it, vi } from "vitest";
-import type { PostgreSqlConnectionSettings } from "../../src/storage/postgresql/contracts.js";
+import type {
+  PostgreSqlConnectionSettings,
+  PostgreSqlQueryExecutor,
+} from "../../src/storage/postgresql/contracts.js";
 import {
   PostgreSqlRuntime,
   POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
@@ -171,6 +174,48 @@ describe("PostgreSQL runtime", () => {
       domain: "transaction", operation: "acquisitionFailure",
     })).rejects.toMatchObject({ operation: "acquisitionFailure" });
     expect(acquisition.release).not.toHaveBeenCalled();
+  });
+
+  it("destroys a transaction client when its signal aborts during acquisition", async () => {
+    const controller = new AbortController();
+    const callback = vi.fn(async () => undefined);
+    const f = fixtures();
+    f.connect.mockImplementationOnce(async () => {
+      controller.abort();
+      return f.poolClient;
+    });
+
+    await expect(f.runtime.transaction(callback, {
+      domain: "transaction", operation: "abortDuringAcquire", signal: controller.signal,
+    })).rejects.toMatchObject({ operation: "abortDuringAcquire" });
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.query).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("fences retained transaction executors after the callback settles", async () => {
+    const f = fixtures((input) => typeof input === "string" ? result([]) : result([{ value: 1 }]));
+    let retained!: PostgreSqlQueryExecutor;
+    await f.runtime.transaction(async (transaction) => {
+      retained = transaction;
+    }, { projectId: "outer-project", domain: "transaction", operation: "retain" });
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual(["BEGIN", "COMMIT"]);
+
+    await expect(retained.query({ text: "SELECT 1" }, {
+      projectId: "query-project", domain: "sessions", operation: "escaped",
+    })).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE",
+      projectId: "query-project",
+      domain: "sessions",
+      operation: "escaped",
+    });
+    await expect(retained.query({ text: "SELECT 2" }, {
+      domain: "transaction", operation: "escapedWithoutProject",
+    })).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE",
+      projectId: "outer-project",
+    });
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual(["BEGIN", "COMMIT"]);
   });
 
   it("destroys a transaction client after a query-local abort", async () => {
