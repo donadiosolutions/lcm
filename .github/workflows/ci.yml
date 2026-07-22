@@ -118,6 +118,7 @@ jobs:
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           use_oidc: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
+          override_pr: ${{ github.event.pull_request.number }}
           files: coverage/lcov.info
           disable_search: true
           binary: ${{ runner.temp }}/codecov
@@ -127,6 +128,7 @@ jobs:
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           use_oidc: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
+          override_pr: ${{ github.event.pull_request.number }}
           files: test-report.junit.xml
           disable_search: true
           report_type: test_results

@@ -55,6 +55,7 @@ describe("CI workflow", () => {
       expect(upload.with).toMatchObject({
         binary: "${{ runner.temp }}/codecov",
         fail_ci_if_error: true,
+        override_pr: "${{ github.event.pull_request.number }}",
         use_oidc:
           "${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}",
       });
