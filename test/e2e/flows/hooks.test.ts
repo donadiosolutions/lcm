@@ -2,11 +2,11 @@
  * E2E Flow Tests: Hooks (Flows 14, 15, 16)
  *
  * Flow 14: SessionEnd hook ingests messages
- * Flow 15: PreCompact hook returns exit 2 with summary
+ * Flow 15: PreCompact hook returns exit 0 with summary
  * Flow 16: Auto-heal validates hooks without throwing
  */
 
-import { beforeAll, afterAll, describe, expect, it } from "vitest";
+import { beforeAll, afterAll, describe, expect, it, vi } from "vitest";
 import { createHarness, type HarnessHandle } from "../harness.js";
 import { DaemonClient } from "../../../src/daemon/client.js";
 
@@ -41,7 +41,7 @@ describe("Flow 14: SessionEnd hook", { timeout: 60_000 }, () => {
 });
 
 describe("Flow 15: PreCompact hook", { timeout: 60_000 }, () => {
-  it("returns exit 2 with summary text", async () => {
+  it("returns exit 0 with summary text", async () => {
     const h = handle!;
 
     // First ingest some data so there is something to compact
@@ -63,15 +63,18 @@ describe("Flow 15: PreCompact hook", { timeout: 60_000 }, () => {
       client: "claude",
     });
 
+    const lifecycle = await import("../../../src/daemon/lifecycle.js");
+    const ensureDaemon = vi.spyOn(lifecycle, "ensureDaemon").mockResolvedValue({
+      connected: true,
+      port: h.daemonPort,
+      spawned: false,
+    });
     const { handlePreCompact } = await import("../../../src/hooks/compact.js");
-    const result = await handlePreCompact(stdinData, client, h.daemonPort);
+    const result = await handlePreCompact(stdinData, client, h.daemonPort)
+      .finally(() => ensureDaemon.mockRestore());
 
-    // exit 2 = replace native compaction; exit 0 = disabled provider (also acceptable)
-    expect([0, 2]).toContain(result.exitCode);
-    // When exit 2, stdout should contain summary text
-    if (result.exitCode === 2) {
-      expect(result.stdout).toBeTruthy();
-    }
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBeTruthy();
   });
 });
 

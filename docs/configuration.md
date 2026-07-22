@@ -190,6 +190,22 @@ then, a valid `postgresql` selection fails before the daemon listens with an
 explicit backend-unavailable error. LCM never falls back to SQLite after an
 explicit PostgreSQL selection.
 
+The installed no-override PreCompact command (`lcm compact --hook`) is a
+best-effort exception to that fail-closed admission path. Before dispatch, its
+wrapper does not resolve `LCM_POSTGRES_URL` or `LCM_POSTGRES_CA_FILE`. If the
+configured backend is unavailable, the credentials are absent, or daemon
+admission fails, the hook exits `0` with no output so it cannot block the
+agent's own compaction. If an installed hook is customized with explicit
+`--timeout-ms` or `--retry-*` flags, only the secret-free LLM request-policy
+projection is loaded to validate those overrides; PostgreSQL credentials are
+still not resolved before fail-open dispatch.
+
+Manual CLI operations, daemon startup and restart, and MCP request admission
+are not covered by that hook exception. They resolve the complete effective
+configuration and fail closed when PostgreSQL credentials, TLS preflight, or
+backend support are unavailable. The hook behavior therefore does not provide
+SQLite fallback or make the PostgreSQL repository backend available.
+
 Store only non-secret pool and timeout settings in `~/.lcm/config.json`:
 
 ```json
