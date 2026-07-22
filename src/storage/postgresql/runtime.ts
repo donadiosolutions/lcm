@@ -42,6 +42,18 @@ function aborted(context: PostgreSqlOperationContext): StorageOperationError {
   );
 }
 
+function abortCause(): Error {
+  return new Error("postgresql query aborted");
+}
+
+async function ignoreCancellationFailure(cancellation: Promise<void>): Promise<void> {
+  try {
+    await cancellation;
+  } catch {
+    // The target connection is destroyed by the caller after abort.
+  }
+}
+
 export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
   private readonly clientConfig: ClientConfig;
   private readonly pool: Pool;
@@ -111,7 +123,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       this.poolFailed = false;
       return result;
     } catch (error) {
-      if (client) {
+      if (client && !destroy && options.signal?.aborted !== true) {
         try {
           await client.query("ROLLBACK");
         } catch {
@@ -137,7 +149,21 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       }, { domain: "factory", operation: "health" });
       const row = result.rows[0];
       const serverMajorVersion = Math.floor(row.server_version_num / 10_000);
-      if (serverMajorVersion !== 18 || row.tls !== true || row.timezone.toUpperCase() !== "UTC") {
+      if (serverMajorVersion !== 18) {
+        return {
+          status: "unavailable",
+          backend: "postgresql",
+          serverMajorVersion,
+          error: new StorageOperationError(
+            "STORAGE_INITIALIZATION_FAILED",
+            "postgresql",
+            undefined,
+            "factory",
+            "health",
+          ),
+        };
+      }
+      if (row.tls !== true || row.timezone.toUpperCase() !== "UTC") {
         throw new StorageOperationError(
           "STORAGE_INITIALIZATION_FAILED",
           "postgresql",
@@ -197,29 +223,52 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     if (signal.aborted) throw aborted(options);
     const pidResult = await client.query<BackendPidRow>({ text: "SELECT pg_backend_pid() AS pid" });
     const pid = pidResult.rows[0].pid;
-    return new Promise<QueryResult<R>>((resolve, reject) => {
-      let settled = false;
-      let cancellationFailed = false;
-      const finish = (callback: () => void): void => {
-        if (settled) return;
-        settled = true;
-        signal.removeEventListener("abort", onAbort);
-        callback();
-      };
+    if (signal.aborted) throw aborted(options);
+
+    type QueryOutcome = { error: Error | null; result?: QueryResult<R> };
+    let cancellation: Promise<void> | undefined;
+    let observeAbort!: () => void;
+    const abortObserved = new Promise<void>((resolve) => { observeAbort = resolve; });
+    const onAbort = (): void => {
+      cancellation ??= this.cancelBackend(pid);
+      observeAbort();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    const queryOutcome = new Promise<QueryOutcome>((resolve) => {
       const query = new Query<R, I>(config, (error, result) => {
-        if (error) finish(() => reject(error));
-        else finish(() => resolve(result as QueryResult<R>));
+        resolve({ error: error ?? null, result: result as QueryResult<R> | undefined });
       });
-      const onAbort = (): void => {
-        void this.cancelBackend(pid).catch(() => {
-          cancellationFailed = true;
-        }).finally(() => {
-          if (cancellationFailed) finish(() => reject(aborted(options)));
-        });
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
       client.query(query);
     });
+
+    try {
+      const first = await Promise.race([
+        queryOutcome.then((outcome) => ({ kind: "query" as const, outcome })),
+        abortObserved.then(() => ({ kind: "abort" as const })),
+      ]);
+      if (first.kind === "query") {
+        if (signal.aborted || cancellation) {
+          if (!cancellation) onAbort();
+          await ignoreCancellationFailure(cancellation!);
+          throw abortCause();
+        }
+        if (first.outcome.error) throw first.outcome.error;
+        return first.outcome.result!;
+      }
+
+      try {
+        await cancellation!;
+      } catch {
+        // The caller destroys the checked-out connection when it observes the
+        // aborted signal, so a failed cancellation cannot leave the query live.
+        throw abortCause();
+      }
+      await queryOutcome;
+      throw abortCause();
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
   }
 
   private async cancelBackend(pid: number): Promise<void> {

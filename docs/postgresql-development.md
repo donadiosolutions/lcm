@@ -107,6 +107,8 @@ The PostgreSQL and CI-only Node references in
    Debian base.
 4. Replace both tag and full digest in the harness, update the image assertions,
    and run `npm run test:postgresql` locally and through both CI matrix jobs.
+   The stable required `ci` check depends on the complete matrix, so any
+   PostgreSQL conformance failure blocks admission even when core CI passes.
 5. Confirm the reports and failure output contain no connection URL, password,
    SQL parameter, CA or private-key material, or temporary secret path.
 

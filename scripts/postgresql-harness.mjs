@@ -78,11 +78,37 @@ export function runProcess(command, args, options = {}) {
   });
 }
 
+export function createProcessLifecycle(processRunner = runProcess) {
+  const active = new Set();
+  let stopping = false;
+
+  const run = (command, args, options) => {
+    if (stopping) return Promise.reject(new Error("PostgreSQL harness setup is stopping"));
+    let operation;
+    try {
+      operation = Promise.resolve(processRunner(command, args, options));
+    } catch (error) {
+      operation = Promise.reject(error);
+    }
+    active.add(operation);
+    const remove = () => active.delete(operation);
+    void operation.then(remove, remove);
+    return operation;
+  };
+
+  const stop = async () => {
+    stopping = true;
+    while (active.size > 0) await Promise.allSettled([...active]);
+  };
+
+  return { run, stop };
+}
+
 async function docker(args, options) {
   return runProcess("docker", args, options);
 }
 
-async function writeTlsFixtures(directory, alias) {
+async function writeTlsFixtures(directory, alias, processRunner = runProcess) {
   const extensionFile = join(directory, "server-ext.cnf");
   writeFileSync(extensionFile, [
     "basicConstraints=CA:FALSE",
@@ -91,24 +117,24 @@ async function writeTlsFixtures(directory, alias) {
     `subjectAltName=DNS:${alias},IP:127.0.0.1`,
     "",
   ].join("\n"), { mode: 0o600 });
-  await runProcess("openssl", ["genrsa", "-out", join(directory, "ca.key"), "2048"]);
-  await runProcess("openssl", [
+  await processRunner("openssl", ["genrsa", "-out", join(directory, "ca.key"), "2048"]);
+  await processRunner("openssl", [
     "req", "-x509", "-new", "-sha256", "-days", "2",
     "-key", join(directory, "ca.key"), "-subj", "/CN=LCM PostgreSQL Test CA",
     "-out", join(directory, "ca.crt"),
   ]);
-  await runProcess("openssl", ["genrsa", "-out", join(directory, "server.key"), "2048"]);
-  await runProcess("openssl", [
+  await processRunner("openssl", ["genrsa", "-out", join(directory, "server.key"), "2048"]);
+  await processRunner("openssl", [
     "req", "-new", "-sha256", "-key", join(directory, "server.key"),
     "-subj", `/CN=${alias}`, "-out", join(directory, "server.csr"),
   ]);
-  await runProcess("openssl", [
+  await processRunner("openssl", [
     "x509", "-req", "-sha256", "-days", "2", "-in", join(directory, "server.csr"),
     "-CA", join(directory, "ca.crt"), "-CAkey", join(directory, "ca.key"),
     "-CAcreateserial", "-extfile", extensionFile, "-out", join(directory, "server.crt"),
   ]);
-  await runProcess("openssl", ["genrsa", "-out", join(directory, "wrong-ca.key"), "2048"]);
-  await runProcess("openssl", [
+  await processRunner("openssl", ["genrsa", "-out", join(directory, "wrong-ca.key"), "2048"]);
+  await processRunner("openssl", [
     "req", "-x509", "-new", "-sha256", "-days", "2",
     "-key", join(directory, "wrong-ca.key"), "-subj", "/CN=LCM Wrong Test CA",
     "-out", join(directory, "wrong-ca.crt"),
@@ -140,11 +166,11 @@ async function removeLabeled(type, name, runId) {
   await docker(args);
 }
 
-async function waitForPostgreSql(container, database) {
+async function waitForPostgreSql(container, database, dockerRunner = docker) {
   let lastError;
   for (let attempt = 0; attempt < 90; attempt += 1) {
     try {
-      await docker(["exec", container, "pg_isready", "--quiet", "--username", "lcm_harness_admin", "--dbname", database]);
+      await dockerRunner(["exec", container, "pg_isready", "--quiet", "--username", "lcm_harness_admin", "--dbname", database]);
       return;
     } catch (error) {
       lastError = error;
@@ -154,16 +180,16 @@ async function waitForPostgreSql(container, database) {
   throw lastError ?? new Error("PostgreSQL readiness timed out");
 }
 
-async function hostPort(container) {
-  const result = await docker(["port", container, "5432/tcp"]);
+async function hostPort(container, dockerRunner = docker) {
+  const result = await dockerRunner(["port", container, "5432/tcp"]);
   const match = result.stdout.match(/127\.0\.0\.1:(\d+)$/u);
   if (!match || match[1] === "5432") throw new Error("Docker did not allocate a safe random loopback port");
   return Number(match[1]);
 }
 
-async function verifyContainerSentinel(names, runId) {
+async function verifyContainerSentinel(names, runId, dockerRunner = docker) {
   validateRunNames(names, runId);
-  const result = await docker([
+  const result = await dockerRunner([
     "exec", names.container,
     "psql", "--username", "lcm_harness_admin", "--dbname", names.controlDatabase,
     "--tuples-only", "--no-align", "--field-separator", "|",
@@ -181,11 +207,11 @@ async function verifyContainerSentinel(names, runId) {
   ) throw new Error("refusing to clean an unowned PostgreSQL harness container");
 }
 
-async function waitForContainerSentinel(names, runId) {
+async function waitForContainerSentinel(names, runId, dockerRunner = docker) {
   let lastError;
   for (let attempt = 0; attempt < 90; attempt += 1) {
     try {
-      await verifyContainerSentinel(names, runId);
+      await verifyContainerSentinel(names, runId, dockerRunner);
       return;
     } catch (error) {
       lastError = error;
@@ -195,7 +221,7 @@ async function waitForContainerSentinel(names, runId) {
   throw lastError ?? new Error("PostgreSQL harness sentinel readiness timed out");
 }
 
-async function runTests(context, ci) {
+async function runTests(context, ci, setupDocker = docker) {
   const env = { ...process.env, ...context.environment };
   for (const key of Object.keys(env)) {
     if (key.startsWith("PG") || key === "LCM_POSTGRES_URL" || key === "LCM_POSTGRES_CA_FILE") delete env[key];
@@ -217,8 +243,8 @@ async function runTests(context, ci) {
     ...context.environment,
     LCM_TEST_POSTGRES_INNER_CI: "true",
   }).map(([key, value]) => `${key}=${value}`).join("\n") + "\n", { mode: 0o600 });
-  await docker([
-    "run", "--name", context.names.runner,
+  await setupDocker([
+    "create", "--name", context.names.runner,
     "--label", `${RUN_LABEL}=${context.runId}`,
     "--network", context.names.network,
     "--env-file", envFile,
@@ -229,7 +255,8 @@ async function runTests(context, ci) {
     "node", "/workspace/node_modules/vitest/vitest.mjs", "run",
     "--configLoader", "runner",
     "--config", "/workspace/vitest.postgresql.config.ts",
-  ], { stdio: "inherit" });
+  ]);
+  await docker(["start", "--attach", context.names.runner], { stdio: "inherit" });
 }
 
 export async function runHarness(options = {}) {
@@ -245,6 +272,9 @@ export async function runHarness(options = {}) {
   };
   const secrets = [...Object.values(passwords), directory];
   validateRunNames(names, runId);
+  const processLifecycle = createProcessLifecycle();
+  const setupProcess = processLifecycle.run;
+  const setupDocker = (args, processOptions) => setupProcess("docker", args, processOptions);
   let cleanupPromise;
   let sentinelReady = false;
   const cleanup = () => {
@@ -259,7 +289,9 @@ export async function runHarness(options = {}) {
     return cleanupPromise;
   };
   const onSignal = (signal) => {
-    void cleanup().finally(() => process.exit(signal === "SIGINT" ? 130 : 143));
+    void processLifecycle.stop()
+      .then(cleanup)
+      .finally(() => process.exit(signal === "SIGINT" ? 130 : 143));
   };
   const onSigint = () => onSignal("SIGINT");
   const onSigterm = () => onSignal("SIGTERM");
@@ -271,11 +303,11 @@ export async function runHarness(options = {}) {
     writeFileSync(join(directory, "admin-password"), `${passwords.admin}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "migrator-password"), `${passwords.migrator}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "runtime-password"), `${passwords.runtime}\n`, { mode: 0o600 });
-    await writeTlsFixtures(directory, names.alias);
-    await docker(["network", "create", "--label", `${RUN_LABEL}=${runId}`, names.network]);
-    await docker(["volume", "create", "--label", `${RUN_LABEL}=${runId}`, names.volume]);
+    await writeTlsFixtures(directory, names.alias, setupProcess);
+    await setupDocker(["network", "create", "--label", `${RUN_LABEL}=${runId}`, names.network]);
+    await setupDocker(["volume", "create", "--label", `${RUN_LABEL}=${runId}`, names.volume]);
     const publish = ci ? [] : ["--publish", "127.0.0.1::5432"];
-    await docker([
+    await setupDocker([
       "create", "--name", names.container,
       "--label", `${RUN_LABEL}=${runId}`,
       "--network", names.network,
@@ -294,17 +326,17 @@ export async function runHarness(options = {}) {
       "-ceu",
       "install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/certs /run/lcm-private; install -o postgres -g postgres -m 0600 /run/lcm-harness/server.key /var/lib/postgresql/certs/server.key; install -o postgres -g postgres -m 0644 /run/lcm-harness/server.crt /run/lcm-harness/ca.crt /var/lib/postgresql/certs/; install -o postgres -g postgres -m 0600 /run/lcm-harness/admin-password /run/lcm-harness/migrator-password /run/lcm-harness/runtime-password /run/lcm-harness/run-id /run/lcm-private/; exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/certs/server.crt -c ssl_key_file=/var/lib/postgresql/certs/server.key -c ssl_ca_file=/var/lib/postgresql/certs/ca.crt -c shared_preload_libraries=pg_stat_statements -c listen_addresses=* -c password_encryption=scram-sha-256 -c timezone=UTC",
     ]);
-    await docker(["start", names.container]);
+    await setupDocker(["start", names.container]);
     try {
-      await waitForPostgreSql(names.container, names.controlDatabase);
+      await waitForPostgreSql(names.container, names.controlDatabase, setupDocker);
     } catch (error) {
       const logs = await docker(["logs", names.container]).catch(() => ({ stdout: "", stderr: "" }));
       throw Object.assign(error, { stderr: `${logs.stdout}\n${logs.stderr}` });
     }
-    await waitForContainerSentinel(names, runId);
+    await waitForContainerSentinel(names, runId, setupDocker);
     sentinelReady = true;
     const host = ci ? names.alias : "127.0.0.1";
-    const port = ci ? 5432 : await hostPort(names.container);
+    const port = ci ? 5432 : await hostPort(names.container, setupDocker);
     const environment = {
       LCM_TEST_POSTGRES_RUN_ID: runId,
       LCM_TEST_POSTGRES_CONTAINER: names.container,
@@ -317,7 +349,8 @@ export async function runHarness(options = {}) {
       LCM_TEST_POSTGRES_WRONG_HOST: ci ? names.wrongAlias : "localhost",
     };
     try {
-      await (options.runTests ?? runTests)({ runId, names, directory, environment }, ci);
+      if (options.runTests) await options.runTests({ runId, names, directory, environment }, ci);
+      else await runTests({ runId, names, directory, environment }, ci, setupDocker);
     } catch (error) {
       const logs = await docker(["logs", names.container]).catch(() => ({ stdout: "", stderr: "" }));
       throw Object.assign(error, { stderr: `${error?.stderr ?? ""}\n${logs.stdout}\n${logs.stderr}` });
@@ -329,6 +362,7 @@ export async function runHarness(options = {}) {
   } finally {
     process.removeListener("SIGINT", onSigint);
     process.removeListener("SIGTERM", onSigterm);
+    await processLifecycle.stop();
     await cleanup();
   }
 }

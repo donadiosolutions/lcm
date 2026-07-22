@@ -12,7 +12,20 @@ interface WorkflowStep {
 
 interface CiWorkflow {
   jobs: {
+    core: {
+      name: string;
+    };
+    postgresql: {
+      strategy: { matrix: { run: number[] } };
+    };
+    ci: {
+      name: string;
+      needs: string[];
+      if: string;
+      steps: WorkflowStep[];
+    };
     codecov: {
+      needs: string;
       steps: WorkflowStep[];
     };
   };
@@ -22,6 +35,23 @@ const source = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.u
 const workflow = loadYaml(source) as CiWorkflow;
 
 describe("CI workflow", () => {
+  it("gates the stable required check on core CI and the complete PostgreSQL matrix", () => {
+    expect(workflow.jobs.core.name).toBe("Core CI");
+    expect(workflow.jobs.postgresql.strategy.matrix.run).toEqual([1, 2]);
+    expect(workflow.jobs.ci).toMatchObject({
+      name: "ci",
+      needs: ["core", "postgresql"],
+      if: "${{ always() }}",
+    });
+    const gate = workflow.jobs.ci.steps.find((step) => step.name === "Require every CI suite");
+    expect(gate?.env).toEqual({
+      CORE_RESULT: "${{ needs.core.result }}",
+      POSTGRESQL_RESULT: "${{ needs.postgresql.result }}",
+    });
+    expect(gate?.run).toContain('[[ "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success ]]');
+    expect(workflow.jobs.codecov.needs).toBe("ci");
+  });
+
   it("reuses one digest-verified pinned Codecov CLI for both uploads", () => {
     const steps = workflow.jobs.codecov.steps;
     const download = steps.find((step) => step.name === "Download verified Codecov CLI");

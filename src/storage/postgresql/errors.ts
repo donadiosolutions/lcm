@@ -11,6 +11,7 @@ const RETRYABLE_SQLSTATES = new Set([
   "08P01",
   "40001",
   "40P01",
+  "53300",
   "57P01",
   "57P02",
   "57P03",

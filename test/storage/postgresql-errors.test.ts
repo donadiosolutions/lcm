@@ -6,7 +6,7 @@ import {
 } from "../../src/storage/postgresql/errors.js";
 
 describe("PostgreSQL error normalization", () => {
-  it.each(["08000", "08001", "08003", "08004", "08006", "08007", "08P01", "40001", "40P01", "57P01", "57P02", "57P03"])(
+  it.each(["08000", "08001", "08003", "08004", "08006", "08007", "08P01", "40001", "40P01", "53300", "57P01", "57P02", "57P03"])(
     "classifies SQLSTATE %s as retryable",
     (code) => expect(isRetryablePostgreSqlError(Object.assign(new Error("driver secret"), { code }))).toBe(true),
   );

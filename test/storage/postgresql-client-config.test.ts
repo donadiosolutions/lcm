@@ -48,6 +48,8 @@ describe("PostgreSQL client configuration", () => {
       password: "encoded/password",
       database: "lcm database",
     });
+    expect(parsePostgreSqlUrl("postgresql://user:password@[2001:db8::1]:5544/database"))
+      .toMatchObject({ host: "2001:db8::1", port: 5544 });
   });
 
   it.each([
@@ -103,6 +105,21 @@ describe("PostgreSQL client configuration", () => {
       database: "lcm database",
       application_name: "lcm",
     });
+  });
+
+  it("passes an unbracketed IPv6 hostname to pg and TLS verification", () => {
+    const ipv6Settings = {
+      ...settings(),
+      url: "postgresql://user:password@[2001:db8::1]:5544/database",
+    };
+    const config = buildPostgreSqlClientConfig(ipv6Settings);
+    expect(config.host).toBe("2001:db8::1");
+
+    const ssl = config.ssl as Exclude<typeof config.ssl, boolean | undefined>;
+    const result = ssl.checkServerIdentity?.("[2001:db8::1]", {} as PeerCertificate);
+    expect(result).toBeInstanceOf(Error);
+    expect(result?.message).toContain("2001:db8::1");
+    expect(result?.message).not.toContain("[2001:db8::1]");
   });
 
   it("rejects missing and empty CA files without leaking their paths", () => {

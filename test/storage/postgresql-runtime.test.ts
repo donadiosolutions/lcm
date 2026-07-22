@@ -197,7 +197,7 @@ describe("PostgreSQL runtime", () => {
       return query;
     }, { domain: "transaction", operation: "outerTransaction" });
     await expect(pending).rejects.toMatchObject({ operation: "outerTransaction" });
-    expect(f.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
     expect(f.release).toHaveBeenCalledWith(true);
   });
 
@@ -208,8 +208,14 @@ describe("PostgreSQL runtime", () => {
     healthy.failPool();
     await expect(healthy.runtime.health()).resolves.toMatchObject({ status: "degraded" });
 
+    const wrongVersion = fixtures(() => result([{ ...healthyRow, server_version_num: 190000 }]));
+    await expect(wrongVersion.runtime.health()).resolves.toMatchObject({
+      status: "unavailable",
+      serverMajorVersion: 19,
+      error: { code: "STORAGE_INITIALIZATION_FAILED" },
+    });
+
     for (const row of [
-      { ...healthyRow, server_version_num: 170000 },
       { ...healthyRow, tls: false },
       { ...healthyRow, timezone: "America/Sao_Paulo" },
     ]) {
@@ -269,6 +275,23 @@ describe("PostgreSQL runtime", () => {
     expect(f.release).toHaveBeenCalledWith(true);
   });
 
+  it("rejects without starting the target query when aborted during backend PID lookup", async () => {
+    const controller = new AbortController();
+    const f = fixtures((input) => {
+      if (typeof input === "object" && input !== null && "text" in input && !("callback" in input)) {
+        controller.abort();
+        return result([{ pid: 72 }]);
+      }
+      throw new Error("target query must not start");
+    });
+    await expect(f.runtime.query({ text: "DELETE FROM sessions" }, {
+      domain: "sessions", operation: "abortDuringPidLookup", signal: controller.signal,
+    })).rejects.toMatchObject({ operation: "abortDuringPidLookup" });
+    expect(f.query).toHaveBeenCalledTimes(1);
+    expect(f.dependencies.createClient).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
   it("cancels an active backend and destroys the checked-out connection", async () => {
     let target: QueryWithCallback | undefined;
     const f = fixtures((input) => {
@@ -290,6 +313,96 @@ describe("PostgreSQL runtime", () => {
     expect(f.cancelQuery).toHaveBeenCalledWith({ text: "SELECT pg_cancel_backend($1) AS cancelled", values: [73] });
     expect(f.cancelEnd).toHaveBeenCalled();
     expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("does not release or reuse the target connection while cancellation is pending", async () => {
+    let target: QueryWithCallback | undefined;
+    let finishCancellation!: (value: QueryResult<{ cancelled: boolean }>) => void;
+    const f = fixtures((input) => {
+      if (typeof input === "object" && input !== null && "text" in input && !("callback" in input)) {
+        return result([{ pid: 74 }]);
+      }
+      target = input as QueryWithCallback;
+      return target;
+    });
+    f.cancelQuery.mockImplementationOnce(() => new Promise((resolve) => { finishCancellation = resolve; }));
+    const controller = new AbortController();
+    const pending = f.runtime.query({ text: "SELECT pg_sleep(10)" }, {
+      domain: "factory", operation: "lateCancel", signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(target).toBeDefined());
+    controller.abort();
+    await vi.waitFor(() => expect(f.cancelQuery).toHaveBeenCalled());
+    target?.callback(null, result([{ value: 1 }]));
+    await Promise.resolve();
+    expect(f.release).not.toHaveBeenCalled();
+
+    finishCancellation(result([{ cancelled: true }]));
+    await expect(pending).rejects.toMatchObject({ operation: "lateCancel" });
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("waits for cancellation when the query callback wins the microtask race", async () => {
+    let finishCancellation!: (value: QueryResult<{ cancelled: boolean }>) => void;
+    const controller = new AbortController();
+    const f = fixtures((input) => {
+      if (typeof input === "object" && input !== null && "text" in input && !("callback" in input)) {
+        return result([{ pid: 76 }]);
+      }
+      const target = input as QueryWithCallback;
+      target.callback(null, result([{ value: 1 }]));
+      controller.abort();
+      return target;
+    });
+    f.cancelQuery.mockImplementationOnce(() => new Promise((resolve) => { finishCancellation = resolve; }));
+    const pending = f.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory", operation: "callbackAbortRace", signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(f.cancelQuery).toHaveBeenCalled());
+    expect(f.release).not.toHaveBeenCalled();
+
+    finishCancellation(result([{ cancelled: true }]));
+    await expect(pending).rejects.toMatchObject({ operation: "callbackAbortRace" });
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("cancels defensively when abort state changes without event delivery", async () => {
+    let abortChecks = 0;
+    const signal = {
+      get aborted() { abortChecks += 1; return abortChecks >= 4; },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as AbortSignal;
+    const f = fixtures((input) => {
+      if (typeof input === "object" && input !== null && "text" in input && !("callback" in input)) {
+        return result([{ pid: 77 }]);
+      }
+      const target = input as QueryWithCallback;
+      target.callback(null, result([{ value: 1 }]));
+      return target;
+    });
+    vi.mocked(f.cancelClient.connect).mockRejectedValueOnce(new Error("connect failed"));
+    await expect(f.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory", operation: "missedAbortEvent", signal,
+    })).rejects.toMatchObject({ operation: "missedAbortEvent" });
+    expect(f.dependencies.createClient).toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("preserves a driver failure when an abort-aware query fails before abort", async () => {
+    const f = fixtures((input) => {
+      if (typeof input === "object" && input !== null && "text" in input && !("callback" in input)) {
+        return result([{ pid: 75 }]);
+      }
+      const target = input as QueryWithCallback;
+      target.callback(Object.assign(new Error("driver secret"), { code: "53300" }));
+      return target;
+    });
+    const controller = new AbortController();
+    await expect(f.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory", operation: "signalledFailure", signal: controller.signal,
+    })).rejects.toMatchObject({ operation: "signalledFailure", retryable: true });
+    expect(f.release).toHaveBeenCalledWith(false);
   });
 
   it.each(["rejected", "connect"])("fails closed when cancellation is %s", async (failure) => {

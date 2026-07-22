@@ -32,6 +32,12 @@ function decoded(value: string): string {
   }
 }
 
+function normalizedHostname(hostname: string): string {
+  return hostname.startsWith("[") && hostname.endsWith("]")
+    ? hostname.slice(1, -1)
+    : hostname;
+}
+
 export function parsePostgreSqlUrl(url: string): ParsedPostgreSqlUrl {
   let parsed: URL;
   try {
@@ -60,7 +66,7 @@ export function parsePostgreSqlUrl(url: string): ParsedPostgreSqlUrl {
   ) {
     throw configurationError();
   }
-  return { host: parsed.hostname, port, user, password, database };
+  return { host: normalizedHostname(parsed.hostname), port, user, password, database };
 }
 
 export function buildPostgreSqlClientConfig(

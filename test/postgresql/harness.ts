@@ -64,14 +64,14 @@ function safeIdentifier(value: string): string {
   return `"${value}"`;
 }
 
-async function runtimeFor(url: string, overrides = {}): Promise<PostgreSqlRuntime> {
+function runtimeFor(url: string, overrides = {}): PostgreSqlRuntime {
   return new PostgreSqlRuntime(settings(url, overrides));
 }
 
 export async function assertHarnessReady(): Promise<void> {
   const env = environment();
-  const migrator = await runtimeFor(env.LCM_TEST_POSTGRES_MIGRATOR_URL);
-  const runtime = await runtimeFor(env.LCM_TEST_POSTGRES_RUNTIME_URL);
+  const migrator = runtimeFor(env.LCM_TEST_POSTGRES_MIGRATOR_URL);
+  const runtime = runtimeFor(env.LCM_TEST_POSTGRES_RUNTIME_URL);
   try {
     const [migratorHealth, runtimeHealth] = await Promise.all([migrator.health(), runtime.health()]);
     if (migratorHealth.status !== "healthy" || migratorHealth.role !== "lcm_test_migrator") {
@@ -125,7 +125,7 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
   const worker = (process.env.VITEST_POOL_ID ?? "0").replace(/[^0-9]/gu, "").slice(0, 3) || "0";
   const name = `lcm_t_${env.LCM_TEST_POSTGRES_RUN_ID.slice(0, 12)}_${worker}_${normalizedLabel}_${randomBytes(4).toString("hex")}`.slice(0, 63);
   const identifier = safeIdentifier(name);
-  const admin = await runtimeFor(env.LCM_TEST_POSTGRES_ADMIN_URL);
+  const admin = runtimeFor(env.LCM_TEST_POSTGRES_ADMIN_URL);
   const adminUrl = databaseUrl(env.LCM_TEST_POSTGRES_ADMIN_URL, name);
   const migratorUrl = databaseUrl(env.LCM_TEST_POSTGRES_MIGRATOR_URL, name);
   const runtimeUrl = databaseUrl(env.LCM_TEST_POSTGRES_RUNTIME_URL, name);
@@ -138,9 +138,9 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
     await admin.close();
   }
 
-  const databaseAdmin = await runtimeFor(adminUrl);
-  const migrator = await runtimeFor(migratorUrl);
-  const runtime = await runtimeFor(runtimeUrl);
+  const databaseAdmin = runtimeFor(adminUrl);
+  const migrator = runtimeFor(migratorUrl);
+  const runtime = runtimeFor(runtimeUrl);
   try {
     for (const extension of ["pg_trgm", "unaccent", "pgcrypto", "pg_stat_statements"] as const) {
       await databaseAdmin.query({ text: `CREATE EXTENSION ${extension}` }, {
@@ -191,7 +191,7 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
     async drop(): Promise<void> {
       if (dropped) return;
       await Promise.allSettled([migrator.close(), runtime.close()]);
-      const guard = await runtimeFor(adminUrl);
+      const guard = runtimeFor(adminUrl);
       try {
         const result = await guard.query<GuardRow>({
           text: `SELECT current_setting('server_version_num')::integer AS server_version_num,
@@ -213,7 +213,7 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
       } finally {
         await guard.close();
       }
-      const control = await runtimeFor(env.LCM_TEST_POSTGRES_ADMIN_URL);
+      const control = runtimeFor(env.LCM_TEST_POSTGRES_ADMIN_URL);
       try {
         await control.query({
           text: "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",

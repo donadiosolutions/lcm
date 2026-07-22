@@ -4,6 +4,7 @@ import {
   NODE_IMAGE,
   POSTGRES_IMAGE,
   RUN_LABEL,
+  createProcessLifecycle,
   createRunNames,
   runProcess,
   sanitizeHarnessText,
@@ -81,5 +82,29 @@ describe("PostgreSQL harness utilities", () => {
     expect(error.stderr).not.toContain("discarded-stderr-prefix");
     await expect(runProcess("lcm-command-that-does-not-exist", []))
       .rejects.toBeInstanceOf(Error);
+  });
+
+  it("quiesces in-flight setup before cleanup and rejects later setup", async () => {
+    let finishCreation!: () => void;
+    let resourceExists = false;
+    const creationBlocked = new Promise<void>((resolve) => {
+      finishCreation = () => {
+        resourceExists = true;
+        resolve();
+      };
+    });
+    const lifecycle = createProcessLifecycle(() => creationBlocked);
+    const creation = lifecycle.run("docker", ["network", "create"]);
+    let stopped = false;
+    const stopping = lifecycle.stop().then(() => { stopped = true; });
+
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    finishCreation();
+    await expect(creation).resolves.toBeUndefined();
+    await stopping;
+    expect(resourceExists).toBe(true);
+    await expect(lifecycle.run("docker", ["volume", "create"]))
+      .rejects.toThrow("setup is stopping");
   });
 });
