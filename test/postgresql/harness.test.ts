@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   dropGate: undefined as Deferred | undefined,
   events: [] as string[],
   operations: [] as string[],
+  queryConfigs: [] as Array<{ text?: string; values?: unknown[] }>,
   runMigrations: vi.fn(async () => ({ applied: [] })),
 }));
 
@@ -50,13 +51,37 @@ vi.mock("../../src/storage/postgresql/runtime.js", () => ({
           throw failure;
         }
       }),
+      health: vi.fn(async () => ({
+        status: "healthy",
+        role: url.username === "migrator" ? "lcm_test_migrator" : "lcm_test_runtime",
+      })),
       query: vi.fn(async (
-        _query: unknown,
+        query: { text?: string; values?: unknown[] },
         context: { operation?: string } = {},
       ) => {
         const operation = context.operation ?? "unknown";
         mocks.operations.push(operation);
         mocks.events.push(`query:${operation}`);
+        mocks.queryConfigs.push(query);
+        if (operation === "harnessReadiness") {
+          return {
+            command: "SELECT", fields: [], oid: 0, rowCount: 1,
+            rows: [{
+              server_version_num: 180_000,
+              role: "lcm_test_migrator",
+              run_id: process.env.LCM_TEST_POSTGRES_RUN_ID,
+              database_name: process.env.LCM_TEST_POSTGRES_CONTROL_DATABASE,
+              runtime_role: "lcm_test_runtime",
+            }],
+          };
+        }
+        if (operation === "harnessExtensions") {
+          const names = query.values?.[0] as string[];
+          return {
+            command: "SELECT", fields: [], oid: 0, rowCount: names.length,
+            rows: names.map((extname) => ({ extname })),
+          };
+        }
         if (operation === "verifyDropSentinel") {
           const databaseName = new URL(settings.url).pathname.slice(1);
           return {
@@ -83,7 +108,8 @@ vi.mock("../../src/storage/postgresql/runtime.js", () => ({
   }),
 }));
 
-import { createPostgreSqlTestDatabase } from "./harness.js";
+import { REQUIRED_POSTGRESQL_EXTENSIONS } from "../../src/storage/postgresql/extensions.js";
+import { assertHarnessReady, createPostgreSqlTestDatabase } from "./harness.js";
 
 const ENVIRONMENT = {
   LCM_TEST_POSTGRES_RUN_ID: "0123456789abcdef0123456789abcdef",
@@ -104,6 +130,7 @@ beforeEach(() => {
   mocks.dropGate = undefined;
   mocks.events.length = 0;
   mocks.operations.length = 0;
+  mocks.queryConfigs.length = 0;
   mocks.runMigrations.mockClear();
 });
 
@@ -112,6 +139,16 @@ afterEach(() => {
 });
 
 describe("PostgreSQL test database lease", () => {
+  it("uses the authoritative required-extension set for readiness", async () => {
+    await expect(assertHarnessReady()).resolves.toBeUndefined();
+
+    const operationIndex = mocks.operations.indexOf("harnessExtensions");
+    expect(operationIndex).toBeGreaterThanOrEqual(0);
+    expect(mocks.queryConfigs[operationIndex]?.values).toEqual([
+      [...REQUIRED_POSTGRESQL_EXTENSIONS],
+    ]);
+  });
+
   it("drops the owned database when the database admin close fails", async () => {
     const secret = "postgresql://admin:close-secret@postgres/private";
     mocks.databaseAdminCloseFailure = new Error(`injected close failure ${secret}`);

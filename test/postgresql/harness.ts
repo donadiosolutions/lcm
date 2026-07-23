@@ -99,13 +99,16 @@ export async function assertHarnessReady(): Promise<void> {
       || row.database_name !== env.LCM_TEST_POSTGRES_CONTROL_DATABASE
       || row.runtime_role !== "lcm_test_runtime"
     ) throw new Error("harness sentinel readiness failed");
+    const requiredExtensions = [...REQUIRED_POSTGRESQL_EXTENSIONS];
     const extensions = await migrator.query<{ extname: string }>({
       text: `SELECT extname FROM pg_extension
              WHERE extname = ANY($1::text[])
              ORDER BY extname`,
-      values: [["pg_stat_statements", "pg_trgm", "pgcrypto", "unaccent"]],
+      values: [requiredExtensions],
     }, { domain: "factory", operation: "harnessExtensions" });
-    if (extensions.rowCount !== 4) throw new Error("harness extension readiness failed");
+    if (extensions.rowCount !== requiredExtensions.length) {
+      throw new Error("harness extension readiness failed");
+    }
   } finally {
     await Promise.allSettled([migrator.close(), runtime.close()]);
   }
