@@ -110,12 +110,17 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 | `version-pr.yml`                     | Push to main + manual `beta`/`stable` dispatch                                      | Auto-create version PRs and enter or exit Changesets beta mode                          |
 | `publish.yml`                        | Stable/beta tag pushes + GitHub release publication                                  | Create draft releases from tags; publish npm only after manual draft publication        |
 
-The CI workflow keeps coverage reporting in a separate no-checkout job that
-consumes the fixed test artifact. Codecov uses OIDC for pushes and same-repository
-PRs, including Dependabot PRs; fork PRs use Codecov's tokenless upload path. The
-reporting job is skipped for `merge_group`; the synthetic commit runs the full
-coverage suite in CI while its separate merge-group workflow supplies the
-required `external-admission` check.
+The CI workflow keeps coverage reporting in separate read-only jobs. Checkout
+uses the job token to fetch `github.repository` at the workflow's `github.sha`,
+but `persist-credentials: false` ensures credentials are not persisted. The jobs
+consume the fixed test artifact and never execute repository code. This matches
+the tree that produced the artifact, including the synthetic merge commit used by
+pull-request runs, while `override_pr` associates the uploads with the PR. The
+trusted job has OIDC permission and handles pushes and same-repository PRs,
+including Dependabot PRs. A mutually exclusive fork-PR job omits OIDC permission
+and uses Codecov's tokenless upload path. Both reporting jobs are skipped for
+`merge_group`; the synthetic commit runs the full coverage suite in CI while its
+separate merge-group workflow supplies the required `external-admission` check.
 
 ## Defaults (predefined answers for brainstorming)
 
