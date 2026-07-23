@@ -38,6 +38,32 @@ interface CiWorkflow {
 
 const source = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
 const workflow = loadYaml(source) as CiWorkflow;
+const expectedCodecovRunSteps = [
+  {
+    name: "Download Vitest reports",
+    run: [
+      "set -Eeuo pipefail",
+      'gh run download "$GITHUB_RUN_ID" \\',
+      '  --repo "$REPOSITORY" \\',
+      "  --name vitest-reports \\",
+      "  --dir .",
+    ].join("\n"),
+  },
+  {
+    name: "Download verified Codecov CLI",
+    run: [
+      "set -Eeuo pipefail",
+      'CODECOV_CLI_PATH="$RUNNER_TEMP/codecov"',
+      'gh release download "$CODECOV_CLI_TAG" \\',
+      '  --repo "$CODECOV_CLI_REPOSITORY" \\',
+      '  --pattern "$CODECOV_CLI_ASSET" \\',
+      '  --output "$CODECOV_CLI_PATH"',
+      "printf '%s  %s\\n' \"$CODECOV_CLI_SHA256\" \"$CODECOV_CLI_PATH\" \\",
+      "  | sha256sum --check --strict",
+      'chmod 0755 "$CODECOV_CLI_PATH"',
+    ].join("\n"),
+  },
+];
 
 describe("CI workflow", () => {
   it("gates the stable required check on core CI and the complete PostgreSQL matrix", () => {
@@ -76,9 +102,16 @@ describe("CI workflow", () => {
     });
   });
 
-  it("checks out the exact report source without executing repository code", () => {
+  it("checks out the artifact-producing tree and permits only fixed infrastructure scripts", () => {
     for (const job of [workflow.jobs.codecov, workflow.jobs["codecov-fork"]]) {
       const { steps } = job;
+      expect(steps.map((step) => step.name)).toEqual([
+        "Checkout source for Codecov",
+        "Download Vitest reports",
+        "Download verified Codecov CLI",
+        "Upload coverage to Codecov",
+        "Upload test results to Codecov",
+      ]);
 
       const checkoutIndex = steps.findIndex((step) => step.name === "Checkout source for Codecov");
       const firstUploadIndex = steps.findIndex((step) =>
@@ -90,15 +123,16 @@ describe("CI workflow", () => {
         name: "Checkout source for Codecov",
         uses: "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
         with: {
-          repository:
-            "${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}",
-          ref: "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}",
+          repository: "${{ github.repository }}",
+          ref: "${{ github.sha }}",
           "persist-credentials": false,
         },
       });
       expect(
-        steps.some((step) => /(?:^|\s)(?:node|npm|npx|pnpm|yarn)(?:\s|$)/u.test(step.run ?? "")),
-      ).toBe(false);
+        steps
+          .filter((step) => step.run !== undefined)
+          .map((step) => ({ name: step.name, run: step.run?.trim() })),
+      ).toEqual(expectedCodecovRunSteps);
     }
   });
 
