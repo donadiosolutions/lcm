@@ -124,11 +124,29 @@ describe("external admission workflow", () => {
 
   it("validates successful neutral CI against exact Actions run metadata", () => {
     expect(evaluator).toContain("repos/$REPOSITORY/actions/runs/$ci_run_id");
-    expect(evaluator).toContain("external-admission-policy.mjs validate-ci-run");
+    expect(evaluator).toContain("external-admission-policy.mjs evaluate-ci-run");
     expect(policySource).toContain('run.event === "pull_request"');
     expect(policySource).toContain('run.path === workflowPath');
     expect(policySource).toContain('run.head_sha === headSha');
     expect(source).toContain('success_description="CI and DCO passed for coverage-neutral diff"');
+  });
+
+  it("keeps transient backing CI workflow runs inside both polling validations", () => {
+    expect(evaluator.match(/Backing CI workflow run/gu)).toHaveLength(2);
+    expect(evaluator.match(/ci_run_evaluation=/gu)).toHaveLength(2);
+    expect(evaluator.match(/ci_run_terminal_failure=/gu)).toHaveLength(2);
+    expect(evaluator).toContain(
+      'run $ci_run_id evaluated as $(jq -r \'.state\' <<<"$ci_run_evaluation"): $ci_run_terminal_failure',
+    );
+    expect(evaluator).toContain(
+      'CI run $current_ci_run_id evaluated as $(jq -r \'.state\' <<<"$current_ci_run_evaluation")',
+    );
+    expect(evaluator.match(/sleep 15\n\s+continue/gu)).toHaveLength(2);
+    expect(policySource).toContain('"pending"');
+    expect(policySource).toContain('"queued"');
+    expect(policySource).toContain('"in_progress"');
+    expect(policySource).toContain('"requested"');
+    expect(policySource).toContain('"waiting"');
   });
 
   it("repeats classification, checks, CI provenance, and PR eligibility before success", () => {

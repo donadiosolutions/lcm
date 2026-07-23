@@ -6,9 +6,9 @@ import {
   CHECK_IDENTITIES,
   classifyPullRequestFiles,
   evaluateAdmissionChecks,
+  evaluateCiActionsRun,
   flattenCheckRunPages,
   flattenPullRequestFilePages,
-  isTrustedCiActionsRun,
   parseActionsRunId,
   requiresGreptileForPath,
   runPolicyCommand,
@@ -279,7 +279,66 @@ test("rejects unsafe or non-positive authenticated check IDs", () => {
   }
 });
 
-test("validates every trusted CI Actions run metadata field", () => {
+test("waits for every documented transient CI Actions run state", () => {
+  const valid = {
+    id: 123,
+    event: "pull_request",
+    path: ".github/workflows/ci.yml",
+    head_sha: HEAD_SHA,
+    repository: { full_name: REPOSITORY },
+  };
+
+  for (const status of ["queued", "in_progress", "pending", "requested", "waiting"]) {
+    assert.deepEqual(evaluateCiActionsRun({ ...valid, status, conclusion: null }, {
+      runId: "123",
+      headSha: HEAD_SHA,
+      repository: REPOSITORY,
+    }), {
+      state: status,
+      ready: false,
+      terminalFailure: undefined,
+    }, status);
+  }
+});
+
+test("accepts only terminal success and rejects every terminal non-success", () => {
+  const valid = {
+    id: 123,
+    event: "pull_request",
+    path: ".github/workflows/ci.yml",
+    head_sha: HEAD_SHA,
+    status: "completed",
+    repository: { full_name: REPOSITORY },
+  };
+  assert.deepEqual(evaluateCiActionsRun({ ...valid, conclusion: "success" }, {
+    runId: "123",
+    headSha: HEAD_SHA,
+    repository: REPOSITORY,
+  }), { state: "success", ready: true, terminalFailure: undefined });
+
+  for (const conclusion of [
+    "action_required",
+    "cancelled",
+    "failure",
+    "neutral",
+    "skipped",
+    "stale",
+    "timed_out",
+  ]) {
+    assert.deepEqual(evaluateCiActionsRun({ ...valid, conclusion }, {
+      runId: "123",
+      headSha: HEAD_SHA,
+      repository: REPOSITORY,
+    }), { state: conclusion, ready: false, terminalFailure: "ci-run" }, conclusion);
+  }
+  assert.deepEqual(evaluateCiActionsRun({ ...valid, conclusion: null }, {
+    runId: "123",
+    headSha: HEAD_SHA,
+    repository: REPOSITORY,
+  }), { state: "missing", ready: false, terminalFailure: "ci-run" });
+});
+
+test("rejects malformed states and every CI Actions run provenance mismatch", () => {
   const valid = {
     id: 123,
     event: "pull_request",
@@ -289,32 +348,37 @@ test("validates every trusted CI Actions run metadata field", () => {
     conclusion: "success",
     repository: { full_name: REPOSITORY },
   };
-  assert.equal(isTrustedCiActionsRun(valid, {
-    runId: "123",
-    headSha: HEAD_SHA,
-    repository: REPOSITORY,
-  }), true);
+
+  for (const status of [undefined, null, "unknown"]) {
+    assert.deepEqual(evaluateCiActionsRun({ ...valid, status }, {
+      runId: "123",
+      headSha: HEAD_SHA,
+      repository: REPOSITORY,
+    }), {
+      state: status === "unknown" ? "unknown" : "missing",
+      ready: false,
+      terminalFailure: "ci-run",
+    }, String(status));
+  }
 
   for (const [field, value] of [
     ["id", 124],
     ["event", "push"],
     ["path", ".github/workflows/other.yml"],
     ["head_sha", "b".repeat(40)],
-    ["status", "in_progress"],
-    ["conclusion", "failure"],
     ["repository", { full_name: "other/repo" }],
   ]) {
-    assert.equal(isTrustedCiActionsRun({ ...valid, [field]: value }, {
+    assert.deepEqual(evaluateCiActionsRun({ ...valid, [field]: value }, {
       runId: 123,
       headSha: HEAD_SHA,
       repository: REPOSITORY,
-    }), false, field);
+    }), { state: "invalid", ready: false, terminalFailure: "ci-run-metadata" }, field);
   }
-  assert.equal(isTrustedCiActionsRun(null, {
+  assert.deepEqual(evaluateCiActionsRun(null, {
     runId: "123",
     headSha: HEAD_SHA,
     repository: REPOSITORY,
-  }), false);
+  }), { state: "invalid", ready: false, terminalFailure: "ci-run-metadata" });
 });
 
 test("exposes the complete policy through its deterministic CLI command seam", () => {
@@ -344,16 +408,16 @@ test("exposes the complete policy through its deterministic CLI command seam", (
     conclusion: "success",
     repository: { full_name: REPOSITORY },
   };
-  assert.equal(runPolicyCommand(
-    "validate-ci-run",
+  assert.deepEqual(JSON.parse(runPolicyCommand(
+    "evaluate-ci-run",
     ["123", HEAD_SHA, REPOSITORY],
     JSON.stringify(run),
-  ), "");
-  assert.throws(() => runPolicyCommand(
-    "validate-ci-run",
+  )), { state: "success", ready: true });
+  assert.deepEqual(JSON.parse(runPolicyCommand(
+    "evaluate-ci-run",
     ["0", HEAD_SHA, REPOSITORY],
     JSON.stringify(run),
-  ), /not trusted/u);
+  )), { state: "invalid", ready: false, terminalFailure: "ci-run-metadata" });
   assert.throws(() => runPolicyCommand("evaluate-checks", [
     HEAD_SHA,
     "maybe",

@@ -47,8 +47,10 @@ of those paths requires authenticated DCO and the exact-head `ci` check from
 the GitHub Actions app. CI is polled but does not trigger the evaluator because
 it also reports on synthetic merge-group commits, which are handled by the
 separate merge-group admission workflow. The neutral path resolves the check's Actions run
-and requires a successful `pull_request` run of `.github/workflows/ci.yml` for
-the same repository and head SHA.
+and waits for a successful terminal `pull_request` run of `.github/workflows/ci.yml` for
+the same repository and head SHA. An aggregate `ci` check may succeed while a trailing
+workflow job is still running, so documented transient run states remain pending inside
+the admission polling loop; provenance mismatches and terminal non-success results fail.
 Every authenticated provider event with a valid commit SHA replaces any stale
 successful admission with `pending` before the PR-association lookup. This is
 necessary because GitHub may omit closed unmerged PRs from a commit's PR
