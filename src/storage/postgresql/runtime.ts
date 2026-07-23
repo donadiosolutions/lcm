@@ -29,7 +29,7 @@ export const POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES: PostgreSqlRuntimeDependenc
 };
 
 type HealthRow = {
-  server_version_num: number;
+  server_version_num: unknown;
   timezone: string;
   role: string;
   tls: boolean;
@@ -37,6 +37,12 @@ type HealthRow = {
 
 type BackendPidRow = { pid: number };
 type CancelRow = { cancelled: boolean };
+
+function sanitizeServerMajorVersion(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? Math.floor(value / 10_000)
+    : null;
+}
 
 function aborted(context: PostgreSqlOperationContext): StorageOperationError {
   return new StorageOperationError(
@@ -253,19 +259,35 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
                       COALESCE((SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()), false) AS tls`,
       }, { domain: "factory", operation: "health" });
       const row = result.rows[0];
-      const serverMajorVersion = Math.floor(row.server_version_num / 10_000);
+      const serverMajorVersion = sanitizeServerMajorVersion(row?.server_version_num);
+      const connectionDiagnostics = {
+        serverMajorVersion,
+        tls: row?.tls,
+        timezone: row?.timezone,
+        role: row?.role,
+      };
+      if (serverMajorVersion !== REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION) {
+        return {
+          status: "unavailable",
+          backend: "postgresql",
+          ...connectionDiagnostics,
+          error: new StorageOperationError(
+            "STORAGE_INITIALIZATION_FAILED",
+            "postgresql",
+            undefined,
+            "factory",
+            "health",
+          ),
+        };
+      }
       const extensions = await inspectRequiredPostgreSqlExtensions(this, {
         operation: "healthRequiredExtensions",
       });
       const diagnostics = {
-        serverMajorVersion,
-        tls: row.tls,
-        timezone: row.timezone,
-        role: row.role,
+        ...connectionDiagnostics,
         extensions,
       };
-      const runtimeReady = serverMajorVersion === REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION
-        && row.tls === true
+      const runtimeReady = row?.tls === true
         && row.timezone.toUpperCase() === "UTC";
       const extensionsReady = areRequiredPostgreSqlExtensionsReady(extensions);
       if (!runtimeReady || !extensionsReady) {

@@ -31,7 +31,14 @@ const SETTINGS: PostgreSqlConnectionSettings = {
   statementTimeoutMs: 300,
 };
 
-const HEALTHY_ROW = {
+interface HealthFixtureRow {
+  readonly server_version_num: unknown;
+  readonly timezone: string;
+  readonly role: string;
+  readonly tls: boolean;
+}
+
+const HEALTHY_ROW: HealthFixtureRow = {
   server_version_num: 180004,
   timezone: "UTC",
   role: "runtime",
@@ -61,7 +68,7 @@ function isExtensionInspection(input: unknown): boolean {
 }
 
 function healthFixtures(
-  healthRow = HEALTHY_ROW,
+  healthRow: HealthFixtureRow = HEALTHY_ROW,
   extensionRows = CURRENT_EXTENSION_ROWS,
 ) {
   return fixtures((input) => isExtensionInspection(input)
@@ -870,21 +877,31 @@ describe("PostgreSQL runtime", () => {
       serverMajorVersion: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
       extensions: CURRENT_EXTENSION_ROWS.map(({ name }) => expect.objectContaining({ name, status: "current" })),
     });
+    expect(healthy.query.mock.calls.filter(([input]) => isExtensionInspection(input))).toHaveLength(1);
     healthy.failPool();
     await expect(healthy.runtime.health()).resolves.toMatchObject({ status: "degraded" });
 
-    const wrongVersion = healthFixtures({
-      ...HEALTHY_ROW,
-      server_version_num: (REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION + 1) * 10_000,
-    });
-    await expect(wrongVersion.runtime.health()).resolves.toMatchObject({
-      status: "unavailable",
-      serverMajorVersion: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION + 1,
-      tls: true,
-      timezone: "UTC",
-      role: "runtime",
-      error: { code: "STORAGE_INITIALIZATION_FAILED" },
-    });
+    for (const serverMajorVersion of [
+      REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION - 1,
+      REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION + 1,
+    ]) {
+      const wrongVersion = healthFixtures({
+        ...HEALTHY_ROW,
+        server_version_num: serverMajorVersion * 10_000,
+      });
+      const health = await wrongVersion.runtime.health();
+      expect(health).toMatchObject({
+        status: "unavailable",
+        serverMajorVersion,
+        tls: true,
+        timezone: "UTC",
+        role: "runtime",
+        error: { code: "STORAGE_INITIALIZATION_FAILED" },
+      });
+      expect(health).not.toHaveProperty("extensions");
+      expect(wrongVersion.query).toHaveBeenCalledTimes(1);
+      expect(wrongVersion.query.mock.calls.some(([input]) => isExtensionInspection(input))).toBe(false);
+    }
 
     for (const row of [
       { ...HEALTHY_ROW, tls: false },
@@ -904,6 +921,35 @@ describe("PostgreSQL runtime", () => {
     await expect(unavailable.runtime.health()).resolves.toMatchObject({ status: "unavailable" });
     await healthy.runtime.close();
     await expect(healthy.runtime.health()).resolves.toEqual({ status: "closed", backend: "postgresql" });
+  });
+
+  it.each([
+    { label: "text", serverVersionNumber: "180004" },
+    { label: "negative", serverVersionNumber: -1 },
+    { label: "fractional", serverVersionNumber: 180_004.5 },
+    { label: "NaN", serverVersionNumber: Number.NaN },
+    { label: "infinite", serverVersionNumber: Number.POSITIVE_INFINITY },
+    { label: "missing", serverVersionNumber: undefined },
+  ])("fails closed before extension inspection for a $label server version", async ({
+    serverVersionNumber,
+  }) => {
+    const malformed = healthFixtures({
+      ...HEALTHY_ROW,
+      server_version_num: serverVersionNumber,
+    });
+    const health = await malformed.runtime.health();
+
+    expect(health).toMatchObject({
+      status: "unavailable",
+      serverMajorVersion: null,
+      tls: true,
+      timezone: "UTC",
+      role: "runtime",
+      error: { code: "STORAGE_INITIALIZATION_FAILED" },
+    });
+    expect(health).not.toHaveProperty("extensions");
+    expect(malformed.query).toHaveBeenCalledTimes(1);
+    expect(malformed.query.mock.calls.some(([input]) => isExtensionInspection(input))).toBe(false);
   });
 
   it.each([
