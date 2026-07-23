@@ -90,7 +90,7 @@ describe("PostgreSQL required extension preflight", () => {
   });
 
   it("reports unavailable, uninstalled, and version-mismatched extensions with sanitized guidance", async () => {
-    const unsafeVersion = "1.3'; DROP EXTENSION pg_trgm; --";
+    const unsafeVersion = "1.3\\'; DROP EXTENSION pg_trgm; --";
     const seam = executor([
       { name: "pg_trgm", default_version: "1.6", installed_version: null, installed_schema: null, relocatable: null, preloaded: null },
       { name: "pgcrypto", default_version: unsafeVersion, installed_version: "1.2", installed_schema: "public", relocatable: true, preloaded: null },
@@ -165,6 +165,8 @@ describe("PostgreSQL required extension preflight", () => {
     expect(areRequiredPostgreSqlExtensionsReady(statuses)).toBe(false);
     expect(areRequiredPostgreSqlExtensionsReady(statuses.slice(1))).toBe(false);
     expect(statuses[2]?.remediation).not.toContain("DROP EXTENSION");
+    expect(statuses[2]?.remediation).not.toContain(unsafeVersion);
+    expect(statuses[2]?.remediation).not.toContain("ALTER EXTENSION");
   });
 
   it("reports newer installed versions without prescribing a downgrade", async () => {
@@ -187,7 +189,7 @@ describe("PostgreSQL required extension preflight", () => {
   });
 
   it("preserves catalog data when installed extension control files are unavailable", async () => {
-    const installedVersion = "1.3'; SELECT private_data; --";
+    const installedVersion = "1.3\\'; DROP EXTENSION pg_trgm; --";
     const seam = executor(CURRENT_ROWS.map((row) => row.name === "pgcrypto"
       ? {
         ...row,
@@ -210,9 +212,12 @@ describe("PostgreSQL required extension preflight", () => {
       preloadRequired: false,
       preloaded: null,
       status: "installed-unavailable",
-      remediation: "Restore extension \"pgcrypto\" control files for installed version '1.3''; SELECT private_data; --' on the PostgreSQL server, then rerun readiness checks.",
+      remediation: "Restore extension \"pgcrypto\" control files for the installed version on the PostgreSQL server, then rerun readiness checks.",
     });
     expect(pgcrypto?.remediation).not.toContain("CREATE EXTENSION");
+    expect(pgcrypto?.remediation).not.toContain("DROP EXTENSION");
+    expect(pgcrypto?.remediation).not.toContain(installedVersion);
+    expect(pgcrypto?.remediation).not.toContain("\\");
     expect(areRequiredPostgreSqlExtensionsReady(statuses)).toBe(false);
   });
 

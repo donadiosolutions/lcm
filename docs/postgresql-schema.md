@@ -219,7 +219,10 @@ but the diagnostic does not infer upgrade direction or emit `ALTER EXTENSION
 ... UPDATE TO`: an installed version may be newer than the default and a
 downgrade path may not exist. Guidance instead tells the administrator to use a
 provider-supported version-management path to align the versions and rerun
-readiness.
+readiness. Catalog-controlled version strings are retained in the structured
+`installedVersion` and `defaultVersion` fields but are never interpolated into
+remediation SQL or prose, so backslashes and quotes cannot change a copied
+command.
 
 `installed-unavailable` means PostgreSQL still records the extension but its
 matching control files are unavailable. Guidance restores those files for the

@@ -68,7 +68,9 @@ readiness with structured, sanitized administrator guidance. A version mismatch
 does not infer upgrade direction or prescribe `ALTER EXTENSION ... UPDATE TO`,
 because the installed version may be newer than the default and a downgrade
 path may not exist. It directs administrators to their provider-supported
-version-management path instead. An installed-but-unavailable
+version-management path instead. Catalog-controlled version strings remain
+available in structured diagnostics but are not interpolated into remediation
+SQL or prose. An installed-but-unavailable
 extension requires restoring its matching control files, not running `CREATE
 EXTENSION`. For an otherwise-current `pg_stat_statements`, least-privilege
 readiness uses `pg_get_loaded_modules()` to verify the active module and does not

@@ -30,10 +30,6 @@ type ExtensionRow = QueryResultRow & {
   preloaded: boolean | null;
 };
 
-function quoteLiteral(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
 function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
 }
@@ -41,7 +37,6 @@ function quoteIdentifier(value: string): string {
 function remediation(
   name: RequiredExtensionName,
   status: PostgreSqlExtensionStatus["status"],
-  installedVersion: string | null,
   requiredSchema: PostgreSqlExtensionStatus["requiredSchema"],
   relocatable: boolean | null,
 ): string | null {
@@ -58,7 +53,7 @@ function remediation(
     return `Add "${name}" to shared_preload_libraries and restart PostgreSQL.`;
   }
   if (status === "installed-unavailable") {
-    return `Restore extension "${name}" control files for installed version ${quoteLiteral(installedVersion as string)} on the PostgreSQL server, then rerun readiness checks.`;
+    return `Restore extension "${name}" control files for the installed version on the PostgreSQL server, then rerun readiness checks.`;
   }
   const create = `CREATE EXTENSION "${name}" WITH SCHEMA ${quoteIdentifier(requiredSchema)};`;
   return status === "unavailable"
@@ -105,7 +100,6 @@ function extensionStatus(
     remediation: remediation(
       name,
       status,
-      installedVersion,
       requiredSchema,
       relocatable,
     ),
