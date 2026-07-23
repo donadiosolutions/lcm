@@ -31,9 +31,16 @@ The merge queue uses squash merging and an `ALLGREEN` grouping strategy. It buil
 
 The required `external-admission` status separates pull-request admission from
 merge-group validation for providers that do not report on synthetic queue
-commits. Authenticated provider `check_run` events drive
-`external-admission.yml`; pull-request lifecycle events do not start this
-write-capable workflow. The handler audits every paginated PR file record,
+commits. Authenticated provider `check_run` events and lifecycle events from the
+canonical `.github/workflows/ci.yml` workflow drive `external-admission.yml`;
+pull-request lifecycle events do not start this write-capable workflow. Provider
+and CI start or rerun events revoke stale admission and exit immediately. Their
+completion events evaluate one current exact-SHA snapshot and exit instead of
+occupying a runner while polling. A default-branch
+`external-admission-reconcile` repository dispatch with the exact PR head SHA
+provides fail-closed reconciliation if an external event is delayed or lost;
+see the [external-admission recovery guide](docs/external-admission.md).
+The handler audits every paginated PR file record,
 including both `filename` and `previous_filename`, before selecting one of two
 admission paths. The flattened file records must exactly match the pull
 request's authoritative `changed_files` count, so GitHub's file-list cap or an
@@ -44,13 +51,14 @@ change to executable `.ts`, `.tsx`, `.mts`, or `.cts` TypeScript under `bin/`,
 lockfile, Vitest config, or TypeScript config) requires authenticated
 `Greptile Review` and DCO successes on the PR's exact head SHA. A diff with none
 of those paths requires authenticated DCO and the exact-head `ci` check from
-the GitHub Actions app. CI is polled but does not trigger the evaluator because
-it also reports on synthetic merge-group commits, which are handled by the
-separate merge-group admission workflow. The neutral path resolves the check's Actions run
-and waits for a successful terminal `pull_request` run of `.github/workflows/ci.yml` for
-the same repository and head SHA. An aggregate `ci` check may succeed while a trailing
-workflow job is still running, so documented transient run states remain pending inside
-the admission polling loop; provenance mismatches and terminal non-success results fail.
+the GitHub Actions app. Only `pull_request` runs of the canonical CI workflow
+can wake the evaluator; push and synthetic merge-group runs are rejected before
+a runner starts. The neutral path resolves the check's Actions run and requires
+a successful terminal `pull_request` run of `.github/workflows/ci.yml` for the
+same repository and head SHA. An aggregate `ci` check may succeed while a
+trailing workflow job is still running, so documented transient run states
+remain pending until the next trusted CI or provider event; provenance
+mismatches and terminal non-success results fail.
 Every authenticated provider event with a valid commit SHA replaces any stale
 successful admission with `pending` before the PR-association lookup. This is
 necessary because GitHub may omit closed unmerged PRs from a commit's PR
@@ -61,7 +69,10 @@ run validation; a closed, draft, ineligible, unassociated, or ambiguous commit r
 pending. Commit-associated PRs, PR files, and check runs are all paginated and
 flattened before evaluation. The executable admission policy is sparsely
 checked out from the trusted workflow revision with persisted credentials
-disabled; it is never loaded from the untrusted PR head.
+disabled; it is never loaded from the untrusted PR head. Although a
+`workflow_run` handler receives a write-capable token, this evaluator never
+downloads CI artifacts or caches and never checks out or executes PR-controlled
+content.
 
 Changes to the admission workflow or its policy are themselves trust-sensitive
 and therefore require Greptile after this policy is active. The PR that first
@@ -103,7 +114,7 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 | Workflow                             | Trigger                                                                              | Purpose                                                                                 |
 | ------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
-| `external-admission.yml`             | Authenticated Greptile and DCO check runs                                              | Require Greptile+DCO for sensitive diffs or poll trusted CI+DCO for neutral diffs        |
+| `external-admission.yml`             | Authenticated Greptile/DCO checks, canonical PR CI lifecycle, default-branch exact-SHA repository dispatch | Statelessly require Greptile+DCO for sensitive diffs or trusted CI+DCO for neutral diffs |
 | `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
 | `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
 | `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |

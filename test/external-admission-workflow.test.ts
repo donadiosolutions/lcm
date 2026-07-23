@@ -3,6 +3,7 @@ import { load as loadYaml } from "js-yaml";
 import { describe, expect, it } from "vitest";
 
 interface WorkflowStep {
+  if?: string;
   name?: string;
   run?: string;
   uses?: string;
@@ -10,12 +11,21 @@ interface WorkflowStep {
 }
 
 interface ExternalAdmissionWorkflow {
-  on: Record<string, { types: string[] }>;
+  concurrency: {
+    "cancel-in-progress": boolean;
+    group: string;
+  };
+  on: {
+    check_run: { types: string[] };
+    repository_dispatch: { types: string[] };
+    workflow_run: { workflows: string[]; types: string[] };
+  };
   permissions: Record<string, string>;
   jobs: {
     "external-admission-evaluator": {
       if: string;
       steps: WorkflowStep[];
+      "timeout-minutes": number;
     };
   };
 }
@@ -28,14 +38,25 @@ const policySource = readFileSync(
   new URL("../.github/scripts/external-admission-policy.mjs", import.meta.url),
   "utf8",
 );
+const documentation = readFileSync(
+  new URL("../docs/external-admission.md", import.meta.url),
+  "utf8",
+);
 const workflow = loadYaml(source) as ExternalAdmissionWorkflow;
 const job = workflow.jobs["external-admission-evaluator"];
-const evaluator = job.steps.find((step) => step.name === "Wait for external admission checks")?.run ?? "";
+const evaluator = job.steps.find((step) => step.name === "Evaluate external admission snapshot")?.run ?? "";
+const completedOrReconcile =
+  "${{ (github.event_name == 'repository_dispatch' && github.event.action == 'external-admission-reconcile' && github.event.client_payload.head_sha != '') || github.event.action == 'completed' }}";
 
 describe("external admission workflow", () => {
-  it("has only the check-run trigger and least privileges needed by the trusted policy", () => {
+  it("uses provider, trusted CI, and default-branch reconciliation events with least privilege", () => {
     expect(workflow.on).toEqual({
       check_run: { types: ["created", "rerequested", "completed"] },
+      repository_dispatch: { types: ["external-admission-reconcile"] },
+      workflow_run: {
+        workflows: ["CI"],
+        types: ["requested", "in_progress", "completed"],
+      },
     });
     expect(workflow.permissions).toEqual({
       actions: "read",
@@ -44,6 +65,7 @@ describe("external admission workflow", () => {
       "pull-requests": "read",
       statuses: "write",
     });
+    expect(job["timeout-minutes"]).toBe(5);
   });
 
   it("revokes admission before checking out the trusted workflow revision", () => {
@@ -51,15 +73,17 @@ describe("external admission workflow", () => {
       "Revoke stale external admission",
       "Check out trusted admission policy",
       "Set up Node.js",
-      "Wait for external admission checks",
+      "Evaluate external admission snapshot",
     ]);
 
     const revoke = job.steps[0]?.run ?? "";
-    expect(revoke).toContain('if [[ ! "$EVENT_HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]');
+    expect(revoke).toContain('EVENT_HEAD_SHA="${EVENT_HEAD_SHA,,}"');
+    expect(revoke).toContain('if [[ ! "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]');
     expect(revoke).toContain('-f state="pending"');
     expect(revoke).not.toContain("/pulls");
 
     const checkout = job.steps[1];
+    expect(checkout?.if).toBe(completedOrReconcile);
     expect(checkout?.uses).toBe(
       "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
     );
@@ -71,24 +95,68 @@ describe("external admission workflow", () => {
     });
 
     const setupNode = job.steps[2];
+    expect(setupNode?.if).toBe(completedOrReconcile);
     expect(setupNode?.uses).toBe(
       "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
     );
     expect(setupNode?.with).toEqual({ "node-version": "22.20.0" });
+
+    expect(job.steps[3]?.if).toBe(completedOrReconcile);
+    expect(evaluator).toContain('HEAD_SHA="${EVENT_HEAD_SHA,,}"');
+    expect(evaluator).toContain('if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]');
+    expect(source).not.toContain("[0-9a-fA-F]");
   });
 
-  it("starts only for Greptile or DCO and polls CI without triggering on merge groups", () => {
+  it("starts only for Greptile, DCO, exact pull-request CI, or trusted reconciliation", () => {
     for (const identity of [
       ["Greptile Review", "867647", "greptile-apps"],
       ["DCO", "1861", "dco"],
     ]) {
       for (const value of identity) expect(job.if).toContain(value);
     }
-    expect(job.if).not.toContain("15368");
-    expect(job.if).not.toContain("github-actions");
-    expect(source).toContain("CI is polled but never starts this evaluator");
+    expect(job.if).toContain("github.event_name == 'repository_dispatch'");
+    expect(job.if).toContain("github.event.action == 'external-admission-reconcile'");
+    expect(job.if).toContain("github.event.client_payload.head_sha != ''");
+    expect(job.if).toContain("github.event.workflow_run.name == 'CI'");
+    expect(job.if).toContain("github.event.workflow_run.event == 'pull_request'");
+    expect(job.if).toContain("github.event.workflow_run.path == '.github/workflows/ci.yml'");
+    expect(job.if).toContain("github.event.workflow_run.repository.full_name == github.repository");
+    expect(source).toContain("GitHub suppresses check_run workflow recursion");
     expect(policySource).toContain('name: "ci", appId: 15368, appSlug: "github-actions"');
     expect(source).not.toMatch(/CodeRabbit|copilot-pull-request-reviewer/iu);
+    expect(source).not.toMatch(/^\s+pull_request(?:_target)?:/gmu);
+    expect(workflow.on).not.toHaveProperty("workflow_dispatch");
+    expect(source).not.toMatch(/^\s+workflow_dispatch:/gmu);
+    expect(source).not.toContain("inputs.head_sha");
+    expect(source.match(/github\.event\.client_payload\.head_sha/gu)).toHaveLength(7);
+  });
+
+  it("isolates rejected CI workflow runs from exact-SHA evaluator concurrency", () => {
+    const group = workflow.concurrency.group;
+    const canonicalCiConditions = [
+      "github.event.workflow_run.name == 'CI'",
+      "github.event.workflow_run.event == 'pull_request'",
+      "github.event.workflow_run.path == '.github/workflows/ci.yml'",
+      "github.event.workflow_run.repository.full_name == github.repository",
+    ];
+
+    expect(workflow.concurrency["cancel-in-progress"]).toBe(true);
+    for (const condition of canonicalCiConditions) {
+      expect(group).toContain(condition);
+      expect(job.if).toContain(condition);
+    }
+    expect(group).toMatch(
+      /github\.event\.workflow_run\.repository\.full_name == github\.repository\s+&&\s+github\.event\.workflow_run\.head_sha/u,
+    );
+    expect(group).toMatch(
+      /github\.event_name == 'workflow_run'\s+&&\s+format\('workflow-run-\{0\}', github\.run_id\)/u,
+    );
+    expect(group).toMatch(
+      /github\.event_name == 'repository_dispatch'\s+&&\s+github\.event\.action == 'external-admission-reconcile'\s+&&\s+github\.event\.client_payload\.head_sha/u,
+    );
+    expect(group).not.toContain(
+      "github.event_name == 'workflow_run' && github.event.workflow_run.head_sha",
+    );
   });
 
   it("paginates every collection and repeats exact pull-request eligibility", () => {
@@ -131,7 +199,7 @@ describe("external admission workflow", () => {
     expect(source).toContain('success_description="CI and DCO passed for coverage-neutral diff"');
   });
 
-  it("keeps transient backing CI workflow runs inside both polling validations", () => {
+  it("leaves transient snapshots pending and never polls on a runner", () => {
     expect(evaluator.match(/Backing CI workflow run/gu)).toHaveLength(2);
     expect(evaluator.match(/ci_run_evaluation=/gu)).toHaveLength(2);
     expect(evaluator.match(/ci_run_terminal_failure=/gu)).toHaveLength(2);
@@ -141,7 +209,13 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain(
       'CI run $current_ci_run_id evaluated as $(jq -r \'.state\' <<<"$current_ci_run_evaluation")',
     );
-    expect(evaluator.match(/sleep 15\n\s+continue/gu)).toHaveLength(2);
+    expect(
+      evaluator.match(
+        /if \[\[ "\$EVENT_SOURCE" == workflow_run && "\$EVENT_WORKFLOW_RUN_ID" != "\$(?:current_)?ci_run_id" \]\]; then/gu,
+      ),
+    ).toHaveLength(2);
+    expect(evaluator).not.toMatch(/\b(?:deadline|sleep|while)\b/u);
+    expect(source).not.toContain("continuing to wait");
     expect(policySource).toContain('"pending"');
     expect(policySource).toContain('"queued"');
     expect(policySource).toContain('"in_progress"');
@@ -166,5 +240,17 @@ describe("external admission workflow", () => {
       expect(markerIndex, marker).toBeGreaterThan(0);
       expect(markerIndex, marker).toBeLessThan(successIndex);
     }
+  });
+
+  it("documents exact-SHA repository-dispatch recovery and its trust boundary", () => {
+    expect(documentation).toContain("Contents: write");
+    expect(documentation).toContain("--json headRefOid");
+    expect(documentation).toContain("repos/donadiosolutions/lcm/dispatches");
+    expect(documentation).toContain("-f event_type=external-admission-reconcile");
+    expect(documentation).toContain('-F "client_payload[head_sha]=$HEAD_SHA"');
+    expect(documentation).toContain("default branch");
+    expect(documentation).toMatch(/\bpending\b/u);
+    expect(documentation).toMatch(/\bsuccess\b/u);
+    expect(documentation).toMatch(/\bfailure\b/iu);
   });
 });
