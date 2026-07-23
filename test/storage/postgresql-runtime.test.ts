@@ -972,6 +972,14 @@ describe("PostgreSQL runtime", () => {
       serverMajorVersion: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
       extensions: CURRENT_EXTENSION_ROWS.map(({ name }) => expect.objectContaining({ name, status: "current" })),
     });
+    const healthSql = (healthy.query.mock.calls[0]?.[0] as { text?: string } | undefined)?.text ?? "";
+    for (const catalogBinding of [
+      "pg_catalog.current_setting('server_version_num')::pg_catalog.int4",
+      "pg_catalog.current_setting('TimeZone')",
+      "FROM pg_catalog.pg_stat_ssl",
+      "OPERATOR(pg_catalog.=)",
+      "pg_catalog.pg_backend_pid()",
+    ]) expect(healthSql).toContain(catalogBinding);
     expect(healthy.query.mock.calls.filter(([input]) => isExtensionInspection(input))).toHaveLength(1);
     healthy.failPool();
     await expect(healthy.runtime.health()).resolves.toMatchObject({ status: "degraded" });

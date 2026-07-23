@@ -1,5 +1,8 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import {
+  PostgreSqlRuntime,
+  POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
+} from "../../src/storage/postgresql/runtime.js";
 import {
   assertHarnessReady,
   harnessEnvironment,
@@ -20,6 +23,54 @@ describe("PostgreSQL 18 runtime", () => {
         timezone: "UTC",
         role: "lcm_test_runtime",
       });
+    });
+  });
+
+  it("ignores hostile health-catalog shadows in the ambient search path", async () => {
+    await withPostgreSqlTestDatabase("runtime-hostile-health", async (database) => {
+      await database.migrator.query({
+        text: `CREATE SCHEMA hostile_health;
+               CREATE FUNCTION hostile_health.current_setting(setting_name text)
+               RETURNS text LANGUAGE sql IMMUTABLE
+               RETURN CASE setting_name
+                 WHEN 'server_version_num' THEN '170000'
+                 WHEN 'TimeZone' THEN 'America/Sao_Paulo'
+                 ELSE ''
+               END;
+               CREATE FUNCTION hostile_health.pg_backend_pid()
+               RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1;
+               CREATE FUNCTION hostile_health.never_equal(left_value integer, right_value integer)
+               RETURNS boolean LANGUAGE sql IMMUTABLE RETURN false;
+               CREATE OPERATOR hostile_health.= (
+                 FUNCTION = hostile_health.never_equal,
+                 LEFTARG = integer,
+                 RIGHTARG = integer
+               );
+               CREATE VIEW hostile_health.pg_stat_ssl AS
+                 SELECT 1::integer AS pid, false AS ssl;
+               GRANT USAGE ON SCHEMA hostile_health TO lcm_test_runtime;
+               GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hostile_health TO lcm_test_runtime;
+               GRANT SELECT ON hostile_health.pg_stat_ssl TO lcm_test_runtime`,
+      }, { domain: "factory", operation: "createHostileHealthCatalog" });
+      const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl), {
+        ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
+        buildConfig: (connectionSettings) => ({
+          ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(connectionSettings),
+          options: "-c timezone=UTC -c search_path=hostile_health,pg_catalog,public",
+        }),
+      });
+      try {
+        await expect(runtime.health()).resolves.toMatchObject({
+          status: "healthy",
+          backend: "postgresql",
+          serverMajorVersion: 18,
+          tls: true,
+          timezone: "UTC",
+          role: "lcm_test_runtime",
+        });
+      } finally {
+        await runtime.close();
+      }
     });
   });
 

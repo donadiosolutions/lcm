@@ -262,10 +262,15 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     const wasPoolFailed = this.poolFailed;
     try {
       const result = await this.query<HealthRow>({
-        text: `SELECT current_setting('server_version_num')::integer AS server_version_num,
-                      current_setting('TimeZone') AS timezone,
-                      current_user AS role,
-                      COALESCE((SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()), false) AS tls`,
+        text: `SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int4
+                        AS server_version_num,
+                      pg_catalog.current_setting('TimeZone') AS timezone,
+                      CURRENT_USER AS role,
+                      COALESCE((
+                        SELECT ssl
+                        FROM pg_catalog.pg_stat_ssl
+                        WHERE pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid()
+                      ), false) AS tls`,
       }, { domain: "factory", operation: "health" });
       const row = result.rows[0];
       const serverMajorVersion = sanitizeServerMajorVersion(row?.server_version_num);
