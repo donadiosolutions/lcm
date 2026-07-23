@@ -40,13 +40,15 @@ RETURN (
     ''
   )
   FROM pg_catalog.regexp_split_to_table(
-    pg_catalog.lower(COALESCE(input, '')),
+    pg_catalog.lower(
+      COALESCE(input, '') COLLATE pg_catalog.pg_unicode_fast
+    ),
     ''
   ) WITH ORDINALITY AS characters(source_character, ordinal)
 );
 
 COMMENT ON FUNCTION lcm.normalize_search_text(text) IS
-  'Pinned PostgreSQL 18.4 unaccent.rules SHA-256 ecf4c41c0883dee17d02431e0a7f24a2611aadf8fe1da06e98c6ccb4acc4a981; canonical JSON SHA-256 21d9c6e1f20f37d7d804b81dc7f62372b68de9ff05037d5f4f3c85cef4868588 (2661 rules)';
+  'PostgreSQL 18 pg_unicode_fast case mapping; pinned PostgreSQL 18.4 unaccent.rules SHA-256 ecf4c41c0883dee17d02431e0a7f24a2611aadf8fe1da06e98c6ccb4acc4a981; canonical JSON SHA-256 21d9c6e1f20f37d7d804b81dc7f62372b68de9ff05037d5f4f3c85cef4868588 (2661 rules)';
 
 CREATE TABLE lcm.machines (
   machine_id uuid PRIMARY KEY DEFAULT uuidv7(),
@@ -154,12 +156,16 @@ CREATE TABLE lcm.message_parts (
   subtask_desc text,
   subtask_agent text,
   step_reason text,
-  step_cost double precision CHECK (step_cost IS NULL OR step_cost >= 0),
+  step_cost double precision CHECK (
+    step_cost IS NULL OR (
+      step_cost >= 0 AND step_cost < 'Infinity'::double precision
+    )
+  ),
   step_tokens_in bigint CHECK (step_tokens_in IS NULL OR step_tokens_in >= 0),
   step_tokens_out bigint CHECK (step_tokens_out IS NULL OR step_tokens_out >= 0),
   snapshot_hash text,
   compaction_auto boolean,
-  metadata jsonb CHECK (metadata IS NULL OR jsonb_typeof(metadata) = 'object'),
+  metadata text,
   UNIQUE (project_id, conversation_id, message_id, ordinal),
   FOREIGN KEY (project_id, conversation_id, message_id)
     REFERENCES lcm.messages(project_id, conversation_id, message_id) ON DELETE CASCADE
@@ -167,8 +173,6 @@ CREATE TABLE lcm.message_parts (
 
 CREATE INDEX message_parts_type_idx
   ON lcm.message_parts (project_id, part_type, message_id, ordinal);
-CREATE INDEX message_parts_metadata_idx
-  ON lcm.message_parts USING gin (metadata jsonb_path_ops) WHERE metadata IS NOT NULL;
 
 CREATE TABLE lcm.native_transcripts (
   transcript_id uuid PRIMARY KEY DEFAULT uuidv7(),
@@ -221,7 +225,7 @@ CREATE INDEX transcript_messages_message_idx
   ON lcm.transcript_messages (project_id, conversation_id, message_id, transcript_id);
 
 CREATE TABLE lcm.summaries (
-  summary_id text PRIMARY KEY DEFAULT uuidv7()::text,
+  summary_id text NOT NULL DEFAULT uuidv7()::text,
   project_id uuid NOT NULL,
   conversation_id bigint NOT NULL,
   kind text NOT NULL CHECK (kind IN ('leaf', 'condensed')),
@@ -237,7 +241,7 @@ CREATE TABLE lcm.summaries (
   search_document tsvector GENERATED ALWAYS AS (
     to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(content))
   ) STORED,
-  UNIQUE (project_id, summary_id),
+  PRIMARY KEY (project_id, summary_id),
   UNIQUE (project_id, conversation_id, summary_id),
   FOREIGN KEY (project_id, conversation_id)
     REFERENCES lcm.conversations(project_id, conversation_id) ON DELETE CASCADE,
@@ -320,7 +324,7 @@ CREATE INDEX context_items_summary_idx
   ON lcm.context_items (project_id, conversation_id, summary_id) WHERE summary_id IS NOT NULL;
 
 CREATE TABLE lcm.large_files (
-  file_id text PRIMARY KEY DEFAULT uuidv7()::text,
+  file_id text NOT NULL DEFAULT uuidv7()::text,
   project_id uuid NOT NULL,
   conversation_id bigint NOT NULL,
   file_name text,
@@ -329,6 +333,7 @@ CREATE TABLE lcm.large_files (
   storage_uri text NOT NULL CHECK (btrim(storage_uri) <> ''),
   exploration_summary text,
   created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+  PRIMARY KEY (project_id, file_id),
   UNIQUE (project_id, conversation_id, file_id),
   FOREIGN KEY (project_id, conversation_id)
     REFERENCES lcm.conversations(project_id, conversation_id) ON DELETE CASCADE
@@ -372,15 +377,14 @@ CREATE TABLE lcm.promoted_memories (
     to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(content))
   ) STORED,
   UNIQUE (project_id, memory_id),
-  FOREIGN KEY (project_id, source_summary_id)
-    REFERENCES lcm.summaries(project_id, summary_id) ON DELETE SET NULL (source_summary_id),
   CHECK (archived_at IS NULL OR archived_at >= created_at)
 );
 
 CREATE INDEX promoted_memories_active_order_idx
   ON lcm.promoted_memories (project_id, created_at, memory_id) WHERE archived_at IS NULL;
 CREATE INDEX promoted_memories_source_summary_idx
-  ON lcm.promoted_memories (project_id, source_summary_id);
+  ON lcm.promoted_memories (project_id, source_project_id, source_summary_id)
+  WHERE source_summary_id IS NOT NULL;
 CREATE INDEX promoted_memories_source_project_idx
   ON lcm.promoted_memories (project_id, source_project_id, created_at, memory_id)
   WHERE source_project_id IS NOT NULL AND archived_at IS NULL;
@@ -395,7 +399,9 @@ CREATE TABLE lcm.promoted_memory_tags (
   project_id uuid NOT NULL,
   memory_id uuid NOT NULL,
   tag text NOT NULL CHECK (tag <> '' AND tag = btrim(tag)),
-  normalized_tag text GENERATED ALWAYS AS (lower(tag)) STORED,
+  normalized_tag text GENERATED ALWAYS AS (
+    pg_catalog.lower(tag COLLATE pg_catalog.pg_unicode_fast)
+  ) STORED,
   PRIMARY KEY (project_id, memory_id, normalized_tag),
   FOREIGN KEY (project_id, memory_id)
     REFERENCES lcm.promoted_memories(project_id, memory_id) ON DELETE CASCADE

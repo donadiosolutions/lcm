@@ -53,26 +53,31 @@ does not add row-level security.
   later lease cannot receive a previously generated token.
 - Timestamps use `timestamptz` and default to `statement_timestamp()`. Checks
   reject reversed lifecycle ranges. Counters, ordinals, token counts, byte
-  counts, depths, and costs are nonnegative; fencing tokens and event versions
-  are strictly positive.
+  counts and depths are nonnegative; step costs are finite and nonnegative;
+  fencing tokens and event versions are strictly positive.
 - Composite foreign keys carry `project_id` and, for conversation data,
   `conversation_id`. They make cross-project and cross-conversation links
   impossible even when a globally unique row ID is known.
-- JSONB is limited to client-native payloads, part or promoted-memory metadata,
-  checkpoint state, and passive-event envelopes. Part metadata is null or an
-  object, native payloads are objects or arrays, and all other JSONB values are
-  objects. Queryable tags, state, counters, identities, and relationships remain
-  normalized columns or relations.
-- `lcm.normalize_search_text(text)` lowercases and applies an embedded copy of
+- JSONB is limited to client-native payloads, promoted-memory metadata,
+  checkpoint state, and passive-event envelopes. Message-part metadata remains
+  opaque nullable text so every backend can preserve caller formatting and even
+  non-JSON values exactly. Native payloads are objects or arrays, and all other
+  JSONB values are objects. Queryable tags, state, counters, identities, and
+  relationships remain normalized columns or relations.
+- `lcm.normalize_search_text(text)` lowercases with PostgreSQL 18's builtin
+  `pg_unicode_fast` collation and applies an embedded copy of
   PostgreSQL 18.4's 2,661 `unaccent.rules` mappings. The source rule file is
   pinned by SHA-256
   `ecf4c41c0883dee17d02431e0a7f24a2611aadf8fe1da06e98c6ccb4acc4a981`;
   its canonical embedded JSON is pinned by SHA-256
   `21d9c6e1f20f37d7d804b81dc7f62372b68de9ff05037d5f4f3c85cef4868588`.
   The migration artifact checksum protects both. The immutable, parallel-safe
-  function has no dependency on the mutable extension dictionary, so an
-  extension package or dictionary update cannot silently change query-time
-  normalization while stored columns and indexes retain older values.
+  function has no dependency on the mutable extension dictionary or the
+  database's libc/ICU collation provider. `pg_unicode_fast` uses PostgreSQL's
+  bundled Unicode full case mapping and is stable within the required major
+  version, so an operating-system, provider, extension, or dictionary update
+  cannot silently change query-time normalization while stored columns and
+  indexes retain older values.
   Messages, summaries, and promoted memories store generated
   `simple`-configuration `tsvector` documents and have both full-text and
   normalized trigram GIN indexes. The function uses a fixed search path and is
@@ -114,8 +119,9 @@ not claim a throughput budget for future repository implementations.
 therefore uses `ON DELETE CASCADE`. Source references and shared identity roots
 use `RESTRICT`, so deletion requires an explicit, ordered administrative
 operation. Join rows cascade only from the record that owns the relationship;
-their source side is restricted. A promoted memory survives deletion of its
-source summary by setting only `source_summary_id` to null.
+their source side is restricted. Promoted-memory provenance identifiers are
+external nullable text, are not owner-scoped foreign keys, and remain unchanged
+when a same-named local summary is deleted.
 
 The baseline does not run retention jobs or silently delete records. Identity,
 source, derived, and administrative records are retained until an explicit
@@ -151,7 +157,7 @@ deletion.
 | --- | --- | --- |
 | `conversations` | Project-scoped source root. Project deletion is restricted; an explicit conversation deletion owns messages, summaries, context, and large-file metadata. Multiple rows may represent segments of one session. | Generated `bigint` primary key and scoped identity; nonblank session; ordered timestamps and optional bootstrap time. `conversations_project_order_idx` supplies deterministic newest-first project ordering, while `conversations_session_lookup_idx` supports session-wide aggregation and deterministic newest-segment lookup. |
 | `messages` | Owned by a conversation and cascades with it. Coverage, context, and transcript provenance references restrict direct deletion until those relationships are handled. | Generated `bigint` primary key; scoped unique sequence and identity; nonnegative sequence and token count; four-role enum. The scoped sequence unique index provides conversation order and `messages_project_created_idx` provides stable project order; `messages_search_document_idx` and `messages_content_trgm_idx` provide FTS and substring/fuzzy access. |
-| `message_parts` | Owned by a message and cascades with it. | UUID primary key with a UUIDv7 default; unique scoped ordinal; nonblank session; closed part-type enum; nonnegative ordinal, cost, and token fields. `message_parts_type_idx` supports scoped type/order access; partial `message_parts_metadata_idx` is a JSONB path-ops GIN index. |
+| `message_parts` | Owned by a message and cascades with it. | UUID primary key with a UUIDv7 default; unique scoped ordinal; nonblank session; closed part-type enum; nonnegative ordinal and token fields; finite nonnegative cost. Nullable metadata is opaque text and round-trips unchanged. `message_parts_type_idx` supports scoped type/order access. |
 | `native_transcripts` | Project- and machine-scoped scrubbed source. Both roots restrict deletion. The #86 repository is append-only and exposes no pre-redaction or implicit deletion path. | UUIDv7-enforced primary key; nonblank client/format/version/session/scrubber/source fields; nonnegative source ordinal; 64-character lowercase SHA-256 content digest and ingest key; object-or-array JSON payload; idempotent `(project_id, machine_id, ingest_key)`; `ingested_at >= observed_at`. Source-order and native-session B-tree indexes give deterministic provenance scans; `native_transcripts_payload_idx` supplies JSONB path containment. |
 | `transcript_messages` | Transcript-owned provenance join: deleting a transcript cascades its links, while the derived message side restricts deletion. | Scoped transcript and message foreign keys; unique message and source ordinal within a transcript; nonnegative source ordinal. `transcript_messages_message_idx` supports reverse provenance lookup. |
 
@@ -159,19 +165,19 @@ deletion.
 
 | Table | Ownership and retention | Enforced invariants and indexes |
 | --- | --- | --- |
-| `summaries` | Owned by a conversation and cascades with it. Coverage, parent, context, file, and promoted-memory links govern direct deletion. | Caller-contract text primary key with a UUIDv7-as-text default when omitted; leaf/condensed kind; nonnegative depth and all token/descendant counts; earliest/latest timestamps are both null or ordered. Conversation-order and project-recent B-tree indexes include stable ID tie-breakers; FTS and normalized trigram GIN indexes cover content. |
+| `summaries` | Owned by a conversation and cascades with it. Coverage, parent, context, and file links govern direct deletion. Promoted-memory provenance is an unbound external identifier. | Project-scoped `(project_id, summary_id)` primary key preserves caller IDs independently in every project, with a UUIDv7-as-text default when omitted; leaf/condensed kind; nonnegative depth and all token/descendant counts; earliest/latest timestamps are both null or ordered. Conversation-order and project-recent B-tree indexes include stable ID tie-breakers; FTS and normalized trigram GIN indexes cover content. |
 | `summary_messages` | Summary-owned coverage join: deleting the summary cascades coverage, while source-message deletion is restricted. | Scoped same-conversation foreign keys; unique source message and ordinal per summary; nonnegative ordinal. `summary_messages_message_idx` supports reverse message coverage. |
 | `summary_parents` | Child-summary-owned DAG edge: deleting the child cascades its outgoing edges, while parent deletion is restricted. | Scoped same-conversation foreign keys, unique parent and ordinal per child, nonnegative ordinal, and no self-edge. `summary_parents_parent_idx` supports deterministic reverse traversal. General cycle rejection is a transactional repository invariant owned by #87 with #90 fencing; adapters remain disabled until it is implemented. |
 | `context_items` | Ordered projection owned by a conversation and cascades with it. Referenced messages and summaries restrict direct deletion. | `(project_id, conversation_id, ordinal)` primary key; nonnegative ordinal; exactly one message or summary reference consistent with `item_type`. Partial message and summary indexes support reverse membership checks. Atomic range replacement and stale-fence rejection belong to #87/#90. |
-| `large_files` | Metadata owned by a conversation and cascades with it; external bytes at `storage_uri` have their own lifecycle. | Caller-contract text primary key with a UUIDv7-as-text default when omitted; nonnegative optional byte size; nonblank storage URI; scoped identity. `large_files_conversation_order_idx` orders by creation time and stable ID. |
+| `large_files` | Metadata owned by a conversation and cascades with it; external bytes at `storage_uri` have their own lifecycle. | Project-scoped `(project_id, file_id)` primary key preserves caller IDs independently in every project, with a UUIDv7-as-text default when omitted; nonnegative optional byte size; nonblank storage URI; conversation-scoped identity. `large_files_conversation_order_idx` orders by creation time and stable ID. |
 | `summary_large_files` | Summary-owned association: deleting the summary cascades the link, while file deletion is restricted. | Scoped same-conversation foreign keys; unique file and ordinal per summary; nonnegative ordinal. `summary_large_files_file_idx` supports reverse file-to-summary lookup. |
 
 ### Recall and administration
 
 | Table | Ownership and retention | Enforced invariants and indexes |
 | --- | --- | --- |
-| `promoted_memories` | Durable memory owned by the UUID `project_id` scope. The separate nullable text `source_project_id` preserves the backend-neutral source identity without granting ownership or weakening the project foreign key. Project deletion is restricted. Deleting a source summary preserves the memory and nulls only its source-summary link. Archive is a retained lifecycle state. | UUID primary key with a UUIDv7 default; nonempty content; nonnegative depth; confidence in `[0,1]`; object JSON metadata; archive time not before creation. `promoted_memories_active_order_idx` supports active and stale-candidate lifecycle scans; `promoted_memories_source_project_idx` supports owner-scoped source filtering; metadata JSONB, FTS, and trigram GIN indexes support filtering and search. |
-| `promoted_memory_tags` | Owned normalized tag join; cascades when its promoted memory is deleted. | Trimmed nonempty tag, generated lowercase normalized tag, and one normalized tag per scoped memory. `promoted_memory_tags_lookup_idx` supports project/tag filtering. |
+| `promoted_memories` | Durable memory owned by the UUID `project_id` scope. The independent nullable text `source_project_id` and `source_summary_id` preserve backend-neutral provenance without asserting that either identifies a local row. Project deletion is restricted; summary deletion cannot erase provenance. Archive is a retained lifecycle state. | UUID primary key with a UUIDv7 default; nonempty content; nonnegative depth; confidence in `[0,1]`; object JSON metadata; archive time not before creation. `promoted_memories_active_order_idx` supports active and stale-candidate lifecycle scans; the source indexes support owner-scoped provenance and source-project filtering; metadata JSONB, FTS, and trigram GIN indexes support filtering and search. |
+| `promoted_memory_tags` | Owned normalized tag join; cascades when its promoted memory is deleted. | Trimmed nonempty tag, generated lowercase normalized tag using the same builtin `pg_unicode_fast` mapping as search, and one normalized tag per scoped memory. `promoted_memory_tags_lookup_idx` supports project/tag filtering. |
 | `recall_surfacing` | Usage history owned by a promoted memory and cascades when the memory is explicitly deleted. | Generated `bigint` primary key and project-scoped memory foreign key. Memory-order and partial nonnull-session indexes provide deterministic recall and feedback aggregation. |
 | `redaction_counters` | Project-scoped aggregate retained as administrative state; project deletion is restricted. It contains counts, not redacted content. | One row per project and `built_in`, `global`, `project`, or `gitleaks` category; nonnegative count; timezone-aware update time. |
 | `ingest_checkpoints` | Project/machine/client/source coordination retained for resumable native ingestion; both identity roots restrict deletion. | Composite primary key; nonnegative source ordinal and imported/skipped/quarantined counts; object JSON checkpoint. `ingest_checkpoints_payload_idx` supports JSONB path inspection. |
@@ -187,19 +193,19 @@ deletion.
 
 ## Named index catalog
 
-Primary keys and unique constraints create additional B-tree indexes. The 47
+Primary keys and unique constraints create additional B-tree indexes. The 46
 explicit indexes below cover ordering, reverse foreign-key checks, search,
 JSONB inspection, and active-state selection.
 
 | Area | Indexes and purpose |
 | --- | --- |
 | Project identity | `project_aliases_project_idx` reverses aliases by project; `conversations_project_order_idx` gives deterministic newest-first project order; `conversations_session_lookup_idx` covers session-wide aggregation and newest-segment selection. |
-| Messages and parts | `messages_project_created_idx` orders project messages; `messages_search_document_idx` and `messages_content_trgm_idx` provide FTS and normalized trigram access; `message_parts_type_idx` supports scoped type scans; partial `message_parts_metadata_idx` provides JSONB path lookup. |
+| Messages and parts | `messages_project_created_idx` orders project messages; `messages_search_document_idx` and `messages_content_trgm_idx` provide FTS and normalized trigram access; `message_parts_type_idx` supports scoped type scans. Opaque part metadata has no semantic index. |
 | Native transcripts | `native_transcripts_source_order_idx` and `native_transcripts_session_idx` provide deterministic provenance/session scans; `native_transcripts_machine_idx` covers the machine FK; `native_transcripts_payload_idx` provides JSONB path lookup; `transcript_messages_message_idx` reverses provenance by message. |
 | Summaries | `summaries_conversation_order_idx` and `summaries_project_recent_idx` provide deterministic conversation/project order; `summaries_search_document_idx` and `summaries_content_trgm_idx` provide FTS and trigram access. |
 | Summary joins | `summary_messages_message_idx` and `summary_messages_summary_idx` cover both scoped coverage FKs; `summary_parents_parent_idx` and `summary_parents_summary_idx` cover both DAG directions; `summary_large_files_file_idx` and `summary_large_files_summary_idx` cover both file-association sides. |
 | Context and large files | Partial `context_items_message_idx` and `context_items_summary_idx` reverse active context membership; `large_files_conversation_order_idx` provides deterministic conversation order. |
-| Promoted memory and recall | `promoted_memories_active_order_idx` supports active/stale scans; `promoted_memories_source_summary_idx` covers nullable source-summary deletion; partial `promoted_memories_source_project_idx` supports active owner-scoped source filtering; `promoted_memories_metadata_idx`, `promoted_memories_search_document_idx`, and `promoted_memories_content_trgm_idx` cover metadata and lexical access; `promoted_memory_tags_lookup_idx` supports normalized tag filtering; `recall_surfacing_memory_order_idx` and partial `recall_surfacing_session_order_idx` support recall aggregation. |
+| Promoted memory and recall | `promoted_memories_active_order_idx` supports active/stale scans; partial `promoted_memories_source_summary_idx` covers owner/source-project/source-summary provenance lookup without imposing a foreign key; partial `promoted_memories_source_project_idx` supports active owner-scoped source filtering; `promoted_memories_metadata_idx`, `promoted_memories_search_document_idx`, and `promoted_memories_content_trgm_idx` cover metadata and lexical access; `promoted_memory_tags_lookup_idx` supports normalized tag filtering; `recall_surfacing_memory_order_idx` and partial `recall_surfacing_session_order_idx` support recall aggregation. |
 | Ingest and instructions | `ingest_checkpoints_payload_idx` provides JSONB path lookup; `ingest_checkpoints_machine_idx` covers machine deletion; `session_ingest_log_completed_idx` orders completed sessions; partial `session_instructions_machine_idx` covers machine-specific instruction deletion. |
 | Passive inbox | Partial `passive_event_inbox_ready_idx`, `passive_event_inbox_retry_idx`, and `passive_event_inbox_claimed_idx` cover claim/retry recovery; `passive_event_inbox_payload_idx` provides JSONB path lookup; `passive_event_inbox_project_idx` covers project deletion for every status. |
 | Fenced leases | Partial `fenced_leases_owner_idx` and `fenced_leases_expiry_idx` cover active-owner and expiry scans; `fenced_leases_owner_machine_idx` covers the complete machine FK independently of release state. |

@@ -88,6 +88,15 @@ wrong namespace, relocatable extensions receive `ALTER EXTENSION ... SET SCHEMA
 requirement without automatic destructive SQL. Complete and verify the
 operation through the cluster administrator, then rerun migration.
 
+Schema conformance also exercises repository-defined opaque metadata and caller
+identifiers directly: message-part metadata must round-trip as text, while
+summary and large-file IDs are unique within a project rather than globally.
+Promoted-memory source IDs are preserved as external provenance without a
+local-summary foreign key. Floating-point step costs reject `NaN` and both
+infinities. Search and tag normalization use PostgreSQL 18's builtin
+`pg_unicode_fast` full case mapping, whose behavior is stable within the
+required major version and independent of libc or ICU provider upgrades.
+
 The migration role must own an existing `lcm` schema. The runner permits an
 absent schema because `0001` creates it as the current migration role, but it
 fails closed when another role owns an existing schema even if that role has

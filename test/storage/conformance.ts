@@ -53,15 +53,20 @@ export function defineCoreStorageConformance(
     expect(await storage.conversations.countMessagesByIdentity(first.conversationId, "user", "alpha needle")).toBe(1);
     expect((await storage.conversations.getMessageById(messages[0].messageId))?.seq).toBe(0);
     expect(await storage.conversations.getMessageById(999_999)).toBeNull();
+    const opaquePartMetadata = "  { \"not\": valid-json }\nscalar  ";
     await storage.conversations.createMessageParts(messages[0].messageId, [{
       sessionId: "session-a",
       partType: "text",
       ordinal: 0,
       textContent: "alpha",
-      metadata: "{}",
+      metadata: opaquePartMetadata,
     }]);
     await storage.conversations.createMessageParts(messages[0].messageId, []);
-    expect(await storage.conversations.getMessageParts(messages[0].messageId)).toMatchObject([{ ordinal: 0, textContent: "alpha" }]);
+    expect(await storage.conversations.getMessageParts(messages[0].messageId)).toMatchObject([{
+      ordinal: 0,
+      textContent: "alpha",
+      metadata: opaquePartMetadata,
+    }]);
     expect(await storage.conversations.getMessageCount(first.conversationId)).toBe(3);
     const split = await storage.conversations.createConversation({ sessionId: "session-a", title: "split" });
     await storage.conversations.createMessage({
@@ -133,6 +138,7 @@ export function defineCoreStorageConformance(
     const memoryId = await storage.promotedMemory.insert({
       content: "durable needle",
       tags: ["architecture"],
+      sourceSummaryId: "external-summary",
       sourceProjectId: "source-a",
       sessionId: "session-a",
       ...({ projectId: "caller-controlled" } as object),
@@ -140,6 +146,7 @@ export function defineCoreStorageConformance(
     expect(await storage.promotedMemory.getById(memoryId)).toMatchObject({
       tags: ["architecture"],
       projectId: "source-a",
+      sourceSummaryId: "external-summary",
     });
     expect(await storage.promotedMemory.getById("missing")).toBeNull();
     expect(await storage.promotedMemory.getAll({
@@ -371,7 +378,36 @@ export function defineCoreStorageConformance(
     expect(await harness.factory.projectExists(firstIdentity)).toBe(true);
     const second = await harness.open("two");
     const firstAgain = await harness.open("one");
-    await first.conversations.createConversation({ sessionId: "same" });
+    const firstConversation = await first.conversations.createConversation({ sessionId: "same" });
+    const secondConversation = await second.conversations.createConversation({ sessionId: "other" });
+    await first.summaries.insertSummary({
+      summaryId: "shared-summary",
+      conversationId: firstConversation.conversationId,
+      kind: "leaf",
+      content: "first project",
+      tokenCount: 2,
+    });
+    await second.summaries.insertSummary({
+      summaryId: "shared-summary",
+      conversationId: secondConversation.conversationId,
+      kind: "leaf",
+      content: "second project",
+      tokenCount: 2,
+    });
+    await first.largeFiles.insertLargeFile({
+      fileId: "shared-file",
+      conversationId: firstConversation.conversationId,
+      storageUri: "local:first",
+    });
+    await second.largeFiles.insertLargeFile({
+      fileId: "shared-file",
+      conversationId: secondConversation.conversationId,
+      storageUri: "local:second",
+    });
+    expect((await first.summaries.getSummary("shared-summary"))?.content).toBe("first project");
+    expect((await second.summaries.getSummary("shared-summary"))?.content).toBe("second project");
+    expect((await first.largeFiles.getLargeFile("shared-file"))?.storageUri).toBe("local:first");
+    expect((await second.largeFiles.getLargeFile("shared-file"))?.storageUri).toBe("local:second");
     expect(await second.conversations.getConversationBySessionId("same")).toBeNull();
     expect(await harness.factory.health()).toMatchObject({ status: "healthy", backend: harness.factory.backend });
     expect(await first.health()).toMatchObject({ status: "healthy", projectId: first.projectId });

@@ -36,7 +36,7 @@ describe("PostgreSQL search normalization artifact", () => {
     });
   });
 
-  it("does not delegate immutable normalization to the mutable extension dictionary", () => {
+  it("pins immutable normalization to PostgreSQL's builtin Unicode collation", () => {
     const sql = schemaBaselineSql();
     const functionStart = sql.indexOf("CREATE FUNCTION lcm.normalize_search_text(input text)");
     const functionEnd = sql.indexOf("CREATE TABLE lcm.machines", functionStart);
@@ -44,7 +44,13 @@ describe("PostgreSQL search normalization artifact", () => {
 
     expect(definition).toContain("IMMUTABLE");
     expect(definition).toContain("SET search_path = pg_catalog");
+    expect(definition).toContain("COLLATE pg_catalog.pg_unicode_fast");
+    expect(definition).not.toContain("pg_catalog.lower(COALESCE(input, ''))");
     expect(definition).not.toContain("public.unaccent(");
     expect(definition).not.toContain("'public.unaccent'::regdictionary");
+    expect(sql).toContain(
+      "pg_catalog.lower(tag COLLATE pg_catalog.pg_unicode_fast)",
+    );
+    expect(sql).not.toContain("GENERATED ALWAYS AS (lower(tag))");
   });
 });
