@@ -124,7 +124,7 @@ jobs:
   codecov:
     name: Codecov upload
     needs: ci
-    if: ${{ github.event_name != 'merge_group' }}
+    if: ${{ github.event_name != 'merge_group' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       # Download the fixed report artifact produced by this workflow run.
@@ -173,7 +173,7 @@ jobs:
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
-          use_oidc: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
+          use_oidc: true
           override_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
           files: coverage/lcov.info
           disable_search: true
@@ -183,8 +183,76 @@ jobs:
       - name: Upload test results to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
-          use_oidc: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
+          use_oidc: true
           override_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+          files: test-report.junit.xml
+          disable_search: true
+          report_type: test_results
+          binary: ${{ runner.temp }}/codecov
+          fail_ci_if_error: true
+
+  codecov-fork:
+    name: Codecov upload (fork)
+    needs: ci
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      # Download the fixed report artifact produced by this workflow run.
+      actions: read
+      # Make the exact fork source tree available for Codecov path reconciliation.
+      contents: read
+    steps:
+      - name: Checkout source for Codecov
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Download Vitest reports
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$REPOSITORY" \
+            --name vitest-reports \
+            --dir .
+
+      - name: Download verified Codecov CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODECOV_CLI_REPOSITORY: codecov/codecov-cli
+          CODECOV_CLI_TAG: v11.2.6
+          CODECOV_CLI_ASSET: codecovcli_linux
+          CODECOV_CLI_SHA256: fd34214e2b2c738e48e3ac90b2c23ec4e975d0e9aee51f2cebe81b5704af3f6c
+        run: |
+          set -Eeuo pipefail
+          CODECOV_CLI_PATH="$RUNNER_TEMP/codecov"
+          gh release download "$CODECOV_CLI_TAG" \
+            --repo "$CODECOV_CLI_REPOSITORY" \
+            --pattern "$CODECOV_CLI_ASSET" \
+            --output "$CODECOV_CLI_PATH"
+          printf '%s  %s\n' "$CODECOV_CLI_SHA256" "$CODECOV_CLI_PATH" \
+            | sha256sum --check --strict
+          chmod 0755 "$CODECOV_CLI_PATH"
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          use_oidc: false
+          override_pr: ${{ github.event.pull_request.number }}
+          files: coverage/lcov.info
+          disable_search: true
+          binary: ${{ runner.temp }}/codecov
+          fail_ci_if_error: true
+
+      - name: Upload test results to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          use_oidc: false
+          override_pr: ${{ github.event.pull_request.number }}
           files: test-report.junit.xml
           disable_search: true
           report_type: test_results
