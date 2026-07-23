@@ -36,7 +36,18 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
+      - name: Check actor permission
+        id: actor-permission
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          perm=$(gh api "repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission" --jq '.permission' 2>/dev/null || true)
+          if [ -z "$perm" ]; then perm="none"; fi
+          echo "permission=$perm" >> "$GITHUB_OUTPUT"
+
       - name: Run Claude Code
+        if: ${{ contains(fromJSON('["admin","maintain","write"]'), steps.actor-permission.outputs.permission) }}
         id: claude
         uses: anthropics/claude-code-action@44423bdec74b97d67543eb16c110546762c110b2 # v1.0.181
         with:
