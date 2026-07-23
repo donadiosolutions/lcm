@@ -19,7 +19,7 @@ does not add row-level security.
   `PUBLIC`; the migration checks this before owned DDL and aborts without
   changing the schema ACL when the privilege is present. The baseline revokes
   privileges from `PUBLIC` on an explicit list of the 23 domain tables, the
-  migration ledger, five generated identity sequences, and
+  migration ledger, six generated identity sequences, and
   `lcm.normalize_search_text(text)`. It deliberately grants no domain access to
   the runtime role while the adapters are disabled. Explicit object lists keep
   privileges on unknown pre-existing tables, sequences, and functions intact;
@@ -32,6 +32,10 @@ does not add row-level security.
   Conversations and messages retain generated `bigint` identities compatible
   with the existing repository contracts. Inbox, recall, and instruction rows
   also use generated numeric identities where a local ordering key is useful.
+  Fencing tokens use a database-owned, generated-always `bigint` identity
+  sequence. Its global allocation is stronger than per-resource monotonicity:
+  deleting a released or expired lease row does not reset the allocator, so a
+  later lease cannot receive a previously generated token.
 - Timestamps use `timestamptz` and default to `statement_timestamp()`. Checks
   reject reversed lifecycle ranges. Counters, ordinals, token counts, byte
   counts, depths, and costs are nonnegative; fencing tokens and event versions
@@ -70,8 +74,12 @@ source, derived, and administrative records are retained until an explicit
 future repository operation removes them. Archived promoted memories remain
 stored. Applied inbox events may be pruned only after the acknowledgement rules
 in #91 are implemented. Released or expired lease rows are short-lived
-coordination state, but cleanup policy belongs to #90. Provider backup retention
-is independent of live-table deletion.
+coordination state, but cleanup must use row deletion without truncating or
+restarting `fenced_leases_fencing_token_seq`. The sequence is durable schema
+state, owned by `fenced_leases.fencing_token`, and is retained for the table's
+lifetime. Cleanup, allocation transactions, takeover, and final-write fence
+checks belong to #90. Provider backup retention is independent of live-table
+deletion.
 
 ## Table catalog
 
@@ -127,7 +135,7 @@ is independent of live-table deletion.
 | Table | Ownership and retention | Enforced invariants and indexes |
 | --- | --- | --- |
 | `passive_event_inbox` | Durable remote copy of a machine's local hook-outbox event. Project and machine deletion are restricted. Retain pending, claimed, retry, and quarantined rows; prune applied rows only after #91's acknowledgement policy. | Generated `bigint` primary key; unique event ID and sequence per machine; positive version, nonnegative sequence/attempt count; closed status enum; claim, applied, and quarantine columns must agree with status; lifecycle timestamps cannot precede receipt. Partial ready, retry-time, and claimed-age B-tree indexes support `SKIP LOCKED` claims and recovery; payload uses a JSONB path-ops GIN index. |
-| `fenced_leases` | Project resource lease owned operationally by a machine/process. Identity roots restrict deletion. Expired/released-row retention and inspection are defined by #90. | One row per project/resource type/key; nonblank owner/process/operation fields; positive monotonically managed fencing token; `renewed_at >= acquired_at`, `expires_at > renewed_at`, and `released_at >= renewed_at` when released. Partial active-owner and active-expiry indexes support diagnostics and takeover. Monotonic allocation and fence checks on final writes are behavioral requirements in #90. |
+| `fenced_leases` | Project resource lease owned operationally by a machine/process. The project and owner-machine foreign keys both use `ON DELETE RESTRICT`. Released or expired rows may be deleted under #90, but the column-owned token sequence is retained until an explicit schema migration drops the table and must never be restarted by cleanup. | `(project_id, resource_type, resource_key)` primary key permits one current row per scoped resource; resource and owner/process/operation fields are nonblank. `fencing_token` is a generated-always `bigint` identity with a positive check, backed by `fenced_leases_fencing_token_seq`, so delete-and-reacquire cannot reuse a generated token. `renewed_at >= acquired_at`, `expires_at > renewed_at`, and `released_at >= renewed_at` when released. Partial active-owner and active-expiry indexes support diagnostics and takeover; `fenced_leases_owner_machine_idx` covers the complete machine foreign key. Allocation transactions, takeover updates, and final-write fence checks remain behavioral requirements in #90. |
 
 ## Named index catalog
 
@@ -226,6 +234,9 @@ privilege hardening is likewise confined to LCM-owned objects: it does not
 change ACLs on unknown objects already present in `lcm`. If an administrator
 has granted schema-level `PUBLIC CREATE`, they must remove that privilege
 outside LCM and rerun migration; LCM fails closed rather than mutating it.
+When #90 enables lease writes, its runtime grant must include only the sequence
+privileges required to consume `fenced_leases_fencing_token_seq`; normal
+maintenance must not receive sequence restart or table-truncate authority.
 
 ## Backup and point-in-time recovery
 
@@ -243,10 +254,12 @@ outside LCM and rerun migration; LCM fails closed rather than mutating it.
   remote inbox effects; do not acknowledge a local event solely because a
   restored checkpoint claims it was applied.
 - A point-in-time restore can rewind inbox status, ingest checkpoints,
-  instructions, recall history, counters, and leases. Stop application workers
-  during recovery, verify the chosen recovery point, let database-clock lease
-  expiry govern takeover, and resume only through the owning repository's
-  reconciliation procedure.
+  instructions, recall history, counters, leases, and the fencing-token
+  sequence. Stop application workers during recovery, verify the chosen
+  recovery point, and ensure no worker from the abandoned timeline can write
+  before resuming. Then let database-clock lease expiry govern takeover and
+  resume only through the owning repository's reconciliation procedure. Do not
+  manually lower or restart the restored fencing-token sequence.
 - PostgreSQL stores only locally scrubbed native transcript payloads by design,
   but scrubbed content, messages, summaries, promoted memories, and metadata are
   still sensitive. Encrypt backups, restrict access, and align provider backup

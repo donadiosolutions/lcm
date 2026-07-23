@@ -503,7 +503,7 @@ CREATE TABLE lcm.fenced_leases (
   owner_machine_id uuid NOT NULL REFERENCES lcm.machines(machine_id) ON DELETE RESTRICT,
   owner_process_id text NOT NULL CHECK (btrim(owner_process_id) <> ''),
   operation text NOT NULL CHECK (btrim(operation) <> ''),
-  fencing_token bigint NOT NULL CHECK (fencing_token > 0),
+  fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0),
   acquired_at timestamptz NOT NULL DEFAULT statement_timestamp(),
   renewed_at timestamptz NOT NULL DEFAULT statement_timestamp(),
   expires_at timestamptz NOT NULL,
@@ -554,6 +554,7 @@ REVOKE ALL PRIVILEGES ON SEQUENCE
   lcm.messages_message_id_seq,
   lcm.recall_surfacing_surfacing_id_seq,
   lcm.session_instructions_instruction_id_seq,
-  lcm.passive_event_inbox_inbox_id_seq
+  lcm.passive_event_inbox_inbox_id_seq,
+  lcm.fenced_leases_fencing_token_seq
 FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON FUNCTION lcm.normalize_search_text(text) FROM PUBLIC;

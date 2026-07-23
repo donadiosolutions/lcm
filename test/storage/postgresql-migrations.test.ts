@@ -62,10 +62,15 @@ function executor(options: {
 
 describe("PostgreSQL migration runner", () => {
   it("loads the pinned artifact and rejects missing or drifted files", () => {
-    expect(loadPostgreSqlMigrations()).toEqual([
+    const migrations = loadPostgreSqlMigrations();
+    expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "5d8c607a5c73c5e00c92ecbe7b46024164b2ceb2c73c23cc25c897737eb7f5b2" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "97436c0fb6b82d699d55f6c17554ebc229b776f24b9a75b19d66041e781979a9" }),
     ]);
+    expect(migrations[1]?.sql).toContain(
+      "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
+    );
+    expect(migrations[1]?.sql).toContain("lcm.fenced_leases_fencing_token_seq");
     expect(() => loadPostgreSqlMigrations(() => { throw new Error("missing private path"); }))
       .toThrowError(expect.objectContaining({ operation: "loadMigrations" }));
     expect(() => loadPostgreSqlMigrations(() => "altered migration"))

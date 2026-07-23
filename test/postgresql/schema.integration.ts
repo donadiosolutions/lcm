@@ -525,8 +525,8 @@ describe("PostgreSQL schema baseline", () => {
       await database.migrator.query({
         text: `INSERT INTO lcm.fenced_leases
                  (project_id, resource_type, resource_key, owner_machine_id, owner_process_id,
-                  operation, fencing_token, renewed_at, expires_at)
-               VALUES ($1, 'project', 'release-check', $2, 'worker', 'test', 1,
+                  operation, renewed_at, expires_at)
+               VALUES ($1, 'project', 'release-check', $2, 'worker', 'test',
                        statement_timestamp() + interval '10 seconds',
                        statement_timestamp() + interval '1 minute')`,
         values: [scope.projectId, scope.machineId],
@@ -536,6 +536,56 @@ describe("PostgreSQL schema baseline", () => {
                WHERE project_id = $1 AND resource_key = 'release-check'`,
         values: [scope.projectId],
       }, { domain: "factory", operation: "rejectReleaseBeforeRenewal" }));
+    });
+  });
+
+  it("does not reuse fencing tokens when released or expired lease rows are cleaned up", async () => {
+    await withPostgreSqlTestDatabase("schema-fencing-allocation", async (database) => {
+      const scope = await seedScope(database.migrator);
+      const acquire = async (operation: string): Promise<bigint> => {
+        const result = await database.migrator.query<{ fencing_token: string }>({
+          text: `INSERT INTO lcm.fenced_leases
+                   (project_id, resource_type, resource_key, owner_machine_id,
+                    owner_process_id, operation, expires_at)
+                 VALUES ($1, 'conversation', $2::text, $3, 'worker', $4,
+                         statement_timestamp() + interval '1 minute')
+                 RETURNING fencing_token::text`,
+          values: [scope.projectId, scope.conversationId, scope.machineId, operation],
+        }, { domain: "factory", operation });
+        return BigInt(result.rows[0]?.fencing_token ?? "0");
+      };
+
+      const firstToken = await acquire("acquireFirstFence");
+      await database.migrator.query({
+        text: `UPDATE lcm.fenced_leases
+               SET released_at = statement_timestamp()
+               WHERE project_id = $1 AND resource_type = 'conversation' AND resource_key = $2::text`,
+        values: [scope.projectId, scope.conversationId],
+      }, { domain: "factory", operation: "releaseFirstFence" });
+      await database.migrator.query({
+        text: `DELETE FROM lcm.fenced_leases
+               WHERE project_id = $1 AND resource_type = 'conversation' AND resource_key = $2::text`,
+        values: [scope.projectId, scope.conversationId],
+      }, { domain: "factory", operation: "cleanReleasedFence" });
+
+      const secondToken = await acquire("acquireSecondFence");
+      expect(secondToken).toBeGreaterThan(firstToken);
+      await database.migrator.query({
+        text: `UPDATE lcm.fenced_leases
+               SET acquired_at = statement_timestamp() - interval '3 minutes',
+                   renewed_at = statement_timestamp() - interval '2 minutes',
+                   expires_at = statement_timestamp() - interval '1 minute'
+               WHERE project_id = $1 AND resource_type = 'conversation' AND resource_key = $2::text`,
+        values: [scope.projectId, scope.conversationId],
+      }, { domain: "factory", operation: "expireSecondFence" });
+      await database.migrator.query({
+        text: `DELETE FROM lcm.fenced_leases
+               WHERE project_id = $1 AND resource_type = 'conversation' AND resource_key = $2::text`,
+        values: [scope.projectId, scope.conversationId],
+      }, { domain: "factory", operation: "cleanExpiredFence" });
+
+      const thirdToken = await acquire("acquireThirdFence");
+      expect(thirdToken).toBeGreaterThan(secondToken);
     });
   });
 
@@ -557,8 +607,8 @@ describe("PostgreSQL schema baseline", () => {
       await database.migrator.query({
         text: `INSERT INTO lcm.fenced_leases
                  (project_id, resource_type, resource_key, owner_machine_id, owner_process_id,
-                  operation, fencing_token, expires_at)
-               VALUES ($1, 'conversation', $2::text, $3, 'worker-1', 'compact', 1,
+                  operation, expires_at)
+               VALUES ($1, 'conversation', $2::text, $3, 'worker-1', 'compact',
                        statement_timestamp() + interval '1 minute')`,
         values: [scope.projectId, scope.conversationId, scope.machineId],
       }, { domain: "factory", operation: "seedLeaseQueryPlan" });
@@ -579,8 +629,8 @@ describe("PostgreSQL schema baseline", () => {
       await database.migrator.query({
         text: `INSERT INTO lcm.fenced_leases
                  (project_id, resource_type, resource_key, owner_machine_id, owner_process_id,
-                  operation, fencing_token, acquired_at, renewed_at, expires_at)
-               SELECT $1, 'fixture', generated.seq::text, $2, 'worker-1', 'compact', generated.seq,
+                  operation, acquired_at, renewed_at, expires_at)
+               SELECT $1, 'fixture', generated.seq::text, $2, 'worker-1', 'compact',
                       statement_timestamp() - interval '2 hours',
                       statement_timestamp() - interval '2 hours',
                       statement_timestamp() - generated.seq * interval '1 second'
@@ -726,12 +776,12 @@ describe("PostgreSQL schema baseline", () => {
         { operation: "inboxTimestampOrder", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload,status,applied_at) VALUES($1,$2,uuidv7(),1,6,'e','{}','applied',now()-interval '1 day')", values: [scope.projectId, scope.machineId] },
         { operation: "inboxEventUnique", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload) VALUES($1,$2,$3,1,2,'e','{}')", values: [scope.projectId, scope.machineId, eventId] },
         { operation: "inboxSequenceUnique", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload) VALUES($1,$2,uuidv7(),1,0,'e','{}')", values: [scope.projectId, scope.machineId] },
-        { operation: "leaseToken", text: "INSERT INTO lcm.fenced_leases(project_id,resource_type,resource_key,owner_machine_id,owner_process_id,operation,fencing_token,expires_at) VALUES($1,'r','k',$2,'p','o',0,now()+interval '1 minute')", values: [scope.projectId, scope.machineId] },
-        { operation: "leaseExpiry", text: "INSERT INTO lcm.fenced_leases(project_id,resource_type,resource_key,owner_machine_id,owner_process_id,operation,fencing_token,expires_at) VALUES($1,'r','k',$2,'p','o',1,now()-interval '1 minute')", values: [scope.projectId, scope.machineId] },
-        { operation: "leaseResourceType", text: "INSERT INTO lcm.fenced_leases(project_id,resource_type,resource_key,owner_machine_id,owner_process_id,operation,fencing_token,expires_at) VALUES($1,'','k',$2,'p','o',1,now()+interval '1 minute')", values: [scope.projectId, scope.machineId] },
-        { operation: "leaseResourceKey", text: "INSERT INTO lcm.fenced_leases(project_id,resource_type,resource_key,owner_machine_id,owner_process_id,operation,fencing_token,expires_at) VALUES($1,'r','',$2,'p','o',1,now()+interval '1 minute')", values: [scope.projectId, scope.machineId] },
-        { operation: "leaseOwner", text: "INSERT INTO lcm.fenced_leases(project_id,resource_type,resource_key,owner_machine_id,owner_process_id,operation,fencing_token,expires_at) VALUES($1,'r','k',$2,'','o',1,now()+interval '1 minute')", values: [scope.projectId, scope.machineId] },
-        { operation: "leaseOperation", text: "INSERT INTO lcm.fenced_leases(project_id,resource_type,resource_key,owner_machine_id,owner_process_id,operation,fencing_token,expires_at) VALUES($1,'r','k',$2,'p','',1,now()+interval '1 minute')", values: [scope.projectId, scope.machineId] },
+        { operation: "leaseToken", text: "INSERT INTO lcm.fenced_leases(project_id,resource_type,resource_key,owner_machine_id,owner_process_id,operation,fencing_token,expires_at) OVERRIDING SYSTEM VALUE VALUES($1,'r','k',$2,'p','o',0,now()+interval '1 minute')", values: [scope.projectId, scope.machineId] },
+        { operation: "leaseExpiry", text: "INSERT INTO lcm.fenced_leases(project_id,resource_type,resource_key,owner_machine_id,owner_process_id,operation,expires_at) VALUES($1,'r','k',$2,'p','o',now()-interval '1 minute')", values: [scope.projectId, scope.machineId] },
+        { operation: "leaseResourceType", text: "INSERT INTO lcm.fenced_leases(project_id,resource_type,resource_key,owner_machine_id,owner_process_id,operation,expires_at) VALUES($1,'','k',$2,'p','o',now()+interval '1 minute')", values: [scope.projectId, scope.machineId] },
+        { operation: "leaseResourceKey", text: "INSERT INTO lcm.fenced_leases(project_id,resource_type,resource_key,owner_machine_id,owner_process_id,operation,expires_at) VALUES($1,'r','',$2,'p','o',now()+interval '1 minute')", values: [scope.projectId, scope.machineId] },
+        { operation: "leaseOwner", text: "INSERT INTO lcm.fenced_leases(project_id,resource_type,resource_key,owner_machine_id,owner_process_id,operation,expires_at) VALUES($1,'r','k',$2,'','o',now()+interval '1 minute')", values: [scope.projectId, scope.machineId] },
+        { operation: "leaseOperation", text: "INSERT INTO lcm.fenced_leases(project_id,resource_type,resource_key,owner_machine_id,owner_process_id,operation,expires_at) VALUES($1,'r','k',$2,'p','',now()+interval '1 minute')", values: [scope.projectId, scope.machineId] },
         { operation: "redactionCategory", text: "INSERT INTO lcm.redaction_counters(project_id,category,count) VALUES($1,'invalid',0)", values: [scope.projectId] },
         { operation: "redactionCount", text: "INSERT INTO lcm.redaction_counters(project_id,category,count) VALUES($1,'global',-1)", values: [scope.projectId] },
       ];
