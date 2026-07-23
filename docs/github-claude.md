@@ -40,8 +40,9 @@ the workflow on sensitive material.
 
 ## Automatic pull request review
 
-The **Claude Code Review** workflow runs when a pull request is opened,
-reopened, marked ready for review, or updated with new commits. It runs only
+The **Claude Code Review** workflow runs when a non-draft pull request is
+opened, reopened, marked ready for review, or updated with new commits. Draft
+pull requests are skipped until they are marked ready for review. It runs only
 for branches in this repository. Fork pull requests and pull requests authored
 by `dependabot[bot]` are excluded so untrusted changes cannot reach the
 secret-backed job.
@@ -60,8 +61,8 @@ duplicate comments. Runs for different pull requests do not cancel each other.
 
 - Claude's findings are advisory and do not replace required human review or
   repository status checks.
-- Draft pull requests are reviewed when opened and when new commits are pushed;
-  marking one ready for review starts another review.
+- Draft pull requests are skipped and receive their first review after they
+  become ready for review.
 - Editing an existing comment to add `@claude` does not trigger the on-demand
   workflow; create a new comment instead.
 - A missing or invalid `CLAUDE_CODE_OAUTH_TOKEN` causes the Claude action to

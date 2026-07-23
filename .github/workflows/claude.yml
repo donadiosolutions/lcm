@@ -46,10 +46,33 @@ jobs:
           additional_permissions: |
             actions: read
 
+          settings: |
+            {
+              "permissions": {
+                "allow": [
+                  "Read",
+                  "Glob",
+                  "Grep",
+                  "Bash(git diff:*)",
+                  "Bash(git log:*)",
+                  "Bash(git show:*)",
+                  "Bash(git status:*)",
+                  "Bash(gh issue comment:*)",
+                  "Bash(gh issue view:*)",
+                  "Bash(gh pr comment:*)",
+                  "Bash(gh pr diff:*)",
+                  "Bash(gh pr view:*)",
+                  "mcp__github_ci__get_ci_status",
+                  "mcp__github_ci__get_workflow_run_details",
+                  "mcp__github_ci__download_job_log",
+                  "mcp__github_comment__update_claude_comment"
+                ]
+              }
+            }
+
           # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
           # prompt: 'Update the pull request description to include a summary of changes.'
 
           # Optional: Add claude_args to customize behavior and configuration
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr *)'
