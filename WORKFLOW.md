@@ -36,8 +36,10 @@ canonical `.github/workflows/ci.yml` workflow drive `external-admission.yml`;
 pull-request lifecycle events do not start this write-capable workflow. Provider
 and CI start or rerun events revoke stale admission and exit immediately. Their
 completion events evaluate one current exact-SHA snapshot and exit instead of
-occupying a runner while polling. A manual dispatch with the exact PR head SHA
-provides fail-closed reconciliation if an external event is delayed or lost.
+occupying a runner while polling. A default-branch
+`external-admission-reconcile` repository dispatch with the exact PR head SHA
+provides fail-closed reconciliation if an external event is delayed or lost;
+see the [external-admission recovery guide](docs/external-admission.md).
 The handler audits every paginated PR file record,
 including both `filename` and `previous_filename`, before selecting one of two
 admission paths. The flattened file records must exactly match the pull
@@ -112,7 +114,7 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 | Workflow                             | Trigger                                                                              | Purpose                                                                                 |
 | ------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
-| `external-admission.yml`             | Authenticated Greptile/DCO checks, canonical PR CI lifecycle, manual exact-SHA dispatch | Statelessly require Greptile+DCO for sensitive diffs or trusted CI+DCO for neutral diffs |
+| `external-admission.yml`             | Authenticated Greptile/DCO checks, canonical PR CI lifecycle, default-branch exact-SHA repository dispatch | Statelessly require Greptile+DCO for sensitive diffs or trusted CI+DCO for neutral diffs |
 | `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
 | `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
 | `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
