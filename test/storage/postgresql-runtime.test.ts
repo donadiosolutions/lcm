@@ -910,9 +910,15 @@ describe("PostgreSQL runtime", () => {
     {
       label: "uninstalled",
       rows: CURRENT_EXTENSION_ROWS.map((row) => row.name === "pg_trgm"
-        ? { ...row, installed_version: null }
+        ? { ...row, installed_version: null, installed_schema: null, relocatable: null }
         : row),
-      expected: { name: "pg_trgm", available: true, status: "uninstalled" },
+      expected: {
+        name: "pg_trgm",
+        available: true,
+        installedSchema: null,
+        relocatable: null,
+        status: "uninstalled",
+      },
     },
     {
       label: "outdated",
