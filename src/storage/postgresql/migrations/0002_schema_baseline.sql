@@ -218,7 +218,7 @@ CREATE INDEX transcript_messages_message_idx
   ON lcm.transcript_messages (project_id, conversation_id, message_id, transcript_id);
 
 CREATE TABLE lcm.summaries (
-  summary_id uuid PRIMARY KEY DEFAULT uuidv7(),
+  summary_id text PRIMARY KEY DEFAULT uuidv7()::text,
   project_id uuid NOT NULL,
   conversation_id bigint NOT NULL,
   kind text NOT NULL CHECK (kind IN ('leaf', 'condensed')),
@@ -254,7 +254,7 @@ CREATE INDEX summaries_content_trgm_idx
 CREATE TABLE lcm.summary_messages (
   project_id uuid NOT NULL,
   conversation_id bigint NOT NULL,
-  summary_id uuid NOT NULL,
+  summary_id text NOT NULL,
   message_id bigint NOT NULL,
   ordinal integer NOT NULL CHECK (ordinal >= 0),
   PRIMARY KEY (project_id, summary_id, message_id),
@@ -273,8 +273,8 @@ CREATE INDEX summary_messages_summary_idx
 CREATE TABLE lcm.summary_parents (
   project_id uuid NOT NULL,
   conversation_id bigint NOT NULL,
-  summary_id uuid NOT NULL,
-  parent_summary_id uuid NOT NULL,
+  summary_id text NOT NULL,
+  parent_summary_id text NOT NULL,
   ordinal integer NOT NULL CHECK (ordinal >= 0),
   PRIMARY KEY (project_id, summary_id, parent_summary_id),
   UNIQUE (project_id, summary_id, ordinal),
@@ -296,7 +296,7 @@ CREATE TABLE lcm.context_items (
   ordinal integer NOT NULL CHECK (ordinal >= 0),
   item_type text NOT NULL CHECK (item_type IN ('message', 'summary')),
   message_id bigint,
-  summary_id uuid,
+  summary_id text,
   created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
   PRIMARY KEY (project_id, conversation_id, ordinal),
   FOREIGN KEY (project_id, conversation_id)
@@ -337,7 +337,7 @@ CREATE INDEX large_files_conversation_order_idx
 CREATE TABLE lcm.summary_large_files (
   project_id uuid NOT NULL,
   conversation_id bigint NOT NULL,
-  summary_id uuid NOT NULL,
+  summary_id text NOT NULL,
   file_id uuid NOT NULL,
   ordinal integer NOT NULL CHECK (ordinal >= 0),
   PRIMARY KEY (project_id, summary_id, file_id),
@@ -357,7 +357,7 @@ CREATE TABLE lcm.promoted_memories (
   memory_id uuid PRIMARY KEY DEFAULT uuidv7(),
   project_id uuid NOT NULL REFERENCES lcm.projects(project_id) ON DELETE RESTRICT,
   content text NOT NULL CHECK (content <> ''),
-  source_summary_id uuid,
+  source_summary_id text,
   session_id text,
   depth integer NOT NULL DEFAULT 0 CHECK (depth >= 0),
   confidence double precision NOT NULL DEFAULT 1.0 CHECK (confidence >= 0 AND confidence <= 1),

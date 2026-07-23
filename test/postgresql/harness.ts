@@ -213,6 +213,23 @@ export async function createPostgreSqlTestDatabase(
     return dropPromise;
   };
   try {
+    await databaseAdmin.query({
+      text: `CREATE TABLE public.__lcm_test_run_sentinel (
+               run_id text PRIMARY KEY,
+               database_name text NOT NULL,
+               runtime_role text NOT NULL CHECK (runtime_role = 'lcm_test_runtime')
+             )`,
+    }, { domain: "factory", operation: "createTestSentinel" });
+    await databaseAdmin.query({
+      text: `INSERT INTO public.__lcm_test_run_sentinel (run_id, database_name, runtime_role)
+             VALUES ($1, $2, 'lcm_test_runtime')`,
+      values: [env.LCM_TEST_POSTGRES_RUN_ID, name],
+    }, { domain: "factory", operation: "writeTestSentinel" });
+    await databaseAdmin.query({
+      text: `REVOKE ALL ON public.__lcm_test_run_sentinel FROM PUBLIC;
+             GRANT SELECT ON public.__lcm_test_run_sentinel TO lcm_test_migrator, lcm_test_runtime`,
+    }, { domain: "factory", operation: "protectTestSentinel" });
+
     const omittedExtensions = new Set(options.omitExtensions ?? []);
     const createdExtensionSchemas = new Set<string>();
     for (const extension of REQUIRED_POSTGRESQL_EXTENSIONS) {
@@ -236,22 +253,6 @@ export async function createPostgreSqlTestDatabase(
         operation: "createTestExtension",
       });
     }
-    await databaseAdmin.query({
-      text: `CREATE TABLE public.__lcm_test_run_sentinel (
-               run_id text PRIMARY KEY,
-               database_name text NOT NULL,
-               runtime_role text NOT NULL CHECK (runtime_role = 'lcm_test_runtime')
-             )`,
-    }, { domain: "factory", operation: "createTestSentinel" });
-    await databaseAdmin.query({
-      text: `INSERT INTO public.__lcm_test_run_sentinel (run_id, database_name, runtime_role)
-             VALUES ($1, $2, 'lcm_test_runtime')`,
-      values: [env.LCM_TEST_POSTGRES_RUN_ID, name],
-    }, { domain: "factory", operation: "writeTestSentinel" });
-    await databaseAdmin.query({
-      text: `REVOKE ALL ON public.__lcm_test_run_sentinel FROM PUBLIC;
-             GRANT SELECT ON public.__lcm_test_run_sentinel TO lcm_test_migrator, lcm_test_runtime`,
-    }, { domain: "factory", operation: "protectTestSentinel" });
     if (options.runMigrations !== false) {
       await runPostgreSqlMigrations(migrator);
       await migrator.query({

@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   dropGate: undefined as Deferred | undefined,
   events: [] as string[],
   operations: [] as string[],
+  queryFailureOperation: undefined as string | undefined,
   queryConfigs: [] as Array<{ text?: string; values?: unknown[] }>,
   runMigrations: vi.fn(async () => ({ applied: [] })),
 }));
@@ -64,6 +65,10 @@ vi.mock("../../src/storage/postgresql/runtime.js", () => ({
         mocks.operations.push(operation);
         mocks.events.push(`query:${operation}`);
         mocks.queryConfigs.push(query);
+        if (mocks.queryFailureOperation === operation) {
+          mocks.queryFailureOperation = undefined;
+          throw new Error(`injected ${operation} failure`);
+        }
         if (operation === "harnessReadiness") {
           return {
             command: "SELECT", fields: [], oid: 0, rowCount: 1,
@@ -132,6 +137,7 @@ beforeEach(() => {
   mocks.dropGate = undefined;
   mocks.events.length = 0;
   mocks.operations.length = 0;
+  mocks.queryFailureOperation = undefined;
   mocks.queryConfigs.length = 0;
   mocks.runMigrations.mockClear();
 });
@@ -180,6 +186,27 @@ describe("PostgreSQL test database lease", () => {
     expect(migratorClose).toBeGreaterThan(databaseAdminClose);
     expect(sentinelGuard).toBeGreaterThan(migratorClose);
     expect(databaseDrop).toBeGreaterThan(sentinelGuard);
+  });
+
+  it("installs the ownership sentinel before fallible extension setup", async () => {
+    mocks.queryFailureOperation = "createTestExtension";
+
+    const failure = await createPostgreSqlTestDatabase("extension-failure")
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "StorageOperationError",
+      backend: "postgresql",
+      domain: "factory",
+      operation: "createTestDatabase",
+    });
+    expect(mocks.dropAttempts).toBe(1);
+    const protectSentinel = mocks.operations.indexOf("protectTestSentinel");
+    const extensionSetup = mocks.operations.indexOf("createTestExtension");
+    const sentinelGuard = mocks.operations.indexOf("verifyDropSentinel");
+    expect(protectSentinel).toBeGreaterThanOrEqual(0);
+    expect(extensionSetup).toBeGreaterThan(protectSentinel);
+    expect(sentinelGuard).toBeGreaterThan(extensionSetup);
   });
 
   it("shares one in-flight and completed drop across concurrent callers", async () => {

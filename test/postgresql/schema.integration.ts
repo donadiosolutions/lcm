@@ -445,11 +445,11 @@ describe("PostgreSQL schema baseline", () => {
       const summary = await database.migrator.query<{ summary_id: string }>({
         text: `INSERT INTO lcm.summaries
                  (summary_id, project_id, conversation_id, kind, content, token_count)
-               VALUES ('6ba7b810-9dad-41d1-80b4-00c04fd430c8', $1, $2, 'leaf', 'legacy UUID summary', 2)
+               VALUES ('sum_0123456789abcdef', $1, $2, 'leaf', 'caller ID summary', 2)
                RETURNING summary_id`,
         values: [scope.projectId, scope.conversationId],
       }, { domain: "factory", operation: "seedSummary" });
-      expect(summary.rows[0]?.summary_id).toBe("6ba7b810-9dad-41d1-80b4-00c04fd430c8");
+      expect(summary.rows[0]?.summary_id).toBe("sum_0123456789abcdef");
       await database.migrator.query({
         text: `INSERT INTO lcm.summary_messages
                  (project_id, conversation_id, summary_id, message_id, ordinal)

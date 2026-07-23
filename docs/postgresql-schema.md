@@ -28,10 +28,13 @@ does not add row-level security.
   privileges on unknown pre-existing tables, sequences, and functions intact;
   issues #84–#91 must grant only the operations required by their repositories.
 - PostgreSQL 18's native [`uuidv7()`](https://www.postgresql.org/docs/18/functions-uuid.html)
-  is the default for machine, project, part, transcript, summary, large-file,
-  and promoted-memory identities. Machine, project, and native-transcript roots
-  enforce UUID version 7; the derived tables permit an explicit UUID during
-  SQLite import/backfill while still generating UUIDv7 for new rows.
+  is the default for machine, project, part, transcript, large-file, and
+  promoted-memory identities. Machine, project, and native-transcript roots
+  enforce UUID version 7; the other UUID-derived tables permit an explicit UUID
+  during SQLite import/backfill while still generating UUIDv7 for new rows.
+  Summary IDs are caller-supplied text because the shared repository contract
+  uses values such as `sum_<16 hex>` and permits arbitrary string identifiers;
+  omitted summary IDs still receive a UUIDv7 rendered as text.
   Conversations and messages retain generated `bigint` identities compatible
   with the existing repository contracts. Inbox, recall, and instruction rows
   also use generated numeric identities where a local ordering key is useful.
@@ -147,7 +150,7 @@ deletion.
 
 | Table | Ownership and retention | Enforced invariants and indexes |
 | --- | --- | --- |
-| `summaries` | Owned by a conversation and cascades with it. Coverage, parent, context, file, and promoted-memory links govern direct deletion. | UUID primary key with a UUIDv7 default; leaf/condensed kind; nonnegative depth and all token/descendant counts; earliest/latest timestamps are both null or ordered. Conversation-order and project-recent B-tree indexes include UUID tie-breakers; FTS and normalized trigram GIN indexes cover content. |
+| `summaries` | Owned by a conversation and cascades with it. Coverage, parent, context, file, and promoted-memory links govern direct deletion. | Caller-contract text primary key with a UUIDv7-as-text default when omitted; leaf/condensed kind; nonnegative depth and all token/descendant counts; earliest/latest timestamps are both null or ordered. Conversation-order and project-recent B-tree indexes include stable ID tie-breakers; FTS and normalized trigram GIN indexes cover content. |
 | `summary_messages` | Summary-owned coverage join: deleting the summary cascades coverage, while source-message deletion is restricted. | Scoped same-conversation foreign keys; unique source message and ordinal per summary; nonnegative ordinal. `summary_messages_message_idx` supports reverse message coverage. |
 | `summary_parents` | Child-summary-owned DAG edge: deleting the child cascades its outgoing edges, while parent deletion is restricted. | Scoped same-conversation foreign keys, unique parent and ordinal per child, nonnegative ordinal, and no self-edge. `summary_parents_parent_idx` supports deterministic reverse traversal. General cycle rejection is a transactional repository invariant owned by #87 with #90 fencing; adapters remain disabled until it is implemented. |
 | `context_items` | Ordered projection owned by a conversation and cascades with it. Referenced messages and summaries restrict direct deletion. | `(project_id, conversation_id, ordinal)` primary key; nonnegative ordinal; exactly one message or summary reference consistent with `item_type`. Partial message and summary indexes support reverse membership checks. Atomic range replacement and stale-fence rejection belong to #87/#90. |
