@@ -153,9 +153,9 @@ describe("PostgreSQL schema baseline", () => {
       const normalizedConstraints = constraints.rows
         .map((row) => `${row.table_name}|${row.constraint_type}|${row.definition}`)
         .join("\n");
-      expect(constraints.rowCount).toBe(173);
+      expect(constraints.rowCount).toBe(171);
       expect(createHash("sha256").update(normalizedConstraints).digest("hex"))
-        .toBe("fd476a72a58859caae5be9e4841d3fe1e3ad23f0dccc446694171b0f7a16ccbf");
+        .toBe("40ee082cd2c5d1bc3342470117d73c546481d4c4b8eb7df210266cc5d7d784dd");
 
       const deleteActions = await database.migrator.query<{
         table_name: string;
@@ -215,6 +215,23 @@ describe("PostgreSQL schema baseline", () => {
       expect(unindexedForeignKeys.rows).toEqual([]);
 
       const scope = await seedScope(database.migrator);
+      const splitConversation = await database.migrator.query<{ conversation_id: string }>({
+        text: `INSERT INTO lcm.conversations (project_id, session_id, title)
+               VALUES ($1, 'session-a', 'split') RETURNING conversation_id`,
+        values: [scope.projectId],
+      }, { domain: "factory", operation: "seedSplitConversation" });
+      await expect(database.migrator.query<{ conversation_id: string }>({
+        text: `SELECT conversation_id FROM lcm.conversations
+               WHERE project_id = $1 AND session_id = 'session-a'
+               ORDER BY created_at DESC, conversation_id DESC`,
+        values: [scope.projectId],
+      }, { domain: "factory", operation: "readSplitConversations" }))
+        .resolves.toMatchObject({
+          rows: [
+            { conversation_id: splitConversation.rows[0]?.conversation_id },
+            { conversation_id: scope.conversationId },
+          ],
+        });
       const identityVersions = await database.migrator.query<{
         machine_version: number;
         project_version: number;
@@ -505,8 +522,8 @@ describe("PostgreSQL schema baseline", () => {
 
       const memory = await database.migrator.query<{ memory_id: string }>({
         text: `INSERT INTO lcm.promoted_memories
-                 (project_id, content, source_summary_id, confidence)
-               VALUES ($1, 'durable memory', $2, 0.75)
+                 (project_id, content, source_summary_id, source_project_id, confidence)
+               VALUES ($1, 'durable memory', $2, 'source-a', 0.75)
                RETURNING memory_id`,
         values: [scope.projectId, summary.rows[0]?.summary_id],
       }, { domain: "factory", operation: "seedPromotedMemory" });
@@ -514,11 +531,18 @@ describe("PostgreSQL schema baseline", () => {
         text: "DELETE FROM lcm.summaries WHERE summary_id = $1",
         values: [summary.rows[0]?.summary_id],
       }, { domain: "factory", operation: "deleteSourceSummary" });
-      const preserved = await database.migrator.query<{ source_summary_id: string | null }>({
-        text: "SELECT source_summary_id FROM lcm.promoted_memories WHERE memory_id = $1",
+      const preserved = await database.migrator.query<{
+        source_project_id: string;
+        source_summary_id: string | null;
+      }>({
+        text: `SELECT source_project_id, source_summary_id
+               FROM lcm.promoted_memories WHERE memory_id = $1`,
         values: [memory.rows[0]?.memory_id],
       }, { domain: "factory", operation: "verifyPromotedPreservation" });
-      expect(preserved.rows[0]?.source_summary_id).toBeNull();
+      expect(preserved.rows[0]).toEqual({
+        source_project_id: "source-a",
+        source_summary_id: null,
+      });
       await expect(database.migrator.query<{ count: string }>({
         text: "SELECT count(*)::text AS count FROM lcm.summary_messages WHERE summary_id = $1",
         values: [summary.rows[0]?.summary_id],
@@ -582,12 +606,14 @@ describe("PostgreSQL schema baseline", () => {
                VALUES ($1, $2, 0, 'summary', $3)`,
         values: [scope.projectId, disposableConversationId, disposableSummary.rows[0]?.summary_id],
       }, { domain: "factory", operation: "seedDisposableContext" });
-      await database.migrator.query({
+      const disposableFile = await database.migrator.query<{ file_id: string }>({
         text: `INSERT INTO lcm.large_files
-                 (project_id, conversation_id, storage_uri)
-               VALUES ($1, $2, 'file:///disposable')`,
+                 (file_id, project_id, conversation_id, storage_uri)
+               VALUES ('file-1', $1, $2, 'file:///disposable')
+               RETURNING file_id`,
         values: [scope.projectId, disposableConversationId],
       }, { domain: "factory", operation: "seedDisposableLargeFile" });
+      expect(disposableFile.rows[0]?.file_id).toBe("file-1");
       await database.migrator.query({
         text: "DELETE FROM lcm.conversations WHERE conversation_id = $1",
         values: [disposableConversationId],
@@ -798,9 +824,15 @@ describe("PostgreSQL schema baseline", () => {
       }, { domain: "factory", operation: "seedMemoryMatrix" });
       await database.migrator.query({
         text: `INSERT INTO lcm.session_instructions(project_id,slot,content,content_hash)
-               VALUES($1,1,'instructions',$2)`,
-        values: [scope.projectId, hashA],
+               VALUES($1,1,'instructions','hash-1')`,
+        values: [scope.projectId],
       }, { domain: "factory", operation: "seedInstructionMatrix" });
+      await expect(database.migrator.query<{ content_hash: string }>({
+        text: `SELECT content_hash FROM lcm.session_instructions
+               WHERE project_id = $1 AND slot = 1`,
+        values: [scope.projectId],
+      }, { domain: "factory", operation: "readInstructionContractHash" }))
+        .resolves.toMatchObject({ rows: [{ content_hash: "hash-1" }] });
       const eventId = "6ba7b810-9dad-41d1-80b4-00c04fd430c8";
       await database.migrator.query({
         text: `INSERT INTO lcm.passive_event_inbox
@@ -874,7 +906,6 @@ describe("PostgreSQL schema baseline", () => {
         { operation: "summaryDescendantTokens", text: "INSERT INTO lcm.summaries(project_id,conversation_id,kind,content,token_count,descendant_token_count) VALUES($1,$2,'leaf','s',0,-1)", values: [scope.projectId, scope.conversationId] },
         { operation: "summarySourceTokens", text: "INSERT INTO lcm.summaries(project_id,conversation_id,kind,content,token_count,source_message_token_count) VALUES($1,$2,'leaf','s',0,-1)", values: [scope.projectId, scope.conversationId] },
         { operation: "instructionUnique", text: "INSERT INTO lcm.session_instructions(project_id,slot,content,content_hash) VALUES($1,1,'duplicate',$2)", values: [scope.projectId, hashB] },
-        { operation: "instructionHash", text: "INSERT INTO lcm.session_instructions(project_id,slot,content,content_hash) VALUES($1,2,'bad','bad')", values: [scope.projectId] },
         { operation: "inboxStatus", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload,status) VALUES($1,$2,uuidv7(),1,1,'e','{}','unknown')", values: [scope.projectId, scope.machineId] },
         { operation: "inboxStatusTime", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload,status) VALUES($1,$2,uuidv7(),1,1,'e','{}','claimed')", values: [scope.projectId, scope.machineId] },
         { operation: "inboxAppliedEquivalence", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload,applied_at) VALUES($1,$2,uuidv7(),1,3,'e','{}',now())", values: [scope.projectId, scope.machineId] },
