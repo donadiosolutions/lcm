@@ -67,10 +67,12 @@ never changes cluster extensions. The migrator owns the `lcm` schema; `PUBLIC`
 has no schema-create privilege in a supported database. Before ledger
 inspection, the runner permits an absent schema but rejects an existing schema
 not owned by the current migration role; delegated `CREATE` is insufficient and
-no ownership is changed automatically. A pre-existing schema that grants
-`PUBLIC CREATE` is rejected before owned DDL without changing its ACL.
+no ownership is changed automatically. Every run rejects a schema that grants
+`PUBLIC CREATE` before ledger inspection without changing its ACL; the baseline
+repeats the guard before its owned DDL.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six
-generated identity sequences, or search-normalization function; unknown
+generated identity sequences, search-normalization function, or
+summary-identity trigger function; unknown
 pre-existing object ACLs are preserved. The normalization function is created
 without replacement, so a same-signature collision fails and rolls back the
 pending migration rather than overwriting operator code. Runtime domain grants

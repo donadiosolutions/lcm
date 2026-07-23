@@ -81,8 +81,11 @@ extension requires restoring its matching control files, not running `CREATE
 EXTENSION`. For an otherwise-current `pg_stat_statements`, least-privilege
 readiness functionally reads `public.pg_stat_statements_info`; only SQLSTATE
 `55000` becomes `not-preloaded`. Migration performs this potentially failing
-probe before its DDL transaction, then verifies the same postmaster epoch under
-the advisory lock. Remediation tells the administrator to add the module to
+probe before its DDL transaction, then verifies the same postmaster epoch and
+loaded module under the advisory lock. It also re-reads the non-probe extension
+catalog contract after acquiring that lock, so a drop, relocation, or version
+change while waiting cannot reach pending DDL; the functional probe is not
+repeated inside the transaction. Remediation tells the administrator to add the module to
 `shared_preload_libraries` and restart PostgreSQL. LCM
 never creates, upgrades, relocates, reinstalls, or drops an extension. For a
 wrong namespace, relocatable extensions receive `ALTER EXTENSION ... SET SCHEMA
@@ -92,7 +95,9 @@ operation through the cluster administrator, then rerun migration.
 
 Schema conformance also exercises repository-defined opaque metadata and caller
 identifiers directly: message-part metadata must round-trip as text, while
-summary and large-file IDs are unique within a project rather than globally.
+unbounded summary IDs round-trip exactly through bounded UUIDv7 relationship
+keys and digest-plus-exact lookup, and large-file IDs are unique within a
+project rather than globally.
 Promoted-memory source IDs are preserved as external provenance without a
 local-summary foreign key. Floating-point step costs reject `NaN` and both
 infinities. Search and tag normalization use PostgreSQL 18's builtin

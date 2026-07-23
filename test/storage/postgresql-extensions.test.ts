@@ -6,6 +6,7 @@ import type {
 } from "../../src/storage/postgresql/contracts.js";
 import {
   areRequiredPostgreSqlExtensionsReady,
+  assertRequiredPostgreSqlExtensionCatalogReady,
   assertRequiredPostgreSqlExtensionsReady,
   inspectRequiredPostgreSqlExtensions,
   PostgreSqlExtensionPreflightError,
@@ -263,6 +264,41 @@ describe("PostgreSQL required extension preflight", () => {
         expect.objectContaining({ name: "pg_stat_statements", status: "not-preloaded" }),
       ]),
     });
+  });
+
+  it("revalidates the exact catalog contract without repeating the functional probe", async () => {
+    const signal = new AbortController().signal;
+    const current = executor(CURRENT_ROWS, "55000");
+    await expect(assertRequiredPostgreSqlExtensionCatalogReady(current, {
+      operation: "lockedCatalogRevalidation",
+      pgStatStatementsPreloaded: true,
+      signal,
+    })).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: "pg_stat_statements",
+        preloaded: true,
+        status: "current",
+      }),
+    ]));
+    expect(current.query).toHaveBeenCalledTimes(1);
+    expect(current.query).toHaveBeenCalledWith(expect.any(Object), {
+      domain: "factory",
+      operation: "lockedCatalogRevalidation",
+      signal,
+    });
+
+    const drifted = executor(CURRENT_ROWS.map((row) => (
+      row.name === "unaccent" ? { ...row, installed_version: null } : row
+    )), "55000");
+    await expect(assertRequiredPostgreSqlExtensionCatalogReady(drifted, {
+      pgStatStatementsPreloaded: true,
+    })).rejects.toMatchObject({
+      operation: "revalidateRequiredExtensionCatalog",
+      extensions: expect.arrayContaining([
+        expect.objectContaining({ name: "unaccent", status: "uninstalled" }),
+      ]),
+    });
+    expect(drifted.query).toHaveBeenCalledTimes(1);
   });
 
   it("propagates probe failures other than the sanitized preload SQLSTATE", async () => {

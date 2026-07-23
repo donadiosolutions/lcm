@@ -266,9 +266,9 @@ describe("PostgreSQL schema baseline", () => {
       const normalizedConstraints = constraints.rows
         .map((row) => `${row.table_name}|${row.constraint_type}|${row.definition}`)
         .join("\n");
-      expect(constraints.rowCount).toBe(166);
+      expect(constraints.rowCount).toBe(164);
       expect(createHash("sha256").update(normalizedConstraints).digest("hex"))
-        .toBe("7c10f183b4136fa876940752282deb0c8714ed81f492b6d42ffac2b455d08292");
+        .toBe("14f3d0cb007554294b45768d2c04e7e29354fe5363dd04bd2e856234a03c5899");
 
       const deleteActions = await database.migrator.query<{
         table_name: string;
@@ -336,7 +336,7 @@ describe("PostgreSQL schema baseline", () => {
                        idx.indpred IS NULL OR
                        pg_get_expr(idx.indpred, idx.indrelid) IN (
                          '(message_id IS NOT NULL)',
-                         '(summary_id IS NOT NULL)',
+                         '(summary_key IS NOT NULL)',
                          '(machine_id IS NOT NULL)'
                        )
                      )
@@ -367,17 +367,22 @@ describe("PostgreSQL schema baseline", () => {
                  )
                ORDER BY index_relation.relname`,
       }, { domain: "factory", operation: "inspectExplicitSchemaIndexes" });
-      expect(explicitIndexes.rowCount).toBe(49);
+      expect(explicitIndexes.rowCount).toBe(50);
       expect(explicitIndexes.rows.map(({ index_name }) => index_name))
         .not.toContain("message_parts_metadata_idx");
       const provenanceIndex = explicitIndexes.rows.find(
         ({ index_name }) => index_name === "promoted_memories_source_summary_idx",
       );
       expect(provenanceIndex?.index_definition).toContain(
-        "(project_id, source_project_id, source_summary_id)",
+        "(project_id, source_project_id, source_summary_id_sha256, memory_id)",
       );
       expect(provenanceIndex?.index_definition).toContain(
         "WHERE (source_summary_id IS NOT NULL)",
+      );
+      expect(explicitIndexes.rows.find(
+        ({ index_name }) => index_name === "summaries_identity_lookup_idx",
+      )?.index_definition).toContain(
+        "(project_id, summary_id_sha256, summary_key)",
       );
       expect(explicitIndexes.rows.find(
         ({ index_name }) => index_name === "promoted_memory_tags_lookup_idx",
@@ -441,11 +446,13 @@ describe("PostgreSQL schema baseline", () => {
       expect(generated.rows).toEqual([
         { table_name: "messages", column_name: "search_document", data_type: "tsvector" },
         { table_name: "promoted_memories", column_name: "search_document", data_type: "tsvector" },
+        { table_name: "promoted_memories", column_name: "source_summary_id_sha256", data_type: "bytea" },
         { table_name: "promoted_memory_tags", column_name: "normalized_tag", data_type: "text" },
         { table_name: "promoted_memory_tags", column_name: "normalized_tag_sha256", data_type: "bytea" },
         { table_name: "promoted_memory_tags", column_name: "search_document", data_type: "tsvector" },
         { table_name: "promoted_memory_tags", column_name: "tag_sha256", data_type: "bytea" },
         { table_name: "summaries", column_name: "search_document", data_type: "tsvector" },
+        { table_name: "summaries", column_name: "summary_id_sha256", data_type: "bytea" },
       ]);
       const tagNormalization = await database.migrator.query<{ expression: string }>({
         text: `SELECT pg_catalog.pg_get_expr(attribute_default.adbin, attribute_default.adrelid)
@@ -505,16 +512,23 @@ describe("PostgreSQL schema baseline", () => {
 
       const privileges = await database.migrator.query<{
         migrator_insert: boolean;
+        public_identity_execute: boolean;
         runtime_select: boolean;
         public_select: boolean;
       }>({
         text: `SELECT
                  has_table_privilege(current_user, 'lcm.messages', 'INSERT') AS migrator_insert,
                  has_table_privilege('lcm_test_runtime', 'lcm.messages', 'SELECT') AS runtime_select,
-                 has_table_privilege('public', 'lcm.messages', 'SELECT') AS public_select`,
+                 has_table_privilege('public', 'lcm.messages', 'SELECT') AS public_select,
+                 has_function_privilege(
+                   'public',
+                   'lcm.enforce_summary_id_uniqueness()',
+                   'EXECUTE'
+                 ) AS public_identity_execute`,
       }, { domain: "factory", operation: "inspectSchemaPrivileges" });
       expect(privileges.rows[0]).toEqual({
         migrator_insert: true,
+        public_identity_execute: false,
         runtime_select: false,
         public_select: false,
       });
@@ -528,6 +542,273 @@ describe("PostgreSQL schema baseline", () => {
         text: "SELECT key FROM lcm.operator_owned_metadata",
       }, { domain: "factory", operation: "verifyUnknownSchemaObject" }))
         .resolves.toMatchObject({ rows: [{ key: "preserve-me" }] });
+    });
+  });
+
+  it("round-trips unbounded summary IDs through bounded scoped relationships", async () => {
+    await withPostgreSqlTestDatabase("schema-long-summary-id", async (database) => {
+      const scope = await seedScope(database.migrator);
+      const longSummaryId = "caller-owned-summary-id:".repeat(600);
+      const longParentId = `${longSummaryId}parent`;
+      const opaqueFileId = "opaque-long-summary-file";
+      const expectedSha256 = createHash("sha256").update(longSummaryId).digest("hex");
+      const message = await database.migrator.query<{ message_id: string }>({
+        text: `INSERT INTO lcm.messages
+                 (project_id, conversation_id, seq, role, content, token_count)
+               VALUES ($1, $2, 0, 'user', 'long summary source', 3)
+               RETURNING message_id`,
+        values: [scope.projectId, scope.conversationId],
+      }, { domain: "factory", operation: "seedLongSummaryMessage" });
+      const summaries = await database.migrator.query<{
+        summary_id: string;
+        summary_key: string;
+        summary_sha256: string;
+        summary_version: number;
+      }>({
+        text: `INSERT INTO lcm.summaries
+                 (summary_id, project_id, conversation_id, kind, content, token_count, created_at)
+               VALUES
+                 ($3, $1, $2, 'leaf', 'long child', 2, '2026-01-01T00:00:00Z'),
+                 ($4, $1, $2, 'condensed', 'long parent', 2, '2026-01-01T00:00:00Z')
+               RETURNING summary_id,
+                         summary_key,
+                         pg_catalog.encode(summary_id_sha256, 'hex') AS summary_sha256,
+                         pg_catalog.uuid_extract_version(summary_key) AS summary_version`,
+        values: [scope.projectId, scope.conversationId, longSummaryId, longParentId],
+      }, { domain: "factory", operation: "seedLongSummaries" });
+      const child = summaries.rows.find(({ summary_id }) => summary_id === longSummaryId);
+      const parent = summaries.rows.find(({ summary_id }) => summary_id === longParentId);
+      expect(child).toMatchObject({
+        summary_id: longSummaryId,
+        summary_sha256: expectedSha256,
+        summary_version: 7,
+      });
+      expect(parent?.summary_version).toBe(7);
+
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.summaries
+                 (summary_id, project_id, conversation_id, kind, content, token_count)
+               VALUES ($3, $1, $2, 'leaf', 'duplicate exact ID', 1)`,
+        values: [scope.projectId, scope.conversationId, longSummaryId],
+      }, { domain: "factory", operation: "rejectDuplicateLongSummaryId" }));
+
+      await database.migrator.query({
+        text: `INSERT INTO lcm.summary_messages
+                 (project_id, conversation_id, summary_key, message_id, ordinal)
+               VALUES ($1, $2, $3, $4, 0)`,
+        values: [
+          scope.projectId,
+          scope.conversationId,
+          child?.summary_key,
+          message.rows[0]?.message_id,
+        ],
+      }, { domain: "factory", operation: "linkLongSummaryMessage" });
+      await database.migrator.query({
+        text: `INSERT INTO lcm.summary_parents
+                 (project_id, conversation_id, summary_key, parent_summary_key, ordinal)
+               VALUES ($1, $2, $3, $4, 0)`,
+        values: [
+          scope.projectId,
+          scope.conversationId,
+          child?.summary_key,
+          parent?.summary_key,
+        ],
+      }, { domain: "factory", operation: "linkLongSummaryParent" });
+      await database.migrator.query({
+        text: `INSERT INTO lcm.context_items
+                 (project_id, conversation_id, ordinal, item_type, summary_key)
+               VALUES ($1, $2, 0, 'summary', $3)`,
+        values: [scope.projectId, scope.conversationId, child?.summary_key],
+      }, { domain: "factory", operation: "linkLongSummaryContext" });
+      await database.migrator.query({
+        text: `INSERT INTO lcm.summary_large_files
+                 (project_id, conversation_id, summary_key, file_id, ordinal)
+               VALUES ($1, $2, $3, $4, 0)`,
+        values: [
+          scope.projectId,
+          scope.conversationId,
+          child?.summary_key,
+          opaqueFileId,
+        ],
+      }, { domain: "factory", operation: "linkLongSummaryFile" });
+
+      await expect(database.migrator.query<{
+        context_summary_id: string;
+        covered_summary_id: string;
+        file_id: string;
+        parent_summary_id: string;
+      }>({
+        text: `SELECT
+                 covered.summary_id AS covered_summary_id,
+                 parent.summary_id AS parent_summary_id,
+                 context_summary.summary_id AS context_summary_id,
+                 file_link.file_id
+               FROM lcm.summary_messages AS coverage
+               JOIN lcm.summaries AS covered
+                 ON covered.project_id = coverage.project_id
+                AND covered.conversation_id = coverage.conversation_id
+                AND covered.summary_key = coverage.summary_key
+               JOIN lcm.summary_parents AS edge
+                 ON edge.project_id = coverage.project_id
+                AND edge.conversation_id = coverage.conversation_id
+                AND edge.summary_key = coverage.summary_key
+               JOIN lcm.summaries AS parent
+                 ON parent.project_id = edge.project_id
+                AND parent.conversation_id = edge.conversation_id
+                AND parent.summary_key = edge.parent_summary_key
+               JOIN lcm.context_items AS context
+                 ON context.project_id = coverage.project_id
+                AND context.conversation_id = coverage.conversation_id
+                AND context.summary_key = coverage.summary_key
+               JOIN lcm.summaries AS context_summary
+                 ON context_summary.project_id = context.project_id
+                AND context_summary.conversation_id = context.conversation_id
+                AND context_summary.summary_key = context.summary_key
+               JOIN lcm.summary_large_files AS file_link
+                 ON file_link.project_id = coverage.project_id
+                AND file_link.conversation_id = coverage.conversation_id
+                AND file_link.summary_key = coverage.summary_key
+               WHERE coverage.message_id = $1`,
+        values: [message.rows[0]?.message_id],
+      }, { domain: "factory", operation: "roundTripLongSummaryRelationships" }))
+        .resolves.toMatchObject({
+          rows: [{
+            context_summary_id: longSummaryId,
+            covered_summary_id: longSummaryId,
+            file_id: opaqueFileId,
+            parent_summary_id: longParentId,
+          }],
+        });
+
+      const order = async (): Promise<string[]> => {
+        const result = await database.migrator.query<{ summary_id: string }>({
+          text: `SELECT summary_id
+                 FROM lcm.summaries
+                 WHERE project_id = $1 AND conversation_id = $2
+                   AND created_at = '2026-01-01T00:00:00Z'
+                 ORDER BY created_at, summary_key`,
+          values: [scope.projectId, scope.conversationId],
+        }, { domain: "factory", operation: "readStableLongSummaryOrder" });
+        return result.rows.map(({ summary_id }) => summary_id);
+      };
+      const firstOrder = await order();
+      expect(firstOrder).toHaveLength(2);
+      expect(new Set(firstOrder)).toEqual(new Set([longSummaryId, longParentId]));
+      expect(await order()).toEqual(firstOrder);
+      await database.migrator.query({
+        text: `INSERT INTO lcm.promoted_memories
+                 (project_id, content, source_project_id, source_summary_id)
+               VALUES ($1, 'long external provenance', 'external-project', $2)`,
+        values: [scope.projectId, longSummaryId],
+      }, { domain: "factory", operation: "seedLongSummaryProvenance" });
+      await expect(database.migrator.query<{ source_summary_id: string }>({
+        text: `SELECT source_summary_id
+               FROM lcm.promoted_memories
+               WHERE project_id = $1
+                 AND source_project_id = 'external-project'
+                 AND source_summary_id_sha256 = public.digest($2, 'sha256')
+                 AND source_summary_id = $2`,
+        values: [scope.projectId, longSummaryId],
+      }, { domain: "factory", operation: "roundTripLongSummaryProvenance" }))
+        .resolves.toMatchObject({ rows: [{ source_summary_id: longSummaryId }] });
+
+      const plans = await database.migrator.transaction(async (transaction) => {
+        await transaction.query({ text: "SET LOCAL enable_seqscan = off" }, {
+          domain: "factory",
+          operation: "forceLongSummaryPlans",
+        });
+        const identity = await transaction.query<{ "QUERY PLAN": unknown }>({
+          text: `EXPLAIN (FORMAT JSON, COSTS OFF)
+                 SELECT summary_id FROM lcm.summaries
+                 WHERE project_id = $1
+                   AND summary_id_sha256 = public.digest($2, 'sha256')
+                   AND summary_id = $2
+                 ORDER BY summary_id_sha256, summary_key`,
+          values: [scope.projectId, longSummaryId],
+        }, { domain: "factory", operation: "explainLongSummaryIdentity" });
+        const ordering = await transaction.query<{ "QUERY PLAN": unknown }>({
+          text: `EXPLAIN (FORMAT JSON, COSTS OFF)
+                 SELECT summary_id FROM lcm.summaries
+                 WHERE project_id = $1
+                 ORDER BY conversation_id, created_at, summary_key`,
+          values: [scope.projectId],
+        }, { domain: "factory", operation: "explainLongSummaryOrder" });
+        const provenance = await transaction.query<{ "QUERY PLAN": unknown }>({
+          text: `EXPLAIN (FORMAT JSON, COSTS OFF)
+                 SELECT source_summary_id FROM lcm.promoted_memories
+                 WHERE project_id = $1
+                   AND source_project_id = 'external-project'
+                   AND source_summary_id_sha256 = public.digest($2, 'sha256')
+                   AND source_summary_id = $2`,
+          values: [scope.projectId, longSummaryId],
+        }, { domain: "factory", operation: "explainLongSummaryProvenance" });
+        return JSON.stringify([identity.rows, ordering.rows, provenance.rows]);
+      });
+      expect(plans).toContain("summaries_identity_lookup_idx");
+      expect(plans).toContain("summaries_conversation_order_idx");
+      expect(plans).toContain("promoted_memories_source_summary_idx");
+    });
+  });
+
+  it("preserves whitespace-only session IDs accepted by the shared contract", async () => {
+    await withPostgreSqlTestDatabase("schema-whitespace-session", async (database) => {
+      const scope = await seedScope(database.migrator);
+      const sessionId = "   ";
+      const conversation = await database.migrator.query<{ conversation_id: string }>({
+        text: `INSERT INTO lcm.conversations (project_id, session_id)
+               VALUES ($1, $2) RETURNING conversation_id`,
+        values: [scope.projectId, sessionId],
+      }, { domain: "factory", operation: "seedWhitespaceSessionConversation" });
+      const message = await database.migrator.query<{ message_id: string }>({
+        text: `INSERT INTO lcm.messages
+                 (project_id, conversation_id, seq, role, content, token_count)
+               VALUES ($1, $2, 0, 'user', 'whitespace session', 2)
+               RETURNING message_id`,
+        values: [scope.projectId, conversation.rows[0]?.conversation_id],
+      }, { domain: "factory", operation: "seedWhitespaceSessionMessage" });
+      await database.migrator.query({
+        text: `INSERT INTO lcm.message_parts
+                 (project_id, conversation_id, message_id, session_id, part_type, ordinal)
+               VALUES ($1, $2, $3, $4, 'text', 0)`,
+        values: [
+          scope.projectId,
+          conversation.rows[0]?.conversation_id,
+          message.rows[0]?.message_id,
+          sessionId,
+        ],
+      }, { domain: "factory", operation: "seedWhitespaceSessionPart" });
+      await database.migrator.query({
+        text: `INSERT INTO lcm.session_ingest_log
+                 (project_id, session_id, message_count)
+               VALUES ($1, $2, 1)`,
+        values: [scope.projectId, sessionId],
+      }, { domain: "factory", operation: "seedWhitespaceSessionIngest" });
+      await expect(database.migrator.query<{
+        conversation_session: string;
+        ingest_session: string;
+        part_session: string;
+      }>({
+        text: `SELECT
+                 conversation.session_id AS conversation_session,
+                 part.session_id AS part_session,
+                 ingest.session_id AS ingest_session
+               FROM lcm.conversations AS conversation
+               JOIN lcm.message_parts AS part
+                 ON part.project_id = conversation.project_id
+                AND part.conversation_id = conversation.conversation_id
+               JOIN lcm.session_ingest_log AS ingest
+                 ON ingest.project_id = conversation.project_id
+                AND ingest.session_id = conversation.session_id
+               WHERE conversation.conversation_id = $1`,
+        values: [conversation.rows[0]?.conversation_id],
+      }, { domain: "factory", operation: "roundTripWhitespaceSessions" }))
+        .resolves.toMatchObject({
+          rows: [{
+            conversation_session: sessionId,
+            ingest_session: sessionId,
+            part_session: sessionId,
+          }],
+        });
     });
   });
 
@@ -675,19 +956,22 @@ describe("PostgreSQL schema baseline", () => {
                RETURNING message_id`,
         values: [scope.projectId, scope.conversationId],
       }, { domain: "factory", operation: "seedSourceMessage" });
-      const summary = await database.migrator.query<{ summary_id: string }>({
+      const summary = await database.migrator.query<{
+        summary_id: string;
+        summary_key: string;
+      }>({
         text: `INSERT INTO lcm.summaries
                  (summary_id, project_id, conversation_id, kind, content, token_count)
                VALUES ('sum_0123456789abcdef', $1, $2, 'leaf', 'caller ID summary', 2)
-               RETURNING summary_id`,
+               RETURNING summary_id, summary_key`,
         values: [scope.projectId, scope.conversationId],
       }, { domain: "factory", operation: "seedSummary" });
       expect(summary.rows[0]?.summary_id).toBe("sum_0123456789abcdef");
       await database.migrator.query({
         text: `INSERT INTO lcm.summary_messages
-                 (project_id, conversation_id, summary_id, message_id, ordinal)
+                 (project_id, conversation_id, summary_key, message_id, ordinal)
                VALUES ($1, $2, $3, $4, 0)`,
-        values: [scope.projectId, scope.conversationId, summary.rows[0]?.summary_id, sourceMessage.rows[0]?.message_id],
+        values: [scope.projectId, scope.conversationId, summary.rows[0]?.summary_key, sourceMessage.rows[0]?.message_id],
       }, { domain: "factory", operation: "linkSummaryMessage" });
       await expectConstraintFailure(database.migrator.transaction(async (transaction) => {
         await transaction.query({
@@ -727,15 +1011,15 @@ describe("PostgreSQL schema baseline", () => {
         .resolves.toMatchObject({ rows: [{ count: "0" }] });
       await expectConstraintFailure(database.migrator.query({
         text: `INSERT INTO lcm.summary_parents
-                 (project_id, conversation_id, summary_id, parent_summary_id, ordinal)
+                 (project_id, conversation_id, summary_key, parent_summary_key, ordinal)
                VALUES ($1, $2, $3, $3, 0)`,
-        values: [scope.projectId, scope.conversationId, summary.rows[0]?.summary_id],
+        values: [scope.projectId, scope.conversationId, summary.rows[0]?.summary_key],
       }, { domain: "factory", operation: "rejectSelfSummaryEdge" }));
       await expectConstraintFailure(database.migrator.query({
         text: `INSERT INTO lcm.context_items
-                 (project_id, conversation_id, ordinal, item_type, message_id, summary_id)
+                 (project_id, conversation_id, ordinal, item_type, message_id, summary_key)
                VALUES ($1, $2, 0, 'message', $3, $4)`,
-        values: [scope.projectId, scope.conversationId, sourceMessage.rows[0]?.message_id, summary.rows[0]?.summary_id],
+        values: [scope.projectId, scope.conversationId, sourceMessage.rows[0]?.message_id, summary.rows[0]?.summary_key],
       }, { domain: "factory", operation: "rejectAmbiguousContextItem" }));
 
       const memory = await database.migrator.query<{ memory_id: string }>({
@@ -763,8 +1047,8 @@ describe("PostgreSQL schema baseline", () => {
       });
       await expect(database.migrator.query<{ count: string }>({
         text: `SELECT count(*)::text AS count FROM lcm.summary_messages
-               WHERE project_id = $1 AND summary_id = $2`,
-        values: [scope.projectId, summary.rows[0]?.summary_id],
+               WHERE project_id = $1 AND summary_key = $2`,
+        values: [scope.projectId, summary.rows[0]?.summary_key],
       }, { domain: "factory", operation: "verifySummaryJoinCascade" }))
         .resolves.toMatchObject({ rows: [{ count: "0" }] });
       await expect(database.migrator.query({
@@ -820,16 +1104,24 @@ describe("PostgreSQL schema baseline", () => {
                VALUES ($1, $2, 0, 'user', 'disposable', 1) RETURNING message_id`,
         values: [scope.projectId, disposableConversationId],
       }, { domain: "factory", operation: "seedDisposableMessage" });
-      const disposableSummary = await database.migrator.query<{ summary_id: string }>({
+      const disposableSummary = await database.migrator.query<{
+        summary_id: string;
+        summary_key: string;
+      }>({
         text: `INSERT INTO lcm.summaries
                  (project_id, conversation_id, kind, content, token_count)
-               VALUES ($1, $2, 'leaf', 'disposable', 1) RETURNING summary_id`,
+               VALUES ($1, $2, 'leaf', 'disposable', 1)
+               RETURNING summary_id, summary_key`,
         values: [scope.projectId, disposableConversationId],
       }, { domain: "factory", operation: "seedDisposableSummary" });
-      const disposableParent = await database.migrator.query<{ summary_id: string }>({
+      const disposableParent = await database.migrator.query<{
+        summary_id: string;
+        summary_key: string;
+      }>({
         text: `INSERT INTO lcm.summaries
                  (project_id, conversation_id, kind, content, token_count)
-               VALUES ($1, $2, 'condensed', 'disposable parent', 1) RETURNING summary_id`,
+               VALUES ($1, $2, 'condensed', 'disposable parent', 1)
+               RETURNING summary_id, summary_key`,
         values: [scope.projectId, disposableConversationId],
       }, { domain: "factory", operation: "seedDisposableParentSummary" });
       await database.migrator.query({
@@ -840,9 +1132,9 @@ describe("PostgreSQL schema baseline", () => {
       }, { domain: "factory", operation: "seedDisposablePart" });
       await database.migrator.query({
         text: `INSERT INTO lcm.context_items
-                 (project_id, conversation_id, ordinal, item_type, summary_id)
+                 (project_id, conversation_id, ordinal, item_type, summary_key)
                VALUES ($1, $2, 0, 'summary', $3)`,
-        values: [scope.projectId, disposableConversationId, disposableSummary.rows[0]?.summary_id],
+        values: [scope.projectId, disposableConversationId, disposableSummary.rows[0]?.summary_key],
       }, { domain: "factory", operation: "seedDisposableContext" });
       await database.migrator.query({
         text: `INSERT INTO lcm.context_items
@@ -852,24 +1144,24 @@ describe("PostgreSQL schema baseline", () => {
       }, { domain: "factory", operation: "seedDisposableMessageContext" });
       await database.migrator.query({
         text: `INSERT INTO lcm.summary_messages
-                 (project_id, conversation_id, summary_id, message_id, ordinal)
+                 (project_id, conversation_id, summary_key, message_id, ordinal)
                VALUES ($1, $2, $3, $4, 0)`,
         values: [
           scope.projectId,
           disposableConversationId,
-          disposableSummary.rows[0]?.summary_id,
+          disposableSummary.rows[0]?.summary_key,
           disposableMessage.rows[0]?.message_id,
         ],
       }, { domain: "factory", operation: "seedDisposableSummaryMessage" });
       await database.migrator.query({
         text: `INSERT INTO lcm.summary_parents
-                 (project_id, conversation_id, summary_id, parent_summary_id, ordinal)
+                 (project_id, conversation_id, summary_key, parent_summary_key, ordinal)
                VALUES ($1, $2, $3, $4, 0)`,
         values: [
           scope.projectId,
           disposableConversationId,
-          disposableSummary.rows[0]?.summary_id,
-          disposableParent.rows[0]?.summary_id,
+          disposableSummary.rows[0]?.summary_key,
+          disposableParent.rows[0]?.summary_key,
         ],
       }, { domain: "factory", operation: "seedDisposableSummaryParent" });
       const disposableFile = await database.migrator.query<{ file_id: string }>({
@@ -882,12 +1174,12 @@ describe("PostgreSQL schema baseline", () => {
       expect(disposableFile.rows[0]?.file_id).toBe("file-1");
       await database.migrator.query({
         text: `INSERT INTO lcm.summary_large_files
-                 (project_id, conversation_id, summary_id, file_id, ordinal)
+                 (project_id, conversation_id, summary_key, file_id, ordinal)
                VALUES ($1, $2, $3, $4, 0)`,
         values: [
           scope.projectId,
           disposableConversationId,
-          disposableSummary.rows[0]?.summary_id,
+          disposableSummary.rows[0]?.summary_key,
           disposableFile.rows[0]?.file_id,
         ],
       }, { domain: "factory", operation: "seedDisposableSummaryFile" });
@@ -1283,12 +1575,18 @@ describe("PostgreSQL schema baseline", () => {
         text: "INSERT INTO lcm.messages(project_id,conversation_id,seq,role,content,token_count) VALUES($1,$2,0,'user','remote',1) RETURNING message_id",
         values: [scope.otherProjectId, scope.otherConversationId],
       }, { domain: "factory", operation: "seedRemotePolicyMessage" });
-      const localSummary = await database.migrator.query<{ summary_id: string }>({
-        text: "INSERT INTO lcm.summaries(project_id,conversation_id,kind,content,token_count) VALUES($1,$2,'leaf','local',1) RETURNING summary_id",
+      const localSummary = await database.migrator.query<{
+        summary_id: string;
+        summary_key: string;
+      }>({
+        text: "INSERT INTO lcm.summaries(project_id,conversation_id,kind,content,token_count) VALUES($1,$2,'leaf','local',1) RETURNING summary_id, summary_key",
         values: [scope.projectId, scope.conversationId],
       }, { domain: "factory", operation: "seedLocalPolicySummary" });
-      const remoteSummary = await database.migrator.query<{ summary_id: string }>({
-        text: "INSERT INTO lcm.summaries(project_id,conversation_id,kind,content,token_count) VALUES($1,$2,'leaf','remote',1) RETURNING summary_id",
+      const remoteSummary = await database.migrator.query<{
+        summary_id: string;
+        summary_key: string;
+      }>({
+        text: "INSERT INTO lcm.summaries(project_id,conversation_id,kind,content,token_count) VALUES($1,$2,'leaf','remote',1) RETURNING summary_id, summary_key",
         values: [scope.otherProjectId, scope.otherConversationId],
       }, { domain: "factory", operation: "seedRemotePolicySummary" });
       const remoteFile = await database.migrator.query<{ file_id: string }>({
@@ -1309,7 +1607,7 @@ describe("PostgreSQL schema baseline", () => {
       const unresolvedFileId = "file_bbbbbbbbbbbbbbbb";
       await database.migrator.query({
         text: `INSERT INTO lcm.summary_large_files
-                 (project_id,conversation_id,summary_id,file_id,ordinal)
+                 (project_id,conversation_id,summary_key,file_id,ordinal)
                VALUES
                  ($1,$2,$3,$4,0),
                  ($1,$2,$3,$4,1),
@@ -1317,7 +1615,7 @@ describe("PostgreSQL schema baseline", () => {
         values: [
           scope.projectId,
           scope.conversationId,
-          localSummary.rows[0]?.summary_id,
+          localSummary.rows[0]?.summary_key,
           crossConversationFileId,
           unresolvedFileId,
         ],
@@ -1325,8 +1623,8 @@ describe("PostgreSQL schema baseline", () => {
       await expect(database.migrator.query<{ file_ids: string[] }>({
         text: `SELECT array_agg(file_id ORDER BY ordinal) AS file_ids
                FROM lcm.summary_large_files
-               WHERE project_id=$1 AND summary_id=$2`,
-        values: [scope.projectId, localSummary.rows[0]?.summary_id],
+               WHERE project_id=$1 AND summary_key=$2`,
+        values: [scope.projectId, localSummary.rows[0]?.summary_key],
       }, { domain: "factory", operation: "readOpaqueSummaryFileIds" }))
         .resolves.toMatchObject({
           rows: [{ file_ids: [crossConversationFileId, crossConversationFileId, unresolvedFileId] }],
@@ -1343,12 +1641,12 @@ describe("PostgreSQL schema baseline", () => {
       }, { domain: "factory", operation: "seedDirectlyDeletedLargeFile" });
       await database.migrator.query({
         text: `INSERT INTO lcm.summary_large_files
-                 (project_id,conversation_id,summary_id,file_id,ordinal)
+                 (project_id,conversation_id,summary_key,file_id,ordinal)
                VALUES($1,$2,$3,$4,3)`,
         values: [
           scope.projectId,
           scope.conversationId,
-          localSummary.rows[0]?.summary_id,
+          localSummary.rows[0]?.summary_key,
           directlyDeletedFileId,
         ],
       }, { domain: "factory", operation: "referenceDirectlyDeletedLargeFile" });
@@ -1360,11 +1658,11 @@ describe("PostgreSQL schema baseline", () => {
       await expect(database.migrator.query<{ retained: boolean }>({
         text: `SELECT EXISTS (
                  SELECT 1 FROM lcm.summary_large_files
-                 WHERE project_id=$1 AND summary_id=$2 AND file_id=$3
+                 WHERE project_id=$1 AND summary_key=$2 AND file_id=$3
                ) AS retained`,
         values: [
           scope.projectId,
-          localSummary.rows[0]?.summary_id,
+          localSummary.rows[0]?.summary_key,
           directlyDeletedFileId,
         ],
       }, { domain: "factory", operation: "verifyOpaqueSummaryFileSurvivesDeletion" }))
@@ -1484,10 +1782,10 @@ describe("PostgreSQL schema baseline", () => {
         });
 
       const invalidCases: Array<{ operation: string; text: string; values: unknown[] }> = [
-        { operation: "summaryMessageCrossScope", text: "INSERT INTO lcm.summary_messages(project_id,conversation_id,summary_id,message_id,ordinal) VALUES($1,$2,$3,$4,0)", values: [scope.projectId, scope.conversationId, localSummary.rows[0]?.summary_id, remoteMessage.rows[0]?.message_id] },
-        { operation: "summaryParentCrossScope", text: "INSERT INTO lcm.summary_parents(project_id,conversation_id,summary_id,parent_summary_id,ordinal) VALUES($1,$2,$3,$4,0)", values: [scope.projectId, scope.conversationId, localSummary.rows[0]?.summary_id, remoteSummary.rows[0]?.summary_id] },
+        { operation: "summaryMessageCrossScope", text: "INSERT INTO lcm.summary_messages(project_id,conversation_id,summary_key,message_id,ordinal) VALUES($1,$2,$3,$4,0)", values: [scope.projectId, scope.conversationId, localSummary.rows[0]?.summary_key, remoteMessage.rows[0]?.message_id] },
+        { operation: "summaryParentCrossScope", text: "INSERT INTO lcm.summary_parents(project_id,conversation_id,summary_key,parent_summary_key,ordinal) VALUES($1,$2,$3,$4,0)", values: [scope.projectId, scope.conversationId, localSummary.rows[0]?.summary_key, remoteSummary.rows[0]?.summary_key] },
         { operation: "contextMessageCrossScope", text: "INSERT INTO lcm.context_items(project_id,conversation_id,ordinal,item_type,message_id) VALUES($1,$2,0,'message',$3)", values: [scope.projectId, scope.conversationId, remoteMessage.rows[0]?.message_id] },
-        { operation: "summaryFileOwnerCrossScope", text: "INSERT INTO lcm.summary_large_files(project_id,conversation_id,summary_id,file_id,ordinal) VALUES($1,$2,$3,$4,3)", values: [scope.projectId, crossConversation.rows[0]?.conversation_id, localSummary.rows[0]?.summary_id, remoteFile.rows[0]?.file_id] },
+        { operation: "summaryFileOwnerCrossScope", text: "INSERT INTO lcm.summary_large_files(project_id,conversation_id,summary_key,file_id,ordinal) VALUES($1,$2,$3,$4,3)", values: [scope.projectId, crossConversation.rows[0]?.conversation_id, localSummary.rows[0]?.summary_key, remoteFile.rows[0]?.file_id] },
         { operation: "transcriptProvenanceCrossScope", text: "INSERT INTO lcm.transcript_messages(project_id,transcript_id,conversation_id,message_id,source_ordinal) SELECT $1,transcript_id,$2,$3,0 FROM lcm.native_transcripts WHERE project_id=$1 LIMIT 1", values: [scope.projectId, scope.conversationId, remoteMessage.rows[0]?.message_id] },
         { operation: "messagePartNaNCost", text: "INSERT INTO lcm.message_parts(project_id,conversation_id,message_id,session_id,part_type,ordinal,step_cost) VALUES($1,$2,$3,'s','step_start',0,'NaN'::double precision)", values: [scope.projectId, scope.conversationId, localMessage.rows[0]?.message_id] },
         { operation: "messagePartPositiveInfinityCost", text: "INSERT INTO lcm.message_parts(project_id,conversation_id,message_id,session_id,part_type,ordinal,step_cost) VALUES($1,$2,$3,'s','step_start',0,'Infinity'::double precision)", values: [scope.projectId, scope.conversationId, localMessage.rows[0]?.message_id] },

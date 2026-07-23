@@ -7,7 +7,10 @@ import type {
   PostgreSqlMigrationResult,
   PostgreSqlQueryExecutor,
 } from "./contracts.js";
-import { assertRequiredPostgreSqlExtensionsReady } from "./extensions.js";
+import {
+  assertRequiredPostgreSqlExtensionCatalogReady,
+  assertRequiredPostgreSqlExtensionsReady,
+} from "./extensions.js";
 import { assertPostgreSqlSearchConfigurationReady } from "./search-configuration.js";
 
 const MIGRATION_MANIFEST = [
@@ -19,7 +22,7 @@ const MIGRATION_MANIFEST = [
   {
     id: "0002_schema_baseline",
     filename: "0002_schema_baseline.sql",
-    sha256: "658e352435bf2d34041b76f80c85b52d46f12a875423daa4f4558f222f2d8903",
+    sha256: "87b49cc610b9d7e6083a4f0d0170e2aed1aac6c8c7ce8b6b5a95ef903c6b25bd",
   },
 ] as const;
 
@@ -32,6 +35,10 @@ type SchemaOwnershipRow = QueryResultRow & {
   current_user_name: unknown;
   schema_exists: unknown;
   owned_by_current_user: unknown;
+};
+type SchemaAclRow = QueryResultRow & {
+  schema_exists: unknown;
+  public_create: unknown;
 };
 
 export const REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION = 18 as const;
@@ -90,6 +97,34 @@ export class PostgreSqlSchemaOwnershipPreflightError extends StorageOperationErr
       schemaExists: this.schemaExists,
       ownedByMigrator: this.ownedByMigrator,
       requiredOwner: this.requiredOwner,
+      remediation: this.remediation,
+    };
+  }
+}
+
+export class PostgreSqlSchemaAclPreflightError extends StorageOperationError {
+  constructor(
+    readonly schemaExists: boolean | null,
+    readonly publicCreate: boolean | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightSchemaAcl",
+    );
+  }
+
+  readonly schemaName = "lcm";
+  readonly remediation = "REVOKE CREATE ON SCHEMA \"lcm\" FROM PUBLIC;";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      schemaName: this.schemaName,
+      schemaExists: this.schemaExists,
+      publicCreate: this.publicCreate,
       remediation: this.remediation,
     };
   }
@@ -230,6 +265,12 @@ export async function runPostgreSqlMigrations(
       throw migrationError("verifyPostmasterContinuity");
     }
 
+    await assertRequiredPostgreSqlExtensionCatalogReady(transaction, {
+      operation: "revalidateRequiredExtensionCatalog",
+      pgStatStatementsPreloaded: true,
+      signal: options.signal,
+    });
+
     const schemaOwnership = await transaction.query<SchemaOwnershipRow>({
       text: `SELECT
         CURRENT_USER::text AS current_user_name,
@@ -257,6 +298,39 @@ export async function runPostgreSqlMigrations(
         ownedByMigrator,
         requiredOwner,
       );
+    }
+
+    const schemaAcl = await transaction.query<SchemaAclRow>({
+      text: `SELECT
+        EXISTS (
+          SELECT 1
+          FROM pg_catalog.pg_namespace AS namespace
+          WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+        ) AS schema_exists,
+        EXISTS (
+          SELECT 1
+          FROM pg_catalog.pg_namespace AS namespace
+          CROSS JOIN LATERAL pg_catalog.aclexplode(
+            COALESCE(
+              namespace.nspacl,
+              pg_catalog.acldefault('n', namespace.nspowner)
+            )
+          ) AS privilege
+          WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+            AND privilege.grantee OPERATOR(pg_catalog.=) 0
+            AND privilege.privilege_type OPERATOR(pg_catalog.=) 'CREATE'
+        ) AS public_create`,
+    }, { domain: "factory", operation: "preflightSchemaAcl", signal: options.signal });
+    const aclSchemaExists = sanitizeBoolean(schemaAcl.rows[0]?.schema_exists);
+    const publicCreate = sanitizeBoolean(schemaAcl.rows[0]?.public_create);
+    if (
+      aclSchemaExists === null
+      || publicCreate === null
+      || aclSchemaExists !== schemaExists
+      || (aclSchemaExists === false && publicCreate !== false)
+      || publicCreate
+    ) {
+      throw new PostgreSqlSchemaAclPreflightError(aclSchemaExists, publicCreate);
     }
 
     const ledger = await transaction.query<LedgerRow>({

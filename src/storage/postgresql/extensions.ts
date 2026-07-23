@@ -34,6 +34,40 @@ type PgStatStatementsProbeRow = QueryResultRow & {
   stats_reset: Date | string | null;
 };
 
+async function inspectRequiredPostgreSqlExtensionCatalog(
+  executor: PostgreSqlQueryExecutor,
+  options: { readonly operation: string; readonly signal?: AbortSignal },
+): Promise<Map<string, ExtensionRow>> {
+  const result = await executor.query<ExtensionRow, [readonly RequiredExtensionName[]]>({
+    text: `WITH required(name) AS (
+             SELECT pg_catalog.unnest($1::text[])
+           )
+           SELECT required.name,
+                  available.default_version,
+                  installed.extversion::text AS installed_version,
+                  namespace.nspname::text AS installed_schema,
+                  installed_version.relocatable
+           FROM required
+           LEFT JOIN pg_catalog.pg_available_extensions AS available
+             ON available.name OPERATOR(pg_catalog.=) required.name
+           LEFT JOIN pg_catalog.pg_extension AS installed
+             ON installed.extname OPERATOR(pg_catalog.=) required.name
+           LEFT JOIN pg_catalog.pg_namespace AS namespace
+             ON namespace.oid OPERATOR(pg_catalog.=) installed.extnamespace
+           LEFT JOIN pg_catalog.pg_available_extension_versions AS installed_version
+             ON installed_version.name OPERATOR(pg_catalog.=) required.name
+            AND installed_version.version OPERATOR(pg_catalog.=) installed.extversion
+            AND installed_version.installed
+           ORDER BY required.name`,
+    values: [REQUIRED_POSTGRESQL_EXTENSIONS],
+  }, {
+    domain: "factory",
+    operation: options.operation,
+    signal: options.signal,
+  });
+  return new Map(result.rows.map((row) => [row.name, row]));
+}
+
 function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
 }
@@ -165,34 +199,10 @@ export async function inspectRequiredPostgreSqlExtensions(
   executor: PostgreSqlQueryExecutor,
   options: { readonly operation?: string; readonly signal?: AbortSignal } = {},
 ): Promise<readonly PostgreSqlExtensionStatus[]> {
-  const result = await executor.query<ExtensionRow, [readonly RequiredExtensionName[]]>({
-    text: `WITH required(name) AS (
-             SELECT pg_catalog.unnest($1::text[])
-           )
-           SELECT required.name,
-                  available.default_version,
-                  installed.extversion::text AS installed_version,
-                  namespace.nspname::text AS installed_schema,
-                  installed_version.relocatable
-           FROM required
-           LEFT JOIN pg_catalog.pg_available_extensions AS available
-             ON available.name OPERATOR(pg_catalog.=) required.name
-           LEFT JOIN pg_catalog.pg_extension AS installed
-             ON installed.extname OPERATOR(pg_catalog.=) required.name
-           LEFT JOIN pg_catalog.pg_namespace AS namespace
-             ON namespace.oid OPERATOR(pg_catalog.=) installed.extnamespace
-           LEFT JOIN pg_catalog.pg_available_extension_versions AS installed_version
-             ON installed_version.name OPERATOR(pg_catalog.=) required.name
-            AND installed_version.version OPERATOR(pg_catalog.=) installed.extversion
-            AND installed_version.installed
-           ORDER BY required.name`,
-    values: [REQUIRED_POSTGRESQL_EXTENSIONS],
-  }, {
-    domain: "factory",
+  const rows = await inspectRequiredPostgreSqlExtensionCatalog(executor, {
     operation: options.operation ?? "inspectRequiredExtensions",
     signal: options.signal,
   });
-  const rows = new Map(result.rows.map((row) => [row.name, row]));
   const pgStatStatements = rows.get("pg_stat_statements");
   const shouldProbe = pgStatStatements !== undefined
     && pgStatStatements.default_version !== null
@@ -210,6 +220,32 @@ export async function inspectRequiredPostgreSqlExtensions(
   return REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => (
     extensionStatus(name, rows.get(name), name === "pg_stat_statements" ? preloaded : null)
   ));
+}
+
+export async function assertRequiredPostgreSqlExtensionCatalogReady(
+  executor: PostgreSqlQueryExecutor,
+  options: {
+    readonly operation?: string;
+    readonly pgStatStatementsPreloaded: boolean;
+    readonly signal?: AbortSignal;
+  },
+): Promise<readonly PostgreSqlExtensionStatus[]> {
+  const operation = options.operation ?? "revalidateRequiredExtensionCatalog";
+  const rows = await inspectRequiredPostgreSqlExtensionCatalog(executor, {
+    operation,
+    signal: options.signal,
+  });
+  const extensions = REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => (
+    extensionStatus(
+      name,
+      rows.get(name),
+      name === "pg_stat_statements" ? options.pgStatStatementsPreloaded : null,
+    )
+  ));
+  if (!areRequiredPostgreSqlExtensionsReady(extensions)) {
+    throw new PostgreSqlExtensionPreflightError(extensions, operation);
+  }
+  return extensions;
 }
 
 export async function assertRequiredPostgreSqlExtensionsReady(

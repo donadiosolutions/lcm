@@ -238,6 +238,46 @@ describe("PostgreSQL migrations and database isolation", () => {
     }
   });
 
+  it("rechecks PUBLIC CREATE drift before a repeated run or later migration", async () => {
+    await withPostgreSqlTestDatabase("public-schema-create-drift", async (database) => {
+      await database.migrator.query({
+        text: "GRANT CREATE ON SCHEMA lcm TO PUBLIC",
+      }, { domain: "factory", operation: "driftPublicSchemaCreate" });
+      const later = migration(
+        "0003_public_acl_probe",
+        "CREATE TABLE lcm.public_acl_probe (id integer PRIMARY KEY);",
+      );
+
+      await expect(runPostgreSqlMigrations(database.migrator, {
+        migrations: [...loadPostgreSqlMigrations(), later],
+      })).rejects.toMatchObject({
+        operation: "preflightSchemaAcl",
+        publicCreate: true,
+        remediation: "REVOKE CREATE ON SCHEMA \"lcm\" FROM PUBLIC;",
+        schemaExists: true,
+        schemaName: "lcm",
+      });
+      await expect(database.migrator.query<{
+        applied_count: string;
+        probe_exists: boolean;
+        public_create: boolean;
+      }>({
+        text: `SELECT
+                 (SELECT count(*)::text FROM lcm.schema_migrations) AS applied_count,
+                 pg_catalog.to_regclass('lcm.public_acl_probe') IS NOT NULL AS probe_exists,
+                 pg_catalog.has_schema_privilege('public', 'lcm', 'CREATE')
+                   AS public_create`,
+      }, { domain: "factory", operation: "verifyRecurringPublicAclRollback" }))
+        .resolves.toMatchObject({
+          rows: [{
+            applied_count: "2",
+            probe_exists: false,
+            public_create: true,
+          }],
+        });
+    });
+  });
+
   it("rejects an administrator-owned schema despite delegated migrator CREATE", async () => {
     const database = await createPostgreSqlTestDatabase("schema-owner", { runMigrations: false });
     const admin = new PostgreSqlRuntime(settings(database.adminUrl));

@@ -4,10 +4,16 @@ import {
   PostgreSqlExtensionPreflightError,
   REQUIRED_POSTGRESQL_EXTENSIONS,
 } from "../../src/storage/postgresql/extensions.js";
+import type {
+  PostgreSqlQueryExecutor,
+  PostgreSqlQueryOptions,
+} from "../../src/storage/postgresql/contracts.js";
 import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations.js";
+import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import {
   assertHarnessReady,
   createPostgreSqlTestDatabase,
+  settings,
   withPostgreSqlTestDatabase,
 } from "./harness.js";
 
@@ -249,6 +255,89 @@ describe("PostgreSQL extension readiness", () => {
       }, { domain: "factory", operation: "verifyWrongExtensionNamespaceRollback" });
       expect(schema.rows).toEqual([{ schema_name: null }]);
     } finally {
+      await database.drop();
+    }
+  });
+
+  it("revalidates extension catalogs after waiting for the migration lock", async () => {
+    const database = await createPostgreSqlTestDatabase("extension-lock-drift", {
+      runMigrations: false,
+    });
+    const blocker = new PostgreSqlRuntime(settings(database.migratorUrl));
+    const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+    let releaseBlocker = (): void => {};
+    let reportBlockerReady = (): void => {};
+    let reportLockAttempt = (): void => {};
+    const holdBlocker = new Promise<void>((resolve) => {
+      releaseBlocker = resolve;
+    });
+    const blockerReady = new Promise<void>((resolve) => {
+      reportBlockerReady = resolve;
+    });
+    const lockAttempted = new Promise<void>((resolve) => {
+      reportLockAttempt = resolve;
+    });
+    const lockSql = `SELECT pg_catalog.pg_advisory_xact_lock(
+      pg_catalog.hashtextextended(
+        pg_catalog.current_database() OPERATOR(pg_catalog.||) ':lcm:migrations',
+        0
+      )
+    )`;
+    const blockingTransaction = blocker.transaction(async (transaction) => {
+      await transaction.query({ text: lockSql }, {
+        domain: "factory",
+        operation: "holdMigrationLock",
+      });
+      reportBlockerReady();
+      await holdBlocker;
+    }, { domain: "factory", operation: "holdMigrationLockTransaction" });
+
+    try {
+      await blockerReady;
+      const interceptingExecutor = {
+        query: database.migrator.query.bind(database.migrator),
+        transaction: <T>(
+          callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
+          options: { domain: "factory"; operation: string; signal?: AbortSignal },
+        ): Promise<T> => database.migrator.transaction(async (transaction) => callback({
+          query: async (
+            input,
+            context: PostgreSqlQueryOptions,
+          ) => {
+            if (context.operation === "lockMigrations") reportLockAttempt();
+            return transaction.query(input, context);
+          },
+        }), options),
+      };
+      const migration = runPostgreSqlMigrations(interceptingExecutor);
+      await lockAttempted;
+      await admin.query({ text: "DROP EXTENSION unaccent" }, {
+        domain: "factory",
+        operation: "dropExtensionWhileMigrationWaits",
+      });
+      releaseBlocker();
+      await blockingTransaction;
+
+      const failure = await migration.catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(PostgreSqlExtensionPreflightError);
+      expect(failure).toMatchObject({
+        operation: "revalidateRequiredExtensionCatalog",
+        extensions: expect.arrayContaining([
+          expect.objectContaining({
+            name: "unaccent",
+            installedVersion: null,
+            status: "uninstalled",
+          }),
+        ]),
+      });
+      await expect(database.migrator.query<{ schema_name: string | null }>({
+        text: "SELECT pg_catalog.to_regnamespace('lcm')::text AS schema_name",
+      }, { domain: "factory", operation: "verifyLockDriftRollback" }))
+        .resolves.toMatchObject({ rows: [{ schema_name: null }] });
+    } finally {
+      releaseBlocker();
+      await blockingTransaction.catch(() => undefined);
+      await Promise.all([admin.close(), blocker.close()]);
       await database.drop();
     }
   });

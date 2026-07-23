@@ -8,6 +8,7 @@ import type {
 } from "../../src/storage/postgresql/contracts.js";
 import {
   loadPostgreSqlMigrations,
+  PostgreSqlSchemaAclPreflightError,
   PostgreSqlSchemaOwnershipPreflightError,
   PostgreSqlServerVersionPreflightError,
   REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
@@ -43,6 +44,7 @@ function executor(options: {
   serverVersion?: number | "missing";
   postmasterEpoch?: unknown;
   postmasterContinuity?: boolean | "missing";
+  schemaAcl?: "absent" | "ready" | "public" | "missing" | "invalid" | "inconsistent";
 } = {}) {
   const operations: string[] = [];
   const query = vi.fn(async <R extends QueryResultRow>(
@@ -80,7 +82,10 @@ function executor(options: {
         ? [] as R[]
         : [{ server_version_num: options.serverVersion ?? 180004 }] as unknown as R[]);
     }
-    if (context.operation === "preflightRequiredExtensions") {
+    if (
+      context.operation === "preflightRequiredExtensions"
+      || context.operation === "revalidateRequiredExtensionCatalog"
+    ) {
       return result(REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => ({
         name,
         default_version: "1.0",
@@ -122,6 +127,19 @@ function executor(options: {
         owned_by_current_user: options.schemaOwnership === "owned",
       }] as unknown as R[]);
     }
+    if (context.operation === "preflightSchemaAcl") {
+      if (options.schemaAcl === "missing") return result([] as R[]);
+      if (options.schemaAcl === "invalid") {
+        return result([{ schema_exists: "yes", public_create: 1 }] as unknown as R[]);
+      }
+      if (options.schemaAcl === "inconsistent") {
+        return result([{ schema_exists: false, public_create: true }] as unknown as R[]);
+      }
+      return result([{
+        schema_exists: options.schemaAcl !== undefined && options.schemaAcl !== "absent",
+        public_create: options.schemaAcl === "public",
+      }] as unknown as R[]);
+    }
     if (context.operation === "inspectMigrationLedger") return result([{ ledger_exists: options.ledger ?? false }] as unknown as R[]);
     if (context.operation === "readMigrations") return result((options.current ?? []) as unknown as R[]);
     return result([] as R[]);
@@ -138,7 +156,7 @@ describe("PostgreSQL migration runner", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "658e352435bf2d34041b76f80c85b52d46f12a875423daa4f4558f222f2d8903" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "87b49cc610b9d7e6083a4f0d0170e2aed1aac6c8c7ce8b6b5a95ef903c6b25bd" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
@@ -179,7 +197,9 @@ describe("PostgreSQL migration runner", () => {
       "lockMigrations",
       "preflightServerVersion",
       "verifyPostmasterContinuity",
+      "revalidateRequiredExtensionCatalog",
       "preflightSchemaOwnership",
+      "preflightSchemaAcl",
       "inspectMigrationLedger",
       "applyMigration:0001_first",
       "recordMigration",
@@ -210,7 +230,7 @@ describe("PostgreSQL migration runner", () => {
   });
 
   it("accepts a pre-existing schema owned by the migration role", async () => {
-    const fake = executor({ schemaOwnership: "owned" });
+    const fake = executor({ schemaAcl: "ready", schemaOwnership: "owned" });
     await expect(runPostgreSqlMigrations(fake.seam, { migrations: [] }))
       .resolves.toEqual({ applied: [], current: [] });
     expect(fake.operations).toContain("preflightSchemaOwnership");
@@ -372,7 +392,70 @@ describe("PostgreSQL migration runner", () => {
       "lockMigrations",
       "preflightServerVersion",
       "verifyPostmasterContinuity",
+      "revalidateRequiredExtensionCatalog",
       "preflightSchemaOwnership",
+    ]);
+  });
+
+  it.each([
+    {
+      label: "PUBLIC CREATE",
+      schemaAcl: "public" as const,
+      schemaExists: true,
+      publicCreate: true,
+    },
+    {
+      label: "missing catalog result",
+      schemaAcl: "missing" as const,
+      schemaExists: null,
+      publicCreate: null,
+    },
+    {
+      label: "malformed catalog result",
+      schemaAcl: "invalid" as const,
+      schemaExists: null,
+      publicCreate: null,
+    },
+    {
+      label: "contradictory catalog result",
+      schemaAcl: "inconsistent" as const,
+      schemaExists: false,
+      publicCreate: true,
+    },
+  ])("fails closed when schema ACL readiness has $label", async ({
+    schemaAcl,
+    schemaExists,
+    publicCreate,
+  }) => {
+    const fake = executor({ schemaAcl, schemaOwnership: "owned" });
+    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [] })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlSchemaAclPreflightError);
+    expect(failure).toMatchObject({
+      code: "STORAGE_INITIALIZATION_FAILED",
+      operation: "preflightSchemaAcl",
+      publicCreate,
+      remediation: "REVOKE CREATE ON SCHEMA \"lcm\" FROM PUBLIC;",
+      schemaExists,
+      schemaName: "lcm",
+    });
+    expect((failure as PostgreSqlSchemaAclPreflightError).toJSON()).toMatchObject({
+      publicCreate,
+      remediation: "REVOKE CREATE ON SCHEMA \"lcm\" FROM PUBLIC;",
+      schemaExists,
+      schemaName: "lcm",
+    });
+    expect(fake.operations).toEqual([
+      "capturePostmasterEpoch",
+      "preflightRequiredExtensions",
+      "preflightRequiredExtensions:probePgStatStatements",
+      "pinMigrationSearchPath",
+      "lockMigrations",
+      "preflightServerVersion",
+      "verifyPostmasterContinuity",
+      "revalidateRequiredExtensionCatalog",
+      "preflightSchemaOwnership",
+      "preflightSchemaAcl",
     ]);
   });
 

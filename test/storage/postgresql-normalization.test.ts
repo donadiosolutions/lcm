@@ -76,5 +76,15 @@ describe("PostgreSQL search normalization artifact", () => {
     expect(sql).not.toContain(
       "ON lcm.promoted_memory_tags (project_id, normalized_tag, memory_id)",
     );
+    expect(sql).toContain("summary_key uuid PRIMARY KEY DEFAULT uuidv7()");
+    expect(sql).toContain("public.digest(summary_id, 'sha256')");
+    expect(sql).toContain(
+      "ON lcm.summaries (project_id, summary_id_sha256, summary_key)",
+    );
+    expect(sql).not.toMatch(/(?:PRIMARY KEY|UNIQUE|INDEX)[^\n]*summary_id\)/u);
+    expect(sql).toContain(
+      "project_id, source_project_id, source_summary_id_sha256, memory_id",
+    );
+    expect(sql).not.toContain("session_id text NOT NULL CHECK (btrim(session_id) <> '')");
   });
 });
