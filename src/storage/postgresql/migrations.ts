@@ -19,7 +19,7 @@ const MIGRATION_MANIFEST = [
   {
     id: "0002_schema_baseline",
     filename: "0002_schema_baseline.sql",
-    sha256: "dcf82e9f9ad0084467696a8a1a1650897ddfb525b0c417b9bcb771d0af78d275",
+    sha256: "469367263cf040340b73af7b83f1fedb05eeef987ccc261057860e9706bd67ed",
   },
 ] as const;
 
@@ -198,22 +198,6 @@ export async function runPostgreSqlMigrations(
       )`,
     }, { domain: "factory", operation: "lockMigrations", signal: options.signal });
 
-    const continuity = await transaction.query<PostmasterContinuityRow>({
-      text: `SELECT
-               pg_catalog.pg_postmaster_start_time()::text OPERATOR(pg_catalog.=) $1::text
-               AND EXISTS (
-                 SELECT 1
-                 FROM pg_catalog.pg_get_loaded_modules() AS loaded
-                 WHERE loaded.module_name OPERATOR(pg_catalog.=) 'pg_stat_statements'
-                    OR loaded.file_name OPERATOR(pg_catalog.~)
-                      '(^|/)pg_stat_statements([.][^/]*)?$'
-               ) AS preflight_still_valid`,
-      values: [postmasterStartedAt],
-    }, { domain: "factory", operation: "verifyPostmasterContinuity", signal: options.signal });
-    if (continuity.rows[0]?.preflight_still_valid !== true) {
-      throw migrationError("verifyPostmasterContinuity");
-    }
-
     const serverVersion = await transaction.query<ServerVersionRow>({
       text: "SELECT pg_catalog.current_setting('server_version_num')::integer AS server_version_num",
     }, { domain: "factory", operation: "preflightServerVersion", signal: options.signal });
@@ -228,6 +212,22 @@ export async function runPostgreSqlMigrations(
         serverVersionNumber,
         serverMajorVersion,
       );
+    }
+
+    const continuity = await transaction.query<PostmasterContinuityRow>({
+      text: `SELECT
+               pg_catalog.pg_postmaster_start_time()::text OPERATOR(pg_catalog.=) $1::text
+               AND EXISTS (
+                 SELECT 1
+                 FROM pg_catalog.pg_get_loaded_modules() AS loaded
+                 WHERE loaded.module_name OPERATOR(pg_catalog.=) 'pg_stat_statements'
+                    OR loaded.file_name OPERATOR(pg_catalog.~)
+                      '(^|/)pg_stat_statements([.][^/]*)?$'
+               ) AS preflight_still_valid`,
+      values: [postmasterStartedAt],
+    }, { domain: "factory", operation: "verifyPostmasterContinuity", signal: options.signal });
+    if (continuity.rows[0]?.preflight_still_valid !== true) {
+      throw migrationError("verifyPostmasterContinuity");
     }
 
     const schemaOwnership = await transaction.query<SchemaOwnershipRow>({

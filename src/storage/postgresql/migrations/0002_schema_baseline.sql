@@ -374,6 +374,9 @@ CREATE TABLE lcm.summary_large_files (
     REFERENCES lcm.summaries(project_id, conversation_id, summary_id) ON DELETE CASCADE
 );
 
+COMMENT ON TABLE lcm.summary_large_files IS
+  'Ordered summary provenance whose file_id is deliberately opaque: unresolved and cross-conversation references are valid, and deleting a large_files row must preserve this reference.';
+
 CREATE INDEX summary_large_files_file_idx
   ON lcm.summary_large_files (project_id, file_id, conversation_id, summary_id, ordinal);
 CREATE INDEX summary_large_files_summary_idx

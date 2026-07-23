@@ -138,7 +138,7 @@ describe("PostgreSQL migration runner", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "dcf82e9f9ad0084467696a8a1a1650897ddfb525b0c417b9bcb771d0af78d275" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "469367263cf040340b73af7b83f1fedb05eeef987ccc261057860e9706bd67ed" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
@@ -174,8 +174,8 @@ describe("PostgreSQL migration runner", () => {
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
       "lockMigrations",
-      "verifyPostmasterContinuity",
       "preflightServerVersion",
+      "verifyPostmasterContinuity",
       "preflightSchemaOwnership",
       "inspectMigrationLedger",
       "applyMigration:0001_first",
@@ -367,13 +367,19 @@ describe("PostgreSQL migration runner", () => {
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
       "lockMigrations",
-      "verifyPostmasterContinuity",
       "preflightServerVersion",
+      "verifyPostmasterContinuity",
       "preflightSchemaOwnership",
     ]);
   });
 
   it.each([
+    {
+      label: "PostgreSQL 17",
+      serverVersion: 170006 as const,
+      serverVersionNumber: 170006,
+      serverMajorVersion: 17,
+    },
     {
       label: "wrong",
       serverVersion: 190001 as const,
@@ -426,8 +432,16 @@ describe("PostgreSQL migration runner", () => {
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
       "lockMigrations",
-      "verifyPostmasterContinuity",
       "preflightServerVersion",
     ]);
+    expect(fake.seam.query.mock.calls.every(([config]) => {
+      const text = typeof config === "object"
+        && config !== null
+        && "text" in config
+        && typeof config.text === "string"
+        ? config.text
+        : "";
+      return !text.includes("pg_get_loaded_modules");
+    })).toBe(true);
   });
 });

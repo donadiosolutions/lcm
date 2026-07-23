@@ -174,7 +174,7 @@ deletion.
 | `summary_parents` | Child-summary-owned DAG edge: deleting the child cascades its outgoing edges, while direct parent deletion fails at commit. | Scoped same-conversation foreign keys; the parent side is deferred `NO ACTION` so a populated conversation-root cascade can delete the entire graph; unique parent and ordinal per child, nonnegative ordinal, and no self-edge. `summary_parents_parent_idx` supports deterministic reverse traversal. General cycle rejection is a transactional repository invariant owned by #87 with #90 fencing; adapters remain disabled until it is implemented. |
 | `context_items` | Ordered projection owned by a conversation and cascades with it. Direct deletion of a referenced message or summary fails at commit. | `(project_id, conversation_id, ordinal)` primary key; both source references are deferred `NO ACTION` so populated conversation-root cascades remain valid; nonnegative ordinal; exactly one message or summary reference consistent with `item_type`. Partial message and summary indexes support reverse membership checks. Atomic range replacement and stale-fence rejection belong to #87/#90. |
 | `large_files` | Metadata owned by a conversation and cascades with it; external bytes at `storage_uri` have their own lifecycle. | Project-scoped `(project_id, file_id)` primary key preserves caller IDs independently in every project, with a UUIDv7-as-text default when omitted; nonnegative optional byte size; nonblank storage URI; conversation-scoped identity. `large_files_conversation_order_idx` orders by creation time and stable ID. |
-| `summary_large_files` | Ordered file-reference array owned by a summary and deleted with it. The file ID is opaque provenance: it can remain unresolved or name a file owned by another conversation without blocking summary creation. | The owner project, conversation, and summary remain protected by a scoped summary foreign key. Ordinal identity preserves caller order and repeated IDs; file IDs deliberately have no existence foreign key. `summary_large_files_file_idx` supports owner-project/exact-ID reverse lookup without asserting local file ownership. |
+| `summary_large_files` | Ordered file-reference array owned by a summary and deleted with it. The file ID is opaque provenance: it can remain unresolved or name a file owned by another conversation without blocking summary creation. Direct deletion of a matching `large_files` row preserves the historical summary reference. | The owner project, conversation, and summary remain protected by a scoped summary foreign key. Ordinal identity preserves caller order and repeated IDs; file IDs deliberately have no existence foreign key. `summary_large_files_file_idx` supports owner-project/exact-ID reverse lookup without asserting local file ownership. |
 
 ### Recall and administration
 
@@ -256,6 +256,10 @@ Migration captures the postmaster start time before this pre-transaction probe
 and, under the advisory lock, verifies that the postmaster did not restart and
 that the module remains loaded. Guidance tells the administrator to add the
 module to `shared_preload_libraries`, restart PostgreSQL, and rerun readiness.
+Runtime health does not evaluate the search fingerprint, which depends on
+`public.digest`, until every required extension is current in `public`; missing
+or misplaced `pgcrypto` therefore returns the structured extension diagnostic
+instead of a secondary fingerprint-query failure.
 
 For a relocatable extension in the wrong namespace, guidance uses `ALTER
 EXTENSION ... SET SCHEMA "public"`. For a non-relocatable installation, it
@@ -293,7 +297,8 @@ on a provider does not justify silently expanding the baseline.
 3. The migration runner validates packaged SHA-256 artifacts, captures the
    postmaster epoch, and performs the functional extension probe before opening
    the DDL transaction. It then opens one transaction, takes a database-scoped
-   transaction advisory lock, verifies postmaster continuity and PostgreSQL 18,
+   transaction advisory lock, verifies PostgreSQL 18 before invoking the
+   version-specific loaded-module catalog, verifies postmaster continuity,
    verifies that any existing
    `lcm` schema is owned by the current migration role, and then verifies the
    complete ordered ledger. `0001` creates the `lcm` schema and immutable ledger; `0002`
@@ -316,8 +321,10 @@ on a provider does not justify silently expanding the baseline.
 `lcm.search_v1` uses PostgreSQL 18's `pg_catalog.default` parser and an
 LCM-owned `lcm.simple_v1` dictionary with 19 explicit token mappings. Its
 catalog fingerprint covers the parser OID, ordered token mappings, dictionary
-template/options, and ownership; no runtime role owns either object. All stored
-vectors and query constructors must name `lcm.search_v1`.
+template/options and ownership, plus the complete
+`lcm.normalize_search_text(text)` definition, owner, security mode, and
+per-function configuration; no runtime role owns any of these objects. All
+stored vectors and query constructors must name `lcm.search_v1`.
 
 Changing the text-search configuration or normalization rules requires a new
 immutable migration; updating `unaccent` alone does not adopt new mappings.

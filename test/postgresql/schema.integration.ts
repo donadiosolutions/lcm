@@ -161,6 +161,51 @@ describe("PostgreSQL schema baseline", () => {
     });
   });
 
+  it("fails closed when the normalization function definition drifts", async () => {
+    await withPostgreSqlTestDatabase("schema-function-drift", async (database) => {
+      await database.migrator.query({
+        text: `CREATE OR REPLACE FUNCTION lcm.normalize_search_text(input text)
+               RETURNS text
+               LANGUAGE sql
+               IMMUTABLE
+               PARALLEL SAFE
+               SET search_path = pg_catalog
+               AS $function$ SELECT $1 $function$`,
+      }, { domain: "factory", operation: "simulateNormalizationDefinitionDrift" });
+
+      await expect(inspectPostgreSqlSearchConfiguration(database.migrator))
+        .resolves.toMatchObject({
+          actualSha256: expect.not.stringMatching(
+            new RegExp(`^${POSTGRESQL_SEARCH_CONFIGURATION_SHA256}$`, "u"),
+          ),
+          objectCount: 19,
+          ownershipReady: true,
+          ready: false,
+        });
+    });
+  });
+
+  it("fails closed when normalization function ownership drifts", async () => {
+    await withPostgreSqlTestDatabase("schema-function-owner", async (database) => {
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+      try {
+        await admin.query({
+          text: "ALTER FUNCTION lcm.normalize_search_text(text) OWNER TO lcm_test_runtime",
+        }, { domain: "factory", operation: "simulateNormalizationOwnerDrift" });
+      } finally {
+        await admin.close();
+      }
+
+      await expect(inspectPostgreSqlSearchConfiguration(database.migrator))
+        .resolves.toMatchObject({
+          actualSha256: expect.any(String),
+          objectCount: 19,
+          ownershipReady: false,
+          ready: false,
+        });
+    });
+  });
+
   it("creates the complete catalog, UUIDv7 identities, generated search columns, and least-privilege baseline", async () => {
     await withPostgreSqlTestDatabase("schema-catalog", async (database) => {
       const tables = await database.migrator.query<{ tablename: string }>({
@@ -169,6 +214,19 @@ describe("PostgreSQL schema baseline", () => {
                ORDER BY tablename`,
       }, { domain: "factory", operation: "inspectSchemaTables" });
       expect(tables.rows.map((row) => row.tablename)).toEqual(DOMAIN_TABLES);
+      await expect(database.migrator.query<{ description: string }>({
+        text: `SELECT pg_catalog.obj_description(
+                 'lcm.summary_large_files'::pg_catalog.regclass,
+                 'pg_class'
+               ) AS description`,
+      }, { domain: "factory", operation: "inspectOpaqueSummaryFileContract" }))
+        .resolves.toMatchObject({
+          rows: [{
+            description: expect.stringContaining(
+              "deleting a large_files row must preserve this reference",
+            ),
+          }],
+        });
 
       const constraints = await database.migrator.query<{
         table_name: string;
@@ -1191,6 +1249,44 @@ describe("PostgreSQL schema baseline", () => {
         .resolves.toMatchObject({
           rows: [{ file_ids: [crossConversationFileId, crossConversationFileId, unresolvedFileId] }],
         });
+      const directlyDeletedFileId = "file_cccccccccccccccc";
+      await database.migrator.query({
+        text: `INSERT INTO lcm.large_files(file_id,project_id,conversation_id,storage_uri)
+               VALUES($1,$2,$3,'file:///direct-delete')`,
+        values: [
+          directlyDeletedFileId,
+          scope.projectId,
+          scope.conversationId,
+        ],
+      }, { domain: "factory", operation: "seedDirectlyDeletedLargeFile" });
+      await database.migrator.query({
+        text: `INSERT INTO lcm.summary_large_files
+                 (project_id,conversation_id,summary_id,file_id,ordinal)
+               VALUES($1,$2,$3,$4,3)`,
+        values: [
+          scope.projectId,
+          scope.conversationId,
+          localSummary.rows[0]?.summary_id,
+          directlyDeletedFileId,
+        ],
+      }, { domain: "factory", operation: "referenceDirectlyDeletedLargeFile" });
+      await database.migrator.query({
+        text: `DELETE FROM lcm.large_files
+               WHERE project_id=$1 AND conversation_id=$2 AND file_id=$3`,
+        values: [scope.projectId, scope.conversationId, directlyDeletedFileId],
+      }, { domain: "factory", operation: "deleteReferencedLargeFileDirectly" });
+      await expect(database.migrator.query<{ retained: boolean }>({
+        text: `SELECT EXISTS (
+                 SELECT 1 FROM lcm.summary_large_files
+                 WHERE project_id=$1 AND summary_id=$2 AND file_id=$3
+               ) AS retained`,
+        values: [
+          scope.projectId,
+          localSummary.rows[0]?.summary_id,
+          directlyDeletedFileId,
+        ],
+      }, { domain: "factory", operation: "verifyOpaqueSummaryFileSurvivesDeletion" }))
+        .resolves.toMatchObject({ rows: [{ retained: true }] });
       await expect(database.migrator.query<{
         earliest_only: boolean;
         latest_only: boolean;

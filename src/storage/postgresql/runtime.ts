@@ -292,6 +292,26 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       const extensions = await inspectRequiredPostgreSqlExtensions(this, {
         operation: "healthRequiredExtensions",
       });
+      const runtimeReady = row?.tls === true
+        && row.timezone.toUpperCase() === "UTC";
+      const extensionsReady = areRequiredPostgreSqlExtensionsReady(extensions);
+      if (!runtimeReady || !extensionsReady) {
+        return {
+          status: "unavailable",
+          backend: "postgresql",
+          ...connectionDiagnostics,
+          extensions,
+          error: runtimeReady
+            ? new PostgreSqlExtensionPreflightError(extensions, "health")
+            : new StorageOperationError(
+              "STORAGE_INITIALIZATION_FAILED",
+              "postgresql",
+              undefined,
+              "factory",
+              "health",
+              ),
+        };
+      }
       const searchConfiguration = await inspectPostgreSqlSearchConfiguration(this, {
         operation: "healthSearchConfiguration",
       });
@@ -300,25 +320,12 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
         extensions,
         searchConfiguration,
       };
-      const runtimeReady = row?.tls === true
-        && row.timezone.toUpperCase() === "UTC";
-      const extensionsReady = areRequiredPostgreSqlExtensionsReady(extensions);
-      if (!runtimeReady || !extensionsReady || !searchConfiguration.ready) {
+      if (!searchConfiguration.ready) {
         return {
           status: "unavailable",
           backend: "postgresql",
           ...diagnostics,
-          error: runtimeReady && extensionsReady
-            ? new PostgreSqlSearchConfigurationPreflightError(searchConfiguration, "health")
-            : runtimeReady
-              ? new PostgreSqlExtensionPreflightError(extensions, "health")
-            : new StorageOperationError(
-              "STORAGE_INITIALIZATION_FAILED",
-              "postgresql",
-              undefined,
-              "factory",
-              "health",
-              ),
+          error: new PostgreSqlSearchConfigurationPreflightError(searchConfiguration, "health"),
         };
       }
       return {

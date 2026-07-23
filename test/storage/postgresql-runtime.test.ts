@@ -69,6 +69,14 @@ function isExtensionInspection(input: unknown): boolean {
     && input.text.includes("pg_available_extensions");
 }
 
+function isSearchConfigurationInspection(input: unknown): boolean {
+  return typeof input === "object"
+    && input !== null
+    && "text" in input
+    && typeof input.text === "string"
+    && input.text.includes("pg_ts_config_map");
+}
+
 function healthFixtures(
   healthRow: HealthFixtureRow = HEALTHY_ROW,
   extensionRows = CURRENT_EXTENSION_ROWS,
@@ -1042,8 +1050,8 @@ describe("PostgreSQL runtime", () => {
   it.each([
     {
       label: "unavailable",
-      rows: CURRENT_EXTENSION_ROWS.slice(1),
-      expected: { name: "pg_stat_statements", available: false, status: "unavailable" },
+      rows: CURRENT_EXTENSION_ROWS.filter(({ name }) => name !== "pgcrypto"),
+      expected: { name: "pgcrypto", available: false, status: "unavailable" },
     },
     {
       label: "uninstalled",
@@ -1092,11 +1100,11 @@ describe("PostgreSQL runtime", () => {
     },
     {
       label: "wrong namespace",
-      rows: CURRENT_EXTENSION_ROWS.map((row) => row.name === "pg_trgm"
+      rows: CURRENT_EXTENSION_ROWS.map((row) => row.name === "pgcrypto"
         ? { ...row, installed_schema: "search" }
         : row),
       expected: {
-        name: "pg_trgm",
+        name: "pgcrypto",
         installedSchema: "search",
         requiredSchema: "public",
         status: "wrong-namespace",
@@ -1114,6 +1122,10 @@ describe("PostgreSQL runtime", () => {
         extensions: expect.arrayContaining([expect.objectContaining(expected)]),
       },
     });
+    const health = await runtime.runtime.health();
+    expect(health).not.toHaveProperty("searchConfiguration");
+    expect(runtime.query.mock.calls.some(([input]) => isSearchConfigurationInspection(input)))
+      .toBe(false);
   });
 
   it("reports text-search catalog drift as unavailable readiness", async () => {

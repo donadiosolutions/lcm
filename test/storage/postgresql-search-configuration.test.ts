@@ -54,6 +54,14 @@ describe("PostgreSQL text-search configuration readiness", () => {
       "pg_catalog.pg_ts_dict",
       "dicttemplate",
       "dictinitoption",
+      "pg_catalog.pg_get_functiondef",
+      "normalize_search_text",
+      "proargtypes",
+      "function_owner",
+      "function_security_invoker",
+      "function_config",
+      "prosecdef",
+      "proconfig",
     ]) expect(inspectionSql).toContain(catalogField);
 
     const direct = executor({
