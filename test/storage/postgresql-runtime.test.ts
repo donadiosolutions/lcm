@@ -48,6 +48,7 @@ const CURRENT_EXTENSION_ROWS = [
   installed_version: "1.0",
   installed_schema: "public",
   relocatable: true,
+  preloaded: name === "pg_stat_statements" ? true : null,
 }));
 
 function isExtensionInspection(input: unknown): boolean {
@@ -926,6 +927,43 @@ describe("PostgreSQL runtime", () => {
         ? { ...row, installed_version: "0.9" }
         : row),
       expected: { name: "unaccent", available: true, status: "outdated" },
+    },
+    {
+      label: "installed but unavailable",
+      rows: CURRENT_EXTENSION_ROWS.map((row) => row.name === "pgcrypto"
+        ? { ...row, default_version: null, relocatable: null }
+        : row),
+      expected: {
+        name: "pgcrypto",
+        available: false,
+        installedVersion: "1.0",
+        installedSchema: "public",
+        status: "installed-unavailable",
+      },
+    },
+    {
+      label: "not preloaded",
+      rows: CURRENT_EXTENSION_ROWS.map((row) => row.name === "pg_stat_statements"
+        ? { ...row, preloaded: false }
+        : row),
+      expected: {
+        name: "pg_stat_statements",
+        preloadRequired: true,
+        preloaded: false,
+        status: "not-preloaded",
+      },
+    },
+    {
+      label: "wrong namespace",
+      rows: CURRENT_EXTENSION_ROWS.map((row) => row.name === "pg_trgm"
+        ? { ...row, installed_schema: "search" }
+        : row),
+      expected: {
+        name: "pg_trgm",
+        installedSchema: "search",
+        requiredSchema: "public",
+        status: "wrong-namespace",
+      },
     },
   ])("reports $label required extensions as unavailable readiness", async ({ rows, expected }) => {
     const runtime = healthFixtures(HEALTHY_ROW, rows);

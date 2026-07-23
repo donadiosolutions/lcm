@@ -18,6 +18,7 @@ type ExtensionRow = QueryResultRow & {
   installed_version: string | null;
   installed_schema: string | null;
   relocatable: boolean | null;
+  preloaded: boolean | null;
 };
 
 function result<R extends QueryResultRow>(rows: R[]): QueryResult<R> {
@@ -38,6 +39,7 @@ const CURRENT_ROWS: ExtensionRow[] = REQUIRED_POSTGRESQL_EXTENSIONS.map((name) =
   installed_version: "1.0",
   installed_schema: "public",
   relocatable: true,
+  preloaded: name === "pg_stat_statements" ? true : null,
 }));
 
 describe("PostgreSQL required extension preflight", () => {
@@ -58,12 +60,14 @@ describe("PostgreSQL required extension preflight", () => {
         requiredSchema: "public",
         installedSchema: "public",
         relocatable: true,
+        preloadRequired: name === "pg_stat_statements",
+        preloaded: name === "pg_stat_statements" ? true : null,
         status: "current",
         remediation: null,
       })),
     );
     expect(seam.query).toHaveBeenCalledWith({
-      text: expect.stringContaining("FROM pg_available_extensions"),
+      text: expect.stringMatching(/FROM required[\s\S]+LEFT JOIN pg_available_extensions/u),
       values: [REQUIRED_POSTGRESQL_EXTENSIONS],
     }, {
       domain: "factory",
@@ -75,10 +79,10 @@ describe("PostgreSQL required extension preflight", () => {
   it("reports unavailable, uninstalled, and outdated extensions with sanitized guidance", async () => {
     const unsafeVersion = "1.3'; DROP EXTENSION pg_trgm; --";
     const seam = executor([
-      { name: "pg_trgm", default_version: "1.6", installed_version: null, installed_schema: null, relocatable: null },
-      { name: "pgcrypto", default_version: unsafeVersion, installed_version: "1.2", installed_schema: "public", relocatable: true },
-      { name: "unaccent", default_version: null, installed_version: null, installed_schema: null, relocatable: null },
-      { name: "not_required", default_version: "9", installed_version: "9", installed_schema: "private", relocatable: true },
+      { name: "pg_trgm", default_version: "1.6", installed_version: null, installed_schema: null, relocatable: null, preloaded: null },
+      { name: "pgcrypto", default_version: unsafeVersion, installed_version: "1.2", installed_schema: "public", relocatable: true, preloaded: null },
+      { name: "unaccent", default_version: null, installed_version: null, installed_schema: null, relocatable: null, preloaded: null },
+      { name: "not_required", default_version: "9", installed_version: "9", installed_schema: "private", relocatable: true, preloaded: null },
     ]);
     const signal = new AbortController().signal;
     const statuses = await inspectRequiredPostgreSqlExtensions(seam, {
@@ -95,6 +99,8 @@ describe("PostgreSQL required extension preflight", () => {
         requiredSchema: "public",
         installedSchema: null,
         relocatable: null,
+        preloadRequired: true,
+        preloaded: null,
         status: "unavailable",
         remediation: "Install extension \"pg_stat_statements\" on the PostgreSQL server, then run CREATE EXTENSION \"pg_stat_statements\" WITH SCHEMA \"public\";",
       },
@@ -106,6 +112,8 @@ describe("PostgreSQL required extension preflight", () => {
         requiredSchema: "public",
         installedSchema: null,
         relocatable: null,
+        preloadRequired: false,
+        preloaded: null,
         status: "uninstalled",
         remediation: "CREATE EXTENSION \"pg_trgm\" WITH SCHEMA \"public\";",
       },
@@ -117,6 +125,8 @@ describe("PostgreSQL required extension preflight", () => {
         requiredSchema: "public",
         installedSchema: "public",
         relocatable: true,
+        preloadRequired: false,
+        preloaded: null,
         status: "outdated",
         remediation: "ALTER EXTENSION \"pgcrypto\" UPDATE TO '1.3''; DROP EXTENSION pg_trgm; --';",
       },
@@ -128,6 +138,8 @@ describe("PostgreSQL required extension preflight", () => {
         requiredSchema: "public",
         installedSchema: null,
         relocatable: null,
+        preloadRequired: false,
+        preloaded: null,
         status: "unavailable",
         remediation: "Install extension \"unaccent\" on the PostgreSQL server, then run CREATE EXTENSION \"unaccent\" WITH SCHEMA \"public\";",
       },
@@ -139,6 +151,65 @@ describe("PostgreSQL required extension preflight", () => {
     });
     expect(areRequiredPostgreSqlExtensionsReady(statuses)).toBe(false);
     expect(areRequiredPostgreSqlExtensionsReady(statuses.slice(1))).toBe(false);
+  });
+
+  it("preserves catalog data when installed extension control files are unavailable", async () => {
+    const installedVersion = "1.3'; SELECT private_data; --";
+    const seam = executor(CURRENT_ROWS.map((row) => row.name === "pgcrypto"
+      ? {
+        ...row,
+        default_version: null,
+        installed_version: installedVersion,
+        relocatable: null,
+      }
+      : row));
+
+    const statuses = await inspectRequiredPostgreSqlExtensions(seam);
+    const pgcrypto = statuses.find((extension) => extension.name === "pgcrypto");
+    expect(pgcrypto).toEqual({
+      name: "pgcrypto",
+      available: false,
+      defaultVersion: null,
+      installedVersion,
+      requiredSchema: "public",
+      installedSchema: "public",
+      relocatable: null,
+      preloadRequired: false,
+      preloaded: null,
+      status: "installed-unavailable",
+      remediation: "Restore extension \"pgcrypto\" control files for installed version '1.3''; SELECT private_data; --' on the PostgreSQL server, then rerun readiness checks.",
+    });
+    expect(pgcrypto?.remediation).not.toContain("CREATE EXTENSION");
+    expect(areRequiredPostgreSqlExtensionsReady(statuses)).toBe(false);
+  });
+
+  it("requires pg_stat_statements to be configured and functionally loaded", async () => {
+    const seam = executor(CURRENT_ROWS.map((row) => row.name === "pg_stat_statements"
+      ? { ...row, preloaded: false }
+      : row));
+
+    const statuses = await inspectRequiredPostgreSqlExtensions(seam);
+    expect(statuses[0]).toMatchObject({
+      name: "pg_stat_statements",
+      preloadRequired: true,
+      preloaded: false,
+      status: "not-preloaded",
+      remediation: "Add \"pg_stat_statements\" to shared_preload_libraries and restart PostgreSQL.",
+    });
+    expect(areRequiredPostgreSqlExtensionsReady(statuses)).toBe(false);
+    expect(seam.query.mock.calls[0]?.[0]).toMatchObject({
+      text: expect.stringContaining("pg_get_loaded_modules"),
+    });
+
+    await expect(assertRequiredPostgreSqlExtensionsReady(executor(
+      CURRENT_ROWS.map((row) => row.name === "pg_stat_statements"
+        ? { ...row, preloaded: false }
+        : row),
+    ))).rejects.toMatchObject({
+      extensions: expect.arrayContaining([
+        expect.objectContaining({ name: "pg_stat_statements", status: "not-preloaded" }),
+      ]),
+    });
   });
 
   it("rejects wrong namespaces with relocatable and non-relocatable remediation", async () => {

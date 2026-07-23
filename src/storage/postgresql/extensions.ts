@@ -27,6 +27,7 @@ type ExtensionRow = QueryResultRow & {
   installed_version: string | null;
   installed_schema: string | null;
   relocatable: boolean | null;
+  preloaded: boolean | null;
 };
 
 function quoteLiteral(value: string): string {
@@ -41,6 +42,7 @@ function remediation(
   name: RequiredExtensionName,
   status: PostgreSqlExtensionStatus["status"],
   defaultVersion: string | null,
+  installedVersion: string | null,
   requiredSchema: PostgreSqlExtensionStatus["requiredSchema"],
   relocatable: boolean | null,
 ): string | null {
@@ -52,6 +54,12 @@ function remediation(
     return relocatable === true
       ? `ALTER EXTENSION "${name}" SET SCHEMA ${quoteIdentifier(requiredSchema)};`
       : `Extension "${name}" must be reinstalled in schema ${quoteIdentifier(requiredSchema)} because its installed version is not relocatable.`;
+  }
+  if (status === "not-preloaded") {
+    return `Add "${name}" to shared_preload_libraries and restart PostgreSQL.`;
+  }
+  if (status === "installed-unavailable") {
+    return `Restore extension "${name}" control files for installed version ${quoteLiteral(installedVersion as string)} on the PostgreSQL server, then rerun readiness checks.`;
   }
   const create = `CREATE EXTENSION "${name}" WITH SCHEMA ${quoteIdentifier(requiredSchema)};`;
   return status === "unavailable"
@@ -68,16 +76,22 @@ function extensionStatus(
   const requiredSchema = REQUIRED_POSTGRESQL_EXTENSION_SCHEMAS[name];
   const installedSchema = row?.installed_schema ?? null;
   const relocatable = row?.relocatable ?? null;
-  const available = row !== undefined && defaultVersion !== null;
+  const preloadRequired = name === "pg_stat_statements";
+  const preloaded = preloadRequired ? row?.preloaded ?? null : null;
+  const available = defaultVersion !== null;
   const status: PostgreSqlExtensionStatus["status"] = !available
-    ? "unavailable"
+    ? installedVersion === null
+      ? "unavailable"
+      : "installed-unavailable"
     : installedVersion === null
       ? "uninstalled"
       : installedSchema !== requiredSchema
         ? "wrong-namespace"
-        : installedVersion === defaultVersion
-          ? "current"
-          : "outdated";
+        : installedVersion !== defaultVersion
+          ? "outdated"
+          : preloadRequired && preloaded !== true
+            ? "not-preloaded"
+            : "current";
   return {
     name,
     available,
@@ -86,8 +100,17 @@ function extensionStatus(
     requiredSchema,
     installedSchema,
     relocatable,
+    preloadRequired,
+    preloaded,
     status,
-    remediation: remediation(name, status, defaultVersion, requiredSchema, relocatable),
+    remediation: remediation(
+      name,
+      status,
+      defaultVersion,
+      installedVersion,
+      requiredSchema,
+      relocatable,
+    ),
   };
 }
 
@@ -122,22 +145,35 @@ export async function inspectRequiredPostgreSqlExtensions(
   options: { readonly operation?: string; readonly signal?: AbortSignal } = {},
 ): Promise<readonly PostgreSqlExtensionStatus[]> {
   const result = await executor.query<ExtensionRow, [readonly RequiredExtensionName[]]>({
-    text: `SELECT available.name::text,
+    text: `WITH required(name) AS (
+             SELECT pg_catalog.unnest($1::text[])
+           )
+           SELECT required.name,
                   available.default_version,
-                  available.installed_version,
+                  installed.extversion::text AS installed_version,
                   namespace.nspname::text AS installed_schema,
-                  installed_version.relocatable
-           FROM pg_available_extensions AS available
+                  installed_version.relocatable,
+                  CASE WHEN required.name = 'pg_stat_statements'
+                    THEN EXISTS (
+                      SELECT 1
+                      FROM pg_catalog.pg_get_loaded_modules() AS loaded
+                      WHERE loaded.module_name = 'pg_stat_statements'
+                         OR loaded.file_name ~ '(^|/)pg_stat_statements([.][^/]*)?$'
+                    )
+                    ELSE NULL
+                  END AS preloaded
+           FROM required
+           LEFT JOIN pg_available_extensions AS available
+             ON available.name = required.name
            LEFT JOIN pg_extension AS installed
-             ON installed.extname = available.name
+             ON installed.extname = required.name
            LEFT JOIN pg_namespace AS namespace
              ON namespace.oid = installed.extnamespace
            LEFT JOIN pg_available_extension_versions AS installed_version
-             ON installed_version.name = available.name
-            AND installed_version.version = available.installed_version
+             ON installed_version.name = required.name
+            AND installed_version.version = installed.extversion
             AND installed_version.installed
-           WHERE available.name = ANY($1::text[])
-           ORDER BY available.name`,
+           ORDER BY required.name`,
     values: [REQUIRED_POSTGRESQL_EXTENSIONS],
   }, {
     domain: "factory",

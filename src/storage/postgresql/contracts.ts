@@ -41,6 +41,8 @@ export interface PostgreSqlMigrationResult {
 
 export type PostgreSqlExtensionReadiness =
   | "current"
+  | "installed-unavailable"
+  | "not-preloaded"
   | "outdated"
   | "unavailable"
   | "uninstalled"
@@ -54,6 +56,8 @@ export interface PostgreSqlExtensionStatus {
   readonly requiredSchema: "public";
   readonly installedSchema: string | null;
   readonly relocatable: boolean | null;
+  readonly preloadRequired: boolean;
+  readonly preloaded: boolean | null;
   readonly status: PostgreSqlExtensionReadiness;
   readonly remediation: string | null;
 }

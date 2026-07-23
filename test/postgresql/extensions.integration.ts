@@ -7,11 +7,37 @@ import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations
 import {
   assertHarnessReady,
   createPostgreSqlTestDatabase,
+  withPostgreSqlTestDatabase,
 } from "./harness.js";
 
 beforeAll(assertHarnessReady);
 
 describe("PostgreSQL extension readiness", () => {
+  it("verifies pg_stat_statements is configured and loaded before reporting current", async () => {
+    await withPostgreSqlTestDatabase("extension-preload", async (database) => {
+      const statuses = await inspectRequiredPostgreSqlExtensions(database.migrator);
+      expect(statuses).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          name: "pg_stat_statements",
+          preloadRequired: true,
+          preloaded: true,
+          status: "current",
+          remediation: null,
+        }),
+      ]));
+      await expect(database.runtime.health()).resolves.toMatchObject({
+        status: "healthy",
+        extensions: expect.arrayContaining([
+          expect.objectContaining({
+            name: "pg_stat_statements",
+            preloaded: true,
+            status: "current",
+          }),
+        ]),
+      });
+    });
+  });
+
   it("blocks migrations before LCM schema creation when a parity extension is missing", async () => {
     const database = await createPostgreSqlTestDatabase("missing-extension", {
       omitExtensions: ["unaccent"],
