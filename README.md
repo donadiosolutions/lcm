@@ -171,6 +171,9 @@ If you also want MCP inside Codex, run `lcm connectors install codex --type mcp`
 
 See [`docs/vscode-codex.md`](docs/vscode-codex.md) for the current VS Code/Codex setup path and remaining limitations.
 
+Repository maintainers can configure the on-demand Claude assistant and
+automatic pull request reviewer using the [Claude GitHub workflows guide](docs/github-claude.md).
+
 ## Hooks
 
 Claude Code uses plugin-managed hooks. All Claude Code hooks auto-heal: each validates that all required entries remain registered and repairs missing entries before continuing. Codex uses native hooks from `~/.codex/hooks.json`.
