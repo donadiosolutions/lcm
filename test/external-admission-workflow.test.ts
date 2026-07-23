@@ -135,6 +135,12 @@ describe("external admission workflow", () => {
     expect(evaluator.match(/Backing CI workflow run/gu)).toHaveLength(2);
     expect(evaluator.match(/ci_run_evaluation=/gu)).toHaveLength(2);
     expect(evaluator.match(/ci_run_terminal_failure=/gu)).toHaveLength(2);
+    expect(evaluator).toContain(
+      'run $ci_run_id evaluated as $(jq -r \'.state\' <<<"$ci_run_evaluation"): $ci_run_terminal_failure',
+    );
+    expect(evaluator).toContain(
+      'CI run $current_ci_run_id evaluated as $(jq -r \'.state\' <<<"$current_ci_run_evaluation")',
+    );
     expect(evaluator.match(/sleep 15\n\s+continue/gu)).toHaveLength(2);
     expect(policySource).toContain('"pending"');
     expect(policySource).toContain('"queued"');

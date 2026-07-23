@@ -241,7 +241,7 @@ jobs:
                 ci_run_evaluation="$(evaluate_ci_run "$ci_run_id" <<<"$ci_run")"
                 ci_run_terminal_failure="$(jq -r '.terminalFailure // empty' <<<"$ci_run_evaluation")"
                 if [[ -n "$ci_run_terminal_failure" ]]; then
-                  echo "Successful CI check is not backed by a successful required pull-request workflow run: $ci_run_terminal_failure" >&2
+                  echo "Successful CI check is not backed by a successful required pull-request workflow run; run $ci_run_id evaluated as $(jq -r '.state' <<<"$ci_run_evaluation"): $ci_run_terminal_failure" >&2
                   exit 1
                 fi
                 if [[ "$(jq -r '.ready' <<<"$ci_run_evaluation")" != true ]]; then
@@ -313,7 +313,7 @@ jobs:
                   jq -r '.terminalFailure // empty' <<<"$current_ci_run_evaluation"
                 )"
                 if [[ -n "$current_ci_run_terminal_failure" ]]; then
-                  echo "CI run became invalid or terminal during final admission validation: $current_ci_run_terminal_failure" >&2
+                  echo "CI run $current_ci_run_id evaluated as $(jq -r '.state' <<<"$current_ci_run_evaluation") and became invalid or terminal during final admission validation: $current_ci_run_terminal_failure" >&2
                   exit 1
                 fi
                 if [[ "$(jq -r '.ready' <<<"$current_ci_run_evaluation")" != true ]]; then
