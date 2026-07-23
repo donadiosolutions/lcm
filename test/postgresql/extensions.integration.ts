@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import {
   inspectRequiredPostgreSqlExtensions,
   PostgreSqlExtensionPreflightError,
+  REQUIRED_POSTGRESQL_EXTENSIONS,
 } from "../../src/storage/postgresql/extensions.js";
 import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations.js";
 import {
