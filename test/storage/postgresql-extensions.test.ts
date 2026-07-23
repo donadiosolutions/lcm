@@ -74,6 +74,9 @@ describe("PostgreSQL required extension preflight", () => {
       operation: "inspectRequiredExtensions",
       signal: undefined,
     });
+    const inspectionSql = seam.query.mock.calls[0]?.[0].text ?? "";
+    expect(inspectionSql.match(/OPERATOR\(pg_catalog\.=\)/gu)).toHaveLength(7);
+    expect(inspectionSql.match(/OPERATOR\(pg_catalog\.~\)/gu)).toHaveLength(1);
   });
 
   it("requires each current extension name exactly once", async () => {

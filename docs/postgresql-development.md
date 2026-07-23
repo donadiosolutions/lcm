@@ -61,6 +61,12 @@ migration: checksum drift is rejected. Add a new migration instead.
 
 Inside the locked migration transaction, the runner requires PostgreSQL 18 and
 inspects `pg_trgm`, `unaccent`, `pgcrypto`, and `pg_stat_statements`.
+The first transaction operation sets a local `search_path` of
+`pg_catalog, public`; it applies through the advisory lock, all preflights, and
+all pending migration SQL, then reverts on commit or rollback. Extension
+inspection additionally binds its operators to `pg_catalog` because runtime
+health can run outside the migration transaction. Tests deliberately install
+matching-signature hostile functions and operators ahead of `pg_catalog`.
 Every extension must be installed in `public` at its available default version.
 Unavailable, installed-but-unavailable, uninstalled, not-preloaded,
 version-mismatched, or wrong-namespace extensions block migration and runtime

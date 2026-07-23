@@ -63,6 +63,69 @@ describe("PostgreSQL extension readiness", () => {
     });
   });
 
+  it("ignores hostile matching-signature operators when required extensions are absent", async () => {
+    const database = await createPostgreSqlTestDatabase("extension-operators", {
+      omitExtensions: ["pg_stat_statements", "unaccent"],
+      runMigrations: false,
+    });
+
+    try {
+      const statuses = await database.migrator.transaction(async (transaction) => {
+        await transaction.query({
+          text: `CREATE SCHEMA hostile_operators;
+                 CREATE FUNCTION hostile_operators.always_true_text(left_value text, right_value text)
+                 RETURNS boolean LANGUAGE sql IMMUTABLE RETURN true;
+                 CREATE FUNCTION hostile_operators.always_true_name(left_value name, right_value text)
+                 RETURNS boolean LANGUAGE sql IMMUTABLE RETURN true;
+                 CREATE FUNCTION hostile_operators.always_true_oid(left_value oid, right_value oid)
+                 RETURNS boolean LANGUAGE sql IMMUTABLE RETURN true;
+                 CREATE OPERATOR hostile_operators.= (
+                   FUNCTION = hostile_operators.always_true_text,
+                   LEFTARG = text,
+                   RIGHTARG = text
+                 );
+                 CREATE OPERATOR hostile_operators.= (
+                   FUNCTION = hostile_operators.always_true_name,
+                   LEFTARG = name,
+                   RIGHTARG = text
+                 );
+                 CREATE OPERATOR hostile_operators.= (
+                   FUNCTION = hostile_operators.always_true_oid,
+                   LEFTARG = oid,
+                   RIGHTARG = oid
+                 );
+                 CREATE OPERATOR hostile_operators.~ (
+                   FUNCTION = hostile_operators.always_true_text,
+                   LEFTARG = text,
+                   RIGHTARG = text
+                 );
+                 SET LOCAL search_path = hostile_operators, pg_catalog, public`,
+        }, { domain: "factory", operation: "installHostileExtensionOperators" });
+        return inspectRequiredPostgreSqlExtensions(transaction);
+      });
+
+      expect(statuses).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          name: "pg_stat_statements",
+          installedVersion: null,
+          status: "uninstalled",
+        }),
+        expect.objectContaining({
+          name: "unaccent",
+          installedVersion: null,
+          status: "uninstalled",
+        }),
+      ]));
+      expect(statuses.filter(({ name }) => (
+        name === "pg_stat_statements" || name === "unaccent"
+      ))).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ status: "current" }),
+      ]));
+    } finally {
+      await database.drop();
+    }
+  });
+
   it("verifies pg_stat_statements is configured and loaded before reporting current", async () => {
     await withPostgreSqlTestDatabase("extension-preload", async (database) => {
       const statuses = await inspectRequiredPostgreSqlExtensions(database.migrator);

@@ -148,25 +148,26 @@ export async function inspectRequiredPostgreSqlExtensions(
                   installed.extversion::text AS installed_version,
                   namespace.nspname::text AS installed_schema,
                   installed_version.relocatable,
-                  CASE WHEN required.name = 'pg_stat_statements'
+                  CASE WHEN required.name OPERATOR(pg_catalog.=) 'pg_stat_statements'
                     THEN EXISTS (
                       SELECT 1
                       FROM pg_catalog.pg_get_loaded_modules() AS loaded
-                      WHERE loaded.module_name = 'pg_stat_statements'
-                         OR loaded.file_name ~ '(^|/)pg_stat_statements([.][^/]*)?$'
+                      WHERE loaded.module_name OPERATOR(pg_catalog.=) 'pg_stat_statements'
+                         OR loaded.file_name OPERATOR(pg_catalog.~)
+                           '(^|/)pg_stat_statements([.][^/]*)?$'
                     )
                     ELSE NULL
                   END AS preloaded
            FROM required
            LEFT JOIN pg_catalog.pg_available_extensions AS available
-             ON available.name = required.name
+             ON available.name OPERATOR(pg_catalog.=) required.name
            LEFT JOIN pg_catalog.pg_extension AS installed
-             ON installed.extname = required.name
+             ON installed.extname OPERATOR(pg_catalog.=) required.name
            LEFT JOIN pg_catalog.pg_namespace AS namespace
-             ON namespace.oid = installed.extnamespace
+             ON namespace.oid OPERATOR(pg_catalog.=) installed.extnamespace
            LEFT JOIN pg_catalog.pg_available_extension_versions AS installed_version
-             ON installed_version.name = required.name
-            AND installed_version.version = installed.extversion
+             ON installed_version.name OPERATOR(pg_catalog.=) required.name
+            AND installed_version.version OPERATOR(pg_catalog.=) installed.extversion
             AND installed_version.installed
            ORDER BY required.name`,
     values: [REQUIRED_POSTGRESQL_EXTENSIONS],

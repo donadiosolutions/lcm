@@ -142,6 +142,7 @@ describe("PostgreSQL migration runner", () => {
       current: ["0001_first", "0002_second"],
     });
     expect(fake.operations).toEqual([
+      "pinMigrationSearchPath",
       "lockMigrations",
       "preflightServerVersion",
       "preflightRequiredExtensions",
@@ -152,6 +153,13 @@ describe("PostgreSQL migration runner", () => {
       "applyMigration:0002_second",
       "recordMigration",
     ]);
+    expect(fake.seam.query).toHaveBeenNthCalledWith(1, {
+      text: "SET LOCAL search_path = pg_catalog, public",
+    }, {
+      domain: "factory",
+      operation: "pinMigrationSearchPath",
+      signal,
+    });
     expect(fake.seam.transaction).toHaveBeenCalledWith(expect.any(Function), {
       domain: "factory", operation: "migrate", signal,
     });
@@ -188,6 +196,8 @@ describe("PostgreSQL migration runner", () => {
     await expect(runPostgreSqlMigrations(executor({ ledger: true, current }).seam)).resolves.toMatchObject({ applied: [] });
     await expect(runPostgreSqlMigrations(executor({ failOperation: "lockMigrations" }).seam, { migrations: [] }))
       .rejects.toThrow("private SQL failure");
+    await expect(runPostgreSqlMigrations(executor({ failOperation: "pinMigrationSearchPath" }).seam, { migrations: [] }))
+      .rejects.toThrow("private SQL failure");
   });
 
   it("fails extension preflight before inspecting or changing the schema", async () => {
@@ -195,6 +205,7 @@ describe("PostgreSQL migration runner", () => {
     await expect(runPostgreSqlMigrations(fake.seam, { migrations: [migration("0001_first")] }))
       .rejects.toThrow("private SQL failure");
     expect(fake.operations).toEqual([
+      "pinMigrationSearchPath",
       "lockMigrations",
       "preflightServerVersion",
       "preflightRequiredExtensions",
@@ -302,6 +313,7 @@ describe("PostgreSQL migration runner", () => {
       remediation,
     });
     expect(fake.operations).toEqual([
+      "pinMigrationSearchPath",
       "lockMigrations",
       "preflightServerVersion",
       "preflightRequiredExtensions",
@@ -356,6 +368,10 @@ describe("PostgreSQL migration runner", () => {
       serverMajorVersion,
       requiredServerMajorVersion: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
     });
-    expect(fake.operations).toEqual(["lockMigrations", "preflightServerVersion"]);
+    expect(fake.operations).toEqual([
+      "pinMigrationSearchPath",
+      "lockMigrations",
+      "preflightServerVersion",
+    ]);
   });
 });

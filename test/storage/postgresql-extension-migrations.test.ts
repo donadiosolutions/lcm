@@ -98,6 +98,7 @@ describe("PostgreSQL migration extension preflight", () => {
       expect(extension.remediation).not.toContain("CREATE EXTENSION");
     }
     expect(fake.operations).toEqual([
+      "pinMigrationSearchPath",
       "lockMigrations",
       "preflightServerVersion",
       "preflightRequiredExtensions",

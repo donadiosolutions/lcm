@@ -172,11 +172,20 @@ export async function runPostgreSqlMigrations(
   validateMigrations(migrations);
   return executor.transaction(async (transaction) => {
     await transaction.query({
-      text: "SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':lcm:migrations', 0))",
+      text: "SET LOCAL search_path = pg_catalog, public",
+    }, { domain: "factory", operation: "pinMigrationSearchPath", signal: options.signal });
+
+    await transaction.query({
+      text: `SELECT pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+          pg_catalog.current_database() OPERATOR(pg_catalog.||) ':lcm:migrations',
+          0
+        )
+      )`,
     }, { domain: "factory", operation: "lockMigrations", signal: options.signal });
 
     const serverVersion = await transaction.query<ServerVersionRow>({
-      text: "SELECT current_setting('server_version_num')::integer AS server_version_num",
+      text: "SELECT pg_catalog.current_setting('server_version_num')::integer AS server_version_num",
     }, { domain: "factory", operation: "preflightServerVersion", signal: options.signal });
     const serverVersionNumber = sanitizeServerVersionNumber(
       serverVersion.rows[0]?.server_version_num,

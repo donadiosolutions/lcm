@@ -92,6 +92,61 @@ describe("PostgreSQL migrations and database isolation", () => {
     }
   });
 
+  it("pins native built-ins under a hostile ambient search path and restores it after rollback", async () => {
+    const database = await createPostgreSqlTestDatabase("migration-search-path", {
+      runMigrations: false,
+    });
+    try {
+      await database.migrator.query({
+        text: `CREATE SCHEMA hostile_builtins;
+               CREATE FUNCTION hostile_builtins.current_setting(setting_name text)
+               RETURNS text LANGUAGE sql IMMUTABLE RETURN '190000';
+               CREATE FUNCTION hostile_builtins.uuidv7()
+               RETURNS uuid LANGUAGE sql IMMUTABLE
+               RETURN '6ba7b810-9dad-41d1-80b4-00c04fd430c8'::uuid;
+               CREATE FUNCTION hostile_builtins.btrim(input text)
+               RETURNS text LANGUAGE sql IMMUTABLE RETURN '';
+               SET search_path = hostile_builtins, pg_catalog, public`,
+      }, { domain: "factory", operation: "installHostileMigrationBuiltins" });
+
+      const failing = migration(
+        "0002_hostile_failure",
+        "CREATE TABLE lcm.hostile_rollback_probe (id integer); SELECT missing FROM absent;",
+      );
+      await expect(runPostgreSqlMigrations(database.migrator, {
+        migrations: [migration("0001_hostile_ledger", ledgerSql), failing],
+      })).rejects.toMatchObject({ backend: "postgresql" });
+      await expect(database.migrator.query<{ exists: boolean }>({
+        text: "SELECT pg_catalog.to_regclass('lcm.hostile_rollback_probe') IS NOT NULL AS exists",
+      }, { domain: "factory", operation: "verifyHostileMigrationRollback" }))
+        .resolves.toMatchObject({ rows: [{ exists: false }] });
+
+      const rollbackSearchPath = await database.migrator.query<{ search_path: string }>({
+        text: "SHOW search_path",
+      }, { domain: "factory", operation: "verifyRollbackSearchPath" });
+      expect(rollbackSearchPath.rows).toEqual([{
+        search_path: "hostile_builtins, pg_catalog, public",
+      }]);
+
+      await runPostgreSqlMigrations(database.migrator);
+      const inserted = await database.migrator.query<{ machine_version: number }>({
+        text: `INSERT INTO lcm.machines (identity_key)
+               VALUES ('native-builtins')
+               RETURNING pg_catalog.uuid_extract_version(machine_id) AS machine_version`,
+      }, { domain: "factory", operation: "verifyNativeMigrationBuiltins" });
+      expect(inserted.rows).toEqual([{ machine_version: 7 }]);
+
+      const committedSearchPath = await database.migrator.query<{ search_path: string }>({
+        text: "SHOW search_path",
+      }, { domain: "factory", operation: "verifyCommittedSearchPath" });
+      expect(committedSearchPath.rows).toEqual([{
+        search_path: "hostile_builtins, pg_catalog, public",
+      }]);
+    } finally {
+      await database.drop();
+    }
+  });
+
   it("fails closed on a colliding operator function without replacing it", async () => {
     const database = await createPostgreSqlTestDatabase("function-collision", { runMigrations: false });
     try {
