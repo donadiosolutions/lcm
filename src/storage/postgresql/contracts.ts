@@ -43,9 +43,9 @@ export type PostgreSqlExtensionReadiness =
   | "current"
   | "installed-unavailable"
   | "not-preloaded"
-  | "outdated"
   | "unavailable"
   | "uninstalled"
+  | "version-mismatch"
   | "wrong-namespace";
 
 export interface PostgreSqlExtensionStatus {

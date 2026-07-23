@@ -41,14 +41,13 @@ function quoteIdentifier(value: string): string {
 function remediation(
   name: RequiredExtensionName,
   status: PostgreSqlExtensionStatus["status"],
-  defaultVersion: string | null,
   installedVersion: string | null,
   requiredSchema: PostgreSqlExtensionStatus["requiredSchema"],
   relocatable: boolean | null,
 ): string | null {
   if (status === "current") return null;
-  if (status === "outdated") {
-    return `ALTER EXTENSION "${name}" UPDATE TO ${quoteLiteral(defaultVersion as string)};`;
+  if (status === "version-mismatch") {
+    return `Extension "${name}" has different installed and server-default versions. Use a provider-supported extension version-management path to align them, then rerun readiness checks.`;
   }
   if (status === "wrong-namespace") {
     return relocatable === true
@@ -88,7 +87,7 @@ function extensionStatus(
       : installedSchema !== requiredSchema
         ? "wrong-namespace"
         : installedVersion !== defaultVersion
-          ? "outdated"
+          ? "version-mismatch"
           : preloadRequired && preloaded !== true
             ? "not-preloaded"
             : "current";
@@ -106,7 +105,6 @@ function extensionStatus(
     remediation: remediation(
       name,
       status,
-      defaultVersion,
       installedVersion,
       requiredSchema,
       relocatable,

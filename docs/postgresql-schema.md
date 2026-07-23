@@ -209,12 +209,17 @@ in the `public` schema at the server's current `default_version`:
 | `pg_stat_statements` | Operator-visible query statistics for diagnosing repository and query-plan behavior; the server must preload it when required by the installation. |
 
 Preflight reports each extension as `current`, `installed-unavailable`,
-`not-preloaded`, `outdated`, `uninstalled`, `unavailable`, or
+`not-preloaded`, `uninstalled`, `unavailable`, `version-mismatch`, or
 `wrong-namespace`. Structured status includes the installed and default
 versions, `requiredSchema`, `installedSchema`, `relocatable`,
 `preloadRequired`, `preloaded`, and sanitized remediation. New-install guidance
-uses `CREATE EXTENSION ... WITH SCHEMA "public"`; outdated guidance uses `ALTER
-EXTENSION ... UPDATE`.
+uses `CREATE EXTENSION ... WITH SCHEMA "public"`. A version mismatch remains
+unready because the installed version must exactly equal the server default,
+but the diagnostic does not infer upgrade direction or emit `ALTER EXTENSION
+... UPDATE TO`: an installed version may be newer than the default and a
+downgrade path may not exist. Guidance instead tells the administrator to use a
+provider-supported version-management path to align the versions and rerun
+readiness.
 
 `installed-unavailable` means PostgreSQL still records the extension but its
 matching control files are unavailable. Guidance restores those files for the

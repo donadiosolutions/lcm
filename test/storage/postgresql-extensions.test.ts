@@ -89,7 +89,7 @@ describe("PostgreSQL required extension preflight", () => {
     expect(areRequiredPostgreSqlExtensionsReady([...statuses, statuses[0]!])).toBe(false);
   });
 
-  it("reports unavailable, uninstalled, and outdated extensions with sanitized guidance", async () => {
+  it("reports unavailable, uninstalled, and version-mismatched extensions with sanitized guidance", async () => {
     const unsafeVersion = "1.3'; DROP EXTENSION pg_trgm; --";
     const seam = executor([
       { name: "pg_trgm", default_version: "1.6", installed_version: null, installed_schema: null, relocatable: null, preloaded: null },
@@ -140,8 +140,8 @@ describe("PostgreSQL required extension preflight", () => {
         relocatable: true,
         preloadRequired: false,
         preloaded: null,
-        status: "outdated",
-        remediation: "ALTER EXTENSION \"pgcrypto\" UPDATE TO '1.3''; DROP EXTENSION pg_trgm; --';",
+        status: "version-mismatch",
+        remediation: "Extension \"pgcrypto\" has different installed and server-default versions. Use a provider-supported extension version-management path to align them, then rerun readiness checks.",
       },
       {
         name: "unaccent",
@@ -164,6 +164,26 @@ describe("PostgreSQL required extension preflight", () => {
     });
     expect(areRequiredPostgreSqlExtensionsReady(statuses)).toBe(false);
     expect(areRequiredPostgreSqlExtensionsReady(statuses.slice(1))).toBe(false);
+    expect(statuses[2]?.remediation).not.toContain("DROP EXTENSION");
+  });
+
+  it("reports newer installed versions without prescribing a downgrade", async () => {
+    const statuses = await inspectRequiredPostgreSqlExtensions(executor(
+      CURRENT_ROWS.map((row) => row.name === "unaccent"
+        ? { ...row, default_version: "1.0", installed_version: "2.0" }
+        : row),
+    ));
+    const unaccent = statuses.find((extension) => extension.name === "unaccent");
+
+    expect(unaccent).toMatchObject({
+      defaultVersion: "1.0",
+      installedVersion: "2.0",
+      status: "version-mismatch",
+      remediation: "Extension \"unaccent\" has different installed and server-default versions. Use a provider-supported extension version-management path to align them, then rerun readiness checks.",
+    });
+    expect(unaccent?.remediation).not.toContain("ALTER EXTENSION");
+    expect(unaccent?.remediation).not.toContain("UPDATE TO");
+    expect(areRequiredPostgreSqlExtensionsReady(statuses)).toBe(false);
   });
 
   it("preserves catalog data when installed extension control files are unavailable", async () => {

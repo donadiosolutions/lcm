@@ -62,9 +62,13 @@ migration: checksum drift is rejected. Add a new migration instead.
 Inside the locked migration transaction, the runner requires PostgreSQL 18 and
 inspects `pg_trgm`, `unaccent`, `pgcrypto`, and `pg_stat_statements`.
 Every extension must be installed in `public` at its available default version.
-Unavailable, installed-but-unavailable, uninstalled, not-preloaded, outdated,
-or wrong-namespace extensions block migration and runtime readiness with
-structured, sanitized administrator guidance. An installed-but-unavailable
+Unavailable, installed-but-unavailable, uninstalled, not-preloaded,
+version-mismatched, or wrong-namespace extensions block migration and runtime
+readiness with structured, sanitized administrator guidance. A version mismatch
+does not infer upgrade direction or prescribe `ALTER EXTENSION ... UPDATE TO`,
+because the installed version may be newer than the default and a downgrade
+path may not exist. It directs administrators to their provider-supported
+version-management path instead. An installed-but-unavailable
 extension requires restoring its matching control files, not running `CREATE
 EXTENSION`. For an otherwise-current `pg_stat_statements`, least-privilege
 readiness uses `pg_get_loaded_modules()` to verify the active module and does not

@@ -1022,11 +1022,11 @@ describe("PostgreSQL runtime", () => {
       },
     },
     {
-      label: "outdated",
+      label: "version mismatch",
       rows: CURRENT_EXTENSION_ROWS.map((row) => row.name === "unaccent"
         ? { ...row, installed_version: "0.9" }
         : row),
-      expected: { name: "unaccent", available: true, status: "outdated" },
+      expected: { name: "unaccent", available: true, status: "version-mismatch" },
     },
     {
       label: "installed but unavailable",
