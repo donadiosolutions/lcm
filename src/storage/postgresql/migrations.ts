@@ -7,6 +7,11 @@ import type {
   PostgreSqlMigrationResult,
   PostgreSqlQueryExecutor,
 } from "./contracts.js";
+import {
+  assertRequiredPostgreSqlExtensionCatalogReady,
+  assertRequiredPostgreSqlExtensionsReady,
+} from "./extensions.js";
+import { assertPostgreSqlSearchConfigurationReady } from "./search-configuration.js";
 
 const MIGRATION_MANIFEST = [
   {
@@ -14,10 +19,220 @@ const MIGRATION_MANIFEST = [
     filename: "0001_migration_ledger.sql",
     sha256: "e2c0f7e366ba291032f6c62436e8db21b3b5bf3589f7f6c889b18a315eb81e63",
   },
+  {
+    id: "0002_schema_baseline",
+    filename: "0002_schema_baseline.sql",
+    sha256: "6386af13407e8944ce188c9ce19b5944f27b9fa58a4ad8660ede347c8beacfa2",
+  },
 ] as const;
 
 type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
 type LedgerRow = QueryResultRow & { ledger_exists: boolean };
+type ServerVersionRow = QueryResultRow & { server_version_num: unknown };
+type PostmasterEpochRow = QueryResultRow & { postmaster_started_at: Date | string };
+type PostmasterContinuityRow = QueryResultRow & { preflight_still_valid: boolean };
+type SchemaOwnershipRow = QueryResultRow & {
+  current_user_name: unknown;
+  schema_exists: unknown;
+  owned_by_current_user: unknown;
+};
+type SchemaAclRow = QueryResultRow & {
+  schema_exists: unknown;
+  public_create: unknown;
+};
+type ServerEncodingRow = QueryResultRow & { server_encoding: unknown };
+type ManagedObjectOwnershipRow = QueryResultRow & {
+  current_user_name: unknown;
+  existing_object_count: unknown;
+  unowned_object_count: unknown;
+};
+
+export const REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION = 18 as const;
+export const REQUIRED_POSTGRESQL_SERVER_ENCODING = "UTF8" as const;
+
+export class PostgreSqlServerVersionPreflightError extends StorageOperationError {
+  constructor(
+    readonly serverVersionNumber: number | null,
+    readonly serverMajorVersion: number | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightServerVersion",
+    );
+  }
+
+  readonly requiredServerMajorVersion = REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION;
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      serverVersionNumber: this.serverVersionNumber,
+      serverMajorVersion: this.serverMajorVersion,
+      requiredServerMajorVersion: this.requiredServerMajorVersion,
+    };
+  }
+}
+
+export class PostgreSqlServerEncodingPreflightError extends StorageOperationError {
+  constructor(
+    readonly serverEncoding: string | null,
+    operation = "preflightServerEncoding",
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      operation,
+    );
+  }
+
+  readonly requiredServerEncoding = REQUIRED_POSTGRESQL_SERVER_ENCODING;
+  readonly remediation =
+    "Create or restore the LCM database with server_encoding UTF8, then rerun readiness.";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      serverEncoding: this.serverEncoding,
+      requiredServerEncoding: this.requiredServerEncoding,
+      remediation: this.remediation,
+    };
+  }
+}
+
+export class PostgreSqlSchemaOwnershipPreflightError extends StorageOperationError {
+  constructor(
+    readonly schemaExists: boolean | null,
+    readonly ownedByMigrator: boolean | null,
+    readonly requiredOwner: string | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightSchemaOwnership",
+    );
+    this.remediation = requiredOwner === null
+      ? null
+      : `Transfer ownership of schema "lcm" and its LCM-owned objects to PostgreSQL role ${quoteIdentifier(requiredOwner)}, then rerun migrations.`;
+  }
+
+  readonly schemaName = "lcm";
+  readonly remediation: string | null;
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      schemaName: this.schemaName,
+      schemaExists: this.schemaExists,
+      ownedByMigrator: this.ownedByMigrator,
+      requiredOwner: this.requiredOwner,
+      remediation: this.remediation,
+    };
+  }
+}
+
+export class PostgreSqlManagedObjectOwnershipPreflightError extends StorageOperationError {
+  constructor(
+    readonly existingObjectCount: number | null,
+    readonly unownedObjectCount: number | null,
+    readonly requiredOwner: string | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightManagedObjectOwnership",
+    );
+    this.remediation = requiredOwner === null
+      ? null
+      : `Transfer ownership of every LCM-managed object in schema "lcm" to PostgreSQL role ${quoteIdentifier(requiredOwner)}, then rerun migrations.`;
+  }
+
+  readonly schemaName = "lcm";
+  readonly remediation: string | null;
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      schemaName: this.schemaName,
+      existingObjectCount: this.existingObjectCount,
+      unownedObjectCount: this.unownedObjectCount,
+      requiredOwner: this.requiredOwner,
+      remediation: this.remediation,
+    };
+  }
+}
+
+export class PostgreSqlSchemaAclPreflightError extends StorageOperationError {
+  constructor(
+    readonly schemaExists: boolean | null,
+    readonly publicCreate: boolean | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightSchemaAcl",
+    );
+  }
+
+  readonly schemaName = "lcm";
+  readonly remediation = "REVOKE CREATE ON SCHEMA \"lcm\" FROM PUBLIC;";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      schemaName: this.schemaName,
+      schemaExists: this.schemaExists,
+      publicCreate: this.publicCreate,
+      remediation: this.remediation,
+    };
+  }
+}
+
+function sanitizeServerVersionNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+function sanitizeBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function sanitizeNonnegativeCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+export function sanitizePostgreSqlServerEncoding(value: unknown): string | null {
+  return typeof value === "string"
+    && /^[A-Z0-9_-]{1,32}$/u.test(value)
+    ? value
+    : null;
+}
+
+function sanitizeRoleName(value: unknown): string | null {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 256
+    && !/[\u0000-\u001f\u007f]/u.test(value)
+    ? value
+    : null;
+}
+
+function quoteIdentifier(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}
 
 function migrationError(operation: string): StorageOperationError {
   return new StorageOperationError(
@@ -74,10 +289,257 @@ export async function runPostgreSqlMigrations(
 ): Promise<PostgreSqlMigrationResult> {
   const migrations = [...(options.migrations ?? loadPostgreSqlMigrations())];
   validateMigrations(migrations);
+  // The functional pg_stat_statements probe can raise SQLSTATE 55000 when the
+  // library was not preloaded. Run it before opening the all-or-nothing DDL
+  // transaction so that expected readiness failure cannot poison that scope.
+  const postmasterEpoch = await executor.query<PostmasterEpochRow>({
+    text: "SELECT pg_catalog.pg_postmaster_start_time()::text AS postmaster_started_at",
+  }, { domain: "factory", operation: "capturePostmasterEpoch", signal: options.signal });
+  const postmasterStartedAt = postmasterEpoch.rows[0]?.postmaster_started_at;
+  if (!(postmasterStartedAt instanceof Date) && typeof postmasterStartedAt !== "string") {
+    throw migrationError("capturePostmasterEpoch");
+  }
+  const serverEncodingResult = await executor.query<ServerEncodingRow>({
+    text: "SELECT pg_catalog.current_setting('server_encoding') AS server_encoding",
+  }, { domain: "factory", operation: "preflightServerEncoding", signal: options.signal });
+  const serverEncoding = sanitizePostgreSqlServerEncoding(
+    serverEncodingResult.rows[0]?.server_encoding,
+  );
+  if (serverEncoding !== REQUIRED_POSTGRESQL_SERVER_ENCODING) {
+    throw new PostgreSqlServerEncodingPreflightError(serverEncoding);
+  }
+  await assertRequiredPostgreSqlExtensionsReady(executor, { signal: options.signal });
   return executor.transaction(async (transaction) => {
     await transaction.query({
-      text: "SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':lcm:migrations', 0))",
+      text: "SET LOCAL search_path = pg_catalog, public",
+    }, { domain: "factory", operation: "pinMigrationSearchPath", signal: options.signal });
+
+    await transaction.query({
+      text: `SELECT pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+          pg_catalog.current_database() OPERATOR(pg_catalog.||) ':lcm:migrations',
+          0
+        )
+      )`,
     }, { domain: "factory", operation: "lockMigrations", signal: options.signal });
+
+    const serverVersion = await transaction.query<ServerVersionRow>({
+      text: "SELECT pg_catalog.current_setting('server_version_num')::integer AS server_version_num",
+    }, { domain: "factory", operation: "preflightServerVersion", signal: options.signal });
+    const serverVersionNumber = sanitizeServerVersionNumber(
+      serverVersion.rows[0]?.server_version_num,
+    );
+    const serverMajorVersion = serverVersionNumber === null
+      ? null
+      : Math.floor(serverVersionNumber / 10_000);
+    if (serverMajorVersion !== REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION) {
+      throw new PostgreSqlServerVersionPreflightError(
+        serverVersionNumber,
+        serverMajorVersion,
+      );
+    }
+
+    const continuity = await transaction.query<PostmasterContinuityRow>({
+      text: `SELECT
+               pg_catalog.pg_postmaster_start_time()::text OPERATOR(pg_catalog.=) $1::text
+               AND EXISTS (
+                 SELECT 1
+                 FROM pg_catalog.pg_get_loaded_modules() AS loaded
+                 WHERE loaded.module_name OPERATOR(pg_catalog.=) 'pg_stat_statements'
+                    OR loaded.file_name OPERATOR(pg_catalog.~)
+                      '(^|/)pg_stat_statements([.][^/]*)?$'
+               ) AS preflight_still_valid`,
+      values: [postmasterStartedAt],
+    }, { domain: "factory", operation: "verifyPostmasterContinuity", signal: options.signal });
+    if (continuity.rows[0]?.preflight_still_valid !== true) {
+      throw migrationError("verifyPostmasterContinuity");
+    }
+
+    await assertRequiredPostgreSqlExtensionCatalogReady(transaction, {
+      operation: "revalidateRequiredExtensionCatalog",
+      pgStatStatementsPreloaded: true,
+      signal: options.signal,
+    });
+
+    const schemaOwnership = await transaction.query<SchemaOwnershipRow>({
+      text: `SELECT
+        CURRENT_USER::text AS current_user_name,
+        EXISTS (
+          SELECT 1
+          FROM pg_catalog.pg_namespace
+          WHERE nspname = 'lcm'
+        ) AS schema_exists,
+        COALESCE((
+          SELECT namespace.nspowner = role.oid
+          FROM pg_catalog.pg_namespace AS namespace
+          INNER JOIN pg_catalog.pg_roles AS role ON role.rolname = CURRENT_USER
+          WHERE namespace.nspname = 'lcm'
+        ), false) AS owned_by_current_user`,
+    }, { domain: "factory", operation: "preflightSchemaOwnership", signal: options.signal });
+    const schemaExists = sanitizeBoolean(schemaOwnership.rows[0]?.schema_exists);
+    const ownedByMigrator = sanitizeBoolean(schemaOwnership.rows[0]?.owned_by_current_user);
+    const requiredOwner = sanitizeRoleName(schemaOwnership.rows[0]?.current_user_name);
+    const ownershipReady = requiredOwner !== null
+      && ((schemaExists === false && ownedByMigrator === false)
+        || (schemaExists === true && ownedByMigrator === true));
+    if (!ownershipReady) {
+      throw new PostgreSqlSchemaOwnershipPreflightError(
+        schemaExists,
+        ownedByMigrator,
+        requiredOwner,
+      );
+    }
+
+    const schemaAcl = await transaction.query<SchemaAclRow>({
+      text: `SELECT
+        EXISTS (
+          SELECT 1
+          FROM pg_catalog.pg_namespace AS namespace
+          WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+        ) AS schema_exists,
+        EXISTS (
+          SELECT 1
+          FROM pg_catalog.pg_namespace AS namespace
+          CROSS JOIN LATERAL pg_catalog.aclexplode(
+            COALESCE(
+              namespace.nspacl,
+              pg_catalog.acldefault('n', namespace.nspowner)
+            )
+          ) AS privilege
+          WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+            AND privilege.grantee OPERATOR(pg_catalog.=) 0
+            AND privilege.privilege_type OPERATOR(pg_catalog.=) 'CREATE'
+        ) AS public_create`,
+    }, { domain: "factory", operation: "preflightSchemaAcl", signal: options.signal });
+    const aclSchemaExists = sanitizeBoolean(schemaAcl.rows[0]?.schema_exists);
+    const publicCreate = sanitizeBoolean(schemaAcl.rows[0]?.public_create);
+    if (
+      aclSchemaExists === null
+      || publicCreate === null
+      || aclSchemaExists !== schemaExists
+      || (aclSchemaExists === false && publicCreate !== false)
+      || publicCreate
+    ) {
+      throw new PostgreSqlSchemaAclPreflightError(aclSchemaExists, publicCreate);
+    }
+
+    const managedOwnership = await transaction.query<ManagedObjectOwnershipRow>({
+      text: `WITH migration_role AS (
+               SELECT role.oid
+               FROM pg_catalog.pg_roles AS role
+               WHERE role.rolname OPERATOR(pg_catalog.=) CURRENT_USER
+             ),
+             managed_objects(owner_oid) AS (
+               SELECT relation.relowner
+               FROM pg_catalog.pg_class AS relation
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+               WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                 AND (
+                   (
+                     relation.relkind OPERATOR(pg_catalog.=) 'r'
+                     AND relation.relname OPERATOR(pg_catalog.=) ANY (
+                       ARRAY[
+                         'schema_migrations', 'machines', 'projects', 'project_aliases',
+                         'conversations', 'messages', 'message_parts', 'native_transcripts',
+                         'transcript_messages', 'summaries', 'summary_messages',
+                         'summary_parents', 'context_items', 'large_files',
+                         'summary_large_files', 'promoted_memories', 'promoted_memory_tags',
+                         'recall_surfacing', 'redaction_counters', 'ingest_checkpoints',
+                         'session_ingest_log', 'session_instructions', 'passive_event_inbox',
+                         'fenced_leases'
+                       ]::pg_catalog.text[]
+                     )
+                   )
+                   OR (
+                     relation.relkind OPERATOR(pg_catalog.=) 'S'
+                     AND relation.relname OPERATOR(pg_catalog.=) ANY (
+                       ARRAY[
+                         'conversations_conversation_id_seq',
+                         'messages_message_id_seq',
+                         'recall_surfacing_surfacing_id_seq',
+                         'session_instructions_instruction_id_seq',
+                         'passive_event_inbox_inbox_id_seq',
+                         'fenced_leases_fencing_token_seq'
+                       ]::pg_catalog.text[]
+                     )
+                   )
+                 )
+               UNION ALL
+               SELECT procedure.proowner
+               FROM pg_catalog.pg_proc AS procedure
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
+               WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                 AND procedure.prokind OPERATOR(pg_catalog.=) 'f'
+                 AND (
+                   (
+                     procedure.proname OPERATOR(pg_catalog.=) 'normalize_search_text'
+                     AND procedure.pronargs OPERATOR(pg_catalog.=) 1
+                     AND procedure.proargtypes[0] OPERATOR(pg_catalog.=)
+                       pg_catalog.to_regtype('pg_catalog.text')
+                   )
+                   OR (
+                     procedure.proname OPERATOR(pg_catalog.=)
+                       'enforce_summary_id_uniqueness'
+                     AND procedure.pronargs OPERATOR(pg_catalog.=) 0
+                   )
+                   OR (
+                     procedure.proname OPERATOR(pg_catalog.=)
+                       'enforce_large_file_id_uniqueness'
+                     AND procedure.pronargs OPERATOR(pg_catalog.=) 0
+                   )
+                 )
+               UNION ALL
+               SELECT dictionary.dictowner
+               FROM pg_catalog.pg_ts_dict AS dictionary
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.oid OPERATOR(pg_catalog.=) dictionary.dictnamespace
+               WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                 AND dictionary.dictname OPERATOR(pg_catalog.=) 'simple_v1'
+               UNION ALL
+               SELECT configuration.cfgowner
+               FROM pg_catalog.pg_ts_config AS configuration
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.oid OPERATOR(pg_catalog.=) configuration.cfgnamespace
+               WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                 AND configuration.cfgname OPERATOR(pg_catalog.=) 'search_v1'
+             )
+             SELECT CURRENT_USER::pg_catalog.text AS current_user_name,
+                    pg_catalog.count(*)::pg_catalog.int4 AS existing_object_count,
+                    pg_catalog.count(*) FILTER (
+                      WHERE managed_objects.owner_oid OPERATOR(pg_catalog.<>) migration_role.oid
+                    )::pg_catalog.int4 AS unowned_object_count
+             FROM managed_objects
+             CROSS JOIN migration_role`,
+    }, {
+      domain: "factory",
+      operation: "preflightManagedObjectOwnership",
+      signal: options.signal,
+    });
+    const existingObjectCount = sanitizeNonnegativeCount(
+      managedOwnership.rows[0]?.existing_object_count,
+    );
+    const unownedObjectCount = sanitizeNonnegativeCount(
+      managedOwnership.rows[0]?.unowned_object_count,
+    );
+    const managedRequiredOwner = sanitizeRoleName(
+      managedOwnership.rows[0]?.current_user_name,
+    );
+    if (
+      existingObjectCount === null
+      || unownedObjectCount === null
+      || unownedObjectCount > existingObjectCount
+      || unownedObjectCount !== 0
+      || managedRequiredOwner === null
+      || managedRequiredOwner !== requiredOwner
+    ) {
+      throw new PostgreSqlManagedObjectOwnershipPreflightError(
+        existingObjectCount,
+        unownedObjectCount,
+        managedRequiredOwner,
+      );
+    }
 
     const ledger = await transaction.query<LedgerRow>({
       text: "SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger_exists",
@@ -110,6 +572,7 @@ export async function runPostgreSqlMigrations(
       }, { domain: "factory", operation: "recordMigration", signal: options.signal });
       applied.push(migration.id);
     }
+    await assertPostgreSqlSearchConfigurationReady(transaction, { signal: options.signal });
     return {
       applied,
       current: migrations.map((migration) => migration.id),

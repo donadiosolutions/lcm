@@ -36,6 +36,26 @@ const RETRYABLE_DRIVER_MESSAGES = new Set([
 
 type PostgreSqlDriverError = Error & { code?: unknown };
 
+export class PostgreSqlStorageOperationError extends StorageOperationError {
+  constructor(
+    code: "STORAGE_INITIALIZATION_FAILED" | "STORAGE_OPERATION_FAILED",
+    context: PostgreSqlOperationContext,
+    readonly sqlState: string | null,
+    retryable: boolean,
+  ) {
+    super(code, "postgresql", context.projectId, context.domain, context.operation, { retryable });
+  }
+
+  override toJSON(): Record<string, unknown> {
+    return { ...super.toJSON(), sqlState: this.sqlState };
+  }
+}
+
+function sanitizeSqlState(error: unknown): string | null {
+  const code = (error as PostgreSqlDriverError | undefined)?.code;
+  return typeof code === "string" && /^[0-9A-Z]{5}$/u.test(code) ? code : null;
+}
+
 export function isPostgreSqlConnectionError(error: unknown): boolean {
   const candidate = error as PostgreSqlDriverError | undefined;
   const code = candidate?.code;
@@ -61,12 +81,10 @@ export function normalizePostgreSqlError(
   code: "STORAGE_INITIALIZATION_FAILED" | "STORAGE_OPERATION_FAILED" = "STORAGE_OPERATION_FAILED",
 ): StorageOperationError {
   if (error instanceof StorageOperationError) return error;
-  return new StorageOperationError(
+  return new PostgreSqlStorageOperationError(
     code,
-    "postgresql",
-    context.projectId,
-    context.domain,
-    context.operation,
-    { retryable: isRetryablePostgreSqlError(error) },
+    context,
+    sanitizeSqlState(error),
+    isRetryablePostgreSqlError(error),
   );
 }

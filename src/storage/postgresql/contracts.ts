@@ -39,12 +39,47 @@ export interface PostgreSqlMigrationResult {
   readonly current: readonly string[];
 }
 
+export type PostgreSqlExtensionReadiness =
+  | "current"
+  | "installed-unavailable"
+  | "not-preloaded"
+  | "unavailable"
+  | "uninstalled"
+  | "version-mismatch"
+  | "wrong-namespace";
+
+export interface PostgreSqlExtensionStatus {
+  readonly name: "pg_stat_statements" | "pg_trgm" | "pgcrypto" | "unaccent";
+  readonly available: boolean;
+  readonly defaultVersion: string | null;
+  readonly installedVersion: string | null;
+  readonly requiredSchema: "public";
+  readonly installedSchema: string | null;
+  readonly relocatable: boolean | null;
+  readonly preloadRequired: boolean;
+  readonly preloaded: boolean | null;
+  readonly status: PostgreSqlExtensionReadiness;
+  readonly remediation: string | null;
+}
+
+export interface PostgreSqlSearchConfigurationStatus {
+  readonly name: "lcm.search_v1";
+  readonly expectedSha256: string;
+  readonly actualSha256: string | null;
+  readonly objectCount: number;
+  readonly ownershipReady: boolean;
+  readonly ready: boolean;
+}
+
 export interface PostgreSqlRuntimeHealth extends StorageHealth {
   readonly backend: "postgresql";
-  readonly serverMajorVersion?: number;
+  readonly serverMajorVersion?: number | null;
+  readonly serverEncoding?: string | null;
   readonly tls?: boolean;
   readonly timezone?: string;
   readonly role?: string;
+  readonly extensions?: readonly PostgreSqlExtensionStatus[];
+  readonly searchConfiguration?: PostgreSqlSearchConfigurationStatus;
 }
 
 export interface PostgreSqlTestDatabaseSentinel {

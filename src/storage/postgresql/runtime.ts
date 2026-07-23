@@ -9,6 +9,21 @@ import type {
 } from "./contracts.js";
 import { buildPostgreSqlClientConfig } from "./client-config.js";
 import { isPostgreSqlConnectionError, normalizePostgreSqlError } from "./errors.js";
+import {
+  areRequiredPostgreSqlExtensionsReady,
+  inspectRequiredPostgreSqlExtensions,
+  PostgreSqlExtensionPreflightError,
+} from "./extensions.js";
+import {
+  PostgreSqlServerEncodingPreflightError,
+  REQUIRED_POSTGRESQL_SERVER_ENCODING,
+  REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
+  sanitizePostgreSqlServerEncoding,
+} from "./migrations.js";
+import {
+  inspectPostgreSqlSearchConfiguration,
+  PostgreSqlSearchConfigurationPreflightError,
+} from "./search-configuration.js";
 
 export interface PostgreSqlRuntimeDependencies {
   readonly createPool: (config: PoolConfig) => Pool;
@@ -22,8 +37,14 @@ export const POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES: PostgreSqlRuntimeDependenc
   buildConfig: buildPostgreSqlClientConfig,
 };
 
+const DEFAULT_POSTGRESQL_TRANSACTION_CONTEXT = {
+  domain: "transaction",
+  operation: "transaction",
+} as const satisfies PostgreSqlOperationContext;
+
 type HealthRow = {
-  server_version_num: number;
+  server_encoding: unknown;
+  server_version_num: unknown;
   timezone: string;
   role: string;
   tls: boolean;
@@ -31,6 +52,12 @@ type HealthRow = {
 
 type BackendPidRow = { pid: number };
 type CancelRow = { cancelled: boolean };
+
+function sanitizeServerMajorVersion(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? Math.floor(value / 10_000)
+    : null;
+}
 
 function aborted(context: PostgreSqlOperationContext): StorageOperationError {
   return new StorageOperationError(
@@ -127,7 +154,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
 
   async transaction<T>(
     callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
-    options: PostgreSqlOperationContext & { signal?: AbortSignal },
+    options: PostgreSqlOperationContext & { signal?: AbortSignal } = DEFAULT_POSTGRESQL_TRANSACTION_CONTEXT,
   ): Promise<T> {
     this.assertOpen(options);
     let client: PoolClient | undefined;
@@ -241,24 +268,32 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     const wasPoolFailed = this.poolFailed;
     try {
       const result = await this.query<HealthRow>({
-        text: `SELECT current_setting('server_version_num')::integer AS server_version_num,
-                      current_setting('TimeZone') AS timezone,
-                      current_user AS role,
-                      COALESCE((SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()), false) AS tls`,
+        text: `SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int4
+                        AS server_version_num,
+                      pg_catalog.current_setting('server_encoding') AS server_encoding,
+                      pg_catalog.current_setting('TimeZone') AS timezone,
+                      CURRENT_USER AS role,
+                      COALESCE((
+                        SELECT ssl
+                        FROM pg_catalog.pg_stat_ssl
+                        WHERE pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid()
+                      ), false) AS tls`,
       }, { domain: "factory", operation: "health" });
       const row = result.rows[0];
-      const serverMajorVersion = Math.floor(row.server_version_num / 10_000);
-      const diagnostics = {
+      const serverMajorVersion = sanitizeServerMajorVersion(row?.server_version_num);
+      const serverEncoding = sanitizePostgreSqlServerEncoding(row?.server_encoding);
+      const connectionDiagnostics = {
         serverMajorVersion,
-        tls: row.tls,
-        timezone: row.timezone,
-        role: row.role,
+        serverEncoding,
+        tls: row?.tls,
+        timezone: row?.timezone,
+        role: row?.role,
       };
-      if (serverMajorVersion !== 18 || row.tls !== true || row.timezone.toUpperCase() !== "UTC") {
+      if (serverMajorVersion !== REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION) {
         return {
           status: "unavailable",
           backend: "postgresql",
-          ...diagnostics,
+          ...connectionDiagnostics,
           error: new StorageOperationError(
             "STORAGE_INITIALIZATION_FAILED",
             "postgresql",
@@ -266,6 +301,53 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
             "factory",
             "health",
           ),
+        };
+      }
+      if (serverEncoding !== REQUIRED_POSTGRESQL_SERVER_ENCODING) {
+        return {
+          status: "unavailable",
+          backend: "postgresql",
+          ...connectionDiagnostics,
+          error: new PostgreSqlServerEncodingPreflightError(serverEncoding, "health"),
+        };
+      }
+      const extensions = await inspectRequiredPostgreSqlExtensions(this, {
+        operation: "healthRequiredExtensions",
+      });
+      const runtimeReady = row?.tls === true
+        && row.timezone.toUpperCase() === "UTC";
+      const extensionsReady = areRequiredPostgreSqlExtensionsReady(extensions);
+      if (!runtimeReady || !extensionsReady) {
+        return {
+          status: "unavailable",
+          backend: "postgresql",
+          ...connectionDiagnostics,
+          extensions,
+          error: runtimeReady
+            ? new PostgreSqlExtensionPreflightError(extensions, "health")
+            : new StorageOperationError(
+              "STORAGE_INITIALIZATION_FAILED",
+              "postgresql",
+              undefined,
+              "factory",
+              "health",
+              ),
+        };
+      }
+      const searchConfiguration = await inspectPostgreSqlSearchConfiguration(this, {
+        operation: "healthSearchConfiguration",
+      });
+      const diagnostics = {
+        ...connectionDiagnostics,
+        extensions,
+        searchConfiguration,
+      };
+      if (!searchConfiguration.ready) {
+        return {
+          status: "unavailable",
+          backend: "postgresql",
+          ...diagnostics,
+          error: new PostgreSqlSearchConfigurationPreflightError(searchConfiguration, "health"),
         };
       }
       return {

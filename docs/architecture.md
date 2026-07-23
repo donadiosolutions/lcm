@@ -15,13 +15,16 @@ construction share the same discriminated resolved configuration. This prevents
 different entry points from applying different precedence or validation rules.
 
 The internal PostgreSQL 18 runtime now provides a bounded `pg` pool, verified
-CA and hostname validation, sanitized SQLSTATE errors, abort cancellation, and
-transactional migrations. It is intentionally not constructed by the
-application storage factory yet: a valid PostgreSQL selection still fails with
-an explicit unavailable-backend error before the daemon listens. The domain
-adapters tracked by #83-#92 must implement the shared repository contracts and
-pass conformance before PostgreSQL can become authoritative. The local SQLite
-hook outbox is not a general cache and remains local after that activation.
+CA and hostname validation, sanitized SQLSTATE errors, abort cancellation,
+transactional migrations, extension readiness, and the complete durable schema
+baseline. It is intentionally not constructed by the application storage
+factory yet: a valid PostgreSQL selection still fails with an explicit
+unavailable-backend error before the daemon listens. The domain adapters tracked
+by #84-#91 must implement the shared repository contracts and pass conformance
+before #92 can make PostgreSQL authoritative. The local SQLite hook outbox is
+not a general cache and remains local after that activation. See the
+[PostgreSQL schema reference](postgresql-schema.md) for table ownership,
+integrity, indexes, retention, extension policy, and recovery implications.
 
 ## Storage repository architecture
 
@@ -53,10 +56,31 @@ connection is destroyed rather than returned to the pool.
 
 Ordered SQL files are packaged in `dist` and checked against an explicit
 SHA-256 manifest before execution. The runner takes a database-scoped
-transaction advisory lock, validates the complete `lcm.schema_migrations`
-history, and rejects unknown, out-of-order, or checksum-drifted entries. Pending
-SQL and its ledger row commit together, making empty, repeated, concurrent, and
-failed runs deterministic.
+transaction advisory lock, requires a UTF-8 PostgreSQL 18 database and the
+current required extensions in the `public` schema, validates the complete
+`lcm.schema_migrations` history, and rejects unknown, out-of-order, or
+checksum-drifted entries. Pending SQL and its ledger row commit together, making
+empty, repeated, concurrent, and failed runs deterministic. Extension
+remediation is diagnostic only, including namespace correction, restoration of
+missing control files, and `pg_stat_statements` preload/restart guidance; LCM
+never changes cluster extensions. The migrator owns the `lcm` schema; `PUBLIC`
+has no schema-create privilege in a supported database. Before ledger
+inspection, the runner permits an absent schema but rejects an existing schema
+not owned by the current migration role; delegated `CREATE` is insufficient and
+no ownership is changed automatically. Every run rejects a schema that grants
+`PUBLIC CREATE` before ledger inspection without changing its ACL; the baseline
+repeats the guard before its owned DDL. Under the same lock, every run also
+verifies that the current migrator still owns each known LCM table, identity
+sequence, helper or trigger function, text-search dictionary, and text-search
+configuration that exists. Unknown schema objects are outside that exact
+catalog allowlist and are neither rejected nor changed.
+`PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six
+generated identity sequences, or the search-normalization, summary-identity,
+and large-file-identity functions; unknown
+pre-existing object ACLs are preserved. The normalization function is created
+without replacement, so a same-signature collision fails and rolls back the
+pending migration rather than overwriting operator code. Runtime domain grants
+remain absent until their owning adapters land.
 
 ### Ownership and domain grouping
 

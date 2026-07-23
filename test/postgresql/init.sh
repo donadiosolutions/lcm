@@ -15,10 +15,10 @@ psql --set=ON_ERROR_STOP=1 \
 CREATE ROLE lcm_test_migrator LOGIN PASSWORD :'migrator_password';
 CREATE ROLE lcm_test_runtime LOGIN PASSWORD :'runtime_password';
 
-CREATE EXTENSION pg_trgm;
-CREATE EXTENSION unaccent;
-CREATE EXTENSION pgcrypto;
-CREATE EXTENSION pg_stat_statements;
+CREATE EXTENSION pg_trgm WITH SCHEMA public;
+CREATE EXTENSION unaccent WITH SCHEMA public;
+CREATE EXTENSION pgcrypto WITH SCHEMA public;
+CREATE EXTENSION pg_stat_statements WITH SCHEMA public;
 
 CREATE TABLE public.__lcm_test_run_sentinel (
   run_id text PRIMARY KEY,

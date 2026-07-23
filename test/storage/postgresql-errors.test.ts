@@ -86,9 +86,15 @@ describe("PostgreSQL error normalization", () => {
       domain: "sessions",
       operation: "write",
       retryable: true,
+      sqlState: "40001",
     });
+    expect(normalized.toJSON()).toMatchObject({ sqlState: "40001" });
     expect(JSON.stringify(normalized)).not.toContain("sensitive");
     expect(normalizePostgreSqlError(new Error("failure"), { domain: "factory", operation: "query" }))
-      .toMatchObject({ code: "STORAGE_OPERATION_FAILED", retryable: false });
+      .toMatchObject({ code: "STORAGE_OPERATION_FAILED", retryable: false, sqlState: null });
+    expect(normalizePostgreSqlError(
+      Object.assign(new Error("failure"), { code: "bad-state" }),
+      { domain: "factory", operation: "query" },
+    )).toMatchObject({ sqlState: null });
   });
 });

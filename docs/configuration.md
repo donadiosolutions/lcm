@@ -184,11 +184,14 @@ not contain a `storage` object continue to use the per-project databases under
 }
 ```
 
-The PostgreSQL configuration and internal PostgreSQL 18 runtime foundation are
-available for development and adapter conformance. The domain repositories are
-still staged in #83-#92, so a valid `postgresql` selection continues to fail
-before the daemon listens with an explicit backend-unavailable error. LCM never
-falls back to SQLite after an explicit PostgreSQL selection.
+The PostgreSQL configuration, internal PostgreSQL 18 runtime, and schema
+baseline are available for development and adapter conformance. The domain
+repositories are still staged in #84-#91, with activation in #92, so a valid
+`postgresql` selection continues to fail before the daemon listens with an
+explicit backend-unavailable error. LCM never falls back to SQLite after an
+explicit PostgreSQL selection. The internal readiness contract also requires
+the parity extensions at their current default versions in the `public` schema;
+see the [PostgreSQL schema reference](postgresql-schema.md#required-extensions-and-postgresql-version).
 
 The installed no-override PreCompact command (`lcm compact --hook`) is a
 best-effort exception to that fail-closed admission path. Before dispatch, its

@@ -1,9 +1,12 @@
 # PostgreSQL development
 
-LCM's PostgreSQL runtime and migration foundation is internal until the domain
-adapters tracked by #83-#92 satisfy the shared storage contracts. SQLite remains
-the default, and the application factory deliberately rejects
-`storage.backend=postgresql` during this stage.
+LCM's PostgreSQL runtime, migration runner, and complete PostgreSQL 18 schema
+baseline are internal until the domain adapters tracked by #84-#91 satisfy the
+shared storage contracts and #92 enables cutover. SQLite remains the default,
+and the application factory deliberately rejects `storage.backend=postgresql`
+during this stage. See the [PostgreSQL schema reference](postgresql-schema.md)
+for tables, integrity rules, index families, extension prerequisites, retention,
+and backup implications.
 
 ## Run the conformance harness
 
@@ -56,9 +59,95 @@ file, calculate its SHA-256 digest and update the explicit manifest in
 `src/storage/postgresql/migrations.ts`. Never edit an already released
 migration: checksum drift is rejected. Add a new migration instead.
 
+Inside the locked migration transaction, the runner requires PostgreSQL 18 and
+inspects `pg_trgm`, `unaccent`, `pgcrypto`, and `pg_stat_statements`.
+Before opening that transaction, it reads
+`pg_catalog.current_setting('server_encoding')` and requires exactly `UTF8`.
+Non-UTF-8 or malformed results fail with sanitized database-recreation or
+restore guidance; LCM never changes encoding. Runtime health enforces the same
+requirement before extension or search-fingerprint inspection.
+The first transaction operation sets a local `search_path` of
+`pg_catalog, public`; it applies through the advisory lock, all preflights, and
+all pending migration SQL, then reverts on commit or rollback. Extension
+inspection additionally binds its operators to `pg_catalog` because runtime
+health can run outside the migration transaction. Tests deliberately install
+matching-signature hostile functions and operators ahead of `pg_catalog`.
+Every extension must be installed in `public` at its available default version.
+Unavailable, installed-but-unavailable, uninstalled, not-preloaded,
+version-mismatched, or wrong-namespace extensions block migration and runtime
+readiness with structured, sanitized administrator guidance. A version mismatch
+does not infer upgrade direction or prescribe `ALTER EXTENSION ... UPDATE TO`,
+because the installed version may be newer than the default and a downgrade
+path may not exist. It directs administrators to their provider-supported
+version-management path instead. Catalog-controlled version strings remain
+available in structured diagnostics but are not interpolated into remediation
+SQL or prose. An installed-but-unavailable
+extension requires restoring its matching control files, not running `CREATE
+EXTENSION`. For an otherwise-current `pg_stat_statements`, least-privilege
+readiness functionally reads `public.pg_stat_statements_info`; only SQLSTATE
+`55000` becomes `not-preloaded`. Migration performs this potentially failing
+probe before its DDL transaction, then verifies the same postmaster epoch and
+loaded module under the advisory lock. It also re-reads the non-probe extension
+catalog contract after acquiring that lock, so a drop, relocation, or version
+change while waiting cannot reach pending DDL; the functional probe is not
+repeated inside the transaction. Remediation tells the administrator to add the module to
+`shared_preload_libraries` and restart PostgreSQL. LCM
+never creates, upgrades, relocates, reinstalls, or drops an extension. For a
+wrong namespace, relocatable extensions receive `ALTER EXTENSION ... SET SCHEMA
+"public"` guidance; non-relocatable extensions receive an explicit reinstall
+requirement without automatic destructive SQL. Complete and verify the
+operation through the cluster administrator, then rerun migration.
+
+Schema conformance also exercises repository-defined opaque metadata and caller
+identifiers directly: message-part metadata must round-trip as text, while
+unbounded summary IDs round-trip exactly through bounded UUIDv7 relationship
+keys and digest-plus-exact lookup. Unbounded large-file IDs use the same
+UUIDv7-key and digest-plus-exact design and remain unique within a project
+rather than globally.
+Promoted-memory source IDs are preserved as external provenance without a
+local-summary foreign key. Floating-point step costs reject `NaN` and both
+infinities. Search and tag normalization use PostgreSQL 18's builtin
+`pg_unicode_fast` full case mapping, whose behavior is stable within the
+required major version and independent of libc or ICU provider upgrades.
+
+The same backend-neutral contract preserves promoted-memory tags exactly,
+including order, duplicates, case distinctions, empty values, and surrounding
+whitespace; tag filters remain case-sensitive even though separately indexed
+normalized and lexical projections support explicit normalized lookup and
+tag-only search. Summary `earliestAt` and `latestAt` values are independently
+optional and are ordered only when both exist. Summary file-reference arrays
+likewise preserve order and duplicates, and unresolved or cross-conversation
+IDs remain opaque rather than requiring a matching `large_files` row.
+Recall surfacing IDs are also opaque text: orphan and historical observations
+remain queryable after a promoted-memory row is absent or deleted.
+
+The migration role must own an existing `lcm` schema. The runner permits an
+absent schema because `0001` creates it as the current migration role, but it
+fails closed when another role owns an existing schema even if that role has
+delegated `CREATE` to the migrator. Transfer ownership explicitly with the
+cluster administrator before retrying; LCM never changes schema ownership.
+On every run, an exact catalog allowlist also checks every existing managed
+table, generated identity sequence, helper or trigger function, text-search
+dictionary, and text-search configuration. Ownership drift blocks repeated
+runs and later pending migrations before ledger inspection. Objects not on the
+allowlist are preserved and may have a different owner.
+Failure diagnostics identify `requiredOwner` using the sanitized PostgreSQL
+`CURRENT_USER` role and provide identifier-quoted transfer guidance. They do
+not expose the existing owner, connection details, or raw database errors, and
+missing or malformed catalog values fail closed.
+
 Exercise at least the empty, repeated, concurrent, rollback, unknown-history,
 out-of-order, and checksum-drift paths. Migration SQL and the ledger insertion
 must remain in the same transaction under the database-scoped advisory lock.
+Create owned helper functions without replacement. A same-signature function
+is an operator collision that must fail and roll back the pending set while
+leaving the existing function unchanged. Revoke `PUBLIC` privileges only from
+explicit LCM-owned tables, sequences, and functions; never use a schema-wide
+object revoke that would alter ACLs on unknown pre-existing objects.
+A supported pre-existing `lcm` schema must not grant `CREATE` to `PUBLIC`.
+Migration checks that prerequisite before owned DDL and fails without revoking
+or otherwise changing the schema ACL; an administrator must remove the unsafe
+grant explicitly before retrying.
 
 If startup reports unknown, out-of-order, or checksum-drifted history, stop and
 compare the packaged manifest with `lcm.schema_migrations`. Do not edit the
@@ -75,7 +164,10 @@ roles for migration and runtime work. The migrator owns LCM schemas and applies
 the ordered migration set; the runtime role receives only the object privileges
 needed by repositories. Keep extension installation with the cluster
 administrator because `pg_stat_statements` and other extensions may exceed the
-migrator's privileges.
+migrator's privileges. Confirm the exact target cluster against DigitalOcean's
+[supported-extension matrix](https://docs.digitalocean.com/products/databases/postgresql/details/supported-extensions/)
+and its `extwlist.extensions` setting before rollout, then confirm the installed
+namespace is `public`.
 
 Size `poolMax` against the cluster connection limit after reserving capacity for
 administration, migrations, monitoring, and other services. Multiply the value

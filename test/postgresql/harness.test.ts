@@ -23,10 +23,13 @@ const mocks = vi.hoisted(() => ({
   dropGate: undefined as Deferred | undefined,
   events: [] as string[],
   operations: [] as string[],
+  queryFailureOperation: undefined as string | undefined,
+  queryConfigs: [] as Array<{ text?: string; values?: unknown[] }>,
   runMigrations: vi.fn(async () => ({ applied: [] })),
 }));
 
-vi.mock("../../src/storage/postgresql/migrations.js", () => ({
+vi.mock("../../src/storage/postgresql/migrations.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../src/storage/postgresql/migrations.js")>(),
   runPostgreSqlMigrations: mocks.runMigrations,
 }));
 
@@ -50,13 +53,41 @@ vi.mock("../../src/storage/postgresql/runtime.js", () => ({
           throw failure;
         }
       }),
+      health: vi.fn(async () => ({
+        status: "healthy",
+        role: url.username === "migrator" ? "lcm_test_migrator" : "lcm_test_runtime",
+      })),
       query: vi.fn(async (
-        _query: unknown,
+        query: { text?: string; values?: unknown[] },
         context: { operation?: string } = {},
       ) => {
         const operation = context.operation ?? "unknown";
         mocks.operations.push(operation);
         mocks.events.push(`query:${operation}`);
+        mocks.queryConfigs.push(query);
+        if (mocks.queryFailureOperation === operation) {
+          mocks.queryFailureOperation = undefined;
+          throw new Error(`injected ${operation} failure`);
+        }
+        if (operation === "harnessReadiness") {
+          return {
+            command: "SELECT", fields: [], oid: 0, rowCount: 1,
+            rows: [{
+              server_version_num: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION * 10_000,
+              role: "lcm_test_migrator",
+              run_id: process.env.LCM_TEST_POSTGRES_RUN_ID,
+              database_name: process.env.LCM_TEST_POSTGRES_CONTROL_DATABASE,
+              runtime_role: "lcm_test_runtime",
+            }],
+          };
+        }
+        if (operation === "harnessExtensions") {
+          const names = query.values?.[0] as string[];
+          return {
+            command: "SELECT", fields: [], oid: 0, rowCount: names.length,
+            rows: names.map((extname) => ({ extname })),
+          };
+        }
         if (operation === "verifyDropSentinel") {
           const databaseName = new URL(settings.url).pathname.slice(1);
           return {
@@ -65,7 +96,7 @@ vi.mock("../../src/storage/postgresql/runtime.js", () => ({
             oid: 0,
             rowCount: 1,
             rows: [{
-              server_version_num: 180_000,
+              server_version_num: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION * 10_000,
               role: "lcm_harness_admin",
               run_id: process.env.LCM_TEST_POSTGRES_RUN_ID,
               database_name: databaseName,
@@ -83,7 +114,9 @@ vi.mock("../../src/storage/postgresql/runtime.js", () => ({
   }),
 }));
 
-import { createPostgreSqlTestDatabase } from "./harness.js";
+import { REQUIRED_POSTGRESQL_EXTENSIONS } from "../../src/storage/postgresql/extensions.js";
+import { REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION } from "../../src/storage/postgresql/migrations.js";
+import { assertHarnessReady, createPostgreSqlTestDatabase } from "./harness.js";
 
 const ENVIRONMENT = {
   LCM_TEST_POSTGRES_RUN_ID: "0123456789abcdef0123456789abcdef",
@@ -104,6 +137,8 @@ beforeEach(() => {
   mocks.dropGate = undefined;
   mocks.events.length = 0;
   mocks.operations.length = 0;
+  mocks.queryFailureOperation = undefined;
+  mocks.queryConfigs.length = 0;
   mocks.runMigrations.mockClear();
 });
 
@@ -112,6 +147,16 @@ afterEach(() => {
 });
 
 describe("PostgreSQL test database lease", () => {
+  it("uses the authoritative required-extension set for readiness", async () => {
+    await expect(assertHarnessReady()).resolves.toBeUndefined();
+
+    const operationIndex = mocks.operations.indexOf("harnessExtensions");
+    expect(operationIndex).toBeGreaterThanOrEqual(0);
+    expect(mocks.queryConfigs[operationIndex]?.values).toEqual([
+      [...REQUIRED_POSTGRESQL_EXTENSIONS],
+    ]);
+  });
+
   it("drops the owned database when the database admin close fails", async () => {
     const secret = "postgresql://admin:close-secret@postgres/private";
     mocks.databaseAdminCloseFailure = new Error(`injected close failure ${secret}`);
@@ -141,6 +186,27 @@ describe("PostgreSQL test database lease", () => {
     expect(migratorClose).toBeGreaterThan(databaseAdminClose);
     expect(sentinelGuard).toBeGreaterThan(migratorClose);
     expect(databaseDrop).toBeGreaterThan(sentinelGuard);
+  });
+
+  it("installs the ownership sentinel before fallible extension setup", async () => {
+    mocks.queryFailureOperation = "createTestExtension";
+
+    const failure = await createPostgreSqlTestDatabase("extension-failure")
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "StorageOperationError",
+      backend: "postgresql",
+      domain: "factory",
+      operation: "createTestDatabase",
+    });
+    expect(mocks.dropAttempts).toBe(1);
+    const protectSentinel = mocks.operations.indexOf("protectTestSentinel");
+    const extensionSetup = mocks.operations.indexOf("createTestExtension");
+    const sentinelGuard = mocks.operations.indexOf("verifyDropSentinel");
+    expect(protectSentinel).toBeGreaterThanOrEqual(0);
+    expect(extensionSetup).toBeGreaterThan(protectSentinel);
+    expect(sentinelGuard).toBeGreaterThan(extensionSetup);
   });
 
   it("shares one in-flight and completed drop across concurrent callers", async () => {
@@ -183,5 +249,39 @@ describe("PostgreSQL test database lease", () => {
     retryGate.resolve();
     await expect(retry).resolves.toBeUndefined();
     expect(mocks.operations.filter((operation) => operation === "drainTestDatabase")).toHaveLength(2);
+  });
+
+  it("creates a guarded unmigrated database with an intentionally omitted extension", async () => {
+    const database = await createPostgreSqlTestDatabase("missing-extension", {
+      omitExtensions: ["unaccent"],
+      runMigrations: false,
+    });
+
+    expect(mocks.operations.filter((operation) => operation === "createTestExtension"))
+      .toHaveLength(3);
+    expect(mocks.operations).not.toContain("grantRuntimeBaseline");
+    expect(mocks.runMigrations).not.toHaveBeenCalled();
+
+    await expect(database.drop()).resolves.toBeUndefined();
+    expect(mocks.operations.filter((operation) => operation === "verifyDropSentinel"))
+      .toHaveLength(1);
+  });
+
+  it("creates one guarded custom namespace for selected extension fixtures", async () => {
+    const database = await createPostgreSqlTestDatabase("extension-schema", {
+      extensionSchemas: {
+        pg_trgm: "lcm_test_extensions",
+        unaccent: "lcm_test_extensions",
+      },
+      runMigrations: false,
+    });
+
+    expect(mocks.operations.filter((operation) => operation === "createTestExtensionSchema"))
+      .toHaveLength(1);
+    expect(mocks.operations.filter((operation) => operation === "createTestExtension"))
+      .toHaveLength(4);
+    expect(mocks.runMigrations).not.toHaveBeenCalled();
+
+    await expect(database.drop()).resolves.toBeUndefined();
   });
 });

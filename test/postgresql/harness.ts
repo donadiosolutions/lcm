@@ -1,8 +1,18 @@
 import { randomBytes } from "node:crypto";
 import type { QueryResultRow } from "pg";
-import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
-import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations.js";
+import {
+  PostgreSqlRuntime,
+  POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
+} from "../../src/storage/postgresql/runtime.js";
+import {
+  REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
+  runPostgreSqlMigrations,
+} from "../../src/storage/postgresql/migrations.js";
 import { normalizePostgreSqlError } from "../../src/storage/postgresql/errors.js";
+import {
+  REQUIRED_POSTGRESQL_EXTENSIONS,
+  REQUIRED_POSTGRESQL_EXTENSION_SCHEMAS,
+} from "../../src/storage/postgresql/extensions.js";
 import type {
   PostgreSqlConnectionSettings,
   PostgreSqlTestDatabaseLease,
@@ -65,8 +75,20 @@ function safeIdentifier(value: string): string {
   return `"${value}"`;
 }
 
-function runtimeFor(url: string, overrides: Parameters<typeof settings>[1] = {}): PostgreSqlRuntime {
-  return new PostgreSqlRuntime(settings(url, overrides));
+function runtimeFor(
+  url: string,
+  overrides: Parameters<typeof settings>[1] = {},
+  startupSearchPath?: string,
+): PostgreSqlRuntime {
+  const connectionSettings = settings(url, overrides);
+  if (startupSearchPath === undefined) return new PostgreSqlRuntime(connectionSettings);
+  return new PostgreSqlRuntime(connectionSettings, {
+    ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
+    buildConfig: (currentSettings) => ({
+      ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(currentSettings),
+      options: `-c timezone=UTC -c search_path=${startupSearchPath}`,
+    }),
+  });
 }
 
 export async function assertHarnessReady(): Promise<void> {
@@ -74,6 +96,7 @@ export async function assertHarnessReady(): Promise<void> {
   const migrator = runtimeFor(env.LCM_TEST_POSTGRES_MIGRATOR_URL);
   const runtime = runtimeFor(env.LCM_TEST_POSTGRES_RUNTIME_URL);
   try {
+    await runPostgreSqlMigrations(migrator);
     const [migratorHealth, runtimeHealth] = await Promise.all([migrator.health(), runtime.health()]);
     if (migratorHealth.status !== "healthy" || migratorHealth.role !== "lcm_test_migrator") {
       throw new Error(`migrator readiness failed: ${JSON.stringify(migratorHealth)}`);
@@ -81,7 +104,6 @@ export async function assertHarnessReady(): Promise<void> {
     if (runtimeHealth.status !== "healthy" || runtimeHealth.role !== "lcm_test_runtime") {
       throw new Error(`runtime readiness failed: ${JSON.stringify(runtimeHealth)}`);
     }
-    await runPostgreSqlMigrations(migrator);
     const assertions = await migrator.query<GuardRow>({
       text: `SELECT current_setting('server_version_num')::integer AS server_version_num,
                     current_user AS role,
@@ -92,19 +114,22 @@ export async function assertHarnessReady(): Promise<void> {
     }, { domain: "factory", operation: "harnessReadiness" });
     const row = assertions.rows[0];
     if (
-      Math.floor(row.server_version_num / 10_000) !== 18
+      Math.floor(row.server_version_num / 10_000) !== REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION
       || row.role !== "lcm_test_migrator"
       || row.run_id !== env.LCM_TEST_POSTGRES_RUN_ID
       || row.database_name !== env.LCM_TEST_POSTGRES_CONTROL_DATABASE
       || row.runtime_role !== "lcm_test_runtime"
     ) throw new Error("harness sentinel readiness failed");
+    const requiredExtensions = [...REQUIRED_POSTGRESQL_EXTENSIONS];
     const extensions = await migrator.query<{ extname: string }>({
       text: `SELECT extname FROM pg_extension
              WHERE extname = ANY($1::text[])
              ORDER BY extname`,
-      values: [["pg_stat_statements", "pg_trgm", "pgcrypto", "unaccent"]],
+      values: [requiredExtensions],
     }, { domain: "factory", operation: "harnessExtensions" });
-    if (extensions.rowCount !== 4) throw new Error("harness extension readiness failed");
+    if (extensions.rowCount !== requiredExtensions.length) {
+      throw new Error("harness extension readiness failed");
+    }
   } finally {
     await Promise.allSettled([migrator.close(), runtime.close()]);
   }
@@ -120,7 +145,23 @@ export interface PostgreSqlTestDatabase extends PostgreSqlTestDatabaseLease {
   drop(): Promise<void>;
 }
 
-export async function createPostgreSqlTestDatabase(label: string): Promise<PostgreSqlTestDatabase> {
+export interface PostgreSqlTestDatabaseOptions {
+  /** Test-only fault injection. Every production-like lease installs all parity extensions. */
+  readonly omitExtensions?: readonly (typeof REQUIRED_POSTGRESQL_EXTENSIONS)[number][];
+  /** Test-only fault injection for installing selected extensions outside their required namespace. */
+  readonly extensionSchemas?: Partial<Record<(typeof REQUIRED_POSTGRESQL_EXTENSIONS)[number], string>>;
+  /** Test-only fault injection for exercising readiness before any LCM DDL. */
+  readonly runMigrations?: boolean;
+  /** Test-only connection search path for proving setup DDL is schema-qualified. */
+  readonly adminSearchPath?: string;
+  /** Test-only database encoding for readiness rejection coverage. */
+  readonly serverEncoding?: "UTF8" | "LATIN1";
+}
+
+export async function createPostgreSqlTestDatabase(
+  label: string,
+  options: PostgreSqlTestDatabaseOptions = {},
+): Promise<PostgreSqlTestDatabase> {
   const env = environment();
   const normalizedLabel = label.toLowerCase().replace(/[^a-z0-9]+/gu, "_").replace(/^_+|_+$/gu, "").slice(0, 12) || "case";
   const worker = (process.env.VITEST_POOL_ID ?? "0").replace(/[^0-9]/gu, "").slice(0, 3) || "0";
@@ -128,10 +169,24 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
   const identifier = safeIdentifier(name);
   const admin = runtimeFor(env.LCM_TEST_POSTGRES_ADMIN_URL);
   const adminUrl = databaseUrl(env.LCM_TEST_POSTGRES_ADMIN_URL, name);
+  const adminSearchPath = options.adminSearchPath
+    ?.split(",")
+    .map((schema) => schema.trim())
+    .map((schema) => {
+      safeIdentifier(schema);
+      return schema;
+    })
+    .join(",");
   const migratorUrl = databaseUrl(env.LCM_TEST_POSTGRES_MIGRATOR_URL, name);
   const runtimeUrl = databaseUrl(env.LCM_TEST_POSTGRES_RUNTIME_URL, name);
+  const serverEncoding = options.serverEncoding ?? "UTF8";
+  const localeClause = serverEncoding === "LATIN1"
+    ? " LC_COLLATE 'C' LC_CTYPE 'C'"
+    : "";
   try {
-    await admin.query({ text: `CREATE DATABASE ${identifier} OWNER lcm_test_migrator TEMPLATE template0` }, {
+    await admin.query({
+      text: `CREATE DATABASE ${identifier} OWNER lcm_test_migrator TEMPLATE template0 ENCODING '${serverEncoding}'${localeClause}`,
+    }, {
       domain: "factory",
       operation: "createTestDatabase",
     });
@@ -139,7 +194,7 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
     await admin.close();
   }
 
-  const databaseAdmin = runtimeFor(adminUrl);
+  const databaseAdmin = runtimeFor(adminUrl, {}, adminSearchPath);
   const migrator = runtimeFor(migratorUrl);
   const runtime = runtimeFor(runtimeUrl);
   let databaseAdminClosePromise: Promise<void> | undefined;
@@ -163,7 +218,7 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
       const row = result.rows[0];
       if (
         !name.startsWith(`lcm_t_${env.LCM_TEST_POSTGRES_RUN_ID.slice(0, 12)}_`)
-        || Math.floor(row.server_version_num / 10_000) !== 18
+        || Math.floor(row.server_version_num / 10_000) !== REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION
         || row.role !== "lcm_harness_admin"
         || row.run_id !== env.LCM_TEST_POSTGRES_RUN_ID
         || row.database_name !== name
@@ -194,12 +249,6 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
     return dropPromise;
   };
   try {
-    for (const extension of ["pg_trgm", "unaccent", "pgcrypto", "pg_stat_statements"] as const) {
-      await databaseAdmin.query({ text: `CREATE EXTENSION ${extension}` }, {
-        domain: "factory",
-        operation: "createTestExtension",
-      });
-    }
     await databaseAdmin.query({
       text: `CREATE TABLE public.__lcm_test_run_sentinel (
                run_id text PRIMARY KEY,
@@ -216,11 +265,36 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
       text: `REVOKE ALL ON public.__lcm_test_run_sentinel FROM PUBLIC;
              GRANT SELECT ON public.__lcm_test_run_sentinel TO lcm_test_migrator, lcm_test_runtime`,
     }, { domain: "factory", operation: "protectTestSentinel" });
-    await runPostgreSqlMigrations(migrator);
-    await migrator.query({
-      text: `GRANT USAGE ON SCHEMA lcm TO lcm_test_runtime;
-             GRANT SELECT ON lcm.schema_migrations TO lcm_test_runtime`,
-    }, { domain: "factory", operation: "grantRuntimeBaseline" });
+
+    const omittedExtensions = new Set(options.omitExtensions ?? []);
+    const createdExtensionSchemas = new Set<string>();
+    for (const extension of REQUIRED_POSTGRESQL_EXTENSIONS) {
+      if (omittedExtensions.has(extension)) continue;
+      const requestedSchema = options.extensionSchemas?.[extension]
+        ?? REQUIRED_POSTGRESQL_EXTENSION_SCHEMAS[extension];
+      const schema = safeIdentifier(requestedSchema);
+      if (requestedSchema !== "public" && !createdExtensionSchemas.has(schema)) {
+        await databaseAdmin.query({ text: `CREATE SCHEMA ${schema}` }, {
+          domain: "factory",
+          operation: "createTestExtensionSchema",
+        });
+        createdExtensionSchemas.add(schema);
+      }
+      const extensionIdentifier = safeIdentifier(extension);
+      await databaseAdmin.query({
+        text: `CREATE EXTENSION ${extensionIdentifier} WITH SCHEMA ${schema}`,
+      }, {
+        domain: "factory",
+        operation: "createTestExtension",
+      });
+    }
+    if (options.runMigrations !== false) {
+      await runPostgreSqlMigrations(migrator);
+      await migrator.query({
+        text: `GRANT USAGE ON SCHEMA lcm TO lcm_test_runtime;
+               GRANT SELECT ON lcm.schema_migrations TO lcm_test_runtime`,
+      }, { domain: "factory", operation: "grantRuntimeBaseline" });
+    }
     await closeDatabaseAdmin();
   } catch (error) {
     await Promise.allSettled([closeDatabaseAdmin(), dropOwnedDatabase()]);
