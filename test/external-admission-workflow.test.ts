@@ -11,6 +11,10 @@ interface WorkflowStep {
 }
 
 interface ExternalAdmissionWorkflow {
+  concurrency: {
+    "cancel-in-progress": boolean;
+    group: string;
+  };
   on: {
     check_run: { types: string[] };
     workflow_run: { workflows: string[]; types: string[] };
@@ -120,6 +124,31 @@ describe("external admission workflow", () => {
     expect(policySource).toContain('name: "ci", appId: 15368, appSlug: "github-actions"');
     expect(source).not.toMatch(/CodeRabbit|copilot-pull-request-reviewer/iu);
     expect(source).not.toMatch(/^\s+pull_request(?:_target)?:/gmu);
+  });
+
+  it("isolates rejected CI workflow runs from exact-SHA evaluator concurrency", () => {
+    const group = workflow.concurrency.group;
+    const canonicalCiConditions = [
+      "github.event.workflow_run.name == 'CI'",
+      "github.event.workflow_run.event == 'pull_request'",
+      "github.event.workflow_run.path == '.github/workflows/ci.yml'",
+      "github.event.workflow_run.repository.full_name == github.repository",
+    ];
+
+    expect(workflow.concurrency["cancel-in-progress"]).toBe(true);
+    for (const condition of canonicalCiConditions) {
+      expect(group).toContain(condition);
+      expect(job.if).toContain(condition);
+    }
+    expect(group).toMatch(
+      /github\.event\.workflow_run\.repository\.full_name == github\.repository\s+&&\s+github\.event\.workflow_run\.head_sha/u,
+    );
+    expect(group).toMatch(
+      /github\.event_name == 'workflow_run'\s+&&\s+format\('workflow-run-\{0\}', github\.run_id\)/u,
+    );
+    expect(group).not.toContain(
+      "github.event_name == 'workflow_run' && github.event.workflow_run.head_sha",
+    );
   });
 
   it("paginates every collection and repeats exact pull-request eligibility", () => {

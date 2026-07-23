@@ -39,7 +39,14 @@ concurrency:
   group: >-
     external-admission-${{
       github.event_name == 'workflow_dispatch' && inputs.head_sha ||
-      github.event_name == 'workflow_run' && github.event.workflow_run.head_sha ||
+      github.event_name == 'workflow_run' &&
+        github.event.workflow_run.name == 'CI' &&
+        github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.path == '.github/workflows/ci.yml' &&
+        github.event.workflow_run.repository.full_name == github.repository &&
+        github.event.workflow_run.head_sha ||
+      github.event_name == 'workflow_run' &&
+        format('workflow-run-{0}', github.run_id) ||
       github.event_name == 'check_run' &&
         ((github.event.check_run.name == 'Greptile Review' && github.event.check_run.app.id == 867647 &&
           github.event.check_run.app.slug == 'greptile-apps') ||
