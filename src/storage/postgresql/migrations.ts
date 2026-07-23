@@ -24,7 +24,41 @@ const MIGRATION_MANIFEST = [
 
 type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
 type LedgerRow = QueryResultRow & { ledger_exists: boolean };
-type ServerVersionRow = QueryResultRow & { server_version_num: number };
+type ServerVersionRow = QueryResultRow & { server_version_num: unknown };
+
+export const REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION = 18 as const;
+
+export class PostgreSqlServerVersionPreflightError extends StorageOperationError {
+  constructor(
+    readonly serverVersionNumber: number | null,
+    readonly serverMajorVersion: number | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightServerVersion",
+    );
+  }
+
+  readonly requiredServerMajorVersion = REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION;
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      serverVersionNumber: this.serverVersionNumber,
+      serverMajorVersion: this.serverMajorVersion,
+      requiredServerMajorVersion: this.requiredServerMajorVersion,
+    };
+  }
+}
+
+function sanitizeServerVersionNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
 
 function migrationError(operation: string): StorageOperationError {
   return new StorageOperationError(
@@ -89,12 +123,17 @@ export async function runPostgreSqlMigrations(
     const serverVersion = await transaction.query<ServerVersionRow>({
       text: "SELECT current_setting('server_version_num')::integer AS server_version_num",
     }, { domain: "factory", operation: "preflightServerVersion", signal: options.signal });
-    const serverVersionNumber = serverVersion.rows[0]?.server_version_num;
-    if (
-      typeof serverVersionNumber !== "number"
-      || Math.floor(serverVersionNumber / 10_000) !== 18
-    ) {
-      throw migrationError("preflightServerVersion");
+    const serverVersionNumber = sanitizeServerVersionNumber(
+      serverVersion.rows[0]?.server_version_num,
+    );
+    const serverMajorVersion = serverVersionNumber === null
+      ? null
+      : Math.floor(serverVersionNumber / 10_000);
+    if (serverMajorVersion !== REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION) {
+      throw new PostgreSqlServerVersionPreflightError(
+        serverVersionNumber,
+        serverMajorVersion,
+      );
     }
 
     await assertRequiredPostgreSqlExtensionsReady(transaction, { signal: options.signal });

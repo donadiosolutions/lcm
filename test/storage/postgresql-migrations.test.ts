@@ -8,6 +8,8 @@ import type {
 } from "../../src/storage/postgresql/contracts.js";
 import {
   loadPostgreSqlMigrations,
+  PostgreSqlServerVersionPreflightError,
+  REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
   runPostgreSqlMigrations,
 } from "../../src/storage/postgresql/migrations.js";
 import { REQUIRED_POSTGRESQL_EXTENSIONS } from "../../src/storage/postgresql/extensions.js";
@@ -141,15 +143,52 @@ describe("PostgreSQL migration runner", () => {
   });
 
   it.each([
-    { label: "wrong", serverVersion: 190001 as const },
-    { label: "missing", serverVersion: "missing" as const },
-  ])("rejects a $label PostgreSQL server version before extension or schema inspection", async ({ serverVersion }) => {
+    {
+      label: "wrong",
+      serverVersion: 190001 as const,
+      serverVersionNumber: 190001,
+      serverMajorVersion: 19,
+    },
+    {
+      label: "missing",
+      serverVersion: "missing" as const,
+      serverVersionNumber: null,
+      serverMajorVersion: null,
+    },
+    {
+      label: "invalid",
+      serverVersion: -1 as const,
+      serverVersionNumber: null,
+      serverMajorVersion: null,
+    },
+    {
+      label: "non-integer",
+      serverVersion: 180004.5 as const,
+      serverVersionNumber: null,
+      serverMajorVersion: null,
+    },
+  ])("rejects a $label PostgreSQL server version before extension or schema inspection", async ({
+    serverVersion,
+    serverVersionNumber,
+    serverMajorVersion,
+  }) => {
     const fake = executor({ serverVersion });
-    await expect(runPostgreSqlMigrations(fake.seam, { migrations: [migration("0001_first")] }))
-      .rejects.toMatchObject({
-        code: "STORAGE_INITIALIZATION_FAILED",
-        operation: "preflightServerVersion",
-      });
+    const failure = await runPostgreSqlMigrations(fake.seam, {
+      migrations: [migration("0001_first")],
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlServerVersionPreflightError);
+    expect(failure).toMatchObject({
+      code: "STORAGE_INITIALIZATION_FAILED",
+      operation: "preflightServerVersion",
+      serverVersionNumber,
+      serverMajorVersion,
+      requiredServerMajorVersion: 18,
+    });
+    expect((failure as PostgreSqlServerVersionPreflightError).toJSON()).toMatchObject({
+      serverVersionNumber,
+      serverMajorVersion,
+      requiredServerMajorVersion: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
+    });
     expect(fake.operations).toEqual(["lockMigrations", "preflightServerVersion"]);
   });
 });
