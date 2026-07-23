@@ -15,7 +15,7 @@ beforeAll(assertHarnessReady);
 describe("PostgreSQL extension readiness", () => {
   it("ignores hostile search_path relations that shadow extension catalogs", async () => {
     await withPostgreSqlTestDatabase("extension-search-path", async (database) => {
-      await database.migrator.transaction(async (transaction) => {
+      const observation = await database.migrator.transaction(async (transaction) => {
         const setup = [
           ["createHostileCatalogSchema", "CREATE SCHEMA hostile_catalog"],
           [
@@ -47,16 +47,18 @@ describe("PostgreSQL extension readiness", () => {
         const searchPath = await transaction.query<{ search_path: string }>({
           text: "SHOW search_path",
         }, { domain: "factory", operation: "verifyHostileCatalogSearchPath" });
-        expect(searchPath.rows).toEqual([{
-          search_path: "hostile_catalog, pg_catalog, public",
-        }]);
-
-        await expect(inspectRequiredPostgreSqlExtensions(transaction)).resolves.toEqual(
-          expect.arrayContaining(REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => (
-            expect.objectContaining({ name, status: "current" })
-          ))),
-        );
+        const statuses = await inspectRequiredPostgreSqlExtensions(transaction);
+        return { searchPath: searchPath.rows, statuses };
       });
+
+      expect(observation.searchPath).toEqual([{
+        search_path: "hostile_catalog, pg_catalog, public",
+      }]);
+      expect(observation.statuses).toEqual(
+        expect.arrayContaining(REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => (
+          expect.objectContaining({ name, status: "current" })
+        ))),
+      );
     });
   });
 
