@@ -18,6 +18,7 @@ import {
   type PostgreSqlRuntimeDependencies,
 } from "../../src/storage/postgresql/runtime.js";
 import { REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION } from "../../src/storage/postgresql/migrations.js";
+import { POSTGRESQL_SEARCH_CONFIGURATION_SHA256 } from "../../src/storage/postgresql/search-configuration.js";
 
 function result<R extends QueryResultRow>(rows: R[]): QueryResult<R> {
   return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows };
@@ -71,10 +72,28 @@ function isExtensionInspection(input: unknown): boolean {
 function healthFixtures(
   healthRow: HealthFixtureRow = HEALTHY_ROW,
   extensionRows = CURRENT_EXTENSION_ROWS,
+  searchConfigurationRow: QueryResultRow = {
+    actual_sha256: POSTGRESQL_SEARCH_CONFIGURATION_SHA256,
+    object_count: "19",
+    ownership_ready: true,
+  },
 ) {
-  return fixtures((input) => isExtensionInspection(input)
-    ? result(extensionRows)
-    : result([healthRow]));
+  return fixtures((input) => {
+    if (isExtensionInspection(input)) return result(extensionRows);
+    if (typeof input === "object" && input !== null && "text" in input && typeof input.text === "string") {
+      if (input.text.includes("pg_stat_statements_info")) {
+        const pgStatStatements = extensionRows.find(({ name }) => name === "pg_stat_statements");
+        if (pgStatStatements?.preloaded === false) {
+          throw Object.assign(new Error("private preload detail"), { code: "55000" });
+        }
+        return result([{ stats_reset: new Date() }]);
+      }
+      if (input.text.includes("pg_ts_config_map")) {
+        return result([searchConfigurationRow]);
+      }
+    }
+    return result([healthRow]);
+  });
 }
 
 type QueryCallback = (error: Error | null, value?: QueryResult<QueryResultRow>) => void;
@@ -358,6 +377,24 @@ describe("PostgreSQL runtime", () => {
     expect(f.query).toHaveBeenCalledWith("ROLLBACK");
     expect(f.query).not.toHaveBeenCalledWith("COMMIT");
     expect(f.release).toHaveBeenCalledWith(false);
+  });
+
+  it("keeps a caught pg_stat_statements SQLSTATE 55000 fatal to the transaction", async () => {
+    const f = fixtures((input) => {
+      if (typeof input === "string") return result([]);
+      throw Object.assign(new Error("must be loaded via shared_preload_libraries"), { code: "55000" });
+    });
+    await expect(f.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "SELECT stats_reset FROM public.pg_stat_statements_info" }, {
+        domain: "factory",
+        operation: "caughtPgStatStatementsProbe",
+      }).catch(() => undefined);
+    })).rejects.toMatchObject({
+      operation: "caughtPgStatStatementsProbe",
+      sqlState: "55000",
+    });
+    expect(f.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(f.query).not.toHaveBeenCalledWith("COMMIT");
   });
 
   it("drains successful unawaited queries and fences retained executors before committing", async () => {
@@ -1075,6 +1112,30 @@ describe("PostgreSQL runtime", () => {
         code: "STORAGE_INITIALIZATION_FAILED",
         operation: "health",
         extensions: expect.arrayContaining([expect.objectContaining(expected)]),
+      },
+    });
+  });
+
+  it("reports text-search catalog drift as unavailable readiness", async () => {
+    const runtime = healthFixtures(HEALTHY_ROW, CURRENT_EXTENSION_ROWS, {
+      actual_sha256: null,
+      object_count: "18",
+      ownership_ready: true,
+    });
+    await expect(runtime.runtime.health()).resolves.toMatchObject({
+      status: "unavailable",
+      backend: "postgresql",
+      searchConfiguration: {
+        objectCount: 18,
+        ready: false,
+      },
+      error: {
+        code: "STORAGE_INITIALIZATION_FAILED",
+        operation: "health",
+        searchConfiguration: {
+          objectCount: 18,
+          ready: false,
+        },
       },
     });
   });

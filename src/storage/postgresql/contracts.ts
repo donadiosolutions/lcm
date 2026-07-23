@@ -62,6 +62,15 @@ export interface PostgreSqlExtensionStatus {
   readonly remediation: string | null;
 }
 
+export interface PostgreSqlSearchConfigurationStatus {
+  readonly name: "lcm.search_v1";
+  readonly expectedSha256: string;
+  readonly actualSha256: string | null;
+  readonly objectCount: number;
+  readonly ownershipReady: boolean;
+  readonly ready: boolean;
+}
+
 export interface PostgreSqlRuntimeHealth extends StorageHealth {
   readonly backend: "postgresql";
   readonly serverMajorVersion?: number | null;
@@ -69,6 +78,7 @@ export interface PostgreSqlRuntimeHealth extends StorageHealth {
   readonly timezone?: string;
   readonly role?: string;
   readonly extensions?: readonly PostgreSqlExtensionStatus[];
+  readonly searchConfiguration?: PostgreSqlSearchConfigurationStatus;
 }
 
 export interface PostgreSqlTestDatabaseSentinel {

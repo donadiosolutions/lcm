@@ -4,6 +4,7 @@ import type {
   PostgreSqlExtensionStatus,
   PostgreSqlQueryExecutor,
 } from "./contracts.js";
+import { PostgreSqlStorageOperationError } from "./errors.js";
 
 export const REQUIRED_POSTGRESQL_EXTENSIONS = [
   "pg_stat_statements",
@@ -27,7 +28,10 @@ type ExtensionRow = QueryResultRow & {
   installed_version: string | null;
   installed_schema: string | null;
   relocatable: boolean | null;
-  preloaded: boolean | null;
+};
+
+type PgStatStatementsProbeRow = QueryResultRow & {
+  stats_reset: Date | string | null;
 };
 
 function quoteIdentifier(value: string): string {
@@ -64,6 +68,7 @@ function remediation(
 function extensionStatus(
   name: RequiredExtensionName,
   row: ExtensionRow | undefined,
+  pgStatStatementsPreloaded: boolean | null,
 ): PostgreSqlExtensionStatus {
   const defaultVersion = row?.default_version ?? null;
   const installedVersion = row?.installed_version ?? null;
@@ -71,7 +76,7 @@ function extensionStatus(
   const installedSchema = row?.installed_schema ?? null;
   const relocatable = row?.relocatable ?? null;
   const preloadRequired = name === "pg_stat_statements";
-  const preloaded = preloadRequired ? row?.preloaded ?? null : null;
+  const preloaded = preloadRequired ? pgStatStatementsPreloaded : null;
   const available = defaultVersion !== null;
   const status: PostgreSqlExtensionStatus["status"] = !available
     ? installedVersion === null
@@ -104,6 +109,27 @@ function extensionStatus(
       relocatable,
     ),
   };
+}
+
+async function probePgStatStatements(
+  executor: PostgreSqlQueryExecutor,
+  options: { readonly operation?: string; readonly signal?: AbortSignal },
+): Promise<boolean> {
+  try {
+    await executor.query<PgStatStatementsProbeRow>({
+      text: "SELECT stats_reset FROM public.pg_stat_statements_info",
+    }, {
+      domain: "factory",
+      operation: options.operation ?? "probePgStatStatements",
+      signal: options.signal,
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof PostgreSqlStorageOperationError && error.sqlState === "55000") {
+      return false;
+    }
+    throw error;
+  }
 }
 
 export function areRequiredPostgreSqlExtensionsReady(
@@ -147,17 +173,7 @@ export async function inspectRequiredPostgreSqlExtensions(
                   available.default_version,
                   installed.extversion::text AS installed_version,
                   namespace.nspname::text AS installed_schema,
-                  installed_version.relocatable,
-                  CASE WHEN required.name OPERATOR(pg_catalog.=) 'pg_stat_statements'
-                    THEN EXISTS (
-                      SELECT 1
-                      FROM pg_catalog.pg_get_loaded_modules() AS loaded
-                      WHERE loaded.module_name OPERATOR(pg_catalog.=) 'pg_stat_statements'
-                         OR loaded.file_name OPERATOR(pg_catalog.~)
-                           '(^|/)pg_stat_statements([.][^/]*)?$'
-                    )
-                    ELSE NULL
-                  END AS preloaded
+                  installed_version.relocatable
            FROM required
            LEFT JOIN pg_catalog.pg_available_extensions AS available
              ON available.name OPERATOR(pg_catalog.=) required.name
@@ -177,7 +193,23 @@ export async function inspectRequiredPostgreSqlExtensions(
     signal: options.signal,
   });
   const rows = new Map(result.rows.map((row) => [row.name, row]));
-  return REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => extensionStatus(name, rows.get(name)));
+  const pgStatStatements = rows.get("pg_stat_statements");
+  const shouldProbe = pgStatStatements !== undefined
+    && pgStatStatements.default_version !== null
+    && pgStatStatements?.installed_version !== null
+    && pgStatStatements.installed_version === pgStatStatements.default_version
+    && pgStatStatements.installed_schema === REQUIRED_POSTGRESQL_EXTENSION_SCHEMAS.pg_stat_statements;
+  const preloaded = shouldProbe
+    ? await probePgStatStatements(executor, {
+      operation: options.operation === undefined
+        ? undefined
+        : `${options.operation}:probePgStatStatements`,
+      signal: options.signal,
+    })
+    : null;
+  return REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => (
+    extensionStatus(name, rows.get(name), name === "pg_stat_statements" ? preloaded : null)
+  ));
 }
 
 export async function assertRequiredPostgreSqlExtensionsReady(

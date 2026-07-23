@@ -14,6 +14,7 @@ import {
   runPostgreSqlMigrations,
 } from "../../src/storage/postgresql/migrations.js";
 import { REQUIRED_POSTGRESQL_EXTENSIONS } from "../../src/storage/postgresql/extensions.js";
+import { POSTGRESQL_SEARCH_CONFIGURATION_SHA256 } from "../../src/storage/postgresql/search-configuration.js";
 
 function migration(id: string, sql = `SELECT '${id}'`): PostgreSqlMigration {
   return { id, filename: `${id}.sql`, sql, sha256: createHash("sha256").update(sql).digest("hex") };
@@ -40,6 +41,8 @@ function executor(options: {
     | "unsafe-user"
     | "quoted-user";
   serverVersion?: number | "missing";
+  postmasterEpoch?: unknown;
+  postmasterContinuity?: boolean | "missing";
 } = {}) {
   const operations: string[] = [];
   const query = vi.fn(async <R extends QueryResultRow>(
@@ -48,6 +51,30 @@ function executor(options: {
   ): Promise<QueryResult<R>> => {
     operations.push(context.operation);
     if (context.operation === options.failOperation) throw new Error("private SQL failure");
+    if (context.operation === "capturePostmasterEpoch") {
+      return options.postmasterEpoch === null
+        ? result([] as R[])
+        : result([{
+          postmaster_started_at: options.postmasterEpoch ?? "2026-01-01 00:00:00+00",
+        }] as unknown as R[]);
+    }
+    if (context.operation.endsWith("probePgStatStatements")) {
+      return result([{ stats_reset: new Date() }] as unknown as R[]);
+    }
+    if (context.operation === "verifyPostmasterContinuity") {
+      return options.postmasterContinuity === "missing"
+        ? result([] as R[])
+        : result([{
+          preflight_still_valid: options.postmasterContinuity ?? true,
+        }] as unknown as R[]);
+    }
+    if (context.operation === "preflightSearchConfiguration") {
+      return result([{
+        actual_sha256: POSTGRESQL_SEARCH_CONFIGURATION_SHA256,
+        object_count: "19",
+        ownership_ready: true,
+      }] as unknown as R[]);
+    }
     if (context.operation === "preflightServerVersion") {
       return result(options.serverVersion === "missing"
         ? [] as R[]
@@ -111,7 +138,7 @@ describe("PostgreSQL migration runner", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "37d510aa773fc37db94e4ab93ab0241e7f0fe3b49cc2747ff07519ba42c6ff30" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "dcf82e9f9ad0084467696a8a1a1650897ddfb525b0c417b9bcb771d0af78d275" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
@@ -134,7 +161,7 @@ describe("PostgreSQL migration runner", () => {
   });
 
   it("applies and records pending migrations atomically with the signal", async () => {
-    const fake = executor();
+    const fake = executor({ postmasterEpoch: new Date("2026-01-01T00:00:00Z") });
     const signal = new AbortController().signal;
     const migrations = [migration("0001_first"), migration("0002_second")];
     await expect(runPostgreSqlMigrations(fake.seam, { migrations, signal })).resolves.toEqual({
@@ -142,18 +169,22 @@ describe("PostgreSQL migration runner", () => {
       current: ["0001_first", "0002_second"],
     });
     expect(fake.operations).toEqual([
+      "capturePostmasterEpoch",
+      "preflightRequiredExtensions",
+      "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
       "lockMigrations",
+      "verifyPostmasterContinuity",
       "preflightServerVersion",
-      "preflightRequiredExtensions",
       "preflightSchemaOwnership",
       "inspectMigrationLedger",
       "applyMigration:0001_first",
       "recordMigration",
       "applyMigration:0002_second",
       "recordMigration",
+      "preflightSearchConfiguration",
     ]);
-    expect(fake.seam.query).toHaveBeenNthCalledWith(1, {
+    expect(fake.seam.query).toHaveBeenNthCalledWith(4, {
       text: "SET LOCAL search_path = pg_catalog, public",
     }, {
       domain: "factory",
@@ -205,11 +236,29 @@ describe("PostgreSQL migration runner", () => {
     await expect(runPostgreSqlMigrations(fake.seam, { migrations: [migration("0001_first")] }))
       .rejects.toThrow("private SQL failure");
     expect(fake.operations).toEqual([
-      "pinMigrationSearchPath",
-      "lockMigrations",
-      "preflightServerVersion",
+      "capturePostmasterEpoch",
       "preflightRequiredExtensions",
     ]);
+  });
+
+  it.each([
+    { label: "missing", postmasterEpoch: null },
+    { label: "malformed", postmasterEpoch: 7 },
+  ])("fails closed on a $label captured postmaster epoch", async ({ postmasterEpoch }) => {
+    await expect(runPostgreSqlMigrations(
+      executor({ postmasterEpoch }).seam,
+      { migrations: [] },
+    )).rejects.toMatchObject({ operation: "capturePostmasterEpoch" });
+  });
+
+  it.each([
+    { label: "changed", postmasterContinuity: false as const },
+    { label: "missing", postmasterContinuity: "missing" as const },
+  ])("fails closed when postmaster continuity is $label", async ({ postmasterContinuity }) => {
+    await expect(runPostgreSqlMigrations(
+      executor({ postmasterContinuity }).seam,
+      { migrations: [] },
+    )).rejects.toMatchObject({ operation: "verifyPostmasterContinuity" });
   });
 
   it.each([
@@ -313,10 +362,13 @@ describe("PostgreSQL migration runner", () => {
       remediation,
     });
     expect(fake.operations).toEqual([
+      "capturePostmasterEpoch",
+      "preflightRequiredExtensions",
+      "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
       "lockMigrations",
+      "verifyPostmasterContinuity",
       "preflightServerVersion",
-      "preflightRequiredExtensions",
       "preflightSchemaOwnership",
     ]);
   });
@@ -369,8 +421,12 @@ describe("PostgreSQL migration runner", () => {
       requiredServerMajorVersion: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
     });
     expect(fake.operations).toEqual([
+      "capturePostmasterEpoch",
+      "preflightRequiredExtensions",
+      "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
       "lockMigrations",
+      "verifyPostmasterContinuity",
       "preflightServerVersion",
     ]);
   });

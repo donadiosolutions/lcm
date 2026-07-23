@@ -52,8 +52,11 @@ describe("PostgreSQL search normalization artifact", () => {
       "pg_catalog.lower(tag COLLATE pg_catalog.pg_unicode_fast)",
     );
     expect(sql).toContain(
-      "to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(tag))",
+      "to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(tag))",
     );
+    expect(sql).toContain("CREATE TEXT SEARCH DICTIONARY lcm.simple_v1");
+    expect(sql).toContain("PARSER = pg_catalog.default");
+    expect(sql).not.toContain("COPY = pg_catalog.simple");
     expect(sql).toContain(
       "USING gin (lcm.normalize_search_text(tag) public.gin_trgm_ops)",
     );

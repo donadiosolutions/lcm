@@ -14,6 +14,26 @@ import {
 beforeAll(assertHarnessReady);
 
 describe("PostgreSQL extension readiness", () => {
+  it("installs default fixtures in public under a restrictive admin search_path", async () => {
+    const database = await createPostgreSqlTestDatabase("extension-admin-path", {
+      adminSearchPath: "pg_catalog",
+    });
+    try {
+      const statuses = await inspectRequiredPostgreSqlExtensions(database.migrator);
+      expect(statuses).toEqual(
+        expect.arrayContaining(REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => (
+          expect.objectContaining({
+            name,
+            installedSchema: "public",
+            status: "current",
+          })
+        ))),
+      );
+    } finally {
+      await database.drop();
+    }
+  });
+
   it("ignores hostile search_path relations that shadow extension catalogs", async () => {
     await withPostgreSqlTestDatabase("extension-search-path", async (database) => {
       const observation = await database.migrator.transaction(async (transaction) => {

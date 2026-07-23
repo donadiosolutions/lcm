@@ -79,9 +79,11 @@ available in structured diagnostics but are not interpolated into remediation
 SQL or prose. An installed-but-unavailable
 extension requires restoring its matching control files, not running `CREATE
 EXTENSION`. For an otherwise-current `pg_stat_statements`, least-privilege
-readiness uses `pg_get_loaded_modules()` to verify the active module and does not
-inspect the superuser-only `shared_preload_libraries` setting. Remediation tells
-the administrator to add the module to that setting and restart PostgreSQL. LCM
+readiness functionally reads `public.pg_stat_statements_info`; only SQLSTATE
+`55000` becomes `not-preloaded`. Migration performs this potentially failing
+probe before its DDL transaction, then verifies the same postmaster epoch under
+the advisory lock. Remediation tells the administrator to add the module to
+`shared_preload_libraries` and restart PostgreSQL. LCM
 never creates, upgrades, relocates, reinstalls, or drops an extension. For a
 wrong namespace, relocatable extensions receive `ALTER EXTENSION ... SET SCHEMA
 "public"` guidance; non-relocatable extensions receive an explicit reinstall

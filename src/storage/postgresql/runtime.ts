@@ -15,6 +15,10 @@ import {
   PostgreSqlExtensionPreflightError,
 } from "./extensions.js";
 import { REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION } from "./migrations.js";
+import {
+  inspectPostgreSqlSearchConfiguration,
+  PostgreSqlSearchConfigurationPreflightError,
+} from "./search-configuration.js";
 
 export interface PostgreSqlRuntimeDependencies {
   readonly createPool: (config: PoolConfig) => Pool;
@@ -288,27 +292,33 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       const extensions = await inspectRequiredPostgreSqlExtensions(this, {
         operation: "healthRequiredExtensions",
       });
+      const searchConfiguration = await inspectPostgreSqlSearchConfiguration(this, {
+        operation: "healthSearchConfiguration",
+      });
       const diagnostics = {
         ...connectionDiagnostics,
         extensions,
+        searchConfiguration,
       };
       const runtimeReady = row?.tls === true
         && row.timezone.toUpperCase() === "UTC";
       const extensionsReady = areRequiredPostgreSqlExtensionsReady(extensions);
-      if (!runtimeReady || !extensionsReady) {
+      if (!runtimeReady || !extensionsReady || !searchConfiguration.ready) {
         return {
           status: "unavailable",
           backend: "postgresql",
           ...diagnostics,
-          error: runtimeReady
-            ? new PostgreSqlExtensionPreflightError(extensions, "health")
+          error: runtimeReady && extensionsReady
+            ? new PostgreSqlSearchConfigurationPreflightError(searchConfiguration, "health")
+            : runtimeReady
+              ? new PostgreSqlExtensionPreflightError(extensions, "health")
             : new StorageOperationError(
               "STORAGE_INITIALIZATION_FAILED",
               "postgresql",
               undefined,
               "factory",
               "health",
-            ),
+              ),
         };
       }
       return {

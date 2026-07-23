@@ -11,6 +11,7 @@ import {
   PostgreSqlExtensionPreflightError,
   REQUIRED_POSTGRESQL_EXTENSIONS,
 } from "../../src/storage/postgresql/extensions.js";
+import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
 
 type ExtensionRow = QueryResultRow & {
   name: string;
@@ -25,11 +26,24 @@ function result<R extends QueryResultRow>(rows: R[]): QueryResult<R> {
   return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows };
 }
 
-function executor(rows: ExtensionRow[]) {
+function executor(rows: ExtensionRow[], probeSqlState?: string) {
   const query = vi.fn(async <R extends QueryResultRow>(
     _config: unknown,
-    _options: PostgreSqlQueryOptions,
-  ): Promise<QueryResult<R>> => result(rows as unknown as R[]));
+    options: PostgreSqlQueryOptions,
+  ): Promise<QueryResult<R>> => {
+    if (options.operation.includes("probePgStatStatements")) {
+      if (probeSqlState !== undefined) {
+        throw new PostgreSqlStorageOperationError(
+          "STORAGE_OPERATION_FAILED",
+          options,
+          probeSqlState,
+          false,
+        );
+      }
+      return result([{ stats_reset: new Date() }] as unknown as R[]);
+    }
+    return result(rows as unknown as R[]);
+  });
   return { query } satisfies PostgreSqlQueryExecutor;
 }
 
@@ -75,8 +89,11 @@ describe("PostgreSQL required extension preflight", () => {
       signal: undefined,
     });
     const inspectionSql = seam.query.mock.calls[0]?.[0].text ?? "";
-    expect(inspectionSql.match(/OPERATOR\(pg_catalog\.=\)/gu)).toHaveLength(7);
-    expect(inspectionSql.match(/OPERATOR\(pg_catalog\.~\)/gu)).toHaveLength(1);
+    expect(inspectionSql.match(/OPERATOR\(pg_catalog\.=\)/gu)).toHaveLength(5);
+    expect(inspectionSql).not.toContain("pg_get_loaded_modules");
+    expect(seam.query.mock.calls[1]?.[0]).toMatchObject({
+      text: "SELECT stats_reset FROM public.pg_stat_statements_info",
+    });
   });
 
   it("requires each current extension name exactly once", async () => {
@@ -225,9 +242,7 @@ describe("PostgreSQL required extension preflight", () => {
   });
 
   it("requires pg_stat_statements to be configured and functionally loaded", async () => {
-    const seam = executor(CURRENT_ROWS.map((row) => row.name === "pg_stat_statements"
-      ? { ...row, preloaded: false }
-      : row));
+    const seam = executor(CURRENT_ROWS, "55000");
 
     const statuses = await inspectRequiredPostgreSqlExtensions(seam);
     expect(statuses[0]).toMatchObject({
@@ -238,19 +253,24 @@ describe("PostgreSQL required extension preflight", () => {
       remediation: "Add \"pg_stat_statements\" to shared_preload_libraries and restart PostgreSQL.",
     });
     expect(areRequiredPostgreSqlExtensionsReady(statuses)).toBe(false);
-    expect(seam.query.mock.calls[0]?.[0]).toMatchObject({
-      text: expect.stringContaining("pg_get_loaded_modules"),
+    expect(seam.query.mock.calls[1]?.[0]).toMatchObject({
+      text: "SELECT stats_reset FROM public.pg_stat_statements_info",
     });
 
-    await expect(assertRequiredPostgreSqlExtensionsReady(executor(
-      CURRENT_ROWS.map((row) => row.name === "pg_stat_statements"
-        ? { ...row, preloaded: false }
-        : row),
-    ))).rejects.toMatchObject({
+    await expect(assertRequiredPostgreSqlExtensionsReady(executor(CURRENT_ROWS, "55000")))
+      .rejects.toMatchObject({
       extensions: expect.arrayContaining([
         expect.objectContaining({ name: "pg_stat_statements", status: "not-preloaded" }),
       ]),
     });
+  });
+
+  it("propagates probe failures other than the sanitized preload SQLSTATE", async () => {
+    await expect(inspectRequiredPostgreSqlExtensions(executor(CURRENT_ROWS, "42501")))
+      .rejects.toMatchObject({
+        operation: "probePgStatStatements",
+        sqlState: "42501",
+      });
   });
 
   it("rejects wrong namespaces with relocatable and non-relocatable remediation", async () => {

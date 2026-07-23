@@ -248,10 +248,14 @@ ambient schema cannot shadow readiness behavior.
 matching control files are unavailable. Guidance restores those files for the
 installed version and reruns readiness; it does not incorrectly suggest
 `CREATE EXTENSION`. `not-preloaded` applies to an otherwise-current
-`pg_stat_statements`: readiness uses `pg_get_loaded_modules()` to verify the
-active module without reading the superuser-only `shared_preload_libraries`
-setting. Guidance tells the administrator to add the module to that setting,
-restart PostgreSQL, and rerun readiness.
+`pg_stat_statements`: readiness performs the non-mutating functional query
+`SELECT stats_reset FROM public.pg_stat_statements_info`. PostgreSQL SQLSTATE
+`55000` is classified as `not-preloaded`; permission, cancellation, transport,
+and other database failures remain failures rather than being mislabeled.
+Migration captures the postmaster start time before this pre-transaction probe
+and, under the advisory lock, verifies that the postmaster did not restart and
+that the module remains loaded. Guidance tells the administrator to add the
+module to `shared_preload_libraries`, restart PostgreSQL, and rerun readiness.
 
 For a relocatable extension in the wrong namespace, guidance uses `ALTER
 EXTENSION ... SET SCHEMA "public"`. For a non-relocatable installation, it
@@ -283,19 +287,22 @@ on a provider does not justify silently expanding the baseline.
 1. The cluster administrator provisions PostgreSQL 18, preloads services such
    as `pg_stat_statements` when necessary, and installs the exact required
    extensions in `public`. The migrator and runtime use separate login roles.
-2. Runtime health verifies server version and extension availability,
-   installation, and version. Failed readiness produces corrective guidance
-   without changing cluster state.
-3. The migration runner validates packaged SHA-256 artifacts, opens one
-   transaction, takes a database-scoped transaction advisory lock, repeats the
-   PostgreSQL 18 and extension readiness checks, verifies that any existing
+2. Runtime health verifies server version, extension readiness, and the
+   fingerprinted `lcm.search_v1` text-search contract. Failed readiness produces
+   corrective guidance without changing cluster state.
+3. The migration runner validates packaged SHA-256 artifacts, captures the
+   postmaster epoch, and performs the functional extension probe before opening
+   the DDL transaction. It then opens one transaction, takes a database-scoped
+   transaction advisory lock, verifies postmaster continuity and PostgreSQL 18,
+   verifies that any existing
    `lcm` schema is owned by the current migration role, and then verifies the
    complete ordered ledger. `0001` creates the `lcm` schema and immutable ledger; `0002`
    first rejects a pre-existing `lcm` schema that grants `PUBLIC CREATE`, then
    creates the 23-table baseline data model and indexes. The guard does not
    revoke or otherwise rewrite the pre-existing schema ACL. Its normalization
    helper uses non-replacing `CREATE FUNCTION`, so an existing same-signature
-   function fails closed.
+   function fails closed. Before commit, the runner verifies the LCM-owned
+   `simple_v1` dictionary and `search_v1` configuration fingerprint.
 4. Each pending migration and its ledger row execute in that same transaction.
    Any DDL, constraint, index, privilege, or ledger failure rolls back the whole
    pending set. Repeated and concurrent runs converge on the same ordered
@@ -306,8 +313,15 @@ on a provider does not justify silently expanding the baseline.
    auto-repair data. Restore the expected artifact/database or add a new ordered
    migration.
 
-Changing normalization rules requires a new immutable migration; updating the
-`unaccent` extension alone does not adopt new mappings. That migration must run
+`lcm.search_v1` uses PostgreSQL 18's `pg_catalog.default` parser and an
+LCM-owned `lcm.simple_v1` dictionary with 19 explicit token mappings. Its
+catalog fingerprint covers the parser OID, ordered token mappings, dictionary
+template/options, and ownership; no runtime role owns either object. All stored
+vectors and query constructors must name `lcm.search_v1`.
+
+Changing the text-search configuration or normalization rules requires a new
+immutable migration; updating `unaccent` alone does not adopt new mappings.
+That migration must run
 under the same advisory lock and transaction as the ledger update and perform
 all of the following:
 
@@ -319,21 +333,19 @@ all of the following:
 
    ```sql
    ALTER TABLE lcm.messages ALTER COLUMN search_document SET EXPRESSION AS
-     (to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(content)));
+     (to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content)));
    ALTER TABLE lcm.summaries ALTER COLUMN search_document SET EXPRESSION AS
-     (to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(content)));
+     (to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content)));
    ALTER TABLE lcm.promoted_memories ALTER COLUMN search_document SET EXPRESSION AS
-     (to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(content)));
+     (to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content)));
    ALTER TABLE lcm.promoted_memory_tags ALTER COLUMN search_document SET EXPRESSION AS
-     (to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(tag)));
+     (to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(tag)));
    ```
 
-3. Rebuild `messages_search_document_idx`, `messages_content_trgm_idx`,
-   `summaries_search_document_idx`, `summaries_content_trgm_idx`,
-   `promoted_memories_search_document_idx`, and
-   `promoted_memories_content_trgm_idx`,
-   `promoted_memory_tags_search_document_idx`, and
-   `promoted_memory_tags_tag_trgm_idx` with plain transactional `REINDEX INDEX`.
+3. Rebuild the four `*_search_document_idx` GIN indexes with plain
+   transactional `REINDEX INDEX`. Rebuild the four trigram indexes too only
+   when `lcm.normalize_search_text` changes; a text-configuration-only change
+   does not affect their expressions.
    Do not use `CONCURRENTLY` inside the migration transaction:
 
    ```sql

@@ -8,6 +8,7 @@ import type {
   PostgreSqlQueryExecutor,
 } from "./contracts.js";
 import { assertRequiredPostgreSqlExtensionsReady } from "./extensions.js";
+import { assertPostgreSqlSearchConfigurationReady } from "./search-configuration.js";
 
 const MIGRATION_MANIFEST = [
   {
@@ -18,13 +19,15 @@ const MIGRATION_MANIFEST = [
   {
     id: "0002_schema_baseline",
     filename: "0002_schema_baseline.sql",
-    sha256: "37d510aa773fc37db94e4ab93ab0241e7f0fe3b49cc2747ff07519ba42c6ff30",
+    sha256: "dcf82e9f9ad0084467696a8a1a1650897ddfb525b0c417b9bcb771d0af78d275",
   },
 ] as const;
 
 type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
 type LedgerRow = QueryResultRow & { ledger_exists: boolean };
 type ServerVersionRow = QueryResultRow & { server_version_num: unknown };
+type PostmasterEpochRow = QueryResultRow & { postmaster_started_at: Date | string };
+type PostmasterContinuityRow = QueryResultRow & { preflight_still_valid: boolean };
 type SchemaOwnershipRow = QueryResultRow & {
   current_user_name: unknown;
   schema_exists: unknown;
@@ -170,6 +173,17 @@ export async function runPostgreSqlMigrations(
 ): Promise<PostgreSqlMigrationResult> {
   const migrations = [...(options.migrations ?? loadPostgreSqlMigrations())];
   validateMigrations(migrations);
+  // The functional pg_stat_statements probe can raise SQLSTATE 55000 when the
+  // library was not preloaded. Run it before opening the all-or-nothing DDL
+  // transaction so that expected readiness failure cannot poison that scope.
+  const postmasterEpoch = await executor.query<PostmasterEpochRow>({
+    text: "SELECT pg_catalog.pg_postmaster_start_time()::text AS postmaster_started_at",
+  }, { domain: "factory", operation: "capturePostmasterEpoch", signal: options.signal });
+  const postmasterStartedAt = postmasterEpoch.rows[0]?.postmaster_started_at;
+  if (!(postmasterStartedAt instanceof Date) && typeof postmasterStartedAt !== "string") {
+    throw migrationError("capturePostmasterEpoch");
+  }
+  await assertRequiredPostgreSqlExtensionsReady(executor, { signal: options.signal });
   return executor.transaction(async (transaction) => {
     await transaction.query({
       text: "SET LOCAL search_path = pg_catalog, public",
@@ -183,6 +197,22 @@ export async function runPostgreSqlMigrations(
         )
       )`,
     }, { domain: "factory", operation: "lockMigrations", signal: options.signal });
+
+    const continuity = await transaction.query<PostmasterContinuityRow>({
+      text: `SELECT
+               pg_catalog.pg_postmaster_start_time()::text OPERATOR(pg_catalog.=) $1::text
+               AND EXISTS (
+                 SELECT 1
+                 FROM pg_catalog.pg_get_loaded_modules() AS loaded
+                 WHERE loaded.module_name OPERATOR(pg_catalog.=) 'pg_stat_statements'
+                    OR loaded.file_name OPERATOR(pg_catalog.~)
+                      '(^|/)pg_stat_statements([.][^/]*)?$'
+               ) AS preflight_still_valid`,
+      values: [postmasterStartedAt],
+    }, { domain: "factory", operation: "verifyPostmasterContinuity", signal: options.signal });
+    if (continuity.rows[0]?.preflight_still_valid !== true) {
+      throw migrationError("verifyPostmasterContinuity");
+    }
 
     const serverVersion = await transaction.query<ServerVersionRow>({
       text: "SELECT pg_catalog.current_setting('server_version_num')::integer AS server_version_num",
@@ -199,8 +229,6 @@ export async function runPostgreSqlMigrations(
         serverMajorVersion,
       );
     }
-
-    await assertRequiredPostgreSqlExtensionsReady(transaction, { signal: options.signal });
 
     const schemaOwnership = await transaction.query<SchemaOwnershipRow>({
       text: `SELECT
@@ -262,6 +290,7 @@ export async function runPostgreSqlMigrations(
       }, { domain: "factory", operation: "recordMigration", signal: options.signal });
       applied.push(migration.id);
     }
+    await assertPostgreSqlSearchConfigurationReady(transaction, { signal: options.signal });
     return {
       applied,
       current: migrations.map((migration) => migration.id),

@@ -5,6 +5,10 @@ import {
   runPostgreSqlMigrations,
 } from "../../src/storage/postgresql/migrations.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import {
+  inspectPostgreSqlSearchConfiguration,
+  POSTGRESQL_SEARCH_CONFIGURATION_SHA256,
+} from "../../src/storage/postgresql/search-configuration.js";
 import { assertHarnessReady, settings, withPostgreSqlTestDatabase } from "./harness.js";
 
 beforeAll(assertHarnessReady);
@@ -123,6 +127,40 @@ async function expectConstraintFailure(promise: Promise<unknown>): Promise<void>
 }
 
 describe("PostgreSQL schema baseline", () => {
+  it("fingerprints the owned text-search contract and fails closed on mapping drift", async () => {
+    await withPostgreSqlTestDatabase("schema-search-config", async (database) => {
+      await expect(inspectPostgreSqlSearchConfiguration(database.migrator))
+        .resolves.toEqual({
+          name: "lcm.search_v1",
+          expectedSha256: POSTGRESQL_SEARCH_CONFIGURATION_SHA256,
+          actualSha256: POSTGRESQL_SEARCH_CONFIGURATION_SHA256,
+          objectCount: 19,
+          ownershipReady: true,
+          ready: true,
+        });
+
+      await database.migrator.query({
+        text: "ALTER TEXT SEARCH CONFIGURATION lcm.search_v1 DROP MAPPING FOR uint",
+      }, { domain: "factory", operation: "simulateSearchConfigurationDrift" });
+
+      await expect(inspectPostgreSqlSearchConfiguration(database.migrator))
+        .resolves.toMatchObject({
+          actualSha256: null,
+          objectCount: 18,
+          ready: false,
+        });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toMatchObject({
+          operation: "preflightSearchConfiguration",
+          searchConfiguration: expect.objectContaining({ objectCount: 18, ready: false }),
+        });
+      await expect(database.runtime.health()).resolves.toMatchObject({
+        status: "unavailable",
+        searchConfiguration: expect.objectContaining({ objectCount: 18, ready: false }),
+      });
+    });
+  });
+
   it("creates the complete catalog, UUIDv7 identities, generated search columns, and least-privilege baseline", async () => {
     await withPostgreSqlTestDatabase("schema-catalog", async (database) => {
       const tables = await database.migrator.query<{ tablename: string }>({
@@ -978,7 +1016,7 @@ describe("PostgreSQL schema baseline", () => {
       const fullTextPlan = await explain(
         `EXPLAIN (FORMAT JSON, COSTS OFF)
          SELECT message_id FROM lcm.messages
-         WHERE search_document @@ websearch_to_tsquery('simple', $1)`,
+         WHERE search_document @@ websearch_to_tsquery('lcm.search_v1', $1)`,
         ["cafe"],
       );
       expect(fullTextPlan).toContain("messages_search_document_idx");
@@ -994,7 +1032,7 @@ describe("PostgreSQL schema baseline", () => {
       const tagFullTextPlan = await explain(
         `EXPLAIN (FORMAT JSON, COSTS OFF)
          SELECT memory_id FROM lcm.promoted_memory_tags
-         WHERE search_document @@ websearch_to_tsquery('simple', $1)`,
+         WHERE search_document @@ websearch_to_tsquery('lcm.search_v1', $1)`,
         ["cafe"],
       );
       expect(tagFullTextPlan).toContain("promoted_memory_tags_search_document_idx");

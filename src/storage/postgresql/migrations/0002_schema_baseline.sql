@@ -25,6 +25,24 @@ BEGIN
 END
 $migration$;
 
+CREATE TEXT SEARCH DICTIONARY lcm.simple_v1 (
+  TEMPLATE = pg_catalog.simple
+);
+
+CREATE TEXT SEARCH CONFIGURATION lcm.search_v1 (
+  PARSER = pg_catalog.default
+);
+
+ALTER TEXT SEARCH CONFIGURATION lcm.search_v1
+  ADD MAPPING FOR
+    asciiword, word, numword, email, url, host, sfloat, version,
+    hword_numpart, hword_part, hword_asciipart, numhword, asciihword,
+    hword, url_path, file, float, int, uint
+  WITH lcm.simple_v1;
+
+COMMENT ON TEXT SEARCH CONFIGURATION lcm.search_v1 IS
+  'LCM PostgreSQL 18 search configuration; catalog SHA-256 7461327e424809adae678114286199753a7916253ecbb5459a7f1e211b30a568';
+
 CREATE FUNCTION lcm.normalize_search_text(input text)
 RETURNS text
 LANGUAGE sql
@@ -111,7 +129,7 @@ CREATE TABLE lcm.messages (
   token_count bigint NOT NULL CHECK (token_count >= 0),
   created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
   search_document tsvector GENERATED ALWAYS AS (
-    to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(content))
+    to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content))
   ) STORED,
   UNIQUE (project_id, conversation_id, seq),
   UNIQUE (project_id, conversation_id, message_id),
@@ -239,7 +257,7 @@ CREATE TABLE lcm.summaries (
   source_message_token_count bigint NOT NULL DEFAULT 0 CHECK (source_message_token_count >= 0),
   created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
   search_document tsvector GENERATED ALWAYS AS (
-    to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(content))
+    to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content))
   ) STORED,
   PRIMARY KEY (project_id, summary_id),
   UNIQUE (project_id, conversation_id, summary_id),
@@ -374,7 +392,7 @@ CREATE TABLE lcm.promoted_memories (
   created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
   archived_at timestamptz,
   search_document tsvector GENERATED ALWAYS AS (
-    to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(content))
+    to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content))
   ) STORED,
   UNIQUE (project_id, memory_id),
   CHECK (archived_at IS NULL OR archived_at >= created_at)
@@ -404,7 +422,7 @@ CREATE TABLE lcm.promoted_memory_tags (
     pg_catalog.lower(tag COLLATE pg_catalog.pg_unicode_fast)
   ) STORED,
   search_document tsvector GENERATED ALWAYS AS (
-    to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(tag))
+    to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(tag))
   ) STORED,
   PRIMARY KEY (project_id, memory_id, ordinal),
   FOREIGN KEY (project_id, memory_id)

@@ -1,12 +1,18 @@
 import { randomBytes } from "node:crypto";
 import type { QueryResultRow } from "pg";
-import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import {
+  PostgreSqlRuntime,
+  POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
+} from "../../src/storage/postgresql/runtime.js";
 import {
   REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
   runPostgreSqlMigrations,
 } from "../../src/storage/postgresql/migrations.js";
 import { normalizePostgreSqlError } from "../../src/storage/postgresql/errors.js";
-import { REQUIRED_POSTGRESQL_EXTENSIONS } from "../../src/storage/postgresql/extensions.js";
+import {
+  REQUIRED_POSTGRESQL_EXTENSIONS,
+  REQUIRED_POSTGRESQL_EXTENSION_SCHEMAS,
+} from "../../src/storage/postgresql/extensions.js";
 import type {
   PostgreSqlConnectionSettings,
   PostgreSqlTestDatabaseLease,
@@ -69,8 +75,20 @@ function safeIdentifier(value: string): string {
   return `"${value}"`;
 }
 
-function runtimeFor(url: string, overrides: Parameters<typeof settings>[1] = {}): PostgreSqlRuntime {
-  return new PostgreSqlRuntime(settings(url, overrides));
+function runtimeFor(
+  url: string,
+  overrides: Parameters<typeof settings>[1] = {},
+  startupSearchPath?: string,
+): PostgreSqlRuntime {
+  const connectionSettings = settings(url, overrides);
+  if (startupSearchPath === undefined) return new PostgreSqlRuntime(connectionSettings);
+  return new PostgreSqlRuntime(connectionSettings, {
+    ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
+    buildConfig: (currentSettings) => ({
+      ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(currentSettings),
+      options: `-c timezone=UTC -c search_path=${startupSearchPath}`,
+    }),
+  });
 }
 
 export async function assertHarnessReady(): Promise<void> {
@@ -78,6 +96,7 @@ export async function assertHarnessReady(): Promise<void> {
   const migrator = runtimeFor(env.LCM_TEST_POSTGRES_MIGRATOR_URL);
   const runtime = runtimeFor(env.LCM_TEST_POSTGRES_RUNTIME_URL);
   try {
+    await runPostgreSqlMigrations(migrator);
     const [migratorHealth, runtimeHealth] = await Promise.all([migrator.health(), runtime.health()]);
     if (migratorHealth.status !== "healthy" || migratorHealth.role !== "lcm_test_migrator") {
       throw new Error(`migrator readiness failed: ${JSON.stringify(migratorHealth)}`);
@@ -85,7 +104,6 @@ export async function assertHarnessReady(): Promise<void> {
     if (runtimeHealth.status !== "healthy" || runtimeHealth.role !== "lcm_test_runtime") {
       throw new Error(`runtime readiness failed: ${JSON.stringify(runtimeHealth)}`);
     }
-    await runPostgreSqlMigrations(migrator);
     const assertions = await migrator.query<GuardRow>({
       text: `SELECT current_setting('server_version_num')::integer AS server_version_num,
                     current_user AS role,
@@ -134,6 +152,8 @@ export interface PostgreSqlTestDatabaseOptions {
   readonly extensionSchemas?: Partial<Record<(typeof REQUIRED_POSTGRESQL_EXTENSIONS)[number], string>>;
   /** Test-only fault injection for exercising readiness before any LCM DDL. */
   readonly runMigrations?: boolean;
+  /** Test-only connection search path for proving setup DDL is schema-qualified. */
+  readonly adminSearchPath?: string;
 }
 
 export async function createPostgreSqlTestDatabase(
@@ -147,6 +167,14 @@ export async function createPostgreSqlTestDatabase(
   const identifier = safeIdentifier(name);
   const admin = runtimeFor(env.LCM_TEST_POSTGRES_ADMIN_URL);
   const adminUrl = databaseUrl(env.LCM_TEST_POSTGRES_ADMIN_URL, name);
+  const adminSearchPath = options.adminSearchPath
+    ?.split(",")
+    .map((schema) => schema.trim())
+    .map((schema) => {
+      safeIdentifier(schema);
+      return schema;
+    })
+    .join(",");
   const migratorUrl = databaseUrl(env.LCM_TEST_POSTGRES_MIGRATOR_URL, name);
   const runtimeUrl = databaseUrl(env.LCM_TEST_POSTGRES_RUNTIME_URL, name);
   try {
@@ -158,7 +186,7 @@ export async function createPostgreSqlTestDatabase(
     await admin.close();
   }
 
-  const databaseAdmin = runtimeFor(adminUrl);
+  const databaseAdmin = runtimeFor(adminUrl, {}, adminSearchPath);
   const migrator = runtimeFor(migratorUrl);
   const runtime = runtimeFor(runtimeUrl);
   let databaseAdminClosePromise: Promise<void> | undefined;
@@ -234,9 +262,10 @@ export async function createPostgreSqlTestDatabase(
     const createdExtensionSchemas = new Set<string>();
     for (const extension of REQUIRED_POSTGRESQL_EXTENSIONS) {
       if (omittedExtensions.has(extension)) continue;
-      const requestedSchema = options.extensionSchemas?.[extension];
-      const schema = requestedSchema === undefined ? undefined : safeIdentifier(requestedSchema);
-      if (schema !== undefined && !createdExtensionSchemas.has(schema)) {
+      const requestedSchema = options.extensionSchemas?.[extension]
+        ?? REQUIRED_POSTGRESQL_EXTENSION_SCHEMAS[extension];
+      const schema = safeIdentifier(requestedSchema);
+      if (requestedSchema !== "public" && !createdExtensionSchemas.has(schema)) {
         await databaseAdmin.query({ text: `CREATE SCHEMA ${schema}` }, {
           domain: "factory",
           operation: "createTestExtensionSchema",
@@ -245,9 +274,7 @@ export async function createPostgreSqlTestDatabase(
       }
       const extensionIdentifier = safeIdentifier(extension);
       await databaseAdmin.query({
-        text: schema === undefined
-          ? `CREATE EXTENSION ${extensionIdentifier}`
-          : `CREATE EXTENSION ${extensionIdentifier} WITH SCHEMA ${schema}`,
+        text: `CREATE EXTENSION ${extensionIdentifier} WITH SCHEMA ${schema}`,
       }, {
         domain: "factory",
         operation: "createTestExtension",

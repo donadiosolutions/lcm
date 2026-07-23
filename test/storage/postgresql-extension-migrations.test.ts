@@ -10,6 +10,7 @@ import {
   REQUIRED_POSTGRESQL_EXTENSIONS,
 } from "../../src/storage/postgresql/extensions.js";
 import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations.js";
+import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
 
 function result<R extends QueryResultRow>(rows: R[]): QueryResult<R> {
   return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows };
@@ -32,6 +33,20 @@ function executor(fault: "control-files" | "preload") {
     context: PostgreSqlQueryOptions,
   ): Promise<QueryResult<R>> => {
     operations.push(context.operation);
+    if (context.operation === "capturePostmasterEpoch") {
+      return result([{ postmaster_started_at: new Date("2026-01-01T00:00:00Z") }] as unknown as R[]);
+    }
+    if (context.operation.endsWith("probePgStatStatements")) {
+      if (fault === "preload") {
+        throw new PostgreSqlStorageOperationError(
+          "STORAGE_OPERATION_FAILED",
+          context,
+          "55000",
+          false,
+        );
+      }
+      return result([{ stats_reset: new Date() }] as unknown as R[]);
+    }
     if (context.operation === "preflightServerVersion") {
       return result([{ server_version_num: 180004 }] as unknown as R[]);
     }
@@ -98,10 +113,11 @@ describe("PostgreSQL migration extension preflight", () => {
       expect(extension.remediation).not.toContain("CREATE EXTENSION");
     }
     expect(fake.operations).toEqual([
-      "pinMigrationSearchPath",
-      "lockMigrations",
-      "preflightServerVersion",
+      "capturePostmasterEpoch",
       "preflightRequiredExtensions",
+      ...(fault === "preload" || fault === "control-files"
+        ? ["preflightRequiredExtensions:probePgStatStatements"]
+        : []),
     ]);
   });
 });
