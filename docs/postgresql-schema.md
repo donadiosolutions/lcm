@@ -321,6 +321,11 @@ If ownership preflight fails, an administrator must transfer the schema and all
 LCM-owned objects to the configured migration role, or restore a correctly
 owned database, before retrying. A `CREATE` grant alone is not a supported
 substitute because later owner-only schema maintenance must remain available.
+Structured diagnostics report `requiredOwner` as the sanitized role name
+resolved from PostgreSQL `CURRENT_USER`, not a generic label, and provide
+identifier-quoted transfer guidance. Missing, malformed, or contradictory
+ownership catalog values fail closed without exposing the existing owner,
+connection details, or raw database errors.
 
 After schema creation, an administrator may grant the runtime role only the
 schema usage, table operations, sequence access, and function execution proven

@@ -81,6 +81,10 @@ absent schema because `0001` creates it as the current migration role, but it
 fails closed when another role owns an existing schema even if that role has
 delegated `CREATE` to the migrator. Transfer ownership explicitly with the
 cluster administrator before retrying; LCM never changes schema ownership.
+Failure diagnostics identify `requiredOwner` using the sanitized PostgreSQL
+`CURRENT_USER` role and provide identifier-quoted transfer guidance. They do
+not expose the existing owner, connection details, or raw database errors, and
+missing or malformed catalog values fail closed.
 
 Exercise at least the empty, repeated, concurrent, rollback, unknown-history,
 out-of-order, and checksum-drift paths. Migration SQL and the ledger insertion

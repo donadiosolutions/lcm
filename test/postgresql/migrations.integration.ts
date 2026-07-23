@@ -199,6 +199,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         operation: "preflightSchemaOwnership",
         schemaExists: true,
         ownedByMigrator: false,
+        requiredOwner: "lcm_test_migrator",
+        remediation: "Transfer ownership of schema \"lcm\" and its LCM-owned objects to PostgreSQL role \"lcm_test_migrator\", then rerun migrations.",
       });
       await expect(admin.query<{
         admin_owned: boolean;

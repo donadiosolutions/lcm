@@ -27,7 +27,18 @@ function executor(options: {
   ledger?: boolean;
   current?: Array<{ id: string; checksum_sha256: string }>;
   failOperation?: string;
-  schemaOwnership?: "absent" | "owned" | "unowned" | "missing" | "invalid" | "inconsistent";
+  schemaOwnership?:
+    | "absent"
+    | "owned"
+    | "unowned"
+    | "missing"
+    | "invalid"
+    | "inconsistent"
+    | "empty-user"
+    | "long-user"
+    | "missing-user"
+    | "unsafe-user"
+    | "quoted-user";
   serverVersion?: number | "missing";
 } = {}) {
   const operations: string[] = [];
@@ -55,12 +66,31 @@ function executor(options: {
     if (context.operation === "preflightSchemaOwnership") {
       if (options.schemaOwnership === "missing") return result([] as R[]);
       if (options.schemaOwnership === "invalid") {
-        return result([{ schema_exists: "yes", owned_by_current_user: 1 }] as unknown as R[]);
+        return result([{
+          current_user_name: 7,
+          schema_exists: "yes",
+          owned_by_current_user: 1,
+        }] as unknown as R[]);
       }
       if (options.schemaOwnership === "inconsistent") {
-        return result([{ schema_exists: false, owned_by_current_user: true }] as unknown as R[]);
+        return result([{
+          current_user_name: "lcm_test_migrator",
+          schema_exists: false,
+          owned_by_current_user: true,
+        }] as unknown as R[]);
       }
       return result([{
+        current_user_name: options.schemaOwnership === "missing-user"
+          ? null
+          : options.schemaOwnership === "empty-user"
+            ? ""
+            : options.schemaOwnership === "long-user"
+              ? "a".repeat(257)
+              : options.schemaOwnership === "unsafe-user"
+                ? "unsafe\nrole"
+                : options.schemaOwnership === "quoted-user"
+                  ? 'migration"owner'
+                  : "lcm_test_migrator",
         schema_exists: options.schemaOwnership !== undefined && options.schemaOwnership !== "absent",
         owned_by_current_user: options.schemaOwnership === "owned",
       }] as unknown as R[]);
@@ -177,29 +207,79 @@ describe("PostgreSQL migration runner", () => {
       schemaOwnership: "unowned" as const,
       schemaExists: true,
       ownedByMigrator: false,
+      requiredOwner: "lcm_test_migrator",
+      remediation: "Transfer ownership of schema \"lcm\" and its LCM-owned objects to PostgreSQL role \"lcm_test_migrator\", then rerun migrations.",
     },
     {
       label: "missing catalog result",
       schemaOwnership: "missing" as const,
       schemaExists: null,
       ownedByMigrator: null,
+      requiredOwner: null,
+      remediation: null,
     },
     {
       label: "malformed catalog result",
       schemaOwnership: "invalid" as const,
       schemaExists: null,
       ownedByMigrator: null,
+      requiredOwner: null,
+      remediation: null,
     },
     {
       label: "contradictory catalog result",
       schemaOwnership: "inconsistent" as const,
       schemaExists: false,
       ownedByMigrator: true,
+      requiredOwner: "lcm_test_migrator",
+      remediation: "Transfer ownership of schema \"lcm\" and its LCM-owned objects to PostgreSQL role \"lcm_test_migrator\", then rerun migrations.",
+    },
+    {
+      label: "missing the current user",
+      schemaOwnership: "missing-user" as const,
+      schemaExists: true,
+      ownedByMigrator: false,
+      requiredOwner: null,
+      remediation: null,
+    },
+    {
+      label: "an empty current user",
+      schemaOwnership: "empty-user" as const,
+      schemaExists: true,
+      ownedByMigrator: false,
+      requiredOwner: null,
+      remediation: null,
+    },
+    {
+      label: "an overlong current user",
+      schemaOwnership: "long-user" as const,
+      schemaExists: true,
+      ownedByMigrator: false,
+      requiredOwner: null,
+      remediation: null,
+    },
+    {
+      label: "an unsafe current user",
+      schemaOwnership: "unsafe-user" as const,
+      schemaExists: true,
+      ownedByMigrator: false,
+      requiredOwner: null,
+      remediation: null,
+    },
+    {
+      label: "a quoted current user",
+      schemaOwnership: "quoted-user" as const,
+      schemaExists: true,
+      ownedByMigrator: false,
+      requiredOwner: 'migration"owner',
+      remediation: "Transfer ownership of schema \"lcm\" and its LCM-owned objects to PostgreSQL role \"migration\"\"owner\", then rerun migrations.",
     },
   ])("fails closed when schema ownership is $label", async ({
     schemaOwnership,
     schemaExists,
     ownedByMigrator,
+    requiredOwner,
+    remediation,
   }) => {
     const fake = executor({ schemaOwnership });
     const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [] })
@@ -211,13 +291,15 @@ describe("PostgreSQL migration runner", () => {
       schemaName: "lcm",
       schemaExists,
       ownedByMigrator,
-      requiredOwner: "migration-role",
+      requiredOwner,
+      remediation,
     });
     expect((failure as PostgreSqlSchemaOwnershipPreflightError).toJSON()).toMatchObject({
       schemaName: "lcm",
       schemaExists,
       ownedByMigrator,
-      requiredOwner: "migration-role",
+      requiredOwner,
+      remediation,
     });
     expect(fake.operations).toEqual([
       "lockMigrations",

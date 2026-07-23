@@ -26,6 +26,7 @@ type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
 type LedgerRow = QueryResultRow & { ledger_exists: boolean };
 type ServerVersionRow = QueryResultRow & { server_version_num: unknown };
 type SchemaOwnershipRow = QueryResultRow & {
+  current_user_name: unknown;
   schema_exists: unknown;
   owned_by_current_user: unknown;
 };
@@ -62,6 +63,7 @@ export class PostgreSqlSchemaOwnershipPreflightError extends StorageOperationErr
   constructor(
     readonly schemaExists: boolean | null,
     readonly ownedByMigrator: boolean | null,
+    readonly requiredOwner: string | null,
   ) {
     super(
       "STORAGE_INITIALIZATION_FAILED",
@@ -70,10 +72,13 @@ export class PostgreSqlSchemaOwnershipPreflightError extends StorageOperationErr
       "factory",
       "preflightSchemaOwnership",
     );
+    this.remediation = requiredOwner === null
+      ? null
+      : `Transfer ownership of schema "lcm" and its LCM-owned objects to PostgreSQL role ${quoteIdentifier(requiredOwner)}, then rerun migrations.`;
   }
 
   readonly schemaName = "lcm";
-  readonly requiredOwner = "migration-role";
+  readonly remediation: string | null;
 
   override toJSON(): Record<string, unknown> {
     return {
@@ -82,6 +87,7 @@ export class PostgreSqlSchemaOwnershipPreflightError extends StorageOperationErr
       schemaExists: this.schemaExists,
       ownedByMigrator: this.ownedByMigrator,
       requiredOwner: this.requiredOwner,
+      remediation: this.remediation,
     };
   }
 }
@@ -94,6 +100,19 @@ function sanitizeServerVersionNumber(value: unknown): number | null {
 
 function sanitizeBoolean(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
+}
+
+function sanitizeRoleName(value: unknown): string | null {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 256
+    && !/[\u0000-\u001f\u007f]/u.test(value)
+    ? value
+    : null;
+}
+
+function quoteIdentifier(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
 }
 
 function migrationError(operation: string): StorageOperationError {
@@ -176,6 +195,7 @@ export async function runPostgreSqlMigrations(
 
     const schemaOwnership = await transaction.query<SchemaOwnershipRow>({
       text: `SELECT
+        CURRENT_USER::text AS current_user_name,
         EXISTS (
           SELECT 1
           FROM pg_catalog.pg_namespace
@@ -190,10 +210,16 @@ export async function runPostgreSqlMigrations(
     }, { domain: "factory", operation: "preflightSchemaOwnership", signal: options.signal });
     const schemaExists = sanitizeBoolean(schemaOwnership.rows[0]?.schema_exists);
     const ownedByMigrator = sanitizeBoolean(schemaOwnership.rows[0]?.owned_by_current_user);
-    const ownershipReady = (schemaExists === false && ownedByMigrator === false)
-      || (schemaExists === true && ownedByMigrator === true);
+    const requiredOwner = sanitizeRoleName(schemaOwnership.rows[0]?.current_user_name);
+    const ownershipReady = requiredOwner !== null
+      && ((schemaExists === false && ownedByMigrator === false)
+        || (schemaExists === true && ownedByMigrator === true));
     if (!ownershipReady) {
-      throw new PostgreSqlSchemaOwnershipPreflightError(schemaExists, ownedByMigrator);
+      throw new PostgreSqlSchemaOwnershipPreflightError(
+        schemaExists,
+        ownedByMigrator,
+        requiredOwner,
+      );
     }
 
     const ledger = await transaction.query<LedgerRow>({
