@@ -62,13 +62,25 @@ migration: checksum drift is rejected. Add a new migration instead.
 Inside the locked migration transaction, the runner requires PostgreSQL 18 and
 inspects `pg_trgm`, `unaccent`, `pgcrypto`, and `pg_stat_statements`.
 Every extension must be installed in `public` at its available default version.
-Unavailable, uninstalled, outdated, or wrong-namespace extensions block
-migration and runtime readiness with structured, sanitized administrator
-guidance. LCM never creates, upgrades, relocates, reinstalls, or drops an
-extension. For a wrong namespace, relocatable extensions receive `ALTER
-EXTENSION ... SET SCHEMA "public"` guidance; non-relocatable extensions receive
-an explicit reinstall requirement without automatic destructive SQL. Complete
-and verify the operation through the cluster administrator, then rerun migration.
+Unavailable, installed-but-unavailable, uninstalled, not-preloaded, outdated,
+or wrong-namespace extensions block migration and runtime readiness with
+structured, sanitized administrator guidance. An installed-but-unavailable
+extension requires restoring its matching control files, not running `CREATE
+EXTENSION`. For an otherwise-current `pg_stat_statements`, least-privilege
+readiness uses `pg_get_loaded_modules()` to verify the active module and does not
+inspect the superuser-only `shared_preload_libraries` setting. Remediation tells
+the administrator to add the module to that setting and restart PostgreSQL. LCM
+never creates, upgrades, relocates, reinstalls, or drops an extension. For a
+wrong namespace, relocatable extensions receive `ALTER EXTENSION ... SET SCHEMA
+"public"` guidance; non-relocatable extensions receive an explicit reinstall
+requirement without automatic destructive SQL. Complete and verify the
+operation through the cluster administrator, then rerun migration.
+
+The migration role must own an existing `lcm` schema. The runner permits an
+absent schema because `0001` creates it as the current migration role, but it
+fails closed when another role owns an existing schema even if that role has
+delegated `CREATE` to the migrator. Transfer ownership explicitly with the
+cluster administrator before retrying; LCM never changes schema ownership.
 
 Exercise at least the empty, repeated, concurrent, rollback, unknown-history,
 out-of-order, and checksum-drift paths. Migration SQL and the ledger insertion

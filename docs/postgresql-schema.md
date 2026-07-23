@@ -15,7 +15,10 @@ does not add row-level security.
 ## Schema-wide rules
 
 - All application objects live in `lcm`. The migrator owns the schema and its
-  objects. A supported pre-existing `lcm` schema must not grant `CREATE` to
+  objects. An absent schema is created by the migration role. A pre-existing
+  schema must already be owned by that same role; a delegated `CREATE` grant is
+  insufficient and fails the ownership preflight without changing the schema.
+  A supported pre-existing `lcm` schema must also not grant `CREATE` to
   `PUBLIC`; the migration checks this before owned DDL and aborts without
   changing the schema ACL when the privilege is present. The baseline revokes
   privileges from `PUBLIC` on an explicit list of the 23 domain tables, the
@@ -168,11 +171,22 @@ in the `public` schema at the server's current `default_version`:
 | `pgcrypto` | Parity prerequisite for cryptographic database operations. IDs still use PostgreSQL 18's native `uuidv7()`, and content hashes arrive as validated lowercase SHA-256 values. |
 | `pg_stat_statements` | Operator-visible query statistics for diagnosing repository and query-plan behavior; the server must preload it when required by the installation. |
 
-Preflight reports each extension as `current`, `outdated`, `uninstalled`,
-`unavailable`, or `wrong-namespace`. Structured status includes the installed
-and default versions, `requiredSchema`, `installedSchema`, `relocatable`, and
-sanitized remediation. New-install guidance uses `CREATE EXTENSION ... WITH
-SCHEMA "public"`; outdated guidance uses `ALTER EXTENSION ... UPDATE`.
+Preflight reports each extension as `current`, `installed-unavailable`,
+`not-preloaded`, `outdated`, `uninstalled`, `unavailable`, or
+`wrong-namespace`. Structured status includes the installed and default
+versions, `requiredSchema`, `installedSchema`, `relocatable`,
+`preloadRequired`, `preloaded`, and sanitized remediation. New-install guidance
+uses `CREATE EXTENSION ... WITH SCHEMA "public"`; outdated guidance uses `ALTER
+EXTENSION ... UPDATE`.
+
+`installed-unavailable` means PostgreSQL still records the extension but its
+matching control files are unavailable. Guidance restores those files for the
+installed version and reruns readiness; it does not incorrectly suggest
+`CREATE EXTENSION`. `not-preloaded` applies to an otherwise-current
+`pg_stat_statements`: readiness uses `pg_get_loaded_modules()` to verify the
+active module without reading the superuser-only `shared_preload_libraries`
+setting. Guidance tells the administrator to add the module to that setting,
+restart PostgreSQL, and rerun readiness.
 
 For a relocatable extension in the wrong namespace, guidance uses `ALTER
 EXTENSION ... SET SCHEMA "public"`. For a non-relocatable installation, it
@@ -209,8 +223,9 @@ on a provider does not justify silently expanding the baseline.
    without changing cluster state.
 3. The migration runner validates packaged SHA-256 artifacts, opens one
    transaction, takes a database-scoped transaction advisory lock, repeats the
-   PostgreSQL 18 and extension readiness checks, and verifies the complete
-   ordered ledger. `0001` creates the `lcm` schema and immutable ledger; `0002`
+   PostgreSQL 18 and extension readiness checks, verifies that any existing
+   `lcm` schema is owned by the current migration role, and then verifies the
+   complete ordered ledger. `0001` creates the `lcm` schema and immutable ledger; `0002`
    first rejects a pre-existing `lcm` schema that grants `PUBLIC CREATE`, then
    creates the 23-table baseline data model and indexes. The guard does not
    revoke or otherwise rewrite the pre-existing schema ACL. Its normalization
@@ -225,6 +240,11 @@ on a provider does not justify silently expanding the baseline.
    rewrite a released migration, edit the ledger, drop an unknown schema, or
    auto-repair data. Restore the expected artifact/database or add a new ordered
    migration.
+
+If ownership preflight fails, an administrator must transfer the schema and all
+LCM-owned objects to the configured migration role, or restore a correctly
+owned database, before retrying. A `CREATE` grant alone is not a supported
+substitute because later owner-only schema maintenance must remain available.
 
 After schema creation, an administrator may grant the runtime role only the
 schema usage, table operations, sequence access, and function execution proven

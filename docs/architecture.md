@@ -61,10 +61,14 @@ extensions in the `public` schema, validates the complete
 `lcm.schema_migrations` history, and rejects unknown, out-of-order, or
 checksum-drifted entries. Pending SQL and its ledger row commit together, making
 empty, repeated, concurrent, and failed runs deterministic. Extension
-remediation is diagnostic only, including namespace correction; LCM never
-changes cluster extensions. The migrator owns the `lcm` schema; `PUBLIC` has no
-schema-create privilege in a supported database. A pre-existing schema that
-grants `PUBLIC CREATE` is rejected before owned DDL without changing its ACL.
+remediation is diagnostic only, including namespace correction, restoration of
+missing control files, and `pg_stat_statements` preload/restart guidance; LCM
+never changes cluster extensions. The migrator owns the `lcm` schema; `PUBLIC`
+has no schema-create privilege in a supported database. Before ledger
+inspection, the runner permits an absent schema but rejects an existing schema
+not owned by the current migration role; delegated `CREATE` is insufficient and
+no ownership is changed automatically. A pre-existing schema that grants
+`PUBLIC CREATE` is rejected before owned DDL without changing its ACL.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, five
 generated identity sequences, or search-normalization function; unknown
 pre-existing object ACLs are preserved. The normalization function is created

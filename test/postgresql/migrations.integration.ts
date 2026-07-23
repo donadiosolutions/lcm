@@ -183,6 +183,55 @@ describe("PostgreSQL migrations and database isolation", () => {
     }
   });
 
+  it("rejects an administrator-owned schema despite delegated migrator CREATE", async () => {
+    const database = await createPostgreSqlTestDatabase("schema-owner", { runMigrations: false });
+    const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+    try {
+      await admin.query({
+        text: `CREATE SCHEMA lcm AUTHORIZATION lcm_harness_admin;
+               CREATE TABLE lcm.operator_table (value text);
+               INSERT INTO lcm.operator_table VALUES ('preserve-me');
+               GRANT USAGE, CREATE ON SCHEMA lcm TO lcm_test_migrator`,
+      }, { domain: "factory", operation: "seedAdminOwnedSchema" });
+
+      await expect(runPostgreSqlMigrations(database.migrator)).rejects.toMatchObject({
+        backend: "postgresql",
+        operation: "preflightSchemaOwnership",
+        schemaExists: true,
+        ownedByMigrator: false,
+      });
+      await expect(admin.query<{
+        admin_owned: boolean;
+        migrator_create: boolean;
+        value: string;
+        ledger: boolean;
+        owned_table: boolean;
+      }>({
+        text: `SELECT
+          namespace.nspowner = 'lcm_harness_admin'::regrole AS admin_owned,
+          has_schema_privilege('lcm_test_migrator', 'lcm', 'CREATE') AS migrator_create,
+          (SELECT value FROM lcm.operator_table) AS value,
+          to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger,
+          to_regclass('lcm.machines') IS NOT NULL AS owned_table
+        FROM pg_catalog.pg_namespace AS namespace
+        WHERE namespace.nspname = 'lcm'`,
+      }, { domain: "factory", operation: "verifyAdminOwnedSchemaPreserved" }))
+        .resolves.toMatchObject({ rows: [{
+          admin_owned: true,
+          migrator_create: true,
+          value: "preserve-me",
+          ledger: false,
+          owned_table: false,
+        }] });
+    } finally {
+      try {
+        await admin.close();
+      } finally {
+        await database.drop();
+      }
+    }
+  });
+
   it("rejects checksum drift and rolls back a failed pending migration", async () => {
     await withPostgreSqlTestDatabase("migration-drift", async (database) => {
       const baseline = migration("0001_migration_ledger", ledgerSql);

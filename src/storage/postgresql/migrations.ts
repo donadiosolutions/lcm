@@ -25,6 +25,10 @@ const MIGRATION_MANIFEST = [
 type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
 type LedgerRow = QueryResultRow & { ledger_exists: boolean };
 type ServerVersionRow = QueryResultRow & { server_version_num: unknown };
+type SchemaOwnershipRow = QueryResultRow & {
+  schema_exists: unknown;
+  owned_by_current_user: unknown;
+};
 
 export const REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION = 18 as const;
 
@@ -54,10 +58,42 @@ export class PostgreSqlServerVersionPreflightError extends StorageOperationError
   }
 }
 
+export class PostgreSqlSchemaOwnershipPreflightError extends StorageOperationError {
+  constructor(
+    readonly schemaExists: boolean | null,
+    readonly ownedByMigrator: boolean | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightSchemaOwnership",
+    );
+  }
+
+  readonly schemaName = "lcm";
+  readonly requiredOwner = "migration-role";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      schemaName: this.schemaName,
+      schemaExists: this.schemaExists,
+      ownedByMigrator: this.ownedByMigrator,
+      requiredOwner: this.requiredOwner,
+    };
+  }
+}
+
 function sanitizeServerVersionNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
     : null;
+}
+
+function sanitizeBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
 }
 
 function migrationError(operation: string): StorageOperationError {
@@ -137,6 +173,28 @@ export async function runPostgreSqlMigrations(
     }
 
     await assertRequiredPostgreSqlExtensionsReady(transaction, { signal: options.signal });
+
+    const schemaOwnership = await transaction.query<SchemaOwnershipRow>({
+      text: `SELECT
+        EXISTS (
+          SELECT 1
+          FROM pg_catalog.pg_namespace
+          WHERE nspname = 'lcm'
+        ) AS schema_exists,
+        COALESCE((
+          SELECT namespace.nspowner = role.oid
+          FROM pg_catalog.pg_namespace AS namespace
+          INNER JOIN pg_catalog.pg_roles AS role ON role.rolname = CURRENT_USER
+          WHERE namespace.nspname = 'lcm'
+        ), false) AS owned_by_current_user`,
+    }, { domain: "factory", operation: "preflightSchemaOwnership", signal: options.signal });
+    const schemaExists = sanitizeBoolean(schemaOwnership.rows[0]?.schema_exists);
+    const ownedByMigrator = sanitizeBoolean(schemaOwnership.rows[0]?.owned_by_current_user);
+    const ownershipReady = (schemaExists === false && ownedByMigrator === false)
+      || (schemaExists === true && ownedByMigrator === true);
+    if (!ownershipReady) {
+      throw new PostgreSqlSchemaOwnershipPreflightError(schemaExists, ownedByMigrator);
+    }
 
     const ledger = await transaction.query<LedgerRow>({
       text: "SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger_exists",

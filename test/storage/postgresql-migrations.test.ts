@@ -8,6 +8,7 @@ import type {
 } from "../../src/storage/postgresql/contracts.js";
 import {
   loadPostgreSqlMigrations,
+  PostgreSqlSchemaOwnershipPreflightError,
   PostgreSqlServerVersionPreflightError,
   REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
   runPostgreSqlMigrations,
@@ -26,6 +27,7 @@ function executor(options: {
   ledger?: boolean;
   current?: Array<{ id: string; checksum_sha256: string }>;
   failOperation?: string;
+  schemaOwnership?: "absent" | "owned" | "unowned" | "missing" | "invalid" | "inconsistent";
   serverVersion?: number | "missing";
 } = {}) {
   const operations: string[] = [];
@@ -47,7 +49,21 @@ function executor(options: {
         installed_version: "1.0",
         installed_schema: "public",
         relocatable: true,
+        preloaded: name === "pg_stat_statements" ? true : null,
       })) as unknown as R[]);
+    }
+    if (context.operation === "preflightSchemaOwnership") {
+      if (options.schemaOwnership === "missing") return result([] as R[]);
+      if (options.schemaOwnership === "invalid") {
+        return result([{ schema_exists: "yes", owned_by_current_user: 1 }] as unknown as R[]);
+      }
+      if (options.schemaOwnership === "inconsistent") {
+        return result([{ schema_exists: false, owned_by_current_user: true }] as unknown as R[]);
+      }
+      return result([{
+        schema_exists: options.schemaOwnership !== undefined && options.schemaOwnership !== "absent",
+        owned_by_current_user: options.schemaOwnership === "owned",
+      }] as unknown as R[]);
     }
     if (context.operation === "inspectMigrationLedger") return result([{ ledger_exists: options.ledger ?? false }] as unknown as R[]);
     if (context.operation === "readMigrations") return result((options.current ?? []) as unknown as R[]);
@@ -99,6 +115,7 @@ describe("PostgreSQL migration runner", () => {
       "lockMigrations",
       "preflightServerVersion",
       "preflightRequiredExtensions",
+      "preflightSchemaOwnership",
       "inspectMigrationLedger",
       "applyMigration:0001_first",
       "recordMigration",
@@ -118,6 +135,13 @@ describe("PostgreSQL migration runner", () => {
       current: ["0001_first", "0002_second"],
     });
     expect(fake.operations).toContain("readMigrations");
+  });
+
+  it("accepts a pre-existing schema owned by the migration role", async () => {
+    const fake = executor({ schemaOwnership: "owned" });
+    await expect(runPostgreSqlMigrations(fake.seam, { migrations: [] }))
+      .resolves.toEqual({ applied: [], current: [] });
+    expect(fake.operations).toContain("preflightSchemaOwnership");
   });
 
   it.each([
@@ -144,6 +168,62 @@ describe("PostgreSQL migration runner", () => {
       "lockMigrations",
       "preflightServerVersion",
       "preflightRequiredExtensions",
+    ]);
+  });
+
+  it.each([
+    {
+      label: "owned by another role",
+      schemaOwnership: "unowned" as const,
+      schemaExists: true,
+      ownedByMigrator: false,
+    },
+    {
+      label: "missing catalog result",
+      schemaOwnership: "missing" as const,
+      schemaExists: null,
+      ownedByMigrator: null,
+    },
+    {
+      label: "malformed catalog result",
+      schemaOwnership: "invalid" as const,
+      schemaExists: null,
+      ownedByMigrator: null,
+    },
+    {
+      label: "contradictory catalog result",
+      schemaOwnership: "inconsistent" as const,
+      schemaExists: false,
+      ownedByMigrator: true,
+    },
+  ])("fails closed when schema ownership is $label", async ({
+    schemaOwnership,
+    schemaExists,
+    ownedByMigrator,
+  }) => {
+    const fake = executor({ schemaOwnership });
+    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [] })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlSchemaOwnershipPreflightError);
+    expect(failure).toMatchObject({
+      code: "STORAGE_INITIALIZATION_FAILED",
+      operation: "preflightSchemaOwnership",
+      schemaName: "lcm",
+      schemaExists,
+      ownedByMigrator,
+      requiredOwner: "migration-role",
+    });
+    expect((failure as PostgreSqlSchemaOwnershipPreflightError).toJSON()).toMatchObject({
+      schemaName: "lcm",
+      schemaExists,
+      ownedByMigrator,
+      requiredOwner: "migration-role",
+    });
+    expect(fake.operations).toEqual([
+      "lockMigrations",
+      "preflightServerVersion",
+      "preflightRequiredExtensions",
+      "preflightSchemaOwnership",
     ]);
   });
 
