@@ -19,7 +19,7 @@ const MIGRATION_MANIFEST = [
   {
     id: "0002_schema_baseline",
     filename: "0002_schema_baseline.sql",
-    sha256: "94ea97d7bf75fdc93acacb2f14e7bedebf13a0020dbcfab5f7ba0b61adb999c3",
+    sha256: "658e352435bf2d34041b76f80c85b52d46f12a875423daa4f4558f222f2d8903",
   },
 ] as const;
 

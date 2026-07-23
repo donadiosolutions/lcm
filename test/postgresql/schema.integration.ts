@@ -161,6 +161,25 @@ describe("PostgreSQL schema baseline", () => {
     });
   });
 
+  it("reports zero mappings for an existing empty text-search configuration", async () => {
+    await withPostgreSqlTestDatabase("schema-empty-search-config", async (database) => {
+      await database.migrator.query({
+        text: `ALTER TEXT SEARCH CONFIGURATION lcm.search_v1
+               DROP MAPPING FOR
+                 asciiword, word, numword, email, url, host, sfloat, version,
+                 hword_numpart, hword_part, hword_asciipart, numhword,
+                 asciihword, hword, url_path, file, float, int, uint`,
+      }, { domain: "factory", operation: "simulateEmptySearchConfiguration" });
+
+      await expect(inspectPostgreSqlSearchConfiguration(database.migrator))
+        .resolves.toMatchObject({
+          actualSha256: null,
+          objectCount: 0,
+          ready: false,
+        });
+    });
+  });
+
   it("fails closed when the normalization function definition drifts", async () => {
     await withPostgreSqlTestDatabase("schema-function-drift", async (database) => {
       await database.migrator.query({
@@ -362,10 +381,10 @@ describe("PostgreSQL schema baseline", () => {
       );
       expect(explicitIndexes.rows.find(
         ({ index_name }) => index_name === "promoted_memory_tags_lookup_idx",
-      )?.index_definition).toContain("(project_id, tag, memory_id)");
+      )?.index_definition).toContain("(project_id, tag_sha256, memory_id)");
       expect(explicitIndexes.rows.find(
         ({ index_name }) => index_name === "promoted_memory_tags_normalized_lookup_idx",
-      )?.index_definition).toContain("(project_id, normalized_tag, memory_id)");
+      )?.index_definition).toContain("(project_id, normalized_tag_sha256, memory_id)");
       expect(explicitIndexes.rows.find(
         ({ index_name }) => index_name === "promoted_memory_tags_search_document_idx",
       )?.index_definition).toContain("USING gin (search_document)");
@@ -423,7 +442,9 @@ describe("PostgreSQL schema baseline", () => {
         { table_name: "messages", column_name: "search_document", data_type: "tsvector" },
         { table_name: "promoted_memories", column_name: "search_document", data_type: "tsvector" },
         { table_name: "promoted_memory_tags", column_name: "normalized_tag", data_type: "text" },
+        { table_name: "promoted_memory_tags", column_name: "normalized_tag_sha256", data_type: "bytea" },
         { table_name: "promoted_memory_tags", column_name: "search_document", data_type: "tsvector" },
+        { table_name: "promoted_memory_tags", column_name: "tag_sha256", data_type: "bytea" },
         { table_name: "summaries", column_name: "search_document", data_type: "tsvector" },
       ]);
       const tagNormalization = await database.migrator.query<{ expression: string }>({
@@ -1095,6 +1116,26 @@ describe("PostgreSQL schema baseline", () => {
       );
       expect(tagFullTextPlan).toContain("promoted_memory_tags_search_document_idx");
 
+      const tagExactPlan = await explain(
+        `EXPLAIN (FORMAT JSON, COSTS OFF)
+         SELECT memory_id FROM lcm.promoted_memory_tags
+         WHERE project_id = $1
+           AND tag_sha256 = public.digest($2, 'sha256')
+           AND tag = $2`,
+        [scope.projectId, "Café tag-only needle"],
+      );
+      expect(tagExactPlan).toContain("promoted_memory_tags_lookup_idx");
+
+      const tagNormalizedPlan = await explain(
+        `EXPLAIN (FORMAT JSON, COSTS OFF)
+         SELECT memory_id FROM lcm.promoted_memory_tags
+         WHERE project_id = $1
+           AND normalized_tag_sha256 = public.digest($2, 'sha256')
+           AND normalized_tag = $2`,
+        [scope.projectId, "café tag-only needle"],
+      );
+      expect(tagNormalizedPlan).toContain("promoted_memory_tags_normalized_lookup_idx");
+
       const tagTrigramPlan = await explain(
         `EXPLAIN (FORMAT JSON, COSTS OFF)
          SELECT memory_id FROM lcm.promoted_memory_tags
@@ -1175,6 +1216,47 @@ describe("PostgreSQL schema baseline", () => {
             tags: ["ÄBC", "Foo", "foo", "", " spaced ", "Foo"],
           }],
         });
+      const longTag = "LongTagValue ".repeat(1_000);
+      const normalizedLongTag = longTag.toLowerCase();
+      const expectedTagSha256 = createHash("sha256").update(longTag).digest("hex");
+      const expectedNormalizedTagSha256 = createHash("sha256")
+        .update(normalizedLongTag)
+        .digest("hex");
+      await expect(database.migrator.query<{
+        normalized_tag: string;
+        normalized_tag_sha256: string;
+        tag: string;
+        tag_sha256: string;
+      }>({
+        text: `INSERT INTO lcm.promoted_memory_tags(project_id,memory_id,ordinal,tag)
+               VALUES($1,$2,6,$3)
+               RETURNING tag,
+                         normalized_tag,
+                         pg_catalog.encode(tag_sha256, 'hex') AS tag_sha256,
+                         pg_catalog.encode(normalized_tag_sha256, 'hex')
+                           AS normalized_tag_sha256`,
+        values: [scope.projectId, memory.rows[0]?.memory_id, longTag],
+      }, { domain: "factory", operation: "roundTripLongPromotedTag" }))
+        .resolves.toMatchObject({
+          command: "INSERT",
+          rowCount: 1,
+          rows: [{
+            normalized_tag: normalizedLongTag,
+            normalized_tag_sha256: expectedNormalizedTagSha256,
+            tag: longTag,
+            tag_sha256: expectedTagSha256,
+          }],
+        });
+      await expect(database.migrator.query<{ ordinal: number }>({
+        text: `SELECT ordinal
+               FROM lcm.promoted_memory_tags
+               WHERE project_id = $1
+                 AND tag_sha256 = public.digest($3, 'sha256')
+                 AND tag = $3
+                 AND memory_id = $2`,
+        values: [scope.projectId, memory.rows[0]?.memory_id, longTag],
+      }, { domain: "factory", operation: "lookupLongPromotedTag" }))
+        .resolves.toMatchObject({ rows: [{ ordinal: 6 }] });
       await database.migrator.query({
         text: `INSERT INTO lcm.session_instructions(project_id,slot,content,content_hash)
                VALUES($1,1,'instructions','hash-1')`,

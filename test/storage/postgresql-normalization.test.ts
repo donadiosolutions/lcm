@@ -63,5 +63,18 @@ describe("PostgreSQL search normalization artifact", () => {
     expect(sql).toContain("PRIMARY KEY (project_id, memory_id, ordinal)");
     expect(sql).not.toContain("PRIMARY KEY (project_id, memory_id, normalized_tag)");
     expect(sql).not.toContain("GENERATED ALWAYS AS (lower(tag))");
+    expect(sql).toContain("public.digest(tag, 'sha256')");
+    expect(sql).toContain(
+      "ON lcm.promoted_memory_tags (project_id, tag_sha256, memory_id)",
+    );
+    expect(sql).toContain(
+      "ON lcm.promoted_memory_tags (project_id, normalized_tag_sha256, memory_id)",
+    );
+    expect(sql).not.toContain(
+      "ON lcm.promoted_memory_tags (project_id, tag, memory_id)",
+    );
+    expect(sql).not.toContain(
+      "ON lcm.promoted_memory_tags (project_id, normalized_tag, memory_id)",
+    );
   });
 });

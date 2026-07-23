@@ -138,7 +138,7 @@ describe("PostgreSQL migration runner", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "94ea97d7bf75fdc93acacb2f14e7bedebf13a0020dbcfab5f7ba0b61adb999c3" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "658e352435bf2d34041b76f80c85b52d46f12a875423daa4f4558f222f2d8903" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",

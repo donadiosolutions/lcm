@@ -65,7 +65,7 @@ export async function inspectPostgreSqlSearchConfiguration(
                ON dictionary_namespace.oid OPERATOR(pg_catalog.=) dictionary.dictnamespace
            ),
            configuration_contract AS (
-             SELECT pg_catalog.count(*) AS mapping_count,
+             SELECT pg_catalog.count(maptokentype) AS mapping_count,
                     pg_catalog.count(DISTINCT oid) AS configuration_count,
                     pg_catalog.min(cfgparser) AS parser_oid,
                     pg_catalog.string_agg(
@@ -79,7 +79,7 @@ export async function inspectPostgreSqlSearchConfiguration(
                         dictionary_options
                       ),
                       E'\\n' ORDER BY maptokentype, mapseqno
-                    ) AS mappings,
+                    ) FILTER (WHERE maptokentype IS NOT NULL) AS mappings,
                     pg_catalog.bool_and(config_owned AND dictionary_owned)
                       AS configuration_owned
              FROM mapping_contract

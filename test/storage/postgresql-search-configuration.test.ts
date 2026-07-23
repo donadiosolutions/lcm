@@ -63,6 +63,8 @@ describe("PostgreSQL text-search configuration readiness", () => {
       "prosecdef",
       "proconfig",
     ]) expect(inspectionSql).toContain(catalogField);
+    expect(inspectionSql).toContain("pg_catalog.count(maptokentype) AS mapping_count");
+    expect(inspectionSql).toContain("FILTER (WHERE maptokentype IS NOT NULL) AS mappings");
 
     const direct = executor({
       actual_sha256: POSTGRESQL_SEARCH_CONFIGURATION_SHA256,

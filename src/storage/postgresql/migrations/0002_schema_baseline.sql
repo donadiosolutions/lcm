@@ -424,6 +424,15 @@ CREATE TABLE lcm.promoted_memory_tags (
   normalized_tag text GENERATED ALWAYS AS (
     pg_catalog.lower(tag COLLATE pg_catalog.pg_unicode_fast)
   ) STORED,
+  tag_sha256 bytea GENERATED ALWAYS AS (
+    public.digest(tag, 'sha256')
+  ) STORED,
+  normalized_tag_sha256 bytea GENERATED ALWAYS AS (
+    public.digest(
+      pg_catalog.lower(tag COLLATE pg_catalog.pg_unicode_fast),
+      'sha256'
+    )
+  ) STORED,
   search_document tsvector GENERATED ALWAYS AS (
     to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(tag))
   ) STORED,
@@ -433,9 +442,9 @@ CREATE TABLE lcm.promoted_memory_tags (
 );
 
 CREATE INDEX promoted_memory_tags_lookup_idx
-  ON lcm.promoted_memory_tags (project_id, tag, memory_id);
+  ON lcm.promoted_memory_tags (project_id, tag_sha256, memory_id);
 CREATE INDEX promoted_memory_tags_normalized_lookup_idx
-  ON lcm.promoted_memory_tags (project_id, normalized_tag, memory_id);
+  ON lcm.promoted_memory_tags (project_id, normalized_tag_sha256, memory_id);
 CREATE INDEX promoted_memory_tags_search_document_idx
   ON lcm.promoted_memory_tags USING gin (search_document);
 CREATE INDEX promoted_memory_tags_tag_trgm_idx
