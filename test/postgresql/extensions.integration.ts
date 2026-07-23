@@ -16,18 +16,40 @@ describe("PostgreSQL extension readiness", () => {
   it("ignores hostile search_path relations that shadow extension catalogs", async () => {
     await withPostgreSqlTestDatabase("extension-search-path", async (database) => {
       await database.migrator.transaction(async (transaction) => {
-        await transaction.query({
-          text: `CREATE SCHEMA hostile_catalog;
-                 CREATE VIEW hostile_catalog.pg_available_extensions AS
-                   SELECT ''::name AS name, NULL::text AS default_version WHERE false;
-                 CREATE VIEW hostile_catalog.pg_extension AS
-                   SELECT ''::name AS extname, NULL::text AS extversion, NULL::oid AS extnamespace WHERE false;
-                 CREATE VIEW hostile_catalog.pg_namespace AS
-                   SELECT NULL::oid AS oid, ''::name AS nspname WHERE false;
-                 CREATE VIEW hostile_catalog.pg_available_extension_versions AS
-                   SELECT ''::name AS name, NULL::text AS version, false AS installed, false AS relocatable WHERE false;
-                 SET LOCAL search_path = hostile_catalog, pg_catalog, public`,
-        }, { domain: "factory", operation: "installHostileExtensionCatalogs" });
+        const setup = [
+          ["createHostileCatalogSchema", "CREATE SCHEMA hostile_catalog"],
+          [
+            "shadowAvailableExtensions",
+            `CREATE VIEW hostile_catalog.pg_available_extensions AS
+               SELECT ''::name AS name, NULL::text AS default_version WHERE false`,
+          ],
+          [
+            "shadowInstalledExtensions",
+            `CREATE VIEW hostile_catalog.pg_extension AS
+               SELECT ''::name AS extname, NULL::text AS extversion, NULL::oid AS extnamespace WHERE false`,
+          ],
+          [
+            "shadowNamespaces",
+            `CREATE VIEW hostile_catalog.pg_namespace AS
+               SELECT NULL::oid AS oid, ''::name AS nspname WHERE false`,
+          ],
+          [
+            "shadowAvailableExtensionVersions",
+            `CREATE VIEW hostile_catalog.pg_available_extension_versions AS
+               SELECT ''::name AS name, NULL::text AS version, false AS installed, false AS relocatable WHERE false`,
+          ],
+          ["setHostileCatalogSearchPath", "SET LOCAL search_path = hostile_catalog, pg_catalog, public"],
+        ] as const;
+        for (const [operation, text] of setup) {
+          await transaction.query({ text }, { domain: "factory", operation });
+        }
+
+        const searchPath = await transaction.query<{ search_path: string }>({
+          text: "SHOW search_path",
+        }, { domain: "factory", operation: "verifyHostileCatalogSearchPath" });
+        expect(searchPath.rows).toEqual([{
+          search_path: "hostile_catalog, pg_catalog, public",
+        }]);
 
         await expect(inspectRequiredPostgreSqlExtensions(transaction)).resolves.toEqual(
           expect.arrayContaining(REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => (
