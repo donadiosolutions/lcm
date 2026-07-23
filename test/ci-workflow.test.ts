@@ -26,6 +26,7 @@ interface CiWorkflow {
     };
     codecov: {
       needs: string;
+      permissions: Record<string, string>;
       steps: WorkflowStep[];
     };
   };
@@ -50,6 +51,35 @@ describe("CI workflow", () => {
     });
     expect(gate?.run).toContain('[[ "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success ]]');
     expect(workflow.jobs.codecov.needs).toBe("ci");
+  });
+
+  it("checks out the exact report source without executing repository code", () => {
+    const { permissions, steps } = workflow.jobs.codecov;
+    expect(permissions).toEqual({
+      actions: "read",
+      contents: "read",
+      "id-token": "write",
+    });
+
+    const checkoutIndex = steps.findIndex((step) => step.name === "Checkout source for Codecov");
+    const firstUploadIndex = steps.findIndex((step) =>
+      step.uses?.startsWith("codecov/codecov-action@"),
+    );
+    expect(checkoutIndex).toBeGreaterThanOrEqual(0);
+    expect(firstUploadIndex).toBeGreaterThan(checkoutIndex);
+    expect(steps[checkoutIndex]).toEqual({
+      name: "Checkout source for Codecov",
+      uses: "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+      with: {
+        repository:
+          "${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}",
+        ref: "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}",
+        "persist-credentials": false,
+      },
+    });
+    expect(
+      steps.some((step) => /(?:^|\s)(?:node|npm|npx|pnpm|yarn)(?:\s|$)/u.test(step.run ?? "")),
+    ).toBe(false);
   });
 
   it("reuses one digest-verified pinned Codecov CLI for both uploads", () => {
