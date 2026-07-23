@@ -72,6 +72,30 @@ does not add row-level security.
   JSONB containment, search, active rows, and queue or lease readiness. The
   repository issues must preserve the documented tie-breakers in their SQL.
 
+## Searchable-content boundary
+
+Issue #83 stores the complete content supplied for indexed messages, summaries,
+and promoted memories. It does not silently truncate content before generating
+the normalized `tsvector` or trigram index entries. PostgreSQL full-text search
+does not index a lexeme that reaches its implementation-specific per-lexeme
+size limit, so adapters must not assume that every arbitrarily large token is
+searchable. The exact byte boundary is a PostgreSQL implementation and encoding
+detail, not a stable LCM schema constant.
+
+Before enabling their write paths, issues #84–#91 must establish and test a
+searchable-content bound against the pinned PostgreSQL 18 runtime. Input beyond
+that bound must be rejected as searchable content or routed without data loss
+to the appropriate `message_parts` or `large_files` representation, with a
+bounded searchable summary or reference where the repository contract requires
+one. Truncating the canonical message, summary, or promoted-memory content is
+not an acceptable fallback.
+
+Those adapters must also benchmark the write cost of pinned normalization plus
+generated full-text and trigram index maintenance before enabling high-volume
+ingest. The measured workload should include representative content sizes,
+languages, concurrency, and the oversized-payload routing path; issue #83 does
+not claim a throughput budget for future repository implementations.
+
 ## Ownership, deletion, and retention
 
 "Owned" below means a row has no independent lifecycle outside its parent and
@@ -146,7 +170,7 @@ deletion.
 
 | Table | Ownership and retention | Enforced invariants and indexes |
 | --- | --- | --- |
-| `passive_event_inbox` | Durable remote copy of a machine's local hook-outbox event. Project and machine deletion are restricted. Retain pending, claimed, retry, and quarantined rows; prune applied rows only after #91's acknowledgement policy. | Generated `bigint` primary key; unique event ID and sequence per machine; positive version, nonnegative sequence/attempt count; closed status enum; claim, applied, and quarantine columns must agree with status; lifecycle timestamps cannot precede receipt. Partial ready, retry-time, and claimed-age B-tree indexes support `SKIP LOCKED` claims and recovery; payload uses a JSONB path-ops GIN index. |
+| `passive_event_inbox` | Durable remote copy of a machine's local hook-outbox event. Project and machine deletion are restricted. Retain pending, claimed, retry, and quarantined rows; prune applied rows only after #91's acknowledgement policy. | Generated `bigint` primary key; unique event ID and sequence per machine; positive version, nonnegative sequence/attempt count; closed status enum; claim, applied, and quarantine columns must agree with status; a nonnull claim owner must be nonblank after trimming. Claim, next-attempt, applied, and quarantine timestamps cannot precede receipt. Equality is permitted for immediate first attempts and claims. Partial ready, retry-time, and claimed-age B-tree indexes support `SKIP LOCKED` claims and recovery; payload uses a JSONB path-ops GIN index. |
 | `fenced_leases` | Project resource lease owned operationally by a machine/process. The project and owner-machine foreign keys both use `ON DELETE RESTRICT`. Released or expired rows may be deleted under #90, but the column-owned token sequence is retained until an explicit schema migration drops the table and must never be restarted by cleanup. | `(project_id, resource_type, resource_key)` primary key permits one current row per scoped resource; resource and owner/process/operation fields are nonblank. `fencing_token` is a generated-always `bigint` identity with a positive check, backed by `fenced_leases_fencing_token_seq`, so delete-and-reacquire cannot reuse a generated token. `renewed_at >= acquired_at`, `expires_at > renewed_at`, and `released_at >= renewed_at` when released. Partial active-owner and active-expiry indexes support diagnostics and takeover; `fenced_leases_owner_machine_idx` covers the complete machine foreign key. Allocation transactions, takeover updates, and final-write fence checks remain behavioral requirements in #90. |
 
 ## Named index catalog

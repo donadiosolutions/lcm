@@ -69,7 +69,7 @@ inspection, the runner permits an absent schema but rejects an existing schema
 not owned by the current migration role; delegated `CREATE` is insufficient and
 no ownership is changed automatically. A pre-existing schema that grants
 `PUBLIC CREATE` is rejected before owned DDL without changing its ACL.
-`PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, five
+`PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six
 generated identity sequences, or search-normalization function; unknown
 pre-existing object ACLs are preserved. The normalization function is created
 without replacement, so a same-signature collision fails and rolls back the
