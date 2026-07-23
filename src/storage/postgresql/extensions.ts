@@ -117,7 +117,10 @@ function extensionStatus(
 export function areRequiredPostgreSqlExtensionsReady(
   extensions: readonly PostgreSqlExtensionStatus[],
 ): boolean {
+  const names = new Set(extensions.map((extension) => extension.name));
   return extensions.length === REQUIRED_POSTGRESQL_EXTENSIONS.length
+    && names.size === REQUIRED_POSTGRESQL_EXTENSIONS.length
+    && REQUIRED_POSTGRESQL_EXTENSIONS.every((name) => names.has(name))
     && extensions.every((extension) => extension.status === "current");
 }
 
@@ -163,13 +166,13 @@ export async function inspectRequiredPostgreSqlExtensions(
                     ELSE NULL
                   END AS preloaded
            FROM required
-           LEFT JOIN pg_available_extensions AS available
+           LEFT JOIN pg_catalog.pg_available_extensions AS available
              ON available.name = required.name
-           LEFT JOIN pg_extension AS installed
+           LEFT JOIN pg_catalog.pg_extension AS installed
              ON installed.extname = required.name
-           LEFT JOIN pg_namespace AS namespace
+           LEFT JOIN pg_catalog.pg_namespace AS namespace
              ON namespace.oid = installed.extnamespace
-           LEFT JOIN pg_available_extension_versions AS installed_version
+           LEFT JOIN pg_catalog.pg_available_extension_versions AS installed_version
              ON installed_version.name = required.name
             AND installed_version.version = installed.extversion
             AND installed_version.installed

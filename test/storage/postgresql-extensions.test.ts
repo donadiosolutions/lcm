@@ -51,8 +51,8 @@ describe("PostgreSQL required extension preflight", () => {
       "unaccent",
     ]);
     const seam = executor([...CURRENT_ROWS].reverse());
-    await expect(inspectRequiredPostgreSqlExtensions(seam)).resolves.toEqual(
-      REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => ({
+    const statuses = await inspectRequiredPostgreSqlExtensions(seam);
+    expect(statuses).toEqual(REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => ({
         name,
         available: true,
         defaultVersion: "1.0",
@@ -64,16 +64,29 @@ describe("PostgreSQL required extension preflight", () => {
         preloaded: name === "pg_stat_statements" ? true : null,
         status: "current",
         remediation: null,
-      })),
-    );
+      })));
+    expect(areRequiredPostgreSqlExtensionsReady(statuses)).toBe(true);
     expect(seam.query).toHaveBeenCalledWith({
-      text: expect.stringMatching(/FROM required[\s\S]+LEFT JOIN pg_available_extensions/u),
+      text: expect.stringMatching(/FROM required[\s\S]+LEFT JOIN pg_catalog\.pg_available_extensions[\s\S]+LEFT JOIN pg_catalog\.pg_extension[\s\S]+LEFT JOIN pg_catalog\.pg_namespace[\s\S]+LEFT JOIN pg_catalog\.pg_available_extension_versions/u),
       values: [REQUIRED_POSTGRESQL_EXTENSIONS],
     }, {
       domain: "factory",
       operation: "inspectRequiredExtensions",
       signal: undefined,
     });
+  });
+
+  it("requires each current extension name exactly once", async () => {
+    const statuses = await inspectRequiredPostgreSqlExtensions(executor(CURRENT_ROWS));
+    expect(areRequiredPostgreSqlExtensionsReady(statuses)).toBe(true);
+    expect(areRequiredPostgreSqlExtensionsReady(statuses.slice(1))).toBe(false);
+    expect(areRequiredPostgreSqlExtensionsReady([
+      statuses[0]!,
+      statuses[1]!,
+      statuses[2]!,
+      statuses[2]!,
+    ])).toBe(false);
+    expect(areRequiredPostgreSqlExtensionsReady([...statuses, statuses[0]!])).toBe(false);
   });
 
   it("reports unavailable, uninstalled, and outdated extensions with sanitized guidance", async () => {
