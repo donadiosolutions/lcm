@@ -108,9 +108,10 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 | `version-pr.yml`                     | Push to main + manual `beta`/`stable` dispatch                                      | Auto-create version PRs and enter or exit Changesets beta mode                          |
 | `publish.yml`                        | Stable/beta tag pushes + GitHub release publication                                  | Create draft releases from tags; publish npm only after manual draft publication        |
 
-The CI workflow keeps coverage reporting in separate read-only jobs that check
-out `github.repository` at the workflow's `github.sha` with credentials disabled,
-consume the fixed test artifact, and never execute repository code. This matches
+The CI workflow keeps coverage reporting in separate read-only jobs. Checkout
+uses the job token to fetch `github.repository` at the workflow's `github.sha`,
+but `persist-credentials: false` ensures credentials are not persisted. The jobs
+consume the fixed test artifact and never execute repository code. This matches
 the tree that produced the artifact, including the synthetic merge commit used by
 pull-request runs, while `override_pr` associates the uploads with the PR. The
 trusted job has OIDC permission and handles pushes and same-repository PRs,
