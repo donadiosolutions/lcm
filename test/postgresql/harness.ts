@@ -1,7 +1,10 @@
 import { randomBytes } from "node:crypto";
 import type { QueryResultRow } from "pg";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
-import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations.js";
+import {
+  REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
+  runPostgreSqlMigrations,
+} from "../../src/storage/postgresql/migrations.js";
 import { normalizePostgreSqlError } from "../../src/storage/postgresql/errors.js";
 import { REQUIRED_POSTGRESQL_EXTENSIONS } from "../../src/storage/postgresql/extensions.js";
 import type {
@@ -93,7 +96,7 @@ export async function assertHarnessReady(): Promise<void> {
     }, { domain: "factory", operation: "harnessReadiness" });
     const row = assertions.rows[0];
     if (
-      Math.floor(row.server_version_num / 10_000) !== 18
+      Math.floor(row.server_version_num / 10_000) !== REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION
       || row.role !== "lcm_test_migrator"
       || row.run_id !== env.LCM_TEST_POSTGRES_RUN_ID
       || row.database_name !== env.LCM_TEST_POSTGRES_CONTROL_DATABASE
@@ -179,7 +182,7 @@ export async function createPostgreSqlTestDatabase(
       const row = result.rows[0];
       if (
         !name.startsWith(`lcm_t_${env.LCM_TEST_POSTGRES_RUN_ID.slice(0, 12)}_`)
-        || Math.floor(row.server_version_num / 10_000) !== 18
+        || Math.floor(row.server_version_num / 10_000) !== REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION
         || row.role !== "lcm_harness_admin"
         || row.run_id !== env.LCM_TEST_POSTGRES_RUN_ID
         || row.database_name !== name

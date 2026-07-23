@@ -14,6 +14,7 @@ import {
   inspectRequiredPostgreSqlExtensions,
   PostgreSqlExtensionPreflightError,
 } from "./extensions.js";
+import { REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION } from "./migrations.js";
 
 export interface PostgreSqlRuntimeDependencies {
   readonly createPool: (config: PoolConfig) => Pool;
@@ -263,7 +264,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
         role: row.role,
         extensions,
       };
-      const runtimeReady = serverMajorVersion === 18
+      const runtimeReady = serverMajorVersion === REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION
         && row.tls === true
         && row.timezone.toUpperCase() === "UTC";
       const extensionsReady = areRequiredPostgreSqlExtensionsReady(extensions);

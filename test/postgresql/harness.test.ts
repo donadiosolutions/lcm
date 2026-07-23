@@ -27,7 +27,8 @@ const mocks = vi.hoisted(() => ({
   runMigrations: vi.fn(async () => ({ applied: [] })),
 }));
 
-vi.mock("../../src/storage/postgresql/migrations.js", () => ({
+vi.mock("../../src/storage/postgresql/migrations.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../src/storage/postgresql/migrations.js")>(),
   runPostgreSqlMigrations: mocks.runMigrations,
 }));
 
@@ -67,7 +68,7 @@ vi.mock("../../src/storage/postgresql/runtime.js", () => ({
           return {
             command: "SELECT", fields: [], oid: 0, rowCount: 1,
             rows: [{
-              server_version_num: 180_000,
+              server_version_num: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION * 10_000,
               role: "lcm_test_migrator",
               run_id: process.env.LCM_TEST_POSTGRES_RUN_ID,
               database_name: process.env.LCM_TEST_POSTGRES_CONTROL_DATABASE,
@@ -90,7 +91,7 @@ vi.mock("../../src/storage/postgresql/runtime.js", () => ({
             oid: 0,
             rowCount: 1,
             rows: [{
-              server_version_num: 180_000,
+              server_version_num: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION * 10_000,
               role: "lcm_harness_admin",
               run_id: process.env.LCM_TEST_POSTGRES_RUN_ID,
               database_name: databaseName,
@@ -109,6 +110,7 @@ vi.mock("../../src/storage/postgresql/runtime.js", () => ({
 }));
 
 import { REQUIRED_POSTGRESQL_EXTENSIONS } from "../../src/storage/postgresql/extensions.js";
+import { REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION } from "../../src/storage/postgresql/migrations.js";
 import { assertHarnessReady, createPostgreSqlTestDatabase } from "./harness.js";
 
 const ENVIRONMENT = {

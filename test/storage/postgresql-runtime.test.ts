@@ -16,6 +16,7 @@ import {
   POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
   type PostgreSqlRuntimeDependencies,
 } from "../../src/storage/postgresql/runtime.js";
+import { REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION } from "../../src/storage/postgresql/migrations.js";
 
 function result<R extends QueryResultRow>(rows: R[]): QueryResult<R> {
   return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows };
@@ -866,16 +867,19 @@ describe("PostgreSQL runtime", () => {
     const healthy = healthFixtures();
     await expect(healthy.runtime.health()).resolves.toMatchObject({
       status: "healthy",
-      serverMajorVersion: 18,
+      serverMajorVersion: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
       extensions: CURRENT_EXTENSION_ROWS.map(({ name }) => expect.objectContaining({ name, status: "current" })),
     });
     healthy.failPool();
     await expect(healthy.runtime.health()).resolves.toMatchObject({ status: "degraded" });
 
-    const wrongVersion = healthFixtures({ ...HEALTHY_ROW, server_version_num: 190000 });
+    const wrongVersion = healthFixtures({
+      ...HEALTHY_ROW,
+      server_version_num: (REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION + 1) * 10_000,
+    });
     await expect(wrongVersion.runtime.health()).resolves.toMatchObject({
       status: "unavailable",
-      serverMajorVersion: 19,
+      serverMajorVersion: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION + 1,
       tls: true,
       timezone: "UTC",
       role: "runtime",
@@ -889,7 +893,7 @@ describe("PostgreSQL runtime", () => {
       const invalid = healthFixtures(row);
       await expect(invalid.runtime.health()).resolves.toMatchObject({
         status: "unavailable",
-        serverMajorVersion: 18,
+        serverMajorVersion: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
         tls: row.tls,
         timezone: row.timezone,
         role: "runtime",
