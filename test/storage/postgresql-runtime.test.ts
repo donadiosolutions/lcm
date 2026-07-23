@@ -7,6 +7,7 @@ import type {
   QueryResultRow,
 } from "pg";
 import { describe, expect, it, vi } from "vitest";
+import { StorageOperationError } from "../../src/storage/errors.js";
 import type {
   PostgreSqlConnectionSettings,
   PostgreSqlQueryExecutor,
@@ -216,6 +217,55 @@ describe("PostgreSQL runtime", () => {
     });
     expect(queryFailure.query).toHaveBeenCalledWith("ROLLBACK");
     expect(queryFailure.release).toHaveBeenCalledWith(false);
+  });
+
+  it("honors omitted transaction options across success and failure paths", async () => {
+    const successful = fixtures((input) => typeof input === "string"
+      ? result([])
+      : result([{ value: 3 }]));
+    await expect(successful.runtime.transaction(async (transaction) => {
+      const selected = await transaction.query<{ value: number }>({ text: "SELECT 3 AS value" }, {
+        domain: "sessions",
+        operation: "insideDefaultTransaction",
+      });
+      return selected.rows[0].value;
+    })).resolves.toBe(3);
+    expect(successful.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      { text: "SELECT 3 AS value" },
+      "COMMIT",
+    ]);
+    expect(successful.release).toHaveBeenCalledWith(false);
+
+    const original = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      undefined,
+      "sessions",
+      "originalCallbackFailure",
+    );
+    const failed = fixtures();
+    await expect(failed.runtime.transaction(async () => { throw original; })).rejects.toBe(original);
+    expect(failed.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(failed.release).toHaveBeenCalledWith(false);
+
+    const acquisition = fixtures();
+    acquisition.connect.mockRejectedValueOnce(new Error("transaction acquisition failed"));
+    await expect(acquisition.runtime.transaction(async () => undefined)).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      domain: "transaction",
+      operation: "transaction",
+    });
+    expect(acquisition.release).not.toHaveBeenCalled();
+
+    const closed = fixtures();
+    await closed.runtime.close();
+    await expect(closed.runtime.transaction(async () => undefined)).rejects.toMatchObject({
+      code: "STORAGE_CLOSED",
+      domain: "transaction",
+      operation: "transaction",
+    });
+    expect(closed.connect).not.toHaveBeenCalled();
   });
 
   it("treats connection loss during COMMIT as non-retryable and destroys the client", async () => {
@@ -640,7 +690,7 @@ describe("PostgreSQL runtime", () => {
     expect(f.release).toHaveBeenCalledWith(false);
   });
 
-  it("destroys a transaction client after a query-local abort", async () => {
+  it("destroys a transaction client after a query-local abort with omitted transaction options", async () => {
     let target: QueryWithCallback | undefined;
     const f = fixtures((input) => {
       if (input === "BEGIN" || input === "ROLLBACK") return result([]);
@@ -662,7 +712,7 @@ describe("PostgreSQL runtime", () => {
       await vi.waitFor(() => expect(f.cancelQuery).toHaveBeenCalled());
       target?.callback(Object.assign(new Error("cancelled"), { code: "57014" }));
       return query;
-    }, { domain: "transaction", operation: "outerTransaction" });
+    });
     await expect(pending).rejects.toMatchObject({ operation: "queryLocalAbort" });
     expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
     expect(f.release).toHaveBeenCalledWith(true);

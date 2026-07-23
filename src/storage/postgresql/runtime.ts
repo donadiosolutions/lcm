@@ -28,6 +28,11 @@ export const POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES: PostgreSqlRuntimeDependenc
   buildConfig: buildPostgreSqlClientConfig,
 };
 
+const DEFAULT_POSTGRESQL_TRANSACTION_CONTEXT = {
+  domain: "transaction",
+  operation: "transaction",
+} as const satisfies PostgreSqlOperationContext;
+
 type HealthRow = {
   server_version_num: unknown;
   timezone: string;
@@ -139,7 +144,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
 
   async transaction<T>(
     callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
-    options: PostgreSqlOperationContext & { signal?: AbortSignal },
+    options: PostgreSqlOperationContext & { signal?: AbortSignal } = DEFAULT_POSTGRESQL_TRANSACTION_CONTEXT,
   ): Promise<T> {
     this.assertOpen(options);
     let client: PoolClient | undefined;
