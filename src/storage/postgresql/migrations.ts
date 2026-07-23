@@ -7,6 +7,7 @@ import type {
   PostgreSqlMigrationResult,
   PostgreSqlQueryExecutor,
 } from "./contracts.js";
+import { assertRequiredPostgreSqlExtensionsReady } from "./extensions.js";
 
 const MIGRATION_MANIFEST = [
   {
@@ -14,10 +15,16 @@ const MIGRATION_MANIFEST = [
     filename: "0001_migration_ledger.sql",
     sha256: "e2c0f7e366ba291032f6c62436e8db21b3b5bf3589f7f6c889b18a315eb81e63",
   },
+  {
+    id: "0002_schema_baseline",
+    filename: "0002_schema_baseline.sql",
+    sha256: "5d8c607a5c73c5e00c92ecbe7b46024164b2ceb2c73c23cc25c897737eb7f5b2",
+  },
 ] as const;
 
 type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
 type LedgerRow = QueryResultRow & { ledger_exists: boolean };
+type ServerVersionRow = QueryResultRow & { server_version_num: number };
 
 function migrationError(operation: string): StorageOperationError {
   return new StorageOperationError(
@@ -78,6 +85,19 @@ export async function runPostgreSqlMigrations(
     await transaction.query({
       text: "SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':lcm:migrations', 0))",
     }, { domain: "factory", operation: "lockMigrations", signal: options.signal });
+
+    const serverVersion = await transaction.query<ServerVersionRow>({
+      text: "SELECT current_setting('server_version_num')::integer AS server_version_num",
+    }, { domain: "factory", operation: "preflightServerVersion", signal: options.signal });
+    const serverVersionNumber = serverVersion.rows[0]?.server_version_num;
+    if (
+      typeof serverVersionNumber !== "number"
+      || Math.floor(serverVersionNumber / 10_000) !== 18
+    ) {
+      throw migrationError("preflightServerVersion");
+    }
+
+    await assertRequiredPostgreSqlExtensionsReady(transaction, { signal: options.signal });
 
     const ledger = await transaction.query<LedgerRow>({
       text: "SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger_exists",

@@ -30,6 +30,43 @@ const SETTINGS: PostgreSqlConnectionSettings = {
   statementTimeoutMs: 300,
 };
 
+const HEALTHY_ROW = {
+  server_version_num: 180004,
+  timezone: "UTC",
+  role: "runtime",
+  tls: true,
+};
+
+const CURRENT_EXTENSION_ROWS = [
+  "pg_stat_statements",
+  "pg_trgm",
+  "pgcrypto",
+  "unaccent",
+].map((name) => ({
+  name,
+  default_version: "1.0",
+  installed_version: "1.0",
+  installed_schema: "public",
+  relocatable: true,
+}));
+
+function isExtensionInspection(input: unknown): boolean {
+  return typeof input === "object"
+    && input !== null
+    && "text" in input
+    && typeof input.text === "string"
+    && input.text.includes("pg_available_extensions");
+}
+
+function healthFixtures(
+  healthRow = HEALTHY_ROW,
+  extensionRows = CURRENT_EXTENSION_ROWS,
+) {
+  return fixtures((input) => isExtensionInspection(input)
+    ? result(extensionRows)
+    : result([healthRow]));
+}
+
 type QueryCallback = (error: Error | null, value?: QueryResult<QueryResultRow>) => void;
 type QueryWithCallback = Query<QueryResultRow, unknown[]> & { callback: QueryCallback };
 
@@ -825,13 +862,16 @@ describe("PostgreSQL runtime", () => {
   });
 
   it("reports healthy, degraded, invalid, unavailable, and closed health", async () => {
-    const healthyRow = { server_version_num: 180004, timezone: "UTC", role: "runtime", tls: true };
-    const healthy = fixtures(() => result([healthyRow]));
-    await expect(healthy.runtime.health()).resolves.toMatchObject({ status: "healthy", serverMajorVersion: 18 });
+    const healthy = healthFixtures();
+    await expect(healthy.runtime.health()).resolves.toMatchObject({
+      status: "healthy",
+      serverMajorVersion: 18,
+      extensions: CURRENT_EXTENSION_ROWS.map(({ name }) => expect.objectContaining({ name, status: "current" })),
+    });
     healthy.failPool();
     await expect(healthy.runtime.health()).resolves.toMatchObject({ status: "degraded" });
 
-    const wrongVersion = fixtures(() => result([{ ...healthyRow, server_version_num: 190000 }]));
+    const wrongVersion = healthFixtures({ ...HEALTHY_ROW, server_version_num: 190000 });
     await expect(wrongVersion.runtime.health()).resolves.toMatchObject({
       status: "unavailable",
       serverMajorVersion: 19,
@@ -842,10 +882,10 @@ describe("PostgreSQL runtime", () => {
     });
 
     for (const row of [
-      { ...healthyRow, tls: false },
-      { ...healthyRow, timezone: "America/Sao_Paulo" },
+      { ...HEALTHY_ROW, tls: false },
+      { ...HEALTHY_ROW, timezone: "America/Sao_Paulo" },
     ]) {
-      const invalid = fixtures(() => result([row]));
+      const invalid = healthFixtures(row);
       await expect(invalid.runtime.health()).resolves.toMatchObject({
         status: "unavailable",
         serverMajorVersion: 18,
@@ -859,6 +899,40 @@ describe("PostgreSQL runtime", () => {
     await expect(unavailable.runtime.health()).resolves.toMatchObject({ status: "unavailable" });
     await healthy.runtime.close();
     await expect(healthy.runtime.health()).resolves.toEqual({ status: "closed", backend: "postgresql" });
+  });
+
+  it.each([
+    {
+      label: "unavailable",
+      rows: CURRENT_EXTENSION_ROWS.slice(1),
+      expected: { name: "pg_stat_statements", available: false, status: "unavailable" },
+    },
+    {
+      label: "uninstalled",
+      rows: CURRENT_EXTENSION_ROWS.map((row) => row.name === "pg_trgm"
+        ? { ...row, installed_version: null }
+        : row),
+      expected: { name: "pg_trgm", available: true, status: "uninstalled" },
+    },
+    {
+      label: "outdated",
+      rows: CURRENT_EXTENSION_ROWS.map((row) => row.name === "unaccent"
+        ? { ...row, installed_version: "0.9" }
+        : row),
+      expected: { name: "unaccent", available: true, status: "outdated" },
+    },
+  ])("reports $label required extensions as unavailable readiness", async ({ rows, expected }) => {
+    const runtime = healthFixtures(HEALTHY_ROW, rows);
+    await expect(runtime.runtime.health()).resolves.toMatchObject({
+      status: "unavailable",
+      backend: "postgresql",
+      extensions: expect.arrayContaining([expect.objectContaining(expected)]),
+      error: {
+        code: "STORAGE_INITIALIZATION_FAILED",
+        operation: "health",
+        extensions: expect.arrayContaining([expect.objectContaining(expected)]),
+      },
+    });
   });
 
   it("closes idempotently and rejects closed operations", async () => {

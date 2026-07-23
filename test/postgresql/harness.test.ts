@@ -184,4 +184,38 @@ describe("PostgreSQL test database lease", () => {
     await expect(retry).resolves.toBeUndefined();
     expect(mocks.operations.filter((operation) => operation === "drainTestDatabase")).toHaveLength(2);
   });
+
+  it("creates a guarded unmigrated database with an intentionally omitted extension", async () => {
+    const database = await createPostgreSqlTestDatabase("missing-extension", {
+      omitExtensions: ["unaccent"],
+      runMigrations: false,
+    });
+
+    expect(mocks.operations.filter((operation) => operation === "createTestExtension"))
+      .toHaveLength(3);
+    expect(mocks.operations).not.toContain("grantRuntimeBaseline");
+    expect(mocks.runMigrations).not.toHaveBeenCalled();
+
+    await expect(database.drop()).resolves.toBeUndefined();
+    expect(mocks.operations.filter((operation) => operation === "verifyDropSentinel"))
+      .toHaveLength(1);
+  });
+
+  it("creates one guarded custom namespace for selected extension fixtures", async () => {
+    const database = await createPostgreSqlTestDatabase("extension-schema", {
+      extensionSchemas: {
+        pg_trgm: "lcm_test_extensions",
+        unaccent: "lcm_test_extensions",
+      },
+      runMigrations: false,
+    });
+
+    expect(mocks.operations.filter((operation) => operation === "createTestExtensionSchema"))
+      .toHaveLength(1);
+    expect(mocks.operations.filter((operation) => operation === "createTestExtension"))
+      .toHaveLength(4);
+    expect(mocks.runMigrations).not.toHaveBeenCalled();
+
+    await expect(database.drop()).resolves.toBeUndefined();
+  });
 });

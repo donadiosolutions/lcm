@@ -39,12 +39,32 @@ export interface PostgreSqlMigrationResult {
   readonly current: readonly string[];
 }
 
+export type PostgreSqlExtensionReadiness =
+  | "current"
+  | "outdated"
+  | "unavailable"
+  | "uninstalled"
+  | "wrong-namespace";
+
+export interface PostgreSqlExtensionStatus {
+  readonly name: "pg_stat_statements" | "pg_trgm" | "pgcrypto" | "unaccent";
+  readonly available: boolean;
+  readonly defaultVersion: string | null;
+  readonly installedVersion: string | null;
+  readonly requiredSchema: "public";
+  readonly installedSchema: string | null;
+  readonly relocatable: boolean | null;
+  readonly status: PostgreSqlExtensionReadiness;
+  readonly remediation: string | null;
+}
+
 export interface PostgreSqlRuntimeHealth extends StorageHealth {
   readonly backend: "postgresql";
   readonly serverMajorVersion?: number;
   readonly tls?: boolean;
   readonly timezone?: string;
   readonly role?: string;
+  readonly extensions?: readonly PostgreSqlExtensionStatus[];
 }
 
 export interface PostgreSqlTestDatabaseSentinel {

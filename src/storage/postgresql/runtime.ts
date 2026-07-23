@@ -9,6 +9,11 @@ import type {
 } from "./contracts.js";
 import { buildPostgreSqlClientConfig } from "./client-config.js";
 import { isPostgreSqlConnectionError, normalizePostgreSqlError } from "./errors.js";
+import {
+  areRequiredPostgreSqlExtensionsReady,
+  inspectRequiredPostgreSqlExtensions,
+  PostgreSqlExtensionPreflightError,
+} from "./extensions.js";
 
 export interface PostgreSqlRuntimeDependencies {
   readonly createPool: (config: PoolConfig) => Pool;
@@ -248,24 +253,34 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       }, { domain: "factory", operation: "health" });
       const row = result.rows[0];
       const serverMajorVersion = Math.floor(row.server_version_num / 10_000);
+      const extensions = await inspectRequiredPostgreSqlExtensions(this, {
+        operation: "healthRequiredExtensions",
+      });
       const diagnostics = {
         serverMajorVersion,
         tls: row.tls,
         timezone: row.timezone,
         role: row.role,
+        extensions,
       };
-      if (serverMajorVersion !== 18 || row.tls !== true || row.timezone.toUpperCase() !== "UTC") {
+      const runtimeReady = serverMajorVersion === 18
+        && row.tls === true
+        && row.timezone.toUpperCase() === "UTC";
+      const extensionsReady = areRequiredPostgreSqlExtensionsReady(extensions);
+      if (!runtimeReady || !extensionsReady) {
         return {
           status: "unavailable",
           backend: "postgresql",
           ...diagnostics,
-          error: new StorageOperationError(
-            "STORAGE_INITIALIZATION_FAILED",
-            "postgresql",
-            undefined,
-            "factory",
-            "health",
-          ),
+          error: runtimeReady
+            ? new PostgreSqlExtensionPreflightError(extensions, "health")
+            : new StorageOperationError(
+              "STORAGE_INITIALIZATION_FAILED",
+              "postgresql",
+              undefined,
+              "factory",
+              "health",
+            ),
         };
       }
       return {

@@ -1,9 +1,12 @@
 # PostgreSQL development
 
-LCM's PostgreSQL runtime and migration foundation is internal until the domain
-adapters tracked by #83-#92 satisfy the shared storage contracts. SQLite remains
-the default, and the application factory deliberately rejects
-`storage.backend=postgresql` during this stage.
+LCM's PostgreSQL runtime, migration runner, and complete PostgreSQL 18 schema
+baseline are internal until the domain adapters tracked by #84-#91 satisfy the
+shared storage contracts and #92 enables cutover. SQLite remains the default,
+and the application factory deliberately rejects `storage.backend=postgresql`
+during this stage. See the [PostgreSQL schema reference](postgresql-schema.md)
+for tables, integrity rules, index families, extension prerequisites, retention,
+and backup implications.
 
 ## Run the conformance harness
 
@@ -56,9 +59,29 @@ file, calculate its SHA-256 digest and update the explicit manifest in
 `src/storage/postgresql/migrations.ts`. Never edit an already released
 migration: checksum drift is rejected. Add a new migration instead.
 
+Inside the locked migration transaction, the runner requires PostgreSQL 18 and
+inspects `pg_trgm`, `unaccent`, `pgcrypto`, and `pg_stat_statements`.
+Every extension must be installed in `public` at its available default version.
+Unavailable, uninstalled, outdated, or wrong-namespace extensions block
+migration and runtime readiness with structured, sanitized administrator
+guidance. LCM never creates, upgrades, relocates, reinstalls, or drops an
+extension. For a wrong namespace, relocatable extensions receive `ALTER
+EXTENSION ... SET SCHEMA "public"` guidance; non-relocatable extensions receive
+an explicit reinstall requirement without automatic destructive SQL. Complete
+and verify the operation through the cluster administrator, then rerun migration.
+
 Exercise at least the empty, repeated, concurrent, rollback, unknown-history,
 out-of-order, and checksum-drift paths. Migration SQL and the ledger insertion
 must remain in the same transaction under the database-scoped advisory lock.
+Create owned helper functions without replacement. A same-signature function
+is an operator collision that must fail and roll back the pending set while
+leaving the existing function unchanged. Revoke `PUBLIC` privileges only from
+explicit LCM-owned tables, sequences, and functions; never use a schema-wide
+object revoke that would alter ACLs on unknown pre-existing objects.
+A supported pre-existing `lcm` schema must not grant `CREATE` to `PUBLIC`.
+Migration checks that prerequisite before owned DDL and fails without revoking
+or otherwise changing the schema ACL; an administrator must remove the unsafe
+grant explicitly before retrying.
 
 If startup reports unknown, out-of-order, or checksum-drifted history, stop and
 compare the packaged manifest with `lcm.schema_migrations`. Do not edit the
@@ -75,7 +98,10 @@ roles for migration and runtime work. The migrator owns LCM schemas and applies
 the ordered migration set; the runtime role receives only the object privileges
 needed by repositories. Keep extension installation with the cluster
 administrator because `pg_stat_statements` and other extensions may exceed the
-migrator's privileges.
+migrator's privileges. Confirm the exact target cluster against DigitalOcean's
+[supported-extension matrix](https://docs.digitalocean.com/products/databases/postgresql/details/supported-extensions/)
+and its `extwlist.extensions` setting before rollout, then confirm the installed
+namespace is `public`.
 
 Size `poolMax` against the cluster connection limit after reserving capacity for
 administration, migrations, monitoring, and other services. Multiply the value

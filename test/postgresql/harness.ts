@@ -3,6 +3,7 @@ import type { QueryResultRow } from "pg";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations.js";
 import { normalizePostgreSqlError } from "../../src/storage/postgresql/errors.js";
+import { REQUIRED_POSTGRESQL_EXTENSIONS } from "../../src/storage/postgresql/extensions.js";
 import type {
   PostgreSqlConnectionSettings,
   PostgreSqlTestDatabaseLease,
@@ -120,7 +121,19 @@ export interface PostgreSqlTestDatabase extends PostgreSqlTestDatabaseLease {
   drop(): Promise<void>;
 }
 
-export async function createPostgreSqlTestDatabase(label: string): Promise<PostgreSqlTestDatabase> {
+export interface PostgreSqlTestDatabaseOptions {
+  /** Test-only fault injection. Every production-like lease installs all parity extensions. */
+  readonly omitExtensions?: readonly (typeof REQUIRED_POSTGRESQL_EXTENSIONS)[number][];
+  /** Test-only fault injection for installing selected extensions outside their required namespace. */
+  readonly extensionSchemas?: Partial<Record<(typeof REQUIRED_POSTGRESQL_EXTENSIONS)[number], string>>;
+  /** Test-only fault injection for exercising readiness before any LCM DDL. */
+  readonly runMigrations?: boolean;
+}
+
+export async function createPostgreSqlTestDatabase(
+  label: string,
+  options: PostgreSqlTestDatabaseOptions = {},
+): Promise<PostgreSqlTestDatabase> {
   const env = environment();
   const normalizedLabel = label.toLowerCase().replace(/[^a-z0-9]+/gu, "_").replace(/^_+|_+$/gu, "").slice(0, 12) || "case";
   const worker = (process.env.VITEST_POOL_ID ?? "0").replace(/[^0-9]/gu, "").slice(0, 3) || "0";
@@ -194,8 +207,25 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
     return dropPromise;
   };
   try {
-    for (const extension of ["pg_trgm", "unaccent", "pgcrypto", "pg_stat_statements"] as const) {
-      await databaseAdmin.query({ text: `CREATE EXTENSION ${extension}` }, {
+    const omittedExtensions = new Set(options.omitExtensions ?? []);
+    const createdExtensionSchemas = new Set<string>();
+    for (const extension of REQUIRED_POSTGRESQL_EXTENSIONS) {
+      if (omittedExtensions.has(extension)) continue;
+      const requestedSchema = options.extensionSchemas?.[extension];
+      const schema = requestedSchema === undefined ? undefined : safeIdentifier(requestedSchema);
+      if (schema !== undefined && !createdExtensionSchemas.has(schema)) {
+        await databaseAdmin.query({ text: `CREATE SCHEMA ${schema}` }, {
+          domain: "factory",
+          operation: "createTestExtensionSchema",
+        });
+        createdExtensionSchemas.add(schema);
+      }
+      const extensionIdentifier = safeIdentifier(extension);
+      await databaseAdmin.query({
+        text: schema === undefined
+          ? `CREATE EXTENSION ${extensionIdentifier}`
+          : `CREATE EXTENSION ${extensionIdentifier} WITH SCHEMA ${schema}`,
+      }, {
         domain: "factory",
         operation: "createTestExtension",
       });
@@ -216,11 +246,13 @@ export async function createPostgreSqlTestDatabase(label: string): Promise<Postg
       text: `REVOKE ALL ON public.__lcm_test_run_sentinel FROM PUBLIC;
              GRANT SELECT ON public.__lcm_test_run_sentinel TO lcm_test_migrator, lcm_test_runtime`,
     }, { domain: "factory", operation: "protectTestSentinel" });
-    await runPostgreSqlMigrations(migrator);
-    await migrator.query({
-      text: `GRANT USAGE ON SCHEMA lcm TO lcm_test_runtime;
-             GRANT SELECT ON lcm.schema_migrations TO lcm_test_runtime`,
-    }, { domain: "factory", operation: "grantRuntimeBaseline" });
+    if (options.runMigrations !== false) {
+      await runPostgreSqlMigrations(migrator);
+      await migrator.query({
+        text: `GRANT USAGE ON SCHEMA lcm TO lcm_test_runtime;
+               GRANT SELECT ON lcm.schema_migrations TO lcm_test_runtime`,
+      }, { domain: "factory", operation: "grantRuntimeBaseline" });
+    }
     await closeDatabaseAdmin();
   } catch (error) {
     await Promise.allSettled([closeDatabaseAdmin(), dropOwnedDatabase()]);

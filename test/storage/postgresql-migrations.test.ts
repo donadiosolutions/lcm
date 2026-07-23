@@ -10,6 +10,7 @@ import {
   loadPostgreSqlMigrations,
   runPostgreSqlMigrations,
 } from "../../src/storage/postgresql/migrations.js";
+import { REQUIRED_POSTGRESQL_EXTENSIONS } from "../../src/storage/postgresql/extensions.js";
 
 function migration(id: string, sql = `SELECT '${id}'`): PostgreSqlMigration {
   return { id, filename: `${id}.sql`, sql, sha256: createHash("sha256").update(sql).digest("hex") };
@@ -23,6 +24,7 @@ function executor(options: {
   ledger?: boolean;
   current?: Array<{ id: string; checksum_sha256: string }>;
   failOperation?: string;
+  serverVersion?: number | "missing";
 } = {}) {
   const operations: string[] = [];
   const query = vi.fn(async <R extends QueryResultRow>(
@@ -31,6 +33,20 @@ function executor(options: {
   ): Promise<QueryResult<R>> => {
     operations.push(context.operation);
     if (context.operation === options.failOperation) throw new Error("private SQL failure");
+    if (context.operation === "preflightServerVersion") {
+      return result(options.serverVersion === "missing"
+        ? [] as R[]
+        : [{ server_version_num: options.serverVersion ?? 180004 }] as unknown as R[]);
+    }
+    if (context.operation === "preflightRequiredExtensions") {
+      return result(REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => ({
+        name,
+        default_version: "1.0",
+        installed_version: "1.0",
+        installed_schema: "public",
+        relocatable: true,
+      })) as unknown as R[]);
+    }
     if (context.operation === "inspectMigrationLedger") return result([{ ledger_exists: options.ledger ?? false }] as unknown as R[]);
     if (context.operation === "readMigrations") return result((options.current ?? []) as unknown as R[]);
     return result([] as R[]);
@@ -46,6 +62,7 @@ describe("PostgreSQL migration runner", () => {
   it("loads the pinned artifact and rejects missing or drifted files", () => {
     expect(loadPostgreSqlMigrations()).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "5d8c607a5c73c5e00c92ecbe7b46024164b2ceb2c73c23cc25c897737eb7f5b2" }),
     ]);
     expect(() => loadPostgreSqlMigrations(() => { throw new Error("missing private path"); }))
       .toThrowError(expect.objectContaining({ operation: "loadMigrations" }));
@@ -73,6 +90,8 @@ describe("PostgreSQL migration runner", () => {
     });
     expect(fake.operations).toEqual([
       "lockMigrations",
+      "preflightServerVersion",
+      "preflightRequiredExtensions",
       "inspectMigrationLedger",
       "applyMigration:0001_first",
       "recordMigration",
@@ -108,5 +127,29 @@ describe("PostgreSQL migration runner", () => {
     await expect(runPostgreSqlMigrations(executor({ ledger: true, current }).seam)).resolves.toMatchObject({ applied: [] });
     await expect(runPostgreSqlMigrations(executor({ failOperation: "lockMigrations" }).seam, { migrations: [] }))
       .rejects.toThrow("private SQL failure");
+  });
+
+  it("fails extension preflight before inspecting or changing the schema", async () => {
+    const fake = executor({ failOperation: "preflightRequiredExtensions" });
+    await expect(runPostgreSqlMigrations(fake.seam, { migrations: [migration("0001_first")] }))
+      .rejects.toThrow("private SQL failure");
+    expect(fake.operations).toEqual([
+      "lockMigrations",
+      "preflightServerVersion",
+      "preflightRequiredExtensions",
+    ]);
+  });
+
+  it.each([
+    { label: "wrong", serverVersion: 190001 as const },
+    { label: "missing", serverVersion: "missing" as const },
+  ])("rejects a $label PostgreSQL server version before extension or schema inspection", async ({ serverVersion }) => {
+    const fake = executor({ serverVersion });
+    await expect(runPostgreSqlMigrations(fake.seam, { migrations: [migration("0001_first")] }))
+      .rejects.toMatchObject({
+        code: "STORAGE_INITIALIZATION_FAILED",
+        operation: "preflightServerVersion",
+      });
+    expect(fake.operations).toEqual(["lockMigrations", "preflightServerVersion"]);
   });
 });

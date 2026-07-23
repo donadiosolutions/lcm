@@ -347,13 +347,15 @@ provider requirements, and deeper operational guidance.
 SQLite remains the zero-configuration storage backend. LCM also validates the
 configuration and verified-TLS prerequisites for an explicit remote-primary
 PostgreSQL selection and includes an internal PostgreSQL 18 pool, migration
-runner, and isolated conformance harness. PostgreSQL domain repositories remain
-staged in #83-#92, so selecting `postgresql` currently fails before daemon
-startup instead of falling back to SQLite. Connection credentials stay out of
-JSON and effective configuration output. See [storage backend configuration](docs/configuration.md#storage-backend)
-for operators and the [storage repository architecture](docs/architecture.md#storage-repository-architecture)
-for repository ownership, lifetimes, transactions, and the local-outbox
-boundary.
+runner, schema baseline, and isolated conformance harness. PostgreSQL domain
+repositories remain staged in #84-#91, with activation in #92, so selecting
+`postgresql` currently fails before daemon startup instead of falling back to
+SQLite. Connection credentials stay out of JSON and effective configuration
+output. See [storage backend configuration](docs/configuration.md#storage-backend)
+for operators, the [PostgreSQL schema reference](docs/postgresql-schema.md) for
+the 23-table data and namespace-aware extension contract, and the
+[storage repository architecture](docs/architecture.md#storage-repository-architecture)
+for repository ownership, lifetimes, transactions, and the local-outbox boundary.
 
 ## Development
 

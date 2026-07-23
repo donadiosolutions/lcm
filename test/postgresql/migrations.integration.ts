@@ -30,20 +30,157 @@ CREATE TABLE IF NOT EXISTS lcm.schema_migrations (
 
 describe("PostgreSQL migrations and database isolation", () => {
   it("applies empty, repeated, and concurrent migration runs deterministically", async () => {
-    await withPostgreSqlTestDatabase("migration-concurrency", async (database) => {
-      await expect(runPostgreSqlMigrations(database.migrator)).resolves.toMatchObject({ applied: [] });
+    const database = await createPostgreSqlTestDatabase("migration-concurrency", { runMigrations: false });
+    try {
+      await database.migrator.query({
+        text: `CREATE SCHEMA lcm;
+               CREATE TABLE lcm.operator_owned_metadata (key text PRIMARY KEY);
+               INSERT INTO lcm.operator_owned_metadata (key) VALUES ('preserve-me')`,
+      }, { domain: "factory", operation: "seedPreexistingSchema" });
       const second = new PostgreSqlRuntime(settings(database.migratorUrl));
       try {
         const [firstResult, secondResult] = await Promise.all([
           runPostgreSqlMigrations(database.migrator),
           runPostgreSqlMigrations(second),
         ]);
-        expect(firstResult.applied).toEqual([]);
-        expect(secondResult.applied).toEqual([]);
+        expect([firstResult.applied, secondResult.applied].sort((left, right) => right.length - left.length))
+          .toEqual([["0001_migration_ledger", "0002_schema_baseline"], []]);
+        await expect(database.migrator.query<{ key: string }>({
+          text: "SELECT key FROM lcm.operator_owned_metadata",
+        }, { domain: "factory", operation: "verifyPreexistingSchema" }))
+          .resolves.toMatchObject({ rows: [{ key: "preserve-me" }] });
+        await expect(runPostgreSqlMigrations(database.migrator)).resolves.toMatchObject({ applied: [] });
       } finally {
         await second.close();
       }
-    });
+    } finally {
+      await database.drop();
+    }
+  });
+
+  it("rolls back the complete pending set and a migration whose ledger insert fails", async () => {
+    const database = await createPostgreSqlTestDatabase("migration-atomic", { runMigrations: false });
+    try {
+      const baseline = migration("0001_atomic_ledger", ledgerSql);
+      const successful = migration("0002_atomic_probe", "CREATE TABLE lcm.pending_set_probe (id integer PRIMARY KEY);");
+      const failing = migration("0003_atomic_failure", "CREATE TABLE lcm.pending_failure_probe (id integer); SELECT missing FROM absent;");
+      await expect(runPostgreSqlMigrations(database.migrator, {
+        migrations: [baseline, successful, failing],
+      })).rejects.toMatchObject({ backend: "postgresql" });
+      await expect(database.migrator.query<{ ledger: boolean; probe: boolean }>({
+        text: `SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger,
+                      to_regclass('lcm.pending_set_probe') IS NOT NULL AS probe`,
+      }, { domain: "factory", operation: "verifyPendingSetRollback" }))
+        .resolves.toMatchObject({ rows: [{ ledger: false, probe: false }] });
+
+      const ledgerFailure = migration("0001_ledger_failure", `CREATE SCHEMA lcm;
+        CREATE TABLE lcm.schema_migrations (
+          id text PRIMARY KEY CHECK (id <> '0001_ledger_failure'),
+          checksum_sha256 text NOT NULL,
+          applied_at timestamptz NOT NULL DEFAULT statement_timestamp()
+        );
+        CREATE TABLE lcm.ledger_failure_probe (id integer PRIMARY KEY);`);
+      await expect(runPostgreSqlMigrations(database.migrator, { migrations: [ledgerFailure] }))
+        .rejects.toMatchObject({ backend: "postgresql" });
+      await expect(database.migrator.query<{ ledger: boolean; probe: boolean }>({
+        text: `SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger,
+                      to_regclass('lcm.ledger_failure_probe') IS NOT NULL AS probe`,
+      }, { domain: "factory", operation: "verifyLedgerInsertRollback" }))
+        .resolves.toMatchObject({ rows: [{ ledger: false, probe: false }] });
+    } finally {
+      await database.drop();
+    }
+  });
+
+  it("fails closed on a colliding operator function without replacing it", async () => {
+    const database = await createPostgreSqlTestDatabase("function-collision", { runMigrations: false });
+    try {
+      await database.migrator.query({
+        text: `CREATE SCHEMA lcm;
+               CREATE FUNCTION lcm.normalize_search_text(input text) RETURNS text
+               LANGUAGE sql IMMUTABLE RETURN 'operator:' || input`,
+      }, { domain: "factory", operation: "seedFunctionCollision" });
+      await expect(runPostgreSqlMigrations(database.migrator)).rejects.toMatchObject({ backend: "postgresql" });
+      await expect(database.migrator.query<{ behavior: string; domain_table: boolean }>({
+        text: `SELECT lcm.normalize_search_text('value') AS behavior,
+                      to_regclass('lcm.machines') IS NOT NULL AS domain_table`,
+      }, { domain: "factory", operation: "verifyFunctionCollisionRollback" }))
+        .resolves.toMatchObject({ rows: [{ behavior: "operator:value", domain_table: false }] });
+    } finally {
+      await database.drop();
+    }
+  });
+
+  it("preserves PUBLIC privileges on unknown pre-existing schema objects", async () => {
+    const database = await createPostgreSqlTestDatabase("unknown-acls", { runMigrations: false });
+    try {
+      await database.migrator.query({
+        text: `CREATE SCHEMA lcm;
+               CREATE TABLE lcm.operator_table (id integer);
+               CREATE SEQUENCE lcm.operator_sequence;
+               CREATE FUNCTION lcm.operator_function() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1;
+               GRANT SELECT ON lcm.operator_table TO PUBLIC;
+               GRANT USAGE ON SEQUENCE lcm.operator_sequence TO PUBLIC;
+               GRANT EXECUTE ON FUNCTION lcm.operator_function() TO PUBLIC`,
+      }, { domain: "factory", operation: "seedUnknownAcls" });
+      await runPostgreSqlMigrations(database.migrator);
+      await expect(database.migrator.query<{
+        unknown_table: boolean;
+        unknown_sequence: boolean;
+        unknown_function: boolean;
+        owned_table: boolean;
+        owned_sequence: boolean;
+        owned_function: boolean;
+      }>({
+        text: `SELECT
+          has_table_privilege('public', 'lcm.operator_table', 'SELECT') AS unknown_table,
+          has_sequence_privilege('public', 'lcm.operator_sequence', 'USAGE') AS unknown_sequence,
+          has_function_privilege('public', 'lcm.operator_function()', 'EXECUTE') AS unknown_function,
+          has_table_privilege('public', 'lcm.messages', 'SELECT') AS owned_table,
+          has_sequence_privilege('public', 'lcm.messages_message_id_seq', 'USAGE') AS owned_sequence,
+          has_function_privilege('public', 'lcm.normalize_search_text(text)', 'EXECUTE') AS owned_function`,
+      }, { domain: "factory", operation: "verifyScopedRevokes" })).resolves.toMatchObject({ rows: [{
+        unknown_table: true,
+        unknown_sequence: true,
+        unknown_function: true,
+        owned_table: false,
+        owned_sequence: false,
+        owned_function: false,
+      }] });
+    } finally {
+      await database.drop();
+    }
+  });
+
+  it("fails before owned DDL when a pre-existing lcm schema grants PUBLIC CREATE", async () => {
+    const database = await createPostgreSqlTestDatabase("public-schema-create", { runMigrations: false });
+    try {
+      await database.migrator.query({
+        text: `CREATE SCHEMA lcm;
+               CREATE TABLE lcm.operator_table (value text);
+               INSERT INTO lcm.operator_table VALUES ('preserve-me');
+               GRANT CREATE ON SCHEMA lcm TO PUBLIC`,
+      }, { domain: "factory", operation: "seedPublicSchemaCreate" });
+      await expect(runPostgreSqlMigrations(database.migrator)).rejects.toMatchObject({ backend: "postgresql" });
+      await expect(database.migrator.query<{
+        public_create: boolean;
+        value: string;
+        owned_table: boolean;
+        ledger: boolean;
+      }>({
+        text: `SELECT has_schema_privilege('public', 'lcm', 'CREATE') AS public_create,
+                      (SELECT value FROM lcm.operator_table) AS value,
+                      to_regclass('lcm.machines') IS NOT NULL AS owned_table,
+                      to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger`,
+      }, { domain: "factory", operation: "verifyPublicSchemaCreateRollback" })).resolves.toMatchObject({ rows: [{
+        public_create: true,
+        value: "preserve-me",
+        owned_table: false,
+        ledger: false,
+      }] });
+    } finally {
+      await database.drop();
+    }
   });
 
   it("rejects checksum drift and rolls back a failed pending migration", async () => {
