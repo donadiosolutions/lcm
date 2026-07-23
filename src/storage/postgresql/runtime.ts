@@ -14,7 +14,12 @@ import {
   inspectRequiredPostgreSqlExtensions,
   PostgreSqlExtensionPreflightError,
 } from "./extensions.js";
-import { REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION } from "./migrations.js";
+import {
+  PostgreSqlServerEncodingPreflightError,
+  REQUIRED_POSTGRESQL_SERVER_ENCODING,
+  REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
+  sanitizePostgreSqlServerEncoding,
+} from "./migrations.js";
 import {
   inspectPostgreSqlSearchConfiguration,
   PostgreSqlSearchConfigurationPreflightError,
@@ -38,6 +43,7 @@ const DEFAULT_POSTGRESQL_TRANSACTION_CONTEXT = {
 } as const satisfies PostgreSqlOperationContext;
 
 type HealthRow = {
+  server_encoding: unknown;
   server_version_num: unknown;
   timezone: string;
   role: string;
@@ -264,6 +270,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       const result = await this.query<HealthRow>({
         text: `SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int4
                         AS server_version_num,
+                      pg_catalog.current_setting('server_encoding') AS server_encoding,
                       pg_catalog.current_setting('TimeZone') AS timezone,
                       CURRENT_USER AS role,
                       COALESCE((
@@ -274,8 +281,10 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       }, { domain: "factory", operation: "health" });
       const row = result.rows[0];
       const serverMajorVersion = sanitizeServerMajorVersion(row?.server_version_num);
+      const serverEncoding = sanitizePostgreSqlServerEncoding(row?.server_encoding);
       const connectionDiagnostics = {
         serverMajorVersion,
+        serverEncoding,
         tls: row?.tls,
         timezone: row?.timezone,
         role: row?.role,
@@ -292,6 +301,14 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
             "factory",
             "health",
           ),
+        };
+      }
+      if (serverEncoding !== REQUIRED_POSTGRESQL_SERVER_ENCODING) {
+        return {
+          status: "unavailable",
+          backend: "postgresql",
+          ...connectionDiagnostics,
+          error: new PostgreSqlServerEncodingPreflightError(serverEncoding, "health"),
         };
       }
       const extensions = await inspectRequiredPostgreSqlExtensions(this, {

@@ -8,9 +8,12 @@ import type {
 } from "../../src/storage/postgresql/contracts.js";
 import {
   loadPostgreSqlMigrations,
+  PostgreSqlManagedObjectOwnershipPreflightError,
   PostgreSqlSchemaAclPreflightError,
   PostgreSqlSchemaOwnershipPreflightError,
+  PostgreSqlServerEncodingPreflightError,
   PostgreSqlServerVersionPreflightError,
+  REQUIRED_POSTGRESQL_SERVER_ENCODING,
   REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
   runPostgreSqlMigrations,
 } from "../../src/storage/postgresql/migrations.js";
@@ -42,9 +45,11 @@ function executor(options: {
     | "unsafe-user"
     | "quoted-user";
   serverVersion?: number | "missing";
+  serverEncoding?: unknown;
   postmasterEpoch?: unknown;
   postmasterContinuity?: boolean | "missing";
   schemaAcl?: "absent" | "ready" | "public" | "missing" | "invalid" | "inconsistent";
+  managedOwnership?: "ready" | "unowned" | "missing" | "invalid" | "inconsistent" | "different-user";
 } = {}) {
   const operations: string[] = [];
   const query = vi.fn(async <R extends QueryResultRow>(
@@ -58,6 +63,13 @@ function executor(options: {
         ? result([] as R[])
         : result([{
           postmaster_started_at: options.postmasterEpoch ?? "2026-01-01 00:00:00+00",
+        }] as unknown as R[]);
+    }
+    if (context.operation === "preflightServerEncoding") {
+      return options.serverEncoding === "missing"
+        ? result([] as R[])
+        : result([{
+          server_encoding: options.serverEncoding ?? REQUIRED_POSTGRESQL_SERVER_ENCODING,
         }] as unknown as R[]);
     }
     if (context.operation.endsWith("probePgStatStatements")) {
@@ -140,6 +152,26 @@ function executor(options: {
         public_create: options.schemaAcl === "public",
       }] as unknown as R[]);
     }
+    if (context.operation === "preflightManagedObjectOwnership") {
+      if (options.managedOwnership === "missing") return result([] as R[]);
+      if (options.managedOwnership === "invalid") {
+        return result([{
+          current_user_name: 7,
+          existing_object_count: "many",
+          unowned_object_count: false,
+        }] as unknown as R[]);
+      }
+      return result([{
+        current_user_name: options.managedOwnership === "different-user"
+          ? "different_migrator"
+          : "lcm_test_migrator",
+        existing_object_count: options.managedOwnership === "inconsistent" ? 0 : 35,
+        unowned_object_count: options.managedOwnership === "unowned"
+          || options.managedOwnership === "inconsistent"
+          ? 1
+          : 0,
+      }] as unknown as R[]);
+    }
     if (context.operation === "inspectMigrationLedger") return result([{ ledger_exists: options.ledger ?? false }] as unknown as R[]);
     if (context.operation === "readMigrations") return result((options.current ?? []) as unknown as R[]);
     return result([] as R[]);
@@ -156,7 +188,7 @@ describe("PostgreSQL migration runner", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "87b49cc610b9d7e6083a4f0d0170e2aed1aac6c8c7ce8b6b5a95ef903c6b25bd" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "6386af13407e8944ce188c9ce19b5944f27b9fa58a4ad8660ede347c8beacfa2" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
@@ -191,6 +223,7 @@ describe("PostgreSQL migration runner", () => {
     });
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
+      "preflightServerEncoding",
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
@@ -200,6 +233,7 @@ describe("PostgreSQL migration runner", () => {
       "revalidateRequiredExtensionCatalog",
       "preflightSchemaOwnership",
       "preflightSchemaAcl",
+      "preflightManagedObjectOwnership",
       "inspectMigrationLedger",
       "applyMigration:0001_first",
       "recordMigration",
@@ -207,7 +241,7 @@ describe("PostgreSQL migration runner", () => {
       "recordMigration",
       "preflightSearchConfiguration",
     ]);
-    expect(fake.seam.query).toHaveBeenNthCalledWith(4, {
+    expect(fake.seam.query).toHaveBeenNthCalledWith(5, {
       text: "SET LOCAL search_path = pg_catalog, public",
     }, {
       domain: "factory",
@@ -260,6 +294,7 @@ describe("PostgreSQL migration runner", () => {
       .rejects.toThrow("private SQL failure");
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
+      "preflightServerEncoding",
       "preflightRequiredExtensions",
     ]);
   });
@@ -272,6 +307,41 @@ describe("PostgreSQL migration runner", () => {
       executor({ postmasterEpoch }).seam,
       { migrations: [] },
     )).rejects.toMatchObject({ operation: "capturePostmasterEpoch" });
+  });
+
+  it.each([
+    { label: "non-UTF8", serverEncoding: "LATIN1", expected: "LATIN1" },
+    { label: "missing", serverEncoding: "missing", expected: null },
+    { label: "malformed", serverEncoding: 7, expected: null },
+    { label: "unsafe", serverEncoding: "UTF8\nprivate", expected: null },
+  ])("rejects $label server encoding before extension inspection or DDL", async ({
+    serverEncoding,
+    expected,
+  }) => {
+    const fake = executor({ serverEncoding });
+    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [] })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlServerEncodingPreflightError);
+    expect(failure).toMatchObject({
+      operation: "preflightServerEncoding",
+      remediation:
+        "Create or restore the LCM database with server_encoding UTF8, then rerun readiness.",
+      requiredServerEncoding: REQUIRED_POSTGRESQL_SERVER_ENCODING,
+      serverEncoding: expected,
+    });
+    expect((failure as PostgreSqlServerEncodingPreflightError).toJSON()).toMatchObject({
+      requiredServerEncoding: "UTF8",
+      serverEncoding: expected,
+    });
+    expect(fake.operations).toEqual([
+      "capturePostmasterEpoch",
+      "preflightServerEncoding",
+    ]);
+    const encodingSql = (fake.seam.query.mock.calls[1]?.[0] as { text?: string }).text ?? "";
+    expect(encodingSql).toBe(
+      "SELECT pg_catalog.current_setting('server_encoding') AS server_encoding",
+    );
+    expect(fake.seam.transaction).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -386,6 +456,7 @@ describe("PostgreSQL migration runner", () => {
     });
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
+      "preflightServerEncoding",
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
@@ -447,6 +518,7 @@ describe("PostgreSQL migration runner", () => {
     });
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
+      "preflightServerEncoding",
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
@@ -457,6 +529,97 @@ describe("PostgreSQL migration runner", () => {
       "preflightSchemaOwnership",
       "preflightSchemaAcl",
     ]);
+  });
+
+  it.each([
+    {
+      label: "an unowned managed object",
+      managedOwnership: "unowned" as const,
+      existingObjectCount: 35,
+      unownedObjectCount: 1,
+      requiredOwner: "lcm_test_migrator",
+    },
+    {
+      label: "a missing catalog row",
+      managedOwnership: "missing" as const,
+      existingObjectCount: null,
+      unownedObjectCount: null,
+      requiredOwner: null,
+    },
+    {
+      label: "malformed catalog values",
+      managedOwnership: "invalid" as const,
+      existingObjectCount: null,
+      unownedObjectCount: null,
+      requiredOwner: null,
+    },
+    {
+      label: "contradictory catalog counts",
+      managedOwnership: "inconsistent" as const,
+      existingObjectCount: 0,
+      unownedObjectCount: 1,
+      requiredOwner: "lcm_test_migrator",
+    },
+    {
+      label: "a changed current role",
+      managedOwnership: "different-user" as const,
+      existingObjectCount: 35,
+      unownedObjectCount: 0,
+      requiredOwner: "different_migrator",
+    },
+  ])("fails closed when managed ownership reports $label", async ({
+    managedOwnership,
+    existingObjectCount,
+    unownedObjectCount,
+    requiredOwner,
+  }) => {
+    const fake = executor({
+      managedOwnership,
+      schemaAcl: "ready",
+      schemaOwnership: "owned",
+    });
+    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [] })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlManagedObjectOwnershipPreflightError);
+    expect(failure).toMatchObject({
+      existingObjectCount,
+      operation: "preflightManagedObjectOwnership",
+      requiredOwner,
+      schemaName: "lcm",
+      unownedObjectCount,
+    });
+    expect((failure as PostgreSqlManagedObjectOwnershipPreflightError).toJSON())
+      .toMatchObject({
+        existingObjectCount,
+        requiredOwner,
+        schemaName: "lcm",
+        unownedObjectCount,
+      });
+    expect(fake.operations).toEqual([
+      "capturePostmasterEpoch",
+      "preflightServerEncoding",
+      "preflightRequiredExtensions",
+      "preflightRequiredExtensions:probePgStatStatements",
+      "pinMigrationSearchPath",
+      "lockMigrations",
+      "preflightServerVersion",
+      "verifyPostmasterContinuity",
+      "revalidateRequiredExtensionCatalog",
+      "preflightSchemaOwnership",
+      "preflightSchemaAcl",
+      "preflightManagedObjectOwnership",
+    ]);
+    const ownershipCall = fake.seam.query.mock.calls.find(([, context]) => (
+      context.operation === "preflightManagedObjectOwnership"
+    ));
+    const ownershipSql = (ownershipCall?.[0] as { text?: string } | undefined)?.text ?? "";
+    for (const catalog of [
+      "pg_catalog.pg_class",
+      "pg_catalog.pg_proc",
+      "pg_catalog.pg_ts_dict",
+      "pg_catalog.pg_ts_config",
+      "OPERATOR(pg_catalog.=)",
+    ]) expect(ownershipSql).toContain(catalog);
   });
 
   it.each([
@@ -514,6 +677,7 @@ describe("PostgreSQL migration runner", () => {
     });
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
+      "preflightServerEncoding",
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",

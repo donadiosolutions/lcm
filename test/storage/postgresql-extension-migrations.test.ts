@@ -36,6 +36,9 @@ function executor(fault: "control-files" | "preload") {
     if (context.operation === "capturePostmasterEpoch") {
       return result([{ postmaster_started_at: new Date("2026-01-01T00:00:00Z") }] as unknown as R[]);
     }
+    if (context.operation === "preflightServerEncoding") {
+      return result([{ server_encoding: "UTF8" }] as unknown as R[]);
+    }
     if (context.operation.endsWith("probePgStatStatements")) {
       if (fault === "preload") {
         throw new PostgreSqlStorageOperationError(
@@ -114,6 +117,7 @@ describe("PostgreSQL migration extension preflight", () => {
     }
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
+      "preflightServerEncoding",
       "preflightRequiredExtensions",
       ...(fault === "preload" || fault === "control-files"
         ? ["preflightRequiredExtensions:probePgStatStatements"]

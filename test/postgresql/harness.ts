@@ -154,6 +154,8 @@ export interface PostgreSqlTestDatabaseOptions {
   readonly runMigrations?: boolean;
   /** Test-only connection search path for proving setup DDL is schema-qualified. */
   readonly adminSearchPath?: string;
+  /** Test-only database encoding for readiness rejection coverage. */
+  readonly serverEncoding?: "UTF8" | "LATIN1";
 }
 
 export async function createPostgreSqlTestDatabase(
@@ -177,8 +179,14 @@ export async function createPostgreSqlTestDatabase(
     .join(",");
   const migratorUrl = databaseUrl(env.LCM_TEST_POSTGRES_MIGRATOR_URL, name);
   const runtimeUrl = databaseUrl(env.LCM_TEST_POSTGRES_RUNTIME_URL, name);
+  const serverEncoding = options.serverEncoding ?? "UTF8";
+  const localeClause = serverEncoding === "LATIN1"
+    ? " LC_COLLATE 'C' LC_CTYPE 'C'"
+    : "";
   try {
-    await admin.query({ text: `CREATE DATABASE ${identifier} OWNER lcm_test_migrator TEMPLATE template0` }, {
+    await admin.query({
+      text: `CREATE DATABASE ${identifier} OWNER lcm_test_migrator TEMPLATE template0 ENCODING '${serverEncoding}'${localeClause}`,
+    }, {
       domain: "factory",
       operation: "createTestDatabase",
     });

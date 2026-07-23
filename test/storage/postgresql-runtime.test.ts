@@ -17,7 +17,11 @@ import {
   POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
   type PostgreSqlRuntimeDependencies,
 } from "../../src/storage/postgresql/runtime.js";
-import { REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION } from "../../src/storage/postgresql/migrations.js";
+import {
+  PostgreSqlServerEncodingPreflightError,
+  REQUIRED_POSTGRESQL_SERVER_ENCODING,
+  REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
+} from "../../src/storage/postgresql/migrations.js";
 import { POSTGRESQL_SEARCH_CONFIGURATION_SHA256 } from "../../src/storage/postgresql/search-configuration.js";
 
 function result<R extends QueryResultRow>(rows: R[]): QueryResult<R> {
@@ -34,6 +38,7 @@ const SETTINGS: PostgreSqlConnectionSettings = {
 };
 
 interface HealthFixtureRow {
+  readonly server_encoding: unknown;
   readonly server_version_num: unknown;
   readonly timezone: string;
   readonly role: string;
@@ -41,6 +46,7 @@ interface HealthFixtureRow {
 }
 
 const HEALTHY_ROW: HealthFixtureRow = {
+  server_encoding: "UTF8",
   server_version_num: 180004,
   timezone: "UTC",
   role: "runtime",
@@ -969,12 +975,14 @@ describe("PostgreSQL runtime", () => {
     const healthy = healthFixtures();
     await expect(healthy.runtime.health()).resolves.toMatchObject({
       status: "healthy",
+      serverEncoding: REQUIRED_POSTGRESQL_SERVER_ENCODING,
       serverMajorVersion: REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
       extensions: CURRENT_EXTENSION_ROWS.map(({ name }) => expect.objectContaining({ name, status: "current" })),
     });
     const healthSql = (healthy.query.mock.calls[0]?.[0] as { text?: string } | undefined)?.text ?? "";
     for (const catalogBinding of [
       "pg_catalog.current_setting('server_version_num')::pg_catalog.int4",
+      "pg_catalog.current_setting('server_encoding')",
       "pg_catalog.current_setting('TimeZone')",
       "FROM pg_catalog.pg_stat_ssl",
       "OPERATOR(pg_catalog.=)",
@@ -1004,6 +1012,33 @@ describe("PostgreSQL runtime", () => {
       expect(health).not.toHaveProperty("extensions");
       expect(wrongVersion.query).toHaveBeenCalledTimes(1);
       expect(wrongVersion.query.mock.calls.some(([input]) => isExtensionInspection(input))).toBe(false);
+    }
+
+    for (const { value, expected } of [
+      { value: "LATIN1", expected: "LATIN1" },
+      { value: "UTF8\nprivate", expected: null },
+      { value: 7, expected: null },
+      { value: undefined, expected: null },
+    ]) {
+      const wrongEncoding = healthFixtures({
+        ...HEALTHY_ROW,
+        server_encoding: value,
+      });
+      const health = await wrongEncoding.runtime.health();
+      expect(health).toMatchObject({
+        status: "unavailable",
+        serverEncoding: expected,
+        error: {
+          operation: "health",
+          remediation:
+            "Create or restore the LCM database with server_encoding UTF8, then rerun readiness.",
+          requiredServerEncoding: "UTF8",
+          serverEncoding: expected,
+        },
+      });
+      expect(health.error).toBeInstanceOf(PostgreSqlServerEncodingPreflightError);
+      expect(health).not.toHaveProperty("extensions");
+      expect(wrongEncoding.query).toHaveBeenCalledTimes(1);
     }
 
     for (const row of [

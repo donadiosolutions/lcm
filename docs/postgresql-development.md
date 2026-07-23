@@ -61,6 +61,11 @@ migration: checksum drift is rejected. Add a new migration instead.
 
 Inside the locked migration transaction, the runner requires PostgreSQL 18 and
 inspects `pg_trgm`, `unaccent`, `pgcrypto`, and `pg_stat_statements`.
+Before opening that transaction, it reads
+`pg_catalog.current_setting('server_encoding')` and requires exactly `UTF8`.
+Non-UTF-8 or malformed results fail with sanitized database-recreation or
+restore guidance; LCM never changes encoding. Runtime health enforces the same
+requirement before extension or search-fingerprint inspection.
 The first transaction operation sets a local `search_path` of
 `pg_catalog, public`; it applies through the advisory lock, all preflights, and
 all pending migration SQL, then reverts on commit or rollback. Extension
@@ -96,8 +101,9 @@ operation through the cluster administrator, then rerun migration.
 Schema conformance also exercises repository-defined opaque metadata and caller
 identifiers directly: message-part metadata must round-trip as text, while
 unbounded summary IDs round-trip exactly through bounded UUIDv7 relationship
-keys and digest-plus-exact lookup, and large-file IDs are unique within a
-project rather than globally.
+keys and digest-plus-exact lookup. Unbounded large-file IDs use the same
+UUIDv7-key and digest-plus-exact design and remain unique within a project
+rather than globally.
 Promoted-memory source IDs are preserved as external provenance without a
 local-summary foreign key. Floating-point step costs reject `NaN` and both
 infinities. Search and tag normalization use PostgreSQL 18's builtin
@@ -120,6 +126,11 @@ absent schema because `0001` creates it as the current migration role, but it
 fails closed when another role owns an existing schema even if that role has
 delegated `CREATE` to the migrator. Transfer ownership explicitly with the
 cluster administrator before retrying; LCM never changes schema ownership.
+On every run, an exact catalog allowlist also checks every existing managed
+table, generated identity sequence, helper or trigger function, text-search
+dictionary, and text-search configuration. Ownership drift blocks repeated
+runs and later pending migrations before ledger inspection. Objects not on the
+allowlist are preserved and may have a different owner.
 Failure diagnostics identify `requiredOwner` using the sanitized PostgreSQL
 `CURRENT_USER` role and provide identifier-quoted transfer guidance. They do
 not expose the existing owner, connection details, or raw database errors, and

@@ -147,6 +147,41 @@ describe("PostgreSQL migrations and database isolation", () => {
     }
   });
 
+  it("rejects a non-UTF8 database before DDL and reports runtime incompatibility", async () => {
+    const database = await createPostgreSqlTestDatabase("migration-latin1", {
+      runMigrations: false,
+      serverEncoding: "LATIN1",
+    });
+    try {
+      await expect(runPostgreSqlMigrations(database.migrator)).rejects.toMatchObject({
+        operation: "preflightServerEncoding",
+        remediation:
+          "Create or restore the LCM database with server_encoding UTF8, then rerun readiness.",
+        requiredServerEncoding: "UTF8",
+        serverEncoding: "LATIN1",
+      });
+      await expect(database.runtime.health()).resolves.toMatchObject({
+        status: "unavailable",
+        serverEncoding: "LATIN1",
+        error: {
+          operation: "health",
+          requiredServerEncoding: "UTF8",
+          serverEncoding: "LATIN1",
+        },
+      });
+      await expect(database.migrator.query<{ schema_exists: boolean }>({
+        text: `SELECT EXISTS (
+                 SELECT 1
+                 FROM pg_catalog.pg_namespace
+                 WHERE nspname OPERATOR(pg_catalog.=) 'lcm'
+               ) AS schema_exists`,
+      }, { domain: "factory", operation: "verifyEncodingPreflightNoDdl" }))
+        .resolves.toMatchObject({ rows: [{ schema_exists: false }] });
+    } finally {
+      await database.drop();
+    }
+  });
+
   it("fails closed on a colliding operator function without replacing it", async () => {
     const database = await createPostgreSqlTestDatabase("function-collision", { runMigrations: false });
     try {
@@ -327,6 +362,115 @@ describe("PostgreSQL migrations and database isolation", () => {
         await database.drop();
       }
     }
+  });
+
+  it("rechecks ownership of every managed object class while ignoring unknown objects", async () => {
+    await withPostgreSqlTestDatabase("managed-owner-drift", async (database) => {
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+      const later = migration(
+        "0003_managed_owner_probe",
+        "CREATE TABLE lcm.managed_owner_probe (id integer PRIMARY KEY);",
+      );
+      try {
+        await admin.query({
+          text: `CREATE TABLE lcm.operator_admin_owned (value text);
+                 ALTER TABLE lcm.operator_admin_owned OWNER TO lcm_harness_admin`,
+        }, { domain: "factory", operation: "seedUnknownAdminOwnedObject" });
+        await expect(runPostgreSqlMigrations(database.migrator))
+          .resolves.toMatchObject({ applied: [] });
+
+        const drifts = [
+          {
+            label: "table",
+            apply: "ALTER TABLE lcm.messages OWNER TO lcm_harness_admin",
+            restore: "ALTER TABLE lcm.messages OWNER TO lcm_test_migrator",
+          },
+          {
+            label: "sequence",
+            apply: "ALTER TABLE lcm.fenced_leases OWNER TO lcm_harness_admin",
+            restore: "ALTER TABLE lcm.fenced_leases OWNER TO lcm_test_migrator",
+          },
+          {
+            label: "normalization function",
+            apply:
+              "ALTER FUNCTION lcm.normalize_search_text(text) OWNER TO lcm_harness_admin",
+            restore:
+              "ALTER FUNCTION lcm.normalize_search_text(text) OWNER TO lcm_test_migrator",
+          },
+          {
+            label: "trigger function",
+            apply:
+              "ALTER FUNCTION lcm.enforce_summary_id_uniqueness() OWNER TO lcm_harness_admin",
+            restore:
+              "ALTER FUNCTION lcm.enforce_summary_id_uniqueness() OWNER TO lcm_test_migrator",
+          },
+          {
+            label: "dictionary",
+            apply:
+              "ALTER TEXT SEARCH DICTIONARY lcm.simple_v1 OWNER TO lcm_harness_admin",
+            restore:
+              "ALTER TEXT SEARCH DICTIONARY lcm.simple_v1 OWNER TO lcm_test_migrator",
+          },
+          {
+            label: "configuration",
+            apply:
+              "ALTER TEXT SEARCH CONFIGURATION lcm.search_v1 OWNER TO lcm_harness_admin",
+            restore:
+              "ALTER TEXT SEARCH CONFIGURATION lcm.search_v1 OWNER TO lcm_test_migrator",
+          },
+        ] as const;
+
+        for (const drift of drifts) {
+          await admin.query({ text: drift.apply }, {
+            domain: "factory",
+            operation: `driftManagedOwner:${drift.label}`,
+          });
+          try {
+            const failure = await runPostgreSqlMigrations(database.migrator, {
+              migrations: [...loadPostgreSqlMigrations(), later],
+            }).catch((error: unknown) => error);
+            expect(failure).toMatchObject({
+              existingObjectCount: 35,
+              operation: "preflightManagedObjectOwnership",
+              requiredOwner: "lcm_test_migrator",
+              schemaName: "lcm",
+            });
+            expect((failure as { unownedObjectCount?: number }).unownedObjectCount)
+              .toBeGreaterThan(0);
+          } finally {
+            await admin.query({ text: drift.restore }, {
+              domain: "factory",
+              operation: `restoreManagedOwner:${drift.label}`,
+            });
+          }
+          await expect(runPostgreSqlMigrations(database.migrator))
+            .resolves.toMatchObject({ applied: [] });
+        }
+
+        await expect(database.migrator.query<{
+          applied_count: string;
+          operator_preserved: boolean;
+          probe_exists: boolean;
+        }>({
+          text: `SELECT
+                   (SELECT pg_catalog.count(*)::pg_catalog.text
+                    FROM lcm.schema_migrations) AS applied_count,
+                   pg_catalog.to_regclass('lcm.operator_admin_owned') IS NOT NULL
+                     AS operator_preserved,
+                   pg_catalog.to_regclass('lcm.managed_owner_probe') IS NOT NULL
+                     AS probe_exists`,
+        }, { domain: "factory", operation: "verifyManagedOwnerRollback" }))
+          .resolves.toMatchObject({
+            rows: [{
+              applied_count: "2",
+              operator_preserved: true,
+              probe_exists: false,
+            }],
+          });
+      } finally {
+        await admin.close();
+      }
+    });
   });
 
   it("rejects checksum drift and rolls back a failed pending migration", async () => {

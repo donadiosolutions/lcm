@@ -24,18 +24,29 @@ does not add row-level security.
   owned DDL. Either check aborts without changing the schema ACL. The baseline revokes
   privileges from `PUBLIC` on an explicit list of the 23 domain tables, the
   migration ledger, six generated identity sequences, and
-  `lcm.normalize_search_text(text)` and the summary-identity trigger function.
+  `lcm.normalize_search_text(text)` plus the summary- and large-file-identity
+  trigger functions.
   It deliberately grants no domain access to
   the runtime role while the adapters are disabled. Explicit object lists keep
   privileges on unknown pre-existing tables, sequences, and functions intact;
   issues #84–#91 must grant only the operations required by their repositories.
+- Before starting the DDL transaction, migration requires
+  `pg_catalog.current_setting('server_encoding')` to return exactly `UTF8`.
+  Runtime health enforces the same database-encoding contract before extension
+  or search-fingerprint inspection. Missing, malformed, or non-UTF-8 values
+  produce sanitized restore/recreation guidance; LCM never mutates database
+  encoding.
 - The migration runner captures the postmaster epoch and completes required
   extension readiness, including the functional `pg_stat_statements` probe,
   before opening the DDL transaction. Inside that transaction it pins the local
   `search_path` to `pg_catalog, public` before taking the advisory lock, checking
   PostgreSQL 18 and postmaster/module continuity, revalidating the exact
   extension catalog snapshot without repeating the functional probe, checking
-  schema ownership and `PUBLIC CREATE`, or executing pending SQL. This makes
+  schema ownership, `PUBLIC CREATE`, and exact managed-object ownership, or
+  executing pending SQL. The recurring ownership allowlist covers the
+  migration ledger, 23 domain tables, six generated identity sequences, three
+  helper or trigger functions, and the LCM text-search dictionary and
+  configuration. Unknown `lcm` objects are ignored and never mutated. This makes
   unqualified PostgreSQL built-ins in the immutable migrations resolve to native
   catalog objects while retaining intentional access to extension objects in
   `public`; the setting reverts on either commit or rollback. Extension
@@ -57,7 +68,10 @@ does not add row-level security.
   caller ID never enters an index tuple. A transaction advisory lock on the
   project/hash candidate plus the residual comparison enforces exact
   project-scoped uniqueness without treating a theoretical hash collision as
-  identity.
+  identity. Large files use the same pattern: `file_key` carries bounded
+  identity and ordering, while `file_id_sha256` narrows exact caller-ID lookup.
+  Opaque summary file references retain their original `file_id` text and a
+  generated digest candidate without gaining a local-file foreign key.
   Conversations and messages retain generated `bigint` identities compatible
   with the existing repository contracts. Inbox, recall, and instruction rows
   also use generated numeric identities where a local ordering key is useful.
@@ -187,8 +201,8 @@ deletion.
 | `summary_messages` | Summary-owned coverage join: deleting the summary cascades coverage, while direct source-message deletion fails at commit. | Bounded `summary_key` relationships carry explicit project/conversation scope. The source side is deferred `NO ACTION` so a populated conversation-root cascade can delete both sides; source message and ordinal are unique per summary and ordinal is nonnegative. `summary_messages_message_idx` supports reverse message coverage. |
 | `summary_parents` | Child-summary-owned DAG edge: deleting the child cascades its outgoing edges, while direct parent deletion fails at commit. | Bounded child and parent summary keys carry explicit project/conversation scope. The parent side is deferred `NO ACTION` so a populated conversation-root cascade can delete the entire graph; parent and ordinal are unique per child, ordinal is nonnegative, and self-edges are rejected. `summary_parents_parent_idx` supports deterministic reverse traversal. General cycle rejection is a transactional repository invariant owned by #87 with #90 fencing; adapters remain disabled until it is implemented. |
 | `context_items` | Ordered projection owned by a conversation and cascades with it. Direct deletion of a referenced message or summary fails at commit. | `(project_id, conversation_id, ordinal)` primary key; message IDs and bounded summary keys are deferred `NO ACTION` references so populated conversation-root cascades remain valid; nonnegative ordinal; exactly one source reference consistent with `item_type`. Partial message and summary indexes support reverse membership checks. Atomic range replacement and stale-fence rejection belong to #87/#90. |
-| `large_files` | Metadata owned by a conversation and cascades with it; external bytes at `storage_uri` have their own lifecycle. | Project-scoped `(project_id, file_id)` primary key preserves caller IDs independently in every project, with a UUIDv7-as-text default when omitted; nonnegative optional byte size; nonblank storage URI; conversation-scoped identity. `large_files_conversation_order_idx` orders by creation time and stable ID. |
-| `summary_large_files` | Ordered file-reference array owned by a summary and deleted with it. The file ID is opaque provenance: it can remain unresolved or name a file owned by another conversation without blocking summary creation. Direct deletion of a matching `large_files` row preserves the historical summary reference. | The owner project, conversation, and bounded summary key remain protected by a scoped summary foreign key. Ordinal identity preserves caller order and repeated IDs; file IDs deliberately have no existence foreign key. `summary_large_files_file_idx` supports owner-project/exact-ID reverse lookup without asserting local file ownership. |
+| `large_files` | Metadata owned by a conversation and cascades with it; external bytes at `storage_uri` have their own lifecycle. | Exact, unbounded caller `file_id` text is unique within a project and defaults to UUIDv7 text when omitted. A generated SHA-256 candidate plus exact residual comparison enforces and looks up that identity; UUIDv7 `file_key` is the bounded primary, scoped, and ordering key. Optional byte size is nonnegative and storage URI is nonblank. |
+| `summary_large_files` | Ordered file-reference array owned by a summary and deleted with it. The file ID is opaque provenance: it can remain unresolved or name a file owned by another conversation without blocking summary creation. Direct deletion of a matching `large_files` row preserves the historical summary reference. | The owner project, conversation, and bounded summary key remain protected by a scoped summary foreign key. Ordinal identity preserves caller order and repeated IDs; exact unbounded file text plus its generated SHA-256 candidate supports bounded lookup. File IDs deliberately have no existence foreign key, and an exact residual predicate is required. |
 
 ### Recall and administration
 
@@ -211,7 +225,7 @@ deletion.
 
 ## Named index catalog
 
-Primary keys and unique constraints create additional B-tree indexes. The 50
+Primary keys and unique constraints create additional B-tree indexes. The 51
 explicit indexes below cover ordering, reverse foreign-key checks, search,
 JSONB inspection, and active-state selection.
 
@@ -221,8 +235,8 @@ JSONB inspection, and active-state selection.
 | Messages and parts | `messages_project_created_idx` orders project messages; `messages_search_document_idx` and `messages_content_trgm_idx` provide FTS and normalized trigram access; `message_parts_type_idx` supports scoped type scans. Opaque part metadata has no semantic index. |
 | Native transcripts | `native_transcripts_source_order_idx` and `native_transcripts_session_idx` provide deterministic provenance/session scans; `native_transcripts_machine_idx` covers the machine FK; `native_transcripts_payload_idx` provides JSONB path lookup; `transcript_messages_message_idx` reverses provenance by message. |
 | Summaries | `summaries_identity_lookup_idx` bounds project-scoped external-ID candidates by SHA-256 and requires the exact `summary_id` residual; `summaries_conversation_order_idx` and `summaries_project_recent_idx` provide deterministic conversation/project order by the UUIDv7 relationship key; `summaries_search_document_idx` and `summaries_content_trgm_idx` provide FTS and trigram access. |
-| Summary joins | `summary_messages_message_idx` and `summary_messages_summary_idx` cover both scoped coverage FKs; `summary_parents_parent_idx` and `summary_parents_summary_idx` cover both DAG directions; `summary_large_files_summary_idx` covers the owner FK and `summary_large_files_file_idx` supports exact opaque-reference lookup within the owner project. |
-| Context and large files | Partial `context_items_message_idx` and `context_items_summary_idx` reverse active context membership; `large_files_conversation_order_idx` provides deterministic conversation order. |
+| Summary joins | `summary_messages_message_idx` and `summary_messages_summary_idx` cover both scoped coverage FKs; `summary_parents_parent_idx` and `summary_parents_summary_idx` cover both DAG directions; `summary_large_files_summary_idx` covers the owner FK and `summary_large_files_file_idx` uses the opaque file digest candidate for bounded owner-project lookup with an exact text residual. |
+| Context and large files | Partial `context_items_message_idx` and `context_items_summary_idx` reverse active context membership; `large_files_identity_lookup_idx` bounds project-scoped caller-ID candidates by SHA-256 and requires exact `file_id` comparison; `large_files_conversation_order_idx` orders by the bounded UUIDv7 file key. |
 | Promoted memory and recall | `promoted_memories_active_order_idx` supports active/stale scans; partial `promoted_memories_source_summary_idx` uses a bounded source-summary SHA-256 candidate and requires the exact source text residual without imposing a foreign key; partial `promoted_memories_source_project_idx` supports active owner-scoped source filtering; `promoted_memories_metadata_idx`, `promoted_memories_search_document_idx`, and `promoted_memories_content_trgm_idx` cover metadata and content search; `promoted_memory_tags_lookup_idx` uses `(project_id, tag_sha256, memory_id)` for bounded exact case-sensitive candidate lookup while `promoted_memory_tags_normalized_lookup_idx` uses `(project_id, normalized_tag_sha256, memory_id)` for bounded normalized candidates. Both require a residual exact text comparison to reject theoretical hash collisions. `promoted_memory_tags_search_document_idx` and `promoted_memory_tags_tag_trgm_idx` support tag-only lexical search; `recall_surfacing_memory_order_idx` and partial `recall_surfacing_session_order_idx` support recall aggregation. |
 | Ingest and instructions | `ingest_checkpoints_payload_idx` provides JSONB path lookup; `ingest_checkpoints_machine_idx` covers machine deletion; `session_ingest_log_completed_idx` orders completed sessions; partial `session_instructions_machine_idx` covers machine-specific instruction deletion. |
 | Passive inbox | Partial `passive_event_inbox_ready_idx`, `passive_event_inbox_retry_idx`, and `passive_event_inbox_claimed_idx` cover claim/retry recovery; `passive_event_inbox_payload_idx` provides JSONB path lookup; `passive_event_inbox_project_idx` covers project deletion for every status. |
@@ -237,7 +251,7 @@ in the `public` schema at the server's current `default_version`:
 | --- | --- |
 | `unaccent` | Operational prerequisite and provenance for the pinned accent-insensitive rule set. Migration tests compare every embedded source mapping with PostgreSQL 18.4's dictionary, but indexed normalization does not call the mutable dictionary at runtime. |
 | `pg_trgm` | GIN operator support for bounded substring and fuzzy lexical fallback. |
-| `pgcrypto` | Supplies fixed-width SHA-256 candidate keys for unbounded summary IDs, external summary provenance, and promoted-memory tags. Exact residual text comparison remains mandatory. IDs still use PostgreSQL 18's native `uuidv7()`, and content hashes arrive as validated lowercase SHA-256 values. |
+| `pgcrypto` | Supplies fixed-width SHA-256 candidate keys for unbounded summary IDs, large-file IDs, opaque file and summary provenance, and promoted-memory tags. Exact residual text comparison remains mandatory. IDs still use PostgreSQL 18's native `uuidv7()`, and content hashes arrive as validated lowercase SHA-256 values. |
 | `pg_stat_statements` | Operator-visible query statistics for diagnosing repository and query-plan behavior; the server must preload it when required by the installation. |
 
 Preflight reports each extension as `current`, `installed-unavailable`,
@@ -308,17 +322,19 @@ on a provider does not justify silently expanding the baseline.
 1. The cluster administrator provisions PostgreSQL 18, preloads services such
    as `pg_stat_statements` when necessary, and installs the exact required
    extensions in `public`. The migrator and runtime use separate login roles.
-2. Runtime health verifies server version, extension readiness, and the
-   fingerprinted `lcm.search_v1` text-search contract. Failed readiness produces
-   corrective guidance without changing cluster state.
+2. Runtime health verifies server version, UTF-8 database encoding, extension
+   readiness, and the fingerprinted `lcm.search_v1` text-search contract.
+   Failed readiness produces corrective guidance without changing database or
+   cluster state.
 3. The migration runner validates packaged SHA-256 artifacts, captures the
-   postmaster epoch, and performs the functional extension probe before opening
-   the DDL transaction. It then opens one transaction, takes a database-scoped
+   postmaster epoch, requires UTF-8, and performs the functional extension probe
+   before opening the DDL transaction. It then opens one transaction, takes a database-scoped
    transaction advisory lock, verifies PostgreSQL 18 before invoking the
    version-specific loaded-module catalog, verifies postmaster continuity,
    revalidates the non-probe extension catalog contract, verifies that any
    existing `lcm` schema is owned by the current migration role, rejects
-   schema-level `PUBLIC CREATE` on every run, and then verifies the
+   schema-level `PUBLIC CREATE`, verifies every existing managed object is still
+   owned by that role, and then verifies the
    complete ordered ledger. `0001` creates the `lcm` schema and immutable ledger; `0002`
    first rejects a pre-existing `lcm` schema that grants `PUBLIC CREATE`, then
    creates the 23-table baseline data model and indexes. The guard does not
@@ -396,6 +412,9 @@ If ownership preflight fails, an administrator must transfer the schema and all
 LCM-owned objects to the configured migration role, or restore a correctly
 owned database, before retrying. A `CREATE` grant alone is not a supported
 substitute because later owner-only schema maintenance must remain available.
+The recurring object check is limited to the exact baseline table, identity
+sequence, function, dictionary, and configuration names and signatures;
+operator-owned objects not on that allowlist may retain another owner.
 Structured diagnostics report `requiredOwner` as the sanitized role name
 resolved from PostgreSQL `CURRENT_USER`, not a generic label, and provide
 identifier-quoted transfer guidance. Missing, malformed, or contradictory
@@ -417,7 +436,8 @@ maintenance must not receive sequence restart or table-truncate authority.
 ## Backup and point-in-time recovery
 
 - Back up and restore the complete database, including the `lcm` schema,
-  migration ledger, identities, sequences, normalized relationships, and
+  migration ledger, caller-owned IDs, bounded summary/file relationship keys,
+  generated digest candidates, sequences, normalized relationships, and
   extension catalog expectations. Do not restore selected application tables
   without their scoped parents and restricted source relationships.
 - After restore or point-in-time recovery, run readiness and migration-history

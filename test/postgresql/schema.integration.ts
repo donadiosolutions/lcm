@@ -266,9 +266,9 @@ describe("PostgreSQL schema baseline", () => {
       const normalizedConstraints = constraints.rows
         .map((row) => `${row.table_name}|${row.constraint_type}|${row.definition}`)
         .join("\n");
-      expect(constraints.rowCount).toBe(164);
+      expect(constraints.rowCount).toBe(165);
       expect(createHash("sha256").update(normalizedConstraints).digest("hex"))
-        .toBe("14f3d0cb007554294b45768d2c04e7e29354fe5363dd04bd2e856234a03c5899");
+        .toBe("a8187f5b89ffc29072b30208643ce96b5c0d06fb352d9cf9a9f001b1b3219b32");
 
       const deleteActions = await database.migrator.query<{
         table_name: string;
@@ -367,7 +367,7 @@ describe("PostgreSQL schema baseline", () => {
                  )
                ORDER BY index_relation.relname`,
       }, { domain: "factory", operation: "inspectExplicitSchemaIndexes" });
-      expect(explicitIndexes.rowCount).toBe(50);
+      expect(explicitIndexes.rowCount).toBe(51);
       expect(explicitIndexes.rows.map(({ index_name }) => index_name))
         .not.toContain("message_parts_metadata_idx");
       const provenanceIndex = explicitIndexes.rows.find(
@@ -383,6 +383,16 @@ describe("PostgreSQL schema baseline", () => {
         ({ index_name }) => index_name === "summaries_identity_lookup_idx",
       )?.index_definition).toContain(
         "(project_id, summary_id_sha256, summary_key)",
+      );
+      expect(explicitIndexes.rows.find(
+        ({ index_name }) => index_name === "large_files_identity_lookup_idx",
+      )?.index_definition).toContain(
+        "(project_id, file_id_sha256, file_key)",
+      );
+      expect(explicitIndexes.rows.find(
+        ({ index_name }) => index_name === "summary_large_files_file_idx",
+      )?.index_definition).toContain(
+        "(project_id, file_id_sha256, conversation_id, summary_key, ordinal)",
       );
       expect(explicitIndexes.rows.find(
         ({ index_name }) => index_name === "promoted_memory_tags_lookup_idx",
@@ -444,6 +454,7 @@ describe("PostgreSQL schema baseline", () => {
                ORDER BY table_name, column_name`,
       }, { domain: "factory", operation: "inspectGeneratedColumns" });
       expect(generated.rows).toEqual([
+        { table_name: "large_files", column_name: "file_id_sha256", data_type: "bytea" },
         { table_name: "messages", column_name: "search_document", data_type: "tsvector" },
         { table_name: "promoted_memories", column_name: "search_document", data_type: "tsvector" },
         { table_name: "promoted_memories", column_name: "source_summary_id_sha256", data_type: "bytea" },
@@ -453,6 +464,7 @@ describe("PostgreSQL schema baseline", () => {
         { table_name: "promoted_memory_tags", column_name: "tag_sha256", data_type: "bytea" },
         { table_name: "summaries", column_name: "search_document", data_type: "tsvector" },
         { table_name: "summaries", column_name: "summary_id_sha256", data_type: "bytea" },
+        { table_name: "summary_large_files", column_name: "file_id_sha256", data_type: "bytea" },
       ]);
       const tagNormalization = await database.migrator.query<{ expression: string }>({
         text: `SELECT pg_catalog.pg_get_expr(attribute_default.adbin, attribute_default.adrelid)
@@ -512,6 +524,7 @@ describe("PostgreSQL schema baseline", () => {
 
       const privileges = await database.migrator.query<{
         migrator_insert: boolean;
+        public_file_identity_execute: boolean;
         public_identity_execute: boolean;
         runtime_select: boolean;
         public_select: boolean;
@@ -524,10 +537,16 @@ describe("PostgreSQL schema baseline", () => {
                    'public',
                    'lcm.enforce_summary_id_uniqueness()',
                    'EXECUTE'
-                 ) AS public_identity_execute`,
+                 ) AS public_identity_execute,
+                 has_function_privilege(
+                   'public',
+                   'lcm.enforce_large_file_id_uniqueness()',
+                   'EXECUTE'
+                 ) AS public_file_identity_execute`,
       }, { domain: "factory", operation: "inspectSchemaPrivileges" });
       expect(privileges.rows[0]).toEqual({
         migrator_insert: true,
+        public_file_identity_execute: false,
         public_identity_execute: false,
         runtime_select: false,
         public_select: false,
@@ -747,6 +766,183 @@ describe("PostgreSQL schema baseline", () => {
       expect(plans).toContain("summaries_identity_lookup_idx");
       expect(plans).toContain("summaries_conversation_order_idx");
       expect(plans).toContain("promoted_memories_source_summary_idx");
+    });
+  });
+
+  it("round-trips unbounded file IDs without coupling opaque summary provenance", async () => {
+    await withPostgreSqlTestDatabase("schema-long-file-id", async (database) => {
+      const scope = await seedScope(database.migrator);
+      const longFileId = "caller-owned-file-id:".repeat(700);
+      const longSiblingId = `${longFileId}sibling`;
+      const crossConversationFileId = `${longFileId}cross-conversation`;
+      const unresolvedFileId = `${longFileId}unresolved`;
+      const expectedSha256 = createHash("sha256").update(longFileId).digest("hex");
+      const secondConversation = await database.migrator.query<{ conversation_id: string }>({
+        text: `INSERT INTO lcm.conversations (project_id, session_id)
+               VALUES ($1, 'long-file-second-conversation')
+               RETURNING conversation_id`,
+        values: [scope.projectId],
+      }, { domain: "factory", operation: "seedLongFileSecondConversation" });
+      const files = await database.migrator.query<{
+        file_id: string;
+        file_key: string;
+        file_sha256: string;
+        file_version: number;
+      }>({
+        text: `INSERT INTO lcm.large_files
+                 (file_id, project_id, conversation_id, storage_uri, created_at)
+               VALUES
+                 ($3, $1, $2, 'file:///long-primary', '2026-01-01T00:00:00Z'),
+                 ($4, $1, $2, 'file:///long-sibling', '2026-01-01T00:00:00Z')
+               RETURNING file_id, file_key,
+                         pg_catalog.encode(file_id_sha256, 'hex') AS file_sha256,
+                         pg_catalog.uuid_extract_version(file_key) AS file_version`,
+        values: [
+          scope.projectId,
+          scope.conversationId,
+          longFileId,
+          longSiblingId,
+        ],
+      }, { domain: "factory", operation: "seedLongFileIdentities" });
+      const primary = files.rows.find(({ file_id }) => file_id === longFileId);
+      expect(primary).toMatchObject({
+        file_id: longFileId,
+        file_sha256: expectedSha256,
+        file_version: 7,
+      });
+
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.large_files
+                 (file_id, project_id, conversation_id, storage_uri)
+               VALUES ($3, $1, $2, 'file:///duplicate')`,
+        values: [scope.projectId, scope.conversationId, longFileId],
+      }, { domain: "factory", operation: "rejectDuplicateLongFileId" }));
+      await expect(database.migrator.query<{ file_id: string }>({
+        text: `INSERT INTO lcm.large_files
+                 (file_id, project_id, conversation_id, storage_uri)
+               VALUES ($3, $1, $2, 'file:///other-project')
+               RETURNING file_id`,
+        values: [scope.otherProjectId, scope.otherConversationId, longFileId],
+      }, { domain: "factory", operation: "allowProjectScopedLongFileId" }))
+        .resolves.toMatchObject({ rows: [{ file_id: longFileId }] });
+      await database.migrator.query({
+        text: `INSERT INTO lcm.large_files
+                 (file_id, project_id, conversation_id, storage_uri)
+               VALUES ($3, $1, $2, 'file:///cross-conversation')`,
+        values: [
+          scope.projectId,
+          secondConversation.rows[0]?.conversation_id,
+          crossConversationFileId,
+        ],
+      }, { domain: "factory", operation: "seedCrossConversationLongFile" });
+
+      const summary = await database.migrator.query<{ summary_key: string }>({
+        text: `INSERT INTO lcm.summaries
+                 (summary_id, project_id, conversation_id, kind, content, token_count)
+               VALUES ('long-file-summary', $1, $2, 'leaf', 'long file provenance', 3)
+               RETURNING summary_key`,
+        values: [scope.projectId, scope.conversationId],
+      }, { domain: "factory", operation: "seedLongFileSummary" });
+      await database.migrator.query({
+        text: `INSERT INTO lcm.summary_large_files
+                 (project_id, conversation_id, summary_key, file_id, ordinal)
+               VALUES
+                 ($1, $2, $3, $4, 0),
+                 ($1, $2, $3, $5, 1),
+                 ($1, $2, $3, $6, 2)`,
+        values: [
+          scope.projectId,
+          scope.conversationId,
+          summary.rows[0]?.summary_key,
+          longFileId,
+          crossConversationFileId,
+          unresolvedFileId,
+        ],
+      }, { domain: "factory", operation: "seedLongOpaqueFileReferences" });
+      await expect(database.migrator.query<{ file_ids: string[] }>({
+        text: `SELECT pg_catalog.array_agg(file_id ORDER BY ordinal) AS file_ids
+               FROM lcm.summary_large_files
+               WHERE project_id = $1 AND summary_key = $2`,
+        values: [scope.projectId, summary.rows[0]?.summary_key],
+      }, { domain: "factory", operation: "roundTripLongOpaqueFileReferences" }))
+        .resolves.toMatchObject({
+          rows: [{
+            file_ids: [longFileId, crossConversationFileId, unresolvedFileId],
+          }],
+        });
+
+      const order = async (): Promise<string[]> => {
+        const ordered = await database.migrator.query<{ file_id: string }>({
+          text: `SELECT file_id
+                 FROM lcm.large_files
+                 WHERE project_id = $1
+                   AND conversation_id = $2
+                   AND created_at = '2026-01-01T00:00:00Z'
+                 ORDER BY created_at, file_key`,
+          values: [scope.projectId, scope.conversationId],
+        }, { domain: "factory", operation: "readStableLongFileOrder" });
+        return ordered.rows.map(({ file_id }) => file_id);
+      };
+      const firstOrder = await order();
+      expect(firstOrder).toHaveLength(2);
+      expect(new Set(firstOrder)).toEqual(new Set([longFileId, longSiblingId]));
+      expect(await order()).toEqual(firstOrder);
+
+      const plans = await database.migrator.transaction(async (transaction) => {
+        await transaction.query({ text: "SET LOCAL enable_seqscan = off" }, {
+          domain: "factory",
+          operation: "forceLongFilePlans",
+        });
+        const identity = await transaction.query<{ "QUERY PLAN": unknown }>({
+          text: `EXPLAIN (FORMAT JSON, COSTS OFF)
+                 SELECT file_id FROM lcm.large_files
+                 WHERE project_id = $1
+                   AND file_id_sha256 = public.digest($2, 'sha256')
+                   AND file_id = $2
+                 ORDER BY file_id_sha256, file_key`,
+          values: [scope.projectId, longFileId],
+        }, { domain: "factory", operation: "explainLongFileIdentity" });
+        const ordering = await transaction.query<{ "QUERY PLAN": unknown }>({
+          text: `EXPLAIN (FORMAT JSON, COSTS OFF)
+                 SELECT file_id FROM lcm.large_files
+                 WHERE project_id = $1
+                 ORDER BY conversation_id, created_at, file_key`,
+          values: [scope.projectId],
+        }, { domain: "factory", operation: "explainLongFileOrder" });
+        const opaque = await transaction.query<{ "QUERY PLAN": unknown }>({
+          text: `EXPLAIN (FORMAT JSON, COSTS OFF)
+                 SELECT file_id FROM lcm.summary_large_files
+                 WHERE project_id = $1
+                   AND file_id_sha256 = public.digest($2, 'sha256')
+                   AND file_id = $2
+                 ORDER BY file_id_sha256, conversation_id, summary_key, ordinal`,
+          values: [scope.projectId, longFileId],
+        }, { domain: "factory", operation: "explainLongOpaqueFileLookup" });
+        return JSON.stringify([identity.rows, ordering.rows, opaque.rows]);
+      });
+      expect(plans).toContain("large_files_identity_lookup_idx");
+      expect(plans).toContain("large_files_conversation_order_idx");
+      expect(plans).toContain("summary_large_files_file_idx");
+
+      await database.migrator.query({
+        text: `DELETE FROM lcm.large_files
+               WHERE project_id = $1
+                 AND file_id_sha256 = public.digest($2, 'sha256')
+                 AND file_id = $2`,
+        values: [scope.projectId, longFileId],
+      }, { domain: "factory", operation: "deleteResolvedLongFile" });
+      await expect(database.migrator.query<{ preserved: boolean }>({
+        text: `SELECT EXISTS (
+                 SELECT 1
+                 FROM lcm.summary_large_files
+                 WHERE project_id = $1
+                   AND summary_key = $2
+                   AND file_id_sha256 = public.digest($3, 'sha256')
+                   AND file_id = $3
+               ) AS preserved`,
+        values: [scope.projectId, summary.rows[0]?.summary_key, longFileId],
+      }, { domain: "factory", operation: "verifyLongOpaqueFilePreserved" }))
+        .resolves.toMatchObject({ rows: [{ preserved: true }] });
     });
   });
 

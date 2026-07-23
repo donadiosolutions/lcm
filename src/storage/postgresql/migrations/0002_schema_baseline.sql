@@ -390,7 +390,11 @@ CREATE INDEX context_items_summary_idx
   WHERE summary_key IS NOT NULL;
 
 CREATE TABLE lcm.large_files (
+  file_key uuid PRIMARY KEY DEFAULT uuidv7(),
   file_id text NOT NULL DEFAULT uuidv7()::text,
+  file_id_sha256 bytea GENERATED ALWAYS AS (
+    public.digest(file_id, 'sha256')
+  ) STORED,
   project_id uuid NOT NULL,
   conversation_id bigint NOT NULL,
   file_name text,
@@ -399,20 +403,61 @@ CREATE TABLE lcm.large_files (
   storage_uri text NOT NULL CHECK (btrim(storage_uri) <> ''),
   exploration_summary text,
   created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
-  PRIMARY KEY (project_id, file_id),
-  UNIQUE (project_id, conversation_id, file_id),
+  UNIQUE (project_id, conversation_id, file_key),
   FOREIGN KEY (project_id, conversation_id)
-    REFERENCES lcm.conversations(project_id, conversation_id) ON DELETE CASCADE
+    REFERENCES lcm.conversations(project_id, conversation_id) ON DELETE CASCADE,
+  CHECK ((uuid_extract_version(file_key) = 7) IS TRUE)
 );
 
+CREATE INDEX large_files_identity_lookup_idx
+  ON lcm.large_files (project_id, file_id_sha256, file_key);
 CREATE INDEX large_files_conversation_order_idx
-  ON lcm.large_files (project_id, conversation_id, created_at, file_id);
+  ON lcm.large_files (project_id, conversation_id, created_at, file_key);
+
+CREATE FUNCTION lcm.enforce_large_file_id_uniqueness()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $function$
+DECLARE
+  requested_sha256 bytea := public.digest(NEW.file_id, 'sha256');
+BEGIN
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      NEW.project_id::text
+        OPERATOR(pg_catalog.||) ':file:'
+        OPERATOR(pg_catalog.||) pg_catalog.encode(requested_sha256, 'hex'),
+      0
+    )
+  );
+  IF EXISTS (
+    SELECT 1
+    FROM lcm.large_files AS existing
+    WHERE existing.project_id OPERATOR(pg_catalog.=) NEW.project_id
+      AND existing.file_id_sha256 OPERATOR(pg_catalog.=) requested_sha256
+      AND existing.file_id OPERATOR(pg_catalog.=) NEW.file_id
+      AND existing.file_key OPERATOR(pg_catalog.<>) NEW.file_key
+  ) THEN
+    RAISE EXCEPTION 'duplicate large-file identifier in project'
+      USING ERRCODE = 'unique_violation',
+            CONSTRAINT = 'large_files_project_file_id_key';
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+CREATE TRIGGER large_files_enforce_file_id_uniqueness
+BEFORE INSERT OR UPDATE OF project_id, file_id ON lcm.large_files
+FOR EACH ROW EXECUTE FUNCTION lcm.enforce_large_file_id_uniqueness();
 
 CREATE TABLE lcm.summary_large_files (
   project_id uuid NOT NULL,
   conversation_id bigint NOT NULL,
   summary_key uuid NOT NULL,
   file_id text NOT NULL,
+  file_id_sha256 bytea GENERATED ALWAYS AS (
+    public.digest(file_id, 'sha256')
+  ) STORED,
   ordinal integer NOT NULL CHECK (ordinal >= 0),
   PRIMARY KEY (project_id, summary_key, ordinal),
   FOREIGN KEY (project_id, conversation_id, summary_key)
@@ -423,7 +468,9 @@ COMMENT ON TABLE lcm.summary_large_files IS
   'Ordered summary provenance whose file_id is deliberately opaque: unresolved and cross-conversation references are valid, and deleting a large_files row must preserve this reference.';
 
 CREATE INDEX summary_large_files_file_idx
-  ON lcm.summary_large_files (project_id, file_id, conversation_id, summary_key, ordinal);
+  ON lcm.summary_large_files (
+    project_id, file_id_sha256, conversation_id, summary_key, ordinal
+  );
 CREATE INDEX summary_large_files_summary_idx
   ON lcm.summary_large_files (project_id, conversation_id, summary_key);
 
@@ -678,3 +725,4 @@ REVOKE ALL PRIVILEGES ON SEQUENCE
 FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON FUNCTION lcm.normalize_search_text(text) FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON FUNCTION lcm.enforce_summary_id_uniqueness() FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON FUNCTION lcm.enforce_large_file_id_uniqueness() FROM PUBLIC;

@@ -56,8 +56,8 @@ connection is destroyed rather than returned to the pool.
 
 Ordered SQL files are packaged in `dist` and checked against an explicit
 SHA-256 manifest before execution. The runner takes a database-scoped
-transaction advisory lock, requires PostgreSQL 18 and the current required
-extensions in the `public` schema, validates the complete
+transaction advisory lock, requires a UTF-8 PostgreSQL 18 database and the
+current required extensions in the `public` schema, validates the complete
 `lcm.schema_migrations` history, and rejects unknown, out-of-order, or
 checksum-drifted entries. Pending SQL and its ledger row commit together, making
 empty, repeated, concurrent, and failed runs deterministic. Extension
@@ -69,10 +69,14 @@ inspection, the runner permits an absent schema but rejects an existing schema
 not owned by the current migration role; delegated `CREATE` is insufficient and
 no ownership is changed automatically. Every run rejects a schema that grants
 `PUBLIC CREATE` before ledger inspection without changing its ACL; the baseline
-repeats the guard before its owned DDL.
+repeats the guard before its owned DDL. Under the same lock, every run also
+verifies that the current migrator still owns each known LCM table, identity
+sequence, helper or trigger function, text-search dictionary, and text-search
+configuration that exists. Unknown schema objects are outside that exact
+catalog allowlist and are neither rejected nor changed.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six
-generated identity sequences, search-normalization function, or
-summary-identity trigger function; unknown
+generated identity sequences, or the search-normalization, summary-identity,
+and large-file-identity functions; unknown
 pre-existing object ACLs are preserved. The normalization function is created
 without replacement, so a same-signature collision fails and rolls back the
 pending migration rather than overwriting operator code. Runtime domain grants

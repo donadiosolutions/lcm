@@ -85,6 +85,15 @@ describe("PostgreSQL search normalization artifact", () => {
     expect(sql).toContain(
       "project_id, source_project_id, source_summary_id_sha256, memory_id",
     );
+    expect(sql).toContain("file_key uuid PRIMARY KEY DEFAULT uuidv7()");
+    expect(sql).toContain("public.digest(file_id, 'sha256')");
+    expect(sql).toContain(
+      "ON lcm.large_files (project_id, file_id_sha256, file_key)",
+    );
+    expect(sql).toContain(
+      "project_id, file_id_sha256, conversation_id, summary_key, ordinal",
+    );
+    expect(sql).not.toMatch(/(?:PRIMARY KEY|UNIQUE|INDEX)[^\n]*file_id\)/u);
     expect(sql).not.toContain("session_id text NOT NULL CHECK (btrim(session_id) <> '')");
   });
 });

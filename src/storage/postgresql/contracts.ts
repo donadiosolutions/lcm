@@ -74,6 +74,7 @@ export interface PostgreSqlSearchConfigurationStatus {
 export interface PostgreSqlRuntimeHealth extends StorageHealth {
   readonly backend: "postgresql";
   readonly serverMajorVersion?: number | null;
+  readonly serverEncoding?: string | null;
   readonly tls?: boolean;
   readonly timezone?: string;
   readonly role?: string;
