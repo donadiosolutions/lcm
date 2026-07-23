@@ -51,13 +51,22 @@ does not add row-level security.
   object, native payloads are objects or arrays, and all other JSONB values are
   objects. Queryable tags, state, counters, identities, and relationships remain
   normalized columns or relations.
-- `lcm.normalize_search_text(text)` lowercases and applies `unaccent` with a
-  fixed dictionary. Messages, summaries, and promoted memories store generated
+- `lcm.normalize_search_text(text)` lowercases and applies an embedded copy of
+  PostgreSQL 18.4's 2,661 `unaccent.rules` mappings. The source rule file is
+  pinned by SHA-256
+  `ecf4c41c0883dee17d02431e0a7f24a2611aadf8fe1da06e98c6ccb4acc4a981`;
+  its canonical embedded JSON is pinned by SHA-256
+  `21d9c6e1f20f37d7d804b81dc7f62372b68de9ff05037d5f4f3c85cef4868588`.
+  The migration artifact checksum protects both. The immutable, parallel-safe
+  function has no dependency on the mutable extension dictionary, so an
+  extension package or dictionary update cannot silently change query-time
+  normalization while stored columns and indexes retain older values.
+  Messages, summaries, and promoted memories store generated
   `simple`-configuration `tsvector` documents and have both full-text and
-  normalized trigram GIN indexes. The function is immutable and parallel-safe,
-  uses a fixed search path, and is not executable by `PUBLIC`. The migration
-  creates this exact signature without replacement: a pre-existing function at
-  that signature is treated as an operator collision, not overwritten.
+  normalized trigram GIN indexes. The function uses a fixed search path and is
+  not executable by `PUBLIC`. The migration creates this exact signature
+  without replacement: a pre-existing function at that signature is treated as
+  an operator collision, not overwritten.
 - Primary keys and unique constraints supply their own B-tree indexes. Named
   secondary indexes cover stable ordering, reverse foreign-key traversal,
   JSONB containment, search, active rows, and queue or lease readiness. The
@@ -166,7 +175,7 @@ in the `public` schema at the server's current `default_version`:
 
 | Extension | Baseline purpose |
 | --- | --- |
-| `unaccent` | Stable accent-insensitive normalization used by generated search documents and trigram expressions. |
+| `unaccent` | Operational prerequisite and provenance for the pinned accent-insensitive rule set. Migration tests compare every embedded source mapping with PostgreSQL 18.4's dictionary, but indexed normalization does not call the mutable dictionary at runtime. |
 | `pg_trgm` | GIN operator support for bounded substring and fuzzy lexical fallback. |
 | `pgcrypto` | Parity prerequisite for cryptographic database operations. IDs still use PostgreSQL 18's native `uuidv7()`, and content hashes arrive as validated lowercase SHA-256 values. |
 | `pg_stat_statements` | Operator-visible query statistics for diagnosing repository and query-plan behavior; the server must preload it when required by the installation. |
@@ -240,6 +249,49 @@ on a provider does not justify silently expanding the baseline.
    rewrite a released migration, edit the ledger, drop an unknown schema, or
    auto-repair data. Restore the expected artifact/database or add a new ordered
    migration.
+
+Changing normalization rules requires a new immutable migration; updating the
+`unaccent` extension alone does not adopt new mappings. That migration must run
+under the same advisory lock and transaction as the ledger update and perform
+all of the following:
+
+1. Replace the embedded mapping, both fingerprints, and the body of
+   `lcm.normalize_search_text(text)` with the reviewed rule set.
+2. Rewrite each stored generated column with PostgreSQL 18's `SET EXPRESSION`
+   form, even though the SQL expression text remains the same. This
+   deterministically recomputes every stored value with the new function:
+
+   ```sql
+   ALTER TABLE lcm.messages ALTER COLUMN search_document SET EXPRESSION AS
+     (to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(content)));
+   ALTER TABLE lcm.summaries ALTER COLUMN search_document SET EXPRESSION AS
+     (to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(content)));
+   ALTER TABLE lcm.promoted_memories ALTER COLUMN search_document SET EXPRESSION AS
+     (to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(content)));
+   ```
+
+3. Rebuild `messages_search_document_idx`, `messages_content_trgm_idx`,
+   `summaries_search_document_idx`, `summaries_content_trgm_idx`,
+   `promoted_memories_search_document_idx`, and
+   `promoted_memories_content_trgm_idx` with plain transactional `REINDEX
+   INDEX`. Do not use `CONCURRENTLY` inside the migration transaction:
+
+   ```sql
+   REINDEX INDEX lcm.messages_search_document_idx;
+   REINDEX INDEX lcm.messages_content_trgm_idx;
+   REINDEX INDEX lcm.summaries_search_document_idx;
+   REINDEX INDEX lcm.summaries_content_trgm_idx;
+   REINDEX INDEX lcm.promoted_memories_search_document_idx;
+   REINDEX INDEX lcm.promoted_memories_content_trgm_idx;
+   ```
+4. Record the migration only after all three rewrites and all six index rebuilds
+   succeed. Any failure must roll back the function, generated values, indexes,
+   and ledger together.
+
+Writers must remain stopped until that migration commits. Never use `ALTER TEXT
+SEARCH DICTIONARY`, an extension update, or an out-of-band function replacement
+as a shortcut: those operations do not provide the atomic stored-column rewrite
+and reindex contract.
 
 If ownership preflight fails, an administrator must transfer the schema and all
 LCM-owned objects to the configured migration role, or restore a correctly

@@ -1,10 +1,19 @@
 import { createHash } from "node:crypto";
 import { beforeAll, describe, expect, it } from "vitest";
-import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations.js";
-import type { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
-import { assertHarnessReady, withPostgreSqlTestDatabase } from "./harness.js";
+import {
+  loadPostgreSqlMigrations,
+  runPostgreSqlMigrations,
+} from "../../src/storage/postgresql/migrations.js";
+import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import { assertHarnessReady, settings, withPostgreSqlTestDatabase } from "./harness.js";
 
 beforeAll(assertHarnessReady);
+
+const SCHEMA_BASELINE_SQL = loadPostgreSqlMigrations()
+  .find(({ id }) => id === "0002_schema_baseline")?.sql ?? "";
+const PINNED_NORMALIZATION_RULES = JSON.parse(
+  /\$rules\$(\{[^\n]+\})\$rules\$::jsonb/u.exec(SCHEMA_BASELINE_SQL)?.[1] ?? "{}",
+) as Record<string, string>;
 
 const DOMAIN_TABLES = [
   "context_items",
@@ -239,6 +248,43 @@ describe("PostgreSQL schema baseline", () => {
         { table_name: "summaries", column_name: "search_document", data_type: "tsvector" },
       ]);
 
+      const normalization = await database.migrator.query<{
+        description: string;
+        parallel_safety: string;
+        unaccent_dependencies: string;
+        volatility: string;
+      }>({
+        text: `SELECT pg_catalog.obj_description(procedure.oid, 'pg_proc') AS description,
+                      procedure.provolatile::text AS volatility,
+                      procedure.proparallel::text AS parallel_safety,
+                      count(extension.oid) FILTER (WHERE extension.extname = 'unaccent')::text
+                        AS unaccent_dependencies
+               FROM pg_catalog.pg_proc AS procedure
+               JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+               LEFT JOIN pg_catalog.pg_depend AS dependency ON dependency.objid = procedure.oid
+               LEFT JOIN pg_catalog.pg_extension AS extension ON extension.oid = dependency.refobjid
+               WHERE namespace.nspname = 'lcm' AND procedure.proname = 'normalize_search_text'
+               GROUP BY procedure.oid`,
+      }, { domain: "factory", operation: "inspectNormalizationContract" });
+      expect(normalization.rows[0]).toEqual({
+        description: "Pinned PostgreSQL 18.4 unaccent.rules SHA-256 ecf4c41c0883dee17d02431e0a7f24a2611aadf8fe1da06e98c6ccb4acc4a981; canonical JSON SHA-256 21d9c6e1f20f37d7d804b81dc7f62372b68de9ff05037d5f4f3c85cef4868588 (2661 rules)",
+        parallel_safety: "s",
+        unaccent_dependencies: "0",
+        volatility: "i",
+      });
+      expect(Object.keys(PINNED_NORMALIZATION_RULES)).toHaveLength(2_661);
+      await expect(database.migrator.query<{ mismatch_count: string }>({
+        text: `SELECT count(*)::text AS mismatch_count
+               FROM pg_catalog.unnest($1::text[]) AS pinned(source_character)
+               WHERE lcm.normalize_search_text(source_character) IS DISTINCT FROM
+                 public.unaccent(
+                   'public.unaccent'::regdictionary,
+                   pg_catalog.lower(source_character)
+                 )`,
+        values: [Object.keys(PINNED_NORMALIZATION_RULES)],
+      }, { domain: "factory", operation: "compareAllPinnedNormalizationRules" }))
+        .resolves.toMatchObject({ rows: [{ mismatch_count: "0" }] });
+
       const privileges = await database.migrator.query<{
         migrator_insert: boolean;
         runtime_select: boolean;
@@ -264,6 +310,49 @@ describe("PostgreSQL schema baseline", () => {
         text: "SELECT key FROM lcm.operator_owned_metadata",
       }, { domain: "factory", operation: "verifyUnknownSchemaObject" }))
         .resolves.toMatchObject({ rows: [{ key: "preserve-me" }] });
+    });
+  });
+
+  it("keeps indexed normalization stable when the mutable unaccent extension is removed", async () => {
+    await withPostgreSqlTestDatabase("schema-pinned-normalization", async (database) => {
+      const scope = await seedScope(database.migrator);
+      const normalize = async (): Promise<string> => {
+        const result = await database.migrator.query<{ normalized: string }>({
+          text: "SELECT lcm.normalize_search_text('Café ﬃ ⅒') AS normalized",
+        }, { domain: "factory", operation: "readPinnedNormalization" });
+        return result.rows[0]?.normalized ?? "";
+      };
+
+      expect(await normalize()).toBe("cafe ffi  1/10");
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+      try {
+        await admin.query({ text: "DROP EXTENSION unaccent" }, {
+          domain: "factory",
+          operation: "simulateUnaccentRuleRemoval",
+        });
+      } finally {
+        await admin.close();
+      }
+      expect(await normalize()).toBe("cafe ffi  1/10");
+      await database.migrator.query({
+        text: `INSERT INTO lcm.messages
+                 (project_id, conversation_id, seq, role, content, token_count)
+               VALUES ($1, $2, 0, 'user', 'Café after extension drift', 4)`,
+        values: [scope.projectId, scope.conversationId],
+      }, { domain: "factory", operation: "writeWithPinnedNormalization" });
+      await expect(database.migrator.query<{ search_document: string }>({
+        text: `SELECT search_document::text
+               FROM lcm.messages
+               WHERE project_id = $1 AND conversation_id = $2 AND seq = 0`,
+        values: [scope.projectId, scope.conversationId],
+      }, { domain: "factory", operation: "readStableSearchDocument" }))
+        .resolves.toMatchObject({ rows: [{ search_document: "'after':2 'cafe':1 'drift':4 'extension':3" }] });
+      await expect(database.runtime.health()).resolves.toMatchObject({
+        status: "unavailable",
+        extensions: expect.arrayContaining([
+          expect.objectContaining({ name: "unaccent", status: "uninstalled" }),
+        ]),
+      });
     });
   });
 
