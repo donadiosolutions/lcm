@@ -27,14 +27,18 @@ does not add row-level security.
   the runtime role while the adapters are disabled. Explicit object lists keep
   privileges on unknown pre-existing tables, sequences, and functions intact;
   issues #84–#91 must grant only the operations required by their repositories.
-- The migration runner pins the transaction-local `search_path` to
-  `pg_catalog, public` before taking the advisory lock, inspecting readiness, or
-  executing pending SQL. This makes unqualified PostgreSQL built-ins in the
-  immutable migrations resolve to native catalog objects while retaining
-  intentional access to extension objects in `public`; the setting reverts on
-  either commit or rollback. Extension inspection also schema-qualifies every
-  catalog operator because runtime health can execute outside that migration
-  transaction.
+- The migration runner captures the postmaster epoch and completes required
+  extension readiness, including the functional `pg_stat_statements` probe,
+  before opening the DDL transaction. Inside that transaction it pins the local
+  `search_path` to `pg_catalog, public` before taking the advisory lock, checking
+  PostgreSQL 18 and postmaster/module continuity, performing the remaining
+  transactional readiness checks, or executing pending SQL. This makes
+  unqualified PostgreSQL built-ins in the immutable migrations resolve to native
+  catalog objects while retaining intentional access to extension objects in
+  `public`; the setting reverts on either commit or rollback. Extension
+  inspection also schema-qualifies every catalog operator because it runs
+  outside that migration transaction and runtime health uses the same
+  inspection path.
 - PostgreSQL 18's native [`uuidv7()`](https://www.postgresql.org/docs/18/functions-uuid.html)
   is the default for machine, project, part, transcript, and promoted-memory
   identities. Machine, project, and native-transcript roots enforce UUID

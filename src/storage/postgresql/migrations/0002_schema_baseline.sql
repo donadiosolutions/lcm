@@ -41,7 +41,7 @@ ALTER TEXT SEARCH CONFIGURATION lcm.search_v1
   WITH lcm.simple_v1;
 
 COMMENT ON TEXT SEARCH CONFIGURATION lcm.search_v1 IS
-  'LCM PostgreSQL 18 search configuration; catalog SHA-256 7461327e424809adae678114286199753a7916253ecbb5459a7f1e211b30a568';
+  'LCM PostgreSQL 18 search configuration; catalog SHA-256 2ffff1a443e48f12879e1fd2b6e47a05ba93d5cd0ae828171ffe84146f5e5dfc';
 
 CREATE FUNCTION lcm.normalize_search_text(input text)
 RETURNS text

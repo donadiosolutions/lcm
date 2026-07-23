@@ -138,10 +138,13 @@ describe("PostgreSQL migration runner", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "469367263cf040340b73af7b83f1fedb05eeef987ccc261057860e9706bd67ed" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "94ea97d7bf75fdc93acacb2f14e7bedebf13a0020dbcfab5f7ba0b61adb999c3" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
+    );
+    expect(migrations[1]?.sql).toContain(
+      `catalog SHA-256 ${POSTGRESQL_SEARCH_CONFIGURATION_SHA256}`,
     );
     expect(migrations[1]?.sql).toContain("lcm.fenced_leases_fencing_token_seq");
     expect(() => loadPostgreSqlMigrations(() => { throw new Error("missing private path"); }))
