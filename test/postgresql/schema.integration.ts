@@ -617,7 +617,7 @@ describe("PostgreSQL schema baseline", () => {
         `EXPLAIN (FORMAT JSON, COSTS OFF)
          SELECT message_id FROM lcm.messages
          WHERE lcm.normalize_search_text(content) % lcm.normalize_search_text($1)`,
-        ["schema basline"],
+        ["schema baseline"],
       );
       expect(trigramPlan).toContain("messages_content_trgm_idx");
 
@@ -669,7 +669,7 @@ describe("PostgreSQL schema baseline", () => {
           VALUES($1,$2,$3,1,0,'event','{}')`,
         values: [scope.projectId, scope.machineId, eventId],
       }, { domain: "factory", operation: "seedInboxMatrix" });
-      const localMessage = await database.migrator.query<{ message_id: string }>({
+      await database.migrator.query<{ message_id: string }>({
         text: "INSERT INTO lcm.messages(project_id,conversation_id,seq,role,content,token_count) VALUES($1,$2,0,'user','local',1) RETURNING message_id",
         values: [scope.projectId, scope.conversationId],
       }, { domain: "factory", operation: "seedLocalPolicyMessage" });
