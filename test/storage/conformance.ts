@@ -89,6 +89,11 @@ export function defineCoreStorageConformance(
       kind: "leaf",
       content: "leaf needle",
       tokenCount: 5,
+      fileIds: [
+        "file_aaaaaaaaaaaaaaaa",
+        "file_aaaaaaaaaaaaaaaa",
+        "file_bbbbbbbbbbbbbbbb",
+      ],
       earliestAt: new Date("2026-01-01T00:00:00Z"),
       latestAt: new Date("2026-01-02T00:00:00Z"),
     });
@@ -99,11 +104,42 @@ export function defineCoreStorageConformance(
       content: "parent",
       tokenCount: 6,
     });
+    const earliestOnly = await storage.summaries.insertSummary({
+      summaryId: "earliest-only",
+      conversationId: second.conversationId,
+      kind: "leaf",
+      content: "earliest only",
+      tokenCount: 2,
+      earliestAt: new Date("2026-01-03T00:00:00Z"),
+    });
+    const latestOnly = await storage.summaries.insertSummary({
+      summaryId: "latest-only",
+      conversationId: second.conversationId,
+      kind: "leaf",
+      content: "latest only",
+      tokenCount: 2,
+      latestAt: new Date("2026-01-04T00:00:00Z"),
+    });
+    expect(earliestOnly).toMatchObject({
+      earliestAt: new Date("2026-01-03T00:00:00Z"),
+      latestAt: null,
+    });
+    expect(latestOnly).toMatchObject({
+      earliestAt: null,
+      latestAt: new Date("2026-01-04T00:00:00Z"),
+    });
     await storage.summaries.linkSummaryToMessages(leaf.summaryId, messages.map((row) => row.messageId));
     await storage.summaries.linkSummaryToMessages(leaf.summaryId, []);
     await storage.summaries.linkSummaryToParents(leaf.summaryId, [parent.summaryId]);
     await storage.summaries.linkSummaryToParents(parent.summaryId, []);
     expect(await storage.summaries.getSummary("missing")).toBeNull();
+    expect(await storage.summaries.getSummary(leaf.summaryId)).toMatchObject({
+      fileIds: [
+        "file_aaaaaaaaaaaaaaaa",
+        "file_aaaaaaaaaaaaaaaa",
+        "file_bbbbbbbbbbbbbbbb",
+      ],
+    });
     expect(await storage.summaries.getSummariesByConversation(first.conversationId)).toHaveLength(2);
     expect(await storage.summaries.listRecentSummaries(1)).toHaveLength(1);
     expect((await storage.summaries.listRecentSummariesForSession("session-a", 5)).map((row) => row.depth)).toEqual([1, 0]);
@@ -137,14 +173,14 @@ export function defineCoreStorageConformance(
 
     const memoryId = await storage.promotedMemory.insert({
       content: "durable needle",
-      tags: ["architecture"],
+      tags: ["architecture", "Foo", "foo", "", " spaced ", "Foo"],
       sourceSummaryId: "external-summary",
       sourceProjectId: "source-a",
       sessionId: "session-a",
       ...({ projectId: "caller-controlled" } as object),
     } as Parameters<typeof storage.promotedMemory.insert>[0]);
     expect(await storage.promotedMemory.getById(memoryId)).toMatchObject({
-      tags: ["architecture"],
+      tags: ["architecture", "Foo", "foo", "", " spaced ", "Foo"],
       projectId: "source-a",
       sourceSummaryId: "external-summary",
     });
@@ -154,6 +190,9 @@ export function defineCoreStorageConformance(
       tags: ["architecture"],
       ...({ projectId: "caller-controlled" } as object),
     })).toHaveLength(1);
+    expect(await storage.promotedMemory.getAll({ tags: ["Foo"] })).toHaveLength(1);
+    expect(await storage.promotedMemory.getAll({ tags: ["foo"] })).toHaveLength(1);
+    expect(await storage.promotedMemory.getAll({ tags: ["FOO"] })).toEqual([]);
     expect(await storage.promotedMemory.getAll({ sourceProjectId: "missing" })).toEqual([]);
     expect(await storage.promotedMemory.listContentPrefixes(5)).toEqual(["durable needle"]);
     await storage.promotedMemory.update(memoryId, { content: "updated needle", confidence: 0.8, tags: ["updated"] });
@@ -183,9 +222,13 @@ export function defineCoreStorageConformance(
     });
 
     await storage.recall.logSurfacing([memoryId], "session-a");
+    await storage.recall.logSurfacing(["id-1", "id-x", "id-1"], null);
     await storage.recall.logSurfacing([], null);
     expect((await storage.recall.getFeedback([memoryId])).get(memoryId)?.surfacingCount).toBe(1);
-    expect((await storage.recall.getStats()).memoriesSurfaced).toBe(1);
+    const orphanFeedback = await storage.recall.getFeedback(["id-1", "id-x"]);
+    expect(orphanFeedback.get("id-1")?.surfacingCount).toBe(2);
+    expect(orphanFeedback.get("id-x")?.surfacingCount).toBe(1);
+    expect((await storage.recall.getStats()).memoriesSurfaced).toBe(3);
     await storage.redactionAdmin.upsertCounts({ gitleaks: 1, builtIn: 1, global: 1, project: 1 });
     await storage.redactionAdmin.upsertCounts({ gitleaks: 0, builtIn: 0, global: 0, project: 0 });
     await storage.coordination.recordSessionIngest("session-a", 3);
@@ -215,6 +258,7 @@ export function defineCoreStorageConformance(
     expect(await storage.conversations.deleteMessages([])).toBe(0);
     await storage.promotedMemory.deleteById(memoryId);
     expect(await storage.promotedMemory.getById(memoryId)).toBeNull();
+    expect((await storage.recall.getFeedback([memoryId])).get(memoryId)?.surfacingCount).toBe(1);
     await storage.close();
     await harness.factory.close();
   });

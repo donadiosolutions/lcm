@@ -51,6 +51,14 @@ describe("PostgreSQL search normalization artifact", () => {
     expect(sql).toContain(
       "pg_catalog.lower(tag COLLATE pg_catalog.pg_unicode_fast)",
     );
+    expect(sql).toContain(
+      "to_tsvector('pg_catalog.simple'::regconfig, lcm.normalize_search_text(tag))",
+    );
+    expect(sql).toContain(
+      "USING gin (lcm.normalize_search_text(tag) public.gin_trgm_ops)",
+    );
+    expect(sql).toContain("PRIMARY KEY (project_id, memory_id, ordinal)");
+    expect(sql).not.toContain("PRIMARY KEY (project_id, memory_id, normalized_tag)");
     expect(sql).not.toContain("GENERATED ALWAYS AS (lower(tag))");
   });
 });

@@ -97,6 +97,17 @@ infinities. Search and tag normalization use PostgreSQL 18's builtin
 `pg_unicode_fast` full case mapping, whose behavior is stable within the
 required major version and independent of libc or ICU provider upgrades.
 
+The same backend-neutral contract preserves promoted-memory tags exactly,
+including order, duplicates, case distinctions, empty values, and surrounding
+whitespace; tag filters remain case-sensitive even though separately indexed
+normalized and lexical projections support explicit normalized lookup and
+tag-only search. Summary `earliestAt` and `latestAt` values are independently
+optional and are ordered only when both exist. Summary file-reference arrays
+likewise preserve order and duplicates, and unresolved or cross-conversation
+IDs remain opaque rather than requiring a matching `large_files` row.
+Recall surfacing IDs are also opaque text: orphan and historical observations
+remain queryable after a promoted-memory row is absent or deleted.
+
 The migration role must own an existing `lcm` schema. The runner permits an
 absent schema because `0001` creates it as the current migration role, but it
 fails closed when another role owns an existing schema even if that role has
