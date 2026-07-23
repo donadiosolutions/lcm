@@ -153,9 +153,9 @@ describe("PostgreSQL schema baseline", () => {
       const normalizedConstraints = constraints.rows
         .map((row) => `${row.table_name}|${row.constraint_type}|${row.definition}`)
         .join("\n");
-      expect(constraints.rowCount).toBe(171);
+      expect(constraints.rowCount).toBe(173);
       expect(createHash("sha256").update(normalizedConstraints).digest("hex"))
-        .toBe("520defe81e8a77176fb8cfa6a50defd975dc4c456532b38abdbd0d54ae522540");
+        .toBe("fd476a72a58859caae5be9e4841d3fe1e3ad23f0dccc446694171b0f7a16ccbf");
 
       const deleteActions = await database.migrator.query<{
         table_name: string;
@@ -828,6 +828,24 @@ describe("PostgreSQL schema baseline", () => {
         text: "INSERT INTO lcm.large_files(project_id,conversation_id,storage_uri) VALUES($1,$2,'file:///remote') RETURNING file_id",
         values: [scope.otherProjectId, scope.otherConversationId],
       }, { domain: "factory", operation: "seedRemotePolicyFile" });
+      await expect(database.migrator.query<{
+        claimed_by: string;
+        immediate_attempt: boolean;
+        immediate_claim: boolean;
+      }>({
+        text: `INSERT INTO lcm.passive_event_inbox
+                 (project_id, machine_id, event_id, event_version, machine_sequence,
+                  event_type, payload, status, received_at, next_attempt_at, claimed_at, claimed_by)
+               VALUES ($1, $2, uuidv7(), 1, 12, 'event', '{}'::jsonb, 'claimed',
+                       statement_timestamp(), statement_timestamp(), statement_timestamp(), 'worker')
+               RETURNING claimed_by,
+                         next_attempt_at = received_at AS immediate_attempt,
+                         claimed_at = received_at AS immediate_claim`,
+        values: [scope.projectId, scope.machineId],
+      }, { domain: "factory", operation: "acceptInboxTimestampBoundaries" }))
+        .resolves.toMatchObject({
+          rows: [{ claimed_by: "worker", immediate_attempt: true, immediate_claim: true }],
+        });
 
       const invalidCases: Array<{ operation: string; text: string; values: unknown[] }> = [
         { operation: "summaryMessageCrossScope", text: "INSERT INTO lcm.summary_messages(project_id,conversation_id,summary_id,message_id,ordinal) VALUES($1,$2,$3,$4,0)", values: [scope.projectId, scope.conversationId, localSummary.rows[0]?.summary_id, remoteMessage.rows[0]?.message_id] },
@@ -863,6 +881,8 @@ describe("PostgreSQL schema baseline", () => {
         { operation: "inboxQuarantineEquivalence", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload,status,quarantined_at) VALUES($1,$2,uuidv7(),1,4,'e','{}','quarantined',now())", values: [scope.projectId, scope.machineId] },
         { operation: "inboxClaimPair", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload,claimed_by) VALUES($1,$2,uuidv7(),1,5,'e','{}','worker')", values: [scope.projectId, scope.machineId] },
         { operation: "inboxTimestampOrder", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload,status,applied_at) VALUES($1,$2,uuidv7(),1,6,'e','{}','applied',now()-interval '1 day')", values: [scope.projectId, scope.machineId] },
+        { operation: "inboxRetryBeforeReceipt", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload,received_at,next_attempt_at) VALUES($1,$2,uuidv7(),1,10,'e','{}',now(),now()-interval '1 second')", values: [scope.projectId, scope.machineId] },
+        { operation: "inboxBlankClaimOwner", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload,status,claimed_at,claimed_by) VALUES($1,$2,uuidv7(),1,11,'e','{}','claimed',now(),'   ')", values: [scope.projectId, scope.machineId] },
         { operation: "inboxEventUnique", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload) VALUES($1,$2,$3,1,2,'e','{}')", values: [scope.projectId, scope.machineId, eventId] },
         { operation: "inboxSequenceUnique", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload) VALUES($1,$2,uuidv7(),1,0,'e','{}')", values: [scope.projectId, scope.machineId] },
         { operation: "leaseToken", text: "INSERT INTO lcm.fenced_leases(project_id,resource_type,resource_key,owner_machine_id,owner_process_id,operation,fencing_token,expires_at) OVERRIDING SYSTEM VALUE VALUES($1,'r','k',$2,'p','o',0,now()+interval '1 minute')", values: [scope.projectId, scope.machineId] },

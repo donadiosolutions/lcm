@@ -487,6 +487,8 @@ CREATE TABLE lcm.passive_event_inbox (
   quarantine_reason text,
   UNIQUE (machine_id, event_id),
   UNIQUE (machine_id, machine_sequence),
+  CHECK (next_attempt_at >= received_at),
+  CHECK (claimed_by IS NULL OR btrim(claimed_by) <> ''),
   CHECK ((claimed_at IS NULL) = (claimed_by IS NULL)),
   CHECK ((status = 'claimed') = (claimed_at IS NOT NULL)),
   CHECK ((status = 'applied') = (applied_at IS NOT NULL)),
