@@ -455,6 +455,50 @@ describe("PostgreSQL identity repository", () => {
       .rejects.toBeInstanceOf(PostgreSqlIdentityNotFoundError);
   });
 
+  it("inserts an absent alias during an initial binding without an expected prior owner", async () => {
+    let selectCount = 0;
+    const db = executor((config) => {
+      if (config.text.includes("SELECT project_id FROM")) {
+        return result([{ project_id: projectRow.project_id }]);
+      }
+      if (config.text.includes("FOR UPDATE")) {
+        selectCount += 1;
+        return result(selectCount === 1 ? [] : [aliasRow]);
+      }
+      if (config.text.includes("INSERT INTO lcm.project_aliases")) return result([aliasRow]);
+      if (config.text.includes("UPDATE lcm.project_aliases")) {
+        throw new Error("initial binding must not update an absent alias");
+      }
+      throw new Error(`unexpected SQL: ${config.text}`);
+    });
+    const repository = new PostgreSqlIdentityRepository(db);
+
+    await expect(repository.replaceProjectAliases({
+      machineId: machineRow.machine_id,
+      projectId: projectRow.project_id,
+      aliases: [{
+        path: aliasRow.path,
+        normalizedPath: aliasRow.normalized_path,
+      }],
+    })).resolves.toMatchObject({
+      aliases: [{ normalizedPath: aliasRow.normalized_path }],
+      prior: [null],
+      inserted: [true],
+    });
+    expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining("INSERT INTO lcm.project_aliases"),
+      values: [
+        projectRow.project_id,
+        machineRow.machine_id,
+        aliasRow.path,
+        aliasRow.normalized_path,
+      ],
+    }), expect.objectContaining({ operation: "replaceProjectAliases" }));
+    expect(db.query.mock.calls.some(([config]) => (
+      (config as QueryConfig<unknown[]>).text.includes("UPDATE lcm.project_aliases")
+    ))).toBe(false);
+  });
+
   it("preserves batch replacement snapshots when COMMIT outcomes are unknown", async () => {
     const replacementId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021";
     const insertedAlias = {

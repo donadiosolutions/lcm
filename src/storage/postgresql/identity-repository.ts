@@ -451,7 +451,7 @@ export class PostgreSqlIdentityRepository {
         const inserted = input.aliases.map(() => false);
         for (const [index, alias] of input.aliases.entries()) {
           const row = currentByPath.get(alias.normalizedPath);
-          if (row?.project_id === input.expectedPriorProjectId) {
+          if (row && row.project_id === input.expectedPriorProjectId) {
             await transaction.query({
               text: `UPDATE lcm.project_aliases
                      SET project_id = $1,
