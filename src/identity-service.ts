@@ -7,6 +7,7 @@ import {
   ensurePendingMachineIdentity,
   finalizeMachineIdentity,
   machineIdentityPath,
+  MachineIdentityFileError,
   MachineIdentityRegistrationChangedError,
   normalizeMachineDisplayName,
   normalizeUuidV7,
@@ -100,6 +101,7 @@ export interface IdentityRepository {
     machineId: string,
     normalizedPath: string,
     projectId: string,
+    path: string,
   ): Promise<RemoteAliasOwnership | null>;
   unlinkProjectAliasesIfOwned(
     machineId: string,
@@ -151,6 +153,10 @@ export interface IdentitySession {
 export interface IdentityServiceDependencies {
   readonly openSession: (config: ResolvedStorageConfig) => Promise<IdentitySession>;
   readonly homeDir?: string;
+  /** @internal Deterministic retry seam for remote identity lock tests. */
+  readonly waitForRemoteIdentityLock?: (delayMs: number) => Promise<void>;
+  /** @internal Bounded retry override for remote identity lock tests. */
+  readonly remoteIdentityLockMaxAttempts?: number;
 }
 
 export class RemoteIdentityConfigurationError extends Error {
@@ -202,6 +208,8 @@ export async function openPostgreSqlIdentitySession(
 
 const DEFAULT_DEPENDENCIES: IdentityServiceDependencies = {
   openSession: openPostgreSqlIdentitySession,
+  waitForRemoteIdentityLock: wait,
+  remoteIdentityLockMaxAttempts: 200,
 };
 
 const REMOTE_IDENTITY_LOCK_RETRY_MS = 25;
@@ -237,15 +245,27 @@ function withRemoteIdentityMutationLock<T>(
 }
 
 async function withQueuedRemoteIdentityMutationLock<T>(
-  homeDir: string | undefined,
+  deps: IdentityServiceDependencies,
   callback: () => Promise<T>,
 ): Promise<T> {
+  // `dependencies()` always overlays callers onto these required defaults.
+  const maxAttempts = Math.max(1, deps.remoteIdentityLockMaxAttempts!);
+  const waitForRetry = deps.waitForRemoteIdentityLock!;
+  let attempt = 0;
   while (true) {
+    attempt += 1;
     try {
-      return await withRemoteIdentityMutationLock(homeDir, callback);
+      return await withRemoteIdentityMutationLock(deps.homeDir, callback);
     } catch (error) {
       if (!(error instanceof PrivateMutationLockContentionError)) throw error;
-      await wait(REMOTE_IDENTITY_LOCK_RETRY_MS);
+      if (attempt === maxAttempts) {
+        const lockPath = `${machineIdentityPath(deps.homeDir)}.remote.lock`;
+        throw new MachineIdentityFileError(
+          `remote identity mutation remained busy after ${maxAttempts} attempts`,
+          `Verify no machine recovery or PostgreSQL project mutation is active; inspect ${quoteShellArgument(lockPath)} and remove it only after proving its owner is stale, then rerun \`lcm machine register\`.`,
+        );
+      }
+      await waitForRetry(REMOTE_IDENTITY_LOCK_RETRY_MS);
     }
   }
 }
@@ -385,27 +405,43 @@ async function coordinatedRemoteEntryPaths(
   entry: ProjectMapEntry,
 ): Promise<RemoteProjectAliasInput[]> {
   const lexicalPaths = lexicalEntryPaths(entry);
-  const resolved = entry.remoteProjectId
+  const stored = entry.remoteProjectId
     ? await resolveStoredRemoteAliases(
       repository,
       machineId,
       entry.remoteProjectId,
       lexicalPaths,
-    ).then((stored) => {
-      const storedByPath = new Map(stored.map((alias) => [alias.path, alias]));
-      return lexicalPaths.map((path) => storedByPath.get(path) ?? remotePath(path));
-    })
-    : lexicalPaths.map(remotePath);
-  const normalizedOwners = new Map<string, string>();
-  for (const path of resolved) {
-    const prior = normalizedOwners.get(path.normalizedPath);
-    if (prior && prior !== path.path) {
+    )
+    : [];
+  const storedByPath = new Map(stored.map((alias) => [alias.path, alias]));
+  const storedByNormalizedPath = new Map(
+    stored.map((alias) => [alias.normalizedPath, alias]),
+  );
+  const candidates = lexicalPaths.map(
+    (path) => storedByPath.get(path) ?? remotePath(path),
+  );
+  const resolved: RemoteProjectAliasInput[] = [];
+  const normalizedIndexes = new Map<string, number>();
+  for (const path of candidates) {
+    const priorIndex = normalizedIndexes.get(path.normalizedPath);
+    if (priorIndex === undefined) {
+      normalizedIndexes.set(path.normalizedPath, resolved.length);
+      resolved.push(path);
+      continue;
+    }
+    const prior = resolved[priorIndex]!;
+    const persisted = storedByNormalizedPath.get(path.normalizedPath);
+    if (persisted) {
+      // PostgreSQL's unique normalized identity is authoritative for lexical
+      // spelling. This collapses a canonical path plus its persisted symlink
+      // alias into one idempotent relink input.
+      resolved[priorIndex] = persisted;
+    } else {
       throw new ProjectIdentityReconciliationError(
-        `local project paths ${prior} and ${path.path} resolve to the same PostgreSQL identity ${path.normalizedPath}`,
+        `local project paths ${prior.path} and ${path.path} resolve to the same PostgreSQL identity ${path.normalizedPath}`,
         `Remove the duplicate local alias with \`lcm project unlink -- ${quoteShellArgument(path.path)}\` before creating or linking the PostgreSQL project.`,
       );
     }
-    normalizedOwners.set(path.normalizedPath, path.path);
   }
   return resolved;
 }
@@ -464,14 +500,12 @@ export async function registerMachine(
   const requestedDisplayName = options.displayName === undefined
     ? undefined
     : normalizeMachineDisplayName(options.displayName);
-  return withQueuedRemoteIdentityMutationLock(deps.homeDir, () => {
+  return withQueuedRemoteIdentityMutationLock(deps, () => {
     const pending = ensurePendingMachineIdentity(
       requestedDisplayName,
       deps.homeDir,
     );
-    const displayName = pending.identity.machineId === null
-      ? pending.identity.displayName
-      : requestedDisplayName ?? pending.identity.displayName;
+    const displayName = requestedDisplayName ?? pending.identity.displayName;
     return withSession(config, deps, async (repository) => {
       const registered = await repository.registerMachine(
         pending.identity.identityKey,
@@ -911,6 +945,7 @@ async function confirmRemoteAliasUnlink(
       machineId,
       normalizedPath,
       expectedProjectId,
+      path,
     );
   } catch (error) {
     if (!(error instanceof PostgreSqlIdentityUnlinkPathOutcomeUnknownError)) throw error;

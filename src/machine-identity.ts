@@ -177,7 +177,10 @@ function readMachineIdentityContent(path: string): string | null {
         "Move the unsafe path aside, then run `lcm machine recover <machine-id>`.",
       );
     }
-    if ((stat.mode & 0o077) !== 0) {
+    // Windows does not implement POSIX owner/group/other permission bits.
+    // Node may still populate mode with compatibility values there, so only
+    // enforce the 0600 mask on platforms where those bits are meaningful.
+    if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
       throw new MachineIdentityFileError(
         "machine.json permissions are too broad; expected mode 0600",
         `Run \`chmod 600 -- ${quoteShellArgument(path)}\`, then retry.`,

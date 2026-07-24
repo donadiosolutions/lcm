@@ -728,6 +728,7 @@ export class PostgreSqlIdentityRepository {
     machineId: string,
     normalizedPath: string,
     projectId: string,
+    path: string,
   ): Promise<RemoteAliasOwnership | null> {
     let candidate: RemoteAliasOwnership | null | undefined;
     try {
@@ -737,8 +738,9 @@ export class PostgreSqlIdentityRepository {
                  WHERE machine_id = $1
                    AND normalized_path = $2
                    AND project_id = $3
+                   AND path = $4
                  RETURNING project_id, machine_id, path, normalized_path, linked_at`,
-          values: [machineId, normalizedPath, projectId],
+          values: [machineId, normalizedPath, projectId, path],
         }, { domain: "identity", operation: "unlinkProjectAliasIfOwned", projectId });
         const row = result.rows[0];
         candidate = row ? { projectId: row.project_id, alias: aliasFromRow(row) } : null;
@@ -764,6 +766,10 @@ export class PostgreSqlIdentityRepository {
     try {
       return await this.executor.transaction(async (transaction) => {
         const normalizedPaths = aliases.map(({ normalizedPath }) => normalizedPath);
+        const paths = aliases.map(({ path }) => path);
+        const expectedPaths = new Map(
+          aliases.map((alias) => [alias.normalizedPath, alias.path]),
+        );
         const current = await transaction.query<AliasRow>({
           text: `SELECT project_id, machine_id, path, normalized_path, linked_at
                  FROM lcm.project_aliases
@@ -772,7 +778,10 @@ export class PostgreSqlIdentityRepository {
                  FOR UPDATE`,
           values: [machineId, normalizedPaths],
         }, { domain: "identity", operation: "unlinkProjectAliasesIfOwned", projectId });
-        if (current.rows.some((row) => row.project_id !== projectId)) {
+        if (current.rows.some((row) => (
+          row.project_id !== projectId
+          || expectedPaths.get(row.normalized_path) !== row.path
+        ))) {
           candidate = null;
           return null;
         }
@@ -780,9 +789,12 @@ export class PostgreSqlIdentityRepository {
           text: `DELETE FROM lcm.project_aliases
                  WHERE machine_id = $1
                    AND project_id = $2
-                   AND normalized_path = ANY($3::text[])
+                   AND (normalized_path, path) IN (
+                     SELECT normalized_path, path
+                     FROM unnest($3::text[], $4::text[]) AS expected(normalized_path, path)
+                   )
                  RETURNING project_id, machine_id, path, normalized_path, linked_at`,
-          values: [machineId, projectId, normalizedPaths],
+          values: [machineId, projectId, normalizedPaths, paths],
         }, { domain: "identity", operation: "unlinkProjectAliasesIfOwned", projectId });
         candidate = removed.rows.map(aliasFromRow);
         return candidate;

@@ -55,6 +55,7 @@ import {
   ensurePendingMachineIdentity,
   machineIdentityPath,
 } from "../src/machine-identity.js";
+import { withPrivateMutationLockAsync } from "../src/private-mutation-lock.js";
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const MACHINE_B = "018f22c4-6d2a-7f10-9a4c-6b8d3e5f9013";
@@ -218,15 +219,21 @@ function fakeRepository(): IdentityRepository & {
       aliases.delete(normalizedPath);
       return existing ?? null;
     }),
-    unlinkProjectAliasIfOwned: vi.fn(async (_machineId, normalizedPath, projectId) => {
+    unlinkProjectAliasIfOwned: vi.fn(async (_machineId, normalizedPath, projectId, path) => {
       const existing = aliases.get(normalizedPath);
-      if (existing?.projectId !== projectId) return null;
+      if (existing?.projectId !== projectId || existing.alias.path !== path) return null;
       aliases.delete(normalizedPath);
       return existing;
     }),
     unlinkProjectAliasesIfOwned: vi.fn(async (_machineId, projectId, inputs) => {
       const current = inputs.map(({ normalizedPath }) => aliases.get(normalizedPath));
-      if (current.some((owner) => owner && owner.projectId !== projectId)) return null;
+      if (current.some((owner, index) => (
+        owner
+        && (
+          owner.projectId !== projectId
+          || owner.alias.path !== inputs[index]?.path
+        )
+      ))) return null;
       const removed = current.flatMap((owner) => owner ? [owner.alias] : []);
       for (const { normalizedPath } of inputs) aliases.delete(normalizedPath);
       return removed;
@@ -594,21 +601,64 @@ describe("identity service", () => {
     expect(repository.recoverMachine).not.toHaveBeenCalled();
   });
 
-  it("keeps the exclusive pending-file winner's name across concurrent registration calls", async () => {
+  it("honors an explicit retry name while retaining the pending identity key", async () => {
     const pending = ensurePendingMachineIdentity("Winning Machine", home);
 
     await expect(registerMachine(
       POSTGRESQL_CONFIG,
-      { displayName: "Losing Machine" },
+      { displayName: "  Requested Retry  " },
       deps,
     )).resolves.toMatchObject({
       created: false,
-      identity: { displayName: "Winning Machine" },
+      identity: {
+        identityKey: pending.identity.identityKey,
+        displayName: "Requested Retry",
+      },
     });
     expect(repository.registerMachine).toHaveBeenCalledWith(
       pending.identity.identityKey,
-      "Winning Machine",
+      "Requested Retry",
     );
+  });
+
+  it("bounds registration retries when the remote identity lock stays busy", async () => {
+    const lockPath = `${machineIdentityPath(home)}.remote.lock`;
+    let releaseLock!: () => void;
+    let signalAcquired!: () => void;
+    const acquired = new Promise<void>((resolve) => { signalAcquired = resolve; });
+    const release = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const holder = withPrivateMutationLockAsync(
+      lockPath,
+      "remote identity",
+      async () => {
+        signalAcquired();
+        await release;
+      },
+    );
+    await acquired;
+    const waitForRetry = vi.fn(async () => undefined);
+
+    try {
+      await expect(registerMachine(
+        POSTGRESQL_CONFIG,
+        { displayName: "Machine A" },
+        {
+          ...deps,
+          remoteIdentityLockMaxAttempts: 2,
+          waitForRemoteIdentityLock: waitForRetry,
+        },
+      )).rejects.toMatchObject({
+        name: "MachineIdentityFileError",
+        message: expect.stringContaining("remained busy after 2 attempts"),
+        remediation: expect.stringContaining("lcm machine register"),
+      });
+      expect(waitForRetry).toHaveBeenCalledTimes(1);
+      expect(repository.registerMachine).not.toHaveBeenCalled();
+      expect(showMachine(deps)).toBeNull();
+    } finally {
+      releaseLock();
+      await holder;
+    }
   });
 
   it("requires PostgreSQL configuration before creating local registration state", async () => {
@@ -1339,6 +1389,32 @@ describe("identity service", () => {
     );
   });
 
+  it("idempotently relinks a symlink-created project using PostgreSQL lexical spelling", async () => {
+    await register();
+    const canonical = makeProject("remote-relink-created-symlink-target");
+    const entered = join(home, "remote-relink-created-symlink-entered");
+    symlinkSync(canonical, entered);
+    const created = await createProject(POSTGRESQL_CONFIG, entered, {}, deps);
+    repository.replaceProjectAliases.mockClear();
+
+    await expect(linkProject(
+      POSTGRESQL_CONFIG,
+      created.remote.projectId,
+      entered,
+      {},
+      deps,
+    )).resolves.toMatchObject({
+      local: { canonical, remoteProjectId: created.remote.projectId },
+      remoteAlias: { path: entered, normalizedPath: canonical },
+    });
+    expect(repository.replaceProjectAliases).toHaveBeenCalledWith({
+      machineId: MACHINE_ID,
+      projectId: created.remote.projectId,
+      aliases: [{ path: entered, normalizedPath: canonical }],
+      recoveryPath: entered,
+    });
+  });
+
   it("compensates when a committed batch omits the selected symlink identity", async () => {
     await register();
     const canonical = makeProject("remote-link-missing-selected-target");
@@ -1507,7 +1583,7 @@ describe("identity service", () => {
     const linked = makeProject("rebind-missing-alias");
     const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
     await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
-    await repository.unlinkProjectAliasIfOwned(MACHINE_ID, linked, PROJECT_A);
+    await repository.unlinkProjectAliasIfOwned(MACHINE_ID, linked, PROJECT_A, linked);
 
     await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_B, canonical, {}, deps))
       .resolves.toMatchObject({ local: { remoteProjectId: PROJECT_B } });
@@ -2335,6 +2411,7 @@ describe("identity service", () => {
       MACHINE_ID,
       occupied,
       PROJECT_A,
+      occupied,
     );
   });
 
@@ -2652,7 +2729,7 @@ describe("identity service", () => {
     const linked = makeProject("unlink-missing-alias");
     const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
     await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
-    await repository.unlinkProjectAliasIfOwned(MACHINE_ID, linked, PROJECT_A);
+    await repository.unlinkProjectAliasIfOwned(MACHINE_ID, linked, PROJECT_A, linked);
 
     await expect(unlinkProject(POSTGRESQL_CONFIG, canonical, deps))
       .resolves.toMatchObject({ hash: bound.local.id, aliasRemoved: false });
@@ -2680,8 +2757,13 @@ describe("identity service", () => {
     const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
     await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
     const originalUnlink = repository.unlinkProjectAliasIfOwned.getMockImplementation()!;
-    repository.unlinkProjectAliasIfOwned = vi.fn(async (machineId, normalizedPath, projectId) => {
-      const candidate = await originalUnlink(machineId, normalizedPath, projectId);
+    repository.unlinkProjectAliasIfOwned = vi.fn(async (
+      machineId,
+      normalizedPath,
+      projectId,
+      path,
+    ) => {
+      const candidate = await originalUnlink(machineId, normalizedPath, projectId, path);
       throw new PostgreSqlIdentityUnlinkPathOutcomeUnknownError(candidate);
     });
 
@@ -2690,8 +2772,13 @@ describe("identity service", () => {
 
     const absentAtCommit = makeProject("uncertain-unlink-null-candidate");
     await linkProject(POSTGRESQL_CONFIG, bound.local.id, absentAtCommit, {}, deps);
-    repository.unlinkProjectAliasIfOwned = vi.fn(async (machineId, path, projectId) => {
-      await originalUnlink(machineId, path, projectId);
+    repository.unlinkProjectAliasIfOwned = vi.fn(async (
+      machineId,
+      normalizedPath,
+      projectId,
+      path,
+    ) => {
+      await originalUnlink(machineId, normalizedPath, projectId, path);
       throw new PostgreSqlIdentityUnlinkPathOutcomeUnknownError(
         null,
         "unlinkProjectAliasIfOwned",
@@ -2791,7 +2878,7 @@ describe("identity service", () => {
     const linked = makeProject("unlink-absent-row-alias");
     const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
     await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
-    await repository.unlinkProjectAliasIfOwned(MACHINE_ID, linked, PROJECT_A);
+    await repository.unlinkProjectAliasIfOwned(MACHINE_ID, linked, PROJECT_A, linked);
     repository.unlinkProjectAliasIfOwned.mockClear();
 
     await expect(unlinkProject(POSTGRESQL_CONFIG, linked, deps))
@@ -3063,8 +3150,13 @@ describe("identity service", () => {
     const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
     await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
     const originalUnlink = repository.unlinkProjectAliasIfOwned.getMockImplementation()!;
-    repository.unlinkProjectAliasIfOwned = vi.fn(async (machineId, normalizedPath, projectId) => {
-      const removed = await originalUnlink(machineId, normalizedPath, projectId);
+    repository.unlinkProjectAliasIfOwned = vi.fn(async (
+      machineId,
+      normalizedPath,
+      projectId,
+      path,
+    ) => {
+      const removed = await originalUnlink(machineId, normalizedPath, projectId, path);
       addProjectAlias(makeProject("unlink-alias-concurrent-add"), { hash: bound.local.id });
       return removed;
     });
@@ -3083,8 +3175,13 @@ describe("identity service", () => {
     await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
     const expectedEntry = showProjectMapEntry(bound.local.id).entry;
     const originalUnlink = repository.unlinkProjectAliasIfOwned.getMockImplementation()!;
-    repository.unlinkProjectAliasIfOwned = vi.fn(async (machineId, normalizedPath, projectId) => {
-      const removed = await originalUnlink(machineId, normalizedPath, projectId);
+    repository.unlinkProjectAliasIfOwned = vi.fn(async (
+      machineId,
+      normalizedPath,
+      projectId,
+      path,
+    ) => {
+      const removed = await originalUnlink(machineId, normalizedPath, projectId, path);
       removeProjectAlias(linked, { hash: bound.local.id, expectedEntry });
       return removed;
     });
@@ -3114,8 +3211,8 @@ describe("identity service", () => {
       (resolve) => { unlinkReachedRepository = resolve; },
     );
     repository.unlinkProjectAliasIfOwned = vi.fn(
-      async (machineId, normalizedPath, projectId) => {
-        const removed = await originalUnlink(machineId, normalizedPath, projectId);
+      async (machineId, normalizedPath, projectId, path) => {
+        const removed = await originalUnlink(machineId, normalizedPath, projectId, path);
         unlinkReachedRepository();
         await unlinkGate;
         return removed;
@@ -3206,8 +3303,13 @@ describe("identity service", () => {
     const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
     await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
     const originalUnlink = repository.unlinkProjectAliasIfOwned.getMockImplementation()!;
-    repository.unlinkProjectAliasIfOwned = vi.fn(async (machineId, normalizedPath, projectId) => {
-      const removed = await originalUnlink(machineId, normalizedPath, projectId);
+    repository.unlinkProjectAliasIfOwned = vi.fn(async (
+      machineId,
+      normalizedPath,
+      projectId,
+      path,
+    ) => {
+      const removed = await originalUnlink(machineId, normalizedPath, projectId, path);
       writeFileSync(projectMapPath(), "{broken");
       return removed;
     });
@@ -3244,8 +3346,9 @@ describe("identity service", () => {
         machineId,
         normalizedPath,
         projectId,
+        path,
       ) => {
-        const removed = await originalUnlink(machineId, normalizedPath, projectId);
+        const removed = await originalUnlink(machineId, normalizedPath, projectId, path);
         writeFileSync(projectMapPath(), "{broken");
         return removed;
       });
@@ -3281,8 +3384,13 @@ describe("identity service", () => {
     const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
     await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
     const originalUnlink = repository.unlinkProjectAliasIfOwned.getMockImplementation()!;
-    repository.unlinkProjectAliasIfOwned = vi.fn(async (machineId, normalizedPath, projectId) => {
-      const removed = await originalUnlink(machineId, normalizedPath, projectId);
+    repository.unlinkProjectAliasIfOwned = vi.fn(async (
+      machineId,
+      normalizedPath,
+      projectId,
+      path,
+    ) => {
+      const removed = await originalUnlink(machineId, normalizedPath, projectId, path);
       writeFileSync(projectMapPath(), "{broken");
       return removed;
     });

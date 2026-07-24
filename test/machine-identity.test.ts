@@ -256,6 +256,14 @@ describe("machine identity file", () => {
     expect(() => readMachineIdentity(home)).toThrow("configured size limit");
   });
 
+  it("does not interpret compatibility mode bits as POSIX permissions on Windows", () => {
+    const pending = ensurePendingMachineIdentity("Windows Machine", home);
+    chmodSync(machineIdentityPath(home), 0o644);
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+
+    expect(readMachineIdentity(home)).toEqual(pending.identity);
+  });
+
   it("shell-quotes a hostile machine identity path in permission remediation", () => {
     const hostileHome = join(home, "home with ' quote `tick` $(subshell) --");
     const path = machineIdentityPath(hostileHome);

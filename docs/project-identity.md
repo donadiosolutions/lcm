@@ -258,6 +258,16 @@ idempotent recovery command. Restoration compares the expected PostgreSQL
 owner transactionally and stops for manual reconciliation if a concurrent
 operation has taken ownership of the path.
 
+Once PostgreSQL confirms a project create, that published project and its
+aliases are retained if the subsequent local map binding fails. LCM does not
+delete them because another LCM home may already have adopted the published
+identity. Reconcile the affected local path with the exact command reported by
+the error:
+
+```bash
+lcm project link -- <created-project-uuid> <entered-path>
+```
+
 Create readback also compares the alias owner with the exact candidate project
 UUID produced inside the uncertain transaction. A different project claiming
 the path is reported as a collision and is never adopted. Authorized rebinds

@@ -652,10 +652,36 @@ describe("PostgreSQL 18 machine and project identities", () => {
         machine.machineId,
         "/work/local-only",
         replacement.projectId,
+        "/work/local-only/.",
+      )).resolves.toBeNull();
+      await expect(repository.resolveProject(machine.machineId, "/work/local-only"))
+        .resolves.toMatchObject({
+          projectId: replacement.projectId,
+          alias: { path: "/work/local-only" },
+        });
+      await expect(repository.unlinkProjectAliasIfOwned(
+        machine.machineId,
+        "/work/local-only",
+        replacement.projectId,
+        "/work/local-only",
       )).resolves.toMatchObject({
         projectId: replacement.projectId,
         alias: { normalizedPath: "/work/local-only" },
       });
+      await expect(repository.unlinkProjectAliasesIfOwned(
+        machine.machineId,
+        replacement.projectId,
+        entryAliases.map((alias, index) => (
+          index === 0 ? { ...alias, path: `${alias.path}/.` } : alias
+        )),
+      )).resolves.toBeNull();
+      for (const alias of entryAliases.slice(0, 2)) {
+        await expect(repository.resolveProject(machine.machineId, alias.normalizedPath))
+          .resolves.toMatchObject({
+            projectId: replacement.projectId,
+            alias: { path: alias.path },
+          });
+      }
       const removed = await repository.unlinkProjectAliasesIfOwned(
         machine.machineId,
         replacement.projectId,
