@@ -1114,10 +1114,21 @@ describe("PostgreSQL migrations and database isolation", () => {
     try {
       expect(new Set(databases.map((database) => database.name)).size).toBe(3);
       await Promise.all(databases.map(async (database) => {
-        const forbidden = migration("0002_runtime_forbidden", "CREATE TABLE lcm.runtime_forbidden (id integer);");
+        const forbidden = migration(
+          "0003_runtime_forbidden",
+          "CREATE TABLE lcm.runtime_forbidden (id integer);",
+        );
         await expect(runPostgreSqlMigrations(database.runtime, {
           migrations: [...loadPostgreSqlMigrations(), forbidden],
-        })).rejects.toMatchObject({ backend: "postgresql" });
+        })).rejects.toMatchObject({
+          backend: "postgresql",
+          code: "STORAGE_INITIALIZATION_FAILED",
+          operation: "preflightSchemaOwnership",
+          ownedByMigrator: false,
+          requiredOwner: "lcm_test_runtime",
+          schemaExists: true,
+          schemaName: "lcm",
+        });
       }));
     } finally {
       await Promise.all(databases.map(async (database) => database.drop()));
