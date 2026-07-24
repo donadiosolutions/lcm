@@ -228,8 +228,9 @@ same exact path set with expected-owner checks instead of deleting every alias
 for the machine/project pair. Batch rebinds and unlinks read back every path
 after an uncertain commit before changing the local map, and batch restoration
 is all-or-nothing when a local map write fails.
-Created-project compensation removes only the exact first alias before deleting
-the project if it remains unreferenced. Project listings use one ordered
+Created-project compensation removes the complete exact alias set created for
+the local entry (its canonical path and every alias) before deleting the
+project if it remains unreferenced. Project listings use one ordered
 PostgreSQL snapshot so project and alias rows cannot come from different reads.
 
 Hooks remain successful when PostgreSQL identity or storage is unavailable.

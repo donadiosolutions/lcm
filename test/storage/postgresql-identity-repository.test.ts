@@ -1228,4 +1228,38 @@ describe("PostgreSQL identity repository", () => {
       text: expect.stringContaining("LEFT JOIN lcm.project_aliases"),
     }), expect.objectContaining({ operation: "listProjects" }));
   });
+
+  it("gets one project through a parameterized project-ID-filtered snapshot", async () => {
+    const secondAlias = {
+      ...aliasRow,
+      path: "/work/project-alias",
+      normalized_path: "/work/project-alias",
+    };
+    const db = executor(() => result([
+      { ...projectRow, ...aliasRow },
+      { ...projectRow, ...secondAlias },
+    ]));
+    const repository = new PostgreSqlIdentityRepository(db);
+
+    await expect(repository.getProject(projectRow.project_id)).resolves.toEqual(
+      expect.objectContaining({
+        projectId: projectRow.project_id,
+        aliases: [
+          expect.objectContaining({ normalizedPath: aliasRow.normalized_path }),
+          expect.objectContaining({ normalizedPath: secondAlias.normalized_path }),
+        ],
+      }),
+    );
+    expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining("WHERE project.project_id = $1"),
+      values: [projectRow.project_id],
+    }), {
+      domain: "identity",
+      operation: "getProject",
+      projectId: projectRow.project_id,
+    });
+
+    const missing = new PostgreSqlIdentityRepository(executor(() => result([])));
+    await expect(missing.getProject(projectRow.project_id)).resolves.toBeNull();
+  });
 });

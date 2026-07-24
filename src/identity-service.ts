@@ -128,6 +128,7 @@ export interface IdentityRepository {
     paths: readonly string[],
   ): Promise<RemoteAliasOwnership[]>;
   listProjects(): Promise<RemoteProject[]>;
+  getProject(projectId: string): Promise<RemoteProject | null>;
 }
 
 export interface IdentitySession {
@@ -341,6 +342,13 @@ function normalizeProjectDisplayName(value: string): string {
   return normalized;
 }
 
+function defaultProjectDisplayName(projectPath: string): string {
+  const inferred = basename(normalizeProjectPath(projectPath));
+  // Native path.basename returns an empty string for filesystem roots,
+  // including drive and share roots on Windows.
+  return inferred || "Filesystem root";
+}
+
 async function withSession<T>(
   config: ResolvedStorageConfig,
   deps: IdentityServiceDependencies,
@@ -469,8 +477,11 @@ export async function showProject(
   const shown = showProjectMapEntry(target);
   if (config.backend === "sqlite" || !shown.entry.remoteProjectId) return shown;
   const deps = dependencies(dependencyOverrides);
-  const projects = await withSession(config, deps, (repository) => repository.listProjects());
-  const remote = projects.find(({ projectId }) => projectId === shown.entry.remoteProjectId);
+  const remote = await withSession(
+    config,
+    deps,
+    (repository) => repository.getProject(shown.entry.remoteProjectId!),
+  );
   if (!remote) {
     throw new ProjectIdentityReconciliationError(
       `local project ${shown.hash} references missing PostgreSQL project ${shown.entry.remoteProjectId}`,
@@ -548,7 +559,7 @@ export async function createProject(
   const deps = dependencies(dependencyOverrides);
   const machine = requireMachineIdentity(deps.homeDir);
   const displayName = normalizeProjectDisplayName(
-    options.displayName ?? basename(normalizeProjectPath(projectPath)),
+    options.displayName ?? defaultProjectDisplayName(projectPath),
   );
   const local = resolveProjectIdentity(projectPath);
   if (local.remoteProjectId) {

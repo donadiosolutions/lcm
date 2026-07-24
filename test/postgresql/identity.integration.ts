@@ -306,6 +306,18 @@ describe("PostgreSQL 18 machine and project identities", () => {
           ],
         }),
       ]);
+      await expect(repository.getProject(project.projectId)).resolves.toEqual(
+        expect.objectContaining({
+          projectId: project.projectId,
+          aliases: [
+            expect.objectContaining({ machineId: machineA.machineId, path: "/srv/a/project" }),
+            expect.objectContaining({ machineId: machineB.machineId, path: "/opt/b/different-path" }),
+          ],
+        }),
+      );
+      await expect(
+        repository.getProject("018f22c4-6d2a-7f10-8a4c-6b8d3e5f9999"),
+      ).resolves.toBeNull();
     });
   });
 
@@ -643,6 +655,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
         resolveProjectAliasesByPath: repository.resolveProjectAliasesByPath.bind(repository),
         resolveProject: repository.resolveProject.bind(repository),
         listProjects: repository.listProjects.bind(repository),
+        getProject: repository.getProject.bind(repository),
       };
       try {
         await expect(createIdentityProject(config, projectPath, {}, {

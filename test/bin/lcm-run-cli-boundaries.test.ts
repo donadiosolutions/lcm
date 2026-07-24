@@ -344,6 +344,32 @@ describe("runCli identity boundaries", () => {
     expect(log).toHaveBeenCalledWith("  name: Remote Injected");
 
     log.mockClear();
+    state.projectLink.mockResolvedValueOnce({
+      local: {
+        id: "hash",
+        canonical: "/linked\u001b]8;;https://attacker.invalid\u0007click\u001b]8;;\u0007\nInjected",
+        aliases: [],
+        remoteProjectId: "remote-id",
+      },
+    });
+    await invoke(["project", "link", "remote-id"]);
+    expect(log).toHaveBeenCalledWith("Linked /linkedclick Injected");
+
+    log.mockClear();
+    state.projectCreate.mockResolvedValueOnce({
+      local: {
+        id: "hash",
+        canonical: "/created\u001b[31mred\u001b[0m\nInjected",
+        aliases: [],
+        remoteProjectId: "remote-id",
+      },
+      remote: { projectId: "remote-id", displayName: "Remote", aliases: [] },
+    });
+    await invoke(["project", "create"]);
+    expect(log).toHaveBeenCalledWith("  path: /createdred Injected");
+
+    log.mockClear();
+    write.mockClear();
     state.projectShow.mockResolvedValueOnce({
       hash: "hash",
       entry: {
@@ -358,6 +384,31 @@ describe("runCli identity boundaries", () => {
     expect(jsonOutput).toContain("\\nInjected");
     expect(jsonOutput).toContain("\\u001b]8;;https://attacker.invalid");
     expect(jsonOutput).toContain("\\u001b[31mred");
+
+    write.mockClear();
+    state.projectLink.mockResolvedValueOnce({
+      local: {
+        id: "hash",
+        canonical: "/linked\u001b]8;;https://attacker.invalid\u0007click\nInjected",
+        aliases: [],
+        remoteProjectId: "remote-id",
+      },
+    });
+    state.projectCreate.mockResolvedValueOnce({
+      local: {
+        id: "hash",
+        canonical: "/created\u001b[31mred\u001b[0m\nInjected",
+        aliases: [],
+        remoteProjectId: "remote-id",
+      },
+      remote: { projectId: "remote-id", displayName: "Remote", aliases: [] },
+    });
+    await invoke(["project", "link", "remote-id", "--json"]);
+    await invoke(["project", "create", "--json"]);
+    const mutationJsonOutput = write.mock.calls.map(([value]) => String(value)).join("");
+    expect(mutationJsonOutput).toContain("\\nInjected");
+    expect(mutationJsonOutput).toContain("\\u001b]8;;https://attacker.invalid");
+    expect(mutationJsonOutput).toContain("\\u001b[31mred");
   });
 
   it("renders every machine operation in text and JSON forms", async () => {

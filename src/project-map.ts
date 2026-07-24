@@ -70,6 +70,7 @@ const HASH_RE = /^[a-f0-9]{64}$/;
 const MAX_PROJECT_MAP_BYTES = 4 * 1024 * 1024;
 const MAX_PROJECT_MAP_LOCK_BYTES = 1024;
 let cache: { path: string; mtimeMs: number | null; map: ProjectMap; metadataPopulated: boolean } | null = null;
+const activeProjectMapMutationLocks = new Set<string>();
 
 type ProjectMapLockOwner = {
   readonly version: 1;
@@ -306,10 +307,11 @@ function withProjectMapMutationLock<T>(
   };
   const content = `${JSON.stringify(owner)}\n`;
   acquireProjectMapMutationLock(lockPath, content, observer);
+  activeProjectMapMutationLocks.add(lockPath);
   try {
-    cache = null;
     return callback();
   } finally {
+    activeProjectMapMutationLocks.delete(lockPath);
     if (readBoundedRegularFile(lockPath, {
       maxBytes: MAX_PROJECT_MAP_LOCK_BYTES,
       allowedRoot: dirname(lockPath),
@@ -453,7 +455,7 @@ function assertCurrentMapIsWritable(path: string): void {
   }
 }
 
-export function writeProjectMap(
+function writeProjectMap(
   map: ProjectMap,
   homeDir?: string,
   opts: { metadataPopulated?: boolean } = {},
@@ -500,7 +502,12 @@ function loadProjectMap(opts: { strict?: boolean; reload?: boolean; homeDir?: st
   }
 }
 
-function loadProjectMapWithMetadata(opts: { strict?: boolean; reload?: boolean; homeDir?: string } = {}): ProjectMap {
+function loadProjectMapWithMetadata(opts: {
+  strict?: boolean;
+  reload?: boolean;
+  homeDir?: string;
+  _beforeMetadataLockForTesting?: () => void;
+} = {}): ProjectMap {
   const path = projectMapPath(opts.homeDir);
   const map = loadProjectMap(opts);
   if (!opts.reload && cache?.path === path && cache.metadataPopulated) {
@@ -509,8 +516,25 @@ function loadProjectMapWithMetadata(opts: { strict?: boolean; reload?: boolean; 
 
   const populated = populateFromExistingProjectMetadata(map, opts.homeDir);
   if (populated.changed) {
-    writeProjectMap(populated.map, opts.homeDir, { metadataPopulated: true });
-    return populated.map;
+    if (activeProjectMapMutationLocks.has(projectMapMutationLockPath(opts.homeDir))) {
+      writeProjectMap(populated.map, opts.homeDir, { metadataPopulated: true });
+      return populated.map;
+    }
+    opts._beforeMetadataLockForTesting?.();
+    return withProjectMapMutationLock(() => {
+      const current = loadProjectMap({
+        strict: true,
+        reload: true,
+        homeDir: opts.homeDir,
+      });
+      const locked = populateFromExistingProjectMetadata(current, opts.homeDir);
+      if (locked.changed) {
+        writeProjectMap(locked.map, opts.homeDir, { metadataPopulated: true });
+      } else {
+        cache = { ...cache!, map: cloneMap(current), metadataPopulated: true };
+      }
+      return locked.map;
+    }, opts.homeDir);
   }
 
   cache = { ...cache!, map: cloneMap(map), metadataPopulated: true };
@@ -616,33 +640,65 @@ function existingProjectHasStoredData(hash: string): boolean {
     || existsSync(join(lcmHomeDir(), "events", `${hash}.db`));
 }
 
-export function resolveProjectIdentity(cwd: string): ProjectIdentity {
-  const map = loadProjectMapWithMetadata();
-
-  const normalized = normalizeProjectPath(cwd);
+function identityForMatches(
+  map: ProjectMap,
+  cwd: string,
+  normalized: string,
+): ProjectIdentity | null {
   const matches = findPathMatches(map, cwd);
   if (matches.size > 1) {
     throw new Error(`project path maps to multiple hashes: ${normalized} (${[...matches].join(", ")})`);
   }
-  if (matches.size === 1) {
-    const id = [...matches][0];
-    return {
-      id,
-      canonical: resolve(map[id].canonical),
-      ...(map[id].remoteProjectId ? { remoteProjectId: map[id].remoteProjectId } : {}),
-    };
-  }
-
-  const id = hashProjectPath(normalized);
-  if (!map[id]) {
-    map[id] = { canonical: normalized, aliases: [] };
-    writeProjectMap(map, undefined, { metadataPopulated: true });
-  }
+  if (matches.size === 0) return null;
+  const id = [...matches][0];
   return {
     id,
     canonical: resolve(map[id].canonical),
     ...(map[id].remoteProjectId ? { remoteProjectId: map[id].remoteProjectId } : {}),
   };
+}
+
+export function resolveProjectIdentity(
+  cwd: string,
+  opts: {
+    /** @internal Test-only synchronization seam for deterministic race coverage. */
+    readonly _beforeMissingEntryLockForTesting?: () => void;
+    /** @internal Test-only synchronization seam for metadata backfill coverage. */
+    readonly _beforeMetadataLockForTesting?: () => void;
+  } = {},
+): ProjectIdentity {
+  const map = loadProjectMapWithMetadata({
+    _beforeMetadataLockForTesting: opts._beforeMetadataLockForTesting,
+  });
+  const normalized = normalizeProjectPath(cwd);
+  const existing = identityForMatches(map, cwd, normalized);
+  if (existing) return existing;
+
+  opts._beforeMissingEntryLockForTesting?.();
+  const createMissingIdentity = (): ProjectIdentity => {
+    let current: ProjectMap;
+    try {
+      current = loadProjectMapWithMetadata({ strict: true, reload: true });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "map.json is invalid";
+      throw new Error(`refusing to overwrite invalid map.json: ${detail}`);
+    }
+    if (!existsSync(projectMapPath())) current = map;
+    const raced = identityForMatches(current, cwd, normalized);
+    if (raced) return raced;
+    const id = hashProjectPath(normalized);
+    current[id] ??= { canonical: normalized, aliases: [] };
+    writeProjectMap(current, undefined, { metadataPopulated: true });
+    return {
+      id,
+      canonical: resolve(current[id].canonical),
+      ...(current[id].remoteProjectId ? { remoteProjectId: current[id].remoteProjectId } : {}),
+    };
+  };
+  if (activeProjectMapMutationLocks.has(projectMapMutationLockPath())) {
+    return createMissingIdentity();
+  }
+  return withProjectMapMutationLock(createMissingIdentity);
 }
 
 export function listProjectMapEntries(): ProjectMap {
@@ -924,7 +980,7 @@ export function removeProjectAlias(alias: string, opts: {
   });
 }
 
-export function validateProjectMap(opts: { homeDir?: string; fix?: boolean } = {}): ProjectMapValidation {
+function validateProjectMapUnlocked(opts: { homeDir?: string; fix?: boolean }): ProjectMapValidation {
   const path = projectMapPath(opts.homeDir);
   const file = readMapFile(path);
   if (!file) {
@@ -978,7 +1034,13 @@ export function validateProjectMap(opts: { homeDir?: string; fix?: boolean } = {
   };
 }
 
-export function reloadProjectMapCache(opts: { reformat?: boolean } = {}): boolean {
+export function validateProjectMap(opts: { homeDir?: string; fix?: boolean } = {}): ProjectMapValidation {
+  return opts.fix
+    ? withProjectMapMutationLock(() => validateProjectMapUnlocked(opts), opts.homeDir)
+    : validateProjectMapUnlocked(opts);
+}
+
+function reloadProjectMapCacheUnlocked(opts: { reformat?: boolean }): boolean {
   const path = projectMapPath();
   const file = readMapFile(path);
   if (!file) {
@@ -998,6 +1060,12 @@ export function reloadProjectMapCache(opts: { reformat?: boolean } = {}): boolea
   } catch {
     return false;
   }
+}
+
+export function reloadProjectMapCache(opts: { reformat?: boolean } = {}): boolean {
+  return opts.reformat
+    ? withProjectMapMutationLock(() => reloadProjectMapCacheUnlocked(opts))
+    : reloadProjectMapCacheUnlocked(opts);
 }
 
 export function watchProjectMap(): { close: () => void } {

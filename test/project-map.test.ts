@@ -71,6 +71,21 @@ describe("project map", () => {
     }, null, 2) + "\n");
   });
 
+  it("does not lose a concurrent remote binding while auto-creating an entry", () => {
+    const canonical = makeDir("automatic-entry-binding-race");
+
+    const resolved = resolveProjectIdentity(canonical, {
+      _beforeMissingEntryLockForTesting: () => {
+        const concurrent = resolveProjectIdentity(canonical);
+        setRemoteProjectBinding(remoteProjectId, { hash: concurrent.id });
+      },
+    });
+
+    expect(resolved.remoteProjectId).toBe(remoteProjectId);
+    expect(resolveProjectIdentity(canonical).remoteProjectId).toBe(remoteProjectId);
+    expect(listProjectMapEntries()[resolved.id].remoteProjectId).toBe(remoteProjectId);
+  });
+
   it("resolves canonical and alias paths to the same project paths", () => {
     const canonical = makeDir("canonical");
     const alias = makeDir("alias");
@@ -727,6 +742,43 @@ describe("project map", () => {
     expect(map[hash]?.canonical).toBe(normalizeProjectPath(canonical));
   });
 
+  it("rechecks metadata under the mutation lock after a concurrent backfill", () => {
+    const canonical = makeDir("from-meta-race");
+    const hash = hashProjectPath(normalizeProjectPath(canonical));
+    mkdirSync(join(homedir(), ".lcm", "projects", hash), { recursive: true });
+    writeFileSync(
+      join(homedir(), ".lcm", "projects", hash, "meta.json"),
+      JSON.stringify({ cwd: canonical }),
+    );
+
+    const identity = resolveProjectIdentity(canonical, {
+      _beforeMetadataLockForTesting: () => {
+        expect(listProjectMapEntries()[hash]?.canonical).toBe(
+          normalizeProjectPath(canonical),
+        );
+      },
+    });
+
+    expect(identity.id).toBe(hash);
+    expect(listProjectMapEntries()[hash]?.canonical).toBe(normalizeProjectPath(canonical));
+  });
+
+  it("backfills metadata directly while an alias mutation already owns the lock", () => {
+    const canonical = makeDir("from-meta-during-alias");
+    const alias = makeDir("from-meta-during-alias-alias");
+    const hash = hashProjectPath(normalizeProjectPath(canonical));
+    mkdirSync(join(homedir(), ".lcm", "projects", hash), { recursive: true });
+    writeFileSync(
+      join(homedir(), ".lcm", "projects", hash, "meta.json"),
+      JSON.stringify({ cwd: canonical }),
+    );
+
+    const added = addProjectAlias(alias, { canonical });
+
+    expect(added.hash).toBe(hash);
+    expect(added.entry.aliases).toContain(normalizeProjectPath(alias));
+  });
+
   it("shows metadata-backed map entries by hash and path", () => {
     const canonical = makeDir("show-from-meta");
     const hash = hashProjectPath(normalizeProjectPath(canonical));
@@ -756,6 +808,17 @@ describe("project map", () => {
 
     expect(Object.keys(map)).toHaveLength(1);
     expect(validation.ok).toBe(true);
+  });
+
+  it("reports an absent map as a valid empty map", () => {
+    expect(validateProjectMap()).toEqual({
+      ok: true,
+      map: {},
+      path: projectMapPath(),
+      errors: [],
+      warnings: ["map.json does not exist yet"],
+      fixApplied: false,
+    });
   });
 
   it("reports invalid JSON without rewriting the map", () => {
@@ -802,6 +865,49 @@ describe("project map", () => {
     expect(() => resolveProjectIdentity(unseen)).toThrow(
       "refusing to overwrite invalid map.json: map.json is invalid",
     );
+  });
+
+  it("rejects a non-regular map file through the public read seam", () => {
+    const target = join(homedir(), "map-symlink-target.json");
+    writeFileSync(target, "{}");
+    symlinkSync(target, projectMapPath());
+
+    expect(() => listProjectMapEntries()).toThrow();
+  });
+
+  it("refuses an invalid edit made after a mutation snapshot", () => {
+    const canonical = makeDir("invalid-after-snapshot");
+    const local = resolveProjectIdentity(canonical);
+    const expectedEntry = showProjectMapEntry(local.id).entry;
+    const options = {
+      hash: local.id,
+      get expectedEntry() {
+        writeFileSync(projectMapPath(), "{not-json");
+        return expectedEntry;
+      },
+    };
+
+    expect(() => setRemoteProjectBinding(remoteProjectId, options))
+      .toThrow(/refusing to overwrite invalid map\.json/);
+    expect(readFileSync(projectMapPath(), "utf8")).toBe("{not-json");
+  });
+
+  it("normalizes a primitive parse failure after a mutation snapshot", () => {
+    const canonical = makeDir("primitive-invalid-after-snapshot");
+    const local = resolveProjectIdentity(canonical);
+    const expectedEntry = showProjectMapEntry(local.id).entry;
+    const options = {
+      hash: local.id,
+      get expectedEntry() {
+        vi.spyOn(JSON, "parse").mockImplementationOnce(() => {
+          throw "parse failed";
+        });
+        return expectedEntry;
+      },
+    };
+
+    expect(() => setRemoteProjectBinding(remoteProjectId, options))
+      .toThrow("refusing to overwrite invalid map.json: map.json is invalid");
   });
 
   it("keeps cached aliases when map.json temporarily disappears", () => {
@@ -1312,6 +1418,28 @@ describe("project map", () => {
     clearProjectMapCache();
 
     expect(resolveProjectIdentity(target)).toEqual({ id, canonical: normalizeProjectPath(other) });
+  });
+
+  it("cancels a pending map-watch reload when closed", async () => {
+    const idleWatcher = watchProjectMap();
+    idleWatcher.close();
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const mapWatcher = watchProjectMap();
+    try {
+      writeFileSync(projectMapPath(), "{}\n");
+      for (let attempt = 0; attempt < 100 && vi.getTimerCount() === 0; attempt += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      expect(vi.getTimerCount()).toBe(1);
+
+      mapWatcher.close();
+
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      mapWatcher.close();
+      vi.useRealTimers();
+    }
   });
 
   it("reloads map watches for directory creation, deletion, and file changes", async () => {

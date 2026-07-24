@@ -282,6 +282,40 @@ function aliasFromRow(row: AliasRow): RemoteProjectAlias {
   };
 }
 
+function projectsFromJoinRows(rows: readonly ProjectAliasJoinRow[]): RemoteProject[] {
+  const projects: Array<Omit<RemoteProject, "aliases"> & {
+    aliases: RemoteProjectAlias[];
+  }> = [];
+  for (const row of rows) {
+    let project = projects.at(-1);
+    if (project?.projectId !== row.project_id) {
+      project = {
+        projectId: row.project_id,
+        displayName: row.display_name,
+        createdAt: iso(row.created_at),
+        updatedAt: iso(row.updated_at),
+        aliases: [],
+      };
+      projects.push(project);
+    }
+    if (
+      row.machine_id !== null
+      && row.path !== null
+      && row.normalized_path !== null
+      && row.linked_at !== null
+    ) {
+      project.aliases.push(aliasFromRow({
+        ...row,
+        machine_id: row.machine_id,
+        path: row.path,
+        normalized_path: row.normalized_path,
+        linked_at: row.linked_at,
+      }));
+    }
+  }
+  return projects;
+}
+
 class PostgreSqlIdentityBatchConflictMarker extends StorageOperationError {
   constructor(projectId: string) {
     super(
@@ -971,36 +1005,27 @@ export class PostgreSqlIdentityRepository {
                       alias.machine_id,
                       alias.normalized_path`,
     }, { domain: "identity", operation: "listProjects" });
-    const projects: Array<Omit<RemoteProject, "aliases"> & {
-      aliases: RemoteProjectAlias[];
-    }> = [];
-    for (const row of joined.rows) {
-      let project = projects.at(-1);
-      if (project?.projectId !== row.project_id) {
-        project = {
-          projectId: row.project_id,
-          displayName: row.display_name,
-          createdAt: iso(row.created_at),
-          updatedAt: iso(row.updated_at),
-          aliases: [],
-        };
-        projects.push(project);
-      }
-      if (
-        row.machine_id !== null
-        && row.path !== null
-        && row.normalized_path !== null
-        && row.linked_at !== null
-      ) {
-        project.aliases.push(aliasFromRow({
-          ...row,
-          machine_id: row.machine_id,
-          path: row.path,
-          normalized_path: row.normalized_path,
-          linked_at: row.linked_at,
-        }));
-      }
-    }
-    return projects;
+    return projectsFromJoinRows(joined.rows);
+  }
+
+  async getProject(projectId: string): Promise<RemoteProject | null> {
+    const joined = await this.executor.query<ProjectAliasJoinRow>({
+      text: `SELECT project.project_id,
+                    project.display_name,
+                    project.created_at,
+                    project.updated_at,
+                    alias.machine_id,
+                    alias.path,
+                    alias.normalized_path,
+                    alias.linked_at
+             FROM lcm.projects AS project
+             LEFT JOIN lcm.project_aliases AS alias
+               ON alias.project_id = project.project_id
+             WHERE project.project_id = $1
+             ORDER BY alias.machine_id,
+                      alias.normalized_path`,
+      values: [projectId],
+    }, { domain: "identity", operation: "getProject", projectId });
+    return projectsFromJoinRows(joined.rows)[0] ?? null;
   }
 }

@@ -266,6 +266,7 @@ function fakeRepository(): IdentityRepository & {
     )),
     resolveProject: vi.fn(async (_machineId, normalizedPath) => aliases.get(normalizedPath) ?? null),
     listProjects: vi.fn(async () => [...projects.values()]),
+    getProject: vi.fn(async (projectId) => projects.get(projectId) ?? null),
   };
   Object.defineProperty(repository, "setNextProjectId", {
     value: (value: string) => { nextProjectId = value; },
@@ -395,11 +396,13 @@ describe("identity service", () => {
       .toMatchObject({ entry: { canonical: path } });
 
     setRemoteProjectBinding(PROJECT_A, { canonical: path });
-    repository.listProjects = vi.fn(async () => [remoteProject(PROJECT_A)]);
+    repository.getProject = vi.fn(async () => remoteProject(PROJECT_A));
     await expect(showProject(POSTGRESQL_CONFIG, path, deps))
       .resolves.toMatchObject({ remote: { projectId: PROJECT_A } });
+    expect(repository.getProject).toHaveBeenCalledWith(PROJECT_A);
+    expect(repository.listProjects).not.toHaveBeenCalled();
 
-    repository.listProjects = vi.fn(async () => []);
+    repository.getProject = vi.fn(async () => null);
     await expect(showProject(POSTGRESQL_CONFIG, path, deps))
       .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
   });
@@ -521,8 +524,17 @@ describe("identity service", () => {
     await expect(createProject(POSTGRESQL_CONFIG, file, {}, deps))
       .rejects.toThrow("must be an existing directory");
     await expect(createProject(POSTGRESQL_CONFIG, "/", {}, deps))
-      .rejects.toThrow("display name must not be blank");
+      .resolves.toMatchObject({ remote: { displayName: "Filesystem root" } });
+    expect(repository.createProject).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        displayName: "Filesystem root",
+        path: "/",
+        normalizedPath: "/",
+      }),
+    );
     const named = makeProject("validated-name");
+    await expect(createProject(POSTGRESQL_CONFIG, named, { displayName: "   " }, deps))
+      .rejects.toThrow("display name must not be blank");
     await expect(createProject(POSTGRESQL_CONFIG, named, { displayName: "bad\nname" }, deps))
       .rejects.toThrow("control characters");
     await expect(createProject(POSTGRESQL_CONFIG, named, { displayName: "x".repeat(257) }, deps))

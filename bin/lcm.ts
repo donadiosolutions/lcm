@@ -460,7 +460,7 @@ export function registerProjectCommand(program: Command): void {
           printJson(result);
           return;
         }
-        console.log(`Linked ${result.local.canonical}`);
+        console.log(`Linked ${sanitizeTerminalText(result.local.canonical)}`);
         console.log(`  local hash: ${result.local.id}`);
         if (result.local.remoteProjectId) {
           console.log(`  PostgreSQL project: ${result.local.remoteProjectId}`);
@@ -521,7 +521,7 @@ export function registerProjectCommand(program: Command): void {
         }
         console.log(`Created PostgreSQL project ${result.remote.projectId}`);
         console.log(`  local hash: ${result.local.id}`);
-        console.log(`  path: ${result.local.canonical}`);
+        console.log(`  path: ${sanitizeTerminalText(result.local.canonical)}`);
       } catch (err) {
         projectError(err, opts);
       }
