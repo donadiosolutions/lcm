@@ -43,11 +43,16 @@ type SchemaAclRow = QueryResultRow & {
 type ServerEncodingRow = QueryResultRow & { server_encoding: unknown };
 type ManagedObjectOwnershipRow = QueryResultRow & {
   current_user_name: unknown;
-  baseline_applied: unknown;
   expected_object_count: unknown;
   existing_object_count: unknown;
-  missing_object_count: unknown;
   unowned_object_count: unknown;
+};
+type ExpectedBaselineDefinitionInventory = {
+  readonly constraintIdentities: readonly string[];
+  readonly generatedColumnIdentities: readonly string[];
+  readonly indexNames: readonly string[];
+  readonly objectCount: number;
+  readonly triggerIdentities: readonly string[];
 };
 type BaselineDefinitionInventoryRow = QueryResultRow & {
   baseline_applied: unknown;
@@ -66,7 +71,7 @@ type IdentityFunctionFingerprintRow = QueryResultRow & {
 export const REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION = 18 as const;
 export const REQUIRED_POSTGRESQL_SERVER_ENCODING = "UTF8" as const;
 
-function expectedBaselineDefinitionInventory() {
+function expectedBaselineDefinitionInventory(): ExpectedBaselineDefinitionInventory {
 const EXPECTED_BASELINE_INDEX_NAMES = `
   project_aliases_project_idx conversations_project_order_idx conversations_session_lookup_idx
   messages_project_created_idx messages_search_document_idx messages_content_trgm_idx
@@ -691,25 +696,6 @@ export async function runPostgreSqlMigrations(
       throw new PostgreSqlSchemaAclPreflightError(aclSchemaExists, publicCreate);
     }
 
-    const ledger = await transaction.query<LedgerRow>({
-      text: "SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger_exists",
-    }, { domain: "factory", operation: "inspectMigrationLedger", signal: options.signal });
-    const current = ledger.rows[0]?.ledger_exists
-      ? (await transaction.query<MigrationRow>({
-        text: "SELECT id, checksum_sha256 FROM lcm.schema_migrations ORDER BY id",
-      }, { domain: "factory", operation: "readMigrations", signal: options.signal })).rows
-      : [];
-
-    if (current.length > migrations.length) throw migrationError("verifyMigrationHistory");
-    for (let index = 0; index < current.length; index += 1) {
-      const expected = migrations[index];
-      const applied = current[index];
-      if (!expected || applied.id !== expected.id || applied.checksum_sha256 !== expected.sha256) {
-        throw migrationError("verifyMigrationHistory");
-      }
-    }
-    const baselineApplied = current.some(({ id }) => id === "0002_schema_baseline");
-
     const managedOwnership = await transaction.query<ManagedObjectOwnershipRow>({
       text: `WITH migration_role AS (
                SELECT role.oid
@@ -798,36 +784,23 @@ export async function runPostgreSqlMigrations(
                  AND configuration.cfgname OPERATOR(pg_catalog.=) 'search_v1'
              )
              SELECT CURRENT_USER::pg_catalog.text AS current_user_name,
-                    $1::pg_catalog.bool AS baseline_applied,
                     36::pg_catalog.int4 AS expected_object_count,
                     pg_catalog.count(*)::pg_catalog.int4 AS existing_object_count,
-                    CASE
-                      WHEN $1::pg_catalog.bool
-                        THEN (36 - pg_catalog.count(*))::pg_catalog.int4
-                      ELSE 0::pg_catalog.int4
-                    END AS missing_object_count,
                     pg_catalog.count(*) FILTER (
                       WHERE managed_objects.owner_oid OPERATOR(pg_catalog.<>) migration_role.oid
                     )::pg_catalog.int4 AS unowned_object_count
              FROM managed_objects
              CROSS JOIN migration_role`,
-      values: [baselineApplied],
     }, {
       domain: "factory",
       operation: "preflightManagedObjectOwnership",
       signal: options.signal,
     });
-    const catalogBaselineApplied = sanitizeBoolean(
-      managedOwnership.rows[0]?.baseline_applied,
-    );
     const expectedObjectCount = sanitizeNonnegativeCount(
       managedOwnership.rows[0]?.expected_object_count,
     );
     const existingObjectCount = sanitizeNonnegativeCount(
       managedOwnership.rows[0]?.existing_object_count,
-    );
-    const missingObjectCount = sanitizeNonnegativeCount(
-      managedOwnership.rows[0]?.missing_object_count,
     );
     const unownedObjectCount = sanitizeNonnegativeCount(
       managedOwnership.rows[0]?.unowned_object_count,
@@ -836,21 +809,49 @@ export async function runPostgreSqlMigrations(
       managedOwnership.rows[0]?.current_user_name,
     );
     if (
-      catalogBaselineApplied === null
-      || catalogBaselineApplied !== baselineApplied
-      || expectedObjectCount !== 36
+      expectedObjectCount !== 36
       || existingObjectCount === null
-      || missingObjectCount === null
+      || existingObjectCount > expectedObjectCount
       || unownedObjectCount === null
-      || (baselineApplied && existingObjectCount + missingObjectCount !== expectedObjectCount)
-      || missingObjectCount !== 0
       || unownedObjectCount > existingObjectCount
       || unownedObjectCount !== 0
       || managedRequiredOwner === null
       || managedRequiredOwner !== requiredOwner
     ) {
       throw new PostgreSqlManagedObjectOwnershipPreflightError(
-        catalogBaselineApplied,
+        null,
+        expectedObjectCount,
+        existingObjectCount,
+        null,
+        unownedObjectCount,
+        managedRequiredOwner,
+      );
+    }
+
+    const ledger = await transaction.query<LedgerRow>({
+      text: "SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger_exists",
+    }, { domain: "factory", operation: "inspectMigrationLedger", signal: options.signal });
+    const current = ledger.rows[0]?.ledger_exists
+      ? (await transaction.query<MigrationRow>({
+        text: "SELECT id, checksum_sha256 FROM lcm.schema_migrations ORDER BY id",
+      }, { domain: "factory", operation: "readMigrations", signal: options.signal })).rows
+      : [];
+
+    if (current.length > migrations.length) throw migrationError("verifyMigrationHistory");
+    for (let index = 0; index < current.length; index += 1) {
+      const expected = migrations[index];
+      const applied = current[index];
+      if (!expected || applied.id !== expected.id || applied.checksum_sha256 !== expected.sha256) {
+        throw migrationError("verifyMigrationHistory");
+      }
+    }
+    const baselineApplied = current.some(({ id }) => id === "0002_schema_baseline");
+    const missingObjectCount = baselineApplied
+      ? expectedObjectCount - existingObjectCount
+      : 0;
+    if (missingObjectCount !== 0) {
+      throw new PostgreSqlManagedObjectOwnershipPreflightError(
+        baselineApplied,
         expectedObjectCount,
         existingObjectCount,
         missingObjectCount,

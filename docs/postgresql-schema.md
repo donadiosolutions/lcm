@@ -21,7 +21,10 @@ does not add row-level security.
   insufficient and fails the ownership preflight without changing the schema.
   A supported `lcm` schema must also not grant `CREATE` to `PUBLIC`; every
   migration run checks the exact catalog ACL under the advisory lock before
-  ledger inspection, and the immutable baseline repeats the defense before its
+  ledger inspection. The same catalog-only phase verifies ownership of every
+  existing allowlisted LCM object, including the migration ledger, before any
+  ledger row is read; baseline completeness is checked after the applied
+  history is known. The immutable baseline repeats the ACL defense before its
   owned DDL. Either check aborts without changing the schema ACL. The baseline revokes
   privileges from `PUBLIC` on an explicit list of the 23 domain tables, the
   migration ledger, six generated identity sequences, and

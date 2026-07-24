@@ -364,6 +364,32 @@ describe("PostgreSQL migrations and database isolation", () => {
     }
   });
 
+  it("reports ledger ownership drift before reading the ledger", async () => {
+    await withPostgreSqlTestDatabase("ledger-owner-drift", async (database) => {
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+      try {
+        await admin.query({
+          text: "ALTER TABLE lcm.schema_migrations OWNER TO lcm_harness_admin",
+        }, { domain: "factory", operation: "driftMigrationLedgerOwner" });
+        await expect(runPostgreSqlMigrations(database.migrator))
+          .rejects.toMatchObject({
+            baselineApplied: null,
+            existingObjectCount: 36,
+            missingObjectCount: null,
+            operation: "preflightManagedObjectOwnership",
+            requiredOwner: "lcm_test_migrator",
+            schemaName: "lcm",
+            unownedObjectCount: 1,
+          });
+      } finally {
+        await admin.query({
+          text: "ALTER TABLE lcm.schema_migrations OWNER TO lcm_test_migrator",
+        }, { domain: "factory", operation: "restoreMigrationLedgerOwner" });
+        await admin.close();
+      }
+    });
+  });
+
   it("rechecks ownership of every managed object class while ignoring unknown objects", async () => {
     await withPostgreSqlTestDatabase("managed-owner-drift", async (database) => {
       const admin = new PostgreSqlRuntime(settings(database.adminUrl));

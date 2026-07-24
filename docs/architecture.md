@@ -72,8 +72,11 @@ no ownership is changed automatically. Every run rejects a schema that grants
 repeats the guard before its owned DDL. Under the same lock, every run also
 verifies that the current migrator still owns each known LCM table, identity
 sequence, helper or trigger function, text-search dictionary, and text-search
-configuration that exists. Unknown schema objects are outside that exact
-catalog allowlist and are neither rejected nor changed.
+configuration that exists before reading any ledger rows. This catalog-only
+phase therefore returns structured ownership diagnostics even when the ledger
+table itself has drifted to another owner. Baseline completeness is evaluated
+after the applied history is known. Unknown schema objects are outside that
+exact catalog allowlist and are neither rejected nor changed.
 After the baseline is recorded, it also verifies the explicit existence and
 canonical definitions of all allowlisted secondary indexes, triggers, and
 constraints, plus every stored generated-column expression; indexes must remain

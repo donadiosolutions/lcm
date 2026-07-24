@@ -295,8 +295,8 @@ describe("PostgreSQL migration runner", () => {
       "revalidateRequiredExtensionCatalog",
       "preflightSchemaOwnership",
       "preflightSchemaAcl",
-      "inspectMigrationLedger",
       "preflightManagedObjectOwnership",
+      "inspectMigrationLedger",
       "preflightBaselineDefinitions",
       "preflightIdentityFunctionDefinitions",
       "applyMigration:0001_first",
@@ -671,7 +671,6 @@ describe("PostgreSQL migration runner", () => {
       "revalidateRequiredExtensionCatalog",
       "preflightSchemaOwnership",
       "preflightSchemaAcl",
-      "inspectMigrationLedger",
       "preflightManagedObjectOwnership",
     ]);
     const ownershipCall = fake.seam.query.mock.calls.find(([, context]) => (
