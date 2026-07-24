@@ -843,6 +843,29 @@ describe("PostgreSQL migrations and database isolation", () => {
     });
   });
 
+  it("rejects inheritance relationships involving managed tables", async () => {
+    await withPostgreSqlTestDatabase("table-inheritance-drift", async (database) => {
+      try {
+        await database.migrator.query({
+          text: "CREATE TABLE lcm.projects_inheritance_probe () INHERITS (lcm.projects)",
+        }, { domain: "factory", operation: "createManagedTableInheritance" });
+        await expect(runPostgreSqlMigrations(database.migrator))
+          .rejects.toMatchObject({
+            baselineApplied: true,
+            driftedDefinitionGroupCount: 1,
+            expectedObjectCount: 723,
+            existingObjectCount: 723,
+            missingObjectCount: 0,
+            operation: "preflightBaselineDefinitions",
+          });
+      } finally {
+        await database.migrator.query({
+          text: "DROP TABLE IF EXISTS lcm.projects_inheritance_probe",
+        }, { domain: "factory", operation: "dropManagedTableInheritance" });
+      }
+    });
+  });
+
   it("rejects relation ACL drift", async () => {
     await withPostgreSqlTestDatabase("relation-acl-drift", async (database) => {
       await database.migrator.query({

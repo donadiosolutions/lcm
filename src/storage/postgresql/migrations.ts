@@ -400,7 +400,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       index: "16e10e2a4fc080f52b11315ee2b03d5df258d216f293bb0051b56beb16035374",
       ordinaryColumn: "1cca7e1d3a1143074cb2eb2b809e816a2f4d1e06feba1e1b6bac46f8a725c487",
       relationAcl: "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
-      table: "46e5fa830f718f92b845942ef96f545177cd337b0b8103f3691014804068a109",
+      table: "5ccf4137ba8c1dbe8462176414b89f30616b26622d9680d77c5e2ae271d2f64d",
       trigger: "2c858da82c9238186861e0bcd184952ff941c7233f98a16083b20e6528006fb9",
     },
     identityFunctions: [
@@ -705,7 +705,11 @@ export class PostgreSqlSchemaAclPreflightError extends StorageOperationError {
 
 export class PostgreSqlSchemaSnapshotRegistryError extends StorageOperationError {
   constructor(
-    readonly reason: "duplicate_migration_id" | "unknown_migration_id",
+    readonly reason:
+      | "duplicate_identity_function"
+      | "duplicate_migration_id"
+      | "identity_function_mismatch"
+      | "unknown_migration_id",
     readonly migrationId: string,
   ) {
     super(
@@ -715,9 +719,16 @@ export class PostgreSqlSchemaSnapshotRegistryError extends StorageOperationError
       "factory",
       "validateSchemaSnapshotRegistry",
     );
-    this.message = reason === "duplicate_migration_id"
-      ? `PostgreSQL schema snapshot registry contains duplicate migrationId ${migrationId}`
-      : `PostgreSQL schema snapshot registry references unknown migrationId ${migrationId}`;
+    this.message = {
+      duplicate_identity_function:
+        `PostgreSQL schema snapshot ${migrationId} contains duplicate identity function names`,
+      duplicate_migration_id:
+        `PostgreSQL schema snapshot registry contains duplicate migrationId ${migrationId}`,
+      identity_function_mismatch:
+        `PostgreSQL schema snapshot ${migrationId} identity functions do not match managed zero-argument functions`,
+      unknown_migration_id:
+        `PostgreSQL schema snapshot registry references unknown migrationId ${migrationId}`,
+    }[reason];
   }
 
   override toJSON(): Record<string, unknown> {
@@ -821,6 +832,30 @@ function validateSchemaSnapshotRegistry(
     if (!migrationIds.has(snapshot.migrationId)) {
       throw new PostgreSqlSchemaSnapshotRegistryError(
         "unknown_migration_id",
+        snapshot.migrationId,
+      );
+    }
+    const identityFunctionNames = snapshot.identityFunctions.map(({ name }) => name);
+    if (new Set(identityFunctionNames).size !== identityFunctionNames.length) {
+      throw new PostgreSqlSchemaSnapshotRegistryError(
+        "duplicate_identity_function",
+        snapshot.migrationId,
+      );
+    }
+    const managedZeroArgumentFunctions = snapshot.managedObjectIdentities
+      .filter((identity) => identity.startsWith("function|"))
+      .map((identity) => identity.split("|"))
+      .filter(([, , argumentsIdentity]) => argumentsIdentity === "")
+      .map(([, name]) => name!)
+      .sort();
+    if (
+      identityFunctionNames.length !== managedZeroArgumentFunctions.length
+      || [...identityFunctionNames].sort().some(
+        (name, index) => name !== managedZeroArgumentFunctions[index],
+      )
+    ) {
+      throw new PostgreSqlSchemaSnapshotRegistryError(
+        "identity_function_mismatch",
         snapshot.migrationId,
       );
     }
@@ -1337,7 +1372,20 @@ export async function runPostgreSqlMigrations(
                         relation.relpersistence::pg_catalog.text AS persistence,
                         relation.relrowsecurity::pg_catalog.text AS row_security,
                         relation.relforcerowsecurity::pg_catalog.text
-                          AS force_row_security
+                          AS force_row_security,
+                        relation.relispartition::pg_catalog.text AS is_partition,
+                        EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_inherits AS inheritance
+                          WHERE inheritance.inhrelid OPERATOR(pg_catalog.=)
+                            relation.oid
+                        )::pg_catalog.text AS has_parent,
+                        EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_inherits AS inheritance
+                          WHERE inheritance.inhparent OPERATOR(pg_catalog.=)
+                            relation.oid
+                        )::pg_catalog.text AS has_child
                  FROM pg_catalog.pg_class AS relation
                  JOIN pg_catalog.pg_namespace AS namespace
                    ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
@@ -1604,7 +1652,10 @@ export async function runPostgreSqlMigrations(
                                   table_name,
                                   persistence,
                                   row_security,
-                                  force_row_security
+                                  force_row_security,
+                                  is_partition,
+                                  has_parent,
+                                  has_child
                                 ),
                                 E'\\n'
                                 ORDER BY table_name

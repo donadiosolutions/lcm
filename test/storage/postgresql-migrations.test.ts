@@ -277,7 +277,10 @@ describe("PostgreSQL migration runner", () => {
         sha256: `${name}-sha256`,
       })),
       indexNames: Array.from({ length: counts[0] }, (_, index) => `i${index}`),
-      managedObjectIdentities: [`table|${migrationId}`],
+      managedObjectIdentities: [
+        `table|${migrationId}`,
+        ...identityFunctionNames.map((name) => `function|${name}|`),
+      ],
       migrationId,
       ordinaryColumnIdentities:
         Array.from({ length: counts[8] }, (_, index) => `t|o${index}`),
@@ -446,6 +449,30 @@ describe("PostgreSQL migration runner", () => {
         "unknown_migration_id",
         "0003_unknown_snapshot",
         "PostgreSQL schema snapshot registry references unknown migrationId 0003_unknown_snapshot",
+      ],
+      [
+        [{
+          ...snapshot,
+          identityFunctions: [
+            snapshot.identityFunctions[0]!,
+            snapshot.identityFunctions[0]!,
+          ],
+        }],
+        "duplicate_identity_function",
+        snapshot.migrationId,
+        `PostgreSQL schema snapshot ${snapshot.migrationId} contains duplicate identity function names`,
+      ],
+      [
+        [{
+          ...snapshot,
+          identityFunctions: [{
+            ...snapshot.identityFunctions[0]!,
+            name: "unexpected_identity_function",
+          }],
+        }],
+        "identity_function_mismatch",
+        snapshot.migrationId,
+        `PostgreSQL schema snapshot ${snapshot.migrationId} identity functions do not match managed zero-argument functions`,
       ],
     ] as const) {
       const fake = executor();
@@ -1005,6 +1032,8 @@ describe("PostgreSQL migration runner", () => {
       "relation.relpersistence",
       "relation.relrowsecurity",
       "relation.relforcerowsecurity",
+      "relation.relispartition",
+      "pg_catalog.pg_inherits",
       "trigger.tgenabled",
       "trigger.tgconstraint",
       "object_name",

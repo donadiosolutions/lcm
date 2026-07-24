@@ -168,7 +168,8 @@ It fingerprints all six generated identity sequences by type, increment,
 minimum, maximum, start, cache, cycle state, internal identity dependency, and
 owning table/column.
 It also requires all 24 allowlisted tables to remain ordinary permanent tables
-with both row-level-security flags disabled, and fingerprints the complete
+with both row-level-security flags disabled and no inheritance or partition
+parent/child relationships, and fingerprints the complete
 effective ACL of every allowlisted table and identity sequence. ACL comparison
 expands PostgreSQL default ACLs when the
 stored ACL is null and normalizes only the owning role, so explicit owner-only

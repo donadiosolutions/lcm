@@ -98,7 +98,8 @@ its internal enforcement triggers and binds each name to its definition.
 Ordinary columns retain type, nullability, default, identity, and resolved
 collation metadata; generated columns retain their formatted type, nullability,
 generated state, fully deparsed expression, and resolved collation. Tables must remain permanent with
-row-level security neither enabled nor forced.
+row-level security neither enabled nor forced, and cannot participate in
+inheritance or partition parent/child relationships.
 Effective relation ACLs normalize only the owner, so added `PUBLIC` or named
 role privileges and grant options fail closed while null and explicit
 owner-only defaults compare equally.

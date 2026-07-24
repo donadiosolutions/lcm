@@ -103,7 +103,8 @@ does not add row-level security.
   namespace-qualified collation. Table fingerprints require ordinary permanent
   persistence with row-level security disabled and not forced, so `UNLOGGED`,
   temporary, `ENABLE ROW LEVEL SECURITY`, or `FORCE ROW LEVEL SECURITY` drift
-  fails closed. Relation ACL
+  fails closed. The same fingerprint rejects any inheritance or partition
+  parent/child relationship involving a managed table. Relation ACL
   fingerprints expand the effective ACL, including PostgreSQL's default ACL
   when `relacl` is null, and normalize only the owning role. `PUBLIC`, named
   role, privilege, grant-option, foreign-grantor, or missing-owner drift on any
