@@ -14,7 +14,7 @@ import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
 import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
-import { closeRouteStorage } from "./storage-lifecycle.js";
+import { closeRouteStorage, storageRouteFailureResponse } from "./storage-lifecycle.js";
 
 function isParsedMessage(value: unknown): value is ParsedMessage {
   if (!value || typeof value !== "object") return false;
@@ -70,6 +70,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
 
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
+    let activeFactory: StorageBackendFactory | undefined;
     try {
       const identity = projectIdentity(cwd, config.storage);
       ensureProjectDir(cwd);
@@ -77,8 +78,8 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         config.security?.sensitivePatterns ?? [],
         paths.dir,
       );
-      const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await factory.openProject(identity);
+      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+      project = await activeFactory.openProject(identity);
       const ingest = await project.transaction(async (repositories) => {
         const row = await repositories.coordination.getSessionIngest(session_id);
         if (row && parsed.length <= row.messageCount) return null;
@@ -148,6 +149,11 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       });
     } catch (err) {
       await safeLogError("ingest", err, { cwd, sessionId: session_id });
+      const storageFailure = storageRouteFailureResponse(activeFactory, err, "ingest");
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
+        return;
+      }
       sendJson(res, 500, { error: "ingest failed", code: "INGEST_FAILED" });
     } finally {
       await closeRouteStorage(project, ownedFactory);

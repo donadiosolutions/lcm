@@ -247,6 +247,27 @@ describe("handleUserPromptSubmit", () => {
     expect(failed.stdout).toContain("<learning-instruction>");
   });
 
+  it("keeps the prompt hook successful when prompt-search reports staged PostgreSQL", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    mockExtractUserPromptEvents.mockReturnValue([]);
+    const stagedError = Object.assign(new Error("request failed with status 503"), {
+      status: 503,
+      body: {
+        code: "STORAGE_BACKEND_STAGED",
+        storageBackend: "postgresql",
+      },
+    });
+
+    const result = await handleUserPromptSubmit(
+      JSON.stringify({ prompt: "hello", session_id: "s1", cwd: "/project" }),
+      asDaemonClient({ post: vi.fn().mockRejectedValue(stagedError) }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("<learning-instruction>");
+    expect(result.stdout).not.toContain("STORAGE_BACKEND_STAGED");
+  });
+
   it("handles empty stdin and logs extraction errors using the environment cwd", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     expect((await handleUserPromptSubmit("", asDaemonClient({ post: vi.fn() }))).stdout).toContain("<learning-instruction>");

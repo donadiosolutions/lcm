@@ -694,7 +694,7 @@ export class PostgreSqlIdentityRepository {
         return candidate;
       }, { domain: "identity", operation: "unlinkProjectAliasIfOwned", projectId });
     } catch (error) {
-      if (error instanceof PostgreSqlCommitOutcomeUnknownError && candidate !== undefined) {
+      if (error instanceof PostgreSqlCommitOutcomeUnknownError && candidate != null) {
         throw new PostgreSqlIdentityUnlinkPathOutcomeUnknownError(
           candidate,
           "unlinkProjectAliasIfOwned",

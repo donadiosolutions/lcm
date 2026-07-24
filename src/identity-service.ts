@@ -265,6 +265,18 @@ function lexicalEntryPaths(entry: ProjectMapEntry): string[] {
   return [...new Set([entry.canonical, ...entry.aliases].map((path) => resolve(path)))];
 }
 
+function projectEntryMatchesCompletedUnbind(
+  current: ProjectMapEntry,
+  expected: ProjectMapEntry,
+): boolean {
+  const currentAliases = current.aliases.map((path) => resolve(path)).sort();
+  const expectedAliases = expected.aliases.map((path) => resolve(path)).sort();
+  return current.remoteProjectId === undefined
+    && resolve(current.canonical) === resolve(expected.canonical)
+    && currentAliases.length === expectedAliases.length
+    && currentAliases.every((path, index) => path === expectedAliases[index]);
+}
+
 async function resolveStoredRemoteAliases(
   repository: IdentityRepository,
   machineId: string,
@@ -395,7 +407,9 @@ export async function registerMachine(
     requestedDisplayName,
     deps.homeDir,
   );
-  const displayName = requestedDisplayName ?? pending.identity.displayName;
+  const displayName = pending.identity.machineId === null
+    ? pending.identity.displayName
+    : requestedDisplayName ?? pending.identity.displayName;
   return withSession(config, deps, async (repository) => {
     const registered = await repository.registerMachine(
       pending.identity.identityKey,
@@ -1088,6 +1102,21 @@ export async function unlinkProject(
           expectedEntry: shown.entry,
         });
       } catch (error) {
+        try {
+          const current = showProjectMapEntry(shown.hash);
+          if (
+            !current.transient
+            && projectEntryMatchesCompletedUnbind(current.entry, shown.entry)
+          ) {
+            return {
+              hash: shown.hash,
+              remoteProjectId: shown.entry.remoteProjectId,
+              aliasRemoved: false,
+            };
+          }
+        } catch {
+          // An unreadable or conflicting local map still requires remote restoration.
+        }
         try {
           const restored = await restoreRemoteUnlinkedAliases(
             repository,

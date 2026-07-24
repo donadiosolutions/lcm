@@ -29,7 +29,7 @@ import {
 } from "../summarizer.js";
 import { validateCwd } from "../validate-cwd.js";
 import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
-import { closeRouteStorage } from "./storage-lifecycle.js";
+import { closeRouteStorage, storageRouteFailureResponse } from "./storage-lifecycle.js";
 
 interface CompactRequestBody {
   session_id: string;
@@ -174,6 +174,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
   return async (_req, res, body) => {
     let parsed: unknown;
     let ownedFactory: StorageBackendFactory | undefined;
+    let activeFactory: StorageBackendFactory | undefined;
     try {
       parsed = JSON.parse(body || "{}");
     } catch {
@@ -312,10 +313,10 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
           paths.dir,
         );
 
-        const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
         let project: ProjectStorage | undefined;
         try {
-          project = await factory.openProject(identity);
+          project = await activeFactory.openProject(identity);
           const conversation = await project.conversations.getOrCreateConversation(session_id);
 
           // Ingest new messages from the transcript into the DB.
@@ -457,6 +458,11 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
 
       sendJson(res, 200, result);
     } catch (err) {
+      const storageFailure = storageRouteFailureResponse(activeFactory, err, "compact");
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
+        return;
+      }
       sendJson(res, 500, { error: err instanceof Error ? err.message : "compact failed" });
     } finally {
       await closeRouteStorage(undefined, ownedFactory);

@@ -9,6 +9,7 @@ import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
 import { projectDbPath } from "../../src/daemon/project.js";
 import { recoverMachineIdentity } from "../../src/machine-identity.js";
+import { UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
 import {
   clearProjectMapCache,
   hashProjectPath,
@@ -85,7 +86,11 @@ describe("daemon server", () => {
       {
         storage: { backend: "postgresql" },
         daemon: { port: 0, idleTimeoutMs: 0 },
-        llm: { provider: "disabled" },
+        llm: {
+          provider: "openai",
+          model: "local-test",
+          baseURL: "http://127.0.0.1:11435/v1",
+        },
       },
       {
         LCM_POSTGRES_URL: "postgresql://user:secret@db.example.test/lcm",
@@ -125,10 +130,15 @@ describe("daemon server", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ cwd: tempHome, text: "remember" }),
     });
-    expect(storeResponse.status).toBe(500);
-    const store = await storeResponse.json() as { error: string };
-    expect(store.error).toContain("has no PostgreSQL binding");
-    expect(store.error).not.toContain("storage initialization failed");
+    expect(storeResponse.status).toBe(409);
+    const store = await storeResponse.json() as Record<string, unknown>;
+    expect(store).toEqual({
+      code: "STORAGE_IDENTITY_REQUIRED",
+      storageBackend: "postgresql",
+      error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+    });
+    expect(JSON.stringify(store)).not.toContain(tempHome!);
+    expect(JSON.stringify(store)).not.toContain("storage initialization failed");
 
     const manualReadRequests = [
       { path: "/search", operation: "search", body: { cwd: tempHome, query: "remember" } },
@@ -145,10 +155,10 @@ describe("daemon server", () => {
       });
       expect(response.status).toBe(409);
       const identityRequired = await response.json() as Record<string, unknown>;
-      expect(identityRequired).toMatchObject({
+      expect(identityRequired).toEqual({
         code: "STORAGE_IDENTITY_REQUIRED",
         storageBackend: "postgresql",
-        error: expect.stringContaining("has no PostgreSQL binding"),
+        error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
       });
       expect(JSON.stringify(identityRequired)).not.toContain(tempHome);
       expect(JSON.stringify(identityRequired)).not.toContain("secret");
@@ -191,6 +201,54 @@ describe("daemon server", () => {
         error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
         storageBackend: "postgresql",
       });
+      expect(JSON.stringify(unavailable)).not.toContain("secret");
+    }
+
+    const stagedProjectRequests = [
+      {
+        path: "/compact",
+        operation: "compact",
+        body: { cwd: tempHome, session_id: "s1", skip_ingest: true },
+      },
+      { path: "/store", operation: "store", body: { cwd: tempHome, text: "remember" } },
+      { path: "/promote", operation: "promote", body: { cwd: tempHome } },
+      { path: "/restore", operation: "restore", body: { cwd: tempHome, session_id: "s1" } },
+      {
+        path: "/ingest",
+        operation: "ingest",
+        body: {
+          cwd: tempHome,
+          session_id: "s1",
+          messages: [{ role: "user", content: "remember", tokenCount: 1 }],
+        },
+      },
+      {
+        path: "/session-complete",
+        operation: "session-complete",
+        body: { cwd: tempHome, session_id: "s1" },
+      },
+      { path: "/review-stale", operation: "review-stale", body: { cwd: tempHome } },
+      {
+        path: "/prompt-search",
+        operation: "prompt-search",
+        body: { cwd: tempHome, query: "remember" },
+      },
+      { path: "/promote-events", operation: "promote-events", body: { cwd: tempHome } },
+    ];
+    for (const request of stagedProjectRequests) {
+      const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request.body),
+      });
+      expect(response.status).toBe(503);
+      const unavailable = await response.json();
+      expect(unavailable).toEqual({
+        code: "STORAGE_BACKEND_STAGED",
+        error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
+        storageBackend: "postgresql",
+      });
+      expect(JSON.stringify(unavailable)).not.toContain(tempHome);
       expect(JSON.stringify(unavailable)).not.toContain("secret");
     }
 

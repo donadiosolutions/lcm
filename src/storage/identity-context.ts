@@ -10,6 +10,10 @@ export class StorageIdentityConfigurationError extends Error {
   }
 }
 
+export const UNBOUND_POSTGRESQL_PROJECT_MESSAGE =
+  "local project has no PostgreSQL binding; from the affected project directory, "
+  + "run `lcm project create` or `lcm project link <project-id>`";
+
 export function resolveStorageIdentityContext(
   config: ResolvedStorageConfig,
   local: ProjectIdentity,
@@ -24,7 +28,7 @@ export function resolveStorageIdentityContext(
   }
   if (!local.remoteProjectId) {
     throw new StorageIdentityConfigurationError(
-      `local project ${local.id} has no PostgreSQL binding; run \`lcm project create ${local.canonical}\` or \`lcm project link <project-id> ${local.canonical}\``,
+      UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
     );
   }
   const machine = requireMachineIdentity(homeDir);

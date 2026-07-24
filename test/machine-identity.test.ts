@@ -130,6 +130,79 @@ describe("machine identity file", () => {
     expect(requireMachineIdentity(home)).toEqual(identity);
   });
 
+  it("serializes differing-name finalizers and converges on the first completed registration", () => {
+    const pending = ensurePendingMachineIdentity("Machine A", home).identity;
+    let concurrentError: unknown;
+    let attempted = false;
+    const identity = finalizeMachineIdentity(pending, MACHINE_A, "Machine A", home, {
+      _lockObserverForTesting: (event) => {
+        if (event !== "before-main-lock-release-read" || attempted) return;
+        attempted = true;
+        try {
+          finalizeMachineIdentity(pending, MACHINE_A, "Machine B", home);
+        } catch (error) {
+          concurrentError = error;
+        }
+      },
+    });
+
+    expect(concurrentError).toMatchObject({
+      message: expect.stringContaining("machine identity mutation is already in progress"),
+    });
+    expect(finalizeMachineIdentity(pending, MACHINE_A, "Machine B", home)).toEqual(identity);
+    expect(readMachineIdentity(home)).toEqual(identity);
+  });
+
+  it("does not let forced recovery overwrite an in-flight finalization", () => {
+    const pending = ensurePendingMachineIdentity("Machine A", home).identity;
+    const recoveredIdentity: MachineIdentity = {
+      version: 1,
+      identityKey: `machine:${"b".repeat(64)}`,
+      machineId: MACHINE_B,
+      displayName: "Machine B",
+    };
+    let recoveryError: unknown;
+    let attempted = false;
+    const finalized = finalizeMachineIdentity(pending, MACHINE_A, "Machine A", home, {
+      _lockObserverForTesting: (event) => {
+        if (event !== "before-main-lock-release-read" || attempted) return;
+        attempted = true;
+        try {
+          recoverMachineIdentity(recoveredIdentity, { homeDir: home, force: true });
+        } catch (error) {
+          recoveryError = error;
+        }
+      },
+    });
+
+    expect(recoveryError).toMatchObject({
+      message: expect.stringContaining("machine identity mutation is already in progress"),
+    });
+    expect(readMachineIdentity(home)).toEqual(finalized);
+    expect(existsSync(oldMachineIdentitiesDir(home))).toBe(false);
+  });
+
+  it("reclaims a crashed machine identity mutation owner before recovery", () => {
+    const lockPath = `${machineIdentityPath(home)}.lock`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(lockPath, `${JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      processStartTime: "1",
+      nonce: "c".repeat(32),
+    })}\n`, { mode: 0o600 });
+    const identity: MachineIdentity = {
+      version: 1,
+      identityKey: `machine:${"a".repeat(64)}`,
+      machineId: MACHINE_A,
+      displayName: "Machine A",
+    };
+
+    expect(recoverMachineIdentity(identity, { homeDir: home })).toEqual({ identity });
+    expect(existsSync(lockPath)).toBe(false);
+    expect(readMachineIdentity(home)).toEqual(identity);
+  });
+
   it("rejects missing, unsafe, broad, and oversized files", () => {
     expect(readMachineIdentity(home)).toBeNull();
     expect(() => requireMachineIdentity(home)).toThrow("not registered");
@@ -174,6 +247,7 @@ describe("machine identity file", () => {
     ["array", "[]"],
     ["version", JSON.stringify({ version: 2, identityKey: `machine:${"a".repeat(64)}`, machineId: null, displayName: "A" })],
     ["identity key", JSON.stringify({ version: 1, identityKey: "bad", machineId: null, displayName: "A" })],
+    ["newline identity key", JSON.stringify({ version: 1, identityKey: `machine:${"a".repeat(64)}\n`, machineId: null, displayName: "A" })],
     ["display type", JSON.stringify({ version: 1, identityKey: `machine:${"a".repeat(64)}`, machineId: null, displayName: 1 })],
     ["empty display", JSON.stringify({ version: 1, identityKey: `machine:${"a".repeat(64)}`, machineId: null, displayName: " " })],
     ["long display", JSON.stringify({ version: 1, identityKey: `machine:${"a".repeat(64)}`, machineId: null, displayName: "a".repeat(257) })],
@@ -223,6 +297,27 @@ describe("machine identity file", () => {
     writeFileSync(machineIdentityPath(home), `${JSON.stringify(replacement)}\n`, { mode: 0o600 });
     expect(() => finalizeMachineIdentity(pending, MACHINE_A, "Machine A", home))
       .toThrow("changed during registration");
+  });
+
+  it("rejects a pending identity changed immediately before finalization", () => {
+    const pending = ensurePendingMachineIdentity("Machine A", home).identity;
+    let changed = false;
+
+    expect(() => finalizeMachineIdentity(pending, MACHINE_A, "Machine A", home, {
+      _lockObserverForTesting: (event) => {
+        if (event !== "before-main-lock-publish" || changed) return;
+        changed = true;
+        writeFileSync(
+          machineIdentityPath(home),
+          `${JSON.stringify({ ...pending, displayName: "Machine B" })}\n`,
+          { mode: 0o600 },
+        );
+      },
+    })).toThrow("changed during registration");
+    expect(readMachineIdentity(home)).toMatchObject({
+      machineId: null,
+      displayName: "Machine B",
+    });
   });
 
   it("rejects a stale finalized ID", () => {

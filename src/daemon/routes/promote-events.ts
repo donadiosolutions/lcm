@@ -17,7 +17,7 @@ import {
   type ProjectStorage,
   type StorageBackendFactory,
 } from "../../storage/index.js";
-import { closeRouteStorage } from "./storage-lifecycle.js";
+import { closeRouteStorage, storageRouteFailureResponse } from "./storage-lifecycle.js";
 
 const AUTO_TAGS: Record<string, string> = {
   decision: "type:preference",
@@ -149,16 +149,30 @@ export function createPromoteEventsHandler(
       return;
     }
 
+    let ownedFactory: StorageBackendFactory | undefined;
+    const activeFactory = storageFactory
+      ?? (ownedFactory = createStorageBackendFactory(config.storage));
     try {
       const result = input.drain === true
-        ? await drainEventsForCwd(config, cwd, undefined, storageFactory)
-        : await promoteEventsForCwd(config, cwd, undefined, storageFactory);
+        ? await drainEventsForCwd(config, cwd, undefined, activeFactory)
+        : await promoteEventsForCwd(config, cwd, undefined, activeFactory);
       sendJson(res, 200, result);
     } catch (error) {
       // Log detailed failure but avoid exposing internal error/stack info to the client
       await safeLogError("promote-events", error, { cwd });
+      const storageFailure = storageRouteFailureResponse(
+        activeFactory,
+        error,
+        "promote-events",
+      );
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
+        return;
+      }
       sendJson(res, 500, { error: "failed to promote events" });
       return;
+    } finally {
+      await closeRouteStorage(ownedFactory);
     }
   };
 }
@@ -168,6 +182,9 @@ export function createPromoteAllEventsHandler(
   storageFactory?: StorageBackendFactory,
 ): RouteHandler {
   return async (_req, res) => {
+    let ownedFactory: StorageBackendFactory | undefined;
+    const activeFactory = storageFactory
+      ?? (ownedFactory = createStorageBackendFactory(config.storage));
     try {
       const result: PromoteAllResult = {
         promoted: 0,
@@ -241,7 +258,12 @@ export function createPromoteAllEventsHandler(
         }
 
         try {
-          const projectResult = await drainEventsForCwd(config, sidecar.cwd, sidecar.path, storageFactory);
+          const projectResult = await drainEventsForCwd(
+            config,
+            sidecar.cwd,
+            sidecar.path,
+            activeFactory,
+          );
           result.promoted += projectResult.promoted;
           result.skipped += projectResult.skipped;
           result.correlated += projectResult.correlated;
@@ -255,6 +277,9 @@ export function createPromoteAllEventsHandler(
             unprocessedBefore: sidecar.unprocessed,
           });
         } catch (error) {
+          if (storageRouteFailureResponse(activeFactory, error, "promote-events-all")) {
+            throw error;
+          }
           result.errors++;
           result.failedProjects++;
           await safeLogError("promote-events", error, { cwd: sidecar.cwd });
@@ -275,7 +300,18 @@ export function createPromoteAllEventsHandler(
       sendJson(res, 200, result);
     } catch (error) {
       await safeLogError("promote-events", error, {});
+      const storageFailure = storageRouteFailureResponse(
+        activeFactory,
+        error,
+        "promote-events-all",
+      );
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
+        return;
+      }
       sendJson(res, 500, { error: "failed to promote events" });
+    } finally {
+      await closeRouteStorage(ownedFactory);
     }
   };
 }

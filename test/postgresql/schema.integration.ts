@@ -85,7 +85,8 @@ interface SeededScope {
 async function seedScope(database: PostgreSqlRuntime): Promise<SeededScope> {
   const machines = await database.query<{ machine_id: string }>({
     text: `INSERT INTO lcm.machines (identity_key, display_name)
-           VALUES ('machine-a', 'Machine A'), ('machine-b', 'Machine B')`,
+           VALUES ('machine:${"a".repeat(64)}', 'Machine A'),
+                  ('machine:${"b".repeat(64)}', 'Machine B')`,
   }, { domain: "factory", operation: "seedMachines" });
   const machineRows = await database.query<{ machine_id: string }>({
     text: "SELECT machine_id FROM lcm.machines ORDER BY identity_key",
@@ -292,7 +293,7 @@ describe("PostgreSQL schema baseline", () => {
         .join("\n");
       expect(constraints.rowCount).toBe(168);
       expect(createHash("sha256").update(normalizedConstraints).digest("hex"))
-        .toBe("224efb3262dd78a2da9d961916d4f8c23a22c48285110ff02ea9aa6f15cc526f");
+        .toBe("4246efe1b46f580331db9274a4f650d3b07aec284b50989badcd6bc2a4133026");
 
       const deleteActions = await database.migrator.query<{
         table_name: string;
@@ -465,6 +466,15 @@ describe("PostgreSQL schema baseline", () => {
         text: `INSERT INTO lcm.machines (machine_id, identity_key)
                VALUES ('6ba7b810-9dad-41d1-80b4-00c04fd430c8', 'legacy-machine')`,
       }, { domain: "factory", operation: "rejectLegacyDistributedIdentity" }));
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.machines (identity_key, display_name)
+               VALUES ('legacy-machine', 'Legacy Machine')`,
+      }, { domain: "factory", operation: "rejectInvalidMachineIdentityKey" }));
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.machines (identity_key, display_name)
+               VALUES ($1, 'Trailing Newline Machine')`,
+        values: [`machine:${"a".repeat(64)}\n`],
+      }, { domain: "factory", operation: "rejectTrailingNewlineMachineIdentityKey" }));
 
       const generated = await database.migrator.query<{
         table_name: string;

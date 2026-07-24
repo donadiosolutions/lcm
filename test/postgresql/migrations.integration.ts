@@ -48,7 +48,11 @@ describe("PostgreSQL migrations and database isolation", () => {
           runPostgreSqlMigrations(second),
         ]);
         expect([firstResult.applied, secondResult.applied].sort((left, right) => right.length - left.length))
-          .toEqual([["0001_migration_ledger", "0002_schema_baseline"], []]);
+          .toEqual([[
+            "0001_migration_ledger",
+            "0002_schema_baseline",
+            "0003_machine_identity_key",
+          ], []]);
         await expect(database.migrator.query<{ key: string }>({
           text: "SELECT key FROM lcm.operator_owned_metadata",
         }, { domain: "factory", operation: "verifyPreexistingSchema" }))
@@ -145,7 +149,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       await runPostgreSqlMigrations(database.migrator);
       const inserted = await database.migrator.query<{ machine_version: number }>({
         text: `INSERT INTO lcm.machines (identity_key)
-               VALUES ('native-builtins')
+               VALUES ('machine:${"c".repeat(64)}')
                RETURNING pg_catalog.uuid_extract_version(machine_id) AS machine_version`,
       }, { domain: "factory", operation: "verifyNativeMigrationBuiltins" });
       expect(inserted.rows).toEqual([{ machine_version: 7 }]);
@@ -323,7 +327,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       }, { domain: "factory", operation: "verifyRecurringPublicAclRollback" }))
         .resolves.toMatchObject({
           rows: [{
-              applied_count: "2",
+              applied_count: "3",
             probe_exists: false,
             public_create: true,
           }],
@@ -469,7 +473,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         await expect(database.migrator.query<{ applied_count: string }>({
           text: "SELECT count(*)::text AS applied_count FROM lcm.schema_migrations_backup",
         }, { domain: "factory", operation: "verifyLedgerRowsPreservedAfterRelkindDrift" }))
-          .resolves.toMatchObject({ rows: [{ applied_count: "2" }] });
+          .resolves.toMatchObject({ rows: [{ applied_count: "3" }] });
       } finally {
         if (replacementViewCreated) {
           await database.migrator.query({
@@ -489,7 +493,7 @@ describe("PostgreSQL migrations and database isolation", () => {
     await withPostgreSqlTestDatabase("managed-owner-drift", async (database) => {
       const admin = new PostgreSqlRuntime(settings(database.adminUrl));
       const later = migration(
-        "0003_managed_owner_probe",
+        "0004_managed_owner_probe",
         "CREATE TABLE lcm.managed_owner_probe (id integer PRIMARY KEY);",
       );
       try {
@@ -583,7 +587,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         }, { domain: "factory", operation: "verifyManagedOwnerRollback" }))
           .resolves.toMatchObject({
             rows: [{
-              applied_count: "2",
+              applied_count: "3",
               operator_preserved: true,
               probe_exists: false,
             }],
@@ -1127,7 +1131,7 @@ describe("PostgreSQL migrations and database isolation", () => {
   it("rolls back a pending migration that violates its target schema snapshot", async () => {
     await withPostgreSqlTestDatabase("target-schema-snapshot", async (database) => {
       const invalidTarget = migration(
-        "0003_invalid_column_snapshot",
+        "0004_invalid_column_snapshot",
         "ALTER TABLE lcm.projects ALTER COLUMN identity_key DROP NOT NULL",
       );
       await expect(runPostgreSqlMigrations(database.migrator, {
@@ -1145,7 +1149,7 @@ describe("PostgreSQL migrations and database isolation", () => {
                  EXISTS (
                    SELECT 1
                    FROM lcm.schema_migrations
-                   WHERE id = '0003_invalid_column_snapshot'
+                   WHERE id = '0004_invalid_column_snapshot'
                  ) AS applied,
                  attribute.attnotnull AS not_null
                FROM pg_catalog.pg_attribute AS attribute
@@ -1166,9 +1170,10 @@ describe("PostgreSQL migrations and database isolation", () => {
   it("uses versioned managed inventories for valid additions and target rollback", async () => {
     await withPostgreSqlTestDatabase("target-managed-snapshot", async (database) => {
       const packagedMigrations = loadPostgreSqlMigrations();
-      const baselineSnapshot = loadPostgreSqlSchemaSnapshots()[0]!;
+      const packagedSnapshots = loadPostgreSqlSchemaSnapshots();
+      const baselineSnapshot = packagedSnapshots.at(-1)!;
       const addManagedObject = migration(
-        "0003_add_managed_snapshot_probe",
+        "0004_add_managed_snapshot_probe",
         "CREATE TABLE lcm.managed_snapshot_probe (id integer PRIMARY KEY)",
       );
       const futureSnapshot = {
@@ -1181,11 +1186,11 @@ describe("PostgreSQL migrations and database isolation", () => {
       };
       await expect(runPostgreSqlMigrations(database.migrator, {
         migrations: [...packagedMigrations, addManagedObject],
-        schemaSnapshots: [baselineSnapshot, futureSnapshot],
+        schemaSnapshots: [...packagedSnapshots, futureSnapshot],
       })).resolves.toMatchObject({ applied: [addManagedObject.id] });
 
       const dropManagedObject = migration(
-        "0004_drop_managed_snapshot_probe",
+        "0005_drop_managed_snapshot_probe",
         "DROP TABLE lcm.managed_snapshot_probe",
       );
       const damagedTargetSnapshot = {
@@ -1195,7 +1200,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       await expect(runPostgreSqlMigrations(database.migrator, {
         migrations: [...packagedMigrations, addManagedObject, dropManagedObject],
         schemaSnapshots: [
-          baselineSnapshot,
+          ...packagedSnapshots,
           futureSnapshot,
           damagedTargetSnapshot,
         ],
@@ -1214,7 +1219,7 @@ describe("PostgreSQL migrations and database isolation", () => {
                  EXISTS (
                    SELECT 1
                    FROM lcm.schema_migrations
-                   WHERE id = '0004_drop_managed_snapshot_probe'
+                   WHERE id = '0005_drop_managed_snapshot_probe'
                  ) AS applied,
                  pg_catalog.to_regclass('lcm.managed_snapshot_probe')
                    IS NOT NULL AS table_exists`,

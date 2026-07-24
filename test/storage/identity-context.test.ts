@@ -7,6 +7,7 @@ import { machineIdentityPath } from "../../src/machine-identity.js";
 import {
   resolveStorageIdentityContext,
   StorageIdentityConfigurationError,
+  UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
 } from "../../src/storage/identity-context.js";
 
 const local = {
@@ -56,10 +57,18 @@ describe("resolveStorageIdentityContext", () => {
   });
 
   it("fails closed when PostgreSQL has no explicit project binding", () => {
-    expect(() => resolveStorageIdentityContext(postgresql, local))
-      .toThrow(StorageIdentityConfigurationError);
-    expect(() => resolveStorageIdentityContext(postgresql, local))
-      .toThrow("lcm project create");
+    let error: unknown;
+    try {
+      resolveStorageIdentityContext(postgresql, local);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(StorageIdentityConfigurationError);
+    expect(error).toMatchObject({
+      message: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+    });
+    expect(UNBOUND_POSTGRESQL_PROJECT_MESSAGE).not.toContain(local.id);
+    expect(UNBOUND_POSTGRESQL_PROJECT_MESSAGE).not.toContain(local.canonical);
   });
 
   it("fails closed when PostgreSQL has no finalized machine registration", () => {

@@ -18,6 +18,7 @@ import type {
   StorageBackendFactory,
   StorageIdentityContext,
 } from "../../src/storage/index.js";
+import { UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const PROJECT_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
@@ -104,7 +105,7 @@ describe("daemon storage identity routing", () => {
   });
 
   it("fails closed before an injected PostgreSQL factory sees an unbound project", async () => {
-    resolveProjectIdentity(cwd);
+    const local = resolveProjectIdentity(cwd);
     const openProject = vi.fn();
     const factory = {
       openProject,
@@ -126,9 +127,13 @@ describe("daemon storage identity routing", () => {
     );
 
     expect(openProject).not.toHaveBeenCalled();
-    expect(response.end).toHaveBeenCalledWith(expect.stringContaining(
-      "has no PostgreSQL binding",
-    ));
+    expect(response.end).toHaveBeenCalledWith(JSON.stringify({
+      code: "STORAGE_IDENTITY_REQUIRED",
+      error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+      storageBackend: "postgresql",
+    }));
+    expect(UNBOUND_POSTGRESQL_PROJECT_MESSAGE).not.toContain(local.id);
+    expect(UNBOUND_POSTGRESQL_PROJECT_MESSAGE).not.toContain(cwd);
   });
 
   it("validates PostgreSQL identity before constructing the unavailable default factory", async () => {
@@ -148,9 +153,11 @@ describe("daemon storage identity routing", () => {
       JSON.stringify({ text: "remember", cwd }),
     );
 
-    expect(response.end).toHaveBeenCalledWith(expect.stringContaining(
-      "has no PostgreSQL binding",
-    ));
+    expect(response.end).toHaveBeenCalledWith(JSON.stringify({
+      code: "STORAGE_IDENTITY_REQUIRED",
+      error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+      storageBackend: "postgresql",
+    }));
     expect(response.end).not.toHaveBeenCalledWith(expect.stringContaining(
       "not available in this release",
     ));

@@ -7,7 +7,11 @@ import type { RecallFeedback } from "../../db/recall.js";
 import { selectMemoryHintsWithinBudget } from "../../hooks/memory-context.js";
 import { validateCwd } from "../validate-cwd.js";
 import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
-import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
+import {
+  closeRouteStorage,
+  openExistingProject,
+  storageRouteFailureResponse,
+} from "./storage-lifecycle.js";
 
 const CANDIDATE_LIMIT_MULTIPLIER = 5;
 const MIN_CANDIDATE_LIMIT = 10;
@@ -230,10 +234,11 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
 
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
+    let activeFactory: StorageBackendFactory | undefined;
     try {
       const identity = projectIdentity(validatedCwd, config.storage);
-      const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await openExistingProject(factory, identity) ?? undefined;
+      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+      project = await openExistingProject(activeFactory, identity) ?? undefined;
       if (!project) {
         sendJson(res, 200, { hints: [] });
         return;
@@ -334,7 +339,16 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
       } catch { /* non-fatal */ }
 
       sendJson(res, 200, debugResponse ? { hints, ids, debug: debugResponse } : { hints, ids });
-    } catch {
+    } catch (error) {
+      const storageFailure = storageRouteFailureResponse(
+        activeFactory,
+        error,
+        "prompt-search",
+      );
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
+        return;
+      }
       sendJson(res, 200, { hints: [] });
     } finally {
       await closeRouteStorage(project, ownedFactory);

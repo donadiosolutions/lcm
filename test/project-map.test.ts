@@ -223,6 +223,93 @@ describe("project map", () => {
     expect(readFileSync(lockPath, "utf8")).toBe(completeWinner);
   });
 
+  it("retries lock publication when the winning owner releases before inspection", () => {
+    const canonical = makeDir("remote-lock-owner-release-race");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    const winner = `${JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      processStartTime: null,
+      nonce: "7".repeat(32),
+    })}\n`;
+    let publications = 0;
+
+    expect(setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _lockObserverForTesting: (event, path) => {
+        if (event === "before-main-lock-publish") {
+          publications += 1;
+          if (publications === 1) writeFileSync(path, winner, { mode: 0o600 });
+        }
+        if (event === "before-main-lock-owner-read") rmSync(path);
+      },
+    })).toMatchObject({ changed: true });
+    expect(publications).toBe(2);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("bounds repeated lock-owner disappearance retries", () => {
+    const canonical = makeDir("remote-lock-owner-release-churn");
+    const local = resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    const winner = `${JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      processStartTime: null,
+      nonce: "8".repeat(32),
+    })}\n`;
+    let publications = 0;
+
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _lockObserverForTesting: (event, path) => {
+        if (event === "before-main-lock-publish") {
+          publications += 1;
+          writeFileSync(path, winner, { mode: 0o600 });
+        }
+        if (event === "before-main-lock-owner-read") rmSync(path);
+      },
+    })).toThrow("project map mutation lock changed repeatedly during acquisition");
+    expect(publications).toBe(2);
+    expect(existsSync(lockPath)).toBe(false);
+    expect(listProjectMapEntries()[local.id].remoteProjectId).toBeUndefined();
+  });
+
+  it("does not retry permission failures while inspecting the winning lock", () => {
+    const canonical = makeDir("remote-lock-owner-read-denied");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    const winner = `${JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      processStartTime: null,
+      nonce: "9".repeat(32),
+    })}\n`;
+    const denied = Object.assign(new Error("lock owner read denied"), { code: "EACCES" });
+    let publications = 0;
+    let thrown: unknown;
+
+    try {
+      setRemoteProjectBinding(remoteProjectId, {
+        canonical,
+        _lockObserverForTesting: (event, path) => {
+          if (event === "before-main-lock-publish") {
+            publications += 1;
+            writeFileSync(path, winner, { mode: 0o600 });
+          }
+          if (event === "before-main-lock-owner-read") throw denied;
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBe(denied);
+    expect(publications).toBe(1);
+    expect(readFileSync(lockPath, "utf8")).toBe(winner);
+  });
+
   it("reclaims only dead or PID-reused map lock owners", () => {
     const canonical = makeDir("remote-stale-lock");
     resolveProjectIdentity(canonical);

@@ -11,6 +11,10 @@ import {
   readBoundedRegularFile,
   writePrivateFileExclusive,
 } from "./security-files.js";
+import {
+  withPrivateMutationLock,
+  type PrivateMutationLockObserver,
+} from "./private-mutation-lock.js";
 
 const MACHINE_IDENTITY_VERSION = 1 as const;
 const MAX_MACHINE_IDENTITY_BYTES = 64 * 1024;
@@ -54,6 +58,10 @@ export function machineIdentityPath(homeDir?: string): string {
 
 export function oldMachineIdentitiesDir(homeDir?: string): string {
   return join(lcmHomeDir(homeDir), "oldmachines");
+}
+
+function machineIdentityMutationLockPath(homeDir?: string): string {
+  return `${machineIdentityPath(homeDir)}.lock`;
 }
 
 export function isUuidV7(value: string): boolean {
@@ -103,7 +111,11 @@ function parseMachineIdentity(content: string): StoredMachineIdentity {
       "Upgrade LCM or run `lcm machine recover <machine-id> --force` with a supported version.",
     );
   }
-  if (typeof record.identityKey !== "string" || !IDENTITY_KEY_RE.test(record.identityKey)) {
+  if (
+    typeof record.identityKey !== "string"
+    || record.identityKey.length !== 72
+    || !IDENTITY_KEY_RE.test(record.identityKey)
+  ) {
     throw new MachineIdentityFileError(
       "machine.json contains an invalid identity key",
       "Run `lcm machine recover <machine-id> --force` to replace the invalid file.",
@@ -228,6 +240,10 @@ export function finalizeMachineIdentity(
   machineId: string,
   displayName: string,
   homeDir?: string,
+  options: {
+    /** @internal Test-only synchronization seam for deterministic race coverage. */
+    readonly _lockObserverForTesting?: PrivateMutationLockObserver;
+  } = {},
 ): MachineIdentity {
   const normalizedMachineId = normalizeUuidV7(machineId);
   if (!normalizedMachineId) {
@@ -236,27 +252,54 @@ export function finalizeMachineIdentity(
       "Verify the PostgreSQL 18 schema and rerun `lcm machine register`.",
     );
   }
-  const current = readMachineIdentity(homeDir);
-  if (current === null || current.identityKey !== pending.identityKey) {
-    throw new MachineIdentityFileError(
-      "machine identity changed during registration",
-      "Run `lcm machine show` and recover the intended identity explicitly.",
-    );
-  }
-  if (current.machineId !== null && current.machineId !== normalizedMachineId) {
-    throw new MachineIdentityFileError(
-      "machine.json is stale and disagrees with PostgreSQL",
-      `Run \`lcm machine recover ${normalizedMachineId} --force\` to reconcile it.`,
-    );
-  }
-  const identity: MachineIdentity = {
+  const intended: MachineIdentity = {
     version: MACHINE_IDENTITY_VERSION,
     identityKey: pending.identityKey,
     machineId: normalizedMachineId,
     displayName: normalizeMachineDisplayName(displayName),
   };
-  atomicWritePrivateFile(machineIdentityPath(homeDir), prettyMachineIdentity(identity));
-  return identity;
+  return withPrivateMutationLock(
+    machineIdentityMutationLockPath(homeDir),
+    "machine identity",
+    () => {
+      const current = readMachineIdentity(homeDir);
+      if (current === null || current.identityKey !== pending.identityKey) {
+        throw new MachineIdentityFileError(
+          "machine identity changed during registration",
+          "Run `lcm machine show` and recover the intended identity explicitly.",
+        );
+      }
+      if (current.machineId !== null) {
+        if (current.machineId !== normalizedMachineId) {
+          throw new MachineIdentityFileError(
+            "machine.json is stale and disagrees with PostgreSQL",
+            `Run \`lcm machine recover ${normalizedMachineId} --force\` to reconcile it.`,
+          );
+        }
+        if (
+          pending.machineId === null
+          || (
+            current.machineId === intended.machineId
+            && current.displayName === intended.displayName
+          )
+        ) {
+          return current;
+        }
+      }
+      if (
+        current.machineId !== pending.machineId
+        || current.displayName !== pending.displayName
+      ) {
+        throw new MachineIdentityFileError(
+          "machine identity changed during registration",
+          "Run `lcm machine show` and retry the registration explicitly.",
+        );
+      }
+      atomicWritePrivateFile(machineIdentityPath(homeDir), prettyMachineIdentity(intended));
+      return intended;
+    },
+    options._lockObserverForTesting,
+  );
 }
 
 function backupExistingMachineIdentity(homeDir?: string): string | undefined {
@@ -279,7 +322,12 @@ function backupExistingMachineIdentity(homeDir?: string): string | undefined {
 
 export function recoverMachineIdentity(
   identity: MachineIdentity,
-  options: { readonly force?: boolean; readonly homeDir?: string } = {},
+  options: {
+    readonly force?: boolean;
+    readonly homeDir?: string;
+    /** @internal Test-only synchronization seam for deterministic race coverage. */
+    readonly _lockObserverForTesting?: PrivateMutationLockObserver;
+  } = {},
 ): MachineIdentityRecoveryResult {
   const validated = parseMachineIdentity(prettyMachineIdentity(identity));
   if (validated.machineId === null) {
@@ -289,30 +337,37 @@ export function recoverMachineIdentity(
     );
   }
   identity = validated;
-  const path = machineIdentityPath(options.homeDir);
-  let existing: StoredMachineIdentity | null = null;
-  let invalid = false;
-  try {
-    existing = readMachineIdentity(options.homeDir);
-  } catch (error) {
-    if (!options.force) throw error;
-    invalid = true;
-  }
-  if (!invalid && existing !== null) {
-    if (
-      existing.machineId === identity.machineId
-      && existing.identityKey === identity.identityKey
-    ) {
-      return { identity: existing };
-    }
-    if (!options.force) {
-      throw new MachineIdentityFileError(
-        "machine.json already contains a different identity",
-        `Run \`lcm machine recover ${identity.machineId} --force\` to replace it explicitly.`,
-      );
-    }
-  }
-  const backupPath = backupExistingMachineIdentity(options.homeDir);
-  atomicWritePrivateFile(path, prettyMachineIdentity(identity));
-  return { identity, backupPath };
+  return withPrivateMutationLock(
+    machineIdentityMutationLockPath(options.homeDir),
+    "machine identity",
+    () => {
+      const path = machineIdentityPath(options.homeDir);
+      let existing: StoredMachineIdentity | null = null;
+      let invalid = false;
+      try {
+        existing = readMachineIdentity(options.homeDir);
+      } catch (error) {
+        if (!options.force) throw error;
+        invalid = true;
+      }
+      if (!invalid && existing !== null) {
+        if (
+          existing.machineId === identity.machineId
+          && existing.identityKey === identity.identityKey
+        ) {
+          return { identity: existing };
+        }
+        if (!options.force) {
+          throw new MachineIdentityFileError(
+            "machine.json already contains a different identity",
+            `Run \`lcm machine recover ${identity.machineId} --force\` to replace it explicitly.`,
+          );
+        }
+      }
+      const backupPath = backupExistingMachineIdentity(options.homeDir);
+      atomicWritePrivateFile(path, prettyMachineIdentity(identity));
+      return { identity, backupPath };
+    },
+    options._lockObserverForTesting,
+  );
 }

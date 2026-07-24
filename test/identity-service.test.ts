@@ -25,6 +25,7 @@ import {
 } from "../src/identity-service.js";
 import {
   addProjectAlias,
+  clearRemoteProjectBinding,
   clearProjectMapCache,
   listProjectMapEntries,
   projectMapPath,
@@ -47,6 +48,7 @@ import {
 } from "../src/storage/postgresql/identity-repository.js";
 import { PostgreSqlCommitOutcomeUnknownError } from "../src/storage/postgresql/errors.js";
 import { quoteShellArgument } from "../src/shell-quote.js";
+import { ensurePendingMachineIdentity } from "../src/machine-identity.js";
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const PROJECT_A = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
@@ -351,6 +353,23 @@ describe("identity service", () => {
       deps,
     )).rejects.toThrow("printable characters");
     expect(repository.registerMachine).toHaveBeenCalledTimes(calls);
+  });
+
+  it("keeps the exclusive pending-file winner's name across concurrent registration calls", async () => {
+    const pending = ensurePendingMachineIdentity("Winning Machine", home);
+
+    await expect(registerMachine(
+      POSTGRESQL_CONFIG,
+      { displayName: "Losing Machine" },
+      deps,
+    )).resolves.toMatchObject({
+      created: false,
+      identity: { displayName: "Winning Machine" },
+    });
+    expect(repository.registerMachine).toHaveBeenCalledWith(
+      pending.identity.identityKey,
+      "Winning Machine",
+    );
   });
 
   it("requires PostgreSQL configuration before creating local registration state", async () => {
@@ -1786,6 +1805,33 @@ describe("identity service", () => {
       canonical,
     });
     expect(resolveProjectIdentity(canonical).remoteProjectId).toBeUndefined();
+  });
+
+  it("does not restore remote aliases after a concurrent canonical unlink already won", async () => {
+    await register();
+    const canonical = makeProject("unlink-canonical-concurrent-winner");
+    const linked = makeProject("unlink-canonical-concurrent-winner-alias");
+    const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
+    const originalUnlink = repository.unlinkProjectAliasesIfOwned.getMockImplementation()!;
+    repository.unlinkProjectAliasesIfOwned = vi.fn(async (machineId, projectId, inputs) => {
+      const removed = await originalUnlink(machineId, projectId, inputs);
+      clearRemoteProjectBinding(bound.local.id, PROJECT_A, {
+        expectedEntry: showProjectMapEntry(bound.local.id).entry,
+      });
+      return removed;
+    });
+
+    await expect(unlinkProject(POSTGRESQL_CONFIG, canonical, deps))
+      .resolves.toEqual({
+        hash: bound.local.id,
+        remoteProjectId: PROJECT_A,
+        aliasRemoved: false,
+      });
+    expect(repository.restoreProjectAliases).not.toHaveBeenCalled();
+    expect(resolveProjectIdentity(canonical).remoteProjectId).toBeUndefined();
+    await expect(repository.resolveProject(MACHINE_ID, canonical)).resolves.toBeNull();
+    await expect(repository.resolveProject(MACHINE_ID, linked)).resolves.toBeNull();
   });
 
   it("unlinks a deleted symlink alias by its persisted PostgreSQL identity", async () => {

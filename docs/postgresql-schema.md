@@ -275,7 +275,7 @@ deletion.
 
 | Table | Ownership and retention | Enforced invariants and indexes |
 | --- | --- | --- |
-| `machines` | Independent identity root. Retain through reimages and require aliases, transcripts, checkpoints, instructions, inbox events, and leases to be handled before deletion. All incoming references restrict deletion. | UUIDv7-enforced primary key; nonblank globally unique `identity_key`; optional nonblank display name; `last_seen_at >= registered_at`. |
+| `machines` | Independent identity root. Retain through reimages and require aliases, transcripts, checkpoints, instructions, inbox events, and leases to be handled before deletion. All incoming references restrict deletion. | UUIDv7-enforced primary key; globally unique `identity_key` in the exact `machine:<64 lowercase hex>` format used by the private local identity file; optional nonblank display name; `last_seen_at >= registered_at`. |
 | `projects` | Independent identity root and project-scope anchor. No dependent table silently cascades from project deletion. | UUIDv7-enforced internal primary key; required unique `identity_key` is an opaque random 32-byte value generated for each PostgreSQL project creation and is never derived from a local path/hash; `updated_at >= created_at`. |
 | `project_aliases` | Explicit machine-to-project link retained until unlink. Both project and machine references restrict deletion. | `(machine_id, normalized_path)` primary key makes one normalized path on a machine resolve to one project; path is nonempty and normalized path is trimmed and nonempty. `project_aliases_project_idx` supports project-to-machine/path listing. |
 
@@ -442,7 +442,12 @@ on a provider does not justify silently expanding the baseline.
    revoke or otherwise rewrite the pre-existing schema ACL. Its normalization
    helper uses non-replacing `CREATE FUNCTION`, so an existing same-signature
    function fails closed. Before commit, the runner verifies the LCM-owned
-   `simple_v1` dictionary and `search_v1` configuration fingerprint.
+   `simple_v1` dictionary and `search_v1` configuration fingerprint. `0003`
+   replaces the original nonblank-only machine identity-key check with the exact
+   `machine:<64 lowercase hex>` contract and registers the corresponding schema
+   fingerprint. Existing nonconforming rows stop the migration and are never
+   rewritten; an operator must reconcile those rows from verified machine
+   identity records before retrying.
 4. Each pending migration and its ledger row execute in that same transaction.
    Any DDL, constraint, index, privilege, or ledger failure rolls back the whole
    pending set. Repeated and concurrent runs converge on the same ordered

@@ -247,18 +247,26 @@ bootstrap and remain available for later promotion.
 
 PostgreSQL domain repositories are still staged. With PostgreSQL selected, the
 daemon starts so identity validation remains reachable, but `GET /health`
-reports unavailable storage. `POST /status`, `/search`, `/grep`, `/recent`,
-`/describe`, and `/expand`, plus `GET /stats` and `/stats/pool`, return fixed
-`503` responses after their applicable identity checks. Before those manual
-read routes reach the staged backend, an absent project binding, missing or
-pending registration, or invalid machine identity returns `409` with
+reports unavailable storage. After applicable request and identity validation,
+storage-backed routes including `/compact`, `/ingest`, `/promote`, `/restore`,
+`/store`, `/session-complete`, `/review-stale`, `/prompt-search`,
+`/promote-events`, `/promote-events/all`, `/search`, `/grep`, `/recent`,
+`/describe`, and `/expand`, plus fixed `/status`, `/stats`, and `/stats/pool`,
+return sanitized `503` responses. Before those project routes reach the staged
+backend, an absent project binding, missing or pending registration, or invalid
+machine identity returns `409` with
 `code: "STORAGE_IDENTITY_REQUIRED"` and `storageBackend: "postgresql"`.
+Unbound-project guidance intentionally omits the local hash and filesystem
+path. Run the suggested `lcm project create` or
+`lcm project link <project-id>` command from the affected project directory.
 SQLite keeps its existing best-effort empty-result behavior. Every fixed staged
 route response includes the stable machine-readable code
 `STORAGE_BACKEND_STAGED` and `storageBackend: "postgresql"`; clients must not
-authenticate or branch on the human-readable error text. The hook-facing
-`POST /prompt-search` endpoint remains best-effort and returns an empty hint
-set during an outage so prompt hooks stay successful. The daemon does not run
+authenticate or branch on the human-readable error text. The raw hook-facing
+`POST /prompt-search` endpoint reports that same `503`; the prompt hook/client
+layer treats the response as an unavailable optional hint source and still
+exits successfully with the learning instruction. Passive events are already
+durable in the local SQLite outbox before that request. The daemon does not run
 SQLite transcript scans or passive-outbox sweeps. Other project operations fail
 at a cause-free unavailable-backend boundary after validating machine
 registration and the explicit project binding. LCM does not fall back to

@@ -24,6 +24,16 @@ export type StorageIdentityRequiredResponse = {
   readonly storageBackend: "postgresql";
 };
 
+export type StorageRouteFailureResponse =
+  | {
+      readonly status: 409;
+      readonly body: StorageIdentityRequiredResponse;
+    }
+  | {
+      readonly status: 503;
+      readonly body: StagedPostgreSqlUnavailableResponse;
+    };
+
 async function settleClose(resource: AsyncClosable | undefined): Promise<void> {
   if (!resource) return;
   try {
@@ -76,4 +86,20 @@ export function storageIdentityRequiredResponse(
     error: error.message,
     storageBackend: "postgresql",
   };
+}
+
+/**
+ * Classify storage admission failures after a route has performed its normal
+ * request validation. Identity failures take precedence because they happen
+ * before the staged factory is opened.
+ */
+export function storageRouteFailureResponse(
+  factory: StorageBackendFactory | undefined,
+  error: unknown,
+  operation: string,
+): StorageRouteFailureResponse | null {
+  const identityRequired = storageIdentityRequiredResponse(error);
+  if (identityRequired) return { status: 409, body: identityRequired };
+  const unavailable = stagedPostgreSqlUnavailableResponse(factory, error, operation);
+  return unavailable ? { status: 503, body: unavailable } : null;
 }

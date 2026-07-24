@@ -385,6 +385,7 @@ describe("PostgreSQL migration runner", () => {
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
       expect.objectContaining({ id: "0002_schema_baseline", sha256: "e96cad6c577c9f088d02366e22bbbe3f876217363659feea6d2edc1918885bae" }),
+      expect.objectContaining({ id: "0003_machine_identity_key", sha256: "bdc38d19bde5825eb1d59e9044769cbf9cac52be5c9fe34237f93ec347c3807b" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
@@ -467,8 +468,16 @@ describe("PostgreSQL migration runner", () => {
     const fake = executor();
     await expect(runPostgreSqlMigrations(fake.seam, { migrations, schemaSnapshots }))
       .resolves.toEqual({
-        applied: ["0001_migration_ledger", "0002_schema_baseline"],
-        current: ["0001_migration_ledger", "0002_schema_baseline"],
+        applied: [
+          "0001_migration_ledger",
+          "0002_schema_baseline",
+          "0003_machine_identity_key",
+        ],
+        current: [
+          "0001_migration_ledger",
+          "0002_schema_baseline",
+          "0003_machine_identity_key",
+        ],
       });
     expect(fake.operations).toEqual(expect.arrayContaining([
       "applyMigration:0002_schema_baseline",
@@ -476,6 +485,8 @@ describe("PostgreSQL migration runner", () => {
       "preflightIdentityFunctionDefinitions",
     ]));
     expect(fake.operations.indexOf("applyMigration:0002_schema_baseline"))
+      .toBeLessThan(fake.operations.indexOf("preflightBaselineDefinitions"));
+    expect(fake.operations.indexOf("applyMigration:0003_machine_identity_key"))
       .toBeLessThan(fake.operations.indexOf("preflightBaselineDefinitions"));
     expect(fake.operations.indexOf("preflightBaselineDefinitions"))
       .toBeLessThan(fake.operations.indexOf("preflightSearchConfiguration"));
