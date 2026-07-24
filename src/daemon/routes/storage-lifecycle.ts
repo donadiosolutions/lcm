@@ -11,6 +11,7 @@ import {
   stagedPostgreSqlUnavailablePayload,
   type StagedPostgreSqlUnavailableResponse,
 } from "../staged-postgresql.js";
+import { sanitizeError } from "../safe-error.js";
 
 interface AsyncClosable {
   close(): Promise<void> | void;
@@ -91,7 +92,7 @@ export function storageIdentityRequiredResponse(
   }
   return {
     code: STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
-    error: error.message,
+    error: sanitizeError(error.message),
     storageBackend: "postgresql",
   };
 }

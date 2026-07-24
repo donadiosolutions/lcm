@@ -97,4 +97,22 @@ describe("route storage cleanup", () => {
       storageBackend: "postgresql",
     });
   });
+
+  it("redacts machine identity paths while preserving actionable remediation", () => {
+    const machineIdentityPath = "/home/private-user/.lcm/machine.json";
+    const response = storageIdentityRequiredResponse(
+      new MachineIdentityFileError(
+        "machine.json permissions are too broad; expected mode 0600",
+        `Run \`chmod 600 -- ${machineIdentityPath}\`, then retry.`,
+      ),
+    );
+
+    expect(response).toEqual({
+      code: "STORAGE_IDENTITY_REQUIRED",
+      error: "machine.json permissions are too broad; expected mode 0600. "
+        + "Run `chmod 600 -- <path>`, then retry.",
+      storageBackend: "postgresql",
+    });
+    expect(JSON.stringify(response)).not.toContain(machineIdentityPath);
+  });
 });

@@ -302,7 +302,9 @@ backend, an absent project binding, missing or pending registration, or invalid
 machine identity returns `409` with
 `code: "STORAGE_IDENTITY_REQUIRED"` and `storageBackend: "postgresql"`.
 Unbound-project guidance intentionally omits the local hash and filesystem
-path. Run the suggested `lcm project create` or
+path. Machine-file guidance similarly replaces the host-local identity path
+with `<path>` while retaining safe remediation such as `chmod 600`. Run the
+suggested `lcm project create` or
 `lcm project link <project-id>` command from the affected project directory.
 SQLite keeps its existing best-effort empty-result behavior. Every fixed staged
 route response includes the stable machine-readable code
