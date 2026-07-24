@@ -137,6 +137,13 @@ absent schema because `0001` creates it as the current migration role, but it
 fails closed when another role owns an existing schema even if that role has
 delegated `CREATE` to the migrator. Transfer ownership explicitly with the
 cluster administrator before retrying; LCM never changes schema ownership.
+The locked migration transaction also requires its own backend session to
+report `session_replication_role = origin` before taking the advisory lock or
+trusting any LCM schema metadata. Replica or local mode can suppress internal
+constraint triggers such as foreign-key enforcement, so readiness fails with
+structured remediation instead of resetting this privileged, session-local
+setting. Restore `origin` on that connection, or reconnect with the default
+session state, before retrying.
 On every run, a catalog-only ledger preflight permits
 `lcm.schema_migrations` to be absent for first installation, but requires a
 present ledger relation to be an ordinary table owned by the current migration

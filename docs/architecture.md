@@ -65,7 +65,11 @@ remediation is diagnostic only, including namespace correction, restoration of
 missing control files, and `pg_stat_statements` preload/restart guidance; LCM
 never changes cluster extensions. The migrator owns the `lcm` schema; `PUBLIC`
 has no schema-create privilege in a supported database. Before ledger
-inspection, the runner permits an absent schema but rejects an existing schema
+inspection, the transaction connection must have
+`session_replication_role = origin`; replica, local, missing, or malformed
+session state fails before the advisory lock and every LCM schema or constraint
+fingerprint. The runner does not reset this privileged per-session setting.
+It permits an absent schema but rejects an existing schema
 not owned by the current migration role; delegated `CREATE` is insufficient and
 no ownership is changed automatically. Every run rejects a schema that grants
 `PUBLIC CREATE` before ledger inspection without changing its ACL; the baseline

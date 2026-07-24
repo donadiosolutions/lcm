@@ -33,6 +33,9 @@ type MigrationLedgerRelationRow = QueryResultRow & {
   owned_by_current_user: unknown;
   relation_kind: unknown;
 };
+type SessionReplicationRoleRow = QueryResultRow & {
+  session_replication_role: unknown;
+};
 type ServerVersionRow = QueryResultRow & { server_version_num: unknown };
 type PostmasterEpochRow = QueryResultRow & { postmaster_started_at: Date | string };
 type PostmasterContinuityRow = QueryResultRow & { preflight_still_valid: boolean };
@@ -701,7 +704,7 @@ export class PostgreSqlBaselineDefinitionPreflightError extends StorageOperation
 
   readonly schemaName = "lcm";
   readonly remediation =
-    "Restore every missing or changed LCM baseline table, relation ACL, index, trigger, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.";
+    "Restore every missing or changed LCM baseline table, relation ACL, column ACL, index, trigger, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.";
 
   override toJSON(): Record<string, unknown> {
     return {
@@ -712,6 +715,31 @@ export class PostgreSqlBaselineDefinitionPreflightError extends StorageOperation
       existingObjectCount: this.existingObjectCount,
       missingObjectCount: this.missingObjectCount,
       driftedDefinitionGroupCount: this.driftedDefinitionGroupCount,
+      remediation: this.remediation,
+    };
+  }
+}
+
+export class PostgreSqlSessionReplicationRolePreflightError extends StorageOperationError {
+  constructor(readonly sessionReplicationRole: "local" | "origin" | "replica" | null) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightSessionReplicationRole",
+    );
+  }
+
+  readonly requiredSessionReplicationRole = "origin";
+  readonly remediation =
+    "Set session_replication_role to origin on the migration connection, or reconnect with its default session state, then rerun migrations.";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      sessionReplicationRole: this.sessionReplicationRole,
+      requiredSessionReplicationRole: this.requiredSessionReplicationRole,
       remediation: this.remediation,
     };
   }
@@ -786,6 +814,14 @@ function sanitizeServerVersionNumber(value: unknown): number | null {
 
 function sanitizeBoolean(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
+}
+
+function sanitizeSessionReplicationRole(
+  value: unknown,
+): "local" | "origin" | "replica" | null {
+  return value === "local" || value === "origin" || value === "replica"
+    ? value
+    : null;
 }
 
 function sanitizeNonnegativeCount(value: unknown): number | null {
@@ -949,6 +985,24 @@ export async function runPostgreSqlMigrations(
     await transaction.query({
       text: "SET LOCAL quote_all_identifiers = off",
     }, { domain: "factory", operation: "pinMigrationDeparserSettings", signal: options.signal });
+
+    const replicationRole = await transaction.query<SessionReplicationRoleRow>({
+      text: `SELECT pg_catalog.current_setting(
+               'session_replication_role'
+             ) AS session_replication_role`,
+    }, {
+      domain: "factory",
+      operation: "preflightSessionReplicationRole",
+      signal: options.signal,
+    });
+    const sessionReplicationRole = sanitizeSessionReplicationRole(
+      replicationRole.rows[0]?.session_replication_role,
+    );
+    if (sessionReplicationRole !== "origin") {
+      throw new PostgreSqlSessionReplicationRolePreflightError(
+        sessionReplicationRole,
+      );
+    }
 
     await transaction.query({
       text: `SELECT pg_catalog.pg_advisory_xact_lock(

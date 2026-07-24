@@ -409,6 +409,38 @@ describe("PostgreSQL migrations and database isolation", () => {
     });
   });
 
+  it("rejects a migration session in replica mode before schema trust", async () => {
+    await withPostgreSqlTestDatabase("migration-replication-role", async (database) => {
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl, { poolMax: 1 }));
+      try {
+        await admin.query({
+          text: "SET session_replication_role = replica",
+        }, { domain: "factory", operation: "enableReplicaRoleForMigration" });
+        await expect(runPostgreSqlMigrations(admin))
+          .rejects.toMatchObject({
+            operation: "preflightSessionReplicationRole",
+            remediation:
+              "Set session_replication_role to origin on the migration connection, or reconnect with its default session state, then rerun migrations.",
+            requiredSessionReplicationRole: "origin",
+            sessionReplicationRole: "replica",
+          });
+      } finally {
+        await admin.query({
+          text: "SET session_replication_role = origin",
+        }, { domain: "factory", operation: "restoreOriginRoleAfterMigrationPreflight" });
+        await expect(admin.query<{ session_replication_role: string }>({
+          text: `SELECT pg_catalog.current_setting(
+                   'session_replication_role'
+                 ) AS session_replication_role`,
+        }, { domain: "factory", operation: "verifyOriginRoleAfterMigrationPreflight" }))
+          .resolves.toMatchObject({
+            rows: [{ session_replication_role: "origin" }],
+          });
+        await admin.close();
+      }
+    });
+  });
+
   it("rejects a view masquerading as the migration ledger before reading it", async () => {
     await withPostgreSqlTestDatabase("ledger-wrong-relkind", async (database) => {
       let ledgerRenamed = false;

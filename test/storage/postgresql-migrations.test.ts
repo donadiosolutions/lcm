@@ -16,6 +16,7 @@ import {
   PostgreSqlManagedObjectOwnershipPreflightError,
   PostgreSqlSchemaAclPreflightError,
   PostgreSqlSchemaOwnershipPreflightError,
+  PostgreSqlSessionReplicationRolePreflightError,
   PostgreSqlServerEncodingPreflightError,
   PostgreSqlServerVersionPreflightError,
   REQUIRED_POSTGRESQL_SERVER_ENCODING,
@@ -56,6 +57,7 @@ function executor(options: {
   serverEncoding?: unknown;
   postmasterEpoch?: unknown;
   postmasterContinuity?: boolean | "missing";
+  sessionReplicationRole?: "origin" | "replica" | "local" | "missing" | "invalid";
   schemaAcl?: "absent" | "ready" | "public" | "missing" | "invalid" | "inconsistent";
   managedOwnership?: "ready" | "unowned" | "missing-object" | "missing" | "invalid" | "inconsistent" | "different-user";
   baselineDefinitions?: "ready" | "missing-object" | "drifted" | "missing" | "invalid" | "inconsistent";
@@ -103,6 +105,14 @@ function executor(options: {
       return result(options.serverVersion === "missing"
         ? [] as R[]
         : [{ server_version_num: options.serverVersion ?? 180004 }] as unknown as R[]);
+    }
+    if (context.operation === "preflightSessionReplicationRole") {
+      if (options.sessionReplicationRole === "missing") return result([] as R[]);
+      return result([{
+        session_replication_role: options.sessionReplicationRole === "invalid"
+          ? 7
+          : options.sessionReplicationRole ?? "origin",
+      }] as unknown as R[]);
     }
     if (
       context.operation === "preflightRequiredExtensions"
@@ -417,6 +427,7 @@ describe("PostgreSQL migration runner", () => {
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
       "pinMigrationDeparserSettings",
+      "preflightSessionReplicationRole",
       "lockMigrations",
       "preflightServerVersion",
       "verifyPostmasterContinuity",
@@ -677,6 +688,71 @@ describe("PostgreSQL migration runner", () => {
     }).seam, { migrations: [], schemaSnapshots: [] })).rejects.toThrow("private SQL failure");
   });
 
+  it.each([
+    {
+      label: "replica mode",
+      sessionReplicationRole: "replica" as const,
+      reportedRole: "replica",
+    },
+    {
+      label: "local mode",
+      sessionReplicationRole: "local" as const,
+      reportedRole: "local",
+    },
+    {
+      label: "a missing setting row",
+      sessionReplicationRole: "missing" as const,
+      reportedRole: null,
+    },
+    {
+      label: "a malformed setting value",
+      sessionReplicationRole: "invalid" as const,
+      reportedRole: null,
+    },
+  ])("rejects $label before migration catalog trust", async ({
+    sessionReplicationRole,
+    reportedRole,
+  }) => {
+    const fake = executor({ sessionReplicationRole });
+    const failure = await runPostgreSqlMigrations(fake.seam, {
+      migrations: [],
+      schemaSnapshots: [],
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlSessionReplicationRolePreflightError);
+    expect(failure).toMatchObject({
+      code: "STORAGE_INITIALIZATION_FAILED",
+      operation: "preflightSessionReplicationRole",
+      remediation:
+        "Set session_replication_role to origin on the migration connection, or reconnect with its default session state, then rerun migrations.",
+      requiredSessionReplicationRole: "origin",
+      sessionReplicationRole: reportedRole,
+    });
+    expect((failure as PostgreSqlSessionReplicationRolePreflightError).toJSON())
+      .toMatchObject({
+        requiredSessionReplicationRole: "origin",
+        sessionReplicationRole: reportedRole,
+      });
+    expect(fake.operations).toEqual([
+      "capturePostmasterEpoch",
+      "preflightServerEncoding",
+      "preflightRequiredExtensions",
+      "preflightRequiredExtensions:probePgStatStatements",
+      "pinMigrationSearchPath",
+      "pinMigrationDeparserSettings",
+      "preflightSessionReplicationRole",
+    ]);
+    for (const laterOperation of [
+      "lockMigrations",
+      "preflightSchemaOwnership",
+      "preflightMigrationLedgerRelation",
+      "preflightManagedObjectOwnership",
+      "readMigrations",
+      "preflightBaselineDefinitions",
+    ]) {
+      expect(fake.operations).not.toContain(laterOperation);
+    }
+  });
+
   it("fails extension preflight before inspecting or changing the schema", async () => {
     const fake = executor({ failOperation: "preflightRequiredExtensions" });
     await expect(runPostgreSqlMigrations(fake.seam, { migrations: [migration("0001_first")], schemaSnapshots: [] }))
@@ -854,6 +930,7 @@ describe("PostgreSQL migration runner", () => {
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
       "pinMigrationDeparserSettings",
+      "preflightSessionReplicationRole",
       "lockMigrations",
       "preflightServerVersion",
       "verifyPostmasterContinuity",
@@ -917,6 +994,7 @@ describe("PostgreSQL migration runner", () => {
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
       "pinMigrationDeparserSettings",
+      "preflightSessionReplicationRole",
       "lockMigrations",
       "preflightServerVersion",
       "verifyPostmasterContinuity",
@@ -999,6 +1077,7 @@ describe("PostgreSQL migration runner", () => {
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
       "pinMigrationDeparserSettings",
+      "preflightSessionReplicationRole",
       "lockMigrations",
       "preflightServerVersion",
       "verifyPostmasterContinuity",
@@ -1124,7 +1203,7 @@ describe("PostgreSQL migration runner", () => {
       missingObjectCount,
       operation: "preflightBaselineDefinitions",
       remediation:
-        "Restore every missing or changed LCM baseline table, relation ACL, index, trigger, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.",
+        "Restore every missing or changed LCM baseline table, relation ACL, column ACL, index, trigger, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.",
     });
     expect((failure as PostgreSqlBaselineDefinitionPreflightError).toJSON())
       .toMatchObject({
@@ -1134,6 +1213,8 @@ describe("PostgreSQL migration runner", () => {
         expectedObjectCount,
         missingObjectCount,
       });
+    expect((failure as PostgreSqlBaselineDefinitionPreflightError).remediation)
+      .toContain("column ACL");
     const inventoryCall = fake.seam.query.mock.calls.find(([, context]) => (
       context.operation === "preflightBaselineDefinitions"
     ));
@@ -1385,6 +1466,7 @@ describe("PostgreSQL migration runner", () => {
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
       "pinMigrationDeparserSettings",
+      "preflightSessionReplicationRole",
       "lockMigrations",
       "preflightServerVersion",
     ]);
