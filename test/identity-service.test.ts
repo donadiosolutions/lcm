@@ -1098,6 +1098,32 @@ describe("identity service", () => {
       });
   });
 
+  it("clears insertion ownership after uncertain batch readback before compensation", async () => {
+    await register();
+    const path = makeProject("uncertain-confirmed-compensation");
+    const originalReplace = repository.replaceProjectAliases.getMockImplementation()!;
+    repository.replaceProjectAliases = vi.fn(async (input) => {
+      const candidate = await originalReplace(input);
+      writeFileSync(projectMapPath(), "{broken");
+      throw new PostgreSqlIdentityReplaceAliasesOutcomeUnknownError(
+        input.projectId,
+        candidate!,
+      );
+    });
+
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, path, {}, deps))
+      .rejects.toThrow("Expected property name");
+    expect(repository.restoreProjectAliasBatch).toHaveBeenCalledWith(
+      MACHINE_ID,
+      PROJECT_A,
+      [null],
+      [false],
+      [{ path, normalizedPath: path }],
+    );
+    await expect(repository.resolveProject(MACHINE_ID, path))
+      .resolves.toMatchObject({ projectId: PROJECT_A });
+  });
+
   it("reports uncertain links when readback is absent or unavailable", async () => {
     await register();
     const absent = makeProject("uncertain-absent");

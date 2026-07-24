@@ -658,7 +658,13 @@ async function confirmRemoteBatchReplacement(
       );
     }
     if (resolved.every((owner) => owner?.projectId === input.projectId)) {
-      return error.candidate;
+      return {
+        ...error.candidate,
+        // Readback proves the desired owner, not which transaction inserted
+        // it. A concurrent same-project transaction may have won after this
+        // transaction rolled back, so later compensation must not delete it.
+        inserted: error.candidate.inserted.map(() => false),
+      };
     }
     if (resolved.every((owner, index) => {
       const prior = error.candidate.prior[index];
