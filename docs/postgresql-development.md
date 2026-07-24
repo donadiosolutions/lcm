@@ -174,6 +174,9 @@ expands PostgreSQL default ACLs when the
 stored ACL is null and normalizes only the owning role, so explicit owner-only
 ACLs compare equal to defaults while `PUBLIC`, named-role, privilege,
 grant-option, foreign-grantor, and missing-owner drift fail closed.
+The separate 220-column ACL group includes one canonical identity row for
+every ordinary and generated column even when `attacl` is null, then expands
+all explicit column grants with the same owner-only normalization.
 Constraint fingerprints include the owning table and constraint name as well
 as type, definition, and internal-trigger state; renaming or swapping
 same-type constraints is drift.

@@ -89,7 +89,8 @@ pending SQL and ledger writes, so a migration may add managed objects without
 weakening the earlier contract. Definition checks cover all allowlisted
 secondary indexes, triggers, constraints, all 205 ordinary columns, stored
 generated-column expressions, identity sequences, all 24 table persistence
-states, and the complete effective ACLs of the tables and sequences; indexes must remain
+states, the complete effective ACLs of the tables and sequences, and the exact
+ACL state of all 220 ordinary and generated columns; indexes must remain
 valid and ready and inherit ownership from their tables. Trigger inventory also
 requires ordinary enabled mode, rejecting disabled, replica-only, or
 always-enabled drift. Constraint inventory includes the enablement state of
@@ -100,8 +101,11 @@ generated state, fully deparsed expression, and resolved collation. Tables must 
 row-level security neither enabled nor forced.
 Effective relation ACLs normalize only the owner, so added `PUBLIC` or named
 role privileges and grant options fail closed while null and explicit
-owner-only defaults compare equally. Identity sequences retain their allocation parameters, internal
-dependency, and owning table/column. Migration transactions pin
+owner-only defaults compare equally.
+Column ACL fingerprints preserve every no-ACL identity and reject any explicit
+column grant drift.
+Identity sequences retain their allocation parameters, internal dependency,
+and owning table/column. Migration transactions pin
 `quote_all_identifiers = off` before catalog deparsing. Unknown operator-created
 indexes, triggers, and constraints remain outside the inventory.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six

@@ -48,6 +48,7 @@ type ManagedObjectOwnershipRow = QueryResultRow & {
   unowned_object_count: unknown;
 };
 type ExpectedBaselineDefinitionInventory = {
+  readonly columnAclIdentities: readonly string[];
   readonly constraintIdentities: readonly string[];
   readonly generatedColumnIdentities: readonly string[];
   readonly identitySequenceIdentities: readonly string[];
@@ -60,6 +61,7 @@ type ExpectedBaselineDefinitionInventory = {
 };
 export type PostgreSqlSchemaSnapshot = ExpectedBaselineDefinitionInventory & {
   readonly definitionHashes: {
+    readonly columnAcl: string;
     readonly constraint: string;
     readonly generatedColumn: string;
     readonly identitySequence: string;
@@ -371,6 +373,10 @@ const EXPECTED_BASELINE_CONSTRAINT_IDENTITIES =
   });
 
   return {
+    columnAclIdentities: [
+      ...EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES,
+      ...EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES,
+    ],
     constraintIdentities: EXPECTED_BASELINE_CONSTRAINT_IDENTITIES,
     generatedColumnIdentities: EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES,
     identitySequenceIdentities: EXPECTED_BASELINE_IDENTITY_SEQUENCE_IDENTITIES,
@@ -387,6 +393,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
   return [{
     ...expectedBaselineDefinitionInventory(),
     definitionHashes: {
+      columnAcl: "d3d92012f458893ce5bf0ff0d1f72699ba6d8a9ef42d25a62c0ccede9e582f9c",
       constraint: "f445a06d320f46f8c5d829f89a3a7bc0b13c5507096b111f125d9f0dd0ba0e2f",
       generatedColumn: "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
       identitySequence: "ccfebcc68f473f655f1c83f0815e18d2f697489bba38278d20bf3718fd0a502e",
@@ -439,6 +446,11 @@ export function getPostgreSqlSchemaSnapshotExpectations(
       "generated_column",
       snapshot.generatedColumnIdentities.length,
       snapshot.definitionHashes.generatedColumn,
+    ],
+    [
+      "column_acl",
+      snapshot.columnAclIdentities.length,
+      snapshot.definitionHashes.columnAcl,
     ],
     [
       "identity_sequence",
@@ -1384,6 +1396,49 @@ export async function runPostgreSqlMigrations(
                  WHERE acl_relations.object_identity OPERATOR(pg_catalog.=)
                    ANY ($9::pg_catalog.text[])
                ),
+               actual_column_acls AS (
+                 SELECT pg_catalog.concat_ws(
+                          '|',
+                          relation.relname,
+                          attribute.attname
+                        ) AS object_identity,
+                        COALESCE(
+                          CASE
+                            WHEN privilege.grantee OPERATOR(pg_catalog.=)
+                              relation.relowner
+                              THEN 'owner'
+                            ELSE privilege.grantee::pg_catalog.text
+                          END,
+                          ''
+                        ) AS grantee,
+                        COALESCE(
+                          CASE
+                            WHEN privilege.grantor OPERATOR(pg_catalog.=)
+                              relation.relowner
+                              THEN 'owner'
+                            ELSE privilege.grantor::pg_catalog.text
+                          END,
+                          ''
+                        ) AS grantor,
+                        COALESCE(privilege.privilege_type, '') AS privilege_type,
+                        COALESCE(
+                          privilege.is_grantable::pg_catalog.text,
+                          ''
+                        ) AS is_grantable
+                 FROM pg_catalog.pg_attribute AS attribute
+                 JOIN pg_catalog.pg_class AS relation
+                   ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 LEFT JOIN LATERAL pg_catalog.aclexplode(attribute.attacl)
+                   AS privilege ON true
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND pg_catalog.concat_ws(
+                     '|',
+                     relation.relname,
+                     attribute.attname
+                   ) OPERATOR(pg_catalog.=) ANY ($10::pg_catalog.text[])
+               ),
                actual_groups(object_kind, existing_count, definition_sha256) AS (
                  SELECT 'index'::pg_catalog.text,
                         pg_catalog.count(*)::pg_catalog.int4,
@@ -1478,6 +1533,34 @@ export async function runPostgreSqlMigrations(
                           'hex'
                         )
                  FROM actual_generated_columns
+                 UNION ALL
+                 SELECT 'column_acl'::pg_catalog.text,
+                        pg_catalog.count(
+                          DISTINCT object_identity
+                        )::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  object_identity,
+                                  grantee,
+                                  grantor,
+                                  privilege_type,
+                                  is_grantable
+                                ),
+                                E'\\n'
+                                ORDER BY object_identity, grantee, grantor,
+                                  privilege_type, is_grantable
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_column_acls
                  UNION ALL
                  SELECT 'identity_sequence'::pg_catalog.text,
                         pg_catalog.count(*)::pg_catalog.int4,
@@ -1596,18 +1679,18 @@ export async function runPostgreSqlMigrations(
                ) AS (
                  SELECT *
                  FROM ROWS FROM (
-                   pg_catalog.unnest($11::pg_catalog.text[]),
-                   pg_catalog.unnest($12::pg_catalog.int4[]),
-                   pg_catalog.unnest($13::pg_catalog.text[])
+                   pg_catalog.unnest($12::pg_catalog.text[]),
+                   pg_catalog.unnest($13::pg_catalog.int4[]),
+                   pg_catalog.unnest($14::pg_catalog.text[])
                  )
                )
                SELECT $1::pg_catalog.bool AS baseline_applied,
-                      $10::pg_catalog.int4 AS expected_object_count,
+                      $11::pg_catalog.int4 AS expected_object_count,
                       pg_catalog.sum(actual_groups.existing_count)::pg_catalog.int4
                         AS existing_object_count,
                       CASE
                         WHEN $1::pg_catalog.bool THEN (
-                          $10 - pg_catalog.sum(actual_groups.existing_count)
+                          $11 - pg_catalog.sum(actual_groups.existing_count)
                         )::pg_catalog.int4
                         ELSE 0::pg_catalog.int4
                       END AS missing_object_count,
@@ -1632,6 +1715,7 @@ export async function runPostgreSqlMigrations(
           expectedBaselineDefinitions.identitySequenceIdentities,
           expectedBaselineDefinitions.tableIdentities,
           expectedBaselineDefinitions.relationAclIdentities,
+          expectedBaselineDefinitions.columnAclIdentities,
           snapshotExpectations.definitionObjectCount,
           snapshotExpectations.definitionGroupKinds,
           snapshotExpectations.definitionGroupCounts,

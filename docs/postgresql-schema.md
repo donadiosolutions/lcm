@@ -80,7 +80,8 @@ does not add row-level security.
   secondary indexes, all 168 table constraints, all three identity-enforcement
   triggers, all 15 stored generated columns, all six generated identity
   sequences, all 24 permanent tables, the complete effective ACLs of those
-  tables and six sequences, and all 205 ordinary columns: 503 definitions
+  tables and six sequences, all 205 ordinary columns, and the exact effective
+  column ACL state of all 220 ordinary and generated columns: 723 definitions
   total. The ordinary-column allowlist includes
   `recall_surfacing.surfaced_at`, and a live-catalog regression requires the
   allowlist to equal the complete ordinary-column inventory of the 24 tables.
@@ -107,6 +108,10 @@ does not add row-level security.
   when `relacl` is null, and normalize only the owning role. `PUBLIC`, named
   role, privilege, grant-option, foreign-grantor, or missing-owner drift on any
   allowlisted table or identity sequence therefore fails closed.
+  Column ACL fingerprints retain every allowlisted column even when `attacl`
+  is null and expand every explicit entry. Any `PUBLIC`, named-role,
+  foreign-grantor, privilege, or grant-option drift on a column therefore also
+  fails closed.
   Identity-sequence
   fingerprints bind each exact sequence name to its PostgreSQL data type,
   increment, minimum, maximum, start, cache, cycle state, internal identity
