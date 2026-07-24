@@ -2688,6 +2688,41 @@ describe("identity service", () => {
     expect(resolveProjectIdentity(canonical).remoteProjectId).toBeUndefined();
   });
 
+  it("does not treat an unrecorded symlink to the canonical path as a canonical unlink", async () => {
+    await register();
+    const canonical = makeProject("unlink-unrecorded-symlink-canonical");
+    const recordedAlias = makeProject("unlink-unrecorded-symlink-recorded-alias");
+    const unrecorded = join(home, "unlink-unrecorded-symlink");
+    symlinkSync(canonical, unrecorded);
+    const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    await linkProject(POSTGRESQL_CONFIG, bound.local.id, recordedAlias, {}, deps);
+    repository.unlinkProjectAliasesIfOwned.mockClear();
+    repository.unlinkProjectAliasIfOwned.mockClear();
+    vi.mocked(deps.openSession!).mockClear();
+
+    await expect(unlinkProject(POSTGRESQL_CONFIG, unrecorded, deps))
+      .rejects.toThrow(`project is not mapped: ${unrecorded}`);
+
+    expect(repository.unlinkProjectAliasesIfOwned).not.toHaveBeenCalled();
+    expect(repository.unlinkProjectAliasIfOwned).not.toHaveBeenCalled();
+    expect(deps.openSession).not.toHaveBeenCalled();
+    expect(showProjectMapEntry(bound.local.id).entry).toEqual({
+      canonical,
+      aliases: [recordedAlias],
+      remoteProjectId: PROJECT_A,
+    });
+    await expect(repository.resolveProject(MACHINE_ID, canonical))
+      .resolves.toMatchObject({
+        projectId: PROJECT_A,
+        alias: { path: canonical, normalizedPath: canonical },
+      });
+    await expect(repository.resolveProject(MACHINE_ID, recordedAlias))
+      .resolves.toMatchObject({
+        projectId: PROJECT_A,
+        alias: { path: recordedAlias, normalizedPath: recordedAlias },
+      });
+  });
+
   it("does not restore remote aliases after a concurrent canonical unlink already won", async () => {
     await register();
     const canonical = makeProject("unlink-canonical-concurrent-winner");

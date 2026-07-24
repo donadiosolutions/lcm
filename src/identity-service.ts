@@ -1309,6 +1309,9 @@ async function unlinkProjectMutation(
   const shown = showProjectMapEntry(projectPath);
   if (shown.transient) throw new Error(`project is not mapped: ${projectPath}`);
   const aliasPath = shown.entry.aliases.find((alias) => resolve(alias) === projectPath);
+  if (!aliasPath && resolve(shown.entry.canonical) !== projectPath) {
+    throw new Error(`project is not mapped: ${projectPath}`);
+  }
   if (!aliasPath) {
     if (!shown.entry.remoteProjectId) {
       throw new Error(`canonical project ${shown.hash} has no remote binding to unlink`);
