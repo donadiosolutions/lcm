@@ -613,8 +613,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 448,
-          existingObjectCount: 447,
+          expectedObjectCount: 503,
+          existingObjectCount: 502,
           missingObjectCount: 1,
           operation: "preflightBaselineDefinitions",
         });
@@ -634,8 +634,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 448,
-          existingObjectCount: 448,
+          expectedObjectCount: 503,
+          existingObjectCount: 503,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -655,8 +655,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 448,
-          existingObjectCount: 448,
+          expectedObjectCount: 503,
+          existingObjectCount: 503,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -674,8 +674,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 448,
-            existingObjectCount: 448,
+            expectedObjectCount: 503,
+            existingObjectCount: 503,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -698,11 +698,41 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 448,
-          existingObjectCount: 447,
+          expectedObjectCount: 503,
+          existingObjectCount: 502,
           missingObjectCount: 1,
           operation: "preflightBaselineDefinitions",
         });
+    });
+  });
+
+  it("pins every ordinary column on the allowlisted baseline tables", async () => {
+    await withPostgreSqlTestDatabase("ordinary-column-inventory", async (database) => {
+      const snapshot = loadPostgreSqlSchemaSnapshots()[0]!;
+      const result = await database.migrator.query<{ object_identity: string }>({
+        text: `SELECT pg_catalog.concat_ws(
+                         '|',
+                         relation.relname,
+                         attribute.attname
+                       ) AS object_identity
+               FROM pg_catalog.pg_attribute AS attribute
+               JOIN pg_catalog.pg_class AS relation
+                 ON relation.oid = attribute.attrelid
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.oid = relation.relnamespace
+               WHERE namespace.nspname = 'lcm'
+                 AND relation.relkind = 'r'
+                 AND relation.relname = ANY ($1::text[])
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+                 AND attribute.attgenerated = ''
+               ORDER BY object_identity`,
+        values: [snapshot.tableIdentities],
+      }, { domain: "factory", operation: "verifyOrdinaryColumnInventory" });
+      expect(result.rows.map(({ object_identity }) => object_identity))
+        .toEqual([...snapshot.ordinaryColumnIdentities].sort());
+      expect(snapshot.ordinaryColumnIdentities).toHaveLength(205);
+      expect(snapshot.ordinaryColumnIdentities).toContain("recall_surfacing|surfaced_at");
     });
   });
 
@@ -715,8 +745,60 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 448,
-          existingObjectCount: 448,
+          expectedObjectCount: 503,
+          existingObjectCount: 503,
+          missingObjectCount: 0,
+          operation: "preflightBaselineDefinitions",
+        });
+    });
+  });
+
+  it("rejects ordinary column collation drift", async () => {
+    await withPostgreSqlTestDatabase("ordinary-column-collation-drift", async (database) => {
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.projects
+               ALTER COLUMN display_name TYPE text COLLATE pg_catalog."C"`,
+      }, { domain: "factory", operation: "alterProjectDisplayNameCollation" });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toMatchObject({
+          baselineApplied: true,
+          driftedDefinitionGroupCount: 1,
+          expectedObjectCount: 503,
+          existingObjectCount: 503,
+          missingObjectCount: 0,
+          operation: "preflightBaselineDefinitions",
+        });
+    });
+  });
+
+  it("rejects table persistence drift", async () => {
+    await withPostgreSqlTestDatabase("table-persistence-drift", async (database) => {
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.schema_migrations SET UNLOGGED",
+      }, { domain: "factory", operation: "alterBaselineTablePersistence" });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toMatchObject({
+          baselineApplied: true,
+          driftedDefinitionGroupCount: 1,
+          expectedObjectCount: 503,
+          existingObjectCount: 503,
+          missingObjectCount: 0,
+          operation: "preflightBaselineDefinitions",
+        });
+    });
+  });
+
+  it("rejects relation ACL drift", async () => {
+    await withPostgreSqlTestDatabase("relation-acl-drift", async (database) => {
+      await database.migrator.query({
+        text: "GRANT SELECT ON TABLE lcm.projects TO PUBLIC",
+      }, { domain: "factory", operation: "grantPublicProjectSelect" });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toMatchObject({
+          baselineApplied: true,
+          driftedDefinitionGroupCount: 1,
+          expectedObjectCount: 503,
+          existingObjectCount: 503,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -733,8 +815,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 448,
-          existingObjectCount: 448,
+          expectedObjectCount: 503,
+          existingObjectCount: 503,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -758,8 +840,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 448,
-          existingObjectCount: 448,
+          expectedObjectCount: 503,
+          existingObjectCount: 503,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });

@@ -157,11 +157,21 @@ large-file, and session-ingest identity functions are also fingerprinted by
 stored body and security configuration. Body, language/return type,
 security-definer/leakproof, volatility, parallel-safety, fixed search path, or
 complete normalized ACL drift fails closed.
-The `0002` definition inventory also fingerprints every allowlisted ordinary
-column's formatted type, nullability, deparsed default, and identity state.
+The `0002` definition inventory also fingerprints the complete 205-column
+ordinary inventory of its 24 allowlisted tables, including
+`recall_surfacing.surfaced_at`. Each ordinary column retains its formatted
+type, nullability, deparsed default, identity state, and resolved
+namespace-qualified collation. Generated-column fingerprints retain the same
+resolved collation in addition to generated state and expression.
 It fingerprints all six generated identity sequences by type, increment,
 minimum, maximum, start, cache, cycle state, internal identity dependency, and
 owning table/column.
+It also requires all 24 allowlisted tables to remain ordinary permanent tables
+and fingerprints the complete effective ACL of every allowlisted table and
+identity sequence. ACL comparison expands PostgreSQL default ACLs when the
+stored ACL is null and normalizes only the owning role, so explicit owner-only
+ACLs compare equal to defaults while `PUBLIC`, named-role, privilege,
+grant-option, foreign-grantor, and missing-owner drift fail closed.
 Constraint fingerprints include the owning table and constraint name as well
 as type, definition, and internal-trigger state; renaming or swapping
 same-type constraints is drift.

@@ -87,15 +87,19 @@ The selected current snapshot verifies its managed inventory and definitions
 before pending SQL; the selected target snapshot repeats both checks after
 pending SQL and ledger writes, so a migration may add managed objects without
 weakening the earlier contract. Definition checks cover all allowlisted
-secondary indexes, triggers, constraints, ordinary columns, stored
-generated-column expressions, and identity sequences; indexes must remain
+secondary indexes, triggers, constraints, all 205 ordinary columns, stored
+generated-column expressions, identity sequences, all 24 table persistence
+states, and the complete effective ACLs of the tables and sequences; indexes must remain
 valid and ready and inherit ownership from their tables. Trigger inventory also
 requires ordinary enabled mode, rejecting disabled, replica-only, or
 always-enabled drift. Constraint inventory includes the enablement state of
 its internal enforcement triggers and binds each name to its definition.
-Ordinary columns retain type, nullability, default, and identity metadata;
-generated columns retain both their generated state and fully deparsed
-expression. Identity sequences retain their allocation parameters, internal
+Ordinary columns retain type, nullability, default, identity, and resolved
+collation metadata; generated columns retain their generated state, fully
+deparsed expression, and resolved collation. Tables must remain permanent.
+Effective relation ACLs normalize only the owner, so added `PUBLIC` or named
+role privileges and grant options fail closed while null and explicit
+owner-only defaults compare equally. Identity sequences retain their allocation parameters, internal
 dependency, and owning table/column. Migration transactions pin
 `quote_all_identifiers = off` before catalog deparsing. Unknown operator-created
 indexes, triggers, and constraints remain outside the inventory.

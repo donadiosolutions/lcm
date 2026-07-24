@@ -222,12 +222,12 @@ function executor(options: {
       }
       return result([{
         baseline_applied: true,
-        expected_object_count: 448,
+        expected_object_count: 503,
         existing_object_count: options.baselineDefinitions === "inconsistent"
-          ? 449
+          ? 504
           : options.baselineDefinitions === "missing-object"
-            ? 447
-            : 448,
+            ? 502
+            : 503,
         missing_object_count: options.baselineDefinitions === "missing-object" ? 1 : 0,
         drifted_definition_group_count:
           options.baselineDefinitions === "drifted"
@@ -251,7 +251,7 @@ describe("PostgreSQL migration runner", () => {
   it("derives changed future expectations and selects by migration history, not registry order", () => {
     const snapshot = (
       migrationId: string,
-      counts: readonly [number, number, number, number, number, number],
+      counts: readonly [number, number, number, number, number, number, number, number],
       identityFunctionNames: readonly string[],
     ): PostgreSqlSchemaSnapshot => ({
       constraintIdentities: Array.from({ length: counts[2] }, (_, index) => `t|c${index}`),
@@ -261,6 +261,8 @@ describe("PostgreSQL migration runner", () => {
         identitySequence: `${migrationId}-sequence`,
         index: `${migrationId}-index`,
         ordinaryColumn: `${migrationId}-ordinary`,
+        relationAcl: `${migrationId}-relation-acl`,
+        table: `${migrationId}-table`,
         trigger: `${migrationId}-trigger`,
       },
       generatedColumnIdentities:
@@ -275,11 +277,18 @@ describe("PostgreSQL migration runner", () => {
       managedObjectIdentities: [`table|${migrationId}`],
       migrationId,
       ordinaryColumnIdentities:
-        Array.from({ length: counts[5] }, (_, index) => `t|o${index}`),
+        Array.from({ length: counts[7] }, (_, index) => `t|o${index}`),
+      relationAclIdentities:
+        Array.from({ length: counts[6] }, (_, index) => `table|a${index}`),
+      tableIdentities: Array.from({ length: counts[5] }, (_, index) => `t${index}`),
       triggerIdentities: Array.from({ length: counts[1] }, (_, index) => `t|tr${index}`),
     });
-    const older = snapshot("0002_schema_baseline", [1, 1, 1, 1, 1, 1], ["old_helper"]);
-    const newer = snapshot("0003_future", [2, 0, 3, 1, 2, 4], [
+    const older = snapshot(
+      "0002_schema_baseline",
+      [1, 1, 1, 1, 1, 1, 1, 1],
+      ["old_helper"],
+    );
+    const newer = snapshot("0003_future", [2, 0, 3, 1, 2, 4, 5, 6], [
       "new_helper",
       "second_helper",
     ]);
@@ -289,13 +298,15 @@ describe("PostgreSQL migration runner", () => {
       [newer, older],
     )).toBe(newer);
     expect(getPostgreSqlSchemaSnapshotExpectations(newer)).toEqual({
-      definitionGroupCounts: [2, 0, 3, 1, 2, 4],
+      definitionGroupCounts: [2, 0, 3, 1, 2, 4, 5, 6],
       definitionGroupHashes: [
         "0003_future-index",
         "0003_future-trigger",
         "0003_future-constraint",
         "0003_future-generated",
         "0003_future-sequence",
+        "0003_future-table",
+        "0003_future-relation-acl",
         "0003_future-ordinary",
       ],
       definitionGroupKinds: [
@@ -304,9 +315,11 @@ describe("PostgreSQL migration runner", () => {
         "constraint",
         "generated_column",
         "identity_sequence",
+        "table",
+        "relation_acl",
         "ordinary_column",
       ],
-      definitionObjectCount: 12,
+      definitionObjectCount: 23,
       identityFunctionHashes: ["new_helper-sha256", "second_helper-sha256"],
       identityFunctionNames: ["new_helper", "second_helper"],
     });
@@ -819,8 +832,8 @@ describe("PostgreSQL migration runner", () => {
       label: "a missing index, trigger, or constraint",
       baselineDefinitions: "missing-object" as const,
       baselineApplied: true,
-      expectedObjectCount: 448,
-      existingObjectCount: 447,
+      expectedObjectCount: 503,
+      existingObjectCount: 502,
       missingObjectCount: 1,
       driftedDefinitionGroupCount: 1,
     },
@@ -828,8 +841,8 @@ describe("PostgreSQL migration runner", () => {
       label: "definition drift",
       baselineDefinitions: "drifted" as const,
       baselineApplied: true,
-      expectedObjectCount: 448,
-      existingObjectCount: 448,
+      expectedObjectCount: 503,
+      existingObjectCount: 503,
       missingObjectCount: 0,
       driftedDefinitionGroupCount: 1,
     },
@@ -855,8 +868,8 @@ describe("PostgreSQL migration runner", () => {
       label: "contradictory catalog counts",
       baselineDefinitions: "inconsistent" as const,
       baselineApplied: true,
-      expectedObjectCount: 448,
-      existingObjectCount: 449,
+      expectedObjectCount: 503,
+      existingObjectCount: 504,
       missingObjectCount: 0,
       driftedDefinitionGroupCount: 0,
     },
@@ -891,7 +904,7 @@ describe("PostgreSQL migration runner", () => {
       missingObjectCount,
       operation: "preflightBaselineDefinitions",
       remediation:
-        "Restore every missing or changed LCM baseline index, trigger, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.",
+        "Restore every missing or changed LCM baseline table, relation ACL, index, trigger, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.",
     });
     expect((failure as PostgreSqlBaselineDefinitionPreflightError).toJSON())
       .toMatchObject({
@@ -914,6 +927,9 @@ describe("PostgreSQL migration runner", () => {
       "pg_catalog.pg_attrdef",
       "pg_catalog.pg_sequence",
       "pg_catalog.pg_depend",
+      "pg_catalog.pg_collation",
+      "pg_catalog.aclexplode",
+      "pg_catalog.acldefault",
       "pg_catalog.pg_get_indexdef",
       "pg_catalog.pg_get_triggerdef",
       "pg_catalog.pg_get_constraintdef",
@@ -921,6 +937,7 @@ describe("PostgreSQL migration runner", () => {
       "pg_catalog.format_type",
       "attribute.attnotnull",
       "attribute.attidentity",
+      "relation.relpersistence",
       "trigger.tgenabled",
       "trigger.tgconstraint",
       "object_name",
@@ -934,19 +951,25 @@ describe("PostgreSQL migration runner", () => {
         ]),
         expect.arrayContaining(["session_ingest_log|session_ingest_log_pkey"]),
         expect.arrayContaining(["session_ingest_log|session_id_sha256"]),
-        expect.arrayContaining(["projects|identity_key"]),
+        expect.arrayContaining(["projects|identity_key", "recall_surfacing|surfaced_at"]),
         expect.arrayContaining(["conversations_conversation_id_seq"]),
-        448,
+        expect.arrayContaining(["schema_migrations", "fenced_leases"]),
+        expect.arrayContaining(["table|schema_migrations", "sequence|fenced_leases_fencing_token_seq"]),
+        503,
         [
           "index",
           "trigger",
           "constraint",
           "generated_column",
           "identity_sequence",
+          "table",
+          "relation_acl",
           "ordinary_column",
         ],
-        [52, 3, 168, 15, 6, 204],
+        [52, 3, 168, 15, 6, 24, 30, 205],
         [
+          expect.any(String),
+          expect.any(String),
           expect.any(String),
           expect.any(String),
           expect.any(String),
@@ -956,7 +979,7 @@ describe("PostgreSQL migration runner", () => {
         ],
       ]);
     expect(inventorySql).toContain("pg_catalog.unnest");
-    for (const hardcodedGroupCount of [52, 3, 168, 15, 6, 204]) {
+    for (const hardcodedGroupCount of [52, 3, 168, 15, 6, 24, 30, 205]) {
       expect(inventorySql).not.toMatch(
         new RegExp(`\\b${hardcodedGroupCount}::pg_catalog\\.int4`, "u"),
       );

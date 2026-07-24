@@ -291,8 +291,7 @@ export async function createPostgreSqlTestDatabase(
     if (options.runMigrations !== false) {
       await runPostgreSqlMigrations(migrator);
       await migrator.query({
-        text: `GRANT USAGE ON SCHEMA lcm TO lcm_test_runtime;
-               GRANT SELECT ON lcm.schema_migrations TO lcm_test_runtime`,
+        text: "GRANT USAGE ON SCHEMA lcm TO lcm_test_runtime",
       }, { domain: "factory", operation: "grantRuntimeBaseline" });
     }
     await closeDatabaseAdmin();

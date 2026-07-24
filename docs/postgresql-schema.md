@@ -77,7 +77,11 @@ does not add row-level security.
 - The `0002` snapshot checks an explicit definition inventory of all 52 named
   secondary indexes, all 168 table constraints, all three identity-enforcement
   triggers, all 15 stored generated columns, all six generated identity
-  sequences, and all 204 ordinary columns: 448 definitions total.
+  sequences, all 24 permanent tables, the complete effective ACLs of those
+  tables and six sequences, and all 205 ordinary columns: 503 definitions
+  total. The ordinary-column allowlist includes
+  `recall_surfacing.surfaced_at`, and a live-catalog regression requires the
+  allowlist to equal the complete ordinary-column inventory of the 24 tables.
   Each allowlisted object must exist, every index must
   remain valid and ready, and canonical index, trigger, fully qualified
   constraint, generation-expression, and ordinary-column definitions must
@@ -88,9 +92,17 @@ does not add row-level security.
   to its owning table, type, fully qualified definition, and stable
   enablement-state multiset of their zero or more internal enforcement
   triggers. Generated-column fingerprints bind the exact table, column,
-  `attgenerated` state, and PostgreSQL-deparsed expression. Ordinary-column
+  `attgenerated` state, PostgreSQL-deparsed expression, and resolved
+  namespace-qualified collation. Ordinary-column
   fingerprints bind the exact table and column to its formatted type,
-  nullability, deparsed default, and identity state. Identity-sequence
+  nullability, deparsed default, identity state, and resolved
+  namespace-qualified collation. Table fingerprints require ordinary permanent
+  persistence, so `UNLOGGED` or temporary drift fails closed. Relation ACL
+  fingerprints expand the effective ACL, including PostgreSQL's default ACL
+  when `relacl` is null, and normalize only the owning role. `PUBLIC`, named
+  role, privilege, grant-option, foreign-grantor, or missing-owner drift on any
+  allowlisted table or identity sequence therefore fails closed.
+  Identity-sequence
   fingerprints bind each exact sequence name to its PostgreSQL data type,
   increment, minimum, maximum, start, cache, cycle state, internal identity
   dependency, and owning table/column. Index ownership
