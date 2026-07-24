@@ -9,6 +9,7 @@ import {
   hashProjectPath,
   listProjectMapEntries,
   normalizeProjectPath,
+  oldMapsDir,
   projectMapPathsForHash,
   projectMapPath,
   projectMapEntryHasStoredData,
@@ -749,7 +750,7 @@ describe("project map", () => {
     expect((statSync(result.backupPath!).mode & 0o777)).toBe(0o600);
   });
 
-  it("preserves the first backup when multiple writes share a timestamp", () => {
+  it("creates distinct current backups when multiple writes share a timestamp", () => {
     const canonical = makeDir("canonical-exclusive-backup");
     const firstAlias = makeDir("first-exclusive-alias");
     const secondAlias = makeDir("second-exclusive-alias");
@@ -759,10 +760,51 @@ describe("project map", () => {
     const first = addProjectAlias(firstAlias, { canonical });
     const firstBackup = readFileSync(first.backupPath!, "utf-8");
     const second = addProjectAlias(secondAlias, { canonical });
+    const secondBackup = readFileSync(second.backupPath!, "utf-8");
 
-    expect(second.backupPath).toBe(first.backupPath);
-    expect(readFileSync(second.backupPath!, "utf-8")).toBe(firstBackup);
+    expect(second.backupPath).not.toBe(first.backupPath);
+    expect(second.backupPath).toBe(join(oldMapsDir(), "map-1700000000-1.json"));
+    expect(readFileSync(first.backupPath!, "utf-8")).toBe(firstBackup);
     expect(firstBackup).not.toContain(firstAlias);
+    expect(secondBackup).toContain(firstAlias);
+    expect(secondBackup).not.toContain(secondAlias);
+  });
+
+  it("does not overwrite a concurrently reserved same-timestamp backup name", () => {
+    const canonical = makeDir("canonical-concurrent-backup");
+    const alias = makeDir("concurrent-backup-alias");
+    projectId(canonical);
+    vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+    mkdirSync(oldMapsDir(), { recursive: true });
+    const reserved = join(oldMapsDir(), "map-1700000000.json");
+    writeFileSync(reserved, "concurrent winner", { mode: 0o600 });
+
+    const result = addProjectAlias(alias, { canonical });
+
+    expect(readFileSync(reserved, "utf8")).toBe("concurrent winner");
+    expect(result.backupPath).toBe(join(oldMapsDir(), "map-1700000000-1.json"));
+    expect(statSync(result.backupPath!).mode & 0o777).toBe(0o600);
+  });
+
+  it("fails without mutating the map when all bounded backup suffixes are occupied", () => {
+    const canonical = makeDir("canonical-backup-exhaustion");
+    const alias = makeDir("backup-exhaustion-alias");
+    projectId(canonical);
+    const before = readFileSync(projectMapPath(), "utf8");
+    vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+    mkdirSync(oldMapsDir(), { recursive: true });
+    for (let suffix = 0; suffix < 1_000; suffix += 1) {
+      const discriminator = suffix === 0 ? "" : `-${suffix}`;
+      writeFileSync(
+        join(oldMapsDir(), `map-1700000000${discriminator}.json`),
+        String(suffix),
+        { mode: 0o600 },
+      );
+    }
+
+    expect(() => addProjectAlias(alias, { canonical }))
+      .toThrow("could not create an exclusive project map backup after 1000 attempts");
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(before);
   });
 
   it("keeps an alias identity stable when its path is later replaced by a symlink", () => {

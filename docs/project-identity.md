@@ -37,7 +37,9 @@ display name. LCM never prints the identity key.
 The file and all recovery backups use mode `0600`; `~/.lcm` and backup
 directories use mode `0700`. LCM rejects symlinks, non-regular files,
 over-sized files, permissive modes, malformed JSON, unsupported versions,
-invalid keys, and invalid UUIDs.
+invalid keys, invalid display names, and invalid UUIDs. Permission-repair
+commands quote the complete file path and separate it from options so spaces,
+shell metacharacters, and leading dashes cannot change the command.
 
 Registration first creates a private pending identity with an exclusive write,
 then idempotently upserts its opaque key in PostgreSQL and atomically finalizes
@@ -195,6 +197,12 @@ local SQLite behavior.
 ## Atomic reconciliation and outages
 
 Local map writes are atomic and privately backed up under `~/.lcm/oldmaps/`.
+Every mutation that replaces an existing map reserves a new private backup
+exclusively. Backups use `map-<unix-seconds>.json`, then suffixes `-1` through
+`-999` when the same timestamp is already occupied; concurrent writers never
+reuse or overwrite a backup. If all 1,000 bounded candidates are occupied, the
+mutation fails before changing `map.json` and asks the operator to move old
+backups aside.
 Every map mutation holds a private owner-aware exclusive lock and clears only
 the expected prior UUID. Locks record the owning PID and process-start marker;
 LCM reclaims a lock only when the owner is provably dead or the PID has been
@@ -241,7 +249,11 @@ PostgreSQL domain repositories are still staged. With PostgreSQL selected, the
 daemon starts so identity validation remains reachable, but `GET /health`
 reports unavailable storage. `POST /status`, `/search`, `/grep`, `/recent`,
 `/describe`, and `/expand`, plus `GET /stats` and `/stats/pool`, return fixed
-`503` responses after their applicable identity checks. Every fixed staged
+`503` responses after their applicable identity checks. Before those manual
+read routes reach the staged backend, an absent project binding, missing or
+pending registration, or invalid machine identity returns `409` with
+`code: "STORAGE_IDENTITY_REQUIRED"` and `storageBackend: "postgresql"`.
+SQLite keeps its existing best-effort empty-result behavior. Every fixed staged
 route response includes the stable machine-readable code
 `STORAGE_BACKEND_STAGED` and `storageBackend: "postgresql"`; clients must not
 authenticate or branch on the human-readable error text. The hook-facing

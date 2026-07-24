@@ -5,6 +5,8 @@ import type {
 } from "../../storage/index.js";
 import { StorageOperationError } from "../../storage/errors.js";
 import { UnavailablePostgreSqlStorageBackendFactory } from "../../storage/factory.js";
+import { StorageIdentityConfigurationError } from "../../storage/identity-context.js";
+import { MachineIdentityFileError } from "../../machine-identity.js";
 import {
   stagedPostgreSqlUnavailablePayload,
   type StagedPostgreSqlUnavailableResponse,
@@ -13,6 +15,14 @@ import {
 interface AsyncClosable {
   close(): Promise<void> | void;
 }
+
+export const STORAGE_IDENTITY_REQUIRED_ERROR_CODE = "STORAGE_IDENTITY_REQUIRED" as const;
+
+export type StorageIdentityRequiredResponse = {
+  readonly code: typeof STORAGE_IDENTITY_REQUIRED_ERROR_CODE;
+  readonly error: string;
+  readonly storageBackend: "postgresql";
+};
 
 async function settleClose(resource: AsyncClosable | undefined): Promise<void> {
   if (!resource) return;
@@ -50,4 +60,20 @@ export function stagedPostgreSqlUnavailableResponse(
     return null;
   }
   return stagedPostgreSqlUnavailablePayload(operation);
+}
+
+export function storageIdentityRequiredResponse(
+  error: unknown,
+): StorageIdentityRequiredResponse | null {
+  if (
+    !(error instanceof StorageIdentityConfigurationError)
+    && !(error instanceof MachineIdentityFileError)
+  ) {
+    return null;
+  }
+  return {
+    code: STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
+    error: error.message,
+    storageBackend: "postgresql",
+  };
 }

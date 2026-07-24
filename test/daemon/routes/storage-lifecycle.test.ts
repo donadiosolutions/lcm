@@ -3,8 +3,11 @@ import {
   closeRouteStorage,
   openExistingProject,
   stagedPostgreSqlUnavailableResponse,
+  storageIdentityRequiredResponse,
 } from "../../../src/daemon/routes/storage-lifecycle.js";
+import { MachineIdentityFileError } from "../../../src/machine-identity.js";
 import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
+import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 
 describe("route storage cleanup", () => {
   it("ignores absent resources", async () => {
@@ -53,5 +56,23 @@ describe("route storage cleanup", () => {
         error: "grep is unavailable while PostgreSQL storage repositories are staged",
         storageBackend: "postgresql",
       });
+  });
+
+  it("recognizes only typed PostgreSQL identity admission failures", () => {
+    expect(storageIdentityRequiredResponse(new Error("other"))).toBeNull();
+    expect(storageIdentityRequiredResponse(
+      new StorageIdentityConfigurationError("binding required"),
+    )).toEqual({
+      code: "STORAGE_IDENTITY_REQUIRED",
+      error: "binding required",
+      storageBackend: "postgresql",
+    });
+    expect(storageIdentityRequiredResponse(
+      new MachineIdentityFileError("machine missing", "Register it."),
+    )).toEqual({
+      code: "STORAGE_IDENTITY_REQUIRED",
+      error: "machine missing. Register it.",
+      storageBackend: "postgresql",
+    });
   });
 });

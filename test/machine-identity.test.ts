@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ensurePendingMachineIdentity,
@@ -26,6 +26,7 @@ import {
   requireMachineIdentity,
   type MachineIdentity,
 } from "../src/machine-identity.js";
+import { quoteShellArgument } from "../src/shell-quote.js";
 
 const MACHINE_A = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const MACHINE_B = "018f22c4-6d2a-7f10-9a4c-6b8d3e5f9013";
@@ -147,6 +148,25 @@ describe("machine identity file", () => {
     chmodSync(machineIdentityPath(home), 0o600);
     writeFileSync(machineIdentityPath(home), "x".repeat(64 * 1024 + 1));
     expect(() => readMachineIdentity(home)).toThrow("configured size limit");
+  });
+
+  it("shell-quotes a hostile machine identity path in permission remediation", () => {
+    const hostileHome = join(home, "home with ' quote `tick` $(subshell) --");
+    const path = machineIdentityPath(hostileHome);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, "{}", { mode: 0o600 });
+    chmodSync(path, 0o644);
+
+    let error: unknown;
+    try {
+      readMachineIdentity(hostileHome);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toMatchObject({
+      remediation: `Run \`chmod 600 -- ${quoteShellArgument(path)}\`, then retry.`,
+    });
   });
 
   it.each([

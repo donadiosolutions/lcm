@@ -130,21 +130,55 @@ describe("daemon server", () => {
     expect(store.error).toContain("has no PostgreSQL binding");
     expect(store.error).not.toContain("storage initialization failed");
 
+    const manualReadRequests = [
+      { path: "/search", operation: "search", body: { cwd: tempHome, query: "remember" } },
+      { path: "/grep", operation: "grep", body: { cwd: tempHome, query: "remember" } },
+      { path: "/recent", operation: "recent", body: { cwd: tempHome } },
+      { path: "/describe", operation: "describe", body: { cwd: tempHome, nodeId: "node" } },
+      { path: "/expand", operation: "expand", body: { cwd: tempHome, nodeId: "node" } },
+    ];
+    for (const request of manualReadRequests) {
+      const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request.body),
+      });
+      expect(response.status).toBe(409);
+      const identityRequired = await response.json() as Record<string, unknown>;
+      expect(identityRequired).toMatchObject({
+        code: "STORAGE_IDENTITY_REQUIRED",
+        storageBackend: "postgresql",
+        error: expect.stringContaining("has no PostgreSQL binding"),
+      });
+      expect(JSON.stringify(identityRequired)).not.toContain(tempHome);
+      expect(JSON.stringify(identityRequired)).not.toContain("secret");
+    }
+
+    const local = resolveProjectIdentity(tempHome!);
+    setRemoteProjectBinding("018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020", { hash: local.id });
+    for (const request of manualReadRequests) {
+      const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request.body),
+      });
+      expect(response.status).toBe(409);
+      const identityRequired = await response.json() as Record<string, unknown>;
+      expect(identityRequired).toEqual({
+        code: "STORAGE_IDENTITY_REQUIRED",
+        error: "machine identity is not registered. "
+          + "Run `lcm machine register` before linking a PostgreSQL project.",
+        storageBackend: "postgresql",
+      });
+    }
+
     recoverMachineIdentity({
       version: 1,
       identityKey: `machine:${"a".repeat(64)}`,
       machineId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012",
       displayName: "Machine A",
     }, { homeDir: tempHome });
-    const local = resolveProjectIdentity(tempHome!);
-    setRemoteProjectBinding("018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020", { hash: local.id });
-    for (const request of [
-      { path: "/search", operation: "search", body: { cwd: tempHome, query: "remember" } },
-      { path: "/grep", operation: "grep", body: { cwd: tempHome, query: "remember" } },
-      { path: "/recent", operation: "recent", body: { cwd: tempHome } },
-      { path: "/describe", operation: "describe", body: { cwd: tempHome, nodeId: "node" } },
-      { path: "/expand", operation: "expand", body: { cwd: tempHome, nodeId: "node" } },
-    ]) {
+    for (const request of manualReadRequests) {
       const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

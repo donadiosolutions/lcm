@@ -70,6 +70,7 @@ export type ProjectMapValidation = {
 const HASH_RE = /^[a-f0-9]{64}$/;
 const MAX_PROJECT_MAP_BYTES = 4 * 1024 * 1024;
 const MAX_PROJECT_MAP_LOCK_BYTES = 1024;
+const MAX_PROJECT_MAP_BACKUP_ATTEMPTS = 1_000;
 let cache: { path: string; mtimeMs: number | null; map: ProjectMap; metadataPopulated: boolean } | null = null;
 const activeProjectMapMutationLocks = new Set<string>();
 
@@ -449,14 +450,19 @@ function createBackupIfNeeded(path: string, homeDir?: string): string | undefine
   if (!existsSync(path)) return undefined;
   const backupDir = oldMapsDir(homeDir);
   ensurePrivateDirectory(backupDir);
-  const backupPath = join(backupDir, `map-${Math.floor(Date.now() / 1000)}.json`);
-  if (!existsSync(backupPath)) {
-    writePrivateFileExclusive(backupPath, readBoundedRegularFile(path, {
-      allowedRoot: dirname(path),
-      maxBytes: MAX_PROJECT_MAP_BYTES,
-    }));
+  const timestamp = Math.floor(Date.now() / 1000);
+  const content = readBoundedRegularFile(path, {
+    allowedRoot: dirname(path),
+    maxBytes: MAX_PROJECT_MAP_BYTES,
+  });
+  for (let suffix = 0; suffix < MAX_PROJECT_MAP_BACKUP_ATTEMPTS; suffix += 1) {
+    const discriminator = suffix === 0 ? "" : `-${suffix}`;
+    const backupPath = join(backupDir, `map-${timestamp}${discriminator}.json`);
+    if (writePrivateFileExclusive(backupPath, content)) return backupPath;
   }
-  return backupPath;
+  throw new Error(
+    `could not create an exclusive project map backup after ${MAX_PROJECT_MAP_BACKUP_ATTEMPTS} attempts; move old backups aside and retry`,
+  );
 }
 
 function assertCurrentMapIsWritable(path: string): void {

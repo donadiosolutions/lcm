@@ -3,6 +3,7 @@ import { lstatSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { lcmHomeDir } from "./runtime-paths.js";
+import { quoteShellArgument } from "./shell-quote.js";
 import {
   atomicWritePrivateFile,
   atomicWritePrivateFileExclusive,
@@ -156,7 +157,7 @@ function readMachineIdentityContent(path: string): string | null {
     if ((stat.mode & 0o077) !== 0) {
       throw new MachineIdentityFileError(
         "machine.json permissions are too broad; expected mode 0600",
-        `Run \`chmod 600 ${path}\`, then retry.`,
+        `Run \`chmod 600 -- ${quoteShellArgument(path)}\`, then retry.`,
       );
     }
     return readBoundedRegularFile(path, {

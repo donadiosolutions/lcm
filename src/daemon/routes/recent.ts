@@ -8,6 +8,7 @@ import {
   closeRouteStorage,
   openExistingProject,
   stagedPostgreSqlUnavailableResponse,
+  storageIdentityRequiredResponse,
 } from "./storage-lifecycle.js";
 
 function sqliteTimestamp(date: Date): string {
@@ -54,6 +55,11 @@ export function createRecentHandler(config: DaemonConfig, storageFactory?: Stora
       }));
       sendJson(res, 200, { summaries: rows });
     } catch (error) {
+      const identityRequired = storageIdentityRequiredResponse(error);
+      if (identityRequired) {
+        sendJson(res, 409, identityRequired);
+        return;
+      }
       const unavailable = stagedPostgreSqlUnavailableResponse(activeFactory, error, "recent");
       if (unavailable) {
         sendJson(res, 503, unavailable);

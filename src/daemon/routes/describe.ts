@@ -9,6 +9,7 @@ import {
   closeRouteStorage,
   openExistingProject,
   stagedPostgreSqlUnavailableResponse,
+  storageIdentityRequiredResponse,
 } from "./storage-lifecycle.js";
 
 export function createDescribeHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
@@ -51,6 +52,11 @@ export function createDescribeHandler(config: DaemonConfig, storageFactory?: Sto
       const result = await engine.describe(nodeId);
       sendJson(res, 200, { node: result });
     } catch (err) {
+      const identityRequired = storageIdentityRequiredResponse(err);
+      if (identityRequired) {
+        sendJson(res, 409, identityRequired);
+        return;
+      }
       const unavailable = stagedPostgreSqlUnavailableResponse(activeFactory, err, "describe");
       if (unavailable) {
         sendJson(res, 503, unavailable);

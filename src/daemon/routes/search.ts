@@ -9,6 +9,7 @@ import {
   closeRouteStorage,
   openExistingProject,
   stagedPostgreSqlUnavailableResponse,
+  storageIdentityRequiredResponse,
 } from "./storage-lifecycle.js";
 
 export function createSearchHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
@@ -70,6 +71,11 @@ export function createSearchHandler(config: DaemonConfig, storageFactory?: Stora
           }
         }
       } catch (error) {
+        const identityRequired = storageIdentityRequiredResponse(error);
+        if (identityRequired) {
+          sendJson(res, 409, identityRequired);
+          return;
+        }
         const unavailable = stagedPostgreSqlUnavailableResponse(activeFactory, error, "search");
         if (unavailable) {
           sendJson(res, 503, unavailable);

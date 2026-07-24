@@ -10,6 +10,7 @@ import {
   closeRouteStorage,
   openExistingProject,
   stagedPostgreSqlUnavailableResponse,
+  storageIdentityRequiredResponse,
 } from "./storage-lifecycle.js";
 
 export function createExpandHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
@@ -53,6 +54,11 @@ export function createExpandHandler(config: DaemonConfig, storageFactory?: Stora
       const result = await orchestrator.expand({ summaryIds: [nodeId], maxDepth: depth });
       sendJson(res, 200, result);
     } catch (err) {
+      const identityRequired = storageIdentityRequiredResponse(err);
+      if (identityRequired) {
+        sendJson(res, 409, identityRequired);
+        return;
+      }
       const unavailable = stagedPostgreSqlUnavailableResponse(activeFactory, err, "expand");
       if (unavailable) {
         sendJson(res, 503, unavailable);

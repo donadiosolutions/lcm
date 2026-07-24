@@ -9,6 +9,7 @@ import {
   closeRouteStorage,
   openExistingProject,
   stagedPostgreSqlUnavailableResponse,
+  storageIdentityRequiredResponse,
 } from "./storage-lifecycle.js";
 
 export function createGrepHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
@@ -49,6 +50,11 @@ export function createGrepHandler(config: DaemonConfig, storageFactory?: Storage
       const result = await engine.grep({ query, mode: mode ?? "full_text", scope: scope ?? "both", since });
       sendJson(res, 200, result);
     } catch (error) {
+      const identityRequired = storageIdentityRequiredResponse(error);
+      if (identityRequired) {
+        sendJson(res, 409, identityRequired);
+        return;
+      }
       const unavailable = stagedPostgreSqlUnavailableResponse(activeFactory, error, "grep");
       if (unavailable) {
         sendJson(res, 503, unavailable);
