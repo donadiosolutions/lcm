@@ -9,7 +9,12 @@ import {
   type LlmReasoningEffort,
   type LlmRequestPolicy,
 } from "../config.js";
-import { projectPaths, ensureProjectDir, isSafeTranscriptPath } from "../project.js";
+import {
+  projectPaths,
+  ensureProjectDir,
+  isSafeTranscriptPath,
+  projectIdentity,
+} from "../project.js";
 import { enqueue } from "../project-queue.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
@@ -306,10 +311,11 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
           paths.dir,
         );
 
+        const identity = projectIdentity(cwd, config.storage);
         const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
         let project: ProjectStorage | undefined;
         try {
-          project = await factory.openProject(paths);
+          project = await factory.openProject(identity);
           const conversation = await project.conversations.getOrCreateConversation(session_id);
 
           // Ingest new messages from the transcript into the DB.

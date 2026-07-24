@@ -1,5 +1,8 @@
-import type { ProjectIdentity } from "../../project-map.js";
-import type { ProjectStorage, StorageBackendFactory } from "../../storage/index.js";
+import type {
+  ProjectStorage,
+  StorageBackendFactory,
+  StorageIdentityContext,
+} from "../../storage/index.js";
 
 interface AsyncClosable {
   close(): Promise<void> | void;
@@ -24,7 +27,7 @@ export async function closeRouteStorage(
 /** Open a project only when it already exists in the selected backend. */
 export async function openExistingProject(
   factory: StorageBackendFactory,
-  identity: ProjectIdentity,
+  identity: StorageIdentityContext,
 ): Promise<ProjectStorage | null> {
   return factory.openExistingProject(identity);
 }

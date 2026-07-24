@@ -1,8 +1,21 @@
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
+import type { ResolvedStorageConfig } from "../../src/daemon/config.js";
 import {
+  createProject as createIdentityProject,
+  type IdentityRepository,
+} from "../../src/identity-service.js";
+import { recoverMachineIdentity } from "../../src/machine-identity.js";
+import { clearProjectMapCache, resolveProjectIdentity } from "../../src/project-map.js";
+import {
+  PostgreSqlIdentityCreateOutcomeUnknownError,
+  type PostgreSqlIdentityExecutor,
   PostgreSqlIdentityConflictError,
   PostgreSqlIdentityRepository,
 } from "../../src/storage/postgresql/identity-repository.js";
+import { PostgreSqlCommitOutcomeUnknownError } from "../../src/storage/postgresql/errors.js";
 import { assertHarnessReady, withPostgreSqlTestDatabase } from "./harness.js";
 
 beforeAll(assertHarnessReady);
@@ -142,6 +155,179 @@ describe("PostgreSQL 18 machine and project identities", () => {
       await expect(repository.deleteProjectIfUnreferenced(project.projectId)).resolves.toBe(true);
       await expect(repository.recoverMachine(machine.machineId))
         .resolves.toMatchObject({ identityKey: `machine:${"d".repeat(64)}` });
+    });
+  });
+
+  it("restores aliases by expected ownership and cleans up creates atomically", async () => {
+    await withPostgreSqlTestDatabase("identity-reconcile", async (database) => {
+      const repository = new PostgreSqlIdentityRepository(database.migrator);
+      const machine = await repository.registerMachine(
+        `machine:${"e".repeat(64)}`,
+        "Machine E",
+      );
+      const original = await repository.createProject({
+        machineId: machine.machineId,
+        displayName: "Original",
+        path: "/work/reconcile",
+        normalizedPath: "/work/reconcile",
+      });
+      const replacement = await repository.createProject({
+        machineId: machine.machineId,
+        displayName: "Replacement",
+        path: "/work/replacement",
+        normalizedPath: "/work/replacement",
+      });
+      const prior = await repository.resolveProject(machine.machineId, "/work/reconcile");
+      expect(prior).toMatchObject({ projectId: original.projectId });
+      await expect(repository.replaceProjectAlias({
+        machineId: machine.machineId,
+        expectedPriorProjectId: replacement.projectId,
+        projectId: original.projectId,
+        path: "/work/reconcile",
+        normalizedPath: "/work/reconcile",
+      })).resolves.toBeNull();
+      await expect(repository.replaceProjectAlias({
+        machineId: machine.machineId,
+        expectedPriorProjectId: original.projectId,
+        projectId: replacement.projectId,
+        path: "/work/reconcile",
+        normalizedPath: "/work/reconcile",
+      })).resolves.toMatchObject({ path: "/work/reconcile" });
+      await expect(repository.resolveProject(machine.machineId, "/work/reconcile"))
+        .resolves.toMatchObject({ projectId: replacement.projectId });
+      await expect(repository.restoreProjectAlias({
+        machineId: machine.machineId,
+        normalizedPath: "/work/reconcile",
+        currentProjectId: replacement.projectId,
+        prior,
+      })).resolves.toBe(true);
+      await expect(repository.resolveProject(machine.machineId, "/work/reconcile"))
+        .resolves.toMatchObject({ projectId: original.projectId });
+      await expect(repository.restoreProjectAlias({
+        machineId: machine.machineId,
+        normalizedPath: "/work/reconcile",
+        currentProjectId: replacement.projectId,
+        prior: null,
+      })).resolves.toBe(false);
+
+      const disposable = await repository.createProject({
+        machineId: machine.machineId,
+        displayName: "Disposable",
+        path: "/work/disposable",
+        normalizedPath: "/work/disposable",
+      });
+      await expect(repository.cleanupCreatedProject(
+        machine.machineId,
+        disposable.projectId,
+        "/work/disposable",
+      )).resolves.toBe(true);
+      await expect(repository.resolveProject(machine.machineId, "/work/disposable"))
+        .resolves.toBeNull();
+      expect((await repository.listProjects()).map(({ projectId }) => projectId))
+        .not.toContain(disposable.projectId);
+    });
+  });
+
+  it("does not bind a concurrent project after an ambiguous create rolls back", async () => {
+    await withPostgreSqlTestDatabase("identity-create-race", async (database) => {
+      const repository = new PostgreSqlIdentityRepository(database.migrator);
+      const machine = await repository.registerMachine(
+        `machine:${"f".repeat(64)}`,
+        "Machine F",
+      );
+      let candidateId: string | undefined;
+      const rollbackExecutor = {
+        query: database.migrator.query.bind(database.migrator),
+        transaction: async <T>(
+          callback: Parameters<PostgreSqlIdentityExecutor["transaction"]>[0],
+          options: Parameters<PostgreSqlIdentityExecutor["transaction"]>[1],
+        ): Promise<T> => {
+          try {
+            await database.migrator.transaction(async (transaction) => {
+              const candidate = await callback(transaction);
+              candidateId = (candidate as { projectId: string }).projectId;
+              throw new Error("force candidate rollback");
+            }, options);
+          } catch {
+            // The candidate transaction is intentionally rolled back.
+          }
+          throw new PostgreSqlCommitOutcomeUnknownError(options);
+        },
+      } as PostgreSqlIdentityExecutor;
+      const uncertain = new PostgreSqlIdentityRepository(rollbackExecutor);
+      const home = mkdtempSync(join(tmpdir(), "lcm-pg-create-race-"));
+      const projectPath = join(home, "project");
+      mkdirSync(projectPath);
+      const originalHome = process.env.HOME;
+      const originalUserProfile = process.env.USERPROFILE;
+      process.env.HOME = home;
+      process.env.USERPROFILE = home;
+      clearProjectMapCache();
+      recoverMachineIdentity({
+        version: 1,
+        identityKey: machine.identityKey,
+        machineId: machine.machineId,
+        displayName: machine.displayName,
+      }, { homeDir: home });
+      const config: ResolvedStorageConfig = {
+        backend: "postgresql",
+        postgresql: {
+          url: "postgresql://unused",
+          caFile: "/unused",
+          poolMax: 1,
+          connectionTimeoutMs: 1,
+          idleTimeoutMs: 1,
+          statementTimeoutMs: 1,
+        },
+      };
+      const facade: IdentityRepository = {
+        registerMachine: repository.registerMachine.bind(repository),
+        recoverMachine: repository.recoverMachine.bind(repository),
+        createProject: async (input) => {
+          try {
+            return await uncertain.createProject(input);
+          } catch (error) {
+            expect(error).toBeInstanceOf(PostgreSqlIdentityCreateOutcomeUnknownError);
+            await repository.createProject({
+              ...input,
+              displayName: "Concurrent owner",
+            });
+            throw error;
+          }
+        },
+        linkProject: repository.linkProject.bind(repository),
+        replaceProjectAlias: repository.replaceProjectAlias.bind(repository),
+        unlinkPath: repository.unlinkPath.bind(repository),
+        unlinkProjectAliasIfOwned: repository.unlinkProjectAliasIfOwned.bind(repository),
+        unlinkProject: repository.unlinkProject.bind(repository),
+        deleteProjectIfUnreferenced: repository.deleteProjectIfUnreferenced.bind(repository),
+        cleanupCreatedProject: repository.cleanupCreatedProject.bind(repository),
+        restoreProjectAlias: repository.restoreProjectAlias.bind(repository),
+        resolveProject: repository.resolveProject.bind(repository),
+        listProjects: repository.listProjects.bind(repository),
+      };
+      try {
+        await expect(createIdentityProject(config, projectPath, {}, {
+          homeDir: home,
+          openSession: async () => ({
+            repository: facade,
+            close: async () => undefined,
+          }),
+        })).rejects.toMatchObject({
+          message: expect.stringContaining("does not own"),
+        });
+        const owner = await repository.resolveProject(machine.machineId, projectPath);
+        expect(owner?.projectId).toBeDefined();
+        expect(owner?.projectId).not.toBe(candidateId);
+        expect(resolveProjectIdentity(projectPath).remoteProjectId).toBeUndefined();
+      } finally {
+        clearProjectMapCache();
+        rmSync(home, { recursive: true, force: true });
+        if (originalHome === undefined) delete process.env.HOME;
+        else process.env.HOME = originalHome;
+        if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = originalUserProfile;
+      }
     });
   });
 });

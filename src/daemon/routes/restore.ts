@@ -95,10 +95,10 @@ export function createRestoreHandler(
       const orientation = buildOrientationPrompt();
       const openProject = async (createIfMissing: boolean): Promise<ProjectStorage | null> => {
         if (project) return project;
+        const identity = projectIdentity(cwd!, config.storage);
         const factory = storageFactory
           ?? ownedFactory
           ?? (ownedFactory = createStorageBackendFactory(config.storage));
-        const identity = projectIdentity(cwd!);
         project = createIfMissing
           ? await factory.openProject(identity)
           : await openExistingProject(factory, identity) ?? undefined;

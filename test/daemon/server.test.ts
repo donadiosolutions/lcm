@@ -63,6 +63,60 @@ describe("daemon server", () => {
     }
   });
 
+  it("starts with staged PostgreSQL storage and validates route identity before unavailability", async () => {
+    const caPath = join(tempHome!, "postgres-ca.pem");
+    writeFileSync(
+      caPath,
+      "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n",
+      { mode: 0o600 },
+    );
+    const config = loadDaemonConfig(
+      "/nonexistent",
+      {
+        storage: { backend: "postgresql" },
+        daemon: { port: 0, idleTimeoutMs: 0 },
+        llm: { provider: "disabled" },
+      },
+      {
+        LCM_POSTGRES_URL: "postgresql://user:secret@db.example.test/lcm",
+        LCM_POSTGRES_CA_FILE: caPath,
+      },
+    );
+    daemon = await createDaemon(config);
+    const port = daemon.address().port;
+
+    const healthResponse = await fetch(`http://127.0.0.1:${port}/health`);
+    expect(healthResponse.status).toBe(503);
+    const health = await healthResponse.json() as {
+      status: string;
+      storageBackend: string;
+      storage: { status: string; error: Record<string, unknown> };
+    };
+    expect(health).toMatchObject({
+      status: "unavailable",
+      storageBackend: "postgresql",
+      storage: {
+        status: "unavailable",
+        error: {
+          code: "STORAGE_INITIALIZATION_FAILED",
+          backend: "postgresql",
+          operation: "health",
+        },
+      },
+    });
+    expect(JSON.stringify(health)).not.toContain("secret");
+
+    const storeResponse = await fetch(`http://127.0.0.1:${port}/store`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: tempHome, text: "remember" }),
+    });
+    expect(storeResponse.status).toBe(500);
+    const store = await storeResponse.json() as { error: string };
+    expect(store.error).toContain("has no PostgreSQL binding");
+    expect(store.error).not.toContain("storage initialization failed");
+  });
+
   it("returns 404 for unknown routes", async () => {
     daemon = await createDaemon(loadDaemonConfig("/x", { daemon: { port: 0 } }));
     const res = await fetch(`http://127.0.0.1:${daemon.address().port}/nope`);

@@ -4,11 +4,24 @@ import { join, resolve, normalize, join as pathJoin, dirname, basename, parse } 
 import { lcmHomeDir } from "../runtime-paths.js";
 import { resolveProjectIdentity, type ProjectIdentity } from "../project-map.js";
 import { atomicWritePrivateFile, ensurePrivateDirectory, readBoundedRegularFile } from "../security-files.js";
+import type { StorageIdentityContext } from "../storage/contracts.js";
+import { resolveStorageIdentityContext } from "../storage/identity-context.js";
+import type { ResolvedStorageConfig } from "./config.js";
 
 const MAX_PROJECT_METADATA_BYTES = 1024 * 1024;
 
-export const projectIdentity = (cwd: string): ProjectIdentity =>
-  resolveProjectIdentity(cwd);
+export function projectIdentity(cwd: string): ProjectIdentity;
+export function projectIdentity(
+  cwd: string,
+  config: ResolvedStorageConfig,
+): StorageIdentityContext;
+export function projectIdentity(
+  cwd: string,
+  config?: ResolvedStorageConfig,
+): ProjectIdentity | StorageIdentityContext {
+  const local = resolveProjectIdentity(cwd);
+  return config ? resolveStorageIdentityContext(config, local) : local;
+}
 
 export const projectId = (cwd: string): string =>
   projectIdentity(cwd).id;

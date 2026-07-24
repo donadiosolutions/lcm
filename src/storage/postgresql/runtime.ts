@@ -8,7 +8,11 @@ import type {
   PostgreSqlRuntimeHealth,
 } from "./contracts.js";
 import { buildPostgreSqlClientConfig } from "./client-config.js";
-import { isPostgreSqlConnectionError, normalizePostgreSqlError } from "./errors.js";
+import {
+  isPostgreSqlConnectionError,
+  normalizePostgreSqlError,
+  PostgreSqlCommitOutcomeUnknownError,
+} from "./errors.js";
 import {
   areRequiredPostgreSqlExtensionsReady,
   inspectRequiredPostgreSqlExtensions,
@@ -249,13 +253,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
         }
       }
       if (commitOutcomeAmbiguous) {
-        throw new StorageOperationError(
-          "STORAGE_OPERATION_FAILED",
-          "postgresql",
-          options.projectId,
-          options.domain,
-          options.operation,
-        );
+        throw new PostgreSqlCommitOutcomeUnknownError(options);
       }
       throw normalizePostgreSqlError(error, options);
     } finally {

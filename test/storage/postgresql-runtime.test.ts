@@ -301,7 +301,7 @@ describe("PostgreSQL runtime", () => {
     expect(closed.connect).not.toHaveBeenCalled();
   });
 
-  it("treats connection loss during COMMIT as non-retryable and destroys the client", async () => {
+  it("marks connection loss during COMMIT as an ambiguous non-retryable outcome and destroys the client", async () => {
     const f = fixtures((input) => {
       if (input === "COMMIT") throw Object.assign(new Error("connection secret"), { code: "08006" });
       return result([]);
@@ -315,6 +315,7 @@ describe("PostgreSQL runtime", () => {
       projectId: "project",
       domain: "transaction",
       operation: "ambiguousCommit",
+      name: "PostgreSqlCommitOutcomeUnknownError",
       retryable: false,
     });
     expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");

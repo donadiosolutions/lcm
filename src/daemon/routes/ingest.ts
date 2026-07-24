@@ -1,6 +1,11 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { DaemonConfig } from "../config.js";
-import { projectPaths, ensureProjectDir, isSafeTranscriptPath } from "../project.js";
+import {
+  projectPaths,
+  ensureProjectDir,
+  isSafeTranscriptPath,
+  projectIdentity,
+} from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { ParsedMessage } from "../../transcript.js";
@@ -72,8 +77,9 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
     try {
+      const identity = projectIdentity(cwd, config.storage);
       const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await factory.openProject(paths);
+      project = await factory.openProject(identity);
       const ingest = await project.transaction(async (repositories) => {
         const row = await repositories.coordination.getSessionIngest(session_id);
         if (row && parsed.length <= row.messageCount) return null;

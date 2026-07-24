@@ -37,6 +37,7 @@ vi.mock("../../../src/db/connection.js", () => ({
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
   projectPaths: (cwd: string) => ({ id: "pid", dir: `${cwd}/project`, dbPath: `${cwd}/lcm.db`, metaPath: `${cwd}/meta.json`, canonical: cwd }),
+  projectIdentity: (cwd: string) => ({ id: "pid", canonical: cwd }),
   ensureProjectDir: vi.fn(),
   isSafeTranscriptPath: mocks.safeTranscript,
 }));

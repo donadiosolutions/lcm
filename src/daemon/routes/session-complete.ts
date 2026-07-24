@@ -24,8 +24,9 @@ export function createSessionCompleteHandler(config: DaemonConfig, storageFactor
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
     try {
+      const identity = projectIdentity(cwd, config.storage);
       const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await factory.openProject(projectIdentity(cwd));
+      project = await factory.openProject(identity);
       await project.transaction(async (repositories) => {
         const messageCount = await repositories.conversations.getMessageCountBySessionId(session_id);
         await repositories.coordination.recordSessionIngest(session_id, messageCount);

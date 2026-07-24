@@ -11,7 +11,6 @@ import {
   resolveStorageConfig,
 } from "../../src/daemon/config.js";
 import { createDaemon } from "../../src/daemon/server.js";
-import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
 import { parsePostgreSqlUrl } from "../../src/storage/postgresql/client-config.js";
 
 const tempDirs: string[] = [];
@@ -421,8 +420,23 @@ describe("storage configuration", () => {
     expect(daemonConfigForPersistence(parseDaemonConfig("{}")).storage).toEqual({ backend: "sqlite" });
   });
 
-  it("fails before the daemon listens when the selected PostgreSQL implementation is unavailable", async () => {
-    const config = parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, postgresEnv());
-    await expect(createDaemon(config)).rejects.toBeInstanceOf(StorageBackendUnavailableError);
+  it("starts the daemon with explicitly unavailable staged PostgreSQL storage", async () => {
+    const config = parseDaemonConfig(
+      "{}",
+      { storage: { backend: "postgresql" }, daemon: { port: 0, idleTimeoutMs: 0 } },
+      postgresEnv(),
+    );
+    const daemon = await createDaemon(config);
+    try {
+      const response = await fetch(`http://127.0.0.1:${daemon.address().port}/health`);
+      await expect(response.json()).resolves.toMatchObject({
+        status: "unavailable",
+        storageBackend: "postgresql",
+        storage: { status: "unavailable" },
+      });
+      expect(response.status).toBe(503);
+    } finally {
+      await daemon.stop();
+    }
   });
 });

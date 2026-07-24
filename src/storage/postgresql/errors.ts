@@ -51,6 +51,24 @@ export class PostgreSqlStorageOperationError extends StorageOperationError {
   }
 }
 
+/**
+ * A transport failure observed after COMMIT was sent. The server may have
+ * committed successfully, so callers must reconcile through an authoritative
+ * read before retrying a non-idempotent operation.
+ */
+export class PostgreSqlCommitOutcomeUnknownError extends StorageOperationError {
+  constructor(context: PostgreSqlOperationContext) {
+    super(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      context.projectId,
+      context.domain,
+      context.operation,
+    );
+    this.name = "PostgreSqlCommitOutcomeUnknownError";
+  }
+}
+
 function sanitizeSqlState(error: unknown): string | null {
   const code = (error as PostgreSqlDriverError | undefined)?.code;
   return typeof code === "string" && /^[0-9A-Z]{5}$/u.test(code) ? code : null;

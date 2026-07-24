@@ -78,8 +78,9 @@ export function createStoreHandler(
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
     try {
+      const identity = projectIdentity(projectPath, config.storage);
       const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await factory.openProject(projectIdentity(projectPath));
+      project = await factory.openProject(identity);
 
       const id = await project.promotedMemory.insert({
         content: scrubbedText,

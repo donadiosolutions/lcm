@@ -59,7 +59,7 @@ export function isUuidV7(value: string): boolean {
   return UUIDV7_RE.test(value);
 }
 
-function normalizeDisplayName(value: string | undefined): string {
+export function normalizeMachineDisplayName(value: string | undefined): string {
   const normalized = (value ?? hostname()).trim();
   if (
     normalized.length === 0
@@ -109,7 +109,7 @@ function parseMachineIdentity(content: string): StoredMachineIdentity {
       "Run `lcm machine recover <machine-id> --force` to replace the invalid file.",
     );
   }
-  const displayName = normalizeDisplayName(record.displayName);
+  const displayName = normalizeMachineDisplayName(record.displayName);
   if (record.machineId !== null && (
     typeof record.machineId !== "string" || !isUuidV7(record.machineId)
   )) {
@@ -190,7 +190,7 @@ export function ensurePendingMachineIdentity(
     version: MACHINE_IDENTITY_VERSION,
     identityKey: `machine:${randomBytes(32).toString("hex")}`,
     machineId: null,
-    displayName: normalizeDisplayName(displayName),
+    displayName: normalizeMachineDisplayName(displayName),
   };
   const path = machineIdentityPath(homeDir);
   const created = (fileOperations.writeExclusive ?? atomicWritePrivateFileExclusive)(
@@ -237,7 +237,7 @@ export function finalizeMachineIdentity(
     version: MACHINE_IDENTITY_VERSION,
     identityKey: pending.identityKey,
     machineId,
-    displayName: normalizeDisplayName(displayName),
+    displayName: normalizeMachineDisplayName(displayName),
   };
   atomicWritePrivateFile(machineIdentityPath(homeDir), prettyMachineIdentity(identity));
   return identity;
@@ -249,9 +249,16 @@ function backupExistingMachineIdentity(homeDir?: string): string | undefined {
   if (content === null) return undefined;
   const directory = oldMachineIdentitiesDir(homeDir);
   ensurePrivateDirectory(directory);
-  const backupPath = join(directory, `machine-${Math.floor(Date.now() / 1000)}.json`);
-  writePrivateFileExclusive(backupPath, content);
-  return backupPath;
+  const timestamp = Math.floor(Date.now() / 1000);
+  for (let suffix = 0; suffix < 1_000; suffix += 1) {
+    const discriminator = suffix === 0 ? "" : `-${suffix}`;
+    const backupPath = join(directory, `machine-${timestamp}${discriminator}.json`);
+    if (writePrivateFileExclusive(backupPath, content)) return backupPath;
+  }
+  throw new MachineIdentityFileError(
+    "could not create an exclusive backup for machine.json",
+    "Move old backup files aside, then retry the forced recovery.",
+  );
 }
 
 export function recoverMachineIdentity(

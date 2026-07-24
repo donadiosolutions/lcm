@@ -46,8 +46,9 @@ export function createPromoteHandler(
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
     try {
+        const identity = projectIdentity(cwd, config.storage);
         const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-        project = await openExistingProject(factory, projectIdentity(cwd)) ?? undefined;
+        project = await openExistingProject(factory, identity) ?? undefined;
         if (!project) {
           sendJson(res, 200, { processed: 0, promoted: 0 });
           return;

@@ -231,8 +231,9 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
     try {
+      const identity = projectIdentity(validatedCwd, config.storage);
       const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await openExistingProject(factory, projectIdentity(validatedCwd)) ?? undefined;
+      project = await openExistingProject(factory, identity) ?? undefined;
       if (!project) {
         sendJson(res, 200, { hints: [] });
         return;

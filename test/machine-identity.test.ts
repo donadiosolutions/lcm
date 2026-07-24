@@ -191,6 +191,66 @@ describe("machine identity file", () => {
     expect(readMachineIdentity(home)).toEqual(second);
   });
 
+  it("uses an exclusive suffix when a forced-recovery backup name collides", () => {
+    const first: MachineIdentity = {
+      version: 1,
+      identityKey: `machine:${"a".repeat(64)}`,
+      machineId: MACHINE_A,
+      displayName: "Machine A",
+    };
+    const second: MachineIdentity = {
+      version: 1,
+      identityKey: `machine:${"b".repeat(64)}`,
+      machineId: MACHINE_B,
+      displayName: "Machine B",
+    };
+    recoverMachineIdentity(first, { homeDir: home });
+    vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+
+    const firstRecovery = recoverMachineIdentity(second, { homeDir: home, force: true });
+    const secondRecovery = recoverMachineIdentity(first, { homeDir: home, force: true });
+
+    expect(firstRecovery.backupPath).toBe(
+      join(oldMachineIdentitiesDir(home), "machine-1700000000.json"),
+    );
+    expect(secondRecovery.backupPath).toBe(
+      join(oldMachineIdentitiesDir(home), "machine-1700000000-1.json"),
+    );
+    expect(JSON.parse(readFileSync(secondRecovery.backupPath!, "utf8"))).toEqual(second);
+    expect(readMachineIdentity(home)).toEqual(first);
+  });
+
+  it("does not replace machine.json when no exclusive backup name is available", () => {
+    const first: MachineIdentity = {
+      version: 1,
+      identityKey: `machine:${"a".repeat(64)}`,
+      machineId: MACHINE_A,
+      displayName: "Machine A",
+    };
+    const second: MachineIdentity = {
+      version: 1,
+      identityKey: `machine:${"b".repeat(64)}`,
+      machineId: MACHINE_B,
+      displayName: "Machine B",
+    };
+    recoverMachineIdentity(first, { homeDir: home });
+    const backupDir = oldMachineIdentitiesDir(home);
+    mkdirSync(backupDir, { recursive: true });
+    vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+    for (let suffix = 0; suffix < 1_000; suffix += 1) {
+      const discriminator = suffix === 0 ? "" : `-${suffix}`;
+      writeFileSync(
+        join(backupDir, `machine-1700000000${discriminator}.json`),
+        "occupied",
+        { mode: 0o600 },
+      );
+    }
+
+    expect(() => recoverMachineIdentity(second, { homeDir: home, force: true }))
+      .toThrow("could not create an exclusive backup");
+    expect(readMachineIdentity(home)).toEqual(first);
+  });
+
   it("force-recovers a corrupt regular file and preserves its bytes", () => {
     mkdirSync(join(home, ".lcm"), { recursive: true });
     writeFileSync(machineIdentityPath(home), "{broken", { mode: 0o600 });

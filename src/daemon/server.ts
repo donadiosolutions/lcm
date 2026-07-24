@@ -30,7 +30,6 @@ import { PKG_VERSION } from "./version.js";
 import { normalizeDaemonPort, normalizeIdleTimeoutMs } from "./http-url.js";
 import { projectsDir as lcmProjectsDir } from "../runtime-paths.js";
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
-import { selectStorageBackend } from "../storage/backend.js";
 import { createStorageBackendFactory } from "../storage/index.js";
 export { PKG_VERSION };
 
@@ -113,7 +112,6 @@ async function settleCleanup(callback: () => void | Promise<void>): Promise<void
 }
 
 export async function createDaemon(config: DaemonConfig, options?: DaemonOptions): Promise<DaemonInstance> {
-  selectStorageBackend(config.storage);
   const hasSetTimeoutOverride = options?._setTimeout !== undefined;
   const hasClearTimeoutOverride = options?._clearTimeout !== undefined;
   if (hasSetTimeoutOverride !== hasClearTimeoutOverride) {

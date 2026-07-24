@@ -352,8 +352,11 @@ configuration and verified-TLS prerequisites for an explicit remote-primary
 PostgreSQL selection and includes an internal PostgreSQL 18 pool, migration
 runner, schema baseline, and isolated conformance harness. PostgreSQL domain
 repositories remain staged in #84-#91, with activation in #92, so selecting
-`postgresql` currently fails before daemon startup instead of falling back to
-SQLite. Connection credentials stay out of JSON and effective configuration
+`postgresql` starts the daemon with an explicitly unavailable storage factory
+instead of falling back to SQLite. The health endpoint reports `503` and
+unavailable storage; project routes first validate machine registration and the
+explicit project binding, then fail safely at the unavailable repository
+boundary. Connection credentials stay out of JSON and effective configuration
 output. See [storage backend configuration](docs/configuration.md#storage-backend)
 for operators, the [PostgreSQL schema reference](docs/postgresql-schema.md) for
 the 23-table data and namespace-aware extension contract, and the

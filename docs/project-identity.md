@@ -63,9 +63,11 @@ files are never silently replaced:
 lcm machine recover <machine-uuid> --force
 ```
 
-Forced recovery first writes a private backup under `~/.lcm/oldmachines/` and
-then atomically replaces the file. Recovery requires the explicit machine UUID;
-it does not search by hostname or display name. An unknown UUID fails without
+Forced recovery first writes a uniquely named, exclusive private backup under
+`~/.lcm/oldmachines/` and then atomically replaces the file. If a backup name
+collides, LCM selects a suffix and never replaces `machine.json` until its
+previous bytes are preserved. Recovery requires the explicit machine UUID; it
+does not search by hostname or display name. An unknown UUID fails without
 changing the local file.
 
 ## Create and pair projects
@@ -179,14 +181,34 @@ local SQLite behavior.
 ## Atomic reconciliation and outages
 
 Local map writes are atomic and privately backed up under `~/.lcm/oldmaps/`.
-Remote mutations use PostgreSQL transactions. When a commit result is
-uncertain, LCM performs authoritative readback. A confirmed binding is retained;
-otherwise LCM restores the previous map or alias state and returns an exact,
-idempotent recovery command.
+Remote mutations use PostgreSQL transactions. Only a transport failure after
+`COMMIT` triggers authoritative readback; deterministic collisions and unknown
+UUIDs retain their original errors. A confirmed create or link is retained.
+Otherwise LCM restores the previous map or alias state and returns an exact,
+idempotent recovery command. Restoration compares the expected PostgreSQL
+owner transactionally and stops for manual reconciliation if a concurrent
+operation has taken ownership of the path.
+
+Create readback also compares the alias owner with the exact candidate project
+UUID produced inside the uncertain transaction. A different project claiming
+the path is reported as a collision and is never adopted. Authorized rebinds
+replace the expected prior owner in one transaction, without an intermediate
+unlink. Remote alias and whole-project unlinks retain their expected ownership
+snapshots and reconcile uncertain commits before changing the local map.
+Created-project compensation removes only the exact first alias before deleting
+the project if it remains unreferenced. Project listings use one ordered
+PostgreSQL snapshot so project and alias rows cannot come from different reads.
 
 Hooks remain successful when PostgreSQL identity or storage is unavailable.
 User-prompt passive events are written to the local SQLite outbox before remote
 bootstrap and remain available for later promotion.
+
+PostgreSQL domain repositories are still staged. With PostgreSQL selected, the
+daemon starts so identity validation remains reachable, but `GET /health`
+reports unavailable storage and project operations fail at a cause-free
+unavailable-backend boundary after validating machine registration and the
+explicit project binding. LCM does not fall back to SQLite or advertise
+PostgreSQL data capabilities during this staged state.
 
 ## Ambiguity and doctor
 

@@ -36,8 +36,9 @@ export function createSearchHandler(config: DaemonConfig, storageFactory?: Stora
       let project: ProjectStorage | undefined;
       let ownedFactory: StorageBackendFactory | undefined;
       try {
+        const identity = projectIdentity(cwd, config.storage);
         const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-        project = await openExistingProject(factory, projectIdentity(cwd)) ?? undefined;
+        project = await openExistingProject(factory, identity) ?? undefined;
         if (project) {
 
           // Episodic: FTS5 search across messages + summaries

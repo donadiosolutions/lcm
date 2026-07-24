@@ -44,8 +44,9 @@ export function createReviewStaleHandler(config: DaemonConfig, storageFactory?: 
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
     try {
+      const identity = projectIdentity(cwd, config.storage);
       const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await openExistingProject(factory, projectIdentity(cwd)) ?? undefined;
+      project = await openExistingProject(factory, identity) ?? undefined;
       if (!project) {
         sendJson(res, 200, { stale: [], total: 0 });
         return;
