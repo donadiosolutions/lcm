@@ -1223,31 +1223,72 @@ describe("PostgreSQL schema baseline", () => {
   });
 
   it("fails closed for exact identity enforcement above READ COMMITTED", async () => {
-    await withPostgreSqlTestDatabase("schema-session-isolation", async (database) => {
+    await withPostgreSqlTestDatabase("schema-identity-isolation", async (database) => {
       const scope = await seedScope(database.migrator);
-      await expect(database.migrator.transaction(async (transaction) => {
-        await transaction.query({
-          text: "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
-        }, { domain: "factory", operation: "raiseSessionIdentityIsolation" });
-        await transaction.query({
-          text: `INSERT INTO lcm.session_ingest_log
-                   (project_id, session_id, message_count)
-                 VALUES ($1, 'repeatable-read-session', 1)`,
-          values: [scope.projectId],
-        }, { domain: "factory", operation: "rejectStaleSessionIdentitySnapshot" });
-      }, { domain: "transaction", operation: "enforceSessionIdentityIsolation" }))
-        .rejects.toMatchObject({
-          operation: "rejectStaleSessionIdentitySnapshot",
+      const cases = [
+        {
+          identity: "repeatable-read-summary",
+          insert: `INSERT INTO lcm.summaries
+                     (summary_id, project_id, conversation_id, kind, content, token_count)
+                   VALUES ($3, $1, $2, 'leaf', 'repeatable-read summary', 1)`,
+          label: "Summary",
+          residual: `SELECT pg_catalog.count(*)::pg_catalog.text AS count
+                     FROM lcm.summaries
+                     WHERE project_id = $1 AND summary_id = $2`,
+          values: [scope.projectId, scope.conversationId, "repeatable-read-summary"],
+        },
+        {
+          identity: "repeatable-read-file",
+          insert: `INSERT INTO lcm.large_files
+                     (file_id, project_id, conversation_id, storage_uri)
+                   VALUES ($3, $1, $2, 'file:///repeatable-read')`,
+          label: "LargeFile",
+          residual: `SELECT pg_catalog.count(*)::pg_catalog.text AS count
+                     FROM lcm.large_files
+                     WHERE project_id = $1 AND file_id = $2`,
+          values: [scope.projectId, scope.conversationId, "repeatable-read-file"],
+        },
+        {
+          identity: "repeatable-read-session",
+          insert: `INSERT INTO lcm.session_ingest_log
+                     (project_id, session_id, message_count)
+                   VALUES ($1, $2, 1)`,
+          label: "Session",
+          residual: `SELECT pg_catalog.count(*)::pg_catalog.text AS count
+                     FROM lcm.session_ingest_log
+                     WHERE project_id = $1 AND session_id = $2`,
+          values: [scope.projectId, "repeatable-read-session"],
+        },
+      ] as const;
+
+      for (const identityCase of cases) {
+        const rejectOperation = `rejectStale${identityCase.label}IdentitySnapshot`;
+        await expect(database.migrator.transaction(async (transaction) => {
+          await transaction.query({
+            text: "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+          }, {
+            domain: "factory",
+            operation: `raise${identityCase.label}IdentityIsolation`,
+          });
+          await transaction.query({
+            text: identityCase.insert,
+            values: [...identityCase.values],
+          }, { domain: "factory", operation: rejectOperation });
+        }, {
+          domain: "transaction",
+          operation: `enforce${identityCase.label}IdentityIsolation`,
+        })).rejects.toMatchObject({
+          operation: rejectOperation,
           sqlState: "0A000",
         });
-      await expect(database.migrator.query<{ count: string }>({
-        text: `SELECT pg_catalog.count(*)::pg_catalog.text AS count
-               FROM lcm.session_ingest_log
-               WHERE project_id = $1
-                 AND session_id = 'repeatable-read-session'`,
-        values: [scope.projectId],
-      }, { domain: "factory", operation: "verifyRejectedStaleSessionIdentitySnapshot" }))
-        .resolves.toMatchObject({ rows: [{ count: "0" }] });
+        await expect(database.migrator.query<{ count: string }>({
+          text: identityCase.residual,
+          values: [scope.projectId, identityCase.identity],
+        }, {
+          domain: "factory",
+          operation: `verifyRejectedStale${identityCase.label}IdentitySnapshot`,
+        })).resolves.toMatchObject({ rows: [{ count: "0" }] });
+      }
     });
   });
 

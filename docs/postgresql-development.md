@@ -134,16 +134,19 @@ absent schema because `0001` creates it as the current migration role, but it
 fails closed when another role owns an existing schema even if that role has
 delegated `CREATE` to the migrator. Transfer ownership explicitly with the
 cluster administrator before retrying; LCM never changes schema ownership.
-On every run, the runner first verifies the ordered ledger, then compares the
-catalog with the complete expected `0002` inventory and ownership allowlist.
+On every run, the runner first checks ownership of every existing allowlisted
+object through `pg_catalog`, including `lcm.schema_migrations`, before reading
+any ledger rows. It then verifies the ordered ledger, derives whether `0002`
+was applied, and only then requires the complete expected `0002` inventory.
 A missing table, generated identity sequence, helper or trigger function,
 text-search dictionary, or text-search configuration blocks repeated runs and
-later pending migrations; a smaller surviving inventory is not accepted.
+later pending migrations once that baseline is trusted; a smaller surviving
+inventory is not accepted.
 Unknown objects remain preserved and may have a different owner. The summary,
 large-file, and session-ingest identity functions are also fingerprinted by
 stored body and security configuration. Body, language/return type,
 security-definer/leakproof, volatility, parallel-safety, fixed search path, or
-`PUBLIC EXECUTE` drift fails closed.
+complete normalized ACL drift fails closed.
 Failure diagnostics identify `requiredOwner` using the sanitized PostgreSQL
 `CURRENT_USER` role and provide identifier-quoted transfer guidance. They do
 not expose the existing owner, connection details, or raw database errors, and

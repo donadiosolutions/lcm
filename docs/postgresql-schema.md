@@ -46,10 +46,12 @@ does not add row-level security.
   `search_path` to `pg_catalog, public` before taking the advisory lock, checking
   PostgreSQL 18 and postmaster/module continuity, revalidating the exact
   extension catalog snapshot without repeating the functional probe, checking
-  schema ownership, `PUBLIC CREATE`, the exact ordered ledger, and complete
-  managed-object inventory and ownership before executing pending SQL. Once
-  `0002` is recorded, any missing allowlisted object fails readiness instead of
-  being mistaken for a smaller valid inventory. The recurring allowlist covers the
+  schema ownership and `PUBLIC CREATE`, then checking ownership of every
+  existing allowlisted object before reading the exact ordered ledger. Only
+  after the ledger establishes that `0002` is recorded does the runner require
+  the complete managed-object inventory; any missing allowlisted object then
+  fails readiness instead of being mistaken for a smaller valid inventory.
+  The recurring allowlist covers the
   migration ledger, 23 domain tables, six generated identity sequences, four
   helper or trigger functions, and the LCM text-search dictionary and
   configuration. Unknown `lcm` objects are ignored and never mutated. This makes
@@ -376,9 +378,10 @@ on a provider does not justify silently expanding the baseline.
    version-specific loaded-module catalog, verifies postmaster continuity,
    revalidates the non-probe extension catalog contract, verifies that any
    existing `lcm` schema is owned by the current migration role, rejects
-   schema-level `PUBLIC CREATE`, verifies the complete ordered ledger, then
-   verifies that every expected managed object exists and remains owned by that
-   role. `0001` creates the `lcm` schema and immutable ledger; `0002`
+   schema-level `PUBLIC CREATE`, and verifies ownership of every existing
+   allowlisted object before reading the complete ordered ledger. After the
+   ledger establishes that `0002` was applied, it verifies that every expected
+   managed object exists. `0001` creates the `lcm` schema and immutable ledger; `0002`
    first rejects a pre-existing `lcm` schema that grants `PUBLIC CREATE`, then
    creates the 23-table baseline data model and indexes, the backend-neutral
    project identity key, and bounded session-identity lookup keys. The guard does not
