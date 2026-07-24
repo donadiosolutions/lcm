@@ -11,6 +11,7 @@ import {
 
 const MAX_PRIVATE_MUTATION_LOCK_BYTES = 1024;
 const MAX_DISAPPEARED_OWNER_READ_RETRIES = 1;
+const abandonedMutationLocks = new Map<string, string>();
 
 type PrivateMutationLockOwner = {
   readonly version: 1;
@@ -246,7 +247,10 @@ function acquireMutationLock(
   let disappearedOwnerReadRetries = 0;
   while (true) {
     observer("before-main-lock-publish", lockPath);
-    if (atomicWritePrivateFileExclusive(lockPath, content)) return;
+    if (atomicWritePrivateFileExclusive(lockPath, content)) {
+      abandonedMutationLocks.delete(lockPath);
+      return;
+    }
 
     let existing: ReturnType<typeof readLockOwner>;
     try {
@@ -261,6 +265,18 @@ function acquireMutationLock(
       }
       disappearedOwnerReadRetries += 1;
       continue;
+    }
+
+    const abandonedContent = abandonedMutationLocks.get(lockPath);
+    if (abandonedContent !== undefined) {
+      if (existing.content !== abandonedContent) {
+        abandonedMutationLocks.delete(lockPath);
+      } else {
+        deleteRegularFile(lockPath);
+        abandonedMutationLocks.delete(lockPath);
+        disappearedOwnerReadRetries = 0;
+        continue;
+      }
     }
 
     const state = lockOwnerState(existing.owner, observer);
@@ -331,6 +347,7 @@ function releaseMutationLock(
   label: string,
   observer: PrivateMutationLockObserver,
   callbackFailed: boolean,
+  callbackError: unknown,
 ): void {
   try {
     observer("before-main-lock-release-read", lockPath);
@@ -344,8 +361,55 @@ function releaseMutationLock(
     if (!deleteRegularFile(lockPath)) {
       throw new Error(`${label} mutation lock disappeared before release`);
     }
+    abandonedMutationLocks.delete(lockPath);
   } catch (releaseError) {
     if (!callbackFailed) throw releaseError;
+    let current: string;
+    try {
+      current = readBoundedRegularFile(lockPath, {
+        maxBytes: MAX_PRIVATE_MUTATION_LOCK_BYTES,
+        allowedRoot: dirname(lockPath),
+      });
+    } catch (recoveryError) {
+      if (isMissingFileError(recoveryError)) {
+        abandonedMutationLocks.delete(lockPath);
+        return;
+      }
+      abandonedMutationLocks.set(lockPath, content);
+      throw new AggregateError(
+        [callbackError, releaseError, recoveryError],
+        `${label} mutation failed and lock cleanup could not be recovered`,
+        { cause: callbackError },
+      );
+    }
+    if (current !== content) {
+      abandonedMutationLocks.delete(lockPath);
+      throw new AggregateError(
+        [
+          callbackError,
+          releaseError,
+          new Error(`${label} mutation lock ownership changed during release recovery`),
+        ],
+        `${label} mutation failed and lock cleanup could not be recovered`,
+        { cause: callbackError },
+      );
+    }
+    try {
+      deleteRegularFile(lockPath);
+    } catch (recoveryError) {
+      abandonedMutationLocks.set(lockPath, content);
+      throw new AggregateError(
+        [callbackError, releaseError, recoveryError],
+        `${label} mutation failed and lock cleanup could not be recovered`,
+        { cause: callbackError },
+      );
+    }
+    abandonedMutationLocks.delete(lockPath);
+    throw new AggregateError(
+      [callbackError, releaseError],
+      `${label} mutation failed after lock cleanup initially failed`,
+      { cause: callbackError },
+    );
   }
 }
 
@@ -358,13 +422,22 @@ export function withPrivateMutationLock<T>(
   const content = createMutationLockContent(observer);
   acquireMutationLock(lockPath, content, label, observer);
   let callbackFailed = false;
+  let callbackError: unknown;
   try {
     return callback();
   } catch (error) {
     callbackFailed = true;
+    callbackError = error;
     throw error;
   } finally {
-    releaseMutationLock(lockPath, content, label, observer, callbackFailed);
+    releaseMutationLock(
+      lockPath,
+      content,
+      label,
+      observer,
+      callbackFailed,
+      callbackError,
+    );
   }
 }
 
@@ -377,12 +450,21 @@ export async function withPrivateMutationLockAsync<T>(
   const content = createMutationLockContent(observer);
   acquireMutationLock(lockPath, content, label, observer);
   let callbackFailed = false;
+  let callbackError: unknown;
   try {
     return await callback();
   } catch (error) {
     callbackFailed = true;
+    callbackError = error;
     throw error;
   } finally {
-    releaseMutationLock(lockPath, content, label, observer, callbackFailed);
+    releaseMutationLock(
+      lockPath,
+      content,
+      label,
+      observer,
+      callbackFailed,
+      callbackError,
+    );
   }
 }

@@ -175,6 +175,8 @@ vi.mock("node:fs", async (importOriginal) => ({
 
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { buildCompactionMessage, createCompactHandler } from "../../../src/daemon/routes/compact.js";
+import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
+import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 
 function config() {
   const value = loadDaemonConfig("/does-not-exist");
@@ -392,6 +394,181 @@ describe("compact route coverage", () => {
     const second = response();
     await handler({} as never, second.res, JSON.stringify({ session_id: "same", cwd: "/tmp" }));
     expect(second.json()).toEqual({ skipped: true, actionTaken: false, summary: "Compaction already in progress for this session." });
+    release();
+    await firstCall;
+  });
+
+  it("admits PostgreSQL identity before returning the duplicate shortcut", async () => {
+    let release!: () => void;
+    state.summarizerGate = new Promise<void>((resolve) => { release = resolve; });
+    state.identityError = new StorageIdentityConfigurationError("project is unbound");
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        caFile: "/ca.pem",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+    const handler = createCompactHandler(value);
+    const first = response();
+    const firstCall = handler(
+      {} as never,
+      first.res,
+      JSON.stringify({ session_id: "postgres-duplicate-identity", cwd: "/tmp" }),
+    );
+    const duplicate = response();
+    await handler(
+      {} as never,
+      duplicate.res,
+      JSON.stringify({ session_id: "postgres-duplicate-identity", cwd: "/tmp" }),
+    );
+
+    expect(duplicate.json()).toMatchObject({
+      code: "STORAGE_IDENTITY_REQUIRED",
+      storageBackend: "postgresql",
+    });
+    release();
+    await firstCall;
+  });
+
+  it("admits PostgreSQL staging before returning the duplicate shortcut", async () => {
+    let release!: () => void;
+    state.summarizerGate = new Promise<void>((resolve) => { release = resolve; });
+    state.paths.mockImplementation((cwd: string) => ({
+      id: "pid",
+      dir: "/tmp/project",
+      dbPath: "/tmp/project/lcm.db",
+      metaPath: "/tmp/project/meta.json",
+      canonical: cwd,
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+    }));
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        caFile: "/ca.pem",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+    const handler = createCompactHandler(
+      value,
+      new UnavailablePostgreSqlStorageBackendFactory(),
+    );
+    const first = response();
+    const firstCall = handler(
+      {} as never,
+      first.res,
+      JSON.stringify({ session_id: "postgres-duplicate-staged", cwd: "/tmp" }),
+    );
+    const duplicate = response();
+    await handler(
+      {} as never,
+      duplicate.res,
+      JSON.stringify({ session_id: "postgres-duplicate-staged", cwd: "/tmp" }),
+    );
+
+    expect(duplicate.json()).toMatchObject({
+      code: "STORAGE_BACKEND_STAGED",
+      storageBackend: "postgresql",
+    });
+    release();
+    await firstCall;
+  });
+
+  it("returns the duplicate shortcut only after successful PostgreSQL admission", async () => {
+    let release!: () => void;
+    state.summarizerGate = new Promise<void>((resolve) => { release = resolve; });
+    state.paths.mockImplementation((cwd: string) => ({
+      id: "pid",
+      dir: "/tmp/project",
+      dbPath: "/tmp/project/lcm.db",
+      metaPath: "/tmp/project/meta.json",
+      canonical: cwd,
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+    }));
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        caFile: "/ca.pem",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+    const handler = createCompactHandler(value);
+    const first = response();
+    const firstCall = handler(
+      {} as never,
+      first.res,
+      JSON.stringify({ session_id: "postgres-duplicate-success", cwd: "/tmp" }),
+    );
+    const duplicate = response();
+    await handler(
+      {} as never,
+      duplicate.res,
+      JSON.stringify({ session_id: "postgres-duplicate-success", cwd: "/tmp" }),
+    );
+
+    expect(duplicate.json()).toEqual({
+      skipped: true,
+      actionTaken: false,
+      summary: "Compaction already in progress for this session.",
+    });
+    expect(state.openProject).toHaveBeenCalledTimes(1);
+    release();
+    await firstCall;
+  });
+
+  it.each([
+    ["Error", new Error("identity resolver failed"), "identity resolver failed"],
+    ["non-Error", "identity resolver failed", "compact failed"],
+  ])("reports a %s PostgreSQL duplicate-admission failure", async (
+    _label,
+    identityError,
+    expectedError,
+  ) => {
+    let release!: () => void;
+    state.summarizerGate = new Promise<void>((resolve) => { release = resolve; });
+    state.identityError = identityError;
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        caFile: "/ca.pem",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+    const handler = createCompactHandler(value);
+    const first = response();
+    const firstCall = handler(
+      {} as never,
+      first.res,
+      JSON.stringify({ session_id: "postgres-duplicate-error", cwd: "/tmp" }),
+    );
+    const duplicate = response();
+    await handler(
+      {} as never,
+      duplicate.res,
+      JSON.stringify({ session_id: "postgres-duplicate-error", cwd: "/tmp" }),
+    );
+
+    expect(duplicate.json()).toEqual({ error: expectedError });
     release();
     await firstCall;
   });
