@@ -70,6 +70,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       const failing = migration("0003_atomic_failure", "CREATE TABLE lcm.pending_failure_probe (id integer); SELECT missing FROM absent;");
       await expect(runPostgreSqlMigrations(database.migrator, {
         migrations: [baseline, successful, failing],
+        schemaSnapshots: [],
       })).rejects.toMatchObject({ backend: "postgresql" });
       await expect(database.migrator.query<{ ledger: boolean; probe: boolean }>({
         text: `SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger,
@@ -84,7 +85,10 @@ describe("PostgreSQL migrations and database isolation", () => {
           applied_at timestamptz NOT NULL DEFAULT statement_timestamp()
         );
         CREATE TABLE lcm.ledger_failure_probe (id integer PRIMARY KEY);`);
-      await expect(runPostgreSqlMigrations(database.migrator, { migrations: [ledgerFailure] }))
+      await expect(runPostgreSqlMigrations(database.migrator, {
+        migrations: [ledgerFailure],
+        schemaSnapshots: [],
+      }))
         .rejects.toMatchObject({ backend: "postgresql" });
       await expect(database.migrator.query<{ ledger: boolean; probe: boolean }>({
         text: `SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger,
@@ -120,6 +124,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       );
       await expect(runPostgreSqlMigrations(database.migrator, {
         migrations: [migration("0001_hostile_ledger", ledgerSql), failing],
+        schemaSnapshots: [],
       })).rejects.toMatchObject({ backend: "postgresql" });
       await expect(database.migrator.query<{ exists: boolean }>({
         text: "SELECT pg_catalog.to_regclass('lcm.hostile_rollback_probe') IS NOT NULL AS exists",
@@ -1070,7 +1075,10 @@ describe("PostgreSQL migrations and database isolation", () => {
   it("rejects checksum drift and rolls back a failed pending migration", async () => {
     await withPostgreSqlTestDatabase("migration-drift", async (database) => {
       const baseline = migration("0001_migration_ledger", ledgerSql);
-      await expect(runPostgreSqlMigrations(database.migrator, { migrations: [baseline] }))
+      await expect(runPostgreSqlMigrations(database.migrator, {
+        migrations: [baseline],
+        schemaSnapshots: [],
+      }))
         .rejects.toMatchObject({ operation: "verifyMigrationHistory" });
 
       const current = await database.migrator.query<{ checksum_sha256: string }>({
@@ -1086,7 +1094,10 @@ describe("PostgreSQL migrations and database isolation", () => {
         )),
       };
       const failing = migration("0002_failure", "CREATE TABLE lcm.rollback_probe (id integer); SELECT missing_column FROM missing_table;");
-      await expect(runPostgreSqlMigrations(database.migrator, { migrations: [exactBaseline, failing] }))
+      await expect(runPostgreSqlMigrations(database.migrator, {
+        migrations: [exactBaseline, failing],
+        schemaSnapshots: [],
+      }))
         .rejects.toMatchObject({ backend: "postgresql" });
       await expect(database.migrator.query<{ exists: boolean }>({
         text: "SELECT to_regclass('lcm.rollback_probe') IS NOT NULL AS exists",
