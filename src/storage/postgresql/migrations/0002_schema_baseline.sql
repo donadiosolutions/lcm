@@ -96,7 +96,8 @@ CREATE TABLE lcm.project_aliases (
   path text NOT NULL CHECK (path <> ''),
   normalized_path text NOT NULL CHECK (normalized_path <> '' AND normalized_path = btrim(normalized_path)),
   linked_at timestamptz NOT NULL DEFAULT statement_timestamp(),
-  PRIMARY KEY (machine_id, normalized_path)
+  PRIMARY KEY (machine_id, normalized_path),
+  UNIQUE (machine_id, path)
 );
 
 CREATE INDEX project_aliases_project_idx

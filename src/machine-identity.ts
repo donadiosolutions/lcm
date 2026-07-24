@@ -7,9 +7,9 @@ import { quoteShellArgument } from "./shell-quote.js";
 import {
   atomicWritePrivateFile,
   atomicWritePrivateFileExclusive,
+  copyRegularFilePrivateExclusive,
   ensurePrivateDirectory,
   readBoundedRegularFile,
-  writePrivateFileExclusive,
 } from "./security-files.js";
 import {
   withPrivateMutationLock,
@@ -332,18 +332,13 @@ function backupExistingMachineIdentity(homeDir?: string): string | undefined {
   if (!validateMachineIdentityFile(path)) return undefined;
   const directory = oldMachineIdentitiesDir(homeDir);
   ensurePrivateDirectory(directory);
-  // Recovery backups are not parsed and therefore intentionally do not share
-  // the 64 KiB identity-document limit. The descriptor-bound reader still
-  // enforces regular-file, no-follow, containment, and replacement checks.
-  const content = readBoundedRegularFile(path, {
-    allowedRoot: dirname(path),
-    maxBytes: Number.MAX_SAFE_INTEGER,
-  });
   const timestamp = Math.floor(Date.now() / 1000);
   for (let suffix = 0; suffix < 1_000; suffix += 1) {
     const discriminator = suffix === 0 ? "" : `-${suffix}`;
     const backupPath = join(directory, `machine-${timestamp}${discriminator}.json`);
-    if (writePrivateFileExclusive(backupPath, content)) return backupPath;
+    if (copyRegularFilePrivateExclusive(path, backupPath, {
+      allowedRoot: dirname(path),
+    })) return backupPath;
   }
   throw new MachineIdentityFileError(
     "could not create an exclusive backup for machine.json",

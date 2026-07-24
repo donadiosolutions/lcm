@@ -9,7 +9,14 @@ import {
   statSync,
   symlinkSync,
   appendFileSync,
+  closeSync,
+  fchmodSync,
+  openSync,
+  realpathSync,
+  statSync as fsStatSync,
+  unlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
@@ -17,6 +24,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   atomicWritePrivateFile,
   atomicWritePrivateFileExclusive,
+  copyRegularFilePrivateExclusive,
   deleteRegularFile,
   ensurePrivateDirectory,
   readBoundedRegularFile,
@@ -88,21 +96,177 @@ describe("private filesystem primitives", () => {
     expect(existsSync(target)).toBe(false);
   });
 
-  it("does not remove a new temporary-path owner after publishing its own inode", () => {
+  it("does not publish a replacement when private-mode setup fails", () => {
     const root = makeRoot();
     const target = join(root, "metadata.json");
     const tempPath = join(root, `.metadata.json.${"ef".repeat(12)}.tmp`);
     const failure = new Error("chmod failed");
+    writeFileSync(target, "original", { mode: 0o600 });
 
     expect(() => atomicWritePrivateFile(target, "private metadata", {
       random: () => Buffer.alloc(12, 0xef),
-      chmod: () => {
-        writeFileSync(tempPath, "next owner", { mode: 0o600 });
+      fchmod: () => {
         throw failure;
       },
     })).toThrow(failure);
-    expect(readFileSync(target, "utf-8")).toBe("private metadata");
-    expect(readFileSync(tempPath, "utf-8")).toBe("next owner");
+    expect(readFileSync(target, "utf-8")).toBe("original");
+    expect(existsSync(tempPath)).toBe(false);
+  });
+
+  it("streams a validated regular file into an exclusive private destination", () => {
+    const root = makeRoot();
+    const source = join(root, "machine.json");
+    const destination = join(root, "oldmachines", "machine.json");
+    const content = "0123456789".repeat(10_000);
+    writeFileSync(source, content, { mode: 0o600 });
+
+    expect(copyRegularFilePrivateExclusive(source, destination, {
+      allowedRoot: root,
+      _chunkBytesForTesting: 17,
+    })).toBe(true);
+    expect(copyRegularFilePrivateExclusive(source, destination, {
+      allowedRoot: root,
+      _chunkBytesForTesting: 17,
+    })).toBe(false);
+    expect(readFileSync(destination, "utf8")).toBe(content);
+    expect(statSync(destination).mode & 0o777).toBe(0o600);
+  });
+
+  it("rejects invalid chunks, escaped sources, directories, and changed source identities", () => {
+    const root = makeRoot();
+    const outside = makeRoot();
+    const source = join(root, "machine.json");
+    const sourceDirectory = join(root, "directory");
+    const destination = join(root, "oldmachines", "machine.json");
+    writeFileSync(source, "identity", { mode: 0o600 });
+    mkdirSync(sourceDirectory);
+
+    expect(() => copyRegularFilePrivateExclusive(source, destination, {
+      allowedRoot: root,
+      _chunkBytesForTesting: 0,
+    })).toThrow(RangeError);
+    expect(() => copyRegularFilePrivateExclusive(source, destination, {
+      allowedRoot: outside,
+    })).toThrow("outside the permitted root");
+    expect(() => copyRegularFilePrivateExclusive(sourceDirectory, destination, {
+      allowedRoot: root,
+    })).toThrow("not a regular file");
+
+    let realpathCalls = 0;
+    expect(() => copyRegularFilePrivateExclusive(source, destination, {
+      allowedRoot: root,
+      _operationsForTesting: {
+        realpath: ((path: string) => {
+          realpathCalls += 1;
+          return realpathCalls === 3 ? outside : realpathSync(path);
+        }) as typeof realpathSync,
+      },
+    })).toThrow("outside the permitted root");
+
+    expect(() => copyRegularFilePrivateExclusive(source, destination, {
+      allowedRoot: root,
+      _operationsForTesting: {
+        stat: ((path: string) => {
+          const current = fsStatSync(path);
+          return { ...current, ino: current.ino + 1 };
+        }) as typeof fsStatSync,
+      },
+    })).toThrow("file changed during validation");
+  });
+
+  it("preserves destination-open and zero-progress write failures", () => {
+    const root = makeRoot();
+    const source = join(root, "machine.json");
+    const destination = join(root, "oldmachines", "machine.json");
+    const openFailure = Object.assign(new Error("destination open failed"), {
+      code: "EACCES",
+    });
+    writeFileSync(source, "identity", { mode: 0o600 });
+
+    expect(() => copyRegularFilePrivateExclusive(source, destination, {
+      allowedRoot: root,
+      _operationsForTesting: {
+        open: ((path: string, flags: string | number, mode?: number) => {
+          if (flags === "wx") throw openFailure;
+          return openSync(path, flags, mode);
+        }) as typeof openSync,
+      },
+    })).toThrow(openFailure);
+    expect(existsSync(destination)).toBe(false);
+
+    expect(() => copyRegularFilePrivateExclusive(source, destination, {
+      allowedRoot: root,
+      _operationsForTesting: {
+        write: (() => 0) as typeof writeSync,
+      },
+    })).toThrow("private backup write made no progress");
+    expect(existsSync(destination)).toBe(false);
+  });
+
+  it("preserves copy failures when destination cleanup also fails", () => {
+    const root = makeRoot();
+    const source = join(root, "machine.json");
+    const destination = join(root, "oldmachines", "machine.json");
+    const copyFailure = new Error("private mode failed");
+    let destinationFd: number | undefined;
+    writeFileSync(source, "identity", { mode: 0o600 });
+
+    expect(() => copyRegularFilePrivateExclusive(source, destination, {
+      allowedRoot: root,
+      _operationsForTesting: {
+        open: ((path: string, flags: string | number, mode?: number) => {
+          const fd = openSync(path, flags, mode);
+          if (flags === "wx") destinationFd = fd;
+          return fd;
+        }) as typeof openSync,
+        fchmod: (() => {
+          throw copyFailure;
+        }) as typeof fchmodSync,
+        close: ((fd: number) => {
+          closeSync(fd);
+          if (fd === destinationFd) throw new Error("cleanup close failed");
+        }) as typeof closeSync,
+        unlink: ((path: string) => {
+          unlinkSync(path);
+          throw new Error("cleanup unlink failed");
+        }) as typeof unlinkSync,
+      },
+    })).toThrow(copyFailure);
+    expect(existsSync(destination)).toBe(false);
+  });
+
+  it("suppresses source-close errors after success or while preserving a copy failure", () => {
+    const root = makeRoot();
+    const source = join(root, "machine.json");
+    const firstDestination = join(root, "oldmachines", "first.json");
+    const secondDestination = join(root, "oldmachines", "second.json");
+    writeFileSync(source, "identity", { mode: 0o600 });
+
+    let closeCalls = 0;
+    expect(copyRegularFilePrivateExclusive(source, firstDestination, {
+      allowedRoot: root,
+      _operationsForTesting: {
+        close: ((fd: number) => {
+          closeCalls += 1;
+          closeSync(fd);
+          if (closeCalls === 2) throw new Error("source close failed");
+        }) as typeof closeSync,
+      },
+    })).toBe(true);
+
+    const copyFailure = new Error("copy failed");
+    expect(() => copyRegularFilePrivateExclusive(source, secondDestination, {
+      allowedRoot: root,
+      _operationsForTesting: {
+        fstat: (() => {
+          throw copyFailure;
+        }) as never,
+        close: ((fd: number) => {
+          closeSync(fd);
+          throw new Error("source close failed");
+        }) as typeof closeSync,
+      },
+    })).toThrow(copyFailure);
   });
 
   it("reads a bounded regular file and returns descriptor metadata", () => {

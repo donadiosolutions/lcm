@@ -403,6 +403,7 @@ async function coordinatedRemoteEntryPaths(
   repository: IdentityRepository,
   machineId: string,
   entry: ProjectMapEntry,
+  preferredLexicalPath: string,
 ): Promise<RemoteProjectAliasInput[]> {
   const lexicalPaths = lexicalEntryPaths(entry);
   const stored = entry.remoteProjectId
@@ -437,10 +438,16 @@ async function coordinatedRemoteEntryPaths(
       // alias into one idempotent relink input.
       resolved[priorIndex] = persisted;
     } else {
-      throw new ProjectIdentityReconciliationError(
-        `local project paths ${prior.path} and ${path.path} resolve to the same PostgreSQL identity ${path.normalizedPath}`,
-        `Remove the duplicate local alias with \`lcm project unlink -- ${quoteShellArgument(path.path)}\` before creating or linking the PostgreSQL project.`,
+      const preferred = [prior, path].find(
+        (candidate) => candidate.path === preferredLexicalPath,
       );
+      if (!preferred) {
+        throw new ProjectIdentityReconciliationError(
+          `local project paths ${prior.path} and ${path.path} resolve to the same PostgreSQL identity ${path.normalizedPath}`,
+          `Remove the duplicate local alias with \`lcm project unlink -- ${quoteShellArgument(path.path)}\` before creating or linking the PostgreSQL project.`,
+        );
+      }
+      resolved[priorIndex] = preferred;
     }
   }
   return resolved;
@@ -1117,12 +1124,20 @@ async function linkRemoteProject(
     );
   }
   return withSession(config, deps, async (repository) => {
+    const requestedPath = remotePath(projectPath);
+    const requestedIsStored = lexicalEntryPaths(shown.entry).includes(requestedPath.path);
+    const intendedEntry = requestedIsStored
+      ? shown.entry
+      : {
+          ...shown.entry,
+          aliases: [...shown.entry.aliases, requestedPath.path],
+        };
     const entryPaths = await coordinatedRemoteEntryPaths(
       repository,
       machine.machineId,
-      shown.entry,
+      intendedEntry,
+      requestedPath.path,
     );
-    const requestedPath = remotePath(projectPath);
     const mutation = await confirmRemoteBatchReplacement(repository, {
       machineId: machine.machineId,
       ...(local.remoteProjectId && local.remoteProjectId !== normalizedRemoteProjectId
@@ -1144,6 +1159,7 @@ async function linkRemoteProject(
       }
       const binding = setRemoteProjectBinding(normalizedRemoteProjectId, {
         hash: local.id,
+        ...(!requestedIsStored ? { alias: requestedPath.path } : {}),
         allowExistingData: options.allowExistingData,
         expectedEntry: shown.entry,
       });

@@ -63,7 +63,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
 
     const paths = projectPaths(cwd);
     const parsed = resolveMessages(input, cwd);
-    if (parsed.length === 0) {
+    if (parsed.length === 0 && config.storage.backend === "sqlite") {
       sendJson(res, 200, { ingested: 0, totalTokens: 0 });
       return;
     }
@@ -73,6 +73,13 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
     let activeFactory: StorageBackendFactory | undefined;
     try {
       const identity = projectIdentity(cwd, config.storage);
+      if (parsed.length === 0) {
+        activeFactory = storageFactory
+          ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        project = await activeFactory.openProject(identity);
+        sendJson(res, 200, { ingested: 0, totalTokens: 0 });
+        return;
+      }
       ensureProjectDir(cwd);
       const scrubber = await ScrubEngine.forProject(
         config.security?.sensitivePatterns ?? [],

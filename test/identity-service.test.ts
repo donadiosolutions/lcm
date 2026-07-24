@@ -1513,14 +1513,15 @@ describe("identity service", () => {
     await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, entered, {}, deps))
       .resolves.toMatchObject({
         local: { canonical, remoteProjectId: PROJECT_A },
-        remoteAlias: { path: canonical, normalizedPath: canonical },
+        remoteAlias: { path: entered, normalizedPath: canonical },
       });
     expect(repository.replaceProjectAliases).toHaveBeenCalledWith(
       expect.objectContaining({
-        aliases: [{ path: canonical, normalizedPath: canonical }],
+        aliases: [{ path: entered, normalizedPath: canonical }],
         recoveryPath: entered,
       }),
     );
+    expect(showProjectMapEntry(canonical).entry.aliases).toContain(entered);
   });
 
   it("idempotently relinks a symlink-created project using PostgreSQL lexical spelling", async () => {
@@ -1615,7 +1616,7 @@ describe("identity service", () => {
     }
   });
 
-  it("rejects duplicate normalized canonical and alias identities before create or link", async () => {
+  it("rejects duplicate normalized identities on create but preserves the selected link spelling", async () => {
     await register();
     const canonical = makeProject("duplicate-normalized-canonical");
     const entered = join(home, "duplicate-normalized-symlink");
@@ -1629,10 +1630,35 @@ describe("identity service", () => {
     await expect(createProject(POSTGRESQL_CONFIG, canonical, {}, deps))
       .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
     await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, entered, {}, deps))
-      .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
+      .resolves.toMatchObject({
+        local: { remoteProjectId: PROJECT_A },
+        remoteAlias: { path: entered, normalizedPath: canonical },
+      });
     expect(repository.createProject).not.toHaveBeenCalled();
+    expect(repository.replaceProjectAliases).toHaveBeenCalledWith(
+      expect.objectContaining({
+        aliases: [{ path: entered, normalizedPath: canonical }],
+      }),
+    );
+    expect(resolveProjectIdentity(canonical).remoteProjectId).toBe(PROJECT_A);
+  });
+
+  it("rejects a duplicate normalized pair that does not contain the selected spelling", async () => {
+    await register();
+    const canonical = makeProject("duplicate-normalized-three-way-canonical");
+    const first = join(home, "duplicate-normalized-three-way-first");
+    const selected = join(home, "duplicate-normalized-three-way-selected");
+    symlinkSync(canonical, first);
+    symlinkSync(canonical, selected);
+    const local = resolveProjectIdentity(canonical);
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [local.id]: { canonical, aliases: [first, selected] },
+    }));
+    clearProjectMapCache();
+
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, selected, {}, deps))
+      .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
     expect(repository.replaceProjectAliases).not.toHaveBeenCalled();
-    expect(resolveProjectIdentity(canonical).remoteProjectId).toBeUndefined();
   });
 
   it("rejects adding a symlink alias that duplicates an existing normalized identity", async () => {

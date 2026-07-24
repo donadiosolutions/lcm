@@ -266,12 +266,12 @@ function executor(options: {
       }
       return result([{
         baseline_applied: true,
-        expected_object_count: 723,
+        expected_object_count: 724,
         existing_object_count: options.baselineDefinitions === "inconsistent"
-          ? 724
+          ? 725
           : options.baselineDefinitions === "missing-object"
-            ? 722
-            : 723,
+            ? 723
+            : 724,
         missing_object_count: options.baselineDefinitions === "missing-object" ? 1 : 0,
         drifted_definition_group_count:
           options.baselineDefinitions === "drifted"
@@ -384,7 +384,7 @@ describe("PostgreSQL migration runner", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "e96cad6c577c9f088d02366e22bbbe3f876217363659feea6d2edc1918885bae" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "3f2dd30cc533899a31f6415fef49c377e82523315ce8fc3e87253f5351ec0a8f" }),
       expect.objectContaining({ id: "0003_machine_identity_key", sha256: "bdc38d19bde5825eb1d59e9044769cbf9cac52be5c9fe34237f93ec347c3807b" }),
       expect.objectContaining({ id: "0004_machine_display_name", sha256: "f12b4e5493da187e4c8cd4083766010b896961225cadd6fe568e4e99264e3421" }),
     ]);
@@ -1147,8 +1147,8 @@ describe("PostgreSQL migration runner", () => {
       label: "a missing index, trigger, or constraint",
       baselineDefinitions: "missing-object" as const,
       baselineApplied: true,
-      expectedObjectCount: 723,
-      existingObjectCount: 722,
+      expectedObjectCount: 724,
+      existingObjectCount: 723,
       missingObjectCount: 1,
       driftedDefinitionGroupCount: 1,
     },
@@ -1156,8 +1156,8 @@ describe("PostgreSQL migration runner", () => {
       label: "definition drift",
       baselineDefinitions: "drifted" as const,
       baselineApplied: true,
-      expectedObjectCount: 723,
-      existingObjectCount: 723,
+      expectedObjectCount: 724,
+      existingObjectCount: 724,
       missingObjectCount: 0,
       driftedDefinitionGroupCount: 1,
     },
@@ -1183,8 +1183,8 @@ describe("PostgreSQL migration runner", () => {
       label: "contradictory catalog counts",
       baselineDefinitions: "inconsistent" as const,
       baselineApplied: true,
-      expectedObjectCount: 723,
-      existingObjectCount: 724,
+      expectedObjectCount: 724,
+      existingObjectCount: 725,
       missingObjectCount: 0,
       driftedDefinitionGroupCount: 0,
     },
@@ -1282,7 +1282,7 @@ describe("PostgreSQL migration runner", () => {
           "projects|identity_key",
           "session_ingest_log|session_id_sha256",
         ]),
-        723,
+        724,
         [
           "index",
           "trigger",
@@ -1294,7 +1294,7 @@ describe("PostgreSQL migration runner", () => {
           "relation_acl",
           "ordinary_column",
         ],
-        [52, 3, 168, 15, 220, 6, 24, 30, 205],
+        [52, 3, 169, 15, 220, 6, 24, 30, 205],
         [
           expect.any(String),
           expect.any(String),

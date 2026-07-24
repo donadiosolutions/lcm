@@ -152,40 +152,66 @@ function readMapFile(path: string): { content: string; mtimeMs: number | null } 
   }
 }
 
+class InvalidProjectMapError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidProjectMapError";
+  }
+}
+
 function parseProjectMap(content: string): ProjectMap {
-  const parsed = JSON.parse(content) as unknown;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content) as unknown;
+  } catch (error) {
+    throw new InvalidProjectMapError(
+      error instanceof Error ? error.message : "map.json is invalid",
+    );
+  }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("map.json must be an object");
+    throw new InvalidProjectMapError("map.json must be an object");
   }
 
   const map: ProjectMap = {};
   for (const [hash, value] of Object.entries(parsed)) {
     if (!HASH_RE.test(hash)) {
-      throw new Error(`map entry key must be a 64-character lowercase sha256 hash: ${hash}`);
+      throw new InvalidProjectMapError(
+        `map entry key must be a 64-character lowercase sha256 hash: ${hash}`,
+      );
     }
     if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error(`map entry ${hash} must be an object`);
+      throw new InvalidProjectMapError(`map entry ${hash} must be an object`);
     }
     const entry = value as Record<string, unknown>;
     if (typeof entry.canonical !== "string" || entry.canonical.length === 0) {
-      throw new Error(`map entry ${hash}.canonical must be a non-empty string`);
+      throw new InvalidProjectMapError(
+        `map entry ${hash}.canonical must be a non-empty string`,
+      );
     }
     if (!isAbsolute(entry.canonical)) {
-      throw new Error(`map entry ${hash}.canonical must be an absolute path`);
+      throw new InvalidProjectMapError(
+        `map entry ${hash}.canonical must be an absolute path`,
+      );
     }
     if (!Array.isArray(entry.aliases) || !entry.aliases.every((alias) => typeof alias === "string" && alias.length > 0)) {
-      throw new Error(`map entry ${hash}.aliases must be an array of non-empty strings`);
+      throw new InvalidProjectMapError(
+        `map entry ${hash}.aliases must be an array of non-empty strings`,
+      );
     }
     for (const alias of entry.aliases) {
       if (!isAbsolute(alias)) {
-        throw new Error(`map entry ${hash}.aliases must contain only absolute paths: ${alias}`);
+        throw new InvalidProjectMapError(
+          `map entry ${hash}.aliases must contain only absolute paths: ${alias}`,
+        );
       }
     }
     const remoteProjectId = typeof entry.remoteProjectId === "string"
       ? normalizeUuidV7(entry.remoteProjectId)
       : null;
     if (entry.remoteProjectId !== undefined && remoteProjectId === null) {
-      throw new Error(`map entry ${hash}.remoteProjectId must be a PostgreSQL UUIDv7`);
+      throw new InvalidProjectMapError(
+        `map entry ${hash}.remoteProjectId must be a PostgreSQL UUIDv7`,
+      );
     }
     map[hash] = {
       canonical: entry.canonical,
@@ -227,8 +253,7 @@ function assertCurrentMapIsWritable(path: string): void {
   try {
     parseProjectMap(file.content);
   } catch (err) {
-    const detail = err instanceof Error ? err.message : "map.json is invalid";
-    throw new Error(`refusing to overwrite invalid map.json: ${detail}`);
+    throw new Error(`refusing to overwrite invalid map.json: ${(err as Error).message}`);
   }
 }
 
@@ -457,9 +482,14 @@ export function resolveProjectIdentity(
     try {
       current = loadProjectMapWithMetadata({ strict: true, reload: true });
     } catch (error) {
-      const detail = error instanceof Error ? error.message : "map.json is invalid";
-      throw new Error(`refusing to overwrite invalid map.json: ${detail}`);
+      if (error instanceof InvalidProjectMapError) {
+        throw new Error(`refusing to overwrite invalid map.json: ${error.message}`);
+      }
+      throw error;
     }
+    // Preserve a known-good in-memory snapshot when the file disappeared
+    // between the optimistic read and the locked reload. A genuinely fresh
+    // bootstrap has an empty snapshot and follows this same path.
     if (!existsSync(projectMapPath())) current = map;
     const raced = identityForMatches(current, cwd, normalized);
     if (raced) return raced;
@@ -567,6 +597,7 @@ export function setRemoteProjectBinding(
   opts: {
     readonly canonical?: string;
     readonly hash?: string;
+    readonly alias?: string;
     readonly allowExistingData?: boolean;
     readonly expectedEntry?: ProjectMapEntry;
     /** @internal Test-only synchronization seam for deterministic race coverage. */
@@ -588,8 +619,30 @@ export function setRemoteProjectBinding(
     opts._afterLockForTesting?.();
     const target = resolveCliTarget({ canonical: opts.canonical, hash: opts.hash });
     assertExpectedProjectMapEntry(target.hash, target.entry, opts.expectedEntry);
+    let aliasChanged = false;
+    if (opts.alias !== undefined) {
+      const alias = resolve(opts.alias);
+      if (!existsSync(alias)) throw new Error(`alias path does not exist: ${alias}`);
+      if (!statSync(alias).isDirectory()) {
+        throw new Error(`alias path must be an existing directory: ${alias}`);
+      }
+      const owners = collectPathOwners(target.map).get(alias) ?? new Set<string>();
+      const foreignOwners = [...owners].filter((owner) => owner !== target.hash);
+      if (foreignOwners.length > 0) {
+        throw new Error(
+          `alias is already mapped to another hash: ${alias} (${foreignOwners.join(", ")})`,
+        );
+      }
+      if (
+        resolve(target.entry.canonical) !== alias
+        && !target.entry.aliases.some((candidate) => resolve(candidate) === alias)
+      ) {
+        target.map[target.hash].aliases.push(alias);
+        aliasChanged = true;
+      }
+    }
     const current = target.entry.remoteProjectId;
-    if (current === normalizedRemoteProjectId) {
+    if (current === normalizedRemoteProjectId && !aliasChanged) {
       return { hash: target.hash, entry: target.entry, changed: false };
     }
     if (
@@ -772,7 +825,7 @@ function validateProjectMapUnlocked(opts: { homeDir?: string; fix?: boolean }): 
       ok: false,
       map: null,
       path,
-      errors: [err instanceof Error ? err.message : "map.json is invalid"],
+      errors: [(err as Error).message],
       warnings: [],
       fixApplied: false,
     };

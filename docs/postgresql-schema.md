@@ -110,13 +110,16 @@ does not add row-level security.
   fails closed. The same fingerprint rejects any inheritance or partition
   parent/child relationship involving a managed table. Relation ACL
   fingerprints expand the effective ACL, including PostgreSQL's default ACL
-  when `relacl` is null, and normalize only the owning role. `PUBLIC`, named
-  role, privilege, grant-option, foreign-grantor, or missing-owner drift on any
-  allowlisted table or identity sequence therefore fails closed.
+  when `relacl` is null. They normalize the owning role and exact non-grantable
+  identity-repository privilege shapes granted to named runtime roles by the
+  documented script. Any `PUBLIC`, grantable, foreign-grantor, missing-owner,
+  or privilege outside that allowlist on an allowlisted table or identity
+  sequence therefore fails closed.
   Column ACL fingerprints retain every allowlisted column even when `attacl`
-  is null and expand every explicit entry. Any `PUBLIC`, named-role,
-  foreign-grantor, privilege, or grant-option drift on a column therefore also
-  fails closed.
+  is null and expand every explicit entry. They normalize only the script's
+  exact insert and update column-grant shapes for named runtime roles; any
+  `PUBLIC`, foreign-grantor, grantable, or out-of-allowlist privilege on a
+  column therefore also fails closed.
   Identity-sequence
   fingerprints bind each exact sequence name to its PostgreSQL data type,
   increment, minimum, maximum, start, cache, cycle state, internal identity
@@ -277,7 +280,7 @@ deletion.
 | --- | --- | --- |
 | `machines` | Independent identity root. Retain through reimages and require aliases, transcripts, checkpoints, instructions, inbox events, and leases to be handled before deletion. All incoming references restrict deletion. | UUIDv7-enforced primary key; globally unique `identity_key` in the exact `machine:<64 lowercase hex>` format used by the private local identity file; optional nonblank display name; `last_seen_at >= registered_at`. |
 | `projects` | Independent identity root and project-scope anchor. No dependent table silently cascades from project deletion. | UUIDv7-enforced internal primary key; required unique `identity_key` is an opaque random 32-byte value generated for each PostgreSQL project creation and is never derived from a local path/hash; `updated_at >= created_at`. |
-| `project_aliases` | Explicit machine-to-project link retained until unlink. Both project and machine references restrict deletion. | `(machine_id, normalized_path)` primary key makes one normalized path on a machine resolve to one project; path is nonempty and normalized path is trimmed and nonempty. `project_aliases_project_idx` supports project-to-machine/path listing. |
+| `project_aliases` | Explicit machine-to-project link retained until unlink. Both project and machine references restrict deletion. | `(machine_id, normalized_path)` primary key makes one normalized path on a machine resolve to one project; `UNIQUE (machine_id, path)` prevents the same stored lexical spelling from being redirected after a symlink is retargeted. Both paths are nonempty and normalized path is trimmed and nonempty. `project_aliases_project_idx` supports project-to-machine/path listing. |
 
 ### Source records
 

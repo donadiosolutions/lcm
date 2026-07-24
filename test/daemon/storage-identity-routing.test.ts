@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DaemonConfig, ResolvedStorageConfig } from "../../src/daemon/config.js";
+import { createCompactHandler } from "../../src/daemon/routes/compact.js";
+import { createIngestHandler } from "../../src/daemon/routes/ingest.js";
 import { createStoreHandler } from "../../src/daemon/routes/store.js";
 import {
   recoverMachineIdentity,
@@ -18,6 +20,8 @@ import type {
   StorageBackendFactory,
   StorageIdentityContext,
 } from "../../src/storage/index.js";
+import * as storageFactoryModule from "../../src/storage/factory.js";
+import { UnavailablePostgreSqlStorageBackendFactory } from "../../src/storage/factory.js";
 import { UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
@@ -161,5 +165,112 @@ describe("daemon storage identity routing", () => {
     expect(response.end).not.toHaveBeenCalledWith(expect.stringContaining(
       "not available in this release",
     ));
+  });
+
+  it("admits disabled compaction and empty ingest through PostgreSQL identity and staging", async () => {
+    const machine: MachineIdentity = {
+      version: 1,
+      identityKey: `machine:${"a".repeat(64)}`,
+      machineId: MACHINE_ID,
+      displayName: "Machine A",
+    };
+    recoverMachineIdentity(machine, { homeDir: home });
+    const local = resolveProjectIdentity(cwd);
+    const response = {
+      writeHead: vi.fn(),
+      end: vi.fn(),
+    };
+    const config = {
+      storage: POSTGRESQL_STORAGE,
+      llm: { provider: "disabled" },
+      security: { sensitivePatterns: [], notify_on_filter: false },
+    } as unknown as DaemonConfig;
+
+    await createCompactHandler(config, new UnavailablePostgreSqlStorageBackendFactory())(
+      {} as never,
+      response as never,
+      JSON.stringify({ session_id: "disabled", cwd }),
+    );
+    expect(response.end).toHaveBeenLastCalledWith(JSON.stringify({
+      code: "STORAGE_IDENTITY_REQUIRED",
+      error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+      storageBackend: "postgresql",
+    }));
+
+    setRemoteProjectBinding(PROJECT_ID, { hash: local.id });
+    response.end.mockClear();
+    await createCompactHandler(config, new UnavailablePostgreSqlStorageBackendFactory())(
+      {} as never,
+      response as never,
+      JSON.stringify({ session_id: "disabled", cwd }),
+    );
+    expect(response.end).toHaveBeenLastCalledWith(expect.stringContaining(
+      "\"code\":\"STORAGE_BACKEND_STAGED\"",
+    ));
+
+    response.end.mockClear();
+    await createIngestHandler(config, new UnavailablePostgreSqlStorageBackendFactory())(
+      {} as never,
+      response as never,
+      JSON.stringify({ session_id: "empty", cwd, messages: [] }),
+    );
+    expect(response.end).toHaveBeenLastCalledWith(expect.stringContaining(
+      "\"code\":\"STORAGE_BACKEND_STAGED\"",
+    ));
+  });
+
+  it("uses and closes the default factory for admitted PostgreSQL no-ops", async () => {
+    recoverMachineIdentity({
+      version: 1,
+      identityKey: `machine:${"a".repeat(64)}`,
+      machineId: MACHINE_ID,
+      displayName: "Machine A",
+    }, { homeDir: home });
+    const local = resolveProjectIdentity(cwd);
+    setRemoteProjectBinding(PROJECT_ID, { hash: local.id });
+    const closeProject = vi.fn(async () => undefined);
+    const openProject = vi.fn(async () => ({
+      close: closeProject,
+    } as unknown as ProjectStorage));
+    const closeFactory = vi.fn(async () => undefined);
+    const factory = {
+      openProject,
+      close: closeFactory,
+    } as unknown as StorageBackendFactory;
+    vi.spyOn(storageFactoryModule, "createStorageBackendFactory")
+      .mockReturnValue(factory);
+    const response = {
+      writeHead: vi.fn(),
+      end: vi.fn(),
+    };
+    const config = {
+      storage: POSTGRESQL_STORAGE,
+      llm: { provider: "disabled" },
+      security: { sensitivePatterns: [], notify_on_filter: false },
+    } as unknown as DaemonConfig;
+
+    await createCompactHandler(config)(
+      {} as never,
+      response as never,
+      JSON.stringify({ session_id: "disabled-default", cwd }),
+    );
+    expect(response.end).toHaveBeenLastCalledWith(expect.stringContaining(
+      "\"actionTaken\":false",
+    ));
+    expect(closeProject).toHaveBeenCalledTimes(1);
+    expect(closeFactory).toHaveBeenCalledTimes(1);
+
+    response.end.mockClear();
+    await createIngestHandler(config)(
+      {} as never,
+      response as never,
+      JSON.stringify({ session_id: "empty-default", cwd, messages: [] }),
+    );
+    expect(response.end).toHaveBeenLastCalledWith(JSON.stringify({
+      ingested: 0,
+      totalTokens: 0,
+    }));
+    expect(closeProject).toHaveBeenCalledTimes(2);
+    expect(closeFactory).toHaveBeenCalledTimes(2);
   });
 });

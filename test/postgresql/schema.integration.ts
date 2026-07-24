@@ -291,9 +291,9 @@ describe("PostgreSQL schema baseline", () => {
       const normalizedConstraints = constraints.rows
         .map((row) => `${row.table_name}|${row.constraint_type}|${row.definition}`)
         .join("\n");
-      expect(constraints.rowCount).toBe(168);
+      expect(constraints.rowCount).toBe(169);
       expect(createHash("sha256").update(normalizedConstraints).digest("hex"))
-        .toBe("0448257b57874af4b4117861bb103721fe27ac09a7ec94451d063d93202f8379");
+        .toBe("c3a1717bdbce6322206fe8a25a6fe6d2d09edc55e0b8f6bf988aec83997b2c0d");
 
       const deleteActions = await database.migrator.query<{
         table_name: string;
@@ -1509,6 +1509,16 @@ describe("PostgreSQL schema baseline", () => {
                VALUES ($1, $2, '/workspace/a/', '/workspace/a')`,
         values: [scope.otherProjectId, scope.machineId],
       }, { domain: "factory", operation: "rejectAliasCollision" }));
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.project_aliases (project_id, machine_id, path, normalized_path)
+               VALUES ($1, $2, '/workspace/a', '/workspace/retargeted')`,
+        values: [scope.otherProjectId, scope.machineId],
+      }, { domain: "factory", operation: "rejectRetargetedLexicalAlias" }));
+      await database.migrator.query({
+        text: `INSERT INTO lcm.project_aliases (project_id, machine_id, path, normalized_path)
+               VALUES ($1, $2, '/workspace/a', '/workspace/retargeted')`,
+        values: [scope.otherProjectId, scope.otherMachineId],
+      }, { domain: "factory", operation: "allowLexicalAliasOnOtherMachine" });
       await database.migrator.query({
         text: `INSERT INTO lcm.session_ingest_log (project_id, session_id, message_count)
                VALUES ($1, 'session-a', 1)`,

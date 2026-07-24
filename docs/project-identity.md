@@ -35,7 +35,9 @@ opaque random identity key, the PostgreSQL-assigned machine UUIDv7, and the
 display name. LCM never prints the identity key.
 
 The file and all recovery backups use mode `0600`; `~/.lcm` and backup
-directories use mode `0700`. LCM rejects symlinks, non-regular files,
+directories use mode `0700`. Recovery streams the validated source descriptor
+into an exclusive private backup, so even a large rejected file is never
+buffered in memory or copied through a later path lookup. LCM rejects symlinks, non-regular files,
 over-sized files, permissive modes, malformed JSON, unsupported versions,
 invalid keys, invalid display names, and invalid UUIDs. Permission-repair
 commands quote the complete file path and separate it from options so spaces,
@@ -317,7 +319,10 @@ durable in the local SQLite outbox before that request. Setting
 `restoration.promptSearchMaxResults` to `0` suppresses returned hints, but does
 not bypass PostgreSQL identity or storage admission: missing identity still
 returns `409`, and the staged backend still returns `503`. SQLite retains its
-immediate empty-result behavior for this setting. The daemon does not run SQLite
+immediate empty-result behavior for this setting. Disabled compaction and an
+empty ingestion batch follow the same rule: PostgreSQL still validates explicit
+identity and backend availability, while SQLite preserves its existing no-op
+responses. The daemon does not run SQLite
 transcript scans or passive-outbox sweeps. Other project operations fail
 at a cause-free unavailable-backend boundary after validating machine
 registration and the explicit project binding. LCM does not fall back to

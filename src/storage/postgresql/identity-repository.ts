@@ -156,6 +156,39 @@ export class PostgreSqlIdentityAliasPathConflictError extends StorageOperationEr
   }
 }
 
+export class PostgreSqlIdentityAliasNormalizedPathConflictError
+  extends StorageOperationError {
+  constructor(
+    readonly machineId: string,
+    readonly path: string,
+    readonly projectIdCandidate: string,
+    readonly existingNormalizedPath: string,
+    readonly requestedNormalizedPath: string,
+  ) {
+    super(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      projectIdCandidate,
+      "identity",
+      "linkProject",
+    );
+    this.name = "PostgreSqlIdentityAliasNormalizedPathConflictError";
+    this.message =
+      `lexical path ${path} on machine ${machineId} is already linked with normalized path ${existingNormalizedPath}; refusing conflicting normalized path ${requestedNormalizedPath}`;
+  }
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      machineId: this.machineId,
+      path: this.path,
+      projectId: this.projectIdCandidate,
+      existingNormalizedPath: this.existingNormalizedPath,
+      requestedNormalizedPath: this.requestedNormalizedPath,
+    };
+  }
+}
+
 export class PostgreSqlIdentityNotFoundError extends StorageOperationError {
   constructor(
     readonly identityType: "machine" | "project",
@@ -315,6 +348,53 @@ function aliasFromRow(row: AliasRow): RemoteProjectAlias {
   };
 }
 
+function assertLexicalAliasOwnership(
+  rows: readonly AliasRow[],
+  machineId: string,
+  projectId: string,
+  aliases: readonly RemoteProjectAliasInput[],
+): void {
+  for (const alias of aliases) {
+    const lexicalOwner = rows.find((row) => row.path === alias.path);
+    if (
+      lexicalOwner
+      && lexicalOwner.normalized_path !== alias.normalizedPath
+    ) {
+      throw new PostgreSqlIdentityAliasNormalizedPathConflictError(
+        machineId,
+        alias.path,
+        projectId,
+        lexicalOwner.normalized_path,
+        alias.normalizedPath,
+      );
+    }
+  }
+}
+
+function assertUniqueLexicalAliasInputs(
+  machineId: string,
+  projectId: string,
+  aliases: readonly RemoteProjectAliasInput[],
+): void {
+  const normalizedByPath = new Map<string, string>();
+  for (const alias of aliases) {
+    const existingNormalizedPath = normalizedByPath.get(alias.path);
+    if (
+      existingNormalizedPath !== undefined
+      && existingNormalizedPath !== alias.normalizedPath
+    ) {
+      throw new PostgreSqlIdentityAliasNormalizedPathConflictError(
+        machineId,
+        alias.path,
+        projectId,
+        existingNormalizedPath,
+        alias.normalizedPath,
+      );
+    }
+    normalizedByPath.set(alias.path, alias.normalizedPath);
+  }
+}
+
 function projectsFromJoinRows(rows: readonly ProjectAliasJoinRow[]): RemoteProject[] {
   const projects: Array<Omit<RemoteProject, "aliases"> & {
     aliases: RemoteProjectAlias[];
@@ -461,6 +541,19 @@ export class PostgreSqlIdentityRepository {
       if (!project.rows[0]) {
         throw new PostgreSqlIdentityNotFoundError("project", input.projectId);
       }
+      const lexicalOwner = await transaction.query<AliasRow>({
+        text: `SELECT project_id, machine_id, path, normalized_path, linked_at
+               FROM lcm.project_aliases
+               WHERE machine_id = $1 AND path = $2
+               FOR UPDATE`,
+        values: [input.machineId, input.path],
+      }, { domain: "identity", operation: "replaceProjectAlias", projectId: input.projectId });
+      assertLexicalAliasOwnership(
+        lexicalOwner.rows,
+        input.machineId,
+        input.projectId,
+        [input],
+      );
       const replaced = await transaction.query<AliasRow>({
         text: `UPDATE lcm.project_aliases
                SET project_id = $1,
@@ -500,15 +593,32 @@ export class PostgreSqlIdentityRepository {
           throw new PostgreSqlIdentityNotFoundError("project", input.projectId);
         }
         const normalizedPaths = input.aliases.map(({ normalizedPath }) => normalizedPath);
+        const paths = input.aliases.map(({ path }) => path);
+        assertUniqueLexicalAliasInputs(
+          input.machineId,
+          input.projectId,
+          input.aliases,
+        );
         const current = await transaction.query<AliasRow>({
           text: `SELECT project_id, machine_id, path, normalized_path, linked_at
                  FROM lcm.project_aliases
                  WHERE machine_id = $1
-                   AND normalized_path = ANY($2::text[])
+                   AND (
+                     normalized_path = ANY($2::text[])
+                     OR path = ANY($3::text[])
+                   )
                  FOR UPDATE`,
-          values: [input.machineId, normalizedPaths],
+          values: [input.machineId, normalizedPaths, paths],
         }, { domain: "identity", operation: "replaceProjectAliases", projectId: input.projectId });
+        assertLexicalAliasOwnership(
+          current.rows,
+          input.machineId,
+          input.projectId,
+          input.aliases,
+        );
         if (current.rows.some((row) => (
+          normalizedPaths.includes(row.normalized_path)
+          &&
           row.project_id !== input.projectId
           && row.project_id !== input.expectedPriorProjectId
         ))) {
@@ -555,7 +665,7 @@ export class PostgreSqlIdentityRepository {
               text: `INSERT INTO lcm.project_aliases
                        (project_id, machine_id, path, normalized_path)
                      VALUES ($1, $2, $3, $4)
-                     ON CONFLICT (machine_id, normalized_path) DO NOTHING
+                     ON CONFLICT DO NOTHING
                      RETURNING project_id, machine_id, path, normalized_path, linked_at`,
               values: [input.projectId, input.machineId, alias.path, alias.normalizedPath],
             }, { domain: "identity", operation: "replaceProjectAliases", projectId: input.projectId });
@@ -566,10 +676,19 @@ export class PostgreSqlIdentityRepository {
           text: `SELECT project_id, machine_id, path, normalized_path, linked_at
                  FROM lcm.project_aliases
                  WHERE machine_id = $1
-                   AND normalized_path = ANY($2::text[])
+                   AND (
+                     normalized_path = ANY($2::text[])
+                     OR path = ANY($3::text[])
+                   )
                  FOR UPDATE`,
-          values: [input.machineId, normalizedPaths],
+          values: [input.machineId, normalizedPaths, paths],
         }, { domain: "identity", operation: "replaceProjectAliases", projectId: input.projectId });
+        assertLexicalAliasOwnership(
+          final.rows,
+          input.machineId,
+          input.projectId,
+          input.aliases,
+        );
         const finalByPath = new Map(final.rows.map((row) => [row.normalized_path, row]));
         if (
           final.rows.length !== input.aliases.length
@@ -650,7 +769,7 @@ export class PostgreSqlIdentityRepository {
       text: `INSERT INTO lcm.project_aliases
                (project_id, machine_id, path, normalized_path)
              VALUES ($1, $2, $3, $4)
-             ON CONFLICT (machine_id, normalized_path) DO NOTHING
+             ON CONFLICT DO NOTHING
              RETURNING project_id, machine_id, path, normalized_path, linked_at`,
       values: [input.projectId, input.machineId, input.path, input.normalizedPath],
     }, { domain: "identity", operation: "linkProject", projectId: input.projectId });
@@ -664,10 +783,19 @@ export class PostgreSqlIdentityRepository {
     const existing = await executor.query<AliasRow>({
       text: `SELECT project_id, machine_id, path, normalized_path, linked_at
              FROM lcm.project_aliases
-             WHERE machine_id = $1 AND normalized_path = $2`,
-      values: [input.machineId, input.normalizedPath],
+             WHERE machine_id = $1
+               AND (normalized_path = $2 OR path = $3)`,
+      values: [input.machineId, input.normalizedPath, input.path],
     }, { domain: "identity", operation: "resolveAlias", projectId: input.projectId });
-    const row = existing.rows[0];
+    assertLexicalAliasOwnership(
+      existing.rows,
+      input.machineId,
+      input.projectId,
+      [input],
+    );
+    const row = existing.rows.find(
+      (candidate) => candidate.normalized_path === input.normalizedPath,
+    );
     if (!row) {
       throw new PostgreSqlIdentityNotFoundError("project", input.projectId);
     }

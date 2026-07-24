@@ -293,6 +293,18 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         effectiveRequestPolicy,
       );
       if (!summarize) {
+        if (config.storage.backend === "postgresql") {
+          const paths = projectPaths(cwd);
+          const identity = resolveStorageIdentityContext(config.storage, {
+            id: paths.id,
+            canonical: paths.canonical,
+            ...(paths.remoteProjectId ? { remoteProjectId: paths.remoteProjectId } : {}),
+          });
+          activeFactory = storageFactory
+            ?? (ownedFactory = createStorageBackendFactory(config.storage));
+          const project = await activeFactory.openProject(identity);
+          await closeRouteStorage(project, undefined);
+        }
         sendJson(res, 200, {
           actionTaken: false,
           summary: "Summarization disabled — no summarizer configured.",

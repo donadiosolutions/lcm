@@ -11,6 +11,7 @@ import {
 import { recoverMachineIdentity } from "../../src/machine-identity.js";
 import { clearProjectMapCache, resolveProjectIdentity } from "../../src/project-map.js";
 import {
+  PostgreSqlIdentityAliasNormalizedPathConflictError,
   PostgreSqlIdentityAliasPathConflictError,
   PostgreSqlIdentityCreateOutcomeUnknownError,
   PostgreSqlIdentityConflictError,
@@ -497,6 +498,14 @@ describe("PostgreSQL 18 machine and project identities", () => {
         existingProjectId: first.projectId,
         requestedProjectId: second.projectId,
       });
+      await expect(repository.linkProject({
+        machineId: machine.machineId,
+        projectId: second.projectId,
+        path: "/work/collision",
+        normalizedPath: "/work/retargeted",
+      })).rejects.toBeInstanceOf(
+        PostgreSqlIdentityAliasNormalizedPathConflictError,
+      );
 
       const listed = await repository.listProjects();
       expect(listed.map(({ projectId }) => projectId)).toEqual([

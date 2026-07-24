@@ -119,6 +119,43 @@ describe("project map", () => {
     expect(isProjectHash(remoteProjectId)).toBe(false);
   });
 
+  it("validates and idempotently retains aliases during remote binding", () => {
+    const canonical = makeDir("remote-alias-validation");
+    const local = resolveProjectIdentity(canonical);
+    const missing = join(homedir(), "remote-alias-missing");
+    const file = join(homedir(), "remote-alias-file");
+    writeFileSync(file, "not a directory");
+
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      hash: local.id,
+      alias: missing,
+    })).toThrow("alias path does not exist");
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      hash: local.id,
+      alias: file,
+    })).toThrow("alias path must be an existing directory");
+
+    const foreign = makeDir("remote-alias-foreign");
+    resolveProjectIdentity(foreign);
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      hash: local.id,
+      alias: foreign,
+    })).toThrow("alias is already mapped to another hash");
+
+    expect(setRemoteProjectBinding(remoteProjectId, {
+      hash: local.id,
+      alias: canonical,
+    })).toMatchObject({ changed: true });
+    const alias = makeDir("remote-alias-existing");
+    addProjectAlias(alias, { hash: local.id });
+    expect(setRemoteProjectBinding(remoteProjectId, {
+      hash: local.id,
+      alias,
+    })).toMatchObject({ changed: false });
+    expect(() => showProjectMapEntry("a".repeat(64)))
+      .toThrow("unknown project hash");
+  });
+
   it("clears only the remote binding while retaining the local entry", () => {
     const canonical = makeDir("remote-unlink");
     const local = resolveProjectIdentity(canonical);
@@ -1177,6 +1214,19 @@ describe("project map", () => {
 
     expect(() => resolveProjectIdentity(unseen)).toThrow(/refusing to overwrite invalid map\.json/);
     expect(readFileSync(projectMapPath(), "utf-8")).toBe("{not-json");
+  });
+
+  it("preserves non-format map read failures during locked missing-entry creation", () => {
+    const canonical = makeDir("io-error-canonical");
+    resolveProjectIdentity(canonical);
+    const unseen = makeDir("io-error-unseen");
+
+    expect(() => resolveProjectIdentity(unseen, {
+      _beforeMissingEntryLockForTesting: () => {
+        rmSync(projectMapPath());
+        mkdirSync(projectMapPath());
+      },
+    })).toThrow("path is not a regular file");
   });
 
   it("refuses an overwrite when map parsing throws a non-Error value", (): void => {

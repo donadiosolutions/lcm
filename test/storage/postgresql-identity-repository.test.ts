@@ -5,6 +5,7 @@ import type {
   PostgreSqlIdentityExecutor,
 } from "../../src/storage/postgresql/identity-repository.js";
 import {
+  PostgreSqlIdentityAliasNormalizedPathConflictError,
   PostgreSqlIdentityAliasPathConflictError,
   PostgreSqlIdentityCreateOutcomeUnknownError,
   PostgreSqlIdentityConflictError,
@@ -318,6 +319,23 @@ describe("PostgreSQL identity repository", () => {
       existingPath: aliasRow.path,
       requestedPath: conflictingPath,
     });
+
+    const retargeted = await repository.linkProjectWithOwnership({
+      ...input,
+      normalizedPath: "/work/retargeted-project",
+    }).catch((error: unknown) => error);
+    expect(retargeted).toBeInstanceOf(
+      PostgreSqlIdentityAliasNormalizedPathConflictError,
+    );
+    expect(
+      (retargeted as PostgreSqlIdentityAliasNormalizedPathConflictError).toJSON(),
+    ).toMatchObject({
+      machineId: machineRow.machine_id,
+      path: aliasRow.path,
+      projectId: projectRow.project_id,
+      existingNormalizedPath: aliasRow.normalized_path,
+      requestedNormalizedPath: "/work/retargeted-project",
+    });
   });
 
   it("preserves alias insertion ownership when a link COMMIT outcome is unknown", async () => {
@@ -366,6 +384,9 @@ describe("PostgreSQL identity repository", () => {
     const db = executor((config) => {
       if (config.text.includes("SELECT project_id FROM")) {
         return result([{ project_id: replacementId }]);
+      }
+      if (config.text.includes("WHERE machine_id = $1 AND path = $2")) {
+        return result([aliasRow]);
       }
       if (config.text.includes("UPDATE lcm.project_aliases")) {
         return result(replaced ? [{ ...aliasRow, project_id: replacementId }] : []);
@@ -440,6 +461,16 @@ describe("PostgreSQL identity repository", () => {
         { path: secondAlias.path, normalizedPath: secondAlias.normalized_path },
       ],
     };
+
+    await expect(repository.replaceProjectAliases({
+      ...input,
+      aliases: [
+        { path: aliasRow.path, normalizedPath: aliasRow.normalized_path },
+        { path: aliasRow.path, normalizedPath: secondAlias.normalized_path },
+      ],
+    })).rejects.toBeInstanceOf(
+      PostgreSqlIdentityAliasNormalizedPathConflictError,
+    );
 
     await expect(repository.replaceProjectAliases(input))
       .resolves.toMatchObject({
