@@ -126,9 +126,8 @@ export function isSafeTranscriptPath(transcriptPath: string, cwd: string): strin
   return false;
 }
 
-/** Ensures the project dir exists and writes cwd to meta.json. */
-export const ensureProjectDir = (cwd: string): string => {
-  const identity = resolveProjectIdentity(cwd);
+/** Ensures the snapshotted project dir exists and writes its canonical cwd to meta.json. */
+export const ensureProjectDirForIdentity = (identity: ProjectIdentity): string => {
   const dir = join(lcmHomeDir(), "projects", identity.id);
   ensurePrivateDirectory(lcmHomeDir());
   ensurePrivateDirectory(join(lcmHomeDir(), "projects"));
@@ -146,3 +145,7 @@ export const ensureProjectDir = (cwd: string): string => {
   atomicWritePrivateFile(metaPath, JSON.stringify(meta, null, 2) + "\n");
   return dir;
 };
+
+/** Ensures the current project dir exists and writes cwd to meta.json. */
+export const ensureProjectDir = (cwd: string): string =>
+  ensureProjectDirForIdentity(resolveProjectIdentity(cwd));

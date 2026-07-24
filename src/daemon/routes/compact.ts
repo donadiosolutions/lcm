@@ -11,9 +11,8 @@ import {
 } from "../config.js";
 import {
   projectPaths,
-  ensureProjectDir,
+  ensureProjectDirForIdentity,
   isSafeTranscriptPath,
-  projectIdentity,
 } from "../project.js";
 import { enqueue } from "../project-queue.js";
 import { sendJson } from "../server.js";
@@ -28,7 +27,12 @@ import {
   type EffectiveProvider,
 } from "../summarizer.js";
 import { validateCwd } from "../validate-cwd.js";
-import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
+import {
+  createStorageBackendFactory,
+  resolveStorageIdentityContext,
+  type ProjectStorage,
+  type StorageBackendFactory,
+} from "../../storage/index.js";
 import { closeRouteStorage, storageRouteFailureResponse } from "./storage-lifecycle.js";
 
 interface CompactRequestBody {
@@ -303,10 +307,15 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         return;
       }
       const paths = projectPaths(cwd);
+      const localIdentity = {
+        id: paths.id,
+        canonical: paths.canonical,
+        ...(paths.remoteProjectId ? { remoteProjectId: paths.remoteProjectId } : {}),
+      };
+      const identity = resolveStorageIdentityContext(config.storage, localIdentity);
       const pid = paths.id;
       const result = await enqueue(pid, async () => {
-        const identity = projectIdentity(cwd, config.storage);
-        ensureProjectDir(cwd);
+        ensureProjectDirForIdentity(localIdentity);
 
         const scrubber = await ScrubEngine.forProject(
           config.security?.sensitivePatterns ?? [],

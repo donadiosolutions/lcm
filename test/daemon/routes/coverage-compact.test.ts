@@ -15,8 +15,33 @@ const state = vi.hoisted(() => ({
   metaText: "{}",
   metaError: undefined as unknown,
   identityError: undefined as unknown,
-  identity: vi.fn((cwd: string) => ({ id: "pid", canonical: cwd })),
+  paths: vi.fn((cwd: string) => ({
+    id: "pid",
+    dir: "/tmp/project",
+    dbPath: "/tmp/project/lcm.db",
+    metaPath: "/tmp/project/meta.json",
+    canonical: cwd,
+  })),
+  identity: vi.fn((
+    _cwd: string,
+    _config?: unknown,
+    local?: { id: string; canonical: string; remoteProjectId?: string },
+  ) => local?.remoteProjectId
+    ? {
+        id: local.remoteProjectId,
+        localProjectId: local.id,
+        canonical: local.canonical,
+        remoteProjectId: local.remoteProjectId,
+        machineId: "machine-id",
+      }
+    : {
+        ...local,
+        id: local?.id ?? "pid",
+        localProjectId: local?.id ?? "pid",
+      }),
   ensureProject: vi.fn(),
+  queuedKeys: [] as string[],
+  beforeQueuedWork: undefined as (() => void) | undefined,
   scrubber: vi.fn(async () => ({ scrubWithCounts: (content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }) })),
   openProject: vi.fn(),
 }));
@@ -49,16 +74,18 @@ vi.mock("../../../src/daemon/summarizer.js", () => ({
 }));
 
 vi.mock("../../../src/daemon/project.js", () => ({
-  projectPaths: (cwd: string) => ({ id: "pid", dir: "/tmp/project", dbPath: "/tmp/project/lcm.db", metaPath: "/tmp/project/meta.json", canonical: cwd }),
-  projectIdentity: (cwd: string) => {
-    if (state.identityError !== undefined) throw state.identityError;
-    return state.identity(cwd);
-  },
-  ensureProjectDir: state.ensureProject,
+  projectPaths: state.paths,
+  ensureProjectDirForIdentity: state.ensureProject,
   isSafeTranscriptPath: () => true,
 }));
 
-vi.mock("../../../src/daemon/project-queue.js", () => ({ enqueue: (_id: string, work: () => unknown) => work() }));
+vi.mock("../../../src/daemon/project-queue.js", () => ({
+  enqueue: (id: string, work: () => unknown) => {
+    state.queuedKeys.push(id);
+    state.beforeQueuedWork?.();
+    return work();
+  },
+}));
 vi.mock("../../../src/db/connection.js", () => ({
   getLcmConnection: () => ({}),
   closeLcmConnection: vi.fn(),
@@ -93,6 +120,14 @@ vi.mock("../../../src/store/summary-store.js", () => ({
   },
 }));
 vi.mock("../../../src/storage/index.js", () => ({
+  resolveStorageIdentityContext: (storageConfig: unknown, local: {
+    id: string;
+    canonical: string;
+    remoteProjectId?: string;
+  }) => {
+    if (state.identityError !== undefined) throw state.identityError;
+    return state.identity(local.canonical, storageConfig, local);
+  },
   createStorageBackendFactory: () => ({
     openProject: async (...args: unknown[]) => {
       state.openProject(...args);
@@ -177,8 +212,33 @@ describe("compact route coverage", () => {
     state.metaText = "{}";
     state.metaError = undefined;
     state.identityError = undefined;
-    state.identity.mockClear();
+    state.paths.mockReset();
+    state.paths.mockImplementation((cwd: string) => ({
+      id: "pid",
+      dir: "/tmp/project",
+      dbPath: "/tmp/project/lcm.db",
+      metaPath: "/tmp/project/meta.json",
+      canonical: cwd,
+    }));
+    state.identity.mockReset();
+    state.identity.mockImplementation((_cwd, _storageConfig, local) => (
+      local?.remoteProjectId
+        ? {
+            id: local.remoteProjectId,
+            localProjectId: local.id,
+            canonical: local.canonical,
+            remoteProjectId: local.remoteProjectId,
+            machineId: "machine-id",
+          }
+        : {
+            ...local,
+            id: local?.id ?? "pid",
+            localProjectId: local?.id ?? "pid",
+          }
+    ));
     state.ensureProject.mockClear();
+    state.queuedKeys = [];
+    state.beforeQueuedWork = undefined;
     state.scrubber.mockClear();
     state.openProject.mockClear();
   });
@@ -212,6 +272,61 @@ describe("compact route coverage", () => {
       .toBeLessThan(state.scrubber.mock.invocationCallOrder[0]);
     expect(state.scrubber.mock.invocationCallOrder[0])
       .toBeLessThan(state.openProject.mock.invocationCallOrder[0]);
+  });
+
+  it("uses one local and remote identity snapshot across queued execution", async () => {
+    const first = {
+      id: "local-hash-a",
+      canonical: "/work/project",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      dir: "/lcm/projects/local-hash-a",
+      dbPath: "/lcm/projects/local-hash-a/db.sqlite",
+      metaPath: "/lcm/projects/local-hash-a/meta.json",
+    };
+    const concurrent = {
+      ...first,
+      id: "local-hash-b",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
+      dir: "/lcm/projects/local-hash-b",
+      dbPath: "/lcm/projects/local-hash-b/db.sqlite",
+      metaPath: "/lcm/projects/local-hash-b/meta.json",
+    };
+    state.paths.mockReturnValueOnce(first);
+    state.beforeQueuedWork = () => {
+      state.paths.mockReturnValue(concurrent);
+    };
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://user:secret@db.example/lcm",
+        poolMax: 5,
+        connectionTimeoutMs: 10_000,
+        idleTimeoutMs: 30_000,
+        statementTimeoutMs: 60_000,
+      },
+    };
+
+    await expect(call(JSON.stringify({
+      session_id: "queued-snapshot",
+      cwd: first.canonical,
+    }), value)).resolves.toMatchObject({ actionTaken: false });
+
+    expect(state.paths).toHaveBeenCalledOnce();
+    expect(state.queuedKeys).toEqual([first.id]);
+    expect(state.ensureProject).toHaveBeenCalledWith({
+      id: first.id,
+      canonical: first.canonical,
+      remoteProjectId: first.remoteProjectId,
+    });
+    expect(state.scrubber).toHaveBeenCalledWith([], first.dir);
+    expect(state.openProject).toHaveBeenCalledWith({
+      id: first.remoteProjectId,
+      localProjectId: first.id,
+      canonical: first.canonical,
+      remoteProjectId: first.remoteProjectId,
+      machineId: "machine-id",
+    });
   });
 
   it.each([
