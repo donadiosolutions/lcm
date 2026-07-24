@@ -85,7 +85,8 @@ interface SeededScope {
 async function seedScope(database: PostgreSqlRuntime): Promise<SeededScope> {
   const machines = await database.query<{ machine_id: string }>({
     text: `INSERT INTO lcm.machines (identity_key, display_name)
-           VALUES ('machine-a', 'Machine A'), ('machine-b', 'Machine B')`,
+           VALUES ('machine:${"a".repeat(64)}', 'Machine A'),
+                  ('machine:${"b".repeat(64)}', 'Machine B')`,
   }, { domain: "factory", operation: "seedMachines" });
   const machineRows = await database.query<{ machine_id: string }>({
     text: "SELECT machine_id FROM lcm.machines ORDER BY identity_key",
@@ -290,9 +291,9 @@ describe("PostgreSQL schema baseline", () => {
       const normalizedConstraints = constraints.rows
         .map((row) => `${row.table_name}|${row.constraint_type}|${row.definition}`)
         .join("\n");
-      expect(constraints.rowCount).toBe(168);
+      expect(constraints.rowCount).toBe(169);
       expect(createHash("sha256").update(normalizedConstraints).digest("hex"))
-        .toBe("224efb3262dd78a2da9d961916d4f8c23a22c48285110ff02ea9aa6f15cc526f");
+        .toBe("c3a1717bdbce6322206fe8a25a6fe6d2d09edc55e0b8f6bf988aec83997b2c0d");
 
       const deleteActions = await database.migrator.query<{
         table_name: string;
@@ -465,6 +466,49 @@ describe("PostgreSQL schema baseline", () => {
         text: `INSERT INTO lcm.machines (machine_id, identity_key)
                VALUES ('6ba7b810-9dad-41d1-80b4-00c04fd430c8', 'legacy-machine')`,
       }, { domain: "factory", operation: "rejectLegacyDistributedIdentity" }));
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.machines (identity_key, display_name)
+               VALUES ('legacy-machine', 'Legacy Machine')`,
+      }, { domain: "factory", operation: "rejectInvalidMachineIdentityKey" }));
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.machines (identity_key, display_name)
+               VALUES ($1, 'Trailing Newline Machine')`,
+        values: [`machine:${"a".repeat(64)}\n`],
+      }, { domain: "factory", operation: "rejectTrailingNewlineMachineIdentityKey" }));
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.machines (identity_key, display_name)
+               VALUES ($1, $2)`,
+        values: [`machine:${"b".repeat(64)}`, "bad\nname"],
+      }, { domain: "factory", operation: "rejectControlMachineDisplayName" }));
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.machines (identity_key, display_name)
+               VALUES ($1, $2)`,
+        values: [`machine:${"c".repeat(64)}`, "bad\u2066name"],
+      }, { domain: "factory", operation: "rejectBidiMachineDisplayName" }));
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.machines (identity_key, display_name)
+               VALUES ($1, $2)`,
+        values: [`machine:${"d".repeat(64)}`, "x".repeat(257)],
+      }, { domain: "factory", operation: "rejectLongMachineDisplayName" }));
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.machines (identity_key, display_name)
+               VALUES ($1, $2)`,
+        values: [`machine:${"e".repeat(64)}`, "😀".repeat(129)],
+      }, { domain: "factory", operation: "rejectLongUtf16MachineDisplayName" }));
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.machines (identity_key, display_name)
+               VALUES ($1, $2)`,
+        values: [`machine:${"f".repeat(64)}`, "\u00a0\u3000"],
+      }, { domain: "factory", operation: "rejectBlankMachineDisplayName" }));
+      await expect(database.migrator.query<{ display_name: string }>({
+        text: `INSERT INTO lcm.machines (identity_key, display_name)
+               VALUES ($1, $2)
+               RETURNING display_name`,
+        values: [`machine:${"0".repeat(64)}`, "😀".repeat(128)],
+      }, { domain: "factory", operation: "acceptMaximumUtf16MachineDisplayName" }))
+        .resolves.toMatchObject({
+          rows: [{ display_name: "😀".repeat(128) }],
+        });
 
       const generated = await database.migrator.query<{
         table_name: string;
@@ -1465,6 +1509,16 @@ describe("PostgreSQL schema baseline", () => {
                VALUES ($1, $2, '/workspace/a/', '/workspace/a')`,
         values: [scope.otherProjectId, scope.machineId],
       }, { domain: "factory", operation: "rejectAliasCollision" }));
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.project_aliases (project_id, machine_id, path, normalized_path)
+               VALUES ($1, $2, '/workspace/a', '/workspace/retargeted')`,
+        values: [scope.otherProjectId, scope.machineId],
+      }, { domain: "factory", operation: "rejectRetargetedLexicalAlias" }));
+      await database.migrator.query({
+        text: `INSERT INTO lcm.project_aliases (project_id, machine_id, path, normalized_path)
+               VALUES ($1, $2, '/workspace/a', '/workspace/retargeted')`,
+        values: [scope.otherProjectId, scope.otherMachineId],
+      }, { domain: "factory", operation: "allowLexicalAliasOnOtherMachine" });
       await database.migrator.query({
         text: `INSERT INTO lcm.session_ingest_log (project_id, session_id, message_count)
                VALUES ($1, 'session-a', 1)`,

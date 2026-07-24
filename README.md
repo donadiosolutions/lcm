@@ -228,15 +228,16 @@ lcm stats                  # memory and compression overview
 lcm stats -v               # per-conversation breakdown
 lcm stats --pool           # connection pool statistics
 
-# Project path aliases
-lcm map list               # list canonical project paths and aliases
-lcm map list --json        # output the project path map as JSON
-lcm map show               # show the current project's canonical path and aliases
-lcm map show [path-or-hash] # show a specific path or project hash
-lcm map add <alias>        # add an alias to the current project
-lcm map add <alias> --canonical <path> # add an alias to a specific canonical project
-lcm map add <alias> --hash <hash>      # add an alias to a specific project hash
-lcm map remove <alias>     # remove an alias from its unambiguous project
+# Machine and project identity
+lcm machine register --name workstation # register this machine for PostgreSQL
+lcm machine show --json                  # show the local machine UUID
+lcm machine recover <machine-uuid>       # recover after a reimage
+lcm project create [path] --name lcm     # create and bind a PostgreSQL project
+lcm project link <project-uuid> [path]   # pair a path to a remote project
+lcm project link <local-hash> <alias>    # add a same-machine path alias
+lcm project unlink [path]                # remove an alias or remote binding
+lcm project list --json                  # list local and remote identities
+lcm project show [path|local-hash|project-uuid] # inspect one uniquely mapped project
 
 # Compaction & promotion
 lcm compact                # compact the current project
@@ -291,7 +292,12 @@ lcm post-tool              # PostToolUse hook (passive learning)
 lcm mcp                    # start MCP server
 ```
 
-See [Project path aliases](docs/project-map.md) for `lcm map` ambiguity rules, manual `~/.lcm/map.json` edits, backups, and daemon reload behavior.
+See [Machine registration and project identity](docs/project-identity.md) for
+PostgreSQL pairing, reimage recovery, local aliases, permissions,
+unlink/relink behavior, migration binding, and ambiguity diagnosis.
+Remote UUID show targets resolve through that local project map: exactly one
+local entry must bind the UUID. Unknown or multiply mapped UUIDs are rejected;
+use `lcm project list --json` and select a local path or hash to diagnose them.
 
 ## Configuration
 
@@ -349,9 +355,16 @@ configuration and verified-TLS prerequisites for an explicit remote-primary
 PostgreSQL selection and includes an internal PostgreSQL 18 pool, migration
 runner, schema baseline, and isolated conformance harness. PostgreSQL domain
 repositories remain staged in #84-#91, with activation in #92, so selecting
-`postgresql` currently fails before daemon startup instead of falling back to
-SQLite. Connection credentials stay out of JSON and effective configuration
-output. See [storage backend configuration](docs/configuration.md#storage-backend)
+`postgresql` starts the daemon with an explicitly unavailable storage factory
+instead of falling back to SQLite. The health endpoint reports `503` and
+unavailable storage; status and statistics routes return fixed `503` responses,
+and SQLite background scans remain disabled. Project routes first validate
+machine registration and the explicit project binding, then fail safely at the
+unavailable repository boundary. Connection credentials stay out of JSON and
+effective configuration output. Provision the schema as its migration owner
+with `lcm postgres migrate`, then apply the
+[exact identity runtime grants](docs/postgresql-runtime-identity-grants.sql)
+before machine registration. See [storage backend configuration](docs/configuration.md#storage-backend)
 for operators, the [PostgreSQL schema reference](docs/postgresql-schema.md) for
 the 23-table data and namespace-aware extension contract, and the
 [storage repository architecture](docs/architecture.md#storage-repository-architecture)

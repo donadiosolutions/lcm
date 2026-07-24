@@ -4,7 +4,11 @@ import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { validateCwd } from "../validate-cwd.js";
 import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
-import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
+import {
+  closeRouteStorage,
+  openExistingProject,
+  storageRouteFailureResponse,
+} from "./storage-lifecycle.js";
 
 export type StaleCandidate = {
   id: string;
@@ -43,9 +47,11 @@ export function createReviewStaleHandler(config: DaemonConfig, storageFactory?: 
 
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
+    let activeFactory: StorageBackendFactory | undefined;
     try {
-      const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await openExistingProject(factory, projectIdentity(cwd)) ?? undefined;
+      const identity = projectIdentity(cwd, config.storage);
+      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+      project = await openExistingProject(activeFactory, identity) ?? undefined;
       if (!project) {
         sendJson(res, 200, { stale: [], total: 0 });
         return;
@@ -98,6 +104,11 @@ export function createReviewStaleHandler(config: DaemonConfig, storageFactory?: 
 
       sendJson(res, 200, { stale, total: stale.length });
     } catch (err) {
+      const storageFailure = storageRouteFailureResponse(activeFactory, err, "review-stale");
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
+        return;
+      }
       sendJson(res, 500, { error: err instanceof Error ? err.message : "review-stale failed" });
     } finally {
       await closeRouteStorage(project, ownedFactory);

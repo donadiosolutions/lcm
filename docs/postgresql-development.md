@@ -104,9 +104,11 @@ unbounded summary IDs round-trip exactly through bounded UUIDv7 relationship
 keys and digest-plus-exact lookup. Unbounded large-file IDs use the same
 UUIDv7-key and digest-plus-exact design and remain unique within a project
 rather than globally.
-The backend-neutral 64-hex `ProjectIdentity.id` is stored separately from the
-internal UUID and display label, so another machine resolves the same logical
-project without depending on a machine-local path alias. Arbitrary-length
+Each remote project receives a globally unique opaque random 32-byte
+`identity_key` that is independent of every machine-local path hash. The
+internal UUID is the explicit cross-machine project identifier; another
+machine joins that logical project only through `lcm project link <uuid>`, not
+by reproducing a path-derived key. Arbitrary-length
 session IDs remain exact text, but conversations, native transcripts, recall
 surfacing, and ingest completion index only fixed-width SHA-256 candidates.
 Repository lookups must retain exact session-text equality as the collision

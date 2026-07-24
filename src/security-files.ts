@@ -3,9 +3,11 @@ import {
   chmodSync,
   closeSync,
   constants,
+  fchmodSync,
   fstatSync,
   fsyncSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   openSync,
   readSync,
@@ -16,6 +18,7 @@ import {
   type Stats,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { basename, dirname, join, sep } from "node:path";
 
@@ -104,22 +107,149 @@ export function readBoundedRegularFile(path: string, options: BoundedFileOptions
 }
 
 /** Atomically replace a private file from a same-directory exclusive temp file. */
-export function atomicWritePrivateFile(path: string, content: string): void {
+export function atomicWritePrivateFile(
+  path: string,
+  content: string,
+  operations: {
+    readonly close?: typeof closeSync;
+    readonly fchmod?: typeof fchmodSync;
+    readonly open?: typeof openSync;
+    readonly random?: (size: number) => Buffer;
+    readonly remove?: typeof rmSync;
+    readonly rename?: typeof renameSync;
+    readonly sync?: typeof fsyncSync;
+    readonly write?: typeof writeFileSync;
+  } = {},
+): void {
   const directory = dirname(path);
   ensurePrivateDirectory(directory);
-  const tempPath = join(directory, `.${basename(path)}.${randomBytes(12).toString("hex")}.tmp`);
+  const tempPath = join(
+    directory,
+    `.${basename(path)}.${(operations.random ?? randomBytes)(12).toString("hex")}.tmp`,
+  );
+  let ownsTempPath = false;
   try {
-    const fd = openSync(tempPath, "wx", PRIVATE_FILE_MODE);
+    const fd = (operations.open ?? openSync)(tempPath, "wx", PRIVATE_FILE_MODE);
+    ownsTempPath = true;
     try {
-      writeFileSync(fd, content, "utf-8");
-      fsyncSync(fd);
+      (operations.write ?? writeFileSync)(fd, content, "utf-8");
+      (operations.fchmod ?? fchmodSync)(fd, PRIVATE_FILE_MODE);
+      (operations.sync ?? fsyncSync)(fd);
     } finally {
-      closeSync(fd);
+      (operations.close ?? closeSync)(fd);
     }
-    renameSync(tempPath, path);
-    chmodSync(path, PRIVATE_FILE_MODE);
+    (operations.rename ?? renameSync)(tempPath, path);
+    ownsTempPath = false;
   } finally {
-    rmSync(tempPath, { force: true });
+    if (ownsTempPath) (operations.remove ?? rmSync)(tempPath, { force: true });
+  }
+}
+
+/**
+ * Copy a validated regular file into a new private destination without
+ * retaining the source in memory. The source pathname is bound to one
+ * no-follow descriptor before the destination is created.
+ */
+export function copyRegularFilePrivateExclusive(
+  sourcePath: string,
+  destinationPath: string,
+  options: {
+    readonly allowedRoot: string;
+    /** @internal Deterministic streaming seam for tests. */
+    readonly _chunkBytesForTesting?: number;
+    /** @internal Deterministic I/O failure seam for tests. */
+    readonly _operationsForTesting?: Partial<{
+      readonly close: typeof closeSync;
+      readonly fchmod: typeof fchmodSync;
+      readonly fstat: typeof fstatSync;
+      readonly open: typeof openSync;
+      readonly read: typeof readSync;
+      readonly realpath: typeof realpathSync;
+      readonly stat: typeof statSync;
+      readonly sync: typeof fsyncSync;
+      readonly unlink: typeof unlinkSync;
+      readonly write: typeof writeSync;
+    }>;
+  },
+): boolean {
+  const io = {
+    close: closeSync,
+    fchmod: fchmodSync,
+    fstat: fstatSync,
+    open: openSync,
+    read: readSync,
+    realpath: realpathSync,
+    stat: statSync,
+    sync: fsyncSync,
+    unlink: unlinkSync,
+    write: writeSync,
+    ...options._operationsForTesting,
+  };
+  const chunkBytes = options._chunkBytesForTesting ?? 64 * 1024;
+  if (!Number.isSafeInteger(chunkBytes) || chunkBytes <= 0) {
+    throw new RangeError("chunkBytes must be a positive safe integer");
+  }
+  const allowedRoot = io.realpath(options.allowedRoot);
+  const realParent = io.realpath(dirname(sourcePath));
+  if (!isContainedPath(allowedRoot, realParent)) {
+    throw new Error("file is outside the permitted root");
+  }
+
+  const sourceFd = io.open(sourcePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let destinationFd: number | undefined;
+  try {
+    const sourceStat = io.fstat(sourceFd);
+    if (!sourceStat.isFile()) throw new Error("path is not a regular file");
+    const openedPath = io.realpath(sourcePath);
+    if (!isContainedPath(allowedRoot, openedPath)) {
+      throw new Error("file is outside the permitted root");
+    }
+    const current = io.stat(openedPath);
+    if (current.dev !== sourceStat.dev || current.ino !== sourceStat.ino) {
+      throw new Error("file changed during validation");
+    }
+
+    ensurePrivateDirectory(dirname(destinationPath));
+    try {
+      destinationFd = io.open(destinationPath, "wx", PRIVATE_FILE_MODE);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        return false;
+      }
+      throw error;
+    }
+    const buffer = Buffer.allocUnsafe(chunkBytes);
+    for (;;) {
+      const bytesRead = io.read(sourceFd, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      let written = 0;
+      while (written < bytesRead) {
+        const bytesWritten = io.write(
+          destinationFd,
+          buffer,
+          written,
+          bytesRead - written,
+          null,
+        );
+        if (bytesWritten === 0) throw new Error("private backup write made no progress");
+        written += bytesWritten;
+      }
+    }
+    io.fchmod(destinationFd, PRIVATE_FILE_MODE);
+    io.sync(destinationFd);
+    io.close(destinationFd);
+    destinationFd = undefined;
+    return true;
+  } catch (error) {
+    if (destinationFd !== undefined) {
+      try { io.close(destinationFd); } catch { /* preserve the original failure */ }
+      try { io.unlink(destinationPath); } catch { /* preserve the original failure */ }
+    }
+    throw error;
+  } finally {
+    try {
+      io.close(sourceFd);
+    } catch { /* preserve the completed result or original copy failure */ }
   }
 }
 
@@ -161,6 +291,68 @@ export function writePrivateFileExclusive(
     }
     if (!created && (error as NodeJS.ErrnoException).code === "EEXIST") return false;
     throw error;
+  }
+}
+
+/**
+ * Atomically create a private file only when the final destination is absent.
+ *
+ * The completed temporary file is hard-linked into place so concurrent readers
+ * can never observe a partially written destination. The link operation is
+ * same-directory and exclusive: an existing destination wins without being
+ * replaced.
+ */
+export function atomicWritePrivateFileExclusive(
+  path: string,
+  content: string,
+  operations: {
+    readonly chmod?: typeof chmodSync;
+    readonly link?: typeof linkSync;
+    readonly random?: (size: number) => Buffer;
+    readonly remove?: typeof rmSync;
+  } = {},
+): boolean {
+  const directory = dirname(path);
+  ensurePrivateDirectory(directory);
+  const tempPath = join(
+    directory,
+    `.${basename(path)}.${(operations.random ?? randomBytes)(12).toString("hex")}.tmp`,
+  );
+  let ownsTempPath = false;
+  let published = false;
+  try {
+    const fd = openSync(tempPath, "wx", PRIVATE_FILE_MODE);
+    ownsTempPath = true;
+    try {
+      writeFileSync(fd, content, "utf-8");
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    // A hard link shares the completed temporary inode, including its mode.
+    // Finish every fallible setup step before publishing the destination so a
+    // thrown setup error can never strand a lock that the caller did not
+    // acquire.
+    (operations.chmod ?? chmodSync)(tempPath, PRIVATE_FILE_MODE);
+    try {
+      (operations.link ?? linkSync)(tempPath, path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error;
+    }
+    published = true;
+    return true;
+  } finally {
+    if (ownsTempPath) {
+      try {
+        (operations.remove ?? rmSync)(tempPath, { force: true });
+      } catch (error) {
+        // Once the destination is published it is complete and private. A
+        // best-effort temporary-link cleanup failure must not report lock
+        // acquisition failure while leaving that valid destination behind.
+        if (!published) throw error;
+      }
+    }
   }
 }
 

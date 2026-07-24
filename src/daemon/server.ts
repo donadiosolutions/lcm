@@ -2,6 +2,7 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import type { DaemonConfig } from "./config.js";
 import { sanitizeError } from "./safe-error.js";
+import { stagedPostgreSqlUnavailablePayload } from "./staged-postgresql.js";
 import { readAuthToken } from "./auth.js";
 import type { ProxyManager } from "./proxy-manager.js";
 import { createCompactHandler } from "./routes/compact.js";
@@ -30,7 +31,6 @@ import { PKG_VERSION } from "./version.js";
 import { normalizeDaemonPort, normalizeIdleTimeoutMs } from "./http-url.js";
 import { projectsDir as lcmProjectsDir } from "../runtime-paths.js";
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
-import { selectStorageBackend } from "../storage/backend.js";
 import { createStorageBackendFactory } from "../storage/index.js";
 export { PKG_VERSION };
 
@@ -104,6 +104,12 @@ function clearIdleTimer(timer: ReturnType<typeof setTimeout> | null, clearTimer:
   return null;
 }
 
+function stagedPostgreSqlUnavailableHandler(operation: string): RouteHandler {
+  return async (_req, res) => {
+    sendJson(res, 503, stagedPostgreSqlUnavailablePayload(operation));
+  };
+}
+
 async function settleCleanup(callback: () => void | Promise<void>): Promise<void> {
   try {
     await callback();
@@ -113,7 +119,6 @@ async function settleCleanup(callback: () => void | Promise<void>): Promise<void
 }
 
 export async function createDaemon(config: DaemonConfig, options?: DaemonOptions): Promise<DaemonInstance> {
-  selectStorageBackend(config.storage);
   const hasSetTimeoutOverride = options?._setTimeout !== undefined;
   const hasClearTimeoutOverride = options?._clearTimeout !== undefined;
   if (hasSetTimeoutOverride !== hasClearTimeoutOverride) {
@@ -130,6 +135,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     throw new Error(`Auth token file specified but could not be read: ${options.tokenPath}`);
   }
   const storageFactory = createStorageBackendFactory(config.storage);
+  const sqliteStorage = config.storage.backend === "sqlite";
   let constructedProcessor: PassiveEventProcessor | undefined;
   let constructedWatcher: ReturnType<typeof watchProjectMap> | undefined;
   let constructedIngestInterval: ReturnType<typeof setInterval> | undefined;
@@ -191,9 +197,20 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   constructedProcessor = passiveEventProcessor;
   routes.set("POST /promote-events", createPromoteEventsHandler(config, storageFactory));
   routes.set("POST /promote-events/all", createPromoteAllEventsHandler(config, storageFactory));
-  routes.set("POST /promote-events/notify", createPromoteEventsNotifyHandler(passiveEventProcessor));
-  routes.set("GET /stats", createStatsHandler());
-  routes.set("GET /stats/pool", createPoolStatsHandler());
+  routes.set(
+    "POST /promote-events/notify",
+    sqliteStorage
+      ? createPromoteEventsNotifyHandler(passiveEventProcessor)
+      : stagedPostgreSqlUnavailableHandler("promote-events-notify"),
+  );
+  routes.set(
+    "GET /stats",
+    sqliteStorage ? createStatsHandler() : stagedPostgreSqlUnavailableHandler("stats"),
+  );
+  routes.set(
+    "GET /stats/pool",
+    sqliteStorage ? createPoolStatsHandler() : stagedPostgreSqlUnavailableHandler("pool stats"),
+  );
   routes.set("POST /review-stale", createReviewStaleHandler(config, storageFactory));
   // Status handler is registered after listen() when we know the actual port
   const projectMapWatcher = watchProjectMap();
@@ -269,9 +286,11 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     return scan;
   };
 
-  const ingestInterval = setInterval(runTranscriptScan, INGEST_INTERVAL_MS);
+  const ingestInterval = sqliteStorage
+    ? setInterval(runTranscriptScan, INGEST_INTERVAL_MS)
+    : undefined;
   constructedIngestInterval = ingestInterval;
-  ingestInterval.unref(); // don't prevent process exit
+  ingestInterval?.unref(); // don't prevent process exit
 
   const server: Server = createServer(async (req, res) => {
     resetIdleTimer();
@@ -307,7 +326,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
 
   const cleanupStartupFailure = async (): Promise<void> => {
     startupCleanupStarted = true;
-    await settleCleanup(() => clearInterval(ingestInterval));
+    if (ingestInterval) await settleCleanup(() => clearInterval(ingestInterval));
     await settleCleanup(() => activeIngestScan);
     await settleCleanup(() => projectMapWatcher.close());
     await settleCleanup(() => passiveEventProcessor.stopAndWait());
@@ -337,13 +356,19 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       const actualPort = addr.port;
 
       // Now that we know the actual port, register the status handler
-      routes.set("POST /status", createStatusHandler(config, startTime, actualPort));
-      passiveEventProcessor.start();
+      routes.set(
+        "POST /status",
+        sqliteStorage
+          ? createStatusHandler(config, startTime, actualPort)
+          : stagedPostgreSqlUnavailableHandler("status"),
+      );
+      if (sqliteStorage) passiveEventProcessor.start();
+      else passiveEventProcessor.stop();
 
       resolve({
         address: () => addr,
         stop: async () => {
-          await settleCleanup(() => clearInterval(ingestInterval));
+          if (ingestInterval) await settleCleanup(() => clearInterval(ingestInterval));
           await settleCleanup(() => activeIngestScan);
           await settleCleanup(() => projectMapWatcher.close());
           await settleCleanup(() => passiveEventProcessor.stopAndWait());

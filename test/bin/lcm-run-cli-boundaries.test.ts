@@ -24,10 +24,34 @@ const state = vi.hoisted(() => ({
   files: new Map<string, string>(),
   exists: new Set<string>(),
   entries: [] as Array<{ name: string; isDirectory: () => boolean }>,
-  mapList: vi.fn(() => ({ hash: { canonical: "/canonical", aliases: ["/alias"] } })),
-  mapShow: vi.fn(() => ({ hash: "hash", entry: { canonical: "/canonical", aliases: ["/alias"] } })),
-  mapAdd: vi.fn(() => ({ hash: "hash", warning: "already mapped" })),
-  mapRemove: vi.fn(() => ({ hash: "hash", removed: true })),
+  projectList: vi.fn(async () => ({
+    local: [{ hash: "hash", canonical: "/canonical", aliases: ["/alias"], remoteProjectId: "remote-id" }],
+    remote: [{ projectId: "remote-id", displayName: "Remote", aliases: [{ machineId: "machine-id", path: "/canonical" }] }],
+  })),
+  projectShow: vi.fn(async () => ({
+    hash: "hash",
+    entry: { canonical: "/canonical", aliases: ["/alias"], remoteProjectId: "remote-id" },
+    remote: { projectId: "remote-id", displayName: "Remote", aliases: [] },
+  })),
+  projectLink: vi.fn(async () => ({
+    local: { id: "hash", canonical: "/canonical", aliases: ["/alias"], remoteProjectId: "remote-id" },
+  })),
+  projectUnlink: vi.fn(async () => ({ hash: "hash", remoteProjectId: "remote-id", aliasRemoved: true })),
+  projectCreate: vi.fn(async () => ({
+    local: { id: "hash", canonical: "/canonical", aliases: [], remoteProjectId: "remote-id" },
+    remote: { projectId: "remote-id", displayName: "Remote", aliases: [] },
+  })),
+  machineRegister: vi.fn(async () => ({
+    identity: { version: 1, machineId: "machine-id", displayName: "Workstation", identityKey: "secret" },
+    created: true,
+  })),
+  machineShow: vi.fn(() => ({
+    version: 1, machineId: "machine-id", displayName: "Workstation", identityKey: "secret",
+  })),
+  machineRecover: vi.fn(async () => ({
+    identity: { version: 1, machineId: "machine-id", displayName: "Workstation", identityKey: "secret" },
+    backupPath: "/lcm/machine.json.backup",
+  })),
   installConnector: vi.fn(() => ({ path: "/hook", requiresRestart: false })),
   removeConnector: vi.fn(() => true),
   installed: [] as Array<{ agentId: string; type: string; path: string }>,
@@ -79,9 +103,15 @@ vi.mock("../../src/daemon/client.js", () => ({ DaemonClient: class { post = stat
 vi.mock("../../src/daemon/server.js", () => ({ createDaemon: state.createDaemon }));
 vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: vi.fn() }));
 vi.mock("../../src/cli-help.js", () => ({ printHelp: vi.fn() }));
-vi.mock("../../src/project-map.js", () => ({
-  listProjectMapEntries: state.mapList, showProjectMapEntry: state.mapShow,
-  addProjectAlias: state.mapAdd, removeProjectAlias: state.mapRemove,
+vi.mock("../../src/identity-service.js", () => ({
+  listProjects: state.projectList,
+  showProject: state.projectShow,
+  linkProject: state.projectLink,
+  unlinkProject: state.projectUnlink,
+  createProject: state.projectCreate,
+  registerMachine: state.machineRegister,
+  showMachine: state.machineShow,
+  recoverMachine: state.machineRecover,
 }));
 vi.mock("../../src/config-manager.js", () => ({
   getConfigValue: vi.fn(() => "value"), formatConfigValue: vi.fn((value: unknown) => String(value)),
@@ -131,7 +161,7 @@ vi.mock("../../installer/uninstall.js", () => ({ uninstall: vi.fn(async () => un
 vi.mock("../../installer/dry-run-deps.js", () => ({ DryRunServiceDeps: class {} }));
 
 const {
-  compactFailureExitCode, registerMapCommand, registerMemoryCommands,
+  compactFailureExitCode, registerMachineCommand, registerMemoryCommands, registerProjectCommand,
   resolveCompactRequestPolicyOverride, resolveManualCompactProvider, runCli, withHookOverrides,
 } = await import("../../bin/lcm.js");
 
@@ -185,10 +215,34 @@ beforeEach(() => {
   state.importPatch = { lastResult: { ok: true } };
   state.health.mockResolvedValue(true);
   state.portableResult = { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false };
-  state.mapList.mockReturnValue({ hash: { canonical: "/canonical", aliases: ["/alias"] } });
-  state.mapShow.mockReturnValue({ hash: "hash", entry: { canonical: "/canonical", aliases: ["/alias"] } });
-  state.mapAdd.mockReturnValue({ hash: "hash", warning: "already mapped" });
-  state.mapRemove.mockReturnValue({ hash: "hash", removed: true });
+  state.projectList.mockResolvedValue({
+    local: [{ hash: "hash", canonical: "/canonical", aliases: ["/alias"], remoteProjectId: "remote-id" }],
+    remote: [{ projectId: "remote-id", displayName: "Remote", aliases: [{ machineId: "machine-id", path: "/canonical" }] }],
+  });
+  state.projectShow.mockResolvedValue({
+    hash: "hash",
+    entry: { canonical: "/canonical", aliases: ["/alias"], remoteProjectId: "remote-id" },
+    remote: { projectId: "remote-id", displayName: "Remote", aliases: [] },
+  });
+  state.projectLink.mockResolvedValue({
+    local: { id: "hash", canonical: "/canonical", aliases: ["/alias"], remoteProjectId: "remote-id" },
+  });
+  state.projectUnlink.mockResolvedValue({ hash: "hash", remoteProjectId: "remote-id", aliasRemoved: true });
+  state.projectCreate.mockResolvedValue({
+    local: { id: "hash", canonical: "/canonical", aliases: [], remoteProjectId: "remote-id" },
+    remote: { projectId: "remote-id", displayName: "Remote", aliases: [] },
+  });
+  state.machineRegister.mockResolvedValue({
+    identity: { version: 1, machineId: "machine-id", displayName: "Workstation", identityKey: "secret" },
+    created: true,
+  });
+  state.machineShow.mockReturnValue({
+    version: 1, machineId: "machine-id", displayName: "Workstation", identityKey: "secret",
+  });
+  state.machineRecover.mockResolvedValue({
+    identity: { version: 1, machineId: "machine-id", displayName: "Workstation", identityKey: "secret" },
+    backupPath: "/lcm/machine.json.backup",
+  });
   state.installConnector.mockReturnValue({ path: "/hook", requiresRestart: false });
   state.removeConnector.mockReturnValue(true);
   process.exitCode = undefined;
@@ -201,16 +255,23 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("runCli map boundaries", () => {
-  it("covers nested help callbacks through the registration seam", async () => {
-    const actions = captureActions(registerMapCommand);
-    await expect(actions.get("map")!({ help: true })).rejects.toThrow("exit:0");
-    await expect(actions.get("map")!({})).rejects.toThrow("exit:1");
-    for (const name of ["list", "show", "add", "remove"]) {
-      const handler = actions.get(name)!;
-      const args = name === "list" ? [{ help: true }] : name === "show" ? [undefined, { help: true }] : ["/alias", { help: true }];
-      await expect(Promise.resolve().then(() => handler(...args))).rejects.toThrow("exit:0");
-    }
+describe("runCli identity boundaries", () => {
+  it("covers nested project and machine help callbacks through the registration seam", async () => {
+    const projectActions = captureActions(registerProjectCommand);
+    await expect(projectActions.get("project")!({ help: true })).rejects.toThrow("exit:0");
+    await expect(projectActions.get("project")!({})).rejects.toThrow("exit:1");
+    await expect(projectActions.get("list")!({ help: true })).rejects.toThrow("exit:0");
+    await expect(projectActions.get("show")!(undefined, { help: true })).rejects.toThrow("exit:0");
+    await expect(projectActions.get("link")!(undefined, undefined, { help: true })).rejects.toThrow("exit:0");
+    await expect(projectActions.get("unlink")!(undefined, { help: true })).rejects.toThrow("exit:0");
+    await expect(projectActions.get("create")!(undefined, { help: true })).rejects.toThrow("exit:0");
+
+    const machineActions = captureActions(registerMachineCommand);
+    await expect(machineActions.get("machine")!({ help: true })).rejects.toThrow("exit:0");
+    await expect(machineActions.get("machine")!({})).rejects.toThrow("exit:1");
+    await expect(machineActions.get("register")!({ help: true })).rejects.toThrow("exit:0");
+    await expect(machineActions.get("show")!({ help: true })).rejects.toThrow("exit:0");
+    await expect(machineActions.get("recover")!(undefined, { help: true })).rejects.toThrow("exit:0");
   });
 
   it("covers pure compact option boundary combinations", () => {
@@ -233,27 +294,149 @@ describe("runCli map boundaries", () => {
     }, false)).toContain('"fast_mode":false');
   });
 
-  it("renders every map operation in text and JSON forms", async () => {
-    expect(await invoke(["map", "list"])).toBeUndefined();
-    expect(await invoke(["map", "list", "--json"])).toBeUndefined();
-    expect(await invoke(["map", "show", "/alias"])).toBeUndefined();
-    expect(await invoke(["map", "show", "--json"])).toBeUndefined();
-    expect(await invoke(["map", "add", "/new", "--canonical", "/canonical"])).toBeUndefined();
-    expect(await invoke(["map", "add", "/new", "--hash", "hash", "--json"])).toBeUndefined();
-    state.mapRemove.mockReturnValueOnce({ hash: "hash", removed: false });
-    expect(await invoke(["map", "remove", "/missing"])).toBeUndefined();
-    expect(await invoke(["map", "remove", "/alias", "--json"])).toBeUndefined();
+  it("renders every project operation in text and JSON forms", async () => {
+    expect(await invoke(["project", "list"])).toBeUndefined();
+    expect(await invoke(["project", "list", "--json"])).toBeUndefined();
+    expect(await invoke(["project", "show", "/alias"])).toBeUndefined();
+    expect(await invoke(["project", "show", "--json"])).toBeUndefined();
+    expect(await invoke(["project", "link", "remote-id", "/canonical", "--allow-existing-data"])).toBeUndefined();
+    expect(await invoke(["project", "link", "remote-id", "--json"])).toBeUndefined();
+    expect(await invoke(["project", "unlink", "/alias"])).toBeUndefined();
+    expect(await invoke(["project", "unlink", "--json"])).toBeUndefined();
+    expect(await invoke(["project", "create", "/canonical", "--name", "Remote"])).toBeUndefined();
+    expect(await invoke(["project", "create", "--json"])).toBeUndefined();
   });
 
-  it("reports Error and primitive map failures in text and JSON", async () => {
-    state.mapList.mockImplementationOnce(() => { throw new Error("list failed"); });
-    expect((await invoke(["map", "list"]))?.message).toBe("exit:1");
-    state.mapShow.mockImplementationOnce(() => { throw "show failed"; });
-    expect((await invoke(["map", "show", "--json"]))?.message).toBe("exit:1");
-    state.mapAdd.mockImplementationOnce(() => { throw new Error("add failed"); });
-    expect((await invoke(["map", "add", "/x"]))?.message).toBe("exit:1");
-    state.mapRemove.mockImplementationOnce(() => { throw new Error("remove failed"); });
-    expect((await invoke(["map", "remove", "/x"]))?.message).toBe("exit:1");
+  it("sanitizes persisted remote project text only for human output", async () => {
+    const log = vi.spyOn(console, "log");
+    const write = vi.spyOn(process.stdout, "write");
+    state.projectList.mockResolvedValueOnce({
+      local: [{
+        hash: "local-hash",
+        canonical: "/canonical\u001b]8;;https://attacker.invalid\u0007click\u001b]8;;\u0007",
+        aliases: ["/alias\u001b[31mred\u001b[0m"],
+      }],
+      remote: [{
+        projectId: "remote-id",
+        displayName: "Remote\nInjected",
+        aliases: [{ machineId: "machine-id", path: "/safe\nInjected" }],
+      }],
+    });
+    await invoke(["project", "list"]);
+    expect(log).toHaveBeenCalledWith("  canonical: /canonicalclick");
+    expect(log).toHaveBeenCalledWith("  alias: /aliasred");
+    expect(log).toHaveBeenCalledWith("  remote-id  Remote Injected");
+    expect(log).toHaveBeenCalledWith("    machine-id: /safe Injected");
+
+    log.mockClear();
+    state.projectShow.mockResolvedValueOnce({
+      hash: "hash",
+      entry: {
+        canonical: "/canonical\u001b]8;;https://attacker.invalid\u0007click\u001b]8;;\u0007",
+        aliases: ["/alias\u001b[31mred\u001b[0m"],
+        remoteProjectId: "remote-id",
+      },
+      remote: { projectId: "remote-id", displayName: "Remote\nInjected", aliases: [] },
+    });
+    await invoke(["project", "show"]);
+    expect(log).toHaveBeenCalledWith("  canonical: /canonicalclick");
+    expect(log).toHaveBeenCalledWith("  alias: /aliasred");
+    expect(log).toHaveBeenCalledWith("  name: Remote Injected");
+
+    log.mockClear();
+    state.projectLink.mockResolvedValueOnce({
+      local: {
+        id: "hash",
+        canonical: "/linked\u001b]8;;https://attacker.invalid\u0007click\u001b]8;;\u0007\nInjected",
+        aliases: [],
+        remoteProjectId: "remote-id",
+      },
+    });
+    await invoke(["project", "link", "remote-id"]);
+    expect(log).toHaveBeenCalledWith("Linked /linkedclick Injected");
+
+    log.mockClear();
+    state.projectCreate.mockResolvedValueOnce({
+      local: {
+        id: "hash",
+        canonical: "/created\u001b[31mred\u001b[0m\nInjected",
+        aliases: [],
+        remoteProjectId: "remote-id",
+      },
+      remote: { projectId: "remote-id", displayName: "Remote", aliases: [] },
+    });
+    await invoke(["project", "create"]);
+    expect(log).toHaveBeenCalledWith("  path: /createdred Injected");
+
+    log.mockClear();
+    write.mockClear();
+    state.projectShow.mockResolvedValueOnce({
+      hash: "hash",
+      entry: {
+        canonical: "/canonical\u001b]8;;https://attacker.invalid\u0007click\u001b]8;;\u0007",
+        aliases: ["/alias\u001b[31mred\u001b[0m"],
+        remoteProjectId: "remote-id",
+      },
+      remote: { projectId: "remote-id", displayName: "Remote\nInjected", aliases: [] },
+    });
+    await invoke(["project", "show", "--json"]);
+    const jsonOutput = write.mock.calls.map(([value]) => String(value)).join("");
+    expect(jsonOutput).toContain("\\nInjected");
+    expect(jsonOutput).toContain("\\u001b]8;;https://attacker.invalid");
+    expect(jsonOutput).toContain("\\u001b[31mred");
+
+    write.mockClear();
+    state.projectLink.mockResolvedValueOnce({
+      local: {
+        id: "hash",
+        canonical: "/linked\u001b]8;;https://attacker.invalid\u0007click\nInjected",
+        aliases: [],
+        remoteProjectId: "remote-id",
+      },
+    });
+    state.projectCreate.mockResolvedValueOnce({
+      local: {
+        id: "hash",
+        canonical: "/created\u001b[31mred\u001b[0m\nInjected",
+        aliases: [],
+        remoteProjectId: "remote-id",
+      },
+      remote: { projectId: "remote-id", displayName: "Remote", aliases: [] },
+    });
+    await invoke(["project", "link", "remote-id", "--json"]);
+    await invoke(["project", "create", "--json"]);
+    const mutationJsonOutput = write.mock.calls.map(([value]) => String(value)).join("");
+    expect(mutationJsonOutput).toContain("\\nInjected");
+    expect(mutationJsonOutput).toContain("\\u001b]8;;https://attacker.invalid");
+    expect(mutationJsonOutput).toContain("\\u001b[31mred");
+  });
+
+  it("renders every machine operation in text and JSON forms", async () => {
+    expect(await invoke(["machine", "register", "--name", "Workstation"])).toBeUndefined();
+    expect(await invoke(["machine", "register", "--json"])).toBeUndefined();
+    expect(await invoke(["machine", "show"])).toBeUndefined();
+    expect(await invoke(["machine", "show", "--json"])).toBeUndefined();
+    expect(await invoke(["machine", "recover", "machine-id", "--force"])).toBeUndefined();
+    expect(await invoke(["machine", "recover", "machine-id", "--json"])).toBeUndefined();
+  });
+
+  it("reports Error and primitive identity failures in text and JSON", async () => {
+    state.projectList.mockRejectedValueOnce(new Error("list failed"));
+    expect((await invoke(["project", "list"]))?.message).toBe("exit:1");
+    state.projectShow.mockRejectedValueOnce("show failed");
+    expect((await invoke(["project", "show", "--json"]))?.message).toBe("exit:1");
+    state.projectLink.mockRejectedValueOnce(new Error("link failed"));
+    expect((await invoke(["project", "link", "target"]))?.message).toBe("exit:1");
+    state.projectUnlink.mockRejectedValueOnce(new Error("unlink failed"));
+    expect((await invoke(["project", "unlink"]))?.message).toBe("exit:1");
+    state.projectCreate.mockRejectedValueOnce(new Error("create failed"));
+    expect((await invoke(["project", "create", "--json"]))?.message).toBe("exit:1");
+    state.machineRegister.mockRejectedValueOnce(new Error("register failed"));
+    expect((await invoke(["machine", "register"]))?.message).toBe("exit:1");
+    state.machineShow.mockImplementationOnce(() => { throw "show failed"; });
+    expect((await invoke(["machine", "show", "--json"]))?.message).toBe("exit:1");
+    state.machineRecover.mockRejectedValueOnce(new Error("recover failed"));
+    expect((await invoke(["machine", "recover", "machine-id"]))?.message).toBe("exit:1");
   });
 
   it("covers malformed memory option shapes through registration callbacks", async () => {
@@ -386,11 +569,34 @@ describe("runCli lifecycle and connector boundaries", () => {
     state.restartDaemon.mockResolvedValueOnce({ connected: false, restarted: false, spawned: false, pid: undefined });
     await expect(actions.get("daemon/restart")!({})).rejects.toThrow("exit:1");
 
-    state.mapAdd.mockReturnValueOnce({ hash: "hash" });
-    const mapActions = captureActions(registerMapCommand);
-    await expect(mapActions.get("add")!("/new", {})).resolves.toBeUndefined();
-    state.mapRemove.mockReturnValueOnce({ hash: "hash", removed: true });
-    await expect(mapActions.get("remove")!("/new", {})).resolves.toBeUndefined();
+    state.projectList.mockResolvedValueOnce({
+      local: [{ hash: "hash", canonical: "/canonical", aliases: [] }],
+    });
+    expect(await invoke(["project", "list"])).toBeUndefined();
+    state.projectShow.mockResolvedValueOnce({
+      hash: "hash",
+      entry: { canonical: "/canonical", aliases: [] },
+    });
+    expect(await invoke(["project", "show"])).toBeUndefined();
+    state.projectLink.mockResolvedValueOnce({
+      local: { id: "hash", canonical: "/canonical", aliases: [] },
+    });
+    expect(await invoke(["project", "link", "hash"])).toBeUndefined();
+    state.projectUnlink.mockResolvedValueOnce({ hash: "hash", aliasRemoved: false });
+    expect(await invoke(["project", "unlink"])).toBeUndefined();
+    state.machineRegister.mockResolvedValueOnce({
+      identity: { version: 1, machineId: "machine-id", displayName: "Workstation", identityKey: "secret" },
+      created: false,
+    });
+    expect(await invoke(["machine", "register"])).toBeUndefined();
+    state.machineShow.mockReturnValueOnce({
+      version: 1, machineId: null, displayName: "Workstation", identityKey: "secret",
+    });
+    expect(await invoke(["machine", "show"])).toBeUndefined();
+    state.machineRecover.mockResolvedValueOnce({
+      identity: { version: 1, machineId: "machine-id", displayName: "Workstation", identityKey: "secret" },
+    });
+    expect(await invoke(["machine", "recover", "machine-id"])).toBeUndefined();
 
     state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] };
     state.post.mockResolvedValueOnce({ processed: 1, promoted: 1 });

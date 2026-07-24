@@ -1,6 +1,11 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { DaemonConfig } from "../config.js";
-import { projectPaths, ensureProjectDir, isSafeTranscriptPath } from "../project.js";
+import {
+  projectPaths,
+  ensureProjectDir,
+  isSafeTranscriptPath,
+  projectIdentity,
+} from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { ParsedMessage } from "../../transcript.js";
@@ -9,7 +14,7 @@ import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
 import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
-import { closeRouteStorage } from "./storage-lifecycle.js";
+import { closeRouteStorage, storageRouteFailureResponse } from "./storage-lifecycle.js";
 
 function isParsedMessage(value: unknown): value is ParsedMessage {
   if (!value || typeof value !== "object") return false;
@@ -57,30 +62,49 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
     }
 
     const paths = projectPaths(cwd);
-    const parsed = resolveMessages(input, cwd);
-    if (parsed.length === 0) {
-      sendJson(res, 200, { ingested: 0, totalTokens: 0 });
-      return;
+    let sqliteMessages: ParsedMessage[] | undefined;
+    if (config.storage.backend === "sqlite") {
+      sqliteMessages = resolveMessages(input, cwd);
+      if (sqliteMessages.length === 0) {
+        sendJson(res, 200, { ingested: 0, totalTokens: 0 });
+        return;
+      }
     }
-
-    ensureProjectDir(cwd);
-    const scrubber = await ScrubEngine.forProject(
-      config.security?.sensitivePatterns ?? [],
-      paths.dir,
-    );
 
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
+    let activeFactory: StorageBackendFactory | undefined;
     try {
-      const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await factory.openProject(paths);
+      const identity = projectIdentity(cwd, config.storage);
+      let resolvedMessages: ParsedMessage[];
+      if (config.storage.backend === "postgresql") {
+        activeFactory = storageFactory
+          ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        project = await activeFactory.openProject(identity);
+        resolvedMessages = resolveMessages(input, cwd);
+      } else {
+        resolvedMessages = sqliteMessages as ParsedMessage[];
+      }
+      if (resolvedMessages.length === 0) {
+        sendJson(res, 200, { ingested: 0, totalTokens: 0 });
+        return;
+      }
+      ensureProjectDir(cwd);
+      const scrubber = await ScrubEngine.forProject(
+        config.security?.sensitivePatterns ?? [],
+        paths.dir,
+      );
+      if (!project) {
+        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        project = await activeFactory.openProject(identity);
+      }
       const ingest = await project.transaction(async (repositories) => {
         const row = await repositories.coordination.getSessionIngest(session_id);
-        if (row && parsed.length <= row.messageCount) return null;
+        if (row && resolvedMessages.length <= row.messageCount) return null;
 
         const conversation = await repositories.conversations.getOrCreateConversation(session_id);
         const storedCount = await repositories.conversations.getMessageCount(conversation.conversationId);
-        const newMessages = parsed.slice(storedCount);
+        const newMessages = resolvedMessages.slice(storedCount);
         if (newMessages.length === 0) return null;
 
         const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
@@ -143,6 +167,11 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       });
     } catch (err) {
       await safeLogError("ingest", err, { cwd, sessionId: session_id });
+      const storageFailure = storageRouteFailureResponse(activeFactory, err, "ingest");
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
+        return;
+      }
       sendJson(res, 500, { error: "ingest failed", code: "INGEST_FAILED" });
     } finally {
       await closeRouteStorage(project, ownedFactory);

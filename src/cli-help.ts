@@ -101,22 +101,54 @@ const HELP: Record<string, CommandHelp> = {
     notes: "Exits with code 1 if any check fails. Integrate into CI or shell startup for early detection.",
   },
 
-  map: {
-    summary: "Manage project path aliases in ~/.lcm/map.json.",
-    usage: "lcm map <list|show|add|remove> [options]",
+  machine: {
+    summary: "Register, inspect, or recover this machine's PostgreSQL UUID identity.",
+    usage: "lcm machine <register|show|recover> [options]",
     options: [
-      ["list [--json]", "List all canonical project paths and aliases"],
-      ["show [path-or-hash] [--json]", "Show one map entry; defaults to the current project"],
-      ["add <alias> [--canonical <path>|--hash <hash>] [--json]", "Add an alias to a project"],
-      ["remove <alias> [--canonical <path>|--hash <hash>] [--json]", "Remove an alias"],
+      ["register [--name <name>] [--json]", "Create or idempotently refresh ~/.lcm/machine.json"],
+      ["show [--json]", "Show the local registration state without printing its opaque identity key"],
+      ["recover <machine-id> [--force] [--json]", "Recover an explicit PostgreSQL machine UUID"],
     ],
     examples: [
-      ["lcm map show", "Show the current project's canonical path and aliases"],
-      ["lcm map add /work/project-alias", "Add an alias to the current project"],
-      ["lcm map add /work/project-alias --canonical /src/project", "Add an alias to a specific canonical project"],
-      ["lcm map list --json", "Output all entries as JSON"],
+      ["lcm machine register --name workstation", "Register this machine"],
+      ["lcm machine show --json", "Inspect the local identity state"],
+      ["lcm machine recover 018f... --force", "Replace and back up a stale or corrupt local file"],
     ],
-    notes: "Aliases may point to missing paths, but canonical targets must exist. Cross-project path ambiguity is refused.",
+    notes: "Registration requires the PostgreSQL backend configuration. machine.json and its backups use mode 0600. Recovery never guesses from hostnames, Git remotes, or repository content.",
+  },
+
+  project: {
+    summary: "Manage local path aliases and explicit PostgreSQL project identities.",
+    usage: "lcm project <create|link|unlink|list|show> [options]",
+    options: [
+      ["create [path] [--name <name>] [--json]", "Create and bind a PostgreSQL project"],
+      ["link <project-id|local-target> [path] [--allow-existing-data] [--json]", "Link a path explicitly"],
+      ["unlink [path] [--json]", "Remove a local alias or PostgreSQL binding"],
+      ["list [--json]", "List local mappings and, when selected, PostgreSQL projects"],
+      ["show [path|local-hash|remote-project-id] [--json]", "Show one uniquely mapped local project and its remote identity"],
+    ],
+    examples: [
+      ["lcm project create --name lcm", "Create a remote project for the current path"],
+      ["lcm project link 018f... /work/lcm", "Bind a path to an explicit PostgreSQL project"],
+      ["lcm project link <local-hash> /work/lcm-alias", "Add a same-machine path alias"],
+      ["lcm project unlink /work/lcm-alias", "Remove an alias without deleting local data"],
+      ["lcm project list --json", "Inspect local and remote identities"],
+      ["lcm project show <remote-project-uuid>", "Show the unique local mapping for a remote project"],
+    ],
+    notes: "Local hashes and SQLite data remain unchanged. A remote UUID show target must have exactly one local binding; unknown or multiply mapped UUIDs fail closed. Rebinding a data-bearing local project requires --allow-existing-data. LCM never infers identity from Git remotes, names, or contents.",
+  },
+
+  postgres: {
+    summary: "Apply the packaged PostgreSQL schema as an administrator-controlled migration role.",
+    usage: "lcm postgres migrate [--json]",
+    options: [
+      ["migrate [--json]", "Verify and apply packaged checksummed migrations"],
+    ],
+    examples: [
+      ["lcm postgres migrate", "Apply pending migrations and report the current schema history"],
+      ["lcm postgres migrate --json", "Return applied and current migration IDs as JSON"],
+    ],
+    notes: "Configure storage.backend=postgresql and supply the migration role through LCM_POSTGRES_URL plus the verified CA path through LCM_POSTGRES_CA_FILE. The command validates PostgreSQL 18, extensions, ownership, migration checksums, and schema fingerprints. It does not install extensions or grant runtime privileges.",
   },
 
   search: {
@@ -454,7 +486,9 @@ const GROUPS = [
       { name: "config <get|set> <path>", summary: "Inspect or update validated local configuration" },
       { name: "status [--json]", summary: "Daemon status and project memory stats" },
       { name: "doctor", summary: "Diagnostics: daemon, hooks, MCP, summarizer" },
-      { name: "map <list|show|add|remove>", summary: "Manage project path aliases" },
+      { name: "machine <register|show|recover>", summary: "Manage this machine's PostgreSQL identity" },
+      { name: "project <create|link|unlink|list|show>", summary: "Manage local and PostgreSQL project identities" },
+      { name: "postgres migrate [--json]", summary: "Apply packaged PostgreSQL schema migrations" },
       { name: "mcp", summary: "Start the MCP server (stdio transport)" },
     ],
   },

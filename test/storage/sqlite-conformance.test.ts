@@ -4,7 +4,10 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { projectIdentity } from "../../src/daemon/project.js";
 import { sqliteStorageCapabilities, requireStorageCapability } from "../../src/storage/capabilities.js";
-import { createStorageBackendFactory } from "../../src/storage/factory.js";
+import {
+  createStorageBackendFactory,
+  UnavailablePostgreSqlStorageBackendFactory,
+} from "../../src/storage/factory.js";
 import { normalizeStorageError, StorageOperationError } from "../../src/storage/errors.js";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import { SqliteExecutor } from "../../src/storage/sqlite/executor.js";
@@ -37,9 +40,9 @@ function harness(): StorageContractHarness {
 describe("SQLite storage backend conformance", () => {
   defineCoreStorageConformance(harness);
 
-  it("selects SQLite and reports PostgreSQL unavailable", () => {
+  it("selects SQLite and exposes a cause-free staged PostgreSQL boundary", async () => {
     expect(createStorageBackendFactory({ backend: "sqlite" })).toBeInstanceOf(SqliteStorageBackendFactory);
-    expect(() => createStorageBackendFactory({
+    const factory = createStorageBackendFactory({
       backend: "postgresql",
       postgresql: {
         poolMax: 5,
@@ -49,7 +52,59 @@ describe("SQLite storage backend conformance", () => {
         url: "postgresql://example.test/lcm",
         caFile: "/safe/ca.pem",
       },
-    })).toThrow("not available");
+    });
+    expect(factory).toBeInstanceOf(UnavailablePostgreSqlStorageBackendFactory);
+    expect(factory.backend).toBe("postgresql");
+    expect(factory.capabilities).toEqual({
+      transactions: false,
+      lexicalSearch: false,
+      regexSearch: false,
+      nativeFullTextSearch: "unavailable",
+      coordination: "distributed",
+    });
+    expect(Object.isFrozen(factory.capabilities)).toBe(true);
+    await expect(factory.health()).resolves.toMatchObject({
+      status: "unavailable",
+      backend: "postgresql",
+      error: {
+        code: "STORAGE_INITIALIZATION_FAILED",
+        backend: "postgresql",
+        projectId: undefined,
+        domain: "factory",
+        operation: "health",
+      },
+    });
+
+    const identity = {
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      localProjectId: "local-hash",
+      canonical: "/work/project",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      machineId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012",
+    };
+    await expect(factory.projectExists(identity)).rejects.toMatchObject({
+      code: "STORAGE_INITIALIZATION_FAILED",
+      projectId: identity.id,
+      operation: "projectExists",
+    });
+    await expect(factory.openExistingProject(identity)).rejects.toMatchObject({
+      code: "STORAGE_INITIALIZATION_FAILED",
+      projectId: identity.id,
+      operation: "openExistingProject",
+    });
+    await expect(factory.openProject(identity)).rejects.toMatchObject({
+      code: "STORAGE_INITIALIZATION_FAILED",
+      projectId: identity.id,
+      operation: "openProject",
+    });
+
+    await factory.close();
+    await factory.close();
+    await expect(factory.health()).resolves.toEqual({ status: "closed", backend: "postgresql" });
+    await expect(factory.projectExists(identity)).rejects.toMatchObject({
+      code: "STORAGE_CLOSED",
+      projectId: identity.id,
+    });
   });
 
   it("exposes frozen capabilities and normalized cause-free errors", () => {

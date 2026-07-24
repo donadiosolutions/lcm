@@ -5,9 +5,11 @@ This reference describes the durable PostgreSQL baseline introduced by
 23 domain tables, backend-neutral project identity, and bounded session lookup
 keys. This is a schema and readiness contract, not an enabled
 application backend. SQLite remains the authoritative production adapter.
-PostgreSQL selection continues to fail before daemon startup until the
-repositories in issues #84–#91 pass conformance and the cutover work in #92
-explicitly enables the backend.
+PostgreSQL machine and project identity operations are enabled by issue #84.
+Managed daemons may start with PostgreSQL selected so those operations are
+available, but storage-backed health, status, statistics, and data routes remain
+fail-closed until the domain repositories in issues #85–#91 pass conformance
+and the cutover work in #92 explicitly enables the backend.
 
 The design is single-user and multi-machine. Project scoping prevents accidental
 cross-project relationships; it is not a tenant or authorization boundary and
@@ -30,10 +32,11 @@ does not add row-level security.
   migration ledger, six generated identity sequences, and
   `lcm.normalize_search_text(text)` plus the summary-, large-file-, and
   session-ingest-identity trigger functions.
-  It deliberately grants no domain access to
-  the runtime role while the adapters are disabled. Explicit object lists keep
-  privileges on unknown pre-existing tables, sequences, and functions intact;
-  issues #84–#91 must grant only the operations required by their repositories.
+  It deliberately grants no domain access to the runtime role by default.
+  Administrators grant only the exact operations required by each enabled
+  repository; issue #84 grants the machine and project identity operations
+  described below. Explicit object lists keep privileges on unknown
+  pre-existing tables, sequences, and functions intact.
 - Before starting the DDL transaction, migration requires
   `pg_catalog.current_setting('server_encoding')` to return exactly `UTF8`.
   Runtime health enforces the same database-encoding contract before extension
@@ -107,13 +110,16 @@ does not add row-level security.
   fails closed. The same fingerprint rejects any inheritance or partition
   parent/child relationship involving a managed table. Relation ACL
   fingerprints expand the effective ACL, including PostgreSQL's default ACL
-  when `relacl` is null, and normalize only the owning role. `PUBLIC`, named
-  role, privilege, grant-option, foreign-grantor, or missing-owner drift on any
-  allowlisted table or identity sequence therefore fails closed.
+  when `relacl` is null. They normalize the owning role and exact non-grantable
+  identity-repository privilege shapes granted to named runtime roles by the
+  documented script. Any `PUBLIC`, grantable, foreign-grantor, missing-owner,
+  or privilege outside that allowlist on an allowlisted table or identity
+  sequence therefore fails closed.
   Column ACL fingerprints retain every allowlisted column even when `attacl`
-  is null and expand every explicit entry. Any `PUBLIC`, named-role,
-  foreign-grantor, privilege, or grant-option drift on a column therefore also
-  fails closed.
+  is null and expand every explicit entry. They normalize only the script's
+  exact insert and update column-grant shapes for named runtime roles; any
+  `PUBLIC`, foreign-grantor, grantable, or out-of-allowlist privilege on a
+  column therefore also fails closed.
   Identity-sequence
   fingerprints bind each exact sequence name to its PostgreSQL data type,
   increment, minimum, maximum, start, cache, cycle state, internal identity
@@ -272,9 +278,9 @@ deletion.
 
 | Table | Ownership and retention | Enforced invariants and indexes |
 | --- | --- | --- |
-| `machines` | Independent identity root. Retain through reimages and require aliases, transcripts, checkpoints, instructions, inbox events, and leases to be handled before deletion. All incoming references restrict deletion. | UUIDv7-enforced primary key; nonblank globally unique `identity_key`; optional nonblank display name; `last_seen_at >= registered_at`. |
-| `projects` | Independent identity root and project-scope anchor. No dependent table silently cascades from project deletion. | UUIDv7-enforced internal primary key; required unique 64-lowercase-hex `identity_key` stores the backend-neutral `ProjectIdentity.id` independently from the nonunique display name; `updated_at >= created_at`. |
-| `project_aliases` | Explicit machine-to-project link retained until unlink. Both project and machine references restrict deletion. | `(machine_id, normalized_path)` primary key makes one normalized path on a machine resolve to one project; path is nonempty and normalized path is trimmed and nonempty. `project_aliases_project_idx` supports project-to-machine/path listing. |
+| `machines` | Independent identity root. Retain through reimages and require aliases, transcripts, checkpoints, instructions, inbox events, and leases to be handled before deletion. All incoming references restrict deletion. | UUIDv7-enforced primary key; globally unique `identity_key` in the exact `machine:<64 lowercase hex>` format used by the private local identity file; optional nonblank display name; `last_seen_at >= registered_at`. |
+| `projects` | Independent identity root and project-scope anchor. No dependent table silently cascades from project deletion. | UUIDv7-enforced internal primary key; required unique `identity_key` is an opaque random 32-byte value generated for each PostgreSQL project creation and is never derived from a local path/hash; `updated_at >= created_at`. |
+| `project_aliases` | Explicit machine-to-project link retained until unlink. Both project and machine references restrict deletion. | `(machine_id, normalized_path)` primary key makes one normalized path on a machine resolve to one project; `UNIQUE (machine_id, path)` prevents the same stored lexical spelling from being redirected after a symlink is retargeted. Both paths are nonempty and normalized path is trimmed and nonempty. `project_aliases_project_idx` supports project-to-machine/path listing. |
 
 ### Source records
 
@@ -415,6 +421,9 @@ on a provider does not justify silently expanding the baseline.
 1. The cluster administrator provisions PostgreSQL 18, preloads services such
    as `pg_stat_statements` when necessary, and installs the exact required
    extensions in `public`. The migrator and runtime use separate login roles.
+   With `storage.backend` configured, the supported packaged entry point is
+   `LCM_POSTGRES_URL="$LCM_POSTGRES_MIGRATION_URL" lcm postgres migrate`; it
+   accepts `--json` for automation and closes the migration pool before exit.
 2. Runtime health verifies server version, UTF-8 database encoding, extension
    readiness, and the fingerprinted `lcm.search_v1` text-search contract.
    Failed readiness produces corrective guidance without changing database or
@@ -439,7 +448,19 @@ on a provider does not justify silently expanding the baseline.
    revoke or otherwise rewrite the pre-existing schema ACL. Its normalization
    helper uses non-replacing `CREATE FUNCTION`, so an existing same-signature
    function fails closed. Before commit, the runner verifies the LCM-owned
-   `simple_v1` dictionary and `search_v1` configuration fingerprint.
+   `simple_v1` dictionary and `search_v1` configuration fingerprint. `0003`
+   replaces the original nonblank-only machine identity-key check with the exact
+   `machine:<64 lowercase hex>` contract and registers the corresponding schema
+   fingerprint. Existing nonconforming rows stop the migration and are never
+   rewritten; an operator must reconcile those rows from verified machine
+   identity records before retrying. `0004` replaces the permissive machine
+   display-name check with the CLI's recovery-safe contract: after local-style
+   whitespace trimming the name must occupy 1–256 UTF-16 code units and must
+   contain no control, bidirectional-formatting, line-separator, or
+   paragraph-separator characters. `NULL` remains valid for legacy machines and
+   is rendered through the deterministic `Machine <uuid>` fallback. Existing
+   invalid non-null names stop the migration without being rewritten; correct
+   them from verified machine records before retrying.
 4. Each pending migration and its ledger row execute in that same transaction.
    Any DDL, constraint, index, privilege, or ledger failure rolls back the whole
    pending set. Repeated and concurrent runs converge on the same ordered
@@ -519,14 +540,37 @@ identifier-quoted transfer guidance. Missing, malformed, or contradictory
 ownership catalog values fail closed without exposing the existing owner,
 connection details, or raw database errors.
 
-After schema creation, an administrator may grant the runtime role only the
-schema usage, table operations, sequence access, and function execution proven
-necessary by implemented repositories. Issue #83 intentionally leaves those
-domain grants absent because no PostgreSQL adapter is enabled yet. Migration
-privilege hardening is likewise confined to LCM-owned objects: it does not
-change ACLs on unknown objects already present in `lcm`. If an administrator
-has granted schema-level `PUBLIC CREATE`, they must remove that privilege
-outside LCM and rerun migration; LCM fails closed rather than mutating it.
+After schema creation, an administrator grants the issue #84 identity
+repository only its exact runtime privileges with the reviewed
+[`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql)
+script:
+
+```bash
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-identity-grants.sql
+```
+
+Replace `lcm_runtime` with the deployment's runtime role. The script grants
+schema `USAGE` and table `SELECT` where identity readback requires it. Writes
+are column-scoped: machines may insert only `identity_key` and `display_name`
+and update only `display_name` and `last_seen_at`; projects may insert only
+their per-creation opaque random `identity_key` and `display_name`, and may delete rows;
+aliases may insert `project_id`, `machine_id`, `path`, and `normalized_path`,
+update only `project_id`, `path`, and `linked_at`, and delete rows. Generated
+IDs and timestamps remain unwritable, and immutable machine identity, project
+identity, and normalized-path columns cannot be updated after insertion. The
+script grants no table ownership, `TRUNCATE`, sequence access, function
+execution, schema creation, or privileges on future tables.
+Without these grants, machine registration and project pairing fail closed
+with a sanitized PostgreSQL operation error. Migrations intentionally do not
+apply runtime grants because the migration role cannot safely infer a
+deployment's runtime role.
+
+Migration privilege hardening is likewise confined to LCM-owned objects: it
+does not change ACLs on unknown objects already present in `lcm`. If an
+administrator has granted schema-level `PUBLIC CREATE`, they must remove that
+privilege outside LCM and rerun migration; LCM fails closed rather than mutating it.
 When #90 enables lease writes, its runtime grant must include only the sequence
 privileges required to consume `fenced_leases_fencing_token_seq`; normal
 maintenance must not receive sequence restart or table-truncate authority.
@@ -543,7 +587,9 @@ maintenance must not receive sequence restart or table-truncate authority.
   current versions first; extension binaries and server preload configuration
   are cluster infrastructure, not rows in an application backup.
 - The local `~/.lcm/machine.json`, project map, and SQLite hook outbox are not in
-  a PostgreSQL backup. Preserve them separately. Once #91 exists, replay uses
+  a PostgreSQL backup. Preserve them separately. Recover a lost machine file
+  with the explicit PostgreSQL machine UUID via `lcm machine recover`; restore
+  project bindings explicitly via `lcm project link`. Once #91 exists, replay uses
   `(machine_id, event_id)` and machine sequence uniqueness to avoid duplicate
   remote inbox effects; do not acknowledge a local event solely because a
   restored checkpoint claims it was applied.

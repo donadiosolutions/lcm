@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EventRow, PatternReinforcementStats } from "../../../src/hooks/events-db.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { MachineIdentityFileError } from "../../../src/machine-identity.js";
+import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
 
 const mocks = vi.hoisted(() => ({
   events: vi.fn(() => [] as EventRow[]),
@@ -19,10 +21,13 @@ const mocks = vi.hoisted(() => ({
   log: vi.fn(),
   send: vi.fn(),
   scrub: vi.fn((text: string) => text),
+  identity: vi.fn(() => ({ id: "pid", canonical: "/cwd" })),
+  openOutbox: vi.fn(),
 }));
 
 vi.mock("../../../src/hooks/events-db.js", () => ({
   EventsDb: class {
+    constructor() { mocks.openOutbox(); }
     getUnprocessed = mocks.events;
     getPatternReinforcement = mocks.reinforcement;
     markProcessed = mocks.mark;
@@ -36,7 +41,7 @@ vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
 vi.mock("../../../src/daemon/project.js", () => ({
   projectDir: () => "/project",
-  projectIdentity: () => ({ id: "pid", canonical: "/cwd" }),
+  projectIdentity: mocks.identity,
 }));
 vi.mock("../../../src/storage/index.js", () => ({
   createStorageBackendFactory: () => ({ openProject: mocks.openProject, close: mocks.closeFactory }),
@@ -53,6 +58,11 @@ import {
   drainEventsForCwd,
   promoteEventsForCwd,
 } from "../../../src/daemon/routes/promote-events.js";
+import {
+  createPromoteEventsNotifyHandler,
+  PassiveEventProcessor,
+  PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+} from "../../../src/daemon/passive-event-processor.js";
 
 function event(overrides: Partial<EventRow>): EventRow {
   return {
@@ -71,6 +81,19 @@ function event(overrides: Partial<EventRow>): EventRow {
 }
 
 const config = loadDaemonConfig("/tmp/promote-events-unit");
+const postgresqlConfig = {
+  ...config,
+  storage: {
+    backend: "postgresql",
+    postgresql: {
+      url: "postgresql://user:secret@db.example/lcm",
+      poolMax: 5,
+      connectionTimeoutMs: 10_000,
+      idleTimeoutMs: 30_000,
+      statementTimeoutMs: 60_000,
+    },
+  },
+} as const;
 
 function projectStorage() {
   return {
@@ -93,6 +116,7 @@ describe("promote-events unit boundaries", () => {
     mocks.dedup.mockResolvedValue("id");
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
+    mocks.identity.mockReturnValue({ id: "pid", canonical: "/cwd" });
     mocks.closeProject.mockResolvedValue(undefined);
     mocks.closeFactory.mockResolvedValue(undefined);
     mocks.closeEvents.mockImplementation(() => undefined);
@@ -104,6 +128,126 @@ describe("promote-events unit boundaries", () => {
     await createPromoteAllEventsHandler(config)({} as never, response, "");
     expect(mocks.log).toHaveBeenCalledWith("promote-events", expect.any(Error), {});
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "failed to promote events" });
+  });
+
+  it("fails identity before opening the local outbox for direct, drain, all, and notify paths", async () => {
+    const identityFailure = new Error("PostgreSQL project binding is required");
+    mocks.identity.mockImplementation(() => { throw identityFailure; });
+
+    await expect(promoteEventsForCwd(config, "/cwd", "/events.db"))
+      .rejects.toBe(identityFailure);
+    await expect(drainEventsForCwd(config, "/cwd", "/events.db"))
+      .rejects.toBe(identityFailure);
+
+    const directResponse = {} as never;
+    await createPromoteEventsHandler(config)(
+      {} as never,
+      directResponse,
+      JSON.stringify({ cwd: "/cwd" }),
+    );
+    expect(mocks.send).toHaveBeenLastCalledWith(directResponse, 500, {
+      error: "failed to promote events",
+    });
+
+    mocks.collect.mockReturnValueOnce([{
+      projectId: "pid",
+      cwd: "/cwd",
+      path: "/events.db",
+      metadataMissing: false,
+      captured: 1,
+      unprocessed: 1,
+      errors: 0,
+      lastCapture: "2026",
+      file: "pid.db",
+    }]);
+    const allResponse = {} as never;
+    await createPromoteAllEventsHandler(config)({} as never, allResponse, "");
+    expect(mocks.send.mock.calls.at(-1)?.[2]).toMatchObject({
+      failedProjects: 1,
+      processedProjects: 0,
+    });
+
+    const processor = new PassiveEventProcessor(
+      config,
+      PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+      {
+        promoteEventsForCwd,
+        setTimeout: vi.fn(() => ({ unref: vi.fn() })) as never,
+        clearTimeout: vi.fn() as never,
+        setInterval: vi.fn() as never,
+        clearInterval: vi.fn() as never,
+        safeLogError: mocks.log,
+      },
+    );
+    const notifyResponse = {} as never;
+    await createPromoteEventsNotifyHandler(processor)(
+      {} as never,
+      notifyResponse,
+      JSON.stringify({ cwd: "/cwd", priority: 1 }),
+    );
+    await processor.flushOnce();
+    expect(mocks.send).toHaveBeenCalledWith(notifyResponse, 200, { queued: true });
+    expect(mocks.log).toHaveBeenCalledWith(
+      "passive-event-processor",
+      identityFailure,
+      { cwd: "/cwd" },
+    );
+    expect(mocks.openOutbox).not.toHaveBeenCalled();
+    expect(mocks.openProject).not.toHaveBeenCalled();
+  });
+
+  it("returns the typed identity response when a global sidecar drain fails admission", async () => {
+    const identityFailure = new MachineIdentityFileError(
+      "machine identity is not registered",
+      "Run `lcm machine register`.",
+    );
+    mocks.identity.mockImplementation(() => { throw identityFailure; });
+    mocks.collect.mockReturnValueOnce([{
+      projectId: "pid",
+      cwd: "/cwd",
+      path: "/events.db",
+      metadataMissing: false,
+      captured: 1,
+      unprocessed: 1,
+      errors: 0,
+      lastCapture: "2026",
+      file: "pid.db",
+    }]);
+
+    const response = {} as never;
+    await createPromoteAllEventsHandler(postgresqlConfig)({} as never, response, "");
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 409, {
+      code: "STORAGE_IDENTITY_REQUIRED",
+      error: "Machine identity is unavailable. Run `lcm machine show` for recovery guidance.",
+      storageBackend: "postgresql",
+    });
+    expect(mocks.openOutbox).not.toHaveBeenCalled();
+  });
+
+  it("admits PostgreSQL storage before opening either promotion outbox", async () => {
+    const staged = new UnavailablePostgreSqlStorageBackendFactory();
+
+    await expect(drainEventsForCwd(
+      postgresqlConfig,
+      "/cwd",
+      "/events.db",
+      staged,
+    )).rejects.toThrow("postgresql storage initialization failed for project pid");
+    expect(mocks.openOutbox).not.toHaveBeenCalled();
+
+    const response = {} as never;
+    await createPromoteEventsHandler(postgresqlConfig, staged)(
+      {} as never,
+      response,
+      JSON.stringify({ cwd: "/cwd" }),
+    );
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      code: "STORAGE_BACKEND_STAGED",
+      error: "promote-events is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
+    expect(mocks.openOutbox).not.toHaveBeenCalled();
   });
 
   it("reports incomplete global drains and closes owned factories when projects fail to open", async () => {
@@ -128,6 +272,10 @@ describe("promote-events unit boundaries", () => {
     mocks.events.mockReturnValueOnce([]);
     await expect(drainEventsForCwd(config, "/cwd", "/events.db"))
       .resolves.toMatchObject({ batches: 0, message: "no unprocessed events" });
+    expect(mocks.identity.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.openOutbox.mock.invocationCallOrder[0]);
+    expect(mocks.openOutbox.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.openProject.mock.invocationCallOrder[0]);
   });
 
   it("uses but does not close an injected process storage factory", async () => {

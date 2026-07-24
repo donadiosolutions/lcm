@@ -820,6 +820,31 @@ describe("doctor service coverage", () => {
     expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
   });
 
+  it("uses the recognized health PID after lifecycle validation omits its PID", async () => {
+    const readPaths: string[] = [];
+    mocks.ensureDaemon.mockResolvedValue({ connected: true });
+    mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
+      if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
+        const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
+        return { status: path === "/health-pid/bin:/usr/bin" ? 0 : 1, stdout: "", stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    const results = await runDoctor(makeDeps({
+      config: { llm: { provider: "codex-process" } },
+      procEnviron: "PATH=/health-pid/bin:/usr/bin\0",
+      readPaths,
+      health: [
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 4343 }) },
+        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 4343 }) },
+      ],
+    }));
+
+    expect(readPaths).toContain("/proc/4343/environ");
+    expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
+  });
+
   it("uses only the lifecycle-verified PID when post-validation health reports another PID", async () => {
     const readPaths: string[] = [];
     mocks.ensureDaemon.mockResolvedValue({ connected: true, pid: 4242 });

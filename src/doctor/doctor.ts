@@ -23,7 +23,10 @@ import {
   type LlmRetryPolicy,
   type ResolvedStorageConfig,
 } from "../daemon/config.js";
-import { selectStorageBackend } from "../storage/backend.js";
+import {
+  isStagedPostgreSqlHealth,
+  type StagedPostgreSqlHealthResponse,
+} from "../daemon/staged-postgresql.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -55,7 +58,6 @@ interface DoctorConfig {
   port: number;
   storageBackend: "sqlite" | "postgresql" | "unavailable";
   storage?: ResolvedStorageConfig;
-  storageSelectionError?: Error;
   summarizer: string;
   apiMode?: string;
   reasoningEffort?: string;
@@ -67,6 +69,22 @@ interface DoctorConfig {
 
 const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start";
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
+
+type DoctorDaemonHealth = StagedPostgreSqlHealthResponse & {
+  readonly status?: string;
+};
+
+async function readRecognizedDaemonHealth(
+  fetchFn: typeof globalThis.fetch,
+  port: number,
+): Promise<DoctorDaemonHealth | null> {
+  const res = await fetchFn(`http://127.0.0.1:${port}/health`);
+  const health = await res.json() as DoctorDaemonHealth;
+  return (res.ok && health.status === "ok")
+    || isStagedPostgreSqlHealth(res.status, health)
+    ? health
+    : null;
+}
 
 export interface DoctorRunOptions {
   verbose?: boolean;
@@ -118,22 +136,6 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
   try {
     content = deps.readFileSync(resolvedConfigPath, "utf-8");
     const config = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
-    try {
-      selectStorageBackend(config.storage);
-    } catch (error) {
-      return {
-        port: config.daemon.port,
-        storageBackend: "unavailable",
-        storage: config.storage,
-        storageSelectionError: error as Error,
-        summarizer: config.llm.provider,
-        apiMode: config.llm.apiMode,
-        reasoningEffort: config.llm.reasoningEffort,
-        fastMode: config.llm.fastMode,
-        requestTimeoutMs: config.llm.provider === "openai" ? config.llm.requestTimeoutMs : undefined,
-        retry: config.llm.provider === "openai" ? config.llm.retry : undefined,
-      };
-    }
     return {
       port: config.daemon.port,
       storageBackend: config.storage.backend,
@@ -408,6 +410,7 @@ async function checkPassiveLearning(
   results: CheckResult[],
   options: Required<DoctorRunOptions>,
   daemonHealthy: boolean,
+  daemonStorageReady: boolean,
 ): Promise<void> {
   const statsOptions = { timeoutMs: 2000, maxDbs: options.eventsMaxDbs, pruneOrphanSidecars: true };
   const stats = options.verbose
@@ -427,6 +430,13 @@ async function checkPassiveLearning(
   // Capture check
   if (stats.captured === 0) {
     results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: "No events captured — passive learning may not be active\n     Fix: run 'lcm install' to re-register hooks, then use a Bash or Edit tool to trigger the first event capture; re-run /lcm-doctor to verify" });
+  } else if (stats.unprocessed > 0 && daemonHealthy && !daemonStorageReady) {
+    results.push({
+      name: "events-capture",
+      category: "Passive Learning",
+      status: "warn",
+      message: `${stats.captured} events (${stats.unprocessed} unprocessed) — daemon is up but storage is unavailable; the queue cannot drain until storage is healthy`,
+    });
   } else if (stats.unprocessed >= PASSIVE_BACKLOG_WARN_THRESHOLD) {
     const sidecarCount = stats.sidecarsWithUnprocessed ?? 0;
     const orphanCount = stats.orphanedSidecarsWithUnprocessed ?? 0;
@@ -569,26 +579,21 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
 
   // ── Daemon ──
   let daemonHealthy = false;
+  let daemonStorageReady = false;
   let daemonVersion: string | undefined;
   let daemonPid: number | undefined;
-  if (!config.storageSelectionError) {
-    try {
-      const res = await deps.fetch(`http://127.0.0.1:${config.port}/health`);
-      if (res.ok) {
-        const h = (await res.json()) as { status?: string; version?: string; pid?: number };
-        daemonHealthy = h.status === "ok";
-        daemonVersion = h.version;
-      }
-    } catch {}
-  }
+  let initialHealthPid: number | undefined;
+  try {
+    const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
+    if (h) {
+      daemonHealthy = true;
+      daemonStorageReady = h.status === "ok";
+      daemonVersion = h.version;
+      initialHealthPid = h.pid;
+    }
+  } catch {}
 
-  if (config.storageSelectionError) {
-    results.push({
-      name: "daemon", category: "Daemon", status: "fail",
-      message: `localhost:${config.port} — automatic start skipped: ${config.storageSelectionError.message}`,
-      fixApplied: false,
-    });
-  } else if (config.validationError || config.storageBackend === "unavailable") {
+  if (config.validationError || config.storageBackend === "unavailable") {
     results.push(daemonHealthy
       ? {
           name: "daemon", category: "Daemon", status: "warn",
@@ -605,7 +610,6 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     const versionMismatch = Boolean(pkgVersion && daemonVersion !== pkgVersion);
     const daemonVersionLabel = daemonVersion ? `v${daemonVersion}` : "unknown version";
     try {
-      selectStorageBackend(config.storage!);
       const { ensureDaemon } = await import("../daemon/lifecycle.js");
       const ensureResult = await ensureDaemon({
         port: config.port,
@@ -615,16 +619,17 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         expectedStorageBackend: config.storageBackend,
         enforceUserManagerParent: true,
       });
-      if (ensureResult.connected) daemonPid = ensureResult.pid;
+      if (ensureResult.connected) daemonPid = ensureResult.pid ?? initialHealthPid;
 
       let postRestartVersion: string | undefined;
       let postRestartOk = false;
+      let postRestartStorageReady = false;
       if (ensureResult.connected) {
         try {
-          const res = await deps.fetch(`http://127.0.0.1:${config.port}/health`);
-          if (res.ok) {
-            const h = (await res.json()) as { status?: string; version?: string };
-            postRestartOk = h.status === "ok";
+          const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
+          if (h) {
+            postRestartOk = true;
+            postRestartStorageReady = h.status === "ok";
             postRestartVersion = h.version;
           }
         } catch { /* non-fatal */ }
@@ -640,6 +645,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
             fixApplied: true,
           });
           daemonHealthy = true;
+          daemonStorageReady = postRestartStorageReady;
         } else if (ensureResult.connected) {
           const runningVersionLabel = postRestartVersion ? `v${postRestartVersion}` : daemonVersionLabel;
           results.push({
@@ -648,6 +654,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
             fixApplied: false,
           });
           daemonHealthy = false;
+          daemonStorageReady = false;
         } else {
           results.push({
             name: "daemon", category: "Daemon", status: "fail",
@@ -655,6 +662,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
             fixApplied: false,
           });
           daemonHealthy = false;
+          daemonStorageReady = false;
         }
       } else if (!ensureResult.connected) {
         results.push({
@@ -663,6 +671,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
           fixApplied: false,
         });
         daemonHealthy = false;
+        daemonStorageReady = false;
       } else if (ensureResult.restartedForParent) {
         const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
         results.push({
@@ -671,6 +680,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
           fixApplied: true,
         });
         daemonHealthy = true;
+        daemonStorageReady = postRestartStorageReady;
       } else if (ensureResult.warning) {
         results.push({
           name: "daemon", category: "Daemon", status: "warn",
@@ -684,6 +694,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       }
     } catch {
       daemonHealthy = false;
+      daemonStorageReady = false;
       if (versionMismatch) {
         results.push({ name: "daemon", category: "Daemon", status: "warn",
           message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed)\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}` });
@@ -695,7 +706,6 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   } else {
     // Auto-fix: try ensureDaemon
     try {
-      selectStorageBackend(config.storage!);
       const { ensureDaemon } = await import("../daemon/lifecycle.js");
       const ensureResult = await ensureDaemon({
         port: config.port,
@@ -710,6 +720,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
         results.push({ name: "daemon", category: "Daemon", status: "warn", message: `localhost:${config.port} — started${warning}`, fixApplied: true });
         daemonHealthy = true;
+        // SQLite startup cannot return staged health. PostgreSQL startup may
+        // be connected while its storage repositories remain unavailable.
+        daemonStorageReady = config.storageBackend === "sqlite";
       } else {
         results.push({ name: "daemon", category: "Daemon", status: "fail", message: `localhost:${config.port} not responding\n     Fix: lcm daemon start` });
       }
@@ -929,7 +942,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   // ── Passive Learning ──
   // The hooks check above always reports pass or warn, so passive-learning
   // diagnostics are always applicable by the time this point is reached.
-  await checkPassiveLearning(results, options, daemonHealthy);
+  await checkPassiveLearning(results, options, daemonHealthy, daemonStorageReady);
 
   return results;
 }

@@ -12,7 +12,7 @@ const state = vi.hoisted(() => ({
     project: { messageCount: 2, summaryCount: 1, promotedCount: 1, lastIngest: "now", lastCompact: "now", lastPromote: "now" },
   }) : ({ ok: true, promoted: 1, processed: 1, skipped: 0, errors: 0, processedProjects: 1 })),
   get: vi.fn(async () => ({ totalConnections: 2, activeConnections: 1, idleConnections: 1, connections: [{ refs: 1, status: "active", path: "/db" }] })),
-  health: vi.fn(async () => true),
+  health: vi.fn(async (): Promise<unknown> => true),
   dispatchHook: vi.fn(async () => ({ stdout: "hook-output", exitCode: 0 })),
   loadConfig: vi.fn(() => ({
     daemon: state.daemonPort === undefined ? undefined : { port: state.daemonPort },
@@ -59,6 +59,11 @@ const state = vi.hoisted(() => ({
   sensitiveStdout: "sensitive",
   packageVersion: "1.4.0" as unknown,
   storageBackend: "sqlite" as "sqlite" | "postgresql",
+  provisionResult: {
+    applied: ["0001_migration_ledger"],
+    current: ["0001_migration_ledger"],
+  },
+  provisionError: undefined as unknown,
 }));
 
 const fakeStdin = vi.hoisted(() => ({
@@ -149,6 +154,12 @@ vi.mock("../../src/portable-knowledge.js", () => ({
   exportKnowledge: vi.fn(async () => { if (state.exportError) throw state.exportError; return state.portableResult; }),
   importKnowledge: vi.fn(async () => { if (state.importKnowledgeError) throw state.importKnowledgeError; return state.portableResult; }),
 }));
+vi.mock("../../src/storage/postgresql/provisioning.js", () => ({
+  provisionPostgreSql: vi.fn(async () => {
+    if (state.provisionError !== undefined) throw state.provisionError;
+    return state.provisionResult;
+  }),
+}));
 
 const {
   handleCliError, resolveCompactRequestPolicyOverride, runCli, runMainIfInvoked, shouldRunMain,
@@ -191,6 +202,11 @@ beforeEach(() => {
   state.sensitiveStdout = "sensitive";
   state.packageVersion = "1.4.0";
   state.storageBackend = "sqlite";
+  state.provisionResult = {
+    applied: ["0001_migration_ledger"],
+    current: ["0001_migration_ledger"],
+  };
+  state.provisionError = undefined;
   state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/project"] };
 });
 
@@ -300,8 +316,12 @@ describe("runCli registration and help dispatch", () => {
   it.each([
     [[], undefined], [["--help"], undefined], [["help"], undefined], [["help", "compact"], "compact"],
     [["daemon", "--help"], "daemon"], [["daemon", "start", "--help"], "daemon"], [["daemon", "restart", "--help"], "daemon"],
-    [["map", "--help"], "map"], [["map", "list", "--help"], "map"], [["map", "show", "--help"], "map"],
-    [["map", "add", "--help"], "map"], [["map", "remove", "--help"], "map"],
+    [["machine", "--help"], "machine"], [["machine", "register", "--help"], "machine"],
+    [["machine", "show", "--help"], "machine"], [["machine", "recover", "--help"], "machine"],
+    [["project", "--help"], "project"], [["project", "list", "--help"], "project"],
+    [["project", "show", "--help"], "project"], [["project", "link", "--help"], "project"],
+    [["project", "unlink", "--help"], "project"], [["project", "create", "--help"], "project"],
+    [["postgres", "--help"], "postgres"], [["postgres", "migrate", "--help"], "postgres"],
     [["connectors", "list", "--help"], "connectors"], [["connectors", "install", "--help"], "connectors"],
     [["connectors", "remove", "--help"], "connectors"], [["connectors", "doctor", "--help"], "connectors"],
     [["config", "get", "daemon.port", "--help"], "config"],
@@ -329,6 +349,12 @@ describe("runCli registration and help dispatch", () => {
       expect(state.configGetValue).not.toHaveBeenCalled();
       expect(state.configSetValue).not.toHaveBeenCalled();
     }
+  });
+
+  it("rejects removed map help through the unknown-command path", async () => {
+    expect((await invoke(["map", "add", "--help"]))?.message).toBe("exit:1");
+    expect(state.printHelp).toHaveBeenCalledWith();
+    expect(state.printHelp).not.toHaveBeenCalledWith("map");
   });
 });
 
@@ -360,7 +386,6 @@ describe("runCli daemon-backed and utility actions", () => {
     ["describe", "node"],
     ["expand", "node"],
     ["store", "memory"],
-    ["status"],
     ["stats", "--pool"],
     ["events", "promote"],
   ])("rejects daemon-backed command %# before lifecycle mutation when PostgreSQL is selected", async (...args) => {
@@ -398,15 +423,15 @@ describe("runCli orchestration actions", () => {
     await expect(runCli(["node", "lcm", "stats"])).rejects.toBeInstanceOf(StorageBackendUnavailableError);
   });
 
-  it.each(["start", "restart"])("refuses daemon %s before lifecycle mutation when the effective backend is unavailable", async (action) => {
+  it.each(["start", "restart"])("runs managed daemon %s with staged PostgreSQL storage", async (action) => {
     state.loadConfig.mockReturnValueOnce({ daemon: { port: 3737 }, storage: { backend: "postgresql" } });
 
-    await expect(runCli(["node", "lcm", "daemon", action])).rejects.toMatchObject({
-      name: "StorageBackendUnavailableError",
-      message: expect.stringContaining("use storage.backend \"sqlite\""),
-    });
-    expect(state.ensureDaemon).not.toHaveBeenCalled();
-    expect(state.restartDaemon).not.toHaveBeenCalled();
+    expect((await invoke(["daemon", action]))?.message).toBe("exit:0");
+    const lifecycle = action === "start" ? state.ensureDaemon : state.restartDaemon;
+    expect(lifecycle).toHaveBeenCalledWith(expect.objectContaining({
+      port: 3737,
+      expectedStorageBackend: "postgresql",
+    }));
   });
 
   it.each([
@@ -572,6 +597,94 @@ describe("runCli failure and alternate presentation branches", () => {
     expect((await invoke(["stats", "--pool"]))?.message).toBe("exit:1");
     state.get.mockRejectedValueOnce("pool failed");
     expect((await invoke(["stats", "--pool"]))?.message).toBe("exit:1");
+  });
+
+  it("reports a staged PostgreSQL daemon as up with unavailable storage", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const stagedHealth = {
+      status: "unavailable",
+      version: "1.4.1",
+      storageBackend: "postgresql",
+      uptime: 10,
+      pid: 1234,
+      storage: { status: "unavailable" },
+    };
+    state.storageBackend = "postgresql";
+
+    state.health.mockResolvedValueOnce(stagedHealth);
+    expect(await invoke(["status"])).toBeUndefined();
+    const text = log.mock.calls.map(([message]) => String(message)).join("\n");
+    expect(text).toContain("Daemon: up");
+    expect(text).toContain("Storage: postgresql (unavailable)");
+    expect(text).not.toContain("Project:");
+    expect(state.post).not.toHaveBeenCalled();
+
+    log.mockClear();
+    state.health.mockResolvedValueOnce(stagedHealth);
+    expect(await invoke(["status", "--json"])).toBeUndefined();
+    expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toEqual({
+      daemon: {
+        status: "up",
+        version: "1.4.1",
+        uptime: 10,
+        port: 3737,
+        storageBackend: "postgresql",
+        storageStatus: "unavailable",
+      },
+    });
+    expect(state.post).not.toHaveBeenCalled();
+  });
+
+  it("runs the supported PostgreSQL migration command in text and JSON modes", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    state.storageBackend = "postgresql";
+
+    expect(await invoke(["postgres", "migrate"])).toBeUndefined();
+    expect(log.mock.calls.map(([message]) => String(message)).join("\n"))
+      .toContain("Applied 1 PostgreSQL migration: 0001_migration_ledger");
+
+    state.provisionResult = {
+      applied: ["0001_migration_ledger", "0002_schema_baseline"],
+      current: ["0001_migration_ledger", "0002_schema_baseline"],
+    };
+    log.mockClear();
+    expect(await invoke(["postgres", "migrate"])).toBeUndefined();
+    expect(log.mock.calls.map(([message]) => String(message)).join("\n"))
+      .toContain("Applied 2 PostgreSQL migrations: 0001_migration_ledger, 0002_schema_baseline");
+
+    state.provisionResult = {
+      applied: [],
+      current: ["0001_migration_ledger"],
+    };
+    log.mockClear();
+    expect(await invoke(["postgres", "migrate"])).toBeUndefined();
+    expect(log).toHaveBeenCalledWith("PostgreSQL schema is current.");
+
+    expect(await invoke(["postgres", "migrate", "--json"])).toBeUndefined();
+    expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toEqual({
+      backend: "postgresql",
+      applied: [],
+      current: ["0001_migration_ledger"],
+    });
+  });
+
+  it("reports PostgreSQL migration errors in text and JSON modes", async () => {
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    state.provisionError = new Error("migration unavailable");
+
+    expect((await invoke(["postgres", "migrate"]))?.message).toBe("exit:1");
+    expect(stderr).toHaveBeenCalledWith("Error: migration unavailable");
+    expect((await invoke(["postgres", "migrate", "--json"]))?.message).toBe("exit:1");
+    expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toEqual({
+      error: "migration unavailable",
+    });
+
+    state.provisionError = "migration unavailable";
+    expect((await invoke(["postgres", "migrate"]))?.message).toBe("exit:1");
+    expect((await invoke(["postgres"]))?.message).toBe("exit:1");
   });
 
   it("covers event result variants", async () => {

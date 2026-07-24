@@ -7,8 +7,17 @@ import { DatabaseSync } from "node:sqlite";
 import { claudeProjectDirName, createDaemon, projectTranscriptScanCwds, type DaemonInstance } from "../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
-import { projectDbPath } from "../../src/daemon/project.js";
-import { clearProjectMapCache, hashProjectPath, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
+import { projectDbPath, projectDir } from "../../src/daemon/project.js";
+import { recoverMachineIdentity } from "../../src/machine-identity.js";
+import { UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
+import {
+  clearProjectMapCache,
+  hashProjectPath,
+  normalizeProjectPath,
+  projectMapPath,
+  resolveProjectIdentity,
+  setRemoteProjectBinding,
+} from "../../src/project-map.js";
 
 describe("daemon server", () => {
   const originalHome = process.env.HOME;
@@ -60,6 +69,226 @@ describe("daemon server", () => {
       expect(data.pid).toBe(process.pid);
     } finally {
       await daemon.stop();
+    }
+  });
+
+  it("starts with staged PostgreSQL storage and validates route identity before unavailability", async () => {
+    const scanForTranscripts = vi.fn(async () => undefined);
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+    const caPath = join(tempHome!, "postgres-ca.pem");
+    writeFileSync(
+      caPath,
+      "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n",
+      { mode: 0o600 },
+    );
+    const config = loadDaemonConfig(
+      "/nonexistent",
+      {
+        storage: { backend: "postgresql" },
+        daemon: { port: 0, idleTimeoutMs: 0 },
+        llm: {
+          provider: "openai",
+          model: "local-test",
+          baseURL: "http://127.0.0.1:11435/v1",
+        },
+      },
+      {
+        LCM_POSTGRES_URL: "postgresql://user:secret@db.example.test/lcm",
+        LCM_POSTGRES_CA_FILE: caPath,
+      },
+    );
+    config.restoration.promptSearchMaxResults = 0;
+    daemon = await createDaemon(config, { _scanForTranscripts: scanForTranscripts });
+    const port = daemon.address().port;
+
+    expect(setIntervalSpy).not.toHaveBeenCalledWith(expect.any(Function), 10 * 60 * 1000);
+    expect(setIntervalSpy).not.toHaveBeenCalledWith(expect.any(Function), 5 * 60 * 1000);
+    expect(scanForTranscripts).not.toHaveBeenCalled();
+
+    const healthResponse = await fetch(`http://127.0.0.1:${port}/health`);
+    expect(healthResponse.status).toBe(503);
+    const health = await healthResponse.json() as {
+      status: string;
+      storageBackend: string;
+      storage: { status: string; error: Record<string, unknown> };
+    };
+    expect(health).toMatchObject({
+      status: "unavailable",
+      storageBackend: "postgresql",
+      storage: {
+        status: "unavailable",
+        error: {
+          code: "STORAGE_INITIALIZATION_FAILED",
+          backend: "postgresql",
+          operation: "health",
+        },
+      },
+    });
+    expect(JSON.stringify(health)).not.toContain("secret");
+
+    const patternsPath = join(projectDir(tempHome!), "sensitive-patterns.txt");
+    mkdirSync(projectDir(tempHome!), { recursive: true });
+    writeFileSync(patternsPath, "[", { mode: 0o600 });
+    const storeResponse = await fetch(`http://127.0.0.1:${port}/store`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: tempHome, text: "remember" }),
+    });
+    rmSync(patternsPath, { force: true });
+    expect(storeResponse.status).toBe(409);
+    const store = await storeResponse.json() as Record<string, unknown>;
+    expect(store).toEqual({
+      code: "STORAGE_IDENTITY_REQUIRED",
+      storageBackend: "postgresql",
+      error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+    });
+    expect(JSON.stringify(store)).not.toContain(tempHome!);
+    expect(JSON.stringify(store)).not.toContain("storage initialization failed");
+
+    const manualReadRequests = [
+      { path: "/search", operation: "search", body: { cwd: tempHome, query: "remember" } },
+      { path: "/grep", operation: "grep", body: { cwd: tempHome, query: "remember" } },
+      { path: "/recent", operation: "recent", body: { cwd: tempHome } },
+      { path: "/describe", operation: "describe", body: { cwd: tempHome, nodeId: "node" } },
+      { path: "/expand", operation: "expand", body: { cwd: tempHome, nodeId: "node" } },
+      {
+        path: "/prompt-search",
+        operation: "prompt-search",
+        body: { cwd: tempHome, query: "remember" },
+      },
+    ];
+    for (const request of manualReadRequests) {
+      const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request.body),
+      });
+      expect(response.status).toBe(409);
+      const identityRequired = await response.json() as Record<string, unknown>;
+      expect(identityRequired).toEqual({
+        code: "STORAGE_IDENTITY_REQUIRED",
+        storageBackend: "postgresql",
+        error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+      });
+      expect(JSON.stringify(identityRequired)).not.toContain(tempHome);
+      expect(JSON.stringify(identityRequired)).not.toContain("secret");
+    }
+
+    const local = resolveProjectIdentity(tempHome!);
+    setRemoteProjectBinding("018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020", { hash: local.id });
+    for (const request of manualReadRequests) {
+      const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request.body),
+      });
+      expect(response.status).toBe(409);
+      const identityRequired = await response.json() as Record<string, unknown>;
+      expect(identityRequired).toEqual({
+        code: "STORAGE_IDENTITY_REQUIRED",
+        error: "Machine identity is unavailable. "
+          + "Run `lcm machine show` for recovery guidance.",
+        storageBackend: "postgresql",
+      });
+    }
+
+    recoverMachineIdentity({
+      version: 1,
+      identityKey: `machine:${"a".repeat(64)}`,
+      machineId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012",
+      displayName: "Machine A",
+    }, { homeDir: tempHome });
+    for (const request of manualReadRequests) {
+      const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request.body),
+      });
+      expect(response.status).toBe(503);
+      const unavailable = await response.json();
+      expect(unavailable).toEqual({
+        code: "STORAGE_BACKEND_STAGED",
+        error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
+        storageBackend: "postgresql",
+      });
+      expect(JSON.stringify(unavailable)).not.toContain("secret");
+    }
+
+    const stagedProjectRequests = [
+      {
+        path: "/compact",
+        operation: "compact",
+        body: { cwd: tempHome, session_id: "s1", skip_ingest: true },
+      },
+      { path: "/store", operation: "store", body: { cwd: tempHome, text: "remember" } },
+      { path: "/promote", operation: "promote", body: { cwd: tempHome } },
+      { path: "/restore", operation: "restore", body: { cwd: tempHome, session_id: "s1" } },
+      {
+        path: "/ingest",
+        operation: "ingest",
+        body: {
+          cwd: tempHome,
+          session_id: "s1",
+          messages: [{ role: "user", content: "remember", tokenCount: 1 }],
+        },
+      },
+      {
+        path: "/session-complete",
+        operation: "session-complete",
+        body: { cwd: tempHome, session_id: "s1" },
+      },
+      { path: "/review-stale", operation: "review-stale", body: { cwd: tempHome } },
+      {
+        path: "/prompt-search",
+        operation: "prompt-search",
+        body: { cwd: tempHome, query: "remember" },
+      },
+      { path: "/promote-events", operation: "promote-events", body: { cwd: tempHome } },
+      {
+        path: "/promote-events/notify",
+        operation: "promote-events-notify",
+        body: { cwd: tempHome },
+      },
+    ];
+    for (const request of stagedProjectRequests) {
+      const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request.body),
+      });
+      expect(response.status).toBe(503);
+      const unavailable = await response.json();
+      expect(unavailable).toEqual({
+        code: "STORAGE_BACKEND_STAGED",
+        error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
+        storageBackend: "postgresql",
+      });
+      expect(JSON.stringify(unavailable)).not.toContain(tempHome);
+      expect(JSON.stringify(unavailable)).not.toContain("secret");
+    }
+
+    for (const request of [
+      { path: "/stats", method: "GET", operation: "stats" },
+      { path: "/stats/pool", method: "GET", operation: "pool stats" },
+      { path: "/status", method: "POST", operation: "status" },
+    ]) {
+      const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {
+        method: request.method,
+        ...(request.method === "POST"
+          ? {
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ cwd: tempHome }),
+            }
+          : {}),
+      });
+      expect(response.status).toBe(503);
+      const unavailable = await response.json() as Record<string, unknown>;
+      expect(unavailable).toEqual({
+        code: "STORAGE_BACKEND_STAGED",
+        error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
+        storageBackend: "postgresql",
+      });
+      expect(JSON.stringify(unavailable)).not.toContain("secret");
     }
   });
 

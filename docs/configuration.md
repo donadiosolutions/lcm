@@ -153,7 +153,11 @@ The actual summary size depends on the LLM's output; these values are guidelines
 Prompt-time recall now has a second budget layer after `/prompt-search` ranking.
 
 - `restoration.promptSearchMaxResults` still controls how many top-ranked results the route aims to consider first.
-- Setting `restoration.promptSearchMaxResults` to `0` disables prompt-memory recall completely, regardless of `maxInjectedMemoryItems`.
+- Setting `restoration.promptSearchMaxResults` to `0` disables prompt-memory
+  recall completely, regardless of `maxInjectedMemoryItems`. SQLite returns an
+  empty result immediately. PostgreSQL still performs machine registration,
+  explicit project-binding, and storage-availability admission first, so an
+  invalid identity remains `409` and a staged backend remains `503`.
 - `restoration.promptSnippetLength` still controls the per-result snippet size before final emission.
 - `restoration.maxInjectedMemoryItems` caps how many deduped hints can survive into the final `<memory-context>` block.
 - `restoration.dedupMinPrefix` dedupes identical or near-identical hints by normalized prefix before emission.
@@ -185,11 +189,14 @@ not contain a `storage` object continue to use the per-project databases under
 ```
 
 The PostgreSQL configuration, internal PostgreSQL 18 runtime, and schema
-baseline are available for development and adapter conformance. The domain
-repositories are still staged in #84-#91, with activation in #92, so a valid
-`postgresql` selection continues to fail before the daemon listens with an
-explicit backend-unavailable error. LCM never falls back to SQLite after an
-explicit PostgreSQL selection. The internal readiness contract also requires
+baseline are available for development and adapter conformance. Machine and
+project identity operations are enabled by #84. The remaining storage/domain
+repositories in #85-#91 stay staged until the #92 cutover, so a valid
+`postgresql` selection starts the managed daemon, but other storage-backed
+routes remain unavailable and return a sanitized `503` until those
+repositories are activated. Managed start/restart recognizes that authenticated staged response
+as daemon readiness; it does not treat PostgreSQL storage as ready and never
+falls back to SQLite after an explicit PostgreSQL selection. The internal readiness contract also requires
 the parity extensions at their current default versions in the `public` schema;
 see the [PostgreSQL schema reference](postgresql-schema.md#required-extensions-and-postgresql-version).
 
@@ -203,10 +210,12 @@ agent's own compaction. If an installed hook is customized with explicit
 projection is loaded to validate those overrides; PostgreSQL credentials are
 still not resolved before fail-open dispatch.
 
-Manual CLI operations, daemon startup and restart, and MCP request admission
-are not covered by that hook exception. They resolve the complete effective
-configuration and fail closed when PostgreSQL credentials, TLS preflight, or
-backend support are unavailable. The hook behavior therefore does not provide
+Manual CLI operations and MCP request admission are not covered by that hook
+exception. They resolve the complete effective configuration and fail closed
+when PostgreSQL credentials, TLS preflight, identity registration, explicit
+project binding, or backend support are unavailable. Daemon startup and
+restart may retain the authenticated staged process described above, but its
+storage routes remain fail-closed. The hook behavior therefore does not provide
 SQLite fallback or make the PostgreSQL repository backend available.
 
 Store only non-secret pool and timeout settings in `~/.lcm/config.json`:
@@ -241,6 +250,44 @@ export LCM_POSTGRES_URL='postgresql://USER:PASSWORD@HOST:25060/DATABASE'
 export LCM_POSTGRES_CA_FILE='/absolute/path/to/ca-certificate.crt'
 lcm daemon restart
 ```
+
+### Provisioning a PostgreSQL database
+
+Provisioning is an explicit administrator workflow. First create a UTF-8
+PostgreSQL 18 database, preload `pg_stat_statements`, install the required
+extensions in `public`, and configure `storage.backend` as shown above. Use a
+dedicated migration role that owns the database and any existing `lcm` schema;
+do not use the restricted runtime role for DDL. Then apply the migrations
+packaged with the installed LCM version:
+
+```bash
+export LCM_POSTGRES_CA_FILE='/absolute/path/to/ca-certificate.crt'
+LCM_POSTGRES_URL="$LCM_POSTGRES_MIGRATION_URL" lcm postgres migrate
+```
+
+Use `--json` for automation. The command opens the production PostgreSQL
+runtime without requiring a pre-existing LCM schema, verifies the packaged SQL
+and SHA-256 manifest, takes the migration advisory lock, validates PostgreSQL
+18, extensions, ownership, history, and schema fingerprints, applies pending
+migrations transactionally, and closes its pool before returning. Repeated and
+concurrent invocations converge. It never installs extensions, repairs drift,
+changes ownership, or grants application privileges.
+
+After migration, apply the reviewed
+[`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql)
+as an administrator, substituting the deployment's restricted runtime role:
+
+```bash
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-identity-grants.sql
+```
+
+Finally restore `LCM_POSTGRES_URL` to the restricted runtime-role URL, run
+`lcm machine register`, pair projects explicitly, and restart the daemon.
+Never leave the daemon or identity commands configured with migration-owner
+credentials. See the [PostgreSQL schema reference](postgresql-schema.md) for
+the exact extension, role, ownership, ACL, backup, and recovery contracts.
 
 The URL must use the `postgresql:` scheme. Do not add `ssl`, `sslmode`,
 `sslcert`, `sslkey`, `sslrootcert`, or other `ssl*` query parameters; LCM owns
@@ -344,13 +391,26 @@ Session restore locks use a SHA-256 digest of the agent session ID under `~/.lcm
 
 Project-local transcript paths remain supported for normal working directories. A working directory equal to the filesystem root does not authorize every file on the machine; provider-managed Claude and Codex transcript directories remain available in that case.
 
-## Project path aliases
+## Machine and project identities
 
-LCM records canonical project paths and aliases in `~/.lcm/map.json`. All project database paths, passive-learning sidecars, metadata, sensitive-pattern files, and search/promotion routes resolve through that map before choosing a project hash.
+LCM records canonical paths, same-machine aliases, and optional PostgreSQL
+project UUIDv7 bindings in `~/.lcm/map.json`. SQLite databases,
+passive-learning sidecars, metadata, sensitive-pattern files, and local
+search/promotion routes continue to use the path-derived local hash.
 
-Use `lcm map list`, `lcm map show`, `lcm map add`, and `lcm map remove` to manage aliases. Manual edits are supported; the daemon reloads valid changes without restart, pretty-prints valid non-canonical JSON, and keeps the last valid in-memory map during transient invalid saves.
+Use `lcm machine register|show|recover` for the private
+`~/.lcm/machine.json`, and `lcm project create|link|unlink|list|show` for
+project identities and aliases. PostgreSQL use fails closed until the machine
+is registered and the local project is explicitly bound. Hooks retain passive
+events in the local SQLite outbox during identity or PostgreSQL outages.
 
-See [Project path aliases](project-map.md) for the file format, backup behavior, ambiguity rules, and command reference.
+Manual map edits remain backward-compatible; the daemon reloads valid changes
+without restart, pretty-prints valid non-canonical JSON, and keeps the last
+valid in-memory map during transient invalid saves.
+
+See [Machine registration and project identity](project-identity.md) for
+permissions, recovery, pairing, stored-data guards, backup behavior, migration,
+ambiguity rules, and the command reference.
 
 ## Model selection
 

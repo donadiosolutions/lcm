@@ -27,6 +27,7 @@ import type { RecallFeedback, RecallStats } from "../db/recall.js";
 export type StorageBackendName = "sqlite" | "postgresql";
 export type StorageDomain =
   | "factory"
+  | "identity"
   | "conversations"
   | "summaries"
   | "context"
@@ -192,13 +193,25 @@ export interface ProjectStorage extends ProjectRepositories {
   close(): Promise<void>;
 }
 
+/**
+ * Identity carried from local path resolution into a backend factory.
+ *
+ * SQLite uses `id`/`localProjectId`, while PostgreSQL uses the explicit remote
+ * UUID in `id` and additionally requires `machineId`. Optional fields preserve
+ * structural compatibility for existing SQLite-only callers.
+ */
+export interface StorageIdentityContext extends ProjectIdentity {
+  readonly localProjectId?: string;
+  readonly machineId?: string;
+}
+
 export interface StorageBackendFactory {
   readonly backend: StorageBackendName;
   readonly capabilities: StorageCapabilities;
-  projectExists(identity: ProjectIdentity): Promise<boolean>;
+  projectExists(identity: StorageIdentityContext): Promise<boolean>;
   /** Open an already-present project without creating backend state. */
-  openExistingProject(identity: ProjectIdentity): Promise<ProjectStorage | null>;
-  openProject(identity: ProjectIdentity): Promise<ProjectStorage>;
+  openExistingProject(identity: StorageIdentityContext): Promise<ProjectStorage | null>;
+  openProject(identity: StorageIdentityContext): Promise<ProjectStorage>;
   health(): Promise<StorageHealth>;
   close(): Promise<void>;
 }

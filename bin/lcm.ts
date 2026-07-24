@@ -29,6 +29,7 @@ import {
 } from "../src/runtime-paths.js";
 import type { ProgressState } from "../src/cli/progress-state.js";
 import { StorageBackendUnavailableError } from "../src/storage/backend.js";
+import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -201,7 +202,7 @@ function resolveCustomHelpRequest(cliArgv: string[]): CustomHelpRequest | undefi
   if (!args.includes("-h") && !args.includes("--help")) return undefined;
 
   const [command] = args;
-  return args.length >= 3 && ["daemon", "config", "map", "connectors"].includes(command)
+  return args.length >= 3 && ["daemon", "config", "connectors"].includes(command)
     ? { command }
     : undefined;
 }
@@ -326,13 +327,20 @@ export function registerMemoryCommands(program: Command): void {
     });
 }
 
-export function registerMapCommand(program: Command): void {
-  type MapRootOptions = { help?: boolean };
-  type MapListOptions = { help?: boolean; json?: boolean };
-  type MapShowOptions = MapListOptions;
-  type MapMutateOptions = { help?: boolean; canonical?: string; hash?: string; json?: boolean };
+async function loadIdentityStorageConfig() {
+  const { loadDaemonConfig } = await import("../src/daemon/config.js");
+  return loadDaemonConfig(defaultConfigPath()).storage;
+}
 
-  const mapError = (err: unknown, opts: { json?: boolean } = {}): never => {
+export function registerProjectCommand(program: Command): void {
+  type ProjectOptions = {
+    help?: boolean;
+    json?: boolean;
+    name?: string;
+    allowExistingData?: boolean;
+  };
+
+  const projectError = (err: unknown, opts: { json?: boolean } = {}): never => {
     const message = err instanceof Error ? err.message : String(err);
     if (opts.json) {
       printJson({ error: message });
@@ -342,125 +350,383 @@ export function registerMapCommand(program: Command): void {
     exit(1);
   };
 
-  const mapCmd = new Command("map").description("Manage project path aliases");
-  mapCmd.helpOption(false).option("-h, --help", "Show help");
-  mapCmd.action(async (opts: MapRootOptions) => {
-    if (opts.help) {
+  const projectCmd = new Command("project").description("Manage local and PostgreSQL project identities");
+  projectCmd.helpOption(false).option("-h, --help", "Show help");
+  const projectHelpRequested = (opts: ProjectOptions): boolean =>
+    opts.help === true || projectCmd.opts<ProjectOptions>().help === true;
+  projectCmd.action(async (opts: ProjectOptions) => {
+    if (projectHelpRequested(opts)) {
       const { printHelp } = await import("../src/cli-help.js");
-      printHelp("map"); exit(0);
+      printHelp("project"); exit(0);
     }
-    console.error("Usage: lcm map <list|show|add|remove> [options]");
+    console.error("Usage: lcm project <create|link|unlink|list|show> [options]");
     exit(1);
   });
 
-  mapCmd
+  projectCmd
     .command("list")
-    .description("List project path map entries")
+    .description("List local projects and configured PostgreSQL identities")
     .option("--json", "Output structured JSON")
     .helpOption(false)
     .option("-h, --help", "Show help")
-    .action(async (opts: MapListOptions) => {
-      if (opts.help) {
+    .action(async (opts: ProjectOptions) => {
+      if (projectHelpRequested(opts)) {
         const { printHelp } = await import("../src/cli-help.js");
-        printHelp("map"); exit(0);
+        printHelp("project"); exit(0);
       }
-      const { listProjectMapEntries } = await import("../src/project-map.js");
       try {
-        const map = listProjectMapEntries();
+        const { listProjects } = await import("../src/identity-service.js");
+        const result = await listProjects(await loadIdentityStorageConfig());
         if (opts.json) {
-          printJson({ entries: map });
+          printJson(result);
           return;
         }
-        for (const [hash, entry] of Object.entries(map)) {
-          console.log(`${hash}`);
-          console.log(`  canonical: ${entry.canonical}`);
-          for (const alias of entry.aliases) console.log(`  alias: ${alias}`);
+        for (const entry of result.local) {
+          console.log(entry.hash);
+          console.log(`  canonical: ${sanitizeTerminalText(entry.canonical)}`);
+          if (entry.remoteProjectId) console.log(`  PostgreSQL project: ${entry.remoteProjectId}`);
+          for (const alias of entry.aliases) {
+            console.log(`  alias: ${sanitizeTerminalText(alias)}`);
+          }
+        }
+        if (result.remote) {
+          console.log("PostgreSQL projects:");
+          for (const remote of result.remote) {
+            console.log(`  ${remote.projectId}  ${sanitizeTerminalText(remote.displayName)}`);
+            for (const alias of remote.aliases) {
+              console.log(`    ${alias.machineId}: ${sanitizeTerminalText(alias.path)}`);
+            }
+          }
         }
       } catch (err) {
-        mapError(err, opts);
+        projectError(err, opts);
       }
     });
 
-  mapCmd
+  projectCmd
     .command("show [target]")
-    .description("Show one project path map entry")
+    .description("Show one local project and its PostgreSQL identity")
     .option("--json", "Output structured JSON")
     .helpOption(false)
     .option("-h, --help", "Show help")
-    .action(async (target: string | undefined, opts: MapShowOptions) => {
-      if (opts.help) {
+    .action(async (target: string | undefined, opts: ProjectOptions) => {
+      if (projectHelpRequested(opts)) {
         const { printHelp } = await import("../src/cli-help.js");
-        printHelp("map"); exit(0);
+        printHelp("project"); exit(0);
       }
-      const { showProjectMapEntry } = await import("../src/project-map.js");
       try {
-        const shown = showProjectMapEntry(target);
+        const { showProject } = await import("../src/identity-service.js");
+        const shown = await showProject(await loadIdentityStorageConfig(), target);
         if (opts.json) {
           printJson(shown);
           return;
         }
         console.log(shown.hash);
-        console.log(`  canonical: ${shown.entry.canonical}`);
-        for (const alias of shown.entry.aliases) console.log(`  alias: ${alias}`);
-      } catch (err) {
-        mapError(err, opts);
-      }
-    });
-
-  mapCmd
-    .command("add <alias>")
-    .description("Add an alias for a project path")
-    .option("--canonical <path>", "Target canonical project path")
-    .option("--hash <hash>", "Target project hash")
-    .option("--json", "Output structured JSON")
-    .helpOption(false)
-    .option("-h, --help", "Show help")
-    .action(async (alias: string, opts: MapMutateOptions) => {
-      if (opts.help) {
-        const { printHelp } = await import("../src/cli-help.js");
-        printHelp("map"); exit(0);
-      }
-      const { addProjectAlias } = await import("../src/project-map.js");
-      try {
-        const result = addProjectAlias(alias, { canonical: opts.canonical, hash: opts.hash });
-        if (opts.json) {
-          printJson({ added: true, ...result });
-          return;
+        console.log(`  canonical: ${sanitizeTerminalText(shown.entry.canonical)}`);
+        if (shown.entry.remoteProjectId) {
+          console.log(`  PostgreSQL project: ${shown.entry.remoteProjectId}`);
         }
-        if (result.warning) console.error(`Warning: ${result.warning}`);
-        console.log(`Added alias to ${result.hash}`);
+        for (const alias of shown.entry.aliases) {
+          console.log(`  alias: ${sanitizeTerminalText(alias)}`);
+        }
+        if (shown.remote) console.log(`  name: ${sanitizeTerminalText(shown.remote.displayName)}`);
       } catch (err) {
-        mapError(err, opts);
+        projectError(err, opts);
       }
     });
 
-  mapCmd
-    .command("remove <alias>")
-    .description("Remove an alias from a project path")
-    .option("--canonical <path>", "Target canonical project path")
-    .option("--hash <hash>", "Target project hash")
+  projectCmd
+    .command("link [target] [path]")
+    .description("Link a path to a PostgreSQL UUID or local project target")
+    .option("--allow-existing-data", "Acknowledge rebinding a data-bearing local project")
     .option("--json", "Output structured JSON")
     .helpOption(false)
     .option("-h, --help", "Show help")
-    .action(async (alias: string, opts: MapMutateOptions) => {
-      if (opts.help) {
+    .action(async (target: string | undefined, path: string | undefined, opts: ProjectOptions) => {
+      if (projectHelpRequested(opts)) {
         const { printHelp } = await import("../src/cli-help.js");
-        printHelp("map"); exit(0);
+        printHelp("project"); exit(0);
       }
-      const { removeProjectAlias } = await import("../src/project-map.js");
       try {
-        const result = removeProjectAlias(alias, { canonical: opts.canonical, hash: opts.hash });
+        if (!target) throw new Error("missing required argument 'target'");
+        const { linkProject } = await import("../src/identity-service.js");
+        const result = await linkProject(
+          await loadIdentityStorageConfig(),
+          target,
+          path,
+          { allowExistingData: opts.allowExistingData },
+        );
         if (opts.json) {
           printJson(result);
           return;
         }
-        console.log(result.removed ? `Removed alias from ${result.hash}` : `Alias was not present on ${result.hash}`);
+        console.log(`Linked ${sanitizeTerminalText(result.local.canonical)}`);
+        console.log(`  local hash: ${result.local.id}`);
+        if (result.local.remoteProjectId) {
+          console.log(`  PostgreSQL project: ${result.local.remoteProjectId}`);
+        }
       } catch (err) {
-        mapError(err, opts);
+        projectError(err, opts);
       }
     });
 
-  program.addCommand(mapCmd);
+  projectCmd
+    .command("unlink [path]")
+    .description("Remove a local alias or PostgreSQL project binding")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (path: string | undefined, opts: ProjectOptions) => {
+      if (projectHelpRequested(opts)) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("project"); exit(0);
+      }
+      try {
+        const { unlinkProject } = await import("../src/identity-service.js");
+        const result = await unlinkProject(await loadIdentityStorageConfig(), path);
+        if (opts.json) {
+          printJson(result);
+          return;
+        }
+        console.log(
+          `${result.aliasRemoved ? "Removed project alias from" : "Unbound PostgreSQL project from"} ${result.hash}`,
+        );
+      } catch (err) {
+        projectError(err, opts);
+      }
+    });
+
+  projectCmd
+    .command("create [path]")
+    .description("Create a PostgreSQL project and bind a local path")
+    .option("--name <display-name>", "Human-readable project name")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (path: string | undefined, opts: ProjectOptions) => {
+      if (projectHelpRequested(opts)) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("project"); exit(0);
+      }
+      try {
+        const { createProject } = await import("../src/identity-service.js");
+        const result = await createProject(
+          await loadIdentityStorageConfig(),
+          path,
+          { displayName: opts.name },
+        );
+        if (opts.json) {
+          printJson(result);
+          return;
+        }
+        console.log(`Created PostgreSQL project ${result.remote.projectId}`);
+        console.log(`  local hash: ${result.local.id}`);
+        console.log(`  path: ${sanitizeTerminalText(result.local.canonical)}`);
+      } catch (err) {
+        projectError(err, opts);
+      }
+    });
+
+  program.addCommand(projectCmd);
+}
+
+export function registerMachineCommand(program: Command): void {
+  type MachineOptions = {
+    help?: boolean;
+    json?: boolean;
+    name?: string;
+    force?: boolean;
+  };
+  const machineError = (err: unknown, opts: MachineOptions): never => {
+    const message = err instanceof Error ? err.message : String(err);
+    if (opts.json) printJson({ error: message });
+    else console.error(`Error: ${message}`);
+    exit(1);
+  };
+  const machineCmd = new Command("machine").description("Manage this machine's PostgreSQL identity");
+  machineCmd.helpOption(false).option("-h, --help", "Show help");
+  const machineHelpRequested = (opts: MachineOptions): boolean =>
+    opts.help === true || machineCmd.opts<MachineOptions>().help === true;
+  machineCmd.action(async (opts: MachineOptions) => {
+    if (machineHelpRequested(opts)) {
+      const { printHelp } = await import("../src/cli-help.js");
+      printHelp("machine"); exit(0);
+    }
+    console.error("Usage: lcm machine <register|show|recover> [options]");
+    exit(1);
+  });
+
+  machineCmd
+    .command("register")
+    .description("Register or refresh this machine in PostgreSQL")
+    .option("--name <display-name>", "Human-readable machine name")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (opts: MachineOptions) => {
+      if (machineHelpRequested(opts)) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("machine"); exit(0);
+      }
+      try {
+        const { registerMachine } = await import("../src/identity-service.js");
+        const result = await registerMachine(
+          await loadIdentityStorageConfig(),
+          { displayName: opts.name },
+        );
+        const output = {
+          registered: true,
+          created: result.created,
+          machineId: result.identity.machineId,
+          displayName: result.identity.displayName,
+          version: result.identity.version,
+        };
+        if (opts.json) {
+          printJson(output);
+          return;
+        }
+        console.log(`${result.created ? "Registered" : "Refreshed"} machine ${output.machineId}`);
+        console.log(`  name: ${output.displayName}`);
+      } catch (err) {
+        machineError(err, opts);
+      }
+    });
+
+  machineCmd
+    .command("show")
+    .description("Show this machine's local identity")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (opts: MachineOptions) => {
+      if (machineHelpRequested(opts)) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("machine"); exit(0);
+      }
+      try {
+        const { showMachine } = await import("../src/identity-service.js");
+        const shown = showMachine();
+        if (!shown) throw new Error("machine identity is not registered; run `lcm machine register`");
+        const output = {
+          version: shown.version,
+          status: shown.machineId === null ? "pending" : "registered",
+          machineId: shown.machineId,
+          displayName: shown.displayName,
+        };
+        if (opts.json) {
+          printJson(output);
+          return;
+        }
+        console.log(output.machineId ?? "pending");
+        console.log(`  status: ${output.status}`);
+        console.log(`  name: ${output.displayName}`);
+      } catch (err) {
+        machineError(err, opts);
+      }
+    });
+
+  machineCmd
+    .command("recover [machine-id]")
+    .description("Recover a machine identity by its PostgreSQL UUID")
+    .option("--force", "Replace and privately back up a conflicting local identity")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (machineId: string | undefined, opts: MachineOptions) => {
+      if (machineHelpRequested(opts)) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("machine"); exit(0);
+      }
+      try {
+        if (!machineId) throw new Error("missing required argument 'machine-id'");
+        const { recoverMachine } = await import("../src/identity-service.js");
+        const result = await recoverMachine(
+          await loadIdentityStorageConfig(),
+          machineId,
+          { force: opts.force },
+        );
+        const output = {
+          recovered: true,
+          machineId: result.identity.machineId,
+          displayName: result.identity.displayName,
+          ...(result.backupPath ? { backupPath: result.backupPath } : {}),
+        };
+        if (opts.json) {
+          printJson(output);
+          return;
+        }
+        console.log(`Recovered machine ${output.machineId}`);
+        console.log(`  name: ${output.displayName}`);
+        if (output.backupPath) console.log(`  backup: ${output.backupPath}`);
+      } catch (err) {
+        machineError(err, opts);
+      }
+    });
+
+  program.addCommand(machineCmd);
+}
+
+export function registerPostgreSqlCommand(program: Command): void {
+  type PostgreSqlOptions = {
+    help?: boolean;
+    json?: boolean;
+  };
+  const postgresCmd = new Command("postgres")
+    .description("Provision and maintain PostgreSQL storage");
+  postgresCmd.helpOption(false).option("-h, --help", "Show help");
+  const helpRequested = (opts: PostgreSqlOptions): boolean =>
+    opts.help === true || postgresCmd.opts<PostgreSqlOptions>().help === true;
+  postgresCmd.action(async (opts: PostgreSqlOptions) => {
+    if (helpRequested(opts)) {
+      const { printHelp } = await import("../src/cli-help.js");
+      printHelp("postgres"); exit(0);
+    }
+    console.error("Usage: lcm postgres migrate [--json]");
+    exit(1);
+  });
+
+  postgresCmd
+    .command("migrate")
+    .description("Apply packaged PostgreSQL schema migrations")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (opts: PostgreSqlOptions) => {
+      if (helpRequested(opts)) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("postgres"); exit(0);
+      }
+      try {
+        const { provisionPostgreSql } = await import(
+          "../src/storage/postgresql/provisioning.js"
+        );
+        const result = await provisionPostgreSql(await loadIdentityStorageConfig());
+        const output = {
+          backend: "postgresql",
+          applied: [...result.applied],
+          current: [...result.current],
+        };
+        if (opts.json) {
+          printJson(output);
+          return;
+        }
+        if (output.applied.length === 0) {
+          console.log("PostgreSQL schema is current.");
+        } else {
+          console.log(
+            `Applied ${output.applied.length} PostgreSQL migration${output.applied.length === 1 ? "" : "s"}: ${output.applied.join(", ")}`,
+          );
+        }
+        console.log(`  current migrations: ${output.current.length}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (opts.json) printJson({ error: message });
+        else console.error(`Error: ${message}`);
+        exit(1);
+      }
+    });
+
+  program.addCommand(postgresCmd);
 }
 
 function collectRepeatedOption(value: string, previous: string[] = []): string[] {
@@ -519,14 +785,16 @@ export function writeCliError(value: string): void {
   process.stderr.write(value);
 }
 
-async function createDaemonClientOrExit(): Promise<DaemonClient> {
+async function createDaemonClientOrExit(
+  options: { readonly preflightStorage?: boolean } = {},
+): Promise<DaemonClient> {
   const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
   const { loadDaemonConfig } = await import("../src/daemon/config.js");
   const { selectStorageBackend } = await import("../src/storage/backend.js");
 
   migrateLegacyHomeIfNeeded();
   const config = loadDaemonConfig(defaultConfigPath());
-  selectStorageBackend(config.storage);
+  if (options.preflightStorage !== false) selectStorageBackend(config.storage);
   const port = config.daemon?.port ?? 3737;
   const pidFilePath = daemonPidPath();
   const tokenPath = daemonTokenPath();
@@ -592,9 +860,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       if (!opts.foreground) {
         const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
         const { loadDaemonConfig } = await import("../src/daemon/config.js");
-        const { selectStorageBackend } = await import("../src/storage/backend.js");
         const config = loadDaemonConfig(defaultConfigPath());
-        selectStorageBackend(config.storage);
         const port = config.daemon?.port ?? 3737;
         const result = await ensureDaemon({
           port,
@@ -652,9 +918,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       if (opts.help) await withCustomHelp(daemonCmd, "daemon");
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
       const { restartDaemon } = await import("../src/daemon/lifecycle.js");
-      const { selectStorageBackend } = await import("../src/storage/backend.js");
       const config = loadDaemonConfig(defaultConfigPath());
-      selectStorageBackend(config.storage);
       const port = config.daemon?.port ?? 3737;
       const result = await restartDaemon({
         port,
@@ -1051,17 +1315,31 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       const { homedir } = await import("node:os");
       const config = loadDaemonConfig(defaultConfigPath());
       const jsonFlag: boolean = opts.json ?? false;
-      const client = await createDaemonClientOrExit();
+      const client = await createDaemonClientOrExit({ preflightStorage: false });
 
       let daemonStatus = "down";
       let statusData: any = null;
 
       try {
         const health = await client.health();
-        if (health) daemonStatus = "up";
+        if (health) {
+          daemonStatus = "up";
+          if (health.status === "unavailable") {
+            statusData = {
+              daemon: {
+                status: "up",
+                version: health.version,
+                uptime: health.uptime,
+                port: config.daemon.port,
+                storageBackend: health.storageBackend,
+                storageStatus: "unavailable",
+              },
+            };
+          }
+        }
 
         // Also fetch /status endpoint if daemon is up
-        if (daemonStatus === "up") {
+        if (daemonStatus === "up" && !statusData) {
           statusData = await client.post("/status", { cwd: process.cwd() });
         }
       } catch {}
@@ -1084,14 +1362,21 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
           console.log(`  Uptime: ${statusData.daemon.uptime}s`);
           console.log(`  Port: ${statusData.daemon.port}`);
           console.log(`  Provider: ${providerDisplay}`);
-          console.log();
-          console.log("Project:");
-          console.log(`  Messages: ${statusData.project.messageCount}`);
-          console.log(`  Summaries: ${statusData.project.summaryCount}`);
-          console.log(`  Promoted: ${statusData.project.promotedCount}`);
-          if (statusData.project.lastIngest) console.log(`  Last Ingest: ${statusData.project.lastIngest}`);
-          if (statusData.project.lastCompact) console.log(`  Last Compact: ${statusData.project.lastCompact}`);
-          if (statusData.project.lastPromote) console.log(`  Last Promote: ${statusData.project.lastPromote}`);
+          if (statusData.daemon.storageBackend) {
+            console.log(
+              `  Storage: ${statusData.daemon.storageBackend} (${statusData.daemon.storageStatus})`,
+            );
+          }
+          if (statusData.project) {
+            console.log();
+            console.log("Project:");
+            console.log(`  Messages: ${statusData.project.messageCount}`);
+            console.log(`  Summaries: ${statusData.project.summaryCount}`);
+            console.log(`  Promoted: ${statusData.project.promotedCount}`);
+            if (statusData.project.lastIngest) console.log(`  Last Ingest: ${statusData.project.lastIngest}`);
+            if (statusData.project.lastCompact) console.log(`  Last Compact: ${statusData.project.lastCompact}`);
+            if (statusData.project.lastPromote) console.log(`  Last Promote: ${statusData.project.lastPromote}`);
+          }
         } else {
           console.log(`daemon: ${daemonStatus} · provider: ${providerDisplay}`);
         }
@@ -1245,7 +1530,9 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
 
   program.addCommand(eventsCmd);
 
-  registerMapCommand(program);
+  registerMachineCommand(program);
+  registerProjectCommand(program);
+  registerPostgreSqlCommand(program);
   registerMemoryCommands(program);
 
   // ─── diagnose ──────────────────────────────────────────────────────────────

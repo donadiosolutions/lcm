@@ -5,7 +5,12 @@ import type { RouteHandler } from "../server.js";
 import { createRetrievalEngine } from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
 import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
-import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
+import {
+  closeRouteStorage,
+  openExistingProject,
+  stagedPostgreSqlUnavailableResponse,
+  storageIdentityRequiredResponse,
+} from "./storage-lifecycle.js";
 
 export function createDescribeHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body) => {
@@ -34,9 +39,11 @@ export function createDescribeHandler(config: DaemonConfig, storageFactory?: Sto
 
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
+    let activeFactory: StorageBackendFactory | undefined;
     try {
-      const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await openExistingProject(factory, projectIdentity(cwd)) ?? undefined;
+      const identity = projectIdentity(cwd, config.storage);
+      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+      project = await openExistingProject(activeFactory, identity) ?? undefined;
       if (!project) {
         sendJson(res, 200, { node: null });
         return;
@@ -45,6 +52,16 @@ export function createDescribeHandler(config: DaemonConfig, storageFactory?: Sto
       const result = await engine.describe(nodeId);
       sendJson(res, 200, { node: result });
     } catch (err) {
+      const identityRequired = storageIdentityRequiredResponse(err);
+      if (identityRequired) {
+        sendJson(res, 409, identityRequired);
+        return;
+      }
+      const unavailable = stagedPostgreSqlUnavailableResponse(activeFactory, err, "describe");
+      if (unavailable) {
+        sendJson(res, 503, unavailable);
+        return;
+      }
       sendJson(res, 200, { node: null, error: err instanceof Error ? err.message : "describe failed" });
     } finally {
       await closeRouteStorage(project, ownedFactory);

@@ -189,6 +189,41 @@ describe("prompt-search route coverage", () => {
     expect(state.closed).toEqual([]);
   });
 
+  it("admits PostgreSQL storage before returning a disabled empty result", async () => {
+    const projectClose = vi.fn(async () => undefined);
+    const project = {
+      lexicalSearch: { searchPromoted: vi.fn(async () => []) },
+      recall: {
+        getFeedback: vi.fn(async () => new Map()),
+        logSurfacing: vi.fn(async () => undefined),
+      },
+      close: projectClose,
+    };
+    const factory = makeMockStorageFactory({
+      projectExists: vi.fn(async () => true),
+      openProject: vi.fn(async () => project as unknown as ProjectStorage),
+    });
+
+    expect(await call(
+      JSON.stringify({ query: "q", cwd: "/tmp" }),
+      (value) => {
+        value.storage = {
+          backend: "postgresql",
+          postgresql: {
+            url: "postgresql://user:secret@db.example/lcm",
+            poolMax: 5,
+            connectionTimeoutMs: 10_000,
+            idleTimeoutMs: 30_000,
+            statementTimeoutMs: 60_000,
+          },
+        };
+        value.restoration.promptSearchMaxResults = 0;
+      },
+      factory,
+    )).toEqual({ hints: [], ids: [] });
+    expect(projectClose).toHaveBeenCalledOnce();
+  });
+
   it("returns no suggestions without opening a missing database", async () => {
     state.exists = false;
     expect(await call(JSON.stringify({ query: "q", cwd: "/tmp" }))).toEqual({ hints: [] });

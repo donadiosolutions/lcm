@@ -5,7 +5,12 @@ import type { RouteHandler } from "../server.js";
 import { createRetrievalEngine } from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
 import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
-import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
+import {
+  closeRouteStorage,
+  openExistingProject,
+  stagedPostgreSqlUnavailableResponse,
+  storageIdentityRequiredResponse,
+} from "./storage-lifecycle.js";
 
 export function createSearchHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body) => {
@@ -35,9 +40,11 @@ export function createSearchHandler(config: DaemonConfig, storageFactory?: Stora
     if (cwd) {
       let project: ProjectStorage | undefined;
       let ownedFactory: StorageBackendFactory | undefined;
+      let activeFactory: StorageBackendFactory | undefined;
       try {
-        const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-        project = await openExistingProject(factory, projectIdentity(cwd)) ?? undefined;
+        const identity = projectIdentity(cwd, config.storage);
+        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        project = await openExistingProject(activeFactory, identity) ?? undefined;
         if (project) {
 
           // Episodic: FTS5 search across messages + summaries
@@ -63,7 +70,19 @@ export function createSearchHandler(config: DaemonConfig, storageFactory?: Stora
             } catch { /* non-fatal */ }
           }
         }
-      } catch { /* non-fatal */ }
+      } catch (error) {
+        const identityRequired = storageIdentityRequiredResponse(error);
+        if (identityRequired) {
+          sendJson(res, 409, identityRequired);
+          return;
+        }
+        const unavailable = stagedPostgreSqlUnavailableResponse(activeFactory, error, "search");
+        if (unavailable) {
+          sendJson(res, 503, unavailable);
+          return;
+        }
+        // SQLite read/search failures remain non-fatal and return empty layers.
+      }
       finally {
         await closeRouteStorage(project, ownedFactory);
       }

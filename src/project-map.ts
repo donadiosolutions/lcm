@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import {
   existsSync,
-  mkdirSync,
   realpathSync,
   readdirSync,
   statSync,
@@ -17,17 +16,44 @@ import {
   readBoundedRegularFileWithStat,
   writePrivateFileExclusive,
 } from "./security-files.js";
+import { normalizeUuidV7 } from "./machine-identity.js";
+import {
+  PrivateMutationLockContentionError,
+  withPrivateMutationLock,
+  type PrivateMutationLockObserver,
+} from "./private-mutation-lock.js";
 
 export type ProjectMapEntry = {
   canonical: string;
   aliases: string[];
+  remoteProjectId?: string;
 };
 
 export type ProjectMap = Record<string, ProjectMapEntry>;
 
+function projectMapEntriesEqual(left: ProjectMapEntry, right: ProjectMapEntry): boolean {
+  const leftAliases = left.aliases.map((path) => resolve(path)).sort();
+  const rightAliases = right.aliases.map((path) => resolve(path)).sort();
+  return left.remoteProjectId === right.remoteProjectId
+    && resolve(left.canonical) === resolve(right.canonical)
+    && leftAliases.length === rightAliases.length
+    && leftAliases.every((path, index) => path === rightAliases[index]);
+}
+
+function assertExpectedProjectMapEntry(
+  hash: string,
+  actual: ProjectMapEntry,
+  expected: ProjectMapEntry | undefined,
+): void {
+  if (expected && !projectMapEntriesEqual(actual, expected)) {
+    throw new Error(`project map entry ${hash} changed during coordinated mutation`);
+  }
+}
+
 export type ProjectIdentity = {
   id: string;
   canonical: string;
+  remoteProjectId?: string;
 };
 
 export type ProjectMapValidation = {
@@ -42,7 +68,31 @@ export type ProjectMapValidation = {
 
 const HASH_RE = /^[a-f0-9]{64}$/;
 const MAX_PROJECT_MAP_BYTES = 4 * 1024 * 1024;
+const MAX_PROJECT_MAP_BACKUP_ATTEMPTS = 1_000;
 let cache: { path: string; mtimeMs: number | null; map: ProjectMap; metadataPopulated: boolean } | null = null;
+const activeProjectMapMutationLocks = new Set<string>();
+
+export type ProjectMapLockObserver = PrivateMutationLockObserver;
+
+function projectMapMutationLockPath(homeDir?: string): string {
+  return `${projectMapPath(homeDir)}.lock`;
+}
+
+function withProjectMapMutationLock<T>(
+  callback: () => T,
+  homeDir?: string,
+  observer?: ProjectMapLockObserver,
+): T {
+  const lockPath = projectMapMutationLockPath(homeDir);
+  return withPrivateMutationLock(lockPath, "project map", () => {
+    activeProjectMapMutationLocks.add(lockPath);
+    try {
+      return callback();
+    } finally {
+      activeProjectMapMutationLocks.delete(lockPath);
+    }
+  }, observer);
+}
 
 export function projectMapPath(homeDir?: string): string {
   return join(lcmHomeDir(homeDir), "map.json");
@@ -77,7 +127,11 @@ function cloneMap(map: ProjectMap): ProjectMap {
   return Object.fromEntries(
     Object.entries(map).map(([hash, entry]) => [
       hash,
-      { canonical: entry.canonical, aliases: [...entry.aliases] },
+      {
+        canonical: entry.canonical,
+        aliases: [...entry.aliases],
+        ...(entry.remoteProjectId ? { remoteProjectId: entry.remoteProjectId } : {}),
+      },
     ]),
   );
 }
@@ -98,38 +152,73 @@ function readMapFile(path: string): { content: string; mtimeMs: number | null } 
   }
 }
 
+class InvalidProjectMapError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidProjectMapError";
+  }
+}
+
 function parseProjectMap(content: string): ProjectMap {
-  const parsed = JSON.parse(content) as unknown;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content) as unknown;
+  } catch (error) {
+    throw new InvalidProjectMapError(
+      error instanceof Error ? error.message : "map.json is invalid",
+    );
+  }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("map.json must be an object");
+    throw new InvalidProjectMapError("map.json must be an object");
   }
 
   const map: ProjectMap = {};
   for (const [hash, value] of Object.entries(parsed)) {
     if (!HASH_RE.test(hash)) {
-      throw new Error(`map entry key must be a 64-character lowercase sha256 hash: ${hash}`);
+      throw new InvalidProjectMapError(
+        `map entry key must be a 64-character lowercase sha256 hash: ${hash}`,
+      );
     }
     if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error(`map entry ${hash} must be an object`);
+      throw new InvalidProjectMapError(`map entry ${hash} must be an object`);
     }
     const entry = value as Record<string, unknown>;
     if (typeof entry.canonical !== "string" || entry.canonical.length === 0) {
-      throw new Error(`map entry ${hash}.canonical must be a non-empty string`);
+      throw new InvalidProjectMapError(
+        `map entry ${hash}.canonical must be a non-empty string`,
+      );
     }
     if (!isAbsolute(entry.canonical)) {
-      throw new Error(`map entry ${hash}.canonical must be an absolute path`);
+      throw new InvalidProjectMapError(
+        `map entry ${hash}.canonical must be an absolute path`,
+      );
     }
     if (!Array.isArray(entry.aliases) || !entry.aliases.every((alias) => typeof alias === "string" && alias.length > 0)) {
-      throw new Error(`map entry ${hash}.aliases must be an array of non-empty strings`);
+      throw new InvalidProjectMapError(
+        `map entry ${hash}.aliases must be an array of non-empty strings`,
+      );
     }
     for (const alias of entry.aliases) {
       if (!isAbsolute(alias)) {
-        throw new Error(`map entry ${hash}.aliases must contain only absolute paths: ${alias}`);
+        throw new InvalidProjectMapError(
+          `map entry ${hash}.aliases must contain only absolute paths: ${alias}`,
+        );
       }
+    }
+    const remoteProjectId = typeof entry.remoteProjectId === "string"
+      ? normalizeUuidV7(entry.remoteProjectId)
+      : null;
+    if (entry.remoteProjectId !== undefined && remoteProjectId === null) {
+      throw new InvalidProjectMapError(
+        `map entry ${hash}.remoteProjectId must be a PostgreSQL UUIDv7`,
+      );
     }
     map[hash] = {
       canonical: entry.canonical,
       aliases: [...entry.aliases],
+      ...(remoteProjectId
+        ? { remoteProjectId }
+        : {}),
     };
   }
   return map;
@@ -143,14 +232,19 @@ function createBackupIfNeeded(path: string, homeDir?: string): string | undefine
   if (!existsSync(path)) return undefined;
   const backupDir = oldMapsDir(homeDir);
   ensurePrivateDirectory(backupDir);
-  const backupPath = join(backupDir, `map-${Math.floor(Date.now() / 1000)}.json`);
-  if (!existsSync(backupPath)) {
-    writePrivateFileExclusive(backupPath, readBoundedRegularFile(path, {
-      allowedRoot: dirname(path),
-      maxBytes: MAX_PROJECT_MAP_BYTES,
-    }));
+  const timestamp = Math.floor(Date.now() / 1000);
+  const content = readBoundedRegularFile(path, {
+    allowedRoot: dirname(path),
+    maxBytes: MAX_PROJECT_MAP_BYTES,
+  });
+  for (let suffix = 0; suffix < MAX_PROJECT_MAP_BACKUP_ATTEMPTS; suffix += 1) {
+    const discriminator = suffix === 0 ? "" : `-${suffix}`;
+    const backupPath = join(backupDir, `map-${timestamp}${discriminator}.json`);
+    if (writePrivateFileExclusive(backupPath, content)) return backupPath;
   }
-  return backupPath;
+  throw new Error(
+    `could not create an exclusive project map backup after ${MAX_PROJECT_MAP_BACKUP_ATTEMPTS} attempts; move old backups aside and retry`,
+  );
 }
 
 function assertCurrentMapIsWritable(path: string): void {
@@ -159,12 +253,11 @@ function assertCurrentMapIsWritable(path: string): void {
   try {
     parseProjectMap(file.content);
   } catch (err) {
-    const detail = err instanceof Error ? err.message : "map.json is invalid";
-    throw new Error(`refusing to overwrite invalid map.json: ${detail}`);
+    throw new Error(`refusing to overwrite invalid map.json: ${(err as Error).message}`);
   }
 }
 
-export function writeProjectMap(
+function writeProjectMap(
   map: ProjectMap,
   homeDir?: string,
   opts: { metadataPopulated?: boolean } = {},
@@ -211,7 +304,12 @@ function loadProjectMap(opts: { strict?: boolean; reload?: boolean; homeDir?: st
   }
 }
 
-function loadProjectMapWithMetadata(opts: { strict?: boolean; reload?: boolean; homeDir?: string } = {}): ProjectMap {
+function loadProjectMapWithMetadata(opts: {
+  strict?: boolean;
+  reload?: boolean;
+  homeDir?: string;
+  _beforeMetadataLockForTesting?: () => void;
+} = {}): ProjectMap {
   const path = projectMapPath(opts.homeDir);
   const map = loadProjectMap(opts);
   if (!opts.reload && cache?.path === path && cache.metadataPopulated) {
@@ -220,8 +318,25 @@ function loadProjectMapWithMetadata(opts: { strict?: boolean; reload?: boolean; 
 
   const populated = populateFromExistingProjectMetadata(map, opts.homeDir);
   if (populated.changed) {
-    writeProjectMap(populated.map, opts.homeDir, { metadataPopulated: true });
-    return populated.map;
+    if (activeProjectMapMutationLocks.has(projectMapMutationLockPath(opts.homeDir))) {
+      writeProjectMap(populated.map, opts.homeDir, { metadataPopulated: true });
+      return populated.map;
+    }
+    opts._beforeMetadataLockForTesting?.();
+    return withProjectMapMutationLock(() => {
+      const current = loadProjectMap({
+        strict: true,
+        reload: true,
+        homeDir: opts.homeDir,
+      });
+      const locked = populateFromExistingProjectMetadata(current, opts.homeDir);
+      if (locked.changed) {
+        writeProjectMap(locked.map, opts.homeDir, { metadataPopulated: true });
+      } else {
+        cache = { ...cache!, map: cloneMap(current), metadataPopulated: true };
+      }
+      return locked.map;
+    }, opts.homeDir);
   }
 
   cache = { ...cache!, map: cloneMap(map), metadataPopulated: true };
@@ -327,25 +442,70 @@ function existingProjectHasStoredData(hash: string): boolean {
     || existsSync(join(lcmHomeDir(), "events", `${hash}.db`));
 }
 
-export function resolveProjectIdentity(cwd: string): ProjectIdentity {
-  const map = loadProjectMapWithMetadata();
-
-  const normalized = normalizeProjectPath(cwd);
+function identityForMatches(
+  map: ProjectMap,
+  cwd: string,
+  normalized: string,
+): ProjectIdentity | null {
   const matches = findPathMatches(map, cwd);
   if (matches.size > 1) {
     throw new Error(`project path maps to multiple hashes: ${normalized} (${[...matches].join(", ")})`);
   }
-  if (matches.size === 1) {
-    const id = [...matches][0];
-    return { id, canonical: resolve(map[id].canonical) };
-  }
+  if (matches.size === 0) return null;
+  const id = [...matches][0];
+  return {
+    id,
+    canonical: resolve(map[id].canonical),
+    ...(map[id].remoteProjectId ? { remoteProjectId: map[id].remoteProjectId } : {}),
+  };
+}
 
-  const id = hashProjectPath(normalized);
-  if (!map[id]) {
-    map[id] = { canonical: normalized, aliases: [] };
-    writeProjectMap(map, undefined, { metadataPopulated: true });
+export function resolveProjectIdentity(
+  cwd: string,
+  opts: {
+    /** @internal Test-only synchronization seam for deterministic race coverage. */
+    readonly _beforeMissingEntryLockForTesting?: () => void;
+    /** @internal Test-only synchronization seam for metadata backfill coverage. */
+    readonly _beforeMetadataLockForTesting?: () => void;
+  } = {},
+): ProjectIdentity {
+  const map = loadProjectMapWithMetadata({
+    _beforeMetadataLockForTesting: opts._beforeMetadataLockForTesting,
+  });
+  const normalized = normalizeProjectPath(cwd);
+  const existing = identityForMatches(map, cwd, normalized);
+  if (existing) return existing;
+
+  opts._beforeMissingEntryLockForTesting?.();
+  const createMissingIdentity = (): ProjectIdentity => {
+    let current: ProjectMap;
+    try {
+      current = loadProjectMapWithMetadata({ strict: true, reload: true });
+    } catch (error) {
+      if (error instanceof InvalidProjectMapError) {
+        throw new Error(`refusing to overwrite invalid map.json: ${error.message}`);
+      }
+      throw error;
+    }
+    // Preserve a known-good in-memory snapshot when the file disappeared
+    // between the optimistic read and the locked reload. A genuinely fresh
+    // bootstrap has an empty snapshot and follows this same path.
+    if (!existsSync(projectMapPath())) current = map;
+    const raced = identityForMatches(current, cwd, normalized);
+    if (raced) return raced;
+    const id = hashProjectPath(normalized);
+    current[id] ??= { canonical: normalized, aliases: [] };
+    writeProjectMap(current, undefined, { metadataPopulated: true });
+    return {
+      id,
+      canonical: resolve(current[id].canonical),
+      ...(current[id].remoteProjectId ? { remoteProjectId: current[id].remoteProjectId } : {}),
+    };
+  };
+  if (activeProjectMapMutationLocks.has(projectMapMutationLockPath())) {
+    return createMissingIdentity();
   }
-  return { id, canonical: resolve(map[id].canonical) };
+  return withProjectMapMutationLock(createMissingIdentity);
 }
 
 export function listProjectMapEntries(): ProjectMap {
@@ -369,6 +529,19 @@ export function showProjectMapEntry(target?: string): { hash: string; entry: Pro
     const entry = map[target];
     if (!entry) throw new Error(`unknown project hash: ${target}`);
     return { hash: target, entry };
+  }
+  const remoteProjectId = normalizeUuidV7(target);
+  if (remoteProjectId) {
+    const matches = Object.entries(map).filter(
+      ([, entry]) => entry.remoteProjectId === remoteProjectId,
+    );
+    if (matches.length === 0) throw new Error(`unknown remote project UUIDv7: ${remoteProjectId}`);
+    if (matches.length > 1) {
+      throw new Error(
+        `remote project UUIDv7 maps to multiple local hashes: ${remoteProjectId} (${matches.map(([hash]) => hash).join(", ")})`,
+      );
+    }
+    return { hash: matches[0][0], entry: matches[0][1] };
   }
   const matches = findPathMatches(map, target);
   if (matches.size > 1) throw new Error(`project path maps to multiple hashes: ${target} (${[...matches].join(", ")})`);
@@ -411,49 +584,194 @@ export function projectMapPathsForHash(hash: string): string[] {
   return [...new Set([entry.canonical, ...entry.aliases].map((path) => resolve(path)))];
 }
 
-export function addProjectAlias(alias: string, opts: { canonical?: string; hash?: string } = {}): { hash: string; entry: ProjectMapEntry; warning?: string; backupPath?: string } {
+export function isProjectHash(value: string): boolean {
+  return HASH_RE.test(value);
+}
+
+export function projectMapEntryHasStoredData(hash: string): boolean {
+  return existingProjectHasStoredData(hash);
+}
+
+export function setRemoteProjectBinding(
+  remoteProjectId: string,
+  opts: {
+    readonly canonical?: string;
+    readonly hash?: string;
+    readonly alias?: string;
+    readonly allowExistingData?: boolean;
+    readonly expectedEntry?: ProjectMapEntry;
+    /** @internal Test-only synchronization seam for deterministic race coverage. */
+    readonly _afterLockForTesting?: () => void;
+    /** @internal Test-only failure injection for lock protocol boundaries. */
+    readonly _lockObserverForTesting?: ProjectMapLockObserver;
+  } = {},
+): {
+  readonly hash: string;
+  readonly entry: ProjectMapEntry;
+  readonly changed: boolean;
+  readonly backupPath?: string;
+} {
+  const normalizedRemoteProjectId = normalizeUuidV7(remoteProjectId);
+  if (!normalizedRemoteProjectId) {
+    throw new Error(`invalid remote project UUIDv7: ${remoteProjectId}`);
+  }
+  return withProjectMapMutationLock(() => {
+    opts._afterLockForTesting?.();
+    const target = resolveCliTarget({ canonical: opts.canonical, hash: opts.hash });
+    assertExpectedProjectMapEntry(target.hash, target.entry, opts.expectedEntry);
+    let aliasChanged = false;
+    if (opts.alias !== undefined) {
+      const alias = resolve(opts.alias);
+      if (!existsSync(alias)) throw new Error(`alias path does not exist: ${alias}`);
+      if (!statSync(alias).isDirectory()) {
+        throw new Error(`alias path must be an existing directory: ${alias}`);
+      }
+      const owners = collectPathOwners(target.map).get(alias) ?? new Set<string>();
+      const foreignOwners = [...owners].filter((owner) => owner !== target.hash);
+      if (foreignOwners.length > 0) {
+        throw new Error(
+          `alias is already mapped to another hash: ${alias} (${foreignOwners.join(", ")})`,
+        );
+      }
+      if (
+        resolve(target.entry.canonical) !== alias
+        && !target.entry.aliases.some((candidate) => resolve(candidate) === alias)
+      ) {
+        target.map[target.hash].aliases.push(alias);
+        aliasChanged = true;
+      }
+    }
+    const current = target.entry.remoteProjectId;
+    if (current === normalizedRemoteProjectId && !aliasChanged) {
+      return { hash: target.hash, entry: target.entry, changed: false };
+    }
+    if (
+      current !== undefined
+      && existingProjectHasStoredData(target.hash)
+      && !opts.allowExistingData
+    ) {
+      throw new Error(
+        `project ${target.hash} already has local data; rerun with --allow-existing-data to rebind it explicitly`,
+      );
+    }
+    target.map[target.hash].remoteProjectId = normalizedRemoteProjectId;
+    const write = writeProjectMap(target.map);
+    return {
+      hash: target.hash,
+      entry: target.map[target.hash],
+      changed: true,
+      backupPath: write.backupPath,
+    };
+  }, undefined, opts._lockObserverForTesting);
+}
+
+export function clearRemoteProjectBinding(
+  target: string | undefined,
+  expectedRemoteProjectId: string,
+  opts: {
+    readonly expectedEntry?: ProjectMapEntry;
+    /** @internal Test-only synchronization seam for deterministic race coverage. */
+    readonly _afterLockForTesting?: () => void;
+  } = {},
+): {
+  readonly hash: string;
+  readonly entry: ProjectMapEntry;
+  readonly remoteProjectId?: string;
+  readonly changed: boolean;
+  readonly backupPath?: string;
+} {
+  const normalizedExpectedRemoteProjectId = normalizeUuidV7(expectedRemoteProjectId);
+  if (!normalizedExpectedRemoteProjectId) {
+    throw new Error(`invalid expected remote project UUIDv7: ${expectedRemoteProjectId}`);
+  }
+  return withProjectMapMutationLock(() => {
+    opts._afterLockForTesting?.();
+    const shown = showProjectMapEntry(target);
+    if (shown.transient) {
+      throw new Error(`project is not mapped: ${target ?? process.cwd()}`);
+    }
+    const map = listProjectMapEntries();
+    // The lock makes the non-transient result and this same cached map one
+    // synchronous mutation snapshot.
+    const entry = map[shown.hash]!;
+    assertExpectedProjectMapEntry(shown.hash, entry, opts.expectedEntry);
+    if (entry.remoteProjectId !== normalizedExpectedRemoteProjectId) {
+      throw new Error(
+        `project ${shown.hash} remote binding changed; expected ${expectedRemoteProjectId}`,
+      );
+    }
+    delete entry.remoteProjectId;
+    const write = writeProjectMap(map);
+    return {
+      hash: shown.hash,
+      entry,
+      remoteProjectId: normalizedExpectedRemoteProjectId,
+      changed: true,
+      backupPath: write.backupPath,
+    };
+  });
+}
+
+export function addProjectAlias(alias: string, opts: {
+  canonical?: string;
+  hash?: string;
+  expectedEntry?: ProjectMapEntry;
+  _afterLockForTesting?: () => void;
+} = {}): { hash: string; entry: ProjectMapEntry; warning?: string; backupPath?: string } {
   const normalizedAlias = resolve(alias);
   if (!existsSync(normalizedAlias)) throw new Error(`alias path does not exist: ${normalizedAlias}`);
   if (!statSync(normalizedAlias).isDirectory()) throw new Error(`alias path must be an existing directory: ${normalizedAlias}`);
-  const target = resolveCliTarget(opts);
-  const canonical = resolve(target.entry.canonical);
-  if (normalizedAlias === canonical) {
-    throw new Error(`alias matches canonical path for ${target.hash}: ${normalizedAlias}`);
-  }
-
-  const owners = collectPathOwners(target.map);
-  const existingOwners = owners.get(normalizedAlias) ?? new Set<string>();
-  if (existingOwners.has(target.hash)) {
-    throw new Error(`alias is already mapped to ${target.hash}: ${normalizedAlias}`);
-  }
-  if (existingOwners.size > 0) {
-    const canonicalAlias = normalizeProjectPath(normalizedAlias);
-    const adoptableOwners = [...existingOwners].filter((ownerHash) => {
-      const entry = target.map[ownerHash];
-      return entry
-        && ownerHash === hashProjectPath(canonicalAlias)
-        && normalizeProjectPath(entry.canonical) === canonicalAlias
-        && entry.aliases.length === 0;
-    });
-    if (existingOwners.size === 1 && adoptableOwners.length === 1) {
-      if (existingProjectHasStoredData(adoptableOwners[0])) {
-        throw new Error(`alias is already a project with stored data: ${normalizedAlias} (${adoptableOwners[0]})`);
-      }
-      delete target.map[adoptableOwners[0]];
-    } else {
-      throw new Error(`alias is already mapped to another hash: ${normalizedAlias} (${[...existingOwners].join(", ")})`);
+  return withProjectMapMutationLock(() => {
+    opts._afterLockForTesting?.();
+    const target = resolveCliTarget(opts);
+    assertExpectedProjectMapEntry(target.hash, target.entry, opts.expectedEntry);
+    const canonical = resolve(target.entry.canonical);
+    if (normalizedAlias === canonical) {
+      throw new Error(`alias matches canonical path for ${target.hash}: ${normalizedAlias}`);
     }
-  }
 
-  target.map[target.hash].aliases.push(normalizedAlias);
-  const write = writeProjectMap(target.map);
-  return { hash: target.hash, entry: target.map[target.hash], backupPath: write.backupPath };
+    const owners = collectPathOwners(target.map);
+    const existingOwners = owners.get(normalizedAlias) ?? new Set<string>();
+    if (existingOwners.has(target.hash)) {
+      throw new Error(`alias is already mapped to ${target.hash}: ${normalizedAlias}`);
+    }
+    if (existingOwners.size > 0) {
+      const canonicalAlias = normalizeProjectPath(normalizedAlias);
+      const adoptableOwners = [...existingOwners].filter((ownerHash) => {
+        const entry = target.map[ownerHash];
+        return entry
+          && ownerHash === hashProjectPath(canonicalAlias)
+          && normalizeProjectPath(entry.canonical) === canonicalAlias
+          && entry.aliases.length === 0
+          && entry.remoteProjectId === undefined;
+      });
+      if (existingOwners.size === 1 && adoptableOwners.length === 1) {
+        if (existingProjectHasStoredData(adoptableOwners[0])) {
+          throw new Error(`alias is already a project with stored data: ${normalizedAlias} (${adoptableOwners[0]})`);
+        }
+        delete target.map[adoptableOwners[0]];
+      } else {
+        throw new Error(`alias is already mapped to another hash: ${normalizedAlias} (${[...existingOwners].join(", ")})`);
+      }
+    }
+
+    target.map[target.hash].aliases.push(normalizedAlias);
+    const write = writeProjectMap(target.map);
+    return { hash: target.hash, entry: target.map[target.hash], backupPath: write.backupPath };
+  });
 }
 
-export function removeProjectAlias(alias: string, opts: { canonical?: string; hash?: string } = {}): { hash: string; entry: ProjectMapEntry; removed: boolean; backupPath?: string } {
+export function removeProjectAlias(alias: string, opts: {
+  canonical?: string;
+  hash?: string;
+  expectedEntry?: ProjectMapEntry;
+  _afterLockForTesting?: () => void;
+} = {}): { hash: string; entry: ProjectMapEntry; removed: boolean; backupPath?: string } {
   const normalizedAlias = resolve(alias);
-  let map = loadProjectMap({ strict: true, reload: true });
-  let hash: string;
+  return withProjectMapMutationLock(() => {
+    opts._afterLockForTesting?.();
+    const map = loadProjectMap({ strict: true, reload: true });
+    let hash: string;
 
   if (opts.canonical && opts.hash) {
     throw new Error("--canonical and --hash are mutually exclusive");
@@ -482,15 +800,17 @@ export function removeProjectAlias(alias: string, opts: { canonical?: string; ha
     hash = owners[0];
   }
 
-  const entry = map[hash];
-  const before = entry.aliases.length;
-  entry.aliases = entry.aliases.filter((candidate) => resolve(candidate) !== normalizedAlias);
-  const removed = entry.aliases.length !== before;
-  const write: { backupPath?: string } = removed ? writeProjectMap(map) : {};
-  return { hash, entry, removed, backupPath: write.backupPath };
+    const entry = map[hash];
+    assertExpectedProjectMapEntry(hash, entry, opts.expectedEntry);
+    const before = entry.aliases.length;
+    entry.aliases = entry.aliases.filter((candidate) => resolve(candidate) !== normalizedAlias);
+    const removed = entry.aliases.length !== before;
+    const write: { backupPath?: string } = removed ? writeProjectMap(map) : {};
+    return { hash, entry, removed, backupPath: write.backupPath };
+  });
 }
 
-export function validateProjectMap(opts: { homeDir?: string; fix?: boolean } = {}): ProjectMapValidation {
+function validateProjectMapUnlocked(opts: { homeDir?: string; fix?: boolean }): ProjectMapValidation {
   const path = projectMapPath(opts.homeDir);
   const file = readMapFile(path);
   if (!file) {
@@ -505,7 +825,7 @@ export function validateProjectMap(opts: { homeDir?: string; fix?: boolean } = {
       ok: false,
       map: null,
       path,
-      errors: [err instanceof Error ? err.message : "map.json is invalid"],
+      errors: [(err as Error).message],
       warnings: [],
       fixApplied: false,
     };
@@ -544,7 +864,13 @@ export function validateProjectMap(opts: { homeDir?: string; fix?: boolean } = {
   };
 }
 
-export function reloadProjectMapCache(opts: { reformat?: boolean } = {}): boolean {
+export function validateProjectMap(opts: { homeDir?: string; fix?: boolean } = {}): ProjectMapValidation {
+  return opts.fix
+    ? withProjectMapMutationLock(() => validateProjectMapUnlocked(opts), opts.homeDir)
+    : validateProjectMapUnlocked(opts);
+}
+
+function reloadProjectMapCacheUnlocked(opts: { reformat?: boolean }): boolean {
   const path = projectMapPath();
   const file = readMapFile(path);
   if (!file) {
@@ -566,25 +892,46 @@ export function reloadProjectMapCache(opts: { reformat?: boolean } = {}): boolea
   }
 }
 
+export function reloadProjectMapCache(opts: { reformat?: boolean } = {}): boolean {
+  return opts.reformat
+    ? withProjectMapMutationLock(() => reloadProjectMapCacheUnlocked(opts))
+    : reloadProjectMapCacheUnlocked(opts);
+}
+
 export function watchProjectMap(): { close: () => void } {
   const path = projectMapPath();
   ensurePrivateDirectory(dirname(path));
   let closed = false;
   let watcher: FSWatcher | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let activeWatchPath: string | undefined;
+  let arm: () => void;
 
-  const arm = () => {
+  const scheduleReload = (watchPath: string | undefined) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = undefined;
+      try {
+        reloadProjectMapCache({ reformat: true });
+      } catch (error) {
+        if (error instanceof PrivateMutationLockContentionError) {
+          scheduleReload(watchPath);
+        }
+        return;
+      }
+      if (!closed && !existsSync(path)) arm();
+      if (!closed && watchPath === path) arm();
+    }, 25);
+  };
+
+  arm = () => {
     try {
       watcher?.close();
       const watchPath = existsSync(path) ? path : dirname(path);
+      activeWatchPath = watchPath;
       watcher = watch(watchPath, (_event, filename) => {
         if (watchPath !== path && filename && filename.toString() !== "map.json") return;
-        if (timer) clearTimeout(timer);
-        timer = setTimeout(() => {
-          reloadProjectMapCache({ reformat: true });
-          if (!closed && !existsSync(path)) arm();
-          if (!closed && watchPath === path) arm();
-        }, 25);
+        scheduleReload(watchPath);
       });
       watcher.unref();
     } catch {
@@ -592,8 +939,15 @@ export function watchProjectMap(): { close: () => void } {
     }
   };
 
-  reloadProjectMapCache({ reformat: true });
+  let startupContended = false;
+  try {
+    reloadProjectMapCache({ reformat: true });
+  } catch (error) {
+    if (!(error instanceof PrivateMutationLockContentionError)) throw error;
+    startupContended = true;
+  }
   arm();
+  if (startupContended) scheduleReload(activeWatchPath);
 
   return {
     close: () => {

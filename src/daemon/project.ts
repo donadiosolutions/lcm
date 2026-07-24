@@ -4,11 +4,24 @@ import { join, resolve, normalize, join as pathJoin, dirname, basename, parse } 
 import { lcmHomeDir } from "../runtime-paths.js";
 import { resolveProjectIdentity, type ProjectIdentity } from "../project-map.js";
 import { atomicWritePrivateFile, ensurePrivateDirectory, readBoundedRegularFile } from "../security-files.js";
+import type { StorageIdentityContext } from "../storage/contracts.js";
+import { resolveStorageIdentityContext } from "../storage/identity-context.js";
+import type { ResolvedStorageConfig } from "./config.js";
 
 const MAX_PROJECT_METADATA_BYTES = 1024 * 1024;
 
-export const projectIdentity = (cwd: string): ProjectIdentity =>
-  resolveProjectIdentity(cwd);
+export function projectIdentity(cwd: string): ProjectIdentity;
+export function projectIdentity(
+  cwd: string,
+  config: ResolvedStorageConfig,
+): StorageIdentityContext;
+export function projectIdentity(
+  cwd: string,
+  config?: ResolvedStorageConfig,
+): ProjectIdentity | StorageIdentityContext {
+  const local = resolveProjectIdentity(cwd);
+  return config ? resolveStorageIdentityContext(config, local) : local;
+}
 
 export const projectId = (cwd: string): string =>
   projectIdentity(cwd).id;
@@ -113,9 +126,8 @@ export function isSafeTranscriptPath(transcriptPath: string, cwd: string): strin
   return false;
 }
 
-/** Ensures the project dir exists and writes cwd to meta.json. */
-export const ensureProjectDir = (cwd: string): string => {
-  const identity = resolveProjectIdentity(cwd);
+/** Ensures the snapshotted project dir exists and writes its canonical cwd to meta.json. */
+export const ensureProjectDirForIdentity = (identity: ProjectIdentity): string => {
   const dir = join(lcmHomeDir(), "projects", identity.id);
   ensurePrivateDirectory(lcmHomeDir());
   ensurePrivateDirectory(join(lcmHomeDir(), "projects"));
@@ -133,3 +145,7 @@ export const ensureProjectDir = (cwd: string): string => {
   atomicWritePrivateFile(metaPath, JSON.stringify(meta, null, 2) + "\n");
   return dir;
 };
+
+/** Ensures the current project dir exists and writes cwd to meta.json. */
+export const ensureProjectDir = (cwd: string): string =>
+  ensureProjectDirForIdentity(resolveProjectIdentity(cwd));

@@ -208,6 +208,25 @@ describe("mocked server states unavailable from Node HTTP", () => {
     await expect(createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }))).rejects.toThrow("listen failed");
   });
 
+  it("cleans staged PostgreSQL startup failure without a SQLite ingest interval", async () => {
+    state.fail = true;
+    const config = loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } });
+    config.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://unused",
+        caFile: "/unused",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+
+    await expect(createDaemon(config)).rejects.toThrow("listen failed");
+    expect(state.closeFactory).toHaveBeenCalledOnce();
+  });
+
   it("rejects unhealthy storage admission with a cause-free payload", async () => {
     state.health = {
       status: "unavailable",

@@ -443,6 +443,62 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.message).toContain("localhost:3737");
     expect(daemonResult?.message).toContain("daemon parent invariant is not verified");
   });
+
+  it("does not recognize a successful HTTP response with unavailable non-staged health", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 3737,
+      spawned: true,
+    });
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ status: "unavailable", version: "0.5.0" }),
+    });
+
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch,
+    }));
+
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(results.find((result) => result.name === "daemon")).toMatchObject({
+      status: "warn",
+      fixApplied: true,
+    });
+    expect(results.find((result) => result.name === "daemon")?.message)
+      .toContain("started");
+  });
+
+  it("ignores unrecognized health returned after validating a healthy daemon", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 3737,
+      spawned: false,
+    });
+    const fetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: "ok", version: "0.5.0" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: "unavailable", version: "0.5.0" }),
+      });
+
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch,
+    }));
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(results.find((result) => result.name === "daemon")).toMatchObject({
+      status: "pass",
+      message: "localhost:3737 (up)",
+    });
+  });
 });
 
 describe("runDoctor summarizer modes", () => {
@@ -705,7 +761,7 @@ describe("runDoctor configuration validation", () => {
     }
   });
 
-  it("reports a valid PostgreSQL selection unavailable without daemon network or lifecycle activity", async () => {
+  it("checks a valid PostgreSQL selection through daemon health and lifecycle", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-doctor-postgres-"));
     const caFile = join(dir, "ca.pem");
     writeFileSync(caFile, "test-ca");
@@ -733,12 +789,91 @@ describe("runDoctor configuration validation", () => {
 
         const configResult = results.find((result) => result.name === "config");
         expect(configResult, configResult?.message).toMatchObject({ status: "pass" });
-        expect(results.find((result) => result.name === "stack")?.message).toContain("Storage: unavailable");
-        expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "fail", fixApplied: false });
-        expect(results.find((result) => result.name === "daemon")?.message).toContain("postgresql storage backend is not available");
+        expect(results.find((result) => result.name === "stack")?.message).toContain("Storage: postgresql");
+        expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "fail" });
+        expect(results.find((result) => result.name === "daemon")?.message).toContain("not responding");
       }
-      expect(fetch).not.toHaveBeenCalled();
-      expect(ensureDaemon).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(ensureDaemon).toHaveBeenCalledTimes(2);
+    } finally {
+      if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = previousUrl;
+      if (previousCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = previousCaFile;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("recognizes exact staged PostgreSQL health without reporting a daemon start", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-doctor-postgres-staged-"));
+    const caFile = join(dir, "ca.pem");
+    writeFileSync(caFile, "test-ca");
+    const previousUrl = process.env.LCM_POSTGRES_URL;
+    const previousCaFile = process.env.LCM_POSTGRES_CA_FILE;
+    process.env.LCM_POSTGRES_URL = "postgresql://user:password@db.example/lcm";
+    process.env.LCM_POSTGRES_CA_FILE = caFile;
+    const stagedHealth = {
+      status: "unavailable",
+      version: "0.5.0",
+      storageBackend: "postgresql",
+      uptime: 10,
+      pid: 4242,
+      storage: {
+        status: "unavailable",
+        error: {
+          code: "STORAGE_INITIALIZATION_FAILED",
+          backend: "postgresql",
+          domain: "factory",
+          operation: "health",
+        },
+      },
+    };
+    const fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => stagedHealth,
+    });
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 3737,
+      spawned: false,
+      pid: 4242,
+      startMethod: "existing",
+    });
+    mockCollectEventStats.mockReturnValue({
+      captured: 100,
+      unprocessed: 5,
+      errors: 0,
+      lastCapture: "2026-03-26 10:00:00",
+    });
+    try {
+      const results = await runDoctor(minimalDeps({
+        fetch,
+        readFileSync: (path: string) => {
+          if (path.endsWith("config.json")) {
+            return JSON.stringify({ storage: { backend: "postgresql" } });
+          }
+          return minimalDeps().readFileSync(path);
+        },
+      }));
+
+      expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+        expectedStorageBackend: "postgresql",
+        expectedVersion: "0.5.0",
+      }));
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "pass",
+        message: "localhost:3737 (up)",
+      });
+      expect(results.find((result) => result.name === "daemon")?.fixApplied)
+        .not.toBe(true);
+      expect(results.find((result) => result.name === "events-capture")).toMatchObject({
+        status: "warn",
+        message: expect.stringContaining("queue cannot drain until storage is healthy"),
+      });
+      expect(results.find((result) => result.name === "events-capture")?.message)
+        .not.toContain("queued for automatic daemon processing");
     } finally {
       if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
       else process.env.LCM_POSTGRES_URL = previousUrl;

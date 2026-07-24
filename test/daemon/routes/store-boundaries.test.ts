@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   openProject: vi.fn(),
   projectClose: vi.fn(async () => undefined),
   factoryClose: vi.fn(async () => undefined),
+  identity: vi.fn((cwd: string) => ({ id: "pid", canonical: cwd })),
 }));
 
 vi.mock("node:fs", async (importOriginal) => ({
@@ -26,7 +27,7 @@ vi.mock("../../../src/db/connection.js", () => ({
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
   projectDir: (cwd: string) => `${cwd}/project`,
-  projectIdentity: (cwd: string) => ({ id: "pid", canonical: cwd }),
+  projectIdentity: mocks.identity,
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/db/migration.js", () => ({ runLcmMigrations: mocks.migrate }));
@@ -54,6 +55,7 @@ describe("store persistence boundaries", () => {
     mocks.scrub.mockImplementation((text: string) => `scrubbed:${text}`);
     mocks.forProject.mockImplementation(async () => ({ scrub: mocks.scrub }));
     mocks.validate.mockImplementation((cwd: string) => cwd);
+    mocks.identity.mockImplementation((cwd: string) => ({ id: "pid", canonical: cwd }));
     mocks.getConnection.mockReturnValue({});
     mocks.openProject.mockResolvedValue({
       promotedMemory: { insert: mocks.insert },
@@ -125,6 +127,18 @@ describe("store persistence boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "store failed" });
     expect(mocks.projectClose).toHaveBeenCalledTimes(2);
     expect(mocks.factoryClose).toHaveBeenCalledTimes(2);
+  });
+
+  it("resolves storage identity before reading project scrub patterns", async () => {
+    const handler = createStoreHandler(config);
+    mocks.identity.mockImplementationOnce(() => { throw new Error("identity failed"); });
+
+    await handler({} as never, response, JSON.stringify({ text: "value", cwd: "/unbound" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "identity failed" });
+    expect(mocks.stat).not.toHaveBeenCalled();
+    expect(mocks.forProject).not.toHaveBeenCalled();
+    expect(mocks.openProject).not.toHaveBeenCalled();
   });
 
   it("returns a structured error without closing when acquisition fails", async () => {

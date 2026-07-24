@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   openProject: vi.fn(),
   createFactory: vi.fn(),
   projectExists: vi.fn(async () => true),
+  projectIdentity: vi.fn((cwd: string) => ({ id: cwd, canonical: cwd })),
   send: vi.fn(),
   writeHead: vi.fn(),
   end: vi.fn(),
@@ -35,7 +36,7 @@ vi.mock("node:fs", async (importOriginal) => ({
 vi.mock("../../../src/daemon/project.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../../src/daemon/project.js")>(),
   projectDbPath: (cwd: string) => `${cwd}/lcm.db`,
-  projectIdentity: (cwd: string) => ({ id: cwd, canonical: cwd }),
+  projectIdentity: mocks.projectIdentity,
 }));
 vi.mock("../../../src/daemon/server.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../../src/daemon/server.js")>(),
@@ -74,6 +75,9 @@ import { createRecentHandler } from "../../../src/daemon/routes/recent.js";
 import { createPoolStatsHandler } from "../../../src/daemon/routes/pool-stats.js";
 import { createStatsHandler } from "../../../src/daemon/routes/stats.js";
 import { createSearchHandler } from "../../../src/daemon/routes/search.js";
+import { MachineIdentityFileError } from "../../../src/machine-identity.js";
+import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
+import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 
 const config = loadDaemonConfig("/tmp/lcm-persistence-routes");
 const response = {
@@ -112,6 +116,7 @@ describe("persistence read route boundaries", () => {
     }
     mocks.exists.mockReturnValue(true);
     mocks.projectExists.mockResolvedValue(true);
+    mocks.projectIdentity.mockImplementation((cwd: string) => ({ id: cwd, canonical: cwd }));
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.describe.mockResolvedValue({ id: "node" });
     mocks.expand.mockResolvedValue({ expanded: ["node"] });
@@ -157,6 +162,15 @@ describe("persistence read route boundaries", () => {
     const ownedCloseCount = mocks.factoryClose.mock.calls.length;
     await invoke(createDescribeHandler(config, injectedFactory()), { nodeId: "n", cwd: "/ok" });
     expect(mocks.factoryClose).toHaveBeenCalledTimes(ownedCloseCount);
+    await invoke(
+      createDescribeHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
+      { nodeId: "n", cwd: "/ok" },
+    );
+    expectLast(503, {
+      code: "STORAGE_BACKEND_STAGED",
+      error: "describe is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
   });
 
   it("uses the injected backend without consulting a local SQLite path", async () => {
@@ -200,6 +214,15 @@ describe("persistence read route boundaries", () => {
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
     expectLast(200, { expanded: null, error: "expansion failed" });
     await invoke(createExpandHandler(config, injectedFactory()), { nodeId: "n", cwd: "/ok" });
+    await invoke(
+      createExpandHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
+      { nodeId: "n", cwd: "/ok" },
+    );
+    expectLast(503, {
+      code: "STORAGE_BACKEND_STAGED",
+      error: "expand is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
   });
 
   it("covers grep validation, defaults, missing projects, success, and failure", async () => {
@@ -222,6 +245,15 @@ describe("persistence read route boundaries", () => {
     await invoke(handler, { query: "q", cwd: "/ok" });
     expectLast(200, { matches: [] });
     await invoke(createGrepHandler(config, injectedFactory()), { query: "q", cwd: "/ok" });
+    await invoke(
+      createGrepHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
+      { query: "q", cwd: "/ok" },
+    );
+    expectLast(503, {
+      code: "STORAGE_BACKEND_STAGED",
+      error: "grep is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
   });
 
   it("covers recent validation, missing projects, defaults, success, and failure", async () => {
@@ -255,6 +287,15 @@ describe("persistence read route boundaries", () => {
     await invoke(handler, { cwd: "/ok" });
     expectLast(200, { summaries: [] });
     await invoke(createRecentHandler(config, injectedFactory()), { cwd: "/ok" });
+    await invoke(
+      createRecentHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
+      { cwd: "/ok" },
+    );
+    expectLast(503, {
+      code: "STORAGE_BACKEND_STAGED",
+      error: "recent is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
   });
 
   it("covers pool and aggregate stats success and failure payloads", async () => {
@@ -314,5 +355,53 @@ describe("persistence read route boundaries", () => {
     await invoke(handler, { query: "q", cwd: "/ok" });
     expectLast(200, { episodic: [], promoted: [] });
     await invoke(createSearchHandler(config, injectedFactory()), { query: "q", cwd: "/ok", layers: [] });
+
+    const stagedFactory = new UnavailablePostgreSqlStorageBackendFactory();
+    await invoke(createSearchHandler(config, stagedFactory), { query: "q", cwd: "/ok" });
+    expectLast(503, {
+      code: "STORAGE_BACKEND_STAGED",
+      error: "search is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
+
+    const nonStorageFailure = new UnavailablePostgreSqlStorageBackendFactory();
+    vi.spyOn(nonStorageFailure, "openExistingProject")
+      .mockRejectedValueOnce(new Error("unrelated failure"));
+    await invoke(createSearchHandler(config, nonStorageFailure), { query: "q", cwd: "/ok" });
+    expectLast(200, { episodic: [], promoted: [] });
+  });
+
+  it.each([
+    ["unbound project", new StorageIdentityConfigurationError("project binding is required")],
+    [
+      "unregistered machine",
+      new MachineIdentityFileError(
+        "machine identity is not registered",
+        "Run `lcm machine register` before linking a PostgreSQL project.",
+      ),
+    ],
+  ])("returns structured identity admission failures for every manual read route: %s", async (
+    _case,
+    identityError,
+  ) => {
+    for (const [handler, body] of [
+      [createSearchHandler(config), { query: "q", cwd: "/ok" }],
+      [createGrepHandler(config), { query: "q", cwd: "/ok" }],
+      [createRecentHandler(config), { cwd: "/ok" }],
+      [createDescribeHandler(config), { nodeId: "n", cwd: "/ok" }],
+      [createExpandHandler(config), { nodeId: "n", cwd: "/ok" }],
+    ] as const) {
+      mocks.projectIdentity.mockImplementationOnce(() => {
+        throw identityError;
+      });
+      await invoke(handler, body);
+      expectLast(409, {
+        code: "STORAGE_IDENTITY_REQUIRED",
+        error: identityError instanceof MachineIdentityFileError
+          ? "Machine identity is unavailable. Run `lcm machine show` for recovery guidance."
+          : identityError.message,
+        storageBackend: "postgresql",
+      });
+    }
   });
 });

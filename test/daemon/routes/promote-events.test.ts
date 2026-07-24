@@ -10,6 +10,16 @@ import { ensureProjectDir, projectDbPath, projectId } from "../../../src/daemon/
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
 import { PromotedStore } from "../../../src/db/promoted.js";
+import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
+import { recoverMachineIdentity } from "../../../src/machine-identity.js";
+import {
+  clearProjectMapCache,
+  resolveProjectIdentity,
+  setRemoteProjectBinding,
+} from "../../../src/project-map.js";
+
+const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
+const PROJECT_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
 
 const eventPathMocks = vi.hoisted(() => ({
   eventsDir: vi.fn(),
@@ -100,6 +110,7 @@ describe("promote-events route", () => {
     eventPathMocks.eventsDir.mockReturnValue(dir);
     vi.mocked(eventsDbPath).mockReturnValue(sidecarPath);
     vi.mocked(deduplicateAndInsert).mockClear();
+    clearProjectMapCache();
   });
 
   afterEach(() => {
@@ -114,6 +125,7 @@ describe("promote-events route", () => {
       process.env.HOME = originalHome;
     }
     vi.clearAllMocks();
+    clearProjectMapCache();
   });
 
   it("promotes priority 1 events via deduplicateAndInsert", async () => {
@@ -377,6 +389,71 @@ describe("promote-events route", () => {
     } finally {
       getUnprocessed.mockRestore();
     }
+  });
+
+  it("returns the exact staged response for a discovered PostgreSQL project", async () => {
+    const projectCwd = mkdtempSync(join(tmpdir(), "promote-all-staged-"));
+    extraDirs.push(projectCwd);
+    const projectSidecarPath = join(dir, `${projectId(projectCwd)}.db`);
+    ensureProjectDir(projectCwd);
+    const edb = new EventsDb(projectSidecarPath);
+    edb.insertEvent(
+      "s1",
+      { type: "decision", category: "decision", data: "retain locally", priority: 1 },
+      "UserPromptSubmit",
+    );
+    edb.close();
+    const local = resolveProjectIdentity(projectCwd);
+    setRemoteProjectBinding(PROJECT_ID, { hash: local.id });
+    recoverMachineIdentity({
+      version: 1,
+      identityKey: `machine:${"a".repeat(64)}`,
+      machineId: MACHINE_ID,
+      displayName: "Machine A",
+    }, { homeDir });
+    const config = makeConfig();
+    config.storage = {
+      backend: "postgresql",
+      url: "postgresql://example.invalid/lcm",
+      poolMax: 1,
+      connectionTimeoutMs: 100,
+      idleTimeoutMs: 100,
+      statementTimeoutMs: 100,
+    };
+
+    const output = mockRes();
+    await createPromoteAllEventsHandler(
+      config,
+      new UnavailablePostgreSqlStorageBackendFactory(),
+    )(request, output.res, "");
+
+    expect(output.res.writeHead).toHaveBeenCalledWith(
+      503,
+      { "Content-Type": "application/json" },
+    );
+    expect(output.getBody()).toEqual({
+      code: "STORAGE_BACKEND_STAGED",
+      error: "promote-events-all is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
+  });
+
+  it("returns the exact staged response before scanning an empty sidecar directory", async () => {
+    const output = mockRes();
+    await createPromoteAllEventsHandler(
+      makeConfig(),
+      new UnavailablePostgreSqlStorageBackendFactory(),
+    )(request, output.res, "");
+
+    expect(output.res.writeHead).toHaveBeenCalledWith(
+      503,
+      { "Content-Type": "application/json" },
+    );
+    expect(output.getBody()).toEqual({
+      code: "STORAGE_BACKEND_STAGED",
+      error: "promote-events-all is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
   });
 
   it("promotes metadata-backed sidecars across all projects", async () => {

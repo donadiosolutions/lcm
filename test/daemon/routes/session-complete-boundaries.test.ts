@@ -89,9 +89,14 @@ describe("session complete persistence boundaries", () => {
     expect(mocks.run).toHaveBeenLastCalledWith("s-empty", 0);
     expect(mocks.close).toHaveBeenCalledTimes(3);
 
-    mocks.migrate.mockImplementationOnce(() => { throw new Error("migration failed"); });
+    mocks.migrate.mockImplementationOnce(() => {
+      throw new Error("migration failed at /srv/private/session.db");
+    });
     await handler({} as never, response, JSON.stringify({ session_id: "s3", cwd: "/ok" }));
-    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "migration failed" });
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "migration failed at <path>",
+    });
+    expect(JSON.stringify(mocks.send.mock.lastCall)).not.toContain("/srv/private/session.db");
     mocks.migrate.mockImplementationOnce(() => { throw "failure"; });
     await handler({} as never, response, JSON.stringify({ session_id: "s4", cwd: "/ok" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "session completion failed" });

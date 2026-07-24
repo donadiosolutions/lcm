@@ -13,7 +13,11 @@ import {
   type ProjectStorage,
   type StorageBackendFactory,
 } from "../../storage/index.js";
-import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
+import {
+  closeRouteStorage,
+  openExistingProject,
+  storageRouteFailureResponse,
+} from "./storage-lifecycle.js";
 
 export function createPromoteHandler(
   config: DaemonConfig,
@@ -45,9 +49,11 @@ export function createPromoteHandler(
 
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
+    let activeFactory: StorageBackendFactory | undefined;
     try {
-        const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-        project = await openExistingProject(factory, projectIdentity(cwd)) ?? undefined;
+        const identity = projectIdentity(cwd, config.storage);
+        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        project = await openExistingProject(activeFactory, identity) ?? undefined;
         if (!project) {
           sendJson(res, 200, { processed: 0, promoted: 0 });
           return;
@@ -130,6 +136,11 @@ export function createPromoteHandler(
           } catch { /* non-fatal */ }
         }
     } catch (err) {
+      const storageFailure = storageRouteFailureResponse(activeFactory, err, "promote");
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
+        return;
+      }
       sendJson(res, 500, { error: err instanceof Error ? err.message : "promote failed" });
       return;
     } finally {

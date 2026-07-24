@@ -1,9 +1,15 @@
 import { readAuthToken } from "./auth.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { daemonJsonRequest, daemonPortFromLoopbackUrl, normalizeDaemonPath } from "./http-url.js";
+import {
+  daemonJsonRequest,
+  daemonJsonResponse,
+  daemonPortFromLoopbackUrl,
+  normalizeDaemonPath,
+} from "./http-url.js";
 import { daemonTokenPath } from "../runtime-paths.js";
 import type { StorageBackend } from "./config.js";
+import { isStagedPostgreSqlHealth } from "./staged-postgresql.js";
 
 export type DaemonHealth = {
   status: string;
@@ -11,6 +17,15 @@ export type DaemonHealth = {
   storageBackend: StorageBackend;
   uptime: number;
   pid: number;
+  storage?: {
+    status: string;
+    error?: {
+      code?: string;
+      backend?: string;
+      domain?: string;
+      operation?: string;
+    };
+  };
 };
 
 type DaemonHealthResponse = Omit<DaemonHealth, "storageBackend"> & {
@@ -38,9 +53,16 @@ export class DaemonClient {
 
   async health(): Promise<DaemonHealth | null> {
     try {
-      const health = await daemonJsonRequest<DaemonHealthResponse>(this.port, "/health", {
+      const response = await daemonJsonResponse<DaemonHealthResponse>(this.port, "/health", {
         method: "GET",
       });
+      const health = response.data;
+      if (
+        (response.statusCode < 200 || response.statusCode >= 300)
+        && !isStagedPostgreSqlHealth(response.statusCode, health)
+      ) {
+        return null;
+      }
       // Daemons predating backend identity were necessarily SQLite-only.
       return { ...health, storageBackend: health.storageBackend ?? "sqlite" };
     } catch { return null; }

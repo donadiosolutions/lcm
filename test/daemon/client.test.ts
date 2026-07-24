@@ -44,6 +44,58 @@ describe("DaemonClient", () => {
     }
   });
 
+  it("recognizes only the structured staged PostgreSQL 503 health response", async () => {
+    let requestCount = 0;
+    const server = createServer((_request, response) => {
+      requestCount++;
+      response.writeHead(503, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        status: "unavailable",
+        version: "1.4.1",
+        storageBackend: "postgresql",
+        uptime: 10,
+        pid: 1234,
+        storage: {
+          status: "unavailable",
+          error: {
+            code: requestCount === 1
+              ? "STORAGE_INITIALIZATION_FAILED"
+              : "STORAGE_OPERATION_FAILED",
+            backend: "postgresql",
+            domain: "factory",
+            operation: "health",
+          },
+        },
+      }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("expected TCP server address");
+      const client = new DaemonClient(`http://127.0.0.1:${address.port}`);
+      await expect(client.health()).resolves.toEqual({
+        status: "unavailable",
+        version: "1.4.1",
+        storageBackend: "postgresql",
+        uptime: 10,
+        pid: 1234,
+        storage: {
+          status: "unavailable",
+          error: {
+            code: "STORAGE_INITIALIZATION_FAILED",
+            backend: "postgresql",
+            domain: "factory",
+            operation: "health",
+          },
+        },
+      });
+      await expect(client.health()).resolves.toBeNull();
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
   it("returns null when daemon not running", async () => {
     expect(await new DaemonClient("http://127.0.0.1:19999").health()).toBeNull();
   });

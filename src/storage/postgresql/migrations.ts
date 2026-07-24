@@ -22,7 +22,17 @@ const MIGRATION_MANIFEST = [
   {
     id: "0002_schema_baseline",
     filename: "0002_schema_baseline.sql",
-    sha256: "e96cad6c577c9f088d02366e22bbbe3f876217363659feea6d2edc1918885bae",
+    sha256: "3f2dd30cc533899a31f6415fef49c377e82523315ce8fc3e87253f5351ec0a8f",
+  },
+  {
+    id: "0003_machine_identity_key",
+    filename: "0003_machine_identity_key.sql",
+    sha256: "bdc38d19bde5825eb1d59e9044769cbf9cac52be5c9fe34237f93ec347c3807b",
+  },
+  {
+    id: "0004_machine_display_name",
+    filename: "0004_machine_display_name.sql",
+    sha256: "f12b4e5493da187e4c8cd4083766010b896961225cadd6fe568e4e99264e3421",
   },
 ] as const;
 
@@ -314,7 +324,8 @@ const EXPECTED_BASELINE_CONSTRAINT_NAMES = `
   passive_event_inbox_pkey passive_event_inbox_machine_id_event_id_key
   passive_event_inbox_machine_id_machine_sequence_key project_aliases_normalized_path_check
   project_aliases_path_check project_aliases_machine_id_fkey project_aliases_project_id_fkey
-  project_aliases_pkey projects_display_name_check projects_identity_key_check projects_check
+  project_aliases_pkey project_aliases_machine_id_path_key projects_display_name_check
+  projects_identity_key_check projects_check
   projects_project_id_check projects_pkey projects_identity_key_key promoted_memories_check
   promoted_memories_confidence_check promoted_memories_content_check
   promoted_memories_depth_check promoted_memories_metadata_check
@@ -398,11 +409,11 @@ const EXPECTED_BASELINE_CONSTRAINT_IDENTITIES =
 }
 
 export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapshot[] {
-  return [{
+  const baseline: PostgreSqlSchemaSnapshot = {
     ...expectedBaselineDefinitionInventory(),
     definitionHashes: {
       columnAcl: "d3d92012f458893ce5bf0ff0d1f72699ba6d8a9ef42d25a62c0ccede9e582f9c",
-      constraint: "f445a06d320f46f8c5d829f89a3a7bc0b13c5507096b111f125d9f0dd0ba0e2f",
+      constraint: "51a94179d9b50316b2f221c19bc00caa77d52fb60d050f8b3b7b1aec91311381",
       generatedColumn: "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
       identitySequence: "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
       index: "16e10e2a4fc080f52b11315ee2b03d5df258d216f293bb0051b56beb16035374",
@@ -426,7 +437,26 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       },
     ],
     migrationId: "0002_schema_baseline",
-  }];
+  };
+  return [
+    baseline,
+    {
+      ...baseline,
+      definitionHashes: {
+        ...baseline.definitionHashes,
+        constraint: "386dc5c566e4a5fcb075b6674ceec67b2ec9e545763497d9ba0001b6777e6a28",
+      },
+      migrationId: "0003_machine_identity_key",
+    },
+    {
+      ...baseline,
+      definitionHashes: {
+        ...baseline.definitionHashes,
+        constraint: "619d530d52ec35db5336cc253eb16f264a64bde67c382a356a3609ea93f804af",
+      },
+      migrationId: "0004_machine_display_name",
+    },
+  ];
 }
 
 export function selectLatestPostgreSqlSchemaSnapshot(
@@ -1595,8 +1625,33 @@ export async function runPostgreSqlMigrations(
                  ) AS privilege
                  WHERE acl_relations.object_identity OPERATOR(pg_catalog.=)
                    ANY ($9::pg_catalog.text[])
+                   AND NOT (
+                     privilege.grantee OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
+                     AND privilege.grantee OPERATOR(pg_catalog.<>) acl_relations.owner_oid
+                     AND privilege.grantor OPERATOR(pg_catalog.=) acl_relations.owner_oid
+                     AND privilege.is_grantable OPERATOR(pg_catalog.=) false
+                     AND (
+                       (
+                         acl_relations.object_identity OPERATOR(pg_catalog.=)
+                           'table|machines'
+                         AND privilege.privilege_type OPERATOR(pg_catalog.=) 'SELECT'
+                       )
+                       OR (
+                         acl_relations.object_identity OPERATOR(pg_catalog.=)
+                           'table|projects'
+                         AND privilege.privilege_type OPERATOR(pg_catalog.=)
+                           ANY (ARRAY['SELECT', 'DELETE']::pg_catalog.text[])
+                       )
+                       OR (
+                         acl_relations.object_identity OPERATOR(pg_catalog.=)
+                           'table|project_aliases'
+                         AND privilege.privilege_type OPERATOR(pg_catalog.=)
+                           ANY (ARRAY['SELECT', 'DELETE']::pg_catalog.text[])
+                       )
+                     )
+                   )
                ),
-               actual_column_acls AS (
+               raw_column_acls AS (
                  SELECT pg_catalog.concat_ws(
                           '|',
                           relation.relname,
@@ -1624,7 +1679,71 @@ export async function runPostgreSqlMigrations(
                         COALESCE(
                           privilege.is_grantable::pg_catalog.text,
                           ''
-                        ) AS is_grantable
+                        ) AS is_grantable,
+                        COALESCE(
+                          privilege.grantee OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
+                          AND privilege.grantee OPERATOR(pg_catalog.<>) relation.relowner
+                          AND privilege.grantor OPERATOR(pg_catalog.=) relation.relowner
+                          AND privilege.is_grantable OPERATOR(pg_catalog.=) false
+                          AND (
+                            (
+                              relation.relname OPERATOR(pg_catalog.=) 'machines'
+                              AND (
+                                (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY['identity_key', 'display_name']::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                                )
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY['display_name', 'last_seen_at']::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type OPERATOR(pg_catalog.=) 'UPDATE'
+                                )
+                              )
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=) 'projects'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY['identity_key', 'display_name']::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=) 'project_aliases'
+                              AND (
+                                (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'machine_id',
+                                        'path',
+                                        'normalized_path'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                                )
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'path',
+                                        'linked_at'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type OPERATOR(pg_catalog.=) 'UPDATE'
+                                )
+                              )
+                            )
+                          ),
+                          false
+                        ) AS sanctioned
                  FROM pg_catalog.pg_attribute AS attribute
                  JOIN pg_catalog.pg_class AS relation
                    ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
@@ -1638,6 +1757,20 @@ export async function runPostgreSqlMigrations(
                      relation.relname,
                      attribute.attname
                    ) OPERATOR(pg_catalog.=) ANY ($10::pg_catalog.text[])
+               ),
+               actual_column_acls AS (
+                 SELECT DISTINCT object_identity,
+                        CASE WHEN sanctioned THEN '' ELSE grantee END AS grantee,
+                        CASE WHEN sanctioned THEN '' ELSE grantor END AS grantor,
+                        CASE
+                          WHEN sanctioned THEN ''
+                          ELSE privilege_type
+                        END AS privilege_type,
+                        CASE
+                          WHEN sanctioned THEN ''
+                          ELSE is_grantable
+                        END AS is_grantable
+                 FROM raw_column_acls
                ),
                actual_groups(object_kind, existing_count, definition_sha256) AS (
                  SELECT 'index'::pg_catalog.text,

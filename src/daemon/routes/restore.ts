@@ -16,7 +16,11 @@ import {
   type ProjectStorage,
   type StorageBackendFactory,
 } from "../../storage/index.js";
-import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
+import {
+  closeRouteStorage,
+  openExistingProject,
+  storageRouteFailureResponse,
+} from "./storage-lifecycle.js";
 const MAX_SESSION_INSTRUCTIONS_BYTES = 1024 * 1024;
 
 function sessionInstructionsId(client: TranscriptClient): number {
@@ -78,6 +82,7 @@ export function createRestoreHandler(
   return async (_req, res, body) => {
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
+    let activeFactory: StorageBackendFactory | undefined;
     try {
       const input = JSON.parse(body || "{}");
       const { session_id, source } = input;
@@ -95,14 +100,17 @@ export function createRestoreHandler(
       const orientation = buildOrientationPrompt();
       const openProject = async (createIfMissing: boolean): Promise<ProjectStorage | null> => {
         if (project) return project;
-        const factory = storageFactory
+        const identity = projectIdentity(cwd!, config.storage);
+        activeFactory = storageFactory
           ?? ownedFactory
           ?? (ownedFactory = createStorageBackendFactory(config.storage));
-        const identity = projectIdentity(cwd!);
         project = createIfMissing
-          ? await factory.openProject(identity)
-          : await openExistingProject(factory, identity) ?? undefined;
+          ? await activeFactory.openProject(identity)
+          : await openExistingProject(activeFactory, identity) ?? undefined;
         return project ?? null;
+      };
+      const rethrowStorageAdmissionFailure = (error: unknown): void => {
+        if (storageRouteFailureResponse(activeFactory, error, "restore")) throw error;
       };
 
       // Post-compaction detection
@@ -124,7 +132,10 @@ export function createRestoreHandler(
               instructionsContext = `<project-instructions>\n${row.content}\n</project-instructions>`;
             }
           }
-        } catch { /* non-fatal */ }
+        } catch (error) {
+          rethrowStorageAdmissionFailure(error);
+          // Other restoration read failures remain non-fatal.
+        }
       }
 
       if (isPostCompact) {
@@ -193,7 +204,10 @@ export function createRestoreHandler(
               instructionsContext = "";
             }
           } catch { /* non-fatal */ }
-        } catch { /* non-fatal */ }
+        } catch (error) {
+          rethrowStorageAdmissionFailure(error);
+          // Other restoration read/write failures remain non-fatal.
+        }
       }
 
       // Query passive-capture insights from promoted store
@@ -213,7 +227,10 @@ export function createRestoreHandler(
             .filter((r) => r.confidence >= minConfidence && (!r.createdAt || Date.parse(r.createdAt) >= cutoffMs))
             .slice(0, 5)
             .map((r) => ({ content: r.content, confidence: r.confidence, tags: r.tags }));
-        } catch { /* non-fatal */ }
+        } catch (error) {
+          rethrowStorageAdmissionFailure(error);
+          // Other passive-insight read failures remain non-fatal.
+        }
       }
 
       const context = [orientation, episodicContext, promotedContext, instructionsContext].filter(Boolean).join("\n\n");
@@ -223,6 +240,11 @@ export function createRestoreHandler(
       }
       sendJson(res, 200, responseBody);
     } catch (err) {
+      const storageFailure = storageRouteFailureResponse(activeFactory, err, "restore");
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
+        return;
+      }
       sendJson(res, 500, { error: err instanceof Error ? err.message : "restore failed" });
     } finally {
       await closeRouteStorage(project, ownedFactory);

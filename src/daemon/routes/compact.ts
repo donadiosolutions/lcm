@@ -9,7 +9,11 @@ import {
   type LlmReasoningEffort,
   type LlmRequestPolicy,
 } from "../config.js";
-import { projectPaths, ensureProjectDir, isSafeTranscriptPath } from "../project.js";
+import {
+  projectPaths,
+  ensureProjectDirForIdentity,
+  isSafeTranscriptPath,
+} from "../project.js";
 import { enqueue } from "../project-queue.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
@@ -23,8 +27,13 @@ import {
   type EffectiveProvider,
 } from "../summarizer.js";
 import { validateCwd } from "../validate-cwd.js";
-import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
-import { closeRouteStorage } from "./storage-lifecycle.js";
+import {
+  createStorageBackendFactory,
+  resolveStorageIdentityContext,
+  type ProjectStorage,
+  type StorageBackendFactory,
+} from "../../storage/index.js";
+import { closeRouteStorage, storageRouteFailureResponse } from "./storage-lifecycle.js";
 
 interface CompactRequestBody {
   session_id: string;
@@ -169,6 +178,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
   return async (_req, res, body) => {
     let parsed: unknown;
     let ownedFactory: StorageBackendFactory | undefined;
+    let activeFactory: StorageBackendFactory | undefined;
     try {
       parsed = JSON.parse(body || "{}");
     } catch {
@@ -261,6 +271,36 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
     // Guard must be checked and set synchronously (before any await) to prevent
     // concurrent requests from racing through the has() check before add() runs.
     if (compactingNow.has(session_id)) {
+      if (config.storage.backend === "postgresql") {
+        try {
+          const paths = projectPaths(cwd);
+          const identity = resolveStorageIdentityContext(config.storage, {
+            id: paths.id,
+            canonical: paths.canonical,
+            ...(paths.remoteProjectId ? { remoteProjectId: paths.remoteProjectId } : {}),
+          });
+          activeFactory = storageFactory
+            ?? (ownedFactory = createStorageBackendFactory(config.storage));
+          const project = await activeFactory.openProject(identity);
+          await closeRouteStorage(project, undefined);
+        } catch (err) {
+          const storageFailure = storageRouteFailureResponse(
+            activeFactory,
+            err,
+            "compact",
+          );
+          if (storageFailure) {
+            sendJson(res, storageFailure.status, storageFailure.body);
+          } else {
+            sendJson(res, 500, {
+              error: err instanceof Error ? err.message : "compact failed",
+            });
+          }
+          return;
+        } finally {
+          await closeRouteStorage(undefined, ownedFactory);
+        }
+      }
       sendJson(res, 200, { skipped: true, actionTaken: false, summary: "Compaction already in progress for this session." });
       return;
     }
@@ -283,6 +323,18 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         effectiveRequestPolicy,
       );
       if (!summarize) {
+        if (config.storage.backend === "postgresql") {
+          const paths = projectPaths(cwd);
+          const identity = resolveStorageIdentityContext(config.storage, {
+            id: paths.id,
+            canonical: paths.canonical,
+            ...(paths.remoteProjectId ? { remoteProjectId: paths.remoteProjectId } : {}),
+          });
+          activeFactory = storageFactory
+            ?? (ownedFactory = createStorageBackendFactory(config.storage));
+          const project = await activeFactory.openProject(identity);
+          await closeRouteStorage(project, undefined);
+        }
         sendJson(res, 200, {
           actionTaken: false,
           summary: "Summarization disabled — no summarizer configured.",
@@ -297,19 +349,25 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         return;
       }
       const paths = projectPaths(cwd);
+      const localIdentity = {
+        id: paths.id,
+        canonical: paths.canonical,
+        ...(paths.remoteProjectId ? { remoteProjectId: paths.remoteProjectId } : {}),
+      };
+      const identity = resolveStorageIdentityContext(config.storage, localIdentity);
       const pid = paths.id;
       const result = await enqueue(pid, async () => {
-        ensureProjectDir(cwd);
+        ensureProjectDirForIdentity(localIdentity);
 
         const scrubber = await ScrubEngine.forProject(
           config.security?.sensitivePatterns ?? [],
           paths.dir,
         );
 
-        const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
         let project: ProjectStorage | undefined;
         try {
-          project = await factory.openProject(paths);
+          project = await activeFactory.openProject(identity);
           const conversation = await project.conversations.getOrCreateConversation(session_id);
 
           // Ingest new messages from the transcript into the DB.
@@ -451,6 +509,11 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
 
       sendJson(res, 200, result);
     } catch (err) {
+      const storageFailure = storageRouteFailureResponse(activeFactory, err, "compact");
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
+        return;
+      }
       sendJson(res, 500, { error: err instanceof Error ? err.message : "compact failed" });
     } finally {
       await closeRouteStorage(undefined, ownedFactory);

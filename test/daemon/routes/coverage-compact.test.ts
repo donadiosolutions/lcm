@@ -14,6 +14,36 @@ const state = vi.hoisted(() => ({
   existingMeta: false,
   metaText: "{}",
   metaError: undefined as unknown,
+  identityError: undefined as unknown,
+  paths: vi.fn((cwd: string) => ({
+    id: "pid",
+    dir: "/tmp/project",
+    dbPath: "/tmp/project/lcm.db",
+    metaPath: "/tmp/project/meta.json",
+    canonical: cwd,
+  })),
+  identity: vi.fn((
+    _cwd: string,
+    _config?: unknown,
+    local?: { id: string; canonical: string; remoteProjectId?: string },
+  ) => local?.remoteProjectId
+    ? {
+        id: local.remoteProjectId,
+        localProjectId: local.id,
+        canonical: local.canonical,
+        remoteProjectId: local.remoteProjectId,
+        machineId: "machine-id",
+      }
+    : {
+        ...local,
+        id: local?.id ?? "pid",
+        localProjectId: local?.id ?? "pid",
+      }),
+  ensureProject: vi.fn(),
+  queuedKeys: [] as string[],
+  beforeQueuedWork: undefined as (() => void) | undefined,
+  scrubber: vi.fn(async () => ({ scrubWithCounts: (content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }) })),
+  openProject: vi.fn(),
 }));
 
 vi.mock("../../../src/daemon/config.js", async (importOriginal) => {
@@ -44,12 +74,18 @@ vi.mock("../../../src/daemon/summarizer.js", () => ({
 }));
 
 vi.mock("../../../src/daemon/project.js", () => ({
-  projectPaths: (cwd: string) => ({ id: "pid", dir: "/tmp/project", dbPath: "/tmp/project/lcm.db", metaPath: "/tmp/project/meta.json", canonical: cwd }),
-  ensureProjectDir: vi.fn(),
+  projectPaths: state.paths,
+  ensureProjectDirForIdentity: state.ensureProject,
   isSafeTranscriptPath: () => true,
 }));
 
-vi.mock("../../../src/daemon/project-queue.js", () => ({ enqueue: (_id: string, work: () => unknown) => work() }));
+vi.mock("../../../src/daemon/project-queue.js", () => ({
+  enqueue: (id: string, work: () => unknown) => {
+    state.queuedKeys.push(id);
+    state.beforeQueuedWork?.();
+    return work();
+  },
+}));
 vi.mock("../../../src/db/connection.js", () => ({
   getLcmConnection: () => ({}),
   closeLcmConnection: vi.fn(),
@@ -65,7 +101,7 @@ vi.mock("../../../src/transcript-provider.js", () => ({
   parseTranscriptForClient: () => state.messages,
 }));
 vi.mock("../../../src/scrub.js", () => ({
-  ScrubEngine: { forProject: async () => ({ scrubWithCounts: (content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }) }) },
+  ScrubEngine: { forProject: state.scrubber },
 }));
 vi.mock("../../../src/store/conversation-store.js", () => ({
   ConversationStore: class {
@@ -84,8 +120,17 @@ vi.mock("../../../src/store/summary-store.js", () => ({
   },
 }));
 vi.mock("../../../src/storage/index.js", () => ({
+  resolveStorageIdentityContext: (storageConfig: unknown, local: {
+    id: string;
+    canonical: string;
+    remoteProjectId?: string;
+  }) => {
+    if (state.identityError !== undefined) throw state.identityError;
+    return state.identity(local.canonical, storageConfig, local);
+  },
   createStorageBackendFactory: () => ({
-    openProject: async () => {
+    openProject: async (...args: unknown[]) => {
+      state.openProject(...args);
       const conversations = {
         getOrCreateConversation: async () => ({ conversationId: "conversation" }),
         getMessageCount: async () => 0,
@@ -130,6 +175,8 @@ vi.mock("node:fs", async (importOriginal) => ({
 
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { buildCompactionMessage, createCompactHandler } from "../../../src/daemon/routes/compact.js";
+import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
+import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 
 function config() {
   const value = loadDaemonConfig("/does-not-exist");
@@ -166,6 +213,36 @@ describe("compact route coverage", () => {
     state.existingMeta = false;
     state.metaText = "{}";
     state.metaError = undefined;
+    state.identityError = undefined;
+    state.paths.mockReset();
+    state.paths.mockImplementation((cwd: string) => ({
+      id: "pid",
+      dir: "/tmp/project",
+      dbPath: "/tmp/project/lcm.db",
+      metaPath: "/tmp/project/meta.json",
+      canonical: cwd,
+    }));
+    state.identity.mockReset();
+    state.identity.mockImplementation((_cwd, _storageConfig, local) => (
+      local?.remoteProjectId
+        ? {
+            id: local.remoteProjectId,
+            localProjectId: local.id,
+            canonical: local.canonical,
+            remoteProjectId: local.remoteProjectId,
+            machineId: "machine-id",
+          }
+        : {
+            ...local,
+            id: local?.id ?? "pid",
+            localProjectId: local?.id ?? "pid",
+          }
+    ));
+    state.ensureProject.mockClear();
+    state.queuedKeys = [];
+    state.beforeQueuedWork = undefined;
+    state.scrubber.mockClear();
+    state.openProject.mockClear();
   });
 
   it("formats million-token and zero-input compactions", () => {
@@ -173,6 +250,85 @@ describe("compact route coverage", () => {
       .toContain("1.0M");
     expect(buildCompactionMessage({ tokensBefore: 0, tokensAfter: 0, messageCount: 0, summaryCount: 0, maxDepth: 0, promotedCount: 0 }))
       .toContain("0.0% saved");
+  });
+
+  it("fails PostgreSQL identity before local directory, scrubber, or storage effects", async () => {
+    state.identityError = new Error("PostgreSQL project binding is required");
+
+    await expect(call(JSON.stringify({ session_id: "identity", cwd: "/tmp" })))
+      .resolves.toEqual({ error: "PostgreSQL project binding is required" });
+    expect(state.ensureProject).not.toHaveBeenCalled();
+    expect(state.scrubber).not.toHaveBeenCalled();
+    expect(state.openProject).not.toHaveBeenCalled();
+  });
+
+  it("keeps successful SQLite identity ahead of local compaction setup", async () => {
+    await expect(call(JSON.stringify({ session_id: "sqlite-order", cwd: "/tmp" })))
+      .resolves.toMatchObject({ actionTaken: false });
+    expect(state.ensureProject).toHaveBeenCalledOnce();
+    expect(state.scrubber).toHaveBeenCalledOnce();
+    expect(state.openProject).toHaveBeenCalledOnce();
+    expect(state.identity.mock.invocationCallOrder[0])
+      .toBeLessThan(state.ensureProject.mock.invocationCallOrder[0]);
+    expect(state.ensureProject.mock.invocationCallOrder[0])
+      .toBeLessThan(state.scrubber.mock.invocationCallOrder[0]);
+    expect(state.scrubber.mock.invocationCallOrder[0])
+      .toBeLessThan(state.openProject.mock.invocationCallOrder[0]);
+  });
+
+  it("uses one local and remote identity snapshot across queued execution", async () => {
+    const first = {
+      id: "local-hash-a",
+      canonical: "/work/project",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      dir: "/lcm/projects/local-hash-a",
+      dbPath: "/lcm/projects/local-hash-a/db.sqlite",
+      metaPath: "/lcm/projects/local-hash-a/meta.json",
+    };
+    const concurrent = {
+      ...first,
+      id: "local-hash-b",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
+      dir: "/lcm/projects/local-hash-b",
+      dbPath: "/lcm/projects/local-hash-b/db.sqlite",
+      metaPath: "/lcm/projects/local-hash-b/meta.json",
+    };
+    state.paths.mockReturnValueOnce(first);
+    state.beforeQueuedWork = () => {
+      state.paths.mockReturnValue(concurrent);
+    };
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://user:secret@db.example/lcm",
+        poolMax: 5,
+        connectionTimeoutMs: 10_000,
+        idleTimeoutMs: 30_000,
+        statementTimeoutMs: 60_000,
+      },
+    };
+
+    await expect(call(JSON.stringify({
+      session_id: "queued-snapshot",
+      cwd: first.canonical,
+    }), value)).resolves.toMatchObject({ actionTaken: false });
+
+    expect(state.paths).toHaveBeenCalledOnce();
+    expect(state.queuedKeys).toEqual([first.id]);
+    expect(state.ensureProject).toHaveBeenCalledWith({
+      id: first.id,
+      canonical: first.canonical,
+      remoteProjectId: first.remoteProjectId,
+    });
+    expect(state.scrubber).toHaveBeenCalledWith([], first.dir);
+    expect(state.openProject).toHaveBeenCalledWith({
+      id: first.remoteProjectId,
+      localProjectId: first.id,
+      canonical: first.canonical,
+      remoteProjectId: first.remoteProjectId,
+      machineId: "machine-id",
+    });
   });
 
   it.each([
@@ -238,6 +394,181 @@ describe("compact route coverage", () => {
     const second = response();
     await handler({} as never, second.res, JSON.stringify({ session_id: "same", cwd: "/tmp" }));
     expect(second.json()).toEqual({ skipped: true, actionTaken: false, summary: "Compaction already in progress for this session." });
+    release();
+    await firstCall;
+  });
+
+  it("admits PostgreSQL identity before returning the duplicate shortcut", async () => {
+    let release!: () => void;
+    state.summarizerGate = new Promise<void>((resolve) => { release = resolve; });
+    state.identityError = new StorageIdentityConfigurationError("project is unbound");
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        caFile: "/ca.pem",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+    const handler = createCompactHandler(value);
+    const first = response();
+    const firstCall = handler(
+      {} as never,
+      first.res,
+      JSON.stringify({ session_id: "postgres-duplicate-identity", cwd: "/tmp" }),
+    );
+    const duplicate = response();
+    await handler(
+      {} as never,
+      duplicate.res,
+      JSON.stringify({ session_id: "postgres-duplicate-identity", cwd: "/tmp" }),
+    );
+
+    expect(duplicate.json()).toMatchObject({
+      code: "STORAGE_IDENTITY_REQUIRED",
+      storageBackend: "postgresql",
+    });
+    release();
+    await firstCall;
+  });
+
+  it("admits PostgreSQL staging before returning the duplicate shortcut", async () => {
+    let release!: () => void;
+    state.summarizerGate = new Promise<void>((resolve) => { release = resolve; });
+    state.paths.mockImplementation((cwd: string) => ({
+      id: "pid",
+      dir: "/tmp/project",
+      dbPath: "/tmp/project/lcm.db",
+      metaPath: "/tmp/project/meta.json",
+      canonical: cwd,
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+    }));
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        caFile: "/ca.pem",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+    const handler = createCompactHandler(
+      value,
+      new UnavailablePostgreSqlStorageBackendFactory(),
+    );
+    const first = response();
+    const firstCall = handler(
+      {} as never,
+      first.res,
+      JSON.stringify({ session_id: "postgres-duplicate-staged", cwd: "/tmp" }),
+    );
+    const duplicate = response();
+    await handler(
+      {} as never,
+      duplicate.res,
+      JSON.stringify({ session_id: "postgres-duplicate-staged", cwd: "/tmp" }),
+    );
+
+    expect(duplicate.json()).toMatchObject({
+      code: "STORAGE_BACKEND_STAGED",
+      storageBackend: "postgresql",
+    });
+    release();
+    await firstCall;
+  });
+
+  it("returns the duplicate shortcut only after successful PostgreSQL admission", async () => {
+    let release!: () => void;
+    state.summarizerGate = new Promise<void>((resolve) => { release = resolve; });
+    state.paths.mockImplementation((cwd: string) => ({
+      id: "pid",
+      dir: "/tmp/project",
+      dbPath: "/tmp/project/lcm.db",
+      metaPath: "/tmp/project/meta.json",
+      canonical: cwd,
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+    }));
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        caFile: "/ca.pem",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+    const handler = createCompactHandler(value);
+    const first = response();
+    const firstCall = handler(
+      {} as never,
+      first.res,
+      JSON.stringify({ session_id: "postgres-duplicate-success", cwd: "/tmp" }),
+    );
+    const duplicate = response();
+    await handler(
+      {} as never,
+      duplicate.res,
+      JSON.stringify({ session_id: "postgres-duplicate-success", cwd: "/tmp" }),
+    );
+
+    expect(duplicate.json()).toEqual({
+      skipped: true,
+      actionTaken: false,
+      summary: "Compaction already in progress for this session.",
+    });
+    expect(state.openProject).toHaveBeenCalledTimes(1);
+    release();
+    await firstCall;
+  });
+
+  it.each([
+    ["Error", new Error("identity resolver failed"), "identity resolver failed"],
+    ["non-Error", "identity resolver failed", "compact failed"],
+  ])("reports a %s PostgreSQL duplicate-admission failure", async (
+    _label,
+    identityError,
+    expectedError,
+  ) => {
+    let release!: () => void;
+    state.summarizerGate = new Promise<void>((resolve) => { release = resolve; });
+    state.identityError = identityError;
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        caFile: "/ca.pem",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+    const handler = createCompactHandler(value);
+    const first = response();
+    const firstCall = handler(
+      {} as never,
+      first.res,
+      JSON.stringify({ session_id: "postgres-duplicate-error", cwd: "/tmp" }),
+    );
+    const duplicate = response();
+    await handler(
+      {} as never,
+      duplicate.res,
+      JSON.stringify({ session_id: "postgres-duplicate-error", cwd: "/tmp" }),
+    );
+
+    expect(duplicate.json()).toEqual({ error: expectedError });
     release();
     await firstCall;
   });

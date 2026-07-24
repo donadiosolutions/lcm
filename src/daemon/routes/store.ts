@@ -11,7 +11,7 @@ import {
   type ProjectStorage,
   type StorageBackendFactory,
 } from "../../storage/index.js";
-import { closeRouteStorage } from "./storage-lifecycle.js";
+import { closeRouteStorage, storageRouteFailureResponse } from "./storage-lifecycle.js";
 
 /** Cache entry for a per-project ScrubEngine. */
 interface ScrubCacheEntry {
@@ -71,15 +71,16 @@ export function createStoreHandler(
       return;
     }
 
-    const scrubber = await getScrubEngine(config, projectDir(projectPath));
-    const scrubbedText = scrubber.scrub(text);
-    const scrubbedTags = tags.map((tag: string) => scrubber.scrub(tag));
-
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
+    let activeFactory: StorageBackendFactory | undefined;
     try {
-      const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await factory.openProject(projectIdentity(projectPath));
+      const identity = projectIdentity(projectPath, config.storage);
+      const scrubber = await getScrubEngine(config, projectDir(projectPath));
+      const scrubbedText = scrubber.scrub(text);
+      const scrubbedTags = tags.map((tag: string) => scrubber.scrub(tag));
+      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+      project = await activeFactory.openProject(identity);
 
       const id = await project.promotedMemory.insert({
         content: scrubbedText,
@@ -92,6 +93,11 @@ export function createStoreHandler(
 
       sendJson(res, 200, { stored: true, id });
     } catch (err) {
+      const storageFailure = storageRouteFailureResponse(activeFactory, err, "store");
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
+        return;
+      }
       sendJson(res, 500, { error: sanitizeError(err instanceof Error ? err.message : "store failed") });
     } finally {
       await closeRouteStorage(project, ownedFactory);
