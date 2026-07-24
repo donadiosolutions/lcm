@@ -90,6 +90,11 @@ pre-existing object ACLs are preserved. The normalization function is created
 without replacement, so a same-signature collision fails and rolls back the
 pending migration rather than overwriting operator code. Runtime domain grants
 remain absent until their owning adapters land.
+The three advisory-locked exact-identity triggers require `READ COMMITTED`
+isolation so their post-lock residual query receives a fresh snapshot; they
+fail closed under `REPEATABLE READ` and `SERIALIZABLE`. Recurring readiness
+normalizes and compares every ACL entry on those functions and accepts only the
+owning role's non-grantable `EXECUTE` privilege.
 
 ### Ownership and domain grouping
 

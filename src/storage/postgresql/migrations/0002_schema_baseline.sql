@@ -300,6 +300,12 @@ AS $function$
 DECLARE
   requested_sha256 bytea := public.digest(NEW.summary_id, 'sha256');
 BEGIN
+  IF pg_catalog.current_setting('transaction_isolation')
+       OPERATOR(pg_catalog.<>) 'read committed' THEN
+    RAISE EXCEPTION
+      'exact summary identifier enforcement requires READ COMMITTED isolation'
+      USING ERRCODE = 'feature_not_supported';
+  END IF;
   PERFORM pg_catalog.pg_advisory_xact_lock(
     pg_catalog.hashtextextended(
       NEW.project_id::text
@@ -433,6 +439,12 @@ AS $function$
 DECLARE
   requested_sha256 bytea := public.digest(NEW.file_id, 'sha256');
 BEGIN
+  IF pg_catalog.current_setting('transaction_isolation')
+       OPERATOR(pg_catalog.<>) 'read committed' THEN
+    RAISE EXCEPTION
+      'exact large-file identifier enforcement requires READ COMMITTED isolation'
+      USING ERRCODE = 'feature_not_supported';
+  END IF;
   PERFORM pg_catalog.pg_advisory_xact_lock(
     pg_catalog.hashtextextended(
       NEW.project_id::text
@@ -629,6 +641,12 @@ AS $function$
 DECLARE
   requested_sha256 bytea := public.digest(NEW.session_id, 'sha256');
 BEGIN
+  IF pg_catalog.current_setting('transaction_isolation')
+       OPERATOR(pg_catalog.<>) 'read committed' THEN
+    RAISE EXCEPTION
+      'exact session-ingest identifier enforcement requires READ COMMITTED isolation'
+      USING ERRCODE = 'feature_not_supported';
+  END IF;
   PERFORM pg_catalog.pg_advisory_xact_lock(
     pg_catalog.hashtextextended(
       NEW.project_id::text

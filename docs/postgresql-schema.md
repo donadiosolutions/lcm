@@ -77,9 +77,11 @@ does not add row-level security.
   `lcm.enforce_large_file_id_uniqueness()`, and
   `lcm.enforce_session_ingest_id_uniqueness()`. The check covers the stored
   body, language and trigger return type, invoker/security and leakproof flags,
-  volatility, parallel safety, fixed `search_path`, and absence of `PUBLIC
-  EXECUTE`. Owner-side definition, attribute, or privilege drift therefore
-  fails closed even when the function name and arity still match.
+  volatility, parallel safety, fixed `search_path`, and the complete normalized
+  function ACL. Only non-grantable `EXECUTE` by the owning role is accepted;
+  `PUBLIC`, named-role, grant-option, foreign-grantor, missing-owner, and other
+  ACL drift therefore fail closed even when the function name and arity still
+  match.
 - PostgreSQL 18's native [`uuidv7()`](https://www.postgresql.org/docs/18/functions-uuid.html)
   is the default for machine, project, part, transcript, promoted-memory, and
   internal summary relationship identities. Machine, project,
@@ -105,7 +107,11 @@ does not add row-level security.
   ingest completion. Queries retain the exact text predicate as the residual.
   Session-ingest rows use an internal UUIDv7 `ingest_key`; a transaction
   advisory lock plus digest candidate and exact residual preserves exact
-  per-project uniqueness without indexing arbitrary-length session text.
+  per-project uniqueness without indexing arbitrary-length session text. These
+  advisory-locked exact-identity triggers require `READ COMMITTED` isolation,
+  where the residual query can observe a preceding lock holder's commit. They
+  fail closed with SQLSTATE `0A000` under `REPEATABLE READ` or `SERIALIZABLE`
+  instead of trusting a transaction-wide stale snapshot.
   Conversations and messages retain generated `bigint` identities compatible
   with the existing repository contracts. Inbox, recall, and instruction rows
   also use generated numeric identities where a local ordering key is useful.
@@ -247,7 +253,7 @@ deletion.
 | `recall_surfacing` | Project-owned historical usage evidence retained independently when a promoted-memory row is missing or deleted. Project deletion remains restricted. | Generated `bigint` primary key and opaque text `memory_id`; there is deliberately no promoted-memory foreign key, so arbitrary caller IDs, orphan observations, and historical feedback round-trip. Memory-order and partial fixed-width session-digest indexes provide deterministic recall and feedback aggregation with exact-text residuals. |
 | `redaction_counters` | Project-scoped aggregate retained as administrative state; project deletion is restricted. It contains counts, not redacted content. | One row per project and `built_in`, `global`, `project`, or `gitleaks` category; nonnegative count; timezone-aware update time. |
 | `ingest_checkpoints` | Project/machine/client/source coordination retained for resumable native ingestion; both identity roots restrict deletion. | Composite primary key; nonnegative source ordinal and imported/skipped/quarantined counts; object JSON checkpoint. `ingest_checkpoints_payload_idx` supports JSONB path inspection. |
-| `session_ingest_log` | Project-scoped completion marker retained to make whole-session ingestion idempotent; project deletion is restricted. Remove it only through an explicit replay or administrative workflow. | UUIDv7 `ingest_key` primary key; exact nonnull arbitrary-length session ID, including whitespace-only values; generated SHA-256 lookup candidate; nonnegative message count; timezone-aware completion time. The identity trigger uses a project/digest advisory lock plus exact residual to enforce one matching session per project without placing raw text in a B-tree. `session_ingest_log_completed_idx` supplies deterministic newest-first project scans. |
+| `session_ingest_log` | Project-scoped completion marker retained to make whole-session ingestion idempotent; project deletion is restricted. Remove it only through an explicit replay or administrative workflow. | UUIDv7 `ingest_key` primary key; exact nonnull arbitrary-length session ID, including whitespace-only values; generated SHA-256 lookup candidate; nonnegative message count; timezone-aware completion time. Under required `READ COMMITTED` isolation, the identity trigger uses a project/digest advisory lock plus exact residual to enforce one matching session per project without placing raw text in a B-tree; higher isolation fails closed with SQLSTATE `0A000`. `session_ingest_log_completed_idx` supplies deterministic newest-first project scans. |
 | `session_instructions` | Project-scoped cached instruction content, optionally machine-specific. Project and machine references restrict deletion. | Generated `bigint` primary key; nonnegative slot; caller-defined text content hash preserved unchanged; `UNIQUE NULLS NOT DISTINCT (project_id, machine_id, slot)` permits one project-global value per slot. |
 
 ### Distributed coordination

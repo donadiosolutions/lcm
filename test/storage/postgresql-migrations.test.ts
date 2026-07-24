@@ -250,7 +250,7 @@ describe("PostgreSQL migration runner", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "c97d053f16663197dadea1fb67823a5a05e3bdf3bfe3b6113003aaf16c77a276" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "fa454af24f0729d8b19143cd1455da3bcbf4f982435802ddd615060ba321dc43" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
@@ -914,7 +914,9 @@ describe("PostgreSQL migration runner", () => {
       "provolatile",
       "proparallel",
       "proconfig",
-      "public_execute",
+      "normalized_acl",
+      "aclexplode",
+      "owner|owner|EXECUTE|false",
     ]) expect(fingerprintSql).toContain(fingerprintedField);
   });
 

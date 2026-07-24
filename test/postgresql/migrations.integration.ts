@@ -701,6 +701,40 @@ describe("PostgreSQL migrations and database isolation", () => {
     });
   });
 
+  it("rejects identity-trigger EXECUTE granted to a named role", async () => {
+    await withPostgreSqlTestDatabase("migration-trigger-named-acl", async (database) => {
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+      try {
+        await admin.query({
+          text: "CREATE ROLE lcm_identity_acl_probe",
+        }, { domain: "factory", operation: "createIdentityAclProbeRole" });
+        await database.migrator.query({
+          text: `GRANT EXECUTE
+                 ON FUNCTION lcm.enforce_session_ingest_id_uniqueness()
+                 TO lcm_identity_acl_probe`,
+        }, { domain: "factory", operation: "grantIdentityFunctionToNamedRole" });
+        await expect(runPostgreSqlMigrations(database.migrator))
+          .rejects.toMatchObject({
+            baselineApplied: true,
+            driftedFunctionCount: 1,
+            existingFunctionCount: 3,
+            expectedFunctionCount: 3,
+            operation: "preflightIdentityFunctionDefinitions",
+          });
+      } finally {
+        await database.migrator.query({
+          text: `REVOKE ALL
+                 ON FUNCTION lcm.enforce_session_ingest_id_uniqueness()
+                 FROM lcm_identity_acl_probe`,
+        }, { domain: "factory", operation: "revokeIdentityFunctionFromNamedRole" });
+        await admin.query({
+          text: "DROP ROLE lcm_identity_acl_probe",
+        }, { domain: "factory", operation: "dropIdentityAclProbeRole" });
+        await admin.close();
+      }
+    });
+  });
+
   it("rejects checksum drift and rolls back a failed pending migration", async () => {
     await withPostgreSqlTestDatabase("migration-drift", async (database) => {
       const baseline = migration("0001_migration_ledger", ledgerSql);

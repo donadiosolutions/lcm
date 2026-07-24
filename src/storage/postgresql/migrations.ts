@@ -22,7 +22,7 @@ const MIGRATION_MANIFEST = [
   {
     id: "0002_schema_baseline",
     filename: "0002_schema_baseline.sql",
-    sha256: "c97d053f16663197dadea1fb67823a5a05e3bdf3bfe3b6113003aaf16c77a276",
+    sha256: "fa454af24f0729d8b19143cd1455da3bcbf4f982435802ddd615060ba321dc43",
   },
 ] as const;
 
@@ -1153,15 +1153,15 @@ export async function runPostgreSqlMigrations(
                  VALUES
                    (
                      'enforce_summary_id_uniqueness'::pg_catalog.text,
-                     '588b89ccad1812592ae24358f0096205dc87613a7d7fe73b28dc544d089f0210'::pg_catalog.text
+                     '2e4d8b18c207e251edfbc81dac50cd0e0dba45dc0768ef50eeded33f5571d975'::pg_catalog.text
                    ),
                    (
                      'enforce_large_file_id_uniqueness'::pg_catalog.text,
-                     '88a8ec57d47017294c1532788dafc3e89fc406887e92338f89b3dc24033906ac'::pg_catalog.text
+                     '89d25e96d0ccc63954135183605c7aadbcb4c726143c8c56c67b9cd49398957b'::pg_catalog.text
                    ),
                    (
                      'enforce_session_ingest_id_uniqueness'::pg_catalog.text,
-                     '99df5c443c85f2620ed281c2b05ba4a18af4cfd8c1cd408671af3f7d0f9bed22'::pg_catalog.text
+                     'b7e1725a4d6ee95f3e806386025734c6d6d44853642231048a2b23a0d9fc6021'::pg_catalog.text
                    )
                ),
                actual_functions AS (
@@ -1175,17 +1175,36 @@ export async function runPostgreSqlMigrations(
                         procedure.proconfig,
                         language.lanname,
                         procedure.prorettype,
-                        EXISTS (
-                          SELECT 1
+                        (
+                          SELECT pg_catalog.string_agg(
+                            pg_catalog.concat_ws(
+                              '|',
+                              CASE
+                                WHEN privilege.grantee
+                                  OPERATOR(pg_catalog.=) procedure.proowner
+                                  THEN 'owner'
+                                ELSE privilege.grantee::pg_catalog.text
+                              END,
+                              CASE
+                                WHEN privilege.grantor
+                                  OPERATOR(pg_catalog.=) procedure.proowner
+                                  THEN 'owner'
+                                ELSE privilege.grantor::pg_catalog.text
+                              END,
+                              privilege.privilege_type,
+                              privilege.is_grantable::pg_catalog.text
+                            ),
+                            E'\\n'
+                            ORDER BY privilege.grantee, privilege.grantor,
+                              privilege.privilege_type, privilege.is_grantable
+                          )
                           FROM pg_catalog.aclexplode(
                             COALESCE(
                               procedure.proacl,
                               pg_catalog.acldefault('f', procedure.proowner)
                             )
                           ) AS privilege
-                          WHERE privilege.grantee OPERATOR(pg_catalog.=) 0
-                            AND privilege.privilege_type OPERATOR(pg_catalog.=) 'EXECUTE'
-                        ) AS public_execute
+                        ) AS normalized_acl
                  FROM pg_catalog.pg_proc AS procedure
                  JOIN pg_catalog.pg_namespace AS namespace
                    ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
@@ -1222,7 +1241,8 @@ export async function runPostgreSqlMigrations(
                             OR actual_functions.proparallel OPERATOR(pg_catalog.<>) 'u'
                             OR actual_functions.proconfig IS DISTINCT FROM
                               ARRAY['search_path=pg_catalog, public']::pg_catalog.text[]
-                            OR actual_functions.public_execute
+                            OR actual_functions.normalized_acl IS DISTINCT FROM
+                              'owner|owner|EXECUTE|false'
                         )::pg_catalog.int4
                         ELSE 0::pg_catalog.int4
                       END AS drifted_function_count

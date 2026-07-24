@@ -1222,6 +1222,35 @@ describe("PostgreSQL schema baseline", () => {
     });
   });
 
+  it("fails closed for exact identity enforcement above READ COMMITTED", async () => {
+    await withPostgreSqlTestDatabase("schema-session-isolation", async (database) => {
+      const scope = await seedScope(database.migrator);
+      await expect(database.migrator.transaction(async (transaction) => {
+        await transaction.query({
+          text: "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        }, { domain: "factory", operation: "raiseSessionIdentityIsolation" });
+        await transaction.query({
+          text: `INSERT INTO lcm.session_ingest_log
+                   (project_id, session_id, message_count)
+                 VALUES ($1, 'repeatable-read-session', 1)`,
+          values: [scope.projectId],
+        }, { domain: "factory", operation: "rejectStaleSessionIdentitySnapshot" });
+      }, { domain: "transaction", operation: "enforceSessionIdentityIsolation" }))
+        .rejects.toMatchObject({
+          operation: "rejectStaleSessionIdentitySnapshot",
+          sqlState: "0A000",
+        });
+      await expect(database.migrator.query<{ count: string }>({
+        text: `SELECT pg_catalog.count(*)::pg_catalog.text AS count
+               FROM lcm.session_ingest_log
+               WHERE project_id = $1
+                 AND session_id = 'repeatable-read-session'`,
+        values: [scope.projectId],
+      }, { domain: "factory", operation: "verifyRejectedStaleSessionIdentitySnapshot" }))
+        .resolves.toMatchObject({ rows: [{ count: "0" }] });
+    });
+  });
+
   it("stores one backend-neutral ProjectIdentity id per internal project UUID", async () => {
     await withPostgreSqlTestDatabase("schema-project-identity", async (database) => {
       const scope = await seedScope(database.migrator);
