@@ -121,6 +121,39 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 | `version-pr.yml`                     | Push to main + manual `beta`/`stable` dispatch                                      | Auto-create version PRs and enter or exit Changesets beta mode                          |
 | `publish.yml`                        | Stable/beta tag pushes + GitHub release publication                                  | Create draft releases from tags; publish npm only after manual draft publication        |
 
+### CI Environment Caches
+
+The canonical CI workflow initializes its dependency environment in one
+Blacksmith job before Core CI and the PostgreSQL matrix begin. The repository
+local `.github/actions/setup-ci` composite action is the only installation
+entrypoint used by those jobs. It maintains exact, fallback-free caches for:
+
+- `node_modules`, keyed by the Node version, runner OS and architecture, and
+  the complete npm installation contract: `package.json`, `package-lock.json`,
+  and `.npmrc`;
+- the digest-pinned PostgreSQL and Node images used by the conformance harness;
+- a cleanly stopped PostgreSQL 18 cluster containing a secret-free
+  `lcm_harness_template` database with the required extensions.
+
+An exact `node_modules` hit skips `npm ci` only after the cache stamp, platform,
+Node version, npm installation-contract digest, package inventory, and
+`npm ls --all` all validate. Image restores are checked against their
+repository digests.
+Image and template archives carry SHA-256 sidecars, and PostgreSQL template
+archives also reject unsafe or incomplete paths before use.
+
+The PostgreSQL cache is immutable initialization state, not a reusable test
+database. Each matrix leg extracts it into a new labeled volume, clones a unique
+control database, generates new passwords and TLS material, inserts its own run
+sentinel, and cleans every run-scoped container, network, volume, and secret.
+The cached cluster contains no login-capable harness roles, credentials,
+private keys, run identifiers, test databases, or sentinels.
+
+Environment initialization, Core CI, PostgreSQL conformance, and both CodeQL
+profiles use Blacksmith runners. The small aggregate check and read-only
+Codecov upload jobs use GitHub-hosted runners. Publishing remains GitHub-hosted
+because npm trusted provenance does not accept self-hosted runners.
+
 The CI workflow keeps coverage reporting in separate read-only jobs. Checkout
 uses the job token to fetch `github.repository` at the workflow's `github.sha`,
 but `persist-credentials: false` ensures credentials are not persisted. The jobs

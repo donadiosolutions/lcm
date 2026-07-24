@@ -12,6 +12,7 @@ import {
   harnessErrorDetails,
   isMissingDockerObjectError,
   removeLabeled,
+  resolveConfiguredTemplateArchive,
   runProcess,
   runSanitizedProcess,
   sanitizeHarnessText,
@@ -34,6 +35,7 @@ describe("PostgreSQL harness utilities", () => {
       container: `lcm-pg-${"a".repeat(20)}`,
       network: `lcm-pg-net-${"a".repeat(20)}`,
       volume: `lcm-pg-data-${"a".repeat(20)}`,
+      restore: `lcm-pg-restore-${"a".repeat(20)}`,
       runner: `lcm-pg-runner-${"a".repeat(20)}`,
       alias: `lcm-pg-${"a".repeat(20)}.test`,
       wrongAlias: `lcm-pg-wrong-${"a".repeat(20)}.test`,
@@ -41,6 +43,23 @@ describe("PostgreSQL harness utilities", () => {
     });
     expect(() => validateRunNames(names, "not-random")).toThrow("run ID");
     expect(() => validateRunNames({ ...names, volume: "foreign-volume" }, runId)).toThrow("volume");
+  });
+
+  it("fails closed with context when a configured template archive cannot be resolved", () => {
+    const missing = "/cache/missing-postgresql-template.tar";
+    const missingError = Object.assign(new Error("not found"), { code: "ENOENT" });
+    expect(resolveConfiguredTemplateArchive("  ")).toBe("");
+    expect(() => resolveConfiguredTemplateArchive(missing, {
+      realpath: () => { throw missingError; },
+    })).toThrow(`configured PostgreSQL template archive could not be resolved: ${missing}`);
+    expect(() => resolveConfiguredTemplateArchive("/cache/template.tar", {
+      realpath: () => "/resolved/template.tar",
+      stat: () => ({ isFile: () => false }),
+    })).toThrow("configured PostgreSQL template archive is not a regular file: /resolved/template.tar");
+    expect(resolveConfiguredTemplateArchive("/cache/template.tar", {
+      realpath: () => "/resolved/template.tar",
+      stat: () => ({ isFile: () => true }),
+    })).toBe("/resolved/template.tar");
   });
 
   it("isolates Vitest caches by validated harness run ID", () => {
@@ -382,6 +401,8 @@ describe("PostgreSQL harness utilities", () => {
     const rules = attributes.split(/\r?\n/u);
     expect(rules).toContain("src/storage/postgresql/migrations/*.sql text eol=lf");
     expect(rules).toContain("test/postgresql/init.sh text eol=lf");
+    expect(rules).toContain("test/postgresql/template-init.sh text eol=lf");
+    expect(rules).toContain("test/postgresql/cached-run-init.sh text eol=lf");
   });
 
   it("cleans every owned resource and the secret directory in order", async () => {
@@ -400,6 +421,7 @@ describe("PostgreSQL harness utilities", () => {
     })).resolves.toBeUndefined();
 
     expect(events).toEqual([
+      `remove:container:${names.restore}`,
       `remove:container:${names.runner}`,
       "verify:sentinel",
       `remove:container:${names.container}`,
@@ -477,6 +499,7 @@ describe("PostgreSQL harness utilities", () => {
       "directory remove failed",
     ].join("\n"));
     expect(attempts).toEqual([
+      `container:${names.restore}`,
       `container:${names.runner}`,
       `container:${names.container}`,
       `volume:${names.volume}`,

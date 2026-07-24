@@ -1,0 +1,136 @@
+name: Set up CI environment
+description: Restore or seed the verified Node.js and PostgreSQL CI environment.
+
+inputs:
+  stage-postgresql:
+    description: Restore the PostgreSQL images and sanitized template cluster.
+    required: false
+    default: "false"
+
+outputs:
+  node-modules-cache-hit:
+    description: Whether the exact node_modules cache was restored.
+    value: ${{ steps.restore-node-modules.outputs.cache-hit }}
+  images-cache-hit:
+    description: Whether the exact PostgreSQL harness image cache was restored.
+    value: ${{ steps.restore-images.outputs.cache-hit }}
+  postgresql-template-cache-hit:
+    description: Whether the exact initialized PostgreSQL template cache was restored.
+    value: ${{ steps.restore-postgresql-template.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      with:
+        node-version: "22.20.0"
+        cache: npm
+
+    - name: Derive exact cache keys
+      id: cache-metadata
+      shell: bash
+      run: node scripts/ci-environment.mjs cache-metadata >> "$GITHUB_OUTPUT"
+
+    - name: Restore installed Node dependencies
+      id: restore-node-modules
+      uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        path: node_modules
+        key: ${{ steps.cache-metadata.outputs.node-modules-key }}
+
+    - name: Install or validate Node dependencies
+      shell: bash
+      env:
+        NODE_MODULES_CACHE_HIT: ${{ steps.restore-node-modules.outputs.cache-hit }}
+      run: |
+        set -Eeuo pipefail
+        if [[ "$NODE_MODULES_CACHE_HIT" == "true" ]]; then
+          node scripts/ci-environment.mjs validate-node-modules node_modules
+        else
+          npm ci
+          npm ls --all --json >/dev/null
+          node scripts/ci-environment.mjs write-node-modules-stamp node_modules
+        fi
+        npm ls --all --json >/dev/null
+
+    - name: Save installed Node dependencies
+      if: ${{ steps.restore-node-modules.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        path: node_modules
+        key: ${{ steps.cache-metadata.outputs.node-modules-key }}
+
+    - name: Prepare PostgreSQL cache paths
+      if: ${{ inputs.stage-postgresql == 'true' }}
+      shell: bash
+      run: mkdir -p "$RUNNER_TEMP/lcm-ci"
+
+    - name: Restore PostgreSQL harness images
+      if: ${{ inputs.stage-postgresql == 'true' }}
+      id: restore-images
+      uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        path: |
+          ${{ runner.temp }}/lcm-ci/postgresql-images.tar
+          ${{ runner.temp }}/lcm-ci/postgresql-images.tar.sha256
+        key: ${{ steps.cache-metadata.outputs.images-key }}
+
+    - name: Stage PostgreSQL harness images
+      if: ${{ inputs.stage-postgresql == 'true' }}
+      shell: bash
+      env:
+        IMAGES_CACHE_HIT: ${{ steps.restore-images.outputs.cache-hit }}
+      run: |
+        set -Eeuo pipefail
+        if [[ "$IMAGES_CACHE_HIT" == "true" ]]; then
+          node scripts/ci-environment.mjs load-images "$RUNNER_TEMP/lcm-ci/postgresql-images.tar"
+        else
+          node scripts/ci-environment.mjs stage-images "$RUNNER_TEMP/lcm-ci/postgresql-images.tar"
+        fi
+
+    - name: Save PostgreSQL harness images
+      if: ${{ inputs.stage-postgresql == 'true' && steps.restore-images.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        path: |
+          ${{ runner.temp }}/lcm-ci/postgresql-images.tar
+          ${{ runner.temp }}/lcm-ci/postgresql-images.tar.sha256
+        key: ${{ steps.cache-metadata.outputs.images-key }}
+
+    - name: Restore initialized PostgreSQL template
+      if: ${{ inputs.stage-postgresql == 'true' }}
+      id: restore-postgresql-template
+      uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        path: |
+          ${{ runner.temp }}/lcm-ci/postgresql-template.tar
+          ${{ runner.temp }}/lcm-ci/postgresql-template.tar.sha256
+        key: ${{ steps.cache-metadata.outputs.template-key }}
+
+    - name: Build or validate initialized PostgreSQL template
+      if: ${{ inputs.stage-postgresql == 'true' }}
+      shell: bash
+      env:
+        POSTGRESQL_TEMPLATE_CACHE_HIT: ${{ steps.restore-postgresql-template.outputs.cache-hit }}
+      run: |
+        set -Eeuo pipefail
+        if [[ "$POSTGRESQL_TEMPLATE_CACHE_HIT" == "true" ]]; then
+          node scripts/ci-environment.mjs validate-postgresql-template "$RUNNER_TEMP/lcm-ci/postgresql-template.tar"
+        else
+          node scripts/ci-environment.mjs build-postgresql-template "$RUNNER_TEMP/lcm-ci/postgresql-template.tar"
+        fi
+
+    - name: Save initialized PostgreSQL template
+      if: ${{ inputs.stage-postgresql == 'true' && steps.restore-postgresql-template.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        path: |
+          ${{ runner.temp }}/lcm-ci/postgresql-template.tar
+          ${{ runner.temp }}/lcm-ci/postgresql-template.tar.sha256
+        key: ${{ steps.cache-metadata.outputs.template-key }}
+
+    - name: Expose initialized PostgreSQL template
+      if: ${{ inputs.stage-postgresql == 'true' }}
+      shell: bash
+      run: printf 'LCM_POSTGRES_TEMPLATE_ARCHIVE=%s\n' "$RUNNER_TEMP/lcm-ci/postgresql-template.tar" >> "$GITHUB_ENV"
