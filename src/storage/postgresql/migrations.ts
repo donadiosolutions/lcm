@@ -89,10 +89,10 @@ const EXPECTED_BASELINE_INDEX_NAMES = `
   fenced_leases_owner_idx fenced_leases_expiry_idx fenced_leases_owner_machine_idx
 `.trim().split(/\s+/u);
 
-const EXPECTED_BASELINE_TRIGGER_NAMES = [
-  "large_files_enforce_file_id_uniqueness",
-  "session_ingest_log_enforce_session_id_uniqueness",
-  "summaries_enforce_summary_id_uniqueness",
+const EXPECTED_BASELINE_TRIGGER_IDENTITIES = [
+  "large_files|large_files_enforce_file_id_uniqueness",
+  "session_ingest_log|session_ingest_log_enforce_session_id_uniqueness",
+  "summaries|summaries_enforce_summary_id_uniqueness",
 ] as const;
 
 const EXPECTED_BASELINE_CONSTRAINT_NAMES = `
@@ -173,10 +173,45 @@ const EXPECTED_BASELINE_CONSTRAINT_NAMES = `
   transcript_messages_project_id_transcript_id_source_ordinal_key
 `.trim().split(/\s+/u);
 
+const EXPECTED_BASELINE_CONSTRAINT_TABLES = [
+  "context_items",
+  "conversations",
+  "fenced_leases",
+  "ingest_checkpoints",
+  "large_files",
+  "machines",
+  "message_parts",
+  "messages",
+  "native_transcripts",
+  "passive_event_inbox",
+  "project_aliases",
+  "projects",
+  "promoted_memories",
+  "promoted_memory_tags",
+  "recall_surfacing",
+  "redaction_counters",
+  "schema_migrations",
+  "session_ingest_log",
+  "session_instructions",
+  "summaries",
+  "summary_large_files",
+  "summary_messages",
+  "summary_parents",
+  "transcript_messages",
+] as const;
+
+const EXPECTED_BASELINE_CONSTRAINT_IDENTITIES =
+  EXPECTED_BASELINE_CONSTRAINT_NAMES.map((constraintName) => {
+    const tableName = EXPECTED_BASELINE_CONSTRAINT_TABLES.find(
+      (candidate) => constraintName.startsWith(`${candidate}_`),
+    )!;
+    return `${tableName}|${constraintName}`;
+  });
+
 const EXPECTED_BASELINE_DEFINITION_COUNT =
   EXPECTED_BASELINE_INDEX_NAMES.length
-  + EXPECTED_BASELINE_TRIGGER_NAMES.length
-  + EXPECTED_BASELINE_CONSTRAINT_NAMES.length;
+  + EXPECTED_BASELINE_TRIGGER_IDENTITIES.length
+  + EXPECTED_BASELINE_CONSTRAINT_IDENTITIES.length;
 
 export class PostgreSqlServerVersionPreflightError extends StorageOperationError {
   constructor(
@@ -823,8 +858,11 @@ export async function runPostgreSqlMigrations(
                    ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                    AND NOT trigger.tgisinternal
-                   AND trigger.tgname OPERATOR(pg_catalog.=)
-                     ANY ($3::pg_catalog.text[])
+                   AND pg_catalog.concat_ws(
+                     '|',
+                     relation.relname,
+                     trigger.tgname
+                   ) OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
                ),
                actual_constraints AS (
                  SELECT constraint_metadata.conname AS object_name,
@@ -841,8 +879,11 @@ export async function runPostgreSqlMigrations(
                  JOIN pg_catalog.pg_namespace AS namespace
                    ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-                   AND constraint_metadata.conname OPERATOR(pg_catalog.=)
-                     ANY ($4::pg_catalog.text[])
+                   AND pg_catalog.concat_ws(
+                     '|',
+                     relation.relname,
+                     constraint_metadata.conname
+                   ) OPERATOR(pg_catalog.=) ANY ($4::pg_catalog.text[])
                ),
                actual_groups(object_kind, existing_count, definition_sha256) AS (
                  SELECT 'index'::pg_catalog.text,
@@ -955,8 +996,8 @@ export async function runPostgreSqlMigrations(
         values: [
           baselineApplied,
           EXPECTED_BASELINE_INDEX_NAMES,
-          EXPECTED_BASELINE_TRIGGER_NAMES,
-          EXPECTED_BASELINE_CONSTRAINT_NAMES,
+          EXPECTED_BASELINE_TRIGGER_IDENTITIES,
+          EXPECTED_BASELINE_CONSTRAINT_IDENTITIES,
           EXPECTED_BASELINE_DEFINITION_COUNT,
         ],
       }, {

@@ -819,9 +819,9 @@ describe("PostgreSQL migration runner", () => {
         true,
         expect.arrayContaining(["session_ingest_log_identity_lookup_idx"]),
         expect.arrayContaining([
-          "session_ingest_log_enforce_session_id_uniqueness",
+          "session_ingest_log|session_ingest_log_enforce_session_id_uniqueness",
         ]),
-        expect.arrayContaining(["session_ingest_log_pkey"]),
+        expect.arrayContaining(["session_ingest_log|session_ingest_log_pkey"]),
         223,
       ]);
   });

@@ -473,6 +473,69 @@ describe("PostgreSQL migrations and database isolation", () => {
     });
   });
 
+  it("ignores same-name trigger and constraint collisions on operator tables", async () => {
+    await withPostgreSqlTestDatabase("definition-collision", async (database) => {
+      try {
+        await database.migrator.query({
+          text: `CREATE TABLE lcm.operator_definition_collision (
+                   operator_id integer,
+                   project_id uuid,
+                   session_id text,
+                   CONSTRAINT session_ingest_log_message_count_check
+                     CHECK (operator_id > 0)
+                 );
+                 CREATE TRIGGER session_ingest_log_enforce_session_id_uniqueness
+                   BEFORE INSERT ON lcm.operator_definition_collision
+                   FOR EACH ROW
+                   EXECUTE FUNCTION lcm.enforce_session_ingest_id_uniqueness()`,
+        }, { domain: "factory", operation: "seedDefinitionNameCollisions" });
+
+        await expect(runPostgreSqlMigrations(database.migrator))
+          .resolves.toMatchObject({ applied: [] });
+        await expect(database.migrator.query<{
+          constraint_collision: boolean;
+          trigger_collision: boolean;
+        }>({
+          text: `SELECT
+                   EXISTS (
+                     SELECT 1
+                     FROM pg_catalog.pg_constraint AS constraint_metadata
+                     JOIN pg_catalog.pg_class AS relation
+                       ON relation.oid = constraint_metadata.conrelid
+                     JOIN pg_catalog.pg_namespace AS namespace
+                       ON namespace.oid = relation.relnamespace
+                     WHERE namespace.nspname = 'lcm'
+                       AND relation.relname = 'operator_definition_collision'
+                       AND constraint_metadata.conname =
+                         'session_ingest_log_message_count_check'
+                   ) AS constraint_collision,
+                   EXISTS (
+                     SELECT 1
+                     FROM pg_catalog.pg_trigger AS trigger
+                     JOIN pg_catalog.pg_class AS relation
+                       ON relation.oid = trigger.tgrelid
+                     JOIN pg_catalog.pg_namespace AS namespace
+                       ON namespace.oid = relation.relnamespace
+                     WHERE namespace.nspname = 'lcm'
+                       AND relation.relname = 'operator_definition_collision'
+                       AND trigger.tgname =
+                         'session_ingest_log_enforce_session_id_uniqueness'
+                   ) AS trigger_collision`,
+        }, { domain: "factory", operation: "verifyDefinitionNameCollisions" }))
+          .resolves.toMatchObject({
+            rows: [{
+              constraint_collision: true,
+              trigger_collision: true,
+            }],
+          });
+      } finally {
+        await database.migrator.query({
+          text: "DROP TABLE IF EXISTS lcm.operator_definition_collision",
+        }, { domain: "factory", operation: "dropDefinitionNameCollisions" });
+      }
+    });
+  });
+
   it("rejects a missing object from the recorded 0002 inventory", async () => {
     await withPostgreSqlTestDatabase("migration-missing-object", async (database) => {
       await database.migrator.query({
