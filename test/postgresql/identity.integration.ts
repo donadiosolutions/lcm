@@ -210,6 +210,87 @@ describe("PostgreSQL 18 machine and project identities", () => {
         prior: null,
       })).resolves.toBe(false);
 
+      await repository.linkProject({
+        machineId: machine.machineId,
+        projectId: original.projectId,
+        path: "/work/reconcile-alias",
+        normalizedPath: "/work/reconcile-alias",
+      });
+      await repository.linkProject({
+        machineId: machine.machineId,
+        projectId: original.projectId,
+        path: "/work/sibling-entry",
+        normalizedPath: "/work/sibling-entry",
+      });
+      const foreign = await repository.createProject({
+        machineId: machine.machineId,
+        displayName: "Foreign",
+        path: "/work/foreign",
+        normalizedPath: "/work/foreign",
+      });
+      const collision = [
+        { path: "/work/reconcile", normalizedPath: "/work/reconcile" },
+        { path: "/work/foreign", normalizedPath: "/work/foreign" },
+      ];
+      await expect(repository.replaceProjectAliases({
+        machineId: machine.machineId,
+        expectedPriorProjectId: original.projectId,
+        projectId: replacement.projectId,
+        aliases: collision,
+      })).resolves.toBeNull();
+      await expect(repository.resolveProject(machine.machineId, "/work/reconcile"))
+        .resolves.toMatchObject({ projectId: original.projectId });
+      await expect(repository.resolveProject(machine.machineId, "/work/foreign"))
+        .resolves.toMatchObject({ projectId: foreign.projectId });
+
+      const entryAliases = [
+        { path: "/work/reconcile", normalizedPath: "/work/reconcile" },
+        { path: "/work/reconcile-alias", normalizedPath: "/work/reconcile-alias" },
+        { path: "/work/local-only", normalizedPath: "/work/local-only" },
+      ];
+      const replacementMutation = await repository.replaceProjectAliases({
+        machineId: machine.machineId,
+        expectedPriorProjectId: original.projectId,
+        projectId: replacement.projectId,
+        aliases: entryAliases,
+      });
+      expect(replacementMutation).toMatchObject({
+        aliases: [{}, {}, {}],
+        prior: [
+          { projectId: original.projectId },
+          { projectId: original.projectId },
+          null,
+        ],
+      });
+      for (const alias of entryAliases) {
+        await expect(repository.resolveProject(machine.machineId, alias.normalizedPath))
+          .resolves.toMatchObject({ projectId: replacement.projectId });
+      }
+      await expect(repository.unlinkProjectAliasIfOwned(
+        machine.machineId,
+        replacement.projectId,
+        "/work/local-only",
+      )).resolves.toMatchObject({ normalizedPath: "/work/local-only" });
+      const removed = await repository.unlinkProjectAliasesIfOwned(
+        machine.machineId,
+        replacement.projectId,
+        entryAliases,
+      );
+      expect(removed).toHaveLength(2);
+      await expect(repository.resolveProject(machine.machineId, "/work/sibling-entry"))
+        .resolves.toMatchObject({ projectId: original.projectId });
+      await expect(repository.restoreProjectAliases(
+        machine.machineId,
+        replacement.projectId,
+        removed!,
+      )).resolves.toBe(true);
+      for (const alias of entryAliases.slice(0, 2)) {
+        await expect(repository.resolveProject(machine.machineId, alias.normalizedPath))
+          .resolves.toMatchObject({ projectId: replacement.projectId });
+      }
+      await expect(repository.resolveProject(machine.machineId, "/work/local-only"))
+        .resolves.toBeNull();
+
       const disposable = await repository.createProject({
         machineId: machine.machineId,
         displayName: "Disposable",
@@ -219,7 +300,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
       await expect(repository.cleanupCreatedProject(
         machine.machineId,
         disposable.projectId,
-        "/work/disposable",
+        ["/work/disposable"],
       )).resolves.toBe(true);
       await expect(repository.resolveProject(machine.machineId, "/work/disposable"))
         .resolves.toBeNull();
@@ -297,12 +378,16 @@ describe("PostgreSQL 18 machine and project identities", () => {
         },
         linkProject: repository.linkProject.bind(repository),
         replaceProjectAlias: repository.replaceProjectAlias.bind(repository),
+        replaceProjectAliases: repository.replaceProjectAliases.bind(repository),
         unlinkPath: repository.unlinkPath.bind(repository),
         unlinkProjectAliasIfOwned: repository.unlinkProjectAliasIfOwned.bind(repository),
+        unlinkProjectAliasesIfOwned: repository.unlinkProjectAliasesIfOwned.bind(repository),
         unlinkProject: repository.unlinkProject.bind(repository),
         deleteProjectIfUnreferenced: repository.deleteProjectIfUnreferenced.bind(repository),
         cleanupCreatedProject: repository.cleanupCreatedProject.bind(repository),
         restoreProjectAlias: repository.restoreProjectAlias.bind(repository),
+        restoreProjectAliases: repository.restoreProjectAliases.bind(repository),
+        restoreProjectAliasBatch: repository.restoreProjectAliasBatch.bind(repository),
         resolveProject: repository.resolveProject.bind(repository),
         listProjects: repository.listProjects.bind(repository),
       };

@@ -31,12 +31,15 @@ import {
 import {
   PostgreSqlIdentityRepository,
   PostgreSqlIdentityCreateOutcomeUnknownError,
+  PostgreSqlIdentityReplaceAliasesOutcomeUnknownError,
+  PostgreSqlIdentityUnlinkAliasesOutcomeUnknownError,
   PostgreSqlIdentityUnlinkPathOutcomeUnknownError,
-  PostgreSqlIdentityUnlinkProjectOutcomeUnknownError,
   type RemoteAliasOwnership,
+  type RemoteAliasBatchMutation,
   type RegisteredMachine,
   type RemoteProject,
   type RemoteProjectAlias,
+  type RemoteProjectAliasInput,
 } from "./storage/postgresql/identity-repository.js";
 import { PostgreSqlCommitOutcomeUnknownError } from "./storage/postgresql/errors.js";
 import { PostgreSqlRuntime } from "./storage/postgresql/runtime.js";
@@ -49,6 +52,7 @@ export interface IdentityRepository {
     readonly displayName: string;
     readonly path: string;
     readonly normalizedPath: string;
+    readonly aliases?: readonly RemoteProjectAliasInput[];
   }): Promise<RemoteProject>;
   linkProject(input: {
     readonly machineId: string;
@@ -63,6 +67,12 @@ export interface IdentityRepository {
     readonly path: string;
     readonly normalizedPath: string;
   }): Promise<RemoteProjectAlias | null>;
+  replaceProjectAliases(input: {
+    readonly machineId: string;
+    readonly expectedPriorProjectId?: string;
+    readonly projectId: string;
+    readonly aliases: readonly RemoteProjectAliasInput[];
+  }): Promise<RemoteAliasBatchMutation | null>;
   unlinkPath(
     machineId: string,
     normalizedPath: string,
@@ -72,12 +82,17 @@ export interface IdentityRepository {
     normalizedPath: string,
     projectId: string,
   ): Promise<RemoteAliasOwnership | null>;
+  unlinkProjectAliasesIfOwned(
+    machineId: string,
+    projectId: string,
+    aliases: readonly RemoteProjectAliasInput[],
+  ): Promise<RemoteProjectAlias[] | null>;
   unlinkProject(machineId: string, projectId: string): Promise<RemoteProjectAlias[]>;
   deleteProjectIfUnreferenced(projectId: string): Promise<boolean>;
   cleanupCreatedProject(
     machineId: string,
     projectId: string,
-    normalizedPath: string,
+    normalizedPaths: readonly string[],
   ): Promise<boolean>;
   restoreProjectAlias(input: {
     readonly machineId: string;
@@ -85,6 +100,17 @@ export interface IdentityRepository {
     readonly currentProjectId: string;
     readonly prior: RemoteAliasOwnership | null;
   }): Promise<boolean>;
+  restoreProjectAliases(
+    machineId: string,
+    projectId: string,
+    aliases: readonly RemoteProjectAlias[],
+  ): Promise<boolean>;
+  restoreProjectAliasBatch(
+    machineId: string,
+    currentProjectId: string,
+    prior: readonly (RemoteAliasOwnership | null)[],
+    aliases: readonly RemoteProjectAliasInput[],
+  ): Promise<boolean>;
   resolveProject(
     machineId: string,
     normalizedPath: string,
@@ -169,6 +195,18 @@ function remotePath(path: string): { readonly path: string; readonly normalizedP
   return { path: absolute, normalizedPath: realpathSync(absolute) };
 }
 
+function remoteEntryPaths(entry: ProjectMapEntry): Array<{
+  readonly path: string;
+  readonly normalizedPath: string;
+}> {
+  const paths = new Map<string, { readonly path: string; readonly normalizedPath: string }>();
+  for (const entryPath of [entry.canonical, ...entry.aliases]) {
+    const remote = remotePath(entryPath);
+    paths.set(remote.normalizedPath, remote);
+  }
+  return [...paths.values()];
+}
+
 async function withSession<T>(
   config: ResolvedStorageConfig,
   deps: IdentityServiceDependencies,
@@ -179,7 +217,11 @@ async function withSession<T>(
   try {
     return await callback(session.repository);
   } finally {
-    await session.close();
+    try {
+      await session.close();
+    } catch {
+      // Session cleanup is best-effort and never replaces the operation result.
+    }
   }
 }
 
@@ -307,9 +349,9 @@ async function compensateCreatedProject(
   repository: IdentityRepository,
   projectId: string,
   machineId: string,
-  normalizedPath: string,
+  normalizedPaths: readonly string[],
 ): Promise<void> {
-  await repository.cleanupCreatedProject(machineId, projectId, normalizedPath);
+  await repository.cleanupCreatedProject(machineId, projectId, normalizedPaths);
 }
 
 async function createRemoteProject(
@@ -319,6 +361,7 @@ async function createRemoteProject(
     readonly displayName: string;
     readonly path: string;
     readonly normalizedPath: string;
+    readonly aliases: readonly RemoteProjectAliasInput[];
   },
 ): Promise<RemoteProject> {
   try {
@@ -326,24 +369,31 @@ async function createRemoteProject(
   } catch (error) {
     if (!(error instanceof PostgreSqlIdentityCreateOutcomeUnknownError)) throw error;
     const candidate = error.candidate;
-    let resolved: RemoteAliasOwnership | null;
+    let resolved: Array<RemoteAliasOwnership | null>;
     try {
-      resolved = await repository.resolveProject(input.machineId, input.normalizedPath);
+      resolved = await Promise.all(
+        input.aliases.map(
+          ({ normalizedPath }) => repository.resolveProject(input.machineId, normalizedPath),
+        ),
+      );
     } catch {
       throw new ProjectIdentityReconciliationError(
         "PostgreSQL project creation commit outcome is unknown and readback failed",
         `Inspect \`lcm project list --json\`, then run \`lcm project link ${candidate.projectId} ${input.path}\` only if that project owns the path.`,
       );
     }
-    if (!resolved) {
+    if (resolved.every((owner) => owner === null)) {
       throw new ProjectIdentityReconciliationError(
-        "PostgreSQL did not retain a project alias after the uncertain create",
+        "PostgreSQL did not retain the project aliases after the uncertain create",
         `Rerun \`lcm project create ${input.path} --name ${JSON.stringify(input.displayName)}\`.`,
       );
     }
-    if (resolved.projectId === candidate.projectId) return candidate;
+    if (resolved.every((owner) => owner?.projectId === candidate.projectId)) return candidate;
+    const ownerIds = [...new Set(
+      resolved.flatMap((owner) => owner ? [owner.projectId] : []),
+    )];
     throw new ProjectIdentityReconciliationError(
-      `PostgreSQL project creation candidate ${candidate.projectId} does not own ${input.normalizedPath}; it is owned by ${resolved.projectId}`,
+      `PostgreSQL project creation candidate ${candidate.projectId} does not own every local path; observed owners: ${ownerIds.join(", ")}`,
       `Run \`lcm project show ${input.path} --json\` and resolve the collision before retrying.`,
     );
   }
@@ -355,6 +405,7 @@ export async function createProject(
   options: { readonly displayName?: string } = {},
   dependencyOverrides?: Partial<IdentityServiceDependencies>,
 ): Promise<{ readonly local: ProjectIdentity; readonly remote: RemoteProject }> {
+  requirePostgreSqlConfig(config);
   const projectPath = assertProjectDirectory(path);
   const deps = dependencies(dependencyOverrides);
   const machine = requireMachineIdentity(deps.homeDir);
@@ -366,11 +417,14 @@ export async function createProject(
       `local project ${local.id} is already bound to PostgreSQL project ${local.remoteProjectId}`,
     );
   }
+  const entryPaths = remoteEntryPaths(showProjectMapEntry(local.id).entry);
+  const selectedPath = remotePath(projectPath);
   return withSession(config, deps, async (repository) => {
     const remote = await createRemoteProject(repository, {
       machineId: machine.machineId,
       displayName,
-      ...remotePath(projectPath),
+      ...selectedPath,
+      aliases: entryPaths,
     });
     try {
       setRemoteProjectBinding(remote.projectId, { hash: local.id });
@@ -380,7 +434,7 @@ export async function createProject(
           repository,
           remote.projectId,
           machine.machineId,
-          remotePath(projectPath).normalizedPath,
+          entryPaths.map(({ normalizedPath }) => normalizedPath),
         );
       } catch {
         throw new ProjectIdentityReconciliationError(
@@ -423,66 +477,90 @@ async function confirmRemoteLink(
   }
 }
 
-async function confirmRemoteReplacement(
+async function confirmRemoteBatchReplacement(
   repository: IdentityRepository,
   input: {
     readonly machineId: string;
-    readonly expectedPriorProjectId: string;
+    readonly expectedPriorProjectId?: string;
     readonly projectId: string;
-    readonly path: string;
-    readonly normalizedPath: string;
+    readonly aliases: readonly RemoteProjectAliasInput[];
+    readonly recoveryPath: string;
   },
-): Promise<RemoteProjectAlias> {
+): Promise<RemoteAliasBatchMutation> {
   try {
-    const replaced = await repository.replaceProjectAlias(input);
+    const replaced = await repository.replaceProjectAliases(input);
     if (replaced) return replaced;
     throw new ProjectIdentityReconciliationError(
-      "PostgreSQL alias ownership changed before the authorized rebind",
-      "Inspect `lcm project list --json` and reconcile the path explicitly.",
+      "PostgreSQL alias ownership changed before the authorized project rebind",
+      "Inspect `lcm project list --json` and reconcile every local project path explicitly.",
     );
   } catch (error) {
-    if (!(error instanceof PostgreSqlCommitOutcomeUnknownError)) throw error;
-    let resolved: RemoteAliasOwnership | null;
+    if (!(error instanceof PostgreSqlIdentityReplaceAliasesOutcomeUnknownError)) throw error;
+    let resolved: Array<RemoteAliasOwnership | null>;
     try {
-      resolved = await repository.resolveProject(input.machineId, input.normalizedPath);
+      resolved = await Promise.all(
+        input.aliases.map(
+          ({ normalizedPath }) => repository.resolveProject(input.machineId, normalizedPath),
+        ),
+      );
     } catch {
       throw new ProjectIdentityReconciliationError(
         "PostgreSQL project rebind commit outcome is unknown and readback failed",
-        `Inspect \`lcm project list --json\`, then rerun \`lcm project link ${input.projectId} ${input.path}\`.`,
+        `Inspect \`lcm project list --json\`, then rerun \`lcm project link ${input.projectId} ${input.recoveryPath}\`.`,
       );
     }
-    if (resolved?.projectId === input.projectId) return resolved.alias;
-    if (resolved?.projectId === input.expectedPriorProjectId) {
+    if (resolved.every((owner) => owner?.projectId === input.projectId)) {
+      return error.candidate;
+    }
+    if (resolved.every((owner, index) => {
+      const prior = error.candidate.prior[index];
+      return prior
+        ? owner?.projectId === prior.projectId
+        : owner === null;
+    })) {
       throw new ProjectIdentityReconciliationError(
-        "PostgreSQL retained the prior alias owner after the uncertain rebind",
-        `Rerun \`lcm project link ${input.projectId} ${input.path}\`; the operation is safe to retry.`,
+        "PostgreSQL retained the prior alias owners after the uncertain project rebind",
+        `Rerun \`lcm project link ${input.projectId} ${input.recoveryPath}\`; the operation is safe to retry.`,
       );
     }
     throw new ProjectIdentityReconciliationError(
-      "PostgreSQL alias ownership changed during the uncertain rebind",
-      "Inspect `lcm project list --json` and reconcile the path explicitly.",
+      "PostgreSQL alias ownership diverged during the uncertain project rebind",
+      "Inspect `lcm project list --json` and reconcile every local project path explicitly.",
     );
   }
 }
 
-async function restoreRemoteAlias(
+async function restoreRemoteBatchReplacement(
   repository: IdentityRepository,
   machineId: string,
-  prior: { readonly projectId: string; readonly alias: RemoteProjectAlias } | null,
   currentProjectId: string,
-  normalizedPath: string,
-): Promise<void> {
-  const restored = await repository.restoreProjectAlias({
-    machineId,
-    normalizedPath,
-    currentProjectId,
-    prior,
-  });
-  if (!restored) {
-    throw new ProjectIdentityReconciliationError(
-      "PostgreSQL alias ownership changed during restoration",
-      "Inspect `lcm project list --json` and reconcile the path explicitly.",
+  mutation: RemoteAliasBatchMutation,
+  aliases: readonly RemoteProjectAliasInput[],
+): Promise<boolean> {
+  try {
+    return await repository.restoreProjectAliasBatch(
+      machineId,
+      currentProjectId,
+      mutation.prior,
+      aliases,
     );
+  } catch (error) {
+    if (!(error instanceof PostgreSqlCommitOutcomeUnknownError)) throw error;
+    try {
+      const owners = await Promise.all(
+        aliases.map(
+          ({ normalizedPath }) => repository.resolveProject(machineId, normalizedPath),
+        ),
+      );
+      return owners.every((owner, index) => {
+        const prior = mutation.prior[index];
+        return prior
+          ? owner?.projectId === prior.projectId
+          : owner === null;
+      });
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -524,38 +602,77 @@ async function confirmRemoteAliasUnlink(
   }
 }
 
-async function confirmRemoteProjectUnlink(
+async function confirmRemoteProjectAliasesUnlink(
   repository: IdentityRepository,
   machineId: string,
   projectId: string,
   canonicalPath: string,
+  aliases: readonly RemoteProjectAliasInput[],
 ): Promise<RemoteProjectAlias[]> {
   try {
-    return await repository.unlinkProject(machineId, projectId);
+    const removed = await repository.unlinkProjectAliasesIfOwned(
+      machineId,
+      projectId,
+      aliases,
+    );
+    if (removed) return removed;
+    throw new ProjectIdentityReconciliationError(
+      "PostgreSQL alias ownership changed before the authorized project unlink",
+      "Inspect `lcm project list --json` and reconcile every local project path explicitly.",
+    );
   } catch (error) {
-    if (!(error instanceof PostgreSqlIdentityUnlinkProjectOutcomeUnknownError)) throw error;
+    if (!(error instanceof PostgreSqlIdentityUnlinkAliasesOutcomeUnknownError)) throw error;
     try {
-      for (const alias of error.aliases) {
-        const resolved = await repository.resolveProject(machineId, alias.normalizedPath);
-        if (!resolved) continue;
-        if (resolved.projectId === projectId) {
-          throw new ProjectIdentityReconciliationError(
-            "PostgreSQL retained at least one alias after the uncertain project unlink",
-            `Rerun \`lcm project unlink ${canonicalPath}\`; the operation is safe to retry.`,
-          );
-        }
+      const owners = await Promise.all(
+        aliases.map(
+          ({ normalizedPath }) => repository.resolveProject(machineId, normalizedPath),
+        ),
+      );
+      if (owners.every((owner) => owner === null)) return [...error.aliases];
+      const removedPaths = new Set(error.aliases.map(({ normalizedPath }) => normalizedPath));
+      if (owners.every((owner, index) => (
+        removedPaths.has(aliases[index].normalizedPath)
+          ? owner?.projectId === projectId
+          : owner === null
+      ))) {
         throw new ProjectIdentityReconciliationError(
-          `PostgreSQL alias ${alias.normalizedPath} changed to project ${resolved.projectId} during unlink`,
-          "Inspect `lcm project list --json` and reconcile the path explicitly.",
+          "PostgreSQL retained the local project aliases after the uncertain unlink",
+          `Rerun \`lcm project unlink ${canonicalPath}\`; the operation is safe to retry.`,
         );
       }
-      return [...error.aliases];
+      throw new ProjectIdentityReconciliationError(
+        "PostgreSQL alias ownership diverged during the uncertain project unlink",
+        "Inspect `lcm project list --json` and reconcile every local project path explicitly.",
+      );
     } catch (readbackError) {
       if (readbackError instanceof ProjectIdentityReconciliationError) throw readbackError;
       throw new ProjectIdentityReconciliationError(
         "PostgreSQL project unlink commit outcome is unknown and readback failed",
         `Inspect \`lcm project list --json\`, then rerun \`lcm project unlink ${canonicalPath}\`.`,
       );
+    }
+  }
+}
+
+async function restoreRemoteUnlinkedAliases(
+  repository: IdentityRepository,
+  machineId: string,
+  projectId: string,
+  aliases: readonly RemoteProjectAlias[],
+): Promise<boolean> {
+  try {
+    return await repository.restoreProjectAliases(machineId, projectId, aliases);
+  } catch (error) {
+    if (!(error instanceof PostgreSqlCommitOutcomeUnknownError)) throw error;
+    try {
+      const owners = await Promise.all(
+        aliases.map(
+          (alias) => repository.resolveProject(machineId, alias.normalizedPath),
+        ),
+      );
+      return owners.every((owner) => owner?.projectId === projectId);
+    } catch {
+      return false;
     }
   }
 }
@@ -570,6 +687,7 @@ async function linkRemoteProject(
   readonly local: ProjectIdentity;
   readonly remoteAlias: RemoteProjectAlias;
 }> {
+  requirePostgreSqlConfig(config);
   const machine = requireMachineIdentity(deps.homeDir);
   const local = resolveProjectIdentity(projectPath);
   if (
@@ -584,26 +702,24 @@ async function linkRemoteProject(
   }
   const path = remotePath(projectPath);
   return withSession(config, deps, async (repository) => {
-    const prior = await repository.resolveProject(machine.machineId, path.normalizedPath);
-    let remoteAlias: RemoteProjectAlias;
-    if (prior && prior.projectId !== remoteProjectId) {
-      if (local.remoteProjectId !== prior.projectId) {
-        throw new Error(
-          `path ${path.normalizedPath} is linked to PostgreSQL project ${prior.projectId}; local binding ${local.remoteProjectId ?? "is absent"} does not authorize replacing it`,
-        );
-      }
-      remoteAlias = await confirmRemoteReplacement(repository, {
-        machineId: machine.machineId,
-        expectedPriorProjectId: prior.projectId,
-        projectId: remoteProjectId,
-        ...path,
-      });
-    } else {
-      remoteAlias = await confirmRemoteLink(repository, {
-        machineId: machine.machineId,
-        projectId: remoteProjectId,
-        ...path,
-      });
+    const entryPaths = remoteEntryPaths(showProjectMapEntry(local.id).entry);
+    const mutation = await confirmRemoteBatchReplacement(repository, {
+      machineId: machine.machineId,
+      ...(local.remoteProjectId && local.remoteProjectId !== remoteProjectId
+        ? { expectedPriorProjectId: local.remoteProjectId }
+        : {}),
+      projectId: remoteProjectId,
+      aliases: entryPaths,
+      recoveryPath: projectPath,
+    });
+    const remoteAlias = mutation.aliases.find(
+      (alias) => alias.normalizedPath === path.normalizedPath,
+    );
+    if (!remoteAlias) {
+      throw new ProjectIdentityReconciliationError(
+        "PostgreSQL binding did not return the selected local project path",
+        "Inspect `lcm project list --json` and reconcile every local project path explicitly.",
+      );
     }
     try {
       setRemoteProjectBinding(remoteProjectId, {
@@ -611,15 +727,19 @@ async function linkRemoteProject(
         allowExistingData: options.allowExistingData,
       });
     } catch (error) {
+      let restored = false;
       try {
-        await restoreRemoteAlias(
+        restored = await restoreRemoteBatchReplacement(
           repository,
           machine.machineId,
-          prior,
           remoteProjectId,
-          path.normalizedPath,
+          mutation,
+          entryPaths,
         );
       } catch {
+        // The reconciliation error below preserves one recovery contract.
+      }
+      if (!restored) {
         throw new ProjectIdentityReconciliationError(
           "the local project map write failed and PostgreSQL could not be restored",
           `Inspect \`lcm project list --json\`, then rerun \`lcm project link ${remoteProjectId} ${projectPath}\`.`,
@@ -650,6 +770,7 @@ async function linkLocalAlias(
     const result = addProjectAlias(aliasPath, targetOptions);
     return { local: resolveProjectIdentity(result.entry.canonical) };
   }
+  requirePostgreSqlConfig(config);
   const machine = requireMachineIdentity(deps.homeDir);
   const alias = remotePath(aliasPath);
   return withSession(config, deps, async (repository) => {
@@ -704,22 +825,6 @@ export async function linkProject(
     : linkLocalAlias(config, target, projectPath, deps);
 }
 
-async function relinkAliases(
-  repository: IdentityRepository,
-  machineId: string,
-  projectId: string,
-  aliases: readonly RemoteProjectAlias[],
-): Promise<void> {
-  for (const alias of aliases) {
-    await repository.linkProject({
-      machineId,
-      projectId,
-      path: alias.path,
-      normalizedPath: alias.normalizedPath,
-    });
-  }
-}
-
 export async function unlinkProject(
   config: ResolvedStorageConfig,
   path = process.cwd(),
@@ -737,25 +842,29 @@ export async function unlinkProject(
     if (!shown.entry.remoteProjectId) {
       throw new Error(`canonical project ${shown.hash} has no remote binding to unlink`);
     }
+    requirePostgreSqlConfig(config);
     const deps = dependencies(dependencyOverrides);
     const machine = requireMachineIdentity(deps.homeDir);
     return withSession(config, deps, async (repository) => {
-      const removed = await confirmRemoteProjectUnlink(
+      const entryPaths = remoteEntryPaths(shown.entry);
+      const removed = await confirmRemoteProjectAliasesUnlink(
         repository,
         machine.machineId,
         shown.entry.remoteProjectId!,
         shown.entry.canonical,
+        entryPaths,
       );
       try {
         clearRemoteProjectBinding(shown.hash);
       } catch (error) {
         try {
-          await relinkAliases(
+          const restored = await restoreRemoteUnlinkedAliases(
             repository,
             machine.machineId,
             shown.entry.remoteProjectId!,
             removed,
           );
+          if (!restored) throw new Error("PostgreSQL aliases changed during restoration");
         } catch {
           throw new ProjectIdentityReconciliationError(
             "the local unbind failed and PostgreSQL aliases could not be restored",
@@ -773,8 +882,12 @@ export async function unlinkProject(
   }
   if (!shown.entry.remoteProjectId) {
     removeProjectAlias(aliasPath, { hash: shown.hash });
-    return { hash: shown.hash, aliasRemoved: true };
+    return {
+      hash: shown.hash,
+      aliasRemoved: true,
+    };
   }
+  requirePostgreSqlConfig(config);
   const deps = dependencies(dependencyOverrides);
   const machine = requireMachineIdentity(deps.homeDir);
   return withSession(config, deps, async (repository) => {

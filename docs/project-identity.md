@@ -103,7 +103,12 @@ lcm project link <new-project-uuid> /work/lcm --allow-existing-data
 ```
 
 The flag acknowledges the rebind; it does not move, merge, or delete SQLite
-data.
+data. Because `remoteProjectId` belongs to the whole local map entry, a rebind
+atomically moves the canonical path and every alias in that entry from the
+expected prior PostgreSQL project to the new UUID. Missing remote rows from a
+pre-existing local alias are inserted into the new project in the same
+transaction. If any path has a different owner, none of the paths are
+redirected.
 
 ## Same-machine aliases
 
@@ -143,6 +148,9 @@ lcm project unlink /mnt/work/lcm
 
 LCM removes the local alias and, when applicable, its remote alias. It does not
 delete the local hash, SQLite database, or passive-event sidecar.
+Alias add/remove operations on a remote-bound entry require PostgreSQL
+configuration so the local and remote path sets cannot intentionally diverge.
+Only aliases on an unbound entry remain purely local under SQLite.
 
 Unlink the canonical path:
 
@@ -150,9 +158,11 @@ Unlink the canonical path:
 lcm project unlink /work/lcm
 ```
 
-This clears the local `remoteProjectId` and removes every remote alias for that
-machine/project pair. The canonical map entry, its local aliases, SQLite
-database, and sidecar remain. Relink explicitly with:
+This clears the local `remoteProjectId` and removes only the remote aliases
+represented by that local entry's canonical path and aliases. Other local
+entries may share the same PostgreSQL project UUID; their remote aliases are
+not removed. The canonical map entry, its local aliases, SQLite database, and
+sidecar remain. Relink explicitly with:
 
 ```bash
 lcm project link <project-uuid> /work/lcm
@@ -192,9 +202,12 @@ operation has taken ownership of the path.
 Create readback also compares the alias owner with the exact candidate project
 UUID produced inside the uncertain transaction. A different project claiming
 the path is reported as a collision and is never adopted. Authorized rebinds
-replace the expected prior owner in one transaction, without an intermediate
-unlink. Remote alias and whole-project unlinks retain their expected ownership
-snapshots and reconcile uncertain commits before changing the local map.
+replace every path in the selected local entry from the expected prior owner in
+one transaction, without an intermediate unlink. Canonical unlinks delete that
+same exact path set with expected-owner checks instead of deleting every alias
+for the machine/project pair. Batch rebinds and unlinks read back every path
+after an uncertain commit before changing the local map, and batch restoration
+is all-or-nothing when a local map write fails.
 Created-project compensation removes only the exact first alias before deleting
 the project if it remains unreferenced. Project listings use one ordered
 PostgreSQL snapshot so project and alias rows cannot come from different reads.
