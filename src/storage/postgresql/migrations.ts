@@ -66,6 +66,7 @@ type IdentityFunctionFingerprintRow = QueryResultRow & {
 export const REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION = 18 as const;
 export const REQUIRED_POSTGRESQL_SERVER_ENCODING = "UTF8" as const;
 
+function expectedBaselineDefinitionInventory() {
 const EXPECTED_BASELINE_INDEX_NAMES = `
   project_aliases_project_idx conversations_project_order_idx conversations_session_lookup_idx
   messages_project_created_idx messages_search_document_idx messages_content_trgm_idx
@@ -212,6 +213,14 @@ const EXPECTED_BASELINE_DEFINITION_COUNT =
   EXPECTED_BASELINE_INDEX_NAMES.length
   + EXPECTED_BASELINE_TRIGGER_IDENTITIES.length
   + EXPECTED_BASELINE_CONSTRAINT_IDENTITIES.length;
+
+  return {
+    constraintIdentities: EXPECTED_BASELINE_CONSTRAINT_IDENTITIES,
+    indexNames: EXPECTED_BASELINE_INDEX_NAMES,
+    objectCount: EXPECTED_BASELINE_DEFINITION_COUNT,
+    triggerIdentities: EXPECTED_BASELINE_TRIGGER_IDENTITIES,
+  } as const;
+}
 
 export class PostgreSqlServerVersionPreflightError extends StorageOperationError {
   constructor(
@@ -830,6 +839,7 @@ export async function runPostgreSqlMigrations(
       );
     }
 
+    const expectedBaselineDefinitions = expectedBaselineDefinitionInventory();
     const baselineDefinitions =
       await transaction.query<BaselineDefinitionInventoryRow>({
         text: `WITH actual_indexes AS (
@@ -995,10 +1005,10 @@ export async function runPostgreSqlMigrations(
                JOIN actual_groups USING (object_kind)`,
         values: [
           baselineApplied,
-          EXPECTED_BASELINE_INDEX_NAMES,
-          EXPECTED_BASELINE_TRIGGER_IDENTITIES,
-          EXPECTED_BASELINE_CONSTRAINT_IDENTITIES,
-          EXPECTED_BASELINE_DEFINITION_COUNT,
+          expectedBaselineDefinitions.indexNames,
+          expectedBaselineDefinitions.triggerIdentities,
+          expectedBaselineDefinitions.constraintIdentities,
+          expectedBaselineDefinitions.objectCount,
         ],
       }, {
         domain: "factory",
@@ -1023,7 +1033,7 @@ export async function runPostgreSqlMigrations(
     if (
       definitionBaselineApplied === null
       || definitionBaselineApplied !== baselineApplied
-      || expectedDefinitionObjectCount !== EXPECTED_BASELINE_DEFINITION_COUNT
+      || expectedDefinitionObjectCount !== expectedBaselineDefinitions.objectCount
       || existingDefinitionObjectCount === null
       || existingDefinitionObjectCount > expectedDefinitionObjectCount
       || missingDefinitionObjectCount === null
