@@ -2,7 +2,8 @@
 
 This reference describes the durable PostgreSQL baseline introduced by
 `0001_migration_ledger.sql` and `0002_schema_baseline.sql`. The latter creates
-23 domain tables. This is a schema and readiness contract, not an enabled
+23 domain tables, backend-neutral project identity, and bounded session lookup
+keys. This is a schema and readiness contract, not an enabled
 application backend. SQLite remains the authoritative production adapter.
 PostgreSQL machine and project identity operations are enabled by issue #84.
 Managed daemons may start with PostgreSQL selected so those operations are
@@ -22,16 +23,20 @@ does not add row-level security.
   insufficient and fails the ownership preflight without changing the schema.
   A supported `lcm` schema must also not grant `CREATE` to `PUBLIC`; every
   migration run checks the exact catalog ACL under the advisory lock before
-  ledger inspection, and the immutable baseline repeats the defense before its
+  ledger inspection. The same catalog-only phase verifies ownership of every
+  existing allowlisted LCM object, including the migration ledger, before any
+  ledger row is read; baseline completeness is checked after the applied
+  history is known. The immutable baseline repeats the ACL defense before its
   owned DDL. Either check aborts without changing the schema ACL. The baseline revokes
   privileges from `PUBLIC` on an explicit list of the 23 domain tables, the
   migration ledger, six generated identity sequences, and
-  `lcm.normalize_search_text(text)` plus the summary- and large-file-identity
-  trigger functions.
-  It deliberately grants no domain access to the runtime role. Administrators
-  grant the exact operations required by each enabled repository separately.
-  Explicit object lists keep privileges on unknown pre-existing tables,
-  sequences, and functions intact.
+  `lcm.normalize_search_text(text)` plus the summary-, large-file-, and
+  session-ingest-identity trigger functions.
+  It deliberately grants no domain access to the runtime role by default.
+  Administrators grant only the exact operations required by each enabled
+  repository; issue #84 grants the machine and project identity operations
+  described below. Explicit object lists keep privileges on unknown
+  pre-existing tables, sequences, and functions intact.
 - Before starting the DDL transaction, migration requires
   `pg_catalog.current_setting('server_encoding')` to return exactly `UTF8`.
   Runtime health enforces the same database-encoding contract before extension
@@ -41,12 +46,20 @@ does not add row-level security.
 - The migration runner captures the postmaster epoch and completes required
   extension readiness, including the functional `pg_stat_statements` probe,
   before opening the DDL transaction. Inside that transaction it pins the local
-  `search_path` to `pg_catalog, public` before taking the advisory lock, checking
-  PostgreSQL 18 and postmaster/module continuity, revalidating the exact
+  `search_path` to `pg_catalog, public` and `quote_all_identifiers` to `off`
+  before taking the advisory lock. Pinning the deparser setting makes every
+  `pg_get_*` fingerprint independent of role or database defaults. The runner
+  then checks PostgreSQL 18 and postmaster/module continuity, revalidates the exact
   extension catalog snapshot without repeating the functional probe, checking
-  schema ownership, `PUBLIC CREATE`, and exact managed-object ownership, or
-  executing pending SQL. The recurring ownership allowlist covers the
-  migration ledger, 23 domain tables, six generated identity sequences, three
+  schema ownership and `PUBLIC CREATE`, then checking ownership of every
+  existing allowlisted object before reading the exact ordered ledger. Only
+  after the ledger is trusted does the runner require the complete
+  managed-object inventory from the selected current snapshot; any missing
+  allowlisted object then fails readiness instead of being mistaken for a
+  smaller valid inventory. After pending SQL and ledger rows, the selected
+  target snapshot's managed inventory is checked again before commit.
+  The recurring allowlist covers the
+  migration ledger, 23 domain tables, six generated identity sequences, four
   helper or trigger functions, and the LCM text-search dictionary and
   configuration. Unknown `lcm` objects are ignored and never mutated. This makes
   unqualified PostgreSQL built-ins in the immutable migrations resolve to native
@@ -55,6 +68,76 @@ does not add row-level security.
   inspection also schema-qualifies every catalog operator because it runs
   outside that migration transaction and runtime health uses the same
   inspection path.
+- Managed-object identities, definition fingerprints, and function
+  fingerprints are registered by migration ID.
+  Before pending SQL, the runner walks the trusted ledger from newest to oldest
+  and checks the first migration with a registered snapshot. After applying and
+  recording the pending set, it does the same for the target history in the
+  same transaction; failure rolls back both DDL and ledger rows. Registry
+  declaration order does not affect selection. A future migration can
+  therefore add its own snapshot without requiring the pre-upgrade schema to
+  satisfy the future definition. Before catalog access, the registry rejects
+  duplicate snapshot migration IDs and IDs absent from the supplied migration
+  history.
+- The `0002` snapshot checks an explicit definition inventory of all 52 named
+  secondary indexes, all 168 table constraints, all three identity-enforcement
+  triggers, all 15 stored generated columns, all six generated identity
+  sequences, all 24 permanent tables, the complete effective ACLs of those
+  tables and six sequences, all 205 ordinary columns, and the exact effective
+  column ACL state of all 220 ordinary and generated columns: 723 definitions
+  total. The ordinary-column allowlist includes
+  `recall_surfacing.surfaced_at`, and a live-catalog regression requires the
+  allowlist to equal the complete ordinary-column inventory of the 24 tables.
+  Each allowlisted object must exist, every index must
+  remain valid and ready, and canonical index, trigger, fully qualified
+  constraint, generation-expression, and ordinary-column definitions must
+  retain their pinned fingerprints. Trigger fingerprints include the
+  enablement mode and require
+  always-enabled mode (`A`), so the identity checks cannot be bypassed by
+  `session_replication_role = replica`; disabled, ordinary, or replica-only
+  drift fails readiness. Constraint fingerprints bind the constraint name
+  to its owning table, type, fully qualified definition, and stable
+  enablement-state multiset of their zero or more internal enforcement
+  triggers. Generated-column fingerprints bind the exact table, column,
+  formatted type, nullability, `attgenerated` state, PostgreSQL-deparsed
+  expression, and resolved
+  namespace-qualified collation. Ordinary-column
+  fingerprints bind the exact table and column to its formatted type,
+  nullability, deparsed default, identity state, and resolved
+  namespace-qualified collation. Table fingerprints require ordinary permanent
+  persistence with row-level security disabled and not forced, so `UNLOGGED`,
+  temporary, `ENABLE ROW LEVEL SECURITY`, or `FORCE ROW LEVEL SECURITY` drift
+  fails closed. The same fingerprint rejects any inheritance or partition
+  parent/child relationship involving a managed table. Relation ACL
+  fingerprints expand the effective ACL, including PostgreSQL's default ACL
+  when `relacl` is null, and normalize only the owning role. `PUBLIC`, named
+  role, privilege, grant-option, foreign-grantor, or missing-owner drift on any
+  allowlisted table or identity sequence therefore fails closed.
+  Column ACL fingerprints retain every allowlisted column even when `attacl`
+  is null and expand every explicit entry. Any `PUBLIC`, named-role,
+  foreign-grantor, privilege, or grant-option drift on a column therefore also
+  fails closed.
+  Identity-sequence
+  fingerprints bind each exact sequence name to its PostgreSQL data type,
+  increment, minimum, maximum, start, cache, cycle state, internal identity
+  dependency, owning table/column, and permanent persistence. `SET UNLOGGED`
+  drift therefore fails closed. Index ownership
+  follows the owning table; triggers and constraints are checked as existence
+  and definition inventory.
+  Additional operator-created objects remain outside the allowlist and are
+  ignored.
+- Recurring migration readiness fingerprints the bodies and security
+  configuration of `lcm.enforce_summary_id_uniqueness()` and
+  `lcm.enforce_large_file_id_uniqueness()`, and
+  `lcm.enforce_session_ingest_id_uniqueness()`. The check covers the stored
+  body, language and trigger return type, invoker/security and leakproof flags,
+  volatility, parallel safety, fixed `search_path`, and the complete normalized
+  function ACL. Only non-grantable `EXECUTE` by the owning role is accepted;
+  `PUBLIC`, named-role, grant-option, foreign-grantor, missing-owner, and other
+  ACL drift therefore fail closed even when the function name and arity still
+  match. The snapshot owns the complete helper-name and body-hash lists,
+  including their count, so later migrations can add or remove helpers without
+  changing the verifier SQL.
 - PostgreSQL 18's native [`uuidv7()`](https://www.postgresql.org/docs/18/functions-uuid.html)
   is the default for machine, project, part, transcript, promoted-memory, and
   internal summary relationship identities. Machine, project,
@@ -74,6 +157,17 @@ does not add row-level security.
   identity and ordering, while `file_id_sha256` narrows exact caller-ID lookup.
   Opaque summary file references retain their original `file_id` text and a
   generated digest candidate without gaining a local-file foreign key.
+  Caller-owned session identifiers use the same collision-safe lookup shape:
+  exact text remains canonical, while generated SHA-256 candidates carry every
+  B-tree lookup for conversations, native transcripts, recall surfacing, and
+  ingest completion. Queries retain the exact text predicate as the residual.
+  Session-ingest rows use an internal UUIDv7 `ingest_key`; a transaction
+  advisory lock plus digest candidate and exact residual preserves exact
+  per-project uniqueness without indexing arbitrary-length session text. These
+  advisory-locked exact-identity triggers require `READ COMMITTED` isolation,
+  where the residual query can observe a preceding lock holder's commit. They
+  fail closed with SQLSTATE `0A000` under `REPEATABLE READ` or `SERIALIZABLE`
+  instead of trusting a transaction-wide stale snapshot.
   Conversations and messages retain generated `bigint` identities compatible
   with the existing repository contracts. Inbox, recall, and instruction rows
   also use generated numeric identities where a local ordering key is useful.
@@ -175,24 +269,24 @@ deletion.
 
 | Table | Ownership and retention | Enforced invariants and indexes |
 | --- | --- | --- |
-| `schema_migrations` | Migrator-owned ledger retained for the database lifetime. Application code must never edit it. | Migration ID primary key; checksum is exactly 64 lowercase hexadecimal characters; `applied_at` is timezone-aware. The runner also enforces manifest order and checksum equality. |
+| `schema_migrations` | Migrator-owned ordinary table retained for the database lifetime. Application code must never edit it. A catalog-only preflight rejects a view, materialized view, foreign table, other relation kind, or ownership drift before reading ledger rows; absence remains valid only for first installation. | Migration ID primary key; checksum is exactly 64 lowercase hexadecimal characters; `applied_at` is timezone-aware. The runner also enforces manifest order and checksum equality. |
 
 ### Identity
 
 | Table | Ownership and retention | Enforced invariants and indexes |
 | --- | --- | --- |
 | `machines` | Independent identity root. Retain through reimages and require aliases, transcripts, checkpoints, instructions, inbox events, and leases to be handled before deletion. All incoming references restrict deletion. | UUIDv7-enforced primary key; nonblank globally unique `identity_key`; optional nonblank display name; `last_seen_at >= registered_at`. |
-| `projects` | Independent identity root and project-scope anchor. No dependent table silently cascades from project deletion. | UUIDv7-enforced primary key; nonblank display name; `updated_at >= created_at`. |
+| `projects` | Independent identity root and project-scope anchor. No dependent table silently cascades from project deletion. | UUIDv7-enforced internal primary key; required unique 64-lowercase-hex `identity_key` stores the backend-neutral `ProjectIdentity.id` independently from the nonunique display name; `updated_at >= created_at`. |
 | `project_aliases` | Explicit machine-to-project link retained until unlink. Both project and machine references restrict deletion. | `(machine_id, normalized_path)` primary key makes one normalized path on a machine resolve to one project; path is nonempty and normalized path is trimmed and nonempty. `project_aliases_project_idx` supports project-to-machine/path listing. |
 
 ### Source records
 
 | Table | Ownership and retention | Enforced invariants and indexes |
 | --- | --- | --- |
-| `conversations` | Project-scoped source root. Project deletion is restricted; an explicit conversation deletion owns messages, summaries, context, and large-file metadata. Multiple rows may represent segments of one session. | Generated `bigint` primary key and scoped identity; exact nonnull session text, including whitespace-only caller values accepted by the shared contract; ordered timestamps and optional bootstrap time. `conversations_project_order_idx` supplies deterministic newest-first project ordering, while `conversations_session_lookup_idx` supports session-wide aggregation and deterministic newest-segment lookup. |
+| `conversations` | Project-scoped source root. Project deletion is restricted; an explicit conversation deletion owns messages, summaries, context, and large-file metadata. Multiple rows may represent segments of one session. | Generated `bigint` primary key and scoped identity; exact nonnull session text, including whitespace-only and arbitrary-length caller values accepted by the shared contract; ordered timestamps and optional bootstrap time. `conversations_project_order_idx` supplies deterministic newest-first project ordering, while `conversations_session_lookup_idx` uses the fixed-width session SHA-256 candidate. Every lookup retains exact `session_id` equality as a collision residual. |
 | `messages` | Owned by a conversation and cascades with it. Coverage, context, and transcript provenance references restrict direct deletion until those relationships are handled. | Generated `bigint` primary key; scoped unique sequence and identity; nonnegative sequence and token count; four-role enum. The scoped sequence unique index provides conversation order and `messages_project_created_idx` provides stable project order; `messages_search_document_idx` and `messages_content_trgm_idx` provide FTS and substring/fuzzy access. |
 | `message_parts` | Owned by a message and cascades with it. | UUID primary key with a UUIDv7 default; unique scoped ordinal; exact nonnull session text; closed part-type enum; nonnegative ordinal and token fields; finite nonnegative cost. Nullable metadata is opaque text and round-trips unchanged. `message_parts_type_idx` supports scoped type/order access. |
-| `native_transcripts` | Project- and machine-scoped scrubbed source. Both roots restrict deletion. The #86 repository is append-only and exposes no pre-redaction or implicit deletion path. | UUIDv7-enforced primary key; nonblank client/format/version/session/scrubber/source fields; nonnegative source ordinal; 64-character lowercase SHA-256 content digest and ingest key; object-or-array JSON payload; idempotent `(project_id, machine_id, ingest_key)`; `ingested_at >= observed_at`. Source-order and native-session B-tree indexes give deterministic provenance scans; `native_transcripts_payload_idx` supplies JSONB path containment. |
+| `native_transcripts` | Project- and machine-scoped scrubbed source. Both roots restrict deletion. The #86 repository is append-only and exposes no pre-redaction or implicit deletion path. | UUIDv7-enforced primary key; nonblank client/format/version/session/scrubber/source fields; nonnegative source ordinal; 64-character lowercase SHA-256 content digest and ingest key; object-or-array JSON payload; idempotent `(project_id, machine_id, ingest_key)`; `ingested_at >= observed_at`. Source-order and fixed-width native-session digest indexes give deterministic provenance scans with exact-text residuals; `native_transcripts_payload_idx` supplies JSONB path containment. |
 | `transcript_messages` | Transcript-owned provenance join: deleting a transcript cascades its links, while the derived message side restricts deletion. | Scoped transcript and message foreign keys; unique message and source ordinal within a transcript; nonnegative source ordinal. `transcript_messages_message_idx` supports reverse provenance lookup. |
 
 ### Derived memory
@@ -212,10 +306,10 @@ deletion.
 | --- | --- | --- |
 | `promoted_memories` | Durable memory owned by the UUID `project_id` scope. The independent nullable text `source_project_id` and `source_summary_id` preserve backend-neutral provenance without asserting that either identifies a local row. Project deletion is restricted; summary deletion cannot erase provenance. Archive is a retained lifecycle state. | UUID primary key with a UUIDv7 default; nonempty content; nonnegative depth; confidence in `[0,1]`; object JSON metadata; archive time not before creation. The unbounded source-summary text uses a generated SHA-256 candidate index with an exact residual predicate. Active, source, metadata JSONB, FTS, and trigram indexes support lifecycle, provenance, filtering, and search. |
 | `promoted_memory_tags` | Ordered exact tag array owned by a promoted memory; cascades when its promoted memory is deleted. | Ordinal identity preserves order, duplicates, case distinctions, empty tags, surrounding whitespace, and unbounded tag length exactly. `tag` remains the case-sensitive filtering value. The generated lowercase `normalized_tag` uses the same builtin `pg_unicode_fast` mapping as search but is neither identity nor a uniqueness boundary. Fixed-width generated SHA-256 keys keep raw and normalized B-tree lookups within PostgreSQL index-tuple limits; lookup predicates use the corresponding hash and retain exact `tag` or `normalized_tag` comparison as collision verification. Generated FTS and normalized trigram GIN indexes let promoted-memory search include tag-only matches. |
-| `recall_surfacing` | Project-owned historical usage evidence retained independently when a promoted-memory row is missing or deleted. Project deletion remains restricted. | Generated `bigint` primary key and opaque text `memory_id`; there is deliberately no promoted-memory foreign key, so arbitrary caller IDs, orphan observations, and historical feedback round-trip. Memory-order and partial nonnull-session indexes provide deterministic recall and feedback aggregation. |
+| `recall_surfacing` | Project-owned historical usage evidence retained independently when a promoted-memory row is missing or deleted. Project deletion remains restricted. | Generated `bigint` primary key and opaque text `memory_id`; there is deliberately no promoted-memory foreign key, so arbitrary caller IDs, orphan observations, and historical feedback round-trip. Memory-order and partial fixed-width session-digest indexes provide deterministic recall and feedback aggregation with exact-text residuals. |
 | `redaction_counters` | Project-scoped aggregate retained as administrative state; project deletion is restricted. It contains counts, not redacted content. | One row per project and `built_in`, `global`, `project`, or `gitleaks` category; nonnegative count; timezone-aware update time. |
 | `ingest_checkpoints` | Project/machine/client/source coordination retained for resumable native ingestion; both identity roots restrict deletion. | Composite primary key; nonnegative source ordinal and imported/skipped/quarantined counts; object JSON checkpoint. `ingest_checkpoints_payload_idx` supports JSONB path inspection. |
-| `session_ingest_log` | Project-scoped completion marker retained to make whole-session ingestion idempotent; project deletion is restricted. Remove it only through an explicit replay or administrative workflow. | `(project_id, session_id)` primary key; exact nonnull session ID, including whitespace-only values; nonnegative message count; timezone-aware completion time. `session_ingest_log_completed_idx` supplies deterministic newest-first project scans. |
+| `session_ingest_log` | Project-scoped completion marker retained to make whole-session ingestion idempotent; project deletion is restricted. Remove it only through an explicit replay or administrative workflow. | UUIDv7 `ingest_key` primary key; exact nonnull arbitrary-length session ID, including whitespace-only values; generated SHA-256 lookup candidate; nonnegative message count; timezone-aware completion time. Under required `READ COMMITTED` isolation, the identity trigger uses a project/digest advisory lock plus exact residual to enforce one matching session per project without placing raw text in a B-tree; on updates it excludes the row identified by `OLD.ingest_key`, so rotating the primary key does not mistake that row for a duplicate while collisions with other rows still fail. Higher isolation fails closed with SQLSTATE `0A000`. `session_ingest_log_completed_idx` supplies deterministic newest-first project scans. |
 | `session_instructions` | Project-scoped cached instruction content, optionally machine-specific. Project and machine references restrict deletion. | Generated `bigint` primary key; nonnegative slot; caller-defined text content hash preserved unchanged; `UNIQUE NULLS NOT DISTINCT (project_id, machine_id, slot)` permits one project-global value per slot. |
 
 ### Distributed coordination
@@ -227,20 +321,20 @@ deletion.
 
 ## Named index catalog
 
-Primary keys and unique constraints create additional B-tree indexes. The 51
+Primary keys and unique constraints create additional B-tree indexes. The 52
 explicit indexes below cover ordering, reverse foreign-key checks, search,
 JSONB inspection, and active-state selection.
 
 | Area | Indexes and purpose |
 | --- | --- |
-| Project identity | `project_aliases_project_idx` reverses aliases by project; `conversations_project_order_idx` gives deterministic newest-first project order; `conversations_session_lookup_idx` covers session-wide aggregation and newest-segment selection. |
+| Project identity | `project_aliases_project_idx` reverses aliases by project; `conversations_project_order_idx` gives deterministic newest-first project order; `conversations_session_lookup_idx` uses the session digest candidate for bounded session-wide aggregation and newest-segment selection with an exact residual. |
 | Messages and parts | `messages_project_created_idx` orders project messages; `messages_search_document_idx` and `messages_content_trgm_idx` provide FTS and normalized trigram access; `message_parts_type_idx` supports scoped type scans. Opaque part metadata has no semantic index. |
 | Native transcripts | `native_transcripts_source_order_idx` and `native_transcripts_session_idx` provide deterministic provenance/session scans; `native_transcripts_machine_idx` covers the machine FK; `native_transcripts_payload_idx` provides JSONB path lookup; `transcript_messages_message_idx` reverses provenance by message. |
 | Summaries | `summaries_identity_lookup_idx` bounds project-scoped external-ID candidates by SHA-256 and requires the exact `summary_id` residual; `summaries_conversation_order_idx` and `summaries_project_recent_idx` provide deterministic conversation/project order by the UUIDv7 relationship key; `summaries_search_document_idx` and `summaries_content_trgm_idx` provide FTS and trigram access. |
 | Summary joins | `summary_messages_message_idx` and `summary_messages_summary_idx` cover both scoped coverage FKs; `summary_parents_parent_idx` and `summary_parents_summary_idx` cover both DAG directions; `summary_large_files_summary_idx` covers the owner FK and `summary_large_files_file_idx` uses the opaque file digest candidate for bounded owner-project lookup with an exact text residual. |
 | Context and large files | Partial `context_items_message_idx` and `context_items_summary_idx` reverse active context membership; `large_files_identity_lookup_idx` bounds project-scoped caller-ID candidates by SHA-256 and requires exact `file_id` comparison; `large_files_conversation_order_idx` orders by the bounded UUIDv7 file key. |
 | Promoted memory and recall | `promoted_memories_active_order_idx` supports active/stale scans; partial `promoted_memories_source_summary_idx` uses a bounded source-summary SHA-256 candidate and requires the exact source text residual without imposing a foreign key; partial `promoted_memories_source_project_idx` supports active owner-scoped source filtering; `promoted_memories_metadata_idx`, `promoted_memories_search_document_idx`, and `promoted_memories_content_trgm_idx` cover metadata and content search; `promoted_memory_tags_lookup_idx` uses `(project_id, tag_sha256, memory_id)` for bounded exact case-sensitive candidate lookup while `promoted_memory_tags_normalized_lookup_idx` uses `(project_id, normalized_tag_sha256, memory_id)` for bounded normalized candidates. Both require a residual exact text comparison to reject theoretical hash collisions. `promoted_memory_tags_search_document_idx` and `promoted_memory_tags_tag_trgm_idx` support tag-only lexical search; `recall_surfacing_memory_order_idx` and partial `recall_surfacing_session_order_idx` support recall aggregation. |
-| Ingest and instructions | `ingest_checkpoints_payload_idx` provides JSONB path lookup; `ingest_checkpoints_machine_idx` covers machine deletion; `session_ingest_log_completed_idx` orders completed sessions; partial `session_instructions_machine_idx` covers machine-specific instruction deletion. |
+| Ingest and instructions | `ingest_checkpoints_payload_idx` provides JSONB path lookup; `ingest_checkpoints_machine_idx` covers machine deletion; `session_ingest_log_identity_lookup_idx` bounds exact session candidates by digest and UUIDv7 key; `session_ingest_log_completed_idx` orders completed sessions; partial `session_instructions_machine_idx` covers machine-specific instruction deletion. |
 | Passive inbox | Partial `passive_event_inbox_ready_idx`, `passive_event_inbox_retry_idx`, and `passive_event_inbox_claimed_idx` cover claim/retry recovery; `passive_event_inbox_payload_idx` provides JSONB path lookup; `passive_event_inbox_project_idx` covers project deletion for every status. |
 | Fenced leases | Partial `fenced_leases_owner_idx` and `fenced_leases_expiry_idx` cover active-owner and expiry scans; `fenced_leases_owner_machine_idx` covers the complete machine FK independently of release state. |
 
@@ -253,7 +347,7 @@ in the `public` schema at the server's current `default_version`:
 | --- | --- |
 | `unaccent` | Operational prerequisite and provenance for the pinned accent-insensitive rule set. Migration tests compare every embedded source mapping with PostgreSQL 18.4's dictionary, but indexed normalization does not call the mutable dictionary at runtime. |
 | `pg_trgm` | GIN operator support for bounded substring and fuzzy lexical fallback. |
-| `pgcrypto` | Supplies fixed-width SHA-256 candidate keys for unbounded summary IDs, large-file IDs, opaque file and summary provenance, and promoted-memory tags. Exact residual text comparison remains mandatory. IDs still use PostgreSQL 18's native `uuidv7()`, and content hashes arrive as validated lowercase SHA-256 values. |
+| `pgcrypto` | Supplies fixed-width SHA-256 candidate keys for unbounded summary IDs, large-file IDs, session IDs, opaque file and summary provenance, and promoted-memory tags. Exact residual text comparison remains mandatory. IDs still use PostgreSQL 18's native `uuidv7()`, and content hashes arrive as validated lowercase SHA-256 values. |
 | `pg_stat_statements` | Operator-visible query statistics for diagnosing repository and query-plan behavior; the server must preload it when required by the installation. |
 
 Preflight reports each extension as `current`, `installed-unavailable`,
@@ -335,11 +429,16 @@ on a provider does not justify silently expanding the baseline.
    version-specific loaded-module catalog, verifies postmaster continuity,
    revalidates the non-probe extension catalog contract, verifies that any
    existing `lcm` schema is owned by the current migration role, rejects
-   schema-level `PUBLIC CREATE`, verifies every existing managed object is still
-   owned by that role, and then verifies the
-   complete ordered ledger. `0001` creates the `lcm` schema and immutable ledger; `0002`
+   schema-level `PUBLIC CREATE`, and verifies ownership of every existing
+   allowlisted object before reading the complete ordered ledger. After the
+   ledger establishes the current snapshot, it verifies that snapshot's exact
+   managed inventory and definitions before pending SQL. After applying the
+   pending set, it verifies the newest snapshot registered for the target
+   history, including its managed inventory, before commit. `0001` creates the
+   `lcm` schema and immutable ledger; `0002`
    first rejects a pre-existing `lcm` schema that grants `PUBLIC CREATE`, then
-   creates the 23-table baseline data model and indexes. The guard does not
+   creates the 23-table baseline data model and indexes, the backend-neutral
+   project identity key, and bounded session-identity lookup keys. The guard does not
    revoke or otherwise rewrite the pre-existing schema ACL. Its normalization
    helper uses non-replacing `CREATE FUNCTION`, so an existing same-signature
    function fails closed. Before commit, the runner verifies the LCM-owned
@@ -438,12 +537,13 @@ Replace `lcm_runtime` with the deployment's runtime role. The script grants
 schema `USAGE` and table `SELECT` where identity readback requires it. Writes
 are column-scoped: machines may insert only `identity_key` and `display_name`
 and update only `display_name` and `last_seen_at`; projects may insert only
-`display_name` and delete rows; aliases may insert `project_id`, `machine_id`,
-`path`, and `normalized_path`, update only `project_id`, `path`, and
-`linked_at`, and delete rows. Generated IDs and timestamps remain unwritable,
-and immutable machine identity and normalized-path columns cannot be updated
-after insertion. The script grants no table ownership, `TRUNCATE`, sequence
-access, function execution, schema creation, or privileges on future tables.
+their backend-neutral `identity_key` and `display_name`, and may delete rows;
+aliases may insert `project_id`, `machine_id`, `path`, and `normalized_path`,
+update only `project_id`, `path`, and `linked_at`, and delete rows. Generated
+IDs and timestamps remain unwritable, and immutable machine identity, project
+identity, and normalized-path columns cannot be updated after insertion. The
+script grants no table ownership, `TRUNCATE`, sequence access, function
+execution, schema creation, or privileges on future tables.
 Without these grants, machine registration and project pairing fail closed
 with a sanitized PostgreSQL operation error. Migrations intentionally do not
 apply runtime grants because the migration role cannot safely infer a

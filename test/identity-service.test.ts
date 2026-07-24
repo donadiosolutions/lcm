@@ -421,6 +421,9 @@ describe("identity service", () => {
 
     expect(created.local).toEqual({ ...before, remoteProjectId: PROJECT_A });
     expect(created.remote).toMatchObject({ projectId: PROJECT_A, displayName: "Created" });
+    expect(repository.createProject).toHaveBeenCalledWith(expect.objectContaining({
+      identityKey: before.id,
+    }));
     await expect(createProject(POSTGRESQL_CONFIG, path, {}, deps))
       .rejects.toThrow("already bound");
   });

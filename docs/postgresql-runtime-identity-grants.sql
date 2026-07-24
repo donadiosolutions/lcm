@@ -15,7 +15,7 @@ GRANT INSERT (identity_key, display_name),
 ON TABLE lcm.machines TO :"lcm_runtime_role";
 
 GRANT SELECT, DELETE ON TABLE lcm.projects TO :"lcm_runtime_role";
-GRANT INSERT (display_name)
+GRANT INSERT (identity_key, display_name)
 ON TABLE lcm.projects TO :"lcm_runtime_role";
 
 GRANT SELECT, DELETE ON TABLE lcm.project_aliases TO :"lcm_runtime_role";

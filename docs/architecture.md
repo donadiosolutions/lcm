@@ -65,22 +65,71 @@ remediation is diagnostic only, including namespace correction, restoration of
 missing control files, and `pg_stat_statements` preload/restart guidance; LCM
 never changes cluster extensions. The migrator owns the `lcm` schema; `PUBLIC`
 has no schema-create privilege in a supported database. Before ledger
-inspection, the runner permits an absent schema but rejects an existing schema
+inspection, the transaction connection must have
+`session_replication_role = origin`; replica, local, missing, or malformed
+session state fails before the advisory lock and every LCM schema or constraint
+fingerprint. The runner does not reset this privileged per-session setting.
+It permits an absent schema but rejects an existing schema
 not owned by the current migration role; delegated `CREATE` is insufficient and
 no ownership is changed automatically. Every run rejects a schema that grants
 `PUBLIC CREATE` before ledger inspection without changing its ACL; the baseline
-repeats the guard before its owned DDL. Under the same lock, every run also
-verifies that the current migrator still owns each known LCM table, identity
+repeats the guard before its owned DDL. A catalog-only ledger relation
+preflight permits absence on first installation; when
+`lcm.schema_migrations` exists, it must be an ordinary table owned by the
+current migration role. Views, materialized views, foreign tables, and every
+other relation kind fail before any ledger-row query. Under the same lock,
+every run also verifies that the current migrator still owns each known LCM table, identity
 sequence, helper or trigger function, text-search dictionary, and text-search
-configuration that exists. Unknown schema objects are outside that exact
-catalog allowlist and are neither rejected nor changed.
+configuration that exists before reading any ledger rows. This catalog-only
+phase therefore returns structured ownership diagnostics before history is
+trusted. Baseline completeness is evaluated after the applied history is
+known. Unknown schema objects are outside that exact catalog allowlist and are
+neither rejected nor changed.
+Schema snapshots are keyed by migration ID and own both the exact managed
+object inventory and definition fingerprints. The newest migration in
+the trusted current ledger that has a registered snapshot is checked before
+pending SQL, while the newest migration in the target history that has a
+registered snapshot is checked after applying and recording the pending set but
+before commit. Selection follows migration history rather than registry order.
+The selected current snapshot verifies its managed inventory and definitions
+before pending SQL; the selected target snapshot repeats both checks after
+pending SQL and ledger writes, so a migration may add managed objects without
+weakening the earlier contract. Definition checks cover all allowlisted
+secondary indexes, triggers, constraints, all 205 ordinary columns, stored
+generated-column expressions, identity sequences, all 24 table persistence
+states, the complete effective ACLs of the tables and sequences, and the exact
+ACL state of all 220 ordinary and generated columns; indexes must remain
+valid and ready and inherit ownership from their tables. Identity-trigger
+inventory requires always-enabled mode, rejecting disabled, ordinary, or
+replica-only drift and enforcing checks under `session_replication_role =
+replica`. Constraint inventory includes the enablement state of
+its internal enforcement triggers and binds each name to its definition.
+Ordinary columns retain type, nullability, default, identity, and resolved
+collation metadata; generated columns retain their formatted type, nullability,
+generated state, fully deparsed expression, and resolved collation. Tables must remain permanent with
+row-level security neither enabled nor forced, and cannot participate in
+inheritance or partition parent/child relationships.
+Effective relation ACLs normalize only the owner, so added `PUBLIC` or named
+role privileges and grant options fail closed while null and explicit
+owner-only defaults compare equally.
+Column ACL fingerprints preserve every no-ACL identity and reject any explicit
+column grant drift.
+Identity sequences retain permanent persistence, allocation parameters,
+internal dependency, and owning table/column. Migration transactions pin
+`quote_all_identifiers = off` before catalog deparsing. Unknown operator-created
+indexes, triggers, and constraints remain outside the inventory.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six
 generated identity sequences, or the search-normalization, summary-identity,
-and large-file-identity functions; unknown
+large-file-identity, and session-ingest-identity functions; unknown
 pre-existing object ACLs are preserved. The normalization function is created
 without replacement, so a same-signature collision fails and rolls back the
 pending migration rather than overwriting operator code. Runtime domain grants
 remain absent until their owning adapters land.
+The three advisory-locked exact-identity triggers require `READ COMMITTED`
+isolation so their post-lock residual query receives a fresh snapshot; they
+fail closed under `REPEATABLE READ` and `SERIALIZABLE`. Recurring readiness
+normalizes and compares every ACL entry on those functions and accepts only the
+owning role's non-grantable `EXECUTE` privilege.
 
 ### Ownership and domain grouping
 

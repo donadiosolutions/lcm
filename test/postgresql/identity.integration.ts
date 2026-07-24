@@ -84,6 +84,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
       expect(grantedMachine).toMatchObject({ displayName: "Granted" });
       const grantedProject = await repository.createProject({
         machineId: grantedMachine.machineId,
+        identityKey: "1".repeat(64),
         displayName: "Granted project",
         path: "/work/granted",
         normalizedPath: "/work/granted",
@@ -107,8 +108,10 @@ describe("PostgreSQL 18 machine and project identities", () => {
         projects_insert: boolean;
         projects_update: boolean;
         projects_delete: boolean;
+        projects_insert_identity_key: boolean;
         projects_insert_display_name: boolean;
         projects_insert_project_id: boolean;
+        projects_update_identity_key: boolean;
         aliases_select: boolean;
         aliases_insert: boolean;
         aliases_update: boolean;
@@ -144,8 +147,10 @@ describe("PostgreSQL 18 machine and project identities", () => {
                  has_table_privilege('lcm_test_runtime', 'lcm.projects', 'INSERT') AS projects_insert,
                  has_table_privilege('lcm_test_runtime', 'lcm.projects', 'UPDATE') AS projects_update,
                  has_table_privilege('lcm_test_runtime', 'lcm.projects', 'DELETE') AS projects_delete,
+                 has_column_privilege('lcm_test_runtime', 'lcm.projects', 'identity_key', 'INSERT') AS projects_insert_identity_key,
                  has_column_privilege('lcm_test_runtime', 'lcm.projects', 'display_name', 'INSERT') AS projects_insert_display_name,
                  has_column_privilege('lcm_test_runtime', 'lcm.projects', 'project_id', 'INSERT') AS projects_insert_project_id,
+                 has_column_privilege('lcm_test_runtime', 'lcm.projects', 'identity_key', 'UPDATE') AS projects_update_identity_key,
                  has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'SELECT') AS aliases_select,
                  has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'INSERT') AS aliases_insert,
                  has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'UPDATE') AS aliases_update,
@@ -181,8 +186,10 @@ describe("PostgreSQL 18 machine and project identities", () => {
         projects_insert: false,
         projects_update: false,
         projects_delete: true,
+        projects_insert_identity_key: true,
         projects_insert_display_name: true,
         projects_insert_project_id: false,
+        projects_update_identity_key: false,
         aliases_select: true,
         aliases_insert: false,
         aliases_update: false,
@@ -223,12 +230,21 @@ describe("PostgreSQL 18 machine and project identities", () => {
           values: [grantedMachine.machineId],
         },
         {
-          text: "INSERT INTO lcm.projects (project_id, display_name) VALUES ($1, $2)",
-          values: ["018f22c4-6d2a-7f10-8a4c-6b8d3e5f9091", "Forbidden"],
+          text: `INSERT INTO lcm.projects (project_id, identity_key, display_name)
+                 VALUES ($1, $2, $3)`,
+          values: [
+            "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9091",
+            "e".repeat(64),
+            "Forbidden",
+          ],
         },
         {
           text: "UPDATE lcm.projects SET display_name = $1 WHERE project_id = $2",
           values: ["Forbidden", grantedProject.projectId],
+        },
+        {
+          text: "UPDATE lcm.projects SET identity_key = $1 WHERE project_id = $2",
+          values: ["f".repeat(64), grantedProject.projectId],
         },
         {
           text: "UPDATE lcm.project_aliases SET machine_id = $1 WHERE project_id = $2",
@@ -283,6 +299,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
       );
       const project = await repository.createProject({
         machineId: machineA.machineId,
+        identityKey: "1".repeat(64),
         displayName: "Shared project",
         path: "/srv/a/project",
         normalizedPath: "/srv/a/project",
@@ -331,6 +348,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
       );
       const first = await repository.createProject({
         machineId: machine.machineId,
+        identityKey: "1".repeat(64),
         displayName: "First",
         path: "/work/collision",
         normalizedPath: "/work/collision",
@@ -350,6 +368,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
       }, { domain: "identity", operation: "countProjectsBeforeRollback" });
       await expect(repository.createProject({
         machineId: machine.machineId,
+        identityKey: "2".repeat(64),
         displayName: "Must roll back",
         path: "/work/collision",
         normalizedPath: "/work/collision",
@@ -361,6 +380,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
 
       const second = await repository.createProject({
         machineId: machine.machineId,
+        identityKey: "3".repeat(64),
         displayName: "Second",
         path: "/work/second",
         normalizedPath: "/work/second",
@@ -395,6 +415,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
       );
       const project = await repository.createProject({
         machineId: machine.machineId,
+        identityKey: "1".repeat(64),
         displayName: "Disposable",
         path: "/work/canonical",
         normalizedPath: "/work/canonical",
@@ -426,12 +447,14 @@ describe("PostgreSQL 18 machine and project identities", () => {
       );
       const original = await repository.createProject({
         machineId: machine.machineId,
+        identityKey: "1".repeat(64),
         displayName: "Original",
         path: "/work/reconcile",
         normalizedPath: "/work/reconcile",
       });
       const replacement = await repository.createProject({
         machineId: machine.machineId,
+        identityKey: "2".repeat(64),
         displayName: "Replacement",
         path: "/work/replacement",
         normalizedPath: "/work/replacement",
@@ -483,6 +506,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
       });
       const foreign = await repository.createProject({
         machineId: machine.machineId,
+        identityKey: "3".repeat(64),
         displayName: "Foreign",
         path: "/work/foreign",
         normalizedPath: "/work/foreign",
@@ -555,6 +579,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
 
       const disposable = await repository.createProject({
         machineId: machine.machineId,
+        identityKey: "4".repeat(64),
         displayName: "Disposable",
         path: "/work/disposable",
         normalizedPath: "/work/disposable",
@@ -692,6 +717,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
       );
       const project = await repository.createProject({
         machineId: machine.machineId,
+        identityKey: "1".repeat(64),
         displayName: "Link race target",
         path: "/work/link-race-root",
         normalizedPath: "/work/link-race-root",

@@ -91,8 +91,14 @@ async function seedScope(database: PostgreSqlRuntime): Promise<SeededScope> {
     text: "SELECT machine_id FROM lcm.machines ORDER BY identity_key",
   }, { domain: "factory", operation: "readSeedMachines" });
   const projects = await database.query<{ project_id: string }>({
-    text: `INSERT INTO lcm.projects (display_name)
-           VALUES ('Project A'), ('Project B')`,
+    text: `INSERT INTO lcm.projects (identity_key, display_name)
+           VALUES (
+             pg_catalog.repeat('a', 64),
+             'Project A'
+           ), (
+             pg_catalog.repeat('b', 64),
+             'Project B'
+           )`,
   }, { domain: "factory", operation: "seedProjects" });
   const projectRows = await database.query<{ project_id: string }>({
     text: "SELECT project_id FROM lcm.projects ORDER BY display_name",
@@ -124,6 +130,24 @@ async function seedScope(database: PostgreSqlRuntime): Promise<SeededScope> {
 
 async function expectConstraintFailure(promise: Promise<unknown>): Promise<void> {
   await expect(promise).rejects.toMatchObject({ backend: "postgresql" });
+}
+
+async function withinTestDeadline<T>(
+  promise: Promise<T>,
+  label: string,
+  timeoutMs = 3_000,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 describe("PostgreSQL schema baseline", () => {
@@ -266,9 +290,9 @@ describe("PostgreSQL schema baseline", () => {
       const normalizedConstraints = constraints.rows
         .map((row) => `${row.table_name}|${row.constraint_type}|${row.definition}`)
         .join("\n");
-      expect(constraints.rowCount).toBe(165);
+      expect(constraints.rowCount).toBe(168);
       expect(createHash("sha256").update(normalizedConstraints).digest("hex"))
-        .toBe("a8187f5b89ffc29072b30208643ce96b5c0d06fb352d9cf9a9f001b1b3219b32");
+        .toBe("224efb3262dd78a2da9d961916d4f8c23a22c48285110ff02ea9aa6f15cc526f");
 
       const deleteActions = await database.migrator.query<{
         table_name: string;
@@ -367,7 +391,7 @@ describe("PostgreSQL schema baseline", () => {
                  )
                ORDER BY index_relation.relname`,
       }, { domain: "factory", operation: "inspectExplicitSchemaIndexes" });
-      expect(explicitIndexes.rowCount).toBe(51);
+      expect(explicitIndexes.rowCount).toBe(52);
       expect(explicitIndexes.rows.map(({ index_name }) => index_name))
         .not.toContain("message_parts_metadata_idx");
       const provenanceIndex = explicitIndexes.rows.find(
@@ -454,14 +478,18 @@ describe("PostgreSQL schema baseline", () => {
                ORDER BY table_name, column_name`,
       }, { domain: "factory", operation: "inspectGeneratedColumns" });
       expect(generated.rows).toEqual([
+        { table_name: "conversations", column_name: "session_id_sha256", data_type: "bytea" },
         { table_name: "large_files", column_name: "file_id_sha256", data_type: "bytea" },
         { table_name: "messages", column_name: "search_document", data_type: "tsvector" },
+        { table_name: "native_transcripts", column_name: "native_session_id_sha256", data_type: "bytea" },
         { table_name: "promoted_memories", column_name: "search_document", data_type: "tsvector" },
         { table_name: "promoted_memories", column_name: "source_summary_id_sha256", data_type: "bytea" },
         { table_name: "promoted_memory_tags", column_name: "normalized_tag", data_type: "text" },
         { table_name: "promoted_memory_tags", column_name: "normalized_tag_sha256", data_type: "bytea" },
         { table_name: "promoted_memory_tags", column_name: "search_document", data_type: "tsvector" },
         { table_name: "promoted_memory_tags", column_name: "tag_sha256", data_type: "bytea" },
+        { table_name: "recall_surfacing", column_name: "session_id_sha256", data_type: "bytea" },
+        { table_name: "session_ingest_log", column_name: "session_id_sha256", data_type: "bytea" },
         { table_name: "summaries", column_name: "search_document", data_type: "tsvector" },
         { table_name: "summaries", column_name: "summary_id_sha256", data_type: "bytea" },
         { table_name: "summary_large_files", column_name: "file_id_sha256", data_type: "bytea" },
@@ -1005,6 +1033,379 @@ describe("PostgreSQL schema baseline", () => {
             part_session: sessionId,
           }],
         });
+    });
+  });
+
+  it("round-trips unbounded session IDs through fixed-width candidate indexes", async () => {
+    await withPostgreSqlTestDatabase("schema-long-session", async (database) => {
+      const scope = await seedScope(database.migrator);
+      const sessionId = `session-${"x".repeat(12_000)}`;
+      const conversation = await database.migrator.query<{
+        conversation_id: string;
+        session_id: string;
+      }>({
+        text: `INSERT INTO lcm.conversations (project_id, session_id)
+               VALUES ($1, $2)
+               RETURNING conversation_id, session_id`,
+        values: [scope.projectId, sessionId],
+      }, { domain: "factory", operation: "seedLongSessionConversation" });
+      expect(conversation.rows[0]?.session_id).toBe(sessionId);
+
+      await database.migrator.query({
+        text: `INSERT INTO lcm.session_ingest_log
+                 (project_id, session_id, message_count)
+               VALUES ($1, $2, 1)`,
+        values: [scope.projectId, sessionId],
+      }, { domain: "factory", operation: "seedLongSessionIngest" });
+      await expect(database.migrator.query<{
+        conversation_id: string;
+        message_count: string;
+      }>({
+        text: `SELECT conversation.conversation_id,
+                      ingest.message_count::pg_catalog.text AS message_count
+               FROM lcm.conversations AS conversation
+               JOIN lcm.session_ingest_log AS ingest
+                 ON ingest.project_id = conversation.project_id
+                AND ingest.session_id_sha256 =
+                  public.digest(conversation.session_id, 'sha256')
+                AND ingest.session_id = conversation.session_id
+               WHERE conversation.project_id = $1
+                 AND conversation.session_id_sha256 = public.digest($2, 'sha256')
+                 AND conversation.session_id = $2`,
+        values: [scope.projectId, sessionId],
+      }, { domain: "factory", operation: "resolveLongSessionExactly" }))
+        .resolves.toMatchObject({
+          rows: [{
+            conversation_id: conversation.rows[0]?.conversation_id,
+            message_count: "1",
+          }],
+        });
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.session_ingest_log
+                 (project_id, session_id, message_count)
+               VALUES ($1, $2, 2)`,
+        values: [scope.projectId, sessionId],
+      }, { domain: "factory", operation: "rejectDuplicateLongSessionIngest" }));
+
+      const indexes = await database.migrator.query<{
+        indexname: string;
+        indexdef: string;
+      }>({
+        text: `SELECT indexname, indexdef
+               FROM pg_catalog.pg_indexes
+               WHERE schemaname = 'lcm'
+                 AND indexname = ANY($1::pg_catalog.text[])
+               ORDER BY indexname`,
+        values: [[
+          "conversations_session_lookup_idx",
+          "native_transcripts_session_idx",
+          "recall_surfacing_session_order_idx",
+          "session_ingest_log_identity_lookup_idx",
+        ]],
+      }, { domain: "factory", operation: "inspectBoundedSessionIndexes" });
+      expect(indexes.rows).toHaveLength(4);
+      for (const index of indexes.rows) {
+        expect(index.indexdef).toContain("_sha256");
+        expect(index.indexdef).not.toMatch(/\(project_id, (native_)?session_id,/u);
+      }
+    });
+  });
+
+  it("excludes the old ingest row while rotating its primary key", async () => {
+    await withPostgreSqlTestDatabase("schema-session-ingest-key-rotation", async (database) => {
+      const scope = await seedScope(database.migrator);
+      const seeded = await database.migrator.query<{
+        ingest_key: string;
+        session_id: string;
+      }>({
+        text: `INSERT INTO lcm.session_ingest_log
+                 (project_id, session_id, message_count)
+               VALUES
+                 ($1, 'rotating-session', 1),
+                 ($1, 'occupied-session', 2)
+               RETURNING ingest_key::pg_catalog.text, session_id`,
+        values: [scope.projectId],
+      }, { domain: "factory", operation: "seedSessionIngestKeyRotation" });
+      const rotating = seeded.rows.find(({ session_id }) => session_id === "rotating-session");
+      const occupied = seeded.rows.find(({ session_id }) => session_id === "occupied-session");
+      expect(rotating).toBeDefined();
+      expect(occupied).toBeDefined();
+
+      const rotated = await database.migrator.query<{
+        ingest_key: string;
+        project_id: string;
+        session_id: string;
+      }>({
+        text: `UPDATE lcm.session_ingest_log
+               SET ingest_key = uuidv7(),
+                   project_id = $2,
+                   session_id = $3
+               WHERE ingest_key = $1
+               RETURNING
+                 ingest_key::pg_catalog.text,
+                 project_id::pg_catalog.text,
+                 session_id`,
+        values: [rotating!.ingest_key, scope.projectId, rotating!.session_id],
+      }, { domain: "factory", operation: "rotateSessionIngestKey" });
+      expect(rotated.rows).toHaveLength(1);
+      expect(rotated.rows[0]).toMatchObject({
+        project_id: scope.projectId,
+        session_id: rotating!.session_id,
+      });
+      expect(rotated.rows[0]?.ingest_key).not.toBe(rotating!.ingest_key);
+
+      await expect(database.migrator.query({
+        text: `UPDATE lcm.session_ingest_log
+               SET ingest_key = uuidv7(),
+                   project_id = $2,
+                   session_id = $3
+               WHERE ingest_key = $1`,
+        values: [
+          rotated.rows[0]!.ingest_key,
+          scope.projectId,
+          occupied!.session_id,
+        ],
+      }, { domain: "factory", operation: "rejectSessionIngestRotationCollision" }))
+        .rejects.toMatchObject({
+          operation: "rejectSessionIngestRotationCollision",
+          sqlState: "23505",
+        });
+      await expect(database.migrator.query({
+        text: `INSERT INTO lcm.session_ingest_log
+                 (project_id, session_id, message_count)
+               VALUES ($1, $2, 3)`,
+        values: [scope.projectId, rotating!.session_id],
+      }, { domain: "factory", operation: "rejectSessionIngestDuplicateAfterRotation" }))
+        .rejects.toMatchObject({
+          operation: "rejectSessionIngestDuplicateAfterRotation",
+          sqlState: "23505",
+        });
+      await expect(database.migrator.query<{
+        ingest_key: string;
+        session_id: string;
+      }>({
+        text: `SELECT ingest_key::pg_catalog.text, session_id
+               FROM lcm.session_ingest_log
+               WHERE project_id = $1
+               ORDER BY session_id`,
+        values: [scope.projectId],
+      }, { domain: "factory", operation: "verifySessionIngestRowsAfterRotation" }))
+        .resolves.toMatchObject({
+          rows: [
+            {
+              ingest_key: occupied!.ingest_key,
+              session_id: occupied!.session_id,
+            },
+            {
+              ingest_key: rotated.rows[0]!.ingest_key,
+              session_id: rotating!.session_id,
+            },
+          ],
+        });
+    });
+  });
+
+  it("serializes concurrent exact session-ingest identity claims", async () => {
+    await withPostgreSqlTestDatabase("schema-session-race", async (database) => {
+      const scope = await seedScope(database.migrator);
+      const first = new PostgreSqlRuntime(settings(database.migratorUrl, {
+        statementTimeoutMs: 5_000,
+      }));
+      const second = new PostgreSqlRuntime(settings(database.migratorUrl, {
+        statementTimeoutMs: 5_000,
+      }));
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+      let releaseFirst = (): void => {};
+      let reportFirstInserted = (): void => {};
+      let reportSecondPid = (_pid: number): void => {};
+      const holdFirst = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const firstInserted = new Promise<void>((resolve) => {
+        reportFirstInserted = resolve;
+      });
+      const secondPid = new Promise<number>((resolve) => {
+        reportSecondPid = resolve;
+      });
+      let firstTransaction = Promise.resolve();
+      let secondOutcome: Promise<unknown> = Promise.resolve(null);
+
+      try {
+        firstTransaction = first.transaction(async (transaction) => {
+          await transaction.query({
+            text: `INSERT INTO lcm.session_ingest_log
+                     (project_id, session_id, message_count)
+                   VALUES ($1, 'concurrent-session', 1)`,
+            values: [scope.projectId],
+          }, { domain: "factory", operation: "claimSessionIdentityFirst" });
+          reportFirstInserted();
+          await holdFirst;
+        }, { domain: "transaction", operation: "holdFirstSessionIdentityClaim" });
+        await withinTestDeadline(firstInserted, "the first session identity claim");
+
+        let secondSettled = false;
+        secondOutcome = second.transaction(async (transaction) => {
+          const pid = await transaction.query<{ pid: number }>({
+            text: "SELECT pg_catalog.pg_backend_pid() AS pid",
+          }, { domain: "factory", operation: "readSecondSessionClaimPid" });
+          reportSecondPid(pid.rows[0]!.pid);
+          await transaction.query({
+            text: `INSERT INTO lcm.session_ingest_log
+                     (project_id, session_id, message_count)
+                   VALUES ($1, 'concurrent-session', 2)`,
+            values: [scope.projectId],
+          }, { domain: "factory", operation: "claimSessionIdentitySecond" });
+        }, { domain: "transaction", operation: "attemptSecondSessionIdentityClaim" })
+          .then(
+            () => {
+              secondSettled = true;
+              return null;
+            },
+            (error: unknown) => {
+              secondSettled = true;
+              return error;
+            },
+          );
+
+        const pid = await withinTestDeadline(secondPid, "the second claimant backend");
+        let blockedOnAdvisoryLock = false;
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          const lock = await admin.query<{ blocked: boolean }>({
+            text: `SELECT EXISTS (
+                     SELECT 1
+                     FROM pg_catalog.pg_locks
+                     WHERE pid = $1
+                       AND locktype = 'advisory'
+                       AND NOT granted
+                   ) AS blocked`,
+            values: [pid],
+          }, { domain: "factory", operation: "inspectSecondSessionIdentityLock" });
+          if (lock.rows[0]?.blocked) {
+            blockedOnAdvisoryLock = true;
+            break;
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        }
+        expect(blockedOnAdvisoryLock).toBe(true);
+        expect(secondSettled).toBe(false);
+
+        releaseFirst();
+        await withinTestDeadline(firstTransaction, "the first claimant commit");
+        const secondFailure = await withinTestDeadline(
+          secondOutcome,
+          "the duplicate claimant failure",
+        );
+        expect(secondFailure).toMatchObject({
+          backend: "postgresql",
+          operation: "claimSessionIdentitySecond",
+          sqlState: "23505",
+        });
+        await expect(database.migrator.query<{ count: string }>({
+          text: `SELECT pg_catalog.count(*)::pg_catalog.text AS count
+                 FROM lcm.session_ingest_log
+                 WHERE project_id = $1
+                   AND session_id = 'concurrent-session'`,
+          values: [scope.projectId],
+        }, { domain: "factory", operation: "verifySingleSessionIdentityWinner" }))
+          .resolves.toMatchObject({ rows: [{ count: "1" }] });
+      } finally {
+        releaseFirst();
+        await Promise.allSettled([firstTransaction, secondOutcome]);
+        await Promise.allSettled([admin.close(), second.close(), first.close()]);
+      }
+    });
+  });
+
+  it("fails closed for exact identity enforcement above READ COMMITTED", async () => {
+    await withPostgreSqlTestDatabase("schema-identity-isolation", async (database) => {
+      const scope = await seedScope(database.migrator);
+      const cases = [
+        {
+          identity: "repeatable-read-summary",
+          insert: `INSERT INTO lcm.summaries
+                     (summary_id, project_id, conversation_id, kind, content, token_count)
+                   VALUES ($3, $1, $2, 'leaf', 'repeatable-read summary', 1)`,
+          label: "Summary",
+          residual: `SELECT pg_catalog.count(*)::pg_catalog.text AS count
+                     FROM lcm.summaries
+                     WHERE project_id = $1 AND summary_id = $2`,
+          values: [scope.projectId, scope.conversationId, "repeatable-read-summary"],
+        },
+        {
+          identity: "repeatable-read-file",
+          insert: `INSERT INTO lcm.large_files
+                     (file_id, project_id, conversation_id, storage_uri)
+                   VALUES ($3, $1, $2, 'file:///repeatable-read')`,
+          label: "LargeFile",
+          residual: `SELECT pg_catalog.count(*)::pg_catalog.text AS count
+                     FROM lcm.large_files
+                     WHERE project_id = $1 AND file_id = $2`,
+          values: [scope.projectId, scope.conversationId, "repeatable-read-file"],
+        },
+        {
+          identity: "repeatable-read-session",
+          insert: `INSERT INTO lcm.session_ingest_log
+                     (project_id, session_id, message_count)
+                   VALUES ($1, $2, 1)`,
+          label: "Session",
+          residual: `SELECT pg_catalog.count(*)::pg_catalog.text AS count
+                     FROM lcm.session_ingest_log
+                     WHERE project_id = $1 AND session_id = $2`,
+          values: [scope.projectId, "repeatable-read-session"],
+        },
+      ] as const;
+
+      for (const identityCase of cases) {
+        const rejectOperation = `rejectStale${identityCase.label}IdentitySnapshot`;
+        await expect(database.migrator.transaction(async (transaction) => {
+          await transaction.query({
+            text: "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+          }, {
+            domain: "factory",
+            operation: `raise${identityCase.label}IdentityIsolation`,
+          });
+          await transaction.query({
+            text: identityCase.insert,
+            values: [...identityCase.values],
+          }, { domain: "factory", operation: rejectOperation });
+        }, {
+          domain: "transaction",
+          operation: `enforce${identityCase.label}IdentityIsolation`,
+        })).rejects.toMatchObject({
+          operation: rejectOperation,
+          sqlState: "0A000",
+        });
+        await expect(database.migrator.query<{ count: string }>({
+          text: identityCase.residual,
+          values: [scope.projectId, identityCase.identity],
+        }, {
+          domain: "factory",
+          operation: `verifyRejectedStale${identityCase.label}IdentitySnapshot`,
+        })).resolves.toMatchObject({ rows: [{ count: "0" }] });
+      }
+    });
+  });
+
+  it("stores one backend-neutral ProjectIdentity id per internal project UUID", async () => {
+    await withPostgreSqlTestDatabase("schema-project-identity", async (database) => {
+      const scope = await seedScope(database.migrator);
+      await expect(database.migrator.query<{ project_id: string }>({
+        text: `SELECT project_id
+               FROM lcm.projects
+               WHERE identity_key = pg_catalog.repeat('a', 64)`,
+      }, { domain: "factory", operation: "resolveProjectIdentityAcrossMachines" }))
+        .resolves.toMatchObject({ rows: [{ project_id: scope.projectId }] });
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.projects (identity_key, display_name)
+               VALUES (pg_catalog.repeat('a', 64), 'Duplicate identity')`,
+      }, { domain: "factory", operation: "rejectDuplicateProjectIdentity" }));
+      await expectConstraintFailure(database.migrator.query({
+        text: "INSERT INTO lcm.projects (display_name) VALUES ('Missing identity')",
+      }, { domain: "factory", operation: "rejectMissingProjectIdentity" }));
+      await expectConstraintFailure(database.migrator.query({
+        text: `INSERT INTO lcm.projects (identity_key, display_name)
+               VALUES ('not-a-project-hash', 'Invalid identity')`,
+      }, { domain: "factory", operation: "rejectInvalidProjectIdentity" }));
     });
   });
 

@@ -53,4 +53,19 @@ describe("package.json", () => {
       expect(source).not.toContain("execSync(");
     }
   });
+
+  it("tree-shakes migration-only definition inventories from the CLI bundle", () => {
+    const migrationSource = readFileSync(
+      new URL("../src/storage/postgresql/migrations.ts", import.meta.url),
+      "utf8",
+    );
+    const cliBundle = readFileSync(new URL("../lcm.mjs", import.meta.url), "utf8");
+    for (const inventoryIdentity of [
+      "session_ingest_log_identity_lookup_idx",
+      "transcript_messages_project_id_transcript_id_source_ordinal_key",
+    ]) {
+      expect(migrationSource).toContain(inventoryIdentity);
+      expect(cliBundle).not.toContain(inventoryIdentity);
+    }
+  });
 });

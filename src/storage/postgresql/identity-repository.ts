@@ -363,6 +363,7 @@ export class PostgreSqlIdentityRepository {
 
   async createProject(input: {
     readonly machineId: string;
+    readonly identityKey: string;
     readonly displayName: string;
     readonly path: string;
     readonly normalizedPath: string;
@@ -373,10 +374,10 @@ export class PostgreSqlIdentityRepository {
     try {
       return await this.executor.transaction(async (transaction) => {
         const created = await transaction.query<ProjectRow>({
-          text: `INSERT INTO lcm.projects (display_name)
-                 VALUES ($1)
+          text: `INSERT INTO lcm.projects (identity_key, display_name)
+                 VALUES ($1, $2)
                  RETURNING project_id, display_name, created_at, updated_at`,
-          values: [displayName],
+          values: [input.identityKey, displayName],
         }, { domain: "identity", operation: "createProject" });
         const row = created.rows[0];
         if (!row) throw new PostgreSqlIdentityNotFoundError("project", displayName);

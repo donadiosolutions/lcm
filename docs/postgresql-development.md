@@ -104,6 +104,17 @@ unbounded summary IDs round-trip exactly through bounded UUIDv7 relationship
 keys and digest-plus-exact lookup. Unbounded large-file IDs use the same
 UUIDv7-key and digest-plus-exact design and remain unique within a project
 rather than globally.
+The backend-neutral 64-hex `ProjectIdentity.id` is stored separately from the
+internal UUID and display label, so another machine resolves the same logical
+project without depending on a machine-local path alias. Arbitrary-length
+session IDs remain exact text, but conversations, native transcripts, recall
+surfacing, and ingest completion index only fixed-width SHA-256 candidates.
+Repository lookups must retain exact session-text equality as the collision
+residual. Session-ingest uniqueness uses an internal UUIDv7 key and an
+advisory-locked digest-plus-residual trigger rather than a raw-text primary key.
+All three exact-identity triggers are `ENABLE ALWAYS`; privileged replica-mode
+sessions therefore execute the same uniqueness checks instead of bypassing
+them.
 Promoted-memory source IDs are preserved as external provenance without a
 local-summary foreign key. Floating-point step costs reject `NaN` and both
 infinities. Search and tag normalization use PostgreSQL 18's builtin
@@ -126,15 +137,72 @@ absent schema because `0001` creates it as the current migration role, but it
 fails closed when another role owns an existing schema even if that role has
 delegated `CREATE` to the migrator. Transfer ownership explicitly with the
 cluster administrator before retrying; LCM never changes schema ownership.
-On every run, an exact catalog allowlist also checks every existing managed
-table, generated identity sequence, helper or trigger function, text-search
-dictionary, and text-search configuration. Ownership drift blocks repeated
-runs and later pending migrations before ledger inspection. Objects not on the
-allowlist are preserved and may have a different owner.
+The locked migration transaction also requires its own backend session to
+report `session_replication_role = origin` before taking the advisory lock or
+trusting any LCM schema metadata. Replica or local mode can suppress internal
+constraint triggers such as foreign-key enforcement, so readiness fails with
+structured remediation instead of resetting this privileged, session-local
+setting. Restore `origin` on that connection, or reconnect with the default
+session state, before retrying.
+On every run, a catalog-only ledger preflight permits
+`lcm.schema_migrations` to be absent for first installation, but requires a
+present ledger relation to be an ordinary table owned by the current migration
+role. A view, materialized view, foreign table, or other relation kind is
+rejected before any ledger row is read. The runner then checks ownership of
+every existing allowlisted object through `pg_catalog`, verifies the ordered
+ledger, and requires the exact managed inventory owned by the selected current
+snapshot before pending SQL.
+After pending SQL and ledger rows, it requires the target snapshot's managed
+inventory before commit.
+Schema snapshots are keyed by migration ID: walk validated history from newest
+to oldest to select the first registered snapshot, validate the current
+snapshot before pending SQL, and validate the target snapshot after applying
+and recording the pending set but before commit. Registry order is irrelevant.
+Add a new snapshot entry whenever a future migration intentionally changes a
+fingerprinted definition or managed object. Each snapshot owns the exact
+managed-object identities, every definition-group identity, derived count and
+hash, plus the complete identity-function name/hash list.
+A missing table, generated identity sequence, helper or trigger function,
+text-search dictionary, or text-search configuration blocks repeated runs and
+later pending migrations once that baseline is trusted; a smaller surviving
+inventory is not accepted.
+Unknown objects remain preserved and may have a different owner. The summary,
+large-file, and session-ingest identity functions are also fingerprinted by
+stored body and security configuration. Body, language/return type,
+security-definer/leakproof, volatility, parallel-safety, fixed search path, or
+complete normalized ACL drift fails closed.
+The `0002` definition inventory also fingerprints the complete 205-column
+ordinary inventory of its 24 allowlisted tables, including
+`recall_surfacing.surfaced_at`. Each ordinary column retains its formatted
+type, nullability, deparsed default, identity state, and resolved
+namespace-qualified collation. Generated-column fingerprints retain the same
+resolved collation in addition to formatted type, nullability, generated state,
+and expression.
+It fingerprints all six generated identity sequences by type, increment,
+minimum, maximum, start, cache, cycle state, internal identity dependency, and
+owning table/column, and requires permanent persistence.
+It also requires all 24 allowlisted tables to remain ordinary permanent tables
+with both row-level-security flags disabled and no inheritance or partition
+parent/child relationships, and fingerprints the complete
+effective ACL of every allowlisted table and identity sequence. ACL comparison
+expands PostgreSQL default ACLs when the
+stored ACL is null and normalizes only the owning role, so explicit owner-only
+ACLs compare equal to defaults while `PUBLIC`, named-role, privilege,
+grant-option, foreign-grantor, and missing-owner drift fail closed.
+The separate 220-column ACL group includes one canonical identity row for
+every ordinary and generated column even when `attacl` is null, then expands
+all explicit column grants with the same owner-only normalization.
+Constraint fingerprints include the owning table and constraint name as well
+as type, definition, and internal-trigger state; renaming or swapping
+same-type constraints is drift.
 Failure diagnostics identify `requiredOwner` using the sanitized PostgreSQL
 `CURRENT_USER` role and provide identifier-quoted transfer guidance. They do
 not expose the existing owner, connection details, or raw database errors, and
 missing or malformed catalog values fail closed.
+Migration transactions pin `search_path = pg_catalog, public` and
+`quote_all_identifiers = off` before catalog deparsing. Tests that change role,
+database, or session GUC defaults must prove those ambient settings neither
+change a fingerprint nor leak across commit or rollback.
 
 Exercise at least the empty, repeated, concurrent, rollback, unknown-history,
 out-of-order, and checksum-drift paths. Migration SQL and the ledger insertion

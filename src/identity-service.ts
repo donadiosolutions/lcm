@@ -50,6 +50,7 @@ export interface IdentityRepository {
   recoverMachine(machineId: string): Promise<RegisteredMachine>;
   createProject(input: {
     readonly machineId: string;
+    readonly identityKey: string;
     readonly displayName: string;
     readonly path: string;
     readonly normalizedPath: string;
@@ -507,6 +508,7 @@ async function createRemoteProject(
   repository: IdentityRepository,
   input: {
     readonly machineId: string;
+    readonly identityKey: string;
     readonly displayName: string;
     readonly path: string;
     readonly normalizedPath: string;
@@ -573,6 +575,7 @@ export async function createProject(
   return withSession(config, deps, async (repository) => {
     const remote = await createRemoteProject(repository, {
       machineId: machine.machineId,
+      identityKey: local.id,
       displayName,
       ...selectedPath,
       aliases: entryPaths,
