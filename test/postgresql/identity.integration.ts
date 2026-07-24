@@ -636,6 +636,11 @@ describe("PostgreSQL 18 machine and project identities", () => {
         replacement.projectId,
         removed!,
       )).resolves.toBe(true);
+      await expect(repository.restoreProjectAliases(
+        machine.machineId,
+        replacement.projectId,
+        removed!,
+      )).resolves.toBe(true);
       for (const alias of entryAliases.slice(0, 2)) {
         await expect(repository.resolveProject(machine.machineId, alias.normalizedPath))
           .resolves.toMatchObject({ projectId: replacement.projectId });

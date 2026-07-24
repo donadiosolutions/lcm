@@ -31,6 +31,7 @@ import {
 import {
   PostgreSqlIdentityRepository,
   PostgreSqlIdentityCreateOutcomeUnknownError,
+  PostgreSqlIdentityLinkOutcomeUnknownError,
   PostgreSqlIdentityReplaceAliasesOutcomeUnknownError,
   PostgreSqlIdentityUnlinkAliasesOutcomeUnknownError,
   PostgreSqlIdentityUnlinkPathOutcomeUnknownError,
@@ -868,6 +869,30 @@ async function restoreRemoteUnlinkedAliases(
   }
 }
 
+async function restoreRemoteUnlinkedAlias(
+  repository: IdentityRepository,
+  input: {
+    readonly machineId: string;
+    readonly projectId: string;
+    readonly path: string;
+    readonly normalizedPath: string;
+  },
+): Promise<boolean> {
+  try {
+    await repository.linkProject(input);
+    return true;
+  } catch (error) {
+    if (!(error instanceof PostgreSqlIdentityLinkOutcomeUnknownError)) return false;
+    try {
+      const owner = await repository.resolveProject(input.machineId, input.normalizedPath);
+      return owner?.projectId === input.projectId
+        && owner.alias.path === input.path;
+    } catch {
+      return false;
+    }
+  }
+}
+
 async function linkRemoteProject(
   config: ResolvedStorageConfig,
   remoteProjectId: string,
@@ -1185,14 +1210,13 @@ export async function unlinkProject(
         };
       }
       if (removed) {
-        try {
-          await repository.linkProject({
-            machineId: machine.machineId,
-            projectId: removed.projectId,
-            path: removed.alias.path,
-            normalizedPath: removed.alias.normalizedPath,
-          });
-        } catch {
+        const restored = await restoreRemoteUnlinkedAlias(repository, {
+          machineId: machine.machineId,
+          projectId: removed.projectId,
+          path: removed.alias.path,
+          normalizedPath: removed.alias.normalizedPath,
+        });
+        if (!restored) {
           throw new ProjectIdentityReconciliationError(
             "the local alias removal failed and PostgreSQL could not be restored",
             `Rerun \`lcm project link -- ${quoteShellArgument(shown.entry.remoteProjectId!)} ${quoteShellArgument(aliasPath)}\`.`,

@@ -37,6 +37,7 @@ import {
 import {
   PostgreSqlIdentityConflictError,
   PostgreSqlIdentityCreateOutcomeUnknownError,
+  PostgreSqlIdentityLinkOutcomeUnknownError,
   PostgreSqlIdentityNotFoundError,
   PostgreSqlIdentityReplaceAliasesOutcomeUnknownError,
   PostgreSqlIdentityUnlinkAliasesOutcomeUnknownError,
@@ -2380,6 +2381,81 @@ describe("identity service", () => {
     expect(listProjectMapEntries()[bound.local.id].aliases).not.toContain(linked);
     expect(repository.linkProject).not.toHaveBeenCalled();
   });
+
+  it("accepts an uncertain alias restoration after authoritative readback", async () => {
+    await register();
+    const canonical = makeProject("unlink-alias-uncertain-restore-canonical");
+    const linked = makeProject("unlink-alias-uncertain-restore-path");
+    const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
+    const originalUnlink = repository.unlinkProjectAliasIfOwned.getMockImplementation()!;
+    repository.unlinkProjectAliasIfOwned = vi.fn(async (machineId, normalizedPath, projectId) => {
+      const removed = await originalUnlink(machineId, normalizedPath, projectId);
+      writeFileSync(projectMapPath(), "{broken");
+      return removed;
+    });
+    const originalLink = repository.linkProject.getMockImplementation()!;
+    repository.linkProject = vi.fn(async (input) => {
+      const restored = await originalLink(input);
+      throw new PostgreSqlIdentityLinkOutcomeUnknownError(input.projectId, {
+        alias: restored,
+        inserted: true,
+      });
+    });
+
+    const error = await unlinkProject(POSTGRESQL_CONFIG, linked, deps)
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(ProjectIdentityReconciliationError);
+    expect(repository.resolveProject).toHaveBeenCalledWith(MACHINE_ID, linked);
+    await expect(repository.resolveProject(MACHINE_ID, linked)).resolves.toMatchObject({
+      projectId: PROJECT_A,
+      alias: { path: linked },
+    });
+  });
+
+  it.each(["project", "path", "readback"] as const)(
+    "rejects an uncertain alias restoration after %s divergence",
+    async (outcome) => {
+      await register();
+      const canonical = makeProject(`unlink-alias-uncertain-${outcome}-canonical`);
+      const linked = makeProject(`unlink-alias-uncertain-${outcome}-path`);
+      const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+      await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
+      const originalUnlink = repository.unlinkProjectAliasIfOwned.getMockImplementation()!;
+      repository.unlinkProjectAliasIfOwned = vi.fn(async (
+        machineId,
+        normalizedPath,
+        projectId,
+      ) => {
+        const removed = await originalUnlink(machineId, normalizedPath, projectId);
+        writeFileSync(projectMapPath(), "{broken");
+        return removed;
+      });
+      repository.linkProject = vi.fn(async (input) => {
+        throw new PostgreSqlIdentityLinkOutcomeUnknownError(input.projectId, {
+          alias: alias(input.projectId, input.normalizedPath, input.path),
+          inserted: true,
+        });
+      });
+      repository.resolveProject = vi.fn(async () => {
+        if (outcome === "readback") throw new Error("readback failed");
+        if (outcome === "project") {
+          return {
+            projectId: PROJECT_B,
+            alias: alias(PROJECT_B, linked),
+          };
+        }
+        return {
+          projectId: PROJECT_A,
+          alias: alias(PROJECT_A, linked, `${linked}-other-lexical-path`),
+        };
+      });
+
+      await expect(unlinkProject(POSTGRESQL_CONFIG, linked, deps))
+        .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
+    },
+  );
 
   it("reports when remote alias removal rollback cannot restore PostgreSQL", async () => {
     await register();

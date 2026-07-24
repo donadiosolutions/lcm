@@ -909,7 +909,13 @@ describe("PostgreSQL identity repository", () => {
         return result([{ project_id: projectRow.project_id }]);
       }
       if (config.text.includes("INSERT INTO lcm.project_aliases")) {
-        return result([aliasRow]);
+        return result([{
+          ...aliasRow,
+          project_id: String(config.values?.[0]),
+          machine_id: String(config.values?.[1]),
+          path: String(config.values?.[2]),
+          normalized_path: String(config.values?.[3]),
+        }]);
       }
       throw new Error(`unexpected SQL: ${config.text}`);
     });
@@ -950,12 +956,53 @@ describe("PostgreSQL identity repository", () => {
       projectRow.project_id,
       removed!,
     )).resolves.toBe(true);
+    db.query.mockClear();
     currentRows = [aliasRow];
     await expect(repository.restoreProjectAliases(
       machineRow.machine_id,
       projectRow.project_id,
       removed!,
+    )).resolves.toBe(true);
+    expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining("INSERT INTO lcm.project_aliases"),
+      values: [
+        projectRow.project_id,
+        machineRow.machine_id,
+        secondAlias.path,
+        secondAlias.normalized_path,
+      ],
+    }), expect.objectContaining({ operation: "linkProject" }));
+
+    db.query.mockClear();
+    currentRows = [aliasRow, secondAlias];
+    await expect(repository.restoreProjectAliases(
+      machineRow.machine_id,
+      projectRow.project_id,
+      removed!,
+    )).resolves.toBe(true);
+    expect(db.query).not.toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringContaining("INSERT INTO") }),
+      expect.anything(),
+    );
+
+    currentRows = [{ ...aliasRow, project_id: "other" }];
+    await expect(repository.restoreProjectAliases(
+      machineRow.machine_id,
+      projectRow.project_id,
+      removed!,
     )).resolves.toBe(false);
+
+    db.query.mockClear();
+    currentRows = [{ ...aliasRow, path: "/same-project-different-lexical-path" }];
+    await expect(repository.restoreProjectAliases(
+      machineRow.machine_id,
+      projectRow.project_id,
+      removed!,
+    )).resolves.toBe(false);
+    expect(db.query).not.toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringContaining("INSERT INTO") }),
+      expect.anything(),
+    );
   });
 
   it("preserves batch unlink snapshots when COMMIT outcomes are unknown", async () => {

@@ -807,8 +807,16 @@ export class PostgreSqlIdentityRepository {
                FOR UPDATE`,
         values: [machineId, normalizedPaths],
       }, { domain: "identity", operation: "restoreProjectAliases", projectId });
-      if (current.rows.length > 0) return false;
+      if (current.rows.some((row) => row.project_id !== projectId)) return false;
+      const currentByPath = new Map(current.rows.map((row) => [row.normalized_path, row]));
+      if (aliases.some((alias) => {
+        const existing = currentByPath.get(alias.normalizedPath);
+        return existing !== undefined && existing.path !== alias.path;
+      })) {
+        return false;
+      }
       for (const alias of aliases) {
+        if (currentByPath.has(alias.normalizedPath)) continue;
         await this.linkWithExecutor(transaction, {
           machineId,
           projectId,
