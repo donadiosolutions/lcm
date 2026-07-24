@@ -840,6 +840,12 @@ describe("runDoctor configuration validation", () => {
       pid: 4242,
       startMethod: "existing",
     });
+    mockCollectEventStats.mockReturnValue({
+      captured: 100,
+      unprocessed: 5,
+      errors: 0,
+      lastCapture: "2026-03-26 10:00:00",
+    });
     try {
       const results = await runDoctor(minimalDeps({
         fetch,
@@ -862,6 +868,12 @@ describe("runDoctor configuration validation", () => {
       });
       expect(results.find((result) => result.name === "daemon")?.fixApplied)
         .not.toBe(true);
+      expect(results.find((result) => result.name === "events-capture")).toMatchObject({
+        status: "warn",
+        message: expect.stringContaining("queue cannot drain until storage is healthy"),
+      });
+      expect(results.find((result) => result.name === "events-capture")?.message)
+        .not.toContain("queued for automatic daemon processing");
     } finally {
       if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
       else process.env.LCM_POSTGRES_URL = previousUrl;

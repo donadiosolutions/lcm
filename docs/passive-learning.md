@@ -154,7 +154,13 @@ Run `lcm doctor --verbose` to see the per-project breakdown and recent error det
 
 By default, doctor scans up to 50 passive-learning sidecar DBs. Use `lcm doctor --events-max-dbs <n>` to set another count limit, or `lcm doctor --events-max-dbs all` / `lcm doctor --events-max-dbs unlimited` to remove the count limit. Sidecars skipped because of the count or timeout budget are reported as skipped, not warnings.
 
-Low nonzero backlog is reported as passing because the daemon processes queued events automatically. When the daemon is healthy but 200 or more queued events remain across project sidecars, `lcm doctor` warns and suggests `lcm events promote --all` instead of asking you to restart the daemon.
+Low nonzero backlog is reported as passing when both the daemon and its storage
+backend are healthy, because the daemon processes queued events automatically.
+If the daemon process is reachable while PostgreSQL storage is unavailable,
+`lcm doctor` warns that the queue cannot drain until storage recovers. When the
+daemon and storage are healthy but 200 or more queued events remain across
+project sidecars, `lcm doctor` warns and suggests `lcm events promote --all`
+instead of asking you to restart the daemon.
 
 During the sidecar scan, lcm also prunes orphan sidecars that are safe to remove. A sidecar is pruned only when its project metadata is missing and it has no unprocessed events. Empty orphan sidecars are removed immediately; processed-only orphan sidecars are removed after the 30-day stale retention window.
 

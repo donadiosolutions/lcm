@@ -2189,6 +2189,33 @@ describe("identity service", () => {
       });
   });
 
+  it("rejects ambiguous bound-entry alias links with another lexical path", async () => {
+    await register();
+    const canonical = makeProject("remote-alias-lexical-canonical");
+    const linked = makeProject("remote-alias-lexical");
+    const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    repository.linkProjectWithOwnership = vi.fn(async (input) => {
+      throw new PostgreSqlCommitOutcomeUnknownError({
+        domain: "identity",
+        operation: "linkProject",
+        projectId: input.projectId,
+      });
+    });
+    repository.resolveProject = vi.fn(async (_machineId, normalizedPath) => ({
+      projectId: PROJECT_A,
+      alias: alias(PROJECT_A, normalizedPath, `${linked}/.`),
+    }));
+
+    await expect(linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps))
+      .rejects.toMatchObject({
+        name: "ProjectIdentityReconciliationError",
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_A)} ${quoteShellArgument(linked)}`,
+        ),
+      });
+    expect(listProjectMapEntries()[bound.local.id].aliases).not.toContain(linked);
+  });
+
   it("fails closed for deterministic, absent, and unreadable bound-entry alias links", async () => {
     await register();
     const canonical = makeProject("remote-alias-fail-canonical");
@@ -2865,6 +2892,43 @@ describe("identity service", () => {
       .rejects.toThrow("Expected property name");
     await expect(repository.resolveProject(MACHINE_ID, canonical))
       .resolves.toMatchObject({ projectId: PROJECT_A });
+  });
+
+  it("rejects ambiguous canonical-unlink restoration with another lexical path", async () => {
+    await register();
+    const canonical = makeProject("unbind-restore-lexical");
+    await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    const concurrentPath = `${canonical}/.`;
+    const originalUnlink = repository.unlinkProjectAliasesIfOwned.getMockImplementation()!;
+    const originalRestore = repository.restoreProjectAliases.getMockImplementation()!;
+    repository.unlinkProjectAliasesIfOwned = vi.fn(async (machineId, projectId, paths) => {
+      const removed = await originalUnlink(machineId, projectId, paths);
+      writeFileSync(projectMapPath(), "{broken");
+      return removed;
+    });
+    repository.restoreProjectAliases = vi.fn(async (machineId, projectId, aliases) => {
+      await originalRestore(machineId, projectId, aliases);
+      await repository.replaceProjectAlias({
+        machineId,
+        expectedPriorProjectId: projectId,
+        projectId,
+        path: concurrentPath,
+        normalizedPath: canonical,
+      });
+      throw new PostgreSqlCommitOutcomeUnknownError({
+        domain: "identity",
+        operation: "restoreProjectAliases",
+        projectId,
+      });
+    });
+
+    await expect(unlinkProject(POSTGRESQL_CONFIG, canonical, deps))
+      .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
+    await expect(repository.resolveProject(MACHINE_ID, canonical))
+      .resolves.toMatchObject({
+        projectId: PROJECT_A,
+        alias: { path: concurrentPath, normalizedPath: canonical },
+      });
   });
 
   it("fails closed when batch restoration after unbind is deterministic or unreadable", async () => {

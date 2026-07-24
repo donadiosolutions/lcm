@@ -758,6 +758,35 @@ describe("PostgreSQL identity repository", () => {
     })).resolves.toBeNull();
   });
 
+  it("rolls back a batch replacement when a same-project winner uses another lexical path", async () => {
+    const concurrentWinner = {
+      ...aliasRow,
+      path: `${aliasRow.path}/.`,
+    };
+    let selectCount = 0;
+    const db = executor((config) => {
+      if (config.text.includes("SELECT project_id FROM")) {
+        return result([{ project_id: projectRow.project_id }]);
+      }
+      if (config.text.includes("FOR UPDATE")) {
+        selectCount += 1;
+        return result(selectCount === 1 ? [] : [concurrentWinner]);
+      }
+      if (config.text.includes("INSERT INTO lcm.project_aliases")) return result([]);
+      throw new Error(`unexpected SQL: ${config.text}`);
+    });
+    const repository = new PostgreSqlIdentityRepository(db);
+
+    await expect(repository.replaceProjectAliases({
+      machineId: machineRow.machine_id,
+      projectId: projectRow.project_id,
+      aliases: [{
+        path: aliasRow.path,
+        normalizedPath: aliasRow.normalized_path,
+      }],
+    })).resolves.toBeNull();
+  });
+
   it("rejects missing projects, collisions, and vanished conflicting rows", async () => {
     const missingProject = new PostgreSqlIdentityRepository(executor(() => result([])));
     await expect(missingProject.linkProject({

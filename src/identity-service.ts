@@ -788,7 +788,10 @@ async function confirmRemoteLink(
     if (!(error instanceof PostgreSqlCommitOutcomeUnknownError)) throw error;
     try {
       const resolved = await repository.resolveProject(input.machineId, input.normalizedPath);
-      if (resolved?.projectId === input.projectId) {
+      if (
+        resolved?.projectId === input.projectId
+        && resolved.alias.path === input.path
+      ) {
         return {
           alias: resolved.alias,
           // Even a transaction that reached INSERT ... RETURNING does not
@@ -1022,7 +1025,10 @@ async function restoreRemoteUnlinkedAliases(
           (alias) => repository.resolveProject(machineId, alias.normalizedPath),
         ),
       );
-      return owners.every((owner) => owner?.projectId === projectId);
+      return owners.every((owner, index) => (
+        owner?.projectId === projectId
+        && owner.alias.path === aliases[index]?.path
+      ));
     } catch {
       return false;
     }

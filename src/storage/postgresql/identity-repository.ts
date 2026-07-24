@@ -578,7 +578,10 @@ export class PostgreSqlIdentityRepository {
         const finalByPath = new Map(final.rows.map((row) => [row.normalized_path, row]));
         if (
           final.rows.length !== input.aliases.length
-          || final.rows.some((row) => row.project_id !== input.projectId)
+          || input.aliases.some((alias) => {
+            const row = finalByPath.get(alias.normalizedPath);
+            return row?.project_id !== input.projectId || row.path !== alias.path;
+          })
         ) {
           throw new PostgreSqlIdentityBatchConflictMarker(input.projectId);
         }
