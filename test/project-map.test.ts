@@ -354,6 +354,33 @@ describe("project map", () => {
     expect(readFileSync(lockPath, "utf8")).toBe(stale);
   });
 
+  it("reports a reclaim claim whose owner publication is still incomplete", () => {
+    const canonical = makeDir("remote-reclaim-owner-publication-race");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    const nonce = "d".repeat(32);
+    const stale = `${JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      processStartTime: "1",
+      nonce,
+    })}\n`;
+    const claimPath = `${lockPath}.reclaim-${nonce}`;
+    writeFileSync(lockPath, stale, { mode: 0o600 });
+
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _lockObserverForTesting: (event, path) => {
+        if (event === "before-claim-mkdir") mkdirSync(path, { mode: 0o700 });
+      },
+    })).toThrow(
+      "project map lock reclamation changed during acquisition; retry the operation",
+    );
+    expect(readFileSync(lockPath, "utf8")).toBe(stale);
+    expect(existsSync(claimPath)).toBe(true);
+    expect(existsSync(join(claimPath, "owner.json"))).toBe(false);
+  });
+
   it("recovers a reclaim claim whose owner crashed without deleting a successor generation", () => {
     const canonical = makeDir("remote-crashed-reclaimer");
     resolveProjectIdentity(canonical);

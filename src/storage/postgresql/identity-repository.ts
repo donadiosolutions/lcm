@@ -124,6 +124,38 @@ export class PostgreSqlIdentityConflictError extends StorageOperationError {
   }
 }
 
+export class PostgreSqlIdentityAliasPathConflictError extends StorageOperationError {
+  constructor(
+    readonly machineId: string,
+    readonly normalizedPath: string,
+    readonly projectIdCandidate: string,
+    readonly existingPath: string,
+    readonly requestedPath: string,
+  ) {
+    super(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      projectIdCandidate,
+      "identity",
+      "linkProject",
+    );
+    this.name = "PostgreSqlIdentityAliasPathConflictError";
+    this.message =
+      `normalized path ${normalizedPath} on machine ${machineId} is already linked to project ${projectIdCandidate} as lexical path ${existingPath}; refusing conflicting lexical path ${requestedPath}`;
+  }
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      machineId: this.machineId,
+      normalizedPath: this.normalizedPath,
+      projectId: this.projectIdCandidate,
+      existingPath: this.existingPath,
+      requestedPath: this.requestedPath,
+    };
+  }
+}
+
 export class PostgreSqlIdentityNotFoundError extends StorageOperationError {
   constructor(
     readonly identityType: "machine" | "project",
@@ -454,7 +486,7 @@ export class PostgreSqlIdentityRepository {
     readonly projectId: string;
     readonly aliases: readonly RemoteProjectAliasInput[];
   }): Promise<RemoteAliasBatchMutation | null> {
-    let candidate: RemoteAliasBatchMutation | undefined;
+    let candidate: RemoteAliasBatchMutation | null | undefined;
     try {
       return await this.executor.transaction(async (transaction) => {
         const project = await transaction.query<{ project_id: string }>({
@@ -477,7 +509,8 @@ export class PostgreSqlIdentityRepository {
           row.project_id !== input.projectId
           && row.project_id !== input.expectedPriorProjectId
         ))) {
-          return null;
+          candidate = null;
+          return candidate;
         }
         const currentByPath = new Map(current.rows.map((row) => [row.normalized_path, row]));
         const prior = input.aliases.map(({ normalizedPath }) => {
@@ -557,8 +590,11 @@ export class PostgreSqlIdentityRepository {
       }, { domain: "identity", operation: "replaceProjectAliases", projectId: input.projectId });
     } catch (error) {
       if (error instanceof PostgreSqlIdentityBatchConflictMarker) return null;
-      if (error instanceof PostgreSqlCommitOutcomeUnknownError && candidate) {
-        throw new PostgreSqlIdentityReplaceAliasesOutcomeUnknownError(input.projectId, candidate);
+      if (error instanceof PostgreSqlCommitOutcomeUnknownError) {
+        if (candidate === null) return null;
+        if (candidate) {
+          throw new PostgreSqlIdentityReplaceAliasesOutcomeUnknownError(input.projectId, candidate);
+        }
       }
       throw error;
     }
@@ -640,6 +676,15 @@ export class PostgreSqlIdentityRepository {
         input.normalizedPath,
         row.project_id,
         input.projectId,
+      );
+    }
+    if (row.path !== input.path) {
+      throw new PostgreSqlIdentityAliasPathConflictError(
+        input.machineId,
+        input.normalizedPath,
+        input.projectId,
+        row.path,
+        input.path,
       );
     }
     return {

@@ -141,7 +141,17 @@ function acquireReclaimClaim(
   if (createReclaimClaim(claimPath, content, label, observer)) return;
 
   const ownerPath = join(claimPath, "owner.json");
-  const existing = readLockOwner(ownerPath, label);
+  let existing: ReturnType<typeof readLockOwner>;
+  try {
+    existing = readLockOwner(ownerPath, label);
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      throw new Error(
+        `${label} lock reclamation changed during acquisition; retry the operation`,
+      );
+    }
+    throw error;
+  }
   const state = lockOwnerState(existing.owner, observer);
   if (state !== "stale") {
     const reason = state === "live"

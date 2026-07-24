@@ -11,6 +11,7 @@ import {
 import { recoverMachineIdentity } from "../../src/machine-identity.js";
 import { clearProjectMapCache, resolveProjectIdentity } from "../../src/project-map.js";
 import {
+  PostgreSqlIdentityAliasPathConflictError,
   PostgreSqlIdentityCreateOutcomeUnknownError,
   PostgreSqlIdentityConflictError,
   PostgreSqlIdentityRepository,
@@ -786,7 +787,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
         normalizedPath: "/work/link-race-root",
       });
 
-      const results = await Promise.all([
+      const results = await Promise.allSettled([
         repository.linkProjectWithOwnership({
           machineId: machine.machineId,
           projectId: project.projectId,
@@ -800,9 +801,19 @@ describe("PostgreSQL 18 machine and project identities", () => {
           normalizedPath: "/work/link-race-alias",
         }),
       ]);
-      expect(results.map(({ inserted }) => inserted).sort()).toEqual([false, true]);
-      expect(new Set(results.map(({ alias }) => alias.path)).size).toBe(1);
-      const winningPath = results.find(({ inserted }) => inserted)!.alias.path;
+      const fulfilled = results.filter(
+        (result): result is PromiseFulfilledResult<Awaited<
+          ReturnType<typeof repository.linkProjectWithOwnership>
+        >> => result.status === "fulfilled",
+      );
+      const rejected = results.filter(
+        (result): result is PromiseRejectedResult => result.status === "rejected",
+      );
+      expect(fulfilled).toHaveLength(1);
+      expect(fulfilled[0].value.inserted).toBe(true);
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0].reason).toBeInstanceOf(PostgreSqlIdentityAliasPathConflictError);
+      const winningPath = fulfilled[0].value.alias.path;
       await expect(repository.resolveProject(machine.machineId, "/work/link-race-alias"))
         .resolves.toMatchObject({
           projectId: project.projectId,

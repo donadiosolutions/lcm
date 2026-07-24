@@ -95,6 +95,9 @@ lcm project link <project-uuid> /home/me/src/lcm
 The path must be an existing directory. An identical link is idempotent. If
 the same normalized path on the same machine already belongs to another remote
 project, LCM reports a collision and does not merge or redirect either project.
+If the same remote project already owns that normalized path under a different
+lexical path spelling, LCM also reports a collision; it does not replace the
+winning spelling implicitly.
 
 Binding a previously unbound local project preserves its local data. Rebinding
 an entry that already points to a different remote UUID is blocked when that
