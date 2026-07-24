@@ -52,6 +52,16 @@ export class MachineIdentityFileError extends Error {
   }
 }
 
+export class MachineIdentityRegistrationChangedError extends MachineIdentityFileError {
+  constructor() {
+    super(
+      "machine identity changed during registration",
+      "Run `lcm machine show` and retry the registration explicitly.",
+    );
+    this.name = "MachineIdentityRegistrationChangedError";
+  }
+}
+
 export function machineIdentityPath(homeDir?: string): string {
   return join(lcmHomeDir(homeDir), "machine.json");
 }
@@ -210,30 +220,39 @@ export function ensurePendingMachineIdentity(
   homeDir?: string,
   fileOperations: {
     readonly writeExclusive?: typeof atomicWritePrivateFileExclusive;
+    /** @internal Test-only synchronization seam for deterministic race coverage. */
+    readonly _lockObserverForTesting?: PrivateMutationLockObserver;
   } = {},
 ): { readonly identity: StoredMachineIdentity; readonly created: boolean } {
-  const existing = readMachineIdentity(homeDir);
-  if (existing !== null) return { identity: existing, created: false };
-  const pending: PendingMachineIdentity = {
-    version: MACHINE_IDENTITY_VERSION,
-    identityKey: `machine:${randomBytes(32).toString("hex")}`,
-    machineId: null,
-    displayName: normalizeMachineDisplayName(displayName),
-  };
-  const path = machineIdentityPath(homeDir);
-  const created = (fileOperations.writeExclusive ?? atomicWritePrivateFileExclusive)(
-    path,
-    prettyMachineIdentity(pending),
+  return withPrivateMutationLock(
+    machineIdentityMutationLockPath(homeDir),
+    "machine identity",
+    () => {
+      const existing = readMachineIdentity(homeDir);
+      if (existing !== null) return { identity: existing, created: false };
+      const pending: PendingMachineIdentity = {
+        version: MACHINE_IDENTITY_VERSION,
+        identityKey: `machine:${randomBytes(32).toString("hex")}`,
+        machineId: null,
+        displayName: normalizeMachineDisplayName(displayName),
+      };
+      const path = machineIdentityPath(homeDir);
+      const created = (fileOperations.writeExclusive ?? atomicWritePrivateFileExclusive)(
+        path,
+        prettyMachineIdentity(pending),
+      );
+      if (created) return { identity: pending, created: true };
+      const winner = readMachineIdentity(homeDir);
+      if (winner === null) {
+        throw new MachineIdentityFileError(
+          "machine identity disappeared during concurrent registration",
+          "Run `lcm machine register` again.",
+        );
+      }
+      return { identity: winner, created: false };
+    },
+    fileOperations._lockObserverForTesting,
   );
-  if (created) return { identity: pending, created: true };
-  const winner = readMachineIdentity(homeDir);
-  if (winner === null) {
-    throw new MachineIdentityFileError(
-      "machine identity disappeared during concurrent registration",
-      "Run `lcm machine register` again.",
-    );
-  }
-  return { identity: winner, created: false };
 }
 
 export function finalizeMachineIdentity(
@@ -291,10 +310,7 @@ export function finalizeMachineIdentity(
         current.machineId !== pending.machineId
         || current.displayName !== pending.displayName
       ) {
-        throw new MachineIdentityFileError(
-          "machine identity changed during registration",
-          "Run `lcm machine show` and retry the registration explicitly.",
-        );
+        throw new MachineIdentityRegistrationChangedError();
       }
       atomicWritePrivateFile(machineIdentityPath(homeDir), prettyMachineIdentity(intended));
       return intended;
@@ -355,6 +371,7 @@ export function recoverMachineIdentity(
         if (
           existing.machineId === identity.machineId
           && existing.identityKey === identity.identityKey
+          && existing.displayName === identity.displayName
         ) {
           return { identity: existing };
         }

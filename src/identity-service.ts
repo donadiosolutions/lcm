@@ -4,6 +4,7 @@ import type { ResolvedStorageConfig } from "./daemon/config.js";
 import {
   ensurePendingMachineIdentity,
   finalizeMachineIdentity,
+  MachineIdentityRegistrationChangedError,
   normalizeMachineDisplayName,
   normalizeUuidV7,
   readMachineIdentity,
@@ -19,6 +20,7 @@ import {
   isProjectHash,
   listProjectMapEntries,
   normalizeProjectPath,
+  projectMapPath,
   projectMapEntryHasStoredData,
   removeProjectAlias,
   resolveProjectIdentity,
@@ -28,6 +30,7 @@ import {
   type ProjectMap,
   type ProjectMapEntry,
 } from "./project-map.js";
+import { withPrivateMutationLockAsync } from "./private-mutation-lock.js";
 import {
   PostgreSqlIdentityRepository,
   PostgreSqlIdentityCreateOutcomeUnknownError,
@@ -198,6 +201,16 @@ function dependencies(
   overrides?: Partial<IdentityServiceDependencies>,
 ): IdentityServiceDependencies {
   return { ...DEFAULT_DEPENDENCIES, ...overrides };
+}
+
+function withProjectIdentityMutationLock<T>(
+  callback: () => Promise<T>,
+): Promise<T> {
+  return withPrivateMutationLockAsync(
+    `${projectMapPath()}.identity.lock`,
+    "project identity",
+    callback,
+  );
 }
 
 function assertProjectDirectory(path: string): string {
@@ -416,12 +429,28 @@ export async function registerMachine(
       pending.identity.identityKey,
       displayName,
     );
-    const identity = finalizeMachineIdentity(
-      pending.identity,
-      registered.machineId,
-      registered.displayName,
-      deps.homeDir,
-    );
+    let identity: MachineIdentity;
+    try {
+      identity = finalizeMachineIdentity(
+        pending.identity,
+        registered.machineId,
+        registered.displayName,
+        deps.homeDir,
+      );
+    } catch (error) {
+      if (!(error instanceof MachineIdentityRegistrationChangedError)) throw error;
+      const authoritative = await repository.recoverMachine(registered.machineId);
+      if (
+        authoritative.machineId !== registered.machineId
+        || authoritative.identityKey !== pending.identity.identityKey
+      ) {
+        throw error;
+      }
+      identity = recoverMachineIdentity(machineFromRegistered(authoritative), {
+        force: true,
+        homeDir: deps.homeDir,
+      }).identity;
+    }
     return { identity, created: pending.created };
   });
 }
@@ -761,9 +790,13 @@ async function restoreRemoteBatchReplacement(
         const prior = mutation.prior[index];
         return prior
           ? owner?.projectId === prior.projectId
+            && owner.alias.path === prior.alias.path
+            && owner.alias.normalizedPath === prior.alias.normalizedPath
           : mutation.inserted[index]
             ? owner === null
-            : owner?.projectId === currentProjectId;
+            : owner?.projectId === currentProjectId
+              && owner.alias.path === aliases[index]?.path
+              && owner.alias.normalizedPath === aliases[index]?.normalizedPath;
       });
     } catch {
       return false;
@@ -1020,68 +1053,74 @@ async function linkLocalAlias(
   readonly local: ProjectIdentity;
   readonly remoteAlias?: RemoteProjectAlias;
 }> {
-  const targetOptions = isProjectHash(target) ? { hash: target } : { canonical: target };
-  const shown = showProjectMapEntry(target);
-  if (shown.transient) throw new Error(`unknown local project target: ${target}`);
-  remoteEntryPaths({
-    ...shown.entry,
-    aliases: [...shown.entry.aliases, resolve(aliasPath)],
-  });
-  if (!shown.entry.remoteProjectId) {
-    const result = addProjectAlias(aliasPath, { ...targetOptions, expectedEntry: shown.entry });
-    return { local: resolveProjectIdentity(result.entry.canonical) };
-  }
-  requirePostgreSqlConfig(config);
-  const machine = requireMachineIdentity(deps.homeDir);
-  const alias = remotePath(aliasPath);
-  return withSession(config, deps, async (repository) => {
-    const remoteMutation = await confirmRemoteLink(repository, {
-      machineId: machine.machineId,
-      projectId: shown.entry.remoteProjectId!,
-      ...alias,
+  return withProjectIdentityMutationLock(async () => {
+    const targetOptions = isProjectHash(target) ? { hash: target } : { canonical: target };
+    const shown = showProjectMapEntry(target);
+    if (shown.transient) throw new Error(`unknown local project target: ${target}`);
+    remoteEntryPaths({
+      ...shown.entry,
+      aliases: [...shown.entry.aliases, resolve(aliasPath)],
     });
-    try {
-      addProjectAlias(aliasPath, { ...targetOptions, expectedEntry: shown.entry });
-    } catch (error) {
-      const confirmed = confirmedLocalRemoteBinding(
-        shown.hash,
-        shown.entry.remoteProjectId!,
-        [alias],
-        false,
-      );
-      if (confirmed) {
-        return {
-          local: confirmed,
-          remoteAlias: remoteMutation.alias,
-        };
-      }
-      if (remoteMutation.inserted) {
-        try {
-          await confirmRemoteAliasUnlink(
-            repository,
-            machine.machineId,
-            alias.normalizedPath,
-            shown.entry.remoteProjectId!,
-            aliasPath,
-          );
-        } catch {
+    const remoteProjectId = shown.entry.remoteProjectId;
+    if (!remoteProjectId) {
+      const result = addProjectAlias(aliasPath, {
+        ...targetOptions,
+        expectedEntry: shown.entry,
+      });
+      return { local: resolveProjectIdentity(result.entry.canonical) };
+    }
+    requirePostgreSqlConfig(config);
+    const machine = requireMachineIdentity(deps.homeDir);
+    const alias = remotePath(aliasPath);
+    return withSession(config, deps, async (repository) => {
+      const remoteMutation = await confirmRemoteLink(repository, {
+        machineId: machine.machineId,
+        projectId: remoteProjectId,
+        ...alias,
+      });
+      try {
+        addProjectAlias(aliasPath, { ...targetOptions, expectedEntry: shown.entry });
+      } catch (error) {
+        const confirmed = confirmedLocalRemoteBinding(
+          shown.hash,
+          remoteProjectId,
+          [alias],
+          false,
+        );
+        if (confirmed) {
+          return {
+            local: confirmed,
+            remoteAlias: remoteMutation.alias,
+          };
+        }
+        if (remoteMutation.inserted) {
+          try {
+            await confirmRemoteAliasUnlink(
+              repository,
+              machine.machineId,
+              alias.normalizedPath,
+              remoteProjectId,
+              aliasPath,
+            );
+          } catch {
+            throw new ProjectIdentityReconciliationError(
+              "the local alias write failed and its PostgreSQL alias could not be removed",
+              `Run \`lcm project unlink -- ${quoteShellArgument(aliasPath)}\` to reconcile it.`,
+            );
+          }
+        } else {
           throw new ProjectIdentityReconciliationError(
-            "the local alias write failed and its PostgreSQL alias could not be removed",
-            `Run \`lcm project unlink -- ${quoteShellArgument(aliasPath)}\` to reconcile it.`,
+            "the local alias write lost a concurrent update while PostgreSQL retained the alias",
+            `Rerun \`lcm project link -- ${quoteShellArgument(shown.hash)} ${quoteShellArgument(aliasPath)}\`; the operation is idempotent.`,
           );
         }
-      } else {
-        throw new ProjectIdentityReconciliationError(
-          "the local alias write lost a concurrent update while PostgreSQL retained the alias",
-          `Rerun \`lcm project link -- ${quoteShellArgument(shown.hash)} ${quoteShellArgument(aliasPath)}\`; the operation is idempotent.`,
-        );
+        throw error;
       }
-      throw error;
-    }
-    return {
-      local: resolveProjectIdentity(shown.entry.canonical),
-      remoteAlias: remoteMutation.alias,
-    };
+      return {
+        local: resolveProjectIdentity(shown.entry.canonical),
+        remoteAlias: remoteMutation.alias,
+      };
+    });
   });
 }
 
@@ -1103,16 +1142,15 @@ export async function linkProject(
     : linkLocalAlias(config, target, projectPath, deps);
 }
 
-export async function unlinkProject(
+async function unlinkProjectMutation(
   config: ResolvedStorageConfig,
-  path = process.cwd(),
-  dependencyOverrides?: Partial<IdentityServiceDependencies>,
+  projectPath: string,
+  deps: IdentityServiceDependencies,
 ): Promise<{
   readonly hash: string;
   readonly remoteProjectId?: string;
   readonly aliasRemoved: boolean;
 }> {
-  const projectPath = resolve(path);
   const shown = showProjectMapEntry(projectPath);
   if (shown.transient) throw new Error(`project is not mapped: ${projectPath}`);
   const aliasPath = shown.entry.aliases.find((alias) => resolve(alias) === projectPath);
@@ -1121,7 +1159,6 @@ export async function unlinkProject(
       throw new Error(`canonical project ${shown.hash} has no remote binding to unlink`);
     }
     requirePostgreSqlConfig(config);
-    const deps = dependencies(dependencyOverrides);
     const machine = requireMachineIdentity(deps.homeDir);
     return withSession(config, deps, async (repository) => {
       const entryPaths = await resolveStoredRemoteAliases(
@@ -1188,7 +1225,6 @@ export async function unlinkProject(
     };
   }
   requirePostgreSqlConfig(config);
-  const deps = dependencies(dependencyOverrides);
   const machine = requireMachineIdentity(deps.homeDir);
   return withSession(config, deps, async (repository) => {
     const [storedAlias] = await resolveStoredRemoteAliases(
@@ -1246,4 +1282,24 @@ export async function unlinkProject(
       aliasRemoved: true,
     };
   });
+}
+
+export async function unlinkProject(
+  config: ResolvedStorageConfig,
+  path = process.cwd(),
+  dependencyOverrides?: Partial<IdentityServiceDependencies>,
+): Promise<{
+  readonly hash: string;
+  readonly remoteProjectId?: string;
+  readonly aliasRemoved: boolean;
+}> {
+  const projectPath = resolve(path);
+  const shown = showProjectMapEntry(projectPath);
+  const deps = dependencies(dependencyOverrides);
+  if (shown.transient || !shown.entry.remoteProjectId) {
+    return unlinkProjectMutation(config, projectPath, deps);
+  }
+  return withProjectIdentityMutationLock(
+    () => unlinkProjectMutation(config, projectPath, deps),
+  );
 }

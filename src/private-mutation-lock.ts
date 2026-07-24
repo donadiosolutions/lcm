@@ -260,19 +260,49 @@ function acquireMutationLock(
   }
 }
 
-export function withPrivateMutationLock<T>(
-  lockPath: string,
-  label: string,
-  callback: () => T,
-  observer: PrivateMutationLockObserver = NOOP_PRIVATE_MUTATION_LOCK_OBSERVER,
-): T {
+function createMutationLockContent(
+  observer: PrivateMutationLockObserver,
+): string {
   const owner: PrivateMutationLockOwner = {
     version: 1,
     pid: process.pid,
     processStartTime: processStartTime(process.pid, observer),
     nonce: randomBytes(16).toString("hex"),
   };
-  const content = `${JSON.stringify(owner)}\n`;
+  return `${JSON.stringify(owner)}\n`;
+}
+
+function releaseMutationLock(
+  lockPath: string,
+  content: string,
+  label: string,
+  observer: PrivateMutationLockObserver,
+  callbackFailed: boolean,
+): void {
+  try {
+    observer("before-main-lock-release-read", lockPath);
+    if (readBoundedRegularFile(lockPath, {
+      maxBytes: MAX_PRIVATE_MUTATION_LOCK_BYTES,
+      allowedRoot: dirname(lockPath),
+    }) !== content) {
+      throw new Error(`${label} mutation lock ownership changed before release`);
+    }
+    observer("before-main-lock-release-delete", lockPath);
+    if (!deleteRegularFile(lockPath)) {
+      throw new Error(`${label} mutation lock disappeared before release`);
+    }
+  } catch (releaseError) {
+    if (!callbackFailed) throw releaseError;
+  }
+}
+
+export function withPrivateMutationLock<T>(
+  lockPath: string,
+  label: string,
+  callback: () => T,
+  observer: PrivateMutationLockObserver = NOOP_PRIVATE_MUTATION_LOCK_OBSERVER,
+): T {
+  const content = createMutationLockContent(observer);
   acquireMutationLock(lockPath, content, label, observer);
   let callbackFailed = false;
   try {
@@ -281,20 +311,25 @@ export function withPrivateMutationLock<T>(
     callbackFailed = true;
     throw error;
   } finally {
-    try {
-      observer("before-main-lock-release-read", lockPath);
-      if (readBoundedRegularFile(lockPath, {
-        maxBytes: MAX_PRIVATE_MUTATION_LOCK_BYTES,
-        allowedRoot: dirname(lockPath),
-      }) !== content) {
-        throw new Error(`${label} mutation lock ownership changed before release`);
-      }
-      observer("before-main-lock-release-delete", lockPath);
-      if (!deleteRegularFile(lockPath)) {
-        throw new Error(`${label} mutation lock disappeared before release`);
-      }
-    } catch (releaseError) {
-      if (!callbackFailed) throw releaseError;
-    }
+    releaseMutationLock(lockPath, content, label, observer, callbackFailed);
+  }
+}
+
+export async function withPrivateMutationLockAsync<T>(
+  lockPath: string,
+  label: string,
+  callback: () => Promise<T>,
+  observer: PrivateMutationLockObserver = NOOP_PRIVATE_MUTATION_LOCK_OBSERVER,
+): Promise<T> {
+  const content = createMutationLockContent(observer);
+  acquireMutationLock(lockPath, content, label, observer);
+  let callbackFailed = false;
+  try {
+    return await callback();
+  } catch (error) {
+    callbackFailed = true;
+    throw error;
+  } finally {
+    releaseMutationLock(lockPath, content, label, observer, callbackFailed);
   }
 }

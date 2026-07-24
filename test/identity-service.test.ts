@@ -50,7 +50,10 @@ import {
 } from "../src/storage/postgresql/identity-repository.js";
 import { PostgreSqlCommitOutcomeUnknownError } from "../src/storage/postgresql/errors.js";
 import { quoteShellArgument } from "../src/shell-quote.js";
-import { ensurePendingMachineIdentity } from "../src/machine-identity.js";
+import {
+  ensurePendingMachineIdentity,
+  machineIdentityPath,
+} from "../src/machine-identity.js";
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const PROJECT_A = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
@@ -355,6 +358,125 @@ describe("identity service", () => {
       deps,
     )).rejects.toThrow("printable characters");
     expect(repository.registerMachine).toHaveBeenCalledTimes(calls);
+  });
+
+  it("reconciles the local name when concurrent PostgreSQL upserts commit out of local order", async () => {
+    await register();
+    const identityKey = showMachine(deps)!.identityKey;
+    let databaseDisplayName = "Machine A";
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const firstReachedRepository = new Promise<void>((resolve) => { firstStarted = resolve; });
+    repository.registerMachine = vi.fn(async (_identityKey, displayName) => {
+      if (displayName === "First Rename") {
+        firstStarted();
+        await firstGate;
+      }
+      databaseDisplayName = displayName;
+      return {
+        machineId: MACHINE_ID,
+        identityKey,
+        displayName,
+        registeredAt: "2026-01-01T00:00:00.000Z",
+        lastSeenAt: "2026-01-01T00:00:00.000Z",
+      };
+    });
+    repository.recoverMachine = vi.fn(async () => ({
+      machineId: MACHINE_ID,
+      identityKey,
+      displayName: databaseDisplayName,
+      registeredAt: "2026-01-01T00:00:00.000Z",
+      lastSeenAt: "2026-01-01T00:00:00.000Z",
+    }));
+
+    const first = registerMachine(
+      POSTGRESQL_CONFIG,
+      { displayName: "First Rename" },
+      deps,
+    );
+    await firstReachedRepository;
+    await expect(registerMachine(
+      POSTGRESQL_CONFIG,
+      { displayName: "Second Rename" },
+      deps,
+    )).resolves.toMatchObject({ identity: { displayName: "Second Rename" } });
+    releaseFirst();
+
+    await expect(first).resolves.toMatchObject({
+      identity: { machineId: MACHINE_ID, displayName: "First Rename" },
+    });
+    expect(databaseDisplayName).toBe("First Rename");
+    expect(showMachine(deps)).toMatchObject({
+      identityKey,
+      machineId: MACHINE_ID,
+      displayName: "First Rename",
+    });
+    expect(repository.recoverMachine).toHaveBeenCalledWith(MACHINE_ID);
+  });
+
+  it.each([
+    {
+      case: "machine ID",
+      recoveredMachineId: "018f22c4-6d2a-7f10-9a4c-6b8d3e5f9013",
+      recoveredIdentityKey: undefined,
+    },
+    {
+      case: "identity key",
+      recoveredMachineId: MACHINE_ID,
+      recoveredIdentityKey: `machine:${"b".repeat(64)}`,
+    },
+  ])("fails closed when registration readback returns a different $case", async ({
+    recoveredMachineId,
+    recoveredIdentityKey,
+  }) => {
+    await register();
+    const original = showMachine(deps)!;
+    repository.registerMachine = vi.fn(async (identityKey, displayName) => {
+      writeFileSync(
+        machineIdentityPath(home),
+        `${JSON.stringify({ ...original, displayName: "Concurrent Rename" })}\n`,
+        { mode: 0o600 },
+      );
+      return {
+        machineId: MACHINE_ID,
+        identityKey,
+        displayName,
+        registeredAt: "2026-01-01T00:00:00.000Z",
+        lastSeenAt: "2026-01-01T00:00:00.000Z",
+      };
+    });
+    repository.recoverMachine = vi.fn(async () => ({
+      machineId: recoveredMachineId,
+      identityKey: recoveredIdentityKey ?? original.identityKey,
+      displayName: "Requested Rename",
+      registeredAt: "2026-01-01T00:00:00.000Z",
+      lastSeenAt: "2026-01-01T00:00:00.000Z",
+    }));
+
+    await expect(registerMachine(
+      POSTGRESQL_CONFIG,
+      { displayName: "Requested Rename" },
+      deps,
+    )).rejects.toThrow("machine identity changed during registration");
+    expect(showMachine(deps)).toMatchObject({ displayName: "Concurrent Rename" });
+  });
+
+  it("preserves non-concurrency machine finalization errors", async () => {
+    repository.registerMachine = vi.fn(async (identityKey, displayName) => ({
+      machineId: "not-a-uuid",
+      identityKey,
+      displayName,
+      registeredAt: "2026-01-01T00:00:00.000Z",
+      lastSeenAt: "2026-01-01T00:00:00.000Z",
+    }));
+
+    await expect(registerMachine(
+      POSTGRESQL_CONFIG,
+      { displayName: "Machine A" },
+      deps,
+    )).rejects.toThrow("PostgreSQL returned an invalid machine ID");
+    expect(repository.recoverMachine).not.toHaveBeenCalled();
   });
 
   it("keeps the exclusive pending-file winner's name across concurrent registration calls", async () => {
@@ -1292,6 +1414,49 @@ describe("identity service", () => {
       .resolves.toMatchObject({
         projectId: PROJECT_A,
         alias: { path },
+      });
+  });
+
+  it("rejects ambiguous restoration readback with the prior project but a different lexical path", async () => {
+    await register();
+    const path = makeProject("lexical-restore-readback");
+    const priorPath = `${path}/.`;
+    const concurrentPath = `${path}/concurrent-lexical-winner`;
+    await repository.linkProject({
+      machineId: MACHINE_ID,
+      projectId: PROJECT_A,
+      path: priorPath,
+      normalizedPath: path,
+    });
+    const originalReplace = repository.replaceProjectAliases.getMockImplementation()!;
+    const originalRestore = repository.restoreProjectAliasBatch.getMockImplementation()!;
+    repository.replaceProjectAliases = vi.fn(async (input) => {
+      const mutation = await originalReplace(input);
+      writeFileSync(projectMapPath(), "{broken");
+      return mutation;
+    });
+    repository.restoreProjectAliasBatch = vi.fn(async (...input) => {
+      await originalRestore(...input);
+      await repository.replaceProjectAlias({
+        machineId: MACHINE_ID,
+        expectedPriorProjectId: PROJECT_A,
+        projectId: PROJECT_A,
+        path: concurrentPath,
+        normalizedPath: path,
+      });
+      throw new PostgreSqlCommitOutcomeUnknownError({
+        domain: "identity",
+        operation: "restoreProjectAliasBatch",
+        projectId: PROJECT_A,
+      });
+    });
+
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, path, {}, deps))
+      .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
+    await expect(repository.resolveProject(MACHINE_ID, path))
+      .resolves.toMatchObject({
+        projectId: PROJECT_A,
+        alias: { path: concurrentPath, normalizedPath: path },
       });
   });
 
@@ -2402,6 +2567,39 @@ describe("identity service", () => {
       });
     expect(listProjectMapEntries()[bound.local.id].aliases).not.toContain(linked);
     expect(repository.linkProject).not.toHaveBeenCalled();
+  });
+
+  it("rejects alias linking while the same remote alias is being unlinked", async () => {
+    await register();
+    const canonical = makeProject("unlink-link-coordination-canonical");
+    const linked = makeProject("unlink-link-coordination-path");
+    const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
+    const originalUnlink = repository.unlinkProjectAliasIfOwned.getMockImplementation()!;
+    let releaseUnlink!: () => void;
+    let unlinkReachedRepository!: () => void;
+    const unlinkGate = new Promise<void>((resolve) => { releaseUnlink = resolve; });
+    const repositoryReached = new Promise<void>(
+      (resolve) => { unlinkReachedRepository = resolve; },
+    );
+    repository.unlinkProjectAliasIfOwned = vi.fn(
+      async (machineId, normalizedPath, projectId) => {
+        const removed = await originalUnlink(machineId, normalizedPath, projectId);
+        unlinkReachedRepository();
+        await unlinkGate;
+        return removed;
+      },
+    );
+
+    const unlinking = unlinkProject(POSTGRESQL_CONFIG, linked, deps);
+    await repositoryReached;
+    await expect(linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps))
+      .rejects.toThrow("project identity mutation is already in progress");
+    releaseUnlink();
+
+    await expect(unlinking).resolves.toMatchObject({ aliasRemoved: true });
+    expect(listProjectMapEntries()[bound.local.id].aliases).not.toContain(linked);
+    await expect(repository.resolveProject(MACHINE_ID, linked)).resolves.toBeNull();
   });
 
   it("accepts an uncertain alias restoration after authoritative readback", async () => {

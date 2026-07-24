@@ -186,6 +186,35 @@ describe("machine identity file", () => {
     expect(existsSync(oldMachineIdentitiesDir(home))).toBe(false);
   });
 
+  it("does not let pending registration publish over an in-flight recovery", () => {
+    const recoveredIdentity: MachineIdentity = {
+      version: 1,
+      identityKey: `machine:${"b".repeat(64)}`,
+      machineId: MACHINE_B,
+      displayName: "Machine B",
+    };
+    let registrationError: unknown;
+    let attempted = false;
+    const recovered = recoverMachineIdentity(recoveredIdentity, {
+      homeDir: home,
+      _lockObserverForTesting: (event) => {
+        if (event !== "before-main-lock-release-read" || attempted) return;
+        attempted = true;
+        try {
+          ensurePendingMachineIdentity("Machine A", home);
+        } catch (error) {
+          registrationError = error;
+        }
+      },
+    });
+
+    expect(registrationError).toMatchObject({
+      message: expect.stringContaining("machine identity mutation is already in progress"),
+    });
+    expect(recovered).toEqual({ identity: recoveredIdentity });
+    expect(readMachineIdentity(home)).toEqual(recoveredIdentity);
+  });
+
   it("reclaims a crashed machine identity mutation owner before recovery", () => {
     const lockPath = `${machineIdentityPath(home)}.lock`;
     mkdirSync(dirname(lockPath), { recursive: true });
@@ -369,6 +398,25 @@ describe("machine identity file", () => {
     expect(statSync(recovered.backupPath!).mode & 0o777).toBe(0o600);
     expect(JSON.parse(readFileSync(recovered.backupPath!, "utf8"))).toEqual(first);
     expect(readMachineIdentity(home)).toEqual(second);
+  });
+
+  it("requires force and backs up a stale display name for the same identity", () => {
+    const stale: MachineIdentity = {
+      version: 1,
+      identityKey: `machine:${"a".repeat(64)}`,
+      machineId: MACHINE_A,
+      displayName: "Stale Name",
+    };
+    const current = { ...stale, displayName: "Current Name" };
+    recoverMachineIdentity(stale, { homeDir: home });
+    expect(() => recoverMachineIdentity(current, { homeDir: home }))
+      .toThrow(`recover ${MACHINE_A} --force`);
+
+    vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+    const recovered = recoverMachineIdentity(current, { homeDir: home, force: true });
+
+    expect(JSON.parse(readFileSync(recovered.backupPath!, "utf8"))).toEqual(stale);
+    expect(readMachineIdentity(home)).toEqual(current);
   });
 
   it("uses an exclusive suffix when a forced-recovery backup name collides", () => {
