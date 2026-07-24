@@ -60,6 +60,51 @@ describe("private filesystem primitives", () => {
     expect(statSync(target).mode & 0o777).toBe(0o600);
   });
 
+  it("does not remove a pre-existing temporary path when exclusive creation loses", () => {
+    const root = makeRoot();
+    const target = join(root, "metadata.json");
+    const random = () => Buffer.alloc(12, 0xab);
+    const tempPath = join(root, `.metadata.json.${"ab".repeat(12)}.tmp`);
+    writeFileSync(tempPath, "concurrent owner", { mode: 0o600 });
+
+    expect(() => atomicWritePrivateFile(target, "private metadata", { random })).toThrow();
+    expect(readFileSync(tempPath, "utf-8")).toBe("concurrent owner");
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("removes only a temporary path it created when initialization fails", () => {
+    const root = makeRoot();
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"cd".repeat(12)}.tmp`);
+    const failure = new Error("write failed");
+
+    expect(() => atomicWritePrivateFile(target, "private metadata", {
+      random: () => Buffer.alloc(12, 0xcd),
+      write: () => {
+        throw failure;
+      },
+    })).toThrow(failure);
+    expect(existsSync(tempPath)).toBe(false);
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("does not remove a new temporary-path owner after publishing its own inode", () => {
+    const root = makeRoot();
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"ef".repeat(12)}.tmp`);
+    const failure = new Error("chmod failed");
+
+    expect(() => atomicWritePrivateFile(target, "private metadata", {
+      random: () => Buffer.alloc(12, 0xef),
+      chmod: () => {
+        writeFileSync(tempPath, "next owner", { mode: 0o600 });
+        throw failure;
+      },
+    })).toThrow(failure);
+    expect(readFileSync(target, "utf-8")).toBe("private metadata");
+    expect(readFileSync(tempPath, "utf-8")).toBe("next owner");
+  });
+
   it("reads a bounded regular file and returns descriptor metadata", () => {
     const root = makeRoot();
     const path = join(root, "data");
@@ -187,6 +232,19 @@ describe("private filesystem primitives", () => {
     expect(atomicWritePrivateFileExclusive(path, "second")).toBe(false);
     expect(readFileSync(path, "utf-8")).toBe("first");
     expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+
+  it("does not remove an existing exclusive-publication temp path when creation loses", () => {
+    const root = makeRoot();
+    const path = join(root, "atomic-exclusive");
+    const tempPath = join(root, `.atomic-exclusive.${"12".repeat(12)}.tmp`);
+    writeFileSync(tempPath, "concurrent owner", { mode: 0o600 });
+
+    expect(() => atomicWritePrivateFileExclusive(path, "content", {
+      random: () => Buffer.alloc(12, 0x12),
+    })).toThrow();
+    expect(readFileSync(tempPath, "utf-8")).toBe("concurrent owner");
+    expect(existsSync(path)).toBe(false);
   });
 
   it("propagates atomic publication failures other than an existing destination", () => {

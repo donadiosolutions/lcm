@@ -105,22 +105,41 @@ export function readBoundedRegularFile(path: string, options: BoundedFileOptions
 }
 
 /** Atomically replace a private file from a same-directory exclusive temp file. */
-export function atomicWritePrivateFile(path: string, content: string): void {
+export function atomicWritePrivateFile(
+  path: string,
+  content: string,
+  operations: {
+    readonly chmod?: typeof chmodSync;
+    readonly close?: typeof closeSync;
+    readonly open?: typeof openSync;
+    readonly random?: (size: number) => Buffer;
+    readonly remove?: typeof rmSync;
+    readonly rename?: typeof renameSync;
+    readonly sync?: typeof fsyncSync;
+    readonly write?: typeof writeFileSync;
+  } = {},
+): void {
   const directory = dirname(path);
   ensurePrivateDirectory(directory);
-  const tempPath = join(directory, `.${basename(path)}.${randomBytes(12).toString("hex")}.tmp`);
+  const tempPath = join(
+    directory,
+    `.${basename(path)}.${(operations.random ?? randomBytes)(12).toString("hex")}.tmp`,
+  );
+  let ownsTempPath = false;
   try {
-    const fd = openSync(tempPath, "wx", PRIVATE_FILE_MODE);
+    const fd = (operations.open ?? openSync)(tempPath, "wx", PRIVATE_FILE_MODE);
+    ownsTempPath = true;
     try {
-      writeFileSync(fd, content, "utf-8");
-      fsyncSync(fd);
+      (operations.write ?? writeFileSync)(fd, content, "utf-8");
+      (operations.sync ?? fsyncSync)(fd);
     } finally {
-      closeSync(fd);
+      (operations.close ?? closeSync)(fd);
     }
-    renameSync(tempPath, path);
-    chmodSync(path, PRIVATE_FILE_MODE);
+    (operations.rename ?? renameSync)(tempPath, path);
+    ownsTempPath = false;
+    (operations.chmod ?? chmodSync)(path, PRIVATE_FILE_MODE);
   } finally {
-    rmSync(tempPath, { force: true });
+    if (ownsTempPath) (operations.remove ?? rmSync)(tempPath, { force: true });
   }
 }
 
@@ -179,15 +198,21 @@ export function atomicWritePrivateFileExclusive(
   operations: {
     readonly chmod?: typeof chmodSync;
     readonly link?: typeof linkSync;
+    readonly random?: (size: number) => Buffer;
     readonly remove?: typeof rmSync;
   } = {},
 ): boolean {
   const directory = dirname(path);
   ensurePrivateDirectory(directory);
-  const tempPath = join(directory, `.${basename(path)}.${randomBytes(12).toString("hex")}.tmp`);
+  const tempPath = join(
+    directory,
+    `.${basename(path)}.${(operations.random ?? randomBytes)(12).toString("hex")}.tmp`,
+  );
+  let ownsTempPath = false;
   let published = false;
   try {
     const fd = openSync(tempPath, "wx", PRIVATE_FILE_MODE);
+    ownsTempPath = true;
     try {
       writeFileSync(fd, content, "utf-8");
       fsyncSync(fd);
@@ -208,13 +233,15 @@ export function atomicWritePrivateFileExclusive(
     published = true;
     return true;
   } finally {
-    try {
-      (operations.remove ?? rmSync)(tempPath, { force: true });
-    } catch (error) {
-      // Once the destination is published it is complete and private. A
-      // best-effort temporary-link cleanup failure must not report lock
-      // acquisition failure while leaving that valid destination behind.
-      if (!published) throw error;
+    if (ownsTempPath) {
+      try {
+        (operations.remove ?? rmSync)(tempPath, { force: true });
+      } catch (error) {
+        // Once the destination is published it is complete and private. A
+        // best-effort temporary-link cleanup failure must not report lock
+        // acquisition failure while leaving that valid destination behind.
+        if (!published) throw error;
+      }
     }
   }
 }
