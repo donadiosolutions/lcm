@@ -5,6 +5,10 @@ import type {
 } from "../../storage/index.js";
 import { StorageOperationError } from "../../storage/errors.js";
 import { UnavailablePostgreSqlStorageBackendFactory } from "../../storage/factory.js";
+import {
+  stagedPostgreSqlUnavailablePayload,
+  type StagedPostgreSqlUnavailableResponse,
+} from "../staged-postgresql.js";
 
 interface AsyncClosable {
   close(): Promise<void> | void;
@@ -38,15 +42,12 @@ export function stagedPostgreSqlUnavailableResponse(
   factory: StorageBackendFactory | undefined,
   error: unknown,
   operation: string,
-): { readonly error: string; readonly storageBackend: "postgresql" } | null {
+): StagedPostgreSqlUnavailableResponse | null {
   if (
     !(factory instanceof UnavailablePostgreSqlStorageBackendFactory)
     || !(error instanceof StorageOperationError)
   ) {
     return null;
   }
-  return {
-    error: `${operation} is unavailable while PostgreSQL storage repositories are staged`,
-    storageBackend: "postgresql",
-  };
+  return stagedPostgreSqlUnavailablePayload(operation);
 }

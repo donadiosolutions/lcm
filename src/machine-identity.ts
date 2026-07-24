@@ -114,7 +114,15 @@ function parseMachineIdentity(content: string): StoredMachineIdentity {
       "Run `lcm machine recover <machine-id> --force` to replace the invalid file.",
     );
   }
-  const displayName = normalizeMachineDisplayName(record.displayName);
+  let displayName: string;
+  try {
+    displayName = normalizeMachineDisplayName(record.displayName);
+  } catch {
+    throw new MachineIdentityFileError(
+      "machine.json contains an invalid display name",
+      "Run `lcm machine recover <machine-id> --force` to replace the invalid file.",
+    );
+  }
   const machineId = record.machineId === null
     ? null
     : typeof record.machineId === "string" ? normalizeUuidV7(record.machineId) : null;

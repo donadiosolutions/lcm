@@ -6,6 +6,7 @@ import { ensureAuthToken, readAuthToken } from "./auth.js";
 import { managedDaemonPath, SYSTEMD_DAEMON_PATH } from "./managed-path.js";
 import { PKG_VERSION } from "./version.js";
 import type { StorageBackend } from "./config.js";
+import { STAGED_POSTGRESQL_ERROR_CODE } from "./staged-postgresql.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
@@ -591,8 +592,7 @@ async function checkDaemonAccess(
     return typeof body === "object"
       && body !== null
       && (body as { storageBackend?: unknown }).storageBackend === "postgresql"
-      && (body as { error?: unknown }).error
-        === "pool stats is unavailable while PostgreSQL storage repositories are staged";
+      && (body as { code?: unknown }).code === STAGED_POSTGRESQL_ERROR_CODE;
   };
   try {
     return await runWithDeadline((signal: AbortSignal): Promise<boolean> => request(signal), deadline);

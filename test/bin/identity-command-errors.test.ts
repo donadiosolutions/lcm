@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Command } from "commander";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { machineIdentityPath } from "../../src/machine-identity.js";
 import { clearProjectMapCache, resolveProjectIdentity } from "../../src/project-map.js";
 
 const exitMock = vi.hoisted(() =>
@@ -163,5 +164,28 @@ describe("identity command exits", () => {
       error: "machine identity is not registered; run `lcm machine register`",
     });
     expect(missing.thrown?.message).toBe("exit:1");
+  });
+
+  it("prints file-recovery guidance for unsafe persisted machine names in text and JSON", async () => {
+    useTempHome();
+    const path = machineIdentityPath();
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      identityKey: `machine:${"a".repeat(64)}`,
+      machineId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012",
+      displayName: "unsafe\u202ename",
+    }), { mode: 0o600 });
+    const expected = "machine.json contains an invalid display name. "
+      + "Run `lcm machine recover <machine-id> --force` to replace the invalid file.";
+
+    const text = await runIdentityCommand("machine", ["show"]);
+    expect(text.stderr).toEqual([`Error: ${expected}`]);
+    expect(text.thrown?.message).toBe("exit:1");
+
+    const json = await runIdentityCommand("machine", ["show", "--json"]);
+    expect(JSON.parse(json.stdout[0])).toEqual({ error: expected });
+    expect(json.thrown?.message).toBe("exit:1");
+    expect(expected).not.toContain("machine register --name");
   });
 });

@@ -241,7 +241,10 @@ PostgreSQL domain repositories are still staged. With PostgreSQL selected, the
 daemon starts so identity validation remains reachable, but `GET /health`
 reports unavailable storage. `POST /status`, `/search`, `/grep`, `/recent`,
 `/describe`, and `/expand`, plus `GET /stats` and `/stats/pool`, return fixed
-`503` responses after their applicable identity checks. The hook-facing
+`503` responses after their applicable identity checks. Every fixed staged
+route response includes the stable machine-readable code
+`STORAGE_BACKEND_STAGED` and `storageBackend: "postgresql"`; clients must not
+authenticate or branch on the human-readable error text. The hook-facing
 `POST /prompt-search` endpoint remains best-effort and returns an empty hint
 set during an outage so prompt hooks stay successful. The daemon does not run
 SQLite transcript scans or passive-outbox sweeps. Other project operations fail

@@ -163,6 +163,7 @@ describe("persistence read route boundaries", () => {
       { nodeId: "n", cwd: "/ok" },
     );
     expectLast(503, {
+      code: "STORAGE_BACKEND_STAGED",
       error: "describe is unavailable while PostgreSQL storage repositories are staged",
       storageBackend: "postgresql",
     });
@@ -214,6 +215,7 @@ describe("persistence read route boundaries", () => {
       { nodeId: "n", cwd: "/ok" },
     );
     expectLast(503, {
+      code: "STORAGE_BACKEND_STAGED",
       error: "expand is unavailable while PostgreSQL storage repositories are staged",
       storageBackend: "postgresql",
     });
@@ -244,6 +246,7 @@ describe("persistence read route boundaries", () => {
       { query: "q", cwd: "/ok" },
     );
     expectLast(503, {
+      code: "STORAGE_BACKEND_STAGED",
       error: "grep is unavailable while PostgreSQL storage repositories are staged",
       storageBackend: "postgresql",
     });
@@ -285,6 +288,7 @@ describe("persistence read route boundaries", () => {
       { cwd: "/ok" },
     );
     expectLast(503, {
+      code: "STORAGE_BACKEND_STAGED",
       error: "recent is unavailable while PostgreSQL storage repositories are staged",
       storageBackend: "postgresql",
     });
@@ -351,6 +355,7 @@ describe("persistence read route boundaries", () => {
     const stagedFactory = new UnavailablePostgreSqlStorageBackendFactory();
     await invoke(createSearchHandler(config, stagedFactory), { query: "q", cwd: "/ok" });
     expectLast(503, {
+      code: "STORAGE_BACKEND_STAGED",
       error: "search is unavailable while PostgreSQL storage repositories are staged",
       storageBackend: "postgresql",
     });

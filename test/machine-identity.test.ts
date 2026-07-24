@@ -166,6 +166,31 @@ describe("machine identity file", () => {
     expect(() => readMachineIdentity(home)).toThrow(MachineIdentityFileError);
   });
 
+  it("uses file-recovery remediation for an unsafe persisted display name", () => {
+    mkdirSync(join(home, ".lcm"), { recursive: true });
+    writeFileSync(machineIdentityPath(home), JSON.stringify({
+      version: 1,
+      identityKey: `machine:${"a".repeat(64)}`,
+      machineId: MACHINE_A,
+      displayName: "unsafe\u0080name",
+    }), { mode: 0o600 });
+
+    const error = (() => {
+      try {
+        readMachineIdentity(home);
+      } catch (caught) {
+        return caught;
+      }
+      return undefined;
+    })();
+
+    expect(error).toBeInstanceOf(MachineIdentityFileError);
+    expect(error).toMatchObject({
+      remediation: "Run `lcm machine recover <machine-id> --force` to replace the invalid file.",
+    });
+    expect((error as Error).message).not.toContain("machine register --name");
+  });
+
   it("rejects invalid PostgreSQL IDs and concurrent identity replacement", () => {
     const pending = ensurePendingMachineIdentity("Machine A", home).identity;
     expect(() => finalizeMachineIdentity(pending, "not-v7", "Machine A", home))

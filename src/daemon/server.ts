@@ -2,6 +2,7 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import type { DaemonConfig } from "./config.js";
 import { sanitizeError } from "./safe-error.js";
+import { stagedPostgreSqlUnavailablePayload } from "./staged-postgresql.js";
 import { readAuthToken } from "./auth.js";
 import type { ProxyManager } from "./proxy-manager.js";
 import { createCompactHandler } from "./routes/compact.js";
@@ -105,10 +106,7 @@ function clearIdleTimer(timer: ReturnType<typeof setTimeout> | null, clearTimer:
 
 function stagedPostgreSqlUnavailableHandler(operation: string): RouteHandler {
   return async (_req, res) => {
-    sendJson(res, 503, {
-      error: `${operation} is unavailable while PostgreSQL storage repositories are staged`,
-      storageBackend: "postgresql",
-    });
+    sendJson(res, 503, stagedPostgreSqlUnavailablePayload(operation));
   };
 }
 

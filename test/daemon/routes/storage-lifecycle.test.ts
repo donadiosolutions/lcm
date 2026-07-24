@@ -49,6 +49,7 @@ describe("route storage cleanup", () => {
       .toBeNull();
     expect(stagedPostgreSqlUnavailableResponse(staged, stagedError, "grep"))
       .toEqual({
+        code: "STORAGE_BACKEND_STAGED",
         error: "grep is unavailable while PostgreSQL storage repositories are staged",
         storageBackend: "postgresql",
       });

@@ -153,6 +153,7 @@ describe("daemon server", () => {
       expect(response.status).toBe(503);
       const unavailable = await response.json();
       expect(unavailable).toEqual({
+        code: "STORAGE_BACKEND_STAGED",
         error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
         storageBackend: "postgresql",
       });
@@ -176,6 +177,7 @@ describe("daemon server", () => {
       expect(response.status).toBe(503);
       const unavailable = await response.json() as Record<string, unknown>;
       expect(unavailable).toEqual({
+        code: "STORAGE_BACKEND_STAGED",
         error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
         storageBackend: "postgresql",
       });
