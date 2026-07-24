@@ -138,11 +138,13 @@ On every run, the runner first checks ownership of every existing allowlisted
 object through `pg_catalog`, including `lcm.schema_migrations`, before reading
 any ledger rows. It then verifies the ordered ledger, derives whether `0002`
 was applied, and only then requires the complete expected `0002` inventory.
-Schema snapshots are keyed by migration ID: validate the newest registered
-snapshot in the current ledger before pending SQL, and validate the newest
-snapshot registered for the target history after applying and recording the
-pending set but before commit. Add a new snapshot entry whenever a future
-migration intentionally changes a fingerprinted definition.
+Schema snapshots are keyed by migration ID: walk validated history from newest
+to oldest to select the first registered snapshot, validate the current
+snapshot before pending SQL, and validate the target snapshot after applying
+and recording the pending set but before commit. Registry order is irrelevant.
+Add a new snapshot entry whenever a future migration intentionally changes a
+fingerprinted definition. Each snapshot owns every definition-group identity,
+derived count and hash plus the complete identity-function name/hash list.
 A missing table, generated identity sequence, helper or trigger function,
 text-search dictionary, or text-search configuration blocks repeated runs and
 later pending migrations once that baseline is trusted; a smaller surviving

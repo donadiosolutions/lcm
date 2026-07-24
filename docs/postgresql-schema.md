@@ -62,12 +62,13 @@ does not add row-level security.
   outside that migration transaction and runtime health uses the same
   inspection path.
 - The definition and function fingerprints are registered by migration ID.
-  Before pending SQL, the runner checks the newest registered snapshot present
-  in the trusted ledger. After applying and recording the pending set, it checks
-  the newest snapshot registered for the target history in the same
-  transaction; failure rolls back both DDL and ledger rows. A future migration
-  can therefore add its own snapshot without requiring the pre-upgrade schema
-  to satisfy the future definition.
+  Before pending SQL, the runner walks the trusted ledger from newest to oldest
+  and checks the first migration with a registered snapshot. After applying and
+  recording the pending set, it does the same for the target history in the
+  same transaction; failure rolls back both DDL and ledger rows. Registry
+  declaration order does not affect selection. A future migration can
+  therefore add its own snapshot without requiring the pre-upgrade schema to
+  satisfy the future definition.
 - The `0002` snapshot checks an explicit definition inventory of all 52 named
   secondary indexes, all 168 table constraints, all three identity-enforcement
   triggers, all 15 stored generated columns, and all 204 ordinary columns.
@@ -97,7 +98,9 @@ does not add row-level security.
   function ACL. Only non-grantable `EXECUTE` by the owning role is accepted;
   `PUBLIC`, named-role, grant-option, foreign-grantor, missing-owner, and other
   ACL drift therefore fail closed even when the function name and arity still
-  match.
+  match. The snapshot owns the complete helper-name and body-hash lists,
+  including their count, so later migrations can add or remove helpers without
+  changing the verifier SQL.
 - PostgreSQL 18's native [`uuidv7()`](https://www.postgresql.org/docs/18/functions-uuid.html)
   is the default for machine, project, part, transcript, promoted-memory, and
   internal summary relationship identities. Machine, project,

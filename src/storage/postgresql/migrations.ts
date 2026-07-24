@@ -51,11 +51,10 @@ type ExpectedBaselineDefinitionInventory = {
   readonly constraintIdentities: readonly string[];
   readonly generatedColumnIdentities: readonly string[];
   readonly indexNames: readonly string[];
-  readonly objectCount: number;
   readonly ordinaryColumnIdentities: readonly string[];
   readonly triggerIdentities: readonly string[];
 };
-type PostgreSqlSchemaSnapshot = ExpectedBaselineDefinitionInventory & {
+export type PostgreSqlSchemaSnapshot = ExpectedBaselineDefinitionInventory & {
   readonly definitionHashes: {
     readonly constraint: string;
     readonly generatedColumn: string;
@@ -63,8 +62,19 @@ type PostgreSqlSchemaSnapshot = ExpectedBaselineDefinitionInventory & {
     readonly ordinaryColumn: string;
     readonly trigger: string;
   };
-  readonly identityFunctionHashes: readonly [string, string, string];
+  readonly identityFunctions: readonly {
+    readonly name: string;
+    readonly sha256: string;
+  }[];
   readonly migrationId: string;
+};
+type PostgreSqlSchemaSnapshotExpectations = {
+  readonly definitionGroupCounts: readonly number[];
+  readonly definitionGroupHashes: readonly string[];
+  readonly definitionGroupKinds: readonly string[];
+  readonly definitionObjectCount: number;
+  readonly identityFunctionHashes: readonly string[];
+  readonly identityFunctionNames: readonly string[];
 };
 type BaselineDefinitionInventoryRow = QueryResultRow & {
   baseline_applied: unknown;
@@ -320,18 +330,10 @@ const EXPECTED_BASELINE_CONSTRAINT_IDENTITIES =
     return `${tableName}|${constraintName}`;
   });
 
-const EXPECTED_BASELINE_DEFINITION_COUNT =
-  EXPECTED_BASELINE_INDEX_NAMES.length
-  + EXPECTED_BASELINE_TRIGGER_IDENTITIES.length
-  + EXPECTED_BASELINE_CONSTRAINT_IDENTITIES.length
-  + EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES.length
-  + EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES.length;
-
   return {
     constraintIdentities: EXPECTED_BASELINE_CONSTRAINT_IDENTITIES,
     generatedColumnIdentities: EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES,
     indexNames: EXPECTED_BASELINE_INDEX_NAMES,
-    objectCount: EXPECTED_BASELINE_DEFINITION_COUNT,
     ordinaryColumnIdentities: EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES,
     triggerIdentities: EXPECTED_BASELINE_TRIGGER_IDENTITIES,
   } as const;
@@ -347,24 +349,64 @@ function postgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapshot[] {
       ordinaryColumn: "e8d2b9f51f717ee058911aff792f8ebcccfc9451755d5803055426b8801a17af",
       trigger: "2c858da82c9238186861e0bcd184952ff941c7233f98a16083b20e6528006fb9",
     },
-    identityFunctionHashes: [
-      "2e4d8b18c207e251edfbc81dac50cd0e0dba45dc0768ef50eeded33f5571d975",
-      "89d25e96d0ccc63954135183605c7aadbcb4c726143c8c56c67b9cd49398957b",
-      "b7e1725a4d6ee95f3e806386025734c6d6d44853642231048a2b23a0d9fc6021",
+    identityFunctions: [
+      {
+        name: "enforce_summary_id_uniqueness",
+        sha256: "2e4d8b18c207e251edfbc81dac50cd0e0dba45dc0768ef50eeded33f5571d975",
+      },
+      {
+        name: "enforce_large_file_id_uniqueness",
+        sha256: "89d25e96d0ccc63954135183605c7aadbcb4c726143c8c56c67b9cd49398957b",
+      },
+      {
+        name: "enforce_session_ingest_id_uniqueness",
+        sha256: "b7e1725a4d6ee95f3e806386025734c6d6d44853642231048a2b23a0d9fc6021",
+      },
     ],
     migrationId: "0002_schema_baseline",
   }];
 }
 
-function latestPostgreSqlSchemaSnapshot(
+export function selectLatestPostgreSqlSchemaSnapshot(
   migrationIds: readonly string[],
+  snapshots: readonly PostgreSqlSchemaSnapshot[],
 ): PostgreSqlSchemaSnapshot | null {
-  const appliedIds = new Set(migrationIds);
-  let latest: PostgreSqlSchemaSnapshot | null = null;
-  for (const snapshot of postgreSqlSchemaSnapshots()) {
-    if (appliedIds.has(snapshot.migrationId)) latest = snapshot;
+  const snapshotsByMigrationId = new Map(
+    snapshots.map((snapshot) => [snapshot.migrationId, snapshot]),
+  );
+  for (let index = migrationIds.length - 1; index >= 0; index -= 1) {
+    const snapshot = snapshotsByMigrationId.get(migrationIds[index]!);
+    if (snapshot) return snapshot;
   }
-  return latest;
+  return null;
+}
+
+export function getPostgreSqlSchemaSnapshotExpectations(
+  snapshot: PostgreSqlSchemaSnapshot,
+): PostgreSqlSchemaSnapshotExpectations {
+  const definitionGroups = [
+    ["index", snapshot.indexNames.length, snapshot.definitionHashes.index],
+    ["trigger", snapshot.triggerIdentities.length, snapshot.definitionHashes.trigger],
+    ["constraint", snapshot.constraintIdentities.length, snapshot.definitionHashes.constraint],
+    [
+      "generated_column",
+      snapshot.generatedColumnIdentities.length,
+      snapshot.definitionHashes.generatedColumn,
+    ],
+    [
+      "ordinary_column",
+      snapshot.ordinaryColumnIdentities.length,
+      snapshot.definitionHashes.ordinaryColumn,
+    ],
+  ] as const;
+  return {
+    definitionGroupCounts: definitionGroups.map(([, count]) => count),
+    definitionGroupHashes: definitionGroups.map(([, , hash]) => hash),
+    definitionGroupKinds: definitionGroups.map(([kind]) => kind),
+    definitionObjectCount: definitionGroups.reduce((total, [, count]) => total + count, 0),
+    identityFunctionHashes: snapshot.identityFunctions.map(({ sha256 }) => sha256),
+    identityFunctionNames: snapshot.identityFunctions.map(({ name }) => name),
+  };
 }
 
 export class PostgreSqlServerVersionPreflightError extends StorageOperationError {
@@ -984,6 +1026,8 @@ export async function runPostgreSqlMigrations(
       expectedBaselineDefinitions: PostgreSqlSchemaSnapshot,
     ): Promise<void> => {
     const baselineApplied = true;
+    const snapshotExpectations =
+      getPostgreSqlSchemaSnapshotExpectations(expectedBaselineDefinitions);
     const baselineDefinitions =
       await transaction.query<BaselineDefinitionInventoryRow>({
         text: `WITH actual_indexes AS (
@@ -1238,32 +1282,12 @@ export async function runPostgreSqlMigrations(
                  expected_count,
                  definition_sha256
                ) AS (
-                 VALUES
-                   (
-                     'index'::pg_catalog.text,
-                     52::pg_catalog.int4,
-                     $8::pg_catalog.text
-                   ),
-                   (
-                     'trigger'::pg_catalog.text,
-                     3::pg_catalog.int4,
-                     $9::pg_catalog.text
-                   ),
-                   (
-                     'constraint'::pg_catalog.text,
-                     168::pg_catalog.int4,
-                     $10::pg_catalog.text
-                   ),
-                   (
-                     'generated_column'::pg_catalog.text,
-                     15::pg_catalog.int4,
-                     $11::pg_catalog.text
-                   ),
-                   (
-                     'ordinary_column'::pg_catalog.text,
-                     204::pg_catalog.int4,
-                     $12::pg_catalog.text
-                   )
+                 SELECT *
+                 FROM ROWS FROM (
+                   pg_catalog.unnest($8::pg_catalog.text[]),
+                   pg_catalog.unnest($9::pg_catalog.int4[]),
+                   pg_catalog.unnest($10::pg_catalog.text[])
+                 )
                )
                SELECT $1::pg_catalog.bool AS baseline_applied,
                       $7::pg_catalog.int4 AS expected_object_count,
@@ -1293,12 +1317,10 @@ export async function runPostgreSqlMigrations(
           expectedBaselineDefinitions.constraintIdentities,
           expectedBaselineDefinitions.generatedColumnIdentities,
           expectedBaselineDefinitions.ordinaryColumnIdentities,
-          expectedBaselineDefinitions.objectCount,
-          expectedBaselineDefinitions.definitionHashes.index,
-          expectedBaselineDefinitions.definitionHashes.trigger,
-          expectedBaselineDefinitions.definitionHashes.constraint,
-          expectedBaselineDefinitions.definitionHashes.generatedColumn,
-          expectedBaselineDefinitions.definitionHashes.ordinaryColumn,
+          snapshotExpectations.definitionObjectCount,
+          snapshotExpectations.definitionGroupKinds,
+          snapshotExpectations.definitionGroupCounts,
+          snapshotExpectations.definitionGroupHashes,
         ],
       }, {
         domain: "factory",
@@ -1323,7 +1345,7 @@ export async function runPostgreSqlMigrations(
     if (
       definitionBaselineApplied === null
       || definitionBaselineApplied !== baselineApplied
-      || expectedDefinitionObjectCount !== expectedBaselineDefinitions.objectCount
+      || expectedDefinitionObjectCount !== snapshotExpectations.definitionObjectCount
       || existingDefinitionObjectCount === null
       || existingDefinitionObjectCount > expectedDefinitionObjectCount
       || missingDefinitionObjectCount === null
@@ -1332,7 +1354,7 @@ export async function runPostgreSqlMigrations(
           !== expectedDefinitionObjectCount)
       || missingDefinitionObjectCount !== 0
       || driftedDefinitionGroupCount === null
-      || driftedDefinitionGroupCount > 5
+      || driftedDefinitionGroupCount > snapshotExpectations.definitionGroupKinds.length
       || driftedDefinitionGroupCount !== 0
     ) {
       throw new PostgreSqlBaselineDefinitionPreflightError(
@@ -1347,19 +1369,11 @@ export async function runPostgreSqlMigrations(
     const identityFunctionFingerprints =
       await transaction.query<IdentityFunctionFingerprintRow>({
         text: `WITH expected_functions(function_name, prosrc_sha256) AS (
-                 VALUES
-                   (
-                     'enforce_summary_id_uniqueness'::pg_catalog.text,
-                     $2::pg_catalog.text
-                   ),
-                   (
-                     'enforce_large_file_id_uniqueness'::pg_catalog.text,
-                     $3::pg_catalog.text
-                   ),
-                   (
-                     'enforce_session_ingest_id_uniqueness'::pg_catalog.text,
-                     $4::pg_catalog.text
-                   )
+                 SELECT *
+                 FROM ROWS FROM (
+                   pg_catalog.unnest($2::pg_catalog.text[]),
+                   pg_catalog.unnest($3::pg_catalog.text[])
+                 )
                ),
                actual_functions AS (
                  SELECT procedure.proname AS function_name,
@@ -1410,13 +1424,8 @@ export async function runPostgreSqlMigrations(
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                    AND procedure.prokind OPERATOR(pg_catalog.=) 'f'
                    AND procedure.pronargs OPERATOR(pg_catalog.=) 0
-                   AND procedure.proname OPERATOR(pg_catalog.=) ANY (
-                     ARRAY[
-                       'enforce_summary_id_uniqueness',
-                       'enforce_large_file_id_uniqueness',
-                       'enforce_session_ingest_id_uniqueness'
-                     ]::pg_catalog.text[]
-                   )
+                   AND procedure.proname OPERATOR(pg_catalog.=)
+                     ANY ($2::pg_catalog.text[])
                )
                SELECT $1::pg_catalog.bool AS baseline_applied,
                       pg_catalog.count(*)::pg_catalog.int4 AS expected_function_count,
@@ -1447,7 +1456,8 @@ export async function runPostgreSqlMigrations(
                LEFT JOIN actual_functions USING (function_name)`,
         values: [
           baselineApplied,
-          ...expectedBaselineDefinitions.identityFunctionHashes,
+          snapshotExpectations.identityFunctionNames,
+          snapshotExpectations.identityFunctionHashes,
         ],
       }, {
         domain: "factory",
@@ -1469,7 +1479,7 @@ export async function runPostgreSqlMigrations(
     if (
       fingerprintBaselineApplied === null
       || fingerprintBaselineApplied !== baselineApplied
-      || expectedFunctionCount !== 3
+      || expectedFunctionCount !== snapshotExpectations.identityFunctionNames.length
       || existingFunctionCount === null
       || existingFunctionCount > expectedFunctionCount
       || driftedFunctionCount === null
@@ -1485,8 +1495,10 @@ export async function runPostgreSqlMigrations(
     }
     };
 
-    const currentSnapshot = latestPostgreSqlSchemaSnapshot(
+    const schemaSnapshots = postgreSqlSchemaSnapshots();
+    const currentSnapshot = selectLatestPostgreSqlSchemaSnapshot(
       current.map(({ id }) => id),
+      schemaSnapshots,
     );
     if (currentSnapshot) await assertSchemaSnapshot(currentSnapshot);
 
@@ -1504,8 +1516,9 @@ export async function runPostgreSqlMigrations(
       applied.push(migration.id);
     }
     if (applied.length > 0) {
-      const targetSnapshot = latestPostgreSqlSchemaSnapshot(
+      const targetSnapshot = selectLatestPostgreSqlSchemaSnapshot(
         migrations.map(({ id }) => id),
+        schemaSnapshots,
       );
       if (targetSnapshot) await assertSchemaSnapshot(targetSnapshot);
     }

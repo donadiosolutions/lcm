@@ -7,6 +7,7 @@ import type {
   PostgreSqlQueryOptions,
 } from "../../src/storage/postgresql/contracts.js";
 import {
+  getPostgreSqlSchemaSnapshotExpectations,
   loadPostgreSqlMigrations,
   PostgreSqlBaselineDefinitionPreflightError,
   PostgreSqlIdentityFunctionPreflightError,
@@ -18,7 +19,9 @@ import {
   REQUIRED_POSTGRESQL_SERVER_ENCODING,
   REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
   runPostgreSqlMigrations,
+  selectLatestPostgreSqlSchemaSnapshot,
 } from "../../src/storage/postgresql/migrations.js";
+import type { PostgreSqlSchemaSnapshot } from "../../src/storage/postgresql/migrations.js";
 import { REQUIRED_POSTGRESQL_EXTENSIONS } from "../../src/storage/postgresql/extensions.js";
 import { POSTGRESQL_SEARCH_CONFIGURATION_SHA256 } from "../../src/storage/postgresql/search-configuration.js";
 
@@ -242,6 +245,68 @@ function executor(options: {
 }
 
 describe("PostgreSQL migration runner", () => {
+  it("derives changed future expectations and selects by migration history, not registry order", () => {
+    const snapshot = (
+      migrationId: string,
+      counts: readonly [number, number, number, number, number],
+      identityFunctionNames: readonly string[],
+    ): PostgreSqlSchemaSnapshot => ({
+      constraintIdentities: Array.from({ length: counts[2] }, (_, index) => `t|c${index}`),
+      definitionHashes: {
+        constraint: `${migrationId}-constraint`,
+        generatedColumn: `${migrationId}-generated`,
+        index: `${migrationId}-index`,
+        ordinaryColumn: `${migrationId}-ordinary`,
+        trigger: `${migrationId}-trigger`,
+      },
+      generatedColumnIdentities:
+        Array.from({ length: counts[3] }, (_, index) => `t|g${index}`),
+      identityFunctions: identityFunctionNames.map((name) => ({
+        name,
+        sha256: `${name}-sha256`,
+      })),
+      indexNames: Array.from({ length: counts[0] }, (_, index) => `i${index}`),
+      migrationId,
+      ordinaryColumnIdentities:
+        Array.from({ length: counts[4] }, (_, index) => `t|o${index}`),
+      triggerIdentities: Array.from({ length: counts[1] }, (_, index) => `t|tr${index}`),
+    });
+    const older = snapshot("0002_schema_baseline", [1, 1, 1, 1, 1], ["old_helper"]);
+    const newer = snapshot("0003_future", [2, 0, 3, 1, 4], [
+      "new_helper",
+      "second_helper",
+    ]);
+
+    expect(selectLatestPostgreSqlSchemaSnapshot(
+      ["0001_migration_ledger", older.migrationId, newer.migrationId],
+      [newer, older],
+    )).toBe(newer);
+    expect(getPostgreSqlSchemaSnapshotExpectations(newer)).toEqual({
+      definitionGroupCounts: [2, 0, 3, 1, 4],
+      definitionGroupHashes: [
+        "0003_future-index",
+        "0003_future-trigger",
+        "0003_future-constraint",
+        "0003_future-generated",
+        "0003_future-ordinary",
+      ],
+      definitionGroupKinds: [
+        "index",
+        "trigger",
+        "constraint",
+        "generated_column",
+        "ordinary_column",
+      ],
+      definitionObjectCount: 10,
+      identityFunctionHashes: ["new_helper-sha256", "second_helper-sha256"],
+      identityFunctionNames: ["new_helper", "second_helper"],
+    });
+    expect(selectLatestPostgreSqlSchemaSnapshot(["0001_migration_ledger"], [
+      newer,
+      older,
+    ])).toBeNull();
+  });
+
   it("loads the pinned artifact and rejects missing or drifted files", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
@@ -845,12 +910,22 @@ describe("PostgreSQL migration runner", () => {
         expect.arrayContaining(["session_ingest_log|session_id_sha256"]),
         expect.arrayContaining(["projects|identity_key"]),
         442,
-        expect.any(String),
-        expect.any(String),
-        expect.any(String),
-        expect.any(String),
-        expect.any(String),
+        ["index", "trigger", "constraint", "generated_column", "ordinary_column"],
+        [52, 3, 168, 15, 204],
+        [
+          expect.any(String),
+          expect.any(String),
+          expect.any(String),
+          expect.any(String),
+          expect.any(String),
+        ],
       ]);
+    expect(inventorySql).toContain("pg_catalog.unnest");
+    for (const hardcodedGroupCount of [52, 3, 168, 15, 204]) {
+      expect(inventorySql).not.toMatch(
+        new RegExp(`\\b${hardcodedGroupCount}::pg_catalog\\.int4`, "u"),
+      );
+    }
   });
 
   it.each([
@@ -940,6 +1015,22 @@ describe("PostgreSQL migration runner", () => {
       "aclexplode",
       "owner|owner|EXECUTE|false",
     ]) expect(fingerprintSql).toContain(fingerprintedField);
+    expect(fingerprintSql).toContain("pg_catalog.unnest");
+    expect(fingerprintSql).not.toContain("'enforce_summary_id_uniqueness'");
+    expect((fingerprintCall?.[0] as { values?: unknown[] } | undefined)?.values)
+      .toEqual([
+        true,
+        [
+          "enforce_summary_id_uniqueness",
+          "enforce_large_file_id_uniqueness",
+          "enforce_session_ingest_id_uniqueness",
+        ],
+        [
+          expect.any(String),
+          expect.any(String),
+          expect.any(String),
+        ],
+      ]);
   });
 
   it.each([

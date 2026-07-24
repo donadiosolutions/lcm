@@ -77,10 +77,12 @@ phase therefore returns structured ownership diagnostics even when the ledger
 table itself has drifted to another owner. Baseline completeness is evaluated
 after the applied history is known. Unknown schema objects are outside that
 exact catalog allowlist and are neither rejected nor changed.
-Schema definition snapshots are keyed by migration ID. The newest registered
-snapshot in the trusted current ledger is checked before pending SQL, while the
-newest registered target snapshot is checked after applying and recording the
-pending set but before commit. After the baseline is recorded, its snapshot
+Schema definition snapshots are keyed by migration ID. The newest migration in
+the trusted current ledger that has a registered snapshot is checked before
+pending SQL, while the newest migration in the target history that has a
+registered snapshot is checked after applying and recording the pending set but
+before commit. Selection follows migration history rather than registry order.
+After the baseline is recorded, its snapshot
 verifies the explicit existence and canonical definitions of all allowlisted
 secondary indexes, triggers, constraints, ordinary columns, and stored
 generated-column expressions; indexes must remain valid and ready and inherit
