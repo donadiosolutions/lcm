@@ -1254,7 +1254,7 @@ describe("PostgreSQL identity repository", () => {
     )).resolves.toBe(false);
   });
 
-  it("preserves a concurrent same-project winner absent from the prior snapshot", async () => {
+  it("preserves a concurrent same-project lexical winner instead of deleting an inserted alias", async () => {
     const db = executor((config) => {
       if (config.text.includes("FOR UPDATE")) return result([aliasRow]);
       throw new Error(`unexpected mutation: ${config.text}`);
@@ -1265,13 +1265,36 @@ describe("PostgreSQL identity repository", () => {
       machineRow.machine_id,
       projectRow.project_id,
       [null],
+      [true],
+      [{ path: "/work/loser", normalizedPath: aliasRow.normalized_path }],
+    )).resolves.toBe(false);
+    expect(db.query).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves a concurrent same-project lexical winner instead of restoring a prior alias", async () => {
+    const priorProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021";
+    const db = executor((config) => {
+      if (config.text.includes("FOR UPDATE")) return result([aliasRow]);
+      throw new Error(`unexpected mutation: ${config.text}`);
+    });
+    const repository = new PostgreSqlIdentityRepository(db);
+
+    await expect(repository.restoreProjectAliasBatch(
+      machineRow.machine_id,
+      projectRow.project_id,
+      [{
+        projectId: priorProjectId,
+        alias: {
+          machineId: machineRow.machine_id,
+          path: "/work/original",
+          normalizedPath: aliasRow.normalized_path,
+          linkedAt: "2026-01-01T00:00:00.000Z",
+        },
+      }],
       [false],
       [{ path: "/work/loser", normalizedPath: aliasRow.normalized_path }],
-    )).resolves.toBe(true);
-    expect(db.query).not.toHaveBeenCalledWith(
-      expect.objectContaining({ text: expect.stringContaining("DELETE FROM") }),
-      expect.anything(),
-    );
+    )).resolves.toBe(false);
+    expect(db.query).toHaveBeenCalledTimes(1);
   });
 
   it("deletes only unreferenced projects", async () => {

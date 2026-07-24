@@ -851,9 +851,15 @@ export class PostgreSqlIdentityRepository {
                FOR UPDATE`,
         values: [machineId, normalizedPaths],
       }, { domain: "identity", operation: "restoreProjectAliasBatch", projectId: currentProjectId });
+      const requestedPathByNormalized = new Map(
+        aliases.map(({ normalizedPath, path }) => [normalizedPath, path]),
+      );
       if (
         current.rows.length !== aliases.length
-        || current.rows.some((row) => row.project_id !== currentProjectId)
+        || current.rows.some((row) => (
+          row.project_id !== currentProjectId
+          || requestedPathByNormalized.get(row.normalized_path) !== row.path
+        ))
       ) {
         return false;
       }
