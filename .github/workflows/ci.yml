@@ -18,8 +18,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  environment:
+    name: Initialize CI environment
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      node-modules-cache-hit: ${{ steps.setup.outputs.node-modules-cache-hit }}
+      images-cache-hit: ${{ steps.setup.outputs.images-cache-hit }}
+      postgresql-template-cache-hit: ${{ steps.setup.outputs.postgresql-template-cache-hit }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize and seed CI environment
+        id: setup
+        uses: ./.github/actions/setup-ci
+        with:
+          stage-postgresql: "true"
+
   core:
     name: Core CI
+    needs: environment
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Checkout
@@ -27,14 +47,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Setup Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: "22.20.0"
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
+      - name: Initialize CI environment
+        uses: ./.github/actions/setup-ci
 
       - name: Type-check
         run: npm run typecheck
@@ -77,6 +91,7 @@ jobs:
 
   postgresql:
     name: PostgreSQL 18 conformance (${{ matrix.run }})
+    needs: environment
     runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:
       fail-fast: false
@@ -88,14 +103,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Setup Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - name: Initialize CI environment
+        uses: ./.github/actions/setup-ci
         with:
-          node-version: "22.20.0"
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
+          stage-postgresql: "true"
 
       - name: Run isolated PostgreSQL 18 conformance harness
         run: npm run test:postgresql
@@ -103,29 +114,32 @@ jobs:
   ci:
     name: ci
     needs:
+      - environment
       - core
       - postgresql
     if: ${{ always() }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - name: Require every CI suite
         env:
+          ENVIRONMENT_RESULT: ${{ needs.environment.result }}
           CORE_RESULT: ${{ needs.core.result }}
           POSTGRESQL_RESULT: ${{ needs.postgresql.result }}
         run: |
           set -Eeuo pipefail
-          if [[ "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success ]]; then
+          if [[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success ]]; then
+            echo "Environment result: $ENVIRONMENT_RESULT" >&2
             echo "Core CI result: $CORE_RESULT" >&2
             echo "PostgreSQL matrix result: $POSTGRESQL_RESULT" >&2
             exit 1
           fi
-          echo "Core CI and every PostgreSQL matrix run passed."
+          echo "Environment, Core CI, and every PostgreSQL matrix run passed."
 
   codecov:
     name: Codecov upload
     needs: ci
     if: ${{ github.event_name != 'merge_group' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions:
       # Download the fixed report artifact produced by this workflow run.
       actions: read
@@ -195,7 +209,7 @@ jobs:
     name: Codecov upload (fork)
     needs: ci
     if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions:
       # Download the fixed report artifact produced by this workflow run.
       actions: read

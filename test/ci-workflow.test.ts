@@ -19,10 +19,19 @@ interface CodecovJob {
 
 interface CiWorkflow {
   jobs: {
+    environment: {
+      name: string;
+      "runs-on": string;
+      steps: WorkflowStep[];
+    };
     core: {
       name: string;
+      needs: string;
+      "runs-on": string;
     };
     postgresql: {
+      needs: string;
+      "runs-on": string;
       strategy: { matrix: { run: number[] } };
     };
     ci: {
@@ -66,20 +75,31 @@ const expectedCodecovRunSteps = [
 ];
 
 describe("CI workflow", () => {
-  it("gates the stable required check on core CI and the complete PostgreSQL matrix", () => {
+  it("seeds the environment and gates the stable check on every required suite", () => {
+    expect(workflow.jobs.environment).toMatchObject({
+      name: "Initialize CI environment",
+      "runs-on": "blacksmith-4vcpu-ubuntu-2404",
+    });
     expect(workflow.jobs.core.name).toBe("Core CI");
+    expect(workflow.jobs.core.needs).toBe("environment");
+    expect(workflow.jobs.core["runs-on"]).toBe("blacksmith-4vcpu-ubuntu-2404");
+    expect(workflow.jobs.postgresql.needs).toBe("environment");
+    expect(workflow.jobs.postgresql["runs-on"]).toBe("blacksmith-4vcpu-ubuntu-2404");
     expect(workflow.jobs.postgresql.strategy.matrix.run).toEqual([1, 2]);
     expect(workflow.jobs.ci).toMatchObject({
       name: "ci",
-      needs: ["core", "postgresql"],
+      needs: ["environment", "core", "postgresql"],
       if: "${{ always() }}",
     });
     const gate = workflow.jobs.ci.steps.find((step) => step.name === "Require every CI suite");
     expect(gate?.env).toEqual({
+      ENVIRONMENT_RESULT: "${{ needs.environment.result }}",
       CORE_RESULT: "${{ needs.core.result }}",
       POSTGRESQL_RESULT: "${{ needs.postgresql.result }}",
     });
-    expect(gate?.run).toContain('[[ "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success ]]');
+    expect(gate?.run).toContain(
+      '[[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success ]]',
+    );
     expect(workflow.jobs.codecov.needs).toBe("ci");
     expect(workflow.jobs["codecov-fork"].needs).toBe("ci");
   });

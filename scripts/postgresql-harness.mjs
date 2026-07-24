@@ -1,18 +1,23 @@
 #!/usr/bin/env node
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
+import {
+  NODE_IMAGE,
+  POSTGRES_IMAGE,
+} from "./postgresql-images.mjs";
+import { validatePostgreSqlTemplateArchive } from "./ci-environment.mjs";
 
-export const POSTGRES_IMAGE = "postgres:18.4-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296";
-export const NODE_IMAGE = "node:22.20.0-bookworm-slim@sha256:b21fe589dfbe5cc39365d0544b9be3f1f33f55f3c86c87a76ff65a02f8f5848e";
+export { NODE_IMAGE, POSTGRES_IMAGE };
 export const RUN_LABEL = "com.donadiosolutions.lcm.postgresql-test-run";
 export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const initScript = join(repositoryRoot, "test", "postgresql", "init.sh");
+const cachedRunInitScript = join(repositoryRoot, "test", "postgresql", "cached-run-init.sh");
 
 export function createRunNames(runId) {
   const short = runId.slice(0, 20);
@@ -20,6 +25,7 @@ export function createRunNames(runId) {
     container: `lcm-pg-${short}`,
     network: `lcm-pg-net-${short}`,
     volume: `lcm-pg-data-${short}`,
+    restore: `lcm-pg-restore-${short}`,
     runner: `lcm-pg-runner-${short}`,
     alias: `lcm-pg-${short}.test`,
     wrongAlias: `lcm-pg-wrong-${short}.test`,
@@ -261,11 +267,11 @@ export async function removeLabeled(type, name, runId, dockerRunner = docker) {
   await dockerRunner(args);
 }
 
-async function waitForPostgreSql(container, database, dockerRunner = docker) {
+async function waitForPostgreSql(container, database, dockerRunner = docker, username = "lcm_harness_admin") {
   let lastError;
   for (let attempt = 0; attempt < 90; attempt += 1) {
     try {
-      await dockerRunner(["exec", container, "pg_isready", "--quiet", "--username", "lcm_harness_admin", "--dbname", database]);
+      await dockerRunner(["exec", container, "pg_isready", "--quiet", "--username", username, "--dbname", database]);
       return;
     } catch (error) {
       lastError = error;
@@ -343,6 +349,7 @@ export async function cleanupHarnessResources(context, dependencies = {}) {
   };
 
   try {
+    await attempt(() => removeResource("container", names.restore));
     await attempt(() => removeResource("container", names.runner));
     const containerOwned = !sentinelReady || await attempt(verifySentinel);
     if (containerOwned) await attempt(() => removeResource("container", names.container));
@@ -457,14 +464,37 @@ export async function runHarness(options = {}) {
 
   try {
     writeFileSync(join(directory, "run-id"), `${runId}\n`, { mode: 0o600 });
+    writeFileSync(join(directory, "database-name"), `${names.controlDatabase}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "admin-password"), `${passwords.admin}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "migrator-password"), `${passwords.migrator}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "runtime-password"), `${passwords.runtime}\n`, { mode: 0o600 });
     await writeTlsFixtures(directory, names.alias, setupProcess);
     await setupDocker(["network", "create", "--label", `${RUN_LABEL}=${runId}`, names.network]);
     await setupDocker(["volume", "create", "--label", `${RUN_LABEL}=${runId}`, names.volume]);
+    const configuredTemplateArchive = String(process.env.LCM_POSTGRES_TEMPLATE_ARCHIVE ?? "").trim();
+    const usingCachedTemplate = configuredTemplateArchive.length > 0;
+    const templateArchive = usingCachedTemplate ? realpathSync(configuredTemplateArchive) : "";
+    if (usingCachedTemplate) {
+      if (!statSync(templateArchive).isFile()) {
+        throw new Error("PostgreSQL template archive must be a regular file");
+      }
+      await validatePostgreSqlTemplateArchive(templateArchive);
+      await setupDocker([
+        "create", "--name", names.restore,
+        "--label", `${RUN_LABEL}=${runId}`,
+        "--network", "none",
+        "--volume", `${names.volume}:/target`,
+        "--volume", `${templateArchive}:/cache/postgresql-template.tar:ro`,
+        "--entrypoint", "/bin/bash",
+        POSTGRES_IMAGE,
+        "-ceu",
+        "tar --extract --file /cache/postgresql-template.tar --directory /target; chown -R postgres:postgres /target",
+      ]);
+      await setupDocker(["start", "--attach", names.restore]);
+      await removeLabeled("container", names.restore, runId, setupDocker);
+    }
     const publish = ci ? [] : ["--publish", "127.0.0.1::5432"];
-    await setupDocker([
+    const containerArgs = [
       "create", "--name", names.container,
       "--label", `${RUN_LABEL}=${runId}`,
       "--network", names.network,
@@ -473,22 +503,38 @@ export async function runHarness(options = {}) {
       ...publish,
       "--volume", `${names.volume}:/var/lib/postgresql`,
       "--volume", `${directory}:/run/lcm-harness:ro`,
-      "--volume", `${initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro`,
-      "--env", "POSTGRES_USER=lcm_harness_admin",
-      "--env", `POSTGRES_DB=${names.controlDatabase}`,
-      "--env", "POSTGRES_PASSWORD_FILE=/run/lcm-private/admin-password",
-      "--env", "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
+      "--volume", `${cachedRunInitScript}:/run/lcm-cached-init.sh:ro`,
+    ];
+    if (!usingCachedTemplate) {
+      containerArgs.push(
+        "--volume", `${initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro`,
+        "--env", "POSTGRES_USER=lcm_harness_admin",
+        "--env", `POSTGRES_DB=${names.controlDatabase}`,
+        "--env", "POSTGRES_PASSWORD_FILE=/run/lcm-private/admin-password",
+        "--env", "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
+      );
+    }
+    containerArgs.push(
       "--entrypoint", "/bin/bash",
       POSTGRES_IMAGE,
       "-ceu",
-      "install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/certs /run/lcm-private; install -o postgres -g postgres -m 0600 /run/lcm-harness/server.key /var/lib/postgresql/certs/server.key; install -o postgres -g postgres -m 0644 /run/lcm-harness/server.crt /run/lcm-harness/ca.crt /var/lib/postgresql/certs/; install -o postgres -g postgres -m 0600 /run/lcm-harness/admin-password /run/lcm-harness/migrator-password /run/lcm-harness/runtime-password /run/lcm-harness/run-id /run/lcm-private/; exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/certs/server.crt -c ssl_key_file=/var/lib/postgresql/certs/server.key -c ssl_ca_file=/var/lib/postgresql/certs/ca.crt -c shared_preload_libraries=pg_stat_statements -c listen_addresses=* -c password_encryption=scram-sha-256 -c timezone=UTC",
-    ]);
+      "install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/certs /run/lcm-private; install -o postgres -g postgres -m 0600 /run/lcm-harness/server.key /var/lib/postgresql/certs/server.key; install -o postgres -g postgres -m 0644 /run/lcm-harness/server.crt /run/lcm-harness/ca.crt /var/lib/postgresql/certs/; install -o postgres -g postgres -m 0600 /run/lcm-harness/admin-password /run/lcm-harness/migrator-password /run/lcm-harness/runtime-password /run/lcm-harness/run-id /run/lcm-harness/database-name /run/lcm-private/; exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/certs/server.crt -c ssl_key_file=/var/lib/postgresql/certs/server.key -c ssl_ca_file=/var/lib/postgresql/certs/ca.crt -c shared_preload_libraries=pg_stat_statements -c listen_addresses=* -c password_encryption=scram-sha-256 -c timezone=UTC",
+    );
+    await setupDocker(containerArgs);
     await setupDocker(["start", names.container]);
     try {
-      await waitForPostgreSql(names.container, names.controlDatabase, setupDocker);
+      await waitForPostgreSql(
+        names.container,
+        usingCachedTemplate ? "postgres" : names.controlDatabase,
+        setupDocker,
+        usingCachedTemplate ? "postgres" : "lcm_harness_admin",
+      );
+      if (usingCachedTemplate) {
+        await setupDocker(["exec", names.container, "/bin/bash", "/run/lcm-cached-init.sh"]);
+      }
     } catch (error) {
       const logs = await docker(["logs", names.container]).catch(() => ({ stdout: "", stderr: "" }));
-      throw Object.assign(error, { stderr: `${logs.stdout}\n${logs.stderr}` });
+      throw Object.assign(error, { stderr: `${error?.stderr ?? ""}\n${logs.stdout}\n${logs.stderr}` });
     }
     await waitForContainerSentinel(names, runId, setupDocker);
     sentinelReady = true;
