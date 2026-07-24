@@ -104,6 +104,14 @@ unbounded summary IDs round-trip exactly through bounded UUIDv7 relationship
 keys and digest-plus-exact lookup. Unbounded large-file IDs use the same
 UUIDv7-key and digest-plus-exact design and remain unique within a project
 rather than globally.
+The backend-neutral 64-hex `ProjectIdentity.id` is stored separately from the
+internal UUID and display label, so another machine resolves the same logical
+project without depending on a machine-local path alias. Arbitrary-length
+session IDs remain exact text, but conversations, native transcripts, recall
+surfacing, and ingest completion index only fixed-width SHA-256 candidates.
+Repository lookups must retain exact session-text equality as the collision
+residual. Session-ingest uniqueness uses an internal UUIDv7 key and an
+advisory-locked digest-plus-residual trigger rather than a raw-text primary key.
 Promoted-memory source IDs are preserved as external provenance without a
 local-summary foreign key. Floating-point step costs reject `NaN` and both
 infinities. Search and tag normalization use PostgreSQL 18's builtin
@@ -126,11 +134,16 @@ absent schema because `0001` creates it as the current migration role, but it
 fails closed when another role owns an existing schema even if that role has
 delegated `CREATE` to the migrator. Transfer ownership explicitly with the
 cluster administrator before retrying; LCM never changes schema ownership.
-On every run, an exact catalog allowlist also checks every existing managed
-table, generated identity sequence, helper or trigger function, text-search
-dictionary, and text-search configuration. Ownership drift blocks repeated
-runs and later pending migrations before ledger inspection. Objects not on the
-allowlist are preserved and may have a different owner.
+On every run, the runner first verifies the ordered ledger, then compares the
+catalog with the complete expected `0002` inventory and ownership allowlist.
+A missing table, generated identity sequence, helper or trigger function,
+text-search dictionary, or text-search configuration blocks repeated runs and
+later pending migrations; a smaller surviving inventory is not accepted.
+Unknown objects remain preserved and may have a different owner. The summary,
+large-file, and session-ingest identity functions are also fingerprinted by
+stored body and security configuration. Body, language/return type,
+security-definer/leakproof, volatility, parallel-safety, fixed search path, or
+`PUBLIC EXECUTE` drift fails closed.
 Failure diagnostics identify `requiredOwner` using the sanitized PostgreSQL
 `CURRENT_USER` role and provide identifier-quoted transfer guidance. They do
 not expose the existing owner, connection details, or raw database errors, and

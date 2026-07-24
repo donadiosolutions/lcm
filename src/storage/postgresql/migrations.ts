@@ -22,7 +22,7 @@ const MIGRATION_MANIFEST = [
   {
     id: "0002_schema_baseline",
     filename: "0002_schema_baseline.sql",
-    sha256: "6386af13407e8944ce188c9ce19b5944f27b9fa58a4ad8660ede347c8beacfa2",
+    sha256: "c97d053f16663197dadea1fb67823a5a05e3bdf3bfe3b6113003aaf16c77a276",
   },
 ] as const;
 
@@ -43,8 +43,17 @@ type SchemaAclRow = QueryResultRow & {
 type ServerEncodingRow = QueryResultRow & { server_encoding: unknown };
 type ManagedObjectOwnershipRow = QueryResultRow & {
   current_user_name: unknown;
+  baseline_applied: unknown;
+  expected_object_count: unknown;
   existing_object_count: unknown;
+  missing_object_count: unknown;
   unowned_object_count: unknown;
+};
+type IdentityFunctionFingerprintRow = QueryResultRow & {
+  baseline_applied: unknown;
+  expected_function_count: unknown;
+  existing_function_count: unknown;
+  drifted_function_count: unknown;
 };
 
 export const REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION = 18 as const;
@@ -139,7 +148,10 @@ export class PostgreSqlSchemaOwnershipPreflightError extends StorageOperationErr
 
 export class PostgreSqlManagedObjectOwnershipPreflightError extends StorageOperationError {
   constructor(
+    readonly baselineApplied: boolean | null,
+    readonly expectedObjectCount: number | null,
     readonly existingObjectCount: number | null,
+    readonly missingObjectCount: number | null,
     readonly unownedObjectCount: number | null,
     readonly requiredOwner: string | null,
   ) {
@@ -150,9 +162,11 @@ export class PostgreSqlManagedObjectOwnershipPreflightError extends StorageOpera
       "factory",
       "preflightManagedObjectOwnership",
     );
-    this.remediation = requiredOwner === null
-      ? null
-      : `Transfer ownership of every LCM-managed object in schema "lcm" to PostgreSQL role ${quoteIdentifier(requiredOwner)}, then rerun migrations.`;
+    this.remediation = missingObjectCount !== null && missingObjectCount > 0
+      ? "Restore every missing LCM-managed object from the matching packaged migration artifact or a verified backup, then rerun migrations."
+      : requiredOwner === null
+        ? null
+        : `Transfer ownership of every LCM-managed object in schema "lcm" to PostgreSQL role ${quoteIdentifier(requiredOwner)}, then rerun migrations.`;
   }
 
   readonly schemaName = "lcm";
@@ -162,9 +176,45 @@ export class PostgreSqlManagedObjectOwnershipPreflightError extends StorageOpera
     return {
       ...super.toJSON(),
       schemaName: this.schemaName,
+      baselineApplied: this.baselineApplied,
+      expectedObjectCount: this.expectedObjectCount,
       existingObjectCount: this.existingObjectCount,
+      missingObjectCount: this.missingObjectCount,
       unownedObjectCount: this.unownedObjectCount,
       requiredOwner: this.requiredOwner,
+      remediation: this.remediation,
+    };
+  }
+}
+
+export class PostgreSqlIdentityFunctionPreflightError extends StorageOperationError {
+  constructor(
+    readonly baselineApplied: boolean | null,
+    readonly expectedFunctionCount: number | null,
+    readonly existingFunctionCount: number | null,
+    readonly driftedFunctionCount: number | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightIdentityFunctionDefinitions",
+    );
+  }
+
+  readonly schemaName = "lcm";
+  readonly remediation =
+    "Restore the packaged LCM identity-enforcement functions and their security configuration, then rerun migrations.";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      schemaName: this.schemaName,
+      baselineApplied: this.baselineApplied,
+      expectedFunctionCount: this.expectedFunctionCount,
+      existingFunctionCount: this.existingFunctionCount,
+      driftedFunctionCount: this.driftedFunctionCount,
       remediation: this.remediation,
     };
   }
@@ -423,6 +473,25 @@ export async function runPostgreSqlMigrations(
       throw new PostgreSqlSchemaAclPreflightError(aclSchemaExists, publicCreate);
     }
 
+    const ledger = await transaction.query<LedgerRow>({
+      text: "SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger_exists",
+    }, { domain: "factory", operation: "inspectMigrationLedger", signal: options.signal });
+    const current = ledger.rows[0]?.ledger_exists
+      ? (await transaction.query<MigrationRow>({
+        text: "SELECT id, checksum_sha256 FROM lcm.schema_migrations ORDER BY id",
+      }, { domain: "factory", operation: "readMigrations", signal: options.signal })).rows
+      : [];
+
+    if (current.length > migrations.length) throw migrationError("verifyMigrationHistory");
+    for (let index = 0; index < current.length; index += 1) {
+      const expected = migrations[index];
+      const applied = current[index];
+      if (!expected || applied.id !== expected.id || applied.checksum_sha256 !== expected.sha256) {
+        throw migrationError("verifyMigrationHistory");
+      }
+    }
+    const baselineApplied = current.some(({ id }) => id === "0002_schema_baseline");
+
     const managedOwnership = await transaction.query<ManagedObjectOwnershipRow>({
       text: `WITH migration_role AS (
                SELECT role.oid
@@ -489,6 +558,11 @@ export async function runPostgreSqlMigrations(
                        'enforce_large_file_id_uniqueness'
                      AND procedure.pronargs OPERATOR(pg_catalog.=) 0
                    )
+                   OR (
+                     procedure.proname OPERATOR(pg_catalog.=)
+                       'enforce_session_ingest_id_uniqueness'
+                     AND procedure.pronargs OPERATOR(pg_catalog.=) 0
+                   )
                  )
                UNION ALL
                SELECT dictionary.dictowner
@@ -506,19 +580,36 @@ export async function runPostgreSqlMigrations(
                  AND configuration.cfgname OPERATOR(pg_catalog.=) 'search_v1'
              )
              SELECT CURRENT_USER::pg_catalog.text AS current_user_name,
+                    $1::pg_catalog.bool AS baseline_applied,
+                    36::pg_catalog.int4 AS expected_object_count,
                     pg_catalog.count(*)::pg_catalog.int4 AS existing_object_count,
+                    CASE
+                      WHEN $1::pg_catalog.bool
+                        THEN (36 - pg_catalog.count(*))::pg_catalog.int4
+                      ELSE 0::pg_catalog.int4
+                    END AS missing_object_count,
                     pg_catalog.count(*) FILTER (
                       WHERE managed_objects.owner_oid OPERATOR(pg_catalog.<>) migration_role.oid
                     )::pg_catalog.int4 AS unowned_object_count
              FROM managed_objects
              CROSS JOIN migration_role`,
+      values: [baselineApplied],
     }, {
       domain: "factory",
       operation: "preflightManagedObjectOwnership",
       signal: options.signal,
     });
+    const catalogBaselineApplied = sanitizeBoolean(
+      managedOwnership.rows[0]?.baseline_applied,
+    );
+    const expectedObjectCount = sanitizeNonnegativeCount(
+      managedOwnership.rows[0]?.expected_object_count,
+    );
     const existingObjectCount = sanitizeNonnegativeCount(
       managedOwnership.rows[0]?.existing_object_count,
+    );
+    const missingObjectCount = sanitizeNonnegativeCount(
+      managedOwnership.rows[0]?.missing_object_count,
     );
     const unownedObjectCount = sanitizeNonnegativeCount(
       managedOwnership.rows[0]?.unowned_object_count,
@@ -527,36 +618,145 @@ export async function runPostgreSqlMigrations(
       managedOwnership.rows[0]?.current_user_name,
     );
     if (
-      existingObjectCount === null
+      catalogBaselineApplied === null
+      || catalogBaselineApplied !== baselineApplied
+      || expectedObjectCount !== 36
+      || existingObjectCount === null
+      || missingObjectCount === null
       || unownedObjectCount === null
+      || (baselineApplied && existingObjectCount + missingObjectCount !== expectedObjectCount)
+      || (!baselineApplied && missingObjectCount !== 0)
+      || missingObjectCount !== 0
       || unownedObjectCount > existingObjectCount
       || unownedObjectCount !== 0
       || managedRequiredOwner === null
       || managedRequiredOwner !== requiredOwner
     ) {
       throw new PostgreSqlManagedObjectOwnershipPreflightError(
+        catalogBaselineApplied,
+        expectedObjectCount,
         existingObjectCount,
+        missingObjectCount,
         unownedObjectCount,
         managedRequiredOwner,
       );
     }
 
-    const ledger = await transaction.query<LedgerRow>({
-      text: "SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger_exists",
-    }, { domain: "factory", operation: "inspectMigrationLedger", signal: options.signal });
-    const current = ledger.rows[0]?.ledger_exists
-      ? (await transaction.query<MigrationRow>({
-        text: "SELECT id, checksum_sha256 FROM lcm.schema_migrations ORDER BY id",
-      }, { domain: "factory", operation: "readMigrations", signal: options.signal })).rows
-      : [];
-
-    if (current.length > migrations.length) throw migrationError("verifyMigrationHistory");
-    for (let index = 0; index < current.length; index += 1) {
-      const expected = migrations[index];
-      const applied = current[index];
-      if (!expected || applied.id !== expected.id || applied.checksum_sha256 !== expected.sha256) {
-        throw migrationError("verifyMigrationHistory");
-      }
+    const identityFunctionFingerprints =
+      await transaction.query<IdentityFunctionFingerprintRow>({
+        text: `WITH expected_functions(function_name, prosrc_sha256) AS (
+                 VALUES
+                   (
+                     'enforce_summary_id_uniqueness'::pg_catalog.text,
+                     '588b89ccad1812592ae24358f0096205dc87613a7d7fe73b28dc544d089f0210'::pg_catalog.text
+                   ),
+                   (
+                     'enforce_large_file_id_uniqueness'::pg_catalog.text,
+                     '88a8ec57d47017294c1532788dafc3e89fc406887e92338f89b3dc24033906ac'::pg_catalog.text
+                   ),
+                   (
+                     'enforce_session_ingest_id_uniqueness'::pg_catalog.text,
+                     '99df5c443c85f2620ed281c2b05ba4a18af4cfd8c1cd408671af3f7d0f9bed22'::pg_catalog.text
+                   )
+               ),
+               actual_functions AS (
+                 SELECT procedure.proname AS function_name,
+                        procedure.oid AS function_oid,
+                        procedure.prosrc,
+                        procedure.prosecdef,
+                        procedure.proleakproof,
+                        procedure.provolatile,
+                        procedure.proparallel,
+                        procedure.proconfig,
+                        language.lanname,
+                        procedure.prorettype,
+                        EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.aclexplode(
+                            COALESCE(
+                              procedure.proacl,
+                              pg_catalog.acldefault('f', procedure.proowner)
+                            )
+                          ) AS privilege
+                          WHERE privilege.grantee OPERATOR(pg_catalog.=) 0
+                            AND privilege.privilege_type OPERATOR(pg_catalog.=) 'EXECUTE'
+                        ) AS public_execute
+                 FROM pg_catalog.pg_proc AS procedure
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
+                 JOIN pg_catalog.pg_language AS language
+                   ON language.oid OPERATOR(pg_catalog.=) procedure.prolang
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND procedure.prokind OPERATOR(pg_catalog.=) 'f'
+                   AND procedure.pronargs OPERATOR(pg_catalog.=) 0
+                   AND procedure.proname OPERATOR(pg_catalog.=) ANY (
+                     ARRAY[
+                       'enforce_summary_id_uniqueness',
+                       'enforce_large_file_id_uniqueness',
+                       'enforce_session_ingest_id_uniqueness'
+                     ]::pg_catalog.text[]
+                   )
+               )
+               SELECT $1::pg_catalog.bool AS baseline_applied,
+                      pg_catalog.count(*)::pg_catalog.int4 AS expected_function_count,
+                      pg_catalog.count(actual_functions.function_oid)::pg_catalog.int4
+                        AS existing_function_count,
+                      CASE
+                        WHEN $1::pg_catalog.bool THEN pg_catalog.count(*) FILTER (
+                          WHERE actual_functions.function_oid IS NULL
+                            OR pg_catalog.encode(
+                              public.digest(actual_functions.prosrc, 'sha256'),
+                              'hex'
+                            ) OPERATOR(pg_catalog.<>) expected_functions.prosrc_sha256
+                            OR actual_functions.lanname OPERATOR(pg_catalog.<>) 'plpgsql'
+                            OR actual_functions.prorettype OPERATOR(pg_catalog.<>)
+                              pg_catalog.to_regtype('pg_catalog.trigger')
+                            OR actual_functions.prosecdef
+                            OR actual_functions.proleakproof
+                            OR actual_functions.provolatile OPERATOR(pg_catalog.<>) 'v'
+                            OR actual_functions.proparallel OPERATOR(pg_catalog.<>) 'u'
+                            OR actual_functions.proconfig IS DISTINCT FROM
+                              ARRAY['search_path=pg_catalog, public']::pg_catalog.text[]
+                            OR actual_functions.public_execute
+                        )::pg_catalog.int4
+                        ELSE 0::pg_catalog.int4
+                      END AS drifted_function_count
+               FROM expected_functions
+               LEFT JOIN actual_functions USING (function_name)`,
+        values: [baselineApplied],
+      }, {
+        domain: "factory",
+        operation: "preflightIdentityFunctionDefinitions",
+        signal: options.signal,
+      });
+    const fingerprintBaselineApplied = sanitizeBoolean(
+      identityFunctionFingerprints.rows[0]?.baseline_applied,
+    );
+    const expectedFunctionCount = sanitizeNonnegativeCount(
+      identityFunctionFingerprints.rows[0]?.expected_function_count,
+    );
+    const existingFunctionCount = sanitizeNonnegativeCount(
+      identityFunctionFingerprints.rows[0]?.existing_function_count,
+    );
+    const driftedFunctionCount = sanitizeNonnegativeCount(
+      identityFunctionFingerprints.rows[0]?.drifted_function_count,
+    );
+    if (
+      fingerprintBaselineApplied === null
+      || fingerprintBaselineApplied !== baselineApplied
+      || expectedFunctionCount !== 3
+      || existingFunctionCount === null
+      || existingFunctionCount > expectedFunctionCount
+      || driftedFunctionCount === null
+      || driftedFunctionCount > expectedFunctionCount
+      || driftedFunctionCount !== 0
+    ) {
+      throw new PostgreSqlIdentityFunctionPreflightError(
+        fingerprintBaselineApplied,
+        expectedFunctionCount,
+        existingFunctionCount,
+        driftedFunctionCount,
+      );
     }
 
     const applied: string[] = [];

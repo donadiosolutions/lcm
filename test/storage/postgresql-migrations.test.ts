@@ -8,6 +8,7 @@ import type {
 } from "../../src/storage/postgresql/contracts.js";
 import {
   loadPostgreSqlMigrations,
+  PostgreSqlIdentityFunctionPreflightError,
   PostgreSqlManagedObjectOwnershipPreflightError,
   PostgreSqlSchemaAclPreflightError,
   PostgreSqlSchemaOwnershipPreflightError,
@@ -49,7 +50,8 @@ function executor(options: {
   postmasterEpoch?: unknown;
   postmasterContinuity?: boolean | "missing";
   schemaAcl?: "absent" | "ready" | "public" | "missing" | "invalid" | "inconsistent";
-  managedOwnership?: "ready" | "unowned" | "missing" | "invalid" | "inconsistent" | "different-user";
+  managedOwnership?: "ready" | "unowned" | "missing-object" | "missing" | "invalid" | "inconsistent" | "different-user";
+  identityFunctions?: "ready" | "drifted" | "missing" | "invalid" | "inconsistent";
 } = {}) {
   const operations: string[] = [];
   const query = vi.fn(async <R extends QueryResultRow>(
@@ -157,7 +159,10 @@ function executor(options: {
       if (options.managedOwnership === "invalid") {
         return result([{
           current_user_name: 7,
+          baseline_applied: "yes",
+          expected_object_count: "many",
           existing_object_count: "many",
+          missing_object_count: false,
           unowned_object_count: false,
         }] as unknown as R[]);
       }
@@ -165,11 +170,37 @@ function executor(options: {
         current_user_name: options.managedOwnership === "different-user"
           ? "different_migrator"
           : "lcm_test_migrator",
-        existing_object_count: options.managedOwnership === "inconsistent" ? 0 : 35,
+        baseline_applied: (options.current ?? []).some(({ id }) => id === "0002_schema_baseline"),
+        expected_object_count: 36,
+        existing_object_count: options.managedOwnership === "inconsistent"
+          ? 0
+          : options.managedOwnership === "missing-object"
+            ? 35
+            : 36,
+        missing_object_count: options.managedOwnership === "missing-object" ? 1 : 0,
         unowned_object_count: options.managedOwnership === "unowned"
           || options.managedOwnership === "inconsistent"
           ? 1
           : 0,
+      }] as unknown as R[]);
+    }
+    if (context.operation === "preflightIdentityFunctionDefinitions") {
+      if (options.identityFunctions === "missing") return result([] as R[]);
+      if (options.identityFunctions === "invalid") {
+        return result([{
+          baseline_applied: "yes",
+          expected_function_count: "two",
+          existing_function_count: false,
+          drifted_function_count: null,
+        }] as unknown as R[]);
+      }
+      const baselineApplied = (options.current ?? [])
+        .some(({ id }) => id === "0002_schema_baseline");
+      return result([{
+        baseline_applied: baselineApplied,
+        expected_function_count: 3,
+        existing_function_count: options.identityFunctions === "inconsistent" ? 4 : 3,
+        drifted_function_count: options.identityFunctions === "drifted" ? 1 : 0,
       }] as unknown as R[]);
     }
     if (context.operation === "inspectMigrationLedger") return result([{ ledger_exists: options.ledger ?? false }] as unknown as R[]);
@@ -188,7 +219,7 @@ describe("PostgreSQL migration runner", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "6386af13407e8944ce188c9ce19b5944f27b9fa58a4ad8660ede347c8beacfa2" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "c97d053f16663197dadea1fb67823a5a05e3bdf3bfe3b6113003aaf16c77a276" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
@@ -233,8 +264,9 @@ describe("PostgreSQL migration runner", () => {
       "revalidateRequiredExtensionCatalog",
       "preflightSchemaOwnership",
       "preflightSchemaAcl",
-      "preflightManagedObjectOwnership",
       "inspectMigrationLedger",
+      "preflightManagedObjectOwnership",
+      "preflightIdentityFunctionDefinitions",
       "applyMigration:0001_first",
       "recordMigration",
       "applyMigration:0002_second",
@@ -535,7 +567,7 @@ describe("PostgreSQL migration runner", () => {
     {
       label: "an unowned managed object",
       managedOwnership: "unowned" as const,
-      existingObjectCount: 35,
+      existingObjectCount: 36,
       unownedObjectCount: 1,
       requiredOwner: "lcm_test_migrator",
     },
@@ -563,7 +595,7 @@ describe("PostgreSQL migration runner", () => {
     {
       label: "a changed current role",
       managedOwnership: "different-user" as const,
-      existingObjectCount: 35,
+      existingObjectCount: 36,
       unownedObjectCount: 0,
       requiredOwner: "different_migrator",
     },
@@ -607,6 +639,7 @@ describe("PostgreSQL migration runner", () => {
       "revalidateRequiredExtensionCatalog",
       "preflightSchemaOwnership",
       "preflightSchemaAcl",
+      "inspectMigrationLedger",
       "preflightManagedObjectOwnership",
     ]);
     const ownershipCall = fake.seam.query.mock.calls.find(([, context]) => (
@@ -620,6 +653,119 @@ describe("PostgreSQL migration runner", () => {
       "pg_catalog.pg_ts_config",
       "OPERATOR(pg_catalog.=)",
     ]) expect(ownershipSql).toContain(catalog);
+  });
+
+  it("rejects a missing managed object after the 0002 baseline is recorded", async () => {
+    const migrations = loadPostgreSqlMigrations();
+    const current = migrations.slice(0, 2).map(({ id, sha256 }) => ({
+      id,
+      checksum_sha256: sha256,
+    }));
+    const fake = executor({
+      current,
+      ledger: true,
+      managedOwnership: "missing-object",
+      schemaAcl: "ready",
+      schemaOwnership: "owned",
+    });
+    const failure = await runPostgreSqlMigrations(fake.seam, { migrations })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlManagedObjectOwnershipPreflightError);
+    expect(failure).toMatchObject({
+      baselineApplied: true,
+      expectedObjectCount: 36,
+      existingObjectCount: 35,
+      missingObjectCount: 1,
+      operation: "preflightManagedObjectOwnership",
+    });
+    expect(fake.operations).not.toContain("applyMigration:0002_schema_baseline");
+  });
+
+  it.each([
+    {
+      label: "drifted",
+      identityFunctions: "drifted" as const,
+      baselineApplied: true,
+      expectedFunctionCount: 3,
+      existingFunctionCount: 3,
+      driftedFunctionCount: 1,
+    },
+    {
+      label: "missing",
+      identityFunctions: "missing" as const,
+      baselineApplied: null,
+      expectedFunctionCount: null,
+      existingFunctionCount: null,
+      driftedFunctionCount: null,
+    },
+    {
+      label: "malformed",
+      identityFunctions: "invalid" as const,
+      baselineApplied: null,
+      expectedFunctionCount: null,
+      existingFunctionCount: null,
+      driftedFunctionCount: null,
+    },
+    {
+      label: "inconsistent",
+      identityFunctions: "inconsistent" as const,
+      baselineApplied: true,
+      expectedFunctionCount: 3,
+      existingFunctionCount: 4,
+      driftedFunctionCount: 0,
+    },
+  ])("rejects $label identity-function fingerprint state", async ({
+    identityFunctions,
+    baselineApplied,
+    expectedFunctionCount,
+    existingFunctionCount,
+    driftedFunctionCount,
+  }) => {
+    const migrations = loadPostgreSqlMigrations();
+    const current = migrations.slice(0, 2).map(({ id, sha256 }) => ({
+      id,
+      checksum_sha256: sha256,
+    }));
+    const fake = executor({
+      current,
+      identityFunctions,
+      ledger: true,
+      schemaAcl: "ready",
+      schemaOwnership: "owned",
+    });
+    const failure = await runPostgreSqlMigrations(fake.seam, { migrations })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlIdentityFunctionPreflightError);
+    expect(failure).toMatchObject({
+      baselineApplied,
+      driftedFunctionCount,
+      existingFunctionCount,
+      expectedFunctionCount,
+      operation: "preflightIdentityFunctionDefinitions",
+      remediation:
+        "Restore the packaged LCM identity-enforcement functions and their security configuration, then rerun migrations.",
+    });
+    expect((failure as PostgreSqlIdentityFunctionPreflightError).toJSON())
+      .toMatchObject({
+        baselineApplied,
+        driftedFunctionCount,
+        existingFunctionCount,
+        expectedFunctionCount,
+      });
+    const fingerprintCall = fake.seam.query.mock.calls.find(([, context]) => (
+      context.operation === "preflightIdentityFunctionDefinitions"
+    ));
+    const fingerprintSql =
+      (fingerprintCall?.[0] as { text?: string } | undefined)?.text ?? "";
+    for (const fingerprintedField of [
+      "prosrc",
+      "prosecdef",
+      "proleakproof",
+      "provolatile",
+      "proparallel",
+      "proconfig",
+      "public_execute",
+    ]) expect(fingerprintSql).toContain(fingerprintedField);
   });
 
   it.each([

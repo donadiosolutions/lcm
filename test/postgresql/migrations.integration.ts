@@ -305,7 +305,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       }, { domain: "factory", operation: "verifyRecurringPublicAclRollback" }))
         .resolves.toMatchObject({
           rows: [{
-            applied_count: "2",
+              applied_count: "2",
             probe_exists: false,
             public_create: true,
           }],
@@ -430,7 +430,7 @@ describe("PostgreSQL migrations and database isolation", () => {
               migrations: [...loadPostgreSqlMigrations(), later],
             }).catch((error: unknown) => error);
             expect(failure).toMatchObject({
-              existingObjectCount: 35,
+              existingObjectCount: 36,
               operation: "preflightManagedObjectOwnership",
               requiredOwner: "lcm_test_migrator",
               schemaName: "lcm",
@@ -470,6 +470,56 @@ describe("PostgreSQL migrations and database isolation", () => {
       } finally {
         await admin.close();
       }
+    });
+  });
+
+  it("rejects a missing object from the recorded 0002 inventory", async () => {
+    await withPostgreSqlTestDatabase("migration-missing-object", async (database) => {
+      await database.migrator.query({
+        text: "DROP TABLE lcm.redaction_counters",
+      }, { domain: "factory", operation: "simulateMissingBaselineObject" });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toMatchObject({
+          baselineApplied: true,
+          expectedObjectCount: 36,
+          existingObjectCount: 35,
+          missingObjectCount: 1,
+          operation: "preflightManagedObjectOwnership",
+        });
+    });
+  });
+
+  it.each([
+    {
+      label: "body",
+      sql: `CREATE OR REPLACE FUNCTION lcm.enforce_summary_id_uniqueness()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            SET search_path = pg_catalog, public
+            AS $function$
+            BEGIN
+              RETURN NEW;
+            END
+            $function$`,
+    },
+    {
+      label: "security configuration",
+      sql: "ALTER FUNCTION lcm.enforce_large_file_id_uniqueness() SECURITY DEFINER",
+    },
+  ])("rejects identity-trigger $label drift", async ({ label, sql }) => {
+    await withPostgreSqlTestDatabase(`migration-trigger-${label}`, async (database) => {
+      await database.migrator.query({ text: sql }, {
+        domain: "factory",
+        operation: `simulateIdentityFunctionDrift:${label}`,
+      });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toMatchObject({
+          baselineApplied: true,
+          driftedFunctionCount: 1,
+          existingFunctionCount: 3,
+          expectedFunctionCount: 3,
+          operation: "preflightIdentityFunctionDefinitions",
+        });
     });
   });
 
