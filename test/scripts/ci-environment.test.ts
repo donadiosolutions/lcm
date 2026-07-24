@@ -1,4 +1,5 @@
 import {
+  linkSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -25,6 +26,7 @@ import {
   validateArchiveChecksum,
   validateImageInspection,
   validateNodeModulesStamp,
+  validatePostgreSqlTemplateArchive,
   validateTemplateArchiveEntries,
   writeArchiveChecksum,
   writeNodeModulesStamp,
@@ -216,12 +218,62 @@ describe("CI environment cache metadata", () => {
       "./18/docker/PG_VERSION",
       "./18/docker/global/pg_control",
     ].join("\n");
-    expect(() => validateTemplateArchiveEntries(valid)).not.toThrow();
-    expect(() => validateTemplateArchiveEntries("")).toThrow("empty");
-    expect(() => validateTemplateArchiveEntries("../PG_VERSION\nglobal/pg_control")).toThrow("unsafe");
-    expect(() => validateTemplateArchiveEntries("/PG_VERSION\nglobal/pg_control")).toThrow("unsafe");
-    expect(() => validateTemplateArchiveEntries("global/pg_control")).toThrow("PG_VERSION");
-    expect(() => validateTemplateArchiveEntries("PG_VERSION")).toThrow("pg_control");
+    const validMetadata = [
+      "drwx------ 0/0 0 2026-01-01 00:00 ./",
+      "drwx------ 0/0 0 2026-01-01 00:00 ./18/",
+      "drwx------ 0/0 0 2026-01-01 00:00 ./18/docker/",
+      "-rw------- 0/0 3 2026-01-01 00:00 ./18/docker/PG_VERSION",
+      "-rw------- 0/0 8 2026-01-01 00:00 ./18/docker/global/pg_control",
+    ].join("\n");
+    expect(() => validateTemplateArchiveEntries(valid, validMetadata)).not.toThrow();
+    expect(() => validateTemplateArchiveEntries("", "")).toThrow("empty");
+    expect(() => validateTemplateArchiveEntries(valid, validMetadata.replace(
+      "-rw------- 0/0 3",
+      "lrwxrwxrwx 0/0 0",
+    ))).toThrow("unsafe entry type");
+    expect(() => validateTemplateArchiveEntries(valid, validMetadata.replace(
+      "-rw------- 0/0 3",
+      "hrw------- 0/0 0",
+    ))).toThrow("unsafe entry type");
+    expect(() => validateTemplateArchiveEntries(valid, validMetadata.split("\n").slice(1).join("\n")))
+      .toThrow("metadata is inconsistent");
+    expect(() => validateTemplateArchiveEntries(
+      "../PG_VERSION\nglobal/pg_control",
+      "-rw------- first\n-rw------- second",
+    )).toThrow("unsafe");
+    expect(() => validateTemplateArchiveEntries(
+      "/PG_VERSION\nglobal/pg_control",
+      "-rw------- first\n-rw------- second",
+    )).toThrow("unsafe");
+    expect(() => validateTemplateArchiveEntries("global/pg_control", "-rw------- control"))
+      .toThrow("PG_VERSION");
+    expect(() => validateTemplateArchiveEntries("PG_VERSION", "-rw------- version"))
+      .toThrow("pg_control");
+  });
+
+  it("rejects link-bearing PostgreSQL template archives before extraction", async () => {
+    const root = temporaryDirectory();
+    const contents = join(root, "contents");
+    mkdirSync(join(contents, "global"), { recursive: true });
+    writeFileSync(join(contents, "PG_VERSION"), "18\n");
+    writeFileSync(join(contents, "global", "pg_control"), "control\n");
+
+    for (const linkType of ["symbolic", "hard"] as const) {
+      const unsafeEntry = join(contents, `unsafe-${linkType}`);
+      if (linkType === "symbolic") symlinkSync("../outside", unsafeEntry);
+      else linkSync(join(contents, "PG_VERSION"), unsafeEntry);
+      const archive = join(root, `${linkType}.tar`);
+      await runProcess("tar", [
+        "--create", "--file", archive,
+        "--directory", contents,
+        ".",
+      ]);
+      await writeArchiveChecksum(archive);
+      await expect(validatePostgreSqlTemplateArchive(archive)).rejects.toThrow(
+        "unsafe entry type",
+      );
+      rmSync(unsafeEntry);
+    }
   });
 
   it("checksums cached archives and rejects modified contents", async () => {

@@ -22,6 +22,7 @@ export const NODE_VERSION = "22.20.0";
 export const POSTGRES_TEMPLATE_DATABASE = "lcm_harness_template";
 export const POSTGRES_TEMPLATE_MARKER = "lcm-postgresql-template-v1";
 export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
+export const MAX_ARCHIVE_INVENTORY_BYTES = 4 * 1024 * 1024;
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const templateInitScript = join(repositoryRoot, "test", "postgresql", "template-init.sh");
@@ -194,9 +195,19 @@ export function validateImageInspection(image, inspection) {
   }
 }
 
-export function validateTemplateArchiveEntries(entries) {
+export function validateTemplateArchiveEntries(entries, verboseEntries) {
   const paths = entries.split(/\r?\n/u).filter(Boolean);
   if (paths.length === 0) throw new Error("PostgreSQL template archive is empty");
+  const metadata = verboseEntries.split(/\r?\n/u).filter(Boolean);
+  if (metadata.length !== paths.length) {
+    throw new Error("PostgreSQL template archive metadata is inconsistent");
+  }
+  for (const entry of metadata) {
+    const type = entry[0];
+    if (type !== "-" && type !== "d") {
+      throw new Error("PostgreSQL template archive contains an unsafe entry type");
+    }
+  }
   for (const path of paths) {
     if (path.startsWith("/") || path.split("/").includes("..")) {
       throw new Error("PostgreSQL template archive contains an unsafe path");
@@ -236,6 +247,11 @@ export async function validateArchiveChecksum(archivePath) {
 
 export function runProcess(command, args, options = {}) {
   return new Promise((resolvePromise, reject) => {
+    const maxCapturedOutputBytes = options.maxCapturedOutputBytes ?? MAX_CAPTURED_OUTPUT_BYTES;
+    if (!Number.isSafeInteger(maxCapturedOutputBytes) || maxCapturedOutputBytes < 1) {
+      reject(new Error("subprocess output limit must be a positive safe integer"));
+      return;
+    }
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env,
@@ -248,18 +264,18 @@ export function runProcess(command, args, options = {}) {
     let settled = false;
     const appendTail = (current, chunk) => {
       const next = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      if (next.length >= MAX_CAPTURED_OUTPUT_BYTES) {
+      if (next.length >= maxCapturedOutputBytes) {
         return {
-          value: next.subarray(-MAX_CAPTURED_OUTPUT_BYTES),
-          truncated: current.length > 0 || next.length > MAX_CAPTURED_OUTPUT_BYTES,
+          value: next.subarray(-maxCapturedOutputBytes),
+          truncated: current.length > 0 || next.length > maxCapturedOutputBytes,
         };
       }
-      if (current.length + next.length <= MAX_CAPTURED_OUTPUT_BYTES) {
+      if (current.length + next.length <= maxCapturedOutputBytes) {
         return { value: Buffer.concat([current, next]), truncated: false };
       }
       return {
         value: Buffer.concat([
-          current.subarray(current.length + next.length - MAX_CAPTURED_OUTPUT_BYTES),
+          current.subarray(current.length + next.length - maxCapturedOutputBytes),
           next,
         ]),
         truncated: true,
@@ -339,6 +355,21 @@ async function removeDockerObject(type, name) {
   });
 }
 
+async function readTemplateArchiveInventory(archivePath) {
+  const commonArguments = [
+    "--list",
+    "--file", archivePath,
+    "--quoting-style=escape",
+  ];
+  const options = { maxCapturedOutputBytes: MAX_ARCHIVE_INVENTORY_BYTES };
+  const paths = await runProcess("tar", commonArguments, options);
+  const metadata = await runProcess("tar", ["--verbose", ...commonArguments], options);
+  if (paths.stdoutTruncated || metadata.stdoutTruncated) {
+    throw new Error("PostgreSQL template archive inventory exceeds the validation limit");
+  }
+  validateTemplateArchiveEntries(paths.stdout, metadata.stdout);
+}
+
 export async function buildPostgreSqlTemplate(archivePath) {
   const suffix = randomBytes(8).toString("hex");
   const container = `lcm-pg-template-${suffix}`;
@@ -407,11 +438,7 @@ export async function buildPostgreSqlTemplate(archivePath) {
       "-ceu",
       "data_dir=\"$(dirname \"$(find /source -mindepth 2 -maxdepth 3 -name PG_VERSION -type f -print -quit)\")\"; test -n \"$data_dir\"; pg_controldata \"$data_dir\" | grep -Eq 'Database cluster state:[[:space:]]+shut down'; tar --numeric-owner --create --file \"/archive/$ARCHIVE_NAME\" --directory /source .",
     ]);
-    const result = await runProcess("tar", ["--list", "--file", archivePath]);
-    if (result.stdoutTruncated) {
-      throw new Error("PostgreSQL template archive inventory exceeds the validation limit");
-    }
-    validateTemplateArchiveEntries(result.stdout);
+    await readTemplateArchiveInventory(archivePath);
     await writeArchiveChecksum(archivePath);
   } finally {
     await removeDockerObject("container", container);
@@ -421,11 +448,7 @@ export async function buildPostgreSqlTemplate(archivePath) {
 
 export async function validatePostgreSqlTemplateArchive(archivePath) {
   await validateArchiveChecksum(archivePath);
-  const result = await runProcess("tar", ["--list", "--file", archivePath]);
-  if (result.stdoutTruncated) {
-    throw new Error("PostgreSQL template archive inventory exceeds the validation limit");
-  }
-  validateTemplateArchiveEntries(result.stdout);
+  await readTemplateArchiveInventory(archivePath);
 }
 
 function writeGithubOutputs(metadata) {
