@@ -457,7 +457,10 @@ function normalizeProjectDisplayName(value: string): string {
 }
 
 function defaultProjectDisplayName(projectPath: string): string {
-  const inferred = basename(normalizeProjectPath(projectPath));
+  // Naming follows exactly the path selected by the operator. Identity
+  // normalization may resolve a symlink for PostgreSQL uniqueness, but must
+  // not replace its lexical basename with the target directory's name.
+  const inferred = basename(projectPath);
   // Native path.basename returns an empty string for filesystem roots,
   // including drive and share roots on Windows.
   return inferred || "Filesystem root";
@@ -729,61 +732,75 @@ export async function createProject(
           ),
           selectedPath,
         ];
-    return withSession(config, deps, async (repository) => {
-      let remote: RemoteProject;
-      try {
-        remote = await createRemoteProject(repository, {
-          machineId: machine.machineId,
-          displayName,
-          ...selectedPath,
-          aliases: entryPaths,
-        });
-      } catch (error) {
-        if (!selectedIsStored) {
-          restoreLocallyAddedCreateAlias(
-            local.id,
-            projectPath,
-            priorEntry,
-            shown.entry,
+    let sessionCallbackStarted = false;
+    try {
+      return await withSession(config, deps, async (repository) => {
+        sessionCallbackStarted = true;
+        let remote: RemoteProject;
+        try {
+          remote = await createRemoteProject(repository, {
+            machineId: machine.machineId,
+            displayName,
+            ...selectedPath,
+            aliases: entryPaths,
+          });
+        } catch (error) {
+          if (!selectedIsStored) {
+            restoreLocallyAddedCreateAlias(
+              local.id,
+              projectPath,
+              priorEntry,
+              shown.entry,
+            );
+          }
+          throw error;
+        }
+        try {
+          setRemoteProjectBinding(remote.projectId, { hash: local.id, expectedEntry: shown.entry });
+        } catch {
+          try {
+            const adopted = showProjectMapEntry(projectPath);
+            if (
+              !adopted.transient
+              && adopted.hash === local.id
+              && adopted.entry.remoteProjectId === remote.projectId
+            ) {
+              return {
+                local: resolveProjectIdentity(projectPath),
+                remote,
+              };
+            }
+          } catch {
+            // An unreadable or conflicting map is not equivalent adoption.
+          }
+          // A committed project is already public to every LCM home that shares
+          // this machine identity. Another home may have adopted it after the
+          // commit but before this local map write failed, and PostgreSQL cannot
+          // distinguish that adoption from the creator's own aliases. Never
+          // delete the published project or aliases as compensation. Retain a
+          // provisional lexical alias as well so the exact recovery command can
+          // address the path that PostgreSQL now owns.
+          throw new ProjectIdentityReconciliationError(
+            "PostgreSQL created the project but the local binding could not be confirmed",
+            `Run \`lcm project link -- ${quoteShellArgument(remote.projectId)} ${quoteShellArgument(projectPath)}\` to reconcile it.`,
           );
         }
-        throw error;
-      }
-      try {
-        setRemoteProjectBinding(remote.projectId, { hash: local.id, expectedEntry: shown.entry });
-      } catch {
-        try {
-          const adopted = showProjectMapEntry(projectPath);
-          if (
-            !adopted.transient
-            && adopted.hash === local.id
-            && adopted.entry.remoteProjectId === remote.projectId
-          ) {
-            return {
-              local: resolveProjectIdentity(projectPath),
-              remote,
-            };
-          }
-        } catch {
-          // An unreadable or conflicting map is not equivalent adoption.
-        }
-        // A committed project is already public to every LCM home that shares
-        // this machine identity. Another home may have adopted it after the
-        // commit but before this local map write failed, and PostgreSQL cannot
-        // distinguish that adoption from the creator's own aliases. Never
-        // delete the published project or aliases as compensation. Retain a
-        // provisional lexical alias as well so the exact recovery command can
-        // address the path that PostgreSQL now owns.
-        throw new ProjectIdentityReconciliationError(
-          "PostgreSQL created the project but the local binding could not be confirmed",
-          `Run \`lcm project link -- ${quoteShellArgument(remote.projectId)} ${quoteShellArgument(projectPath)}\` to reconcile it.`,
+        return {
+          local: resolveProjectIdentity(projectPath),
+          remote,
+        };
+      });
+    } catch (error) {
+      if (!sessionCallbackStarted && !selectedIsStored) {
+        restoreLocallyAddedCreateAlias(
+          local.id,
+          projectPath,
+          priorEntry,
+          shown.entry,
         );
       }
-      return {
-        local: resolveProjectIdentity(projectPath),
-        remote,
-      };
-    });
+      throw error;
+    }
   });
 }
 

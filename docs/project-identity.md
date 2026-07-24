@@ -277,10 +277,14 @@ same exact path set with expected-owner checks instead of deleting every alias
 for the machine/project pair. Batch rebinds and unlinks read back every path
 after an uncertain commit before changing the local map, and batch restoration
 is all-or-nothing when a local map write fails.
-Created-project compensation removes the complete exact alias set created for
-the local entry (its canonical path and every alias) before deleting the
-project if it remains unreferenced. Project listings use one ordered
-PostgreSQL snapshot so project and alias rows cannot come from different reads.
+Failures before the PostgreSQL create callback begins restore any provisional
+local symlink alias with an exact prior-entry comparison, so retrying does not
+produce duplicate normalized paths. After PostgreSQL publishes a project, LCM
+does not delete that project or its aliases to compensate for a failed local
+binding; it retains the published state and reports the exact
+`lcm project link -- <created-project-uuid> <entered-path>` recovery command.
+Project listings use one ordered PostgreSQL snapshot so project and alias rows
+cannot come from different reads.
 
 Hooks remain successful when PostgreSQL identity or storage is unavailable.
 User-prompt passive events are written to the local SQLite outbox before remote

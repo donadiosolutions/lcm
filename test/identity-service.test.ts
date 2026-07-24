@@ -954,6 +954,109 @@ describe("identity service", () => {
     });
   });
 
+  it("restores a newly added symlink alias when session acquisition fails and permits retry", async () => {
+    await register();
+    const canonical = makeProject("create-session-failure-target");
+    const entered = join(home, "create-session-failure-entered");
+    symlinkSync(canonical, entered);
+    const local = resolveProjectIdentity(canonical);
+    const acquisitionFailure = new Error("session acquisition failed");
+    const originalOpenSession = deps.openSession!;
+    const openSession = vi.fn()
+      .mockRejectedValueOnce(acquisitionFailure)
+      .mockImplementation(originalOpenSession);
+    deps = { ...deps, openSession };
+
+    await expect(createProject(POSTGRESQL_CONFIG, entered, {}, deps))
+      .rejects.toBe(acquisitionFailure);
+    expect(showProjectMapEntry(local.id).entry).toEqual({
+      canonical,
+      aliases: [],
+    });
+    expect(repository.createProject).not.toHaveBeenCalled();
+
+    await expect(createProject(POSTGRESQL_CONFIG, entered, {}, deps))
+      .resolves.toMatchObject({
+        local: { id: local.id, canonical, remoteProjectId: PROJECT_A },
+      });
+    expect(showProjectMapEntry(local.id).entry).toEqual({
+      canonical,
+      aliases: [entered],
+      remoteProjectId: PROJECT_A,
+    });
+    expect(repository.createProject).toHaveBeenCalledTimes(1);
+    expect(openSession).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts an exact concurrent alias restoration when session acquisition fails", async () => {
+    await register();
+    const canonical = makeProject("create-session-concurrent-restore-target");
+    const entered = join(home, "create-session-concurrent-restore-entered");
+    symlinkSync(canonical, entered);
+    const local = resolveProjectIdentity(canonical);
+    const acquisitionFailure = new Error("session acquisition failed");
+    deps = {
+      ...deps,
+      openSession: vi.fn(async () => {
+        removeProjectAlias(entered, { hash: local.id });
+        throw acquisitionFailure;
+      }),
+    };
+
+    await expect(createProject(POSTGRESQL_CONFIG, entered, {}, deps))
+      .rejects.toBe(acquisitionFailure);
+    expect(showProjectMapEntry(local.id).entry).toEqual({
+      canonical,
+      aliases: [],
+    });
+  });
+
+  it("does not clobber a concurrent map change while restoring after session failure", async () => {
+    await register();
+    const canonical = makeProject("create-session-concurrent-change-target");
+    const entered = join(home, "create-session-concurrent-change-entered");
+    const concurrent = makeProject("create-session-concurrent-change-alias");
+    symlinkSync(canonical, entered);
+    const local = resolveProjectIdentity(canonical);
+    deps = {
+      ...deps,
+      openSession: vi.fn(async () => {
+        addProjectAlias(concurrent, { hash: local.id });
+        throw new Error("session acquisition failed");
+      }),
+    };
+
+    await expect(createProject(POSTGRESQL_CONFIG, entered, {}, deps))
+      .rejects.toThrow("changed during coordinated mutation");
+    expect(showProjectMapEntry(local.id).entry).toEqual({
+      canonical,
+      aliases: [entered, concurrent],
+    });
+    expect(repository.createProject).not.toHaveBeenCalled();
+  });
+
+  it("retains an existing local alias when session acquisition fails", async () => {
+    await register();
+    const canonical = makeProject("create-session-existing-target");
+    const entered = makeProject("create-session-existing-entered");
+    const local = resolveProjectIdentity(canonical);
+    addProjectAlias(entered, { hash: local.id });
+    const acquisitionFailure = new Error("session acquisition failed");
+    deps = {
+      ...deps,
+      openSession: vi.fn(async () => {
+        throw acquisitionFailure;
+      }),
+    };
+
+    await expect(createProject(POSTGRESQL_CONFIG, entered, {}, deps))
+      .rejects.toBe(acquisitionFailure);
+    expect(showProjectMapEntry(local.id).entry).toEqual({
+      canonical,
+      aliases: [entered],
+    });
+  });
+
   it("accepts an equivalent concurrent restoration after remote creation fails", async () => {
     await register();
     const canonical = makeProject("create-symlink-concurrent-remote-failure-target");
@@ -1174,6 +1277,24 @@ describe("identity service", () => {
       expect.objectContaining({ displayName: "default-name" }),
     );
     expect(repository.createProject.mock.calls.at(-1)?.[0]).not.toHaveProperty("identityKey");
+  });
+
+  it("defaults the project name from the selected symlink's lexical basename", async () => {
+    await register();
+    const canonical = makeProject("default-name-canonical-target");
+    const entered = join(home, "default-name-selected-symlink");
+    symlinkSync(canonical, entered);
+
+    await expect(createProject(POSTGRESQL_CONFIG, entered, {}, deps))
+      .resolves.toMatchObject({
+        local: { canonical },
+        remote: { displayName: "default-name-selected-symlink" },
+      });
+    expect(repository.createProject).toHaveBeenCalledWith(expect.objectContaining({
+      displayName: "default-name-selected-symlink",
+      path: entered,
+      normalizedPath: canonical,
+    }));
   });
 
   it("preserves a created remote project when its local binding cannot be written", async () => {
