@@ -36,6 +36,7 @@ import {
   showProjectMapEntry,
 } from "../src/project-map.js";
 import {
+  PostgreSqlIdentityAliasPathConflictError,
   PostgreSqlIdentityConflictError,
   PostgreSqlIdentityCreateOutcomeUnknownError,
   PostgreSqlIdentityLinkOutcomeUnknownError,
@@ -187,6 +188,18 @@ function fakeRepository(): IdentityRepository & {
       ))) {
         return null;
       }
+      input.aliases.forEach(({ path, normalizedPath }, index) => {
+        const owner = current[index];
+        if (owner?.projectId === input.projectId && owner.alias.path !== path) {
+          throw new PostgreSqlIdentityAliasPathConflictError(
+            input.machineId,
+            normalizedPath,
+            input.projectId,
+            owner.alias.path,
+            path,
+          );
+        }
+      });
       const linked = input.aliases.map(({ path, normalizedPath }) => {
         const remoteAlias = alias(input.projectId, normalizedPath, path);
         aliases.set(normalizedPath, { projectId: input.projectId, alias: remoteAlias });
@@ -2006,7 +2019,7 @@ describe("identity service", () => {
       .resolves.toMatchObject({ projectId: PROJECT_A });
   });
 
-  it("restores a same-owner lexical path refresh when local binding persistence fails", async () => {
+  it("rejects a same-owner lexical path collision without changing either home", async () => {
     await register();
     const path = makeProject("lexical-refresh-compensation");
     const priorPath = `${path}/.`;
@@ -2016,25 +2029,10 @@ describe("identity service", () => {
       path: priorPath,
       normalizedPath: path,
     });
-    const originalReplace = repository.replaceProjectAliases.getMockImplementation()!;
-    repository.replaceProjectAliases = vi.fn(async (input) => {
-      const mutation = await originalReplace(input);
-      writeFileSync(projectMapPath(), "{broken");
-      return mutation;
-    });
 
     await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, path, {}, deps))
-      .rejects.toThrow("Expected property name");
-    expect(repository.restoreProjectAliasBatch).toHaveBeenCalledWith(
-      MACHINE_ID,
-      PROJECT_A,
-      [expect.objectContaining({
-        projectId: PROJECT_A,
-        alias: expect.objectContaining({ path: priorPath }),
-      })],
-      [false],
-      [{ path, normalizedPath: path }],
-    );
+      .rejects.toBeInstanceOf(PostgreSqlIdentityAliasPathConflictError);
+    expect(repository.restoreProjectAliasBatch).not.toHaveBeenCalled();
     await expect(repository.resolveProject(MACHINE_ID, path))
       .resolves.toMatchObject({
         projectId: PROJECT_A,
@@ -2042,14 +2040,13 @@ describe("identity service", () => {
       });
   });
 
-  it("does not restore a stale lexical snapshot after uncertain refresh readback", async () => {
+  it("does not restore an exact alias after uncertain idempotent readback", async () => {
     await register();
     const path = makeProject("lexical-refresh-uncertain");
-    const priorPath = `${path}/.`;
     await repository.linkProject({
       machineId: MACHINE_ID,
       projectId: PROJECT_A,
-      path: priorPath,
+      path,
       normalizedPath: path,
     });
     const originalReplace = repository.replaceProjectAliases.getMockImplementation()!;
@@ -2081,46 +2078,24 @@ describe("identity service", () => {
       });
   });
 
-  it("rejects ambiguous restoration readback with the prior project but a different lexical path", async () => {
+  it("rejects a lexical collision before entering local-map reconciliation", async () => {
     await register();
     const path = makeProject("lexical-restore-readback");
     const priorPath = `${path}/.`;
-    const concurrentPath = `${path}/concurrent-lexical-winner`;
     await repository.linkProject({
       machineId: MACHINE_ID,
       projectId: PROJECT_A,
       path: priorPath,
       normalizedPath: path,
     });
-    const originalReplace = repository.replaceProjectAliases.getMockImplementation()!;
-    const originalRestore = repository.restoreProjectAliasBatch.getMockImplementation()!;
-    repository.replaceProjectAliases = vi.fn(async (input) => {
-      const mutation = await originalReplace(input);
-      writeFileSync(projectMapPath(), "{broken");
-      return mutation;
-    });
-    repository.restoreProjectAliasBatch = vi.fn(async (...input) => {
-      await originalRestore(...input);
-      await repository.replaceProjectAlias({
-        machineId: MACHINE_ID,
-        expectedPriorProjectId: PROJECT_A,
-        projectId: PROJECT_A,
-        path: concurrentPath,
-        normalizedPath: path,
-      });
-      throw new PostgreSqlCommitOutcomeUnknownError({
-        domain: "identity",
-        operation: "restoreProjectAliasBatch",
-        projectId: PROJECT_A,
-      });
-    });
 
     await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, path, {}, deps))
-      .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
+      .rejects.toBeInstanceOf(PostgreSqlIdentityAliasPathConflictError);
+    expect(repository.restoreProjectAliasBatch).not.toHaveBeenCalled();
     await expect(repository.resolveProject(MACHINE_ID, path))
       .resolves.toMatchObject({
         projectId: PROJECT_A,
-        alias: { path: concurrentPath, normalizedPath: path },
+        alias: { path: priorPath, normalizedPath: path },
       });
   });
 

@@ -311,8 +311,12 @@ authenticate or branch on the human-readable error text. The raw hook-facing
 `POST /prompt-search` endpoint reports that same `503`; the prompt hook/client
 layer treats the response as an unavailable optional hint source and still
 exits successfully with the learning instruction. Passive events are already
-durable in the local SQLite outbox before that request. The daemon does not run
-SQLite transcript scans or passive-outbox sweeps. Other project operations fail
+durable in the local SQLite outbox before that request. Setting
+`restoration.promptSearchMaxResults` to `0` suppresses returned hints, but does
+not bypass PostgreSQL identity or storage admission: missing identity still
+returns `409`, and the staged backend still returns `503`. SQLite retains its
+immediate empty-result behavior for this setting. The daemon does not run SQLite
+transcript scans or passive-outbox sweeps. Other project operations fail
 at a cause-free unavailable-backend boundary after validating machine
 registration and the explicit project binding. LCM does not fall back to
 SQLite, return false empty results from manual read routes, or advertise

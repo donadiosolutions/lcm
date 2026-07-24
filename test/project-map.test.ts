@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   addProjectAlias,
   clearRemoteProjectBinding,
@@ -674,20 +674,6 @@ describe("project map", () => {
         },
         expected: "claimed concurrently",
       },
-      {
-        name: "claim-release-read",
-        observer: (event, path) => {
-          if (event === "before-claim-release-read") writeFileSync(path, "changed");
-        },
-        expected: "ownership changed",
-      },
-      {
-        name: "claim-release-delete",
-        observer: (event, path) => {
-          if (event === "before-claim-release-delete") rmSync(path);
-        },
-        expected: "owner disappeared",
-      },
     ];
 
     for (const scenario of scenarios) {
@@ -719,6 +705,53 @@ describe("project map", () => {
         _lockObserverForTesting: scenario.observer,
       })).toThrow(scenario.expected);
     }
+  });
+
+  it.each([
+    {
+      name: "ownership read",
+      observer: (event: string, path: string) => {
+        if (event === "before-claim-release-read") writeFileSync(path, "changed");
+      },
+    },
+    {
+      name: "owner deletion",
+      observer: (event: string, path: string) => {
+        if (event === "before-claim-release-delete") rmSync(path);
+      },
+    },
+    {
+      name: "claim directory removal",
+      observer: (event: string, path: string) => {
+        if (event === "before-claim-release-delete") {
+          writeFileSync(join(dirname(path), "concurrent"), "occupied", { mode: 0o600 });
+        }
+      },
+    },
+  ])("does not strand a published successor when reclaim-claim $name fails", ({ name, observer }) => {
+    const canonical = makeDir(`lock-post-publish-${name.replaceAll(" ", "-")}`);
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    const mainNonce = "d".repeat(32);
+    const reclaimPath = `${lockPath}.reclaim-${mainNonce}`;
+    writeFileSync(lockPath, `${JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      processStartTime: "1",
+      nonce: mainNonce,
+    })}\n`, { mode: 0o600 });
+
+    expect(setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _lockObserverForTesting: observer,
+    }).changed).toBe(true);
+    expect(existsSync(lockPath)).toBe(false);
+    expect(existsSync(reclaimPath)).toBe(true);
+    expect(showProjectMapEntry(canonical).entry.remoteProjectId).toBe(remoteProjectId);
+
+    expect(clearRemoteProjectBinding(canonical, remoteProjectId).changed).toBe(true);
+    expect(existsSync(lockPath)).toBe(false);
+    expect(showProjectMapEntry(canonical).entry.remoteProjectId).toBeUndefined();
   });
 
   it("detects main lock ownership changes before releasing a completed mutation", () => {

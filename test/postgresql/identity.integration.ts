@@ -885,4 +885,52 @@ describe("PostgreSQL 18 machine and project identities", () => {
         });
     });
   });
+
+  it("keeps batch aliases stable when two homes offer different lexical paths", async () => {
+    await withPostgreSqlTestDatabase("identity-batch-two-homes", async (database) => {
+      await grantIdentityRuntimePrivileges(database);
+      const repository = new PostgreSqlIdentityRepository(database.runtime);
+      const machine = await repository.registerMachine(
+        `machine:${"9".repeat(64)}`,
+        "Machine with two homes",
+      );
+      const project = await repository.createProject({
+        machineId: machine.machineId,
+        displayName: "Two-home target",
+        path: "/work/two-home-root",
+        normalizedPath: "/work/two-home-root",
+      });
+      const firstHome = {
+        path: "/home/first/work/project",
+        normalizedPath: "/work/shared-project",
+      };
+
+      await expect(repository.replaceProjectAliases({
+        machineId: machine.machineId,
+        projectId: project.projectId,
+        aliases: [firstHome],
+      })).resolves.toMatchObject({ inserted: [true] });
+      await expect(repository.replaceProjectAliases({
+        machineId: machine.machineId,
+        expectedPriorProjectId: project.projectId,
+        projectId: project.projectId,
+        aliases: [firstHome],
+      })).resolves.toMatchObject({ inserted: [false] });
+
+      await expect(repository.replaceProjectAliases({
+        machineId: machine.machineId,
+        expectedPriorProjectId: project.projectId,
+        projectId: project.projectId,
+        aliases: [{
+          path: "/home/second/work/project",
+          normalizedPath: firstHome.normalizedPath,
+        }],
+      })).rejects.toBeInstanceOf(PostgreSqlIdentityAliasPathConflictError);
+      await expect(repository.resolveProject(machine.machineId, firstHome.normalizedPath))
+        .resolves.toMatchObject({
+          projectId: project.projectId,
+          alias: { path: firstHome.path },
+        });
+    });
+  });
 });

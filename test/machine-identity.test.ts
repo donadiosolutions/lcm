@@ -487,9 +487,10 @@ describe("machine identity file", () => {
     expect(readMachineIdentity(home)).toEqual(first);
   });
 
-  it("force-recovers a corrupt regular file and preserves its bytes", () => {
+  it("force-recovers an oversized corrupt regular file and preserves its bytes", () => {
     mkdirSync(join(home, ".lcm"), { recursive: true });
-    writeFileSync(machineIdentityPath(home), "{broken", { mode: 0o600 });
+    const corrupt = `{${"x".repeat(64 * 1024 + 1)}`;
+    writeFileSync(machineIdentityPath(home), corrupt, { mode: 0o600 });
     const identity: MachineIdentity = {
       version: 1,
       identityKey: `machine:${"a".repeat(64)}`,
@@ -499,7 +500,8 @@ describe("machine identity file", () => {
 
     const recovered = recoverMachineIdentity(identity, { homeDir: home, force: true });
 
-    expect(readFileSync(recovered.backupPath!, "utf8")).toBe("{broken");
+    expect(readFileSync(recovered.backupPath!, "utf8")).toBe(corrupt);
+    expect(statSync(recovered.backupPath!).mode & 0o777).toBe(0o600);
     expect(readMachineIdentity(home)).toEqual(identity);
   });
 

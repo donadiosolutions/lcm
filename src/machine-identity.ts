@@ -168,7 +168,7 @@ function prettyMachineIdentity(identity: StoredMachineIdentity): string {
   return `${JSON.stringify(identity, null, 2)}\n`;
 }
 
-function readMachineIdentityContent(path: string): string | null {
+function validateMachineIdentityFile(path: string): boolean {
   try {
     const stat = lstatSync(path);
     if (!stat.isFile() || stat.isSymbolicLink()) {
@@ -186,14 +186,19 @@ function readMachineIdentityContent(path: string): string | null {
         `Run \`chmod 600 -- ${quoteShellArgument(path)}\`, then retry.`,
       );
     }
-    return readBoundedRegularFile(path, {
-      allowedRoot: dirname(path),
-      maxBytes: MAX_MACHINE_IDENTITY_BYTES,
-    });
+    return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
+}
+
+function readMachineIdentityContent(path: string): string | null {
+  if (!validateMachineIdentityFile(path)) return null;
+  return readBoundedRegularFile(path, {
+    allowedRoot: dirname(path),
+    maxBytes: MAX_MACHINE_IDENTITY_BYTES,
+  });
 }
 
 export function readMachineIdentity(homeDir?: string): StoredMachineIdentity | null {
@@ -324,10 +329,16 @@ export function finalizeMachineIdentity(
 
 function backupExistingMachineIdentity(homeDir?: string): string | undefined {
   const path = machineIdentityPath(homeDir);
-  const content = readMachineIdentityContent(path);
-  if (content === null) return undefined;
+  if (!validateMachineIdentityFile(path)) return undefined;
   const directory = oldMachineIdentitiesDir(homeDir);
   ensurePrivateDirectory(directory);
+  // Recovery backups are not parsed and therefore intentionally do not share
+  // the 64 KiB identity-document limit. The descriptor-bound reader still
+  // enforces regular-file, no-follow, containment, and replacement checks.
+  const content = readBoundedRegularFile(path, {
+    allowedRoot: dirname(path),
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  });
   const timestamp = Math.floor(Date.now() / 1000);
   for (let suffix = 0; suffix < 1_000; suffix += 1) {
     const discriminator = suffix === 0 ? "" : `-${suffix}`;

@@ -227,7 +227,10 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
       return;
     }
 
-    if (config.restoration.promptSearchMaxResults === 0) {
+    if (
+      config.restoration.promptSearchMaxResults === 0
+      && config.storage.backend === "sqlite"
+    ) {
       sendJson(res, 200, { hints: [], ids: [] });
       return;
     }
@@ -239,6 +242,10 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
       const identity = projectIdentity(validatedCwd, config.storage);
       activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
       project = await openExistingProject(activeFactory, identity) ?? undefined;
+      if (config.restoration.promptSearchMaxResults === 0) {
+        sendJson(res, 200, { hints: [], ids: [] });
+        return;
+      }
       if (!project) {
         sendJson(res, 200, { hints: [] });
         return;

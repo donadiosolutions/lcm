@@ -97,6 +97,7 @@ describe("daemon server", () => {
         LCM_POSTGRES_CA_FILE: caPath,
       },
     );
+    config.restoration.promptSearchMaxResults = 0;
     daemon = await createDaemon(config, { _scanForTranscripts: scanForTranscripts });
     const port = daemon.address().port;
 
@@ -150,6 +151,11 @@ describe("daemon server", () => {
       { path: "/recent", operation: "recent", body: { cwd: tempHome } },
       { path: "/describe", operation: "describe", body: { cwd: tempHome, nodeId: "node" } },
       { path: "/expand", operation: "expand", body: { cwd: tempHome, nodeId: "node" } },
+      {
+        path: "/prompt-search",
+        operation: "prompt-search",
+        body: { cwd: tempHome, query: "remember" },
+      },
     ];
     for (const request of manualReadRequests) {
       const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {

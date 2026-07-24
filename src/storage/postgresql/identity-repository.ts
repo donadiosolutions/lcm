@@ -523,7 +523,17 @@ export class PostgreSqlIdentityRepository {
         const inserted = input.aliases.map(() => false);
         for (const [index, alias] of input.aliases.entries()) {
           const row = currentByPath.get(alias.normalizedPath);
-          if (row && row.project_id === input.expectedPriorProjectId) {
+          if (row?.project_id === input.projectId) {
+            if (row.path !== alias.path) {
+              throw new PostgreSqlIdentityAliasPathConflictError(
+                input.machineId,
+                alias.normalizedPath,
+                input.projectId,
+                row.path,
+                alias.path,
+              );
+            }
+          } else if (row && row.project_id === input.expectedPriorProjectId) {
             await transaction.query({
               text: `UPDATE lcm.project_aliases
                      SET project_id = $1,
@@ -540,22 +550,7 @@ export class PostgreSqlIdentityRepository {
                 input.expectedPriorProjectId,
               ],
             }, { domain: "identity", operation: "replaceProjectAliases", projectId: input.projectId });
-          } else if (row?.project_id === input.projectId && row.path !== alias.path) {
-            await transaction.query({
-              text: `UPDATE lcm.project_aliases
-                     SET path = $1,
-                         linked_at = statement_timestamp()
-                     WHERE machine_id = $2
-                       AND normalized_path = $3
-                       AND project_id = $4`,
-              values: [
-                alias.path,
-                input.machineId,
-                alias.normalizedPath,
-                input.projectId,
-              ],
-            }, { domain: "identity", operation: "replaceProjectAliases", projectId: input.projectId });
-          } else if (!row) {
+          } else {
             const created = await transaction.query<AliasRow>({
               text: `INSERT INTO lcm.project_aliases
                        (project_id, machine_id, path, normalized_path)

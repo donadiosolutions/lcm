@@ -272,6 +272,7 @@ function acquireMutationLock(
     }
     const reclaimPath = `${lockPath}.reclaim-${existing.owner.nonce}`;
     acquireReclaimClaim(reclaimPath, content, label, observer);
+    let successorPublished = false;
     try {
       const claimOwnerPath = join(reclaimPath, "owner.json");
       observer("before-claim-removal-read", claimOwnerPath);
@@ -296,8 +297,16 @@ function acquireMutationLock(
       if (!atomicWritePrivateFileExclusive(lockPath, content)) {
         throw new Error(`${label} mutation lock was claimed concurrently; retry the operation`);
       }
+      successorPublished = true;
     } finally {
-      releaseReclaimClaim(reclaimPath, content, label, observer);
+      try {
+        releaseReclaimClaim(reclaimPath, content, label, observer);
+      } catch (error) {
+        // Once the successor main lock is published, it is authoritative.
+        // Reclaim-claim cleanup failure must not report acquisition failure and
+        // strand that live lock without running the protected callback.
+        if (!successorPublished) throw error;
+      }
     }
     return;
   }
