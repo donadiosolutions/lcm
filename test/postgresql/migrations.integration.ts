@@ -647,6 +647,66 @@ describe("PostgreSQL migrations and database isolation", () => {
     });
   });
 
+  it("enforces session identity uniqueness in replica and origin modes", async () => {
+    await withPostgreSqlTestDatabase("identity-trigger-replica", async (database) => {
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+      try {
+        await expect(admin.query<{ replication_role: string }>({
+          text: `SELECT pg_catalog.current_setting(
+                   'session_replication_role'
+                 ) AS replication_role`,
+        }, { domain: "factory", operation: "verifyOriginReplicationRole" }))
+          .resolves.toMatchObject({ rows: [{ replication_role: "origin" }] });
+        const project = await admin.query<{ project_id: string }>({
+          text: `INSERT INTO lcm.projects (identity_key)
+                 VALUES (pg_catalog.repeat('a', 64))
+                 RETURNING project_id::pg_catalog.text`,
+        }, { domain: "factory", operation: "createReplicaIdentityProject" });
+        const projectId = project.rows[0]!.project_id;
+        await admin.query({
+          text: "SET session_replication_role = replica",
+        }, { domain: "factory", operation: "enableReplicaRole" });
+        await admin.query({
+          text: `INSERT INTO lcm.session_ingest_log
+                   (project_id, session_id, message_count)
+                 VALUES ($1, 'replica-session', 1)`,
+          values: [projectId],
+        }, { domain: "factory", operation: "claimReplicaSessionIdentity" });
+        await expect(admin.query({
+          text: `INSERT INTO lcm.session_ingest_log
+                   (project_id, session_id, message_count)
+                 VALUES ($1, 'replica-session', 1)`,
+          values: [projectId],
+        }, { domain: "factory", operation: "rejectReplicaSessionIdentity" }))
+          .rejects.toMatchObject({
+            operation: "rejectReplicaSessionIdentity",
+            sqlState: "23505",
+          });
+      } finally {
+        await admin.query({
+          text: "SET session_replication_role = origin",
+        }, { domain: "factory", operation: "restoreOriginRole" });
+        await admin.close();
+      }
+    });
+  });
+
+  it("normalizes null identity-sequence ACLs with sequence defaults", async () => {
+    await withPostgreSqlTestDatabase("identity-sequence-default-acl", async (database) => {
+      await expect(database.migrator.query<{ has_null_acl: boolean }>({
+        text: `SELECT pg_catalog.bool_or(relation.relacl IS NULL) AS has_null_acl
+               FROM pg_catalog.pg_class AS relation
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.oid = relation.relnamespace
+               WHERE namespace.nspname = 'lcm'
+                 AND relation.relkind = 'S'`,
+      }, { domain: "factory", operation: "inspectIdentitySequenceDefaultAcl" }))
+        .resolves.toMatchObject({ rows: [{ has_null_acl: true }] });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .resolves.toMatchObject({ applied: [] });
+    });
+  });
+
   it("rejects constraint drift containing an lcm-qualified string literal", async () => {
     await withPostgreSqlTestDatabase("constraint-literal-drift", async (database) => {
       await database.migrator.query({

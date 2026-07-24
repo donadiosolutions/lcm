@@ -90,8 +90,9 @@ does not add row-level security.
   constraint, generation-expression, and ordinary-column definitions must
   retain their pinned fingerprints. Trigger fingerprints include the
   enablement mode and require
-  ordinary enabled mode (`O`), so disabled, replica-only, and always-enabled
-  drift all fail readiness. Constraint fingerprints bind the constraint name
+  always-enabled mode (`A`), so the identity checks cannot be bypassed by
+  `session_replication_role = replica`; disabled, ordinary, or replica-only
+  drift fails readiness. Constraint fingerprints bind the constraint name
   to its owning table, type, fully qualified definition, and stable
   enablement-state multiset of their zero or more internal enforcement
   triggers. Generated-column fingerprints bind the exact table, column,

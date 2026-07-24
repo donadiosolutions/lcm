@@ -22,7 +22,7 @@ const MIGRATION_MANIFEST = [
   {
     id: "0002_schema_baseline",
     filename: "0002_schema_baseline.sql",
-    sha256: "fa454af24f0729d8b19143cd1455da3bcbf4f982435802ddd615060ba321dc43",
+    sha256: "8ac25d445ef827e513a110a22f9f58be2e344ac4059adaed3b48c613486a453e",
   },
 ] as const;
 
@@ -401,7 +401,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       ordinaryColumn: "1cca7e1d3a1143074cb2eb2b809e816a2f4d1e06feba1e1b6bac46f8a725c487",
       relationAcl: "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
       table: "5ccf4137ba8c1dbe8462176414b89f30616b26622d9680d77c5e2ae271d2f64d",
-      trigger: "2c858da82c9238186861e0bcd184952ff941c7233f98a16083b20e6528006fb9",
+      trigger: "229e8dd0e6a1c953dd18b4220da95be28121db72f4fbba199e1d6808c4b7afcc",
     },
     identityFunctions: [
       {
@@ -1410,7 +1410,7 @@ export async function runPostgreSqlMigrations(
                           pg_catalog.acldefault(
                             CASE relation.relkind
                               WHEN 'r' THEN 'r'::pg_catalog."char"
-                              WHEN 'S' THEN 'S'::pg_catalog."char"
+                              WHEN 'S' THEN 's'::pg_catalog."char"
                             END,
                             relation.relowner
                           )

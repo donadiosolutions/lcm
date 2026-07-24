@@ -112,6 +112,9 @@ surfacing, and ingest completion index only fixed-width SHA-256 candidates.
 Repository lookups must retain exact session-text equality as the collision
 residual. Session-ingest uniqueness uses an internal UUIDv7 key and an
 advisory-locked digest-plus-residual trigger rather than a raw-text primary key.
+All three exact-identity triggers are `ENABLE ALWAYS`; privileged replica-mode
+sessions therefore execute the same uniqueness checks instead of bypassing
+them.
 Promoted-memory source IDs are preserved as external provenance without a
 local-summary foreign key. Floating-point step costs reject `NaN` and both
 infinities. Search and tag normalization use PostgreSQL 18's builtin

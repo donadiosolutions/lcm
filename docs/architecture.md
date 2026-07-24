@@ -91,9 +91,10 @@ secondary indexes, triggers, constraints, all 205 ordinary columns, stored
 generated-column expressions, identity sequences, all 24 table persistence
 states, the complete effective ACLs of the tables and sequences, and the exact
 ACL state of all 220 ordinary and generated columns; indexes must remain
-valid and ready and inherit ownership from their tables. Trigger inventory also
-requires ordinary enabled mode, rejecting disabled, replica-only, or
-always-enabled drift. Constraint inventory includes the enablement state of
+valid and ready and inherit ownership from their tables. Identity-trigger
+inventory requires always-enabled mode, rejecting disabled, ordinary, or
+replica-only drift and enforcing checks under `session_replication_role =
+replica`. Constraint inventory includes the enablement state of
 its internal enforcement triggers and binds each name to its definition.
 Ordinary columns retain type, nullability, default, identity, and resolved
 collation metadata; generated columns retain their formatted type, nullability,

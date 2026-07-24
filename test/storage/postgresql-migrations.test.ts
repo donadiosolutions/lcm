@@ -341,7 +341,7 @@ describe("PostgreSQL migration runner", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "fa454af24f0729d8b19143cd1455da3bcbf4f982435802ddd615060ba321dc43" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "8ac25d445ef827e513a110a22f9f58be2e344ac4059adaed3b48c613486a453e" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
@@ -1082,6 +1082,7 @@ describe("PostgreSQL migration runner", () => {
         ],
       ]);
     expect(inventorySql).toContain("pg_catalog.unnest");
+    expect(inventorySql).toContain("WHEN 'S' THEN 's'::pg_catalog.\"char\"");
     for (const hardcodedGroupCount of [52, 3, 168, 15, 220, 6, 24, 30, 205]) {
       expect(inventorySql).not.toMatch(
         new RegExp(`\\b${hardcodedGroupCount}::pg_catalog\\.int4`, "u"),
