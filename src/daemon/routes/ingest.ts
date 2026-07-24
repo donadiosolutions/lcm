@@ -68,16 +68,15 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       return;
     }
 
-    ensureProjectDir(cwd);
-    const scrubber = await ScrubEngine.forProject(
-      config.security?.sensitivePatterns ?? [],
-      paths.dir,
-    );
-
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
     try {
       const identity = projectIdentity(cwd, config.storage);
+      ensureProjectDir(cwd);
+      const scrubber = await ScrubEngine.forProject(
+        config.security?.sensitivePatterns ?? [],
+        paths.dir,
+      );
       const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
       project = await factory.openProject(identity);
       const ingest = await project.transaction(async (repositories) => {

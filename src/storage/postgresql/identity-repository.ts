@@ -161,10 +161,13 @@ export class PostgreSqlIdentityCreateOutcomeUnknownError
 
 export class PostgreSqlIdentityUnlinkPathOutcomeUnknownError
   extends PostgreSqlCommitOutcomeUnknownError {
-  constructor(readonly candidate: RemoteAliasOwnership | null) {
+  constructor(
+    readonly candidate: RemoteAliasOwnership | null,
+    operation: "unlinkPath" | "unlinkProjectAliasIfOwned" = "unlinkPath",
+  ) {
     super({
       domain: "identity",
-      operation: "unlinkPath",
+      operation,
       projectId: candidate?.projectId,
     });
     this.name = "PostgreSqlIdentityUnlinkPathOutcomeUnknownError";
@@ -582,7 +585,10 @@ export class PostgreSqlIdentityRepository {
       }, { domain: "identity", operation: "unlinkProjectAliasIfOwned", projectId });
     } catch (error) {
       if (error instanceof PostgreSqlCommitOutcomeUnknownError && candidate !== undefined) {
-        throw new PostgreSqlIdentityUnlinkPathOutcomeUnknownError(candidate);
+        throw new PostgreSqlIdentityUnlinkPathOutcomeUnknownError(
+          candidate,
+          "unlinkProjectAliasIfOwned",
+        );
       }
       throw error;
     }
@@ -848,20 +854,21 @@ export class PostgreSqlIdentityRepository {
 
   async resolveProjectAliasesByPath(
     machineId: string,
-    projectId: string,
     paths: readonly string[],
-  ): Promise<RemoteProjectAlias[]> {
+  ): Promise<RemoteAliasOwnership[]> {
     if (paths.length === 0) return [];
     const result = await this.executor.query<AliasRow>({
       text: `SELECT project_id, machine_id, path, normalized_path, linked_at
              FROM lcm.project_aliases
              WHERE machine_id = $1
-               AND project_id = $2
-               AND path = ANY($3::text[])
-             ORDER BY path ASC, normalized_path ASC`,
-      values: [machineId, projectId, paths],
-    }, { domain: "identity", operation: "resolveProjectAliasesByPath", projectId });
-    return result.rows.map(aliasFromRow);
+               AND path = ANY($2::text[])
+             ORDER BY path ASC, normalized_path ASC, project_id ASC`,
+      values: [machineId, paths],
+    }, { domain: "identity", operation: "resolveProjectAliasesByPath" });
+    return result.rows.map((row) => ({
+      projectId: row.project_id,
+      alias: aliasFromRow(row),
+    }));
   }
 
   async listProjects(): Promise<RemoteProject[]> {

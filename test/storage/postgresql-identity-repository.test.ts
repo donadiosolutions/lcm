@@ -577,6 +577,7 @@ describe("PostgreSQL identity repository", () => {
     expect(pathError).toBeInstanceOf(PostgreSqlIdentityUnlinkPathOutcomeUnknownError);
     expect((pathError as PostgreSqlIdentityUnlinkPathOutcomeUnknownError).candidate)
       .toMatchObject({ projectId: projectRow.project_id });
+    expect(pathError).toMatchObject({ operation: "unlinkPath" });
 
     const ownedError = await repository.unlinkProjectAliasIfOwned(
       machineRow.machine_id,
@@ -584,6 +585,8 @@ describe("PostgreSQL identity repository", () => {
       projectRow.project_id,
     ).catch((caught: unknown) => caught);
     expect(ownedError).toBeInstanceOf(PostgreSqlIdentityUnlinkPathOutcomeUnknownError);
+    expect(ownedError).toMatchObject({ operation: "unlinkProjectAliasIfOwned" });
+    expect(JSON.stringify(ownedError)).not.toContain(aliasRow.path);
 
     const projectError = await repository.unlinkProject(
       machineRow.machine_id,
@@ -942,23 +945,27 @@ describe("PostgreSQL identity repository", () => {
 
     await expect(repository.resolveProjectAliasesByPath(
       machineRow.machine_id,
-      projectRow.project_id,
       [second.path, aliasRow.path],
     )).resolves.toEqual([
       expect.objectContaining({
-        path: second.path,
-        normalizedPath: second.normalized_path,
+        projectId: projectRow.project_id,
+        alias: expect.objectContaining({
+          path: second.path,
+          normalizedPath: second.normalized_path,
+        }),
       }),
       expect.objectContaining({
-        path: aliasRow.path,
-        normalizedPath: aliasRow.normalized_path,
+        projectId: projectRow.project_id,
+        alias: expect.objectContaining({
+          path: aliasRow.path,
+          normalizedPath: aliasRow.normalized_path,
+        }),
       }),
     ]);
     expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
-      text: expect.stringContaining("path = ANY($3::text[])"),
+      text: expect.stringContaining("path = ANY($2::text[])"),
       values: [
         machineRow.machine_id,
-        projectRow.project_id,
         [second.path, aliasRow.path],
       ],
     }), expect.objectContaining({ operation: "resolveProjectAliasesByPath" }));
@@ -966,7 +973,6 @@ describe("PostgreSQL identity repository", () => {
     db.query.mockClear();
     await expect(repository.resolveProjectAliasesByPath(
       machineRow.machine_id,
-      projectRow.project_id,
       [],
     )).resolves.toEqual([]);
     expect(db.query).not.toHaveBeenCalled();

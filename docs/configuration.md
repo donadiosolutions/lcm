@@ -185,11 +185,14 @@ not contain a `storage` object continue to use the per-project databases under
 ```
 
 The PostgreSQL configuration, internal PostgreSQL 18 runtime, and schema
-baseline are available for development and adapter conformance. The domain
-repositories are still staged in #84-#91, with activation in #92, so a valid
-`postgresql` selection continues to fail before the daemon listens with an
-explicit backend-unavailable error. LCM never falls back to SQLite after an
-explicit PostgreSQL selection. The internal readiness contract also requires
+baseline are available for development and adapter conformance. Machine and
+project identity operations are enabled by #84. The remaining storage/domain
+repositories in #85-#91 stay staged until the #92 cutover, so a valid
+`postgresql` selection starts the managed daemon, but other storage-backed
+routes remain unavailable and return a sanitized `503` until those
+repositories are activated. Managed start/restart recognizes that authenticated staged response
+as daemon readiness; it does not treat PostgreSQL storage as ready and never
+falls back to SQLite after an explicit PostgreSQL selection. The internal readiness contract also requires
 the parity extensions at their current default versions in the `public` schema;
 see the [PostgreSQL schema reference](postgresql-schema.md#required-extensions-and-postgresql-version).
 
@@ -203,10 +206,12 @@ agent's own compaction. If an installed hook is customized with explicit
 projection is loaded to validate those overrides; PostgreSQL credentials are
 still not resolved before fail-open dispatch.
 
-Manual CLI operations, daemon startup and restart, and MCP request admission
-are not covered by that hook exception. They resolve the complete effective
-configuration and fail closed when PostgreSQL credentials, TLS preflight, or
-backend support are unavailable. The hook behavior therefore does not provide
+Manual CLI operations and MCP request admission are not covered by that hook
+exception. They resolve the complete effective configuration and fail closed
+when PostgreSQL credentials, TLS preflight, identity registration, explicit
+project binding, or backend support are unavailable. Daemon startup and
+restart may retain the authenticated staged process described above, but its
+storage routes remain fail-closed. The hook behavior therefore does not provide
 SQLite fallback or make the PostgreSQL repository backend available.
 
 Store only non-secret pool and timeout settings in `~/.lcm/config.json`:

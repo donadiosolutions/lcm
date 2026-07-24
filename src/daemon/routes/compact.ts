@@ -304,6 +304,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
       const paths = projectPaths(cwd);
       const pid = paths.id;
       const result = await enqueue(pid, async () => {
+        const identity = projectIdentity(cwd, config.storage);
         ensureProjectDir(cwd);
 
         const scrubber = await ScrubEngine.forProject(
@@ -311,7 +312,6 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
           paths.dir,
         );
 
-        const identity = projectIdentity(cwd, config.storage);
         const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
         let project: ProjectStorage | undefined;
         try {

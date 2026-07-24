@@ -21,6 +21,8 @@ const mocks = vi.hoisted(() => ({
   normalize: vi.fn((client: unknown) => client ?? "claude"),
   scrubCounts: vi.fn((content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 })),
   forProject: vi.fn(async () => ({ scrubWithCounts: mocks.scrubCounts })),
+  identity: vi.fn((cwd: string) => ({ id: "pid", canonical: cwd })),
+  ensureProject: vi.fn(),
   send: vi.fn(),
   logError: vi.fn(),
 }));
@@ -37,8 +39,8 @@ vi.mock("../../../src/db/connection.js", () => ({
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
   projectPaths: (cwd: string) => ({ id: "pid", dir: `${cwd}/project`, dbPath: `${cwd}/lcm.db`, metaPath: `${cwd}/meta.json`, canonical: cwd }),
-  projectIdentity: (cwd: string) => ({ id: "pid", canonical: cwd }),
-  ensureProjectDir: vi.fn(),
+  projectIdentity: mocks.identity,
+  ensureProjectDir: mocks.ensureProject,
   isSafeTranscriptPath: mocks.safeTranscript,
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
@@ -116,6 +118,7 @@ describe("ingest persistence boundaries", () => {
     mocks.normalize.mockImplementation((client: unknown) => client ?? "claude");
     mocks.scrubCounts.mockImplementation((content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }));
     mocks.forProject.mockImplementation(async () => ({ scrubWithCounts: mocks.scrubCounts }));
+    mocks.identity.mockImplementation((cwd: string) => ({ id: "pid", canonical: cwd }));
   });
 
   it("validates required fields and typed cwd failures", async () => {
@@ -208,5 +211,45 @@ describe("ingest persistence boundaries", () => {
     await handler({} as never, response, JSON.stringify({ session_id: "error-two", cwd: "/ok", messages: [validMessage] }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed", code: "INGEST_FAILED" });
     expect(mocks.closeConnection).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails PostgreSQL identity before creating local directories, scrubbers, or storage", async () => {
+    const handler = createIngestHandler(config);
+    const failure = new Error("PostgreSQL project binding is required");
+    mocks.identity.mockImplementationOnce(() => { throw failure; });
+
+    await handler({} as never, response, JSON.stringify({
+      session_id: "unbound",
+      cwd: "/ok",
+      messages: [validMessage],
+    }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "ingest failed",
+      code: "INGEST_FAILED",
+    });
+    expect(mocks.ensureProject).not.toHaveBeenCalled();
+    expect(mocks.forProject).not.toHaveBeenCalled();
+    expect(mocks.getConnection).not.toHaveBeenCalled();
+    expect(mocks.logError).toHaveBeenLastCalledWith("ingest", failure, {
+      cwd: "/ok",
+      sessionId: "unbound",
+    });
+  });
+
+  it("keeps successful SQLite identity ahead of local persistence setup", async () => {
+    const handler = createIngestHandler(config);
+    await handler({} as never, response, JSON.stringify({
+      session_id: "sqlite-order",
+      cwd: "/ok",
+      messages: [validMessage],
+    }));
+
+    expect(mocks.identity.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.ensureProject.mock.invocationCallOrder[0]);
+    expect(mocks.ensureProject.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.forProject.mock.invocationCallOrder[0]);
+    expect(mocks.forProject.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.getConnection.mock.invocationCallOrder[0]);
   });
 });

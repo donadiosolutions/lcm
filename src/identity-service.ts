@@ -117,9 +117,8 @@ export interface IdentityRepository {
   ): Promise<{ readonly projectId: string; readonly alias: RemoteProjectAlias } | null>;
   resolveProjectAliasesByPath(
     machineId: string,
-    projectId: string,
     paths: readonly string[],
-  ): Promise<RemoteProjectAlias[]>;
+  ): Promise<RemoteAliasOwnership[]>;
   listProjects(): Promise<RemoteProject[]>;
 }
 
@@ -207,6 +206,13 @@ function remoteEntryPaths(entry: ProjectMapEntry): Array<{
   const paths = new Map<string, { readonly path: string; readonly normalizedPath: string }>();
   for (const entryPath of [entry.canonical, ...entry.aliases]) {
     const remote = remotePath(entryPath);
+    const prior = paths.get(remote.normalizedPath);
+    if (prior && prior.path !== remote.path) {
+      throw new ProjectIdentityReconciliationError(
+        `local project paths ${prior.path} and ${remote.path} resolve to the same PostgreSQL identity ${remote.normalizedPath}`,
+        "Remove the duplicate local alias with `lcm project unlink <alias>` before creating or linking the PostgreSQL project.",
+      );
+    }
     paths.set(remote.normalizedPath, remote);
   }
   return [...paths.values()];
@@ -224,14 +230,21 @@ async function resolveStoredRemoteAliases(
 ): Promise<RemoteProjectAliasInput[]> {
   const rows = await repository.resolveProjectAliasesByPath(
     machineId,
-    projectId,
     lexicalPaths,
   );
+  const foreign = rows.filter((row) => row.projectId !== projectId);
+  if (foreign.length > 0) {
+    const owners = [...new Set(foreign.map((row) => row.projectId))].sort();
+    throw new ProjectIdentityReconciliationError(
+      `PostgreSQL path ownership changed; expected ${projectId}, observed ${owners.join(", ")}`,
+      "Inspect `lcm project list --json` and resolve the foreign owner before retrying.",
+    );
+  }
   const rowsByPath = new Map<string, RemoteProjectAlias[]>();
   for (const row of rows) {
-    const matching = rowsByPath.get(row.path) ?? [];
-    matching.push(row);
-    rowsByPath.set(row.path, matching);
+    const matching = rowsByPath.get(row.alias.path) ?? [];
+    matching.push(row.alias);
+    rowsByPath.set(row.alias.path, matching);
   }
   const resolved: RemoteProjectAliasInput[] = [];
   for (const path of lexicalPaths) {
@@ -256,15 +269,29 @@ async function coordinatedRemoteEntryPaths(
   entry: ProjectMapEntry,
 ): Promise<RemoteProjectAliasInput[]> {
   const lexicalPaths = lexicalEntryPaths(entry);
-  if (!entry.remoteProjectId) return lexicalPaths.map(remotePath);
-  const stored = await resolveStoredRemoteAliases(
-    repository,
-    machineId,
-    entry.remoteProjectId,
-    lexicalPaths,
-  );
-  const storedByPath = new Map(stored.map((alias) => [alias.path, alias]));
-  return lexicalPaths.map((path) => storedByPath.get(path) ?? remotePath(path));
+  const resolved = entry.remoteProjectId
+    ? await resolveStoredRemoteAliases(
+      repository,
+      machineId,
+      entry.remoteProjectId,
+      lexicalPaths,
+    ).then((stored) => {
+      const storedByPath = new Map(stored.map((alias) => [alias.path, alias]));
+      return lexicalPaths.map((path) => storedByPath.get(path) ?? remotePath(path));
+    })
+    : lexicalPaths.map(remotePath);
+  const normalizedOwners = new Map<string, string>();
+  for (const path of resolved) {
+    const prior = normalizedOwners.get(path.normalizedPath);
+    if (prior && prior !== path.path) {
+      throw new ProjectIdentityReconciliationError(
+        `local project paths ${prior} and ${path.path} resolve to the same PostgreSQL identity ${path.normalizedPath}`,
+        "Remove the duplicate local alias with `lcm project unlink <alias>` before creating or linking the PostgreSQL project.",
+      );
+    }
+    normalizedOwners.set(path.normalizedPath, path.path);
+  }
+  return resolved;
 }
 
 function normalizeProjectDisplayName(value: string): string {
@@ -781,9 +808,7 @@ async function linkRemoteProject(
       machine.machineId,
       shown.entry,
     );
-    const selectedPath = entryPaths.find(
-      (entryPath) => entryPath.path === resolve(projectPath),
-    )!;
+    const requestedPath = remotePath(projectPath);
     const mutation = await confirmRemoteBatchReplacement(repository, {
       machineId: machine.machineId,
       ...(local.remoteProjectId && local.remoteProjectId !== normalizedRemoteProjectId
@@ -793,21 +818,29 @@ async function linkRemoteProject(
       aliases: entryPaths,
       recoveryPath: projectPath,
     });
-    const remoteAlias = mutation.aliases.find(
-      (alias) => alias.normalizedPath === selectedPath.normalizedPath,
-    );
-    if (!remoteAlias) {
-      throw new ProjectIdentityReconciliationError(
-        "PostgreSQL binding did not return the selected local project path",
-        "Inspect `lcm project list --json` and reconcile every local project path explicitly.",
-      );
-    }
     try {
-      setRemoteProjectBinding(normalizedRemoteProjectId, {
+      const remoteAlias = mutation.aliases.find(
+        (alias) => alias.normalizedPath === requestedPath.normalizedPath,
+      );
+      if (!remoteAlias) {
+        throw new ProjectIdentityReconciliationError(
+          "PostgreSQL binding did not return the selected local project path",
+          "Inspect `lcm project list --json` and reconcile every local project path explicitly.",
+        );
+      }
+      const binding = setRemoteProjectBinding(normalizedRemoteProjectId, {
         hash: local.id,
         allowExistingData: options.allowExistingData,
         expectedEntry: shown.entry,
       });
+      return {
+        local: {
+          id: binding.hash,
+          canonical: resolve(binding.entry.canonical),
+          remoteProjectId: normalizedRemoteProjectId,
+        },
+        remoteAlias,
+      };
     } catch (error) {
       let restored = false;
       try {
@@ -829,10 +862,6 @@ async function linkRemoteProject(
       }
       throw error;
     }
-    return {
-      local: resolveProjectIdentity(projectPath),
-      remoteAlias,
-    };
   });
 }
 
@@ -848,6 +877,10 @@ async function linkLocalAlias(
   const targetOptions = isProjectHash(target) ? { hash: target } : { canonical: target };
   const shown = showProjectMapEntry(target);
   if (shown.transient) throw new Error(`unknown local project target: ${target}`);
+  remoteEntryPaths({
+    ...shown.entry,
+    aliases: [...shown.entry.aliases, resolve(aliasPath)],
+  });
   if (!shown.entry.remoteProjectId) {
     const result = addProjectAlias(aliasPath, { ...targetOptions, expectedEntry: shown.entry });
     return { local: resolveProjectIdentity(result.entry.canonical) };

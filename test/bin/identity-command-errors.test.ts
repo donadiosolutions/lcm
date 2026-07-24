@@ -119,6 +119,27 @@ describe("identity command exits", () => {
     expect(result.thrown?.message).toBe("exit:1");
   });
 
+  it("shows positional-subcommand help before validating required arguments", async () => {
+    const project = await runIdentityCommand("project", ["link", "--help"]);
+    expect(printHelpMock).toHaveBeenCalledWith("project");
+    expect(project.thrown?.message).toBe("exit:0");
+
+    printHelpMock.mockClear();
+    const machine = await runIdentityCommand("machine", ["recover", "--help"]);
+    expect(printHelpMock).toHaveBeenCalledWith("machine");
+    expect(machine.thrown?.message).toBe("exit:0");
+  });
+
+  it("reports missing required positional identity arguments outside help", async () => {
+    const project = await runIdentityCommand("project", ["link"]);
+    expect(project.stderr).toEqual(["Error: missing required argument 'target'"]);
+    expect(project.thrown?.message).toBe("exit:1");
+
+    const machine = await runIdentityCommand("machine", ["recover"]);
+    expect(machine.stderr).toEqual(["Error: missing required argument 'machine-id'"]);
+    expect(machine.thrown?.message).toBe("exit:1");
+  });
+
   it("prints errors from project unlink failures", async () => {
     useTempHome();
     const result = await runIdentityCommand("project", ["unlink", "/tmp/not-mapped"]);

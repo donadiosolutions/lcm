@@ -383,9 +383,11 @@ export function registerProjectCommand(program: Command): void {
         }
         for (const entry of result.local) {
           console.log(entry.hash);
-          console.log(`  canonical: ${entry.canonical}`);
+          console.log(`  canonical: ${sanitizeTerminalText(entry.canonical)}`);
           if (entry.remoteProjectId) console.log(`  PostgreSQL project: ${entry.remoteProjectId}`);
-          for (const alias of entry.aliases) console.log(`  alias: ${alias}`);
+          for (const alias of entry.aliases) {
+            console.log(`  alias: ${sanitizeTerminalText(alias)}`);
+          }
         }
         if (result.remote) {
           console.log("PostgreSQL projects:");
@@ -420,11 +422,13 @@ export function registerProjectCommand(program: Command): void {
           return;
         }
         console.log(shown.hash);
-        console.log(`  canonical: ${shown.entry.canonical}`);
+        console.log(`  canonical: ${sanitizeTerminalText(shown.entry.canonical)}`);
         if (shown.entry.remoteProjectId) {
           console.log(`  PostgreSQL project: ${shown.entry.remoteProjectId}`);
         }
-        for (const alias of shown.entry.aliases) console.log(`  alias: ${alias}`);
+        for (const alias of shown.entry.aliases) {
+          console.log(`  alias: ${sanitizeTerminalText(alias)}`);
+        }
         if (shown.remote) console.log(`  name: ${sanitizeTerminalText(shown.remote.displayName)}`);
       } catch (err) {
         projectError(err, opts);
@@ -432,18 +436,19 @@ export function registerProjectCommand(program: Command): void {
     });
 
   projectCmd
-    .command("link <target> [path]")
+    .command("link [target] [path]")
     .description("Link a path to a PostgreSQL UUID or local project target")
     .option("--allow-existing-data", "Acknowledge rebinding a data-bearing local project")
     .option("--json", "Output structured JSON")
     .helpOption(false)
     .option("-h, --help", "Show help")
-    .action(async (target: string, path: string | undefined, opts: ProjectOptions) => {
+    .action(async (target: string | undefined, path: string | undefined, opts: ProjectOptions) => {
       if (projectHelpRequested(opts)) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("project"); exit(0);
       }
       try {
+        if (!target) throw new Error("missing required argument 'target'");
         const { linkProject } = await import("../src/identity-service.js");
         const result = await linkProject(
           await loadIdentityStorageConfig(),
@@ -621,18 +626,19 @@ export function registerMachineCommand(program: Command): void {
     });
 
   machineCmd
-    .command("recover <machine-id>")
+    .command("recover [machine-id]")
     .description("Recover a machine identity by its PostgreSQL UUID")
     .option("--force", "Replace and privately back up a conflicting local identity")
     .option("--json", "Output structured JSON")
     .helpOption(false)
     .option("-h, --help", "Show help")
-    .action(async (machineId: string, opts: MachineOptions) => {
+    .action(async (machineId: string | undefined, opts: MachineOptions) => {
       if (machineHelpRequested(opts)) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("machine"); exit(0);
       }
       try {
+        if (!machineId) throw new Error("missing required argument 'machine-id'");
         const { recoverMachine } = await import("../src/identity-service.js");
         const result = await recoverMachine(
           await loadIdentityStorageConfig(),

@@ -1,3 +1,5 @@
+\set ON_ERROR_STOP on
+
 \if :{?lcm_runtime_role}
 \else
 \echo 'Set lcm_runtime_role to the PostgreSQL runtime role before applying identity grants.'

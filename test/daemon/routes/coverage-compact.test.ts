@@ -14,6 +14,11 @@ const state = vi.hoisted(() => ({
   existingMeta: false,
   metaText: "{}",
   metaError: undefined as unknown,
+  identityError: undefined as unknown,
+  identity: vi.fn((cwd: string) => ({ id: "pid", canonical: cwd })),
+  ensureProject: vi.fn(),
+  scrubber: vi.fn(async () => ({ scrubWithCounts: (content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }) })),
+  openProject: vi.fn(),
 }));
 
 vi.mock("../../../src/daemon/config.js", async (importOriginal) => {
@@ -45,8 +50,11 @@ vi.mock("../../../src/daemon/summarizer.js", () => ({
 
 vi.mock("../../../src/daemon/project.js", () => ({
   projectPaths: (cwd: string) => ({ id: "pid", dir: "/tmp/project", dbPath: "/tmp/project/lcm.db", metaPath: "/tmp/project/meta.json", canonical: cwd }),
-  projectIdentity: (cwd: string) => ({ id: "pid", canonical: cwd }),
-  ensureProjectDir: vi.fn(),
+  projectIdentity: (cwd: string) => {
+    if (state.identityError !== undefined) throw state.identityError;
+    return state.identity(cwd);
+  },
+  ensureProjectDir: state.ensureProject,
   isSafeTranscriptPath: () => true,
 }));
 
@@ -66,7 +74,7 @@ vi.mock("../../../src/transcript-provider.js", () => ({
   parseTranscriptForClient: () => state.messages,
 }));
 vi.mock("../../../src/scrub.js", () => ({
-  ScrubEngine: { forProject: async () => ({ scrubWithCounts: (content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }) }) },
+  ScrubEngine: { forProject: state.scrubber },
 }));
 vi.mock("../../../src/store/conversation-store.js", () => ({
   ConversationStore: class {
@@ -86,7 +94,8 @@ vi.mock("../../../src/store/summary-store.js", () => ({
 }));
 vi.mock("../../../src/storage/index.js", () => ({
   createStorageBackendFactory: () => ({
-    openProject: async () => {
+    openProject: async (...args: unknown[]) => {
+      state.openProject(...args);
       const conversations = {
         getOrCreateConversation: async () => ({ conversationId: "conversation" }),
         getMessageCount: async () => 0,
@@ -167,6 +176,11 @@ describe("compact route coverage", () => {
     state.existingMeta = false;
     state.metaText = "{}";
     state.metaError = undefined;
+    state.identityError = undefined;
+    state.identity.mockClear();
+    state.ensureProject.mockClear();
+    state.scrubber.mockClear();
+    state.openProject.mockClear();
   });
 
   it("formats million-token and zero-input compactions", () => {
@@ -174,6 +188,30 @@ describe("compact route coverage", () => {
       .toContain("1.0M");
     expect(buildCompactionMessage({ tokensBefore: 0, tokensAfter: 0, messageCount: 0, summaryCount: 0, maxDepth: 0, promotedCount: 0 }))
       .toContain("0.0% saved");
+  });
+
+  it("fails PostgreSQL identity before local directory, scrubber, or storage effects", async () => {
+    state.identityError = new Error("PostgreSQL project binding is required");
+
+    await expect(call(JSON.stringify({ session_id: "identity", cwd: "/tmp" })))
+      .resolves.toEqual({ error: "PostgreSQL project binding is required" });
+    expect(state.ensureProject).not.toHaveBeenCalled();
+    expect(state.scrubber).not.toHaveBeenCalled();
+    expect(state.openProject).not.toHaveBeenCalled();
+  });
+
+  it("keeps successful SQLite identity ahead of local compaction setup", async () => {
+    await expect(call(JSON.stringify({ session_id: "sqlite-order", cwd: "/tmp" })))
+      .resolves.toMatchObject({ actionTaken: false });
+    expect(state.ensureProject).toHaveBeenCalledOnce();
+    expect(state.scrubber).toHaveBeenCalledOnce();
+    expect(state.openProject).toHaveBeenCalledOnce();
+    expect(state.identity.mock.invocationCallOrder[0])
+      .toBeLessThan(state.ensureProject.mock.invocationCallOrder[0]);
+    expect(state.ensureProject.mock.invocationCallOrder[0])
+      .toBeLessThan(state.scrubber.mock.invocationCallOrder[0]);
+    expect(state.scrubber.mock.invocationCallOrder[0])
+      .toBeLessThan(state.openProject.mock.invocationCallOrder[0]);
   });
 
   it.each([

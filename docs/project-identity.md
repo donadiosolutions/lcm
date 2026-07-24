@@ -195,9 +195,22 @@ local SQLite behavior.
 ## Atomic reconciliation and outages
 
 Local map writes are atomic and privately backed up under `~/.lcm/oldmaps/`.
-Remote binding set/clear operations also hold a private exclusive map lock and
-clear only the expected prior UUID. A concurrent rebind or entry removal fails
-closed; it is never overwritten by a stale unlink.
+Every map mutation holds a private owner-aware exclusive lock and clears only
+the expected prior UUID. Locks record the owning PID and process-start marker;
+LCM reclaims a lock only when the owner is provably dead or the PID has been
+reused. Live, malformed, symlinked, non-regular, or otherwise ambiguous locks
+fail closed. If an ambiguous lock remains, inspect `~/.lcm/map.json.lock` and
+remove it only after confirming that no LCM project mutation is active. A
+concurrent rebind or entry removal fails closed; it is never overwritten by a
+stale unlink.
+
+Stale-lock recovery uses a private, owner-recorded reclaim lease. If its
+process crashes, another process may take over only after proving that lease
+owner's PID/start generation is stale. Immutable `.stale-<nonce>` tombstone
+directories prevent a delayed contender from moving or deleting a successor
+lease; they are harmless audit artifacts and may be removed during maintenance
+only when no project-map mutation is active.
+
 Remote mutations use PostgreSQL transactions. Only a transport failure after
 `COMMIT` triggers authoritative readback; deterministic collisions and unknown
 UUIDs retain their original errors. A confirmed create or link is retained.

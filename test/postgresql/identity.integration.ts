@@ -64,6 +64,11 @@ describe("PostgreSQL 18 machine and project identities", () => {
 
   it("fails without identity grants and the reviewed grant script is least-privilege", async () => {
     await withPostgreSqlTestDatabase("identity-grants", async (database) => {
+      const grantScript = readFileSync(
+        join(process.cwd(), "docs", "postgresql-runtime-identity-grants.sql"),
+        "utf8",
+      );
+      expect(grantScript.startsWith("\\set ON_ERROR_STOP on\n")).toBe(true);
       const identityKey = `machine:${"0".repeat(64)}`;
       const repository = new PostgreSqlIdentityRepository(database.runtime);
       const denied = await repository.registerMachine(identityKey, "Denied")

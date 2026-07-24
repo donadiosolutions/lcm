@@ -262,7 +262,7 @@ describe("runCli identity boundaries", () => {
     await expect(projectActions.get("project")!({})).rejects.toThrow("exit:1");
     await expect(projectActions.get("list")!({ help: true })).rejects.toThrow("exit:0");
     await expect(projectActions.get("show")!(undefined, { help: true })).rejects.toThrow("exit:0");
-    await expect(projectActions.get("link")!("target", undefined, { help: true })).rejects.toThrow("exit:0");
+    await expect(projectActions.get("link")!(undefined, undefined, { help: true })).rejects.toThrow("exit:0");
     await expect(projectActions.get("unlink")!(undefined, { help: true })).rejects.toThrow("exit:0");
     await expect(projectActions.get("create")!(undefined, { help: true })).rejects.toThrow("exit:0");
 
@@ -271,7 +271,7 @@ describe("runCli identity boundaries", () => {
     await expect(machineActions.get("machine")!({})).rejects.toThrow("exit:1");
     await expect(machineActions.get("register")!({ help: true })).rejects.toThrow("exit:0");
     await expect(machineActions.get("show")!({ help: true })).rejects.toThrow("exit:0");
-    await expect(machineActions.get("recover")!("machine-id", { help: true })).rejects.toThrow("exit:0");
+    await expect(machineActions.get("recover")!(undefined, { help: true })).rejects.toThrow("exit:0");
   });
 
   it("covers pure compact option boundary combinations", () => {
@@ -311,7 +311,11 @@ describe("runCli identity boundaries", () => {
     const log = vi.spyOn(console, "log");
     const write = vi.spyOn(process.stdout, "write");
     state.projectList.mockResolvedValueOnce({
-      local: [],
+      local: [{
+        hash: "local-hash",
+        canonical: "/canonical\u001b]8;;https://attacker.invalid\u0007click\u001b]8;;\u0007",
+        aliases: ["/alias\u001b[31mred\u001b[0m"],
+      }],
       remote: [{
         projectId: "remote-id",
         displayName: "Remote\nInjected",
@@ -319,26 +323,41 @@ describe("runCli identity boundaries", () => {
       }],
     });
     await invoke(["project", "list"]);
+    expect(log).toHaveBeenCalledWith("  canonical: /canonicalclick");
+    expect(log).toHaveBeenCalledWith("  alias: /aliasred");
     expect(log).toHaveBeenCalledWith("  remote-id  Remote Injected");
     expect(log).toHaveBeenCalledWith("    machine-id: /safe Injected");
 
     log.mockClear();
     state.projectShow.mockResolvedValueOnce({
       hash: "hash",
-      entry: { canonical: "/canonical", aliases: [], remoteProjectId: "remote-id" },
+      entry: {
+        canonical: "/canonical\u001b]8;;https://attacker.invalid\u0007click\u001b]8;;\u0007",
+        aliases: ["/alias\u001b[31mred\u001b[0m"],
+        remoteProjectId: "remote-id",
+      },
       remote: { projectId: "remote-id", displayName: "Remote\nInjected", aliases: [] },
     });
     await invoke(["project", "show"]);
+    expect(log).toHaveBeenCalledWith("  canonical: /canonicalclick");
+    expect(log).toHaveBeenCalledWith("  alias: /aliasred");
     expect(log).toHaveBeenCalledWith("  name: Remote Injected");
 
     log.mockClear();
     state.projectShow.mockResolvedValueOnce({
       hash: "hash",
-      entry: { canonical: "/canonical", aliases: [], remoteProjectId: "remote-id" },
+      entry: {
+        canonical: "/canonical\u001b]8;;https://attacker.invalid\u0007click\u001b]8;;\u0007",
+        aliases: ["/alias\u001b[31mred\u001b[0m"],
+        remoteProjectId: "remote-id",
+      },
       remote: { projectId: "remote-id", displayName: "Remote\nInjected", aliases: [] },
     });
     await invoke(["project", "show", "--json"]);
-    expect(write.mock.calls.map(([value]) => String(value)).join("")).toContain("\\nInjected");
+    const jsonOutput = write.mock.calls.map(([value]) => String(value)).join("");
+    expect(jsonOutput).toContain("\\nInjected");
+    expect(jsonOutput).toContain("\\u001b]8;;https://attacker.invalid");
+    expect(jsonOutput).toContain("\\u001b[31mred");
   });
 
   it("renders every machine operation in text and JSON forms", async () => {

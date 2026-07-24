@@ -310,8 +310,8 @@ async function drainEventsForCwdUnlocked(
   let project: ProjectStorage | undefined;
   let ownedFactory: StorageBackendFactory | undefined;
   try {
-    const edb = await outboxFactory.open(sidecarPath);
     const identity = projectIdentity(cwd, config.storage);
+    const edb = await outboxFactory.open(sidecarPath);
     const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
     project = await factory.openProject(identity);
     const scrubber = await ScrubEngine.forProject(
@@ -378,8 +378,8 @@ async function promoteEventsForCwdUnlocked(
   let project: ProjectStorage | undefined;
   let ownedFactory: StorageBackendFactory | undefined;
   try {
-    const edb = await outboxFactory.open(sidecarPath);
     const identity = projectIdentity(cwd, config.storage);
+    const edb = await outboxFactory.open(sidecarPath);
     const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
     project = await factory.openProject(identity);
     const scrubber = await ScrubEngine.forProject(

@@ -1,13 +1,16 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
   realpathSync,
   readdirSync,
+  renameSync,
+  rmdirSync,
   statSync,
   watch,
   type FSWatcher,
 } from "node:fs";
+import { platform } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { lcmHomeDir, projectsDir } from "./runtime-paths.js";
 import {
@@ -65,21 +68,254 @@ export type ProjectMapValidation = {
 
 const HASH_RE = /^[a-f0-9]{64}$/;
 const MAX_PROJECT_MAP_BYTES = 4 * 1024 * 1024;
+const MAX_PROJECT_MAP_LOCK_BYTES = 1024;
 let cache: { path: string; mtimeMs: number | null; map: ProjectMap; metadataPopulated: boolean } | null = null;
+
+type ProjectMapLockOwner = {
+  readonly version: 1;
+  readonly pid: number;
+  readonly processStartTime: string | null;
+  readonly nonce: string;
+};
+
+export type ProjectMapLockObserver = (
+  event: string,
+  path: string,
+  mutable?: { value: string },
+) => void;
+
+const NOOP_PROJECT_MAP_LOCK_OBSERVER: ProjectMapLockObserver = () => undefined;
 
 function projectMapMutationLockPath(homeDir?: string): string {
   return `${projectMapPath(homeDir)}.lock`;
 }
 
-function withProjectMapMutationLock<T>(callback: () => T, homeDir?: string): T {
-  const lockPath = projectMapMutationLockPath(homeDir);
-  if (!writePrivateFileExclusive(lockPath, "")) {
-    throw new Error("project map mutation is already in progress; retry after the active operation completes");
+function processStartTime(
+  pid: number,
+  observer: ProjectMapLockObserver = NOOP_PROJECT_MAP_LOCK_OBSERVER,
+): string | null {
+  const currentPlatform = { value: platform() };
+  observer("platform", "", currentPlatform);
+  if (currentPlatform.value !== "linux") return null;
+  try {
+    const path = `/proc/${pid}/stat`;
+    observer("before-process-stat-read", path);
+    const observed = { value: readBoundedRegularFile(path, {
+      maxBytes: 16 * 1024,
+      allowedRoot: "/proc",
+    }) };
+    observer("after-process-stat-read", path, observed);
+    const fields = observed.value.slice(observed.value.lastIndexOf(")") + 2).split(" ");
+    return fields[19] || null;
+  } catch {
+    return null;
   }
+}
+
+function lockOwnerState(
+  owner: ProjectMapLockOwner,
+  observer: ProjectMapLockObserver = NOOP_PROJECT_MAP_LOCK_OBSERVER,
+): "live" | "stale" | "ambiguous" {
+  try {
+    observer("before-process-probe", String(owner.pid));
+    process.kill(owner.pid, 0);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "ESRCH" ? "stale" : "ambiguous";
+  }
+  const observedStartTime = processStartTime(owner.pid, observer);
+  if (owner.processStartTime === null || observedStartTime === null) return "ambiguous";
+  return observedStartTime === owner.processStartTime ? "live" : "stale";
+}
+
+function readProjectMapLockOwner(lockPath: string): {
+  readonly content: string;
+  readonly owner: ProjectMapLockOwner;
+} {
+  const content = readBoundedRegularFile(lockPath, {
+    maxBytes: MAX_PROJECT_MAP_LOCK_BYTES,
+    allowedRoot: dirname(lockPath),
+  });
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    throw new Error(
+      `project map lock is malformed; inspect ${lockPath} and remove it only after confirming no LCM mutation is active`,
+    );
+  }
+  const owner = value as Partial<ProjectMapLockOwner>;
+  if (
+    !value
+    || typeof value !== "object"
+    || owner.version !== 1
+    || !Number.isSafeInteger(owner.pid)
+    || (owner.pid ?? 0) <= 0
+    || (owner.processStartTime !== null && typeof owner.processStartTime !== "string")
+    || typeof owner.nonce !== "string"
+    || !/^[a-f0-9]{32}$/u.test(owner.nonce)
+  ) {
+    throw new Error(
+      `project map lock has an invalid owner; inspect ${lockPath} and remove it only after confirming no LCM mutation is active`,
+    );
+  }
+  return { content, owner: owner as ProjectMapLockOwner };
+}
+
+function createProjectMapReclaimClaim(
+  claimPath: string,
+  content: string,
+  observer: ProjectMapLockObserver,
+): boolean {
+  try {
+    observer("before-claim-mkdir", claimPath);
+    mkdirSync(claimPath, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    observer("after-claim-mkdir", claimPath);
+    if (!writePrivateFileExclusive(join(claimPath, "owner.json"), content)) {
+      throw new Error(`project map reclaim claim owner already exists: ${claimPath}`);
+    }
+    return true;
+  } catch (error) {
+    try {
+      rmdirSync(claimPath);
+    } catch {
+      // A partially initialized claim fails closed on the next attempt.
+    }
+    throw error;
+  }
+}
+
+function acquireProjectMapReclaimClaim(
+  claimPath: string,
+  content: string,
+  observer: ProjectMapLockObserver,
+): void {
+  if (createProjectMapReclaimClaim(claimPath, content, observer)) return;
+
+  const ownerPath = join(claimPath, "owner.json");
+  const existing = readProjectMapLockOwner(ownerPath);
+  const state = lockOwnerState(existing.owner, observer);
+  if (state !== "stale") {
+    const reason = state === "live"
+      ? `owned by live PID ${existing.owner.pid}`
+      : "owner state is ambiguous";
+    throw new Error(
+      `stale project map lock reclamation is already in progress (${reason}); retry after it completes`,
+    );
+  }
+
+  // The tombstone name is derived from the old claim generation and is never
+  // removed. A delayed contender that read the same stale owner therefore
+  // cannot rename a newly installed successor claim into its place.
+  const tombstonePath = `${claimPath}.stale-${existing.owner.nonce}`;
+  try {
+    observer("before-claim-rename", claimPath);
+    renameSync(claimPath, tombstonePath);
+  } catch {
+    throw new Error("project map lock reclamation changed during stale-owner recovery; retry the operation");
+  }
+  observer("after-claim-rename", claimPath);
+  if (!createProjectMapReclaimClaim(claimPath, content, observer)) {
+    throw new Error("project map lock reclamation was claimed concurrently; retry the operation");
+  }
+}
+
+function releaseProjectMapReclaimClaim(
+  claimPath: string,
+  content: string,
+  observer: ProjectMapLockObserver,
+): void {
+  const ownerPath = join(claimPath, "owner.json");
+  observer("before-claim-release-read", ownerPath);
+  if (readBoundedRegularFile(ownerPath, {
+    maxBytes: MAX_PROJECT_MAP_LOCK_BYTES,
+    allowedRoot: claimPath,
+  }) !== content) {
+    throw new Error("project map lock reclamation ownership changed before release");
+  }
+  observer("before-claim-release-delete", ownerPath);
+  if (!deleteRegularFile(ownerPath)) {
+    throw new Error("project map lock reclamation owner disappeared before release");
+  }
+  rmdirSync(claimPath);
+}
+
+function acquireProjectMapMutationLock(
+  lockPath: string,
+  content: string,
+  observer: ProjectMapLockObserver,
+): void {
+  if (writePrivateFileExclusive(lockPath, content)) return;
+
+  const existing = readProjectMapLockOwner(lockPath);
+  const state = lockOwnerState(existing.owner, observer);
+  if (state !== "stale") {
+    const reason = state === "live" ? `owned by live PID ${existing.owner.pid}` : "owner state is ambiguous";
+    throw new Error(`project map mutation is already in progress (${reason}); retry after the active operation completes`);
+  }
+  const reclaimPath = `${lockPath}.reclaim-${existing.owner.nonce}`;
+  acquireProjectMapReclaimClaim(reclaimPath, content, observer);
+  try {
+    // The owner-nonce-specific reclaim claim serializes every contender that
+    // observed this stale generation. Only its holder may perform the final
+    // exact-content check and unlink, so no contender can delete a successor.
+    const claimOwnerPath = join(reclaimPath, "owner.json");
+    observer("before-claim-removal-read", claimOwnerPath);
+    if (readBoundedRegularFile(claimOwnerPath, {
+      maxBytes: MAX_PROJECT_MAP_LOCK_BYTES,
+      allowedRoot: reclaimPath,
+    }) !== content) {
+      throw new Error("project map lock reclamation ownership changed before stale lock removal");
+    }
+    observer("before-stale-lock-read", lockPath);
+    if (readBoundedRegularFile(lockPath, {
+      maxBytes: MAX_PROJECT_MAP_LOCK_BYTES,
+      allowedRoot: dirname(lockPath),
+    }) !== existing.content) {
+      throw new Error("project map lock changed while checking its stale owner; retry the operation");
+    }
+    observer("before-stale-lock-delete", lockPath);
+    if (!deleteRegularFile(lockPath)) {
+      throw new Error("project map lock disappeared during stale-owner recovery; retry the operation");
+    }
+    observer("before-successor-lock-create", lockPath);
+    if (!writePrivateFileExclusive(lockPath, content)) {
+      throw new Error("project map mutation lock was claimed concurrently; retry the operation");
+    }
+  } finally {
+    releaseProjectMapReclaimClaim(reclaimPath, content, observer);
+  }
+}
+
+function withProjectMapMutationLock<T>(
+  callback: () => T,
+  homeDir?: string,
+  observer: ProjectMapLockObserver = NOOP_PROJECT_MAP_LOCK_OBSERVER,
+): T {
+  const lockPath = projectMapMutationLockPath(homeDir);
+  const owner: ProjectMapLockOwner = {
+    version: 1,
+    pid: process.pid,
+    processStartTime: processStartTime(process.pid, observer),
+    nonce: randomBytes(16).toString("hex"),
+  };
+  const content = `${JSON.stringify(owner)}\n`;
+  acquireProjectMapMutationLock(lockPath, content, observer);
   try {
     cache = null;
     return callback();
   } finally {
+    if (readBoundedRegularFile(lockPath, {
+      maxBytes: MAX_PROJECT_MAP_LOCK_BYTES,
+      allowedRoot: dirname(lockPath),
+    }) !== content) {
+      throw new Error("project map mutation lock ownership changed before release");
+    }
     deleteRegularFile(lockPath);
   }
 }
@@ -502,6 +738,8 @@ export function setRemoteProjectBinding(
     readonly expectedEntry?: ProjectMapEntry;
     /** @internal Test-only synchronization seam for deterministic race coverage. */
     readonly _afterLockForTesting?: () => void;
+    /** @internal Test-only failure injection for lock protocol boundaries. */
+    readonly _lockObserverForTesting?: ProjectMapLockObserver;
   } = {},
 ): {
   readonly hash: string;
@@ -538,7 +776,7 @@ export function setRemoteProjectBinding(
       changed: true,
       backupPath: write.backupPath,
     };
-  });
+  }, undefined, opts._lockObserverForTesting);
 }
 
 export function clearRemoteProjectBinding(

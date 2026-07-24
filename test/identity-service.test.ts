@@ -30,6 +30,7 @@ import {
   projectMapPath,
   resolveProjectIdentity,
   setRemoteProjectBinding,
+  showProjectMapEntry,
 } from "../src/project-map.js";
 import {
   PostgreSqlIdentityConflictError,
@@ -237,13 +238,13 @@ function fakeRepository(): IdentityRepository & {
       }
       return true;
     }),
-    resolveProjectAliasesByPath: vi.fn(async (_machineId, projectId, paths) => (
+    resolveProjectAliasesByPath: vi.fn(async (_machineId, paths) => (
       [...aliases.values()]
-        .filter((owner) => owner.projectId === projectId && paths.includes(owner.alias.path))
-        .map((owner) => owner.alias)
+        .filter((owner) => paths.includes(owner.alias.path))
         .sort((left, right) => (
-          left.path.localeCompare(right.path)
-          || left.normalizedPath.localeCompare(right.normalizedPath)
+          left.alias.path.localeCompare(right.alias.path)
+          || left.alias.normalizedPath.localeCompare(right.alias.normalizedPath)
+          || left.projectId.localeCompare(right.projectId)
         ))
     )),
     resolveProject: vi.fn(async (_machineId, normalizedPath) => aliases.get(normalizedPath) ?? null),
@@ -639,6 +640,43 @@ describe("identity service", () => {
     )).resolves.toMatchObject({ local: { remoteProjectId: PROJECT_B } });
   });
 
+  it("links a remote UUID when the selected CLI path is a symlink to the canonical entry", async () => {
+    await register();
+    const canonical = makeProject("remote-link-symlink-target");
+    const entered = join(home, "remote-link-symlink-entered");
+    symlinkSync(canonical, entered);
+
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, entered, {}, deps))
+      .resolves.toMatchObject({
+        local: { canonical, remoteProjectId: PROJECT_A },
+        remoteAlias: { path: canonical, normalizedPath: canonical },
+      });
+    expect(repository.replaceProjectAliases).toHaveBeenCalledWith(
+      expect.objectContaining({
+        aliases: [{ path: canonical, normalizedPath: canonical }],
+        recoveryPath: entered,
+      }),
+    );
+  });
+
+  it("compensates when a committed batch omits the selected symlink identity", async () => {
+    await register();
+    const canonical = makeProject("remote-link-missing-selected-target");
+    const entered = join(home, "remote-link-missing-selected-entered");
+    symlinkSync(canonical, entered);
+    const originalReplace = repository.replaceProjectAliases.getMockImplementation()!;
+    repository.replaceProjectAliases = vi.fn(async (input) => {
+      const mutation = await originalReplace(input);
+      return mutation ? { ...mutation, aliases: [] } : null;
+    });
+
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, entered, {}, deps))
+      .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
+    expect(repository.restoreProjectAliasBatch).toHaveBeenCalled();
+    await expect(repository.resolveProject(MACHINE_ID, canonical)).resolves.toBeNull();
+    expect(resolveProjectIdentity(canonical).remoteProjectId).toBeUndefined();
+  });
+
   it("atomically rebinds every remote alias represented by one local map entry", async () => {
     await register();
     const canonical = makeProject("batch-rebind-canonical");
@@ -685,6 +723,59 @@ describe("identity service", () => {
       await expect(repository.resolveProject(MACHINE_ID, path))
         .resolves.toMatchObject({ projectId: PROJECT_A });
     }
+  });
+
+  it("rejects duplicate normalized canonical and alias identities before create or link", async () => {
+    await register();
+    const canonical = makeProject("duplicate-normalized-canonical");
+    const entered = join(home, "duplicate-normalized-symlink");
+    symlinkSync(canonical, entered);
+    const local = resolveProjectIdentity(canonical);
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [local.id]: { canonical, aliases: [entered] },
+    }));
+    clearProjectMapCache();
+
+    await expect(createProject(POSTGRESQL_CONFIG, canonical, {}, deps))
+      .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, entered, {}, deps))
+      .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
+    expect(repository.createProject).not.toHaveBeenCalled();
+    expect(repository.replaceProjectAliases).not.toHaveBeenCalled();
+    expect(resolveProjectIdentity(canonical).remoteProjectId).toBeUndefined();
+  });
+
+  it("rejects adding a symlink alias that duplicates an existing normalized identity", async () => {
+    const canonical = makeProject("duplicate-local-link-canonical");
+    const entered = join(home, "duplicate-local-link-symlink");
+    symlinkSync(canonical, entered);
+    const local = resolveProjectIdentity(canonical);
+
+    await expect(linkProject(SQLITE_CONFIG, local.id, entered, {}, deps))
+      .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
+    expect(showProjectMapEntry(local.id).entry.aliases).toEqual([]);
+  });
+
+  it("removes a legacy duplicate-normalized alias without deleting the canonical remote row", async () => {
+    await register();
+    const canonical = makeProject("duplicate-unlink-canonical");
+    const entered = join(home, "duplicate-unlink-symlink");
+    symlinkSync(canonical, entered);
+    const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [bound.local.id]: {
+        canonical,
+        aliases: [entered],
+        remoteProjectId: PROJECT_A,
+      },
+    }));
+    clearProjectMapCache();
+
+    await expect(unlinkProject(POSTGRESQL_CONFIG, entered, deps))
+      .resolves.toMatchObject({ aliasRemoved: true, remoteProjectId: PROJECT_A });
+    await expect(repository.resolveProject(MACHINE_ID, canonical))
+      .resolves.toMatchObject({ projectId: PROJECT_A });
+    expect(showProjectMapEntry(bound.local.id).entry.aliases).toEqual([]);
   });
 
   it("project creation includes every pre-existing local alias", async () => {
@@ -1400,14 +1491,56 @@ describe("identity service", () => {
     const canonical = makeProject("unlink-duplicate-path");
     await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
     repository.resolveProjectAliasesByPath = vi.fn(async () => [
-      alias(PROJECT_A, canonical),
-      alias(PROJECT_A, `${canonical}-other`, canonical),
+      { projectId: PROJECT_A, alias: alias(PROJECT_A, canonical) },
+      { projectId: PROJECT_A, alias: alias(PROJECT_A, `${canonical}-other`, canonical) },
     ]);
 
     await expect(unlinkProject(POSTGRESQL_CONFIG, canonical, deps))
       .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
     expect(repository.unlinkProjectAliasesIfOwned).not.toHaveBeenCalled();
     expect(resolveProjectIdentity(canonical).remoteProjectId).toBe(PROJECT_A);
+  });
+
+  it("rejects a stored lexical path owned by another project before unlink mutation", async () => {
+    await register();
+    const canonical = makeProject("unlink-foreign-owner");
+    await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    repository.resolveProjectAliasesByPath = vi.fn(async () => [{
+      projectId: PROJECT_B,
+      alias: alias(PROJECT_B, canonical),
+    }]);
+
+    await expect(unlinkProject(POSTGRESQL_CONFIG, canonical, deps))
+      .rejects.toMatchObject({
+        name: "ProjectIdentityReconciliationError",
+        remediation: expect.stringContaining("foreign owner"),
+      });
+    expect(repository.unlinkProjectAliasesIfOwned).not.toHaveBeenCalled();
+    expect(resolveProjectIdentity(canonical).remoteProjectId).toBe(PROJECT_A);
+  });
+
+  it("rejects foreign stored owners before alias unlink or project rebind mutations", async () => {
+    await register();
+    const canonical = makeProject("foreign-owner-rebind-canonical");
+    const linked = makeProject("foreign-owner-rebind-alias");
+    const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
+    repository.resolveProjectAliasesByPath = vi.fn(async (_machineId, paths) =>
+      paths.map((path) => ({
+        projectId: PROJECT_B,
+        alias: alias(PROJECT_B, path),
+      })));
+    repository.unlinkProjectAliasIfOwned.mockClear();
+    repository.replaceProjectAliases.mockClear();
+
+    await expect(unlinkProject(POSTGRESQL_CONFIG, linked, deps))
+      .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_B, canonical, {}, deps))
+      .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
+    expect(repository.unlinkProjectAliasIfOwned).not.toHaveBeenCalled();
+    expect(repository.replaceProjectAliases).not.toHaveBeenCalled();
+    expect(resolveProjectIdentity(canonical).remoteProjectId).toBe(PROJECT_A);
+    expect(showProjectMapEntry(bound.local.id).entry.aliases).toContain(linked);
   });
 
   it("canonical unlink preserves aliases owned by a distinct local entry on the same project", async () => {

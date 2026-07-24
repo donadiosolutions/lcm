@@ -145,11 +145,13 @@ describe("project map", () => {
     const local = resolveProjectIdentity(canonical);
     const lockPath = `${projectMapPath()}.lock`;
     let nestedError: unknown;
+    let liveOwner = "";
 
     const bound = setRemoteProjectBinding(remoteProjectId, {
       canonical,
       _afterLockForTesting: () => {
         expect(statSync(lockPath).mode & 0o777).toBe(0o600);
+        liveOwner = readFileSync(lockPath, "utf8");
         try {
           setRemoteProjectBinding(remoteProjectId, { canonical });
         } catch (error) {
@@ -163,10 +165,370 @@ describe("project map", () => {
     expect((nestedError as Error).message).toContain("project map mutation is already in progress");
     expect(existsSync(lockPath)).toBe(false);
 
+    writeFileSync(lockPath, liveOwner, { mode: 0o600 });
+    expect(() => clearRemoteProjectBinding(canonical, remoteProjectId))
+      .toThrow(`owned by live PID ${process.pid}`);
+    rmSync(lockPath);
+
+    const ambiguousOwner = JSON.parse(liveOwner) as Record<string, unknown>;
+    ambiguousOwner.processStartTime = null;
+    ambiguousOwner.nonce = "c".repeat(32);
+    writeFileSync(lockPath, `${JSON.stringify(ambiguousOwner)}\n`, { mode: 0o600 });
+    expect(() => clearRemoteProjectBinding(canonical, remoteProjectId))
+      .toThrow("owner state is ambiguous");
+    rmSync(lockPath);
+
     writeFileSync(lockPath, "", { mode: 0o600 });
     expect(() => clearRemoteProjectBinding(canonical, remoteProjectId))
-      .toThrow("project map mutation is already in progress");
+      .toThrow("project map lock is malformed");
     expect(listProjectMapEntries()[local.id].remoteProjectId).toBe(remoteProjectId);
+  });
+
+  it("reclaims only dead or PID-reused map lock owners", () => {
+    const canonical = makeDir("remote-stale-lock");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    const lock = (pid: number, processStartTime: string | null, nonce: string): string =>
+      `${JSON.stringify({ version: 1, pid, processStartTime, nonce })}\n`;
+
+    writeFileSync(lockPath, lock(2_147_483_647, "1", "a".repeat(32)), { mode: 0o600 });
+    expect(setRemoteProjectBinding(remoteProjectId, { canonical }))
+      .toMatchObject({ changed: true });
+    expect(existsSync(lockPath)).toBe(false);
+
+    writeFileSync(lockPath, lock(process.pid, "definitely-not-this-process", "b".repeat(32)), { mode: 0o600 });
+    expect(setRemoteProjectBinding(remoteProjectId, { canonical }))
+      .toMatchObject({ changed: false });
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("never reclaims a stale generation already claimed by another contender", () => {
+    const canonical = makeDir("remote-competing-reclaimer");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    const nonce = "d".repeat(32);
+    const stale = `${JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      processStartTime: "1",
+      nonce,
+    })}\n`;
+    writeFileSync(lockPath, stale, { mode: 0o600 });
+    const claimPath = `${lockPath}.reclaim-${nonce}`;
+    mkdirSync(claimPath, { mode: 0o700 });
+    writeFileSync(join(claimPath, "owner.json"), `${JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      processStartTime: null,
+      nonce: "e".repeat(32),
+    })}\n`, { mode: 0o600 });
+
+    expect(() => setRemoteProjectBinding(remoteProjectId, { canonical }))
+      .toThrow("reclamation is already in progress");
+    expect(readFileSync(lockPath, "utf8")).toBe(stale);
+  });
+
+  it("recovers a reclaim claim whose owner crashed without deleting a successor generation", () => {
+    const canonical = makeDir("remote-crashed-reclaimer");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    const mainNonce = "f".repeat(32);
+    const claimNonce = "1".repeat(32);
+    const stale = `${JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      processStartTime: "1",
+      nonce: mainNonce,
+    })}\n`;
+    const staleClaim = `${JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      processStartTime: "1",
+      nonce: claimNonce,
+    })}\n`;
+    const claimPath = `${lockPath}.reclaim-${mainNonce}`;
+    writeFileSync(lockPath, stale, { mode: 0o600 });
+    mkdirSync(claimPath, { mode: 0o700 });
+    writeFileSync(join(claimPath, "owner.json"), staleClaim, { mode: 0o600 });
+
+    expect(setRemoteProjectBinding(remoteProjectId, { canonical }))
+      .toMatchObject({ changed: true });
+    expect(existsSync(lockPath)).toBe(false);
+    expect(existsSync(claimPath)).toBe(false);
+    expect(readFileSync(`${claimPath}.stale-${claimNonce}/owner.json`, "utf8"))
+      .toBe(staleClaim);
+  });
+
+  it("fails closed for malformed and symlinked reclaim claim owners", () => {
+    const canonical = makeDir("remote-unsafe-reclaimer");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    const mainNonce = "2".repeat(32);
+    const stale = `${JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      processStartTime: "1",
+      nonce: mainNonce,
+    })}\n`;
+    const claimPath = `${lockPath}.reclaim-${mainNonce}`;
+    writeFileSync(lockPath, stale, { mode: 0o600 });
+    mkdirSync(claimPath, { mode: 0o700 });
+    writeFileSync(join(claimPath, "owner.json"), "{broken", { mode: 0o600 });
+    expect(() => setRemoteProjectBinding(remoteProjectId, { canonical }))
+      .toThrow("project map lock is malformed");
+
+    rmSync(claimPath, { recursive: true });
+    mkdirSync(claimPath, { mode: 0o700 });
+    const target = join(homedir(), "claim-owner-target");
+    writeFileSync(target, stale);
+    symlinkSync(target, join(claimPath, "owner.json"));
+    expect(() => setRemoteProjectBinding(remoteProjectId, { canonical }))
+      .toThrow();
+    expect(readFileSync(lockPath, "utf8")).toBe(stale);
+  });
+
+  it("covers platform, unreadable proc, and empty process-start observations", () => {
+    for (const [name, observer] of [
+      ["non-linux", (event: string, _path: string, mutable?: { value: string }) => {
+        if (event === "platform") mutable!.value = "darwin";
+      }],
+      ["unreadable-proc", (event: string) => {
+        if (event === "before-process-stat-read") throw new Error("proc unavailable");
+      }],
+      ["empty-proc", (event: string, _path: string, mutable?: { value: string }) => {
+        if (event === "after-process-stat-read") mutable!.value = "1 (x) S";
+      }],
+    ] as const) {
+      resetLcmHome();
+      const canonical = makeDir(`lock-process-${name}`);
+      resolveProjectIdentity(canonical);
+      expect(setRemoteProjectBinding(remoteProjectId, {
+        canonical,
+        _lockObserverForTesting: observer,
+      })).toMatchObject({ changed: true });
+    }
+  });
+
+  it("fails closed when probing a lock owner is not permitted", () => {
+    const canonical = makeDir("lock-probe-denied");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    writeFileSync(lockPath, `${JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      processStartTime: "1",
+      nonce: "3".repeat(32),
+    })}\n`, { mode: 0o600 });
+
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _lockObserverForTesting: (event) => {
+        if (event === "before-process-probe") {
+          throw Object.assign(new Error("denied"), { code: "EACCES" });
+        }
+      },
+    })).toThrow("owner state is ambiguous");
+  });
+
+  it("reports a live reclaim claim owner distinctly", () => {
+    const canonical = makeDir("remote-live-reclaimer");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    const mainNonce = "4".repeat(32);
+    const processFields = readFileSync(`/proc/${process.pid}/stat`, "utf8")
+      .slice(readFileSync(`/proc/${process.pid}/stat`, "utf8").lastIndexOf(")") + 2)
+      .trim()
+      .split(" ");
+    const processStartTime = processFields[19];
+    writeFileSync(lockPath, `${JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      processStartTime: "1",
+      nonce: mainNonce,
+    })}\n`, { mode: 0o600 });
+    const claimPath = `${lockPath}.reclaim-${mainNonce}`;
+    mkdirSync(claimPath, { mode: 0o700 });
+    writeFileSync(join(claimPath, "owner.json"), `${JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      processStartTime,
+      nonce: "5".repeat(32),
+    })}\n`, { mode: 0o600 });
+
+    expect(() => setRemoteProjectBinding(remoteProjectId, { canonical }))
+      .toThrow(`owned by live PID ${process.pid}`);
+  });
+
+  it("fails closed at every reclaim protocol filesystem boundary", () => {
+    type Scenario = {
+      readonly name: string;
+      readonly existingClaim?: boolean;
+      readonly observer: (event: string, path: string) => void;
+      readonly expected: string;
+    };
+    const scenarios: Scenario[] = [
+      {
+        name: "claim-mkdir",
+        observer: (event) => {
+          if (event === "before-claim-mkdir") {
+            throw Object.assign(new Error("denied"), { code: "EACCES" });
+          }
+        },
+        expected: "denied",
+      },
+      {
+        name: "claim-owner-write",
+        observer: (event) => {
+          if (event === "after-claim-mkdir") throw new Error("owner write failed");
+        },
+        expected: "owner write failed",
+      },
+      {
+        name: "claim-owner-collision",
+        observer: (event, path) => {
+          if (event === "after-claim-mkdir") {
+            writeFileSync(join(path, "owner.json"), "occupied", { mode: 0o600 });
+          }
+        },
+        expected: "owner already exists",
+      },
+      {
+        name: "claim-rename",
+        existingClaim: true,
+        observer: (event, path) => {
+          if (event === "before-claim-rename") {
+            const owner = JSON.parse(readFileSync(join(path, "owner.json"), "utf8")) as { nonce: string };
+            const tombstone = `${path}.stale-${owner.nonce}`;
+            mkdirSync(tombstone, { mode: 0o700 });
+            writeFileSync(join(tombstone, "owner.json"), "occupied", { mode: 0o600 });
+          }
+        },
+        expected: "reclamation changed",
+      },
+      {
+        name: "claim-successor",
+        existingClaim: true,
+        observer: (event, path) => {
+          if (event === "after-claim-rename") {
+            mkdirSync(path, { mode: 0o700 });
+            writeFileSync(join(path, "owner.json"), "successor", { mode: 0o600 });
+          }
+        },
+        expected: "claimed concurrently",
+      },
+      {
+        name: "claim-removal-read",
+        observer: (event, path) => {
+          if (event === "before-claim-removal-read") writeFileSync(path, "changed");
+        },
+        expected: "ownership changed",
+      },
+      {
+        name: "stale-lock-read",
+        observer: (event, path) => {
+          if (event === "before-stale-lock-read") writeFileSync(path, "changed");
+        },
+        expected: "lock changed",
+      },
+      {
+        name: "stale-lock-delete",
+        observer: (event, path) => {
+          if (event === "before-stale-lock-delete") rmSync(path);
+        },
+        expected: "lock disappeared",
+      },
+      {
+        name: "successor-create",
+        observer: (event, path) => {
+          if (event === "before-successor-lock-create") {
+            writeFileSync(path, "successor", { mode: 0o600 });
+          }
+        },
+        expected: "claimed concurrently",
+      },
+      {
+        name: "claim-release-read",
+        observer: (event, path) => {
+          if (event === "before-claim-release-read") writeFileSync(path, "changed");
+        },
+        expected: "ownership changed",
+      },
+      {
+        name: "claim-release-delete",
+        observer: (event, path) => {
+          if (event === "before-claim-release-delete") rmSync(path);
+        },
+        expected: "owner disappeared",
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      resetLcmHome();
+      const canonical = makeDir(`lock-boundary-${scenario.name}`);
+      resolveProjectIdentity(canonical);
+      const lockPath = `${projectMapPath()}.lock`;
+      const mainNonce = scenario.name.padEnd(32, "a").slice(0, 32)
+        .replace(/[^a-f0-9]/gu, "a");
+      writeFileSync(lockPath, `${JSON.stringify({
+        version: 1,
+        pid: 2_147_483_647,
+        processStartTime: "1",
+        nonce: mainNonce,
+      })}\n`, { mode: 0o600 });
+      if (scenario.existingClaim) {
+        const claimPath = `${lockPath}.reclaim-${mainNonce}`;
+        mkdirSync(claimPath, { mode: 0o700 });
+        writeFileSync(join(claimPath, "owner.json"), `${JSON.stringify({
+          version: 1,
+          pid: 2_147_483_647,
+          processStartTime: "1",
+          nonce: "6".repeat(32),
+        })}\n`, { mode: 0o600 });
+      }
+
+      expect(() => setRemoteProjectBinding(remoteProjectId, {
+        canonical,
+        _lockObserverForTesting: scenario.observer,
+      })).toThrow(scenario.expected);
+    }
+  });
+
+  it("detects main lock ownership changes before releasing a completed mutation", () => {
+    const canonical = makeDir("remote-release-owner-change");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _afterLockForTesting: () => writeFileSync(lockPath, "changed"),
+    })).toThrow("ownership changed before release");
+  });
+
+  it("fails closed for invalid, symlinked, and non-regular map locks", () => {
+    const canonical = makeDir("remote-unsafe-lock");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+
+    writeFileSync(lockPath, JSON.stringify({
+      version: 1,
+      pid: -1,
+      processStartTime: null,
+      nonce: "bad",
+    }), { mode: 0o600 });
+    expect(() => setRemoteProjectBinding(remoteProjectId, { canonical }))
+      .toThrow("invalid owner");
+    rmSync(lockPath);
+
+    const target = join(homedir(), "lock-target");
+    writeFileSync(target, "unsafe");
+    symlinkSync(target, lockPath);
+    expect(() => setRemoteProjectBinding(remoteProjectId, { canonical }))
+      .toThrow();
+    rmSync(lockPath);
+
+    mkdirSync(lockPath);
+    expect(() => setRemoteProjectBinding(remoteProjectId, { canonical }))
+      .toThrow();
   });
 
   it("serializes alias mutations and compares the complete expected entry", () => {
