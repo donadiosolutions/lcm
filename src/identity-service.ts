@@ -1389,13 +1389,15 @@ export async function unlinkProject(
   readonly aliasRemoved: boolean;
 }> {
   const projectPath = resolve(path);
-  const shown = showProjectMapEntry(projectPath);
   const deps = dependencies(dependencyOverrides);
-  if (shown.transient || !shown.entry.remoteProjectId) {
-    return unlinkProjectMutation(config, projectPath, deps);
-  }
-  return withRemoteProjectIdentityMutationLock(
-    deps.homeDir,
-    () => unlinkProjectMutation(config, projectPath, deps),
-  );
+  return withProjectIdentityMutationLock(deps.homeDir, async () => {
+    const shown = showProjectMapEntry(projectPath);
+    if (shown.transient || !shown.entry.remoteProjectId) {
+      return unlinkProjectMutation(config, projectPath, deps);
+    }
+    return withRemoteIdentityMutationLock(
+      deps.homeDir,
+      () => unlinkProjectMutation(config, projectPath, deps),
+    );
+  });
 }

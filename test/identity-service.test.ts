@@ -2927,6 +2927,37 @@ describe("identity service", () => {
     await expect(repository.resolveProject(MACHINE_ID, canonical)).resolves.toBeNull();
   });
 
+  it("classifies unlink under the project lock while a remote link is in progress", async () => {
+    await register();
+    const canonical = makeProject("link-unlink-classification-canonical");
+    resolveProjectIdentity(canonical);
+    const originalReplace = repository.replaceProjectAliases.getMockImplementation()!;
+    let releaseLink!: () => void;
+    let linkReachedRepository!: () => void;
+    const linkGate = new Promise<void>((resolve) => { releaseLink = resolve; });
+    const repositoryReached = new Promise<void>(
+      (resolve) => { linkReachedRepository = resolve; },
+    );
+    repository.replaceProjectAliases = vi.fn(async (input) => {
+      const linked = await originalReplace(input);
+      linkReachedRepository();
+      await linkGate;
+      return linked;
+    });
+
+    const linking = linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    await repositoryReached;
+    expect(showProjectMapEntry(canonical).entry.remoteProjectId).toBeUndefined();
+    await expect(unlinkProject(POSTGRESQL_CONFIG, canonical, deps))
+      .rejects.toThrow("project identity mutation is already in progress");
+    releaseLink();
+
+    await expect(linking).resolves.toMatchObject({
+      local: { remoteProjectId: PROJECT_A },
+    });
+    expect(showProjectMapEntry(canonical).entry.remoteProjectId).toBe(PROJECT_A);
+  });
+
   it("accepts an uncertain alias restoration after authoritative readback", async () => {
     await register();
     const canonical = makeProject("unlink-alias-uncertain-restore-canonical");
