@@ -41,11 +41,13 @@ invalid keys, invalid display names, and invalid UUIDs. Permission-repair
 commands quote the complete file path and separate it from options so spaces,
 shell metacharacters, and leading dashes cannot change the command.
 
-Registration first creates a private pending identity with an exclusive write,
-then idempotently upserts its opaque key in PostgreSQL and atomically finalizes
-the file. Concurrent registrations therefore converge on one machine UUID. If
-a process stops after writing the pending file, rerun `lcm machine register`;
-LCM reuses the same opaque key.
+Registration waits for exclusive remote-identity ownership, creates a private
+pending identity with an exclusive write, idempotently upserts its opaque key
+in PostgreSQL, and atomically finalizes the file before releasing that
+ownership. Registration and recovery therefore cannot overwrite each other
+from stale PostgreSQL reads, and concurrent registrations converge on one
+machine UUID. If a process stops after writing the pending file, rerun `lcm
+machine register`; LCM reuses the same opaque key.
 
 ## Recover after a reimage
 

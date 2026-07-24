@@ -1,5 +1,6 @@
 import { existsSync, statSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
+import { setTimeout as wait } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
 import type { ResolvedStorageConfig } from "./daemon/config.js";
 import {
@@ -33,7 +34,10 @@ import {
   type ProjectMapEntry,
 } from "./project-map.js";
 import { ensurePrivateDirectory } from "./security-files.js";
-import { withPrivateMutationLockAsync } from "./private-mutation-lock.js";
+import {
+  PrivateMutationLockContentionError,
+  withPrivateMutationLockAsync,
+} from "./private-mutation-lock.js";
 import {
   PostgreSqlIdentityRepository,
   PostgreSqlIdentityCreateOutcomeUnknownError,
@@ -200,6 +204,8 @@ const DEFAULT_DEPENDENCIES: IdentityServiceDependencies = {
   openSession: openPostgreSqlIdentitySession,
 };
 
+const REMOTE_IDENTITY_LOCK_RETRY_MS = 25;
+
 function dependencies(
   overrides?: Partial<IdentityServiceDependencies>,
 ): IdentityServiceDependencies {
@@ -228,6 +234,20 @@ function withRemoteIdentityMutationLock<T>(
     "remote identity",
     callback,
   );
+}
+
+async function withQueuedRemoteIdentityMutationLock<T>(
+  homeDir: string | undefined,
+  callback: () => Promise<T>,
+): Promise<T> {
+  while (true) {
+    try {
+      return await withRemoteIdentityMutationLock(homeDir, callback);
+    } catch (error) {
+      if (!(error instanceof PrivateMutationLockContentionError)) throw error;
+      await wait(REMOTE_IDENTITY_LOCK_RETRY_MS);
+    }
+  }
 }
 
 function withRemoteProjectIdentityMutationLock<T>(
@@ -444,41 +464,43 @@ export async function registerMachine(
   const requestedDisplayName = options.displayName === undefined
     ? undefined
     : normalizeMachineDisplayName(options.displayName);
-  const pending = ensurePendingMachineIdentity(
-    requestedDisplayName,
-    deps.homeDir,
-  );
-  const displayName = pending.identity.machineId === null
-    ? pending.identity.displayName
-    : requestedDisplayName ?? pending.identity.displayName;
-  return withSession(config, deps, async (repository) => {
-    const registered = await repository.registerMachine(
-      pending.identity.identityKey,
-      displayName,
+  return withQueuedRemoteIdentityMutationLock(deps.homeDir, () => {
+    const pending = ensurePendingMachineIdentity(
+      requestedDisplayName,
+      deps.homeDir,
     );
-    let identity: MachineIdentity;
-    try {
-      identity = finalizeMachineIdentity(
-        pending.identity,
-        registered.machineId,
-        registered.displayName,
-        deps.homeDir,
+    const displayName = pending.identity.machineId === null
+      ? pending.identity.displayName
+      : requestedDisplayName ?? pending.identity.displayName;
+    return withSession(config, deps, async (repository) => {
+      const registered = await repository.registerMachine(
+        pending.identity.identityKey,
+        displayName,
       );
-    } catch (error) {
-      if (!(error instanceof MachineIdentityRegistrationChangedError)) throw error;
-      const authoritative = await repository.recoverMachine(registered.machineId);
-      if (
-        authoritative.machineId !== registered.machineId
-        || authoritative.identityKey !== pending.identity.identityKey
-      ) {
-        throw error;
+      let identity: MachineIdentity;
+      try {
+        identity = finalizeMachineIdentity(
+          pending.identity,
+          registered.machineId,
+          registered.displayName,
+          deps.homeDir,
+        );
+      } catch (error) {
+        if (!(error instanceof MachineIdentityRegistrationChangedError)) throw error;
+        const authoritative = await repository.recoverMachine(registered.machineId);
+        if (
+          authoritative.machineId !== registered.machineId
+          || authoritative.identityKey !== pending.identity.identityKey
+        ) {
+          throw error;
+        }
+        identity = recoverMachineIdentity(machineFromRegistered(authoritative), {
+          force: true,
+          homeDir: deps.homeDir,
+        }).identity;
       }
-      identity = recoverMachineIdentity(machineFromRegistered(authoritative), {
-        force: true,
-        homeDir: deps.homeDir,
-      }).identity;
-    }
-    return { identity, created: pending.created };
+      return { identity, created: pending.created };
+    });
   });
 }
 

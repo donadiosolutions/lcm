@@ -361,7 +361,7 @@ describe("identity service", () => {
     expect(repository.registerMachine).toHaveBeenCalledTimes(calls);
   });
 
-  it("reconciles the local name when concurrent PostgreSQL upserts commit out of local order", async () => {
+  it("serializes concurrent PostgreSQL upserts and reconciles the waiting registration", async () => {
     await register();
     const identityKey = showMachine(deps)!.identityKey;
     let databaseDisplayName = "Machine A";
@@ -397,23 +397,136 @@ describe("identity service", () => {
       deps,
     );
     await firstReachedRepository;
-    await expect(registerMachine(
+    const second = registerMachine(
       POSTGRESQL_CONFIG,
       { displayName: "Second Rename" },
       deps,
-    )).resolves.toMatchObject({ identity: { displayName: "Second Rename" } });
+    );
+    expect(repository.registerMachine).toHaveBeenCalledTimes(1);
     releaseFirst();
 
     await expect(first).resolves.toMatchObject({
       identity: { machineId: MACHINE_ID, displayName: "First Rename" },
     });
-    expect(databaseDisplayName).toBe("First Rename");
+    await expect(second).resolves.toMatchObject({
+      identity: { machineId: MACHINE_ID, displayName: "Second Rename" },
+    });
+    expect(databaseDisplayName).toBe("Second Rename");
     expect(showMachine(deps)).toMatchObject({
       identityKey,
       machineId: MACHINE_ID,
-      displayName: "First Rename",
+      displayName: "Second Rename",
+    });
+    expect(repository.recoverMachine).not.toHaveBeenCalled();
+  });
+
+  it("keeps a concurrent registration newer than a forced recovery read", async () => {
+    await register();
+    const original = showMachine(deps)!;
+    let releaseRecovery!: () => void;
+    let recoveryStarted!: () => void;
+    const recoveryGate = new Promise<void>((resolve) => { releaseRecovery = resolve; });
+    const recoveryReachedRepository = new Promise<void>(
+      (resolve) => { recoveryStarted = resolve; },
+    );
+    repository.recoverMachine = vi.fn(async () => {
+      const stale = {
+        machineId: MACHINE_ID,
+        identityKey: original.identityKey,
+        displayName: original.displayName,
+        registeredAt: "2026-01-01T00:00:00.000Z",
+        lastSeenAt: "2026-01-01T00:00:00.000Z",
+      };
+      recoveryStarted();
+      await recoveryGate;
+      return stale;
+    });
+    repository.registerMachine.mockClear();
+
+    const recovering = recoverMachine(
+      POSTGRESQL_CONFIG,
+      MACHINE_ID,
+      { force: true },
+      deps,
+    );
+    await recoveryReachedRepository;
+    const registering = registerMachine(
+      POSTGRESQL_CONFIG,
+      { displayName: "New Machine Name" },
+      deps,
+    );
+    expect(repository.registerMachine).not.toHaveBeenCalled();
+    releaseRecovery();
+
+    await expect(recovering).resolves.toMatchObject({
+      identity: { displayName: "Machine A" },
+    });
+    await expect(registering).resolves.toMatchObject({
+      identity: { displayName: "New Machine Name" },
+    });
+    expect(repository.registerMachine).toHaveBeenCalledWith(
+      original.identityKey,
+      "New Machine Name",
+    );
+    expect(showMachine(deps)).toMatchObject({
+      identityKey: original.identityKey,
+      machineId: MACHINE_ID,
+      displayName: "New Machine Name",
+    });
+  });
+
+  it("does not retry malformed remote identity locks during registration", async () => {
+    mkdirSync(join(home, ".lcm"), { recursive: true });
+    writeFileSync(`${machineIdentityPath(home)}.remote.lock`, "not json\n", {
+      mode: 0o600,
+    });
+
+    await expect(registerMachine(
+      POSTGRESQL_CONFIG,
+      { displayName: "Machine A" },
+      deps,
+    )).rejects.toThrow("remote identity lock is malformed");
+    expect(repository.registerMachine).not.toHaveBeenCalled();
+  });
+
+  it("reconciles an out-of-band local rename from authoritative registration readback", async () => {
+    await register();
+    const original = showMachine(deps)!;
+    repository.registerMachine = vi.fn(async (identityKey, displayName) => {
+      writeFileSync(
+        machineIdentityPath(home),
+        `${JSON.stringify({ ...original, displayName: "Out-of-band Rename" })}\n`,
+        { mode: 0o600 },
+      );
+      return {
+        machineId: MACHINE_ID,
+        identityKey,
+        displayName,
+        registeredAt: "2026-01-01T00:00:00.000Z",
+        lastSeenAt: "2026-01-01T00:00:00.000Z",
+      };
+    });
+    repository.recoverMachine = vi.fn(async () => ({
+      machineId: MACHINE_ID,
+      identityKey: original.identityKey,
+      displayName: "Requested Rename",
+      registeredAt: "2026-01-01T00:00:00.000Z",
+      lastSeenAt: "2026-01-01T00:00:00.000Z",
+    }));
+
+    await expect(registerMachine(
+      POSTGRESQL_CONFIG,
+      { displayName: "Requested Rename" },
+      deps,
+    )).resolves.toMatchObject({
+      identity: { displayName: "Requested Rename" },
     });
     expect(repository.recoverMachine).toHaveBeenCalledWith(MACHINE_ID);
+    expect(showMachine(deps)).toMatchObject({
+      identityKey: original.identityKey,
+      machineId: MACHINE_ID,
+      displayName: "Requested Rename",
+    });
   });
 
   it.each([
