@@ -6,7 +6,10 @@ import { ensureAuthToken, readAuthToken } from "./auth.js";
 import { managedDaemonPath, SYSTEMD_DAEMON_PATH } from "./managed-path.js";
 import { PKG_VERSION } from "./version.js";
 import type { StorageBackend } from "./config.js";
-import { STAGED_POSTGRESQL_ERROR_CODE } from "./staged-postgresql.js";
+import {
+  isStagedPostgreSqlHealth,
+  STAGED_POSTGRESQL_ERROR_CODE,
+} from "./staged-postgresql.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
@@ -87,20 +90,9 @@ type HealthResponse = {
   };
 };
 
-function isStagedPostgreSqlUnavailableHealth(health: HealthResponse | null): boolean {
-  const error = health?.storage?.error;
-  return health?.httpStatus === 503
-    && health.status === "unavailable"
-    && health.storageBackend === "postgresql"
-    && health.storage?.status === "unavailable"
-    && error?.code === "STORAGE_INITIALIZATION_FAILED"
-    && error.backend === "postgresql"
-    && error.domain === "factory"
-    && error.operation === "health";
-}
-
 function isRecognizedDaemonHealth(health: HealthResponse | null): health is HealthResponse {
-  return health?.status === "ok" || isStagedPostgreSqlUnavailableHealth(health);
+  return health?.status === "ok"
+    || isStagedPostgreSqlHealth(health?.httpStatus ?? 0, health);
 }
 
 function healthVersionMatches(health: HealthResponse | null, expectedVersion: string | undefined): boolean {

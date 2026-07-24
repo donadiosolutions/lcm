@@ -9,6 +9,7 @@ import {
 } from "./http-url.js";
 import { daemonTokenPath } from "../runtime-paths.js";
 import type { StorageBackend } from "./config.js";
+import { isStagedPostgreSqlHealth } from "./staged-postgresql.js";
 
 export type DaemonHealth = {
   status: string;
@@ -30,24 +31,6 @@ export type DaemonHealth = {
 type DaemonHealthResponse = Omit<DaemonHealth, "storageBackend"> & {
   storageBackend?: StorageBackend;
 };
-
-function isStagedPostgreSqlHealth(
-  statusCode: number,
-  health: DaemonHealthResponse,
-): health is DaemonHealthResponse & { storageBackend: "postgresql" } {
-  const error = health?.storage?.error;
-  return statusCode === 503
-    && health?.status === "unavailable"
-    && health.storageBackend === "postgresql"
-    && typeof health.version === "string"
-    && typeof health.uptime === "number"
-    && typeof health.pid === "number"
-    && health.storage?.status === "unavailable"
-    && error?.code === "STORAGE_INITIALIZATION_FAILED"
-    && error.backend === "postgresql"
-    && error.domain === "factory"
-    && error.operation === "health";
-}
 
 export class DaemonClient {
   private token: string | null = null;

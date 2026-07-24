@@ -197,7 +197,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   constructedProcessor = passiveEventProcessor;
   routes.set("POST /promote-events", createPromoteEventsHandler(config, storageFactory));
   routes.set("POST /promote-events/all", createPromoteAllEventsHandler(config, storageFactory));
-  routes.set("POST /promote-events/notify", createPromoteEventsNotifyHandler(passiveEventProcessor));
+  routes.set(
+    "POST /promote-events/notify",
+    sqliteStorage
+      ? createPromoteEventsNotifyHandler(passiveEventProcessor)
+      : stagedPostgreSqlUnavailableHandler("promote-events-notify"),
+  );
   routes.set(
     "GET /stats",
     sqliteStorage ? createStatsHandler() : stagedPostgreSqlUnavailableHandler("stats"),

@@ -29,6 +29,11 @@ const MIGRATION_MANIFEST = [
     filename: "0003_machine_identity_key.sql",
     sha256: "bdc38d19bde5825eb1d59e9044769cbf9cac52be5c9fe34237f93ec347c3807b",
   },
+  {
+    id: "0004_machine_display_name",
+    filename: "0004_machine_display_name.sql",
+    sha256: "f12b4e5493da187e4c8cd4083766010b896961225cadd6fe568e4e99264e3421",
+  },
 ] as const;
 
 type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
@@ -441,6 +446,14 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
         constraint: "3448649dbf8834201c9401c101cab6b991227c7f87cbf6632372b95f90e90c17",
       },
       migrationId: "0003_machine_identity_key",
+    },
+    {
+      ...baseline,
+      definitionHashes: {
+        ...baseline.definitionHashes,
+        constraint: "eb90091397080e942d873e438a886db517f331ea8a62877755e056ec19de7770",
+      },
+      migrationId: "0004_machine_display_name",
     },
   ];
 }

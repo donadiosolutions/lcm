@@ -238,6 +238,11 @@ describe("daemon server", () => {
         body: { cwd: tempHome, query: "remember" },
       },
       { path: "/promote-events", operation: "promote-events", body: { cwd: tempHome } },
+      {
+        path: "/promote-events/notify",
+        operation: "promote-events-notify",
+        body: { cwd: tempHome },
+      },
     ];
     for (const request of stagedProjectRequests) {
       const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {

@@ -622,6 +622,28 @@ describe("identity service", () => {
     );
   });
 
+  it("preserves a created project adopted by an identical concurrent local binding", async () => {
+    await register();
+    const path = makeProject("create-concurrent-adoption");
+    const local = resolveProjectIdentity(path);
+    const originalCreate = repository.createProject.getMockImplementation()!;
+    repository.createProject = vi.fn(async (input) => {
+      const remote = await originalCreate(input);
+      setRemoteProjectBinding(remote.projectId, { hash: local.id });
+      return remote;
+    });
+
+    await expect(createProject(POSTGRESQL_CONFIG, path, {}, deps))
+      .resolves.toMatchObject({
+        local: { id: local.id, remoteProjectId: PROJECT_A },
+        remote: { projectId: PROJECT_A },
+      });
+    expect(repository.cleanupCreatedProject).not.toHaveBeenCalled();
+    await expect(repository.getProject(PROJECT_A)).resolves.toMatchObject({
+      projectId: PROJECT_A,
+    });
+  });
+
   it("returns an exact recovery command when project creation and cleanup both fail", async () => {
     await register();
     const path = makeProject("create-cleanup-fails");

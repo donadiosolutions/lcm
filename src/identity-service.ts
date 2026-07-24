@@ -601,6 +601,21 @@ export async function createProject(
       setRemoteProjectBinding(remote.projectId, { hash: local.id, expectedEntry: shown.entry });
     } catch (error) {
       try {
+        const adopted = showProjectMapEntry(projectPath);
+        if (
+          !adopted.transient
+          && adopted.hash === local.id
+          && adopted.entry.remoteProjectId === remote.projectId
+        ) {
+          return {
+            local: resolveProjectIdentity(projectPath),
+            remote,
+          };
+        }
+      } catch {
+        // An unreadable or conflicting map is not equivalent adoption.
+      }
+      try {
         await compensateCreatedProject(
           repository,
           remote.projectId,

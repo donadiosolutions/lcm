@@ -146,6 +146,7 @@ describe("ensureDaemon", () => {
             status: "unavailable",
             version: "1.2.3",
             storageBackend: "postgresql",
+            uptime: 10,
             pid: 4242,
             storage: {
               status: "unavailable",
@@ -216,6 +217,7 @@ describe("ensureDaemon", () => {
             status: "unavailable",
             version: "1.2.3",
             storageBackend: "postgresql",
+            uptime: 10,
             pid: 4242,
             storage: {
               status: "unavailable",

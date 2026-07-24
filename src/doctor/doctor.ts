@@ -23,7 +23,10 @@ import {
   type LlmRetryPolicy,
   type ResolvedStorageConfig,
 } from "../daemon/config.js";
-import { selectStorageBackend } from "../storage/backend.js";
+import {
+  isStagedPostgreSqlHealth,
+  type StagedPostgreSqlHealthResponse,
+} from "../daemon/staged-postgresql.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -55,7 +58,6 @@ interface DoctorConfig {
   port: number;
   storageBackend: "sqlite" | "postgresql" | "unavailable";
   storage?: ResolvedStorageConfig;
-  storageSelectionError?: Error;
   summarizer: string;
   apiMode?: string;
   reasoningEffort?: string;
@@ -67,6 +69,22 @@ interface DoctorConfig {
 
 const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start";
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
+
+type DoctorDaemonHealth = StagedPostgreSqlHealthResponse & {
+  readonly status?: string;
+};
+
+async function readRecognizedDaemonHealth(
+  fetchFn: typeof globalThis.fetch,
+  port: number,
+): Promise<DoctorDaemonHealth | null> {
+  const res = await fetchFn(`http://127.0.0.1:${port}/health`);
+  const health = await res.json() as DoctorDaemonHealth;
+  return (res.ok && health.status === "ok")
+    || isStagedPostgreSqlHealth(res.status, health)
+    ? health
+    : null;
+}
 
 export interface DoctorRunOptions {
   verbose?: boolean;
@@ -118,22 +136,6 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
   try {
     content = deps.readFileSync(resolvedConfigPath, "utf-8");
     const config = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
-    try {
-      selectStorageBackend(config.storage);
-    } catch (error) {
-      return {
-        port: config.daemon.port,
-        storageBackend: "unavailable",
-        storage: config.storage,
-        storageSelectionError: error as Error,
-        summarizer: config.llm.provider,
-        apiMode: config.llm.apiMode,
-        reasoningEffort: config.llm.reasoningEffort,
-        fastMode: config.llm.fastMode,
-        requestTimeoutMs: config.llm.provider === "openai" ? config.llm.requestTimeoutMs : undefined,
-        retry: config.llm.provider === "openai" ? config.llm.retry : undefined,
-      };
-    }
     return {
       port: config.daemon.port,
       storageBackend: config.storage.backend,
@@ -571,24 +573,15 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   let daemonHealthy = false;
   let daemonVersion: string | undefined;
   let daemonPid: number | undefined;
-  if (!config.storageSelectionError) {
-    try {
-      const res = await deps.fetch(`http://127.0.0.1:${config.port}/health`);
-      if (res.ok) {
-        const h = (await res.json()) as { status?: string; version?: string; pid?: number };
-        daemonHealthy = h.status === "ok";
-        daemonVersion = h.version;
-      }
-    } catch {}
-  }
+  try {
+    const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
+    if (h) {
+      daemonHealthy = true;
+      daemonVersion = h.version;
+    }
+  } catch {}
 
-  if (config.storageSelectionError) {
-    results.push({
-      name: "daemon", category: "Daemon", status: "fail",
-      message: `localhost:${config.port} — automatic start skipped: ${config.storageSelectionError.message}`,
-      fixApplied: false,
-    });
-  } else if (config.validationError || config.storageBackend === "unavailable") {
+  if (config.validationError || config.storageBackend === "unavailable") {
     results.push(daemonHealthy
       ? {
           name: "daemon", category: "Daemon", status: "warn",
@@ -605,7 +598,6 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     const versionMismatch = Boolean(pkgVersion && daemonVersion !== pkgVersion);
     const daemonVersionLabel = daemonVersion ? `v${daemonVersion}` : "unknown version";
     try {
-      selectStorageBackend(config.storage!);
       const { ensureDaemon } = await import("../daemon/lifecycle.js");
       const ensureResult = await ensureDaemon({
         port: config.port,
@@ -621,10 +613,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       let postRestartOk = false;
       if (ensureResult.connected) {
         try {
-          const res = await deps.fetch(`http://127.0.0.1:${config.port}/health`);
-          if (res.ok) {
-            const h = (await res.json()) as { status?: string; version?: string };
-            postRestartOk = h.status === "ok";
+          const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
+          if (h) {
+            postRestartOk = true;
             postRestartVersion = h.version;
           }
         } catch { /* non-fatal */ }
@@ -695,7 +686,6 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   } else {
     // Auto-fix: try ensureDaemon
     try {
-      selectStorageBackend(config.storage!);
       const { ensureDaemon } = await import("../daemon/lifecycle.js");
       const ensureResult = await ensureDaemon({
         port: config.port,

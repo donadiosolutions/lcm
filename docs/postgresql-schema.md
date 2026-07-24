@@ -447,7 +447,14 @@ on a provider does not justify silently expanding the baseline.
    `machine:<64 lowercase hex>` contract and registers the corresponding schema
    fingerprint. Existing nonconforming rows stop the migration and are never
    rewritten; an operator must reconcile those rows from verified machine
-   identity records before retrying.
+   identity records before retrying. `0004` replaces the permissive machine
+   display-name check with the CLI's recovery-safe contract: after local-style
+   whitespace trimming the name must occupy 1–256 UTF-16 code units and must
+   contain no control, bidirectional-formatting, line-separator, or
+   paragraph-separator characters. `NULL` remains valid for legacy machines and
+   is rendered through the deterministic `Machine <uuid>` fallback. Existing
+   invalid non-null names stop the migration without being rewritten; correct
+   them from verified machine records before retrying.
 4. Each pending migration and its ledger row execute in that same transaction.
    Any DDL, constraint, index, privilege, or ledger failure rolls back the whole
    pending set. Repeated and concurrent runs converge on the same ordered
