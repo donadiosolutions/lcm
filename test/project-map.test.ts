@@ -4,15 +4,19 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   addProjectAlias,
+  clearRemoteProjectBinding,
   clearProjectMapCache,
   hashProjectPath,
   listProjectMapEntries,
   normalizeProjectPath,
   projectMapPathsForHash,
   projectMapPath,
+  projectMapEntryHasStoredData,
+  isProjectHash,
   reloadProjectMapCache,
   removeProjectAlias,
   resolveProjectIdentity,
+  setRemoteProjectBinding,
   showProjectMapEntry,
   validateProjectMap,
   watchProjectMap,
@@ -33,6 +37,7 @@ function makeDir(name: string): string {
 }
 
 describe("project map", () => {
+  const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
   let tempHome: string | undefined;
@@ -77,6 +82,70 @@ describe("project map", () => {
     expect(projectDbPath(alias)).toBe(projectDbPath(canonical));
     expect(projectMetaPath(alias)).toBe(projectMetaPath(canonical));
     expect(eventsDbPath(alias)).toBe(eventsDbPath(canonical));
+  });
+
+  it("evolves legacy entries with an optional remote UUID without changing the local hash", () => {
+    const canonical = makeDir("remote-binding");
+    const local = resolveProjectIdentity(canonical);
+
+    const bound = setRemoteProjectBinding(remoteProjectId, { canonical });
+
+    expect(bound).toMatchObject({ hash: local.id, changed: true });
+    expect(bound.entry.remoteProjectId).toBe(remoteProjectId);
+    expect(resolveProjectIdentity(canonical)).toEqual({
+      ...local,
+      remoteProjectId,
+    });
+    expect(setRemoteProjectBinding(remoteProjectId, { canonical }))
+      .toMatchObject({ hash: local.id, changed: false });
+    expect(isProjectHash(local.id)).toBe(true);
+    expect(isProjectHash(remoteProjectId)).toBe(false);
+  });
+
+  it("clears only the remote binding while retaining the local entry", () => {
+    const canonical = makeDir("remote-unlink");
+    const local = resolveProjectIdentity(canonical);
+    setRemoteProjectBinding(remoteProjectId, { canonical });
+
+    const cleared = clearRemoteProjectBinding(canonical);
+
+    expect(cleared).toMatchObject({
+      hash: local.id,
+      remoteProjectId,
+      changed: true,
+    });
+    expect(cleared.entry.remoteProjectId).toBeUndefined();
+    expect(clearRemoteProjectBinding(canonical))
+      .toMatchObject({ hash: local.id, changed: false });
+    expect(resolveProjectIdentity(canonical)).toEqual(local);
+  });
+
+  it("requires explicit acknowledgement before binding or rebinding data-bearing projects", () => {
+    const canonical = makeDir("remote-data");
+    const local = resolveProjectIdentity(canonical);
+    mkdirSync(join(homedir(), ".lcm", "projects", local.id), { recursive: true });
+    writeFileSync(join(homedir(), ".lcm", "projects", local.id, "db.sqlite"), "");
+    expect(projectMapEntryHasStoredData(local.id)).toBe(true);
+
+    expect(setRemoteProjectBinding(remoteProjectId, { canonical }))
+      .toMatchObject({ changed: true });
+
+    const other = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021";
+    expect(() => setRemoteProjectBinding(other, { canonical }))
+      .toThrow("--allow-existing-data");
+    expect(setRemoteProjectBinding(other, {
+      canonical,
+      allowExistingData: true,
+    })).toMatchObject({ changed: true, entry: { remoteProjectId: other } });
+  });
+
+  it("guards remote binding input and unmapped unlink targets", () => {
+    const canonical = makeDir("remote-invalid");
+    resolveProjectIdentity(canonical);
+    expect(() => setRemoteProjectBinding("not-a-uuid", { canonical }))
+      .toThrow("invalid remote project UUIDv7");
+    expect(() => clearRemoteProjectBinding(makeDir("remote-unmapped")))
+      .toThrow("project is not mapped");
   });
 
   it("rejects missing aliases before they can be reinterpreted as symlinks", () => {
@@ -304,6 +373,7 @@ describe("project map", () => {
     ["non-object entry", { ["a".repeat(64)]: null }],
     ["empty canonical", { ["a".repeat(64)]: { canonical: "", aliases: [] } }],
     ["bad aliases", { ["a".repeat(64)]: { canonical: "/tmp/project", aliases: [""] } }],
+    ["bad remote ID", { ["a".repeat(64)]: { canonical: "/tmp/project", aliases: [], remoteProjectId: "bad" } }],
   ])("rejects invalid map schema: %s", (_label: string, map: unknown) => {
     writeFileSync(projectMapPath(), JSON.stringify(map));
 
@@ -440,6 +510,25 @@ describe("project map", () => {
     clearProjectMapCache();
 
     expect(() => resolveProjectIdentity(shared)).toThrow(/multiple hashes/);
+  });
+
+  it("preserves a remote binding on a legacy hash entry whose canonical path drifted", () => {
+    const target = makeDir("identity-drift-target");
+    const hash = hashProjectPath(normalizeProjectPath(target));
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [hash]: {
+        canonical: makeDir("identity-drift-canonical"),
+        aliases: [],
+        remoteProjectId,
+      },
+    }));
+    clearProjectMapCache();
+
+    expect(resolveProjectIdentity(target)).toEqual({
+      id: hash,
+      canonical: expect.stringContaining("identity-drift-canonical"),
+      remoteProjectId,
+    });
   });
 
   it("rejects a lexical path owned as both an alias and another canonical path", () => {
@@ -631,9 +720,24 @@ describe("project map", () => {
 
     expect(() => addProjectAlias(alias, { canonical: missingCanonical })).toThrow(/does not exist/);
     expect(() => addProjectAlias(alias, { hash: "not-a-hash" })).toThrow(/invalid project hash/);
+    expect(() => removeProjectAlias(alias, { hash: "not-a-hash" })).toThrow(/invalid project hash/);
     expect(() => addProjectAlias(alias, { hash: unknownHash })).toThrow(/unknown project hash/);
     expect(() => removeProjectAlias(join(homedir(), "unmapped-alias"))).toThrow(/not mapped/);
     expect(projectMapPathsForHash(unknownHash)).toEqual([]);
+  });
+
+  it("refuses to clear a remote binding from an unmapped transient target", () => {
+    expect(() => clearRemoteProjectBinding(join(homedir(), "unmapped-clear-target")))
+      .toThrow(/project is not mapped/);
+
+    const originalCwd = process.cwd();
+    const unmapped = makeDir("unmapped-clear-current");
+    process.chdir(unmapped);
+    try {
+      expect(() => clearRemoteProjectBinding()).toThrow(`project is not mapped: ${unmapped}`);
+    } finally {
+      process.chdir(originalCwd);
+    }
   });
 
   it("rejects a file as a canonical alias-removal target", () => {

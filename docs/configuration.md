@@ -344,13 +344,26 @@ Session restore locks use a SHA-256 digest of the agent session ID under `~/.lcm
 
 Project-local transcript paths remain supported for normal working directories. A working directory equal to the filesystem root does not authorize every file on the machine; provider-managed Claude and Codex transcript directories remain available in that case.
 
-## Project path aliases
+## Machine and project identities
 
-LCM records canonical project paths and aliases in `~/.lcm/map.json`. All project database paths, passive-learning sidecars, metadata, sensitive-pattern files, and search/promotion routes resolve through that map before choosing a project hash.
+LCM records canonical paths, same-machine aliases, and optional PostgreSQL
+project UUIDv7 bindings in `~/.lcm/map.json`. SQLite databases,
+passive-learning sidecars, metadata, sensitive-pattern files, and local
+search/promotion routes continue to use the path-derived local hash.
 
-Use `lcm map list`, `lcm map show`, `lcm map add`, and `lcm map remove` to manage aliases. Manual edits are supported; the daemon reloads valid changes without restart, pretty-prints valid non-canonical JSON, and keeps the last valid in-memory map during transient invalid saves.
+Use `lcm machine register|show|recover` for the private
+`~/.lcm/machine.json`, and `lcm project create|link|unlink|list|show` for
+project identities and aliases. PostgreSQL use fails closed until the machine
+is registered and the local project is explicitly bound. Hooks retain passive
+events in the local SQLite outbox during identity or PostgreSQL outages.
 
-See [Project path aliases](project-map.md) for the file format, backup behavior, ambiguity rules, and command reference.
+Manual map edits remain backward-compatible; the daemon reloads valid changes
+without restart, pretty-prints valid non-canonical JSON, and keeps the last
+valid in-memory map during transient invalid saves.
+
+See [Machine registration and project identity](project-identity.md) for
+permissions, recovery, pairing, stored-data guards, backup behavior, migration,
+ambiguity rules, and the command reference.
 
 ## Model selection
 

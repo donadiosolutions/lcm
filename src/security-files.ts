@@ -6,6 +6,7 @@ import {
   fstatSync,
   fsyncSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   openSync,
   readSync,
@@ -161,6 +162,43 @@ export function writePrivateFileExclusive(
     }
     if (!created && (error as NodeJS.ErrnoException).code === "EEXIST") return false;
     throw error;
+  }
+}
+
+/**
+ * Atomically create a private file only when the final destination is absent.
+ *
+ * The completed temporary file is hard-linked into place so concurrent readers
+ * can never observe a partially written destination. The link operation is
+ * same-directory and exclusive: an existing destination wins without being
+ * replaced.
+ */
+export function atomicWritePrivateFileExclusive(
+  path: string,
+  content: string,
+  operations: { readonly link?: typeof linkSync } = {},
+): boolean {
+  const directory = dirname(path);
+  ensurePrivateDirectory(directory);
+  const tempPath = join(directory, `.${basename(path)}.${randomBytes(12).toString("hex")}.tmp`);
+  try {
+    const fd = openSync(tempPath, "wx", PRIVATE_FILE_MODE);
+    try {
+      writeFileSync(fd, content, "utf-8");
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    try {
+      (operations.link ?? linkSync)(tempPath, path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error;
+    }
+    chmodSync(path, PRIVATE_FILE_MODE);
+    return true;
+  } finally {
+    rmSync(tempPath, { force: true });
   }
 }
 

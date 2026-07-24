@@ -1,0 +1,295 @@
+import { randomBytes } from "node:crypto";
+import { lstatSync } from "node:fs";
+import { hostname } from "node:os";
+import { dirname, join } from "node:path";
+import { lcmHomeDir } from "./runtime-paths.js";
+import {
+  atomicWritePrivateFile,
+  atomicWritePrivateFileExclusive,
+  ensurePrivateDirectory,
+  readBoundedRegularFile,
+  writePrivateFileExclusive,
+} from "./security-files.js";
+
+const MACHINE_IDENTITY_VERSION = 1 as const;
+const MAX_MACHINE_IDENTITY_BYTES = 64 * 1024;
+const IDENTITY_KEY_RE = /^machine:[a-f0-9]{64}$/u;
+const UUIDV7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+export interface MachineIdentity {
+  readonly version: typeof MACHINE_IDENTITY_VERSION;
+  readonly identityKey: string;
+  readonly machineId: string;
+  readonly displayName: string;
+}
+
+export interface PendingMachineIdentity {
+  readonly version: typeof MACHINE_IDENTITY_VERSION;
+  readonly identityKey: string;
+  readonly machineId: null;
+  readonly displayName: string;
+}
+
+export type StoredMachineIdentity = MachineIdentity | PendingMachineIdentity;
+
+export interface MachineIdentityRecoveryResult {
+  readonly identity: MachineIdentity;
+  readonly backupPath?: string;
+}
+
+export class MachineIdentityFileError extends Error {
+  constructor(
+    message: string,
+    readonly remediation: string,
+  ) {
+    super(`${message}. ${remediation}`);
+    this.name = "MachineIdentityFileError";
+  }
+}
+
+export function machineIdentityPath(homeDir?: string): string {
+  return join(lcmHomeDir(homeDir), "machine.json");
+}
+
+export function oldMachineIdentitiesDir(homeDir?: string): string {
+  return join(lcmHomeDir(homeDir), "oldmachines");
+}
+
+export function isUuidV7(value: string): boolean {
+  return UUIDV7_RE.test(value);
+}
+
+function normalizeDisplayName(value: string | undefined): string {
+  const normalized = (value ?? hostname()).trim();
+  if (
+    normalized.length === 0
+    || normalized.length > 256
+    || /[\u0000-\u001f\u007f]/u.test(normalized)
+  ) {
+    throw new MachineIdentityFileError(
+      "machine display name must contain 1-256 printable characters",
+      "Run `lcm machine register --name <display-name>` with a valid name.",
+    );
+  }
+  return normalized;
+}
+
+function parseMachineIdentity(content: string): StoredMachineIdentity {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    throw new MachineIdentityFileError(
+      "machine.json contains invalid JSON",
+      "Run `lcm machine recover <machine-id> --force` to replace the corrupt file.",
+    );
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new MachineIdentityFileError(
+      "machine.json must contain an object",
+      "Run `lcm machine recover <machine-id> --force` to replace the invalid file.",
+    );
+  }
+  const record = value as Record<string, unknown>;
+  if (record.version !== MACHINE_IDENTITY_VERSION) {
+    throw new MachineIdentityFileError(
+      `machine.json uses unsupported version ${String(record.version)}`,
+      "Upgrade LCM or run `lcm machine recover <machine-id> --force` with a supported version.",
+    );
+  }
+  if (typeof record.identityKey !== "string" || !IDENTITY_KEY_RE.test(record.identityKey)) {
+    throw new MachineIdentityFileError(
+      "machine.json contains an invalid identity key",
+      "Run `lcm machine recover <machine-id> --force` to replace the invalid file.",
+    );
+  }
+  if (typeof record.displayName !== "string") {
+    throw new MachineIdentityFileError(
+      "machine.json contains an invalid display name",
+      "Run `lcm machine recover <machine-id> --force` to replace the invalid file.",
+    );
+  }
+  const displayName = normalizeDisplayName(record.displayName);
+  if (record.machineId !== null && (
+    typeof record.machineId !== "string" || !isUuidV7(record.machineId)
+  )) {
+    throw new MachineIdentityFileError(
+      "machine.json contains an invalid PostgreSQL machine ID",
+      "Run `lcm machine recover <machine-id> --force` to replace the stale file.",
+    );
+  }
+  return {
+    version: MACHINE_IDENTITY_VERSION,
+    identityKey: record.identityKey,
+    machineId: record.machineId,
+    displayName,
+  };
+}
+
+function prettyMachineIdentity(identity: StoredMachineIdentity): string {
+  return `${JSON.stringify(identity, null, 2)}\n`;
+}
+
+function readMachineIdentityContent(path: string): string | null {
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new MachineIdentityFileError(
+        "machine.json must be a regular file and may not be a symbolic link",
+        "Move the unsafe path aside, then run `lcm machine recover <machine-id>`.",
+      );
+    }
+    if ((stat.mode & 0o077) !== 0) {
+      throw new MachineIdentityFileError(
+        "machine.json permissions are too broad; expected mode 0600",
+        `Run \`chmod 600 ${path}\`, then retry.`,
+      );
+    }
+    return readBoundedRegularFile(path, {
+      allowedRoot: dirname(path),
+      maxBytes: MAX_MACHINE_IDENTITY_BYTES,
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+export function readMachineIdentity(homeDir?: string): StoredMachineIdentity | null {
+  const content = readMachineIdentityContent(machineIdentityPath(homeDir));
+  return content === null ? null : parseMachineIdentity(content);
+}
+
+export function requireMachineIdentity(homeDir?: string): MachineIdentity {
+  const identity = readMachineIdentity(homeDir);
+  if (identity === null) {
+    throw new MachineIdentityFileError(
+      "machine identity is not registered",
+      "Run `lcm machine register` before linking a PostgreSQL project.",
+    );
+  }
+  if (identity.machineId === null) {
+    throw new MachineIdentityFileError(
+      "machine registration is pending",
+      "Run `lcm machine register` again to finish the interrupted registration.",
+    );
+  }
+  return identity;
+}
+
+export function ensurePendingMachineIdentity(
+  displayName?: string,
+  homeDir?: string,
+  fileOperations: {
+    readonly writeExclusive?: typeof atomicWritePrivateFileExclusive;
+  } = {},
+): { readonly identity: StoredMachineIdentity; readonly created: boolean } {
+  const existing = readMachineIdentity(homeDir);
+  if (existing !== null) return { identity: existing, created: false };
+  const pending: PendingMachineIdentity = {
+    version: MACHINE_IDENTITY_VERSION,
+    identityKey: `machine:${randomBytes(32).toString("hex")}`,
+    machineId: null,
+    displayName: normalizeDisplayName(displayName),
+  };
+  const path = machineIdentityPath(homeDir);
+  const created = (fileOperations.writeExclusive ?? atomicWritePrivateFileExclusive)(
+    path,
+    prettyMachineIdentity(pending),
+  );
+  if (created) return { identity: pending, created: true };
+  const winner = readMachineIdentity(homeDir);
+  if (winner === null) {
+    throw new MachineIdentityFileError(
+      "machine identity disappeared during concurrent registration",
+      "Run `lcm machine register` again.",
+    );
+  }
+  return { identity: winner, created: false };
+}
+
+export function finalizeMachineIdentity(
+  pending: StoredMachineIdentity,
+  machineId: string,
+  displayName: string,
+  homeDir?: string,
+): MachineIdentity {
+  if (!isUuidV7(machineId)) {
+    throw new MachineIdentityFileError(
+      "PostgreSQL returned an invalid machine ID",
+      "Verify the PostgreSQL 18 schema and rerun `lcm machine register`.",
+    );
+  }
+  const current = readMachineIdentity(homeDir);
+  if (current === null || current.identityKey !== pending.identityKey) {
+    throw new MachineIdentityFileError(
+      "machine identity changed during registration",
+      "Run `lcm machine show` and recover the intended identity explicitly.",
+    );
+  }
+  if (current.machineId !== null && current.machineId !== machineId) {
+    throw new MachineIdentityFileError(
+      "machine.json is stale and disagrees with PostgreSQL",
+      `Run \`lcm machine recover ${machineId} --force\` to reconcile it.`,
+    );
+  }
+  const identity: MachineIdentity = {
+    version: MACHINE_IDENTITY_VERSION,
+    identityKey: pending.identityKey,
+    machineId,
+    displayName: normalizeDisplayName(displayName),
+  };
+  atomicWritePrivateFile(machineIdentityPath(homeDir), prettyMachineIdentity(identity));
+  return identity;
+}
+
+function backupExistingMachineIdentity(homeDir?: string): string | undefined {
+  const path = machineIdentityPath(homeDir);
+  const content = readMachineIdentityContent(path);
+  if (content === null) return undefined;
+  const directory = oldMachineIdentitiesDir(homeDir);
+  ensurePrivateDirectory(directory);
+  const backupPath = join(directory, `machine-${Math.floor(Date.now() / 1000)}.json`);
+  writePrivateFileExclusive(backupPath, content);
+  return backupPath;
+}
+
+export function recoverMachineIdentity(
+  identity: MachineIdentity,
+  options: { readonly force?: boolean; readonly homeDir?: string } = {},
+): MachineIdentityRecoveryResult {
+  const validated = parseMachineIdentity(prettyMachineIdentity(identity));
+  if (validated.machineId === null) {
+    throw new MachineIdentityFileError(
+      "recovery requires a finalized machine identity",
+      "Provide a PostgreSQL-assigned machine UUIDv7.",
+    );
+  }
+  identity = validated;
+  const path = machineIdentityPath(options.homeDir);
+  let existing: StoredMachineIdentity | null = null;
+  let invalid = false;
+  try {
+    existing = readMachineIdentity(options.homeDir);
+  } catch (error) {
+    if (!options.force) throw error;
+    invalid = true;
+  }
+  if (!invalid && existing !== null) {
+    if (
+      existing.machineId === identity.machineId
+      && existing.identityKey === identity.identityKey
+    ) {
+      return { identity: existing };
+    }
+    if (!options.force) {
+      throw new MachineIdentityFileError(
+        "machine.json already contains a different identity",
+        `Run \`lcm machine recover ${identity.machineId} --force\` to replace it explicitly.`,
+      );
+    }
+  }
+  const backupPath = backupExistingMachineIdentity(options.homeDir);
+  atomicWritePrivateFile(path, prettyMachineIdentity(identity));
+  return { identity, backupPath };
+}

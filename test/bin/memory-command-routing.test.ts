@@ -3,8 +3,8 @@ import { Command } from "commander";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { registerMapCommand, registerMemoryCommands, shouldRunMain } from "../../bin/lcm.js";
-import { clearProjectMapCache, hashProjectPath, normalizeProjectPath } from "../../src/project-map.js";
+import { registerMachineCommand, registerMemoryCommands, registerProjectCommand, shouldRunMain } from "../../bin/lcm.js";
+import { clearProjectMapCache, normalizeProjectPath, resolveProjectIdentity } from "../../src/project-map.js";
 
 const originalCwd = process.cwd();
 const originalHome = process.env.HOME;
@@ -23,10 +23,10 @@ afterEach(() => {
   else process.env.USERPROFILE = originalUserProfile;
 });
 
-async function runMapCommand(args: string[]): Promise<{ stdout: string[]; stderr: string[] }> {
+async function runProjectCommand(args: string[]): Promise<{ stdout: string[]; stderr: string[] }> {
   const program = new Command("lcm");
   program.exitOverride();
-  registerMapCommand(program);
+  registerProjectCommand(program);
   const stdout: string[] = [];
   const stderr: string[] = [];
   vi.spyOn(console, "log").mockImplementation((message?: unknown) => { stdout.push(String(message)); });
@@ -36,7 +36,7 @@ async function runMapCommand(args: string[]): Promise<{ stdout: string[]; stderr
     return true;
   });
 
-  await program.parseAsync(["map", ...args], { from: "user" });
+  await program.parseAsync(["project", ...args], { from: "user" });
 
   return { stdout, stderr };
 }
@@ -83,22 +83,34 @@ describe("memory command registration", () => {
   });
 });
 
-describe("map command registration", () => {
-  it("registers map subcommands", () => {
+describe("identity command registration", () => {
+  it("registers project and machine subcommands", () => {
     const program = new Command("lcm");
-    registerMapCommand(program);
+    registerProjectCommand(program);
+    registerMachineCommand(program);
 
-    const mapCommand = program.commands.find((command) => command.name() === "map");
-    expect(mapCommand).toBeDefined();
-    expect(mapCommand?.commands.map((command) => command.name()).sort()).toEqual(["add", "list", "remove", "show"]);
+    const projectCommand = program.commands.find((command) => command.name() === "project");
+    expect(projectCommand?.commands.map((command) => command.name()).sort()).toEqual([
+      "create",
+      "link",
+      "list",
+      "show",
+      "unlink",
+    ]);
+    const machineCommand = program.commands.find((command) => command.name() === "machine");
+    expect(machineCommand?.commands.map((command) => command.name()).sort()).toEqual([
+      "recover",
+      "register",
+      "show",
+    ]);
   });
 
-  it("adds, lists, shows, and removes aliases through CLI actions", async () => {
-    tempHome = mkdtempSync(join(tmpdir(), "lcm-map-cli-home-"));
+  it("links, lists, shows, and unlinks local aliases through project CLI actions", async () => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-project-cli-home-"));
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
     clearProjectMapCache();
-    const dir = mkdtempSync(join(tmpdir(), "lcm-map-cli-"));
+    const dir = mkdtempSync(join(tmpdir(), "lcm-project-cli-"));
     const canonical = join(dir, "canonical");
     const alias = join(dir, "alias");
     mkdirSync(canonical, { recursive: true });
@@ -106,51 +118,45 @@ describe("map command registration", () => {
     process.chdir(canonical);
 
     try {
-      const add = await runMapCommand(["add", alias, "--canonical", canonical]);
-      const hash = hashProjectPath(normalizeProjectPath(canonical));
-      expect(add.stderr).toEqual([]);
-      expect(add.stdout).toEqual([`Added alias to ${hash}`]);
+      const hash = resolveProjectIdentity(canonical).id;
+      const link = await runProjectCommand(["link", hash, alias]);
+      expect(link.stderr).toEqual([]);
+      expect(link.stdout).toContain(`  local hash: ${hash}`);
 
-      const list = await runMapCommand(["list", "--json"]);
-      const listed = JSON.parse(list.stdout[0]) as { entries: Record<string, { canonical: string; aliases: string[] }> };
-      expect(listed.entries[hash].canonical).toBe(normalizeProjectPath(canonical));
-      expect(listed.entries[hash].aliases).toEqual([normalizeProjectPath(alias)]);
+      const list = await runProjectCommand(["list", "--json"]);
+      const listed = JSON.parse(list.stdout[0]) as {
+        local: Array<{ hash: string; canonical: string; aliases: string[] }>;
+      };
+      expect(listed.local).toContainEqual({
+        hash,
+        canonical: normalizeProjectPath(canonical),
+        aliases: [normalizeProjectPath(alias)],
+      });
 
-      const show = await runMapCommand(["show", hash]);
+      const show = await runProjectCommand(["show", hash]);
       expect(show.stdout).toContain(hash);
       expect(show.stdout).toContain(`  canonical: ${normalizeProjectPath(canonical)}`);
       expect(show.stdout).toContain(`  alias: ${normalizeProjectPath(alias)}`);
 
-      const remove = await runMapCommand(["remove", alias, "--hash", hash, "--json"]);
-      const removed = JSON.parse(remove.stdout[0]) as { hash: string; removed: boolean };
-      expect(removed).toMatchObject({ hash, removed: true });
+      const unlink = await runProjectCommand(["unlink", alias, "--json"]);
+      const unlinked = JSON.parse(unlink.stdout[0]) as { hash: string; aliasRemoved: boolean };
+      expect(unlinked).toMatchObject({ hash, aliasRemoved: true });
 
-      const addJson = await runMapCommand(["add", alias, "--hash", hash, "--json"]);
-      const added = JSON.parse(addJson.stdout[0]) as { added: boolean; hash: string };
-      expect(added.added).toBe(true);
-      expect(added.hash).toBe(hash);
+      const linkJson = await runProjectCommand(["link", canonical, alias, "--json"]);
+      const linked = JSON.parse(linkJson.stdout[0]) as { local: { id: string } };
+      expect(linked.local.id).toBe(hash);
 
-      const showJson = await runMapCommand(["show", alias, "--json"]);
+      const showJson = await runProjectCommand(["show", alias, "--json"]);
       const shown = JSON.parse(showJson.stdout[0]) as { hash: string; entry: { aliases: string[] } };
       expect(shown.hash).toBe(hash);
       expect(shown.entry.aliases).toEqual([normalizeProjectPath(alias)]);
 
-      const listText = await runMapCommand(["list"]);
+      const listText = await runProjectCommand(["list"]);
       expect(listText.stdout).toContain(hash);
       expect(listText.stdout).toContain(`  alias: ${normalizeProjectPath(alias)}`);
 
-      const removeText = await runMapCommand(["remove", alias, "--hash", hash]);
-      expect(removeText.stdout).toEqual([`Removed alias from ${hash}`]);
-
-      const existingAlias = join(dir, "existing-alias");
-      mkdirSync(existingAlias);
-      const addExisting = await runMapCommand(["add", existingAlias, "--hash", hash]);
-      expect(addExisting.stderr).toEqual([]);
-      expect(addExisting.stdout).toEqual([`Added alias to ${hash}`]);
-
-      const absentAlias = join(dir, "absent-alias");
-      const removeAbsent = await runMapCommand(["remove", absentAlias, "--hash", hash]);
-      expect(removeAbsent.stdout).toEqual([`Alias was not present on ${hash}`]);
+      const unlinkText = await runProjectCommand(["unlink", alias]);
+      expect(unlinkText.stdout).toEqual([`Removed project alias from ${hash}`]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

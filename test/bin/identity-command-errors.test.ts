@@ -3,7 +3,7 @@ import { Command } from "commander";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { clearProjectMapCache, hashProjectPath, normalizeProjectPath } from "../../src/project-map.js";
+import { clearProjectMapCache, resolveProjectIdentity } from "../../src/project-map.js";
 
 const exitMock = vi.hoisted(() =>
   vi.fn((code?: string | number | null) => {
@@ -19,7 +19,7 @@ vi.mock("node:process", async (importOriginal) => {
 
 vi.mock("../../src/cli-help.js", () => ({ printHelp: printHelpMock }));
 
-const { registerMapCommand } = await import("../../bin/lcm.js");
+const { registerMachineCommand, registerProjectCommand } = await import("../../bin/lcm.js");
 
 const originalCwd = process.cwd();
 const originalHome = process.env.HOME;
@@ -43,10 +43,14 @@ afterEach(() => {
   else process.env.USERPROFILE = originalUserProfile;
 });
 
-async function runMapCommand(args: string[]): Promise<{ stdout: string[]; stderr: string[]; thrown?: Error }> {
+async function runIdentityCommand(
+  command: "machine" | "project",
+  args: string[],
+): Promise<{ stdout: string[]; stderr: string[]; thrown?: Error }> {
   const program = new Command("lcm");
   program.exitOverride();
-  registerMapCommand(program);
+  registerMachineCommand(program);
+  registerProjectCommand(program);
   const stdout: string[] = [];
   const stderr: string[] = [];
   vi.spyOn(console, "log").mockImplementation((message?: unknown) => { stdout.push(String(message)); });
@@ -57,7 +61,7 @@ async function runMapCommand(args: string[]): Promise<{ stdout: string[]; stderr
   });
 
   try {
-    await program.parseAsync(["map", ...args], { from: "user" });
+    await program.parseAsync([command, ...args], { from: "user" });
     return { stdout, stderr };
   } catch (err) {
     return { stdout, stderr, thrown: err instanceof Error ? err : new Error(String(err)) };
@@ -65,58 +69,78 @@ async function runMapCommand(args: string[]): Promise<{ stdout: string[]; stderr
 }
 
 function useTempHome(): void {
-  tempHome = mkdtempSync(join(tmpdir(), "lcm-map-cli-error-home-"));
+  tempHome = mkdtempSync(join(tmpdir(), "lcm-identity-cli-error-home-"));
   process.env.HOME = tempHome;
   process.env.USERPROFILE = tempHome;
   clearProjectMapCache();
 }
 
-describe("map command exits", () => {
-  it("prints root usage and exits when no map subcommand is provided", async () => {
-    const result = await runMapCommand([]);
+describe("identity command exits", () => {
+  it("prints project root usage and exits when no subcommand is provided", async () => {
+    const result = await runIdentityCommand("project", []);
 
-    expect(result.stderr).toEqual(["Usage: lcm map <list|show|add|remove> [options]"]);
+    expect(result.stderr).toEqual(["Usage: lcm project <create|link|unlink|list|show> [options]"]);
     expect(result.thrown?.message).toBe("exit:1");
     expect(exitMock).toHaveBeenCalledWith(1);
   });
 
-  it("prints custom help for the map root", async () => {
-    const result = await runMapCommand(["--help"]);
+  it("prints custom help for the project root", async () => {
+    const result = await runIdentityCommand("project", ["--help"]);
 
-    expect(printHelpMock).toHaveBeenCalledWith("map");
+    expect(printHelpMock).toHaveBeenCalledWith("project");
     expect(result.thrown?.message).toBe("exit:0");
     expect(exitMock).toHaveBeenCalledWith(0);
   });
 
-  it("prints JSON errors for map show failures", async () => {
+  it("prints JSON errors for project show failures", async () => {
     useTempHome();
-    const result = await runMapCommand(["show", "a".repeat(64), "--json"]);
+    const result = await runIdentityCommand("project", ["show", "a".repeat(64), "--json"]);
 
     expect(JSON.parse(result.stdout[0])).toEqual({ error: `unknown project hash: ${"a".repeat(64)}` });
     expect(result.thrown?.message).toBe("exit:1");
   });
 
-  it("prints text errors for map add failures", async () => {
+  it("prints text errors for project link collisions", async () => {
     useTempHome();
-    tempDir = mkdtempSync(join(tmpdir(), "lcm-map-cli-error-"));
-    const canonical = join(tempDir, "canonical");
+    tempDir = mkdtempSync(join(tmpdir(), "lcm-project-cli-error-"));
+    const first = join(tempDir, "first");
+    const second = join(tempDir, "second");
     const alias = join(tempDir, "alias");
-    mkdirSync(canonical);
+    mkdirSync(first);
+    mkdirSync(second);
     mkdirSync(alias);
-    const hash = hashProjectPath(normalizeProjectPath(canonical));
-    await runMapCommand(["add", alias, "--canonical", canonical]);
+    const firstHash = resolveProjectIdentity(first).id;
+    const secondHash = resolveProjectIdentity(second).id;
+    await runIdentityCommand("project", ["link", firstHash, alias]);
 
-    const result = await runMapCommand(["add", alias, "--hash", hash]);
+    const result = await runIdentityCommand("project", ["link", secondHash, alias]);
 
     expect(result.stderr[0]).toMatch(/^Error: alias is already mapped to /);
     expect(result.thrown?.message).toBe("exit:1");
   });
 
-  it("prints errors from map remove failures", async () => {
+  it("prints errors from project unlink failures", async () => {
     useTempHome();
-    const result = await runMapCommand(["remove", "/tmp/alias", "--hash", "not-a-hash"]);
+    const result = await runIdentityCommand("project", ["unlink", "/tmp/not-mapped"]);
 
-    expect(result.stderr).toEqual(["Error: invalid project hash: not-a-hash"]);
+    expect(result.stderr[0]).toMatch(/^Error: project is not mapped:/);
     expect(result.thrown?.message).toBe("exit:1");
+  });
+
+  it("covers machine root help, usage, and JSON errors", async () => {
+    const usage = await runIdentityCommand("machine", []);
+    expect(usage.stderr).toEqual(["Usage: lcm machine <register|show|recover> [options]"]);
+    expect(usage.thrown?.message).toBe("exit:1");
+
+    const help = await runIdentityCommand("machine", ["--help"]);
+    expect(printHelpMock).toHaveBeenCalledWith("machine");
+    expect(help.thrown?.message).toBe("exit:0");
+
+    useTempHome();
+    const missing = await runIdentityCommand("machine", ["show", "--json"]);
+    expect(JSON.parse(missing.stdout[0])).toEqual({
+      error: "machine identity is not registered; run `lcm machine register`",
+    });
+    expect(missing.thrown?.message).toBe("exit:1");
   });
 });

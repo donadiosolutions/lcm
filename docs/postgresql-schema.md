@@ -445,7 +445,9 @@ maintenance must not receive sequence restart or table-truncate authority.
   current versions first; extension binaries and server preload configuration
   are cluster infrastructure, not rows in an application backup.
 - The local `~/.lcm/machine.json`, project map, and SQLite hook outbox are not in
-  a PostgreSQL backup. Preserve them separately. Once #91 exists, replay uses
+  a PostgreSQL backup. Preserve them separately. Recover a lost machine file
+  with the explicit PostgreSQL machine UUID via `lcm machine recover`; restore
+  project bindings explicitly via `lcm project link`. Once #91 exists, replay uses
   `(machine_id, event_id)` and machine sequence uniqueness to avoid duplicate
   remote inbox effects; do not acknowledge a local event solely because a
   restored checkpoint claims it was applied.

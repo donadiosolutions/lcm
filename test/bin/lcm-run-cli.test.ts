@@ -300,8 +300,11 @@ describe("runCli registration and help dispatch", () => {
   it.each([
     [[], undefined], [["--help"], undefined], [["help"], undefined], [["help", "compact"], "compact"],
     [["daemon", "--help"], "daemon"], [["daemon", "start", "--help"], "daemon"], [["daemon", "restart", "--help"], "daemon"],
-    [["map", "--help"], "map"], [["map", "list", "--help"], "map"], [["map", "show", "--help"], "map"],
-    [["map", "add", "--help"], "map"], [["map", "remove", "--help"], "map"],
+    [["machine", "--help"], "machine"], [["machine", "register", "--help"], "machine"],
+    [["machine", "show", "--help"], "machine"], [["machine", "recover", "machine-id", "--help"], "machine"],
+    [["project", "--help"], "project"], [["project", "list", "--help"], "project"],
+    [["project", "show", "--help"], "project"], [["project", "link", "target", "--help"], "project"],
+    [["project", "unlink", "--help"], "project"], [["project", "create", "--help"], "project"],
     [["connectors", "list", "--help"], "connectors"], [["connectors", "install", "--help"], "connectors"],
     [["connectors", "remove", "--help"], "connectors"], [["connectors", "doctor", "--help"], "connectors"],
     [["config", "get", "daemon.port", "--help"], "config"],

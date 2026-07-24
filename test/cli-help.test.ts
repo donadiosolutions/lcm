@@ -152,13 +152,20 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("lcm doctor --events-max-dbs all");
   });
 
-  it("prints map command help", () => {
+  it("prints machine and project command help", () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-    printHelp("map");
+    printHelp("machine");
     const text = out.mock.calls.map(c => c[0]).join("");
-    expect(text).toContain("lcm map");
-    expect(text).toContain("add <alias>");
-    expect(text).toContain("--canonical");
+    expect(text).toContain("lcm machine");
+    expect(text).toContain("recover <machine-id>");
+    expect(text).toContain("--force");
+
+    out.mockClear();
+    printHelp("project");
+    const projectText = out.mock.calls.map(c => c[0]).join("");
+    expect(projectText).toContain("lcm project");
+    expect(projectText).toContain("link <project-id|local-target>");
+    expect(projectText).toContain("--allow-existing-data");
   });
 
   it("prints import command help with Codex provider flags", () => {

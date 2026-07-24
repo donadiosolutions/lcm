@@ -17,10 +17,12 @@ import {
   readBoundedRegularFileWithStat,
   writePrivateFileExclusive,
 } from "./security-files.js";
+import { isUuidV7 } from "./machine-identity.js";
 
 export type ProjectMapEntry = {
   canonical: string;
   aliases: string[];
+  remoteProjectId?: string;
 };
 
 export type ProjectMap = Record<string, ProjectMapEntry>;
@@ -28,6 +30,7 @@ export type ProjectMap = Record<string, ProjectMapEntry>;
 export type ProjectIdentity = {
   id: string;
   canonical: string;
+  remoteProjectId?: string;
 };
 
 export type ProjectMapValidation = {
@@ -77,7 +80,11 @@ function cloneMap(map: ProjectMap): ProjectMap {
   return Object.fromEntries(
     Object.entries(map).map(([hash, entry]) => [
       hash,
-      { canonical: entry.canonical, aliases: [...entry.aliases] },
+      {
+        canonical: entry.canonical,
+        aliases: [...entry.aliases],
+        ...(entry.remoteProjectId ? { remoteProjectId: entry.remoteProjectId } : {}),
+      },
     ]),
   );
 }
@@ -127,9 +134,17 @@ function parseProjectMap(content: string): ProjectMap {
         throw new Error(`map entry ${hash}.aliases must contain only absolute paths: ${alias}`);
       }
     }
+    if (entry.remoteProjectId !== undefined && (
+      typeof entry.remoteProjectId !== "string" || !isUuidV7(entry.remoteProjectId)
+    )) {
+      throw new Error(`map entry ${hash}.remoteProjectId must be a PostgreSQL UUIDv7`);
+    }
     map[hash] = {
       canonical: entry.canonical,
       aliases: [...entry.aliases],
+      ...(typeof entry.remoteProjectId === "string"
+        ? { remoteProjectId: entry.remoteProjectId }
+        : {}),
     };
   }
   return map;
@@ -337,7 +352,11 @@ export function resolveProjectIdentity(cwd: string): ProjectIdentity {
   }
   if (matches.size === 1) {
     const id = [...matches][0];
-    return { id, canonical: resolve(map[id].canonical) };
+    return {
+      id,
+      canonical: resolve(map[id].canonical),
+      ...(map[id].remoteProjectId ? { remoteProjectId: map[id].remoteProjectId } : {}),
+    };
   }
 
   const id = hashProjectPath(normalized);
@@ -345,7 +364,11 @@ export function resolveProjectIdentity(cwd: string): ProjectIdentity {
     map[id] = { canonical: normalized, aliases: [] };
     writeProjectMap(map, undefined, { metadataPopulated: true });
   }
-  return { id, canonical: resolve(map[id].canonical) };
+  return {
+    id,
+    canonical: resolve(map[id].canonical),
+    ...(map[id].remoteProjectId ? { remoteProjectId: map[id].remoteProjectId } : {}),
+  };
 }
 
 export function listProjectMapEntries(): ProjectMap {
@@ -409,6 +432,84 @@ export function projectMapPathsForHash(hash: string): string[] {
   const entry = map[hash];
   if (!entry) return [];
   return [...new Set([entry.canonical, ...entry.aliases].map((path) => resolve(path)))];
+}
+
+export function isProjectHash(value: string): boolean {
+  return HASH_RE.test(value);
+}
+
+export function projectMapEntryHasStoredData(hash: string): boolean {
+  return existingProjectHasStoredData(hash);
+}
+
+export function setRemoteProjectBinding(
+  remoteProjectId: string,
+  opts: {
+    readonly canonical?: string;
+    readonly hash?: string;
+    readonly allowExistingData?: boolean;
+  } = {},
+): {
+  readonly hash: string;
+  readonly entry: ProjectMapEntry;
+  readonly changed: boolean;
+  readonly backupPath?: string;
+} {
+  if (!isUuidV7(remoteProjectId)) {
+    throw new Error(`invalid remote project UUIDv7: ${remoteProjectId}`);
+  }
+  const target = resolveCliTarget({ canonical: opts.canonical, hash: opts.hash });
+  const current = target.entry.remoteProjectId;
+  if (current === remoteProjectId) {
+    return { hash: target.hash, entry: target.entry, changed: false };
+  }
+  if (
+    current !== undefined
+    && existingProjectHasStoredData(target.hash)
+    && !opts.allowExistingData
+  ) {
+    throw new Error(
+      `project ${target.hash} already has local data; rerun with --allow-existing-data to rebind it explicitly`,
+    );
+  }
+  target.map[target.hash].remoteProjectId = remoteProjectId;
+  const write = writeProjectMap(target.map);
+  return {
+    hash: target.hash,
+    entry: target.map[target.hash],
+    changed: true,
+    backupPath: write.backupPath,
+  };
+}
+
+export function clearRemoteProjectBinding(
+  target?: string,
+): {
+  readonly hash: string;
+  readonly entry: ProjectMapEntry;
+  readonly remoteProjectId?: string;
+  readonly changed: boolean;
+  readonly backupPath?: string;
+} {
+  const shown = showProjectMapEntry(target);
+  if (shown.transient) {
+    throw new Error(`project is not mapped: ${target ?? process.cwd()}`);
+  }
+  const map = listProjectMapEntries();
+  const entry = map[shown.hash];
+  const remoteProjectId = entry.remoteProjectId;
+  if (!remoteProjectId) {
+    return { hash: shown.hash, entry, changed: false };
+  }
+  delete entry.remoteProjectId;
+  const write = writeProjectMap(map);
+  return {
+    hash: shown.hash,
+    entry,
+    remoteProjectId,
+    changed: true,
+    backupPath: write.backupPath,
+  };
 }
 
 export function addProjectAlias(alias: string, opts: { canonical?: string; hash?: string } = {}): { hash: string; entry: ProjectMapEntry; warning?: string; backupPath?: string } {

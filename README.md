@@ -228,15 +228,16 @@ lcm stats                  # memory and compression overview
 lcm stats -v               # per-conversation breakdown
 lcm stats --pool           # connection pool statistics
 
-# Project path aliases
-lcm map list               # list canonical project paths and aliases
-lcm map list --json        # output the project path map as JSON
-lcm map show               # show the current project's canonical path and aliases
-lcm map show [path-or-hash] # show a specific path or project hash
-lcm map add <alias>        # add an alias to the current project
-lcm map add <alias> --canonical <path> # add an alias to a specific canonical project
-lcm map add <alias> --hash <hash>      # add an alias to a specific project hash
-lcm map remove <alias>     # remove an alias from its unambiguous project
+# Machine and project identity
+lcm machine register --name workstation # register this machine for PostgreSQL
+lcm machine show --json                  # show the local machine UUID
+lcm machine recover <machine-uuid>       # recover after a reimage
+lcm project create [path] --name lcm     # create and bind a PostgreSQL project
+lcm project link <project-uuid> [path]   # pair a path to a remote project
+lcm project link <local-hash> <alias>    # add a same-machine path alias
+lcm project unlink [path]                # remove an alias or remote binding
+lcm project list --json                  # list local and remote identities
+lcm project show [path-or-hash]           # inspect one project
 
 # Compaction & promotion
 lcm compact                # compact the current project
@@ -291,7 +292,9 @@ lcm post-tool              # PostToolUse hook (passive learning)
 lcm mcp                    # start MCP server
 ```
 
-See [Project path aliases](docs/project-map.md) for `lcm map` ambiguity rules, manual `~/.lcm/map.json` edits, backups, and daemon reload behavior.
+See [Machine registration and project identity](docs/project-identity.md) for
+PostgreSQL pairing, reimage recovery, local aliases, permissions,
+unlink/relink behavior, migration binding, and ambiguity diagnosis.
 
 ## Configuration
 

@@ -1,5 +1,6 @@
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -15,6 +16,7 @@ import { join, parse } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   atomicWritePrivateFile,
+  atomicWritePrivateFileExclusive,
   deleteRegularFile,
   ensurePrivateDirectory,
   readBoundedRegularFile,
@@ -175,6 +177,29 @@ describe("private filesystem primitives", () => {
     expect(writePrivateFileExclusive(path, "second")).toBe(false);
     expect(readFileSync(path, "utf-8")).toBe("first");
     expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+
+  it("atomically publishes an exclusive private file without replacing the winner", () => {
+    const root = makeRoot();
+    const path = join(root, "atomic-exclusive");
+
+    expect(atomicWritePrivateFileExclusive(path, "first")).toBe(true);
+    expect(atomicWritePrivateFileExclusive(path, "second")).toBe(false);
+    expect(readFileSync(path, "utf-8")).toBe("first");
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+
+  it("propagates atomic publication failures other than an existing destination", () => {
+    const root = makeRoot();
+    const path = join(root, "atomic-denied");
+    const denied = Object.assign(new Error("denied"), { code: "EACCES" });
+
+    expect(() => atomicWritePrivateFileExclusive(path, "content", {
+      link: () => {
+        throw denied;
+      },
+    })).toThrow(denied);
+    expect(existsSync(path)).toBe(false);
   });
 
   it("removes an exclusively created destination when initialization fails", () => {
