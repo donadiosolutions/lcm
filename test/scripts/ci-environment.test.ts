@@ -16,6 +16,7 @@ import {
   NODE_DEPENDENCY_INPUT_PATHS,
   NODE_VERSION,
   POSTGRES_TEMPLATE_INPUT_PATHS,
+  POSTGRES_TEMPLATE_MARKER,
   assertSecureInventoryPlatform,
   cacheMetadata,
   compareInventoryNames,
@@ -60,6 +61,7 @@ describe("CI environment cache metadata", () => {
     expect(action).toContain("actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306");
     expect(action).not.toContain("restore-keys:");
     expect(action).toContain("path: node_modules");
+    expect(action.match(/node-version:\s*"([^"]+)"/u)?.[1]).toBe(NODE_VERSION);
     expect(workflow).toContain("name: Initialize CI environment");
     expect(workflow.match(/runs-on: blacksmith-4vcpu-ubuntu-2404/gu)).toHaveLength(3);
     expect(workflow.match(/uses: \.\/\.github\/actions\/setup-ci/gu)).toHaveLength(3);
@@ -172,13 +174,27 @@ describe("CI environment cache metadata", () => {
       new URL("../postgresql/cached-run-init.sh", import.meta.url),
       "utf8",
     );
+    const harness = readFileSync(
+      new URL("../../scripts/postgresql-harness.mjs", import.meta.url),
+      "utf8",
+    );
 
     expect(templateInitializer.lastIndexOf("\npsql ")).toBeGreaterThan(
       templateInitializer.lastIndexOf("pg_hba.conf"),
     );
     expect(templateInitializer).not.toContain("exec psql");
-    expect(templateInitializer.lastIndexOf("lcm-postgresql-template-v1")).toBeGreaterThan(
+    expect(templateInitializer.lastIndexOf("LCM_POSTGRES_TEMPLATE_MARKER")).toBeGreaterThan(
       templateInitializer.lastIndexOf("pg_hba.conf"),
+    );
+    expect(templateInitializer).not.toContain(POSTGRES_TEMPLATE_MARKER);
+    expect(cachedInitializer).not.toContain(POSTGRES_TEMPLATE_MARKER);
+    expect(templateInitializer).toContain("VALUES (:'template_marker')");
+    expect(cachedInitializer).toContain("current_setting('lcm.template_marker')");
+    expect(environmentInitializer).toContain(
+      "`LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`",
+    );
+    expect(harness).toContain(
+      "`LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`",
     );
     expect(environmentInitializer).toContain('test "$(< /proc/1/comm)" = postgres');
     expect(environmentInitializer).toContain("count(*) = 3 AND bool_and(NOT rolcanlogin)");

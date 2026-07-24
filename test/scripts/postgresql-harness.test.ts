@@ -12,6 +12,7 @@ import {
   harnessErrorDetails,
   isMissingDockerObjectError,
   removeLabeled,
+  resolveConfiguredTemplateArchive,
   runProcess,
   runSanitizedProcess,
   sanitizeHarnessText,
@@ -42,6 +43,23 @@ describe("PostgreSQL harness utilities", () => {
     });
     expect(() => validateRunNames(names, "not-random")).toThrow("run ID");
     expect(() => validateRunNames({ ...names, volume: "foreign-volume" }, runId)).toThrow("volume");
+  });
+
+  it("fails closed with context when a configured template archive cannot be resolved", () => {
+    const missing = "/cache/missing-postgresql-template.tar";
+    const missingError = Object.assign(new Error("not found"), { code: "ENOENT" });
+    expect(resolveConfiguredTemplateArchive("  ")).toBe("");
+    expect(() => resolveConfiguredTemplateArchive(missing, {
+      realpath: () => { throw missingError; },
+    })).toThrow(`configured PostgreSQL template archive could not be resolved: ${missing}`);
+    expect(() => resolveConfiguredTemplateArchive("/cache/template.tar", {
+      realpath: () => "/resolved/template.tar",
+      stat: () => ({ isFile: () => false }),
+    })).toThrow("configured PostgreSQL template archive is not a regular file: /resolved/template.tar");
+    expect(resolveConfiguredTemplateArchive("/cache/template.tar", {
+      realpath: () => "/resolved/template.tar",
+      stat: () => ({ isFile: () => true }),
+    })).toBe("/resolved/template.tar");
   });
 
   it("isolates Vitest caches by validated harness run ID", () => {

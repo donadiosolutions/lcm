@@ -384,6 +384,7 @@ export async function buildPostgreSqlTemplate(archivePath) {
       "--volume", `${templateInitScript}:/docker-entrypoint-initdb.d/10-lcm-template.sh:ro`,
       "--env", "POSTGRES_HOST_AUTH_METHOD=trust",
       "--env", "POSTGRES_DB=postgres",
+      "--env", `LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`,
       POSTGRES_IMAGE,
       "-c", "shared_preload_libraries=pg_stat_statements",
       "-c", "password_encryption=scram-sha-256",

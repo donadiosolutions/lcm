@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+: "${LCM_POSTGRES_TEMPLATE_MARKER:?LCM_POSTGRES_TEMPLATE_MARKER is required}"
 
 ADMIN_PASSWORD="$(< /run/lcm-private/admin-password)"
 MIGRATOR_PASSWORD="$(< /run/lcm-private/migrator-password)"
@@ -14,13 +15,16 @@ psql --set=ON_ERROR_STOP=1 \
   --set=migrator_password="$MIGRATOR_PASSWORD" \
   --set=runtime_password="$RUNTIME_PASSWORD" \
   --set=run_id="$RUN_ID" \
-  --set=database_name="$DATABASE_NAME" <<'SQL'
+  --set=database_name="$DATABASE_NAME" \
+  --set=template_marker="$LCM_POSTGRES_TEMPLATE_MARKER" <<'SQL'
+SELECT set_config('lcm.template_marker', :'template_marker', false);
+
 DO $$
 BEGIN
   IF NOT EXISTS (
     SELECT 1
     FROM public.__lcm_template_marker
-    WHERE marker = 'lcm-postgresql-template-v1'
+    WHERE marker = current_setting('lcm.template_marker')
   ) THEN
     RAISE EXCEPTION 'cached PostgreSQL template marker is invalid';
   END IF;

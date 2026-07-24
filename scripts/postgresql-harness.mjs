@@ -9,7 +9,10 @@ import {
   NODE_IMAGE,
   POSTGRES_IMAGE,
 } from "./postgresql-images.mjs";
-import { validatePostgreSqlTemplateArchive } from "./ci-environment.mjs";
+import {
+  POSTGRES_TEMPLATE_MARKER,
+  validatePostgreSqlTemplateArchive,
+} from "./ci-environment.mjs";
 
 export { NODE_IMAGE, POSTGRES_IMAGE };
 export const RUN_LABEL = "com.donadiosolutions.lcm.postgresql-test-run";
@@ -39,6 +42,33 @@ export function validateRunNames(names, runId) {
   for (const key of Object.keys(expected)) {
     if (names[key] !== expected[key]) throw new Error(`invalid PostgreSQL harness ${key}`);
   }
+}
+
+export function resolveConfiguredTemplateArchive(configuredPath, dependencies = {}) {
+  const candidate = String(configuredPath ?? "").trim();
+  if (!candidate) return "";
+  const resolveRealpath = dependencies.realpath ?? realpathSync;
+  const inspectPath = dependencies.stat ?? statSync;
+  let resolvedPath;
+  try {
+    resolvedPath = resolveRealpath(candidate);
+  } catch (error) {
+    throw new Error(`configured PostgreSQL template archive could not be resolved: ${candidate}`, {
+      cause: error,
+    });
+  }
+  let archiveStat;
+  try {
+    archiveStat = inspectPath(resolvedPath);
+  } catch (error) {
+    throw new Error(`configured PostgreSQL template archive could not be inspected: ${resolvedPath}`, {
+      cause: error,
+    });
+  }
+  if (!archiveStat.isFile()) {
+    throw new Error(`configured PostgreSQL template archive is not a regular file: ${resolvedPath}`);
+  }
+  return resolvedPath;
 }
 
 export function sanitizeHarnessText(value, secrets) {
@@ -472,12 +502,9 @@ export async function runHarness(options = {}) {
     await setupDocker(["network", "create", "--label", `${RUN_LABEL}=${runId}`, names.network]);
     await setupDocker(["volume", "create", "--label", `${RUN_LABEL}=${runId}`, names.volume]);
     const configuredTemplateArchive = String(process.env.LCM_POSTGRES_TEMPLATE_ARCHIVE ?? "").trim();
-    const usingCachedTemplate = configuredTemplateArchive.length > 0;
-    const templateArchive = usingCachedTemplate ? realpathSync(configuredTemplateArchive) : "";
+    const templateArchive = resolveConfiguredTemplateArchive(configuredTemplateArchive);
+    const usingCachedTemplate = templateArchive.length > 0;
     if (usingCachedTemplate) {
-      if (!statSync(templateArchive).isFile()) {
-        throw new Error("PostgreSQL template archive must be a regular file");
-      }
       await validatePostgreSqlTemplateArchive(templateArchive);
       await setupDocker([
         "create", "--name", names.restore,
@@ -501,6 +528,7 @@ export async function runHarness(options = {}) {
       "--network-alias", names.alias,
       "--network-alias", names.wrongAlias,
       ...publish,
+      "--env", `LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`,
       "--volume", `${names.volume}:/var/lib/postgresql`,
       "--volume", `${directory}:/run/lcm-harness:ro`,
       "--volume", `${cachedRunInitScript}:/run/lcm-cached-init.sh:ro`,

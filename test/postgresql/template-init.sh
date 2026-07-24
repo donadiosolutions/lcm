@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+: "${LCM_POSTGRES_TEMPLATE_MARKER:?LCM_POSTGRES_TEMPLATE_MARKER is required}"
 
 psql --set=ON_ERROR_STOP=1 \
   --username "$POSTGRES_USER" \
@@ -36,4 +37,7 @@ printf '%s\n' \
 psql --set=ON_ERROR_STOP=1 \
   --username "$POSTGRES_USER" \
   --dbname "$POSTGRES_DB" \
-  --command "INSERT INTO public.__lcm_template_marker (marker) VALUES ('lcm-postgresql-template-v1')"
+  --set=template_marker="$LCM_POSTGRES_TEMPLATE_MARKER" <<'SQL'
+INSERT INTO public.__lcm_template_marker (marker)
+VALUES (:'template_marker');
+SQL
