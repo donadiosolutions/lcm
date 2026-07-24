@@ -165,6 +165,9 @@ describe("printHelp — per-command detail", () => {
     const projectText = out.mock.calls.map(c => c[0]).join("");
     expect(projectText).toContain("lcm project");
     expect(projectText).toContain("link <project-id|local-target>");
+    expect(projectText).toContain("show [path|local-hash|remote-project-id]");
+    expect(projectText).toContain("lcm project show <remote-project-uuid>");
+    expect(projectText).toContain("exactly one local binding");
     expect(projectText).toContain("--allow-existing-data");
   });
 

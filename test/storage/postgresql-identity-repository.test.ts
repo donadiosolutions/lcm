@@ -868,7 +868,7 @@ describe("PostgreSQL identity repository", () => {
       .toEqual([expect.objectContaining({ normalizedPath: aliasRow.normalized_path })]);
   });
 
-  it("does not report an uncertain owned unlink when COMMIT follows a null deletion", async () => {
+  it("preserves a null owned-unlink snapshot when its COMMIT outcome is unknown", async () => {
     const commitError = new PostgreSqlCommitOutcomeUnknownError({
       domain: "identity",
       operation: "unlinkProjectAliasIfOwned",
@@ -883,11 +883,16 @@ describe("PostgreSQL identity repository", () => {
     });
     const repository = new PostgreSqlIdentityRepository(db);
 
-    await expect(repository.unlinkProjectAliasIfOwned(
+    const error = await repository.unlinkProjectAliasIfOwned(
       machineRow.machine_id,
       aliasRow.normalized_path,
       projectRow.project_id,
-    )).rejects.toBe(commitError);
+    ).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PostgreSqlIdentityUnlinkPathOutcomeUnknownError);
+    expect(error).toMatchObject({
+      candidate: null,
+      operation: "unlinkProjectAliasIfOwned",
+    });
   });
 
   it("batch unlinks and restores only an exact expected-owner alias set", async () => {

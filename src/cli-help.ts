@@ -125,7 +125,7 @@ const HELP: Record<string, CommandHelp> = {
       ["link <project-id|local-target> [path] [--allow-existing-data] [--json]", "Link a path explicitly"],
       ["unlink [path] [--json]", "Remove a local alias or PostgreSQL binding"],
       ["list [--json]", "List local mappings and, when selected, PostgreSQL projects"],
-      ["show [path-or-hash] [--json]", "Show one local project and its remote identity"],
+      ["show [path|local-hash|remote-project-id] [--json]", "Show one uniquely mapped local project and its remote identity"],
     ],
     examples: [
       ["lcm project create --name lcm", "Create a remote project for the current path"],
@@ -133,8 +133,9 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm project link <local-hash> /work/lcm-alias", "Add a same-machine path alias"],
       ["lcm project unlink /work/lcm-alias", "Remove an alias without deleting local data"],
       ["lcm project list --json", "Inspect local and remote identities"],
+      ["lcm project show <remote-project-uuid>", "Show the unique local mapping for a remote project"],
     ],
-    notes: "Local hashes and SQLite data remain unchanged. Rebinding a data-bearing local project requires --allow-existing-data. LCM never infers identity from Git remotes, names, or contents.",
+    notes: "Local hashes and SQLite data remain unchanged. A remote UUID show target must have exactly one local binding; unknown or multiply mapped UUIDs fail closed. Rebinding a data-bearing local project requires --allow-existing-data. LCM never infers identity from Git remotes, names, or contents.",
   },
 
   search: {

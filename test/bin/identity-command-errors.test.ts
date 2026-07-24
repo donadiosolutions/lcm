@@ -4,7 +4,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { machineIdentityPath } from "../../src/machine-identity.js";
-import { clearProjectMapCache, resolveProjectIdentity } from "../../src/project-map.js";
+import {
+  clearProjectMapCache,
+  projectMapPath,
+  resolveProjectIdentity,
+} from "../../src/project-map.js";
 
 const exitMock = vi.hoisted(() =>
   vi.fn((code?: string | number | null) => {
@@ -99,6 +103,45 @@ describe("identity command exits", () => {
 
     expect(JSON.parse(result.stdout[0])).toEqual({ error: `unknown project hash: ${"a".repeat(64)}` });
     expect(result.thrown?.message).toBe("exit:1");
+  });
+
+  it("distinguishes unknown and ambiguous remote UUID show targets", async () => {
+    useTempHome();
+    const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
+    const unknown = await runIdentityCommand("project", ["show", remoteProjectId, "--json"]);
+    expect(JSON.parse(unknown.stdout[0])).toEqual({
+      error: `unknown remote project UUIDv7: ${remoteProjectId}`,
+    });
+    expect(unknown.thrown?.message).toBe("exit:1");
+
+    tempDir = mkdtempSync(join(tmpdir(), "lcm-project-cli-ambiguous-"));
+    const first = join(tempDir, "first");
+    const second = join(tempDir, "second");
+    mkdirSync(first);
+    mkdirSync(second);
+    const firstIdentity = resolveProjectIdentity(first);
+    const secondIdentity = resolveProjectIdentity(second);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [firstIdentity.id]: {
+        canonical: firstIdentity.canonical,
+        aliases: [],
+        remoteProjectId,
+      },
+      [secondIdentity.id]: {
+        canonical: secondIdentity.canonical,
+        aliases: [],
+        remoteProjectId,
+      },
+    }, null, 2)}\n`, { mode: 0o600 });
+    clearProjectMapCache();
+
+    const ambiguous = await runIdentityCommand("project", ["show", remoteProjectId]);
+    expect(ambiguous.stderr[0]).toContain(
+      `remote project UUIDv7 maps to multiple local hashes: ${remoteProjectId}`,
+    );
+    expect(ambiguous.stderr[0]).toContain(firstIdentity.id);
+    expect(ambiguous.stderr[0]).toContain(secondIdentity.id);
+    expect(ambiguous.thrown?.message).toBe("exit:1");
   });
 
   it("prints text errors for project link collisions", async () => {

@@ -237,7 +237,7 @@ lcm project link <project-uuid> [path]   # pair a path to a remote project
 lcm project link <local-hash> <alias>    # add a same-machine path alias
 lcm project unlink [path]                # remove an alias or remote binding
 lcm project list --json                  # list local and remote identities
-lcm project show [path-or-hash]           # inspect one project
+lcm project show [path|local-hash|project-uuid] # inspect one uniquely mapped project
 
 # Compaction & promotion
 lcm compact                # compact the current project
@@ -295,6 +295,9 @@ lcm mcp                    # start MCP server
 See [Machine registration and project identity](docs/project-identity.md) for
 PostgreSQL pairing, reimage recovery, local aliases, permissions,
 unlink/relink behavior, migration binding, and ambiguity diagnosis.
+Remote UUID show targets resolve through that local project map: exactly one
+local entry must bind the UUID. Unknown or multiply mapped UUIDs are rejected;
+use `lcm project list --json` and select a local path or hash to diagnose them.
 
 ## Configuration
 

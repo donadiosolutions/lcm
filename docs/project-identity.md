@@ -137,11 +137,19 @@ lcm project list --json
 lcm project show
 lcm project show /work/lcm
 lcm project show <local-hash>
+lcm project show <remote-project-uuid>
 ```
 
 Under SQLite, `list` and `show` use only the local map. Under PostgreSQL they
 also read the authoritative remote projects. A missing remote project for a
 stored binding fails closed and includes an explicit unlink or relink command.
+Remote UUID targets are first resolved through the local map: exactly one local
+entry must bind the UUID before `show` reads its authoritative PostgreSQL
+project. An unknown remote UUID fails with `unknown remote project UUIDv7`; a
+UUID bound by multiple local entries is rejected as ambiguous. Use
+`lcm project list --json`, then show the intended local path or hash, to
+diagnose either case. `show` never returns a PostgreSQL-only project that has no
+local mapping.
 
 ## Unlink and relink
 

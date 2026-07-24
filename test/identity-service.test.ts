@@ -2005,6 +2005,19 @@ describe("identity service", () => {
     await expect(unlinkProject(POSTGRESQL_CONFIG, linked, deps))
       .resolves.toMatchObject({ aliasRemoved: true });
 
+    const absentAtCommit = makeProject("uncertain-unlink-null-candidate");
+    await linkProject(POSTGRESQL_CONFIG, bound.local.id, absentAtCommit, {}, deps);
+    repository.unlinkProjectAliasIfOwned = vi.fn(async (machineId, path, projectId) => {
+      await originalUnlink(machineId, path, projectId);
+      throw new PostgreSqlIdentityUnlinkPathOutcomeUnknownError(
+        null,
+        "unlinkProjectAliasIfOwned",
+      );
+    });
+    await expect(unlinkProject(POSTGRESQL_CONFIG, absentAtCommit, deps))
+      .resolves.toMatchObject({ aliasRemoved: true });
+    expect(listProjectMapEntries()[bound.local.id].aliases).not.toContain(absentAtCommit);
+
     const linkedAgain = makeProject("uncertain-unlink-alias-again");
     await linkProject(POSTGRESQL_CONFIG, bound.local.id, linkedAgain, {}, deps);
     const candidate = await repository.resolveProject(MACHINE_ID, linkedAgain);
