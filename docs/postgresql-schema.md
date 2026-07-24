@@ -43,14 +43,18 @@ does not add row-level security.
 - The migration runner captures the postmaster epoch and completes required
   extension readiness, including the functional `pg_stat_statements` probe,
   before opening the DDL transaction. Inside that transaction it pins the local
-  `search_path` to `pg_catalog, public` before taking the advisory lock, checking
-  PostgreSQL 18 and postmaster/module continuity, revalidating the exact
+  `search_path` to `pg_catalog, public` and `quote_all_identifiers` to `off`
+  before taking the advisory lock. Pinning the deparser setting makes every
+  `pg_get_*` fingerprint independent of role or database defaults. The runner
+  then checks PostgreSQL 18 and postmaster/module continuity, revalidates the exact
   extension catalog snapshot without repeating the functional probe, checking
   schema ownership and `PUBLIC CREATE`, then checking ownership of every
   existing allowlisted object before reading the exact ordered ledger. Only
-  after the ledger establishes that `0002` is recorded does the runner require
-  the complete managed-object inventory; any missing allowlisted object then
-  fails readiness instead of being mistaken for a smaller valid inventory.
+  after the ledger is trusted does the runner require the complete
+  managed-object inventory from the selected current snapshot; any missing
+  allowlisted object then fails readiness instead of being mistaken for a
+  smaller valid inventory. After pending SQL and ledger rows, the selected
+  target snapshot's managed inventory is checked again before commit.
   The recurring allowlist covers the
   migration ledger, 23 domain tables, six generated identity sequences, four
   helper or trigger functions, and the LCM text-search dictionary and
@@ -61,7 +65,8 @@ does not add row-level security.
   inspection also schema-qualifies every catalog operator because it runs
   outside that migration transaction and runtime health uses the same
   inspection path.
-- The definition and function fingerprints are registered by migration ID.
+- Managed-object identities, definition fingerprints, and function
+  fingerprints are registered by migration ID.
   Before pending SQL, the runner walks the trusted ledger from newest to oldest
   and checks the first migration with a registered snapshot. After applying and
   recording the pending set, it does the same for the target history in the
@@ -71,7 +76,8 @@ does not add row-level security.
   satisfy the future definition.
 - The `0002` snapshot checks an explicit definition inventory of all 52 named
   secondary indexes, all 168 table constraints, all three identity-enforcement
-  triggers, all 15 stored generated columns, and all 204 ordinary columns.
+  triggers, all 15 stored generated columns, all six generated identity
+  sequences, and all 204 ordinary columns: 448 definitions total.
   Each allowlisted object must exist, every index must
   remain valid and ready, and canonical index, trigger, fully qualified
   constraint, generation-expression, and ordinary-column definitions must
@@ -84,7 +90,10 @@ does not add row-level security.
   triggers. Generated-column fingerprints bind the exact table, column,
   `attgenerated` state, and PostgreSQL-deparsed expression. Ordinary-column
   fingerprints bind the exact table and column to its formatted type,
-  nullability, deparsed default, and identity state. Index ownership
+  nullability, deparsed default, and identity state. Identity-sequence
+  fingerprints bind each exact sequence name to its PostgreSQL data type,
+  increment, minimum, maximum, start, cache, cycle state, internal identity
+  dependency, and owning table/column. Index ownership
   follows the owning table; triggers and constraints are checked as existence
   and definition inventory.
   Additional operator-created objects remain outside the allowlist and are
@@ -394,10 +403,11 @@ on a provider does not justify silently expanding the baseline.
    existing `lcm` schema is owned by the current migration role, rejects
    schema-level `PUBLIC CREATE`, and verifies ownership of every existing
    allowlisted object before reading the complete ordered ledger. After the
-   ledger establishes that `0002` was applied, it verifies the registered
-   `0002` schema snapshot before pending SQL. After applying the pending set, it
-   verifies the newest snapshot registered for the target history before
-   commit. `0001` creates the `lcm` schema and immutable ledger; `0002`
+   ledger establishes the current snapshot, it verifies that snapshot's exact
+   managed inventory and definitions before pending SQL. After applying the
+   pending set, it verifies the newest snapshot registered for the target
+   history, including its managed inventory, before commit. `0001` creates the
+   `lcm` schema and immutable ledger; `0002`
    first rejects a pre-existing `lcm` schema that grants `PUBLIC CREATE`, then
    creates the 23-table baseline data model and indexes, the backend-neutral
    project identity key, and bounded session-identity lookup keys. The guard does not

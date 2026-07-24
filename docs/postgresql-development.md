@@ -136,15 +136,18 @@ delegated `CREATE` to the migrator. Transfer ownership explicitly with the
 cluster administrator before retrying; LCM never changes schema ownership.
 On every run, the runner first checks ownership of every existing allowlisted
 object through `pg_catalog`, including `lcm.schema_migrations`, before reading
-any ledger rows. It then verifies the ordered ledger, derives whether `0002`
-was applied, and only then requires the complete expected `0002` inventory.
+any ledger rows. It then verifies the ordered ledger and requires the exact
+managed inventory owned by the selected current snapshot before pending SQL.
+After pending SQL and ledger rows, it requires the target snapshot's managed
+inventory before commit.
 Schema snapshots are keyed by migration ID: walk validated history from newest
 to oldest to select the first registered snapshot, validate the current
 snapshot before pending SQL, and validate the target snapshot after applying
 and recording the pending set but before commit. Registry order is irrelevant.
 Add a new snapshot entry whenever a future migration intentionally changes a
-fingerprinted definition. Each snapshot owns every definition-group identity,
-derived count and hash plus the complete identity-function name/hash list.
+fingerprinted definition or managed object. Each snapshot owns the exact
+managed-object identities, every definition-group identity, derived count and
+hash, plus the complete identity-function name/hash list.
 A missing table, generated identity sequence, helper or trigger function,
 text-search dictionary, or text-search configuration blocks repeated runs and
 later pending migrations once that baseline is trusted; a smaller surviving
@@ -156,6 +159,9 @@ security-definer/leakproof, volatility, parallel-safety, fixed search path, or
 complete normalized ACL drift fails closed.
 The `0002` definition inventory also fingerprints every allowlisted ordinary
 column's formatted type, nullability, deparsed default, and identity state.
+It fingerprints all six generated identity sequences by type, increment,
+minimum, maximum, start, cache, cycle state, internal identity dependency, and
+owning table/column.
 Constraint fingerprints include the owning table and constraint name as well
 as type, definition, and internal-trigger state; renaming or swapping
 same-type constraints is drift.
@@ -163,6 +169,10 @@ Failure diagnostics identify `requiredOwner` using the sanitized PostgreSQL
 `CURRENT_USER` role and provide identifier-quoted transfer guidance. They do
 not expose the existing owner, connection details, or raw database errors, and
 missing or malformed catalog values fail closed.
+Migration transactions pin `search_path = pg_catalog, public` and
+`quote_all_identifiers = off` before catalog deparsing. Tests that change role,
+database, or session GUC defaults must prove those ambient settings neither
+change a fingerprint nor leak across commit or rollback.
 
 Exercise at least the empty, repeated, concurrent, rollback, unknown-history,
 out-of-order, and checksum-drift paths. Migration SQL and the ledger insertion

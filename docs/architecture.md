@@ -77,22 +77,27 @@ phase therefore returns structured ownership diagnostics even when the ledger
 table itself has drifted to another owner. Baseline completeness is evaluated
 after the applied history is known. Unknown schema objects are outside that
 exact catalog allowlist and are neither rejected nor changed.
-Schema definition snapshots are keyed by migration ID. The newest migration in
+Schema snapshots are keyed by migration ID and own both the exact managed
+object inventory and definition fingerprints. The newest migration in
 the trusted current ledger that has a registered snapshot is checked before
 pending SQL, while the newest migration in the target history that has a
 registered snapshot is checked after applying and recording the pending set but
 before commit. Selection follows migration history rather than registry order.
-After the baseline is recorded, its snapshot
-verifies the explicit existence and canonical definitions of all allowlisted
-secondary indexes, triggers, constraints, ordinary columns, and stored
-generated-column expressions; indexes must remain valid and ready and inherit
-ownership from their tables. Trigger inventory also
+The selected current snapshot verifies its managed inventory and definitions
+before pending SQL; the selected target snapshot repeats both checks after
+pending SQL and ledger writes, so a migration may add managed objects without
+weakening the earlier contract. Definition checks cover all allowlisted
+secondary indexes, triggers, constraints, ordinary columns, stored
+generated-column expressions, and identity sequences; indexes must remain
+valid and ready and inherit ownership from their tables. Trigger inventory also
 requires ordinary enabled mode, rejecting disabled, replica-only, or
 always-enabled drift. Constraint inventory includes the enablement state of
 its internal enforcement triggers and binds each name to its definition.
 Ordinary columns retain type, nullability, default, and identity metadata;
 generated columns retain both their generated state and fully deparsed
-expression. Unknown operator-created
+expression. Identity sequences retain their allocation parameters, internal
+dependency, and owning table/column. Migration transactions pin
+`quote_all_identifiers = off` before catalog deparsing. Unknown operator-created
 indexes, triggers, and constraints remain outside the inventory.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six
 generated identity sequences, or the search-normalization, summary-identity,

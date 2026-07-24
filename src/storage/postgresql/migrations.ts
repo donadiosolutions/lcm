@@ -50,7 +50,9 @@ type ManagedObjectOwnershipRow = QueryResultRow & {
 type ExpectedBaselineDefinitionInventory = {
   readonly constraintIdentities: readonly string[];
   readonly generatedColumnIdentities: readonly string[];
+  readonly identitySequenceIdentities: readonly string[];
   readonly indexNames: readonly string[];
+  readonly managedObjectIdentities: readonly string[];
   readonly ordinaryColumnIdentities: readonly string[];
   readonly triggerIdentities: readonly string[];
 };
@@ -58,6 +60,7 @@ export type PostgreSqlSchemaSnapshot = ExpectedBaselineDefinitionInventory & {
   readonly definitionHashes: {
     readonly constraint: string;
     readonly generatedColumn: string;
+    readonly identitySequence: string;
     readonly index: string;
     readonly ordinaryColumn: string;
     readonly trigger: string;
@@ -140,6 +143,34 @@ const EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES = [
   "summaries|summary_id_sha256",
   "summary_large_files|file_id_sha256",
 ] as const;
+
+const EXPECTED_BASELINE_IDENTITY_SEQUENCE_IDENTITIES = [
+  "conversations_conversation_id_seq",
+  "fenced_leases_fencing_token_seq",
+  "messages_message_id_seq",
+  "passive_event_inbox_inbox_id_seq",
+  "recall_surfacing_surfacing_id_seq",
+  "session_instructions_instruction_id_seq",
+] as const;
+
+const EXPECTED_BASELINE_MANAGED_OBJECT_IDENTITIES = `
+  table|schema_migrations table|machines table|projects table|project_aliases
+  table|conversations table|messages table|message_parts table|native_transcripts
+  table|transcript_messages table|summaries table|summary_messages table|summary_parents
+  table|context_items table|large_files table|summary_large_files table|promoted_memories
+  table|promoted_memory_tags table|recall_surfacing table|redaction_counters
+  table|ingest_checkpoints table|session_ingest_log table|session_instructions
+  table|passive_event_inbox table|fenced_leases
+  sequence|conversations_conversation_id_seq sequence|messages_message_id_seq
+  sequence|recall_surfacing_surfacing_id_seq sequence|session_instructions_instruction_id_seq
+  sequence|passive_event_inbox_inbox_id_seq sequence|fenced_leases_fencing_token_seq
+  dictionary|simple_v1 configuration|search_v1
+`.trim().split(/\s+/u).concat([
+  "function|normalize_search_text|input text",
+  "function|enforce_summary_id_uniqueness|",
+  "function|enforce_large_file_id_uniqueness|",
+  "function|enforce_session_ingest_id_uniqueness|",
+]);
 
 const EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES = `
   schema_migrations|id schema_migrations|checksum_sha256 schema_migrations|applied_at
@@ -333,18 +364,21 @@ const EXPECTED_BASELINE_CONSTRAINT_IDENTITIES =
   return {
     constraintIdentities: EXPECTED_BASELINE_CONSTRAINT_IDENTITIES,
     generatedColumnIdentities: EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES,
+    identitySequenceIdentities: EXPECTED_BASELINE_IDENTITY_SEQUENCE_IDENTITIES,
     indexNames: EXPECTED_BASELINE_INDEX_NAMES,
+    managedObjectIdentities: EXPECTED_BASELINE_MANAGED_OBJECT_IDENTITIES,
     ordinaryColumnIdentities: EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES,
     triggerIdentities: EXPECTED_BASELINE_TRIGGER_IDENTITIES,
   } as const;
 }
 
-function postgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapshot[] {
+export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapshot[] {
   return [{
     ...expectedBaselineDefinitionInventory(),
     definitionHashes: {
       constraint: "f445a06d320f46f8c5d829f89a3a7bc0b13c5507096b111f125d9f0dd0ba0e2f",
       generatedColumn: "c05b335f05f12f54649ae048f0233848e32eadc5422f8eaf5cd72183192ea36f",
+      identitySequence: "ccfebcc68f473f655f1c83f0815e18d2f697489bba38278d20bf3718fd0a502e",
       index: "16e10e2a4fc080f52b11315ee2b03d5df258d216f293bb0051b56beb16035374",
       ordinaryColumn: "e8d2b9f51f717ee058911aff792f8ebcccfc9451755d5803055426b8801a17af",
       trigger: "2c858da82c9238186861e0bcd184952ff941c7233f98a16083b20e6528006fb9",
@@ -392,6 +426,11 @@ export function getPostgreSqlSchemaSnapshotExpectations(
       "generated_column",
       snapshot.generatedColumnIdentities.length,
       snapshot.definitionHashes.generatedColumn,
+    ],
+    [
+      "identity_sequence",
+      snapshot.identitySequenceIdentities.length,
+      snapshot.definitionHashes.identitySequence,
     ],
     [
       "ordinary_column",
@@ -589,7 +628,7 @@ export class PostgreSqlBaselineDefinitionPreflightError extends StorageOperation
 
   readonly schemaName = "lcm";
   readonly remediation =
-    "Restore every missing or changed LCM baseline index, trigger, constraint, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.";
+    "Restore every missing or changed LCM baseline index, trigger, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.";
 
   override toJSON(): Record<string, unknown> {
     return {
@@ -720,9 +759,14 @@ export async function runPostgreSqlMigrations(
       options: { domain: "factory"; operation: string; signal?: AbortSignal },
     ): Promise<T>;
   },
-  options: { migrations?: readonly PostgreSqlMigration[]; signal?: AbortSignal } = {},
+  options: {
+    migrations?: readonly PostgreSqlMigration[];
+    schemaSnapshots?: readonly PostgreSqlSchemaSnapshot[];
+    signal?: AbortSignal;
+  } = {},
 ): Promise<PostgreSqlMigrationResult> {
   const migrations = [...(options.migrations ?? loadPostgreSqlMigrations())];
+  const schemaSnapshots = [...(options.schemaSnapshots ?? loadPostgreSqlSchemaSnapshots())];
   validateMigrations(migrations);
   // The functional pg_stat_statements probe can raise SQLSTATE 55000 when the
   // library was not preloaded. Run it before opening the all-or-nothing DDL
@@ -748,6 +792,9 @@ export async function runPostgreSqlMigrations(
     await transaction.query({
       text: "SET LOCAL search_path = pg_catalog, public",
     }, { domain: "factory", operation: "pinMigrationSearchPath", signal: options.signal });
+    await transaction.query({
+      text: "SET LOCAL quote_all_identifiers = off",
+    }, { domain: "factory", operation: "pinMigrationDeparserSettings", signal: options.signal });
 
     await transaction.query({
       text: `SELECT pg_catalog.pg_advisory_xact_lock(
@@ -858,137 +905,125 @@ export async function runPostgreSqlMigrations(
       throw new PostgreSqlSchemaAclPreflightError(aclSchemaExists, publicCreate);
     }
 
-    const managedOwnership = await transaction.query<ManagedObjectOwnershipRow>({
-      text: `WITH migration_role AS (
-               SELECT role.oid
-               FROM pg_catalog.pg_roles AS role
-               WHERE role.rolname OPERATOR(pg_catalog.=) CURRENT_USER
-             ),
-             managed_objects(owner_oid) AS (
-               SELECT relation.relowner
-               FROM pg_catalog.pg_class AS relation
-               JOIN pg_catalog.pg_namespace AS namespace
-                 ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
-               WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-                 AND (
-                   (
-                     relation.relkind OPERATOR(pg_catalog.=) 'r'
-                     AND relation.relname OPERATOR(pg_catalog.=) ANY (
-                       ARRAY[
-                         'schema_migrations', 'machines', 'projects', 'project_aliases',
-                         'conversations', 'messages', 'message_parts', 'native_transcripts',
-                         'transcript_messages', 'summaries', 'summary_messages',
-                         'summary_parents', 'context_items', 'large_files',
-                         'summary_large_files', 'promoted_memories', 'promoted_memory_tags',
-                         'recall_surfacing', 'redaction_counters', 'ingest_checkpoints',
-                         'session_ingest_log', 'session_instructions', 'passive_event_inbox',
-                         'fenced_leases'
-                       ]::pg_catalog.text[]
-                     )
+    const inspectManagedObjects = async (
+      managedObjectIdentities: readonly string[],
+      baselineApplied: boolean | null,
+      requireComplete: boolean,
+    ): Promise<void> => {
+      const managedOwnership = await transaction.query<ManagedObjectOwnershipRow>({
+        text: `WITH migration_role AS (
+                 SELECT role.oid
+                 FROM pg_catalog.pg_roles AS role
+                 WHERE role.rolname OPERATOR(pg_catalog.=) CURRENT_USER
+               ),
+               catalog_objects(object_identity, owner_oid) AS (
+                 SELECT pg_catalog.concat(
+                          CASE relation.relkind
+                            WHEN 'r' THEN 'table|'
+                            WHEN 'S' THEN 'sequence|'
+                          END,
+                          relation.relname
+                        ),
+                        relation.relowner
+                 FROM pg_catalog.pg_class AS relation
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND relation.relkind OPERATOR(pg_catalog.=) ANY (
+                     ARRAY['r', 'S']::pg_catalog."char"[]
                    )
-                   OR (
-                     relation.relkind OPERATOR(pg_catalog.=) 'S'
-                     AND relation.relname OPERATOR(pg_catalog.=) ANY (
-                       ARRAY[
-                         'conversations_conversation_id_seq',
-                         'messages_message_id_seq',
-                         'recall_surfacing_surfacing_id_seq',
-                         'session_instructions_instruction_id_seq',
-                         'passive_event_inbox_inbox_id_seq',
-                         'fenced_leases_fencing_token_seq'
-                       ]::pg_catalog.text[]
-                     )
-                   )
-                 )
-               UNION ALL
-               SELECT procedure.proowner
-               FROM pg_catalog.pg_proc AS procedure
-               JOIN pg_catalog.pg_namespace AS namespace
-                 ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
-               WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-                 AND procedure.prokind OPERATOR(pg_catalog.=) 'f'
-                 AND (
-                   (
-                     procedure.proname OPERATOR(pg_catalog.=) 'normalize_search_text'
-                     AND procedure.pronargs OPERATOR(pg_catalog.=) 1
-                     AND procedure.proargtypes[0] OPERATOR(pg_catalog.=)
-                       pg_catalog.to_regtype('pg_catalog.text')
-                   )
-                   OR (
-                     procedure.proname OPERATOR(pg_catalog.=)
-                       'enforce_summary_id_uniqueness'
-                     AND procedure.pronargs OPERATOR(pg_catalog.=) 0
-                   )
-                   OR (
-                     procedure.proname OPERATOR(pg_catalog.=)
-                       'enforce_large_file_id_uniqueness'
-                     AND procedure.pronargs OPERATOR(pg_catalog.=) 0
-                   )
-                   OR (
-                     procedure.proname OPERATOR(pg_catalog.=)
-                       'enforce_session_ingest_id_uniqueness'
-                     AND procedure.pronargs OPERATOR(pg_catalog.=) 0
-                   )
-                 )
-               UNION ALL
-               SELECT dictionary.dictowner
-               FROM pg_catalog.pg_ts_dict AS dictionary
-               JOIN pg_catalog.pg_namespace AS namespace
-                 ON namespace.oid OPERATOR(pg_catalog.=) dictionary.dictnamespace
-               WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-                 AND dictionary.dictname OPERATOR(pg_catalog.=) 'simple_v1'
-               UNION ALL
-               SELECT configuration.cfgowner
-               FROM pg_catalog.pg_ts_config AS configuration
-               JOIN pg_catalog.pg_namespace AS namespace
-                 ON namespace.oid OPERATOR(pg_catalog.=) configuration.cfgnamespace
-               WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-                 AND configuration.cfgname OPERATOR(pg_catalog.=) 'search_v1'
-             )
-             SELECT CURRENT_USER::pg_catalog.text AS current_user_name,
-                    36::pg_catalog.int4 AS expected_object_count,
-                    pg_catalog.count(*)::pg_catalog.int4 AS existing_object_count,
-                    pg_catalog.count(*) FILTER (
-                      WHERE managed_objects.owner_oid OPERATOR(pg_catalog.<>) migration_role.oid
-                    )::pg_catalog.int4 AS unowned_object_count
-             FROM managed_objects
-             CROSS JOIN migration_role`,
-    }, {
-      domain: "factory",
-      operation: "preflightManagedObjectOwnership",
-      signal: options.signal,
-    });
-    const expectedObjectCount = sanitizeNonnegativeCount(
-      managedOwnership.rows[0]?.expected_object_count,
-    );
-    const existingObjectCount = sanitizeNonnegativeCount(
-      managedOwnership.rows[0]?.existing_object_count,
-    );
-    const unownedObjectCount = sanitizeNonnegativeCount(
-      managedOwnership.rows[0]?.unowned_object_count,
-    );
-    const managedRequiredOwner = sanitizeRoleName(
-      managedOwnership.rows[0]?.current_user_name,
-    );
-    if (
-      expectedObjectCount !== 36
-      || existingObjectCount === null
-      || existingObjectCount > expectedObjectCount
-      || unownedObjectCount === null
-      || unownedObjectCount > existingObjectCount
-      || unownedObjectCount !== 0
-      || managedRequiredOwner === null
-      || managedRequiredOwner !== requiredOwner
-    ) {
-      throw new PostgreSqlManagedObjectOwnershipPreflightError(
-        null,
-        expectedObjectCount,
-        existingObjectCount,
-        null,
-        unownedObjectCount,
-        managedRequiredOwner,
+                 UNION ALL
+                 SELECT pg_catalog.concat(
+                          'function|',
+                          procedure.proname,
+                          '|',
+                          pg_catalog.pg_get_function_identity_arguments(procedure.oid)
+                        ),
+                        procedure.proowner
+                 FROM pg_catalog.pg_proc AS procedure
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND procedure.prokind OPERATOR(pg_catalog.=) 'f'
+                 UNION ALL
+                 SELECT pg_catalog.concat('dictionary|', dictionary.dictname),
+                        dictionary.dictowner
+                 FROM pg_catalog.pg_ts_dict AS dictionary
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) dictionary.dictnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                 UNION ALL
+                 SELECT pg_catalog.concat('configuration|', configuration.cfgname),
+                        configuration.cfgowner
+                 FROM pg_catalog.pg_ts_config AS configuration
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) configuration.cfgnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+               ),
+               managed_objects AS (
+                 SELECT catalog_objects.owner_oid
+                 FROM catalog_objects
+                 WHERE catalog_objects.object_identity OPERATOR(pg_catalog.=)
+                   ANY ($2::pg_catalog.text[])
+               )
+               SELECT CURRENT_USER::pg_catalog.text AS current_user_name,
+                      $1::pg_catalog.int4 AS expected_object_count,
+                      pg_catalog.count(*)::pg_catalog.int4 AS existing_object_count,
+                      pg_catalog.count(*) FILTER (
+                        WHERE managed_objects.owner_oid OPERATOR(pg_catalog.<>) migration_role.oid
+                      )::pg_catalog.int4 AS unowned_object_count
+               FROM managed_objects
+               CROSS JOIN migration_role`,
+        values: [managedObjectIdentities.length, managedObjectIdentities],
+      }, {
+        domain: "factory",
+        operation: "preflightManagedObjectOwnership",
+        signal: options.signal,
+      });
+      const expectedObjectCount = sanitizeNonnegativeCount(
+        managedOwnership.rows[0]?.expected_object_count,
       );
-    }
+      const existingObjectCount = sanitizeNonnegativeCount(
+        managedOwnership.rows[0]?.existing_object_count,
+      );
+      const unownedObjectCount = sanitizeNonnegativeCount(
+        managedOwnership.rows[0]?.unowned_object_count,
+      );
+      const managedRequiredOwner = sanitizeRoleName(
+        managedOwnership.rows[0]?.current_user_name,
+      );
+      const missingObjectCount = requireComplete
+        && expectedObjectCount !== null
+        && existingObjectCount !== null
+        ? expectedObjectCount - existingObjectCount
+        : null;
+      if (
+        expectedObjectCount !== managedObjectIdentities.length
+        || existingObjectCount === null
+        || existingObjectCount > expectedObjectCount
+        || unownedObjectCount === null
+        || unownedObjectCount > existingObjectCount
+        || unownedObjectCount !== 0
+        || managedRequiredOwner === null
+        || managedRequiredOwner !== requiredOwner
+        || (requireComplete && missingObjectCount !== 0)
+      ) {
+        throw new PostgreSqlManagedObjectOwnershipPreflightError(
+          baselineApplied,
+          expectedObjectCount,
+          existingObjectCount,
+          missingObjectCount,
+          unownedObjectCount,
+          managedRequiredOwner,
+        );
+      }
+    };
+    const knownManagedObjectIdentities = [
+      ...new Set(schemaSnapshots.flatMap(({ managedObjectIdentities }) => (
+        managedObjectIdentities
+      ))),
+    ];
+    await inspectManagedObjects(knownManagedObjectIdentities, null, false);
 
     const ledger = await transaction.query<LedgerRow>({
       text: "SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger_exists",
@@ -1007,19 +1042,12 @@ export async function runPostgreSqlMigrations(
         throw migrationError("verifyMigrationHistory");
       }
     }
-    const baselineRecorded = current.some(({ id }) => id === "0002_schema_baseline");
-    const missingObjectCount = baselineRecorded
-      ? expectedObjectCount - existingObjectCount
-      : 0;
-    if (missingObjectCount !== 0) {
-      throw new PostgreSqlManagedObjectOwnershipPreflightError(
-        baselineRecorded,
-        expectedObjectCount,
-        existingObjectCount,
-        missingObjectCount,
-        unownedObjectCount,
-        managedRequiredOwner,
-      );
+    const currentSnapshot = selectLatestPostgreSqlSchemaSnapshot(
+      current.map(({ id }) => id),
+      schemaSnapshots,
+    );
+    if (currentSnapshot) {
+      await inspectManagedObjects(currentSnapshot.managedObjectIdentities, true, true);
     }
 
     const assertSchemaSnapshot = async (
@@ -1159,6 +1187,47 @@ export async function runPostgreSqlMigrations(
                      attribute.attname
                    ) OPERATOR(pg_catalog.=) ANY ($6::pg_catalog.text[])
                ),
+               actual_identity_sequences AS (
+                 SELECT sequence_relation.relname AS sequence_name,
+                        pg_catalog.format_type(
+                          sequence_metadata.seqtypid,
+                          NULL
+                        ) AS data_type,
+                        sequence_metadata.seqincrement::pg_catalog.text AS increment_by,
+                        sequence_metadata.seqmin::pg_catalog.text AS minimum_value,
+                        sequence_metadata.seqmax::pg_catalog.text AS maximum_value,
+                        sequence_metadata.seqstart::pg_catalog.text AS start_value,
+                        sequence_metadata.seqcache::pg_catalog.text AS cache_size,
+                        sequence_metadata.seqcycle::pg_catalog.text AS cycles,
+                        dependency.deptype::pg_catalog.text AS dependency_type,
+                        owning_relation.relname AS owning_table,
+                        owning_attribute.attname AS owning_column
+                 FROM pg_catalog.pg_sequence AS sequence_metadata
+                 JOIN pg_catalog.pg_class AS sequence_relation
+                   ON sequence_relation.oid OPERATOR(pg_catalog.=)
+                     sequence_metadata.seqrelid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=)
+                     sequence_relation.relnamespace
+                 JOIN pg_catalog.pg_depend AS dependency
+                   ON dependency.classid OPERATOR(pg_catalog.=)
+                     pg_catalog.to_regclass('pg_catalog.pg_class')
+                  AND dependency.objid OPERATOR(pg_catalog.=) sequence_relation.oid
+                  AND dependency.objsubid OPERATOR(pg_catalog.=) 0
+                  AND dependency.refclassid OPERATOR(pg_catalog.=)
+                    pg_catalog.to_regclass('pg_catalog.pg_class')
+                  AND dependency.deptype OPERATOR(pg_catalog.=) 'i'
+                 JOIN pg_catalog.pg_class AS owning_relation
+                   ON owning_relation.oid OPERATOR(pg_catalog.=) dependency.refobjid
+                 JOIN pg_catalog.pg_attribute AS owning_attribute
+                   ON owning_attribute.attrelid OPERATOR(pg_catalog.=)
+                     dependency.refobjid
+                  AND owning_attribute.attnum OPERATOR(pg_catalog.=)
+                    dependency.refobjsubid
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND sequence_relation.relname OPERATOR(pg_catalog.=)
+                     ANY ($7::pg_catalog.text[])
+               ),
                actual_groups(object_kind, existing_count, definition_sha256) AS (
                  SELECT 'index'::pg_catalog.text,
                         pg_catalog.count(*)::pg_catalog.int4,
@@ -1251,6 +1320,37 @@ export async function runPostgreSqlMigrations(
                         )
                  FROM actual_generated_columns
                  UNION ALL
+                 SELECT 'identity_sequence'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  sequence_name,
+                                  data_type,
+                                  increment_by,
+                                  minimum_value,
+                                  maximum_value,
+                                  start_value,
+                                  cache_size,
+                                  cycles,
+                                  dependency_type,
+                                  owning_table,
+                                  owning_column
+                                ),
+                                E'\\n'
+                                ORDER BY sequence_name
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_identity_sequences
+                 UNION ALL
                  SELECT 'ordinary_column'::pg_catalog.text,
                         pg_catalog.count(*)::pg_catalog.int4,
                         pg_catalog.encode(
@@ -1284,18 +1384,18 @@ export async function runPostgreSqlMigrations(
                ) AS (
                  SELECT *
                  FROM ROWS FROM (
-                   pg_catalog.unnest($8::pg_catalog.text[]),
-                   pg_catalog.unnest($9::pg_catalog.int4[]),
-                   pg_catalog.unnest($10::pg_catalog.text[])
+                   pg_catalog.unnest($9::pg_catalog.text[]),
+                   pg_catalog.unnest($10::pg_catalog.int4[]),
+                   pg_catalog.unnest($11::pg_catalog.text[])
                  )
                )
                SELECT $1::pg_catalog.bool AS baseline_applied,
-                      $7::pg_catalog.int4 AS expected_object_count,
+                      $8::pg_catalog.int4 AS expected_object_count,
                       pg_catalog.sum(actual_groups.existing_count)::pg_catalog.int4
                         AS existing_object_count,
                       CASE
                         WHEN $1::pg_catalog.bool THEN (
-                          $7 - pg_catalog.sum(actual_groups.existing_count)
+                          $8 - pg_catalog.sum(actual_groups.existing_count)
                         )::pg_catalog.int4
                         ELSE 0::pg_catalog.int4
                       END AS missing_object_count,
@@ -1317,6 +1417,7 @@ export async function runPostgreSqlMigrations(
           expectedBaselineDefinitions.constraintIdentities,
           expectedBaselineDefinitions.generatedColumnIdentities,
           expectedBaselineDefinitions.ordinaryColumnIdentities,
+          expectedBaselineDefinitions.identitySequenceIdentities,
           snapshotExpectations.definitionObjectCount,
           snapshotExpectations.definitionGroupKinds,
           snapshotExpectations.definitionGroupCounts,
@@ -1495,11 +1596,6 @@ export async function runPostgreSqlMigrations(
     }
     };
 
-    const schemaSnapshots = postgreSqlSchemaSnapshots();
-    const currentSnapshot = selectLatestPostgreSqlSchemaSnapshot(
-      current.map(({ id }) => id),
-      schemaSnapshots,
-    );
     if (currentSnapshot) await assertSchemaSnapshot(currentSnapshot);
 
     const applied: string[] = [];
@@ -1520,7 +1616,10 @@ export async function runPostgreSqlMigrations(
         migrations.map(({ id }) => id),
         schemaSnapshots,
       );
-      if (targetSnapshot) await assertSchemaSnapshot(targetSnapshot);
+      if (targetSnapshot) {
+        await inspectManagedObjects(targetSnapshot.managedObjectIdentities, true, true);
+        await assertSchemaSnapshot(targetSnapshot);
+      }
     }
     await assertPostgreSqlSearchConfigurationReady(transaction, { signal: options.signal });
     return {
