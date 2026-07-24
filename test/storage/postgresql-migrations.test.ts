@@ -362,7 +362,7 @@ describe("PostgreSQL migration runner", () => {
     const fake = executor({ postmasterEpoch: new Date("2026-01-01T00:00:00Z") });
     const signal = new AbortController().signal;
     const migrations = [migration("0001_first"), migration("0002_second")];
-    await expect(runPostgreSqlMigrations(fake.seam, { migrations, signal })).resolves.toEqual({
+    await expect(runPostgreSqlMigrations(fake.seam, { migrations, schemaSnapshots: [], signal })).resolves.toEqual({
       applied: ["0001_first", "0002_second"],
       current: ["0001_first", "0002_second"],
     });
@@ -461,12 +461,25 @@ describe("PostgreSQL migration runner", () => {
       });
       expect(fake.seam.query).not.toHaveBeenCalled();
     }
+
+    const inherited = executor();
+    await expect(runPostgreSqlMigrations(inherited.seam, {
+      migrations: [migration("0001_unrelated")],
+    })).rejects.toMatchObject({
+      migrationId: snapshot.migrationId,
+      operation: "validateSchemaSnapshotRegistry",
+      reason: "unknown_migration_id",
+    });
+    expect(inherited.seam.query).not.toHaveBeenCalled();
   });
 
   it("accepts exact ordered history and applies only pending files", async () => {
     const migrations = [migration("0001_first"), migration("0002_second")];
     const fake = executor({ ledger: true, current: [{ id: migrations[0].id, checksum_sha256: migrations[0].sha256 }] });
-    await expect(runPostgreSqlMigrations(fake.seam, { migrations })).resolves.toEqual({
+    await expect(runPostgreSqlMigrations(fake.seam, {
+      migrations,
+      schemaSnapshots: [],
+    })).resolves.toEqual({
       applied: ["0002_second"],
       current: ["0001_first", "0002_second"],
     });
@@ -475,7 +488,7 @@ describe("PostgreSQL migration runner", () => {
 
   it("accepts a pre-existing schema owned by the migration role", async () => {
     const fake = executor({ schemaAcl: "ready", schemaOwnership: "owned" });
-    await expect(runPostgreSqlMigrations(fake.seam, { migrations: [] }))
+    await expect(runPostgreSqlMigrations(fake.seam, { migrations: [], schemaSnapshots: [] }))
       .resolves.toEqual({ applied: [], current: [] });
     expect(fake.operations).toContain("preflightSchemaOwnership");
   });
@@ -485,25 +498,28 @@ describe("PostgreSQL migration runner", () => {
     { current: [{ id: "0001_unknown", checksum_sha256: migration("0001_first").sha256 }], migrations: [migration("0001_first")] },
     { current: [{ id: "0001_first", checksum_sha256: "0".repeat(64) }], migrations: [migration("0001_first")] },
   ])("rejects unknown, excess, or checksum-drifted history", async ({ current, migrations }) => {
-    await expect(runPostgreSqlMigrations(executor({ ledger: true, current }).seam, { migrations }))
+    await expect(runPostgreSqlMigrations(executor({ ledger: true, current }).seam, {
+      migrations,
+      schemaSnapshots: [],
+    }))
       .rejects.toMatchObject({ operation: "verifyMigrationHistory" });
   });
 
   it("uses the packaged manifest by default and propagates transactional failures safely", async () => {
     const current = loadPostgreSqlMigrations().map(({ id, sha256 }) => ({ id, checksum_sha256: sha256 }));
     await expect(runPostgreSqlMigrations(executor({ ledger: true, current }).seam)).resolves.toMatchObject({ applied: [] });
-    await expect(runPostgreSqlMigrations(executor({ failOperation: "lockMigrations" }).seam, { migrations: [] }))
+    await expect(runPostgreSqlMigrations(executor({ failOperation: "lockMigrations" }).seam, { migrations: [], schemaSnapshots: [] }))
       .rejects.toThrow("private SQL failure");
-    await expect(runPostgreSqlMigrations(executor({ failOperation: "pinMigrationSearchPath" }).seam, { migrations: [] }))
+    await expect(runPostgreSqlMigrations(executor({ failOperation: "pinMigrationSearchPath" }).seam, { migrations: [], schemaSnapshots: [] }))
       .rejects.toThrow("private SQL failure");
     await expect(runPostgreSqlMigrations(executor({
       failOperation: "pinMigrationDeparserSettings",
-    }).seam, { migrations: [] })).rejects.toThrow("private SQL failure");
+    }).seam, { migrations: [], schemaSnapshots: [] })).rejects.toThrow("private SQL failure");
   });
 
   it("fails extension preflight before inspecting or changing the schema", async () => {
     const fake = executor({ failOperation: "preflightRequiredExtensions" });
-    await expect(runPostgreSqlMigrations(fake.seam, { migrations: [migration("0001_first")] }))
+    await expect(runPostgreSqlMigrations(fake.seam, { migrations: [migration("0001_first")], schemaSnapshots: [] }))
       .rejects.toThrow("private SQL failure");
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
@@ -518,7 +534,7 @@ describe("PostgreSQL migration runner", () => {
   ])("fails closed on a $label captured postmaster epoch", async ({ postmasterEpoch }) => {
     await expect(runPostgreSqlMigrations(
       executor({ postmasterEpoch }).seam,
-      { migrations: [] },
+      { migrations: [], schemaSnapshots: [] },
     )).rejects.toMatchObject({ operation: "capturePostmasterEpoch" });
   });
 
@@ -532,7 +548,9 @@ describe("PostgreSQL migration runner", () => {
     expected,
   }) => {
     const fake = executor({ serverEncoding });
-    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [] })
+    const failure = await runPostgreSqlMigrations(fake.seam, {
+      migrations: loadPostgreSqlMigrations(),
+    })
       .catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PostgreSqlServerEncodingPreflightError);
     expect(failure).toMatchObject({
@@ -563,7 +581,7 @@ describe("PostgreSQL migration runner", () => {
   ])("fails closed when postmaster continuity is $label", async ({ postmasterContinuity }) => {
     await expect(runPostgreSqlMigrations(
       executor({ postmasterContinuity }).seam,
-      { migrations: [] },
+      { migrations: [], schemaSnapshots: [] },
     )).rejects.toMatchObject({ operation: "verifyPostmasterContinuity" });
   });
 
@@ -648,7 +666,9 @@ describe("PostgreSQL migration runner", () => {
     remediation,
   }) => {
     const fake = executor({ schemaOwnership });
-    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [] })
+    const failure = await runPostgreSqlMigrations(fake.seam, {
+      migrations: loadPostgreSqlMigrations(),
+    })
       .catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PostgreSqlSchemaOwnershipPreflightError);
     expect(failure).toMatchObject({
@@ -713,7 +733,7 @@ describe("PostgreSQL migration runner", () => {
     publicCreate,
   }) => {
     const fake = executor({ schemaAcl, schemaOwnership: "owned" });
-    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [] })
+    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [], schemaSnapshots: [] })
       .catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PostgreSqlSchemaAclPreflightError);
     expect(failure).toMatchObject({
@@ -793,7 +813,9 @@ describe("PostgreSQL migration runner", () => {
       schemaAcl: "ready",
       schemaOwnership: "owned",
     });
-    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [] })
+    const failure = await runPostgreSqlMigrations(fake.seam, {
+      migrations: loadPostgreSqlMigrations(),
+    })
       .catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PostgreSqlManagedObjectOwnershipPreflightError);
     expect(failure).toMatchObject({
@@ -1169,6 +1191,7 @@ describe("PostgreSQL migration runner", () => {
     const fake = executor({ serverVersion });
     const failure = await runPostgreSqlMigrations(fake.seam, {
       migrations: [migration("0001_first")],
+      schemaSnapshots: [],
     }).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PostgreSqlServerVersionPreflightError);
     expect(failure).toMatchObject({

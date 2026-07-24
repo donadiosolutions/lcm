@@ -832,9 +832,7 @@ export async function runPostgreSqlMigrations(
   const migrations = [...(options.migrations ?? loadPostgreSqlMigrations())];
   const schemaSnapshots = [...(options.schemaSnapshots ?? loadPostgreSqlSchemaSnapshots())];
   validateMigrations(migrations);
-  if (options.schemaSnapshots || !options.migrations) {
-    validateSchemaSnapshotRegistry(migrations, schemaSnapshots);
-  }
+  validateSchemaSnapshotRegistry(migrations, schemaSnapshots);
   // The functional pg_stat_statements probe can raise SQLSTATE 55000 when the
   // library was not preloaded. Run it before opening the all-or-nothing DDL
   // transaction so that expected readiness failure cannot poison that scope.
