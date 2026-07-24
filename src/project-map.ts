@@ -311,17 +311,29 @@ function withProjectMapMutationLock<T>(
   const content = `${JSON.stringify(owner)}\n`;
   acquireProjectMapMutationLock(lockPath, content, observer);
   activeProjectMapMutationLocks.add(lockPath);
+  let callbackFailed = false;
   try {
     return callback();
+  } catch (error) {
+    callbackFailed = true;
+    throw error;
   } finally {
     activeProjectMapMutationLocks.delete(lockPath);
-    if (readBoundedRegularFile(lockPath, {
-      maxBytes: MAX_PROJECT_MAP_LOCK_BYTES,
-      allowedRoot: dirname(lockPath),
-    }) !== content) {
-      throw new Error("project map mutation lock ownership changed before release");
+    try {
+      observer("before-main-lock-release-read", lockPath);
+      if (readBoundedRegularFile(lockPath, {
+        maxBytes: MAX_PROJECT_MAP_LOCK_BYTES,
+        allowedRoot: dirname(lockPath),
+      }) !== content) {
+        throw new Error("project map mutation lock ownership changed before release");
+      }
+      observer("before-main-lock-release-delete", lockPath);
+      if (!deleteRegularFile(lockPath)) {
+        throw new Error("project map mutation lock disappeared before release");
+      }
+    } catch (releaseError) {
+      if (!callbackFailed) throw releaseError;
     }
-    deleteRegularFile(lockPath);
   }
 }
 

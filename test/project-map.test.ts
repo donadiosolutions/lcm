@@ -542,6 +542,44 @@ describe("project map", () => {
     })).toThrow("ownership changed before release");
   });
 
+  it.each([
+    ["release read", "before-main-lock-release-read"],
+    ["release delete", "before-main-lock-release-delete"],
+  ])("preserves a callback error when the main lock %s also fails", (_case, failureEvent) => {
+    const canonical = makeDir(`remote-primary-${failureEvent}`);
+    resolveProjectIdentity(canonical);
+    const primary = new Error(`primary callback failure at ${failureEvent}`);
+    let thrown: unknown;
+
+    try {
+      setRemoteProjectBinding(remoteProjectId, {
+        canonical,
+        _afterLockForTesting: () => {
+          throw primary;
+        },
+        _lockObserverForTesting: (event, path) => {
+          if (event === failureEvent) rmSync(path, { force: true });
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBe(primary);
+  });
+
+  it("reports a disappeared main lock when deletion follows a successful callback", () => {
+    const canonical = makeDir("remote-release-delete-disappeared");
+    resolveProjectIdentity(canonical);
+
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _lockObserverForTesting: (event, path) => {
+        if (event === "before-main-lock-release-delete") rmSync(path);
+      },
+    })).toThrow("project map mutation lock disappeared before release");
+  });
+
   it("fails closed for invalid, symlinked, and non-regular map locks", () => {
     const canonical = makeDir("remote-unsafe-lock");
     resolveProjectIdentity(canonical);

@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { closeRouteStorage, openExistingProject } from "../../../src/daemon/routes/storage-lifecycle.js";
+import {
+  closeRouteStorage,
+  openExistingProject,
+  stagedPostgreSqlUnavailableResponse,
+} from "../../../src/daemon/routes/storage-lifecycle.js";
+import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
 
 describe("route storage cleanup", () => {
   it("ignores absent resources", async () => {
@@ -30,5 +35,22 @@ describe("route storage cleanup", () => {
     factory.openExistingProject.mockResolvedValueOnce(project);
     await expect(openExistingProject(factory, identity)).resolves.toBe(project);
     expect(factory.openExistingProject).toHaveBeenCalledWith(identity);
+  });
+
+  it("recognizes only typed failures from the staged PostgreSQL factory", async () => {
+    const staged = new UnavailablePostgreSqlStorageBackendFactory();
+    const identity = { id: "project", canonical: "/project" } as never;
+    const stagedError = await staged.openExistingProject(identity)
+      .catch((error: unknown) => error);
+
+    expect(stagedPostgreSqlUnavailableResponse(undefined, stagedError, "grep"))
+      .toBeNull();
+    expect(stagedPostgreSqlUnavailableResponse(staged, new Error("other"), "grep"))
+      .toBeNull();
+    expect(stagedPostgreSqlUnavailableResponse(staged, stagedError, "grep"))
+      .toEqual({
+        error: "grep is unavailable while PostgreSQL storage repositories are staged",
+        storageBackend: "postgresql",
+      });
   });
 });

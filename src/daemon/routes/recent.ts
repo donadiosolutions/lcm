@@ -4,7 +4,11 @@ import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { validateCwd } from "../validate-cwd.js";
 import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
-import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
+import {
+  closeRouteStorage,
+  openExistingProject,
+  stagedPostgreSqlUnavailableResponse,
+} from "./storage-lifecycle.js";
 
 function sqliteTimestamp(date: Date): string {
   const pad = (value: number): string => String(value).padStart(2, "0");
@@ -31,10 +35,11 @@ export function createRecentHandler(config: DaemonConfig, storageFactory?: Stora
 
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
+    let activeFactory: StorageBackendFactory | undefined;
     try {
       const identity = projectIdentity(cwd, config.storage);
-      const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await openExistingProject(factory, identity) ?? undefined;
+      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+      project = await openExistingProject(activeFactory, identity) ?? undefined;
       if (!project) {
         sendJson(res, 200, { summaries: [] });
         return;
@@ -48,7 +53,12 @@ export function createRecentHandler(config: DaemonConfig, storageFactory?: Stora
         created_at: sqliteTimestamp(summary.createdAt),
       }));
       sendJson(res, 200, { summaries: rows });
-    } catch {
+    } catch (error) {
+      const unavailable = stagedPostgreSqlUnavailableResponse(activeFactory, error, "recent");
+      if (unavailable) {
+        sendJson(res, 503, unavailable);
+        return;
+      }
       sendJson(res, 200, { summaries: [] });
     } finally {
       await closeRouteStorage(project, ownedFactory);

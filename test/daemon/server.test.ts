@@ -138,18 +138,26 @@ describe("daemon server", () => {
     }, { homeDir: tempHome });
     const local = resolveProjectIdentity(tempHome!);
     setRemoteProjectBinding("018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020", { hash: local.id });
-    const searchResponse = await fetch(`http://127.0.0.1:${port}/search`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: tempHome, query: "remember" }),
-    });
-    expect(searchResponse.status).toBe(503);
-    const search = await searchResponse.json();
-    expect(search).toEqual({
-      error: "search is unavailable while PostgreSQL storage repositories are staged",
-      storageBackend: "postgresql",
-    });
-    expect(JSON.stringify(search)).not.toContain("secret");
+    for (const request of [
+      { path: "/search", operation: "search", body: { cwd: tempHome, query: "remember" } },
+      { path: "/grep", operation: "grep", body: { cwd: tempHome, query: "remember" } },
+      { path: "/recent", operation: "recent", body: { cwd: tempHome } },
+      { path: "/describe", operation: "describe", body: { cwd: tempHome, nodeId: "node" } },
+      { path: "/expand", operation: "expand", body: { cwd: tempHome, nodeId: "node" } },
+    ]) {
+      const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request.body),
+      });
+      expect(response.status).toBe(503);
+      const unavailable = await response.json();
+      expect(unavailable).toEqual({
+        error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
+        storageBackend: "postgresql",
+      });
+      expect(JSON.stringify(unavailable)).not.toContain("secret");
+    }
 
     for (const request of [
       { path: "/stats", method: "GET", operation: "stats" },

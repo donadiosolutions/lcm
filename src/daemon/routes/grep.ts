@@ -5,7 +5,11 @@ import type { RouteHandler } from "../server.js";
 import { createRetrievalEngine } from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
 import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
-import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
+import {
+  closeRouteStorage,
+  openExistingProject,
+  stagedPostgreSqlUnavailableResponse,
+} from "./storage-lifecycle.js";
 
 export function createGrepHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body) => {
@@ -32,10 +36,11 @@ export function createGrepHandler(config: DaemonConfig, storageFactory?: Storage
 
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
+    let activeFactory: StorageBackendFactory | undefined;
     try {
       const identity = projectIdentity(cwd, config.storage);
-      const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await openExistingProject(factory, identity) ?? undefined;
+      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+      project = await openExistingProject(activeFactory, identity) ?? undefined;
       if (!project) {
         sendJson(res, 200, { matches: [] });
         return;
@@ -43,7 +48,12 @@ export function createGrepHandler(config: DaemonConfig, storageFactory?: Storage
       const engine = createRetrievalEngine(project);
       const result = await engine.grep({ query, mode: mode ?? "full_text", scope: scope ?? "both", since });
       sendJson(res, 200, result);
-    } catch (err) {
+    } catch (error) {
+      const unavailable = stagedPostgreSqlUnavailableResponse(activeFactory, error, "grep");
+      if (unavailable) {
+        sendJson(res, 503, unavailable);
+        return;
+      }
       sendJson(res, 200, { matches: [] });
     } finally {
       await closeRouteStorage(project, ownedFactory);

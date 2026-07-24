@@ -158,6 +158,14 @@ describe("persistence read route boundaries", () => {
     const ownedCloseCount = mocks.factoryClose.mock.calls.length;
     await invoke(createDescribeHandler(config, injectedFactory()), { nodeId: "n", cwd: "/ok" });
     expect(mocks.factoryClose).toHaveBeenCalledTimes(ownedCloseCount);
+    await invoke(
+      createDescribeHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
+      { nodeId: "n", cwd: "/ok" },
+    );
+    expectLast(503, {
+      error: "describe is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
   });
 
   it("uses the injected backend without consulting a local SQLite path", async () => {
@@ -201,6 +209,14 @@ describe("persistence read route boundaries", () => {
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
     expectLast(200, { expanded: null, error: "expansion failed" });
     await invoke(createExpandHandler(config, injectedFactory()), { nodeId: "n", cwd: "/ok" });
+    await invoke(
+      createExpandHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
+      { nodeId: "n", cwd: "/ok" },
+    );
+    expectLast(503, {
+      error: "expand is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
   });
 
   it("covers grep validation, defaults, missing projects, success, and failure", async () => {
@@ -223,6 +239,14 @@ describe("persistence read route boundaries", () => {
     await invoke(handler, { query: "q", cwd: "/ok" });
     expectLast(200, { matches: [] });
     await invoke(createGrepHandler(config, injectedFactory()), { query: "q", cwd: "/ok" });
+    await invoke(
+      createGrepHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
+      { query: "q", cwd: "/ok" },
+    );
+    expectLast(503, {
+      error: "grep is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
   });
 
   it("covers recent validation, missing projects, defaults, success, and failure", async () => {
@@ -256,6 +280,14 @@ describe("persistence read route boundaries", () => {
     await invoke(handler, { cwd: "/ok" });
     expectLast(200, { summaries: [] });
     await invoke(createRecentHandler(config, injectedFactory()), { cwd: "/ok" });
+    await invoke(
+      createRecentHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
+      { cwd: "/ok" },
+    );
+    expectLast(503, {
+      error: "recent is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
   });
 
   it("covers pool and aggregate stats success and failure payloads", async () => {

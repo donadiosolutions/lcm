@@ -5,9 +5,11 @@ import type { RouteHandler } from "../server.js";
 import { createRetrievalEngine } from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
 import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
-import { StorageOperationError } from "../../storage/errors.js";
-import { UnavailablePostgreSqlStorageBackendFactory } from "../../storage/factory.js";
-import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
+import {
+  closeRouteStorage,
+  openExistingProject,
+  stagedPostgreSqlUnavailableResponse,
+} from "./storage-lifecycle.js";
 
 export function createSearchHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body) => {
@@ -68,14 +70,9 @@ export function createSearchHandler(config: DaemonConfig, storageFactory?: Stora
           }
         }
       } catch (error) {
-        if (
-          activeFactory instanceof UnavailablePostgreSqlStorageBackendFactory
-          && error instanceof StorageOperationError
-        ) {
-          sendJson(res, 503, {
-            error: "search is unavailable while PostgreSQL storage repositories are staged",
-            storageBackend: "postgresql",
-          });
+        const unavailable = stagedPostgreSqlUnavailableResponse(activeFactory, error, "search");
+        if (unavailable) {
+          sendJson(res, 503, unavailable);
           return;
         }
         // SQLite read/search failures remain non-fatal and return empty layers.

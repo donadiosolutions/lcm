@@ -239,12 +239,15 @@ bootstrap and remain available for later promotion.
 
 PostgreSQL domain repositories are still staged. With PostgreSQL selected, the
 daemon starts so identity validation remains reachable, but `GET /health`
-reports unavailable storage. `POST /status`, `POST /search`, `GET /stats`, and
-`GET /stats/pool` return fixed `503` responses after their applicable identity
-checks, and the daemon does not run SQLite transcript scans or passive-outbox
-sweeps. Project operations fail at a cause-free unavailable-backend boundary
-after validating machine registration and the explicit project binding. LCM
-does not fall back to SQLite, return false empty search results, or advertise
+reports unavailable storage. `POST /status`, `/search`, `/grep`, `/recent`,
+`/describe`, and `/expand`, plus `GET /stats` and `/stats/pool`, return fixed
+`503` responses after their applicable identity checks. The hook-facing
+`POST /prompt-search` endpoint remains best-effort and returns an empty hint
+set during an outage so prompt hooks stay successful. The daemon does not run
+SQLite transcript scans or passive-outbox sweeps. Other project operations fail
+at a cause-free unavailable-backend boundary after validating machine
+registration and the explicit project binding. LCM does not fall back to
+SQLite, return false empty results from manual read routes, or advertise
 PostgreSQL data capabilities during this staged state.
 
 ## Ambiguity and doctor

@@ -3,6 +3,8 @@ import type {
   StorageBackendFactory,
   StorageIdentityContext,
 } from "../../storage/index.js";
+import { StorageOperationError } from "../../storage/errors.js";
+import { UnavailablePostgreSqlStorageBackendFactory } from "../../storage/factory.js";
 
 interface AsyncClosable {
   close(): Promise<void> | void;
@@ -30,4 +32,21 @@ export async function openExistingProject(
   identity: StorageIdentityContext,
 ): Promise<ProjectStorage | null> {
   return factory.openExistingProject(identity);
+}
+
+export function stagedPostgreSqlUnavailableResponse(
+  factory: StorageBackendFactory | undefined,
+  error: unknown,
+  operation: string,
+): { readonly error: string; readonly storageBackend: "postgresql" } | null {
+  if (
+    !(factory instanceof UnavailablePostgreSqlStorageBackendFactory)
+    || !(error instanceof StorageOperationError)
+  ) {
+    return null;
+  }
+  return {
+    error: `${operation} is unavailable while PostgreSQL storage repositories are staged`,
+    storageBackend: "postgresql",
+  };
 }
