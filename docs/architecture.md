@@ -76,9 +76,12 @@ configuration that exists. Unknown schema objects are outside that exact
 catalog allowlist and are neither rejected nor changed.
 After the baseline is recorded, it also verifies the explicit existence and
 canonical definitions of all allowlisted secondary indexes, triggers, and
-constraints; indexes must remain valid and ready and inherit ownership from
-their tables. Trigger inventory also requires ordinary enabled mode, rejecting
-disabled, replica-only, or always-enabled drift. Unknown operator-created
+constraints, plus every stored generated-column expression; indexes must remain
+valid and ready and inherit ownership from their tables. Trigger inventory also
+requires ordinary enabled mode, rejecting disabled, replica-only, or
+always-enabled drift. Constraint inventory includes the enablement state of
+its internal enforcement triggers, and generated columns retain both their
+generated state and fully deparsed expression. Unknown operator-created
 indexes, triggers, and constraints remain outside the inventory.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six
 generated identity sequences, or the search-normalization, summary-identity,

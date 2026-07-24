@@ -574,8 +574,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 223,
-          existingObjectCount: 222,
+          expectedObjectCount: 238,
+          existingObjectCount: 237,
           missingObjectCount: 1,
           operation: "preflightBaselineDefinitions",
         });
@@ -595,9 +595,73 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 223,
-          existingObjectCount: 223,
+          expectedObjectCount: 238,
+          existingObjectCount: 238,
           missingObjectCount: 0,
+          operation: "preflightBaselineDefinitions",
+        });
+    });
+  });
+
+  it("rejects constraint drift containing an lcm-qualified string literal", async () => {
+    await withPostgreSqlTestDatabase("constraint-literal-drift", async (database) => {
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.machines
+                 DROP CONSTRAINT machines_display_name_check;
+               ALTER TABLE lcm.machines
+                 ADD CONSTRAINT machines_display_name_check
+                 CHECK (display_name IS NULL OR btrim(display_name) <> 'lcm.')`,
+      }, { domain: "factory", operation: "simulateConstraintLiteralDrift" });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toMatchObject({
+          baselineApplied: true,
+          driftedDefinitionGroupCount: 1,
+          expectedObjectCount: 238,
+          existingObjectCount: 238,
+          missingObjectCount: 0,
+          operation: "preflightBaselineDefinitions",
+        });
+    });
+  });
+
+  it("rejects disabled internal constraint triggers", async () => {
+    await withPostgreSqlTestDatabase("constraint-trigger-disabled", async (database) => {
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+      try {
+        await admin.query({
+          text: "ALTER TABLE lcm.messages DISABLE TRIGGER ALL",
+        }, { domain: "factory", operation: "disableBaselineConstraintTriggers" });
+        await expect(runPostgreSqlMigrations(database.migrator))
+          .rejects.toMatchObject({
+            baselineApplied: true,
+            driftedDefinitionGroupCount: 1,
+            expectedObjectCount: 238,
+            existingObjectCount: 238,
+            missingObjectCount: 0,
+            operation: "preflightBaselineDefinitions",
+          });
+      } finally {
+        await admin.query({
+          text: "ALTER TABLE lcm.messages ENABLE TRIGGER ALL",
+        }, { domain: "factory", operation: "restoreBaselineConstraintTriggers" });
+        await admin.close();
+      }
+    });
+  });
+
+  it("rejects a generated column whose expression is dropped", async () => {
+    await withPostgreSqlTestDatabase("generated-column-drift", async (database) => {
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.session_ingest_log
+               ALTER COLUMN session_id_sha256 DROP EXPRESSION`,
+      }, { domain: "factory", operation: "dropGeneratedColumnExpression" });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toMatchObject({
+          baselineApplied: true,
+          driftedDefinitionGroupCount: 1,
+          expectedObjectCount: 238,
+          existingObjectCount: 237,
+          missingObjectCount: 1,
           operation: "preflightBaselineDefinitions",
         });
     });

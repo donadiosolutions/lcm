@@ -58,13 +58,18 @@ does not add row-level security.
   inspection path.
 - Once `0002` is recorded, recurring readiness also checks an explicit
   definition inventory of all 52 named secondary indexes, all 168 table
-  constraints, and all three identity-enforcement triggers. Each allowlisted
-  object must exist, every index must remain valid and ready, and canonical
-  index, trigger, and constraint definitions must retain their pinned
+  constraints, all three identity-enforcement triggers, and all 15 stored
+  generated columns. Each allowlisted object must exist, every index must
+  remain valid and ready, and canonical index, trigger, fully qualified
+  constraint, and generation-expression definitions must retain their pinned
   fingerprints. Trigger fingerprints include the enablement mode and require
   ordinary enabled mode (`O`), so disabled, replica-only, and always-enabled
-  drift all fail readiness. Index ownership follows the owning table; triggers
-  and constraints are checked as existence and definition inventory.
+  drift all fail readiness. Constraint fingerprints include the stable
+  enablement-state multiset of their zero or more internal enforcement
+  triggers. Generated-column fingerprints bind the exact table, column,
+  `attgenerated` state, and PostgreSQL-deparsed expression. Index ownership
+  follows the owning table; triggers and constraints are checked as existence
+  and definition inventory.
   Additional operator-created objects remain outside the allowlist and are
   ignored.
 - Recurring migration readiness fingerprints the bodies and security

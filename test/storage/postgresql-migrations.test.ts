@@ -220,12 +220,12 @@ function executor(options: {
         .some(({ id }) => id === "0002_schema_baseline");
       return result([{
         baseline_applied: baselineApplied,
-        expected_object_count: 223,
+        expected_object_count: 238,
         existing_object_count: options.baselineDefinitions === "inconsistent"
-          ? 224
+          ? 239
           : options.baselineDefinitions === "missing-object"
-            ? 222
-            : 223,
+            ? 237
+            : 238,
         missing_object_count: options.baselineDefinitions === "missing-object" ? 1 : 0,
         drifted_definition_group_count:
           options.baselineDefinitions === "drifted"
@@ -718,8 +718,8 @@ describe("PostgreSQL migration runner", () => {
       label: "a missing index, trigger, or constraint",
       baselineDefinitions: "missing-object" as const,
       baselineApplied: true,
-      expectedObjectCount: 223,
-      existingObjectCount: 222,
+      expectedObjectCount: 238,
+      existingObjectCount: 237,
       missingObjectCount: 1,
       driftedDefinitionGroupCount: 1,
     },
@@ -727,8 +727,8 @@ describe("PostgreSQL migration runner", () => {
       label: "definition drift",
       baselineDefinitions: "drifted" as const,
       baselineApplied: true,
-      expectedObjectCount: 223,
-      existingObjectCount: 223,
+      expectedObjectCount: 238,
+      existingObjectCount: 238,
       missingObjectCount: 0,
       driftedDefinitionGroupCount: 1,
     },
@@ -754,8 +754,8 @@ describe("PostgreSQL migration runner", () => {
       label: "contradictory catalog counts",
       baselineDefinitions: "inconsistent" as const,
       baselineApplied: true,
-      expectedObjectCount: 223,
-      existingObjectCount: 224,
+      expectedObjectCount: 238,
+      existingObjectCount: 239,
       missingObjectCount: 0,
       driftedDefinitionGroupCount: 0,
     },
@@ -790,7 +790,7 @@ describe("PostgreSQL migration runner", () => {
       missingObjectCount,
       operation: "preflightBaselineDefinitions",
       remediation:
-        "Restore every missing or changed LCM baseline index, trigger, and constraint from the matching packaged migration artifact or a verified backup, then rerun migrations.",
+        "Restore every missing or changed LCM baseline index, trigger, constraint, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.",
     });
     expect((failure as PostgreSqlBaselineDefinitionPreflightError).toJSON())
       .toMatchObject({
@@ -809,10 +809,14 @@ describe("PostgreSQL migration runner", () => {
       "pg_catalog.pg_index",
       "pg_catalog.pg_trigger",
       "pg_catalog.pg_constraint",
+      "pg_catalog.pg_attribute",
+      "pg_catalog.pg_attrdef",
       "pg_catalog.pg_get_indexdef",
       "pg_catalog.pg_get_triggerdef",
       "pg_catalog.pg_get_constraintdef",
+      "pg_catalog.pg_get_expr",
       "trigger.tgenabled",
+      "trigger.tgconstraint",
     ]) expect(inventorySql).toContain(catalog);
     expect((inventoryCall?.[0] as { values?: unknown[] } | undefined)?.values)
       .toEqual([
@@ -822,7 +826,8 @@ describe("PostgreSQL migration runner", () => {
           "session_ingest_log|session_ingest_log_enforce_session_id_uniqueness",
         ]),
         expect.arrayContaining(["session_ingest_log|session_ingest_log_pkey"]),
-        223,
+        expect.arrayContaining(["session_ingest_log|session_id_sha256"]),
+        238,
       ]);
   });
 

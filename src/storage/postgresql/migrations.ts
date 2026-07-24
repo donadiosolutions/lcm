@@ -96,6 +96,24 @@ const EXPECTED_BASELINE_TRIGGER_IDENTITIES = [
   "summaries|summaries_enforce_summary_id_uniqueness",
 ] as const;
 
+const EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES = [
+  "conversations|session_id_sha256",
+  "large_files|file_id_sha256",
+  "messages|search_document",
+  "native_transcripts|native_session_id_sha256",
+  "promoted_memories|search_document",
+  "promoted_memories|source_summary_id_sha256",
+  "promoted_memory_tags|normalized_tag",
+  "promoted_memory_tags|normalized_tag_sha256",
+  "promoted_memory_tags|search_document",
+  "promoted_memory_tags|tag_sha256",
+  "recall_surfacing|session_id_sha256",
+  "session_ingest_log|session_id_sha256",
+  "summaries|search_document",
+  "summaries|summary_id_sha256",
+  "summary_large_files|file_id_sha256",
+] as const;
+
 const EXPECTED_BASELINE_CONSTRAINT_NAMES = `
   context_items_item_type_check context_items_check context_items_ordinal_check
   context_items_project_id_conversation_id_message_id_fkey
@@ -212,10 +230,12 @@ const EXPECTED_BASELINE_CONSTRAINT_IDENTITIES =
 const EXPECTED_BASELINE_DEFINITION_COUNT =
   EXPECTED_BASELINE_INDEX_NAMES.length
   + EXPECTED_BASELINE_TRIGGER_IDENTITIES.length
-  + EXPECTED_BASELINE_CONSTRAINT_IDENTITIES.length;
+  + EXPECTED_BASELINE_CONSTRAINT_IDENTITIES.length
+  + EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES.length;
 
   return {
     constraintIdentities: EXPECTED_BASELINE_CONSTRAINT_IDENTITIES,
+    generatedColumnIdentities: EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES,
     indexNames: EXPECTED_BASELINE_INDEX_NAMES,
     objectCount: EXPECTED_BASELINE_DEFINITION_COUNT,
     triggerIdentities: EXPECTED_BASELINE_TRIGGER_IDENTITIES,
@@ -402,7 +422,7 @@ export class PostgreSqlBaselineDefinitionPreflightError extends StorageOperation
 
   readonly schemaName = "lcm";
   readonly remediation =
-    "Restore every missing or changed LCM baseline index, trigger, and constraint from the matching packaged migration artifact or a verified backup, then rerun migrations.";
+    "Restore every missing or changed LCM baseline index, trigger, constraint, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.";
 
   override toJSON(): Record<string, unknown> {
     return {
@@ -878,22 +898,63 @@ export async function runPostgreSqlMigrations(
                  SELECT constraint_metadata.conname AS object_name,
                         relation.relname AS table_name,
                         constraint_metadata.contype::pg_catalog.text AS constraint_type,
-                        pg_catalog.replace(
-                          pg_catalog.pg_get_constraintdef(constraint_metadata.oid, true),
-                          'lcm.',
+                        pg_catalog.pg_get_constraintdef(
+                          constraint_metadata.oid,
+                          true
+                        ) AS definition,
+                        COALESCE(
+                          constraint_trigger_states.enabled_modes,
                           ''
-                        ) AS definition
+                        ) AS enabled_modes
                  FROM pg_catalog.pg_constraint AS constraint_metadata
                  JOIN pg_catalog.pg_class AS relation
                    ON relation.oid OPERATOR(pg_catalog.=) constraint_metadata.conrelid
                  JOIN pg_catalog.pg_namespace AS namespace
                    ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 LEFT JOIN (
+                   SELECT trigger.tgconstraint AS constraint_oid,
+                          pg_catalog.string_agg(
+                            trigger.tgenabled::pg_catalog.text,
+                            ''
+                            ORDER BY trigger.tgenabled
+                          ) AS enabled_modes
+                   FROM pg_catalog.pg_trigger AS trigger
+                   WHERE trigger.tgconstraint OPERATOR(pg_catalog.<>) 0
+                   GROUP BY trigger.tgconstraint
+                 ) AS constraint_trigger_states
+                   ON constraint_trigger_states.constraint_oid
+                     OPERATOR(pg_catalog.=) constraint_metadata.oid
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                    AND pg_catalog.concat_ws(
                      '|',
                      relation.relname,
                      constraint_metadata.conname
                    ) OPERATOR(pg_catalog.=) ANY ($4::pg_catalog.text[])
+               ),
+               actual_generated_columns AS (
+                 SELECT relation.relname AS table_name,
+                        attribute.attname AS column_name,
+                        attribute.attgenerated::pg_catalog.text AS generation_kind,
+                        pg_catalog.pg_get_expr(
+                          attribute_default.adbin,
+                          attribute_default.adrelid,
+                          true
+                        ) AS generation_expression
+                 FROM pg_catalog.pg_attribute AS attribute
+                 JOIN pg_catalog.pg_class AS relation
+                   ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 JOIN pg_catalog.pg_attrdef AS attribute_default
+                   ON attribute_default.adrelid OPERATOR(pg_catalog.=) attribute.attrelid
+                  AND attribute_default.adnum OPERATOR(pg_catalog.=) attribute.attnum
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND attribute.attgenerated OPERATOR(pg_catalog.<>) ''
+                   AND pg_catalog.concat_ws(
+                     '|',
+                     relation.relname,
+                     attribute.attname
+                   ) OPERATOR(pg_catalog.=) ANY ($5::pg_catalog.text[])
                ),
                actual_groups(object_kind, existing_count, definition_sha256) AS (
                  SELECT 'index'::pg_catalog.text,
@@ -947,10 +1008,12 @@ export async function runPostgreSqlMigrations(
                                   '|',
                                   table_name,
                                   constraint_type,
-                                  definition
+                                  definition,
+                                  enabled_modes
                                 ),
                                 E'\\n'
-                                ORDER BY table_name, constraint_type, definition
+                                ORDER BY table_name, constraint_type, definition,
+                                  enabled_modes
                               ),
                               ''
                             ),
@@ -959,6 +1022,30 @@ export async function runPostgreSqlMigrations(
                           'hex'
                         )
                  FROM actual_constraints
+                 UNION ALL
+                 SELECT 'generated_column'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  table_name,
+                                  column_name,
+                                  generation_kind,
+                                  generation_expression
+                                ),
+                                E'\\n'
+                                ORDER BY table_name, column_name
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_generated_columns
                ),
                expected_groups(
                  object_kind,
@@ -979,16 +1066,21 @@ export async function runPostgreSqlMigrations(
                    (
                      'constraint'::pg_catalog.text,
                      168::pg_catalog.int4,
-                     '224efb3262dd78a2da9d961916d4f8c23a22c48285110ff02ea9aa6f15cc526f'::pg_catalog.text
+                     'fd5bd6e50e143be6dd71f485eaf275f70b32ec16d0de8d0df8519cf5725ff18e'::pg_catalog.text
+                   ),
+                   (
+                     'generated_column'::pg_catalog.text,
+                     15::pg_catalog.int4,
+                     'c05b335f05f12f54649ae048f0233848e32eadc5422f8eaf5cd72183192ea36f'::pg_catalog.text
                    )
                )
                SELECT $1::pg_catalog.bool AS baseline_applied,
-                      $5::pg_catalog.int4 AS expected_object_count,
+                      $6::pg_catalog.int4 AS expected_object_count,
                       pg_catalog.sum(actual_groups.existing_count)::pg_catalog.int4
                         AS existing_object_count,
                       CASE
                         WHEN $1::pg_catalog.bool THEN (
-                          $5 - pg_catalog.sum(actual_groups.existing_count)
+                          $6 - pg_catalog.sum(actual_groups.existing_count)
                         )::pg_catalog.int4
                         ELSE 0::pg_catalog.int4
                       END AS missing_object_count,
@@ -1008,6 +1100,7 @@ export async function runPostgreSqlMigrations(
           expectedBaselineDefinitions.indexNames,
           expectedBaselineDefinitions.triggerIdentities,
           expectedBaselineDefinitions.constraintIdentities,
+          expectedBaselineDefinitions.generatedColumnIdentities,
           expectedBaselineDefinitions.objectCount,
         ],
       }, {
@@ -1042,7 +1135,7 @@ export async function runPostgreSqlMigrations(
           !== expectedDefinitionObjectCount)
       || missingDefinitionObjectCount !== 0
       || driftedDefinitionGroupCount === null
-      || driftedDefinitionGroupCount > 3
+      || driftedDefinitionGroupCount > 4
       || driftedDefinitionGroupCount !== 0
     ) {
       throw new PostgreSqlBaselineDefinitionPreflightError(
