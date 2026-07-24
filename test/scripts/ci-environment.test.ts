@@ -28,6 +28,7 @@ import {
   validateImageInspection,
   validateNodeModulesStamp,
   validatePostgreSqlTemplateArchive,
+  validateTarInventoryCapabilities,
   validateTemplateArchiveEntries,
   writeArchiveChecksum,
   writeNodeModulesStamp,
@@ -265,6 +266,21 @@ describe("CI environment cache metadata", () => {
       .toThrow("PG_VERSION");
     expect(() => validateTemplateArchiveEntries("PG_VERSION", "-rw------- version"))
       .toThrow("pg_control");
+  });
+
+  it("fails closed when GNU tar safe quoting support is unavailable", () => {
+    expect(() => validateTarInventoryCapabilities([
+      "GNU tar help",
+      "  --quoting-style=STYLE",
+      "Valid arguments include: escape",
+    ].join("\n"))).not.toThrow();
+    expect(() => validateTarInventoryCapabilities("bsdtar help")).toThrow(
+      "requires GNU tar with --quoting-style=escape",
+    );
+    expect(() => validateTarInventoryCapabilities(
+      "GNU tar --quoting-style=STYLE escape",
+      true,
+    )).toThrow("install GNU tar and ensure it is first on PATH");
   });
 
   it("rejects link-bearing PostgreSQL template archives before extraction", async () => {

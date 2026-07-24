@@ -129,14 +129,16 @@ local `.github/actions/setup-ci` composite action is the only installation
 entrypoint used by those jobs. It maintains exact, fallback-free caches for:
 
 - `node_modules`, keyed by the Node version, runner OS and architecture, and
-  both npm dependency manifests;
+  the complete npm installation contract: `package.json`, `package-lock.json`,
+  and `.npmrc`;
 - the digest-pinned PostgreSQL and Node images used by the conformance harness;
 - a cleanly stopped PostgreSQL 18 cluster containing a secret-free
   `lcm_harness_template` database with the required extensions.
 
 An exact `node_modules` hit skips `npm ci` only after the cache stamp, platform,
-Node version, dependency-manifest digest, package inventory, and `npm ls --all`
-all validate. Image restores are checked against their repository digests.
+Node version, npm installation-contract digest, package inventory, and
+`npm ls --all` all validate. Image restores are checked against their
+repository digests.
 Image and template archives carry SHA-256 sidecars, and PostgreSQL template
 archives also reject unsafe or incomplete paths before use.
 

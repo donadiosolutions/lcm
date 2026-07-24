@@ -355,7 +355,28 @@ async function removeDockerObject(type, name) {
   });
 }
 
+const GNU_TAR_INVENTORY_ERROR = "PostgreSQL template archive validation requires GNU tar with --quoting-style=escape; install GNU tar and ensure it is first on PATH";
+
+export function validateTarInventoryCapabilities(helpOutput, outputTruncated = false) {
+  if (outputTruncated
+    || !String(helpOutput).includes("--quoting-style")
+    || !/(?:^|\s)escape(?:\s|$)/mu.test(String(helpOutput))) {
+    throw new Error(GNU_TAR_INVENTORY_ERROR);
+  }
+}
+
+async function requireSafeTarInventorySupport() {
+  let help;
+  try {
+    help = await runProcess("tar", ["--help"]);
+  } catch (error) {
+    throw new Error(GNU_TAR_INVENTORY_ERROR, { cause: error });
+  }
+  validateTarInventoryCapabilities(help.stdout, help.stdoutTruncated);
+}
+
 async function readTemplateArchiveInventory(archivePath) {
+  await requireSafeTarInventorySupport();
   const commonArguments = [
     "--list",
     "--file", archivePath,
