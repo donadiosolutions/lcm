@@ -1,5 +1,6 @@
 import type { DaemonConfig } from "../config.js";
 import { projectIdentity } from "../project.js";
+import { sanitizeError } from "../safe-error.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { validateCwd } from "../validate-cwd.js";
@@ -43,7 +44,9 @@ export function createSessionCompleteHandler(config: DaemonConfig, storageFactor
         sendJson(res, storageFailure.status, storageFailure.body);
         return;
       }
-      sendJson(res, 500, { error: err instanceof Error ? err.message : "session completion failed" });
+      sendJson(res, 500, {
+        error: sanitizeError(err instanceof Error ? err.message : "session completion failed"),
+      });
     } finally {
       await closeRouteStorage(project, ownedFactory);
     }
