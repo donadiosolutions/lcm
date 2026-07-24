@@ -499,6 +499,81 @@ describe("PostgreSQL identity repository", () => {
     ))).toBe(false);
   });
 
+  it("refreshes and compensates a same-owner alias lexical path transactionally", async () => {
+    const priorAlias = {
+      ...aliasRow,
+      path: "/work/../work/project",
+    };
+    const refreshedAlias = {
+      ...aliasRow,
+      path: "/work/project",
+    };
+    let selectCount = 0;
+    const replacementDb = executor((config) => {
+      if (config.text.includes("SELECT project_id FROM")) {
+        return result([{ project_id: projectRow.project_id }]);
+      }
+      if (config.text.includes("FOR UPDATE")) {
+        selectCount += 1;
+        return result(selectCount === 1 ? [priorAlias] : [refreshedAlias]);
+      }
+      if (config.text.includes("UPDATE lcm.project_aliases")) return result([]);
+      throw new Error(`unexpected SQL: ${config.text}`);
+    });
+    const repository = new PostgreSqlIdentityRepository(replacementDb);
+    const aliases = [{
+      path: refreshedAlias.path,
+      normalizedPath: refreshedAlias.normalized_path,
+    }];
+
+    const mutation = await repository.replaceProjectAliases({
+      machineId: machineRow.machine_id,
+      projectId: projectRow.project_id,
+      aliases,
+    });
+    expect(mutation).toMatchObject({
+      aliases: [{ path: refreshedAlias.path }],
+      prior: [{
+        projectId: projectRow.project_id,
+        alias: { path: priorAlias.path },
+      }],
+      inserted: [false],
+    });
+    expect(replacementDb.query).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining("SET path = $1"),
+      values: [
+        refreshedAlias.path,
+        machineRow.machine_id,
+        refreshedAlias.normalized_path,
+        projectRow.project_id,
+      ],
+    }), expect.objectContaining({ operation: "replaceProjectAliases" }));
+
+    const restoreDb = executor((config) => {
+      if (config.text.includes("FOR UPDATE")) return result([refreshedAlias]);
+      if (config.text.includes("UPDATE lcm.project_aliases")) return result([]);
+      throw new Error(`unexpected SQL: ${config.text}`);
+    });
+    const restoringRepository = new PostgreSqlIdentityRepository(restoreDb);
+    await expect(restoringRepository.restoreProjectAliasBatch(
+      machineRow.machine_id,
+      projectRow.project_id,
+      mutation!.prior,
+      mutation!.inserted,
+      aliases,
+    )).resolves.toBe(true);
+    expect(restoreDb.query).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining("SET project_id = $1"),
+      values: [
+        projectRow.project_id,
+        priorAlias.path,
+        machineRow.machine_id,
+        priorAlias.normalized_path,
+        projectRow.project_id,
+      ],
+    }), expect.objectContaining({ operation: "restoreProjectAliasBatch" }));
+  });
+
   it("preserves batch replacement snapshots when COMMIT outcomes are unknown", async () => {
     const replacementId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021";
     const insertedAlias = {

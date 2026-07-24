@@ -1116,12 +1116,123 @@ describe("identity service", () => {
     expect(repository.restoreProjectAliasBatch).toHaveBeenCalledWith(
       MACHINE_ID,
       PROJECT_A,
-      [null],
+      [expect.objectContaining({
+        projectId: PROJECT_A,
+        alias: expect.objectContaining({ path }),
+      })],
       [false],
       [{ path, normalizedPath: path }],
     );
     await expect(repository.resolveProject(MACHINE_ID, path))
       .resolves.toMatchObject({ projectId: PROJECT_A });
+  });
+
+  it("restores a same-owner lexical path refresh when local binding persistence fails", async () => {
+    await register();
+    const path = makeProject("lexical-refresh-compensation");
+    const priorPath = `${path}/.`;
+    await repository.linkProject({
+      machineId: MACHINE_ID,
+      projectId: PROJECT_A,
+      path: priorPath,
+      normalizedPath: path,
+    });
+    const originalReplace = repository.replaceProjectAliases.getMockImplementation()!;
+    repository.replaceProjectAliases = vi.fn(async (input) => {
+      const mutation = await originalReplace(input);
+      writeFileSync(projectMapPath(), "{broken");
+      return mutation;
+    });
+
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, path, {}, deps))
+      .rejects.toThrow("Expected property name");
+    expect(repository.restoreProjectAliasBatch).toHaveBeenCalledWith(
+      MACHINE_ID,
+      PROJECT_A,
+      [expect.objectContaining({
+        projectId: PROJECT_A,
+        alias: expect.objectContaining({ path: priorPath }),
+      })],
+      [false],
+      [{ path, normalizedPath: path }],
+    );
+    await expect(repository.resolveProject(MACHINE_ID, path))
+      .resolves.toMatchObject({
+        projectId: PROJECT_A,
+        alias: { path: priorPath },
+      });
+  });
+
+  it("does not restore a stale lexical snapshot after uncertain refresh readback", async () => {
+    await register();
+    const path = makeProject("lexical-refresh-uncertain");
+    const priorPath = `${path}/.`;
+    await repository.linkProject({
+      machineId: MACHINE_ID,
+      projectId: PROJECT_A,
+      path: priorPath,
+      normalizedPath: path,
+    });
+    const originalReplace = repository.replaceProjectAliases.getMockImplementation()!;
+    repository.replaceProjectAliases = vi.fn(async (input) => {
+      const candidate = await originalReplace(input);
+      writeFileSync(projectMapPath(), "{broken");
+      throw new PostgreSqlIdentityReplaceAliasesOutcomeUnknownError(
+        input.projectId,
+        candidate!,
+      );
+    });
+
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, path, {}, deps))
+      .rejects.toThrow("Expected property name");
+    expect(repository.restoreProjectAliasBatch).toHaveBeenCalledWith(
+      MACHINE_ID,
+      PROJECT_A,
+      [expect.objectContaining({
+        projectId: PROJECT_A,
+        alias: expect.objectContaining({ path }),
+      })],
+      [false],
+      [{ path, normalizedPath: path }],
+    );
+    await expect(repository.resolveProject(MACHINE_ID, path))
+      .resolves.toMatchObject({
+        projectId: PROJECT_A,
+        alias: { path },
+      });
+  });
+
+  it("does not restore a stale foreign owner after uncertain rebind readback", async () => {
+    await register();
+    const path = makeProject("foreign-rebind-uncertain");
+    await linkProject(POSTGRESQL_CONFIG, PROJECT_A, path, {}, deps);
+    const originalReplace = repository.replaceProjectAliases.getMockImplementation()!;
+    repository.replaceProjectAliases = vi.fn(async (input) => {
+      const candidate = await originalReplace(input);
+      writeFileSync(projectMapPath(), "{broken");
+      throw new PostgreSqlIdentityReplaceAliasesOutcomeUnknownError(
+        input.projectId,
+        candidate!,
+      );
+    });
+
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_B, path, {}, deps))
+      .rejects.toThrow("Expected property name");
+    expect(repository.restoreProjectAliasBatch).toHaveBeenCalledWith(
+      MACHINE_ID,
+      PROJECT_B,
+      [expect.objectContaining({
+        projectId: PROJECT_B,
+        alias: expect.objectContaining({ path }),
+      })],
+      [false],
+      [{ path, normalizedPath: path }],
+    );
+    await expect(repository.resolveProject(MACHINE_ID, path))
+      .resolves.toMatchObject({
+        projectId: PROJECT_B,
+        alias: { path },
+      });
   });
 
   it("reports uncertain links when readback is absent or unavailable", async () => {

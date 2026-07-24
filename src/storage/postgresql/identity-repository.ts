@@ -468,6 +468,21 @@ export class PostgreSqlIdentityRepository {
                 input.expectedPriorProjectId,
               ],
             }, { domain: "identity", operation: "replaceProjectAliases", projectId: input.projectId });
+          } else if (row?.project_id === input.projectId && row.path !== alias.path) {
+            await transaction.query({
+              text: `UPDATE lcm.project_aliases
+                     SET path = $1,
+                         linked_at = statement_timestamp()
+                     WHERE machine_id = $2
+                       AND normalized_path = $3
+                       AND project_id = $4`,
+              values: [
+                alias.path,
+                input.machineId,
+                alias.normalizedPath,
+                input.projectId,
+              ],
+            }, { domain: "identity", operation: "replaceProjectAliases", projectId: input.projectId });
           } else if (!row) {
             const created = await transaction.query<AliasRow>({
               text: `INSERT INTO lcm.project_aliases
@@ -747,6 +762,7 @@ export class PostgreSqlIdentityRepository {
       ) {
         return false;
       }
+      const currentByPath = new Map(current.rows.map((row) => [row.normalized_path, row]));
       for (const [index, alias] of aliases.entries()) {
         const previous = prior[index];
         if (!previous && inserted[index]) {
@@ -757,7 +773,13 @@ export class PostgreSqlIdentityRepository {
                      AND project_id = $3`,
             values: [machineId, alias.normalizedPath, currentProjectId],
           }, { domain: "identity", operation: "restoreProjectAliasBatch", projectId: currentProjectId });
-        } else if (previous && previous.projectId !== currentProjectId) {
+        } else if (
+          previous
+          && (
+            previous.projectId !== currentProjectId
+            || previous.alias.path !== currentByPath.get(alias.normalizedPath)!.path
+          )
+        ) {
           await transaction.query({
             text: `UPDATE lcm.project_aliases
                    SET project_id = $1,

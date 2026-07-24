@@ -660,9 +660,13 @@ async function confirmRemoteBatchReplacement(
     if (resolved.every((owner) => owner?.projectId === input.projectId)) {
       return {
         ...error.candidate,
-        // Readback proves the desired owner, not which transaction inserted
-        // it. A concurrent same-project transaction may have won after this
-        // transaction rolled back, so later compensation must not delete it.
+        aliases: resolved.map((owner) => owner!.alias),
+        // Readback proves the desired current owner, not whether this
+        // transaction replaced, refreshed, or inserted it. Any pre-transaction
+        // snapshot may therefore be stale; use the authoritative state as the
+        // compensation baseline so a later local failure cannot overwrite a
+        // concurrent winner.
+        prior: resolved.map((owner) => owner!),
         inserted: error.candidate.inserted.map(() => false),
       };
     }
