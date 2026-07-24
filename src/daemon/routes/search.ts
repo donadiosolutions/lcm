@@ -5,6 +5,8 @@ import type { RouteHandler } from "../server.js";
 import { createRetrievalEngine } from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
 import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
+import { StorageOperationError } from "../../storage/errors.js";
+import { UnavailablePostgreSqlStorageBackendFactory } from "../../storage/factory.js";
 import { closeRouteStorage, openExistingProject } from "./storage-lifecycle.js";
 
 export function createSearchHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
@@ -35,10 +37,11 @@ export function createSearchHandler(config: DaemonConfig, storageFactory?: Stora
     if (cwd) {
       let project: ProjectStorage | undefined;
       let ownedFactory: StorageBackendFactory | undefined;
+      let activeFactory: StorageBackendFactory | undefined;
       try {
         const identity = projectIdentity(cwd, config.storage);
-        const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-        project = await openExistingProject(factory, identity) ?? undefined;
+        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        project = await openExistingProject(activeFactory, identity) ?? undefined;
         if (project) {
 
           // Episodic: FTS5 search across messages + summaries
@@ -64,7 +67,19 @@ export function createSearchHandler(config: DaemonConfig, storageFactory?: Stora
             } catch { /* non-fatal */ }
           }
         }
-      } catch { /* non-fatal */ }
+      } catch (error) {
+        if (
+          activeFactory instanceof UnavailablePostgreSqlStorageBackendFactory
+          && error instanceof StorageOperationError
+        ) {
+          sendJson(res, 503, {
+            error: "search is unavailable while PostgreSQL storage repositories are staged",
+            storageBackend: "postgresql",
+          });
+          return;
+        }
+        // SQLite read/search failures remain non-fatal and return empty layers.
+      }
       finally {
         await closeRouteStorage(project, ownedFactory);
       }

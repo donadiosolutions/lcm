@@ -74,6 +74,7 @@ import { createRecentHandler } from "../../../src/daemon/routes/recent.js";
 import { createPoolStatsHandler } from "../../../src/daemon/routes/pool-stats.js";
 import { createStatsHandler } from "../../../src/daemon/routes/stats.js";
 import { createSearchHandler } from "../../../src/daemon/routes/search.js";
+import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
 
 const config = loadDaemonConfig("/tmp/lcm-persistence-routes");
 const response = {
@@ -314,5 +315,18 @@ describe("persistence read route boundaries", () => {
     await invoke(handler, { query: "q", cwd: "/ok" });
     expectLast(200, { episodic: [], promoted: [] });
     await invoke(createSearchHandler(config, injectedFactory()), { query: "q", cwd: "/ok", layers: [] });
+
+    const stagedFactory = new UnavailablePostgreSqlStorageBackendFactory();
+    await invoke(createSearchHandler(config, stagedFactory), { query: "q", cwd: "/ok" });
+    expectLast(503, {
+      error: "search is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
+
+    const nonStorageFailure = new UnavailablePostgreSqlStorageBackendFactory();
+    vi.spyOn(nonStorageFailure, "openExistingProject")
+      .mockRejectedValueOnce(new Error("unrelated failure"));
+    await invoke(createSearchHandler(config, nonStorageFailure), { query: "q", cwd: "/ok" });
+    expectLast(200, { episodic: [], promoted: [] });
   });
 });
