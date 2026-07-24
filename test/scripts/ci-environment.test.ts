@@ -191,10 +191,10 @@ describe("CI environment cache metadata", () => {
     expect(templateInitializer).toContain("VALUES (:'template_marker')");
     expect(cachedInitializer).toContain("current_setting('lcm.template_marker')");
     expect(environmentInitializer).toContain(
-      "`LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`",
+      `\`LCM_POSTGRES_TEMPLATE_MARKER=\${POSTGRES_TEMPLATE_MARKER}\``,
     );
     expect(harness).toContain(
-      "`LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`",
+      `\`LCM_POSTGRES_TEMPLATE_MARKER=\${POSTGRES_TEMPLATE_MARKER}\``,
     );
     expect(environmentInitializer).toContain('test "$(< /proc/1/comm)" = postgres');
     expect(environmentInitializer).toContain("count(*) = 3 AND bool_and(NOT rolcanlogin)");
