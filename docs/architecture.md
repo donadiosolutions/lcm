@@ -95,8 +95,8 @@ requires ordinary enabled mode, rejecting disabled, replica-only, or
 always-enabled drift. Constraint inventory includes the enablement state of
 its internal enforcement triggers and binds each name to its definition.
 Ordinary columns retain type, nullability, default, identity, and resolved
-collation metadata; generated columns retain their generated state, fully
-deparsed expression, and resolved collation. Tables must remain permanent with
+collation metadata; generated columns retain their formatted type, nullability,
+generated state, fully deparsed expression, and resolved collation. Tables must remain permanent with
 row-level security neither enabled nor forced.
 Effective relation ACLs normalize only the owner, so added `PUBLIC` or named
 role privileges and grant options fail closed while null and explicit

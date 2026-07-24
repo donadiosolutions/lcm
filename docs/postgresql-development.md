@@ -162,7 +162,8 @@ ordinary inventory of its 24 allowlisted tables, including
 `recall_surfacing.surfaced_at`. Each ordinary column retains its formatted
 type, nullability, deparsed default, identity state, and resolved
 namespace-qualified collation. Generated-column fingerprints retain the same
-resolved collation in addition to generated state and expression.
+resolved collation in addition to formatted type, nullability, generated state,
+and expression.
 It fingerprints all six generated identity sequences by type, increment,
 minimum, maximum, start, cache, cycle state, internal identity dependency, and
 owning table/column.

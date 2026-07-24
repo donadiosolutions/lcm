@@ -706,6 +706,31 @@ describe("PostgreSQL migrations and database isolation", () => {
     });
   });
 
+  it("rejects generated column nullability drift", async () => {
+    await withPostgreSqlTestDatabase("generated-column-nullability-drift", async (database) => {
+      try {
+        await database.migrator.query({
+          text: `ALTER TABLE lcm.recall_surfacing
+                 ALTER COLUMN session_id_sha256 SET NOT NULL`,
+        }, { domain: "factory", operation: "alterGeneratedColumnNullability" });
+        await expect(runPostgreSqlMigrations(database.migrator))
+          .rejects.toMatchObject({
+            baselineApplied: true,
+            driftedDefinitionGroupCount: 1,
+            expectedObjectCount: 503,
+            existingObjectCount: 503,
+            missingObjectCount: 0,
+            operation: "preflightBaselineDefinitions",
+          });
+      } finally {
+        await database.migrator.query({
+          text: `ALTER TABLE lcm.recall_surfacing
+                 ALTER COLUMN session_id_sha256 DROP NOT NULL`,
+        }, { domain: "factory", operation: "restoreGeneratedColumnNullability" });
+      }
+    });
+  });
+
   it("pins every ordinary column on the allowlisted baseline tables", async () => {
     await withPostgreSqlTestDatabase("ordinary-column-inventory", async (database) => {
       const snapshot = loadPostgreSqlSchemaSnapshots()[0]!;

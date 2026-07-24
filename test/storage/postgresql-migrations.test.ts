@@ -426,6 +426,43 @@ describe("PostgreSQL migration runner", () => {
       .toBeLessThan(fake.operations.indexOf("preflightSearchConfiguration"));
   });
 
+  it("rejects duplicate and unknown schema snapshot registry migration IDs", async () => {
+    const migrations = loadPostgreSqlMigrations();
+    const snapshot = loadPostgreSqlSchemaSnapshots()[0]!;
+    for (const [schemaSnapshots, reason, migrationId, message] of [
+      [
+        [snapshot, snapshot],
+        "duplicate_migration_id",
+        snapshot.migrationId,
+        `PostgreSQL schema snapshot registry contains duplicate migrationId ${snapshot.migrationId}`,
+      ],
+      [
+        [{ ...snapshot, migrationId: "0003_unknown_snapshot" }],
+        "unknown_migration_id",
+        "0003_unknown_snapshot",
+        "PostgreSQL schema snapshot registry references unknown migrationId 0003_unknown_snapshot",
+      ],
+    ] as const) {
+      const fake = executor();
+      const failure = await runPostgreSqlMigrations(fake.seam, {
+        migrations,
+        schemaSnapshots,
+      }).catch((error: unknown) => error);
+      expect(failure).toMatchObject({
+        message,
+        migrationId,
+        operation: "validateSchemaSnapshotRegistry",
+        reason,
+      });
+      expect((failure as { toJSON(): unknown }).toJSON()).toMatchObject({
+        message,
+        migrationId,
+        reason,
+      });
+      expect(fake.seam.query).not.toHaveBeenCalled();
+    }
+  });
+
   it("accepts exact ordered history and applies only pending files", async () => {
     const migrations = [migration("0001_first"), migration("0002_second")];
     const fake = executor({ ledger: true, current: [{ id: migrations[0].id, checksum_sha256: migrations[0].sha256 }] });

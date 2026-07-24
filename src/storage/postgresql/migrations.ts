@@ -388,7 +388,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
     ...expectedBaselineDefinitionInventory(),
     definitionHashes: {
       constraint: "f445a06d320f46f8c5d829f89a3a7bc0b13c5507096b111f125d9f0dd0ba0e2f",
-      generatedColumn: "dfdd392cc3dcc1134d68b582221e1b6342de41c0a64140d9517c485f35937013",
+      generatedColumn: "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
       identitySequence: "ccfebcc68f473f655f1c83f0815e18d2f697489bba38278d20bf3718fd0a502e",
       index: "16e10e2a4fc080f52b11315ee2b03d5df258d216f293bb0051b56beb16035374",
       ordinaryColumn: "1cca7e1d3a1143074cb2eb2b809e816a2f4d1e06feba1e1b6bac46f8a725c487",
@@ -691,6 +691,28 @@ export class PostgreSqlSchemaAclPreflightError extends StorageOperationError {
   }
 }
 
+export class PostgreSqlSchemaSnapshotRegistryError extends StorageOperationError {
+  constructor(
+    readonly reason: "duplicate_migration_id" | "unknown_migration_id",
+    readonly migrationId: string,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "validateSchemaSnapshotRegistry",
+    );
+    this.message = reason === "duplicate_migration_id"
+      ? `PostgreSQL schema snapshot registry contains duplicate migrationId ${migrationId}`
+      : `PostgreSQL schema snapshot registry references unknown migrationId ${migrationId}`;
+  }
+
+  override toJSON(): Record<string, unknown> {
+    return { ...super.toJSON(), reason: this.reason, migrationId: this.migrationId };
+  }
+}
+
 function sanitizeServerVersionNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
@@ -771,6 +793,29 @@ function validateMigrations(migrations: readonly PostgreSqlMigration[]): void {
   }
 }
 
+function validateSchemaSnapshotRegistry(
+  migrations: readonly PostgreSqlMigration[],
+  snapshots: readonly PostgreSqlSchemaSnapshot[],
+): void {
+  const migrationIds = new Set(migrations.map(({ id }) => id));
+  const snapshotIds = new Set<string>();
+  for (const snapshot of snapshots) {
+    if (snapshotIds.has(snapshot.migrationId)) {
+      throw new PostgreSqlSchemaSnapshotRegistryError(
+        "duplicate_migration_id",
+        snapshot.migrationId,
+      );
+    }
+    if (!migrationIds.has(snapshot.migrationId)) {
+      throw new PostgreSqlSchemaSnapshotRegistryError(
+        "unknown_migration_id",
+        snapshot.migrationId,
+      );
+    }
+    snapshotIds.add(snapshot.migrationId);
+  }
+}
+
 export async function runPostgreSqlMigrations(
   executor: PostgreSqlQueryExecutor & {
     transaction<T>(
@@ -787,6 +832,9 @@ export async function runPostgreSqlMigrations(
   const migrations = [...(options.migrations ?? loadPostgreSqlMigrations())];
   const schemaSnapshots = [...(options.schemaSnapshots ?? loadPostgreSqlSchemaSnapshots())];
   validateMigrations(migrations);
+  if (options.schemaSnapshots || !options.migrations) {
+    validateSchemaSnapshotRegistry(migrations, schemaSnapshots);
+  }
   // The functional pg_stat_statements probe can raise SQLSTATE 55000 when the
   // library was not preloaded. Run it before opening the all-or-nothing DDL
   // transaction so that expected readiness failure cannot poison that scope.
@@ -1149,6 +1197,11 @@ export async function runPostgreSqlMigrations(
                actual_generated_columns AS (
                  SELECT relation.relname AS table_name,
                         attribute.attname AS column_name,
+                        pg_catalog.format_type(
+                          attribute.atttypid,
+                          attribute.atttypmod
+                        ) AS data_type,
+                        attribute.attnotnull::pg_catalog.text AS not_null,
                         attribute.attgenerated::pg_catalog.text AS generation_kind,
                         pg_catalog.pg_get_expr(
                           attribute_default.adbin,
@@ -1411,6 +1464,8 @@ export async function runPostgreSqlMigrations(
                                   '|',
                                   table_name,
                                   column_name,
+                                  data_type,
+                                  not_null,
                                   generation_kind,
                                   generation_expression,
                                   collation_name

@@ -73,7 +73,9 @@ does not add row-level security.
   same transaction; failure rolls back both DDL and ledger rows. Registry
   declaration order does not affect selection. A future migration can
   therefore add its own snapshot without requiring the pre-upgrade schema to
-  satisfy the future definition.
+  satisfy the future definition. Before catalog access, the registry rejects
+  duplicate snapshot migration IDs and IDs absent from the supplied migration
+  history.
 - The `0002` snapshot checks an explicit definition inventory of all 52 named
   secondary indexes, all 168 table constraints, all three identity-enforcement
   triggers, all 15 stored generated columns, all six generated identity
@@ -92,7 +94,8 @@ does not add row-level security.
   to its owning table, type, fully qualified definition, and stable
   enablement-state multiset of their zero or more internal enforcement
   triggers. Generated-column fingerprints bind the exact table, column,
-  `attgenerated` state, PostgreSQL-deparsed expression, and resolved
+  formatted type, nullability, `attgenerated` state, PostgreSQL-deparsed
+  expression, and resolved
   namespace-qualified collation. Ordinary-column
   fingerprints bind the exact table and column to its formatted type,
   nullability, deparsed default, identity state, and resolved
