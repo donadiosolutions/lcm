@@ -491,6 +491,57 @@ describe("PostgreSQL migrations and database isolation", () => {
 
   it.each([
     {
+      kind: "index",
+      objectName: "session_ingest_log_identity_lookup_idx",
+      sql: "DROP INDEX lcm.session_ingest_log_identity_lookup_idx",
+    },
+    {
+      kind: "trigger",
+      objectName: "session_ingest_log_enforce_session_id_uniqueness",
+      sql: `DROP TRIGGER session_ingest_log_enforce_session_id_uniqueness
+            ON lcm.session_ingest_log`,
+    },
+  ])("rejects a dropped baseline $kind", async ({ kind, objectName, sql }) => {
+    await withPostgreSqlTestDatabase(`migration-missing-${kind}`, async (database) => {
+      await database.migrator.query({ text: sql }, {
+        domain: "factory",
+        operation: `simulateMissingBaselineDefinition:${objectName}`,
+      });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toMatchObject({
+          baselineApplied: true,
+          driftedDefinitionGroupCount: 1,
+          expectedObjectCount: 223,
+          existingObjectCount: 222,
+          missingObjectCount: 1,
+          operation: "preflightBaselineDefinitions",
+        });
+    });
+  });
+
+  it("rejects a disabled baseline identity trigger", async () => {
+    await withPostgreSqlTestDatabase("migration-disabled-trigger", async (database) => {
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.session_ingest_log
+               DISABLE TRIGGER session_ingest_log_enforce_session_id_uniqueness`,
+      }, {
+        domain: "factory",
+        operation: "simulateDisabledBaselineTrigger",
+      });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toMatchObject({
+          baselineApplied: true,
+          driftedDefinitionGroupCount: 1,
+          expectedObjectCount: 223,
+          existingObjectCount: 223,
+          missingObjectCount: 0,
+          operation: "preflightBaselineDefinitions",
+        });
+    });
+  });
+
+  it.each([
+    {
       label: "body",
       sql: `CREATE OR REPLACE FUNCTION lcm.enforce_summary_id_uniqueness()
             RETURNS trigger

@@ -74,9 +74,15 @@ verifies that the current migrator still owns each known LCM table, identity
 sequence, helper or trigger function, text-search dictionary, and text-search
 configuration that exists. Unknown schema objects are outside that exact
 catalog allowlist and are neither rejected nor changed.
+After the baseline is recorded, it also verifies the explicit existence and
+canonical definitions of all allowlisted secondary indexes, triggers, and
+constraints; indexes must remain valid and ready and inherit ownership from
+their tables. Trigger inventory also requires ordinary enabled mode, rejecting
+disabled, replica-only, or always-enabled drift. Unknown operator-created
+indexes, triggers, and constraints remain outside the inventory.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six
 generated identity sequences, or the search-normalization, summary-identity,
-and large-file-identity functions; unknown
+large-file-identity, and session-ingest-identity functions; unknown
 pre-existing object ACLs are preserved. The normalization function is created
 without replacement, so a same-signature collision fails and rolls back the
 pending migration rather than overwriting operator code. Runtime domain grants

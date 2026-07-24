@@ -49,6 +49,13 @@ type ManagedObjectOwnershipRow = QueryResultRow & {
   missing_object_count: unknown;
   unowned_object_count: unknown;
 };
+type BaselineDefinitionInventoryRow = QueryResultRow & {
+  baseline_applied: unknown;
+  expected_object_count: unknown;
+  existing_object_count: unknown;
+  missing_object_count: unknown;
+  drifted_definition_group_count: unknown;
+};
 type IdentityFunctionFingerprintRow = QueryResultRow & {
   baseline_applied: unknown;
   expected_function_count: unknown;
@@ -58,6 +65,118 @@ type IdentityFunctionFingerprintRow = QueryResultRow & {
 
 export const REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION = 18 as const;
 export const REQUIRED_POSTGRESQL_SERVER_ENCODING = "UTF8" as const;
+
+const EXPECTED_BASELINE_INDEX_NAMES = `
+  project_aliases_project_idx conversations_project_order_idx conversations_session_lookup_idx
+  messages_project_created_idx messages_search_document_idx messages_content_trgm_idx
+  message_parts_type_idx native_transcripts_source_order_idx native_transcripts_session_idx
+  native_transcripts_machine_idx native_transcripts_payload_idx transcript_messages_message_idx
+  summaries_identity_lookup_idx summaries_conversation_order_idx summaries_project_recent_idx
+  summaries_search_document_idx summaries_content_trgm_idx summary_messages_message_idx
+  summary_messages_summary_idx summary_parents_parent_idx summary_parents_summary_idx
+  context_items_message_idx context_items_summary_idx large_files_identity_lookup_idx
+  large_files_conversation_order_idx summary_large_files_file_idx summary_large_files_summary_idx
+  promoted_memories_active_order_idx promoted_memories_source_summary_idx
+  promoted_memories_source_project_idx promoted_memories_metadata_idx
+  promoted_memories_search_document_idx promoted_memories_content_trgm_idx
+  promoted_memory_tags_lookup_idx promoted_memory_tags_normalized_lookup_idx
+  promoted_memory_tags_search_document_idx promoted_memory_tags_tag_trgm_idx
+  recall_surfacing_memory_order_idx recall_surfacing_session_order_idx
+  ingest_checkpoints_payload_idx ingest_checkpoints_machine_idx
+  session_ingest_log_identity_lookup_idx session_ingest_log_completed_idx
+  session_instructions_machine_idx passive_event_inbox_ready_idx passive_event_inbox_retry_idx
+  passive_event_inbox_claimed_idx passive_event_inbox_payload_idx passive_event_inbox_project_idx
+  fenced_leases_owner_idx fenced_leases_expiry_idx fenced_leases_owner_machine_idx
+`.trim().split(/\s+/u);
+
+const EXPECTED_BASELINE_TRIGGER_NAMES = [
+  "large_files_enforce_file_id_uniqueness",
+  "session_ingest_log_enforce_session_id_uniqueness",
+  "summaries_enforce_summary_id_uniqueness",
+] as const;
+
+const EXPECTED_BASELINE_CONSTRAINT_NAMES = `
+  context_items_item_type_check context_items_check context_items_ordinal_check
+  context_items_project_id_conversation_id_message_id_fkey
+  context_items_project_id_conversation_id_fkey
+  context_items_project_id_conversation_id_summary_key_fkey context_items_pkey
+  conversations_check1 conversations_check conversations_project_id_fkey conversations_pkey
+  conversations_project_id_conversation_id_key fenced_leases_operation_check
+  fenced_leases_owner_process_id_check fenced_leases_resource_key_check
+  fenced_leases_resource_type_check fenced_leases_check1 fenced_leases_fencing_token_check
+  fenced_leases_check2 fenced_leases_check fenced_leases_owner_machine_id_fkey
+  fenced_leases_project_id_fkey fenced_leases_pkey ingest_checkpoints_client_name_check
+  ingest_checkpoints_imported_count_check ingest_checkpoints_checkpoint_check
+  ingest_checkpoints_last_source_ordinal_check ingest_checkpoints_quarantined_count_check
+  ingest_checkpoints_skipped_count_check ingest_checkpoints_source_locator_check
+  ingest_checkpoints_machine_id_fkey ingest_checkpoints_project_id_fkey ingest_checkpoints_pkey
+  large_files_storage_uri_check large_files_byte_size_check large_files_file_key_check
+  large_files_project_id_conversation_id_fkey large_files_pkey
+  large_files_project_id_conversation_id_file_key_key machines_identity_key_check
+  machines_display_name_check machines_check machines_machine_id_check machines_pkey
+  machines_identity_key_key message_parts_ordinal_check message_parts_part_type_check
+  message_parts_step_cost_check message_parts_step_tokens_in_check
+  message_parts_step_tokens_out_check message_parts_project_id_conversation_id_message_id_fkey
+  message_parts_pkey message_parts_project_id_conversation_id_message_id_ordinal_key
+  messages_role_check messages_seq_check messages_token_count_check
+  messages_project_id_conversation_id_fkey messages_pkey
+  messages_project_id_conversation_id_message_id_key
+  messages_project_id_conversation_id_seq_key native_transcripts_client_name_check
+  native_transcripts_format_name_check native_transcripts_format_version_check
+  native_transcripts_native_session_id_check native_transcripts_scrubber_version_check
+  native_transcripts_content_sha256_check native_transcripts_check
+  native_transcripts_ingest_key_check native_transcripts_native_payload_check
+  native_transcripts_source_locator_check native_transcripts_source_ordinal_check
+  native_transcripts_transcript_id_check native_transcripts_machine_id_fkey
+  native_transcripts_project_id_fkey native_transcripts_pkey
+  native_transcripts_project_id_machine_id_ingest_key_key
+  native_transcripts_project_id_transcript_id_key passive_event_inbox_check7
+  passive_event_inbox_attempt_count_check passive_event_inbox_event_type_check
+  passive_event_inbox_check1 passive_event_inbox_check6 passive_event_inbox_claimed_by_check
+  passive_event_inbox_event_version_check passive_event_inbox_payload_check
+  passive_event_inbox_machine_sequence_check passive_event_inbox_check
+  passive_event_inbox_check8 passive_event_inbox_check5
+  passive_event_inbox_quarantine_reason_check passive_event_inbox_status_check
+  passive_event_inbox_check3 passive_event_inbox_check2 passive_event_inbox_check4
+  passive_event_inbox_machine_id_fkey passive_event_inbox_project_id_fkey
+  passive_event_inbox_pkey passive_event_inbox_machine_id_event_id_key
+  passive_event_inbox_machine_id_machine_sequence_key project_aliases_normalized_path_check
+  project_aliases_path_check project_aliases_machine_id_fkey project_aliases_project_id_fkey
+  project_aliases_pkey projects_display_name_check projects_identity_key_check projects_check
+  projects_project_id_check projects_pkey projects_identity_key_key promoted_memories_check
+  promoted_memories_confidence_check promoted_memories_content_check
+  promoted_memories_depth_check promoted_memories_metadata_check
+  promoted_memories_project_id_fkey promoted_memories_pkey
+  promoted_memories_project_id_memory_id_key promoted_memory_tags_ordinal_check
+  promoted_memory_tags_project_id_memory_id_fkey promoted_memory_tags_pkey
+  recall_surfacing_project_id_fkey recall_surfacing_pkey redaction_counters_category_check
+  redaction_counters_count_check redaction_counters_project_id_fkey redaction_counters_pkey
+  schema_migrations_checksum_sha256_check schema_migrations_pkey
+  session_ingest_log_message_count_check session_ingest_log_ingest_key_check
+  session_ingest_log_project_id_fkey session_ingest_log_pkey
+  session_instructions_slot_check session_instructions_machine_id_fkey
+  session_instructions_project_id_fkey session_instructions_pkey
+  session_instructions_project_id_machine_id_slot_key summaries_depth_check
+  summaries_descendant_count_check summaries_descendant_token_count_check summaries_check
+  summaries_kind_check summaries_source_message_token_count_check summaries_token_count_check
+  summaries_summary_key_check summaries_project_id_conversation_id_fkey summaries_pkey
+  summaries_project_id_conversation_id_summary_key_key summary_large_files_ordinal_check
+  summary_large_files_project_id_conversation_id_summary_key_fkey summary_large_files_pkey
+  summary_messages_ordinal_check summary_messages_project_id_conversation_id_message_id_fkey
+  summary_messages_project_id_conversation_id_summary_key_fkey summary_messages_pkey
+  summary_messages_project_id_summary_key_ordinal_key summary_parents_ordinal_check
+  summary_parents_check summary_parents_project_id_conversation_id_parent_summary__fkey
+  summary_parents_project_id_conversation_id_summary_key_fkey summary_parents_pkey
+  summary_parents_project_id_summary_key_ordinal_key transcript_messages_source_ordinal_check
+  transcript_messages_project_id_conversation_id_message_id_fkey
+  transcript_messages_project_id_transcript_id_fkey transcript_messages_pkey
+  transcript_messages_project_id_transcript_id_source_ordinal_key
+`.trim().split(/\s+/u);
+
+const EXPECTED_BASELINE_DEFINITION_COUNT =
+  EXPECTED_BASELINE_INDEX_NAMES.length
+  + EXPECTED_BASELINE_TRIGGER_NAMES.length
+  + EXPECTED_BASELINE_CONSTRAINT_NAMES.length;
 
 export class PostgreSqlServerVersionPreflightError extends StorageOperationError {
   constructor(
@@ -215,6 +334,41 @@ export class PostgreSqlIdentityFunctionPreflightError extends StorageOperationEr
       expectedFunctionCount: this.expectedFunctionCount,
       existingFunctionCount: this.existingFunctionCount,
       driftedFunctionCount: this.driftedFunctionCount,
+      remediation: this.remediation,
+    };
+  }
+}
+
+export class PostgreSqlBaselineDefinitionPreflightError extends StorageOperationError {
+  constructor(
+    readonly baselineApplied: boolean | null,
+    readonly expectedObjectCount: number | null,
+    readonly existingObjectCount: number | null,
+    readonly missingObjectCount: number | null,
+    readonly driftedDefinitionGroupCount: number | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightBaselineDefinitions",
+    );
+  }
+
+  readonly schemaName = "lcm";
+  readonly remediation =
+    "Restore every missing or changed LCM baseline index, trigger, and constraint from the matching packaged migration artifact or a verified backup, then rerun migrations.";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      schemaName: this.schemaName,
+      baselineApplied: this.baselineApplied,
+      expectedObjectCount: this.expectedObjectCount,
+      existingObjectCount: this.existingObjectCount,
+      missingObjectCount: this.missingObjectCount,
+      driftedDefinitionGroupCount: this.driftedDefinitionGroupCount,
       remediation: this.remediation,
     };
   }
@@ -639,6 +793,215 @@ export async function runPostgreSqlMigrations(
         missingObjectCount,
         unownedObjectCount,
         managedRequiredOwner,
+      );
+    }
+
+    const baselineDefinitions =
+      await transaction.query<BaselineDefinitionInventoryRow>({
+        text: `WITH actual_indexes AS (
+                 SELECT index_relation.relname AS object_name,
+                        pg_catalog.pg_get_indexdef(index_relation.oid) AS definition
+                 FROM pg_catalog.pg_class AS index_relation
+                 JOIN pg_catalog.pg_index AS index_metadata
+                   ON index_metadata.indexrelid OPERATOR(pg_catalog.=) index_relation.oid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) index_relation.relnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND index_relation.relkind OPERATOR(pg_catalog.=) 'i'
+                   AND index_metadata.indisvalid
+                   AND index_metadata.indisready
+                   AND index_relation.relname OPERATOR(pg_catalog.=)
+                     ANY ($2::pg_catalog.text[])
+               ),
+               actual_triggers AS (
+                 SELECT trigger.tgname AS object_name,
+                        pg_catalog.pg_get_triggerdef(trigger.oid, true) AS definition,
+                        trigger.tgenabled::pg_catalog.text AS enabled_mode
+                 FROM pg_catalog.pg_trigger AS trigger
+                 JOIN pg_catalog.pg_class AS relation
+                   ON relation.oid OPERATOR(pg_catalog.=) trigger.tgrelid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND NOT trigger.tgisinternal
+                   AND trigger.tgname OPERATOR(pg_catalog.=)
+                     ANY ($3::pg_catalog.text[])
+               ),
+               actual_constraints AS (
+                 SELECT constraint_metadata.conname AS object_name,
+                        relation.relname AS table_name,
+                        constraint_metadata.contype::pg_catalog.text AS constraint_type,
+                        pg_catalog.replace(
+                          pg_catalog.pg_get_constraintdef(constraint_metadata.oid, true),
+                          'lcm.',
+                          ''
+                        ) AS definition
+                 FROM pg_catalog.pg_constraint AS constraint_metadata
+                 JOIN pg_catalog.pg_class AS relation
+                   ON relation.oid OPERATOR(pg_catalog.=) constraint_metadata.conrelid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND constraint_metadata.conname OPERATOR(pg_catalog.=)
+                     ANY ($4::pg_catalog.text[])
+               ),
+               actual_groups(object_kind, existing_count, definition_sha256) AS (
+                 SELECT 'index'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws('|', object_name, definition),
+                                E'\\n'
+                                ORDER BY object_name
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_indexes
+                 UNION ALL
+                 SELECT 'trigger'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  object_name,
+                                  definition,
+                                  enabled_mode
+                                ),
+                                E'\\n'
+                                ORDER BY object_name
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_triggers
+                 UNION ALL
+                 SELECT 'constraint'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  table_name,
+                                  constraint_type,
+                                  definition
+                                ),
+                                E'\\n'
+                                ORDER BY table_name, constraint_type, definition
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_constraints
+               ),
+               expected_groups(
+                 object_kind,
+                 expected_count,
+                 definition_sha256
+               ) AS (
+                 VALUES
+                   (
+                     'index'::pg_catalog.text,
+                     52::pg_catalog.int4,
+                     '16e10e2a4fc080f52b11315ee2b03d5df258d216f293bb0051b56beb16035374'::pg_catalog.text
+                   ),
+                   (
+                     'trigger'::pg_catalog.text,
+                     3::pg_catalog.int4,
+                     '2c858da82c9238186861e0bcd184952ff941c7233f98a16083b20e6528006fb9'::pg_catalog.text
+                   ),
+                   (
+                     'constraint'::pg_catalog.text,
+                     168::pg_catalog.int4,
+                     '224efb3262dd78a2da9d961916d4f8c23a22c48285110ff02ea9aa6f15cc526f'::pg_catalog.text
+                   )
+               )
+               SELECT $1::pg_catalog.bool AS baseline_applied,
+                      $5::pg_catalog.int4 AS expected_object_count,
+                      pg_catalog.sum(actual_groups.existing_count)::pg_catalog.int4
+                        AS existing_object_count,
+                      CASE
+                        WHEN $1::pg_catalog.bool THEN (
+                          $5 - pg_catalog.sum(actual_groups.existing_count)
+                        )::pg_catalog.int4
+                        ELSE 0::pg_catalog.int4
+                      END AS missing_object_count,
+                      CASE
+                        WHEN $1::pg_catalog.bool THEN pg_catalog.count(*) FILTER (
+                          WHERE actual_groups.existing_count
+                              OPERATOR(pg_catalog.<>) expected_groups.expected_count
+                            OR actual_groups.definition_sha256
+                              OPERATOR(pg_catalog.<>) expected_groups.definition_sha256
+                        )::pg_catalog.int4
+                        ELSE 0::pg_catalog.int4
+                      END AS drifted_definition_group_count
+               FROM expected_groups
+               JOIN actual_groups USING (object_kind)`,
+        values: [
+          baselineApplied,
+          EXPECTED_BASELINE_INDEX_NAMES,
+          EXPECTED_BASELINE_TRIGGER_NAMES,
+          EXPECTED_BASELINE_CONSTRAINT_NAMES,
+          EXPECTED_BASELINE_DEFINITION_COUNT,
+        ],
+      }, {
+        domain: "factory",
+        operation: "preflightBaselineDefinitions",
+        signal: options.signal,
+      });
+    const definitionBaselineApplied = sanitizeBoolean(
+      baselineDefinitions.rows[0]?.baseline_applied,
+    );
+    const expectedDefinitionObjectCount = sanitizeNonnegativeCount(
+      baselineDefinitions.rows[0]?.expected_object_count,
+    );
+    const existingDefinitionObjectCount = sanitizeNonnegativeCount(
+      baselineDefinitions.rows[0]?.existing_object_count,
+    );
+    const missingDefinitionObjectCount = sanitizeNonnegativeCount(
+      baselineDefinitions.rows[0]?.missing_object_count,
+    );
+    const driftedDefinitionGroupCount = sanitizeNonnegativeCount(
+      baselineDefinitions.rows[0]?.drifted_definition_group_count,
+    );
+    if (
+      definitionBaselineApplied === null
+      || definitionBaselineApplied !== baselineApplied
+      || expectedDefinitionObjectCount !== EXPECTED_BASELINE_DEFINITION_COUNT
+      || existingDefinitionObjectCount === null
+      || existingDefinitionObjectCount > expectedDefinitionObjectCount
+      || missingDefinitionObjectCount === null
+      || (!baselineApplied && missingDefinitionObjectCount !== 0)
+      || (baselineApplied
+        && existingDefinitionObjectCount + missingDefinitionObjectCount
+          !== expectedDefinitionObjectCount)
+      || missingDefinitionObjectCount !== 0
+      || driftedDefinitionGroupCount === null
+      || driftedDefinitionGroupCount > 3
+      || driftedDefinitionGroupCount !== 0
+    ) {
+      throw new PostgreSqlBaselineDefinitionPreflightError(
+        definitionBaselineApplied,
+        expectedDefinitionObjectCount,
+        existingDefinitionObjectCount,
+        missingDefinitionObjectCount,
+        driftedDefinitionGroupCount,
       );
     }
 

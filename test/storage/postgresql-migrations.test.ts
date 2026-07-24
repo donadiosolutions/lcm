@@ -8,6 +8,7 @@ import type {
 } from "../../src/storage/postgresql/contracts.js";
 import {
   loadPostgreSqlMigrations,
+  PostgreSqlBaselineDefinitionPreflightError,
   PostgreSqlIdentityFunctionPreflightError,
   PostgreSqlManagedObjectOwnershipPreflightError,
   PostgreSqlSchemaAclPreflightError,
@@ -51,6 +52,7 @@ function executor(options: {
   postmasterContinuity?: boolean | "missing";
   schemaAcl?: "absent" | "ready" | "public" | "missing" | "invalid" | "inconsistent";
   managedOwnership?: "ready" | "unowned" | "missing-object" | "missing" | "invalid" | "inconsistent" | "different-user";
+  baselineDefinitions?: "ready" | "missing-object" | "drifted" | "missing" | "invalid" | "inconsistent";
   identityFunctions?: "ready" | "drifted" | "missing" | "invalid" | "inconsistent";
 } = {}) {
   const operations: string[] = [];
@@ -203,6 +205,35 @@ function executor(options: {
         drifted_function_count: options.identityFunctions === "drifted" ? 1 : 0,
       }] as unknown as R[]);
     }
+    if (context.operation === "preflightBaselineDefinitions") {
+      if (options.baselineDefinitions === "missing") return result([] as R[]);
+      if (options.baselineDefinitions === "invalid") {
+        return result([{
+          baseline_applied: "yes",
+          expected_object_count: "many",
+          existing_object_count: false,
+          missing_object_count: null,
+          drifted_definition_group_count: "none",
+        }] as unknown as R[]);
+      }
+      const baselineApplied = (options.current ?? [])
+        .some(({ id }) => id === "0002_schema_baseline");
+      return result([{
+        baseline_applied: baselineApplied,
+        expected_object_count: 223,
+        existing_object_count: options.baselineDefinitions === "inconsistent"
+          ? 224
+          : options.baselineDefinitions === "missing-object"
+            ? 222
+            : 223,
+        missing_object_count: options.baselineDefinitions === "missing-object" ? 1 : 0,
+        drifted_definition_group_count:
+          options.baselineDefinitions === "drifted"
+          || options.baselineDefinitions === "missing-object"
+            ? 1
+            : 0,
+      }] as unknown as R[]);
+    }
     if (context.operation === "inspectMigrationLedger") return result([{ ledger_exists: options.ledger ?? false }] as unknown as R[]);
     if (context.operation === "readMigrations") return result((options.current ?? []) as unknown as R[]);
     return result([] as R[]);
@@ -266,6 +297,7 @@ describe("PostgreSQL migration runner", () => {
       "preflightSchemaAcl",
       "inspectMigrationLedger",
       "preflightManagedObjectOwnership",
+      "preflightBaselineDefinitions",
       "preflightIdentityFunctionDefinitions",
       "applyMigration:0001_first",
       "recordMigration",
@@ -679,6 +711,119 @@ describe("PostgreSQL migration runner", () => {
       operation: "preflightManagedObjectOwnership",
     });
     expect(fake.operations).not.toContain("applyMigration:0002_schema_baseline");
+  });
+
+  it.each([
+    {
+      label: "a missing index, trigger, or constraint",
+      baselineDefinitions: "missing-object" as const,
+      baselineApplied: true,
+      expectedObjectCount: 223,
+      existingObjectCount: 222,
+      missingObjectCount: 1,
+      driftedDefinitionGroupCount: 1,
+    },
+    {
+      label: "definition drift",
+      baselineDefinitions: "drifted" as const,
+      baselineApplied: true,
+      expectedObjectCount: 223,
+      existingObjectCount: 223,
+      missingObjectCount: 0,
+      driftedDefinitionGroupCount: 1,
+    },
+    {
+      label: "a missing catalog row",
+      baselineDefinitions: "missing" as const,
+      baselineApplied: null,
+      expectedObjectCount: null,
+      existingObjectCount: null,
+      missingObjectCount: null,
+      driftedDefinitionGroupCount: null,
+    },
+    {
+      label: "malformed catalog values",
+      baselineDefinitions: "invalid" as const,
+      baselineApplied: null,
+      expectedObjectCount: null,
+      existingObjectCount: null,
+      missingObjectCount: null,
+      driftedDefinitionGroupCount: null,
+    },
+    {
+      label: "contradictory catalog counts",
+      baselineDefinitions: "inconsistent" as const,
+      baselineApplied: true,
+      expectedObjectCount: 223,
+      existingObjectCount: 224,
+      missingObjectCount: 0,
+      driftedDefinitionGroupCount: 0,
+    },
+  ])("rejects $label in the baseline definition inventory", async ({
+    baselineDefinitions,
+    baselineApplied,
+    expectedObjectCount,
+    existingObjectCount,
+    missingObjectCount,
+    driftedDefinitionGroupCount,
+  }) => {
+    const migrations = loadPostgreSqlMigrations();
+    const current = migrations.slice(0, 2).map(({ id, sha256 }) => ({
+      id,
+      checksum_sha256: sha256,
+    }));
+    const fake = executor({
+      baselineDefinitions,
+      current,
+      ledger: true,
+      schemaAcl: "ready",
+      schemaOwnership: "owned",
+    });
+    const failure = await runPostgreSqlMigrations(fake.seam, { migrations })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlBaselineDefinitionPreflightError);
+    expect(failure).toMatchObject({
+      baselineApplied,
+      driftedDefinitionGroupCount,
+      existingObjectCount,
+      expectedObjectCount,
+      missingObjectCount,
+      operation: "preflightBaselineDefinitions",
+      remediation:
+        "Restore every missing or changed LCM baseline index, trigger, and constraint from the matching packaged migration artifact or a verified backup, then rerun migrations.",
+    });
+    expect((failure as PostgreSqlBaselineDefinitionPreflightError).toJSON())
+      .toMatchObject({
+        baselineApplied,
+        driftedDefinitionGroupCount,
+        existingObjectCount,
+        expectedObjectCount,
+        missingObjectCount,
+      });
+    const inventoryCall = fake.seam.query.mock.calls.find(([, context]) => (
+      context.operation === "preflightBaselineDefinitions"
+    ));
+    const inventorySql =
+      (inventoryCall?.[0] as { text?: string } | undefined)?.text ?? "";
+    for (const catalog of [
+      "pg_catalog.pg_index",
+      "pg_catalog.pg_trigger",
+      "pg_catalog.pg_constraint",
+      "pg_catalog.pg_get_indexdef",
+      "pg_catalog.pg_get_triggerdef",
+      "pg_catalog.pg_get_constraintdef",
+      "trigger.tgenabled",
+    ]) expect(inventorySql).toContain(catalog);
+    expect((inventoryCall?.[0] as { values?: unknown[] } | undefined)?.values)
+      .toEqual([
+        true,
+        expect.arrayContaining(["session_ingest_log_identity_lookup_idx"]),
+        expect.arrayContaining([
+          "session_ingest_log_enforce_session_id_uniqueness",
+        ]),
+        expect.arrayContaining(["session_ingest_log_pkey"]),
+        223,
+      ]);
   });
 
   it.each([

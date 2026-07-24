@@ -56,10 +56,22 @@ does not add row-level security.
   inspection also schema-qualifies every catalog operator because it runs
   outside that migration transaction and runtime health uses the same
   inspection path.
+- Once `0002` is recorded, recurring readiness also checks an explicit
+  definition inventory of all 52 named secondary indexes, all 168 table
+  constraints, and all three identity-enforcement triggers. Each allowlisted
+  object must exist, every index must remain valid and ready, and canonical
+  index, trigger, and constraint definitions must retain their pinned
+  fingerprints. Trigger fingerprints include the enablement mode and require
+  ordinary enabled mode (`O`), so disabled, replica-only, and always-enabled
+  drift all fail readiness. Index ownership follows the owning table; triggers
+  and constraints are checked as existence and definition inventory.
+  Additional operator-created objects remain outside the allowlist and are
+  ignored.
 - Recurring migration readiness fingerprints the bodies and security
   configuration of `lcm.enforce_summary_id_uniqueness()` and
-  `lcm.enforce_large_file_id_uniqueness()`. The check covers the stored body,
-  language and trigger return type, invoker/security and leakproof flags,
+  `lcm.enforce_large_file_id_uniqueness()`, and
+  `lcm.enforce_session_ingest_id_uniqueness()`. The check covers the stored
+  body, language and trigger return type, invoker/security and leakproof flags,
   volatility, parallel safety, fixed `search_path`, and absence of `PUBLIC
   EXECUTE`. Owner-side definition, attribute, or privilege drift therefore
   fails closed even when the function name and arity still match.
