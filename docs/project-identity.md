@@ -228,9 +228,11 @@ the expected prior UUID. Locks record the owning PID, creation time, and a
 platform process-birth marker (`/proc` on Linux, `ps` on Unix-like systems,
 and the Windows process creation time). LCM reclaims a lock immediately when
 the owner is provably dead or the PID has been reused. If the operating system
-cannot supply an exact birth marker, LCM treats the owner as active for five
-minutes before allowing stale-owner recovery; legacy lock files use their
-modification time for the same bounded fallback. Exact matching birth markers
+cannot supply an exact birth marker for a live PID, ownership is ambiguous and
+LCM fails closed regardless of the lock's age. Legacy lock files without a
+birth marker follow the same rule. Restore process-birth inspection or stop and
+verify the recorded owner before manually removing such a lock; elapsed time
+alone is never proof that no mutation is active. Exact matching birth markers
 remain live regardless of age. Malformed, symlinked, and non-regular locks
 always fail closed. A concurrent rebind or entry removal also fails closed; it
 is never overwritten by a stale unlink.

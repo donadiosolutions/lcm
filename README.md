@@ -361,7 +361,8 @@ unavailable storage; status and statistics routes return fixed `503` responses,
 and SQLite background scans remain disabled. Project routes first validate
 machine registration and the explicit project binding, then fail safely at the
 unavailable repository boundary. Connection credentials stay out of JSON and
-effective configuration output. Apply the
+effective configuration output. Provision the schema as its migration owner
+with `lcm postgres migrate`, then apply the
 [exact identity runtime grants](docs/postgresql-runtime-identity-grants.sql)
 before machine registration. See [storage backend configuration](docs/configuration.md#storage-backend)
 for operators, the [PostgreSQL schema reference](docs/postgresql-schema.md) for

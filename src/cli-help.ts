@@ -138,6 +138,19 @@ const HELP: Record<string, CommandHelp> = {
     notes: "Local hashes and SQLite data remain unchanged. A remote UUID show target must have exactly one local binding; unknown or multiply mapped UUIDs fail closed. Rebinding a data-bearing local project requires --allow-existing-data. LCM never infers identity from Git remotes, names, or contents.",
   },
 
+  postgres: {
+    summary: "Apply the packaged PostgreSQL schema as an administrator-controlled migration role.",
+    usage: "lcm postgres migrate [--json]",
+    options: [
+      ["migrate [--json]", "Verify and apply packaged checksummed migrations"],
+    ],
+    examples: [
+      ["lcm postgres migrate", "Apply pending migrations and report the current schema history"],
+      ["lcm postgres migrate --json", "Return applied and current migration IDs as JSON"],
+    ],
+    notes: "Configure storage.backend=postgresql and supply the migration role through LCM_POSTGRES_URL plus the verified CA path through LCM_POSTGRES_CA_FILE. The command validates PostgreSQL 18, extensions, ownership, migration checksums, and schema fingerprints. It does not install extensions or grant runtime privileges.",
+  },
+
   search: {
     summary: "Search memory across episodic and promoted layers for the current project.",
     usage: "lcm search <query> [--limit N] [--layer episodic|promoted] [--tag <tag>]",
@@ -475,6 +488,7 @@ const GROUPS = [
       { name: "doctor", summary: "Diagnostics: daemon, hooks, MCP, summarizer" },
       { name: "machine <register|show|recover>", summary: "Manage this machine's PostgreSQL identity" },
       { name: "project <create|link|unlink|list|show>", summary: "Manage local and PostgreSQL project identities" },
+      { name: "postgres migrate [--json]", summary: "Apply packaged PostgreSQL schema migrations" },
       { name: "mcp", summary: "Start the MCP server (stdio transport)" },
     ],
   },

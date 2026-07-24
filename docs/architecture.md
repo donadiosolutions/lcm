@@ -4,25 +4,30 @@ This document describes how Long Context Manager (LCM) works internally — the 
 
 ## Storage selection
 
-The daemon resolves one storage backend before opening its listener. SQLite is
-the default and preserves the existing per-project database layout. PostgreSQL
-is an explicit remote-primary selection whose production connection URL comes
-from `LCM_POSTGRES_URL`; verified TLS uses the required
-`LCM_POSTGRES_CA_FILE`. Trusted runtime overrides remain available to tests and
-embedded callers and take precedence over the environment.
+The daemon resolves one storage backend during startup. SQLite is the default
+and preserves the existing per-project database layout. PostgreSQL is an
+explicit remote-primary selection whose production connection URL comes from
+`LCM_POSTGRES_URL`; verified TLS uses the required `LCM_POSTGRES_CA_FILE`.
+Trusted runtime overrides remain available to tests and embedded callers and
+take precedence over the environment.
 Configuration parsing, effective CLI output, doctor, daemon startup, and storage
 construction share the same discriminated resolved configuration. This prevents
 different entry points from applying different precedence or validation rules.
 
-The internal PostgreSQL 18 runtime now provides a bounded `pg` pool, verified
-CA and hostname validation, sanitized SQLSTATE errors, abort cancellation,
+The internal PostgreSQL 18 runtime provides a bounded `pg` pool, verified CA
+and hostname validation, sanitized SQLSTATE errors, abort cancellation,
 transactional migrations, extension readiness, and the complete durable schema
-baseline. It is intentionally not constructed by the application storage
-factory yet: a valid PostgreSQL selection still fails with an explicit
-unavailable-backend error before the daemon listens. The domain adapters tracked
-by #84-#91 must implement the shared repository contracts and pass conformance
-before #92 can make PostgreSQL authoritative. The local SQLite hook outbox is
-not a general cache and remains local after that activation. See the
+baseline. Machine and project identity operations use that runtime directly.
+The general application storage factory remains staged while the domain
+adapters tracked by #85-#91 implement the shared repository contracts. With
+PostgreSQL selected, the daemon still opens its loopback listener and exposes
+an authenticated `/health` response with HTTP `503`, backend
+`postgresql`, and storage status `unavailable`; storage-backed routes also
+return fixed sanitized `503` responses. Lifecycle admission recognizes this
+staged response as the selected daemon without treating its storage as ready or
+falling back to SQLite. Issue #92 activates PostgreSQL as authoritative after
+the adapter gates pass. The local SQLite hook outbox is not a general cache and
+remains local after that activation. See the
 [PostgreSQL schema reference](postgresql-schema.md) for table ownership,
 integrity, indexes, retention, extension policy, and recovery implications.
 
@@ -36,11 +41,12 @@ backend-specific primitive.
 
 SQLite is the authoritative implementation of these contracts and remains the
 zero-configuration default. The reusable conformance suite is backend-neutral,
-while SQLite remains its only production adapter today. The PostgreSQL runtime,
-migration runner, and isolated test-database lease are shared foundations; they
-do not enable PostgreSQL by themselves. Until all PostgreSQL domain adapters and
-rollout gates land, selecting `postgresql` continues to fail explicitly rather
-than falling back to SQLite.
+while SQLite remains its only production domain adapter today. The PostgreSQL
+runtime, migration runner, identity repository, and isolated test-database
+lease are shared foundations; they do not enable the remaining domain
+repositories. Until all PostgreSQL domain adapters and rollout gates land,
+selecting `postgresql` leaves general storage routes explicitly unavailable
+behind the staged loopback daemon rather than falling back to SQLite.
 
 ### PostgreSQL runtime and migrations
 

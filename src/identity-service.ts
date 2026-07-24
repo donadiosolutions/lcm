@@ -592,18 +592,6 @@ export async function showProject(
   return { ...shown, remote };
 }
 
-async function compensateCreatedProject(
-  repository: IdentityRepository,
-  projectId: string,
-  machineId: string,
-  normalizedPaths: readonly string[],
-): Promise<void> {
-  const cleaned = await repository.cleanupCreatedProject(machineId, projectId, normalizedPaths);
-  if (!cleaned) {
-    throw new Error("PostgreSQL created-project cleanup was not confirmed");
-  }
-}
-
 function restoreLocallyAddedCreateAlias(
   hash: string,
   aliasPath: string,
@@ -729,7 +717,7 @@ export async function createProject(
       }
       try {
         setRemoteProjectBinding(remote.projectId, { hash: local.id, expectedEntry: shown.entry });
-      } catch (error) {
+      } catch {
         try {
           const adopted = showProjectMapEntry(projectPath);
           if (
@@ -745,28 +733,17 @@ export async function createProject(
         } catch {
           // An unreadable or conflicting map is not equivalent adoption.
         }
-        try {
-          await compensateCreatedProject(
-            repository,
-            remote.projectId,
-            machine.machineId,
-            entryPaths.map(({ normalizedPath }) => normalizedPath),
-          );
-        } catch {
-          throw new ProjectIdentityReconciliationError(
-            "PostgreSQL created the project but the local binding and automatic cleanup both failed",
-            `Run \`lcm project link -- ${quoteShellArgument(remote.projectId)} ${quoteShellArgument(local.canonical)}\` to reconcile it.`,
-          );
-        }
-        if (!selectedIsStored) {
-          restoreLocallyAddedCreateAlias(
-            local.id,
-            projectPath,
-            priorEntry,
-            shown.entry,
-          );
-        }
-        throw error;
+        // A committed project is already public to every LCM home that shares
+        // this machine identity. Another home may have adopted it after the
+        // commit but before this local map write failed, and PostgreSQL cannot
+        // distinguish that adoption from the creator's own aliases. Never
+        // delete the published project or aliases as compensation. Retain a
+        // provisional lexical alias as well so the exact recovery command can
+        // address the path that PostgreSQL now owns.
+        throw new ProjectIdentityReconciliationError(
+          "PostgreSQL created the project but the local binding could not be confirmed",
+          `Run \`lcm project link -- ${quoteShellArgument(remote.projectId)} ${quoteShellArgument(projectPath)}\` to reconcile it.`,
+        );
       }
       return {
         local: resolveProjectIdentity(projectPath),

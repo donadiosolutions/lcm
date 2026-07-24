@@ -169,6 +169,13 @@ describe("printHelp — per-command detail", () => {
     expect(projectText).toContain("lcm project show <remote-project-uuid>");
     expect(projectText).toContain("exactly one local binding");
     expect(projectText).toContain("--allow-existing-data");
+
+    out.mockClear();
+    printHelp("postgres");
+    const postgresText = out.mock.calls.map(c => c[0]).join("");
+    expect(postgresText).toContain("lcm postgres migrate [--json]");
+    expect(postgresText).toContain("LCM_POSTGRES_URL");
+    expect(postgresText).toContain("does not install extensions or grant runtime privileges");
   });
 
   it("prints import command help with Codex provider flags", () => {

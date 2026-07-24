@@ -1,4 +1,5 @@
 import {
+  copyFileSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -903,7 +904,27 @@ describe("identity service", () => {
     });
   });
 
-  it("restores the prior local map after symlink binding failure and confirmed cleanup", async () => {
+  it("accepts an equivalent concurrent restoration after remote creation fails", async () => {
+    await register();
+    const canonical = makeProject("create-symlink-concurrent-remote-failure-target");
+    const entered = join(home, "create-symlink-concurrent-remote-failure-entered");
+    symlinkSync(canonical, entered);
+    const local = resolveProjectIdentity(canonical);
+    const remoteFailure = new PostgreSqlIdentityNotFoundError("project", PROJECT_A);
+    repository.createProject = vi.fn(async () => {
+      removeProjectAlias(entered, { hash: local.id });
+      throw remoteFailure;
+    });
+
+    await expect(createProject(POSTGRESQL_CONFIG, entered, {}, deps))
+      .rejects.toBe(remoteFailure);
+    expect(showProjectMapEntry(local.id).entry).toEqual({
+      canonical,
+      aliases: [],
+    });
+  });
+
+  it("retains the lexical alias and published project after symlink binding failure", async () => {
     await register();
     const canonical = makeProject("create-symlink-bind-failure-target");
     const entered = join(home, "create-symlink-bind-failure-entered");
@@ -912,23 +933,20 @@ describe("identity service", () => {
       ...remoteProject("invalid-project-id", input.displayName),
       aliases: [alias("invalid-project-id", canonical, entered)],
     }));
-    repository.cleanupCreatedProject = vi.fn(async () => true);
-
     await expect(createProject(POSTGRESQL_CONFIG, entered, {}, deps))
-      .rejects.toThrow("invalid remote project UUIDv7");
+      .rejects.toMatchObject({
+        name: "ProjectIdentityReconciliationError",
+        remediation: expect.stringContaining(quoteShellArgument(entered)),
+      });
 
-    expect(repository.cleanupCreatedProject).toHaveBeenCalledWith(
-      MACHINE_ID,
-      "invalid-project-id",
-      [canonical],
-    );
+    expect(repository.cleanupCreatedProject).not.toHaveBeenCalled();
     expect(showProjectMapEntry(canonical).entry).toEqual({
       canonical,
-      aliases: [],
+      aliases: [entered],
     });
   });
 
-  it("accepts an equivalent concurrent restoration of the symlink create alias", async () => {
+  it("does not run destructive cleanup after a published symlink project", async () => {
     await register();
     const canonical = makeProject("create-symlink-concurrent-restore-target");
     const entered = join(home, "create-symlink-concurrent-restore-entered");
@@ -938,16 +956,12 @@ describe("identity service", () => {
       ...remoteProject("invalid-project-id", input.displayName),
       aliases: [alias("invalid-project-id", canonical, entered)],
     }));
-    repository.cleanupCreatedProject = vi.fn(async () => {
-      removeProjectAlias(entered, { hash: local.id });
-      return true;
-    });
-
     await expect(createProject(POSTGRESQL_CONFIG, entered, {}, deps))
-      .rejects.toThrow("invalid remote project UUIDv7");
+      .rejects.toBeInstanceOf(ProjectIdentityReconciliationError);
+    expect(repository.cleanupCreatedProject).not.toHaveBeenCalled();
     expect(showProjectMapEntry(local.id).entry).toEqual({
       canonical,
-      aliases: [],
+      aliases: [entered],
     });
   });
 
@@ -1112,7 +1126,7 @@ describe("identity service", () => {
     expect(repository.createProject.mock.calls.at(-1)?.[0]).not.toHaveProperty("identityKey");
   });
 
-  it("compensates when a created remote project cannot be written locally", async () => {
+  it("preserves a created remote project when its local binding cannot be written", async () => {
     await register();
     const path = makeProject("create-compensate");
     repository.createProject = vi.fn(async (input) => {
@@ -1123,15 +1137,65 @@ describe("identity service", () => {
         aliases: [alias(PROJECT_A, path)],
       };
     });
-    repository.cleanupCreatedProject = vi.fn(async () => true);
+    await expect(createProject(POSTGRESQL_CONFIG, path, {}, deps))
+      .rejects.toMatchObject({
+        name: "ProjectIdentityReconciliationError",
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_A)} ${quoteShellArgument(path)}`,
+        ),
+      });
+    expect(repository.cleanupCreatedProject).not.toHaveBeenCalled();
+  });
+
+  it("preserves a project adopted by another LCM home before the creator map fails", async () => {
+    await register();
+    const path = makeProject("create-cross-home-adoption");
+    const otherHome = join(home, "other-home");
+    mkdirSync(join(otherHome, ".lcm"), { recursive: true });
+    copyFileSync(machineIdentityPath(home), machineIdentityPath(otherHome));
+    const otherDeps: Partial<IdentityServiceDependencies> = {
+      homeDir: otherHome,
+      openSession: deps.openSession,
+    };
+    const originalCreate = repository.createProject.getMockImplementation()!;
+    repository.createProject = vi.fn(async (input) => {
+      const remote = await originalCreate(input);
+      process.env.HOME = otherHome;
+      process.env.USERPROFILE = otherHome;
+      clearProjectMapCache();
+      try {
+        await linkProject(POSTGRESQL_CONFIG, remote.projectId, path, {}, otherDeps);
+      } finally {
+        process.env.HOME = home;
+        process.env.USERPROFILE = home;
+        clearProjectMapCache();
+      }
+      writeFileSync(projectMapPath(), "{broken");
+      return remote;
+    });
 
     await expect(createProject(POSTGRESQL_CONFIG, path, {}, deps))
-      .rejects.toThrow("Expected property name");
-    expect(repository.cleanupCreatedProject).toHaveBeenCalledWith(
-      MACHINE_ID,
-      PROJECT_A,
-      [path],
-    );
+      .rejects.toMatchObject({
+        name: "ProjectIdentityReconciliationError",
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_A)} ${quoteShellArgument(path)}`,
+        ),
+      });
+    expect(repository.cleanupCreatedProject).not.toHaveBeenCalled();
+    await expect(repository.getProject(PROJECT_A)).resolves.toMatchObject({
+      projectId: PROJECT_A,
+    });
+
+    process.env.HOME = otherHome;
+    process.env.USERPROFILE = otherHome;
+    clearProjectMapCache();
+    try {
+      expect(showProjectMapEntry(path).entry.remoteProjectId).toBe(PROJECT_A);
+    } finally {
+      process.env.HOME = home;
+      process.env.USERPROFILE = home;
+      clearProjectMapCache();
+    }
   });
 
   it("preserves a created project adopted by an identical concurrent local binding", async () => {
@@ -1156,7 +1220,7 @@ describe("identity service", () => {
     });
   });
 
-  it("returns an exact recovery command when project creation and cleanup both fail", async () => {
+  it("ignores destructive cleanup availability after project publication", async () => {
     await register();
     const path = makeProject("create-cleanup-fails");
     repository.createProject = vi.fn(async (input) => {
@@ -1167,39 +1231,16 @@ describe("identity service", () => {
         aliases: [alias(PROJECT_A, path)],
       };
     });
-    repository.cleanupCreatedProject = vi.fn(async () => {
-      throw new Error("cleanup failed");
-    });
+    repository.cleanupCreatedProject = vi.fn(async () => true);
 
     await expect(createProject(POSTGRESQL_CONFIG, path, {}, deps))
       .rejects.toMatchObject({
         name: "ProjectIdentityReconciliationError",
         remediation: expect.stringContaining(
-          `lcm project link -- ${quoteShellArgument(PROJECT_A)}`,
+          `lcm project link -- ${quoteShellArgument(PROJECT_A)} ${quoteShellArgument(path)}`,
         ),
       });
-  });
-
-  it("treats an unconfirmed created-project cleanup as a reconciliation failure", async () => {
-    await register();
-    const path = makeProject("create-cleanup-unconfirmed");
-    repository.createProject = vi.fn(async (input) => {
-      mkdirSync(join(home, ".lcm"), { recursive: true });
-      writeFileSync(projectMapPath(), "{broken");
-      return {
-        ...remoteProject(PROJECT_A, input.displayName),
-        aliases: [alias(PROJECT_A, path)],
-      };
-    });
-    repository.cleanupCreatedProject = vi.fn(async () => false);
-
-    await expect(createProject(POSTGRESQL_CONFIG, path, {}, deps))
-      .rejects.toMatchObject({
-        name: "ProjectIdentityReconciliationError",
-        remediation: expect.stringContaining(
-          `lcm project link -- ${quoteShellArgument(PROJECT_A)}`,
-        ),
-      });
+    expect(repository.cleanupCreatedProject).not.toHaveBeenCalled();
   });
 
   it("links and unlinks a local-only alias under SQLite", async () => {

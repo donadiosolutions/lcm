@@ -418,6 +418,9 @@ on a provider does not justify silently expanding the baseline.
 1. The cluster administrator provisions PostgreSQL 18, preloads services such
    as `pg_stat_statements` when necessary, and installs the exact required
    extensions in `public`. The migrator and runtime use separate login roles.
+   With `storage.backend` configured, the supported packaged entry point is
+   `LCM_POSTGRES_URL="$LCM_POSTGRES_MIGRATION_URL" lcm postgres migrate`; it
+   accepts `--json` for automation and closes the migration pool before exit.
 2. Runtime health verifies server version, UTF-8 database encoding, extension
    readiness, and the fingerprinted `lcm.search_v1` text-search contract.
    Failed readiness produces corrective guidance without changing database or

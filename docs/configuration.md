@@ -247,6 +247,44 @@ export LCM_POSTGRES_CA_FILE='/absolute/path/to/ca-certificate.crt'
 lcm daemon restart
 ```
 
+### Provisioning a PostgreSQL database
+
+Provisioning is an explicit administrator workflow. First create a UTF-8
+PostgreSQL 18 database, preload `pg_stat_statements`, install the required
+extensions in `public`, and configure `storage.backend` as shown above. Use a
+dedicated migration role that owns the database and any existing `lcm` schema;
+do not use the restricted runtime role for DDL. Then apply the migrations
+packaged with the installed LCM version:
+
+```bash
+export LCM_POSTGRES_CA_FILE='/absolute/path/to/ca-certificate.crt'
+LCM_POSTGRES_URL="$LCM_POSTGRES_MIGRATION_URL" lcm postgres migrate
+```
+
+Use `--json` for automation. The command opens the production PostgreSQL
+runtime without requiring a pre-existing LCM schema, verifies the packaged SQL
+and SHA-256 manifest, takes the migration advisory lock, validates PostgreSQL
+18, extensions, ownership, history, and schema fingerprints, applies pending
+migrations transactionally, and closes its pool before returning. Repeated and
+concurrent invocations converge. It never installs extensions, repairs drift,
+changes ownership, or grants application privileges.
+
+After migration, apply the reviewed
+[`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql)
+as an administrator, substituting the deployment's restricted runtime role:
+
+```bash
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-identity-grants.sql
+```
+
+Finally restore `LCM_POSTGRES_URL` to the restricted runtime-role URL, run
+`lcm machine register`, pair projects explicitly, and restart the daemon.
+Never leave the daemon or identity commands configured with migration-owner
+credentials. See the [PostgreSQL schema reference](postgresql-schema.md) for
+the exact extension, role, ownership, ACL, backup, and recovery contracts.
+
 The URL must use the `postgresql:` scheme. Do not add `ssl`, `sslmode`,
 `sslcert`, `sslkey`, `sslrootcert`, or other `ssl*` query parameters; LCM owns
 TLS configuration and uses the required CA file for certificate verification.

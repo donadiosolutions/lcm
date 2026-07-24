@@ -202,7 +202,7 @@ function resolveCustomHelpRequest(cliArgv: string[]): CustomHelpRequest | undefi
   if (!args.includes("-h") && !args.includes("--help")) return undefined;
 
   const [command] = args;
-  return args.length >= 3 && ["daemon", "config", "map", "connectors"].includes(command)
+  return args.length >= 3 && ["daemon", "config", "connectors"].includes(command)
     ? { command }
     : undefined;
 }
@@ -666,6 +666,69 @@ export function registerMachineCommand(program: Command): void {
   program.addCommand(machineCmd);
 }
 
+export function registerPostgreSqlCommand(program: Command): void {
+  type PostgreSqlOptions = {
+    help?: boolean;
+    json?: boolean;
+  };
+  const postgresCmd = new Command("postgres")
+    .description("Provision and maintain PostgreSQL storage");
+  postgresCmd.helpOption(false).option("-h, --help", "Show help");
+  const helpRequested = (opts: PostgreSqlOptions): boolean =>
+    opts.help === true || postgresCmd.opts<PostgreSqlOptions>().help === true;
+  postgresCmd.action(async (opts: PostgreSqlOptions) => {
+    if (helpRequested(opts)) {
+      const { printHelp } = await import("../src/cli-help.js");
+      printHelp("postgres"); exit(0);
+    }
+    console.error("Usage: lcm postgres migrate [--json]");
+    exit(1);
+  });
+
+  postgresCmd
+    .command("migrate")
+    .description("Apply packaged PostgreSQL schema migrations")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (opts: PostgreSqlOptions) => {
+      if (helpRequested(opts)) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("postgres"); exit(0);
+      }
+      try {
+        const { provisionPostgreSql } = await import(
+          "../src/storage/postgresql/provisioning.js"
+        );
+        const result = await provisionPostgreSql(await loadIdentityStorageConfig());
+        const output = {
+          backend: "postgresql",
+          applied: [...result.applied],
+          current: [...result.current],
+        };
+        if (opts.json) {
+          printJson(output);
+          return;
+        }
+        if (output.applied.length === 0) {
+          console.log("PostgreSQL schema is current.");
+        } else {
+          console.log(
+            `Applied ${output.applied.length} PostgreSQL migration${output.applied.length === 1 ? "" : "s"}: ${output.applied.join(", ")}`,
+          );
+        }
+        console.log(`  current migrations: ${output.current.length}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (opts.json) printJson({ error: message });
+        else console.error(`Error: ${message}`);
+        exit(1);
+      }
+    });
+
+  program.addCommand(postgresCmd);
+}
+
 function collectRepeatedOption(value: string, previous: string[] = []): string[] {
   return [...previous, value];
 }
@@ -722,14 +785,16 @@ export function writeCliError(value: string): void {
   process.stderr.write(value);
 }
 
-async function createDaemonClientOrExit(): Promise<DaemonClient> {
+async function createDaemonClientOrExit(
+  options: { readonly preflightStorage?: boolean } = {},
+): Promise<DaemonClient> {
   const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
   const { loadDaemonConfig } = await import("../src/daemon/config.js");
   const { selectStorageBackend } = await import("../src/storage/backend.js");
 
   migrateLegacyHomeIfNeeded();
   const config = loadDaemonConfig(defaultConfigPath());
-  selectStorageBackend(config.storage);
+  if (options.preflightStorage !== false) selectStorageBackend(config.storage);
   const port = config.daemon?.port ?? 3737;
   const pidFilePath = daemonPidPath();
   const tokenPath = daemonTokenPath();
@@ -1250,7 +1315,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       const { homedir } = await import("node:os");
       const config = loadDaemonConfig(defaultConfigPath());
       const jsonFlag: boolean = opts.json ?? false;
-      const client = await createDaemonClientOrExit();
+      const client = await createDaemonClientOrExit({ preflightStorage: false });
 
       let daemonStatus = "down";
       let statusData: any = null;
@@ -1467,6 +1532,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
 
   registerMachineCommand(program);
   registerProjectCommand(program);
+  registerPostgreSqlCommand(program);
   registerMemoryCommands(program);
 
   // ─── diagnose ──────────────────────────────────────────────────────────────
