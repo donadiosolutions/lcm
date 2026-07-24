@@ -266,7 +266,7 @@ deletion.
 
 | Table | Ownership and retention | Enforced invariants and indexes |
 | --- | --- | --- |
-| `schema_migrations` | Migrator-owned ledger retained for the database lifetime. Application code must never edit it. | Migration ID primary key; checksum is exactly 64 lowercase hexadecimal characters; `applied_at` is timezone-aware. The runner also enforces manifest order and checksum equality. |
+| `schema_migrations` | Migrator-owned ordinary table retained for the database lifetime. Application code must never edit it. A catalog-only preflight rejects a view, materialized view, foreign table, other relation kind, or ownership drift before reading ledger rows; absence remains valid only for first installation. | Migration ID primary key; checksum is exactly 64 lowercase hexadecimal characters; `applied_at` is timezone-aware. The runner also enforces manifest order and checksum equality. |
 
 ### Identity
 

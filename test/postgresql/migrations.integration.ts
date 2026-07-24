@@ -382,7 +382,7 @@ describe("PostgreSQL migrations and database isolation", () => {
     }
   });
 
-  it("reports ledger ownership drift before reading the ledger", async () => {
+  it("reports ledger ownership drift through the dedicated relation preflight", async () => {
     await withPostgreSqlTestDatabase("ledger-owner-drift", async (database) => {
       const admin = new PostgreSqlRuntime(settings(database.adminUrl));
       try {
@@ -391,19 +391,64 @@ describe("PostgreSQL migrations and database isolation", () => {
         }, { domain: "factory", operation: "driftMigrationLedgerOwner" });
         await expect(runPostgreSqlMigrations(database.migrator))
           .rejects.toMatchObject({
-            baselineApplied: null,
-            existingObjectCount: 36,
-            missingObjectCount: null,
-            operation: "preflightManagedObjectOwnership",
+            ledgerExists: true,
+            operation: "preflightMigrationLedgerRelation",
+            ownedByMigrator: false,
+            relationKind: "r",
+            relationName: "schema_migrations",
             requiredOwner: "lcm_test_migrator",
+            requiredRelationKind: "r",
             schemaName: "lcm",
-            unownedObjectCount: 1,
           });
       } finally {
         await admin.query({
           text: "ALTER TABLE lcm.schema_migrations OWNER TO lcm_test_migrator",
         }, { domain: "factory", operation: "restoreMigrationLedgerOwner" });
         await admin.close();
+      }
+    });
+  });
+
+  it("rejects a view masquerading as the migration ledger before reading it", async () => {
+    await withPostgreSqlTestDatabase("ledger-wrong-relkind", async (database) => {
+      let ledgerRenamed = false;
+      let replacementViewCreated = false;
+      try {
+        await database.migrator.query({
+          text: "ALTER TABLE lcm.schema_migrations RENAME TO schema_migrations_backup",
+        }, { domain: "factory", operation: "renameMigrationLedgerForRelkindDrift" });
+        ledgerRenamed = true;
+        await database.migrator.query({
+          text: "CREATE VIEW lcm.schema_migrations AS SELECT 1::integer AS wrong_column",
+        }, { domain: "factory", operation: "replaceMigrationLedgerWithView" });
+        replacementViewCreated = true;
+
+        await expect(runPostgreSqlMigrations(database.migrator))
+          .rejects.toMatchObject({
+            ledgerExists: true,
+            operation: "preflightMigrationLedgerRelation",
+            ownedByMigrator: true,
+            relationKind: "v",
+            relationName: "schema_migrations",
+            requiredOwner: "lcm_test_migrator",
+            requiredRelationKind: "r",
+            schemaName: "lcm",
+          });
+        await expect(database.migrator.query<{ applied_count: string }>({
+          text: "SELECT count(*)::text AS applied_count FROM lcm.schema_migrations_backup",
+        }, { domain: "factory", operation: "verifyLedgerRowsPreservedAfterRelkindDrift" }))
+          .resolves.toMatchObject({ rows: [{ applied_count: "2" }] });
+      } finally {
+        if (replacementViewCreated) {
+          await database.migrator.query({
+            text: "DROP VIEW lcm.schema_migrations",
+          }, { domain: "factory", operation: "dropReplacementMigrationLedgerView" });
+        }
+        if (ledgerRenamed) {
+          await database.migrator.query({
+            text: "ALTER TABLE lcm.schema_migrations_backup RENAME TO schema_migrations",
+          }, { domain: "factory", operation: "restoreMigrationLedgerAfterRelkindDrift" });
+        }
       }
     });
   });

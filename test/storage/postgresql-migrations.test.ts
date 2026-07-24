@@ -12,6 +12,7 @@ import {
   loadPostgreSqlSchemaSnapshots,
   PostgreSqlBaselineDefinitionPreflightError,
   PostgreSqlIdentityFunctionPreflightError,
+  PostgreSqlMigrationLedgerRelationPreflightError,
   PostgreSqlManagedObjectOwnershipPreflightError,
   PostgreSqlSchemaAclPreflightError,
   PostgreSqlSchemaOwnershipPreflightError,
@@ -36,6 +37,7 @@ function result<R extends QueryResultRow>(rows: R[]): QueryResult<R> {
 
 function executor(options: {
   ledger?: boolean;
+  ledgerRelation?: "view" | "unowned" | "missing" | "invalid" | "inconsistent";
   current?: Array<{ id: string; checksum_sha256: string }>;
   failOperation?: string;
   schemaOwnership?:
@@ -160,6 +162,38 @@ function executor(options: {
         public_create: options.schemaAcl === "public",
       }] as unknown as R[]);
     }
+    if (context.operation === "preflightMigrationLedgerRelation") {
+      if (options.ledgerRelation === "missing") return result([] as R[]);
+      if (options.ledgerRelation === "invalid") {
+        return result([{
+          current_user_name: 7,
+          ledger_exists: "yes",
+          owned_by_current_user: 1,
+          relation_kind: 4,
+        }] as unknown as R[]);
+      }
+      if (options.ledgerRelation === "inconsistent") {
+        return result([{
+          current_user_name: "lcm_test_migrator",
+          ledger_exists: false,
+          owned_by_current_user: true,
+          relation_kind: "r",
+        }] as unknown as R[]);
+      }
+      const ledgerExists = options.ledger === true
+        || options.ledgerRelation === "view"
+        || options.ledgerRelation === "unowned";
+      return result([{
+        current_user_name: "lcm_test_migrator",
+        ledger_exists: ledgerExists,
+        owned_by_current_user: ledgerExists
+          ? options.ledgerRelation !== "unowned"
+          : null,
+        relation_kind: ledgerExists
+          ? options.ledgerRelation === "view" ? "v" : "r"
+          : null,
+      }] as unknown as R[]);
+    }
     if (context.operation === "preflightManagedObjectOwnership") {
       if (options.managedOwnership === "missing") return result([] as R[]);
       if (options.managedOwnership === "invalid") {
@@ -236,7 +270,6 @@ function executor(options: {
             : 0,
       }] as unknown as R[]);
     }
-    if (context.operation === "inspectMigrationLedger") return result([{ ledger_exists: options.ledger ?? false }] as unknown as R[]);
     if (context.operation === "readMigrations") return result((options.current ?? []) as unknown as R[]);
     return result([] as R[]);
   });
@@ -387,8 +420,8 @@ describe("PostgreSQL migration runner", () => {
       "revalidateRequiredExtensionCatalog",
       "preflightSchemaOwnership",
       "preflightSchemaAcl",
+      "preflightMigrationLedgerRelation",
       "preflightManagedObjectOwnership",
-      "inspectMigrationLedger",
       "applyMigration:0001_first",
       "recordMigration",
       "applyMigration:0002_second",
@@ -516,6 +549,18 @@ describe("PostgreSQL migration runner", () => {
       current: ["0001_first", "0002_second"],
     });
     expect(fake.operations).toContain("readMigrations");
+    expect(fake.operations.indexOf("preflightMigrationLedgerRelation"))
+      .toBeLessThan(fake.operations.indexOf("preflightManagedObjectOwnership"));
+    expect(fake.operations.indexOf("preflightMigrationLedgerRelation"))
+      .toBeLessThan(fake.operations.indexOf("readMigrations"));
+    const ledgerPreflightCall = fake.seam.query.mock.calls.find(([, context]) => (
+      context.operation === "preflightMigrationLedgerRelation"
+    ));
+    const ledgerPreflightSql =
+      (ledgerPreflightCall?.[0] as { text?: string } | undefined)?.text ?? "";
+    expect(ledgerPreflightSql).toContain("pg_catalog.pg_class");
+    expect(ledgerPreflightSql).toContain("pg_catalog.pg_namespace");
+    expect(ledgerPreflightSql).not.toContain("FROM lcm.schema_migrations");
   });
 
   it("accepts a pre-existing schema owned by the migration role", async () => {
@@ -523,6 +568,86 @@ describe("PostgreSQL migration runner", () => {
     await expect(runPostgreSqlMigrations(fake.seam, { migrations: [], schemaSnapshots: [] }))
       .resolves.toEqual({ applied: [], current: [] });
     expect(fake.operations).toContain("preflightSchemaOwnership");
+  });
+
+  it.each([
+    {
+      label: "a view in place of the ledger",
+      ledgerRelation: "view" as const,
+      ledgerExists: true,
+      relationKind: "v",
+      ownedByMigrator: true,
+      requiredOwner: "lcm_test_migrator",
+    },
+    {
+      label: "a ledger owned by another role",
+      ledgerRelation: "unowned" as const,
+      ledgerExists: true,
+      relationKind: "r",
+      ownedByMigrator: false,
+      requiredOwner: "lcm_test_migrator",
+    },
+    {
+      label: "a missing catalog result",
+      ledgerRelation: "missing" as const,
+      ledgerExists: null,
+      relationKind: null,
+      ownedByMigrator: null,
+      requiredOwner: null,
+    },
+    {
+      label: "malformed catalog values",
+      ledgerRelation: "invalid" as const,
+      ledgerExists: null,
+      relationKind: null,
+      ownedByMigrator: null,
+      requiredOwner: null,
+    },
+    {
+      label: "a contradictory absent relation",
+      ledgerRelation: "inconsistent" as const,
+      ledgerExists: false,
+      relationKind: "r",
+      ownedByMigrator: true,
+      requiredOwner: "lcm_test_migrator",
+    },
+  ])("fails closed before ledger reads for $label", async ({
+    ledgerRelation,
+    ledgerExists,
+    relationKind,
+    ownedByMigrator,
+    requiredOwner,
+  }) => {
+    const fake = executor({
+      ledgerRelation,
+      schemaAcl: "ready",
+      schemaOwnership: "owned",
+    });
+    const failure = await runPostgreSqlMigrations(fake.seam, {
+      migrations: loadPostgreSqlMigrations(),
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlMigrationLedgerRelationPreflightError);
+    expect(failure).toMatchObject({
+      ledgerExists,
+      operation: "preflightMigrationLedgerRelation",
+      ownedByMigrator,
+      relationKind,
+      relationName: "schema_migrations",
+      requiredOwner,
+      requiredRelationKind: "r",
+      schemaName: "lcm",
+    });
+    expect((failure as PostgreSqlMigrationLedgerRelationPreflightError).toJSON())
+      .toMatchObject({
+        ledgerExists,
+        ownedByMigrator,
+        relationKind,
+        relationName: "schema_migrations",
+        requiredOwner,
+        requiredRelationKind: "r",
+      });
+    expect(fake.operations).not.toContain("preflightManagedObjectOwnership");
+    expect(fake.operations).not.toContain("readMigrations");
   });
 
   it.each([
@@ -877,6 +1002,7 @@ describe("PostgreSQL migration runner", () => {
       "revalidateRequiredExtensionCatalog",
       "preflightSchemaOwnership",
       "preflightSchemaAcl",
+      "preflightMigrationLedgerRelation",
       "preflightManagedObjectOwnership",
     ]);
     const ownershipCall = fake.seam.query.mock.calls.find(([, context]) => (

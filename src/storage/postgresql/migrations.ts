@@ -27,7 +27,12 @@ const MIGRATION_MANIFEST = [
 ] as const;
 
 type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
-type LedgerRow = QueryResultRow & { ledger_exists: boolean };
+type MigrationLedgerRelationRow = QueryResultRow & {
+  current_user_name: unknown;
+  ledger_exists: unknown;
+  owned_by_current_user: unknown;
+  relation_kind: unknown;
+};
 type ServerVersionRow = QueryResultRow & { server_version_num: unknown };
 type PostmasterEpochRow = QueryResultRow & { postmaster_started_at: Date | string };
 type PostmasterContinuityRow = QueryResultRow & { preflight_still_valid: boolean };
@@ -607,6 +612,43 @@ export class PostgreSqlManagedObjectOwnershipPreflightError extends StorageOpera
   }
 }
 
+export class PostgreSqlMigrationLedgerRelationPreflightError extends StorageOperationError {
+  constructor(
+    readonly ledgerExists: boolean | null,
+    readonly relationKind: string | null,
+    readonly ownedByMigrator: boolean | null,
+    readonly requiredOwner: string | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightMigrationLedgerRelation",
+    );
+  }
+
+  readonly schemaName = "lcm";
+  readonly relationName = "schema_migrations";
+  readonly requiredRelationKind = "r";
+  readonly remediation =
+    "Restore lcm.schema_migrations as an ordinary table owned by the migration role, then rerun migrations.";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      schemaName: this.schemaName,
+      relationName: this.relationName,
+      ledgerExists: this.ledgerExists,
+      relationKind: this.relationKind,
+      requiredRelationKind: this.requiredRelationKind,
+      ownedByMigrator: this.ownedByMigrator,
+      requiredOwner: this.requiredOwner,
+      remediation: this.remediation,
+    };
+  }
+}
+
 export class PostgreSqlIdentityFunctionPreflightError extends StorageOperationError {
   constructor(
     readonly baselineApplied: boolean | null,
@@ -1017,6 +1059,63 @@ export async function runPostgreSqlMigrations(
       throw new PostgreSqlSchemaAclPreflightError(aclSchemaExists, publicCreate);
     }
 
+    const ledgerRelation = await transaction.query<MigrationLedgerRelationRow>({
+      text: `WITH migration_role AS (
+               SELECT role.oid, role.rolname
+               FROM pg_catalog.pg_roles AS role
+               WHERE role.rolname OPERATOR(pg_catalog.=) CURRENT_USER
+             ),
+             ledger_relation AS (
+               SELECT relation.relkind, relation.relowner
+               FROM pg_catalog.pg_class AS relation
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+               WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                 AND relation.relname OPERATOR(pg_catalog.=) 'schema_migrations'
+             )
+             SELECT migration_role.rolname::pg_catalog.text AS current_user_name,
+                    ledger_relation.relkind IS NOT NULL AS ledger_exists,
+                    ledger_relation.relkind::pg_catalog.text AS relation_kind,
+                    CASE
+                      WHEN ledger_relation.relkind IS NULL THEN NULL
+                      ELSE ledger_relation.relowner OPERATOR(pg_catalog.=) migration_role.oid
+                    END AS owned_by_current_user
+             FROM migration_role
+             LEFT JOIN ledger_relation ON true`,
+    }, {
+      domain: "factory",
+      operation: "preflightMigrationLedgerRelation",
+      signal: options.signal,
+    });
+    const ledgerExists = sanitizeBoolean(ledgerRelation.rows[0]?.ledger_exists);
+    const rawRelationKind = ledgerRelation.rows[0]?.relation_kind;
+    const relationKind = typeof rawRelationKind === "string" && rawRelationKind.length === 1
+      ? rawRelationKind
+      : null;
+    const rawLedgerOwnership = ledgerRelation.rows[0]?.owned_by_current_user;
+    const ledgerOwnedByMigrator = sanitizeBoolean(rawLedgerOwnership);
+    const ledgerRequiredOwner = sanitizeRoleName(
+      ledgerRelation.rows[0]?.current_user_name,
+    );
+    const absentLedgerIsValid = ledgerExists === false
+      && rawRelationKind === null
+      && rawLedgerOwnership === null;
+    const presentLedgerIsValid = ledgerExists === true
+      && relationKind === "r"
+      && ledgerOwnedByMigrator === true;
+    if (
+      ledgerRequiredOwner === null
+      || ledgerRequiredOwner !== requiredOwner
+      || (!absentLedgerIsValid && !presentLedgerIsValid)
+    ) {
+      throw new PostgreSqlMigrationLedgerRelationPreflightError(
+        ledgerExists,
+        relationKind,
+        ledgerOwnedByMigrator,
+        ledgerRequiredOwner,
+      );
+    }
+
     const inspectManagedObjects = async (
       managedObjectIdentities: readonly string[],
       baselineApplied: boolean | null,
@@ -1137,10 +1236,7 @@ export async function runPostgreSqlMigrations(
     ];
     await inspectManagedObjects(knownManagedObjectIdentities, null, false);
 
-    const ledger = await transaction.query<LedgerRow>({
-      text: "SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger_exists",
-    }, { domain: "factory", operation: "inspectMigrationLedger", signal: options.signal });
-    const current = ledger.rows[0]?.ledger_exists
+    const current = ledgerExists
       ? (await transaction.query<MigrationRow>({
         text: "SELECT id, checksum_sha256 FROM lcm.schema_migrations ORDER BY id",
       }, { domain: "factory", operation: "readMigrations", signal: options.signal })).rows

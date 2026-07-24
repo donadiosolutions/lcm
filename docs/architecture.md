@@ -69,14 +69,18 @@ inspection, the runner permits an absent schema but rejects an existing schema
 not owned by the current migration role; delegated `CREATE` is insufficient and
 no ownership is changed automatically. Every run rejects a schema that grants
 `PUBLIC CREATE` before ledger inspection without changing its ACL; the baseline
-repeats the guard before its owned DDL. Under the same lock, every run also
-verifies that the current migrator still owns each known LCM table, identity
+repeats the guard before its owned DDL. A catalog-only ledger relation
+preflight permits absence on first installation; when
+`lcm.schema_migrations` exists, it must be an ordinary table owned by the
+current migration role. Views, materialized views, foreign tables, and every
+other relation kind fail before any ledger-row query. Under the same lock,
+every run also verifies that the current migrator still owns each known LCM table, identity
 sequence, helper or trigger function, text-search dictionary, and text-search
 configuration that exists before reading any ledger rows. This catalog-only
-phase therefore returns structured ownership diagnostics even when the ledger
-table itself has drifted to another owner. Baseline completeness is evaluated
-after the applied history is known. Unknown schema objects are outside that
-exact catalog allowlist and are neither rejected nor changed.
+phase therefore returns structured ownership diagnostics before history is
+trusted. Baseline completeness is evaluated after the applied history is
+known. Unknown schema objects are outside that exact catalog allowlist and are
+neither rejected nor changed.
 Schema snapshots are keyed by migration ID and own both the exact managed
 object inventory and definition fingerprints. The newest migration in
 the trusted current ledger that has a registered snapshot is checked before

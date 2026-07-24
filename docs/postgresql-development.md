@@ -137,10 +137,14 @@ absent schema because `0001` creates it as the current migration role, but it
 fails closed when another role owns an existing schema even if that role has
 delegated `CREATE` to the migrator. Transfer ownership explicitly with the
 cluster administrator before retrying; LCM never changes schema ownership.
-On every run, the runner first checks ownership of every existing allowlisted
-object through `pg_catalog`, including `lcm.schema_migrations`, before reading
-any ledger rows. It then verifies the ordered ledger and requires the exact
-managed inventory owned by the selected current snapshot before pending SQL.
+On every run, a catalog-only ledger preflight permits
+`lcm.schema_migrations` to be absent for first installation, but requires a
+present ledger relation to be an ordinary table owned by the current migration
+role. A view, materialized view, foreign table, or other relation kind is
+rejected before any ledger row is read. The runner then checks ownership of
+every existing allowlisted object through `pg_catalog`, verifies the ordered
+ledger, and requires the exact managed inventory owned by the selected current
+snapshot before pending SQL.
 After pending SQL and ledger rows, it requires the target snapshot's managed
 inventory before commit.
 Schema snapshots are keyed by migration ID: walk validated history from newest
