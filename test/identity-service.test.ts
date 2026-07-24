@@ -56,6 +56,7 @@ import {
 } from "../src/machine-identity.js";
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
+const MACHINE_B = "018f22c4-6d2a-7f10-9a4c-6b8d3e5f9013";
 const PROJECT_A = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
 const PROJECT_B = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021";
 const SQLITE_CONFIG: ResolvedStorageConfig = { backend: "sqlite" };
@@ -507,6 +508,168 @@ describe("identity service", () => {
       .resolves.toMatchObject({ identity: { machineId: MACHINE_ID, displayName: "Recovered" } });
     await expect(recoverMachine(POSTGRESQL_CONFIG, "not-v7", {}, deps))
       .rejects.toThrow("invalid PostgreSQL machine UUIDv7");
+  });
+
+  it("rejects forced machine recovery while a project create is in progress", async () => {
+    await register();
+    const path = makeProject("recover-during-create");
+    const originalCreate = repository.createProject.getMockImplementation()!;
+    let releaseCreate!: () => void;
+    let createReachedRepository!: () => void;
+    const createGate = new Promise<void>((resolve) => { releaseCreate = resolve; });
+    const repositoryReached = new Promise<void>(
+      (resolve) => { createReachedRepository = resolve; },
+    );
+    repository.createProject = vi.fn(async (input) => {
+      const created = await originalCreate(input);
+      createReachedRepository();
+      await createGate;
+      return created;
+    });
+    repository.recoverMachine.mockClear();
+
+    const creating = createProject(POSTGRESQL_CONFIG, path, {}, deps);
+    await repositoryReached;
+    await expect(recoverMachine(
+      POSTGRESQL_CONFIG,
+      MACHINE_B,
+      { force: true },
+      deps,
+    )).rejects.toThrow("remote identity mutation is already in progress");
+    expect(repository.recoverMachine).not.toHaveBeenCalled();
+    expect(showMachine(deps)).toMatchObject({ machineId: MACHINE_ID });
+    releaseCreate();
+
+    await expect(creating).resolves.toMatchObject({
+      local: { remoteProjectId: PROJECT_A },
+    });
+    expect(repository.createProject).toHaveBeenCalledWith(
+      expect.objectContaining({ machineId: MACHINE_ID }),
+    );
+  });
+
+  it("rejects forced machine recovery while a project link is in progress", async () => {
+    await register();
+    const path = makeProject("recover-during-link");
+    const originalReplace = repository.replaceProjectAliases.getMockImplementation()!;
+    let releaseLink!: () => void;
+    let linkReachedRepository!: () => void;
+    const linkGate = new Promise<void>((resolve) => { releaseLink = resolve; });
+    const repositoryReached = new Promise<void>(
+      (resolve) => { linkReachedRepository = resolve; },
+    );
+    repository.replaceProjectAliases = vi.fn(async (input) => {
+      const linked = await originalReplace(input);
+      linkReachedRepository();
+      await linkGate;
+      return linked;
+    });
+    repository.recoverMachine.mockClear();
+
+    const linking = linkProject(POSTGRESQL_CONFIG, PROJECT_A, path, {}, deps);
+    await repositoryReached;
+    await expect(recoverMachine(
+      POSTGRESQL_CONFIG,
+      MACHINE_B,
+      { force: true },
+      deps,
+    )).rejects.toThrow("remote identity mutation is already in progress");
+    expect(repository.recoverMachine).not.toHaveBeenCalled();
+    expect(showMachine(deps)).toMatchObject({ machineId: MACHINE_ID });
+    releaseLink();
+
+    await expect(linking).resolves.toMatchObject({
+      local: { remoteProjectId: PROJECT_A },
+    });
+    expect(repository.replaceProjectAliases).toHaveBeenCalledWith(
+      expect.objectContaining({ machineId: MACHINE_ID }),
+    );
+  });
+
+  it("rejects forced machine recovery while a project unlink is in progress", async () => {
+    await register();
+    const path = makeProject("recover-during-unlink");
+    await linkProject(POSTGRESQL_CONFIG, PROJECT_A, path, {}, deps);
+    const originalUnlink = repository.unlinkProjectAliasesIfOwned.getMockImplementation()!;
+    let releaseUnlink!: () => void;
+    let unlinkReachedRepository!: () => void;
+    const unlinkGate = new Promise<void>((resolve) => { releaseUnlink = resolve; });
+    const repositoryReached = new Promise<void>(
+      (resolve) => { unlinkReachedRepository = resolve; },
+    );
+    repository.unlinkProjectAliasesIfOwned = vi.fn(async (machineId, projectId, aliases) => {
+      const removed = await originalUnlink(machineId, projectId, aliases);
+      unlinkReachedRepository();
+      await unlinkGate;
+      return removed;
+    });
+    repository.recoverMachine.mockClear();
+
+    const unlinking = unlinkProject(POSTGRESQL_CONFIG, path, deps);
+    await repositoryReached;
+    await expect(recoverMachine(
+      POSTGRESQL_CONFIG,
+      MACHINE_B,
+      { force: true },
+      deps,
+    )).rejects.toThrow("remote identity mutation is already in progress");
+    expect(repository.recoverMachine).not.toHaveBeenCalled();
+    expect(showMachine(deps)).toMatchObject({ machineId: MACHINE_ID });
+    releaseUnlink();
+
+    await expect(unlinking).resolves.toMatchObject({
+      remoteProjectId: PROJECT_A,
+      aliasRemoved: false,
+    });
+    expect(repository.unlinkProjectAliasesIfOwned).toHaveBeenCalledWith(
+      MACHINE_ID,
+      PROJECT_A,
+      expect.any(Array),
+    );
+  });
+
+  it("uses the recovered machine only after recovery releases remote identity ownership", async () => {
+    await register();
+    const path = makeProject("create-after-recovery");
+    const localCanonical = makeProject("local-link-during-recovery-canonical");
+    const localAlias = makeProject("local-link-during-recovery-alias");
+    const local = resolveProjectIdentity(localCanonical);
+    const originalRecover = repository.recoverMachine.getMockImplementation()!;
+    let releaseRecovery!: () => void;
+    let recoveryReachedRepository!: () => void;
+    const recoveryGate = new Promise<void>((resolve) => { releaseRecovery = resolve; });
+    const repositoryReached = new Promise<void>(
+      (resolve) => { recoveryReachedRepository = resolve; },
+    );
+    repository.recoverMachine = vi.fn(async (machineId) => {
+      const recovered = await originalRecover(machineId);
+      recoveryReachedRepository();
+      await recoveryGate;
+      return recovered;
+    });
+
+    const recovering = recoverMachine(
+      POSTGRESQL_CONFIG,
+      MACHINE_B,
+      { force: true },
+      deps,
+    );
+    await repositoryReached;
+    await expect(linkProject(SQLITE_CONFIG, local.id, localAlias, {}, deps))
+      .resolves.toMatchObject({ local: { id: local.id } });
+    await expect(createProject(POSTGRESQL_CONFIG, path, {}, deps))
+      .rejects.toThrow("remote identity mutation is already in progress");
+    expect(repository.createProject).not.toHaveBeenCalled();
+    releaseRecovery();
+
+    await expect(recovering).resolves.toMatchObject({
+      identity: { machineId: MACHINE_B },
+    });
+    await expect(createProject(POSTGRESQL_CONFIG, path, {}, deps))
+      .resolves.toMatchObject({ local: { remoteProjectId: PROJECT_A } });
+    expect(repository.createProject).toHaveBeenCalledWith(
+      expect.objectContaining({ machineId: MACHINE_B }),
+    );
   });
 
   it("lists local projects offline and enriches PostgreSQL listings", async () => {

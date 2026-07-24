@@ -233,6 +233,12 @@ remain live regardless of age. Malformed, symlinked, and non-regular locks
 always fail closed. A concurrent rebind or entry removal also fails closed; it
 is never overwritten by a stale unlink.
 
+Remote project create, link, and unlink operations also share a cross-domain
+identity lock with machine recovery. Project operations take the project lock
+first and the cross-domain lock second; recovery takes only the cross-domain
+lock. This keeps one machine ID stable across each PostgreSQL mutation and its
+local map commit without deadlocking local-only SQLite alias operations.
+
 Stale-lock recovery uses a private, owner-recorded reclaim lease. If its
 process crashes, another process may take over only after proving that lease
 owner's PID/start generation is stale. Immutable `.stale-<nonce>` tombstone

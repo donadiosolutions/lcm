@@ -1,10 +1,11 @@
 import { existsSync, statSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { ResolvedStorageConfig } from "./daemon/config.js";
 import {
   ensurePendingMachineIdentity,
   finalizeMachineIdentity,
+  machineIdentityPath,
   MachineIdentityRegistrationChangedError,
   normalizeMachineDisplayName,
   normalizeUuidV7,
@@ -31,6 +32,7 @@ import {
   type ProjectMap,
   type ProjectMapEntry,
 } from "./project-map.js";
+import { ensurePrivateDirectory } from "./security-files.js";
 import { withPrivateMutationLockAsync } from "./private-mutation-lock.js";
 import {
   PostgreSqlIdentityRepository,
@@ -205,12 +207,36 @@ function dependencies(
 }
 
 function withProjectIdentityMutationLock<T>(
+  homeDir: string | undefined,
   callback: () => Promise<T>,
 ): Promise<T> {
   return withPrivateMutationLockAsync(
-    `${projectMapPath()}.identity.lock`,
+    `${projectMapPath(homeDir)}.identity.lock`,
     "project identity",
     callback,
+  );
+}
+
+function withRemoteIdentityMutationLock<T>(
+  homeDir: string | undefined,
+  callback: () => Promise<T>,
+): Promise<T> {
+  const lockPath = `${machineIdentityPath(homeDir)}.remote.lock`;
+  ensurePrivateDirectory(dirname(lockPath));
+  return withPrivateMutationLockAsync(
+    lockPath,
+    "remote identity",
+    callback,
+  );
+}
+
+function withRemoteProjectIdentityMutationLock<T>(
+  homeDir: string | undefined,
+  callback: () => Promise<T>,
+): Promise<T> {
+  return withProjectIdentityMutationLock(
+    homeDir,
+    () => withRemoteIdentityMutationLock(homeDir, callback),
   );
 }
 
@@ -470,14 +496,17 @@ export async function recoverMachine(
 ): Promise<MachineIdentityRecoveryResult> {
   const normalizedMachineId = normalizeUuidV7(machineId);
   if (!normalizedMachineId) throw new Error(`invalid PostgreSQL machine UUIDv7: ${machineId}`);
+  requirePostgreSqlConfig(config);
   const deps = dependencies(dependencyOverrides);
-  return withSession(config, deps, async (repository) => {
-    const registered = await repository.recoverMachine(normalizedMachineId);
-    return recoverMachineIdentity(machineFromRegistered(registered), {
-      force: options.force,
-      homeDir: deps.homeDir,
-    });
-  });
+  return withRemoteIdentityMutationLock(deps.homeDir, () => (
+    withSession(config, deps, async (repository) => {
+      const registered = await repository.recoverMachine(normalizedMachineId);
+      return recoverMachineIdentity(machineFromRegistered(registered), {
+        force: options.force,
+        homeDir: deps.homeDir,
+      });
+    })
+  ));
 }
 
 export interface LocalProjectListing {
@@ -618,12 +647,12 @@ export async function createProject(
   requirePostgreSqlConfig(config);
   const projectPath = assertProjectDirectory(path);
   const deps = dependencies(dependencyOverrides);
-  const machine = requireMachineIdentity(deps.homeDir);
   const displayName = normalizeProjectDisplayName(
     options.displayName ?? defaultProjectDisplayName(projectPath),
   );
   const selectedPath = remotePath(projectPath);
-  return withProjectIdentityMutationLock(async () => {
+  return withRemoteProjectIdentityMutationLock(deps.homeDir, async () => {
+    const machine = requireMachineIdentity(deps.homeDir);
     const local = resolveProjectIdentity(projectPath);
     if (local.remoteProjectId) {
       throw new Error(
@@ -1114,7 +1143,7 @@ async function linkLocalAlias(
   readonly local: ProjectIdentity;
   readonly remoteAlias?: RemoteProjectAlias;
 }> {
-  return withProjectIdentityMutationLock(async () => {
+  return withProjectIdentityMutationLock(deps.homeDir, async () => {
     const targetOptions = isProjectHash(target) ? { hash: target } : { canonical: target };
     const shown = showProjectMapEntry(target);
     if (shown.transient) throw new Error(`unknown local project target: ${target}`);
@@ -1131,56 +1160,58 @@ async function linkLocalAlias(
       return { local: resolveProjectIdentity(result.entry.canonical) };
     }
     requirePostgreSqlConfig(config);
-    const machine = requireMachineIdentity(deps.homeDir);
-    const alias = remotePath(aliasPath);
-    return withSession(config, deps, async (repository) => {
-      const remoteMutation = await confirmRemoteLink(repository, {
-        machineId: machine.machineId,
-        projectId: remoteProjectId,
-        ...alias,
-      });
-      try {
-        addProjectAlias(aliasPath, { ...targetOptions, expectedEntry: shown.entry });
-      } catch (error) {
-        const confirmed = confirmedLocalRemoteBinding(
-          shown.hash,
-          remoteProjectId,
-          [alias],
-          false,
-        );
-        if (confirmed) {
-          return {
-            local: confirmed,
-            remoteAlias: remoteMutation.alias,
-          };
-        }
-        if (remoteMutation.inserted) {
-          try {
-            await confirmRemoteAliasUnlink(
-              repository,
-              machine.machineId,
-              alias.normalizedPath,
-              remoteProjectId,
-              aliasPath,
-            );
-          } catch {
+    return withRemoteIdentityMutationLock(deps.homeDir, async () => {
+      const machine = requireMachineIdentity(deps.homeDir);
+      const alias = remotePath(aliasPath);
+      return withSession(config, deps, async (repository) => {
+        const remoteMutation = await confirmRemoteLink(repository, {
+          machineId: machine.machineId,
+          projectId: remoteProjectId,
+          ...alias,
+        });
+        try {
+          addProjectAlias(aliasPath, { ...targetOptions, expectedEntry: shown.entry });
+        } catch (error) {
+          const confirmed = confirmedLocalRemoteBinding(
+            shown.hash,
+            remoteProjectId,
+            [alias],
+            false,
+          );
+          if (confirmed) {
+            return {
+              local: confirmed,
+              remoteAlias: remoteMutation.alias,
+            };
+          }
+          if (remoteMutation.inserted) {
+            try {
+              await confirmRemoteAliasUnlink(
+                repository,
+                machine.machineId,
+                alias.normalizedPath,
+                remoteProjectId,
+                aliasPath,
+              );
+            } catch {
+              throw new ProjectIdentityReconciliationError(
+                "the local alias write failed and its PostgreSQL alias could not be removed",
+                `Run \`lcm project unlink -- ${quoteShellArgument(aliasPath)}\` to reconcile it.`,
+              );
+            }
+          } else {
             throw new ProjectIdentityReconciliationError(
-              "the local alias write failed and its PostgreSQL alias could not be removed",
-              `Run \`lcm project unlink -- ${quoteShellArgument(aliasPath)}\` to reconcile it.`,
+              "the local alias write lost a concurrent update while PostgreSQL retained the alias",
+              `Rerun \`lcm project link -- ${quoteShellArgument(shown.hash)} ${quoteShellArgument(aliasPath)}\`; the operation is idempotent.`,
             );
           }
-        } else {
-          throw new ProjectIdentityReconciliationError(
-            "the local alias write lost a concurrent update while PostgreSQL retained the alias",
-            `Rerun \`lcm project link -- ${quoteShellArgument(shown.hash)} ${quoteShellArgument(aliasPath)}\`; the operation is idempotent.`,
-          );
+          throw error;
         }
-        throw error;
-      }
-      return {
-        local: resolveProjectIdentity(shown.entry.canonical),
-        remoteAlias: remoteMutation.alias,
-      };
+        return {
+          local: resolveProjectIdentity(shown.entry.canonical),
+          remoteAlias: remoteMutation.alias,
+        };
+      });
     });
   });
 }
@@ -1199,7 +1230,8 @@ export async function linkProject(
   const deps = dependencies(dependencyOverrides);
   const remoteProjectId = normalizeUuidV7(target);
   return remoteProjectId
-    ? withProjectIdentityMutationLock(
+    ? withRemoteProjectIdentityMutationLock(
+      deps.homeDir,
       () => linkRemoteProject(config, remoteProjectId, projectPath, options, deps),
     )
     : linkLocalAlias(config, target, projectPath, deps);
@@ -1362,7 +1394,8 @@ export async function unlinkProject(
   if (shown.transient || !shown.entry.remoteProjectId) {
     return unlinkProjectMutation(config, projectPath, deps);
   }
-  return withProjectIdentityMutationLock(
+  return withRemoteProjectIdentityMutationLock(
+    deps.homeDir,
     () => unlinkProjectMutation(config, projectPath, deps),
   );
 }
