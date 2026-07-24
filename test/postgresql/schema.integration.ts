@@ -132,6 +132,24 @@ async function expectConstraintFailure(promise: Promise<unknown>): Promise<void>
   await expect(promise).rejects.toMatchObject({ backend: "postgresql" });
 }
 
+async function withinTestDeadline<T>(
+  promise: Promise<T>,
+  label: string,
+  timeoutMs = 3_000,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 describe("PostgreSQL schema baseline", () => {
   it("fingerprints the owned text-search contract and fails closed on mapping drift", async () => {
     await withPostgreSqlTestDatabase("schema-search-config", async (database) => {
@@ -1089,6 +1107,117 @@ describe("PostgreSQL schema baseline", () => {
       for (const index of indexes.rows) {
         expect(index.indexdef).toContain("_sha256");
         expect(index.indexdef).not.toMatch(/\(project_id, (native_)?session_id,/u);
+      }
+    });
+  });
+
+  it("serializes concurrent exact session-ingest identity claims", async () => {
+    await withPostgreSqlTestDatabase("schema-session-race", async (database) => {
+      const scope = await seedScope(database.migrator);
+      const first = new PostgreSqlRuntime(settings(database.migratorUrl, {
+        statementTimeoutMs: 5_000,
+      }));
+      const second = new PostgreSqlRuntime(settings(database.migratorUrl, {
+        statementTimeoutMs: 5_000,
+      }));
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+      let releaseFirst = (): void => {};
+      let reportFirstInserted = (): void => {};
+      let reportSecondPid = (_pid: number): void => {};
+      const holdFirst = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const firstInserted = new Promise<void>((resolve) => {
+        reportFirstInserted = resolve;
+      });
+      const secondPid = new Promise<number>((resolve) => {
+        reportSecondPid = resolve;
+      });
+      let firstTransaction = Promise.resolve();
+      let secondOutcome: Promise<unknown> = Promise.resolve(null);
+
+      try {
+        firstTransaction = first.transaction(async (transaction) => {
+          await transaction.query({
+            text: `INSERT INTO lcm.session_ingest_log
+                     (project_id, session_id, message_count)
+                   VALUES ($1, 'concurrent-session', 1)`,
+            values: [scope.projectId],
+          }, { domain: "factory", operation: "claimSessionIdentityFirst" });
+          reportFirstInserted();
+          await holdFirst;
+        }, { domain: "transaction", operation: "holdFirstSessionIdentityClaim" });
+        await withinTestDeadline(firstInserted, "the first session identity claim");
+
+        let secondSettled = false;
+        secondOutcome = second.transaction(async (transaction) => {
+          const pid = await transaction.query<{ pid: number }>({
+            text: "SELECT pg_catalog.pg_backend_pid() AS pid",
+          }, { domain: "factory", operation: "readSecondSessionClaimPid" });
+          reportSecondPid(pid.rows[0]!.pid);
+          await transaction.query({
+            text: `INSERT INTO lcm.session_ingest_log
+                     (project_id, session_id, message_count)
+                   VALUES ($1, 'concurrent-session', 2)`,
+            values: [scope.projectId],
+          }, { domain: "factory", operation: "claimSessionIdentitySecond" });
+        }, { domain: "transaction", operation: "attemptSecondSessionIdentityClaim" })
+          .then(
+            () => {
+              secondSettled = true;
+              return null;
+            },
+            (error: unknown) => {
+              secondSettled = true;
+              return error;
+            },
+          );
+
+        const pid = await withinTestDeadline(secondPid, "the second claimant backend");
+        let blockedOnAdvisoryLock = false;
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          const lock = await admin.query<{ blocked: boolean }>({
+            text: `SELECT EXISTS (
+                     SELECT 1
+                     FROM pg_catalog.pg_locks
+                     WHERE pid = $1
+                       AND locktype = 'advisory'
+                       AND NOT granted
+                   ) AS blocked`,
+            values: [pid],
+          }, { domain: "factory", operation: "inspectSecondSessionIdentityLock" });
+          if (lock.rows[0]?.blocked) {
+            blockedOnAdvisoryLock = true;
+            break;
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        }
+        expect(blockedOnAdvisoryLock).toBe(true);
+        expect(secondSettled).toBe(false);
+
+        releaseFirst();
+        await withinTestDeadline(firstTransaction, "the first claimant commit");
+        const secondFailure = await withinTestDeadline(
+          secondOutcome,
+          "the duplicate claimant failure",
+        );
+        expect(secondFailure).toMatchObject({
+          backend: "postgresql",
+          operation: "claimSessionIdentitySecond",
+          sqlState: "23505",
+        });
+        await expect(database.migrator.query<{ count: string }>({
+          text: `SELECT pg_catalog.count(*)::pg_catalog.text AS count
+                 FROM lcm.session_ingest_log
+                 WHERE project_id = $1
+                   AND session_id = 'concurrent-session'`,
+          values: [scope.projectId],
+        }, { domain: "factory", operation: "verifySingleSessionIdentityWinner" }))
+          .resolves.toMatchObject({ rows: [{ count: "1" }] });
+      } finally {
+        releaseFirst();
+        await Promise.allSettled([firstTransaction, secondOutcome]);
+        await Promise.allSettled([admin.close(), second.close(), first.close()]);
       }
     });
   });

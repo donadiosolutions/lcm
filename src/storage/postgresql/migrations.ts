@@ -779,7 +779,6 @@ export async function runPostgreSqlMigrations(
       || missingObjectCount === null
       || unownedObjectCount === null
       || (baselineApplied && existingObjectCount + missingObjectCount !== expectedObjectCount)
-      || (!baselineApplied && missingObjectCount !== 0)
       || missingObjectCount !== 0
       || unownedObjectCount > existingObjectCount
       || unownedObjectCount !== 0
@@ -987,7 +986,6 @@ export async function runPostgreSqlMigrations(
       || existingDefinitionObjectCount === null
       || existingDefinitionObjectCount > expectedDefinitionObjectCount
       || missingDefinitionObjectCount === null
-      || (!baselineApplied && missingDefinitionObjectCount !== 0)
       || (baselineApplied
         && existingDefinitionObjectCount + missingDefinitionObjectCount
           !== expectedDefinitionObjectCount)
