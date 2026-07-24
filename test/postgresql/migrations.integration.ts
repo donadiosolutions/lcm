@@ -788,6 +788,31 @@ describe("PostgreSQL migrations and database isolation", () => {
     });
   });
 
+  it("rejects table row-level-security drift", async () => {
+    await withPostgreSqlTestDatabase("table-row-security-drift", async (database) => {
+      try {
+        await database.migrator.query({
+          text: `ALTER TABLE lcm.projects ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE lcm.projects FORCE ROW LEVEL SECURITY`,
+        }, { domain: "factory", operation: "enableProjectRowSecurity" });
+        await expect(runPostgreSqlMigrations(database.migrator))
+          .rejects.toMatchObject({
+            baselineApplied: true,
+            driftedDefinitionGroupCount: 1,
+            expectedObjectCount: 503,
+            existingObjectCount: 503,
+            missingObjectCount: 0,
+            operation: "preflightBaselineDefinitions",
+          });
+      } finally {
+        await database.migrator.query({
+          text: `ALTER TABLE lcm.projects NO FORCE ROW LEVEL SECURITY;
+                 ALTER TABLE lcm.projects DISABLE ROW LEVEL SECURITY`,
+        }, { domain: "factory", operation: "restoreProjectRowSecurity" });
+      }
+    });
+  });
+
   it("rejects relation ACL drift", async () => {
     await withPostgreSqlTestDatabase("relation-acl-drift", async (database) => {
       await database.migrator.query({

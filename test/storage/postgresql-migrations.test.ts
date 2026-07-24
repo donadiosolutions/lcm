@@ -938,6 +938,8 @@ describe("PostgreSQL migration runner", () => {
       "attribute.attnotnull",
       "attribute.attidentity",
       "relation.relpersistence",
+      "relation.relrowsecurity",
+      "relation.relforcerowsecurity",
       "trigger.tgenabled",
       "trigger.tgconstraint",
       "object_name",

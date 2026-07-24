@@ -97,7 +97,9 @@ does not add row-level security.
   fingerprints bind the exact table and column to its formatted type,
   nullability, deparsed default, identity state, and resolved
   namespace-qualified collation. Table fingerprints require ordinary permanent
-  persistence, so `UNLOGGED` or temporary drift fails closed. Relation ACL
+  persistence with row-level security disabled and not forced, so `UNLOGGED`,
+  temporary, `ENABLE ROW LEVEL SECURITY`, or `FORCE ROW LEVEL SECURITY` drift
+  fails closed. Relation ACL
   fingerprints expand the effective ACL, including PostgreSQL's default ACL
   when `relacl` is null, and normalize only the owning role. `PUBLIC`, named
   role, privilege, grant-option, foreign-grantor, or missing-owner drift on any

@@ -393,7 +393,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       index: "16e10e2a4fc080f52b11315ee2b03d5df258d216f293bb0051b56beb16035374",
       ordinaryColumn: "1cca7e1d3a1143074cb2eb2b809e816a2f4d1e06feba1e1b6bac46f8a725c487",
       relationAcl: "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
-      table: "ad9b74708b95d08b6d8f64c7c4fcabbb8e9089ba62707ec0c6002986c1ee7510",
+      table: "46e5fa830f718f92b845942ef96f545177cd337b0b8103f3691014804068a109",
       trigger: "2c858da82c9238186861e0bcd184952ff941c7233f98a16083b20e6528006fb9",
     },
     identityFunctions: [
@@ -1271,7 +1271,10 @@ export async function runPostgreSqlMigrations(
                ),
                actual_tables AS (
                  SELECT relation.relname AS table_name,
-                        relation.relpersistence::pg_catalog.text AS persistence
+                        relation.relpersistence::pg_catalog.text AS persistence,
+                        relation.relrowsecurity::pg_catalog.text AS row_security,
+                        relation.relforcerowsecurity::pg_catalog.text
+                          AS force_row_security
                  FROM pg_catalog.pg_class AS relation
                  JOIN pg_catalog.pg_namespace AS namespace
                    ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
@@ -1463,7 +1466,9 @@ export async function runPostgreSqlMigrations(
                                 pg_catalog.concat_ws(
                                   '|',
                                   table_name,
-                                  persistence
+                                  persistence,
+                                  row_security,
+                                  force_row_security
                                 ),
                                 E'\\n'
                                 ORDER BY table_name
