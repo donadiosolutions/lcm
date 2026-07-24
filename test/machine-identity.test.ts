@@ -18,6 +18,7 @@ import {
   isUuidV7,
   machineIdentityPath,
   MachineIdentityFileError,
+  normalizeMachineDisplayName,
   normalizeUuidV7,
   oldMachineIdentitiesDir,
   readMachineIdentity,
@@ -63,6 +64,35 @@ describe("machine identity file", () => {
     expect(first.identity.identityKey).toMatch(/^machine:[a-f0-9]{64}$/u);
     expect(second).toEqual({ identity: first.identity, created: false });
     expect(statSync(machineIdentityPath(home)).mode & 0o777).toBe(0o600);
+  });
+
+  it.each([
+    ["C1 lower boundary", "Machine\u0080name"],
+    ["C1 upper boundary", "Machine\u009fname"],
+    ["Arabic letter mark", "Machine\u061cname"],
+    ["left-to-right mark", "Machine\u200ename"],
+    ["right-to-left mark", "Machine\u200fname"],
+    ["bidi embedding lower boundary", "Machine\u202aname"],
+    ["bidi override upper boundary", "Machine\u202ename"],
+    ["bidi isolate lower boundary", "Machine\u2066name"],
+    ["bidi isolate upper boundary", "Machine\u2069name"],
+  ])("rejects terminal-unsafe %s display names", (_case, displayName) => {
+    expect(() => normalizeMachineDisplayName(displayName))
+      .toThrow("printable characters");
+    expect(() => ensurePendingMachineIdentity(displayName, home))
+      .toThrow("printable characters");
+  });
+
+  it.each([
+    "Machine\u00a0name",
+    "Machine\u061bname",
+    "Machine\u061dname",
+    "Machine\u201fname",
+    "Machine\u202fname",
+    "Machine\u2065name",
+    "Machine\u206aname",
+  ])("retains printable Unicode boundary display name %j", (displayName) => {
+    expect(normalizeMachineDisplayName(displayName)).toBe(displayName);
   });
 
   it("uses the hostname default and adopts the winner of an exclusive registration race", () => {

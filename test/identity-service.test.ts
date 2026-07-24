@@ -46,6 +46,7 @@ import {
   type RemoteProjectAliasMutation,
 } from "../src/storage/postgresql/identity-repository.js";
 import { PostgreSqlCommitOutcomeUnknownError } from "../src/storage/postgresql/errors.js";
+import { quoteShellArgument } from "../src/shell-quote.js";
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const PROJECT_A = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
@@ -421,9 +422,7 @@ describe("identity service", () => {
 
     expect(created.local).toEqual({ ...before, remoteProjectId: PROJECT_A });
     expect(created.remote).toMatchObject({ projectId: PROJECT_A, displayName: "Created" });
-    expect(repository.createProject).toHaveBeenCalledWith(expect.objectContaining({
-      identityKey: before.id,
-    }));
+    expect(repository.createProject.mock.calls[0]?.[0]).not.toHaveProperty("identityKey");
     await expect(createProject(POSTGRESQL_CONFIG, path, {}, deps))
       .rejects.toThrow("already bound");
   });
@@ -481,7 +480,9 @@ describe("identity service", () => {
     repository.resolveProject = vi.fn(async () => null);
     await expect(createProject(POSTGRESQL_CONFIG, absent, { displayName: "A Name" }, deps))
       .rejects.toMatchObject({
-        remediation: expect.stringContaining(`lcm project create ${absent} --name "A Name"`),
+        remediation: expect.stringContaining(
+          `lcm project create --name ${quoteShellArgument("A Name")} -- ${quoteShellArgument(absent)}`,
+        ),
       });
 
     const mismatched = makeProject("create-uncertain-mismatched");
@@ -492,7 +493,9 @@ describe("identity service", () => {
     await expect(createProject(POSTGRESQL_CONFIG, mismatched, {}, deps))
       .rejects.toMatchObject({
         message: expect.stringContaining(`candidate ${PROJECT_A}`),
-        remediation: expect.stringContaining(`lcm project show ${mismatched} --json`),
+        remediation: expect.stringContaining(
+          `lcm project show --json -- ${quoteShellArgument(mismatched)}`,
+        ),
       });
 
     const mixed = makeProject("create-uncertain-mixed");
@@ -514,8 +517,31 @@ describe("identity service", () => {
     });
     await expect(createProject(POSTGRESQL_CONFIG, unreadable, {}, deps))
       .rejects.toMatchObject({
-        remediation: expect.stringContaining(`lcm project link ${PROJECT_A} ${unreadable}`),
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_A)} ${quoteShellArgument(unreadable)}`,
+        ),
       });
+  });
+
+  it("shell-quotes every dynamic create retry argument without interpolation", async () => {
+    await register();
+    const projectPath = makeProject("-- spaced ' ` $(not-executed)");
+    const displayName = "-- Name ' ` $(not-executed)";
+    repository.createProject = vi.fn(async () => {
+      throw new PostgreSqlIdentityCreateOutcomeUnknownError(
+        remoteProject(PROJECT_A, displayName),
+      );
+    });
+    repository.resolveProject = vi.fn(async () => null);
+
+    await expect(createProject(
+      POSTGRESQL_CONFIG,
+      projectPath,
+      { displayName },
+      deps,
+    )).rejects.toMatchObject({
+      remediation: `Rerun \`lcm project create --name ${quoteShellArgument(displayName)} -- ${quoteShellArgument(projectPath)}\`.`,
+    });
   });
 
   it("validates project paths and defaults the display name", async () => {
@@ -550,6 +576,7 @@ describe("identity service", () => {
     expect(repository.createProject).toHaveBeenCalledWith(
       expect.objectContaining({ displayName: "default-name" }),
     );
+    expect(repository.createProject.mock.calls.at(-1)?.[0]).not.toHaveProperty("identityKey");
   });
 
   it("compensates when a created remote project cannot be written locally", async () => {
@@ -592,7 +619,9 @@ describe("identity service", () => {
     await expect(createProject(POSTGRESQL_CONFIG, path, {}, deps))
       .rejects.toMatchObject({
         name: "ProjectIdentityReconciliationError",
-        remediation: expect.stringContaining(`lcm project link ${PROJECT_A}`),
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_A)}`,
+        ),
       });
   });
 
@@ -612,7 +641,9 @@ describe("identity service", () => {
     await expect(createProject(POSTGRESQL_CONFIG, path, {}, deps))
       .rejects.toMatchObject({
         name: "ProjectIdentityReconciliationError",
-        remediation: expect.stringContaining(`lcm project link ${PROJECT_A}`),
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_A)}`,
+        ),
       });
   });
 
@@ -1053,7 +1084,9 @@ describe("identity service", () => {
 
       await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_B, canonical, {}, deps))
         .rejects.toMatchObject({
-          remediation: expect.stringContaining(`lcm project link ${PROJECT_B}`),
+          remediation: expect.stringContaining(
+            `lcm project link -- ${quoteShellArgument(PROJECT_B)}`,
+          ),
         });
       repository = fakeRepository();
       deps = {
@@ -1090,7 +1123,9 @@ describe("identity service", () => {
 
     await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_B, path, {}, deps))
       .rejects.toMatchObject({
-        remediation: expect.stringContaining(`lcm project link ${PROJECT_B}`),
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_B)}`,
+        ),
       });
   });
 
@@ -1262,7 +1297,9 @@ describe("identity service", () => {
     repository.resolveProject = vi.fn(async () => null);
     await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, absent, {}, deps))
       .rejects.toMatchObject({
-        remediation: expect.stringContaining(`lcm project link ${PROJECT_A}`),
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_A)}`,
+        ),
       });
 
     const unavailable = makeProject("uncertain-readback-fails");
@@ -1417,7 +1454,9 @@ describe("identity service", () => {
     repository.resolveProject = vi.fn().mockRejectedValue(new Error("readback failed"));
     await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_B, path, {}, deps))
       .rejects.toMatchObject({
-        remediation: expect.stringContaining(`lcm project link ${PROJECT_B}`),
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_B)}`,
+        ),
       });
   });
 
@@ -1467,7 +1506,9 @@ describe("identity service", () => {
 
     await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, path, {}, deps))
       .rejects.toMatchObject({
-        remediation: expect.stringContaining(`lcm project link ${PROJECT_A}`),
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_A)}`,
+        ),
       });
   });
 
@@ -1486,7 +1527,9 @@ describe("identity service", () => {
     await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, path, {}, deps))
       .rejects.toMatchObject({
         name: "ProjectIdentityReconciliationError",
-        remediation: expect.stringContaining(`lcm project link ${PROJECT_A}`),
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_A)}`,
+        ),
       });
     expect(repository.restoreProjectAliasBatch).toHaveBeenCalledWith(
       MACHINE_ID,
@@ -1562,7 +1605,9 @@ describe("identity service", () => {
     const absent = makeProject("remote-alias-absent");
     await expect(linkProject(POSTGRESQL_CONFIG, bound.local.id, absent, {}, deps))
       .rejects.toMatchObject({
-        remediation: expect.stringContaining(`lcm project link ${PROJECT_A} ${absent}`),
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_A)} ${quoteShellArgument(absent)}`,
+        ),
     });
 
     const unreadable = makeProject("remote-alias-unreadable");
@@ -1605,7 +1650,9 @@ describe("identity service", () => {
 
     await expect(linkProject(POSTGRESQL_CONFIG, bound.local.id, occupied, {}, deps))
       .rejects.toMatchObject({
-        remediation: expect.stringContaining(`project unlink ${occupied}`),
+        remediation: expect.stringContaining(
+          `project unlink -- ${quoteShellArgument(occupied)}`,
+        ),
       });
   });
 
@@ -1629,7 +1676,7 @@ describe("identity service", () => {
       .rejects.toMatchObject({
         name: "ProjectIdentityReconciliationError",
         remediation: expect.stringContaining(
-          `lcm project link ${bound.local.id} ${occupied}`,
+          `lcm project link -- ${quoteShellArgument(bound.local.id)} ${quoteShellArgument(occupied)}`,
         ),
       });
     expect(repository.unlinkProjectAliasIfOwned).not.toHaveBeenCalled();
@@ -1654,6 +1701,35 @@ describe("identity service", () => {
         remoteAlias: { normalizedPath: linked },
       });
     expect(repository.unlinkProjectAliasIfOwned).not.toHaveBeenCalled();
+  });
+
+  it("does not confirm a different symlink with the same normalized realpath", async () => {
+    await register();
+    const canonical = makeProject("alias-lexical-race-canonical");
+    const aliasTarget = makeProject("alias-lexical-race-target");
+    const requested = join(home, "alias-lexical-race-requested");
+    const winner = join(home, "alias-lexical-race-winner");
+    symlinkSync(aliasTarget, requested, "dir");
+    symlinkSync(aliasTarget, winner, "dir");
+    const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    const originalLink = repository.linkProjectWithOwnership.getMockImplementation()!;
+    repository.linkProjectWithOwnership = vi.fn(async (input) => {
+      const remoteWinner = await originalLink({ ...input, path: winner });
+      addProjectAlias(winner, { hash: bound.local.id });
+      return { alias: remoteWinner.alias, inserted: false };
+    });
+
+    await expect(linkProject(POSTGRESQL_CONFIG, bound.local.id, requested, {}, deps))
+      .rejects.toMatchObject({
+        name: "ProjectIdentityReconciliationError",
+        remediation: expect.stringContaining(quoteShellArgument(requested)),
+      });
+    expect(showProjectMapEntry(bound.local.id).entry.aliases).toEqual([winner]);
+    await expect(repository.resolveProject(MACHINE_ID, aliasTarget))
+      .resolves.toMatchObject({
+        projectId: PROJECT_A,
+        alias: { path: winner, normalizedPath: aliasTarget },
+      });
   });
 
   it("preserves a concurrent same-project alias winner when the local alias write collides", async () => {
@@ -1681,7 +1757,7 @@ describe("identity service", () => {
       .rejects.toMatchObject({
         name: "ProjectIdentityReconciliationError",
         remediation: expect.stringContaining(
-          `lcm project link ${bound.local.id} ${occupied}`,
+          `lcm project link -- ${quoteShellArgument(bound.local.id)} ${quoteShellArgument(occupied)}`,
         ),
       });
     expect(repository.unlinkProjectAliasIfOwned).not.toHaveBeenCalled();
@@ -1921,7 +1997,9 @@ describe("identity service", () => {
       });
     await expect(unlinkProject(POSTGRESQL_CONFIG, unreadable, deps))
       .rejects.toMatchObject({
-        remediation: expect.stringContaining(`lcm project unlink ${unreadable}`),
+        remediation: expect.stringContaining(
+          `lcm project unlink -- ${quoteShellArgument(unreadable)}`,
+        ),
       });
   });
 
@@ -2008,7 +2086,9 @@ describe("identity service", () => {
     });
     await expect(unlinkProject(POSTGRESQL_CONFIG, canonical, deps))
       .rejects.toMatchObject({
-        remediation: expect.stringContaining(`lcm project unlink ${canonical}`),
+        remediation: expect.stringContaining(
+          `lcm project unlink -- ${quoteShellArgument(canonical)}`,
+        ),
       });
     expect(resolveProjectIdentity(canonical).remoteProjectId).toBe(PROJECT_A);
     expect(bound.local.id).toBe(resolveProjectIdentity(canonical).id);
@@ -2165,7 +2245,9 @@ describe("identity service", () => {
 
       await expect(unlinkProject(POSTGRESQL_CONFIG, canonical, deps))
         .rejects.toMatchObject({
-          remediation: expect.stringContaining(`lcm project link ${PROJECT_A}`),
+          remediation: expect.stringContaining(
+            `lcm project link -- ${quoteShellArgument(PROJECT_A)}`,
+          ),
         });
       repository = fakeRepository();
       deps = {
@@ -2189,7 +2271,9 @@ describe("identity service", () => {
 
     await expect(unlinkProject(POSTGRESQL_CONFIG, canonical, deps))
       .rejects.toMatchObject({
-        remediation: expect.stringContaining(`lcm project link ${PROJECT_A}`),
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_A)}`,
+        ),
       });
   });
 
@@ -2230,7 +2314,9 @@ describe("identity service", () => {
 
     await expect(unlinkProject(POSTGRESQL_CONFIG, linked, deps))
       .rejects.toMatchObject({
-        remediation: expect.stringContaining(`lcm project link ${PROJECT_A}`),
+        remediation: expect.stringContaining(
+          `lcm project link -- ${quoteShellArgument(PROJECT_A)}`,
+        ),
       });
   });
 

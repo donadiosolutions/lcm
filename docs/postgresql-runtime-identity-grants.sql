@@ -15,6 +15,8 @@ GRANT INSERT (identity_key, display_name),
 ON TABLE lcm.machines TO :"lcm_runtime_role";
 
 GRANT SELECT, DELETE ON TABLE lcm.projects TO :"lcm_runtime_role";
+-- identity_key is an opaque random 32-byte value generated once per remote
+-- project creation. It is not a local path hash and remains immutable.
 GRANT INSERT (identity_key, display_name)
 ON TABLE lcm.projects TO :"lcm_runtime_role";
 

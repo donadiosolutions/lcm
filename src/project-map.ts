@@ -15,6 +15,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { lcmHomeDir, projectsDir } from "./runtime-paths.js";
 import {
   atomicWritePrivateFile,
+  atomicWritePrivateFileExclusive,
   deleteRegularFile,
   ensurePrivateDirectory,
   readBoundedRegularFile,
@@ -177,7 +178,8 @@ function createProjectMapReclaimClaim(
   }
   try {
     observer("after-claim-mkdir", claimPath);
-    if (!writePrivateFileExclusive(join(claimPath, "owner.json"), content)) {
+    observer("before-reclaim-owner-publish", join(claimPath, "owner.json"));
+    if (!atomicWritePrivateFileExclusive(join(claimPath, "owner.json"), content)) {
       throw new Error(`project map reclaim claim owner already exists: ${claimPath}`);
     }
     return true;
@@ -251,7 +253,8 @@ function acquireProjectMapMutationLock(
   content: string,
   observer: ProjectMapLockObserver,
 ): void {
-  if (writePrivateFileExclusive(lockPath, content)) return;
+  observer("before-main-lock-publish", lockPath);
+  if (atomicWritePrivateFileExclusive(lockPath, content)) return;
 
   const existing = readProjectMapLockOwner(lockPath);
   const state = lockOwnerState(existing.owner, observer);
@@ -285,7 +288,7 @@ function acquireProjectMapMutationLock(
       throw new Error("project map lock disappeared during stale-owner recovery; retry the operation");
     }
     observer("before-successor-lock-create", lockPath);
-    if (!writePrivateFileExclusive(lockPath, content)) {
+    if (!atomicWritePrivateFileExclusive(lockPath, content)) {
       throw new Error("project map mutation lock was claimed concurrently; retry the operation");
     }
   } finally {

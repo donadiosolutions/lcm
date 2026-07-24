@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { QueryResultRow } from "pg";
 import { StorageOperationError } from "../errors.js";
 import type { PostgreSqlQueryExecutor } from "./contracts.js";
@@ -363,13 +364,13 @@ export class PostgreSqlIdentityRepository {
 
   async createProject(input: {
     readonly machineId: string;
-    readonly identityKey: string;
     readonly displayName: string;
     readonly path: string;
     readonly normalizedPath: string;
     readonly aliases?: readonly RemoteProjectAliasInput[];
   }): Promise<RemoteProject> {
     const displayName = validatedProjectDisplayName(input.displayName);
+    const identityKey = randomBytes(32).toString("hex");
     let candidate: RemoteProject | undefined;
     try {
       return await this.executor.transaction(async (transaction) => {
@@ -377,7 +378,7 @@ export class PostgreSqlIdentityRepository {
           text: `INSERT INTO lcm.projects (identity_key, display_name)
                  VALUES ($1, $2)
                  RETURNING project_id, display_name, created_at, updated_at`,
-          values: [input.identityKey, displayName],
+          values: [identityKey, displayName],
         }, { domain: "identity", operation: "createProject" });
         const row = created.rows[0];
         if (!row) throw new PostgreSqlIdentityNotFoundError("project", displayName);

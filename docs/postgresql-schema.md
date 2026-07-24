@@ -276,7 +276,7 @@ deletion.
 | Table | Ownership and retention | Enforced invariants and indexes |
 | --- | --- | --- |
 | `machines` | Independent identity root. Retain through reimages and require aliases, transcripts, checkpoints, instructions, inbox events, and leases to be handled before deletion. All incoming references restrict deletion. | UUIDv7-enforced primary key; nonblank globally unique `identity_key`; optional nonblank display name; `last_seen_at >= registered_at`. |
-| `projects` | Independent identity root and project-scope anchor. No dependent table silently cascades from project deletion. | UUIDv7-enforced internal primary key; required unique 64-lowercase-hex `identity_key` stores the backend-neutral `ProjectIdentity.id` independently from the nonunique display name; `updated_at >= created_at`. |
+| `projects` | Independent identity root and project-scope anchor. No dependent table silently cascades from project deletion. | UUIDv7-enforced internal primary key; required unique `identity_key` is an opaque random 32-byte value generated for each PostgreSQL project creation and is never derived from a local path/hash; `updated_at >= created_at`. |
 | `project_aliases` | Explicit machine-to-project link retained until unlink. Both project and machine references restrict deletion. | `(machine_id, normalized_path)` primary key makes one normalized path on a machine resolve to one project; path is nonempty and normalized path is trimmed and nonempty. `project_aliases_project_idx` supports project-to-machine/path listing. |
 
 ### Source records
@@ -537,7 +537,7 @@ Replace `lcm_runtime` with the deployment's runtime role. The script grants
 schema `USAGE` and table `SELECT` where identity readback requires it. Writes
 are column-scoped: machines may insert only `identity_key` and `display_name`
 and update only `display_name` and `last_seen_at`; projects may insert only
-their backend-neutral `identity_key` and `display_name`, and may delete rows;
+their per-creation opaque random `identity_key` and `display_name`, and may delete rows;
 aliases may insert `project_id`, `machine_id`, `path`, and `normalized_path`,
 update only `project_id`, `path`, and `linked_at`, and delete rows. Generated
 IDs and timestamps remain unwritable, and immutable machine identity, project

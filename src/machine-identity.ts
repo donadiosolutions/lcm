@@ -69,7 +69,7 @@ export function normalizeMachineDisplayName(value: string | undefined): string {
   if (
     normalized.length === 0
     || normalized.length > 256
-    || /[\u0000-\u001f\u007f]/u.test(normalized)
+    || /[\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069]/u.test(normalized)
   ) {
     throw new MachineIdentityFileError(
       "machine display name must contain 1-256 printable characters",

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import type {
@@ -58,8 +59,6 @@ const projectRow = {
   created_at: new Date("2026-01-01T00:00:00Z"),
   updated_at: "2026-01-01T00:00:00.000Z",
 };
-const projectIdentityKey = "b".repeat(64);
-
 const aliasRow = {
   project_id: projectRow.project_id,
   machine_id: machineRow.machine_id,
@@ -149,7 +148,6 @@ describe("PostgreSQL identity repository", () => {
 
     await expect(repository.createProject({
       machineId: machineRow.machine_id,
-      identityKey: projectIdentityKey,
       displayName: "Project A",
       path: "/work/project",
       normalizedPath: "/work/project",
@@ -178,10 +176,17 @@ describe("PostgreSQL identity repository", () => {
       domain: "identity",
       operation: "createProject",
     });
-    expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
+    const createCall = db.query.mock.calls.find(
+      ([query]) => query.text.includes("INSERT INTO lcm.projects"),
+    );
+    expect(createCall?.[0]).toMatchObject({
       text: expect.stringContaining("identity_key, display_name"),
-      values: [projectIdentityKey, "Project A"],
-    }), expect.objectContaining({ operation: "createProject" }));
+      values: [expect.stringMatching(/^[a-f0-9]{64}$/u), "Project A"],
+    });
+    expect(createCall?.[0].values?.[0]).not.toBe(
+      createHash("sha256").update("/work/project").digest("hex"),
+    );
+    expect(createCall?.[1]).toMatchObject({ operation: "createProject" });
   });
 
   it.each([
@@ -198,7 +203,6 @@ describe("PostgreSQL identity repository", () => {
 
     await expect(repository.createProject({
       machineId: machineRow.machine_id,
-      identityKey: projectIdentityKey,
       displayName,
       path: aliasRow.path,
       normalizedPath: aliasRow.normalized_path,
@@ -218,13 +222,12 @@ describe("PostgreSQL identity repository", () => {
 
     await expect(repository.createProject({
       machineId: machineRow.machine_id,
-      identityKey: projectIdentityKey,
       displayName: "  Projeto café  ",
       path: aliasRow.path,
       normalizedPath: aliasRow.normalized_path,
     })).resolves.toMatchObject({ displayName: "Projeto café" });
     expect(db.query.mock.calls[0][0]).toMatchObject({
-      values: [projectIdentityKey, "Projeto café"],
+      values: [expect.stringMatching(/^[a-f0-9]{64}$/u), "Projeto café"],
     });
   });
 
@@ -232,7 +235,6 @@ describe("PostgreSQL identity repository", () => {
     const repository = new PostgreSqlIdentityRepository(executor(() => result([])));
     await expect(repository.createProject({
       machineId: machineRow.machine_id,
-      identityKey: projectIdentityKey,
       displayName: "Project A",
       path: "/work/project",
       normalizedPath: "/work/project",
@@ -259,7 +261,6 @@ describe("PostgreSQL identity repository", () => {
 
     const error = await repository.createProject({
       machineId: machineRow.machine_id,
-      identityKey: projectIdentityKey,
       displayName: "Project A",
       path: aliasRow.path,
       normalizedPath: aliasRow.normalized_path,

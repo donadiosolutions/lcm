@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -84,7 +85,6 @@ describe("PostgreSQL 18 machine and project identities", () => {
       expect(grantedMachine).toMatchObject({ displayName: "Granted" });
       const grantedProject = await repository.createProject({
         machineId: grantedMachine.machineId,
-        identityKey: "1".repeat(64),
         displayName: "Granted project",
         path: "/work/granted",
         normalizedPath: "/work/granted",
@@ -299,7 +299,6 @@ describe("PostgreSQL 18 machine and project identities", () => {
       );
       const project = await repository.createProject({
         machineId: machineA.machineId,
-        identityKey: "1".repeat(64),
         displayName: "Shared project",
         path: "/srv/a/project",
         normalizedPath: "/srv/a/project",
@@ -338,6 +337,65 @@ describe("PostgreSQL 18 machine and project identities", () => {
     });
   });
 
+  it("lets different machines create distinct projects at the same normalized path", async () => {
+    await withPostgreSqlTestDatabase("identity-same-path-different-machines", async (database) => {
+      await grantIdentityRuntimePrivileges(database);
+      const repository = new PostgreSqlIdentityRepository(database.runtime);
+      const [machineA, machineB] = await Promise.all([
+        repository.registerMachine(`machine:${"1".repeat(64)}`, "Machine A"),
+        repository.registerMachine(`machine:${"2".repeat(64)}`, "Machine B"),
+      ]);
+      const sharedPath = "/work/same-path";
+      const [projectA, projectB] = await Promise.all([
+        repository.createProject({
+          machineId: machineA.machineId,
+          displayName: "Machine A project",
+          path: sharedPath,
+          normalizedPath: sharedPath,
+        }),
+        repository.createProject({
+          machineId: machineB.machineId,
+          displayName: "Machine B project",
+          path: sharedPath,
+          normalizedPath: sharedPath,
+        }),
+      ]);
+
+      expect(projectA.projectId).not.toBe(projectB.projectId);
+      await expect(repository.resolveProject(machineA.machineId, sharedPath))
+        .resolves.toMatchObject({
+          projectId: projectA.projectId,
+          alias: { machineId: machineA.machineId },
+        });
+      await expect(repository.resolveProject(machineB.machineId, sharedPath))
+        .resolves.toMatchObject({
+          projectId: projectB.projectId,
+          alias: { machineId: machineB.machineId },
+        });
+
+      const persisted = await database.migrator.query<{
+        identity_key: string;
+        machine_id: string;
+        project_id: string;
+      }>({
+        text: `SELECT p.project_id::text, p.identity_key, a.machine_id::text
+               FROM lcm.projects AS p
+               JOIN lcm.project_aliases AS a USING (project_id)
+               ORDER BY p.project_id`,
+      }, { domain: "identity", operation: "readSamePathProjectIdentities" });
+      expect(persisted.rows).toHaveLength(2);
+      expect(new Set(persisted.rows.map(({ project_id: id }) => id))).toEqual(
+        new Set([projectA.projectId, projectB.projectId]),
+      );
+      expect(new Set(persisted.rows.map(({ identity_key: key }) => key)).size).toBe(2);
+      expect(persisted.rows.every(({ identity_key: key }) => /^[0-9a-f]{64}$/u.test(key)))
+        .toBe(true);
+      expect(new Set(persisted.rows.map(({ machine_id: id }) => id))).toEqual(
+        new Set([machineA.machineId, machineB.machineId]),
+      );
+    });
+  });
+
   it("enforces path uniqueness, preserves idempotent links, and rolls back failed creates", async () => {
     await withPostgreSqlTestDatabase("identity-conflict", async (database) => {
       await grantIdentityRuntimePrivileges(database);
@@ -348,7 +406,6 @@ describe("PostgreSQL 18 machine and project identities", () => {
       );
       const first = await repository.createProject({
         machineId: machine.machineId,
-        identityKey: "1".repeat(64),
         displayName: "First",
         path: "/work/collision",
         normalizedPath: "/work/collision",
@@ -368,7 +425,6 @@ describe("PostgreSQL 18 machine and project identities", () => {
       }, { domain: "identity", operation: "countProjectsBeforeRollback" });
       await expect(repository.createProject({
         machineId: machine.machineId,
-        identityKey: "2".repeat(64),
         displayName: "Must roll back",
         path: "/work/collision",
         normalizedPath: "/work/collision",
@@ -380,11 +436,24 @@ describe("PostgreSQL 18 machine and project identities", () => {
 
       const second = await repository.createProject({
         machineId: machine.machineId,
-        identityKey: "3".repeat(64),
         displayName: "Second",
         path: "/work/second",
         normalizedPath: "/work/second",
       });
+      const persistedKeys = await database.migrator.query<{ identity_key: string }>({
+        text: "SELECT identity_key FROM lcm.projects ORDER BY project_id",
+      }, { domain: "identity", operation: "readOpaqueProjectIdentityKeys" });
+      expect(persistedKeys.rows.map(({ identity_key: key }) => key)).toEqual([
+        expect.stringMatching(/^[0-9a-f]{64}$/u),
+        expect.stringMatching(/^[0-9a-f]{64}$/u),
+      ]);
+      expect(new Set(persistedKeys.rows.map(({ identity_key: key }) => key)).size).toBe(2);
+      expect(persistedKeys.rows.map(({ identity_key: key }) => key)).not.toContain(
+        createHash("sha256").update("/work/collision").digest("hex"),
+      );
+      expect(persistedKeys.rows.map(({ identity_key: key }) => key)).not.toContain(
+        createHash("sha256").update("/work/second").digest("hex"),
+      );
       await expect(repository.linkProject({
         machineId: machine.machineId,
         projectId: second.projectId,
@@ -415,7 +484,6 @@ describe("PostgreSQL 18 machine and project identities", () => {
       );
       const project = await repository.createProject({
         machineId: machine.machineId,
-        identityKey: "1".repeat(64),
         displayName: "Disposable",
         path: "/work/canonical",
         normalizedPath: "/work/canonical",
@@ -447,14 +515,12 @@ describe("PostgreSQL 18 machine and project identities", () => {
       );
       const original = await repository.createProject({
         machineId: machine.machineId,
-        identityKey: "1".repeat(64),
         displayName: "Original",
         path: "/work/reconcile",
         normalizedPath: "/work/reconcile",
       });
       const replacement = await repository.createProject({
         machineId: machine.machineId,
-        identityKey: "2".repeat(64),
         displayName: "Replacement",
         path: "/work/replacement",
         normalizedPath: "/work/replacement",
@@ -506,7 +572,6 @@ describe("PostgreSQL 18 machine and project identities", () => {
       });
       const foreign = await repository.createProject({
         machineId: machine.machineId,
-        identityKey: "3".repeat(64),
         displayName: "Foreign",
         path: "/work/foreign",
         normalizedPath: "/work/foreign",
@@ -579,7 +644,6 @@ describe("PostgreSQL 18 machine and project identities", () => {
 
       const disposable = await repository.createProject({
         machineId: machine.machineId,
-        identityKey: "4".repeat(64),
         displayName: "Disposable",
         path: "/work/disposable",
         normalizedPath: "/work/disposable",
@@ -717,7 +781,6 @@ describe("PostgreSQL 18 machine and project identities", () => {
       );
       const project = await repository.createProject({
         machineId: machine.machineId,
-        identityKey: "1".repeat(64),
         displayName: "Link race target",
         path: "/work/link-race-root",
         normalizedPath: "/work/link-race-root",

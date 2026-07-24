@@ -199,6 +199,29 @@ describe("project map", () => {
     expect(listProjectMapEntries()[local.id].remoteProjectId).toBe(remoteProjectId);
   });
 
+  it("publishes a complete lock owner atomically when another contender wins initialization", () => {
+    const canonical = makeDir("remote-lock-publication-race");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    const completeWinner = `${JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      processStartTime: null,
+      nonce: "f".repeat(32),
+    })}\n`;
+
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _lockObserverForTesting: (event, path) => {
+        if (event !== "before-main-lock-publish") return;
+        expect(path).toBe(lockPath);
+        expect(existsSync(path)).toBe(false);
+        writeFileSync(path, completeWinner, { mode: 0o600 });
+      },
+    })).toThrow("owner state is ambiguous");
+    expect(readFileSync(lockPath, "utf8")).toBe(completeWinner);
+  });
+
   it("reclaims only dead or PID-reused map lock owners", () => {
     const canonical = makeDir("remote-stale-lock");
     resolveProjectIdentity(canonical);

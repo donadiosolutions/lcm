@@ -75,4 +75,13 @@ describe("openPostgreSqlIdentitySession", () => {
     await expect(openPostgreSqlIdentitySession(postgresql)).rejects.toThrow("probe failed");
     expect(state.close).toHaveBeenCalledOnce();
   });
+
+  it("preserves the primary health failure when cleanup also rejects", async () => {
+    const healthFailure = new Error("primary health failure");
+    state.health.mockRejectedValue(healthFailure);
+    state.close.mockRejectedValueOnce(new Error("secondary close failure"));
+
+    await expect(openPostgreSqlIdentitySession(postgresql)).rejects.toBe(healthFailure);
+    expect(state.close).toHaveBeenCalledOnce();
+  });
 });

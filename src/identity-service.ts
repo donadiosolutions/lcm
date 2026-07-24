@@ -44,13 +44,13 @@ import {
 } from "./storage/postgresql/identity-repository.js";
 import { PostgreSqlCommitOutcomeUnknownError } from "./storage/postgresql/errors.js";
 import { PostgreSqlRuntime } from "./storage/postgresql/runtime.js";
+import { quoteShellArgument } from "./shell-quote.js";
 
 export interface IdentityRepository {
   registerMachine(identityKey: string, displayName: string): Promise<RegisteredMachine>;
   recoverMachine(machineId: string): Promise<RegisteredMachine>;
   createProject(input: {
     readonly machineId: string;
-    readonly identityKey: string;
     readonly displayName: string;
     readonly path: string;
     readonly normalizedPath: string;
@@ -180,7 +180,11 @@ export async function openPostgreSqlIdentitySession(
       close: () => runtime.close(),
     };
   } catch (error) {
-    await runtime.close();
+    try {
+      await runtime.close();
+    } catch {
+      // Preserve the health/setup failure; cleanup is best-effort.
+    }
     throw error;
   }
 }
@@ -220,7 +224,7 @@ function remoteEntryPaths(entry: ProjectMapEntry): Array<{
     if (prior && prior.path !== remote.path) {
       throw new ProjectIdentityReconciliationError(
         `local project paths ${prior.path} and ${remote.path} resolve to the same PostgreSQL identity ${remote.normalizedPath}`,
-        "Remove the duplicate local alias with `lcm project unlink <alias>` before creating or linking the PostgreSQL project.",
+        `Remove the duplicate local alias with \`lcm project unlink -- ${quoteShellArgument(remote.path)}\` before creating or linking the PostgreSQL project.`,
       );
     }
     paths.set(remote.normalizedPath, remote);
@@ -237,12 +241,12 @@ function confirmedLocalRemoteBinding(
   try {
     const current = showProjectMapEntry(hash);
     if (current.transient || current.entry.remoteProjectId !== remoteProjectId) return null;
-    const currentPaths = new Set(
-      remoteEntryPaths(current.entry).map(({ normalizedPath }) => normalizedPath),
-    );
-    const required = new Set(requiredPaths.map(({ normalizedPath }) => normalizedPath));
+    const key = ({ path, normalizedPath }: RemoteProjectAliasInput): string =>
+      `${path}\u0000${normalizedPath}`;
+    const currentPaths = new Set(remoteEntryPaths(current.entry).map(key));
+    const required = new Set(requiredPaths.map(key));
     if (
-      [...required].some((normalizedPath) => !currentPaths.has(normalizedPath))
+      [...required].some((path) => !currentPaths.has(path))
       || (exact && currentPaths.size !== required.size)
     ) {
       return null;
@@ -325,7 +329,7 @@ async function coordinatedRemoteEntryPaths(
     if (prior && prior !== path.path) {
       throw new ProjectIdentityReconciliationError(
         `local project paths ${prior} and ${path.path} resolve to the same PostgreSQL identity ${path.normalizedPath}`,
-        "Remove the duplicate local alias with `lcm project unlink <alias>` before creating or linking the PostgreSQL project.",
+        `Remove the duplicate local alias with \`lcm project unlink -- ${quoteShellArgument(path.path)}\` before creating or linking the PostgreSQL project.`,
       );
     }
     normalizedOwners.set(path.normalizedPath, path.path);
@@ -486,7 +490,7 @@ export async function showProject(
   if (!remote) {
     throw new ProjectIdentityReconciliationError(
       `local project ${shown.hash} references missing PostgreSQL project ${shown.entry.remoteProjectId}`,
-      `Run \`lcm project unlink ${shown.entry.canonical}\` or link the correct project explicitly.`,
+      `Run \`lcm project unlink -- ${quoteShellArgument(shown.entry.canonical)}\` or link the correct project explicitly.`,
     );
   }
   return { ...shown, remote };
@@ -508,7 +512,6 @@ async function createRemoteProject(
   repository: IdentityRepository,
   input: {
     readonly machineId: string;
-    readonly identityKey: string;
     readonly displayName: string;
     readonly path: string;
     readonly normalizedPath: string;
@@ -530,13 +533,13 @@ async function createRemoteProject(
     } catch {
       throw new ProjectIdentityReconciliationError(
         "PostgreSQL project creation commit outcome is unknown and readback failed",
-        `Inspect \`lcm project list --json\`, then run \`lcm project link ${candidate.projectId} ${input.path}\` only if that project owns the path.`,
+        `Inspect \`lcm project list --json\`, then run \`lcm project link -- ${quoteShellArgument(candidate.projectId)} ${quoteShellArgument(input.path)}\` only if that project owns the path.`,
       );
     }
     if (resolved.every((owner) => owner === null)) {
       throw new ProjectIdentityReconciliationError(
         "PostgreSQL did not retain the project aliases after the uncertain create",
-        `Rerun \`lcm project create ${input.path} --name ${JSON.stringify(input.displayName)}\`.`,
+        `Rerun \`lcm project create --name ${quoteShellArgument(input.displayName)} -- ${quoteShellArgument(input.path)}\`.`,
       );
     }
     if (resolved.every((owner) => owner?.projectId === candidate.projectId)) return candidate;
@@ -545,7 +548,7 @@ async function createRemoteProject(
     )];
     throw new ProjectIdentityReconciliationError(
       `PostgreSQL project creation candidate ${candidate.projectId} does not own every local path; observed owners: ${ownerIds.join(", ")}`,
-      `Run \`lcm project show ${input.path} --json\` and resolve the collision before retrying.`,
+      `Run \`lcm project show --json -- ${quoteShellArgument(input.path)}\` and resolve the collision before retrying.`,
     );
   }
 }
@@ -575,7 +578,6 @@ export async function createProject(
   return withSession(config, deps, async (repository) => {
     const remote = await createRemoteProject(repository, {
       machineId: machine.machineId,
-      identityKey: local.id,
       displayName,
       ...selectedPath,
       aliases: entryPaths,
@@ -593,7 +595,7 @@ export async function createProject(
       } catch {
         throw new ProjectIdentityReconciliationError(
           "PostgreSQL created the project but the local binding and automatic cleanup both failed",
-          `Run \`lcm project link ${remote.projectId} ${local.canonical}\` to reconcile it.`,
+          `Run \`lcm project link -- ${quoteShellArgument(remote.projectId)} ${quoteShellArgument(local.canonical)}\` to reconcile it.`,
         );
       }
       throw error;
@@ -634,7 +636,7 @@ async function confirmRemoteLink(
     }
     throw new ProjectIdentityReconciliationError(
       "PostgreSQL project linking did not produce an authoritative result",
-      `Rerun \`lcm project link ${input.projectId} ${input.path}\`; the operation is idempotent.`,
+      `Rerun \`lcm project link -- ${quoteShellArgument(input.projectId)} ${quoteShellArgument(input.path)}\`; the operation is idempotent.`,
     );
   }
 }
@@ -668,7 +670,7 @@ async function confirmRemoteBatchReplacement(
     } catch {
       throw new ProjectIdentityReconciliationError(
         "PostgreSQL project rebind commit outcome is unknown and readback failed",
-        `Inspect \`lcm project list --json\`, then rerun \`lcm project link ${input.projectId} ${input.recoveryPath}\`.`,
+        `Inspect \`lcm project list --json\`, then rerun \`lcm project link -- ${quoteShellArgument(input.projectId)} ${quoteShellArgument(input.recoveryPath)}\`.`,
       );
     }
     if (resolved.every((owner) => owner?.projectId === input.projectId)) {
@@ -692,7 +694,7 @@ async function confirmRemoteBatchReplacement(
     })) {
       throw new ProjectIdentityReconciliationError(
         "PostgreSQL retained the prior alias owners after the uncertain project rebind",
-        `Rerun \`lcm project link ${input.projectId} ${input.recoveryPath}\`; the operation is safe to retry.`,
+        `Rerun \`lcm project link -- ${quoteShellArgument(input.projectId)} ${quoteShellArgument(input.recoveryPath)}\`; the operation is safe to retry.`,
       );
     }
     throw new ProjectIdentityReconciliationError(
@@ -760,14 +762,14 @@ async function confirmRemoteAliasUnlink(
     } catch {
       throw new ProjectIdentityReconciliationError(
         "PostgreSQL alias unlink commit outcome is unknown and readback failed",
-        `Inspect \`lcm project list --json\`, then rerun \`lcm project unlink ${path}\`.`,
+        `Inspect \`lcm project list --json\`, then rerun \`lcm project unlink -- ${quoteShellArgument(path)}\`.`,
       );
     }
     if (!resolved) return error.candidate;
     if (resolved.projectId === expectedProjectId) {
       throw new ProjectIdentityReconciliationError(
         "PostgreSQL retained the alias after the uncertain unlink",
-        `Rerun \`lcm project unlink ${path}\`; the operation is safe to retry.`,
+        `Rerun \`lcm project unlink -- ${quoteShellArgument(path)}\`; the operation is safe to retry.`,
       );
     }
     throw new ProjectIdentityReconciliationError(
@@ -812,7 +814,7 @@ async function confirmRemoteProjectAliasesUnlink(
       ))) {
         throw new ProjectIdentityReconciliationError(
           "PostgreSQL retained the local project aliases after the uncertain unlink",
-          `Rerun \`lcm project unlink ${canonicalPath}\`; the operation is safe to retry.`,
+          `Rerun \`lcm project unlink -- ${quoteShellArgument(canonicalPath)}\`; the operation is safe to retry.`,
         );
       }
       throw new ProjectIdentityReconciliationError(
@@ -823,7 +825,7 @@ async function confirmRemoteProjectAliasesUnlink(
       if (readbackError instanceof ProjectIdentityReconciliationError) throw readbackError;
       throw new ProjectIdentityReconciliationError(
         "PostgreSQL project unlink commit outcome is unknown and readback failed",
-        `Inspect \`lcm project list --json\`, then rerun \`lcm project unlink ${canonicalPath}\`.`,
+        `Inspect \`lcm project list --json\`, then rerun \`lcm project unlink -- ${quoteShellArgument(canonicalPath)}\`.`,
       );
     }
   }
@@ -947,7 +949,7 @@ async function linkRemoteProject(
       if (!restored) {
         throw new ProjectIdentityReconciliationError(
           "the local project map write failed and PostgreSQL could not be restored",
-          `Inspect \`lcm project list --json\`, then rerun \`lcm project link ${normalizedRemoteProjectId} ${projectPath}\`.`,
+          `Inspect \`lcm project list --json\`, then rerun \`lcm project link -- ${quoteShellArgument(normalizedRemoteProjectId)} ${quoteShellArgument(projectPath)}\`.`,
         );
       }
       throw error;
@@ -1011,13 +1013,13 @@ async function linkLocalAlias(
         } catch {
           throw new ProjectIdentityReconciliationError(
             "the local alias write failed and its PostgreSQL alias could not be removed",
-            `Run \`lcm project unlink ${aliasPath}\` to reconcile it.`,
+            `Run \`lcm project unlink -- ${quoteShellArgument(aliasPath)}\` to reconcile it.`,
           );
         }
       } else {
         throw new ProjectIdentityReconciliationError(
           "the local alias write lost a concurrent update while PostgreSQL retained the alias",
-          `Rerun \`lcm project link ${shown.hash} ${aliasPath}\`; the operation is idempotent.`,
+          `Rerun \`lcm project link -- ${quoteShellArgument(shown.hash)} ${quoteShellArgument(aliasPath)}\`; the operation is idempotent.`,
         );
       }
       throw error;
@@ -1097,7 +1099,7 @@ export async function unlinkProject(
         } catch {
           throw new ProjectIdentityReconciliationError(
             "the local unbind failed and PostgreSQL aliases could not be restored",
-            `Rerun \`lcm project link ${shown.entry.remoteProjectId} ${shown.entry.canonical}\`.`,
+            `Rerun \`lcm project link -- ${quoteShellArgument(shown.entry.remoteProjectId!)} ${quoteShellArgument(shown.entry.canonical)}\`.`,
           );
         }
         throw error;
@@ -1149,7 +1151,7 @@ export async function unlinkProject(
         } catch {
           throw new ProjectIdentityReconciliationError(
             "the local alias removal failed and PostgreSQL could not be restored",
-            `Rerun \`lcm project link ${shown.entry.remoteProjectId} ${aliasPath}\`.`,
+            `Rerun \`lcm project link -- ${quoteShellArgument(shown.entry.remoteProjectId!)} ${quoteShellArgument(aliasPath)}\`.`,
           );
         }
       }
