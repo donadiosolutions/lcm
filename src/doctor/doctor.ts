@@ -582,12 +582,14 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   let daemonStorageReady = false;
   let daemonVersion: string | undefined;
   let daemonPid: number | undefined;
+  let initialHealthPid: number | undefined;
   try {
     const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
     if (h) {
       daemonHealthy = true;
       daemonStorageReady = h.status === "ok";
       daemonVersion = h.version;
+      initialHealthPid = h.pid;
     }
   } catch {}
 
@@ -617,7 +619,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         expectedStorageBackend: config.storageBackend,
         enforceUserManagerParent: true,
       });
-      if (ensureResult.connected) daemonPid = ensureResult.pid;
+      if (ensureResult.connected) daemonPid = ensureResult.pid ?? initialHealthPid;
 
       let postRestartVersion: string | undefined;
       let postRestartOk = false;
