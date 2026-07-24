@@ -115,6 +115,18 @@ describe("PostgreSQL identity repository", () => {
     });
   });
 
+  it("uses a deterministic valid display name when a legacy machine row has NULL", async () => {
+    const repository = new PostgreSqlIdentityRepository(executor(() => result([{
+      ...machineRow,
+      display_name: null,
+    }])));
+
+    await expect(repository.recoverMachine(machineRow.machine_id)).resolves.toMatchObject({
+      machineId: machineRow.machine_id,
+      displayName: `Machine ${machineRow.machine_id}`,
+    });
+  });
+
   it("creates a project and every initial alias in one transaction", async () => {
     const secondAlias = {
       ...aliasRow,
@@ -163,6 +175,46 @@ describe("PostgreSQL identity repository", () => {
       domain: "identity",
       operation: "createProject",
     });
+  });
+
+  it.each([
+    ["blank", "   ", "must not be blank"],
+    ["too long", "x".repeat(257), "at most 256"],
+    ["control characters", "bad\nname", "control characters"],
+  ])("rejects a %s project display name before opening a transaction", async (
+    _case,
+    displayName,
+    message,
+  ) => {
+    const db = executor(() => result([]));
+    const repository = new PostgreSqlIdentityRepository(db);
+
+    await expect(repository.createProject({
+      machineId: machineRow.machine_id,
+      displayName,
+      path: aliasRow.path,
+      normalizedPath: aliasRow.normalized_path,
+    })).rejects.toThrow(message);
+    expect(db.transaction).not.toHaveBeenCalled();
+  });
+
+  it("trims Unicode project display names at the persistence boundary", async () => {
+    const unicodeProjectRow = { ...projectRow, display_name: "Projeto café" };
+    const db = executor((config) => {
+      if (config.text.includes("INSERT INTO lcm.projects")) return result([unicodeProjectRow]);
+      if (config.text.includes("SELECT project_id FROM")) return result([{ project_id: projectRow.project_id }]);
+      if (config.text.includes("INSERT INTO lcm.project_aliases")) return result([aliasRow]);
+      throw new Error(`unexpected SQL: ${config.text}`);
+    });
+    const repository = new PostgreSqlIdentityRepository(db);
+
+    await expect(repository.createProject({
+      machineId: machineRow.machine_id,
+      displayName: "  Projeto café  ",
+      path: aliasRow.path,
+      normalizedPath: aliasRow.normalized_path,
+    })).resolves.toMatchObject({ displayName: "Projeto café" });
+    expect(db.query.mock.calls[0][0]).toMatchObject({ values: ["Projeto café"] });
   });
 
   it("rejects a project insert that returns no identity", async () => {

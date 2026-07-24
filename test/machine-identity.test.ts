@@ -18,6 +18,7 @@ import {
   isUuidV7,
   machineIdentityPath,
   MachineIdentityFileError,
+  normalizeUuidV7,
   oldMachineIdentitiesDir,
   readMachineIdentity,
   recoverMachineIdentity,
@@ -44,6 +45,8 @@ describe("machine identity file", () => {
     expect(machineIdentityPath(home)).toBe(join(home, ".lcm", "machine.json"));
     expect(oldMachineIdentitiesDir(home)).toBe(join(home, ".lcm", "oldmachines"));
     expect(isUuidV7(MACHINE_A)).toBe(true);
+    expect(isUuidV7(MACHINE_A.toUpperCase())).toBe(true);
+    expect(normalizeUuidV7(MACHINE_A.toUpperCase())).toBe(MACHINE_A);
     expect(isUuidV7("6ba7b810-9dad-41d1-80b4-00c04fd430c8")).toBe(false);
   });
 
@@ -126,6 +129,7 @@ describe("machine identity file", () => {
     ["long display", JSON.stringify({ version: 1, identityKey: `machine:${"a".repeat(64)}`, machineId: null, displayName: "a".repeat(257) })],
     ["control display", JSON.stringify({ version: 1, identityKey: `machine:${"a".repeat(64)}`, machineId: null, displayName: "bad\u0000name" })],
     ["machine ID", JSON.stringify({ version: 1, identityKey: `machine:${"a".repeat(64)}`, machineId: "not-uuid", displayName: "A" })],
+    ["machine ID type", JSON.stringify({ version: 1, identityKey: `machine:${"a".repeat(64)}`, machineId: 7, displayName: "A" })],
   ])("rejects %s machine identity content", (_label, content) => {
     mkdirSync(join(home, ".lcm"), { recursive: true });
     writeFileSync(machineIdentityPath(home), content, { mode: 0o600 });

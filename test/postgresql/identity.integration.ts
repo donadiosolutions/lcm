@@ -43,6 +43,25 @@ async function grantIdentityRuntimePrivileges(
 }
 
 describe("PostgreSQL 18 machine and project identities", () => {
+  it("recovers a legacy NULL machine display name with a deterministic fallback", async () => {
+    await withPostgreSqlTestDatabase("identity-null-machine-name", async (database) => {
+      await grantIdentityRuntimePrivileges(database);
+      const inserted = await database.migrator.query<{ machine_id: string }>({
+        text: `INSERT INTO lcm.machines (identity_key, display_name)
+               VALUES ($1, NULL)
+               RETURNING machine_id`,
+        values: [`machine:${"f".repeat(64)}`],
+      }, { domain: "identity", operation: "insertNullMachineDisplayName" });
+      const machineId = inserted.rows[0].machine_id;
+      const repository = new PostgreSqlIdentityRepository(database.runtime);
+
+      await expect(repository.recoverMachine(machineId)).resolves.toMatchObject({
+        machineId,
+        displayName: `Machine ${machineId}`,
+      });
+    });
+  });
+
   it("fails without identity grants and the reviewed grant script is least-privilege", async () => {
     await withPostgreSqlTestDatabase("identity-grants", async (database) => {
       const identityKey = `machine:${"0".repeat(64)}`;

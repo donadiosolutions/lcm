@@ -131,6 +131,116 @@ describe("ensureDaemon", () => {
     }
   }, 10_000);
 
+  it("accepts an authenticated staged PostgreSQL daemon with sanitized 503 readiness", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-staged-postgresql-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "4242");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    const fetchMock = vi.fn().mockImplementation(async (url: string): Promise<Response> => {
+      if (url.endsWith("/health")) {
+        return {
+          ok: false,
+          status: 503,
+          json: async () => ({
+            status: "unavailable",
+            version: "1.2.3",
+            storageBackend: "postgresql",
+            pid: 4242,
+            storage: {
+              status: "unavailable",
+              error: {
+                code: "STORAGE_INITIALIZATION_FAILED",
+                backend: "postgresql",
+                domain: "factory",
+                operation: "health",
+              },
+            },
+          }),
+        } as Response;
+      }
+      return {
+        ok: false,
+        status: 503,
+        json: async () => ({
+          error: "pool stats is unavailable while PostgreSQL storage repositories are staged",
+          storageBackend: "postgresql",
+        }),
+      } as Response;
+    });
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      expectedStorageBackend: "postgresql",
+      _skipSpawn: true,
+      _fetchOverride: fetchMock as FetchOverride,
+      _isProcessAliveOverride: (): boolean => true,
+      _listeningPortsOverride: (): number[] => [19999],
+    });
+
+    expect(result).toMatchObject({ connected: true, spawned: false, pid: 4242 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects malformed staged PostgreSQL 503 readiness", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-malformed-postgresql-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "4242");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => ({
+        status: "unavailable",
+        version: "1.2.3",
+        storageBackend: "postgresql",
+        pid: 4242,
+        storage: { status: "unavailable", error: { code: "wrong" } },
+      }),
+    } as Response);
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      expectedStorageBackend: "postgresql",
+      _skipSpawn: true,
+      _fetchOverride: fetchMock as FetchOverride,
+      _isProcessAliveOverride: (): boolean => true,
+      _listeningPortsOverride: (): number[] => [19999],
+    });
+
+    expect(result.connected).toBe(false);
+    expect(fetchMock.mock.calls.every(([url]) => String(url).endsWith("/health"))).toBe(true);
+  });
+
+  it("rejects a non-object 503 health response", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-non-object-health-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => null,
+    } as Response);
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedStorageBackend: "postgresql",
+      _skipSpawn: true,
+      _fetchOverride: fetchMock as FetchOverride,
+    });
+
+    expect(result.connected).toBe(false);
+  });
+
   it("does not connect when health passes but authenticated routes reject the local token", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-auth-"));
     tempDirs.push(tempDir);

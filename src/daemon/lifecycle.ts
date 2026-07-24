@@ -74,7 +74,33 @@ type HealthResponse = {
   storageBackend?: StorageBackend;
   uptime?: number;
   pid?: number;
+  httpStatus?: number;
+  storage?: {
+    status?: string;
+    error?: {
+      code?: string;
+      backend?: string;
+      domain?: string;
+      operation?: string;
+    };
+  };
 };
+
+function isStagedPostgreSqlUnavailableHealth(health: HealthResponse | null): boolean {
+  const error = health?.storage?.error;
+  return health?.httpStatus === 503
+    && health.status === "unavailable"
+    && health.storageBackend === "postgresql"
+    && health.storage?.status === "unavailable"
+    && error?.code === "STORAGE_INITIALIZATION_FAILED"
+    && error.backend === "postgresql"
+    && error.domain === "factory"
+    && error.operation === "health";
+}
+
+function isRecognizedDaemonHealth(health: HealthResponse | null): health is HealthResponse {
+  return health?.status === "ok" || isStagedPostgreSqlUnavailableHealth(health);
+}
 
 function healthVersionMatches(health: HealthResponse | null, expectedVersion: string | undefined): boolean {
   return typeof expectedVersion === "string"
@@ -496,7 +522,12 @@ async function requestDaemonHealth(
   try {
     const url = `http://127.0.0.1:${port}/health`;
     const res = await fetchFn(url, { signal });
-    return res.ok ? (await res.json()) as HealthResponse : null;
+    if (!res.ok && res.status !== 503) return null;
+    const body = await res.json() as unknown;
+    if (typeof body !== "object" || body === null || typeof (body as HealthResponse).status !== "string") {
+      return null;
+    }
+    return { ...(body as HealthResponse), httpStatus: res.status };
   } catch {
     return null;
   }
@@ -545,6 +576,7 @@ async function checkDaemonAccess(
   tokenPath: string,
   fetchFn: typeof globalThis.fetch,
   deadline: RequestDeadline,
+  expectedStorageBackend: StorageBackend,
 ): Promise<boolean> {
   const token = readAuthToken(tokenPath);
   if (!token) return false;
@@ -553,7 +585,14 @@ async function checkDaemonAccess(
       headers: { Authorization: `Bearer ${token}` },
       signal,
     });
-    return res.ok;
+    if (res.ok) return true;
+    if (expectedStorageBackend !== "postgresql" || res.status !== 503) return false;
+    const body = await res.json() as unknown;
+    return typeof body === "object"
+      && body !== null
+      && (body as { storageBackend?: unknown }).storageBackend === "postgresql"
+      && (body as { error?: unknown }).error
+        === "pool stats is unavailable while PostgreSQL storage repositories are staged";
   };
   try {
     return await runWithDeadline((signal: AbortSignal): Promise<boolean> => request(signal), deadline);
@@ -789,7 +828,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   function endpointIdentityMatches(health: HealthResponse | null): boolean {
-    if (health?.status !== "ok" || health.pid === undefined) return false;
+    if (!isRecognizedDaemonHealth(health) || health?.pid === undefined) return false;
     const pid = readPidFile(opts.pidFilePath);
     if (pid === null || health.pid !== pid || !isAlive(pid)) return false;
     const listenerPorts = opts._listeningPortsOverride
@@ -878,7 +917,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         setTimeoutFn,
         clearTimeoutFn,
       };
-      if (!await checkDaemonAccess(opts.port, tokenPath, fetchFn, deadlineOptions)) return null;
+      if (!await checkDaemonAccess(opts.port, tokenPath, fetchFn, deadlineOptions, expectedStorageBackend)) return null;
     }
 
     let parent: ParentInspection | undefined;
@@ -946,13 +985,13 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const health = initialHealthDeadline
     ? await checkDaemonHealth(opts.port, fetchFn, initialHealthDeadline)
     : null;
-  if (health?.status === "ok") {
+  if (isRecognizedDaemonHealth(health)) {
     const initialAccessDeadline = remainingRequestDeadline();
     const identityMatches = endpointIdentityMatches(health);
     const versionMatches = healthVersionMatches(health, expectedVersion);
     const storageBackendMatches = healthStorageBackendMatches(health, expectedStorageBackend);
     const hasAccess = identityMatches && (versionMatches || !storageBackendMatches) && initialAccessDeadline
-      ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, initialAccessDeadline)
+      ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, initialAccessDeadline, health.storageBackend ?? expectedStorageBackend)
       : false;
     const mismatchRepair = await repairMismatchedDaemon(
       health,
@@ -1006,13 +1045,13 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         const retry = retryHealthDeadline
           ? await checkDaemonHealth(opts.port, fetchFn, retryHealthDeadline)
           : null;
-        if (retry?.status === "ok") {
+        if (isRecognizedDaemonHealth(retry)) {
           const retryAccessDeadline = remainingRequestDeadline();
           const retryIdentityMatches = endpointIdentityMatches(retry);
           const retryVersionMatches = healthVersionMatches(retry, expectedVersion);
           const retryStorageBackendMatches = healthStorageBackendMatches(retry, expectedStorageBackend);
           const retryHasAccess = retryIdentityMatches && (retryVersionMatches || !retryStorageBackendMatches) && retryAccessDeadline
-            ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, retryAccessDeadline)
+            ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, retryAccessDeadline, retry.storageBackend ?? expectedStorageBackend)
             : false;
           const mismatchRepair = await repairMismatchedDaemon(
             retry,
@@ -1149,13 +1188,19 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     const healthDeadline = remainingVerificationDeadline();
     if (!healthDeadline) return false;
     const health = await checkDaemonHealth(port, fetchFn, healthDeadline);
-    if (health?.status !== "ok" || health.pid !== pid) return false;
+    if (!isRecognizedDaemonHealth(health) || health.pid !== pid) return false;
     if (!healthVersionMatches(health, expectedVersion)) return false;
     // The current daemon may legitimately use a different backend during a
     // configured transition. Authenticate it independently; ensureOptions
     // applies expectedStorageBackend to the replacement below.
     const accessDeadline = remainingVerificationDeadline();
-    if (!accessDeadline || !await checkDaemonAccess(port, tokenPath, fetchFn, accessDeadline)) return false;
+    if (!accessDeadline || !await checkDaemonAccess(
+      port,
+      tokenPath,
+      fetchFn,
+      accessDeadline,
+      health.storageBackend ?? "sqlite",
+    )) return false;
     return true;
   }
   async function isManaged(pid: number): Promise<boolean> {

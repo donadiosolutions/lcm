@@ -504,6 +504,13 @@ describe("identity service", () => {
       .rejects.toThrow("must be an existing directory");
     await expect(createProject(POSTGRESQL_CONFIG, "/", {}, deps))
       .rejects.toThrow("display name must not be blank");
+    const named = makeProject("validated-name");
+    await expect(createProject(POSTGRESQL_CONFIG, named, { displayName: "bad\nname" }, deps))
+      .rejects.toThrow("control characters");
+    await expect(createProject(POSTGRESQL_CONFIG, named, { displayName: "x".repeat(257) }, deps))
+      .rejects.toThrow("at most 256");
+    await expect(createProject(POSTGRESQL_CONFIG, named, { displayName: "  Projeto café  " }, deps))
+      .resolves.toMatchObject({ remote: { displayName: "Projeto café" } });
 
     const path = makeProject("default-name");
     await createProject(POSTGRESQL_CONFIG, path, {}, deps);
@@ -616,7 +623,7 @@ describe("identity service", () => {
   it("links a remote UUID and requires acknowledgement only for data-bearing rebinds", async () => {
     await register();
     const path = makeProject("remote-link");
-    const first = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, path, {}, deps);
+    const first = await linkProject(POSTGRESQL_CONFIG, PROJECT_A.toUpperCase(), path, {}, deps);
     expect(first.local.remoteProjectId).toBe(PROJECT_A);
 
     mkdirSync(join(home, ".lcm", "projects", first.local.id), { recursive: true });
@@ -737,6 +744,32 @@ describe("identity service", () => {
       await expect(repository.resolveProject(MACHINE_ID, path))
         .resolves.toMatchObject({ projectId: PROJECT_B });
     }
+  });
+
+  it("rebinds a stale symlink alias using its immutable PostgreSQL path identity", async () => {
+    await register();
+    const canonical = makeProject("rebind-stale-canonical");
+    const originalTarget = makeProject("rebind-stale-original");
+    const replacementTarget = makeProject("rebind-stale-replacement");
+    const entered = join(home, "rebind-stale-entered");
+    symlinkSync(originalTarget, entered);
+    const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    await linkProject(POSTGRESQL_CONFIG, bound.local.id, entered, {}, deps);
+    rmSync(entered);
+    symlinkSync(replacementTarget, entered);
+
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_B, canonical, {}, deps))
+      .resolves.toMatchObject({ local: { remoteProjectId: PROJECT_B } });
+    expect(repository.replaceProjectAliases).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        aliases: expect.arrayContaining([
+          { path: entered, normalizedPath: originalTarget },
+        ]),
+      }),
+    );
+    await expect(repository.resolveProject(MACHINE_ID, originalTarget))
+      .resolves.toMatchObject({ projectId: PROJECT_B });
+    await expect(repository.resolveProject(MACHINE_ID, replacementTarget)).resolves.toBeNull();
   });
 
   it("restores every prior alias when a multi-alias rebind cannot update the local map", async () => {
@@ -1614,13 +1647,34 @@ describe("identity service", () => {
     });
 
     await expect(unlinkProject(POSTGRESQL_CONFIG, canonical, deps))
-      .rejects.toThrow(`remote binding changed; expected ${PROJECT_A}`);
+      .rejects.toThrow("changed during coordinated mutation");
     expect(resolveProjectIdentity(canonical).remoteProjectId).toBe(PROJECT_B);
     expect(repository.restoreProjectAliases).toHaveBeenCalledWith(
       MACHINE_ID,
       PROJECT_A,
       expect.arrayContaining([expect.objectContaining({ normalizedPath: canonical })]),
     );
+  });
+
+  it("retains a concurrent local alias and compensates a stale initial remote binding", async () => {
+    await register();
+    const canonical = makeProject("bind-cas-alias-canonical");
+    const concurrentAlias = makeProject("bind-cas-alias-new");
+    const local = resolveProjectIdentity(canonical);
+    const originalReplace = repository.replaceProjectAliases.getMockImplementation()!;
+    repository.replaceProjectAliases = vi.fn(async (input) => {
+      const mutation = await originalReplace(input);
+      addProjectAlias(concurrentAlias, { hash: local.id });
+      return mutation;
+    });
+
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps))
+      .rejects.toThrow("changed during coordinated mutation");
+    expect(listProjectMapEntries()[local.id]).toMatchObject({
+      aliases: [concurrentAlias],
+    });
+    expect(resolveProjectIdentity(canonical).remoteProjectId).toBeUndefined();
+    await expect(repository.resolveProject(MACHINE_ID, canonical)).resolves.toBeNull();
   });
 
   it("authoritatively readbacks ambiguous batch restoration after local unbind failure", async () => {

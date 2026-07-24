@@ -88,10 +88,11 @@ describe("project map", () => {
     const canonical = makeDir("remote-binding");
     const local = resolveProjectIdentity(canonical);
 
-    const bound = setRemoteProjectBinding(remoteProjectId, { canonical });
+    const bound = setRemoteProjectBinding(remoteProjectId.toUpperCase(), { canonical });
 
     expect(bound).toMatchObject({ hash: local.id, changed: true });
     expect(bound.entry.remoteProjectId).toBe(remoteProjectId);
+    expect(showProjectMapEntry(remoteProjectId.toUpperCase()).hash).toBe(local.id);
     expect(resolveProjectIdentity(canonical)).toEqual({
       ...local,
       remoteProjectId,
@@ -118,6 +119,25 @@ describe("project map", () => {
     expect(() => clearRemoteProjectBinding(canonical, remoteProjectId))
       .toThrow(`project ${local.id} remote binding changed; expected ${remoteProjectId}`);
     expect(resolveProjectIdentity(canonical)).toEqual(local);
+  });
+
+  it("fails closed when a remote UUID ambiguously names multiple local entries", () => {
+    const first = makeDir("remote-ambiguous-first");
+    const second = makeDir("remote-ambiguous-second");
+    const firstHash = hashProjectPath(first);
+    const secondHash = hashProjectPath(second);
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [firstHash]: { canonical: first, aliases: [], remoteProjectId },
+      [secondHash]: { canonical: second, aliases: [], remoteProjectId },
+    }));
+
+    expect(() => showProjectMapEntry(remoteProjectId.toUpperCase()))
+      .toThrow("maps to multiple local hashes");
+  });
+
+  it("reports an unknown remote UUID target without treating it as a path", () => {
+    expect(() => showProjectMapEntry(remoteProjectId))
+      .toThrow(`unknown remote project UUIDv7: ${remoteProjectId}`);
   });
 
   it("serializes remote binding mutations with a private exclusive lock", () => {
@@ -147,6 +167,61 @@ describe("project map", () => {
     expect(() => clearRemoteProjectBinding(canonical, remoteProjectId))
       .toThrow("project map mutation is already in progress");
     expect(listProjectMapEntries()[local.id].remoteProjectId).toBe(remoteProjectId);
+  });
+
+  it("serializes alias mutations and compares the complete expected entry", () => {
+    const canonical = makeDir("alias-lock-canonical");
+    const alias = makeDir("alias-lock-first");
+    const concurrent = makeDir("alias-lock-concurrent");
+    const local = resolveProjectIdentity(canonical);
+    const expectedEntry = showProjectMapEntry(local.id).entry;
+    let nestedError: unknown;
+
+    addProjectAlias(alias, {
+      hash: local.id,
+      expectedEntry,
+      _afterLockForTesting: () => {
+        try {
+          addProjectAlias(concurrent, { hash: local.id });
+        } catch (error) {
+          nestedError = error;
+        }
+      },
+    });
+
+    expect((nestedError as Error).message).toContain("project map mutation is already in progress");
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      hash: local.id,
+      expectedEntry,
+    })).toThrow("changed during coordinated mutation");
+    const current = showProjectMapEntry(local.id).entry;
+    expect(() => removeProjectAlias(alias, {
+      hash: local.id,
+      expectedEntry,
+    })).toThrow("changed during coordinated mutation");
+    expect(removeProjectAlias(alias, {
+      hash: local.id,
+      expectedEntry: current,
+    })).toMatchObject({ removed: true });
+  });
+
+  it("does not accept swapping the canonical path with an alias as the same expected entry", () => {
+    const canonical = makeDir("entry-cas-canonical");
+    const alias = makeDir("entry-cas-alias");
+    const local = resolveProjectIdentity(canonical);
+    addProjectAlias(alias, { hash: local.id });
+    const expectedEntry = showProjectMapEntry(local.id).entry;
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [local.id]: {
+        canonical: alias,
+        aliases: [canonical],
+      },
+    }, null, 2) + "\n");
+
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      hash: local.id,
+      expectedEntry,
+    })).toThrow("changed during coordinated mutation");
   });
 
   it("fails closed when a remote binding changes or disappears before clear", () => {

@@ -56,7 +56,12 @@ export function oldMachineIdentitiesDir(homeDir?: string): string {
 }
 
 export function isUuidV7(value: string): boolean {
-  return UUIDV7_RE.test(value);
+  return normalizeUuidV7(value) !== null;
+}
+
+export function normalizeUuidV7(value: string): string | null {
+  const normalized = value.toLowerCase();
+  return UUIDV7_RE.test(normalized) ? normalized : null;
 }
 
 export function normalizeMachineDisplayName(value: string | undefined): string {
@@ -110,9 +115,10 @@ function parseMachineIdentity(content: string): StoredMachineIdentity {
     );
   }
   const displayName = normalizeMachineDisplayName(record.displayName);
-  if (record.machineId !== null && (
-    typeof record.machineId !== "string" || !isUuidV7(record.machineId)
-  )) {
+  const machineId = record.machineId === null
+    ? null
+    : typeof record.machineId === "string" ? normalizeUuidV7(record.machineId) : null;
+  if (record.machineId !== null && machineId === null) {
     throw new MachineIdentityFileError(
       "machine.json contains an invalid PostgreSQL machine ID",
       "Run `lcm machine recover <machine-id> --force` to replace the stale file.",
@@ -121,7 +127,7 @@ function parseMachineIdentity(content: string): StoredMachineIdentity {
   return {
     version: MACHINE_IDENTITY_VERSION,
     identityKey: record.identityKey,
-    machineId: record.machineId,
+    machineId,
     displayName,
   };
 }
@@ -214,7 +220,8 @@ export function finalizeMachineIdentity(
   displayName: string,
   homeDir?: string,
 ): MachineIdentity {
-  if (!isUuidV7(machineId)) {
+  const normalizedMachineId = normalizeUuidV7(machineId);
+  if (!normalizedMachineId) {
     throw new MachineIdentityFileError(
       "PostgreSQL returned an invalid machine ID",
       "Verify the PostgreSQL 18 schema and rerun `lcm machine register`.",
@@ -227,16 +234,16 @@ export function finalizeMachineIdentity(
       "Run `lcm machine show` and recover the intended identity explicitly.",
     );
   }
-  if (current.machineId !== null && current.machineId !== machineId) {
+  if (current.machineId !== null && current.machineId !== normalizedMachineId) {
     throw new MachineIdentityFileError(
       "machine.json is stale and disagrees with PostgreSQL",
-      `Run \`lcm machine recover ${machineId} --force\` to reconcile it.`,
+      `Run \`lcm machine recover ${normalizedMachineId} --force\` to reconcile it.`,
     );
   }
   const identity: MachineIdentity = {
     version: MACHINE_IDENTITY_VERSION,
     identityKey: pending.identityKey,
-    machineId,
+    machineId: normalizedMachineId,
     displayName: normalizeMachineDisplayName(displayName),
   };
   atomicWritePrivateFile(machineIdentityPath(homeDir), prettyMachineIdentity(identity));

@@ -51,7 +51,7 @@ export interface RemoteAliasBatchMutation {
 type MachineRow = QueryResultRow & {
   machine_id: string;
   identity_key: string;
-  display_name: string;
+  display_name: string | null;
   registered_at: Date | string;
   last_seen_at: Date | string;
 };
@@ -220,11 +220,21 @@ function iso(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : value;
 }
 
+function validatedProjectDisplayName(value: string): string {
+  const normalized = value.trim();
+  if (normalized.length === 0) throw new Error("project display name must not be blank");
+  if (normalized.length > 256) throw new Error("project display name must be at most 256 characters");
+  if (/[\u0000-\u001f\u007f]/u.test(normalized)) {
+    throw new Error("project display name must not contain control characters");
+  }
+  return normalized;
+}
+
 function machineFromRow(row: MachineRow): RegisteredMachine {
   return {
     machineId: row.machine_id,
     identityKey: row.identity_key,
-    displayName: row.display_name,
+    displayName: row.display_name ?? `Machine ${row.machine_id}`,
     registeredAt: iso(row.registered_at),
     lastSeenAt: iso(row.last_seen_at),
   };
@@ -239,7 +249,18 @@ function aliasFromRow(row: AliasRow): RemoteProjectAlias {
   };
 }
 
-class PostgreSqlIdentityBatchConflictMarker extends Error {}
+class PostgreSqlIdentityBatchConflictMarker extends StorageOperationError {
+  constructor(projectId: string) {
+    super(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      projectId,
+      "identity",
+      "replaceProjectAliases",
+    );
+    this.name = "PostgreSqlIdentityBatchConflictMarker";
+  }
+}
 
 export class PostgreSqlIdentityRepository {
   constructor(private readonly executor: PostgreSqlIdentityExecutor) {}
@@ -280,6 +301,7 @@ export class PostgreSqlIdentityRepository {
     readonly normalizedPath: string;
     readonly aliases?: readonly RemoteProjectAliasInput[];
   }): Promise<RemoteProject> {
+    const displayName = validatedProjectDisplayName(input.displayName);
     let candidate: RemoteProject | undefined;
     try {
       return await this.executor.transaction(async (transaction) => {
@@ -287,10 +309,10 @@ export class PostgreSqlIdentityRepository {
           text: `INSERT INTO lcm.projects (display_name)
                  VALUES ($1)
                  RETURNING project_id, display_name, created_at, updated_at`,
-          values: [input.displayName],
+          values: [displayName],
         }, { domain: "identity", operation: "createProject" });
         const row = created.rows[0];
-        if (!row) throw new PostgreSqlIdentityNotFoundError("project", input.displayName);
+        if (!row) throw new PostgreSqlIdentityNotFoundError("project", displayName);
         const aliasInputs = input.aliases ?? [{
           path: input.path,
           normalizedPath: input.normalizedPath,
@@ -435,7 +457,7 @@ export class PostgreSqlIdentityRepository {
           final.rows.length !== input.aliases.length
           || final.rows.some((row) => row.project_id !== input.projectId)
         ) {
-          throw new PostgreSqlIdentityBatchConflictMarker();
+          throw new PostgreSqlIdentityBatchConflictMarker(input.projectId);
         }
         candidate = {
           aliases: input.aliases.map(

@@ -307,6 +307,40 @@ describe("runCli identity boundaries", () => {
     expect(await invoke(["project", "create", "--json"])).toBeUndefined();
   });
 
+  it("sanitizes persisted remote project text only for human output", async () => {
+    const log = vi.spyOn(console, "log");
+    const write = vi.spyOn(process.stdout, "write");
+    state.projectList.mockResolvedValueOnce({
+      local: [],
+      remote: [{
+        projectId: "remote-id",
+        displayName: "Remote\nInjected",
+        aliases: [{ machineId: "machine-id", path: "/safe\nInjected" }],
+      }],
+    });
+    await invoke(["project", "list"]);
+    expect(log).toHaveBeenCalledWith("  remote-id  Remote Injected");
+    expect(log).toHaveBeenCalledWith("    machine-id: /safe Injected");
+
+    log.mockClear();
+    state.projectShow.mockResolvedValueOnce({
+      hash: "hash",
+      entry: { canonical: "/canonical", aliases: [], remoteProjectId: "remote-id" },
+      remote: { projectId: "remote-id", displayName: "Remote\nInjected", aliases: [] },
+    });
+    await invoke(["project", "show"]);
+    expect(log).toHaveBeenCalledWith("  name: Remote Injected");
+
+    log.mockClear();
+    state.projectShow.mockResolvedValueOnce({
+      hash: "hash",
+      entry: { canonical: "/canonical", aliases: [], remoteProjectId: "remote-id" },
+      remote: { projectId: "remote-id", displayName: "Remote\nInjected", aliases: [] },
+    });
+    await invoke(["project", "show", "--json"]);
+    expect(write.mock.calls.map(([value]) => String(value)).join("")).toContain("\\nInjected");
+  });
+
   it("renders every machine operation in text and JSON forms", async () => {
     expect(await invoke(["machine", "register", "--name", "Workstation"])).toBeUndefined();
     expect(await invoke(["machine", "register", "--json"])).toBeUndefined();

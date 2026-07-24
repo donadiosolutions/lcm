@@ -1,11 +1,11 @@
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import type { ResolvedStorageConfig } from "./daemon/config.js";
 import {
   ensurePendingMachineIdentity,
   finalizeMachineIdentity,
-  isUuidV7,
   normalizeMachineDisplayName,
+  normalizeUuidV7,
   readMachineIdentity,
   recoverMachineIdentity,
   requireMachineIdentity,
@@ -197,7 +197,7 @@ function assertProjectDirectory(path: string): string {
 
 function remotePath(path: string): { readonly path: string; readonly normalizedPath: string } {
   const absolute = resolve(path);
-  return { path: absolute, normalizedPath: realpathSync(absolute) };
+  return { path: absolute, normalizedPath: normalizeProjectPath(absolute) };
 }
 
 function remoteEntryPaths(entry: ProjectMapEntry): Array<{
@@ -248,6 +248,33 @@ async function resolveStoredRemoteAliases(
     }
   }
   return resolved;
+}
+
+async function coordinatedRemoteEntryPaths(
+  repository: IdentityRepository,
+  machineId: string,
+  entry: ProjectMapEntry,
+): Promise<RemoteProjectAliasInput[]> {
+  const lexicalPaths = lexicalEntryPaths(entry);
+  if (!entry.remoteProjectId) return lexicalPaths.map(remotePath);
+  const stored = await resolveStoredRemoteAliases(
+    repository,
+    machineId,
+    entry.remoteProjectId,
+    lexicalPaths,
+  );
+  const storedByPath = new Map(stored.map((alias) => [alias.path, alias]));
+  return lexicalPaths.map((path) => storedByPath.get(path) ?? remotePath(path));
+}
+
+function normalizeProjectDisplayName(value: string): string {
+  const normalized = value.trim();
+  if (normalized.length === 0) throw new Error("project display name must not be blank");
+  if (normalized.length > 256) throw new Error("project display name must be at most 256 characters");
+  if (/[\u0000-\u001f\u007f]/u.test(normalized)) {
+    throw new Error("project display name must not contain control characters");
+  }
+  return normalized;
 }
 
 async function withSession<T>(
@@ -319,10 +346,11 @@ export async function recoverMachine(
   options: { readonly force?: boolean } = {},
   dependencyOverrides?: Partial<IdentityServiceDependencies>,
 ): Promise<MachineIdentityRecoveryResult> {
-  if (!isUuidV7(machineId)) throw new Error(`invalid PostgreSQL machine UUIDv7: ${machineId}`);
+  const normalizedMachineId = normalizeUuidV7(machineId);
+  if (!normalizedMachineId) throw new Error(`invalid PostgreSQL machine UUIDv7: ${machineId}`);
   const deps = dependencies(dependencyOverrides);
   return withSession(config, deps, async (repository) => {
-    const registered = await repository.recoverMachine(machineId);
+    const registered = await repository.recoverMachine(normalizedMachineId);
     return recoverMachineIdentity(machineFromRegistered(registered), {
       force: options.force,
       homeDir: deps.homeDir,
@@ -452,15 +480,17 @@ export async function createProject(
   const projectPath = assertProjectDirectory(path);
   const deps = dependencies(dependencyOverrides);
   const machine = requireMachineIdentity(deps.homeDir);
-  const displayName = options.displayName?.trim() || basename(normalizeProjectPath(projectPath));
-  if (!displayName) throw new Error("project display name must not be blank");
+  const displayName = normalizeProjectDisplayName(
+    options.displayName ?? basename(normalizeProjectPath(projectPath)),
+  );
   const local = resolveProjectIdentity(projectPath);
   if (local.remoteProjectId) {
     throw new Error(
       `local project ${local.id} is already bound to PostgreSQL project ${local.remoteProjectId}`,
     );
   }
-  const entryPaths = remoteEntryPaths(showProjectMapEntry(local.id).entry);
+  const shown = showProjectMapEntry(local.id);
+  const entryPaths = remoteEntryPaths(shown.entry);
   const selectedPath = remotePath(projectPath);
   return withSession(config, deps, async (repository) => {
     const remote = await createRemoteProject(repository, {
@@ -470,7 +500,7 @@ export async function createProject(
       aliases: entryPaths,
     });
     try {
-      setRemoteProjectBinding(remote.projectId, { hash: local.id });
+      setRemoteProjectBinding(remote.projectId, { hash: local.id, expectedEntry: shown.entry });
     } catch (error) {
       try {
         await compensateCreatedProject(
@@ -730,12 +760,14 @@ async function linkRemoteProject(
   readonly local: ProjectIdentity;
   readonly remoteAlias: RemoteProjectAlias;
 }> {
+  const normalizedRemoteProjectId = remoteProjectId;
   requirePostgreSqlConfig(config);
   const machine = requireMachineIdentity(deps.homeDir);
   const local = resolveProjectIdentity(projectPath);
+  const shown = showProjectMapEntry(local.id);
   if (
     local.remoteProjectId
-    && local.remoteProjectId !== remoteProjectId
+    && local.remoteProjectId !== normalizedRemoteProjectId
     && projectMapEntryHasStoredData(local.id)
     && !options.allowExistingData
   ) {
@@ -743,20 +775,26 @@ async function linkRemoteProject(
       `project ${local.id} already has local data; rerun with --allow-existing-data to rebind it explicitly`,
     );
   }
-  const path = remotePath(projectPath);
   return withSession(config, deps, async (repository) => {
-    const entryPaths = remoteEntryPaths(showProjectMapEntry(local.id).entry);
+    const entryPaths = await coordinatedRemoteEntryPaths(
+      repository,
+      machine.machineId,
+      shown.entry,
+    );
+    const selectedPath = entryPaths.find(
+      (entryPath) => entryPath.path === resolve(projectPath),
+    )!;
     const mutation = await confirmRemoteBatchReplacement(repository, {
       machineId: machine.machineId,
-      ...(local.remoteProjectId && local.remoteProjectId !== remoteProjectId
+      ...(local.remoteProjectId && local.remoteProjectId !== normalizedRemoteProjectId
         ? { expectedPriorProjectId: local.remoteProjectId }
         : {}),
-      projectId: remoteProjectId,
+      projectId: normalizedRemoteProjectId,
       aliases: entryPaths,
       recoveryPath: projectPath,
     });
     const remoteAlias = mutation.aliases.find(
-      (alias) => alias.normalizedPath === path.normalizedPath,
+      (alias) => alias.normalizedPath === selectedPath.normalizedPath,
     );
     if (!remoteAlias) {
       throw new ProjectIdentityReconciliationError(
@@ -765,9 +803,10 @@ async function linkRemoteProject(
       );
     }
     try {
-      setRemoteProjectBinding(remoteProjectId, {
+      setRemoteProjectBinding(normalizedRemoteProjectId, {
         hash: local.id,
         allowExistingData: options.allowExistingData,
+        expectedEntry: shown.entry,
       });
     } catch (error) {
       let restored = false;
@@ -775,7 +814,7 @@ async function linkRemoteProject(
         restored = await restoreRemoteBatchReplacement(
           repository,
           machine.machineId,
-          remoteProjectId,
+          normalizedRemoteProjectId,
           mutation,
           entryPaths,
         );
@@ -785,7 +824,7 @@ async function linkRemoteProject(
       if (!restored) {
         throw new ProjectIdentityReconciliationError(
           "the local project map write failed and PostgreSQL could not be restored",
-          `Inspect \`lcm project list --json\`, then rerun \`lcm project link ${remoteProjectId} ${projectPath}\`.`,
+          `Inspect \`lcm project list --json\`, then rerun \`lcm project link ${normalizedRemoteProjectId} ${projectPath}\`.`,
         );
       }
       throw error;
@@ -810,7 +849,7 @@ async function linkLocalAlias(
   const shown = showProjectMapEntry(target);
   if (shown.transient) throw new Error(`unknown local project target: ${target}`);
   if (!shown.entry.remoteProjectId) {
-    const result = addProjectAlias(aliasPath, targetOptions);
+    const result = addProjectAlias(aliasPath, { ...targetOptions, expectedEntry: shown.entry });
     return { local: resolveProjectIdentity(result.entry.canonical) };
   }
   requirePostgreSqlConfig(config);
@@ -824,7 +863,7 @@ async function linkLocalAlias(
       ...alias,
     });
     try {
-      addProjectAlias(aliasPath, targetOptions);
+      addProjectAlias(aliasPath, { ...targetOptions, expectedEntry: shown.entry });
     } catch (error) {
       if (!prior) {
         try {
@@ -863,8 +902,9 @@ export async function linkProject(
 }> {
   const projectPath = assertProjectDirectory(path);
   const deps = dependencies(dependencyOverrides);
-  return isUuidV7(target)
-    ? linkRemoteProject(config, target, projectPath, options, deps)
+  const remoteProjectId = normalizeUuidV7(target);
+  return remoteProjectId
+    ? linkRemoteProject(config, remoteProjectId, projectPath, options, deps)
     : linkLocalAlias(config, target, projectPath, deps);
 }
 
@@ -903,7 +943,9 @@ export async function unlinkProject(
         entryPaths,
       );
       try {
-        clearRemoteProjectBinding(shown.hash, shown.entry.remoteProjectId!);
+        clearRemoteProjectBinding(shown.hash, shown.entry.remoteProjectId!, {
+          expectedEntry: shown.entry,
+        });
       } catch (error) {
         try {
           const restored = await restoreRemoteUnlinkedAliases(
@@ -929,7 +971,7 @@ export async function unlinkProject(
     });
   }
   if (!shown.entry.remoteProjectId) {
-    removeProjectAlias(aliasPath, { hash: shown.hash });
+    removeProjectAlias(aliasPath, { hash: shown.hash, expectedEntry: shown.entry });
     return {
       hash: shown.hash,
       aliasRemoved: true,
@@ -955,7 +997,7 @@ export async function unlinkProject(
       )
       : null;
     try {
-      removeProjectAlias(aliasPath, { hash: shown.hash });
+      removeProjectAlias(aliasPath, { hash: shown.hash, expectedEntry: shown.entry });
     } catch (error) {
       if (removed) {
         try {

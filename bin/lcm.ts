@@ -29,6 +29,7 @@ import {
 } from "../src/runtime-paths.js";
 import type { ProgressState } from "../src/cli/progress-state.js";
 import { StorageBackendUnavailableError } from "../src/storage/backend.js";
+import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -389,8 +390,10 @@ export function registerProjectCommand(program: Command): void {
         if (result.remote) {
           console.log("PostgreSQL projects:");
           for (const remote of result.remote) {
-            console.log(`  ${remote.projectId}  ${remote.displayName}`);
-            for (const alias of remote.aliases) console.log(`    ${alias.machineId}: ${alias.path}`);
+            console.log(`  ${remote.projectId}  ${sanitizeTerminalText(remote.displayName)}`);
+            for (const alias of remote.aliases) {
+              console.log(`    ${alias.machineId}: ${sanitizeTerminalText(alias.path)}`);
+            }
           }
         }
       } catch (err) {
@@ -422,7 +425,7 @@ export function registerProjectCommand(program: Command): void {
           console.log(`  PostgreSQL project: ${shown.entry.remoteProjectId}`);
         }
         for (const alias of shown.entry.aliases) console.log(`  alias: ${alias}`);
-        if (shown.remote) console.log(`  name: ${shown.remote.displayName}`);
+        if (shown.remote) console.log(`  name: ${sanitizeTerminalText(shown.remote.displayName)}`);
       } catch (err) {
         projectError(err, opts);
       }
