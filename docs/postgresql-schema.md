@@ -61,18 +61,29 @@ does not add row-level security.
   inspection also schema-qualifies every catalog operator because it runs
   outside that migration transaction and runtime health uses the same
   inspection path.
-- Once `0002` is recorded, recurring readiness also checks an explicit
-  definition inventory of all 52 named secondary indexes, all 168 table
-  constraints, all three identity-enforcement triggers, and all 15 stored
-  generated columns. Each allowlisted object must exist, every index must
+- The definition and function fingerprints are registered by migration ID.
+  Before pending SQL, the runner checks the newest registered snapshot present
+  in the trusted ledger. After applying and recording the pending set, it checks
+  the newest snapshot registered for the target history in the same
+  transaction; failure rolls back both DDL and ledger rows. A future migration
+  can therefore add its own snapshot without requiring the pre-upgrade schema
+  to satisfy the future definition.
+- The `0002` snapshot checks an explicit definition inventory of all 52 named
+  secondary indexes, all 168 table constraints, all three identity-enforcement
+  triggers, all 15 stored generated columns, and all 204 ordinary columns.
+  Each allowlisted object must exist, every index must
   remain valid and ready, and canonical index, trigger, fully qualified
-  constraint, and generation-expression definitions must retain their pinned
-  fingerprints. Trigger fingerprints include the enablement mode and require
+  constraint, generation-expression, and ordinary-column definitions must
+  retain their pinned fingerprints. Trigger fingerprints include the
+  enablement mode and require
   ordinary enabled mode (`O`), so disabled, replica-only, and always-enabled
-  drift all fail readiness. Constraint fingerprints include the stable
+  drift all fail readiness. Constraint fingerprints bind the constraint name
+  to its owning table, type, fully qualified definition, and stable
   enablement-state multiset of their zero or more internal enforcement
   triggers. Generated-column fingerprints bind the exact table, column,
-  `attgenerated` state, and PostgreSQL-deparsed expression. Index ownership
+  `attgenerated` state, and PostgreSQL-deparsed expression. Ordinary-column
+  fingerprints bind the exact table and column to its formatted type,
+  nullability, deparsed default, and identity state. Index ownership
   follows the owning table; triggers and constraints are checked as existence
   and definition inventory.
   Additional operator-created objects remain outside the allowlist and are
@@ -380,8 +391,10 @@ on a provider does not justify silently expanding the baseline.
    existing `lcm` schema is owned by the current migration role, rejects
    schema-level `PUBLIC CREATE`, and verifies ownership of every existing
    allowlisted object before reading the complete ordered ledger. After the
-   ledger establishes that `0002` was applied, it verifies that every expected
-   managed object exists. `0001` creates the `lcm` schema and immutable ledger; `0002`
+   ledger establishes that `0002` was applied, it verifies the registered
+   `0002` schema snapshot before pending SQL. After applying the pending set, it
+   verifies the newest snapshot registered for the target history before
+   commit. `0001` creates the `lcm` schema and immutable ledger; `0002`
    first rejects a pre-existing `lcm` schema that grants `PUBLIC CREATE`, then
    creates the 23-table baseline data model and indexes, the backend-neutral
    project identity key, and bounded session-identity lookup keys. The guard does not

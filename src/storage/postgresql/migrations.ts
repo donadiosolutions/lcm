@@ -52,7 +52,19 @@ type ExpectedBaselineDefinitionInventory = {
   readonly generatedColumnIdentities: readonly string[];
   readonly indexNames: readonly string[];
   readonly objectCount: number;
+  readonly ordinaryColumnIdentities: readonly string[];
   readonly triggerIdentities: readonly string[];
+};
+type PostgreSqlSchemaSnapshot = ExpectedBaselineDefinitionInventory & {
+  readonly definitionHashes: {
+    readonly constraint: string;
+    readonly generatedColumn: string;
+    readonly index: string;
+    readonly ordinaryColumn: string;
+    readonly trigger: string;
+  };
+  readonly identityFunctionHashes: readonly [string, string, string];
+  readonly migrationId: string;
 };
 type BaselineDefinitionInventoryRow = QueryResultRow & {
   baseline_applied: unknown;
@@ -118,6 +130,82 @@ const EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES = [
   "summaries|summary_id_sha256",
   "summary_large_files|file_id_sha256",
 ] as const;
+
+const EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES = `
+  schema_migrations|id schema_migrations|checksum_sha256 schema_migrations|applied_at
+  machines|machine_id machines|identity_key machines|display_name machines|registered_at
+  machines|last_seen_at projects|project_id projects|identity_key projects|display_name
+  projects|created_at projects|updated_at project_aliases|project_id project_aliases|machine_id
+  project_aliases|path project_aliases|normalized_path project_aliases|linked_at
+  conversations|conversation_id conversations|project_id conversations|session_id
+  conversations|title conversations|bootstrapped_at conversations|created_at
+  conversations|updated_at messages|message_id messages|project_id messages|conversation_id
+  messages|seq messages|role messages|content messages|token_count messages|created_at
+  message_parts|part_id message_parts|project_id message_parts|conversation_id
+  message_parts|message_id message_parts|session_id message_parts|part_type
+  message_parts|ordinal message_parts|text_content message_parts|is_ignored
+  message_parts|is_synthetic message_parts|tool_call_id message_parts|tool_name
+  message_parts|tool_status message_parts|tool_input message_parts|tool_output
+  message_parts|tool_error message_parts|tool_title message_parts|patch_hash
+  message_parts|patch_files message_parts|file_mime message_parts|file_name
+  message_parts|file_url message_parts|subtask_prompt message_parts|subtask_desc
+  message_parts|subtask_agent message_parts|step_reason message_parts|step_cost
+  message_parts|step_tokens_in message_parts|step_tokens_out message_parts|snapshot_hash
+  message_parts|compaction_auto message_parts|metadata native_transcripts|transcript_id
+  native_transcripts|project_id native_transcripts|machine_id native_transcripts|client_name
+  native_transcripts|format_name native_transcripts|format_version
+  native_transcripts|native_session_id native_transcripts|source_locator
+  native_transcripts|source_ordinal native_transcripts|observed_at
+  native_transcripts|ingested_at native_transcripts|scrubber_version
+  native_transcripts|content_sha256 native_transcripts|ingest_key
+  native_transcripts|native_payload transcript_messages|project_id
+  transcript_messages|transcript_id transcript_messages|conversation_id
+  transcript_messages|message_id transcript_messages|source_ordinal summaries|summary_key
+  summaries|summary_id summaries|project_id summaries|conversation_id summaries|kind
+  summaries|depth summaries|content summaries|token_count summaries|earliest_at
+  summaries|latest_at summaries|descendant_count summaries|descendant_token_count
+  summaries|source_message_token_count summaries|created_at summary_messages|project_id
+  summary_messages|conversation_id summary_messages|summary_key summary_messages|message_id
+  summary_messages|ordinal summary_parents|project_id summary_parents|conversation_id
+  summary_parents|summary_key summary_parents|parent_summary_key summary_parents|ordinal
+  context_items|project_id context_items|conversation_id context_items|ordinal
+  context_items|item_type context_items|message_id context_items|summary_key
+  context_items|created_at large_files|file_key large_files|file_id large_files|project_id
+  large_files|conversation_id large_files|file_name large_files|mime_type
+  large_files|byte_size large_files|storage_uri large_files|exploration_summary
+  large_files|created_at summary_large_files|project_id summary_large_files|conversation_id
+  summary_large_files|summary_key summary_large_files|file_id summary_large_files|ordinal
+  promoted_memories|memory_id promoted_memories|project_id promoted_memories|content
+  promoted_memories|source_summary_id promoted_memories|source_project_id
+  promoted_memories|session_id promoted_memories|depth promoted_memories|confidence
+  promoted_memories|metadata promoted_memories|created_at promoted_memories|archived_at
+  promoted_memory_tags|project_id promoted_memory_tags|memory_id
+  promoted_memory_tags|ordinal promoted_memory_tags|tag recall_surfacing|surfacing_id
+  recall_surfacing|project_id recall_surfacing|memory_id recall_surfacing|session_id
+  redaction_counters|project_id redaction_counters|category redaction_counters|count
+  redaction_counters|updated_at ingest_checkpoints|project_id ingest_checkpoints|machine_id
+  ingest_checkpoints|client_name ingest_checkpoints|source_locator
+  ingest_checkpoints|last_source_ordinal ingest_checkpoints|imported_count
+  ingest_checkpoints|skipped_count ingest_checkpoints|quarantined_count
+  ingest_checkpoints|checkpoint ingest_checkpoints|updated_at session_ingest_log|ingest_key
+  session_ingest_log|project_id session_ingest_log|session_id
+  session_ingest_log|message_count session_ingest_log|completed_at
+  session_instructions|instruction_id session_instructions|project_id
+  session_instructions|machine_id session_instructions|slot session_instructions|content
+  session_instructions|content_hash session_instructions|updated_at
+  passive_event_inbox|inbox_id passive_event_inbox|project_id
+  passive_event_inbox|machine_id passive_event_inbox|event_id
+  passive_event_inbox|event_version passive_event_inbox|machine_sequence
+  passive_event_inbox|event_type passive_event_inbox|payload passive_event_inbox|status
+  passive_event_inbox|attempt_count passive_event_inbox|received_at
+  passive_event_inbox|next_attempt_at passive_event_inbox|claimed_at
+  passive_event_inbox|claimed_by passive_event_inbox|applied_at
+  passive_event_inbox|quarantined_at passive_event_inbox|quarantine_reason
+  fenced_leases|project_id fenced_leases|resource_type fenced_leases|resource_key
+  fenced_leases|owner_machine_id fenced_leases|owner_process_id fenced_leases|operation
+  fenced_leases|fencing_token fenced_leases|acquired_at fenced_leases|renewed_at
+  fenced_leases|expires_at fenced_leases|released_at
+`.trim().split(/\s+/u);
 
 const EXPECTED_BASELINE_CONSTRAINT_NAMES = `
   context_items_item_type_check context_items_check context_items_ordinal_check
@@ -236,15 +324,47 @@ const EXPECTED_BASELINE_DEFINITION_COUNT =
   EXPECTED_BASELINE_INDEX_NAMES.length
   + EXPECTED_BASELINE_TRIGGER_IDENTITIES.length
   + EXPECTED_BASELINE_CONSTRAINT_IDENTITIES.length
-  + EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES.length;
+  + EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES.length
+  + EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES.length;
 
   return {
     constraintIdentities: EXPECTED_BASELINE_CONSTRAINT_IDENTITIES,
     generatedColumnIdentities: EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES,
     indexNames: EXPECTED_BASELINE_INDEX_NAMES,
     objectCount: EXPECTED_BASELINE_DEFINITION_COUNT,
+    ordinaryColumnIdentities: EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES,
     triggerIdentities: EXPECTED_BASELINE_TRIGGER_IDENTITIES,
   } as const;
+}
+
+function postgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapshot[] {
+  return [{
+    ...expectedBaselineDefinitionInventory(),
+    definitionHashes: {
+      constraint: "f445a06d320f46f8c5d829f89a3a7bc0b13c5507096b111f125d9f0dd0ba0e2f",
+      generatedColumn: "c05b335f05f12f54649ae048f0233848e32eadc5422f8eaf5cd72183192ea36f",
+      index: "16e10e2a4fc080f52b11315ee2b03d5df258d216f293bb0051b56beb16035374",
+      ordinaryColumn: "e8d2b9f51f717ee058911aff792f8ebcccfc9451755d5803055426b8801a17af",
+      trigger: "2c858da82c9238186861e0bcd184952ff941c7233f98a16083b20e6528006fb9",
+    },
+    identityFunctionHashes: [
+      "2e4d8b18c207e251edfbc81dac50cd0e0dba45dc0768ef50eeded33f5571d975",
+      "89d25e96d0ccc63954135183605c7aadbcb4c726143c8c56c67b9cd49398957b",
+      "b7e1725a4d6ee95f3e806386025734c6d6d44853642231048a2b23a0d9fc6021",
+    ],
+    migrationId: "0002_schema_baseline",
+  }];
+}
+
+function latestPostgreSqlSchemaSnapshot(
+  migrationIds: readonly string[],
+): PostgreSqlSchemaSnapshot | null {
+  const appliedIds = new Set(migrationIds);
+  let latest: PostgreSqlSchemaSnapshot | null = null;
+  for (const snapshot of postgreSqlSchemaSnapshots()) {
+    if (appliedIds.has(snapshot.migrationId)) latest = snapshot;
+  }
+  return latest;
 }
 
 export class PostgreSqlServerVersionPreflightError extends StorageOperationError {
@@ -427,7 +547,7 @@ export class PostgreSqlBaselineDefinitionPreflightError extends StorageOperation
 
   readonly schemaName = "lcm";
   readonly remediation =
-    "Restore every missing or changed LCM baseline index, trigger, constraint, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.";
+    "Restore every missing or changed LCM baseline index, trigger, constraint, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.";
 
   override toJSON(): Record<string, unknown> {
     return {
@@ -845,13 +965,13 @@ export async function runPostgreSqlMigrations(
         throw migrationError("verifyMigrationHistory");
       }
     }
-    const baselineApplied = current.some(({ id }) => id === "0002_schema_baseline");
-    const missingObjectCount = baselineApplied
+    const baselineRecorded = current.some(({ id }) => id === "0002_schema_baseline");
+    const missingObjectCount = baselineRecorded
       ? expectedObjectCount - existingObjectCount
       : 0;
     if (missingObjectCount !== 0) {
       throw new PostgreSqlManagedObjectOwnershipPreflightError(
-        baselineApplied,
+        baselineRecorded,
         expectedObjectCount,
         existingObjectCount,
         missingObjectCount,
@@ -860,7 +980,10 @@ export async function runPostgreSqlMigrations(
       );
     }
 
-    const expectedBaselineDefinitions = expectedBaselineDefinitionInventory();
+    const assertSchemaSnapshot = async (
+      expectedBaselineDefinitions: PostgreSqlSchemaSnapshot,
+    ): Promise<void> => {
+    const baselineApplied = true;
     const baselineDefinitions =
       await transaction.query<BaselineDefinitionInventoryRow>({
         text: `WITH actual_indexes AS (
@@ -957,6 +1080,41 @@ export async function runPostgreSqlMigrations(
                      attribute.attname
                    ) OPERATOR(pg_catalog.=) ANY ($5::pg_catalog.text[])
                ),
+               actual_ordinary_columns AS (
+                 SELECT relation.relname AS table_name,
+                        attribute.attname AS column_name,
+                        pg_catalog.format_type(
+                          attribute.atttypid,
+                          attribute.atttypmod
+                        ) AS data_type,
+                        attribute.attnotnull::pg_catalog.text AS not_null,
+                        COALESCE(
+                          pg_catalog.pg_get_expr(
+                            attribute_default.adbin,
+                            attribute_default.adrelid,
+                            true
+                          ),
+                          ''
+                        ) AS default_expression,
+                        attribute.attidentity::pg_catalog.text AS identity_kind
+                 FROM pg_catalog.pg_attribute AS attribute
+                 JOIN pg_catalog.pg_class AS relation
+                   ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 LEFT JOIN pg_catalog.pg_attrdef AS attribute_default
+                   ON attribute_default.adrelid OPERATOR(pg_catalog.=) attribute.attrelid
+                  AND attribute_default.adnum OPERATOR(pg_catalog.=) attribute.attnum
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND attribute.attnum OPERATOR(pg_catalog.>) 0
+                   AND NOT attribute.attisdropped
+                   AND attribute.attgenerated OPERATOR(pg_catalog.=) ''
+                   AND pg_catalog.concat_ws(
+                     '|',
+                     relation.relname,
+                     attribute.attname
+                   ) OPERATOR(pg_catalog.=) ANY ($6::pg_catalog.text[])
+               ),
                actual_groups(object_kind, existing_count, definition_sha256) AS (
                  SELECT 'index'::pg_catalog.text,
                         pg_catalog.count(*)::pg_catalog.int4,
@@ -1008,13 +1166,14 @@ export async function runPostgreSqlMigrations(
                                 pg_catalog.concat_ws(
                                   '|',
                                   table_name,
+                                  object_name,
                                   constraint_type,
                                   definition,
                                   enabled_modes
                                 ),
                                 E'\\n'
-                                ORDER BY table_name, constraint_type, definition,
-                                  enabled_modes
+                                ORDER BY table_name, object_name, constraint_type,
+                                  definition, enabled_modes
                               ),
                               ''
                             ),
@@ -1047,6 +1206,32 @@ export async function runPostgreSqlMigrations(
                           'hex'
                         )
                  FROM actual_generated_columns
+                 UNION ALL
+                 SELECT 'ordinary_column'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  table_name,
+                                  column_name,
+                                  data_type,
+                                  not_null,
+                                  default_expression,
+                                  identity_kind
+                                ),
+                                E'\\n'
+                                ORDER BY table_name, column_name
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_ordinary_columns
                ),
                expected_groups(
                  object_kind,
@@ -1057,31 +1242,36 @@ export async function runPostgreSqlMigrations(
                    (
                      'index'::pg_catalog.text,
                      52::pg_catalog.int4,
-                     '16e10e2a4fc080f52b11315ee2b03d5df258d216f293bb0051b56beb16035374'::pg_catalog.text
+                     $8::pg_catalog.text
                    ),
                    (
                      'trigger'::pg_catalog.text,
                      3::pg_catalog.int4,
-                     '2c858da82c9238186861e0bcd184952ff941c7233f98a16083b20e6528006fb9'::pg_catalog.text
+                     $9::pg_catalog.text
                    ),
                    (
                      'constraint'::pg_catalog.text,
                      168::pg_catalog.int4,
-                     'fd5bd6e50e143be6dd71f485eaf275f70b32ec16d0de8d0df8519cf5725ff18e'::pg_catalog.text
+                     $10::pg_catalog.text
                    ),
                    (
                      'generated_column'::pg_catalog.text,
                      15::pg_catalog.int4,
-                     'c05b335f05f12f54649ae048f0233848e32eadc5422f8eaf5cd72183192ea36f'::pg_catalog.text
+                     $11::pg_catalog.text
+                   ),
+                   (
+                     'ordinary_column'::pg_catalog.text,
+                     204::pg_catalog.int4,
+                     $12::pg_catalog.text
                    )
                )
                SELECT $1::pg_catalog.bool AS baseline_applied,
-                      $6::pg_catalog.int4 AS expected_object_count,
+                      $7::pg_catalog.int4 AS expected_object_count,
                       pg_catalog.sum(actual_groups.existing_count)::pg_catalog.int4
                         AS existing_object_count,
                       CASE
                         WHEN $1::pg_catalog.bool THEN (
-                          $6 - pg_catalog.sum(actual_groups.existing_count)
+                          $7 - pg_catalog.sum(actual_groups.existing_count)
                         )::pg_catalog.int4
                         ELSE 0::pg_catalog.int4
                       END AS missing_object_count,
@@ -1102,7 +1292,13 @@ export async function runPostgreSqlMigrations(
           expectedBaselineDefinitions.triggerIdentities,
           expectedBaselineDefinitions.constraintIdentities,
           expectedBaselineDefinitions.generatedColumnIdentities,
+          expectedBaselineDefinitions.ordinaryColumnIdentities,
           expectedBaselineDefinitions.objectCount,
+          expectedBaselineDefinitions.definitionHashes.index,
+          expectedBaselineDefinitions.definitionHashes.trigger,
+          expectedBaselineDefinitions.definitionHashes.constraint,
+          expectedBaselineDefinitions.definitionHashes.generatedColumn,
+          expectedBaselineDefinitions.definitionHashes.ordinaryColumn,
         ],
       }, {
         domain: "factory",
@@ -1136,7 +1332,7 @@ export async function runPostgreSqlMigrations(
           !== expectedDefinitionObjectCount)
       || missingDefinitionObjectCount !== 0
       || driftedDefinitionGroupCount === null
-      || driftedDefinitionGroupCount > 4
+      || driftedDefinitionGroupCount > 5
       || driftedDefinitionGroupCount !== 0
     ) {
       throw new PostgreSqlBaselineDefinitionPreflightError(
@@ -1154,15 +1350,15 @@ export async function runPostgreSqlMigrations(
                  VALUES
                    (
                      'enforce_summary_id_uniqueness'::pg_catalog.text,
-                     '2e4d8b18c207e251edfbc81dac50cd0e0dba45dc0768ef50eeded33f5571d975'::pg_catalog.text
+                     $2::pg_catalog.text
                    ),
                    (
                      'enforce_large_file_id_uniqueness'::pg_catalog.text,
-                     '89d25e96d0ccc63954135183605c7aadbcb4c726143c8c56c67b9cd49398957b'::pg_catalog.text
+                     $3::pg_catalog.text
                    ),
                    (
                      'enforce_session_ingest_id_uniqueness'::pg_catalog.text,
-                     'b7e1725a4d6ee95f3e806386025734c6d6d44853642231048a2b23a0d9fc6021'::pg_catalog.text
+                     $4::pg_catalog.text
                    )
                ),
                actual_functions AS (
@@ -1249,7 +1445,10 @@ export async function runPostgreSqlMigrations(
                       END AS drifted_function_count
                FROM expected_functions
                LEFT JOIN actual_functions USING (function_name)`,
-        values: [baselineApplied],
+        values: [
+          baselineApplied,
+          ...expectedBaselineDefinitions.identityFunctionHashes,
+        ],
       }, {
         domain: "factory",
         operation: "preflightIdentityFunctionDefinitions",
@@ -1284,6 +1483,12 @@ export async function runPostgreSqlMigrations(
         driftedFunctionCount,
       );
     }
+    };
+
+    const currentSnapshot = latestPostgreSqlSchemaSnapshot(
+      current.map(({ id }) => id),
+    );
+    if (currentSnapshot) await assertSchemaSnapshot(currentSnapshot);
 
     const applied: string[] = [];
     for (const migration of migrations.slice(current.length)) {
@@ -1297,6 +1502,12 @@ export async function runPostgreSqlMigrations(
         values: [migration.id, migration.sha256],
       }, { domain: "factory", operation: "recordMigration", signal: options.signal });
       applied.push(migration.id);
+    }
+    if (applied.length > 0) {
+      const targetSnapshot = latestPostgreSqlSchemaSnapshot(
+        migrations.map(({ id }) => id),
+      );
+      if (targetSnapshot) await assertSchemaSnapshot(targetSnapshot);
     }
     await assertPostgreSqlSearchConfigurationReady(transaction, { signal: options.signal });
     return {

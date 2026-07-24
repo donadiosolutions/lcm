@@ -600,8 +600,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 238,
-          existingObjectCount: 237,
+          expectedObjectCount: 442,
+          existingObjectCount: 441,
           missingObjectCount: 1,
           operation: "preflightBaselineDefinitions",
         });
@@ -621,8 +621,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 238,
-          existingObjectCount: 238,
+          expectedObjectCount: 442,
+          existingObjectCount: 442,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -642,8 +642,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 238,
-          existingObjectCount: 238,
+          expectedObjectCount: 442,
+          existingObjectCount: 442,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -661,8 +661,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 238,
-            existingObjectCount: 238,
+            expectedObjectCount: 442,
+            existingObjectCount: 442,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -685,10 +685,91 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 238,
-          existingObjectCount: 237,
+          expectedObjectCount: 442,
+          existingObjectCount: 441,
           missingObjectCount: 1,
           operation: "preflightBaselineDefinitions",
+        });
+    });
+  });
+
+  it("rejects ordinary column metadata drift", async () => {
+    await withPostgreSqlTestDatabase("ordinary-column-drift", async (database) => {
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.projects ALTER COLUMN identity_key DROP NOT NULL",
+      }, { domain: "factory", operation: "dropProjectIdentityNotNull" });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toMatchObject({
+          baselineApplied: true,
+          driftedDefinitionGroupCount: 1,
+          expectedObjectCount: 442,
+          existingObjectCount: 442,
+          missingObjectCount: 0,
+          operation: "preflightBaselineDefinitions",
+        });
+    });
+  });
+
+  it("binds constraint names to their definitions", async () => {
+    await withPostgreSqlTestDatabase("constraint-name-drift", async (database) => {
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.machines
+                 RENAME CONSTRAINT machines_identity_key_check
+                 TO machines_identity_key_check_swap;
+               ALTER TABLE lcm.machines
+                 RENAME CONSTRAINT machines_display_name_check
+                 TO machines_identity_key_check;
+               ALTER TABLE lcm.machines
+                 RENAME CONSTRAINT machines_identity_key_check_swap
+                 TO machines_display_name_check`,
+      }, { domain: "factory", operation: "swapMachineConstraintNames" });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toMatchObject({
+          baselineApplied: true,
+          driftedDefinitionGroupCount: 1,
+          expectedObjectCount: 442,
+          existingObjectCount: 442,
+          missingObjectCount: 0,
+          operation: "preflightBaselineDefinitions",
+        });
+    });
+  });
+
+  it("rolls back a pending migration that violates its target schema snapshot", async () => {
+    await withPostgreSqlTestDatabase("target-schema-snapshot", async (database) => {
+      const invalidTarget = migration(
+        "0003_invalid_column_snapshot",
+        "ALTER TABLE lcm.projects ALTER COLUMN identity_key DROP NOT NULL",
+      );
+      await expect(runPostgreSqlMigrations(database.migrator, {
+        migrations: [...loadPostgreSqlMigrations(), invalidTarget],
+      })).rejects.toMatchObject({
+        baselineApplied: true,
+        driftedDefinitionGroupCount: 1,
+        operation: "preflightBaselineDefinitions",
+      });
+      await expect(database.migrator.query<{
+        applied: boolean;
+        not_null: boolean;
+      }>({
+        text: `SELECT
+                 EXISTS (
+                   SELECT 1
+                   FROM lcm.schema_migrations
+                   WHERE id = '0003_invalid_column_snapshot'
+                 ) AS applied,
+                 attribute.attnotnull AS not_null
+               FROM pg_catalog.pg_attribute AS attribute
+               JOIN pg_catalog.pg_class AS relation
+                 ON relation.oid = attribute.attrelid
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.oid = relation.relnamespace
+               WHERE namespace.nspname = 'lcm'
+                 AND relation.relname = 'projects'
+                 AND attribute.attname = 'identity_key'`,
+      }, { domain: "factory", operation: "verifyTargetSchemaSnapshotRollback" }))
+        .resolves.toMatchObject({
+          rows: [{ applied: false, not_null: true }],
         });
     });
   });

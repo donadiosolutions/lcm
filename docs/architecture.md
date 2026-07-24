@@ -77,14 +77,20 @@ phase therefore returns structured ownership diagnostics even when the ledger
 table itself has drifted to another owner. Baseline completeness is evaluated
 after the applied history is known. Unknown schema objects are outside that
 exact catalog allowlist and are neither rejected nor changed.
-After the baseline is recorded, it also verifies the explicit existence and
-canonical definitions of all allowlisted secondary indexes, triggers, and
-constraints, plus every stored generated-column expression; indexes must remain
-valid and ready and inherit ownership from their tables. Trigger inventory also
+Schema definition snapshots are keyed by migration ID. The newest registered
+snapshot in the trusted current ledger is checked before pending SQL, while the
+newest registered target snapshot is checked after applying and recording the
+pending set but before commit. After the baseline is recorded, its snapshot
+verifies the explicit existence and canonical definitions of all allowlisted
+secondary indexes, triggers, constraints, ordinary columns, and stored
+generated-column expressions; indexes must remain valid and ready and inherit
+ownership from their tables. Trigger inventory also
 requires ordinary enabled mode, rejecting disabled, replica-only, or
 always-enabled drift. Constraint inventory includes the enablement state of
-its internal enforcement triggers, and generated columns retain both their
-generated state and fully deparsed expression. Unknown operator-created
+its internal enforcement triggers and binds each name to its definition.
+Ordinary columns retain type, nullability, default, and identity metadata;
+generated columns retain both their generated state and fully deparsed
+expression. Unknown operator-created
 indexes, triggers, and constraints remain outside the inventory.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six
 generated identity sequences, or the search-normalization, summary-identity,
