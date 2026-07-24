@@ -8,6 +8,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   readlinkSync,
   writeFileSync,
@@ -23,6 +24,8 @@ export const POSTGRES_TEMPLATE_DATABASE = "lcm_harness_template";
 export const POSTGRES_TEMPLATE_MARKER = "lcm-postgresql-template-v1";
 export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
 export const MAX_ARCHIVE_INVENTORY_BYTES = 4 * 1024 * 1024;
+export const MAX_NODE_MODULES_STAMP_BYTES = 4 * 1024;
+export const MAX_ARCHIVE_CHECKSUM_BYTES = 128;
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const templateInitScript = join(repositoryRoot, "test", "postgresql", "template-init.sh");
@@ -146,6 +149,45 @@ function nodeModulesStampPath(nodeModulesPath) {
   return join(nodeModulesPath, ".lcm-ci-cache.json");
 }
 
+function readSecureMetadataFile(path, maximumBytes, label) {
+  assertSecureInventoryPlatform();
+  let descriptor;
+  try {
+    try {
+      descriptor = openSync(
+        path,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+    } catch (error) {
+      throw new Error(`${label} could not be opened securely`, { cause: error });
+    }
+    const stat = fstatSync(descriptor);
+    if (!stat.isFile()) throw new Error(`${label} is not a regular file`);
+    if (stat.size > maximumBytes) {
+      throw new Error(`${label} exceeds the ${maximumBytes}-byte limit`);
+    }
+    const contents = Buffer.alloc(maximumBytes + 1);
+    let offset = 0;
+    while (offset < contents.length) {
+      const bytesRead = readSync(
+        descriptor,
+        contents,
+        offset,
+        contents.length - offset,
+        null,
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > maximumBytes) {
+      throw new Error(`${label} exceeds the ${maximumBytes}-byte limit`);
+    }
+    return contents.subarray(0, offset).toString("utf8");
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
 export function writeNodeModulesStamp(nodeModulesPath, environment = process.env) {
   const metadata = cacheMetadata(environment);
   const stamp = {
@@ -162,7 +204,19 @@ export function writeNodeModulesStamp(nodeModulesPath, environment = process.env
 
 export function validateNodeModulesStamp(nodeModulesPath, environment = process.env) {
   const expected = cacheMetadata(environment);
-  const stamp = JSON.parse(readFileSync(nodeModulesStampPath(nodeModulesPath), "utf8"));
+  let stamp;
+  try {
+    stamp = JSON.parse(readSecureMetadataFile(
+      nodeModulesStampPath(nodeModulesPath),
+      MAX_NODE_MODULES_STAMP_BYTES,
+      "cached node_modules stamp",
+    ));
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error("cached node_modules stamp is invalid JSON", { cause: error });
+    }
+    throw error;
+  }
   const actual = {
     format: CI_CACHE_FORMAT,
     dependencyDigest: expected.dependencyDigest,
@@ -238,7 +292,11 @@ export async function writeArchiveChecksum(archivePath) {
 }
 
 export async function validateArchiveChecksum(archivePath) {
-  const expected = readFileSync(archiveChecksumPath(archivePath), "utf8").trim();
+  const expected = readSecureMetadataFile(
+    archiveChecksumPath(archivePath),
+    MAX_ARCHIVE_CHECKSUM_BYTES,
+    "cached archive checksum sidecar",
+  ).trim();
   if (!/^[0-9a-f]{64}$/u.test(expected)) throw new Error("cached archive checksum is invalid");
   const actual = await sha256File(archivePath);
   if (actual !== expected) throw new Error("cached archive checksum does not match");

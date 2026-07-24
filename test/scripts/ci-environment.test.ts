@@ -12,7 +12,9 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   CI_CACHE_FORMAT,
+  MAX_ARCHIVE_CHECKSUM_BYTES,
   MAX_CAPTURED_OUTPUT_BYTES,
+  MAX_NODE_MODULES_STAMP_BYTES,
   NODE_DEPENDENCY_INPUT_PATHS,
   NODE_VERSION,
   POSTGRES_TEMPLATE_INPUT_PATHS,
@@ -127,6 +129,36 @@ describe("CI environment cache metadata", () => {
     expect(nodeModulesInventoryDigest(nodeModules)).toBe(before);
     symlinkSync(nodeModules, join(root, "linked-node-modules"), "dir");
     expect(() => nodeModulesInventoryDigest(join(root, "linked-node-modules"))).toThrow();
+  });
+
+  it.runIf(process.platform === "linux")("rejects unsafe node_modules stamp metadata", () => {
+    const root = temporaryDirectory();
+    const nodeModules = join(root, "node_modules");
+    mkdirSync(nodeModules);
+    const stamp = join(nodeModules, ".lcm-ci-cache.json");
+    const outside = join(root, "outside-stamp.json");
+    writeFileSync(outside, "{}\n");
+    symlinkSync(outside, stamp);
+    expect(() => validateNodeModulesStamp(nodeModules)).toThrow(
+      "cached node_modules stamp could not be opened securely",
+    );
+
+    rmSync(stamp);
+    mkdirSync(stamp);
+    expect(() => validateNodeModulesStamp(nodeModules)).toThrow(
+      "cached node_modules stamp is not a regular file",
+    );
+
+    rmSync(stamp, { recursive: true });
+    writeFileSync(stamp, "x".repeat(MAX_NODE_MODULES_STAMP_BYTES + 1));
+    expect(() => validateNodeModulesStamp(nodeModules)).toThrow(
+      `cached node_modules stamp exceeds the ${MAX_NODE_MODULES_STAMP_BYTES}-byte limit`,
+    );
+
+    writeFileSync(stamp, "{not-json}\n");
+    expect(() => validateNodeModulesStamp(nodeModules)).toThrow(
+      "cached node_modules stamp is invalid JSON",
+    );
   });
 
   it("makes the secure dependency inventory Linux-only", () => {
@@ -283,7 +315,7 @@ describe("CI environment cache metadata", () => {
     )).toThrow("install GNU tar and ensure it is first on PATH");
   });
 
-  it("rejects link-bearing PostgreSQL template archives before extraction", async () => {
+  it.runIf(process.platform === "linux")("rejects link-bearing PostgreSQL template archives before extraction", async () => {
     const root = temporaryDirectory();
     const contents = join(root, "contents");
     mkdirSync(join(contents, "global"), { recursive: true });
@@ -308,7 +340,7 @@ describe("CI environment cache metadata", () => {
     }
   });
 
-  it("checksums cached archives and rejects modified contents", async () => {
+  it.runIf(process.platform === "linux")("checksums cached archives and rejects modified contents", async () => {
     const root = temporaryDirectory();
     const archive = join(root, "cache.tar");
     writeFileSync(archive, "verified cache contents");
@@ -321,5 +353,35 @@ describe("CI environment cache metadata", () => {
     await expect(validateArchiveChecksum(archive)).rejects.toThrow("does not match");
     writeFileSync(`${archive}.sha256`, "not-a-checksum\n");
     await expect(validateArchiveChecksum(archive)).rejects.toThrow("checksum is invalid");
+  });
+
+  it.runIf(process.platform === "linux")("rejects unsafe archive checksum metadata", async () => {
+    const root = temporaryDirectory();
+    const archive = join(root, "cache.tar");
+    const sidecar = `${archive}.sha256`;
+    const outside = join(root, "outside.sha256");
+    writeFileSync(archive, "verified cache contents");
+    writeFileSync(outside, `${"0".repeat(64)}\n`);
+    symlinkSync(outside, sidecar);
+    await expect(validateArchiveChecksum(archive)).rejects.toThrow(
+      "cached archive checksum sidecar could not be opened securely",
+    );
+
+    rmSync(sidecar);
+    mkdirSync(sidecar);
+    await expect(validateArchiveChecksum(archive)).rejects.toThrow(
+      "cached archive checksum sidecar is not a regular file",
+    );
+
+    rmSync(sidecar, { recursive: true });
+    writeFileSync(sidecar, "0".repeat(MAX_ARCHIVE_CHECKSUM_BYTES + 1));
+    await expect(validateArchiveChecksum(archive)).rejects.toThrow(
+      `cached archive checksum sidecar exceeds the ${MAX_ARCHIVE_CHECKSUM_BYTES}-byte limit`,
+    );
+
+    writeFileSync(sidecar, "not-a-checksum\n");
+    await expect(validateArchiveChecksum(archive)).rejects.toThrow(
+      "cached archive checksum is invalid",
+    );
   });
 });
