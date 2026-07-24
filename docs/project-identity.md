@@ -85,6 +85,13 @@ The name defaults to the path basename. The command creates the remote project
 and first `(machine_id, normalized_path)` alias transactionally, then stores
 the returned UUID in the existing local map entry.
 
+When the selected path is a symlink for a previously unmapped directory, the
+local hash and canonical path still use the resolved target. LCM also records
+the absolute path entered as a local alias and uses that exact lexical spelling
+for the PostgreSQL alias row. `project list`, `project show`, and exact
+`project unlink` therefore continue to recognize the entered path without
+allowing a later symlink replacement to redirect the stored remote identity.
+
 Pair another machine or path to that project:
 
 ```bash

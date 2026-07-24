@@ -17,7 +17,11 @@ import {
   type ProjectStorage,
   type StorageBackendFactory,
 } from "../../storage/index.js";
-import { closeRouteStorage, storageRouteFailureResponse } from "./storage-lifecycle.js";
+import {
+  closeRouteStorage,
+  stagedPostgreSqlFactoryUnavailableResponse,
+  storageRouteFailureResponse,
+} from "./storage-lifecycle.js";
 
 const AUTO_TAGS: Record<string, string> = {
   decision: "type:preference",
@@ -186,6 +190,14 @@ export function createPromoteAllEventsHandler(
     const activeFactory = storageFactory
       ?? (ownedFactory = createStorageBackendFactory(config.storage));
     try {
+      const staged = stagedPostgreSqlFactoryUnavailableResponse(
+        activeFactory,
+        "promote-events-all",
+      );
+      if (staged) {
+        sendJson(res, 503, staged);
+        return;
+      }
       const result: PromoteAllResult = {
         promoted: 0,
         skipped: 0,

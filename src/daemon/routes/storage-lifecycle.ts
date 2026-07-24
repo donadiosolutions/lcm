@@ -64,12 +64,20 @@ export function stagedPostgreSqlUnavailableResponse(
   operation: string,
 ): StagedPostgreSqlUnavailableResponse | null {
   if (
-    !(factory instanceof UnavailablePostgreSqlStorageBackendFactory)
-    || !(error instanceof StorageOperationError)
+    !(error instanceof StorageOperationError)
   ) {
     return null;
   }
-  return stagedPostgreSqlUnavailablePayload(operation);
+  return stagedPostgreSqlFactoryUnavailableResponse(factory, operation);
+}
+
+export function stagedPostgreSqlFactoryUnavailableResponse(
+  factory: StorageBackendFactory | undefined,
+  operation: string,
+): StagedPostgreSqlUnavailableResponse | null {
+  return factory instanceof UnavailablePostgreSqlStorageBackendFactory
+    ? stagedPostgreSqlUnavailablePayload(operation)
+    : null;
 }
 
 export function storageIdentityRequiredResponse(

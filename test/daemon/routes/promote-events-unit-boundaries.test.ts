@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EventRow, PatternReinforcementStats } from "../../../src/hooks/events-db.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { MachineIdentityFileError } from "../../../src/machine-identity.js";
 
 const mocks = vi.hoisted(() => ({
   events: vi.fn(() => [] as EventRow[]),
@@ -179,6 +180,34 @@ describe("promote-events unit boundaries", () => {
     );
     expect(mocks.openOutbox).not.toHaveBeenCalled();
     expect(mocks.openProject).not.toHaveBeenCalled();
+  });
+
+  it("returns the typed identity response when a global sidecar drain fails admission", async () => {
+    const identityFailure = new MachineIdentityFileError(
+      "machine identity is not registered",
+      "Run `lcm machine register`.",
+    );
+    mocks.identity.mockImplementation(() => { throw identityFailure; });
+    mocks.collect.mockReturnValueOnce([{
+      projectId: "pid",
+      cwd: "/cwd",
+      path: "/events.db",
+      metadataMissing: false,
+      captured: 1,
+      unprocessed: 1,
+      errors: 0,
+      lastCapture: "2026",
+      file: "pid.db",
+    }]);
+
+    const response = {} as never;
+    await createPromoteAllEventsHandler(config)({} as never, response, "");
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 409, {
+      code: "STORAGE_IDENTITY_REQUIRED",
+      error: identityFailure.message,
+      storageBackend: "postgresql",
+    });
   });
 
   it("reports incomplete global drains and closes owned factories when projects fail to open", async () => {

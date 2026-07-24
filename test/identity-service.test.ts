@@ -576,12 +576,103 @@ describe("identity service", () => {
     const entered = join(home, "create-realpath-link");
     symlinkSync(canonical, entered);
 
-    await createProject(POSTGRESQL_CONFIG, entered, {}, deps);
+    const created = await createProject(POSTGRESQL_CONFIG, entered, {}, deps);
 
     expect(repository.createProject).toHaveBeenCalledWith(expect.objectContaining({
       path: entered,
       normalizedPath: canonical,
+      aliases: [{ path: entered, normalizedPath: canonical }],
     }));
+    expect(showProjectMapEntry(created.local.id).entry).toEqual({
+      canonical,
+      aliases: [entered],
+      remoteProjectId: PROJECT_A,
+    });
+    await expect(repository.resolveProject(MACHINE_ID, canonical))
+      .resolves.toMatchObject({
+        projectId: PROJECT_A,
+        alias: { path: entered, normalizedPath: canonical },
+      });
+    await expect(showProject(POSTGRESQL_CONFIG, entered, deps))
+      .resolves.toMatchObject({
+        hash: created.local.id,
+        entry: { canonical, aliases: [entered], remoteProjectId: PROJECT_A },
+      });
+    await expect(unlinkProject(POSTGRESQL_CONFIG, entered, deps))
+      .resolves.toMatchObject({
+        hash: created.local.id,
+        remoteProjectId: PROJECT_A,
+        aliasRemoved: true,
+      });
+    expect(showProjectMapEntry(created.local.id).entry.aliases).toEqual([]);
+    await expect(repository.resolveProject(MACHINE_ID, canonical)).resolves.toBeNull();
+  });
+
+  it("restores the prior local map when symlink project creation fails remotely", async () => {
+    await register();
+    const canonical = makeProject("create-symlink-remote-failure-target");
+    const entered = join(home, "create-symlink-remote-failure-entered");
+    symlinkSync(canonical, entered);
+    const remoteFailure = new PostgreSqlIdentityNotFoundError("project", PROJECT_A);
+    repository.createProject = vi.fn(async () => {
+      throw remoteFailure;
+    });
+
+    await expect(createProject(POSTGRESQL_CONFIG, entered, {}, deps))
+      .rejects.toBe(remoteFailure);
+
+    expect(showProjectMapEntry(canonical).entry).toEqual({
+      canonical,
+      aliases: [],
+    });
+  });
+
+  it("restores the prior local map after symlink binding failure and confirmed cleanup", async () => {
+    await register();
+    const canonical = makeProject("create-symlink-bind-failure-target");
+    const entered = join(home, "create-symlink-bind-failure-entered");
+    symlinkSync(canonical, entered);
+    repository.createProject = vi.fn(async (input) => ({
+      ...remoteProject("invalid-project-id", input.displayName),
+      aliases: [alias("invalid-project-id", canonical, entered)],
+    }));
+    repository.cleanupCreatedProject = vi.fn(async () => true);
+
+    await expect(createProject(POSTGRESQL_CONFIG, entered, {}, deps))
+      .rejects.toThrow("invalid remote project UUIDv7");
+
+    expect(repository.cleanupCreatedProject).toHaveBeenCalledWith(
+      MACHINE_ID,
+      "invalid-project-id",
+      [canonical],
+    );
+    expect(showProjectMapEntry(canonical).entry).toEqual({
+      canonical,
+      aliases: [],
+    });
+  });
+
+  it("accepts an equivalent concurrent restoration of the symlink create alias", async () => {
+    await register();
+    const canonical = makeProject("create-symlink-concurrent-restore-target");
+    const entered = join(home, "create-symlink-concurrent-restore-entered");
+    symlinkSync(canonical, entered);
+    const local = resolveProjectIdentity(canonical);
+    repository.createProject = vi.fn(async (input) => ({
+      ...remoteProject("invalid-project-id", input.displayName),
+      aliases: [alias("invalid-project-id", canonical, entered)],
+    }));
+    repository.cleanupCreatedProject = vi.fn(async () => {
+      removeProjectAlias(entered, { hash: local.id });
+      return true;
+    });
+
+    await expect(createProject(POSTGRESQL_CONFIG, entered, {}, deps))
+      .rejects.toThrow("invalid remote project UUIDv7");
+    expect(showProjectMapEntry(local.id).entry).toEqual({
+      canonical,
+      aliases: [],
+    });
   });
 
   it("reconciles only genuinely ambiguous project-create commits", async () => {
@@ -1311,6 +1402,42 @@ describe("identity service", () => {
         local: { remoteProjectId: PROJECT_A },
         remoteAlias: { normalizedPath: path },
       });
+  });
+
+  it("rejects ambiguous same-project rebind readback with a stale lexical path", async () => {
+    await register();
+    const path = makeProject("uncertain-same-project-lexical-rollback");
+    const priorPath = `${path}/.`;
+    const priorAlias = alias(PROJECT_A, path, priorPath);
+    await repository.linkProject({
+      machineId: MACHINE_ID,
+      projectId: PROJECT_A,
+      path: priorPath,
+      normalizedPath: path,
+    });
+    repository.replaceProjectAliases = vi.fn(async (input) => {
+      throw new PostgreSqlIdentityReplaceAliasesOutcomeUnknownError(
+        input.projectId,
+        batchMutation(
+          input.projectId,
+          [path],
+          [{ projectId: PROJECT_A, alias: priorAlias }],
+          [false],
+        ),
+      );
+    });
+
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, path, {}, deps))
+      .rejects.toMatchObject({
+        name: "ProjectIdentityReconciliationError",
+        remediation: expect.stringContaining("safe to retry"),
+      });
+    await expect(repository.resolveProject(MACHINE_ID, path))
+      .resolves.toMatchObject({
+        projectId: PROJECT_A,
+        alias: { path: priorPath, normalizedPath: path },
+      });
+    expect(resolveProjectIdentity(path).remoteProjectId).toBeUndefined();
   });
 
   it("clears insertion ownership after uncertain batch readback before compensation", async () => {

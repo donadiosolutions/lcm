@@ -438,6 +438,24 @@ describe("promote-events route", () => {
     });
   });
 
+  it("returns the exact staged response before scanning an empty sidecar directory", async () => {
+    const output = mockRes();
+    await createPromoteAllEventsHandler(
+      makeConfig(),
+      new UnavailablePostgreSqlStorageBackendFactory(),
+    )(request, output.res, "");
+
+    expect(output.res.writeHead).toHaveBeenCalledWith(
+      503,
+      { "Content-Type": "application/json" },
+    );
+    expect(output.getBody()).toEqual({
+      code: "STORAGE_BACKEND_STAGED",
+      error: "promote-events-all is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
+  });
+
   it("promotes metadata-backed sidecars across all projects", async () => {
     const projectCwd = mkdtempSync(join(tmpdir(), "promote-all-project-"));
     extraDirs.push(projectCwd);

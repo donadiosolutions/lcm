@@ -1,5 +1,6 @@
 import { existsSync, statSync } from "node:fs";
 import { basename, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { ResolvedStorageConfig } from "./daemon/config.js";
 import {
   ensurePendingMachineIdentity,
@@ -552,6 +553,17 @@ async function compensateCreatedProject(
   }
 }
 
+function restoreLocallyAddedCreateAlias(
+  hash: string,
+  aliasPath: string,
+  priorEntry: ProjectMapEntry,
+  addedEntry: ProjectMapEntry,
+): void {
+  const current = showProjectMapEntry(hash);
+  if (isDeepStrictEqual(current.entry, priorEntry)) return;
+  removeProjectAlias(aliasPath, { hash, expectedEntry: addedEntry });
+}
+
 async function createRemoteProject(
   repository: IdentityRepository,
   input: {
@@ -610,59 +622,103 @@ export async function createProject(
   const displayName = normalizeProjectDisplayName(
     options.displayName ?? defaultProjectDisplayName(projectPath),
   );
-  const local = resolveProjectIdentity(projectPath);
-  if (local.remoteProjectId) {
-    throw new Error(
-      `local project ${local.id} is already bound to PostgreSQL project ${local.remoteProjectId}`,
-    );
-  }
-  const shown = showProjectMapEntry(local.id);
-  const entryPaths = remoteEntryPaths(shown.entry);
   const selectedPath = remotePath(projectPath);
-  return withSession(config, deps, async (repository) => {
-    const remote = await createRemoteProject(repository, {
-      machineId: machine.machineId,
-      displayName,
-      ...selectedPath,
-      aliases: entryPaths,
-    });
-    try {
-      setRemoteProjectBinding(remote.projectId, { hash: local.id, expectedEntry: shown.entry });
-    } catch (error) {
-      try {
-        const adopted = showProjectMapEntry(projectPath);
-        if (
-          !adopted.transient
-          && adopted.hash === local.id
-          && adopted.entry.remoteProjectId === remote.projectId
-        ) {
-          return {
-            local: resolveProjectIdentity(projectPath),
-            remote,
-          };
-        }
-      } catch {
-        // An unreadable or conflicting map is not equivalent adoption.
-      }
-      try {
-        await compensateCreatedProject(
-          repository,
-          remote.projectId,
-          machine.machineId,
-          entryPaths.map(({ normalizedPath }) => normalizedPath),
-        );
-      } catch {
-        throw new ProjectIdentityReconciliationError(
-          "PostgreSQL created the project but the local binding and automatic cleanup both failed",
-          `Run \`lcm project link -- ${quoteShellArgument(remote.projectId)} ${quoteShellArgument(local.canonical)}\` to reconcile it.`,
-        );
-      }
-      throw error;
+  return withProjectIdentityMutationLock(async () => {
+    const local = resolveProjectIdentity(projectPath);
+    if (local.remoteProjectId) {
+      throw new Error(
+        `local project ${local.id} is already bound to PostgreSQL project ${local.remoteProjectId}`,
+      );
     }
-    return {
-      local: resolveProjectIdentity(projectPath),
-      remote,
+    let shown = showProjectMapEntry(local.id);
+    const priorEntry = {
+      ...shown.entry,
+      aliases: [...shown.entry.aliases],
     };
+    const priorEntryPaths = remoteEntryPaths(shown.entry);
+    const selectedIsStored = [shown.entry.canonical, ...shown.entry.aliases]
+      .some((entryPath) => resolve(entryPath) === selectedPath.path);
+    if (!selectedIsStored) {
+      const added = addProjectAlias(projectPath, {
+        hash: local.id,
+        expectedEntry: shown.entry,
+      });
+      shown = { hash: added.hash, entry: added.entry };
+    }
+    const entryPaths = selectedIsStored
+      ? priorEntryPaths
+      : [
+          ...priorEntryPaths.filter(
+            ({ normalizedPath }) => normalizedPath !== selectedPath.normalizedPath,
+          ),
+          selectedPath,
+        ];
+    return withSession(config, deps, async (repository) => {
+      let remote: RemoteProject;
+      try {
+        remote = await createRemoteProject(repository, {
+          machineId: machine.machineId,
+          displayName,
+          ...selectedPath,
+          aliases: entryPaths,
+        });
+      } catch (error) {
+        if (!selectedIsStored) {
+          restoreLocallyAddedCreateAlias(
+            local.id,
+            projectPath,
+            priorEntry,
+            shown.entry,
+          );
+        }
+        throw error;
+      }
+      try {
+        setRemoteProjectBinding(remote.projectId, { hash: local.id, expectedEntry: shown.entry });
+      } catch (error) {
+        try {
+          const adopted = showProjectMapEntry(projectPath);
+          if (
+            !adopted.transient
+            && adopted.hash === local.id
+            && adopted.entry.remoteProjectId === remote.projectId
+          ) {
+            return {
+              local: resolveProjectIdentity(projectPath),
+              remote,
+            };
+          }
+        } catch {
+          // An unreadable or conflicting map is not equivalent adoption.
+        }
+        try {
+          await compensateCreatedProject(
+            repository,
+            remote.projectId,
+            machine.machineId,
+            entryPaths.map(({ normalizedPath }) => normalizedPath),
+          );
+        } catch {
+          throw new ProjectIdentityReconciliationError(
+            "PostgreSQL created the project but the local binding and automatic cleanup both failed",
+            `Run \`lcm project link -- ${quoteShellArgument(remote.projectId)} ${quoteShellArgument(local.canonical)}\` to reconcile it.`,
+          );
+        }
+        if (!selectedIsStored) {
+          restoreLocallyAddedCreateAlias(
+            local.id,
+            projectPath,
+            priorEntry,
+            shown.entry,
+          );
+        }
+        throw error;
+      }
+      return {
+        local: resolveProjectIdentity(projectPath),
+        remote,
+      };
+    });
   });
 }
 
@@ -732,7 +788,12 @@ async function confirmRemoteBatchReplacement(
         `Inspect \`lcm project list --json\`, then rerun \`lcm project link -- ${quoteShellArgument(input.projectId)} ${quoteShellArgument(input.recoveryPath)}\`.`,
       );
     }
-    if (resolved.every((owner) => owner?.projectId === input.projectId)) {
+    if (resolved.every((owner, index) => {
+      const requested = input.aliases[index];
+      return owner?.projectId === input.projectId
+        && owner.alias.path === requested?.path
+        && owner.alias.normalizedPath === requested.normalizedPath;
+    })) {
       return {
         ...error.candidate,
         aliases: resolved.map((owner) => owner!.alias),
