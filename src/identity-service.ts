@@ -649,12 +649,15 @@ async function createRemoteProject(
         `Rerun \`lcm project create --name ${quoteShellArgument(input.displayName)} -- ${quoteShellArgument(input.path)}\`.`,
       );
     }
-    if (resolved.every((owner) => owner?.projectId === candidate.projectId)) return candidate;
+    if (resolved.every((owner, index) => (
+      owner?.projectId === candidate.projectId
+      && owner.alias.path === input.aliases[index]!.path
+    ))) return candidate;
     const ownerIds = [...new Set(
       resolved.flatMap((owner) => owner ? [owner.projectId] : []),
     )];
     throw new ProjectIdentityReconciliationError(
-      `PostgreSQL project creation candidate ${candidate.projectId} does not own every local path; observed owners: ${ownerIds.join(", ")}`,
+      `PostgreSQL project creation candidate ${candidate.projectId} does not own every requested local alias exactly; observed owners: ${ownerIds.join(", ")}`,
       `Run \`lcm project show --json -- ${quoteShellArgument(input.path)}\` and resolve the collision before retrying.`,
     );
   }

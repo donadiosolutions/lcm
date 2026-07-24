@@ -462,7 +462,7 @@ describe("project map", () => {
     }
   });
 
-  it("uses portable process birth identities with a bounded stale-owner fallback", () => {
+  it("uses portable process birth identities and never age-reclaims an unverifiable live owner", () => {
     const canonical = makeDir("portable-lock-owner");
     resolveProjectIdentity(canonical);
     const lockPath = `${projectMapPath()}.lock`;
@@ -515,18 +515,22 @@ describe("project map", () => {
     rmSync(lockPath);
 
     writeOwner(null, "e".repeat(32), Date.now() - 10 * 60 * 1000);
-    expect(setRemoteProjectBinding(remoteProjectId, {
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
       canonical,
       _lockObserverForTesting: portableObserver("darwin", ""),
-    })).toMatchObject({ changed: false });
+    })).toThrow("owner state is ambiguous");
+    expect(existsSync(lockPath)).toBe(true);
+    rmSync(lockPath);
 
     writeOwner(null, "f".repeat(32));
     const oldTime = new Date(Date.now() - 10 * 60 * 1000);
     utimesSync(lockPath, oldTime, oldTime);
-    expect(setRemoteProjectBinding(remoteProjectId, {
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
       canonical,
       _lockObserverForTesting: portableObserver("darwin", ""),
-    })).toMatchObject({ changed: false });
+    })).toThrow("owner state is ambiguous");
+    expect(existsSync(lockPath)).toBe(true);
+    rmSync(lockPath);
 
     writeOwner(null, "1".repeat(32), 0);
     expect(() => setRemoteProjectBinding(remoteProjectId, { canonical }))

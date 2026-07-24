@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { lstatSync, mkdirSync, renameSync, rmdirSync } from "node:fs";
+import { mkdirSync, renameSync, rmdirSync } from "node:fs";
 import { platform } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -11,7 +11,6 @@ import {
 
 const MAX_PRIVATE_MUTATION_LOCK_BYTES = 1024;
 const MAX_DISAPPEARED_OWNER_READ_RETRIES = 1;
-const MAX_UNVERIFIED_OWNER_AGE_MS = 5 * 60 * 1000;
 
 type PrivateMutationLockOwner = {
   readonly version: 1;
@@ -82,15 +81,8 @@ function processStartTime(
   return observed.value.trim() || null;
 }
 
-function unverifiedOwnerState(createdAtMs: number): "stale" | "ambiguous" {
-  return Date.now() - createdAtMs >= MAX_UNVERIFIED_OWNER_AGE_MS
-    ? "stale"
-    : "ambiguous";
-}
-
 function lockOwnerState(
   owner: PrivateMutationLockOwner,
-  createdAtMs: number,
   observer: PrivateMutationLockObserver,
 ): "live" | "stale" | "ambiguous" {
   try {
@@ -102,7 +94,7 @@ function lockOwnerState(
   }
   const observedStartTime = processStartTime(owner.pid, observer);
   if (owner.processStartTime === null || observedStartTime === null) {
-    return unverifiedOwnerState(createdAtMs);
+    return "ambiguous";
   }
   return observedStartTime === owner.processStartTime ? "live" : "stale";
 }
@@ -113,7 +105,6 @@ function readLockOwner(
 ): {
   readonly content: string;
   readonly owner: PrivateMutationLockOwner;
-  readonly createdAtMs: number;
 } {
   const content = readBoundedRegularFile(lockPath, {
     maxBytes: MAX_PRIVATE_MUTATION_LOCK_BYTES,
@@ -149,7 +140,6 @@ function readLockOwner(
   return {
     content,
     owner: owner as PrivateMutationLockOwner,
-    createdAtMs: owner.createdAtMs ?? lstatSync(lockPath).mtimeMs,
   };
 }
 
@@ -203,7 +193,7 @@ function acquireReclaimClaim(
     }
     throw error;
   }
-  const state = lockOwnerState(existing.owner, existing.createdAtMs, observer);
+  const state = lockOwnerState(existing.owner, observer);
   if (state !== "stale") {
     const reason = state === "live"
       ? `owned by live PID ${existing.owner.pid}`
@@ -273,7 +263,7 @@ function acquireMutationLock(
       continue;
     }
 
-    const state = lockOwnerState(existing.owner, existing.createdAtMs, observer);
+    const state = lockOwnerState(existing.owner, observer);
     if (state !== "stale") {
       const reason = state === "live" ? `owned by live PID ${existing.owner.pid}` : "owner state is ambiguous";
       throw new PrivateMutationLockContentionError(

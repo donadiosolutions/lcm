@@ -176,11 +176,16 @@ export function writePrivateFileExclusive(
 export function atomicWritePrivateFileExclusive(
   path: string,
   content: string,
-  operations: { readonly link?: typeof linkSync } = {},
+  operations: {
+    readonly chmod?: typeof chmodSync;
+    readonly link?: typeof linkSync;
+    readonly remove?: typeof rmSync;
+  } = {},
 ): boolean {
   const directory = dirname(path);
   ensurePrivateDirectory(directory);
   const tempPath = join(directory, `.${basename(path)}.${randomBytes(12).toString("hex")}.tmp`);
+  let published = false;
   try {
     const fd = openSync(tempPath, "wx", PRIVATE_FILE_MODE);
     try {
@@ -189,16 +194,28 @@ export function atomicWritePrivateFileExclusive(
     } finally {
       closeSync(fd);
     }
+    // A hard link shares the completed temporary inode, including its mode.
+    // Finish every fallible setup step before publishing the destination so a
+    // thrown setup error can never strand a lock that the caller did not
+    // acquire.
+    (operations.chmod ?? chmodSync)(tempPath, PRIVATE_FILE_MODE);
     try {
       (operations.link ?? linkSync)(tempPath, path);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
       throw error;
     }
-    chmodSync(path, PRIVATE_FILE_MODE);
+    published = true;
     return true;
   } finally {
-    rmSync(tempPath, { force: true });
+    try {
+      (operations.remove ?? rmSync)(tempPath, { force: true });
+    } catch (error) {
+      // Once the destination is published it is complete and private. A
+      // best-effort temporary-link cleanup failure must not report lock
+      // acquisition failure while leaving that valid destination behind.
+      if (!published) throw error;
+    }
   }
 }
 

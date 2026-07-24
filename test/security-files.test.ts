@@ -202,6 +202,52 @@ describe("private filesystem primitives", () => {
     expect(existsSync(path)).toBe(false);
   });
 
+  it("completes fallible setup before atomically publishing the destination", () => {
+    const root = makeRoot();
+    const path = join(root, "atomic-setup-denied");
+    const denied = Object.assign(new Error("denied"), { code: "EACCES" });
+    const link = vi.fn();
+
+    expect(() => atomicWritePrivateFileExclusive(path, "content", {
+      chmod: () => {
+        throw denied;
+      },
+      link,
+    })).toThrow(denied);
+    expect(link).not.toHaveBeenCalled();
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("keeps a completed destination usable when temporary-link cleanup fails", () => {
+    const root = makeRoot();
+    const path = join(root, "atomic-cleanup-denied");
+    const denied = Object.assign(new Error("denied"), { code: "EACCES" });
+
+    expect(atomicWritePrivateFileExclusive(path, "content", {
+      remove: () => {
+        throw denied;
+      },
+    })).toBe(true);
+    expect(readFileSync(path, "utf-8")).toBe("content");
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+
+  it("reports temporary-link cleanup failures before publication", () => {
+    const root = makeRoot();
+    const path = join(root, "atomic-unpublished-cleanup-denied");
+    const denied = Object.assign(new Error("denied"), { code: "EACCES" });
+
+    expect(() => atomicWritePrivateFileExclusive(path, "content", {
+      chmod: () => {
+        throw new Error("setup failed");
+      },
+      remove: () => {
+        throw denied;
+      },
+    })).toThrow(denied);
+    expect(existsSync(path)).toBe(false);
+  });
+
   it("removes an exclusively created destination when initialization fails", () => {
     const root = makeRoot();
     const path = join(root, "partial-exclusive");

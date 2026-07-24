@@ -1008,6 +1008,29 @@ describe("identity service", () => {
         ),
       });
 
+    const lexicalMismatch = makeProject("create-uncertain-lexical-mismatch");
+    const lexicalMismatchAlias = makeProject("create-uncertain-lexical-mismatch-alias");
+    addProjectAlias(lexicalMismatchAlias, {
+      hash: resolveProjectIdentity(lexicalMismatch).id,
+    });
+    repository.resolveProject = vi.fn(async (_machineId, normalizedPath) => ({
+      projectId: PROJECT_A,
+      alias: alias(
+        PROJECT_A,
+        normalizedPath,
+        normalizedPath === lexicalMismatch
+          ? lexicalMismatch
+          : `${lexicalMismatchAlias}-concurrent-winner`,
+      ),
+    }));
+    await expect(createProject(POSTGRESQL_CONFIG, lexicalMismatch, {}, deps))
+      .rejects.toMatchObject({
+        message: expect.stringContaining(
+          `candidate ${PROJECT_A} does not own every requested local alias exactly`,
+        ),
+      });
+    expect(showProjectMapEntry(lexicalMismatch).entry.remoteProjectId).toBeUndefined();
+
     const mixed = makeProject("create-uncertain-mixed");
     const mixedAlias = makeProject("create-uncertain-mixed-alias");
     addProjectAlias(mixedAlias, { hash: resolveProjectIdentity(mixed).id });
