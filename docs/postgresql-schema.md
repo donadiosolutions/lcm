@@ -116,7 +116,8 @@ does not add row-level security.
   Identity-sequence
   fingerprints bind each exact sequence name to its PostgreSQL data type,
   increment, minimum, maximum, start, cache, cycle state, internal identity
-  dependency, and owning table/column. Index ownership
+  dependency, owning table/column, and permanent persistence. `SET UNLOGGED`
+  drift therefore fails closed. Index ownership
   follows the owning table; triggers and constraints are checked as existence
   and definition inventory.
   Additional operator-created objects remain outside the allowlist and are

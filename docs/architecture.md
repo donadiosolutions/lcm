@@ -105,8 +105,8 @@ role privileges and grant options fail closed while null and explicit
 owner-only defaults compare equally.
 Column ACL fingerprints preserve every no-ACL identity and reject any explicit
 column grant drift.
-Identity sequences retain their allocation parameters, internal dependency,
-and owning table/column. Migration transactions pin
+Identity sequences retain permanent persistence, allocation parameters,
+internal dependency, and owning table/column. Migration transactions pin
 `quote_all_identifiers = off` before catalog deparsing. Unknown operator-created
 indexes, triggers, and constraints remain outside the inventory.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six

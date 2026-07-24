@@ -396,7 +396,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       columnAcl: "d3d92012f458893ce5bf0ff0d1f72699ba6d8a9ef42d25a62c0ccede9e582f9c",
       constraint: "f445a06d320f46f8c5d829f89a3a7bc0b13c5507096b111f125d9f0dd0ba0e2f",
       generatedColumn: "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
-      identitySequence: "ccfebcc68f473f655f1c83f0815e18d2f697489bba38278d20bf3718fd0a502e",
+      identitySequence: "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
       index: "16e10e2a4fc080f52b11315ee2b03d5df258d216f293bb0051b56beb16035374",
       ordinaryColumn: "1cca7e1d3a1143074cb2eb2b809e816a2f4d1e06feba1e1b6bac46f8a725c487",
       relationAcl: "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
@@ -1328,6 +1328,8 @@ export async function runPostgreSqlMigrations(
                ),
                actual_identity_sequences AS (
                  SELECT sequence_relation.relname AS sequence_name,
+                        sequence_relation.relpersistence::pg_catalog.text
+                          AS persistence,
                         pg_catalog.format_type(
                           sequence_metadata.seqtypid,
                           NULL
@@ -1619,6 +1621,7 @@ export async function runPostgreSqlMigrations(
                                 pg_catalog.concat_ws(
                                   '|',
                                   sequence_name,
+                                  persistence,
                                   data_type,
                                   increment_by,
                                   minimum_value,

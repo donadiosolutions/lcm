@@ -166,7 +166,7 @@ resolved collation in addition to formatted type, nullability, generated state,
 and expression.
 It fingerprints all six generated identity sequences by type, increment,
 minimum, maximum, start, cache, cycle state, internal identity dependency, and
-owning table/column.
+owning table/column, and requires permanent persistence.
 It also requires all 24 allowlisted tables to remain ordinary permanent tables
 with both row-level-security flags disabled and no inheritance or partition
 parent/child relationships, and fingerprints the complete

@@ -1030,6 +1030,7 @@ describe("PostgreSQL migration runner", () => {
       "attribute.attidentity",
       "attribute.attacl",
       "relation.relpersistence",
+      "sequence_relation.relpersistence",
       "relation.relrowsecurity",
       "relation.relforcerowsecurity",
       "relation.relispartition",

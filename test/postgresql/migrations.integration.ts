@@ -924,6 +924,29 @@ describe("PostgreSQL migrations and database isolation", () => {
     });
   });
 
+  it("rejects identity-sequence persistence drift", async () => {
+    await withPostgreSqlTestDatabase("identity-sequence-persistence-drift", async (database) => {
+      try {
+        await database.migrator.query({
+          text: "ALTER SEQUENCE lcm.conversations_conversation_id_seq SET UNLOGGED",
+        }, { domain: "factory", operation: "setIdentitySequenceUnlogged" });
+        await expect(runPostgreSqlMigrations(database.migrator))
+          .rejects.toMatchObject({
+            baselineApplied: true,
+            driftedDefinitionGroupCount: 1,
+            expectedObjectCount: 723,
+            existingObjectCount: 723,
+            missingObjectCount: 0,
+            operation: "preflightBaselineDefinitions",
+          });
+      } finally {
+        await database.migrator.query({
+          text: "ALTER SEQUENCE lcm.conversations_conversation_id_seq SET LOGGED",
+        }, { domain: "factory", operation: "restoreIdentitySequencePersistence" });
+      }
+    });
+  });
+
   it("binds constraint names to their definitions", async () => {
     await withPostgreSqlTestDatabase("constraint-name-drift", async (database) => {
       await database.migrator.query({
