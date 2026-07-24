@@ -22,12 +22,20 @@ const MIGRATION_MANIFEST = [
   {
     id: "0002_schema_baseline",
     filename: "0002_schema_baseline.sql",
-    sha256: "6386af13407e8944ce188c9ce19b5944f27b9fa58a4ad8660ede347c8beacfa2",
+    sha256: "e96cad6c577c9f088d02366e22bbbe3f876217363659feea6d2edc1918885bae",
   },
 ] as const;
 
 type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
-type LedgerRow = QueryResultRow & { ledger_exists: boolean };
+type MigrationLedgerRelationRow = QueryResultRow & {
+  current_user_name: unknown;
+  ledger_exists: unknown;
+  owned_by_current_user: unknown;
+  relation_kind: unknown;
+};
+type SessionReplicationRoleRow = QueryResultRow & {
+  session_replication_role: unknown;
+};
 type ServerVersionRow = QueryResultRow & { server_version_num: unknown };
 type PostmasterEpochRow = QueryResultRow & { postmaster_started_at: Date | string };
 type PostmasterContinuityRow = QueryResultRow & { preflight_still_valid: boolean };
@@ -43,12 +51,441 @@ type SchemaAclRow = QueryResultRow & {
 type ServerEncodingRow = QueryResultRow & { server_encoding: unknown };
 type ManagedObjectOwnershipRow = QueryResultRow & {
   current_user_name: unknown;
+  expected_object_count: unknown;
   existing_object_count: unknown;
   unowned_object_count: unknown;
+};
+type ExpectedBaselineDefinitionInventory = {
+  readonly columnAclIdentities: readonly string[];
+  readonly constraintIdentities: readonly string[];
+  readonly generatedColumnIdentities: readonly string[];
+  readonly identitySequenceIdentities: readonly string[];
+  readonly indexNames: readonly string[];
+  readonly managedObjectIdentities: readonly string[];
+  readonly ordinaryColumnIdentities: readonly string[];
+  readonly relationAclIdentities: readonly string[];
+  readonly tableIdentities: readonly string[];
+  readonly triggerIdentities: readonly string[];
+};
+export type PostgreSqlSchemaSnapshot = ExpectedBaselineDefinitionInventory & {
+  readonly definitionHashes: {
+    readonly columnAcl: string;
+    readonly constraint: string;
+    readonly generatedColumn: string;
+    readonly identitySequence: string;
+    readonly index: string;
+    readonly ordinaryColumn: string;
+    readonly relationAcl: string;
+    readonly table: string;
+    readonly trigger: string;
+  };
+  readonly identityFunctions: readonly {
+    readonly name: string;
+    readonly sha256: string;
+  }[];
+  readonly migrationId: string;
+};
+type PostgreSqlSchemaSnapshotExpectations = {
+  readonly definitionGroupCounts: readonly number[];
+  readonly definitionGroupHashes: readonly string[];
+  readonly definitionGroupKinds: readonly string[];
+  readonly definitionObjectCount: number;
+  readonly identityFunctionHashes: readonly string[];
+  readonly identityFunctionNames: readonly string[];
+};
+type BaselineDefinitionInventoryRow = QueryResultRow & {
+  baseline_applied: unknown;
+  expected_object_count: unknown;
+  existing_object_count: unknown;
+  missing_object_count: unknown;
+  drifted_definition_group_count: unknown;
+};
+type IdentityFunctionFingerprintRow = QueryResultRow & {
+  baseline_applied: unknown;
+  expected_function_count: unknown;
+  existing_function_count: unknown;
+  drifted_function_count: unknown;
 };
 
 export const REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION = 18 as const;
 export const REQUIRED_POSTGRESQL_SERVER_ENCODING = "UTF8" as const;
+
+function expectedBaselineDefinitionInventory(): ExpectedBaselineDefinitionInventory {
+const EXPECTED_BASELINE_INDEX_NAMES = `
+  project_aliases_project_idx conversations_project_order_idx conversations_session_lookup_idx
+  messages_project_created_idx messages_search_document_idx messages_content_trgm_idx
+  message_parts_type_idx native_transcripts_source_order_idx native_transcripts_session_idx
+  native_transcripts_machine_idx native_transcripts_payload_idx transcript_messages_message_idx
+  summaries_identity_lookup_idx summaries_conversation_order_idx summaries_project_recent_idx
+  summaries_search_document_idx summaries_content_trgm_idx summary_messages_message_idx
+  summary_messages_summary_idx summary_parents_parent_idx summary_parents_summary_idx
+  context_items_message_idx context_items_summary_idx large_files_identity_lookup_idx
+  large_files_conversation_order_idx summary_large_files_file_idx summary_large_files_summary_idx
+  promoted_memories_active_order_idx promoted_memories_source_summary_idx
+  promoted_memories_source_project_idx promoted_memories_metadata_idx
+  promoted_memories_search_document_idx promoted_memories_content_trgm_idx
+  promoted_memory_tags_lookup_idx promoted_memory_tags_normalized_lookup_idx
+  promoted_memory_tags_search_document_idx promoted_memory_tags_tag_trgm_idx
+  recall_surfacing_memory_order_idx recall_surfacing_session_order_idx
+  ingest_checkpoints_payload_idx ingest_checkpoints_machine_idx
+  session_ingest_log_identity_lookup_idx session_ingest_log_completed_idx
+  session_instructions_machine_idx passive_event_inbox_ready_idx passive_event_inbox_retry_idx
+  passive_event_inbox_claimed_idx passive_event_inbox_payload_idx passive_event_inbox_project_idx
+  fenced_leases_owner_idx fenced_leases_expiry_idx fenced_leases_owner_machine_idx
+`.trim().split(/\s+/u);
+
+const EXPECTED_BASELINE_TRIGGER_IDENTITIES = [
+  "large_files|large_files_enforce_file_id_uniqueness",
+  "session_ingest_log|session_ingest_log_enforce_session_id_uniqueness",
+  "summaries|summaries_enforce_summary_id_uniqueness",
+] as const;
+
+const EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES = [
+  "conversations|session_id_sha256",
+  "large_files|file_id_sha256",
+  "messages|search_document",
+  "native_transcripts|native_session_id_sha256",
+  "promoted_memories|search_document",
+  "promoted_memories|source_summary_id_sha256",
+  "promoted_memory_tags|normalized_tag",
+  "promoted_memory_tags|normalized_tag_sha256",
+  "promoted_memory_tags|search_document",
+  "promoted_memory_tags|tag_sha256",
+  "recall_surfacing|session_id_sha256",
+  "session_ingest_log|session_id_sha256",
+  "summaries|search_document",
+  "summaries|summary_id_sha256",
+  "summary_large_files|file_id_sha256",
+] as const;
+
+const EXPECTED_BASELINE_IDENTITY_SEQUENCE_IDENTITIES = [
+  "conversations_conversation_id_seq",
+  "fenced_leases_fencing_token_seq",
+  "messages_message_id_seq",
+  "passive_event_inbox_inbox_id_seq",
+  "recall_surfacing_surfacing_id_seq",
+  "session_instructions_instruction_id_seq",
+] as const;
+
+const EXPECTED_BASELINE_TABLE_IDENTITIES = `
+  schema_migrations machines projects project_aliases conversations messages message_parts
+  native_transcripts transcript_messages summaries summary_messages summary_parents
+  context_items large_files summary_large_files promoted_memories promoted_memory_tags
+  recall_surfacing redaction_counters ingest_checkpoints session_ingest_log
+  session_instructions passive_event_inbox fenced_leases
+`.trim().split(/\s+/u);
+
+const EXPECTED_BASELINE_RELATION_ACL_IDENTITIES = [
+  ...EXPECTED_BASELINE_TABLE_IDENTITIES.map((name) => `table|${name}`),
+  ...EXPECTED_BASELINE_IDENTITY_SEQUENCE_IDENTITIES.map((name) => `sequence|${name}`),
+];
+
+const EXPECTED_BASELINE_MANAGED_OBJECT_IDENTITIES = [
+  ...EXPECTED_BASELINE_RELATION_ACL_IDENTITIES,
+  "dictionary|simple_v1",
+  "configuration|search_v1",
+  "function|normalize_search_text|input text",
+  "function|enforce_summary_id_uniqueness|",
+  "function|enforce_large_file_id_uniqueness|",
+  "function|enforce_session_ingest_id_uniqueness|",
+];
+
+const EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES = `
+  schema_migrations|id schema_migrations|checksum_sha256 schema_migrations|applied_at
+  machines|machine_id machines|identity_key machines|display_name machines|registered_at
+  machines|last_seen_at projects|project_id projects|identity_key projects|display_name
+  projects|created_at projects|updated_at project_aliases|project_id project_aliases|machine_id
+  project_aliases|path project_aliases|normalized_path project_aliases|linked_at
+  conversations|conversation_id conversations|project_id conversations|session_id
+  conversations|title conversations|bootstrapped_at conversations|created_at
+  conversations|updated_at messages|message_id messages|project_id messages|conversation_id
+  messages|seq messages|role messages|content messages|token_count messages|created_at
+  message_parts|part_id message_parts|project_id message_parts|conversation_id
+  message_parts|message_id message_parts|session_id message_parts|part_type
+  message_parts|ordinal message_parts|text_content message_parts|is_ignored
+  message_parts|is_synthetic message_parts|tool_call_id message_parts|tool_name
+  message_parts|tool_status message_parts|tool_input message_parts|tool_output
+  message_parts|tool_error message_parts|tool_title message_parts|patch_hash
+  message_parts|patch_files message_parts|file_mime message_parts|file_name
+  message_parts|file_url message_parts|subtask_prompt message_parts|subtask_desc
+  message_parts|subtask_agent message_parts|step_reason message_parts|step_cost
+  message_parts|step_tokens_in message_parts|step_tokens_out message_parts|snapshot_hash
+  message_parts|compaction_auto message_parts|metadata native_transcripts|transcript_id
+  native_transcripts|project_id native_transcripts|machine_id native_transcripts|client_name
+  native_transcripts|format_name native_transcripts|format_version
+  native_transcripts|native_session_id native_transcripts|source_locator
+  native_transcripts|source_ordinal native_transcripts|observed_at
+  native_transcripts|ingested_at native_transcripts|scrubber_version
+  native_transcripts|content_sha256 native_transcripts|ingest_key
+  native_transcripts|native_payload transcript_messages|project_id
+  transcript_messages|transcript_id transcript_messages|conversation_id
+  transcript_messages|message_id transcript_messages|source_ordinal summaries|summary_key
+  summaries|summary_id summaries|project_id summaries|conversation_id summaries|kind
+  summaries|depth summaries|content summaries|token_count summaries|earliest_at
+  summaries|latest_at summaries|descendant_count summaries|descendant_token_count
+  summaries|source_message_token_count summaries|created_at summary_messages|project_id
+  summary_messages|conversation_id summary_messages|summary_key summary_messages|message_id
+  summary_messages|ordinal summary_parents|project_id summary_parents|conversation_id
+  summary_parents|summary_key summary_parents|parent_summary_key summary_parents|ordinal
+  context_items|project_id context_items|conversation_id context_items|ordinal
+  context_items|item_type context_items|message_id context_items|summary_key
+  context_items|created_at large_files|file_key large_files|file_id large_files|project_id
+  large_files|conversation_id large_files|file_name large_files|mime_type
+  large_files|byte_size large_files|storage_uri large_files|exploration_summary
+  large_files|created_at summary_large_files|project_id summary_large_files|conversation_id
+  summary_large_files|summary_key summary_large_files|file_id summary_large_files|ordinal
+  promoted_memories|memory_id promoted_memories|project_id promoted_memories|content
+  promoted_memories|source_summary_id promoted_memories|source_project_id
+  promoted_memories|session_id promoted_memories|depth promoted_memories|confidence
+  promoted_memories|metadata promoted_memories|created_at promoted_memories|archived_at
+  promoted_memory_tags|project_id promoted_memory_tags|memory_id
+  promoted_memory_tags|ordinal promoted_memory_tags|tag recall_surfacing|surfacing_id
+  recall_surfacing|project_id recall_surfacing|memory_id recall_surfacing|session_id
+  recall_surfacing|surfaced_at
+  redaction_counters|project_id redaction_counters|category redaction_counters|count
+  redaction_counters|updated_at ingest_checkpoints|project_id ingest_checkpoints|machine_id
+  ingest_checkpoints|client_name ingest_checkpoints|source_locator
+  ingest_checkpoints|last_source_ordinal ingest_checkpoints|imported_count
+  ingest_checkpoints|skipped_count ingest_checkpoints|quarantined_count
+  ingest_checkpoints|checkpoint ingest_checkpoints|updated_at session_ingest_log|ingest_key
+  session_ingest_log|project_id session_ingest_log|session_id
+  session_ingest_log|message_count session_ingest_log|completed_at
+  session_instructions|instruction_id session_instructions|project_id
+  session_instructions|machine_id session_instructions|slot session_instructions|content
+  session_instructions|content_hash session_instructions|updated_at
+  passive_event_inbox|inbox_id passive_event_inbox|project_id
+  passive_event_inbox|machine_id passive_event_inbox|event_id
+  passive_event_inbox|event_version passive_event_inbox|machine_sequence
+  passive_event_inbox|event_type passive_event_inbox|payload passive_event_inbox|status
+  passive_event_inbox|attempt_count passive_event_inbox|received_at
+  passive_event_inbox|next_attempt_at passive_event_inbox|claimed_at
+  passive_event_inbox|claimed_by passive_event_inbox|applied_at
+  passive_event_inbox|quarantined_at passive_event_inbox|quarantine_reason
+  fenced_leases|project_id fenced_leases|resource_type fenced_leases|resource_key
+  fenced_leases|owner_machine_id fenced_leases|owner_process_id fenced_leases|operation
+  fenced_leases|fencing_token fenced_leases|acquired_at fenced_leases|renewed_at
+  fenced_leases|expires_at fenced_leases|released_at
+`.trim().split(/\s+/u);
+
+const EXPECTED_BASELINE_CONSTRAINT_NAMES = `
+  context_items_item_type_check context_items_check context_items_ordinal_check
+  context_items_project_id_conversation_id_message_id_fkey
+  context_items_project_id_conversation_id_fkey
+  context_items_project_id_conversation_id_summary_key_fkey context_items_pkey
+  conversations_check1 conversations_check conversations_project_id_fkey conversations_pkey
+  conversations_project_id_conversation_id_key fenced_leases_operation_check
+  fenced_leases_owner_process_id_check fenced_leases_resource_key_check
+  fenced_leases_resource_type_check fenced_leases_check1 fenced_leases_fencing_token_check
+  fenced_leases_check2 fenced_leases_check fenced_leases_owner_machine_id_fkey
+  fenced_leases_project_id_fkey fenced_leases_pkey ingest_checkpoints_client_name_check
+  ingest_checkpoints_imported_count_check ingest_checkpoints_checkpoint_check
+  ingest_checkpoints_last_source_ordinal_check ingest_checkpoints_quarantined_count_check
+  ingest_checkpoints_skipped_count_check ingest_checkpoints_source_locator_check
+  ingest_checkpoints_machine_id_fkey ingest_checkpoints_project_id_fkey ingest_checkpoints_pkey
+  large_files_storage_uri_check large_files_byte_size_check large_files_file_key_check
+  large_files_project_id_conversation_id_fkey large_files_pkey
+  large_files_project_id_conversation_id_file_key_key machines_identity_key_check
+  machines_display_name_check machines_check machines_machine_id_check machines_pkey
+  machines_identity_key_key message_parts_ordinal_check message_parts_part_type_check
+  message_parts_step_cost_check message_parts_step_tokens_in_check
+  message_parts_step_tokens_out_check message_parts_project_id_conversation_id_message_id_fkey
+  message_parts_pkey message_parts_project_id_conversation_id_message_id_ordinal_key
+  messages_role_check messages_seq_check messages_token_count_check
+  messages_project_id_conversation_id_fkey messages_pkey
+  messages_project_id_conversation_id_message_id_key
+  messages_project_id_conversation_id_seq_key native_transcripts_client_name_check
+  native_transcripts_format_name_check native_transcripts_format_version_check
+  native_transcripts_native_session_id_check native_transcripts_scrubber_version_check
+  native_transcripts_content_sha256_check native_transcripts_check
+  native_transcripts_ingest_key_check native_transcripts_native_payload_check
+  native_transcripts_source_locator_check native_transcripts_source_ordinal_check
+  native_transcripts_transcript_id_check native_transcripts_machine_id_fkey
+  native_transcripts_project_id_fkey native_transcripts_pkey
+  native_transcripts_project_id_machine_id_ingest_key_key
+  native_transcripts_project_id_transcript_id_key passive_event_inbox_check7
+  passive_event_inbox_attempt_count_check passive_event_inbox_event_type_check
+  passive_event_inbox_check1 passive_event_inbox_check6 passive_event_inbox_claimed_by_check
+  passive_event_inbox_event_version_check passive_event_inbox_payload_check
+  passive_event_inbox_machine_sequence_check passive_event_inbox_check
+  passive_event_inbox_check8 passive_event_inbox_check5
+  passive_event_inbox_quarantine_reason_check passive_event_inbox_status_check
+  passive_event_inbox_check3 passive_event_inbox_check2 passive_event_inbox_check4
+  passive_event_inbox_machine_id_fkey passive_event_inbox_project_id_fkey
+  passive_event_inbox_pkey passive_event_inbox_machine_id_event_id_key
+  passive_event_inbox_machine_id_machine_sequence_key project_aliases_normalized_path_check
+  project_aliases_path_check project_aliases_machine_id_fkey project_aliases_project_id_fkey
+  project_aliases_pkey projects_display_name_check projects_identity_key_check projects_check
+  projects_project_id_check projects_pkey projects_identity_key_key promoted_memories_check
+  promoted_memories_confidence_check promoted_memories_content_check
+  promoted_memories_depth_check promoted_memories_metadata_check
+  promoted_memories_project_id_fkey promoted_memories_pkey
+  promoted_memories_project_id_memory_id_key promoted_memory_tags_ordinal_check
+  promoted_memory_tags_project_id_memory_id_fkey promoted_memory_tags_pkey
+  recall_surfacing_project_id_fkey recall_surfacing_pkey redaction_counters_category_check
+  redaction_counters_count_check redaction_counters_project_id_fkey redaction_counters_pkey
+  schema_migrations_checksum_sha256_check schema_migrations_pkey
+  session_ingest_log_message_count_check session_ingest_log_ingest_key_check
+  session_ingest_log_project_id_fkey session_ingest_log_pkey
+  session_instructions_slot_check session_instructions_machine_id_fkey
+  session_instructions_project_id_fkey session_instructions_pkey
+  session_instructions_project_id_machine_id_slot_key summaries_depth_check
+  summaries_descendant_count_check summaries_descendant_token_count_check summaries_check
+  summaries_kind_check summaries_source_message_token_count_check summaries_token_count_check
+  summaries_summary_key_check summaries_project_id_conversation_id_fkey summaries_pkey
+  summaries_project_id_conversation_id_summary_key_key summary_large_files_ordinal_check
+  summary_large_files_project_id_conversation_id_summary_key_fkey summary_large_files_pkey
+  summary_messages_ordinal_check summary_messages_project_id_conversation_id_message_id_fkey
+  summary_messages_project_id_conversation_id_summary_key_fkey summary_messages_pkey
+  summary_messages_project_id_summary_key_ordinal_key summary_parents_ordinal_check
+  summary_parents_check summary_parents_project_id_conversation_id_parent_summary__fkey
+  summary_parents_project_id_conversation_id_summary_key_fkey summary_parents_pkey
+  summary_parents_project_id_summary_key_ordinal_key transcript_messages_source_ordinal_check
+  transcript_messages_project_id_conversation_id_message_id_fkey
+  transcript_messages_project_id_transcript_id_fkey transcript_messages_pkey
+  transcript_messages_project_id_transcript_id_source_ordinal_key
+`.trim().split(/\s+/u);
+
+const EXPECTED_BASELINE_CONSTRAINT_TABLES = [
+  "context_items",
+  "conversations",
+  "fenced_leases",
+  "ingest_checkpoints",
+  "large_files",
+  "machines",
+  "message_parts",
+  "messages",
+  "native_transcripts",
+  "passive_event_inbox",
+  "project_aliases",
+  "projects",
+  "promoted_memories",
+  "promoted_memory_tags",
+  "recall_surfacing",
+  "redaction_counters",
+  "schema_migrations",
+  "session_ingest_log",
+  "session_instructions",
+  "summaries",
+  "summary_large_files",
+  "summary_messages",
+  "summary_parents",
+  "transcript_messages",
+] as const;
+
+const EXPECTED_BASELINE_CONSTRAINT_IDENTITIES =
+  EXPECTED_BASELINE_CONSTRAINT_NAMES.map((constraintName) => {
+    const tableName = EXPECTED_BASELINE_CONSTRAINT_TABLES.find(
+      (candidate) => constraintName.startsWith(`${candidate}_`),
+    )!;
+    return `${tableName}|${constraintName}`;
+  });
+
+  return {
+    columnAclIdentities: [
+      ...EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES,
+      ...EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES,
+    ],
+    constraintIdentities: EXPECTED_BASELINE_CONSTRAINT_IDENTITIES,
+    generatedColumnIdentities: EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES,
+    identitySequenceIdentities: EXPECTED_BASELINE_IDENTITY_SEQUENCE_IDENTITIES,
+    indexNames: EXPECTED_BASELINE_INDEX_NAMES,
+    managedObjectIdentities: EXPECTED_BASELINE_MANAGED_OBJECT_IDENTITIES,
+    ordinaryColumnIdentities: EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES,
+    relationAclIdentities: EXPECTED_BASELINE_RELATION_ACL_IDENTITIES,
+    tableIdentities: EXPECTED_BASELINE_TABLE_IDENTITIES,
+    triggerIdentities: EXPECTED_BASELINE_TRIGGER_IDENTITIES,
+  } as const;
+}
+
+export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapshot[] {
+  return [{
+    ...expectedBaselineDefinitionInventory(),
+    definitionHashes: {
+      columnAcl: "d3d92012f458893ce5bf0ff0d1f72699ba6d8a9ef42d25a62c0ccede9e582f9c",
+      constraint: "f445a06d320f46f8c5d829f89a3a7bc0b13c5507096b111f125d9f0dd0ba0e2f",
+      generatedColumn: "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
+      identitySequence: "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
+      index: "16e10e2a4fc080f52b11315ee2b03d5df258d216f293bb0051b56beb16035374",
+      ordinaryColumn: "1cca7e1d3a1143074cb2eb2b809e816a2f4d1e06feba1e1b6bac46f8a725c487",
+      relationAcl: "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
+      table: "5ccf4137ba8c1dbe8462176414b89f30616b26622d9680d77c5e2ae271d2f64d",
+      trigger: "229e8dd0e6a1c953dd18b4220da95be28121db72f4fbba199e1d6808c4b7afcc",
+    },
+    identityFunctions: [
+      {
+        name: "enforce_summary_id_uniqueness",
+        sha256: "2e4d8b18c207e251edfbc81dac50cd0e0dba45dc0768ef50eeded33f5571d975",
+      },
+      {
+        name: "enforce_large_file_id_uniqueness",
+        sha256: "89d25e96d0ccc63954135183605c7aadbcb4c726143c8c56c67b9cd49398957b",
+      },
+      {
+        name: "enforce_session_ingest_id_uniqueness",
+        sha256: "9904bce7ff1f89e2317d1b4d156f43b9033574d230b99e4368b7fe59b20172d0",
+      },
+    ],
+    migrationId: "0002_schema_baseline",
+  }];
+}
+
+export function selectLatestPostgreSqlSchemaSnapshot(
+  migrationIds: readonly string[],
+  snapshots: readonly PostgreSqlSchemaSnapshot[],
+): PostgreSqlSchemaSnapshot | null {
+  const snapshotsByMigrationId = new Map(
+    snapshots.map((snapshot) => [snapshot.migrationId, snapshot]),
+  );
+  for (let index = migrationIds.length - 1; index >= 0; index -= 1) {
+    const snapshot = snapshotsByMigrationId.get(migrationIds[index]!);
+    if (snapshot) return snapshot;
+  }
+  return null;
+}
+
+export function getPostgreSqlSchemaSnapshotExpectations(
+  snapshot: PostgreSqlSchemaSnapshot,
+): PostgreSqlSchemaSnapshotExpectations {
+  const definitionGroups = [
+    ["index", snapshot.indexNames.length, snapshot.definitionHashes.index],
+    ["trigger", snapshot.triggerIdentities.length, snapshot.definitionHashes.trigger],
+    ["constraint", snapshot.constraintIdentities.length, snapshot.definitionHashes.constraint],
+    [
+      "generated_column",
+      snapshot.generatedColumnIdentities.length,
+      snapshot.definitionHashes.generatedColumn,
+    ],
+    [
+      "column_acl",
+      snapshot.columnAclIdentities.length,
+      snapshot.definitionHashes.columnAcl,
+    ],
+    [
+      "identity_sequence",
+      snapshot.identitySequenceIdentities.length,
+      snapshot.definitionHashes.identitySequence,
+    ],
+    ["table", snapshot.tableIdentities.length, snapshot.definitionHashes.table],
+    [
+      "relation_acl",
+      snapshot.relationAclIdentities.length,
+      snapshot.definitionHashes.relationAcl,
+    ],
+    [
+      "ordinary_column",
+      snapshot.ordinaryColumnIdentities.length,
+      snapshot.definitionHashes.ordinaryColumn,
+    ],
+  ] as const;
+  return {
+    definitionGroupCounts: definitionGroups.map(([, count]) => count),
+    definitionGroupHashes: definitionGroups.map(([, , hash]) => hash),
+    definitionGroupKinds: definitionGroups.map(([kind]) => kind),
+    definitionObjectCount: definitionGroups.reduce((total, [, count]) => total + count, 0),
+    identityFunctionHashes: snapshot.identityFunctions.map(({ sha256 }) => sha256),
+    identityFunctionNames: snapshot.identityFunctions.map(({ name }) => name),
+  };
+}
 
 export class PostgreSqlServerVersionPreflightError extends StorageOperationError {
   constructor(
@@ -139,7 +576,10 @@ export class PostgreSqlSchemaOwnershipPreflightError extends StorageOperationErr
 
 export class PostgreSqlManagedObjectOwnershipPreflightError extends StorageOperationError {
   constructor(
+    readonly baselineApplied: boolean | null,
+    readonly expectedObjectCount: number | null,
     readonly existingObjectCount: number | null,
+    readonly missingObjectCount: number | null,
     readonly unownedObjectCount: number | null,
     readonly requiredOwner: string | null,
   ) {
@@ -150,9 +590,11 @@ export class PostgreSqlManagedObjectOwnershipPreflightError extends StorageOpera
       "factory",
       "preflightManagedObjectOwnership",
     );
-    this.remediation = requiredOwner === null
-      ? null
-      : `Transfer ownership of every LCM-managed object in schema "lcm" to PostgreSQL role ${quoteIdentifier(requiredOwner)}, then rerun migrations.`;
+    this.remediation = missingObjectCount !== null && missingObjectCount > 0
+      ? "Restore every missing LCM-managed object from the matching packaged migration artifact or a verified backup, then rerun migrations."
+      : requiredOwner === null
+        ? null
+        : `Transfer ownership of every LCM-managed object in schema "lcm" to PostgreSQL role ${quoteIdentifier(requiredOwner)}, then rerun migrations.`;
   }
 
   readonly schemaName = "lcm";
@@ -162,9 +604,142 @@ export class PostgreSqlManagedObjectOwnershipPreflightError extends StorageOpera
     return {
       ...super.toJSON(),
       schemaName: this.schemaName,
+      baselineApplied: this.baselineApplied,
+      expectedObjectCount: this.expectedObjectCount,
       existingObjectCount: this.existingObjectCount,
+      missingObjectCount: this.missingObjectCount,
       unownedObjectCount: this.unownedObjectCount,
       requiredOwner: this.requiredOwner,
+      remediation: this.remediation,
+    };
+  }
+}
+
+export class PostgreSqlMigrationLedgerRelationPreflightError extends StorageOperationError {
+  constructor(
+    readonly ledgerExists: boolean | null,
+    readonly relationKind: string | null,
+    readonly ownedByMigrator: boolean | null,
+    readonly requiredOwner: string | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightMigrationLedgerRelation",
+    );
+  }
+
+  readonly schemaName = "lcm";
+  readonly relationName = "schema_migrations";
+  readonly requiredRelationKind = "r";
+  readonly remediation =
+    "Restore lcm.schema_migrations as an ordinary table owned by the migration role, then rerun migrations.";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      schemaName: this.schemaName,
+      relationName: this.relationName,
+      ledgerExists: this.ledgerExists,
+      relationKind: this.relationKind,
+      requiredRelationKind: this.requiredRelationKind,
+      ownedByMigrator: this.ownedByMigrator,
+      requiredOwner: this.requiredOwner,
+      remediation: this.remediation,
+    };
+  }
+}
+
+export class PostgreSqlIdentityFunctionPreflightError extends StorageOperationError {
+  constructor(
+    readonly baselineApplied: boolean | null,
+    readonly expectedFunctionCount: number | null,
+    readonly existingFunctionCount: number | null,
+    readonly driftedFunctionCount: number | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightIdentityFunctionDefinitions",
+    );
+  }
+
+  readonly schemaName = "lcm";
+  readonly remediation =
+    "Restore the packaged LCM identity-enforcement functions and their security configuration, then rerun migrations.";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      schemaName: this.schemaName,
+      baselineApplied: this.baselineApplied,
+      expectedFunctionCount: this.expectedFunctionCount,
+      existingFunctionCount: this.existingFunctionCount,
+      driftedFunctionCount: this.driftedFunctionCount,
+      remediation: this.remediation,
+    };
+  }
+}
+
+export class PostgreSqlBaselineDefinitionPreflightError extends StorageOperationError {
+  constructor(
+    readonly baselineApplied: boolean | null,
+    readonly expectedObjectCount: number | null,
+    readonly existingObjectCount: number | null,
+    readonly missingObjectCount: number | null,
+    readonly driftedDefinitionGroupCount: number | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightBaselineDefinitions",
+    );
+  }
+
+  readonly schemaName = "lcm";
+  readonly remediation =
+    "Restore every missing or changed LCM baseline table, relation ACL, column ACL, index, trigger, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      schemaName: this.schemaName,
+      baselineApplied: this.baselineApplied,
+      expectedObjectCount: this.expectedObjectCount,
+      existingObjectCount: this.existingObjectCount,
+      missingObjectCount: this.missingObjectCount,
+      driftedDefinitionGroupCount: this.driftedDefinitionGroupCount,
+      remediation: this.remediation,
+    };
+  }
+}
+
+export class PostgreSqlSessionReplicationRolePreflightError extends StorageOperationError {
+  constructor(readonly sessionReplicationRole: "local" | "origin" | "replica" | null) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightSessionReplicationRole",
+    );
+  }
+
+  readonly requiredSessionReplicationRole = "origin";
+  readonly remediation =
+    "Set session_replication_role to origin on the migration connection, or reconnect with its default session state, then rerun migrations.";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      sessionReplicationRole: this.sessionReplicationRole,
+      requiredSessionReplicationRole: this.requiredSessionReplicationRole,
       remediation: this.remediation,
     };
   }
@@ -198,6 +773,39 @@ export class PostgreSqlSchemaAclPreflightError extends StorageOperationError {
   }
 }
 
+export class PostgreSqlSchemaSnapshotRegistryError extends StorageOperationError {
+  constructor(
+    readonly reason:
+      | "duplicate_identity_function"
+      | "duplicate_migration_id"
+      | "identity_function_mismatch"
+      | "unknown_migration_id",
+    readonly migrationId: string,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "validateSchemaSnapshotRegistry",
+    );
+    this.message = {
+      duplicate_identity_function:
+        `PostgreSQL schema snapshot ${migrationId} contains duplicate identity function names`,
+      duplicate_migration_id:
+        `PostgreSQL schema snapshot registry contains duplicate migrationId ${migrationId}`,
+      identity_function_mismatch:
+        `PostgreSQL schema snapshot ${migrationId} identity functions do not match managed zero-argument functions`,
+      unknown_migration_id:
+        `PostgreSQL schema snapshot registry references unknown migrationId ${migrationId}`,
+    }[reason];
+  }
+
+  override toJSON(): Record<string, unknown> {
+    return { ...super.toJSON(), reason: this.reason, migrationId: this.migrationId };
+  }
+}
+
 function sanitizeServerVersionNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
@@ -206,6 +814,14 @@ function sanitizeServerVersionNumber(value: unknown): number | null {
 
 function sanitizeBoolean(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
+}
+
+function sanitizeSessionReplicationRole(
+  value: unknown,
+): "local" | "origin" | "replica" | null {
+  return value === "local" || value === "origin" || value === "replica"
+    ? value
+    : null;
 }
 
 function sanitizeNonnegativeCount(value: unknown): number | null {
@@ -278,6 +894,53 @@ function validateMigrations(migrations: readonly PostgreSqlMigration[]): void {
   }
 }
 
+function validateSchemaSnapshotRegistry(
+  migrations: readonly PostgreSqlMigration[],
+  snapshots: readonly PostgreSqlSchemaSnapshot[],
+): void {
+  const migrationIds = new Set(migrations.map(({ id }) => id));
+  const snapshotIds = new Set<string>();
+  for (const snapshot of snapshots) {
+    if (snapshotIds.has(snapshot.migrationId)) {
+      throw new PostgreSqlSchemaSnapshotRegistryError(
+        "duplicate_migration_id",
+        snapshot.migrationId,
+      );
+    }
+    if (!migrationIds.has(snapshot.migrationId)) {
+      throw new PostgreSqlSchemaSnapshotRegistryError(
+        "unknown_migration_id",
+        snapshot.migrationId,
+      );
+    }
+    const identityFunctionNames = snapshot.identityFunctions.map(({ name }) => name);
+    if (new Set(identityFunctionNames).size !== identityFunctionNames.length) {
+      throw new PostgreSqlSchemaSnapshotRegistryError(
+        "duplicate_identity_function",
+        snapshot.migrationId,
+      );
+    }
+    const managedZeroArgumentFunctions = snapshot.managedObjectIdentities
+      .filter((identity) => identity.startsWith("function|"))
+      .map((identity) => identity.split("|"))
+      .filter(([, , argumentsIdentity]) => argumentsIdentity === "")
+      .map(([, name]) => name!)
+      .sort();
+    if (
+      identityFunctionNames.length !== managedZeroArgumentFunctions.length
+      || [...identityFunctionNames].sort().some(
+        (name, index) => name !== managedZeroArgumentFunctions[index],
+      )
+    ) {
+      throw new PostgreSqlSchemaSnapshotRegistryError(
+        "identity_function_mismatch",
+        snapshot.migrationId,
+      );
+    }
+    snapshotIds.add(snapshot.migrationId);
+  }
+}
+
 export async function runPostgreSqlMigrations(
   executor: PostgreSqlQueryExecutor & {
     transaction<T>(
@@ -285,10 +948,16 @@ export async function runPostgreSqlMigrations(
       options: { domain: "factory"; operation: string; signal?: AbortSignal },
     ): Promise<T>;
   },
-  options: { migrations?: readonly PostgreSqlMigration[]; signal?: AbortSignal } = {},
+  options: {
+    migrations?: readonly PostgreSqlMigration[];
+    schemaSnapshots?: readonly PostgreSqlSchemaSnapshot[];
+    signal?: AbortSignal;
+  } = {},
 ): Promise<PostgreSqlMigrationResult> {
   const migrations = [...(options.migrations ?? loadPostgreSqlMigrations())];
+  const schemaSnapshots = [...(options.schemaSnapshots ?? loadPostgreSqlSchemaSnapshots())];
   validateMigrations(migrations);
+  validateSchemaSnapshotRegistry(migrations, schemaSnapshots);
   // The functional pg_stat_statements probe can raise SQLSTATE 55000 when the
   // library was not preloaded. Run it before opening the all-or-nothing DDL
   // transaction so that expected readiness failure cannot poison that scope.
@@ -313,6 +982,27 @@ export async function runPostgreSqlMigrations(
     await transaction.query({
       text: "SET LOCAL search_path = pg_catalog, public",
     }, { domain: "factory", operation: "pinMigrationSearchPath", signal: options.signal });
+    await transaction.query({
+      text: "SET LOCAL quote_all_identifiers = off",
+    }, { domain: "factory", operation: "pinMigrationDeparserSettings", signal: options.signal });
+
+    const replicationRole = await transaction.query<SessionReplicationRoleRow>({
+      text: `SELECT pg_catalog.current_setting(
+               'session_replication_role'
+             ) AS session_replication_role`,
+    }, {
+      domain: "factory",
+      operation: "preflightSessionReplicationRole",
+      signal: options.signal,
+    });
+    const sessionReplicationRole = sanitizeSessionReplicationRole(
+      replicationRole.rows[0]?.session_replication_role,
+    );
+    if (sessionReplicationRole !== "origin") {
+      throw new PostgreSqlSessionReplicationRolePreflightError(
+        sessionReplicationRole,
+      );
+    }
 
     await transaction.query({
       text: `SELECT pg_catalog.pg_advisory_xact_lock(
@@ -423,128 +1113,184 @@ export async function runPostgreSqlMigrations(
       throw new PostgreSqlSchemaAclPreflightError(aclSchemaExists, publicCreate);
     }
 
-    const managedOwnership = await transaction.query<ManagedObjectOwnershipRow>({
+    const ledgerRelation = await transaction.query<MigrationLedgerRelationRow>({
       text: `WITH migration_role AS (
-               SELECT role.oid
+               SELECT role.oid, role.rolname
                FROM pg_catalog.pg_roles AS role
                WHERE role.rolname OPERATOR(pg_catalog.=) CURRENT_USER
              ),
-             managed_objects(owner_oid) AS (
-               SELECT relation.relowner
+             ledger_relation AS (
+               SELECT relation.relkind, relation.relowner
                FROM pg_catalog.pg_class AS relation
                JOIN pg_catalog.pg_namespace AS namespace
                  ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
                WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-                 AND (
-                   (
-                     relation.relkind OPERATOR(pg_catalog.=) 'r'
-                     AND relation.relname OPERATOR(pg_catalog.=) ANY (
-                       ARRAY[
-                         'schema_migrations', 'machines', 'projects', 'project_aliases',
-                         'conversations', 'messages', 'message_parts', 'native_transcripts',
-                         'transcript_messages', 'summaries', 'summary_messages',
-                         'summary_parents', 'context_items', 'large_files',
-                         'summary_large_files', 'promoted_memories', 'promoted_memory_tags',
-                         'recall_surfacing', 'redaction_counters', 'ingest_checkpoints',
-                         'session_ingest_log', 'session_instructions', 'passive_event_inbox',
-                         'fenced_leases'
-                       ]::pg_catalog.text[]
-                     )
-                   )
-                   OR (
-                     relation.relkind OPERATOR(pg_catalog.=) 'S'
-                     AND relation.relname OPERATOR(pg_catalog.=) ANY (
-                       ARRAY[
-                         'conversations_conversation_id_seq',
-                         'messages_message_id_seq',
-                         'recall_surfacing_surfacing_id_seq',
-                         'session_instructions_instruction_id_seq',
-                         'passive_event_inbox_inbox_id_seq',
-                         'fenced_leases_fencing_token_seq'
-                       ]::pg_catalog.text[]
-                     )
-                   )
-                 )
-               UNION ALL
-               SELECT procedure.proowner
-               FROM pg_catalog.pg_proc AS procedure
-               JOIN pg_catalog.pg_namespace AS namespace
-                 ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
-               WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-                 AND procedure.prokind OPERATOR(pg_catalog.=) 'f'
-                 AND (
-                   (
-                     procedure.proname OPERATOR(pg_catalog.=) 'normalize_search_text'
-                     AND procedure.pronargs OPERATOR(pg_catalog.=) 1
-                     AND procedure.proargtypes[0] OPERATOR(pg_catalog.=)
-                       pg_catalog.to_regtype('pg_catalog.text')
-                   )
-                   OR (
-                     procedure.proname OPERATOR(pg_catalog.=)
-                       'enforce_summary_id_uniqueness'
-                     AND procedure.pronargs OPERATOR(pg_catalog.=) 0
-                   )
-                   OR (
-                     procedure.proname OPERATOR(pg_catalog.=)
-                       'enforce_large_file_id_uniqueness'
-                     AND procedure.pronargs OPERATOR(pg_catalog.=) 0
-                   )
-                 )
-               UNION ALL
-               SELECT dictionary.dictowner
-               FROM pg_catalog.pg_ts_dict AS dictionary
-               JOIN pg_catalog.pg_namespace AS namespace
-                 ON namespace.oid OPERATOR(pg_catalog.=) dictionary.dictnamespace
-               WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-                 AND dictionary.dictname OPERATOR(pg_catalog.=) 'simple_v1'
-               UNION ALL
-               SELECT configuration.cfgowner
-               FROM pg_catalog.pg_ts_config AS configuration
-               JOIN pg_catalog.pg_namespace AS namespace
-                 ON namespace.oid OPERATOR(pg_catalog.=) configuration.cfgnamespace
-               WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-                 AND configuration.cfgname OPERATOR(pg_catalog.=) 'search_v1'
+                 AND relation.relname OPERATOR(pg_catalog.=) 'schema_migrations'
              )
-             SELECT CURRENT_USER::pg_catalog.text AS current_user_name,
-                    pg_catalog.count(*)::pg_catalog.int4 AS existing_object_count,
-                    pg_catalog.count(*) FILTER (
-                      WHERE managed_objects.owner_oid OPERATOR(pg_catalog.<>) migration_role.oid
-                    )::pg_catalog.int4 AS unowned_object_count
-             FROM managed_objects
-             CROSS JOIN migration_role`,
+             SELECT migration_role.rolname::pg_catalog.text AS current_user_name,
+                    ledger_relation.relkind IS NOT NULL AS ledger_exists,
+                    ledger_relation.relkind::pg_catalog.text AS relation_kind,
+                    CASE
+                      WHEN ledger_relation.relkind IS NULL THEN NULL
+                      ELSE ledger_relation.relowner OPERATOR(pg_catalog.=) migration_role.oid
+                    END AS owned_by_current_user
+             FROM migration_role
+             LEFT JOIN ledger_relation ON true`,
     }, {
       domain: "factory",
-      operation: "preflightManagedObjectOwnership",
+      operation: "preflightMigrationLedgerRelation",
       signal: options.signal,
     });
-    const existingObjectCount = sanitizeNonnegativeCount(
-      managedOwnership.rows[0]?.existing_object_count,
+    const ledgerExists = sanitizeBoolean(ledgerRelation.rows[0]?.ledger_exists);
+    const rawRelationKind = ledgerRelation.rows[0]?.relation_kind;
+    const relationKind = typeof rawRelationKind === "string" && rawRelationKind.length === 1
+      ? rawRelationKind
+      : null;
+    const rawLedgerOwnership = ledgerRelation.rows[0]?.owned_by_current_user;
+    const ledgerOwnedByMigrator = sanitizeBoolean(rawLedgerOwnership);
+    const ledgerRequiredOwner = sanitizeRoleName(
+      ledgerRelation.rows[0]?.current_user_name,
     );
-    const unownedObjectCount = sanitizeNonnegativeCount(
-      managedOwnership.rows[0]?.unowned_object_count,
-    );
-    const managedRequiredOwner = sanitizeRoleName(
-      managedOwnership.rows[0]?.current_user_name,
-    );
+    const absentLedgerIsValid = ledgerExists === false
+      && rawRelationKind === null
+      && rawLedgerOwnership === null;
+    const presentLedgerIsValid = ledgerExists === true
+      && relationKind === "r"
+      && ledgerOwnedByMigrator === true;
     if (
-      existingObjectCount === null
-      || unownedObjectCount === null
-      || unownedObjectCount > existingObjectCount
-      || unownedObjectCount !== 0
-      || managedRequiredOwner === null
-      || managedRequiredOwner !== requiredOwner
+      ledgerRequiredOwner === null
+      || ledgerRequiredOwner !== requiredOwner
+      || (!absentLedgerIsValid && !presentLedgerIsValid)
     ) {
-      throw new PostgreSqlManagedObjectOwnershipPreflightError(
-        existingObjectCount,
-        unownedObjectCount,
-        managedRequiredOwner,
+      throw new PostgreSqlMigrationLedgerRelationPreflightError(
+        ledgerExists,
+        relationKind,
+        ledgerOwnedByMigrator,
+        ledgerRequiredOwner,
       );
     }
 
-    const ledger = await transaction.query<LedgerRow>({
-      text: "SELECT to_regclass('lcm.schema_migrations') IS NOT NULL AS ledger_exists",
-    }, { domain: "factory", operation: "inspectMigrationLedger", signal: options.signal });
-    const current = ledger.rows[0]?.ledger_exists
+    const inspectManagedObjects = async (
+      managedObjectIdentities: readonly string[],
+      baselineApplied: boolean | null,
+      requireComplete: boolean,
+    ): Promise<void> => {
+      const managedOwnership = await transaction.query<ManagedObjectOwnershipRow>({
+        text: `WITH migration_role AS (
+                 SELECT role.oid
+                 FROM pg_catalog.pg_roles AS role
+                 WHERE role.rolname OPERATOR(pg_catalog.=) CURRENT_USER
+               ),
+               catalog_objects(object_identity, owner_oid) AS (
+                 SELECT pg_catalog.concat(
+                          CASE relation.relkind
+                            WHEN 'r' THEN 'table|'
+                            WHEN 'S' THEN 'sequence|'
+                          END,
+                          relation.relname
+                        ),
+                        relation.relowner
+                 FROM pg_catalog.pg_class AS relation
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND relation.relkind OPERATOR(pg_catalog.=) ANY (
+                     ARRAY['r', 'S']::pg_catalog."char"[]
+                   )
+                 UNION ALL
+                 SELECT pg_catalog.concat(
+                          'function|',
+                          procedure.proname,
+                          '|',
+                          pg_catalog.pg_get_function_identity_arguments(procedure.oid)
+                        ),
+                        procedure.proowner
+                 FROM pg_catalog.pg_proc AS procedure
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND procedure.prokind OPERATOR(pg_catalog.=) 'f'
+                 UNION ALL
+                 SELECT pg_catalog.concat('dictionary|', dictionary.dictname),
+                        dictionary.dictowner
+                 FROM pg_catalog.pg_ts_dict AS dictionary
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) dictionary.dictnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                 UNION ALL
+                 SELECT pg_catalog.concat('configuration|', configuration.cfgname),
+                        configuration.cfgowner
+                 FROM pg_catalog.pg_ts_config AS configuration
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) configuration.cfgnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+               ),
+               managed_objects AS (
+                 SELECT catalog_objects.owner_oid
+                 FROM catalog_objects
+                 WHERE catalog_objects.object_identity OPERATOR(pg_catalog.=)
+                   ANY ($2::pg_catalog.text[])
+               )
+               SELECT CURRENT_USER::pg_catalog.text AS current_user_name,
+                      $1::pg_catalog.int4 AS expected_object_count,
+                      pg_catalog.count(*)::pg_catalog.int4 AS existing_object_count,
+                      pg_catalog.count(*) FILTER (
+                        WHERE managed_objects.owner_oid OPERATOR(pg_catalog.<>) migration_role.oid
+                      )::pg_catalog.int4 AS unowned_object_count
+               FROM managed_objects
+               CROSS JOIN migration_role`,
+        values: [managedObjectIdentities.length, managedObjectIdentities],
+      }, {
+        domain: "factory",
+        operation: "preflightManagedObjectOwnership",
+        signal: options.signal,
+      });
+      const expectedObjectCount = sanitizeNonnegativeCount(
+        managedOwnership.rows[0]?.expected_object_count,
+      );
+      const existingObjectCount = sanitizeNonnegativeCount(
+        managedOwnership.rows[0]?.existing_object_count,
+      );
+      const unownedObjectCount = sanitizeNonnegativeCount(
+        managedOwnership.rows[0]?.unowned_object_count,
+      );
+      const managedRequiredOwner = sanitizeRoleName(
+        managedOwnership.rows[0]?.current_user_name,
+      );
+      const missingObjectCount = requireComplete
+        && expectedObjectCount !== null
+        && existingObjectCount !== null
+        ? expectedObjectCount - existingObjectCount
+        : null;
+      if (
+        expectedObjectCount !== managedObjectIdentities.length
+        || existingObjectCount === null
+        || existingObjectCount > expectedObjectCount
+        || unownedObjectCount === null
+        || unownedObjectCount > existingObjectCount
+        || unownedObjectCount !== 0
+        || managedRequiredOwner === null
+        || managedRequiredOwner !== requiredOwner
+        || (requireComplete && missingObjectCount !== 0)
+      ) {
+        throw new PostgreSqlManagedObjectOwnershipPreflightError(
+          baselineApplied,
+          expectedObjectCount,
+          existingObjectCount,
+          missingObjectCount,
+          unownedObjectCount,
+          managedRequiredOwner,
+        );
+      }
+    };
+    const knownManagedObjectIdentities = [
+      ...new Set(schemaSnapshots.flatMap(({ managedObjectIdentities }) => (
+        managedObjectIdentities
+      ))),
+    ];
+    await inspectManagedObjects(knownManagedObjectIdentities, null, false);
+
+    const current = ledgerExists
       ? (await transaction.query<MigrationRow>({
         text: "SELECT id, checksum_sha256 FROM lcm.schema_migrations ORDER BY id",
       }, { domain: "factory", operation: "readMigrations", signal: options.signal })).rows
@@ -558,6 +1304,801 @@ export async function runPostgreSqlMigrations(
         throw migrationError("verifyMigrationHistory");
       }
     }
+    const currentSnapshot = selectLatestPostgreSqlSchemaSnapshot(
+      current.map(({ id }) => id),
+      schemaSnapshots,
+    );
+    if (currentSnapshot) {
+      await inspectManagedObjects(currentSnapshot.managedObjectIdentities, true, true);
+    }
+
+    const assertSchemaSnapshot = async (
+      expectedBaselineDefinitions: PostgreSqlSchemaSnapshot,
+    ): Promise<void> => {
+    const baselineApplied = true;
+    const snapshotExpectations =
+      getPostgreSqlSchemaSnapshotExpectations(expectedBaselineDefinitions);
+    const baselineDefinitions =
+      await transaction.query<BaselineDefinitionInventoryRow>({
+        text: `WITH actual_indexes AS (
+                 SELECT index_relation.relname AS object_name,
+                        pg_catalog.pg_get_indexdef(index_relation.oid) AS definition
+                 FROM pg_catalog.pg_class AS index_relation
+                 JOIN pg_catalog.pg_index AS index_metadata
+                   ON index_metadata.indexrelid OPERATOR(pg_catalog.=) index_relation.oid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) index_relation.relnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND index_relation.relkind OPERATOR(pg_catalog.=) 'i'
+                   AND index_metadata.indisvalid
+                   AND index_metadata.indisready
+                   AND index_relation.relname OPERATOR(pg_catalog.=)
+                     ANY ($2::pg_catalog.text[])
+               ),
+               actual_triggers AS (
+                 SELECT trigger.tgname AS object_name,
+                        pg_catalog.pg_get_triggerdef(trigger.oid, true) AS definition,
+                        trigger.tgenabled::pg_catalog.text AS enabled_mode
+                 FROM pg_catalog.pg_trigger AS trigger
+                 JOIN pg_catalog.pg_class AS relation
+                   ON relation.oid OPERATOR(pg_catalog.=) trigger.tgrelid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND NOT trigger.tgisinternal
+                   AND pg_catalog.concat_ws(
+                     '|',
+                     relation.relname,
+                     trigger.tgname
+                   ) OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
+               ),
+               actual_constraints AS (
+                 SELECT constraint_metadata.conname AS object_name,
+                        relation.relname AS table_name,
+                        constraint_metadata.contype::pg_catalog.text AS constraint_type,
+                        pg_catalog.pg_get_constraintdef(
+                          constraint_metadata.oid,
+                          true
+                        ) AS definition,
+                        COALESCE(
+                          constraint_trigger_states.enabled_modes,
+                          ''
+                        ) AS enabled_modes
+                 FROM pg_catalog.pg_constraint AS constraint_metadata
+                 JOIN pg_catalog.pg_class AS relation
+                   ON relation.oid OPERATOR(pg_catalog.=) constraint_metadata.conrelid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 LEFT JOIN (
+                   SELECT trigger.tgconstraint AS constraint_oid,
+                          pg_catalog.string_agg(
+                            trigger.tgenabled::pg_catalog.text,
+                            ''
+                            ORDER BY trigger.tgenabled
+                          ) AS enabled_modes
+                   FROM pg_catalog.pg_trigger AS trigger
+                   WHERE trigger.tgconstraint OPERATOR(pg_catalog.<>) 0
+                   GROUP BY trigger.tgconstraint
+                 ) AS constraint_trigger_states
+                   ON constraint_trigger_states.constraint_oid
+                     OPERATOR(pg_catalog.=) constraint_metadata.oid
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND pg_catalog.concat_ws(
+                     '|',
+                     relation.relname,
+                     constraint_metadata.conname
+                   ) OPERATOR(pg_catalog.=) ANY ($4::pg_catalog.text[])
+               ),
+               actual_generated_columns AS (
+                 SELECT relation.relname AS table_name,
+                        attribute.attname AS column_name,
+                        pg_catalog.format_type(
+                          attribute.atttypid,
+                          attribute.atttypmod
+                        ) AS data_type,
+                        attribute.attnotnull::pg_catalog.text AS not_null,
+                        attribute.attgenerated::pg_catalog.text AS generation_kind,
+                        pg_catalog.pg_get_expr(
+                          attribute_default.adbin,
+                          attribute_default.adrelid,
+                          true
+                        ) AS generation_expression,
+                        pg_catalog.concat_ws(
+                          '.',
+                          collation_namespace.nspname,
+                          collation_metadata.collname
+                        ) AS collation_name
+                 FROM pg_catalog.pg_attribute AS attribute
+                 JOIN pg_catalog.pg_class AS relation
+                   ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 JOIN pg_catalog.pg_attrdef AS attribute_default
+                   ON attribute_default.adrelid OPERATOR(pg_catalog.=) attribute.attrelid
+                  AND attribute_default.adnum OPERATOR(pg_catalog.=) attribute.attnum
+                 LEFT JOIN pg_catalog.pg_collation AS collation_metadata
+                   ON collation_metadata.oid OPERATOR(pg_catalog.=)
+                     attribute.attcollation
+                 LEFT JOIN pg_catalog.pg_namespace AS collation_namespace
+                   ON collation_namespace.oid OPERATOR(pg_catalog.=)
+                     collation_metadata.collnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND attribute.attgenerated OPERATOR(pg_catalog.<>) ''
+                   AND pg_catalog.concat_ws(
+                     '|',
+                     relation.relname,
+                     attribute.attname
+                   ) OPERATOR(pg_catalog.=) ANY ($5::pg_catalog.text[])
+               ),
+               actual_ordinary_columns AS (
+                 SELECT relation.relname AS table_name,
+                        attribute.attname AS column_name,
+                        pg_catalog.format_type(
+                          attribute.atttypid,
+                          attribute.atttypmod
+                        ) AS data_type,
+                        attribute.attnotnull::pg_catalog.text AS not_null,
+                        COALESCE(
+                          pg_catalog.pg_get_expr(
+                            attribute_default.adbin,
+                            attribute_default.adrelid,
+                            true
+                          ),
+                          ''
+                        ) AS default_expression,
+                        attribute.attidentity::pg_catalog.text AS identity_kind,
+                        pg_catalog.concat_ws(
+                          '.',
+                          collation_namespace.nspname,
+                          collation_metadata.collname
+                        ) AS collation_name
+                 FROM pg_catalog.pg_attribute AS attribute
+                 JOIN pg_catalog.pg_class AS relation
+                   ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 LEFT JOIN pg_catalog.pg_attrdef AS attribute_default
+                   ON attribute_default.adrelid OPERATOR(pg_catalog.=) attribute.attrelid
+                  AND attribute_default.adnum OPERATOR(pg_catalog.=) attribute.attnum
+                 LEFT JOIN pg_catalog.pg_collation AS collation_metadata
+                   ON collation_metadata.oid OPERATOR(pg_catalog.=)
+                     attribute.attcollation
+                 LEFT JOIN pg_catalog.pg_namespace AS collation_namespace
+                   ON collation_namespace.oid OPERATOR(pg_catalog.=)
+                     collation_metadata.collnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND attribute.attnum OPERATOR(pg_catalog.>) 0
+                   AND NOT attribute.attisdropped
+                   AND attribute.attgenerated OPERATOR(pg_catalog.=) ''
+                   AND pg_catalog.concat_ws(
+                     '|',
+                     relation.relname,
+                     attribute.attname
+                   ) OPERATOR(pg_catalog.=) ANY ($6::pg_catalog.text[])
+               ),
+               actual_identity_sequences AS (
+                 SELECT sequence_relation.relname AS sequence_name,
+                        sequence_relation.relpersistence::pg_catalog.text
+                          AS persistence,
+                        pg_catalog.format_type(
+                          sequence_metadata.seqtypid,
+                          NULL
+                        ) AS data_type,
+                        sequence_metadata.seqincrement::pg_catalog.text AS increment_by,
+                        sequence_metadata.seqmin::pg_catalog.text AS minimum_value,
+                        sequence_metadata.seqmax::pg_catalog.text AS maximum_value,
+                        sequence_metadata.seqstart::pg_catalog.text AS start_value,
+                        sequence_metadata.seqcache::pg_catalog.text AS cache_size,
+                        sequence_metadata.seqcycle::pg_catalog.text AS cycles,
+                        dependency.deptype::pg_catalog.text AS dependency_type,
+                        owning_relation.relname AS owning_table,
+                        owning_attribute.attname AS owning_column
+                 FROM pg_catalog.pg_sequence AS sequence_metadata
+                 JOIN pg_catalog.pg_class AS sequence_relation
+                   ON sequence_relation.oid OPERATOR(pg_catalog.=)
+                     sequence_metadata.seqrelid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=)
+                     sequence_relation.relnamespace
+                 JOIN pg_catalog.pg_depend AS dependency
+                   ON dependency.classid OPERATOR(pg_catalog.=)
+                     pg_catalog.to_regclass('pg_catalog.pg_class')
+                  AND dependency.objid OPERATOR(pg_catalog.=) sequence_relation.oid
+                  AND dependency.objsubid OPERATOR(pg_catalog.=) 0
+                  AND dependency.refclassid OPERATOR(pg_catalog.=)
+                    pg_catalog.to_regclass('pg_catalog.pg_class')
+                  AND dependency.deptype OPERATOR(pg_catalog.=) 'i'
+                 JOIN pg_catalog.pg_class AS owning_relation
+                   ON owning_relation.oid OPERATOR(pg_catalog.=) dependency.refobjid
+                 JOIN pg_catalog.pg_attribute AS owning_attribute
+                   ON owning_attribute.attrelid OPERATOR(pg_catalog.=)
+                     dependency.refobjid
+                  AND owning_attribute.attnum OPERATOR(pg_catalog.=)
+                    dependency.refobjsubid
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND sequence_relation.relname OPERATOR(pg_catalog.=)
+                     ANY ($7::pg_catalog.text[])
+               ),
+               actual_tables AS (
+                 SELECT relation.relname AS table_name,
+                        relation.relpersistence::pg_catalog.text AS persistence,
+                        relation.relrowsecurity::pg_catalog.text AS row_security,
+                        relation.relforcerowsecurity::pg_catalog.text
+                          AS force_row_security,
+                        relation.relispartition::pg_catalog.text AS is_partition,
+                        EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_inherits AS inheritance
+                          WHERE inheritance.inhrelid OPERATOR(pg_catalog.=)
+                            relation.oid
+                        )::pg_catalog.text AS has_parent,
+                        EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_inherits AS inheritance
+                          WHERE inheritance.inhparent OPERATOR(pg_catalog.=)
+                            relation.oid
+                        )::pg_catalog.text AS has_child
+                 FROM pg_catalog.pg_class AS relation
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND relation.relkind OPERATOR(pg_catalog.=) 'r'
+                   AND relation.relname OPERATOR(pg_catalog.=)
+                     ANY ($8::pg_catalog.text[])
+               ),
+               acl_relations AS (
+                 SELECT pg_catalog.concat(
+                          CASE relation.relkind
+                            WHEN 'r' THEN 'table|'
+                            WHEN 'S' THEN 'sequence|'
+                          END,
+                          relation.relname
+                        ) AS object_identity,
+                        relation.relowner AS owner_oid,
+                        COALESCE(
+                          relation.relacl,
+                          pg_catalog.acldefault(
+                            CASE relation.relkind
+                              WHEN 'r' THEN 'r'::pg_catalog."char"
+                              WHEN 'S' THEN 's'::pg_catalog."char"
+                            END,
+                            relation.relowner
+                          )
+                        ) AS effective_acl
+                 FROM pg_catalog.pg_class AS relation
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND relation.relkind OPERATOR(pg_catalog.=) ANY (
+                     ARRAY['r', 'S']::pg_catalog."char"[]
+                   )
+               ),
+               actual_relation_acls AS (
+                 SELECT acl_relations.object_identity,
+                        CASE
+                          WHEN privilege.grantee OPERATOR(pg_catalog.=)
+                            acl_relations.owner_oid
+                            THEN 'owner'
+                          ELSE privilege.grantee::pg_catalog.text
+                        END AS grantee,
+                        CASE
+                          WHEN privilege.grantor OPERATOR(pg_catalog.=)
+                            acl_relations.owner_oid
+                            THEN 'owner'
+                          ELSE privilege.grantor::pg_catalog.text
+                        END AS grantor,
+                        privilege.privilege_type,
+                        privilege.is_grantable::pg_catalog.text AS is_grantable
+                 FROM acl_relations
+                 CROSS JOIN LATERAL pg_catalog.aclexplode(
+                   acl_relations.effective_acl
+                 ) AS privilege
+                 WHERE acl_relations.object_identity OPERATOR(pg_catalog.=)
+                   ANY ($9::pg_catalog.text[])
+               ),
+               actual_column_acls AS (
+                 SELECT pg_catalog.concat_ws(
+                          '|',
+                          relation.relname,
+                          attribute.attname
+                        ) AS object_identity,
+                        COALESCE(
+                          CASE
+                            WHEN privilege.grantee OPERATOR(pg_catalog.=)
+                              relation.relowner
+                              THEN 'owner'
+                            ELSE privilege.grantee::pg_catalog.text
+                          END,
+                          ''
+                        ) AS grantee,
+                        COALESCE(
+                          CASE
+                            WHEN privilege.grantor OPERATOR(pg_catalog.=)
+                              relation.relowner
+                              THEN 'owner'
+                            ELSE privilege.grantor::pg_catalog.text
+                          END,
+                          ''
+                        ) AS grantor,
+                        COALESCE(privilege.privilege_type, '') AS privilege_type,
+                        COALESCE(
+                          privilege.is_grantable::pg_catalog.text,
+                          ''
+                        ) AS is_grantable
+                 FROM pg_catalog.pg_attribute AS attribute
+                 JOIN pg_catalog.pg_class AS relation
+                   ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 LEFT JOIN LATERAL pg_catalog.aclexplode(attribute.attacl)
+                   AS privilege ON true
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND pg_catalog.concat_ws(
+                     '|',
+                     relation.relname,
+                     attribute.attname
+                   ) OPERATOR(pg_catalog.=) ANY ($10::pg_catalog.text[])
+               ),
+               actual_groups(object_kind, existing_count, definition_sha256) AS (
+                 SELECT 'index'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws('|', object_name, definition),
+                                E'\\n'
+                                ORDER BY object_name
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_indexes
+                 UNION ALL
+                 SELECT 'trigger'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  object_name,
+                                  definition,
+                                  enabled_mode
+                                ),
+                                E'\\n'
+                                ORDER BY object_name
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_triggers
+                 UNION ALL
+                 SELECT 'constraint'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  table_name,
+                                  object_name,
+                                  constraint_type,
+                                  definition,
+                                  enabled_modes
+                                ),
+                                E'\\n'
+                                ORDER BY table_name, object_name, constraint_type,
+                                  definition, enabled_modes
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_constraints
+                 UNION ALL
+                 SELECT 'generated_column'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  table_name,
+                                  column_name,
+                                  data_type,
+                                  not_null,
+                                  generation_kind,
+                                  generation_expression,
+                                  collation_name
+                                ),
+                                E'\\n'
+                                ORDER BY table_name, column_name
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_generated_columns
+                 UNION ALL
+                 SELECT 'column_acl'::pg_catalog.text,
+                        pg_catalog.count(
+                          DISTINCT object_identity
+                        )::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  object_identity,
+                                  grantee,
+                                  grantor,
+                                  privilege_type,
+                                  is_grantable
+                                ),
+                                E'\\n'
+                                ORDER BY object_identity, grantee, grantor,
+                                  privilege_type, is_grantable
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_column_acls
+                 UNION ALL
+                 SELECT 'identity_sequence'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  sequence_name,
+                                  persistence,
+                                  data_type,
+                                  increment_by,
+                                  minimum_value,
+                                  maximum_value,
+                                  start_value,
+                                  cache_size,
+                                  cycles,
+                                  dependency_type,
+                                  owning_table,
+                                  owning_column
+                                ),
+                                E'\\n'
+                                ORDER BY sequence_name
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_identity_sequences
+                 UNION ALL
+                 SELECT 'table'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  table_name,
+                                  persistence,
+                                  row_security,
+                                  force_row_security,
+                                  is_partition,
+                                  has_parent,
+                                  has_child
+                                ),
+                                E'\\n'
+                                ORDER BY table_name
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_tables
+                 UNION ALL
+                 SELECT 'relation_acl'::pg_catalog.text,
+                        pg_catalog.count(
+                          DISTINCT object_identity
+                        )::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  object_identity,
+                                  grantee,
+                                  grantor,
+                                  privilege_type,
+                                  is_grantable
+                                ),
+                                E'\\n'
+                                ORDER BY object_identity, grantee, grantor,
+                                  privilege_type, is_grantable
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_relation_acls
+                 UNION ALL
+                 SELECT 'ordinary_column'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  table_name,
+                                  column_name,
+                                  data_type,
+                                  not_null,
+                                  default_expression,
+                                  identity_kind,
+                                  collation_name
+                                ),
+                                E'\\n'
+                                ORDER BY table_name, column_name
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_ordinary_columns
+               ),
+               expected_groups(
+                 object_kind,
+                 expected_count,
+                 definition_sha256
+               ) AS (
+                 SELECT *
+                 FROM ROWS FROM (
+                   pg_catalog.unnest($12::pg_catalog.text[]),
+                   pg_catalog.unnest($13::pg_catalog.int4[]),
+                   pg_catalog.unnest($14::pg_catalog.text[])
+                 )
+               )
+               SELECT $1::pg_catalog.bool AS baseline_applied,
+                      $11::pg_catalog.int4 AS expected_object_count,
+                      pg_catalog.sum(actual_groups.existing_count)::pg_catalog.int4
+                        AS existing_object_count,
+                      CASE
+                        WHEN $1::pg_catalog.bool THEN (
+                          $11 - pg_catalog.sum(actual_groups.existing_count)
+                        )::pg_catalog.int4
+                        ELSE 0::pg_catalog.int4
+                      END AS missing_object_count,
+                      CASE
+                        WHEN $1::pg_catalog.bool THEN pg_catalog.count(*) FILTER (
+                          WHERE actual_groups.existing_count
+                              OPERATOR(pg_catalog.<>) expected_groups.expected_count
+                            OR actual_groups.definition_sha256
+                              OPERATOR(pg_catalog.<>) expected_groups.definition_sha256
+                        )::pg_catalog.int4
+                        ELSE 0::pg_catalog.int4
+                      END AS drifted_definition_group_count
+               FROM expected_groups
+               JOIN actual_groups USING (object_kind)`,
+        values: [
+          baselineApplied,
+          expectedBaselineDefinitions.indexNames,
+          expectedBaselineDefinitions.triggerIdentities,
+          expectedBaselineDefinitions.constraintIdentities,
+          expectedBaselineDefinitions.generatedColumnIdentities,
+          expectedBaselineDefinitions.ordinaryColumnIdentities,
+          expectedBaselineDefinitions.identitySequenceIdentities,
+          expectedBaselineDefinitions.tableIdentities,
+          expectedBaselineDefinitions.relationAclIdentities,
+          expectedBaselineDefinitions.columnAclIdentities,
+          snapshotExpectations.definitionObjectCount,
+          snapshotExpectations.definitionGroupKinds,
+          snapshotExpectations.definitionGroupCounts,
+          snapshotExpectations.definitionGroupHashes,
+        ],
+      }, {
+        domain: "factory",
+        operation: "preflightBaselineDefinitions",
+        signal: options.signal,
+      });
+    const definitionBaselineApplied = sanitizeBoolean(
+      baselineDefinitions.rows[0]?.baseline_applied,
+    );
+    const expectedDefinitionObjectCount = sanitizeNonnegativeCount(
+      baselineDefinitions.rows[0]?.expected_object_count,
+    );
+    const existingDefinitionObjectCount = sanitizeNonnegativeCount(
+      baselineDefinitions.rows[0]?.existing_object_count,
+    );
+    const missingDefinitionObjectCount = sanitizeNonnegativeCount(
+      baselineDefinitions.rows[0]?.missing_object_count,
+    );
+    const driftedDefinitionGroupCount = sanitizeNonnegativeCount(
+      baselineDefinitions.rows[0]?.drifted_definition_group_count,
+    );
+    if (
+      definitionBaselineApplied === null
+      || definitionBaselineApplied !== baselineApplied
+      || expectedDefinitionObjectCount !== snapshotExpectations.definitionObjectCount
+      || existingDefinitionObjectCount === null
+      || existingDefinitionObjectCount > expectedDefinitionObjectCount
+      || missingDefinitionObjectCount === null
+      || (baselineApplied
+        && existingDefinitionObjectCount + missingDefinitionObjectCount
+          !== expectedDefinitionObjectCount)
+      || missingDefinitionObjectCount !== 0
+      || driftedDefinitionGroupCount === null
+      || driftedDefinitionGroupCount > snapshotExpectations.definitionGroupKinds.length
+      || driftedDefinitionGroupCount !== 0
+    ) {
+      throw new PostgreSqlBaselineDefinitionPreflightError(
+        definitionBaselineApplied,
+        expectedDefinitionObjectCount,
+        existingDefinitionObjectCount,
+        missingDefinitionObjectCount,
+        driftedDefinitionGroupCount,
+      );
+    }
+
+    const identityFunctionFingerprints =
+      await transaction.query<IdentityFunctionFingerprintRow>({
+        text: `WITH expected_functions(function_name, prosrc_sha256) AS (
+                 SELECT *
+                 FROM ROWS FROM (
+                   pg_catalog.unnest($2::pg_catalog.text[]),
+                   pg_catalog.unnest($3::pg_catalog.text[])
+                 )
+               ),
+               actual_functions AS (
+                 SELECT procedure.proname AS function_name,
+                        procedure.oid AS function_oid,
+                        procedure.prosrc,
+                        procedure.prosecdef,
+                        procedure.proleakproof,
+                        procedure.provolatile,
+                        procedure.proparallel,
+                        procedure.proconfig,
+                        language.lanname,
+                        procedure.prorettype,
+                        (
+                          SELECT pg_catalog.string_agg(
+                            pg_catalog.concat_ws(
+                              '|',
+                              CASE
+                                WHEN privilege.grantee
+                                  OPERATOR(pg_catalog.=) procedure.proowner
+                                  THEN 'owner'
+                                ELSE privilege.grantee::pg_catalog.text
+                              END,
+                              CASE
+                                WHEN privilege.grantor
+                                  OPERATOR(pg_catalog.=) procedure.proowner
+                                  THEN 'owner'
+                                ELSE privilege.grantor::pg_catalog.text
+                              END,
+                              privilege.privilege_type,
+                              privilege.is_grantable::pg_catalog.text
+                            ),
+                            E'\\n'
+                            ORDER BY privilege.grantee, privilege.grantor,
+                              privilege.privilege_type, privilege.is_grantable
+                          )
+                          FROM pg_catalog.aclexplode(
+                            COALESCE(
+                              procedure.proacl,
+                              pg_catalog.acldefault('f', procedure.proowner)
+                            )
+                          ) AS privilege
+                        ) AS normalized_acl
+                 FROM pg_catalog.pg_proc AS procedure
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
+                 JOIN pg_catalog.pg_language AS language
+                   ON language.oid OPERATOR(pg_catalog.=) procedure.prolang
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND procedure.prokind OPERATOR(pg_catalog.=) 'f'
+                   AND procedure.pronargs OPERATOR(pg_catalog.=) 0
+                   AND procedure.proname OPERATOR(pg_catalog.=)
+                     ANY ($2::pg_catalog.text[])
+               )
+               SELECT $1::pg_catalog.bool AS baseline_applied,
+                      pg_catalog.count(*)::pg_catalog.int4 AS expected_function_count,
+                      pg_catalog.count(actual_functions.function_oid)::pg_catalog.int4
+                        AS existing_function_count,
+                      CASE
+                        WHEN $1::pg_catalog.bool THEN pg_catalog.count(*) FILTER (
+                          WHERE actual_functions.function_oid IS NULL
+                            OR pg_catalog.encode(
+                              public.digest(actual_functions.prosrc, 'sha256'),
+                              'hex'
+                            ) OPERATOR(pg_catalog.<>) expected_functions.prosrc_sha256
+                            OR actual_functions.lanname OPERATOR(pg_catalog.<>) 'plpgsql'
+                            OR actual_functions.prorettype OPERATOR(pg_catalog.<>)
+                              pg_catalog.to_regtype('pg_catalog.trigger')
+                            OR actual_functions.prosecdef
+                            OR actual_functions.proleakproof
+                            OR actual_functions.provolatile OPERATOR(pg_catalog.<>) 'v'
+                            OR actual_functions.proparallel OPERATOR(pg_catalog.<>) 'u'
+                            OR actual_functions.proconfig IS DISTINCT FROM
+                              ARRAY['search_path=pg_catalog, public']::pg_catalog.text[]
+                            OR actual_functions.normalized_acl IS DISTINCT FROM
+                              'owner|owner|EXECUTE|false'
+                        )::pg_catalog.int4
+                        ELSE 0::pg_catalog.int4
+                      END AS drifted_function_count
+               FROM expected_functions
+               LEFT JOIN actual_functions USING (function_name)`,
+        values: [
+          baselineApplied,
+          snapshotExpectations.identityFunctionNames,
+          snapshotExpectations.identityFunctionHashes,
+        ],
+      }, {
+        domain: "factory",
+        operation: "preflightIdentityFunctionDefinitions",
+        signal: options.signal,
+      });
+    const fingerprintBaselineApplied = sanitizeBoolean(
+      identityFunctionFingerprints.rows[0]?.baseline_applied,
+    );
+    const expectedFunctionCount = sanitizeNonnegativeCount(
+      identityFunctionFingerprints.rows[0]?.expected_function_count,
+    );
+    const existingFunctionCount = sanitizeNonnegativeCount(
+      identityFunctionFingerprints.rows[0]?.existing_function_count,
+    );
+    const driftedFunctionCount = sanitizeNonnegativeCount(
+      identityFunctionFingerprints.rows[0]?.drifted_function_count,
+    );
+    if (
+      fingerprintBaselineApplied === null
+      || fingerprintBaselineApplied !== baselineApplied
+      || expectedFunctionCount !== snapshotExpectations.identityFunctionNames.length
+      || existingFunctionCount === null
+      || existingFunctionCount > expectedFunctionCount
+      || driftedFunctionCount === null
+      || driftedFunctionCount > expectedFunctionCount
+      || driftedFunctionCount !== 0
+    ) {
+      throw new PostgreSqlIdentityFunctionPreflightError(
+        fingerprintBaselineApplied,
+        expectedFunctionCount,
+        existingFunctionCount,
+        driftedFunctionCount,
+      );
+    }
+    };
+
+    if (currentSnapshot) await assertSchemaSnapshot(currentSnapshot);
 
     const applied: string[] = [];
     for (const migration of migrations.slice(current.length)) {
@@ -571,6 +2112,16 @@ export async function runPostgreSqlMigrations(
         values: [migration.id, migration.sha256],
       }, { domain: "factory", operation: "recordMigration", signal: options.signal });
       applied.push(migration.id);
+    }
+    if (applied.length > 0) {
+      const targetSnapshot = selectLatestPostgreSqlSchemaSnapshot(
+        migrations.map(({ id }) => id),
+        schemaSnapshots,
+      );
+      if (targetSnapshot) {
+        await inspectManagedObjects(targetSnapshot.managedObjectIdentities, true, true);
+        await assertSchemaSnapshot(targetSnapshot);
+      }
     }
     await assertPostgreSqlSearchConfigurationReady(transaction, { signal: options.signal });
     return {

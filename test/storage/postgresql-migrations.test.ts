@@ -7,16 +7,24 @@ import type {
   PostgreSqlQueryOptions,
 } from "../../src/storage/postgresql/contracts.js";
 import {
+  getPostgreSqlSchemaSnapshotExpectations,
   loadPostgreSqlMigrations,
+  loadPostgreSqlSchemaSnapshots,
+  PostgreSqlBaselineDefinitionPreflightError,
+  PostgreSqlIdentityFunctionPreflightError,
+  PostgreSqlMigrationLedgerRelationPreflightError,
   PostgreSqlManagedObjectOwnershipPreflightError,
   PostgreSqlSchemaAclPreflightError,
   PostgreSqlSchemaOwnershipPreflightError,
+  PostgreSqlSessionReplicationRolePreflightError,
   PostgreSqlServerEncodingPreflightError,
   PostgreSqlServerVersionPreflightError,
   REQUIRED_POSTGRESQL_SERVER_ENCODING,
   REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
   runPostgreSqlMigrations,
+  selectLatestPostgreSqlSchemaSnapshot,
 } from "../../src/storage/postgresql/migrations.js";
+import type { PostgreSqlSchemaSnapshot } from "../../src/storage/postgresql/migrations.js";
 import { REQUIRED_POSTGRESQL_EXTENSIONS } from "../../src/storage/postgresql/extensions.js";
 import { POSTGRESQL_SEARCH_CONFIGURATION_SHA256 } from "../../src/storage/postgresql/search-configuration.js";
 
@@ -30,6 +38,7 @@ function result<R extends QueryResultRow>(rows: R[]): QueryResult<R> {
 
 function executor(options: {
   ledger?: boolean;
+  ledgerRelation?: "view" | "unowned" | "missing" | "invalid" | "inconsistent";
   current?: Array<{ id: string; checksum_sha256: string }>;
   failOperation?: string;
   schemaOwnership?:
@@ -48,12 +57,15 @@ function executor(options: {
   serverEncoding?: unknown;
   postmasterEpoch?: unknown;
   postmasterContinuity?: boolean | "missing";
+  sessionReplicationRole?: "origin" | "replica" | "local" | "missing" | "invalid";
   schemaAcl?: "absent" | "ready" | "public" | "missing" | "invalid" | "inconsistent";
-  managedOwnership?: "ready" | "unowned" | "missing" | "invalid" | "inconsistent" | "different-user";
+  managedOwnership?: "ready" | "unowned" | "missing-object" | "missing" | "invalid" | "inconsistent" | "different-user";
+  baselineDefinitions?: "ready" | "missing-object" | "drifted" | "missing" | "invalid" | "inconsistent";
+  identityFunctions?: "ready" | "drifted" | "missing" | "invalid" | "inconsistent";
 } = {}) {
   const operations: string[] = [];
   const query = vi.fn(async <R extends QueryResultRow>(
-    _config: unknown,
+    config: unknown,
     context: PostgreSqlQueryOptions,
   ): Promise<QueryResult<R>> => {
     operations.push(context.operation);
@@ -93,6 +105,14 @@ function executor(options: {
       return result(options.serverVersion === "missing"
         ? [] as R[]
         : [{ server_version_num: options.serverVersion ?? 180004 }] as unknown as R[]);
+    }
+    if (context.operation === "preflightSessionReplicationRole") {
+      if (options.sessionReplicationRole === "missing") return result([] as R[]);
+      return result([{
+        session_replication_role: options.sessionReplicationRole === "invalid"
+          ? 7
+          : options.sessionReplicationRole ?? "origin",
+      }] as unknown as R[]);
     }
     if (
       context.operation === "preflightRequiredExtensions"
@@ -152,27 +172,114 @@ function executor(options: {
         public_create: options.schemaAcl === "public",
       }] as unknown as R[]);
     }
+    if (context.operation === "preflightMigrationLedgerRelation") {
+      if (options.ledgerRelation === "missing") return result([] as R[]);
+      if (options.ledgerRelation === "invalid") {
+        return result([{
+          current_user_name: 7,
+          ledger_exists: "yes",
+          owned_by_current_user: 1,
+          relation_kind: 4,
+        }] as unknown as R[]);
+      }
+      if (options.ledgerRelation === "inconsistent") {
+        return result([{
+          current_user_name: "lcm_test_migrator",
+          ledger_exists: false,
+          owned_by_current_user: true,
+          relation_kind: "r",
+        }] as unknown as R[]);
+      }
+      const ledgerExists = options.ledger === true
+        || options.ledgerRelation === "view"
+        || options.ledgerRelation === "unowned";
+      return result([{
+        current_user_name: "lcm_test_migrator",
+        ledger_exists: ledgerExists,
+        owned_by_current_user: ledgerExists
+          ? options.ledgerRelation !== "unowned"
+          : null,
+        relation_kind: ledgerExists
+          ? options.ledgerRelation === "view" ? "v" : "r"
+          : null,
+      }] as unknown as R[]);
+    }
     if (context.operation === "preflightManagedObjectOwnership") {
       if (options.managedOwnership === "missing") return result([] as R[]);
       if (options.managedOwnership === "invalid") {
         return result([{
           current_user_name: 7,
+          baseline_applied: "yes",
+          expected_object_count: "many",
           existing_object_count: "many",
+          missing_object_count: false,
           unowned_object_count: false,
         }] as unknown as R[]);
       }
+      const expectedObjectCount =
+        (config as { values?: unknown[] }).values?.[0] as number;
       return result([{
         current_user_name: options.managedOwnership === "different-user"
           ? "different_migrator"
           : "lcm_test_migrator",
-        existing_object_count: options.managedOwnership === "inconsistent" ? 0 : 35,
+        baseline_applied: (options.current ?? []).some(({ id }) => id === "0002_schema_baseline"),
+        expected_object_count: expectedObjectCount,
+        existing_object_count: options.managedOwnership === "inconsistent"
+          ? 0
+          : options.managedOwnership === "missing-object"
+            ? expectedObjectCount - 1
+            : expectedObjectCount,
+        missing_object_count: options.managedOwnership === "missing-object" ? 1 : 0,
         unowned_object_count: options.managedOwnership === "unowned"
           || options.managedOwnership === "inconsistent"
           ? 1
           : 0,
       }] as unknown as R[]);
     }
-    if (context.operation === "inspectMigrationLedger") return result([{ ledger_exists: options.ledger ?? false }] as unknown as R[]);
+    if (context.operation === "preflightIdentityFunctionDefinitions") {
+      if (options.identityFunctions === "missing") return result([] as R[]);
+      if (options.identityFunctions === "invalid") {
+        return result([{
+          baseline_applied: "yes",
+          expected_function_count: "two",
+          existing_function_count: false,
+          drifted_function_count: null,
+        }] as unknown as R[]);
+      }
+      return result([{
+        baseline_applied: true,
+        expected_function_count: 3,
+        existing_function_count: options.identityFunctions === "inconsistent" ? 4 : 3,
+        drifted_function_count: options.identityFunctions === "drifted" ? 1 : 0,
+      }] as unknown as R[]);
+    }
+    if (context.operation === "preflightBaselineDefinitions") {
+      if (options.baselineDefinitions === "missing") return result([] as R[]);
+      if (options.baselineDefinitions === "invalid") {
+        return result([{
+          baseline_applied: "yes",
+          expected_object_count: "many",
+          existing_object_count: false,
+          missing_object_count: null,
+          drifted_definition_group_count: "none",
+        }] as unknown as R[]);
+      }
+      return result([{
+        baseline_applied: true,
+        expected_object_count: 723,
+        existing_object_count: options.baselineDefinitions === "inconsistent"
+          ? 724
+          : options.baselineDefinitions === "missing-object"
+            ? 722
+            : 723,
+        missing_object_count: options.baselineDefinitions === "missing-object" ? 1 : 0,
+        drifted_definition_group_count:
+          options.baselineDefinitions === "drifted"
+          || options.baselineDefinitions === "missing-object"
+            ? 1
+            : 0,
+      }] as unknown as R[]);
+    }
     if (context.operation === "readMigrations") return result((options.current ?? []) as unknown as R[]);
     return result([] as R[]);
   });
@@ -184,11 +291,100 @@ function executor(options: {
 }
 
 describe("PostgreSQL migration runner", () => {
+  it("derives changed future expectations and selects by migration history, not registry order", () => {
+    const snapshot = (
+      migrationId: string,
+      counts: readonly [number, number, number, number, number, number, number, number, number],
+      identityFunctionNames: readonly string[],
+    ): PostgreSqlSchemaSnapshot => ({
+      constraintIdentities: Array.from({ length: counts[2] }, (_, index) => `t|c${index}`),
+      columnAclIdentities:
+        Array.from({ length: counts[4] }, (_, index) => `t|a${index}`),
+      definitionHashes: {
+        columnAcl: `${migrationId}-column-acl`,
+        constraint: `${migrationId}-constraint`,
+        generatedColumn: `${migrationId}-generated`,
+        identitySequence: `${migrationId}-sequence`,
+        index: `${migrationId}-index`,
+        ordinaryColumn: `${migrationId}-ordinary`,
+        relationAcl: `${migrationId}-relation-acl`,
+        table: `${migrationId}-table`,
+        trigger: `${migrationId}-trigger`,
+      },
+      generatedColumnIdentities:
+        Array.from({ length: counts[3] }, (_, index) => `t|g${index}`),
+      identitySequenceIdentities:
+        Array.from({ length: counts[5] }, (_, index) => `s${index}`),
+      identityFunctions: identityFunctionNames.map((name) => ({
+        name,
+        sha256: `${name}-sha256`,
+      })),
+      indexNames: Array.from({ length: counts[0] }, (_, index) => `i${index}`),
+      managedObjectIdentities: [
+        `table|${migrationId}`,
+        ...identityFunctionNames.map((name) => `function|${name}|`),
+      ],
+      migrationId,
+      ordinaryColumnIdentities:
+        Array.from({ length: counts[8] }, (_, index) => `t|o${index}`),
+      relationAclIdentities:
+        Array.from({ length: counts[7] }, (_, index) => `table|a${index}`),
+      tableIdentities: Array.from({ length: counts[6] }, (_, index) => `t${index}`),
+      triggerIdentities: Array.from({ length: counts[1] }, (_, index) => `t|tr${index}`),
+    });
+    const older = snapshot(
+      "0002_schema_baseline",
+      [1, 1, 1, 1, 1, 1, 1, 1, 1],
+      ["old_helper"],
+    );
+    const newer = snapshot("0003_future", [2, 0, 3, 1, 7, 2, 4, 5, 6], [
+      "new_helper",
+      "second_helper",
+    ]);
+
+    expect(selectLatestPostgreSqlSchemaSnapshot(
+      ["0001_migration_ledger", older.migrationId, newer.migrationId],
+      [newer, older],
+    )).toBe(newer);
+    expect(getPostgreSqlSchemaSnapshotExpectations(newer)).toEqual({
+      definitionGroupCounts: [2, 0, 3, 1, 7, 2, 4, 5, 6],
+      definitionGroupHashes: [
+        "0003_future-index",
+        "0003_future-trigger",
+        "0003_future-constraint",
+        "0003_future-generated",
+        "0003_future-column-acl",
+        "0003_future-sequence",
+        "0003_future-table",
+        "0003_future-relation-acl",
+        "0003_future-ordinary",
+      ],
+      definitionGroupKinds: [
+        "index",
+        "trigger",
+        "constraint",
+        "generated_column",
+        "column_acl",
+        "identity_sequence",
+        "table",
+        "relation_acl",
+        "ordinary_column",
+      ],
+      definitionObjectCount: 30,
+      identityFunctionHashes: ["new_helper-sha256", "second_helper-sha256"],
+      identityFunctionNames: ["new_helper", "second_helper"],
+    });
+    expect(selectLatestPostgreSqlSchemaSnapshot(["0001_migration_ledger"], [
+      newer,
+      older,
+    ])).toBeNull();
+  });
+
   it("loads the pinned artifact and rejects missing or drifted files", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "6386af13407e8944ce188c9ce19b5944f27b9fa58a4ad8660ede347c8beacfa2" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "e96cad6c577c9f088d02366e22bbbe3f876217363659feea6d2edc1918885bae" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
@@ -197,6 +393,9 @@ describe("PostgreSQL migration runner", () => {
       `catalog SHA-256 ${POSTGRESQL_SEARCH_CONFIGURATION_SHA256}`,
     );
     expect(migrations[1]?.sql).toContain("lcm.fenced_leases_fencing_token_seq");
+    expect(migrations[1]?.sql).toContain(
+      "WHEN TG_OP OPERATOR(pg_catalog.=) 'UPDATE' THEN OLD.ingest_key",
+    );
     expect(() => loadPostgreSqlMigrations(() => { throw new Error("missing private path"); }))
       .toThrowError(expect.objectContaining({ operation: "loadMigrations" }));
     expect(() => loadPostgreSqlMigrations(() => "altered migration"))
@@ -217,7 +416,7 @@ describe("PostgreSQL migration runner", () => {
     const fake = executor({ postmasterEpoch: new Date("2026-01-01T00:00:00Z") });
     const signal = new AbortController().signal;
     const migrations = [migration("0001_first"), migration("0002_second")];
-    await expect(runPostgreSqlMigrations(fake.seam, { migrations, signal })).resolves.toEqual({
+    await expect(runPostgreSqlMigrations(fake.seam, { migrations, schemaSnapshots: [], signal })).resolves.toEqual({
       applied: ["0001_first", "0002_second"],
       current: ["0001_first", "0002_second"],
     });
@@ -227,14 +426,16 @@ describe("PostgreSQL migration runner", () => {
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
+      "pinMigrationDeparserSettings",
+      "preflightSessionReplicationRole",
       "lockMigrations",
       "preflightServerVersion",
       "verifyPostmasterContinuity",
       "revalidateRequiredExtensionCatalog",
       "preflightSchemaOwnership",
       "preflightSchemaAcl",
+      "preflightMigrationLedgerRelation",
       "preflightManagedObjectOwnership",
-      "inspectMigrationLedger",
       "applyMigration:0001_first",
       "recordMigration",
       "applyMigration:0002_second",
@@ -248,26 +449,219 @@ describe("PostgreSQL migration runner", () => {
       operation: "pinMigrationSearchPath",
       signal,
     });
+    expect(fake.seam.query).toHaveBeenNthCalledWith(6, {
+      text: "SET LOCAL quote_all_identifiers = off",
+    }, {
+      domain: "factory",
+      operation: "pinMigrationDeparserSettings",
+      signal,
+    });
     expect(fake.seam.transaction).toHaveBeenCalledWith(expect.any(Function), {
       domain: "factory", operation: "migrate", signal,
     });
   });
 
+  it("validates the registered target snapshot after applying its migration", async () => {
+    const migrations = loadPostgreSqlMigrations();
+    const schemaSnapshots = loadPostgreSqlSchemaSnapshots();
+    const fake = executor();
+    await expect(runPostgreSqlMigrations(fake.seam, { migrations, schemaSnapshots }))
+      .resolves.toEqual({
+        applied: ["0001_migration_ledger", "0002_schema_baseline"],
+        current: ["0001_migration_ledger", "0002_schema_baseline"],
+      });
+    expect(fake.operations).toEqual(expect.arrayContaining([
+      "applyMigration:0002_schema_baseline",
+      "preflightBaselineDefinitions",
+      "preflightIdentityFunctionDefinitions",
+    ]));
+    expect(fake.operations.indexOf("applyMigration:0002_schema_baseline"))
+      .toBeLessThan(fake.operations.indexOf("preflightBaselineDefinitions"));
+    expect(fake.operations.indexOf("preflightBaselineDefinitions"))
+      .toBeLessThan(fake.operations.indexOf("preflightSearchConfiguration"));
+  });
+
+  it("rejects duplicate and unknown schema snapshot registry migration IDs", async () => {
+    const migrations = loadPostgreSqlMigrations();
+    const snapshot = loadPostgreSqlSchemaSnapshots()[0]!;
+    for (const [schemaSnapshots, reason, migrationId, message] of [
+      [
+        [snapshot, snapshot],
+        "duplicate_migration_id",
+        snapshot.migrationId,
+        `PostgreSQL schema snapshot registry contains duplicate migrationId ${snapshot.migrationId}`,
+      ],
+      [
+        [{ ...snapshot, migrationId: "0003_unknown_snapshot" }],
+        "unknown_migration_id",
+        "0003_unknown_snapshot",
+        "PostgreSQL schema snapshot registry references unknown migrationId 0003_unknown_snapshot",
+      ],
+      [
+        [{
+          ...snapshot,
+          identityFunctions: [
+            snapshot.identityFunctions[0]!,
+            snapshot.identityFunctions[0]!,
+          ],
+        }],
+        "duplicate_identity_function",
+        snapshot.migrationId,
+        `PostgreSQL schema snapshot ${snapshot.migrationId} contains duplicate identity function names`,
+      ],
+      [
+        [{
+          ...snapshot,
+          identityFunctions: [{
+            ...snapshot.identityFunctions[0]!,
+            name: "unexpected_identity_function",
+          }],
+        }],
+        "identity_function_mismatch",
+        snapshot.migrationId,
+        `PostgreSQL schema snapshot ${snapshot.migrationId} identity functions do not match managed zero-argument functions`,
+      ],
+    ] as const) {
+      const fake = executor();
+      const failure = await runPostgreSqlMigrations(fake.seam, {
+        migrations,
+        schemaSnapshots,
+      }).catch((error: unknown) => error);
+      expect(failure).toMatchObject({
+        message,
+        migrationId,
+        operation: "validateSchemaSnapshotRegistry",
+        reason,
+      });
+      expect((failure as { toJSON(): unknown }).toJSON()).toMatchObject({
+        message,
+        migrationId,
+        reason,
+      });
+      expect(fake.seam.query).not.toHaveBeenCalled();
+    }
+
+    const inherited = executor();
+    await expect(runPostgreSqlMigrations(inherited.seam, {
+      migrations: [migration("0001_unrelated")],
+    })).rejects.toMatchObject({
+      migrationId: snapshot.migrationId,
+      operation: "validateSchemaSnapshotRegistry",
+      reason: "unknown_migration_id",
+    });
+    expect(inherited.seam.query).not.toHaveBeenCalled();
+  });
+
   it("accepts exact ordered history and applies only pending files", async () => {
     const migrations = [migration("0001_first"), migration("0002_second")];
     const fake = executor({ ledger: true, current: [{ id: migrations[0].id, checksum_sha256: migrations[0].sha256 }] });
-    await expect(runPostgreSqlMigrations(fake.seam, { migrations })).resolves.toEqual({
+    await expect(runPostgreSqlMigrations(fake.seam, {
+      migrations,
+      schemaSnapshots: [],
+    })).resolves.toEqual({
       applied: ["0002_second"],
       current: ["0001_first", "0002_second"],
     });
     expect(fake.operations).toContain("readMigrations");
+    expect(fake.operations.indexOf("preflightMigrationLedgerRelation"))
+      .toBeLessThan(fake.operations.indexOf("preflightManagedObjectOwnership"));
+    expect(fake.operations.indexOf("preflightMigrationLedgerRelation"))
+      .toBeLessThan(fake.operations.indexOf("readMigrations"));
+    const ledgerPreflightCall = fake.seam.query.mock.calls.find(([, context]) => (
+      context.operation === "preflightMigrationLedgerRelation"
+    ));
+    const ledgerPreflightSql =
+      (ledgerPreflightCall?.[0] as { text?: string } | undefined)?.text ?? "";
+    expect(ledgerPreflightSql).toContain("pg_catalog.pg_class");
+    expect(ledgerPreflightSql).toContain("pg_catalog.pg_namespace");
+    expect(ledgerPreflightSql).not.toContain("FROM lcm.schema_migrations");
   });
 
   it("accepts a pre-existing schema owned by the migration role", async () => {
     const fake = executor({ schemaAcl: "ready", schemaOwnership: "owned" });
-    await expect(runPostgreSqlMigrations(fake.seam, { migrations: [] }))
+    await expect(runPostgreSqlMigrations(fake.seam, { migrations: [], schemaSnapshots: [] }))
       .resolves.toEqual({ applied: [], current: [] });
     expect(fake.operations).toContain("preflightSchemaOwnership");
+  });
+
+  it.each([
+    {
+      label: "a view in place of the ledger",
+      ledgerRelation: "view" as const,
+      ledgerExists: true,
+      relationKind: "v",
+      ownedByMigrator: true,
+      requiredOwner: "lcm_test_migrator",
+    },
+    {
+      label: "a ledger owned by another role",
+      ledgerRelation: "unowned" as const,
+      ledgerExists: true,
+      relationKind: "r",
+      ownedByMigrator: false,
+      requiredOwner: "lcm_test_migrator",
+    },
+    {
+      label: "a missing catalog result",
+      ledgerRelation: "missing" as const,
+      ledgerExists: null,
+      relationKind: null,
+      ownedByMigrator: null,
+      requiredOwner: null,
+    },
+    {
+      label: "malformed catalog values",
+      ledgerRelation: "invalid" as const,
+      ledgerExists: null,
+      relationKind: null,
+      ownedByMigrator: null,
+      requiredOwner: null,
+    },
+    {
+      label: "a contradictory absent relation",
+      ledgerRelation: "inconsistent" as const,
+      ledgerExists: false,
+      relationKind: "r",
+      ownedByMigrator: true,
+      requiredOwner: "lcm_test_migrator",
+    },
+  ])("fails closed before ledger reads for $label", async ({
+    ledgerRelation,
+    ledgerExists,
+    relationKind,
+    ownedByMigrator,
+    requiredOwner,
+  }) => {
+    const fake = executor({
+      ledgerRelation,
+      schemaAcl: "ready",
+      schemaOwnership: "owned",
+    });
+    const failure = await runPostgreSqlMigrations(fake.seam, {
+      migrations: loadPostgreSqlMigrations(),
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlMigrationLedgerRelationPreflightError);
+    expect(failure).toMatchObject({
+      ledgerExists,
+      operation: "preflightMigrationLedgerRelation",
+      ownedByMigrator,
+      relationKind,
+      relationName: "schema_migrations",
+      requiredOwner,
+      requiredRelationKind: "r",
+      schemaName: "lcm",
+    });
+    expect((failure as PostgreSqlMigrationLedgerRelationPreflightError).toJSON())
+      .toMatchObject({
+        ledgerExists,
+        ownedByMigrator,
+        relationKind,
+        relationName: "schema_migrations",
+        requiredOwner,
+        requiredRelationKind: "r",
+      });
+    expect(fake.operations).not.toContain("preflightManagedObjectOwnership");
+    expect(fake.operations).not.toContain("readMigrations");
   });
 
   it.each([
@@ -275,22 +669,93 @@ describe("PostgreSQL migration runner", () => {
     { current: [{ id: "0001_unknown", checksum_sha256: migration("0001_first").sha256 }], migrations: [migration("0001_first")] },
     { current: [{ id: "0001_first", checksum_sha256: "0".repeat(64) }], migrations: [migration("0001_first")] },
   ])("rejects unknown, excess, or checksum-drifted history", async ({ current, migrations }) => {
-    await expect(runPostgreSqlMigrations(executor({ ledger: true, current }).seam, { migrations }))
+    await expect(runPostgreSqlMigrations(executor({ ledger: true, current }).seam, {
+      migrations,
+      schemaSnapshots: [],
+    }))
       .rejects.toMatchObject({ operation: "verifyMigrationHistory" });
   });
 
   it("uses the packaged manifest by default and propagates transactional failures safely", async () => {
     const current = loadPostgreSqlMigrations().map(({ id, sha256 }) => ({ id, checksum_sha256: sha256 }));
     await expect(runPostgreSqlMigrations(executor({ ledger: true, current }).seam)).resolves.toMatchObject({ applied: [] });
-    await expect(runPostgreSqlMigrations(executor({ failOperation: "lockMigrations" }).seam, { migrations: [] }))
+    await expect(runPostgreSqlMigrations(executor({ failOperation: "lockMigrations" }).seam, { migrations: [], schemaSnapshots: [] }))
       .rejects.toThrow("private SQL failure");
-    await expect(runPostgreSqlMigrations(executor({ failOperation: "pinMigrationSearchPath" }).seam, { migrations: [] }))
+    await expect(runPostgreSqlMigrations(executor({ failOperation: "pinMigrationSearchPath" }).seam, { migrations: [], schemaSnapshots: [] }))
       .rejects.toThrow("private SQL failure");
+    await expect(runPostgreSqlMigrations(executor({
+      failOperation: "pinMigrationDeparserSettings",
+    }).seam, { migrations: [], schemaSnapshots: [] })).rejects.toThrow("private SQL failure");
+  });
+
+  it.each([
+    {
+      label: "replica mode",
+      sessionReplicationRole: "replica" as const,
+      reportedRole: "replica",
+    },
+    {
+      label: "local mode",
+      sessionReplicationRole: "local" as const,
+      reportedRole: "local",
+    },
+    {
+      label: "a missing setting row",
+      sessionReplicationRole: "missing" as const,
+      reportedRole: null,
+    },
+    {
+      label: "a malformed setting value",
+      sessionReplicationRole: "invalid" as const,
+      reportedRole: null,
+    },
+  ])("rejects $label before migration catalog trust", async ({
+    sessionReplicationRole,
+    reportedRole,
+  }) => {
+    const fake = executor({ sessionReplicationRole });
+    const failure = await runPostgreSqlMigrations(fake.seam, {
+      migrations: [],
+      schemaSnapshots: [],
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlSessionReplicationRolePreflightError);
+    expect(failure).toMatchObject({
+      code: "STORAGE_INITIALIZATION_FAILED",
+      operation: "preflightSessionReplicationRole",
+      remediation:
+        "Set session_replication_role to origin on the migration connection, or reconnect with its default session state, then rerun migrations.",
+      requiredSessionReplicationRole: "origin",
+      sessionReplicationRole: reportedRole,
+    });
+    expect((failure as PostgreSqlSessionReplicationRolePreflightError).toJSON())
+      .toMatchObject({
+        requiredSessionReplicationRole: "origin",
+        sessionReplicationRole: reportedRole,
+      });
+    expect(fake.operations).toEqual([
+      "capturePostmasterEpoch",
+      "preflightServerEncoding",
+      "preflightRequiredExtensions",
+      "preflightRequiredExtensions:probePgStatStatements",
+      "pinMigrationSearchPath",
+      "pinMigrationDeparserSettings",
+      "preflightSessionReplicationRole",
+    ]);
+    for (const laterOperation of [
+      "lockMigrations",
+      "preflightSchemaOwnership",
+      "preflightMigrationLedgerRelation",
+      "preflightManagedObjectOwnership",
+      "readMigrations",
+      "preflightBaselineDefinitions",
+    ]) {
+      expect(fake.operations).not.toContain(laterOperation);
+    }
   });
 
   it("fails extension preflight before inspecting or changing the schema", async () => {
     const fake = executor({ failOperation: "preflightRequiredExtensions" });
-    await expect(runPostgreSqlMigrations(fake.seam, { migrations: [migration("0001_first")] }))
+    await expect(runPostgreSqlMigrations(fake.seam, { migrations: [migration("0001_first")], schemaSnapshots: [] }))
       .rejects.toThrow("private SQL failure");
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
@@ -305,7 +770,7 @@ describe("PostgreSQL migration runner", () => {
   ])("fails closed on a $label captured postmaster epoch", async ({ postmasterEpoch }) => {
     await expect(runPostgreSqlMigrations(
       executor({ postmasterEpoch }).seam,
-      { migrations: [] },
+      { migrations: [], schemaSnapshots: [] },
     )).rejects.toMatchObject({ operation: "capturePostmasterEpoch" });
   });
 
@@ -319,7 +784,9 @@ describe("PostgreSQL migration runner", () => {
     expected,
   }) => {
     const fake = executor({ serverEncoding });
-    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [] })
+    const failure = await runPostgreSqlMigrations(fake.seam, {
+      migrations: loadPostgreSqlMigrations(),
+    })
       .catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PostgreSqlServerEncodingPreflightError);
     expect(failure).toMatchObject({
@@ -350,7 +817,7 @@ describe("PostgreSQL migration runner", () => {
   ])("fails closed when postmaster continuity is $label", async ({ postmasterContinuity }) => {
     await expect(runPostgreSqlMigrations(
       executor({ postmasterContinuity }).seam,
-      { migrations: [] },
+      { migrations: [], schemaSnapshots: [] },
     )).rejects.toMatchObject({ operation: "verifyPostmasterContinuity" });
   });
 
@@ -435,7 +902,9 @@ describe("PostgreSQL migration runner", () => {
     remediation,
   }) => {
     const fake = executor({ schemaOwnership });
-    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [] })
+    const failure = await runPostgreSqlMigrations(fake.seam, {
+      migrations: loadPostgreSqlMigrations(),
+    })
       .catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PostgreSqlSchemaOwnershipPreflightError);
     expect(failure).toMatchObject({
@@ -460,6 +929,8 @@ describe("PostgreSQL migration runner", () => {
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
+      "pinMigrationDeparserSettings",
+      "preflightSessionReplicationRole",
       "lockMigrations",
       "preflightServerVersion",
       "verifyPostmasterContinuity",
@@ -499,7 +970,7 @@ describe("PostgreSQL migration runner", () => {
     publicCreate,
   }) => {
     const fake = executor({ schemaAcl, schemaOwnership: "owned" });
-    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [] })
+    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [], schemaSnapshots: [] })
       .catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PostgreSqlSchemaAclPreflightError);
     expect(failure).toMatchObject({
@@ -522,6 +993,8 @@ describe("PostgreSQL migration runner", () => {
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
+      "pinMigrationDeparserSettings",
+      "preflightSessionReplicationRole",
       "lockMigrations",
       "preflightServerVersion",
       "verifyPostmasterContinuity",
@@ -535,7 +1008,7 @@ describe("PostgreSQL migration runner", () => {
     {
       label: "an unowned managed object",
       managedOwnership: "unowned" as const,
-      existingObjectCount: 35,
+      existingObjectCount: 36,
       unownedObjectCount: 1,
       requiredOwner: "lcm_test_migrator",
     },
@@ -563,7 +1036,7 @@ describe("PostgreSQL migration runner", () => {
     {
       label: "a changed current role",
       managedOwnership: "different-user" as const,
-      existingObjectCount: 35,
+      existingObjectCount: 36,
       unownedObjectCount: 0,
       requiredOwner: "different_migrator",
     },
@@ -578,7 +1051,9 @@ describe("PostgreSQL migration runner", () => {
       schemaAcl: "ready",
       schemaOwnership: "owned",
     });
-    const failure = await runPostgreSqlMigrations(fake.seam, { migrations: [] })
+    const failure = await runPostgreSqlMigrations(fake.seam, {
+      migrations: loadPostgreSqlMigrations(),
+    })
       .catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PostgreSqlManagedObjectOwnershipPreflightError);
     expect(failure).toMatchObject({
@@ -601,12 +1076,15 @@ describe("PostgreSQL migration runner", () => {
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
+      "pinMigrationDeparserSettings",
+      "preflightSessionReplicationRole",
       "lockMigrations",
       "preflightServerVersion",
       "verifyPostmasterContinuity",
       "revalidateRequiredExtensionCatalog",
       "preflightSchemaOwnership",
       "preflightSchemaAcl",
+      "preflightMigrationLedgerRelation",
       "preflightManagedObjectOwnership",
     ]);
     const ownershipCall = fake.seam.query.mock.calls.find(([, context]) => (
@@ -620,6 +1098,311 @@ describe("PostgreSQL migration runner", () => {
       "pg_catalog.pg_ts_config",
       "OPERATOR(pg_catalog.=)",
     ]) expect(ownershipSql).toContain(catalog);
+  });
+
+  it("rejects a missing managed object after the 0002 baseline is recorded", async () => {
+    const migrations = loadPostgreSqlMigrations();
+    const current = migrations.slice(0, 2).map(({ id, sha256 }) => ({
+      id,
+      checksum_sha256: sha256,
+    }));
+    const fake = executor({
+      current,
+      ledger: true,
+      managedOwnership: "missing-object",
+      schemaAcl: "ready",
+      schemaOwnership: "owned",
+    });
+    const failure = await runPostgreSqlMigrations(fake.seam, { migrations })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlManagedObjectOwnershipPreflightError);
+    expect(failure).toMatchObject({
+      baselineApplied: true,
+      expectedObjectCount: 36,
+      existingObjectCount: 35,
+      missingObjectCount: 1,
+      operation: "preflightManagedObjectOwnership",
+    });
+    expect(fake.operations).not.toContain("applyMigration:0002_schema_baseline");
+  });
+
+  it.each([
+    {
+      label: "a missing index, trigger, or constraint",
+      baselineDefinitions: "missing-object" as const,
+      baselineApplied: true,
+      expectedObjectCount: 723,
+      existingObjectCount: 722,
+      missingObjectCount: 1,
+      driftedDefinitionGroupCount: 1,
+    },
+    {
+      label: "definition drift",
+      baselineDefinitions: "drifted" as const,
+      baselineApplied: true,
+      expectedObjectCount: 723,
+      existingObjectCount: 723,
+      missingObjectCount: 0,
+      driftedDefinitionGroupCount: 1,
+    },
+    {
+      label: "a missing catalog row",
+      baselineDefinitions: "missing" as const,
+      baselineApplied: null,
+      expectedObjectCount: null,
+      existingObjectCount: null,
+      missingObjectCount: null,
+      driftedDefinitionGroupCount: null,
+    },
+    {
+      label: "malformed catalog values",
+      baselineDefinitions: "invalid" as const,
+      baselineApplied: null,
+      expectedObjectCount: null,
+      existingObjectCount: null,
+      missingObjectCount: null,
+      driftedDefinitionGroupCount: null,
+    },
+    {
+      label: "contradictory catalog counts",
+      baselineDefinitions: "inconsistent" as const,
+      baselineApplied: true,
+      expectedObjectCount: 723,
+      existingObjectCount: 724,
+      missingObjectCount: 0,
+      driftedDefinitionGroupCount: 0,
+    },
+  ])("rejects $label in the baseline definition inventory", async ({
+    baselineDefinitions,
+    baselineApplied,
+    expectedObjectCount,
+    existingObjectCount,
+    missingObjectCount,
+    driftedDefinitionGroupCount,
+  }) => {
+    const migrations = loadPostgreSqlMigrations();
+    const current = migrations.slice(0, 2).map(({ id, sha256 }) => ({
+      id,
+      checksum_sha256: sha256,
+    }));
+    const fake = executor({
+      baselineDefinitions,
+      current,
+      ledger: true,
+      schemaAcl: "ready",
+      schemaOwnership: "owned",
+    });
+    const failure = await runPostgreSqlMigrations(fake.seam, { migrations })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlBaselineDefinitionPreflightError);
+    expect(failure).toMatchObject({
+      baselineApplied,
+      driftedDefinitionGroupCount,
+      existingObjectCount,
+      expectedObjectCount,
+      missingObjectCount,
+      operation: "preflightBaselineDefinitions",
+      remediation:
+        "Restore every missing or changed LCM baseline table, relation ACL, column ACL, index, trigger, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.",
+    });
+    expect((failure as PostgreSqlBaselineDefinitionPreflightError).toJSON())
+      .toMatchObject({
+        baselineApplied,
+        driftedDefinitionGroupCount,
+        existingObjectCount,
+        expectedObjectCount,
+        missingObjectCount,
+      });
+    expect((failure as PostgreSqlBaselineDefinitionPreflightError).remediation)
+      .toContain("column ACL");
+    const inventoryCall = fake.seam.query.mock.calls.find(([, context]) => (
+      context.operation === "preflightBaselineDefinitions"
+    ));
+    const inventorySql =
+      (inventoryCall?.[0] as { text?: string } | undefined)?.text ?? "";
+    for (const catalog of [
+      "pg_catalog.pg_index",
+      "pg_catalog.pg_trigger",
+      "pg_catalog.pg_constraint",
+      "pg_catalog.pg_attribute",
+      "pg_catalog.pg_attrdef",
+      "pg_catalog.pg_sequence",
+      "pg_catalog.pg_depend",
+      "pg_catalog.pg_collation",
+      "pg_catalog.aclexplode",
+      "pg_catalog.acldefault",
+      "pg_catalog.pg_get_indexdef",
+      "pg_catalog.pg_get_triggerdef",
+      "pg_catalog.pg_get_constraintdef",
+      "pg_catalog.pg_get_expr",
+      "pg_catalog.format_type",
+      "attribute.attnotnull",
+      "attribute.attidentity",
+      "attribute.attacl",
+      "relation.relpersistence",
+      "sequence_relation.relpersistence",
+      "relation.relrowsecurity",
+      "relation.relforcerowsecurity",
+      "relation.relispartition",
+      "pg_catalog.pg_inherits",
+      "trigger.tgenabled",
+      "trigger.tgconstraint",
+      "object_name",
+    ]) expect(inventorySql).toContain(catalog);
+    expect((inventoryCall?.[0] as { values?: unknown[] } | undefined)?.values)
+      .toEqual([
+        true,
+        expect.arrayContaining(["session_ingest_log_identity_lookup_idx"]),
+        expect.arrayContaining([
+          "session_ingest_log|session_ingest_log_enforce_session_id_uniqueness",
+        ]),
+        expect.arrayContaining(["session_ingest_log|session_ingest_log_pkey"]),
+        expect.arrayContaining(["session_ingest_log|session_id_sha256"]),
+        expect.arrayContaining(["projects|identity_key", "recall_surfacing|surfaced_at"]),
+        expect.arrayContaining(["conversations_conversation_id_seq"]),
+        expect.arrayContaining(["schema_migrations", "fenced_leases"]),
+        expect.arrayContaining(["table|schema_migrations", "sequence|fenced_leases_fencing_token_seq"]),
+        expect.arrayContaining([
+          "projects|identity_key",
+          "session_ingest_log|session_id_sha256",
+        ]),
+        723,
+        [
+          "index",
+          "trigger",
+          "constraint",
+          "generated_column",
+          "column_acl",
+          "identity_sequence",
+          "table",
+          "relation_acl",
+          "ordinary_column",
+        ],
+        [52, 3, 168, 15, 220, 6, 24, 30, 205],
+        [
+          expect.any(String),
+          expect.any(String),
+          expect.any(String),
+          expect.any(String),
+          expect.any(String),
+          expect.any(String),
+          expect.any(String),
+          expect.any(String),
+          expect.any(String),
+        ],
+      ]);
+    expect(inventorySql).toContain("pg_catalog.unnest");
+    expect(inventorySql).toContain("WHEN 'S' THEN 's'::pg_catalog.\"char\"");
+    for (const hardcodedGroupCount of [52, 3, 168, 15, 220, 6, 24, 30, 205]) {
+      expect(inventorySql).not.toMatch(
+        new RegExp(`\\b${hardcodedGroupCount}::pg_catalog\\.int4`, "u"),
+      );
+    }
+  });
+
+  it.each([
+    {
+      label: "drifted",
+      identityFunctions: "drifted" as const,
+      baselineApplied: true,
+      expectedFunctionCount: 3,
+      existingFunctionCount: 3,
+      driftedFunctionCount: 1,
+    },
+    {
+      label: "missing",
+      identityFunctions: "missing" as const,
+      baselineApplied: null,
+      expectedFunctionCount: null,
+      existingFunctionCount: null,
+      driftedFunctionCount: null,
+    },
+    {
+      label: "malformed",
+      identityFunctions: "invalid" as const,
+      baselineApplied: null,
+      expectedFunctionCount: null,
+      existingFunctionCount: null,
+      driftedFunctionCount: null,
+    },
+    {
+      label: "inconsistent",
+      identityFunctions: "inconsistent" as const,
+      baselineApplied: true,
+      expectedFunctionCount: 3,
+      existingFunctionCount: 4,
+      driftedFunctionCount: 0,
+    },
+  ])("rejects $label identity-function fingerprint state", async ({
+    identityFunctions,
+    baselineApplied,
+    expectedFunctionCount,
+    existingFunctionCount,
+    driftedFunctionCount,
+  }) => {
+    const migrations = loadPostgreSqlMigrations();
+    const current = migrations.slice(0, 2).map(({ id, sha256 }) => ({
+      id,
+      checksum_sha256: sha256,
+    }));
+    const fake = executor({
+      current,
+      identityFunctions,
+      ledger: true,
+      schemaAcl: "ready",
+      schemaOwnership: "owned",
+    });
+    const failure = await runPostgreSqlMigrations(fake.seam, { migrations })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlIdentityFunctionPreflightError);
+    expect(failure).toMatchObject({
+      baselineApplied,
+      driftedFunctionCount,
+      existingFunctionCount,
+      expectedFunctionCount,
+      operation: "preflightIdentityFunctionDefinitions",
+      remediation:
+        "Restore the packaged LCM identity-enforcement functions and their security configuration, then rerun migrations.",
+    });
+    expect((failure as PostgreSqlIdentityFunctionPreflightError).toJSON())
+      .toMatchObject({
+        baselineApplied,
+        driftedFunctionCount,
+        existingFunctionCount,
+        expectedFunctionCount,
+      });
+    const fingerprintCall = fake.seam.query.mock.calls.find(([, context]) => (
+      context.operation === "preflightIdentityFunctionDefinitions"
+    ));
+    const fingerprintSql =
+      (fingerprintCall?.[0] as { text?: string } | undefined)?.text ?? "";
+    for (const fingerprintedField of [
+      "prosrc",
+      "prosecdef",
+      "proleakproof",
+      "provolatile",
+      "proparallel",
+      "proconfig",
+      "normalized_acl",
+      "aclexplode",
+      "owner|owner|EXECUTE|false",
+    ]) expect(fingerprintSql).toContain(fingerprintedField);
+    expect(fingerprintSql).toContain("pg_catalog.unnest");
+    expect(fingerprintSql).not.toContain("'enforce_summary_id_uniqueness'");
+    expect((fingerprintCall?.[0] as { values?: unknown[] } | undefined)?.values)
+      .toEqual([
+        true,
+        [
+          "enforce_summary_id_uniqueness",
+          "enforce_large_file_id_uniqueness",
+          "enforce_session_ingest_id_uniqueness",
+        ],
+        [
+          expect.any(String),
+          expect.any(String),
+          expect.any(String),
+        ],
+      ]);
   });
 
   it.each([
@@ -661,6 +1444,7 @@ describe("PostgreSQL migration runner", () => {
     const fake = executor({ serverVersion });
     const failure = await runPostgreSqlMigrations(fake.seam, {
       migrations: [migration("0001_first")],
+      schemaSnapshots: [],
     }).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PostgreSqlServerVersionPreflightError);
     expect(failure).toMatchObject({
@@ -681,6 +1465,8 @@ describe("PostgreSQL migration runner", () => {
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
+      "pinMigrationDeparserSettings",
+      "preflightSessionReplicationRole",
       "lockMigrations",
       "preflightServerVersion",
     ]);

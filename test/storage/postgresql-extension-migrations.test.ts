@@ -100,6 +100,7 @@ describe("PostgreSQL migration extension preflight", () => {
     const fake = executor(fault);
     const failure = await runPostgreSqlMigrations(fake.seam, {
       migrations: [migration()],
+      schemaSnapshots: [],
     }).catch((error: unknown) => error);
 
     expect(failure).toMatchObject({
