@@ -665,7 +665,12 @@ BEGIN
     WHERE existing.project_id OPERATOR(pg_catalog.=) NEW.project_id
       AND existing.session_id_sha256 OPERATOR(pg_catalog.=) requested_sha256
       AND existing.session_id OPERATOR(pg_catalog.=) NEW.session_id
-      AND existing.ingest_key OPERATOR(pg_catalog.<>) NEW.ingest_key
+      AND existing.ingest_key OPERATOR(pg_catalog.<>) (
+        CASE
+          WHEN TG_OP OPERATOR(pg_catalog.=) 'UPDATE' THEN OLD.ingest_key
+          ELSE NEW.ingest_key
+        END
+      )
   ) THEN
     RAISE EXCEPTION 'duplicate session ingest identifier in project'
       USING ERRCODE = 'unique_violation',

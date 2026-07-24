@@ -374,7 +374,7 @@ describe("PostgreSQL migration runner", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "8ac25d445ef827e513a110a22f9f58be2e344ac4059adaed3b48c613486a453e" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "e96cad6c577c9f088d02366e22bbbe3f876217363659feea6d2edc1918885bae" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
@@ -383,6 +383,9 @@ describe("PostgreSQL migration runner", () => {
       `catalog SHA-256 ${POSTGRESQL_SEARCH_CONFIGURATION_SHA256}`,
     );
     expect(migrations[1]?.sql).toContain("lcm.fenced_leases_fencing_token_seq");
+    expect(migrations[1]?.sql).toContain(
+      "WHEN TG_OP OPERATOR(pg_catalog.=) 'UPDATE' THEN OLD.ingest_key",
+    );
     expect(() => loadPostgreSqlMigrations(() => { throw new Error("missing private path"); }))
       .toThrowError(expect.objectContaining({ operation: "loadMigrations" }));
     expect(() => loadPostgreSqlMigrations(() => "altered migration"))

@@ -22,7 +22,7 @@ const MIGRATION_MANIFEST = [
   {
     id: "0002_schema_baseline",
     filename: "0002_schema_baseline.sql",
-    sha256: "8ac25d445ef827e513a110a22f9f58be2e344ac4059adaed3b48c613486a453e",
+    sha256: "e96cad6c577c9f088d02366e22bbbe3f876217363659feea6d2edc1918885bae",
   },
 ] as const;
 
@@ -419,7 +419,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       },
       {
         name: "enforce_session_ingest_id_uniqueness",
-        sha256: "b7e1725a4d6ee95f3e806386025734c6d6d44853642231048a2b23a0d9fc6021",
+        sha256: "9904bce7ff1f89e2317d1b4d156f43b9033574d230b99e4368b7fe59b20172d0",
       },
     ],
     migrationId: "0002_schema_baseline",

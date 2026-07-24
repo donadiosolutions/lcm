@@ -1111,6 +1111,100 @@ describe("PostgreSQL schema baseline", () => {
     });
   });
 
+  it("excludes the old ingest row while rotating its primary key", async () => {
+    await withPostgreSqlTestDatabase("schema-session-ingest-key-rotation", async (database) => {
+      const scope = await seedScope(database.migrator);
+      const seeded = await database.migrator.query<{
+        ingest_key: string;
+        session_id: string;
+      }>({
+        text: `INSERT INTO lcm.session_ingest_log
+                 (project_id, session_id, message_count)
+               VALUES
+                 ($1, 'rotating-session', 1),
+                 ($1, 'occupied-session', 2)
+               RETURNING ingest_key::pg_catalog.text, session_id`,
+        values: [scope.projectId],
+      }, { domain: "factory", operation: "seedSessionIngestKeyRotation" });
+      const rotating = seeded.rows.find(({ session_id }) => session_id === "rotating-session");
+      const occupied = seeded.rows.find(({ session_id }) => session_id === "occupied-session");
+      expect(rotating).toBeDefined();
+      expect(occupied).toBeDefined();
+
+      const rotated = await database.migrator.query<{
+        ingest_key: string;
+        project_id: string;
+        session_id: string;
+      }>({
+        text: `UPDATE lcm.session_ingest_log
+               SET ingest_key = uuidv7(),
+                   project_id = $2,
+                   session_id = $3
+               WHERE ingest_key = $1
+               RETURNING
+                 ingest_key::pg_catalog.text,
+                 project_id::pg_catalog.text,
+                 session_id`,
+        values: [rotating!.ingest_key, scope.projectId, rotating!.session_id],
+      }, { domain: "factory", operation: "rotateSessionIngestKey" });
+      expect(rotated.rows).toHaveLength(1);
+      expect(rotated.rows[0]).toMatchObject({
+        project_id: scope.projectId,
+        session_id: rotating!.session_id,
+      });
+      expect(rotated.rows[0]?.ingest_key).not.toBe(rotating!.ingest_key);
+
+      await expect(database.migrator.query({
+        text: `UPDATE lcm.session_ingest_log
+               SET ingest_key = uuidv7(),
+                   project_id = $2,
+                   session_id = $3
+               WHERE ingest_key = $1`,
+        values: [
+          rotated.rows[0]!.ingest_key,
+          scope.projectId,
+          occupied!.session_id,
+        ],
+      }, { domain: "factory", operation: "rejectSessionIngestRotationCollision" }))
+        .rejects.toMatchObject({
+          operation: "rejectSessionIngestRotationCollision",
+          sqlState: "23505",
+        });
+      await expect(database.migrator.query({
+        text: `INSERT INTO lcm.session_ingest_log
+                 (project_id, session_id, message_count)
+               VALUES ($1, $2, 3)`,
+        values: [scope.projectId, rotating!.session_id],
+      }, { domain: "factory", operation: "rejectSessionIngestDuplicateAfterRotation" }))
+        .rejects.toMatchObject({
+          operation: "rejectSessionIngestDuplicateAfterRotation",
+          sqlState: "23505",
+        });
+      await expect(database.migrator.query<{
+        ingest_key: string;
+        session_id: string;
+      }>({
+        text: `SELECT ingest_key::pg_catalog.text, session_id
+               FROM lcm.session_ingest_log
+               WHERE project_id = $1
+               ORDER BY session_id`,
+        values: [scope.projectId],
+      }, { domain: "factory", operation: "verifySessionIngestRowsAfterRotation" }))
+        .resolves.toMatchObject({
+          rows: [
+            {
+              ingest_key: occupied!.ingest_key,
+              session_id: occupied!.session_id,
+            },
+            {
+              ingest_key: rotated.rows[0]!.ingest_key,
+              session_id: rotating!.session_id,
+            },
+          ],
+        });
+    });
+  });
+
   it("serializes concurrent exact session-ingest identity claims", async () => {
     await withPostgreSqlTestDatabase("schema-session-race", async (database) => {
       const scope = await seedScope(database.migrator);
