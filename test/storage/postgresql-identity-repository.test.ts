@@ -85,6 +85,10 @@ describe("PostgreSQL identity repository", () => {
       text: expect.stringContaining("ON CONFLICT (identity_key) DO UPDATE"),
       values: [machineRow.identity_key, "Machine A"],
     });
+    expect(db.query.mock.calls[0][0].text).toContain(
+      "GREATEST(\n                   lcm.machines.last_seen_at,\n"
+      + "                   statement_timestamp()\n                 )",
+    );
   });
 
   it("fails closed when registration returns no row", async () => {

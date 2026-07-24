@@ -338,6 +338,39 @@ describe("PostgreSQL 18 machine and project identities", () => {
     });
   });
 
+  it("keeps last-seen time monotonic when an upsert statement has an older timestamp", async () => {
+    await withPostgreSqlTestDatabase("identity-monotonic-last-seen", async (database) => {
+      await grantIdentityRuntimePrivileges(database);
+      const identityKey = `machine:${"c".repeat(64)}`;
+      const inserted = await database.migrator.query<{
+        machine_id: string;
+        last_seen_at: Date | string;
+      }>({
+        text: `INSERT INTO lcm.machines (
+                 identity_key, display_name, registered_at, last_seen_at
+               )
+               VALUES (
+                 $1, 'Before refresh',
+                 statement_timestamp() + interval '1 minute',
+                 statement_timestamp() + interval '1 minute'
+               )
+               RETURNING machine_id, last_seen_at`,
+        values: [identityKey],
+      }, { domain: "identity", operation: "insertFutureMachineIdentity" });
+      const repository = new PostgreSqlIdentityRepository(database.runtime);
+
+      const refreshed = await repository.registerMachine(identityKey, "After refresh");
+
+      expect(refreshed).toMatchObject({
+        machineId: inserted.rows[0].machine_id,
+        displayName: "After refresh",
+      });
+      expect(refreshed.lastSeenAt).toBe(
+        new Date(inserted.rows[0].last_seen_at).toISOString(),
+      );
+    });
+  });
+
   it("lets different machines create distinct projects at the same normalized path", async () => {
     await withPostgreSqlTestDatabase("identity-same-path-different-machines", async (database) => {
       await grantIdentityRuntimePrivileges(database);

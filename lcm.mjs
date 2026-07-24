@@ -9,7 +9,10 @@ ${CONFIG_EXAMPLE}`);this.name="ConfigValidationError"}};DAEMON_KEYS=new Set(["po
              VALUES ($1, $2)
              ON CONFLICT (identity_key) DO UPDATE
              SET display_name = EXCLUDED.display_name,
-                 last_seen_at = statement_timestamp()
+                 last_seen_at = GREATEST(
+                   lcm.machines.last_seen_at,
+                   statement_timestamp()
+                 )
              RETURNING machine_id, identity_key, display_name,
                        registered_at, last_seen_at`,values:[identityKey,displayName]},{domain:"identity",operation:"registerMachine"});const row=result.rows[0];if(!row)throw new PostgreSqlIdentityRegistrationError;return machineFromRow(row)}async recoverMachine(machineId){const result=await this.executor.query({text:`SELECT machine_id, identity_key, display_name,
                     registered_at, last_seen_at

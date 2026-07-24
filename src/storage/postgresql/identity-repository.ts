@@ -371,7 +371,10 @@ export class PostgreSqlIdentityRepository {
              VALUES ($1, $2)
              ON CONFLICT (identity_key) DO UPDATE
              SET display_name = EXCLUDED.display_name,
-                 last_seen_at = statement_timestamp()
+                 last_seen_at = GREATEST(
+                   lcm.machines.last_seen_at,
+                   statement_timestamp()
+                 )
              RETURNING machine_id, identity_key, display_name,
                        registered_at, last_seen_at`,
       values: [identityKey, displayName],
