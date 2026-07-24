@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EventRow, PatternReinforcementStats } from "../../../src/hooks/events-db.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
+import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
 
 const mocks = vi.hoisted(() => ({
   events: vi.fn(() => [] as EventRow[]),
@@ -80,6 +81,19 @@ function event(overrides: Partial<EventRow>): EventRow {
 }
 
 const config = loadDaemonConfig("/tmp/promote-events-unit");
+const postgresqlConfig = {
+  ...config,
+  storage: {
+    backend: "postgresql",
+    postgresql: {
+      url: "postgresql://user:secret@db.example/lcm",
+      poolMax: 5,
+      connectionTimeoutMs: 10_000,
+      idleTimeoutMs: 30_000,
+      statementTimeoutMs: 60_000,
+    },
+  },
+} as const;
 
 function projectStorage() {
   return {
@@ -201,13 +215,39 @@ describe("promote-events unit boundaries", () => {
     }]);
 
     const response = {} as never;
-    await createPromoteAllEventsHandler(config)({} as never, response, "");
+    await createPromoteAllEventsHandler(postgresqlConfig)({} as never, response, "");
 
     expect(mocks.send).toHaveBeenLastCalledWith(response, 409, {
       code: "STORAGE_IDENTITY_REQUIRED",
-      error: identityFailure.message,
+      error: "Machine identity is unavailable. Run `lcm machine show` for recovery guidance.",
       storageBackend: "postgresql",
     });
+    expect(mocks.openOutbox).not.toHaveBeenCalled();
+  });
+
+  it("admits PostgreSQL storage before opening either promotion outbox", async () => {
+    const staged = new UnavailablePostgreSqlStorageBackendFactory();
+
+    await expect(drainEventsForCwd(
+      postgresqlConfig,
+      "/cwd",
+      "/events.db",
+      staged,
+    )).rejects.toThrow("postgresql storage initialization failed for project pid");
+    expect(mocks.openOutbox).not.toHaveBeenCalled();
+
+    const response = {} as never;
+    await createPromoteEventsHandler(postgresqlConfig, staged)(
+      {} as never,
+      response,
+      JSON.stringify({ cwd: "/cwd" }),
+    );
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      code: "STORAGE_BACKEND_STAGED",
+      error: "promote-events is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
+    expect(mocks.openOutbox).not.toHaveBeenCalled();
   });
 
   it("reports incomplete global drains and closes owned factories when projects fail to open", async () => {

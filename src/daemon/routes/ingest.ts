@@ -62,10 +62,13 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
     }
 
     const paths = projectPaths(cwd);
-    const parsed = resolveMessages(input, cwd);
-    if (parsed.length === 0 && config.storage.backend === "sqlite") {
-      sendJson(res, 200, { ingested: 0, totalTokens: 0 });
-      return;
+    let sqliteMessages: ParsedMessage[] | undefined;
+    if (config.storage.backend === "sqlite") {
+      sqliteMessages = resolveMessages(input, cwd);
+      if (sqliteMessages.length === 0) {
+        sendJson(res, 200, { ingested: 0, totalTokens: 0 });
+        return;
+      }
     }
 
     let project: ProjectStorage | undefined;
@@ -73,10 +76,16 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
     let activeFactory: StorageBackendFactory | undefined;
     try {
       const identity = projectIdentity(cwd, config.storage);
-      if (parsed.length === 0) {
+      let resolvedMessages: ParsedMessage[];
+      if (config.storage.backend === "postgresql") {
         activeFactory = storageFactory
           ?? (ownedFactory = createStorageBackendFactory(config.storage));
         project = await activeFactory.openProject(identity);
+        resolvedMessages = resolveMessages(input, cwd);
+      } else {
+        resolvedMessages = sqliteMessages as ParsedMessage[];
+      }
+      if (resolvedMessages.length === 0) {
         sendJson(res, 200, { ingested: 0, totalTokens: 0 });
         return;
       }
@@ -85,15 +94,17 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         config.security?.sensitivePatterns ?? [],
         paths.dir,
       );
-      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await activeFactory.openProject(identity);
+      if (!project) {
+        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        project = await activeFactory.openProject(identity);
+      }
       const ingest = await project.transaction(async (repositories) => {
         const row = await repositories.coordination.getSessionIngest(session_id);
-        if (row && parsed.length <= row.messageCount) return null;
+        if (row && resolvedMessages.length <= row.messageCount) return null;
 
         const conversation = await repositories.conversations.getOrCreateConversation(session_id);
         const storedCount = await repositories.conversations.getMessageCount(conversation.conversationId);
-        const newMessages = parsed.slice(storedCount);
+        const newMessages = resolvedMessages.slice(storedCount);
         if (newMessages.length === 0) return null;
 
         const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };

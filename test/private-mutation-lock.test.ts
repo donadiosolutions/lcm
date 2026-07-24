@@ -1,5 +1,4 @@
 import {
-  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -15,6 +14,7 @@ import {
   PrivateMutationLockContentionError,
   withPrivateMutationLock,
 } from "../src/private-mutation-lock.js";
+import { deleteRegularFile } from "../src/security-files.js";
 
 const roots: string[] = [];
 
@@ -98,26 +98,35 @@ describe("private mutation lock release recovery", () => {
 
   it("tracks a lock when recovery deletion fails and reclaims it after access returns", () => {
     const { lockPath } = makeLock();
-    const root = join(lockPath, "..");
     const primary = new Error("protected mutation failed");
+    const cleanupFailure = new Error("injected recovery deletion failure");
+    let deleteAttempts = 0;
     let thrown: unknown;
     try {
       withPrivateMutationLock(lockPath, "test", () => {
         throw primary;
       }, (event) => {
         if (event !== "before-main-lock-release-read") return;
-        chmodSync(root, 0o500);
         throw new Error("release observer failed");
+      }, {
+        deleteRegularFile(path) {
+          deleteAttempts += 1;
+          if (deleteAttempts === 1) throw cleanupFailure;
+          return deleteRegularFile(path);
+        },
       });
     } catch (error) {
       thrown = error;
-    } finally {
-      chmodSync(root, 0o700);
     }
 
     expect(thrown).toBeInstanceOf(AggregateError);
     expect((thrown as AggregateError).cause).toBe(primary);
-    expect((thrown as AggregateError).errors).toHaveLength(3);
+    expect((thrown as AggregateError).errors).toEqual([
+      primary,
+      expect.any(Error),
+      cleanupFailure,
+    ]);
+    expect(deleteAttempts).toBe(1);
     expect(existsSync(lockPath)).toBe(true);
     expect(withPrivateMutationLock(lockPath, "test", () => "recovered"))
       .toBe("recovered");

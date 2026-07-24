@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { MachineIdentityFileError } from "../../../src/machine-identity.js";
+import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
+import { createStorageBackendFactory } from "../../../src/storage/index.js";
 
 const mocks = vi.hoisted(() => ({
   exists: vi.fn(() => true),
@@ -97,6 +100,19 @@ vi.mock("../../../src/hooks/hook-errors.js", () => ({ safeLogError: mocks.logErr
 import { createIngestHandler } from "../../../src/daemon/routes/ingest.js";
 
 const config = loadDaemonConfig("/tmp/ingest-boundaries");
+const postgresqlConfig = {
+  ...config,
+  storage: {
+    backend: "postgresql",
+    postgresql: {
+      url: "postgresql://user:secret@db.example/lcm",
+      poolMax: 5,
+      connectionTimeoutMs: 10_000,
+      idleTimeoutMs: 30_000,
+      statementTimeoutMs: 60_000,
+    },
+  },
+} as const;
 const response = {} as never;
 const validMessage = { role: "user", content: "content", tokenCount: 2 };
 
@@ -214,27 +230,73 @@ describe("ingest persistence boundaries", () => {
   });
 
   it("fails PostgreSQL identity before creating local directories, scrubbers, or storage", async () => {
-    const handler = createIngestHandler(config);
-    const failure = new Error("PostgreSQL project binding is required");
+    const handler = createIngestHandler(postgresqlConfig);
+    const failure = new MachineIdentityFileError(
+      "machine identity is not registered",
+      "Run `lcm machine register`.",
+    );
     mocks.identity.mockImplementationOnce(() => { throw failure; });
 
     await handler({} as never, response, JSON.stringify({
       session_id: "unbound",
       cwd: "/ok",
-      messages: [validMessage],
+      transcript_path: "/safe",
     }));
 
-    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
-      error: "ingest failed",
-      code: "INGEST_FAILED",
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 409, {
+      code: "STORAGE_IDENTITY_REQUIRED",
+      error: "Machine identity is unavailable. Run `lcm machine show` for recovery guidance.",
+      storageBackend: "postgresql",
     });
     expect(mocks.ensureProject).not.toHaveBeenCalled();
     expect(mocks.forProject).not.toHaveBeenCalled();
     expect(mocks.getConnection).not.toHaveBeenCalled();
+    expect(mocks.safeTranscript).not.toHaveBeenCalled();
+    expect(mocks.exists).not.toHaveBeenCalled();
+    expect(mocks.parse).not.toHaveBeenCalled();
     expect(mocks.logError).toHaveBeenLastCalledWith("ingest", failure, {
       cwd: "/ok",
       sessionId: "unbound",
     });
+  });
+
+  it("rejects staged PostgreSQL before reading a file-backed transcript", async () => {
+    const handler = createIngestHandler(
+      postgresqlConfig,
+      new UnavailablePostgreSqlStorageBackendFactory(),
+    );
+    await handler({} as never, response, JSON.stringify({
+      session_id: "staged",
+      cwd: "/ok",
+      transcript_path: "/safe",
+    }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      code: "STORAGE_BACKEND_STAGED",
+      error: "ingest is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    });
+    expect(mocks.safeTranscript).not.toHaveBeenCalled();
+    expect(mocks.exists).not.toHaveBeenCalled();
+    expect(mocks.parse).not.toHaveBeenCalled();
+  });
+
+  it("reuses the admitted PostgreSQL project for non-empty ingestion", async () => {
+    const factory = createStorageBackendFactory(config.storage);
+    const handler = createIngestHandler(postgresqlConfig, factory);
+    await handler({} as never, response, JSON.stringify({
+      session_id: "postgresql-ingest",
+      cwd: "/ok",
+      messages: [validMessage],
+    }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      ingested: 1,
+      totalTokens: 7,
+    });
+    expect(mocks.getConnection).toHaveBeenCalledOnce();
+    expect(mocks.getConnection.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.ensureProject.mock.invocationCallOrder[0]);
   });
 
   it("keeps successful SQLite identity ahead of local persistence setup", async () => {

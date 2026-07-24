@@ -31,6 +31,15 @@ export type PrivateMutationLockObserver = (
 
 const NOOP_PRIVATE_MUTATION_LOCK_OBSERVER: PrivateMutationLockObserver = () => undefined;
 
+/** @internal Deterministic filesystem seam used by lock recovery tests. */
+export type PrivateMutationLockOperations = {
+  readonly deleteRegularFile: typeof deleteRegularFile;
+};
+
+const DEFAULT_PRIVATE_MUTATION_LOCK_OPERATIONS: PrivateMutationLockOperations = {
+  deleteRegularFile,
+};
+
 function isMissingFileError(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
 }
@@ -222,6 +231,7 @@ function releaseReclaimClaim(
   content: string,
   label: string,
   observer: PrivateMutationLockObserver,
+  operations: PrivateMutationLockOperations,
 ): void {
   const ownerPath = join(claimPath, "owner.json");
   observer("before-claim-release-read", ownerPath);
@@ -232,7 +242,7 @@ function releaseReclaimClaim(
     throw new Error(`${label} lock reclamation ownership changed before release`);
   }
   observer("before-claim-release-delete", ownerPath);
-  if (!deleteRegularFile(ownerPath)) {
+  if (!operations.deleteRegularFile(ownerPath)) {
     throw new Error(`${label} lock reclamation owner disappeared before release`);
   }
   rmdirSync(claimPath);
@@ -243,6 +253,7 @@ function acquireMutationLock(
   content: string,
   label: string,
   observer: PrivateMutationLockObserver,
+  operations: PrivateMutationLockOperations,
 ): void {
   let disappearedOwnerReadRetries = 0;
   while (true) {
@@ -272,7 +283,7 @@ function acquireMutationLock(
       if (existing.content !== abandonedContent) {
         abandonedMutationLocks.delete(lockPath);
       } else {
-        deleteRegularFile(lockPath);
+        operations.deleteRegularFile(lockPath);
         abandonedMutationLocks.delete(lockPath);
         disappearedOwnerReadRetries = 0;
         continue;
@@ -306,7 +317,7 @@ function acquireMutationLock(
         throw new Error(`${label} lock changed while checking its stale owner; retry the operation`);
       }
       observer("before-stale-lock-delete", lockPath);
-      if (!deleteRegularFile(lockPath)) {
+      if (!operations.deleteRegularFile(lockPath)) {
         throw new Error(`${label} lock disappeared during stale-owner recovery; retry the operation`);
       }
       observer("before-successor-lock-create", lockPath);
@@ -316,7 +327,7 @@ function acquireMutationLock(
       successorPublished = true;
     } finally {
       try {
-        releaseReclaimClaim(reclaimPath, content, label, observer);
+        releaseReclaimClaim(reclaimPath, content, label, observer, operations);
       } catch (error) {
         // Once the successor main lock is published, it is authoritative.
         // Reclaim-claim cleanup failure must not report acquisition failure and
@@ -348,6 +359,7 @@ function releaseMutationLock(
   observer: PrivateMutationLockObserver,
   callbackFailed: boolean,
   callbackError: unknown,
+  operations: PrivateMutationLockOperations,
 ): void {
   try {
     observer("before-main-lock-release-read", lockPath);
@@ -358,7 +370,7 @@ function releaseMutationLock(
       throw new Error(`${label} mutation lock ownership changed before release`);
     }
     observer("before-main-lock-release-delete", lockPath);
-    if (!deleteRegularFile(lockPath)) {
+    if (!operations.deleteRegularFile(lockPath)) {
       throw new Error(`${label} mutation lock disappeared before release`);
     }
     abandonedMutationLocks.delete(lockPath);
@@ -395,7 +407,7 @@ function releaseMutationLock(
       );
     }
     try {
-      deleteRegularFile(lockPath);
+      operations.deleteRegularFile(lockPath);
     } catch (recoveryError) {
       abandonedMutationLocks.set(lockPath, content);
       throw new AggregateError(
@@ -418,9 +430,10 @@ export function withPrivateMutationLock<T>(
   label: string,
   callback: () => T,
   observer: PrivateMutationLockObserver = NOOP_PRIVATE_MUTATION_LOCK_OBSERVER,
+  operations: PrivateMutationLockOperations = DEFAULT_PRIVATE_MUTATION_LOCK_OPERATIONS,
 ): T {
   const content = createMutationLockContent(observer);
-  acquireMutationLock(lockPath, content, label, observer);
+  acquireMutationLock(lockPath, content, label, observer, operations);
   let callbackFailed = false;
   let callbackError: unknown;
   try {
@@ -437,6 +450,7 @@ export function withPrivateMutationLock<T>(
       observer,
       callbackFailed,
       callbackError,
+      operations,
     );
   }
 }
@@ -446,9 +460,10 @@ export async function withPrivateMutationLockAsync<T>(
   label: string,
   callback: () => Promise<T>,
   observer: PrivateMutationLockObserver = NOOP_PRIVATE_MUTATION_LOCK_OBSERVER,
+  operations: PrivateMutationLockOperations = DEFAULT_PRIVATE_MUTATION_LOCK_OPERATIONS,
 ): Promise<T> {
   const content = createMutationLockContent(observer);
-  acquireMutationLock(lockPath, content, label, observer);
+  acquireMutationLock(lockPath, content, label, observer, operations);
   let callbackFailed = false;
   let callbackError: unknown;
   try {
@@ -465,6 +480,7 @@ export async function withPrivateMutationLockAsync<T>(
       observer,
       callbackFailed,
       callbackError,
+      operations,
     );
   }
 }

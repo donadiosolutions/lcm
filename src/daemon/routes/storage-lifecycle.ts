@@ -92,7 +92,9 @@ export function storageIdentityRequiredResponse(
   }
   return {
     code: STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
-    error: sanitizeError(error.message),
+    error: error instanceof MachineIdentityFileError
+      ? "Machine identity is unavailable. Run `lcm machine show` for recovery guidance."
+      : sanitizeError(error.message),
     storageBackend: "postgresql",
   };
 }

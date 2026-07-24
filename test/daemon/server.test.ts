@@ -186,8 +186,8 @@ describe("daemon server", () => {
       const identityRequired = await response.json() as Record<string, unknown>;
       expect(identityRequired).toEqual({
         code: "STORAGE_IDENTITY_REQUIRED",
-        error: "machine identity is not registered. "
-          + "Run `lcm machine register` before linking a PostgreSQL project.",
+        error: "Machine identity is unavailable. "
+          + "Run `lcm machine show` for recovery guidance.",
         storageBackend: "postgresql",
       });
     }

@@ -31,7 +31,8 @@ vi.mock("../../../src/daemon/project.js", () => ({
 }));
 vi.mock("../../../src/daemon/orientation.js", () => ({ buildOrientationPrompt: () => "orientation" }));
 vi.mock("../../../src/daemon/content-fence.js", () => ({ fenceContent: (content: string, label: string) => `<${label}>${content}</${label}>` }));
-vi.mock("../../../src/security-files.js", () => ({
+vi.mock("../../../src/security-files.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../src/security-files.js")>()),
   readBoundedRegularFile: (path: string) => {
     state.instructionPaths.push(path);
     if (state.instructionContent !== undefined) return state.instructionContent;

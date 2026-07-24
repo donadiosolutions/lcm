@@ -93,26 +93,29 @@ describe("route storage cleanup", () => {
       new MachineIdentityFileError("machine missing", "Register it."),
     )).toEqual({
       code: "STORAGE_IDENTITY_REQUIRED",
-      error: "machine missing. Register it.",
+      error: "Machine identity is unavailable. Run `lcm machine show` for recovery guidance.",
       storageBackend: "postgresql",
     });
   });
 
-  it("redacts machine identity paths while preserving actionable remediation", () => {
-    const machineIdentityPath = "/home/private-user/.lcm/machine.json";
+  it("never exposes machine identity paths with spaces or shell metacharacters", () => {
+    const machineIdentityPath = "/home/private user/$secret;$(touch nope)/machine'identity.json";
     const response = storageIdentityRequiredResponse(
       new MachineIdentityFileError(
         "machine.json permissions are too broad; expected mode 0600",
-        `Run \`chmod 600 -- ${machineIdentityPath}\`, then retry.`,
+        `Run \`chmod 600 -- '${machineIdentityPath}'\`, then retry.`,
       ),
     );
 
     expect(response).toEqual({
       code: "STORAGE_IDENTITY_REQUIRED",
-      error: "machine.json permissions are too broad; expected mode 0600. "
-        + "Run `chmod 600 -- <path>`, then retry.",
+      error: "Machine identity is unavailable. Run `lcm machine show` for recovery guidance.",
       storageBackend: "postgresql",
     });
-    expect(JSON.stringify(response)).not.toContain(machineIdentityPath);
+    const serialized = JSON.stringify(response);
+    expect(serialized).not.toContain(machineIdentityPath);
+    expect(serialized).not.toContain("private user");
+    expect(serialized).not.toContain("$secret");
+    expect(serialized).not.toContain("touch nope");
   });
 });

@@ -359,9 +359,12 @@ async function drainEventsForCwdUnlocked(
   let ownedFactory: StorageBackendFactory | undefined;
   try {
     const identity = projectIdentity(cwd, config.storage);
-    const edb = await outboxFactory.open(sidecarPath);
     const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-    project = await factory.openProject(identity);
+    if (config.storage.backend === "postgresql") {
+      project = await factory.openProject(identity);
+    }
+    const edb = await outboxFactory.open(sidecarPath);
+    project ??= await factory.openProject(identity);
     const scrubber = await ScrubEngine.forProject(
       config.security.sensitivePatterns,
       projectDir(cwd),
@@ -427,9 +430,12 @@ async function promoteEventsForCwdUnlocked(
   let ownedFactory: StorageBackendFactory | undefined;
   try {
     const identity = projectIdentity(cwd, config.storage);
-    const edb = await outboxFactory.open(sidecarPath);
     const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-    project = await factory.openProject(identity);
+    if (config.storage.backend === "postgresql") {
+      project = await factory.openProject(identity);
+    }
+    const edb = await outboxFactory.open(sidecarPath);
+    project ??= await factory.openProject(identity);
     const scrubber = await ScrubEngine.forProject(
       config.security.sensitivePatterns,
       projectDir(cwd),
