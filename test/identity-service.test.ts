@@ -29,6 +29,7 @@ import {
   clearProjectMapCache,
   listProjectMapEntries,
   projectMapPath,
+  removeProjectAlias,
   resolveProjectIdentity,
   setRemoteProjectBinding,
   showProjectMapEntry,
@@ -2345,7 +2346,7 @@ describe("identity service", () => {
     const originalUnlink = repository.unlinkProjectAliasIfOwned.getMockImplementation()!;
     repository.unlinkProjectAliasIfOwned = vi.fn(async (machineId, normalizedPath, projectId) => {
       const removed = await originalUnlink(machineId, normalizedPath, projectId);
-      writeFileSync(projectMapPath(), "{broken");
+      addProjectAlias(makeProject("unlink-alias-concurrent-add"), { hash: bound.local.id });
       return removed;
     });
 
@@ -2353,6 +2354,31 @@ describe("identity service", () => {
     expect(repository.linkProject).toHaveBeenCalledWith(
       expect.objectContaining({ projectId: PROJECT_A, normalizedPath: linked }),
     );
+  });
+
+  it("does not restore PostgreSQL when an overlapping local alias unlink already won", async () => {
+    await register();
+    const canonical = makeProject("unlink-alias-overlap-canonical");
+    const linked = makeProject("unlink-alias-overlap-path");
+    const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    await linkProject(POSTGRESQL_CONFIG, bound.local.id, linked, {}, deps);
+    const expectedEntry = showProjectMapEntry(bound.local.id).entry;
+    const originalUnlink = repository.unlinkProjectAliasIfOwned.getMockImplementation()!;
+    repository.unlinkProjectAliasIfOwned = vi.fn(async (machineId, normalizedPath, projectId) => {
+      const removed = await originalUnlink(machineId, normalizedPath, projectId);
+      removeProjectAlias(linked, { hash: bound.local.id, expectedEntry });
+      return removed;
+    });
+    repository.linkProject.mockClear();
+
+    await expect(unlinkProject(POSTGRESQL_CONFIG, linked, deps))
+      .resolves.toEqual({
+        hash: bound.local.id,
+        remoteProjectId: PROJECT_A,
+        aliasRemoved: true,
+      });
+    expect(listProjectMapEntries()[bound.local.id].aliases).not.toContain(linked);
+    expect(repository.linkProject).not.toHaveBeenCalled();
   });
 
   it("reports when remote alias removal rollback cannot restore PostgreSQL", async () => {

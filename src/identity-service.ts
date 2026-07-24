@@ -1169,6 +1169,21 @@ export async function unlinkProject(
     try {
       removeProjectAlias(aliasPath, { hash: shown.hash, expectedEntry: shown.entry });
     } catch (error) {
+      let aliasAlreadyRemoved = false;
+      try {
+        const current = listProjectMapEntries()[shown.hash];
+        aliasAlreadyRemoved = current !== undefined
+          && !current.aliases.some((candidate) => resolve(candidate) === resolve(aliasPath));
+      } catch {
+        // Preserve the original local mutation failure and compensate below.
+      }
+      if (aliasAlreadyRemoved) {
+        return {
+          hash: shown.hash,
+          remoteProjectId: shown.entry.remoteProjectId,
+          aliasRemoved: true,
+        };
+      }
       if (removed) {
         try {
           await repository.linkProject({

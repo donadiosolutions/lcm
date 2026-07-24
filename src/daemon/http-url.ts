@@ -66,16 +66,23 @@ export function normalizeDaemonPath(path: string): string {
   return path;
 }
 
-export async function daemonJsonRequest<T>(
+export type DaemonJsonRequestOptions = {
+  method: "GET" | "POST";
+  headers?: Record<string, string>;
+  body?: unknown;
+  timeoutMs?: number;
+};
+
+export type DaemonJsonResponse<T> = {
+  statusCode: number;
+  data: T;
+};
+
+export async function daemonJsonResponse<T>(
   portValue: unknown,
   path: string,
-  options: {
-    method: "GET" | "POST";
-    headers?: Record<string, string>;
-    body?: unknown;
-    timeoutMs?: number;
-  },
-): Promise<T> {
+  options: DaemonJsonRequestOptions,
+): Promise<DaemonJsonResponse<T>> {
   const port = normalizeDaemonPort(portValue);
   const routePath = normalizeDaemonPath(path);
   const json = options.body === undefined ? undefined : JSON.stringify(options.body);
@@ -84,7 +91,7 @@ export async function daemonJsonRequest<T>(
     headers["Content-Length"] = String(Buffer.byteLength(json));
   }
 
-  return await new Promise<T>((resolve, reject) => {
+  return await new Promise<DaemonJsonResponse<T>>((resolve, reject) => {
     const req = request({
       hostname: "127.0.0.1",
       port,
@@ -100,15 +107,8 @@ export async function daemonJsonRequest<T>(
         try {
           const statusCode = res.statusCode ?? 500;
           const raw = Buffer.concat(chunks).toString("utf-8");
-          const data = raw ? JSON.parse(raw) as T & { error?: string } : undefined as T;
-          if (statusCode < 200 || statusCode >= 300) {
-            const message = data && typeof data === "object" && "error" in data && typeof data.error === "string"
-              ? data.error
-              : `HTTP ${statusCode}`;
-            reject(new Error(message));
-            return;
-          }
-          resolve(data);
+          const data = raw ? JSON.parse(raw) as T : undefined as T;
+          resolve({ statusCode, data });
         } catch (err) {
           reject(err);
         }
@@ -125,4 +125,20 @@ export async function daemonJsonRequest<T>(
     }
     req.end();
   });
+}
+
+export async function daemonJsonRequest<T>(
+  portValue: unknown,
+  path: string,
+  options: DaemonJsonRequestOptions,
+): Promise<T> {
+  const { statusCode, data } = await daemonJsonResponse<T>(portValue, path, options);
+  if (statusCode < 200 || statusCode >= 300) {
+    const message = data && typeof data === "object" && "error" in data
+      && typeof (data as { error?: unknown }).error === "string"
+      ? (data as { error: string }).error
+      : `HTTP ${statusCode}`;
+    throw new Error(message);
+  }
+  return data;
 }

@@ -71,15 +71,14 @@ export function createStoreHandler(
       return;
     }
 
-    const scrubber = await getScrubEngine(config, projectDir(projectPath));
-    const scrubbedText = scrubber.scrub(text);
-    const scrubbedTags = tags.map((tag: string) => scrubber.scrub(tag));
-
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
     let activeFactory: StorageBackendFactory | undefined;
     try {
       const identity = projectIdentity(projectPath, config.storage);
+      const scrubber = await getScrubEngine(config, projectDir(projectPath));
+      const scrubbedText = scrubber.scrub(text);
+      const scrubbedTags = tags.map((tag: string) => scrubber.scrub(tag));
       activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
       project = await activeFactory.openProject(identity);
 

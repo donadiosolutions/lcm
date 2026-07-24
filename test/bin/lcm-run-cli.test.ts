@@ -12,7 +12,7 @@ const state = vi.hoisted(() => ({
     project: { messageCount: 2, summaryCount: 1, promotedCount: 1, lastIngest: "now", lastCompact: "now", lastPromote: "now" },
   }) : ({ ok: true, promoted: 1, processed: 1, skipped: 0, errors: 0, processedProjects: 1 })),
   get: vi.fn(async () => ({ totalConnections: 2, activeConnections: 1, idleConnections: 1, connections: [{ refs: 1, status: "active", path: "/db" }] })),
-  health: vi.fn(async () => true),
+  health: vi.fn(async (): Promise<unknown> => true),
   dispatchHook: vi.fn(async () => ({ stdout: "hook-output", exitCode: 0 })),
   loadConfig: vi.fn(() => ({
     daemon: state.daemonPort === undefined ? undefined : { port: state.daemonPort },
@@ -575,6 +575,42 @@ describe("runCli failure and alternate presentation branches", () => {
     expect((await invoke(["stats", "--pool"]))?.message).toBe("exit:1");
     state.get.mockRejectedValueOnce("pool failed");
     expect((await invoke(["stats", "--pool"]))?.message).toBe("exit:1");
+  });
+
+  it("reports a staged PostgreSQL daemon as up with unavailable storage", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const stagedHealth = {
+      status: "unavailable",
+      version: "1.4.1",
+      storageBackend: "postgresql",
+      uptime: 10,
+      pid: 1234,
+      storage: { status: "unavailable" },
+    };
+
+    state.health.mockResolvedValueOnce(stagedHealth);
+    expect(await invoke(["status"])).toBeUndefined();
+    const text = log.mock.calls.map(([message]) => String(message)).join("\n");
+    expect(text).toContain("Daemon: up");
+    expect(text).toContain("Storage: postgresql (unavailable)");
+    expect(text).not.toContain("Project:");
+    expect(state.post).not.toHaveBeenCalled();
+
+    log.mockClear();
+    state.health.mockResolvedValueOnce(stagedHealth);
+    expect(await invoke(["status", "--json"])).toBeUndefined();
+    expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toEqual({
+      daemon: {
+        status: "up",
+        version: "1.4.1",
+        uptime: 10,
+        port: 3737,
+        storageBackend: "postgresql",
+        storageStatus: "unavailable",
+      },
+    });
+    expect(state.post).not.toHaveBeenCalled();
   });
 
   it("covers event result variants", async () => {

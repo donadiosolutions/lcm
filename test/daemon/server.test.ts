@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { claudeProjectDirName, createDaemon, projectTranscriptScanCwds, type DaemonInstance } from "../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
-import { projectDbPath } from "../../src/daemon/project.js";
+import { projectDbPath, projectDir } from "../../src/daemon/project.js";
 import { recoverMachineIdentity } from "../../src/machine-identity.js";
 import { UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
 import {
@@ -125,11 +125,15 @@ describe("daemon server", () => {
     });
     expect(JSON.stringify(health)).not.toContain("secret");
 
+    const patternsPath = join(projectDir(tempHome!), "sensitive-patterns.txt");
+    mkdirSync(projectDir(tempHome!), { recursive: true });
+    writeFileSync(patternsPath, "[", { mode: 0o600 });
     const storeResponse = await fetch(`http://127.0.0.1:${port}/store`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ cwd: tempHome, text: "remember" }),
     });
+    rmSync(patternsPath, { force: true });
     expect(storeResponse.status).toBe(409);
     const store = await storeResponse.json() as Record<string, unknown>;
     expect(store).toEqual({

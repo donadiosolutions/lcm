@@ -1257,10 +1257,24 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
 
       try {
         const health = await client.health();
-        if (health) daemonStatus = "up";
+        if (health) {
+          daemonStatus = "up";
+          if (health.status === "unavailable") {
+            statusData = {
+              daemon: {
+                status: "up",
+                version: health.version,
+                uptime: health.uptime,
+                port: config.daemon.port,
+                storageBackend: health.storageBackend,
+                storageStatus: "unavailable",
+              },
+            };
+          }
+        }
 
         // Also fetch /status endpoint if daemon is up
-        if (daemonStatus === "up") {
+        if (daemonStatus === "up" && !statusData) {
           statusData = await client.post("/status", { cwd: process.cwd() });
         }
       } catch {}
@@ -1283,14 +1297,21 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
           console.log(`  Uptime: ${statusData.daemon.uptime}s`);
           console.log(`  Port: ${statusData.daemon.port}`);
           console.log(`  Provider: ${providerDisplay}`);
-          console.log();
-          console.log("Project:");
-          console.log(`  Messages: ${statusData.project.messageCount}`);
-          console.log(`  Summaries: ${statusData.project.summaryCount}`);
-          console.log(`  Promoted: ${statusData.project.promotedCount}`);
-          if (statusData.project.lastIngest) console.log(`  Last Ingest: ${statusData.project.lastIngest}`);
-          if (statusData.project.lastCompact) console.log(`  Last Compact: ${statusData.project.lastCompact}`);
-          if (statusData.project.lastPromote) console.log(`  Last Promote: ${statusData.project.lastPromote}`);
+          if (statusData.daemon.storageBackend) {
+            console.log(
+              `  Storage: ${statusData.daemon.storageBackend} (${statusData.daemon.storageStatus})`,
+            );
+          }
+          if (statusData.project) {
+            console.log();
+            console.log("Project:");
+            console.log(`  Messages: ${statusData.project.messageCount}`);
+            console.log(`  Summaries: ${statusData.project.summaryCount}`);
+            console.log(`  Promoted: ${statusData.project.promotedCount}`);
+            if (statusData.project.lastIngest) console.log(`  Last Ingest: ${statusData.project.lastIngest}`);
+            if (statusData.project.lastCompact) console.log(`  Last Compact: ${statusData.project.lastCompact}`);
+            if (statusData.project.lastPromote) console.log(`  Last Promote: ${statusData.project.lastPromote}`);
+          }
         } else {
           console.log(`daemon: ${daemonStatus} · provider: ${providerDisplay}`);
         }

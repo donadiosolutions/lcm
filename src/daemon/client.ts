@@ -1,7 +1,12 @@
 import { readAuthToken } from "./auth.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { daemonJsonRequest, daemonPortFromLoopbackUrl, normalizeDaemonPath } from "./http-url.js";
+import {
+  daemonJsonRequest,
+  daemonJsonResponse,
+  daemonPortFromLoopbackUrl,
+  normalizeDaemonPath,
+} from "./http-url.js";
 import { daemonTokenPath } from "../runtime-paths.js";
 import type { StorageBackend } from "./config.js";
 
@@ -11,11 +16,38 @@ export type DaemonHealth = {
   storageBackend: StorageBackend;
   uptime: number;
   pid: number;
+  storage?: {
+    status: string;
+    error?: {
+      code?: string;
+      backend?: string;
+      domain?: string;
+      operation?: string;
+    };
+  };
 };
 
 type DaemonHealthResponse = Omit<DaemonHealth, "storageBackend"> & {
   storageBackend?: StorageBackend;
 };
+
+function isStagedPostgreSqlHealth(
+  statusCode: number,
+  health: DaemonHealthResponse,
+): health is DaemonHealthResponse & { storageBackend: "postgresql" } {
+  const error = health?.storage?.error;
+  return statusCode === 503
+    && health?.status === "unavailable"
+    && health.storageBackend === "postgresql"
+    && typeof health.version === "string"
+    && typeof health.uptime === "number"
+    && typeof health.pid === "number"
+    && health.storage?.status === "unavailable"
+    && error?.code === "STORAGE_INITIALIZATION_FAILED"
+    && error.backend === "postgresql"
+    && error.domain === "factory"
+    && error.operation === "health";
+}
 
 export class DaemonClient {
   private token: string | null = null;
@@ -38,9 +70,16 @@ export class DaemonClient {
 
   async health(): Promise<DaemonHealth | null> {
     try {
-      const health = await daemonJsonRequest<DaemonHealthResponse>(this.port, "/health", {
+      const response = await daemonJsonResponse<DaemonHealthResponse>(this.port, "/health", {
         method: "GET",
       });
+      const health = response.data;
+      if (
+        (response.statusCode < 200 || response.statusCode >= 300)
+        && !isStagedPostgreSqlHealth(response.statusCode, health)
+      ) {
+        return null;
+      }
       // Daemons predating backend identity were necessarily SQLite-only.
       return { ...health, storageBackend: health.storageBackend ?? "sqlite" };
     } catch { return null; }
