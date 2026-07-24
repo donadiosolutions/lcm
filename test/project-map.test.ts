@@ -462,6 +462,77 @@ describe("project map", () => {
     }
   });
 
+  it("uses portable process birth identities with a bounded stale-owner fallback", () => {
+    const canonical = makeDir("portable-lock-owner");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    const writeOwner = (
+      processStartTime: string | null,
+      nonce: string,
+      createdAtMs?: number,
+    ) => {
+      writeFileSync(lockPath, `${JSON.stringify({
+        version: 1,
+        pid: process.pid,
+        processStartTime,
+        nonce,
+        ...(createdAtMs === undefined ? {} : { createdAtMs }),
+      })}\n`, { mode: 0o600 });
+    };
+    const portableObserver = (
+      selectedPlatform: string,
+      observedBirth: string,
+    ) => (event: string, _path: string, mutable?: { value: string }) => {
+      if (event === "platform") mutable!.value = selectedPlatform;
+      if (event === "after-process-birth-command") mutable!.value = observedBirth;
+    };
+
+    writeOwner("darwin-birth", "a".repeat(32), Date.now() - 10 * 60 * 1000);
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _lockObserverForTesting: portableObserver("darwin", "darwin-birth"),
+    })).toThrow(`owned by live PID ${process.pid}`);
+    rmSync(lockPath);
+
+    writeOwner("old-darwin-birth", "b".repeat(32), Date.now());
+    expect(setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _lockObserverForTesting: portableObserver("darwin", "new-darwin-birth"),
+    })).toMatchObject({ changed: true });
+
+    writeOwner("windows-birth", "c".repeat(32), Date.now());
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _lockObserverForTesting: portableObserver("win32", "windows-birth"),
+    })).toThrow(`owned by live PID ${process.pid}`);
+    rmSync(lockPath);
+
+    writeOwner(null, "d".repeat(32), Date.now());
+    expect(() => setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _lockObserverForTesting: portableObserver("darwin", ""),
+    })).toThrow("owner state is ambiguous");
+    rmSync(lockPath);
+
+    writeOwner(null, "e".repeat(32), Date.now() - 10 * 60 * 1000);
+    expect(setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _lockObserverForTesting: portableObserver("darwin", ""),
+    })).toMatchObject({ changed: false });
+
+    writeOwner(null, "f".repeat(32));
+    const oldTime = new Date(Date.now() - 10 * 60 * 1000);
+    utimesSync(lockPath, oldTime, oldTime);
+    expect(setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _lockObserverForTesting: portableObserver("darwin", ""),
+    })).toMatchObject({ changed: false });
+
+    writeOwner(null, "1".repeat(32), 0);
+    expect(() => setRemoteProjectBinding(remoteProjectId, { canonical }))
+      .toThrow("project map lock has an invalid owner");
+  });
+
   it("fails closed when probing a lock owner is not permitted", () => {
     const canonical = makeDir("lock-probe-denied");
     resolveProjectIdentity(canonical);
@@ -1655,6 +1726,71 @@ describe("project map", () => {
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       mapWatcher.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it("retries map-watch reloads while a live writer owns the map lock", () => {
+    const canonical = makeDir("watch-live-writer");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    const processStat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
+    const processStartTime = processStat
+      .slice(processStat.lastIndexOf(")") + 2)
+      .trim()
+      .split(" ")[19];
+    writeFileSync(lockPath, `${JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      processStartTime,
+      nonce: "2".repeat(32),
+      createdAtMs: Date.now(),
+    })}\n`, { mode: 0o600 });
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const watcher = watchProjectMap();
+    try {
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(25);
+      expect(vi.getTimerCount()).toBe(1);
+
+      rmSync(lockPath);
+      vi.advanceTimersByTime(25);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      watcher.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it("surfaces unsafe startup locks without throwing from a delayed reload", () => {
+    const canonical = makeDir("watch-unsafe-writer");
+    resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    writeFileSync(lockPath, "{broken", { mode: 0o600 });
+    expect(() => watchProjectMap()).toThrow("project map lock is malformed");
+
+    const processStat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
+    const processStartTime = processStat
+      .slice(processStat.lastIndexOf(")") + 2)
+      .trim()
+      .split(" ")[19];
+    writeFileSync(lockPath, `${JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      processStartTime,
+      nonce: "3".repeat(32),
+      createdAtMs: Date.now(),
+    })}\n`, { mode: 0o600 });
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const watcher = watchProjectMap();
+    try {
+      writeFileSync(lockPath, "{broken", { mode: 0o600 });
+      expect(() => vi.advanceTimersByTime(25)).not.toThrow();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      watcher.close();
       vi.useRealTimers();
     }
   });

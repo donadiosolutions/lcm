@@ -18,6 +18,7 @@ import {
 } from "./security-files.js";
 import { normalizeUuidV7 } from "./machine-identity.js";
 import {
+  PrivateMutationLockContentionError,
   withPrivateMutationLock,
   type PrivateMutationLockObserver,
 } from "./private-mutation-lock.js";
@@ -850,19 +851,34 @@ export function watchProjectMap(): { close: () => void } {
   let closed = false;
   let watcher: FSWatcher | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let activeWatchPath: string | undefined;
+  let arm: () => void;
 
-  const arm = () => {
+  const scheduleReload = (watchPath: string | undefined) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = undefined;
+      try {
+        reloadProjectMapCache({ reformat: true });
+      } catch (error) {
+        if (error instanceof PrivateMutationLockContentionError) {
+          scheduleReload(watchPath);
+        }
+        return;
+      }
+      if (!closed && !existsSync(path)) arm();
+      if (!closed && watchPath === path) arm();
+    }, 25);
+  };
+
+  arm = () => {
     try {
       watcher?.close();
       const watchPath = existsSync(path) ? path : dirname(path);
+      activeWatchPath = watchPath;
       watcher = watch(watchPath, (_event, filename) => {
         if (watchPath !== path && filename && filename.toString() !== "map.json") return;
-        if (timer) clearTimeout(timer);
-        timer = setTimeout(() => {
-          reloadProjectMapCache({ reformat: true });
-          if (!closed && !existsSync(path)) arm();
-          if (!closed && watchPath === path) arm();
-        }, 25);
+        scheduleReload(watchPath);
       });
       watcher.unref();
     } catch {
@@ -870,8 +886,15 @@ export function watchProjectMap(): { close: () => void } {
     }
   };
 
-  reloadProjectMapCache({ reformat: true });
+  let startupContended = false;
+  try {
+    reloadProjectMapCache({ reformat: true });
+  } catch (error) {
+    if (!(error instanceof PrivateMutationLockContentionError)) throw error;
+    startupContended = true;
+  }
   arm();
+  if (startupContended) scheduleReload(activeWatchPath);
 
   return {
     close: () => {

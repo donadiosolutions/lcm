@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, renameSync, rmdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { lstatSync, mkdirSync, renameSync, rmdirSync } from "node:fs";
 import { platform } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -10,13 +11,17 @@ import {
 
 const MAX_PRIVATE_MUTATION_LOCK_BYTES = 1024;
 const MAX_DISAPPEARED_OWNER_READ_RETRIES = 1;
+const MAX_UNVERIFIED_OWNER_AGE_MS = 5 * 60 * 1000;
 
 type PrivateMutationLockOwner = {
   readonly version: 1;
   readonly pid: number;
   readonly processStartTime: string | null;
   readonly nonce: string;
+  readonly createdAtMs?: number;
 };
+
+export class PrivateMutationLockContentionError extends Error {}
 
 export type PrivateMutationLockObserver = (
   event: string,
@@ -36,24 +41,56 @@ function processStartTime(
 ): string | null {
   const currentPlatform = { value: platform() };
   observer("platform", "", currentPlatform);
-  if (currentPlatform.value !== "linux") return null;
-  try {
-    const path = `/proc/${pid}/stat`;
-    observer("before-process-stat-read", path);
-    const observed = { value: readBoundedRegularFile(path, {
-      maxBytes: 16 * 1024,
-      allowedRoot: "/proc",
-    }) };
-    observer("after-process-stat-read", path, observed);
-    const fields = observed.value.slice(observed.value.lastIndexOf(")") + 2).split(" ");
-    return fields[19] || null;
-  } catch {
-    return null;
+  if (currentPlatform.value === "linux") {
+    try {
+      const path = `/proc/${pid}/stat`;
+      observer("before-process-stat-read", path);
+      const observed = { value: readBoundedRegularFile(path, {
+        maxBytes: 16 * 1024,
+        allowedRoot: "/proc",
+      }) };
+      observer("after-process-stat-read", path, observed);
+      const fields = observed.value.slice(observed.value.lastIndexOf(")") + 2).split(" ");
+      return fields[19] || null;
+    } catch {
+      return null;
+    }
   }
+
+  const command = currentPlatform.value === "win32" ? "powershell.exe" : "ps";
+  const args = currentPlatform.value === "win32"
+    ? [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}').CreationDate.ToUniversalTime().ToString('O')`,
+    ]
+    : ["-o", "lstart=", "-p", String(pid)];
+  const observed = { value: "" };
+  try {
+    observer("before-process-birth-command", command);
+    observed.value = execFileSync(command, args, {
+      encoding: "utf8",
+      maxBuffer: 16 * 1024,
+      timeout: 2_000,
+      windowsHide: true,
+    }).trim();
+  } catch {
+    observed.value = "";
+  }
+  observer("after-process-birth-command", command, observed);
+  return observed.value.trim() || null;
+}
+
+function unverifiedOwnerState(createdAtMs: number): "stale" | "ambiguous" {
+  return Date.now() - createdAtMs >= MAX_UNVERIFIED_OWNER_AGE_MS
+    ? "stale"
+    : "ambiguous";
 }
 
 function lockOwnerState(
   owner: PrivateMutationLockOwner,
+  createdAtMs: number,
   observer: PrivateMutationLockObserver,
 ): "live" | "stale" | "ambiguous" {
   try {
@@ -64,14 +101,20 @@ function lockOwnerState(
     return code === "ESRCH" ? "stale" : "ambiguous";
   }
   const observedStartTime = processStartTime(owner.pid, observer);
-  if (owner.processStartTime === null || observedStartTime === null) return "ambiguous";
+  if (owner.processStartTime === null || observedStartTime === null) {
+    return unverifiedOwnerState(createdAtMs);
+  }
   return observedStartTime === owner.processStartTime ? "live" : "stale";
 }
 
 function readLockOwner(
   lockPath: string,
   label: string,
-): { readonly content: string; readonly owner: PrivateMutationLockOwner } {
+): {
+  readonly content: string;
+  readonly owner: PrivateMutationLockOwner;
+  readonly createdAtMs: number;
+} {
   const content = readBoundedRegularFile(lockPath, {
     maxBytes: MAX_PRIVATE_MUTATION_LOCK_BYTES,
     allowedRoot: dirname(lockPath),
@@ -94,12 +137,20 @@ function readLockOwner(
     || (owner.processStartTime !== null && typeof owner.processStartTime !== "string")
     || typeof owner.nonce !== "string"
     || !/^[a-f0-9]{32}$/u.test(owner.nonce)
+    || (
+      owner.createdAtMs !== undefined
+      && (!Number.isSafeInteger(owner.createdAtMs) || owner.createdAtMs <= 0)
+    )
   ) {
     throw new Error(
       `${label} lock has an invalid owner; inspect ${lockPath} and remove it only after confirming no LCM mutation is active`,
     );
   }
-  return { content, owner: owner as PrivateMutationLockOwner };
+  return {
+    content,
+    owner: owner as PrivateMutationLockOwner,
+    createdAtMs: owner.createdAtMs ?? lstatSync(lockPath).mtimeMs,
+  };
 }
 
 function createReclaimClaim(
@@ -152,12 +203,12 @@ function acquireReclaimClaim(
     }
     throw error;
   }
-  const state = lockOwnerState(existing.owner, observer);
+  const state = lockOwnerState(existing.owner, existing.createdAtMs, observer);
   if (state !== "stale") {
     const reason = state === "live"
       ? `owned by live PID ${existing.owner.pid}`
       : "owner state is ambiguous";
-    throw new Error(
+    throw new PrivateMutationLockContentionError(
       `stale ${label} lock reclamation is already in progress (${reason}); retry after it completes`,
     );
   }
@@ -222,10 +273,12 @@ function acquireMutationLock(
       continue;
     }
 
-    const state = lockOwnerState(existing.owner, observer);
+    const state = lockOwnerState(existing.owner, existing.createdAtMs, observer);
     if (state !== "stale") {
       const reason = state === "live" ? `owned by live PID ${existing.owner.pid}` : "owner state is ambiguous";
-      throw new Error(`${label} mutation is already in progress (${reason}); retry after the active operation completes`);
+      throw new PrivateMutationLockContentionError(
+        `${label} mutation is already in progress (${reason}); retry after the active operation completes`,
+      );
     }
     const reclaimPath = `${lockPath}.reclaim-${existing.owner.nonce}`;
     acquireReclaimClaim(reclaimPath, content, label, observer);
@@ -268,6 +321,7 @@ function createMutationLockContent(
     pid: process.pid,
     processStartTime: processStartTime(process.pid, observer),
     nonce: randomBytes(16).toString("hex"),
+    createdAtMs: Date.now(),
   };
   return `${JSON.stringify(owner)}\n`;
 }

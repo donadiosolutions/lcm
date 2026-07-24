@@ -1199,7 +1199,9 @@ export async function linkProject(
   const deps = dependencies(dependencyOverrides);
   const remoteProjectId = normalizeUuidV7(target);
   return remoteProjectId
-    ? linkRemoteProject(config, remoteProjectId, projectPath, options, deps)
+    ? withProjectIdentityMutationLock(
+      () => linkRemoteProject(config, remoteProjectId, projectPath, options, deps),
+    )
     : linkLocalAlias(config, target, projectPath, deps);
 }
 

@@ -2729,6 +2729,41 @@ describe("identity service", () => {
     await expect(repository.resolveProject(MACHINE_ID, linked)).resolves.toBeNull();
   });
 
+  it("rejects remote UUID linking while the same project is being unlinked", async () => {
+    await register();
+    const canonical = makeProject("unlink-remote-link-coordination-canonical");
+    const bound = await linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps);
+    const originalUnlink = repository.unlinkProjectAliasesIfOwned.getMockImplementation()!;
+    let releaseUnlink!: () => void;
+    let unlinkReachedRepository!: () => void;
+    const unlinkGate = new Promise<void>((resolve) => { releaseUnlink = resolve; });
+    const repositoryReached = new Promise<void>(
+      (resolve) => { unlinkReachedRepository = resolve; },
+    );
+    repository.unlinkProjectAliasesIfOwned = vi.fn(
+      async (machineId, projectId, normalizedPaths) => {
+        const removed = await originalUnlink(machineId, projectId, normalizedPaths);
+        unlinkReachedRepository();
+        await unlinkGate;
+        return removed;
+      },
+    );
+
+    const unlinking = unlinkProject(POSTGRESQL_CONFIG, canonical, deps);
+    await repositoryReached;
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, canonical, {}, deps))
+      .rejects.toThrow("project identity mutation is already in progress");
+    releaseUnlink();
+
+    await expect(unlinking).resolves.toMatchObject({
+      hash: bound.local.id,
+      remoteProjectId: PROJECT_A,
+      aliasRemoved: false,
+    });
+    expect(listProjectMapEntries()[bound.local.id].remoteProjectId).toBeUndefined();
+    await expect(repository.resolveProject(MACHINE_ID, canonical)).resolves.toBeNull();
+  });
+
   it("accepts an uncertain alias restoration after authoritative readback", async () => {
     await register();
     const canonical = makeProject("unlink-alias-uncertain-restore-canonical");

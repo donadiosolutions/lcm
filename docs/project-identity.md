@@ -222,13 +222,16 @@ reuse or overwrite a backup. If all 1,000 bounded candidates are occupied, the
 mutation fails before changing `map.json` and asks the operator to move old
 backups aside.
 Every map mutation holds a private owner-aware exclusive lock and clears only
-the expected prior UUID. Locks record the owning PID and process-start marker;
-LCM reclaims a lock only when the owner is provably dead or the PID has been
-reused. Live, malformed, symlinked, non-regular, or otherwise ambiguous locks
-fail closed. If an ambiguous lock remains, inspect `~/.lcm/map.json.lock` and
-remove it only after confirming that no LCM project mutation is active. A
-concurrent rebind or entry removal fails closed; it is never overwritten by a
-stale unlink.
+the expected prior UUID. Locks record the owning PID, creation time, and a
+platform process-birth marker (`/proc` on Linux, `ps` on Unix-like systems,
+and the Windows process creation time). LCM reclaims a lock immediately when
+the owner is provably dead or the PID has been reused. If the operating system
+cannot supply an exact birth marker, LCM treats the owner as active for five
+minutes before allowing stale-owner recovery; legacy lock files use their
+modification time for the same bounded fallback. Exact matching birth markers
+remain live regardless of age. Malformed, symlinked, and non-regular locks
+always fail closed. A concurrent rebind or entry removal also fails closed; it
+is never overwritten by a stale unlink.
 
 Stale-lock recovery uses a private, owner-recorded reclaim lease. If its
 process crashes, another process may take over only after proving that lease
