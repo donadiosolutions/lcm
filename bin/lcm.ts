@@ -786,9 +786,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       if (!opts.foreground) {
         const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
         const { loadDaemonConfig } = await import("../src/daemon/config.js");
-        const { selectStorageBackend } = await import("../src/storage/backend.js");
         const config = loadDaemonConfig(defaultConfigPath());
-        selectStorageBackend(config.storage);
         const port = config.daemon?.port ?? 3737;
         const result = await ensureDaemon({
           port,
@@ -846,9 +844,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       if (opts.help) await withCustomHelp(daemonCmd, "daemon");
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
       const { restartDaemon } = await import("../src/daemon/lifecycle.js");
-      const { selectStorageBackend } = await import("../src/storage/backend.js");
       const config = loadDaemonConfig(defaultConfigPath());
-      selectStorageBackend(config.storage);
       const port = config.daemon?.port ?? 3737;
       const result = await restartDaemon({
         port,

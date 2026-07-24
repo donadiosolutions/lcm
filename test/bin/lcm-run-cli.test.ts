@@ -401,15 +401,15 @@ describe("runCli orchestration actions", () => {
     await expect(runCli(["node", "lcm", "stats"])).rejects.toBeInstanceOf(StorageBackendUnavailableError);
   });
 
-  it.each(["start", "restart"])("refuses daemon %s before lifecycle mutation when the effective backend is unavailable", async (action) => {
+  it.each(["start", "restart"])("runs managed daemon %s with staged PostgreSQL storage", async (action) => {
     state.loadConfig.mockReturnValueOnce({ daemon: { port: 3737 }, storage: { backend: "postgresql" } });
 
-    await expect(runCli(["node", "lcm", "daemon", action])).rejects.toMatchObject({
-      name: "StorageBackendUnavailableError",
-      message: expect.stringContaining("use storage.backend \"sqlite\""),
-    });
-    expect(state.ensureDaemon).not.toHaveBeenCalled();
-    expect(state.restartDaemon).not.toHaveBeenCalled();
+    expect((await invoke(["daemon", action]))?.message).toBe("exit:0");
+    const lifecycle = action === "start" ? state.ensureDaemon : state.restartDaemon;
+    expect(lifecycle).toHaveBeenCalledWith(expect.objectContaining({
+      port: 3737,
+      expectedStorageBackend: "postgresql",
+    }));
   });
 
   it.each([

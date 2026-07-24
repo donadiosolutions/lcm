@@ -148,6 +148,10 @@ lcm project unlink /mnt/work/lcm
 
 LCM removes the local alias and, when applicable, its remote alias. It does not
 delete the local hash, SQLite database, or passive-event sidecar.
+Remote unlink resolves the alias by its stored lexical `path` and deletes the
+persisted `normalized_path`; it does not run `realpath` again. Unlink therefore
+remains exact after a symlink alias is deleted or retargeted and cannot remove
+the alias currently occupying the symlink's new target.
 Alias add/remove operations on a remote-bound entry require PostgreSQL
 configuration so the local and remote path sets cannot intentionally diverge.
 Only aliases on an unbound entry remain purely local under SQLite.
@@ -191,6 +195,9 @@ local SQLite behavior.
 ## Atomic reconciliation and outages
 
 Local map writes are atomic and privately backed up under `~/.lcm/oldmaps/`.
+Remote binding set/clear operations also hold a private exclusive map lock and
+clear only the expected prior UUID. A concurrent rebind or entry removal fails
+closed; it is never overwritten by a stale unlink.
 Remote mutations use PostgreSQL transactions. Only a transport failure after
 `COMMIT` triggers authoritative readback; deterministic collisions and unknown
 UUIDs retain their original errors. A confirmed create or link is retained.
@@ -218,9 +225,11 @@ bootstrap and remain available for later promotion.
 
 PostgreSQL domain repositories are still staged. With PostgreSQL selected, the
 daemon starts so identity validation remains reachable, but `GET /health`
-reports unavailable storage and project operations fail at a cause-free
-unavailable-backend boundary after validating machine registration and the
-explicit project binding. LCM does not fall back to SQLite or advertise
+reports unavailable storage. `POST /status`, `GET /stats`, and
+`GET /stats/pool` return fixed `503` responses, and the daemon does not run
+SQLite transcript scans or passive-outbox sweeps. Project operations fail at a
+cause-free unavailable-backend boundary after validating machine registration
+and the explicit project binding. LCM does not fall back to SQLite or advertise
 PostgreSQL data capabilities during this staged state.
 
 ## Ambiguity and doctor

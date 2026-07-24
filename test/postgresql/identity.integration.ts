@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
@@ -16,14 +16,107 @@ import {
   PostgreSqlIdentityRepository,
 } from "../../src/storage/postgresql/identity-repository.js";
 import { PostgreSqlCommitOutcomeUnknownError } from "../../src/storage/postgresql/errors.js";
-import { assertHarnessReady, withPostgreSqlTestDatabase } from "./harness.js";
+import {
+  assertHarnessReady,
+  type PostgreSqlTestDatabase,
+  withPostgreSqlTestDatabase,
+} from "./harness.js";
 
 beforeAll(assertHarnessReady);
 
+async function grantIdentityRuntimePrivileges(
+  database: PostgreSqlTestDatabase,
+): Promise<void> {
+  const template = readFileSync(
+    join(process.cwd(), "docs", "postgresql-runtime-identity-grants.sql"),
+    "utf8",
+  );
+  const sql = template
+    .split("\n")
+    .filter((line) => !line.startsWith("\\"))
+    .join("\n")
+    .replaceAll(':"lcm_runtime_role"', '"lcm_test_runtime"');
+  await database.migrator.query({ text: sql }, {
+    domain: "identity",
+    operation: "grantIdentityRuntimePrivileges",
+  });
+}
+
 describe("PostgreSQL 18 machine and project identities", () => {
+  it("fails without identity grants and the reviewed grant script is least-privilege", async () => {
+    await withPostgreSqlTestDatabase("identity-grants", async (database) => {
+      const identityKey = `machine:${"0".repeat(64)}`;
+      const repository = new PostgreSqlIdentityRepository(database.runtime);
+      const denied = await repository.registerMachine(identityKey, "Denied")
+        .catch((error: unknown) => error);
+      expect(denied).toMatchObject({
+        backend: "postgresql",
+        domain: "identity",
+        operation: "registerMachine",
+      });
+      expect(JSON.stringify(denied)).not.toContain(identityKey);
+
+      await grantIdentityRuntimePrivileges(database);
+      await expect(repository.registerMachine(identityKey, "Granted"))
+        .resolves.toMatchObject({ displayName: "Granted" });
+      const privileges = await database.migrator.query<{
+        schema_usage: boolean;
+        schema_create: boolean;
+        machines_select: boolean;
+        machines_insert: boolean;
+        machines_update: boolean;
+        machines_delete: boolean;
+        projects_select: boolean;
+        projects_insert: boolean;
+        projects_update: boolean;
+        projects_delete: boolean;
+        aliases_select: boolean;
+        aliases_insert: boolean;
+        aliases_update: boolean;
+        aliases_delete: boolean;
+        aliases_truncate: boolean;
+      }>({
+        text: `SELECT
+                 has_schema_privilege('lcm_test_runtime', 'lcm', 'USAGE') AS schema_usage,
+                 has_schema_privilege('lcm_test_runtime', 'lcm', 'CREATE') AS schema_create,
+                 has_table_privilege('lcm_test_runtime', 'lcm.machines', 'SELECT') AS machines_select,
+                 has_table_privilege('lcm_test_runtime', 'lcm.machines', 'INSERT') AS machines_insert,
+                 has_table_privilege('lcm_test_runtime', 'lcm.machines', 'UPDATE') AS machines_update,
+                 has_table_privilege('lcm_test_runtime', 'lcm.machines', 'DELETE') AS machines_delete,
+                 has_table_privilege('lcm_test_runtime', 'lcm.projects', 'SELECT') AS projects_select,
+                 has_table_privilege('lcm_test_runtime', 'lcm.projects', 'INSERT') AS projects_insert,
+                 has_table_privilege('lcm_test_runtime', 'lcm.projects', 'UPDATE') AS projects_update,
+                 has_table_privilege('lcm_test_runtime', 'lcm.projects', 'DELETE') AS projects_delete,
+                 has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'SELECT') AS aliases_select,
+                 has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'INSERT') AS aliases_insert,
+                 has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'UPDATE') AS aliases_update,
+                 has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'DELETE') AS aliases_delete,
+                 has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'TRUNCATE') AS aliases_truncate`,
+      }, { domain: "identity", operation: "inspectIdentityRuntimePrivileges" });
+      expect(privileges.rows[0]).toEqual({
+        schema_usage: true,
+        schema_create: false,
+        machines_select: true,
+        machines_insert: true,
+        machines_update: true,
+        machines_delete: false,
+        projects_select: true,
+        projects_insert: true,
+        projects_update: false,
+        projects_delete: true,
+        aliases_select: true,
+        aliases_insert: true,
+        aliases_update: true,
+        aliases_delete: true,
+        aliases_truncate: false,
+      });
+    });
+  });
+
   it("converges concurrent machine upserts and lets two machines share one project", async () => {
     await withPostgreSqlTestDatabase("identity-share", async (database) => {
-      const repository = new PostgreSqlIdentityRepository(database.migrator);
+      await grantIdentityRuntimePrivileges(database);
+      const repository = new PostgreSqlIdentityRepository(database.runtime);
       const identityKey = `machine:${"a".repeat(64)}`;
       const concurrent = await Promise.all([
         repository.registerMachine(identityKey, "Machine A"),
@@ -67,7 +160,8 @@ describe("PostgreSQL 18 machine and project identities", () => {
 
   it("enforces path uniqueness, preserves idempotent links, and rolls back failed creates", async () => {
     await withPostgreSqlTestDatabase("identity-conflict", async (database) => {
-      const repository = new PostgreSqlIdentityRepository(database.migrator);
+      await grantIdentityRuntimePrivileges(database);
+      const repository = new PostgreSqlIdentityRepository(database.runtime);
       const machine = await repository.registerMachine(
         `machine:${"c".repeat(64)}`,
         "Machine C",
@@ -130,7 +224,8 @@ describe("PostgreSQL 18 machine and project identities", () => {
 
   it("unlinks one alias or all aliases and only deletes unreferenced projects", async () => {
     await withPostgreSqlTestDatabase("identity-unlink", async (database) => {
-      const repository = new PostgreSqlIdentityRepository(database.migrator);
+      await grantIdentityRuntimePrivileges(database);
+      const repository = new PostgreSqlIdentityRepository(database.runtime);
       const machine = await repository.registerMachine(
         `machine:${"d".repeat(64)}`,
         "Machine D",
@@ -160,7 +255,8 @@ describe("PostgreSQL 18 machine and project identities", () => {
 
   it("restores aliases by expected ownership and cleans up creates atomically", async () => {
     await withPostgreSqlTestDatabase("identity-reconcile", async (database) => {
-      const repository = new PostgreSqlIdentityRepository(database.migrator);
+      await grantIdentityRuntimePrivileges(database);
+      const repository = new PostgreSqlIdentityRepository(database.runtime);
       const machine = await repository.registerMachine(
         `machine:${"e".repeat(64)}`,
         "Machine E",
@@ -268,9 +364,12 @@ describe("PostgreSQL 18 machine and project identities", () => {
       }
       await expect(repository.unlinkProjectAliasIfOwned(
         machine.machineId,
-        replacement.projectId,
         "/work/local-only",
-      )).resolves.toMatchObject({ normalizedPath: "/work/local-only" });
+        replacement.projectId,
+      )).resolves.toMatchObject({
+        projectId: replacement.projectId,
+        alias: { normalizedPath: "/work/local-only" },
+      });
       const removed = await repository.unlinkProjectAliasesIfOwned(
         machine.machineId,
         replacement.projectId,
@@ -311,20 +410,21 @@ describe("PostgreSQL 18 machine and project identities", () => {
 
   it("does not bind a concurrent project after an ambiguous create rolls back", async () => {
     await withPostgreSqlTestDatabase("identity-create-race", async (database) => {
-      const repository = new PostgreSqlIdentityRepository(database.migrator);
+      await grantIdentityRuntimePrivileges(database);
+      const repository = new PostgreSqlIdentityRepository(database.runtime);
       const machine = await repository.registerMachine(
         `machine:${"f".repeat(64)}`,
         "Machine F",
       );
       let candidateId: string | undefined;
       const rollbackExecutor = {
-        query: database.migrator.query.bind(database.migrator),
+        query: database.runtime.query.bind(database.runtime),
         transaction: async <T>(
           callback: Parameters<PostgreSqlIdentityExecutor["transaction"]>[0],
           options: Parameters<PostgreSqlIdentityExecutor["transaction"]>[1],
         ): Promise<T> => {
           try {
-            await database.migrator.transaction(async (transaction) => {
+            await database.runtime.transaction(async (transaction) => {
               const candidate = await callback(transaction);
               candidateId = (candidate as { projectId: string }).projectId;
               throw new Error("force candidate rollback");
@@ -388,6 +488,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
         restoreProjectAlias: repository.restoreProjectAlias.bind(repository),
         restoreProjectAliases: repository.restoreProjectAliases.bind(repository),
         restoreProjectAliasBatch: repository.restoreProjectAliasBatch.bind(repository),
+        resolveProjectAliasesByPath: repository.resolveProjectAliasesByPath.bind(repository),
         resolveProject: repository.resolveProject.bind(repository),
         listProjects: repository.listProjects.bind(repository),
       };

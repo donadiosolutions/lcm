@@ -4,9 +4,11 @@ This reference describes the durable PostgreSQL baseline introduced by
 `0001_migration_ledger.sql` and `0002_schema_baseline.sql`. The latter creates
 23 domain tables. This is a schema and readiness contract, not an enabled
 application backend. SQLite remains the authoritative production adapter.
-PostgreSQL selection continues to fail before daemon startup until the
-repositories in issues #84–#91 pass conformance and the cutover work in #92
-explicitly enables the backend.
+PostgreSQL machine and project identity operations are enabled by issue #84.
+Managed daemons may start with PostgreSQL selected so those operations are
+available, but storage-backed health, status, statistics, and data routes remain
+fail-closed until the domain repositories in issues #85–#91 pass conformance
+and the cutover work in #92 explicitly enables the backend.
 
 The design is single-user and multi-machine. Project scoping prevents accidental
 cross-project relationships; it is not a tenant or authorization boundary and
@@ -26,10 +28,10 @@ does not add row-level security.
   migration ledger, six generated identity sequences, and
   `lcm.normalize_search_text(text)` plus the summary- and large-file-identity
   trigger functions.
-  It deliberately grants no domain access to
-  the runtime role while the adapters are disabled. Explicit object lists keep
-  privileges on unknown pre-existing tables, sequences, and functions intact;
-  issues #84–#91 must grant only the operations required by their repositories.
+  It deliberately grants no domain access to the runtime role. Administrators
+  grant the exact operations required by each enabled repository separately.
+  Explicit object lists keep privileges on unknown pre-existing tables,
+  sequences, and functions intact.
 - Before starting the DDL transaction, migration requires
   `pg_catalog.current_setting('server_encoding')` to return exactly `UTF8`.
   Runtime health enforces the same database-encoding contract before extension
@@ -421,14 +423,31 @@ identifier-quoted transfer guidance. Missing, malformed, or contradictory
 ownership catalog values fail closed without exposing the existing owner,
 connection details, or raw database errors.
 
-After schema creation, an administrator may grant the runtime role only the
-schema usage, table operations, sequence access, and function execution proven
-necessary by implemented repositories. Issue #83 intentionally leaves those
-domain grants absent because no PostgreSQL adapter is enabled yet. Migration
-privilege hardening is likewise confined to LCM-owned objects: it does not
-change ACLs on unknown objects already present in `lcm`. If an administrator
-has granted schema-level `PUBLIC CREATE`, they must remove that privilege
-outside LCM and rerun migration; LCM fails closed rather than mutating it.
+After schema creation, an administrator grants the issue #84 identity
+repository only its exact runtime privileges with the reviewed
+[`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql)
+script:
+
+```bash
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-identity-grants.sql
+```
+
+Replace `lcm_runtime` with the deployment's runtime role. The script grants
+schema `USAGE`; `SELECT`, `INSERT`, and `UPDATE` on `machines`; `SELECT`,
+`INSERT`, and `DELETE` on `projects`; and all four row operations on
+`project_aliases`. It grants no table ownership, `TRUNCATE`, sequence access,
+function execution, schema creation, or privileges on future tables. Without
+these grants, machine registration and project pairing fail closed with a
+sanitized PostgreSQL operation error. Migrations intentionally do not apply
+runtime grants because the migration role cannot safely infer a deployment's
+runtime role.
+
+Migration privilege hardening is likewise confined to LCM-owned objects: it
+does not change ACLs on unknown objects already present in `lcm`. If an
+administrator has granted schema-level `PUBLIC CREATE`, they must remove that
+privilege outside LCM and rerun migration; LCM fails closed rather than mutating it.
 When #90 enables lease writes, its runtime grant must include only the sequence
 privileges required to consume `fenced_leases_fencing_token_seq`; normal
 maintenance must not receive sequence restart or table-truncate authority.

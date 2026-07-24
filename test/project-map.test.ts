@@ -107,7 +107,7 @@ describe("project map", () => {
     const local = resolveProjectIdentity(canonical);
     setRemoteProjectBinding(remoteProjectId, { canonical });
 
-    const cleared = clearRemoteProjectBinding(canonical);
+    const cleared = clearRemoteProjectBinding(canonical, remoteProjectId);
 
     expect(cleared).toMatchObject({
       hash: local.id,
@@ -115,9 +115,66 @@ describe("project map", () => {
       changed: true,
     });
     expect(cleared.entry.remoteProjectId).toBeUndefined();
-    expect(clearRemoteProjectBinding(canonical))
-      .toMatchObject({ hash: local.id, changed: false });
+    expect(() => clearRemoteProjectBinding(canonical, remoteProjectId))
+      .toThrow(`project ${local.id} remote binding changed; expected ${remoteProjectId}`);
     expect(resolveProjectIdentity(canonical)).toEqual(local);
+  });
+
+  it("serializes remote binding mutations with a private exclusive lock", () => {
+    const canonical = makeDir("remote-lock");
+    const local = resolveProjectIdentity(canonical);
+    const lockPath = `${projectMapPath()}.lock`;
+    let nestedError: unknown;
+
+    const bound = setRemoteProjectBinding(remoteProjectId, {
+      canonical,
+      _afterLockForTesting: () => {
+        expect(statSync(lockPath).mode & 0o777).toBe(0o600);
+        try {
+          setRemoteProjectBinding(remoteProjectId, { canonical });
+        } catch (error) {
+          nestedError = error;
+        }
+      },
+    });
+
+    expect(bound).toMatchObject({ hash: local.id, changed: true });
+    expect(nestedError).toBeInstanceOf(Error);
+    expect((nestedError as Error).message).toContain("project map mutation is already in progress");
+    expect(existsSync(lockPath)).toBe(false);
+
+    writeFileSync(lockPath, "", { mode: 0o600 });
+    expect(() => clearRemoteProjectBinding(canonical, remoteProjectId))
+      .toThrow("project map mutation is already in progress");
+    expect(listProjectMapEntries()[local.id].remoteProjectId).toBe(remoteProjectId);
+  });
+
+  it("fails closed when a remote binding changes or disappears before clear", () => {
+    const canonical = makeDir("remote-clear-cas");
+    const local = resolveProjectIdentity(canonical);
+    const replacement = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021";
+    setRemoteProjectBinding(remoteProjectId, { canonical });
+
+    expect(() => clearRemoteProjectBinding(canonical, remoteProjectId, {
+      _afterLockForTesting: () => {
+        writeFileSync(projectMapPath(), JSON.stringify({
+          [local.id]: {
+            canonical,
+            aliases: [],
+            remoteProjectId: replacement,
+          },
+        }, null, 2) + "\n");
+      },
+    })).toThrow(`remote binding changed; expected ${remoteProjectId}`);
+    expect(listProjectMapEntries()[local.id].remoteProjectId).toBe(replacement);
+
+    expect(() => clearRemoteProjectBinding(canonical, replacement, {
+      _afterLockForTesting: () => {
+        writeFileSync(projectMapPath(), "{}\n");
+      },
+    })).toThrow("project is not mapped");
+    expect(listProjectMapEntries()[local.id]).toBeUndefined();
+    expect(existsSync(`${projectMapPath()}.lock`)).toBe(false);
   });
 
   it("requires explicit acknowledgement before binding or rebinding data-bearing projects", () => {
@@ -144,7 +201,9 @@ describe("project map", () => {
     resolveProjectIdentity(canonical);
     expect(() => setRemoteProjectBinding("not-a-uuid", { canonical }))
       .toThrow("invalid remote project UUIDv7");
-    expect(() => clearRemoteProjectBinding(makeDir("remote-unmapped")))
+    expect(() => clearRemoteProjectBinding(canonical, "not-a-uuid"))
+      .toThrow("invalid expected remote project UUIDv7");
+    expect(() => clearRemoteProjectBinding(makeDir("remote-unmapped"), remoteProjectId))
       .toThrow("project is not mapped");
   });
 
@@ -727,14 +786,18 @@ describe("project map", () => {
   });
 
   it("refuses to clear a remote binding from an unmapped transient target", () => {
-    expect(() => clearRemoteProjectBinding(join(homedir(), "unmapped-clear-target")))
+    expect(() => clearRemoteProjectBinding(
+      join(homedir(), "unmapped-clear-target"),
+      remoteProjectId,
+    ))
       .toThrow(/project is not mapped/);
 
     const originalCwd = process.cwd();
     const unmapped = makeDir("unmapped-clear-current");
     process.chdir(unmapped);
     try {
-      expect(() => clearRemoteProjectBinding()).toThrow(`project is not mapped: ${unmapped}`);
+      expect(() => clearRemoteProjectBinding(undefined, remoteProjectId))
+        .toThrow(`project is not mapped: ${unmapped}`);
     } finally {
       process.chdir(originalCwd);
     }

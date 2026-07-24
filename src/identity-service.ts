@@ -115,6 +115,11 @@ export interface IdentityRepository {
     machineId: string,
     normalizedPath: string,
   ): Promise<{ readonly projectId: string; readonly alias: RemoteProjectAlias } | null>;
+  resolveProjectAliasesByPath(
+    machineId: string,
+    projectId: string,
+    paths: readonly string[],
+  ): Promise<RemoteProjectAlias[]>;
   listProjects(): Promise<RemoteProject[]>;
 }
 
@@ -205,6 +210,44 @@ function remoteEntryPaths(entry: ProjectMapEntry): Array<{
     paths.set(remote.normalizedPath, remote);
   }
   return [...paths.values()];
+}
+
+function lexicalEntryPaths(entry: ProjectMapEntry): string[] {
+  return [...new Set([entry.canonical, ...entry.aliases].map((path) => resolve(path)))];
+}
+
+async function resolveStoredRemoteAliases(
+  repository: IdentityRepository,
+  machineId: string,
+  projectId: string,
+  lexicalPaths: readonly string[],
+): Promise<RemoteProjectAliasInput[]> {
+  const rows = await repository.resolveProjectAliasesByPath(
+    machineId,
+    projectId,
+    lexicalPaths,
+  );
+  const rowsByPath = new Map<string, RemoteProjectAlias[]>();
+  for (const row of rows) {
+    const matching = rowsByPath.get(row.path) ?? [];
+    matching.push(row);
+    rowsByPath.set(row.path, matching);
+  }
+  const resolved: RemoteProjectAliasInput[] = [];
+  for (const path of lexicalPaths) {
+    const matching = rowsByPath.get(path) ?? [];
+    if (matching.length > 1) {
+      throw new ProjectIdentityReconciliationError(
+        `PostgreSQL contains multiple aliases for stored path ${path}`,
+        "Inspect `lcm project list --json` and reconcile the duplicate aliases explicitly.",
+      );
+    }
+    const row = matching[0];
+    if (row) {
+      resolved.push({ path: row.path, normalizedPath: row.normalizedPath });
+    }
+  }
+  return resolved;
 }
 
 async function withSession<T>(
@@ -846,7 +889,12 @@ export async function unlinkProject(
     const deps = dependencies(dependencyOverrides);
     const machine = requireMachineIdentity(deps.homeDir);
     return withSession(config, deps, async (repository) => {
-      const entryPaths = remoteEntryPaths(shown.entry);
+      const entryPaths = await resolveStoredRemoteAliases(
+        repository,
+        machine.machineId,
+        shown.entry.remoteProjectId!,
+        lexicalEntryPaths(shown.entry),
+      );
       const removed = await confirmRemoteProjectAliasesUnlink(
         repository,
         machine.machineId,
@@ -855,7 +903,7 @@ export async function unlinkProject(
         entryPaths,
       );
       try {
-        clearRemoteProjectBinding(shown.hash);
+        clearRemoteProjectBinding(shown.hash, shown.entry.remoteProjectId!);
       } catch (error) {
         try {
           const restored = await restoreRemoteUnlinkedAliases(
@@ -891,13 +939,21 @@ export async function unlinkProject(
   const deps = dependencies(dependencyOverrides);
   const machine = requireMachineIdentity(deps.homeDir);
   return withSession(config, deps, async (repository) => {
-    const removed = await confirmRemoteAliasUnlink(
+    const [storedAlias] = await resolveStoredRemoteAliases(
       repository,
       machine.machineId,
-      remotePath(aliasPath).normalizedPath,
       shown.entry.remoteProjectId!,
-      aliasPath,
+      [resolve(aliasPath)],
     );
+    const removed = storedAlias
+      ? await confirmRemoteAliasUnlink(
+        repository,
+        machine.machineId,
+        storedAlias.normalizedPath,
+        shown.entry.remoteProjectId!,
+        aliasPath,
+      )
+      : null;
     try {
       removeProjectAlias(aliasPath, { hash: shown.hash });
     } catch (error) {

@@ -7,6 +7,7 @@ import {
   PostgreSqlIdentityCreateOutcomeUnknownError,
   PostgreSqlIdentityConflictError,
   PostgreSqlIdentityNotFoundError,
+  PostgreSqlIdentityRegistrationError,
   PostgreSqlIdentityReplaceAliasesOutcomeUnknownError,
   PostgreSqlIdentityRepository,
   PostgreSqlIdentityUnlinkAliasesOutcomeUnknownError,
@@ -86,8 +87,17 @@ describe("PostgreSQL identity repository", () => {
 
   it("fails closed when registration returns no row", async () => {
     const repository = new PostgreSqlIdentityRepository(executor(() => result([])));
-    await expect(repository.registerMachine(machineRow.identity_key, "Machine A"))
-      .rejects.toBeInstanceOf(PostgreSqlIdentityNotFoundError);
+    const error = await repository.registerMachine(machineRow.identity_key, "Machine A")
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PostgreSqlIdentityRegistrationError);
+    expect(error).toMatchObject({
+      operation: "registerMachine",
+      message: "PostgreSQL machine registration did not return an identity",
+    });
+    expect(JSON.stringify(error)).not.toContain(machineRow.identity_key);
+    expect(String(error)).not.toContain(machineRow.identity_key);
+    expect((error as Error & { cause?: unknown }).cause).toBeUndefined();
   });
 
   it("recovers an existing machine and rejects an unknown ID", async () => {
@@ -867,6 +877,47 @@ describe("PostgreSQL identity repository", () => {
     rows = [];
     await expect(repository.resolveProject(machineRow.machine_id, aliasRow.normalized_path))
       .resolves.toBeNull();
+  });
+
+  it("resolves persisted lexical paths without recomputing normalized identities", async () => {
+    const second = {
+      ...aliasRow,
+      path: "/work/deleted-link",
+      normalized_path: "/work/original-target",
+    };
+    const db = executor(() => result([second, aliasRow]));
+    const repository = new PostgreSqlIdentityRepository(db);
+
+    await expect(repository.resolveProjectAliasesByPath(
+      machineRow.machine_id,
+      projectRow.project_id,
+      [second.path, aliasRow.path],
+    )).resolves.toEqual([
+      expect.objectContaining({
+        path: second.path,
+        normalizedPath: second.normalized_path,
+      }),
+      expect.objectContaining({
+        path: aliasRow.path,
+        normalizedPath: aliasRow.normalized_path,
+      }),
+    ]);
+    expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining("path = ANY($3::text[])"),
+      values: [
+        machineRow.machine_id,
+        projectRow.project_id,
+        [second.path, aliasRow.path],
+      ],
+    }), expect.objectContaining({ operation: "resolveProjectAliasesByPath" }));
+
+    db.query.mockClear();
+    await expect(repository.resolveProjectAliasesByPath(
+      machineRow.machine_id,
+      projectRow.project_id,
+      [],
+    )).resolves.toEqual([]);
+    expect(db.query).not.toHaveBeenCalled();
   });
 
   it("lists projects with deterministic grouped aliases", async () => {

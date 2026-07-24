@@ -133,6 +133,20 @@ export class PostgreSqlIdentityNotFoundError extends StorageOperationError {
   }
 }
 
+export class PostgreSqlIdentityRegistrationError extends StorageOperationError {
+  constructor() {
+    super(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      undefined,
+      "identity",
+      "registerMachine",
+    );
+    this.name = "PostgreSqlIdentityRegistrationError";
+    this.message = "PostgreSQL machine registration did not return an identity";
+  }
+}
+
 export class PostgreSqlIdentityCreateOutcomeUnknownError
   extends PostgreSqlCommitOutcomeUnknownError {
   constructor(readonly candidate: RemoteProject) {
@@ -242,7 +256,7 @@ export class PostgreSqlIdentityRepository {
       values: [identityKey, displayName],
     }, { domain: "identity", operation: "registerMachine" });
     const row = result.rows[0];
-    if (!row) throw new PostgreSqlIdentityNotFoundError("machine", identityKey);
+    if (!row) throw new PostgreSqlIdentityRegistrationError();
     return machineFromRow(row);
   }
 
@@ -808,6 +822,24 @@ export class PostgreSqlIdentityRepository {
     }, { domain: "identity", operation: "resolveProject" });
     const row = result.rows[0];
     return row ? { projectId: row.project_id, alias: aliasFromRow(row) } : null;
+  }
+
+  async resolveProjectAliasesByPath(
+    machineId: string,
+    projectId: string,
+    paths: readonly string[],
+  ): Promise<RemoteProjectAlias[]> {
+    if (paths.length === 0) return [];
+    const result = await this.executor.query<AliasRow>({
+      text: `SELECT project_id, machine_id, path, normalized_path, linked_at
+             FROM lcm.project_aliases
+             WHERE machine_id = $1
+               AND project_id = $2
+               AND path = ANY($3::text[])
+             ORDER BY path ASC, normalized_path ASC`,
+      values: [machineId, projectId, paths],
+    }, { domain: "identity", operation: "resolveProjectAliasesByPath", projectId });
+    return result.rows.map(aliasFromRow);
   }
 
   async listProjects(): Promise<RemoteProject[]> {

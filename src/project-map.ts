@@ -12,6 +12,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { lcmHomeDir, projectsDir } from "./runtime-paths.js";
 import {
   atomicWritePrivateFile,
+  deleteRegularFile,
   ensurePrivateDirectory,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
@@ -46,6 +47,23 @@ export type ProjectMapValidation = {
 const HASH_RE = /^[a-f0-9]{64}$/;
 const MAX_PROJECT_MAP_BYTES = 4 * 1024 * 1024;
 let cache: { path: string; mtimeMs: number | null; map: ProjectMap; metadataPopulated: boolean } | null = null;
+
+function projectMapMutationLockPath(homeDir?: string): string {
+  return `${projectMapPath(homeDir)}.lock`;
+}
+
+function withProjectMapMutationLock<T>(callback: () => T, homeDir?: string): T {
+  const lockPath = projectMapMutationLockPath(homeDir);
+  if (!writePrivateFileExclusive(lockPath, "")) {
+    throw new Error("project map mutation is already in progress; retry after the active operation completes");
+  }
+  try {
+    cache = null;
+    return callback();
+  } finally {
+    deleteRegularFile(lockPath);
+  }
+}
 
 export function projectMapPath(homeDir?: string): string {
   return join(lcmHomeDir(homeDir), "map.json");
@@ -448,6 +466,8 @@ export function setRemoteProjectBinding(
     readonly canonical?: string;
     readonly hash?: string;
     readonly allowExistingData?: boolean;
+    /** @internal Test-only synchronization seam for deterministic race coverage. */
+    readonly _afterLockForTesting?: () => void;
   } = {},
 ): {
   readonly hash: string;
@@ -458,32 +478,40 @@ export function setRemoteProjectBinding(
   if (!isUuidV7(remoteProjectId)) {
     throw new Error(`invalid remote project UUIDv7: ${remoteProjectId}`);
   }
-  const target = resolveCliTarget({ canonical: opts.canonical, hash: opts.hash });
-  const current = target.entry.remoteProjectId;
-  if (current === remoteProjectId) {
-    return { hash: target.hash, entry: target.entry, changed: false };
-  }
-  if (
-    current !== undefined
-    && existingProjectHasStoredData(target.hash)
-    && !opts.allowExistingData
-  ) {
-    throw new Error(
-      `project ${target.hash} already has local data; rerun with --allow-existing-data to rebind it explicitly`,
-    );
-  }
-  target.map[target.hash].remoteProjectId = remoteProjectId;
-  const write = writeProjectMap(target.map);
-  return {
-    hash: target.hash,
-    entry: target.map[target.hash],
-    changed: true,
-    backupPath: write.backupPath,
-  };
+  return withProjectMapMutationLock(() => {
+    opts._afterLockForTesting?.();
+    const target = resolveCliTarget({ canonical: opts.canonical, hash: opts.hash });
+    const current = target.entry.remoteProjectId;
+    if (current === remoteProjectId) {
+      return { hash: target.hash, entry: target.entry, changed: false };
+    }
+    if (
+      current !== undefined
+      && existingProjectHasStoredData(target.hash)
+      && !opts.allowExistingData
+    ) {
+      throw new Error(
+        `project ${target.hash} already has local data; rerun with --allow-existing-data to rebind it explicitly`,
+      );
+    }
+    target.map[target.hash].remoteProjectId = remoteProjectId;
+    const write = writeProjectMap(target.map);
+    return {
+      hash: target.hash,
+      entry: target.map[target.hash],
+      changed: true,
+      backupPath: write.backupPath,
+    };
+  });
 }
 
 export function clearRemoteProjectBinding(
-  target?: string,
+  target: string | undefined,
+  expectedRemoteProjectId: string,
+  opts: {
+    /** @internal Test-only synchronization seam for deterministic race coverage. */
+    readonly _afterLockForTesting?: () => void;
+  } = {},
 ): {
   readonly hash: string;
   readonly entry: ProjectMapEntry;
@@ -491,25 +519,34 @@ export function clearRemoteProjectBinding(
   readonly changed: boolean;
   readonly backupPath?: string;
 } {
-  const shown = showProjectMapEntry(target);
-  if (shown.transient) {
-    throw new Error(`project is not mapped: ${target ?? process.cwd()}`);
+  if (!isUuidV7(expectedRemoteProjectId)) {
+    throw new Error(`invalid expected remote project UUIDv7: ${expectedRemoteProjectId}`);
   }
-  const map = listProjectMapEntries();
-  const entry = map[shown.hash];
-  const remoteProjectId = entry.remoteProjectId;
-  if (!remoteProjectId) {
-    return { hash: shown.hash, entry, changed: false };
-  }
-  delete entry.remoteProjectId;
-  const write = writeProjectMap(map);
-  return {
-    hash: shown.hash,
-    entry,
-    remoteProjectId,
-    changed: true,
-    backupPath: write.backupPath,
-  };
+  return withProjectMapMutationLock(() => {
+    opts._afterLockForTesting?.();
+    const shown = showProjectMapEntry(target);
+    if (shown.transient) {
+      throw new Error(`project is not mapped: ${target ?? process.cwd()}`);
+    }
+    const map = listProjectMapEntries();
+    // The lock makes the non-transient result and this same cached map one
+    // synchronous mutation snapshot.
+    const entry = map[shown.hash]!;
+    if (entry.remoteProjectId !== expectedRemoteProjectId) {
+      throw new Error(
+        `project ${shown.hash} remote binding changed; expected ${expectedRemoteProjectId}`,
+      );
+    }
+    delete entry.remoteProjectId;
+    const write = writeProjectMap(map);
+    return {
+      hash: shown.hash,
+      entry,
+      remoteProjectId: expectedRemoteProjectId,
+      changed: true,
+      backupPath: write.backupPath,
+    };
+  });
 }
 
 export function addProjectAlias(alias: string, opts: { canonical?: string; hash?: string } = {}): { hash: string; entry: ProjectMapEntry; warning?: string; backupPath?: string } {

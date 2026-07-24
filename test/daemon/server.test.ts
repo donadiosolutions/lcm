@@ -64,6 +64,8 @@ describe("daemon server", () => {
   });
 
   it("starts with staged PostgreSQL storage and validates route identity before unavailability", async () => {
+    const scanForTranscripts = vi.fn(async () => undefined);
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
     const caPath = join(tempHome!, "postgres-ca.pem");
     writeFileSync(
       caPath,
@@ -82,8 +84,12 @@ describe("daemon server", () => {
         LCM_POSTGRES_CA_FILE: caPath,
       },
     );
-    daemon = await createDaemon(config);
+    daemon = await createDaemon(config, { _scanForTranscripts: scanForTranscripts });
     const port = daemon.address().port;
+
+    expect(setIntervalSpy).not.toHaveBeenCalledWith(expect.any(Function), 10 * 60 * 1000);
+    expect(setIntervalSpy).not.toHaveBeenCalledWith(expect.any(Function), 5 * 60 * 1000);
+    expect(scanForTranscripts).not.toHaveBeenCalled();
 
     const healthResponse = await fetch(`http://127.0.0.1:${port}/health`);
     expect(healthResponse.status).toBe(503);
@@ -115,6 +121,29 @@ describe("daemon server", () => {
     const store = await storeResponse.json() as { error: string };
     expect(store.error).toContain("has no PostgreSQL binding");
     expect(store.error).not.toContain("storage initialization failed");
+
+    for (const request of [
+      { path: "/stats", method: "GET", operation: "stats" },
+      { path: "/stats/pool", method: "GET", operation: "pool stats" },
+      { path: "/status", method: "POST", operation: "status" },
+    ]) {
+      const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {
+        method: request.method,
+        ...(request.method === "POST"
+          ? {
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ cwd: tempHome }),
+            }
+          : {}),
+      });
+      expect(response.status).toBe(503);
+      const unavailable = await response.json() as Record<string, unknown>;
+      expect(unavailable).toEqual({
+        error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
+        storageBackend: "postgresql",
+      });
+      expect(JSON.stringify(unavailable)).not.toContain("secret");
+    }
   });
 
   it("returns 404 for unknown routes", async () => {
