@@ -1120,6 +1120,23 @@ describe("project map", () => {
     expect(projectId(alias)).toBe(canonicalId);
   });
 
+  it("refuses to adopt an already-seen canonical-only project with a remote binding", () => {
+    const canonical = makeDir("remote-canonical");
+    const alias = makeDir("remote-alias");
+    projectId(canonical);
+    const staleAliasId = projectId(alias);
+    const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
+    setRemoteProjectBinding(remoteProjectId, { canonical: alias });
+
+    expect(() => addProjectAlias(alias, { canonical }))
+      .toThrow(/already mapped to another hash/);
+    expect(listProjectMapEntries()[staleAliasId]).toMatchObject({
+      canonical: normalizeProjectPath(alias),
+      aliases: [],
+      remoteProjectId,
+    });
+  });
+
   it("refuses to adopt an already-seen alias project that has stored data", () => {
     const canonical = makeDir("data-canonical");
     const alias = makeDir("data-alias");

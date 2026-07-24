@@ -9,8 +9,18 @@
 BEGIN;
 
 GRANT USAGE ON SCHEMA lcm TO :"lcm_runtime_role";
-GRANT SELECT, INSERT, UPDATE ON TABLE lcm.machines TO :"lcm_runtime_role";
-GRANT SELECT, INSERT, DELETE ON TABLE lcm.projects TO :"lcm_runtime_role";
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE lcm.project_aliases TO :"lcm_runtime_role";
+GRANT SELECT ON TABLE lcm.machines TO :"lcm_runtime_role";
+GRANT INSERT (identity_key, display_name),
+      UPDATE (display_name, last_seen_at)
+ON TABLE lcm.machines TO :"lcm_runtime_role";
+
+GRANT SELECT, DELETE ON TABLE lcm.projects TO :"lcm_runtime_role";
+GRANT INSERT (display_name)
+ON TABLE lcm.projects TO :"lcm_runtime_role";
+
+GRANT SELECT, DELETE ON TABLE lcm.project_aliases TO :"lcm_runtime_role";
+GRANT INSERT (project_id, machine_id, path, normalized_path),
+      UPDATE (project_id, path, linked_at)
+ON TABLE lcm.project_aliases TO :"lcm_runtime_role";
 
 COMMIT;

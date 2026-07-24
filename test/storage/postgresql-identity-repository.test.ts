@@ -6,6 +6,7 @@ import type {
 import {
   PostgreSqlIdentityCreateOutcomeUnknownError,
   PostgreSqlIdentityConflictError,
+  PostgreSqlIdentityLinkOutcomeUnknownError,
   PostgreSqlIdentityNotFoundError,
   PostgreSqlIdentityRegistrationError,
   PostgreSqlIdentityReplaceAliasesOutcomeUnknownError,
@@ -275,9 +276,56 @@ describe("PostgreSQL identity repository", () => {
       normalizedPath: aliasRow.normalized_path,
     };
 
-    await expect(repository.linkProject(input)).resolves.toMatchObject({ path: aliasRow.path });
+    await expect(repository.linkProjectWithOwnership(input)).resolves.toMatchObject({
+      alias: { path: aliasRow.path },
+      inserted: true,
+    });
     insertReturnsRow = false;
+    await expect(repository.linkProjectWithOwnership(input)).resolves.toMatchObject({
+      alias: { path: aliasRow.path },
+      inserted: false,
+    });
     await expect(repository.linkProject(input)).resolves.toMatchObject({ path: aliasRow.path });
+  });
+
+  it("preserves alias insertion ownership when a link COMMIT outcome is unknown", async () => {
+    const db = executor((config) => {
+      if (config.text.includes("SELECT project_id FROM")) {
+        return result([{ project_id: projectRow.project_id }]);
+      }
+      if (config.text.includes("INSERT INTO lcm.project_aliases")) return result([aliasRow]);
+      throw new Error(`unexpected SQL: ${config.text}`);
+    });
+    db.transaction.mockImplementationOnce(async (callback) => {
+      await callback(db);
+      throw new PostgreSqlCommitOutcomeUnknownError({
+        domain: "identity",
+        operation: "linkProject",
+        projectId: projectRow.project_id,
+      });
+    });
+    const repository = new PostgreSqlIdentityRepository(db);
+
+    const error = await repository.linkProjectWithOwnership({
+      machineId: machineRow.machine_id,
+      projectId: projectRow.project_id,
+      path: aliasRow.path,
+      normalizedPath: aliasRow.normalized_path,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PostgreSqlIdentityLinkOutcomeUnknownError);
+    expect((error as PostgreSqlIdentityLinkOutcomeUnknownError).candidate).toMatchObject({
+      alias: { normalizedPath: aliasRow.normalized_path },
+      inserted: true,
+    });
+    expect((error as PostgreSqlIdentityLinkOutcomeUnknownError).toJSON()).toMatchObject({
+      backend: "postgresql",
+      projectId: projectRow.project_id,
+      domain: "identity",
+      operation: "linkProject",
+    });
+    expect(JSON.stringify((error as PostgreSqlIdentityLinkOutcomeUnknownError).toJSON()))
+      .not.toContain(aliasRow.path);
   });
 
   it("atomically replaces an alias only for the expected prior owner", async () => {
@@ -334,6 +382,7 @@ describe("PostgreSQL identity repository", () => {
       normalized_path: "/work/alias",
     };
     let currentRows: QueryResultRow[] = [aliasRow, secondAlias];
+    let insertedRows: QueryResultRow[] = [];
     let selectCount = 0;
     const db = executor((config) => {
       if (config.text.includes("SELECT project_id FROM")) {
@@ -346,7 +395,7 @@ describe("PostgreSQL identity repository", () => {
           : [aliasRow, secondAlias].map((row) => ({ ...row, project_id: replacementId })));
       }
       if (config.text.includes("UPDATE lcm.project_aliases")) return result([]);
-      if (config.text.includes("INSERT INTO lcm.project_aliases")) return result([]);
+      if (config.text.includes("INSERT INTO lcm.project_aliases")) return result(insertedRows);
       throw new Error(`unexpected SQL: ${config.text}`);
     });
     const repository = new PostgreSqlIdentityRepository(db);
@@ -361,7 +410,11 @@ describe("PostgreSQL identity repository", () => {
     };
 
     await expect(repository.replaceProjectAliases(input))
-      .resolves.toMatchObject({ aliases: [{}, {}], prior: [{}, {}] });
+      .resolves.toMatchObject({
+        aliases: [{}, {}],
+        prior: [{}, {}],
+        inserted: [false, false],
+      });
     expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
       text: expect.stringContaining("AND project_id = $5"),
       values: [
@@ -375,7 +428,19 @@ describe("PostgreSQL identity repository", () => {
 
     currentRows = [aliasRow];
     await expect(repository.replaceProjectAliases(input))
-      .resolves.toMatchObject({ aliases: [{}, {}], prior: [{}, null] });
+      .resolves.toMatchObject({
+        aliases: [{}, {}],
+        prior: [{}, null],
+        inserted: [false, false],
+      });
+    insertedRows = [{ ...secondAlias, project_id: replacementId }];
+    await expect(repository.replaceProjectAliases(input))
+      .resolves.toMatchObject({
+        aliases: [{}, {}],
+        prior: [{}, null],
+        inserted: [false, true],
+      });
+    insertedRows = [];
     currentRows = [{ ...aliasRow, project_id: replacementId }, secondAlias];
     await expect(repository.replaceProjectAliases(input))
       .resolves.toMatchObject({
@@ -442,6 +507,7 @@ describe("PostgreSQL identity repository", () => {
           normalizedPath: insertedAlias.normalized_path,
         }],
         prior: [{ projectId: projectRow.project_id }, null],
+        inserted: [false, false],
       });
   });
 
@@ -834,6 +900,7 @@ describe("PostgreSQL identity repository", () => {
           linkedAt: "2026-01-01T00:00:00.000Z",
         },
       }],
+      [false, true, false],
       aliases,
     )).resolves.toBe(true);
     expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
@@ -860,6 +927,7 @@ describe("PostgreSQL identity repository", () => {
       machineRow.machine_id,
       projectRow.project_id,
       [null],
+      [true],
       [{ path: aliasRow.path, normalizedPath: aliasRow.normalized_path }],
     )).resolves.toBe(false);
     const foreign = new PostgreSqlIdentityRepository(executor(() => result([
@@ -869,8 +937,29 @@ describe("PostgreSQL identity repository", () => {
       machineRow.machine_id,
       projectRow.project_id,
       [null],
+      [true],
       [{ path: aliasRow.path, normalizedPath: aliasRow.normalized_path }],
     )).resolves.toBe(false);
+  });
+
+  it("preserves a concurrent same-project winner absent from the prior snapshot", async () => {
+    const db = executor((config) => {
+      if (config.text.includes("FOR UPDATE")) return result([aliasRow]);
+      throw new Error(`unexpected mutation: ${config.text}`);
+    });
+    const repository = new PostgreSqlIdentityRepository(db);
+
+    await expect(repository.restoreProjectAliasBatch(
+      machineRow.machine_id,
+      projectRow.project_id,
+      [null],
+      [false],
+      [{ path: "/work/loser", normalizedPath: aliasRow.normalized_path }],
+    )).resolves.toBe(true);
+    expect(db.query).not.toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringContaining("DELETE FROM") }),
+      expect.anything(),
+    );
   });
 
   it("deletes only unreferenced projects", async () => {

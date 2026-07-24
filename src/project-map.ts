@@ -856,7 +856,8 @@ export function addProjectAlias(alias: string, opts: {
         return entry
           && ownerHash === hashProjectPath(canonicalAlias)
           && normalizeProjectPath(entry.canonical) === canonicalAlias
-          && entry.aliases.length === 0;
+          && entry.aliases.length === 0
+          && entry.remoteProjectId === undefined;
       });
       if (existingOwners.size === 1 && adoptableOwners.length === 1) {
         if (existingProjectHasStoredData(adoptableOwners[0])) {

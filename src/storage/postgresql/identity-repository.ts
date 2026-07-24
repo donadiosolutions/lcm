@@ -43,9 +43,24 @@ export interface RemoteProjectAliasInput {
   readonly normalizedPath: string;
 }
 
+export interface RemoteProjectAliasMutation {
+  readonly alias: RemoteProjectAlias;
+  /**
+   * True only when this transaction inserted the alias. A same-project alias
+   * returned after an ON CONFLICT race is shared state and is not owned by
+   * this invocation for compensation.
+   */
+  readonly inserted: boolean;
+}
+
 export interface RemoteAliasBatchMutation {
   readonly aliases: readonly RemoteProjectAlias[];
   readonly prior: readonly (RemoteAliasOwnership | null)[];
+  /**
+   * True only when this transaction inserted the aligned alias. An absent
+   * prior snapshot can still be followed by a concurrent same-project winner.
+   */
+  readonly inserted: readonly boolean[];
 }
 
 type MachineRow = QueryResultRow & {
@@ -156,6 +171,21 @@ export class PostgreSqlIdentityCreateOutcomeUnknownError
       projectId: candidate.projectId,
     });
     this.name = "PostgreSqlIdentityCreateOutcomeUnknownError";
+  }
+}
+
+export class PostgreSqlIdentityLinkOutcomeUnknownError
+  extends PostgreSqlCommitOutcomeUnknownError {
+  constructor(
+    readonly projectIdCandidate: string,
+    readonly candidate: RemoteProjectAliasMutation,
+  ) {
+    super({
+      domain: "identity",
+      operation: "linkProject",
+      projectId: projectIdCandidate,
+    });
+    this.name = "PostgreSqlIdentityLinkOutcomeUnknownError";
   }
 }
 
@@ -322,11 +352,11 @@ export class PostgreSqlIdentityRepository {
         }];
         const aliases: RemoteProjectAlias[] = [];
         for (const aliasInput of aliasInputs) {
-          aliases.push(await this.linkWithExecutor(transaction, {
+          aliases.push((await this.linkWithExecutor(transaction, {
             machineId: input.machineId,
             projectId: row.project_id,
             ...aliasInput,
-          }));
+          })).alias);
         }
         candidate = {
           projectId: row.project_id,
@@ -418,7 +448,8 @@ export class PostgreSqlIdentityRepository {
           const row = currentByPath.get(normalizedPath);
           return row ? { projectId: row.project_id, alias: aliasFromRow(row) } : null;
         });
-        for (const alias of input.aliases) {
+        const inserted = input.aliases.map(() => false);
+        for (const [index, alias] of input.aliases.entries()) {
           const row = currentByPath.get(alias.normalizedPath);
           if (row?.project_id === input.expectedPriorProjectId) {
             await transaction.query({
@@ -438,13 +469,15 @@ export class PostgreSqlIdentityRepository {
               ],
             }, { domain: "identity", operation: "replaceProjectAliases", projectId: input.projectId });
           } else if (!row) {
-            await transaction.query({
+            const created = await transaction.query<AliasRow>({
               text: `INSERT INTO lcm.project_aliases
                        (project_id, machine_id, path, normalized_path)
                      VALUES ($1, $2, $3, $4)
-                     ON CONFLICT (machine_id, normalized_path) DO NOTHING`,
+                     ON CONFLICT (machine_id, normalized_path) DO NOTHING
+                     RETURNING project_id, machine_id, path, normalized_path, linked_at`,
               values: [input.projectId, input.machineId, alias.path, alias.normalizedPath],
             }, { domain: "identity", operation: "replaceProjectAliases", projectId: input.projectId });
+            inserted[index] = created.rows.length === 1;
           }
         }
         const final = await transaction.query<AliasRow>({
@@ -467,6 +500,7 @@ export class PostgreSqlIdentityRepository {
             ({ normalizedPath }) => aliasFromRow(finalByPath.get(normalizedPath)!),
           ),
           prior,
+          inserted,
         };
         return candidate;
       }, { domain: "identity", operation: "replaceProjectAliases", projectId: input.projectId });
@@ -485,10 +519,27 @@ export class PostgreSqlIdentityRepository {
     readonly path: string;
     readonly normalizedPath: string;
   }): Promise<RemoteProjectAlias> {
-    return this.executor.transaction(
-      (transaction) => this.linkWithExecutor(transaction, input),
-      { domain: "identity", operation: "linkProject", projectId: input.projectId },
-    );
+    return (await this.linkProjectWithOwnership(input)).alias;
+  }
+
+  async linkProjectWithOwnership(input: {
+    readonly machineId: string;
+    readonly projectId: string;
+    readonly path: string;
+    readonly normalizedPath: string;
+  }): Promise<RemoteProjectAliasMutation> {
+    let candidate: RemoteProjectAliasMutation | undefined;
+    try {
+      return await this.executor.transaction(async (transaction) => {
+        candidate = await this.linkWithExecutor(transaction, input);
+        return candidate;
+      }, { domain: "identity", operation: "linkProject", projectId: input.projectId });
+    } catch (error) {
+      if (error instanceof PostgreSqlCommitOutcomeUnknownError && candidate) {
+        throw new PostgreSqlIdentityLinkOutcomeUnknownError(input.projectId, candidate);
+      }
+      throw error;
+    }
   }
 
   private async linkWithExecutor(
@@ -499,7 +550,7 @@ export class PostgreSqlIdentityRepository {
       readonly path: string;
       readonly normalizedPath: string;
     },
-  ): Promise<RemoteProjectAlias> {
+  ): Promise<RemoteProjectAliasMutation> {
     const project = await executor.query<{ project_id: string }>({
       text: "SELECT project_id FROM lcm.projects WHERE project_id = $1",
       values: [input.projectId],
@@ -516,7 +567,12 @@ export class PostgreSqlIdentityRepository {
       values: [input.projectId, input.machineId, input.path, input.normalizedPath],
     }, { domain: "identity", operation: "linkProject", projectId: input.projectId });
     const insertedRow = inserted.rows[0];
-    if (insertedRow) return aliasFromRow(insertedRow);
+    if (insertedRow) {
+      return {
+        alias: aliasFromRow(insertedRow),
+        inserted: true,
+      };
+    }
     const existing = await executor.query<AliasRow>({
       text: `SELECT project_id, machine_id, path, normalized_path, linked_at
              FROM lcm.project_aliases
@@ -535,7 +591,10 @@ export class PostgreSqlIdentityRepository {
         input.projectId,
       );
     }
-    return aliasFromRow(row);
+    return {
+      alias: aliasFromRow(row),
+      inserted: false,
+    };
   }
 
   async unlinkPath(
@@ -669,6 +728,7 @@ export class PostgreSqlIdentityRepository {
     machineId: string,
     currentProjectId: string,
     prior: readonly (RemoteAliasOwnership | null)[],
+    inserted: readonly boolean[],
     aliases: readonly RemoteProjectAliasInput[],
   ): Promise<boolean> {
     return this.executor.transaction(async (transaction) => {
@@ -689,7 +749,7 @@ export class PostgreSqlIdentityRepository {
       }
       for (const [index, alias] of aliases.entries()) {
         const previous = prior[index];
-        if (!previous) {
+        if (!previous && inserted[index]) {
           await transaction.query({
             text: `DELETE FROM lcm.project_aliases
                    WHERE machine_id = $1
@@ -697,7 +757,7 @@ export class PostgreSqlIdentityRepository {
                      AND project_id = $3`,
             values: [machineId, alias.normalizedPath, currentProjectId],
           }, { domain: "identity", operation: "restoreProjectAliasBatch", projectId: currentProjectId });
-        } else if (previous.projectId !== currentProjectId) {
+        } else if (previous && previous.projectId !== currentProjectId) {
           await transaction.query({
             text: `UPDATE lcm.project_aliases
                    SET project_id = $1,

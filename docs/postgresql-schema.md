@@ -435,14 +435,19 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 ```
 
 Replace `lcm_runtime` with the deployment's runtime role. The script grants
-schema `USAGE`; `SELECT`, `INSERT`, and `UPDATE` on `machines`; `SELECT`,
-`INSERT`, and `DELETE` on `projects`; and all four row operations on
-`project_aliases`. It grants no table ownership, `TRUNCATE`, sequence access,
-function execution, schema creation, or privileges on future tables. Without
-these grants, machine registration and project pairing fail closed with a
-sanitized PostgreSQL operation error. Migrations intentionally do not apply
-runtime grants because the migration role cannot safely infer a deployment's
-runtime role.
+schema `USAGE` and table `SELECT` where identity readback requires it. Writes
+are column-scoped: machines may insert only `identity_key` and `display_name`
+and update only `display_name` and `last_seen_at`; projects may insert only
+`display_name` and delete rows; aliases may insert `project_id`, `machine_id`,
+`path`, and `normalized_path`, update only `project_id`, `path`, and
+`linked_at`, and delete rows. Generated IDs and timestamps remain unwritable,
+and immutable machine identity and normalized-path columns cannot be updated
+after insertion. The script grants no table ownership, `TRUNCATE`, sequence
+access, function execution, schema creation, or privileges on future tables.
+Without these grants, machine registration and project pairing fail closed
+with a sanitized PostgreSQL operation error. Migrations intentionally do not
+apply runtime grants because the migration role cannot safely infer a
+deployment's runtime role.
 
 Migration privilege hardening is likewise confined to LCM-owned objects: it
 does not change ACLs on unknown objects already present in `lcm`. If an

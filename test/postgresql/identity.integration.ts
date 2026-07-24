@@ -11,7 +11,6 @@ import { recoverMachineIdentity } from "../../src/machine-identity.js";
 import { clearProjectMapCache, resolveProjectIdentity } from "../../src/project-map.js";
 import {
   PostgreSqlIdentityCreateOutcomeUnknownError,
-  type PostgreSqlIdentityExecutor,
   PostgreSqlIdentityConflictError,
   PostgreSqlIdentityRepository,
 } from "../../src/storage/postgresql/identity-repository.js";
@@ -81,8 +80,14 @@ describe("PostgreSQL 18 machine and project identities", () => {
       expect(JSON.stringify(denied)).not.toContain(identityKey);
 
       await grantIdentityRuntimePrivileges(database);
-      await expect(repository.registerMachine(identityKey, "Granted"))
-        .resolves.toMatchObject({ displayName: "Granted" });
+      const grantedMachine = await repository.registerMachine(identityKey, "Granted");
+      expect(grantedMachine).toMatchObject({ displayName: "Granted" });
+      const grantedProject = await repository.createProject({
+        machineId: grantedMachine.machineId,
+        displayName: "Granted project",
+        path: "/work/granted",
+        normalizedPath: "/work/granted",
+      });
       const privileges = await database.migrator.query<{
         schema_usage: boolean;
         schema_create: boolean;
@@ -90,15 +95,35 @@ describe("PostgreSQL 18 machine and project identities", () => {
         machines_insert: boolean;
         machines_update: boolean;
         machines_delete: boolean;
+        machines_insert_identity_key: boolean;
+        machines_insert_display_name: boolean;
+        machines_insert_machine_id: boolean;
+        machines_update_display_name: boolean;
+        machines_update_last_seen_at: boolean;
+        machines_update_identity_key: boolean;
+        machines_update_machine_id: boolean;
+        machines_update_registered_at: boolean;
         projects_select: boolean;
         projects_insert: boolean;
         projects_update: boolean;
         projects_delete: boolean;
+        projects_insert_display_name: boolean;
+        projects_insert_project_id: boolean;
         aliases_select: boolean;
         aliases_insert: boolean;
         aliases_update: boolean;
         aliases_delete: boolean;
         aliases_truncate: boolean;
+        aliases_insert_project_id: boolean;
+        aliases_insert_machine_id: boolean;
+        aliases_insert_path: boolean;
+        aliases_insert_normalized_path: boolean;
+        aliases_insert_linked_at: boolean;
+        aliases_update_project_id: boolean;
+        aliases_update_path: boolean;
+        aliases_update_linked_at: boolean;
+        aliases_update_machine_id: boolean;
+        aliases_update_normalized_path: boolean;
       }>({
         text: `SELECT
                  has_schema_privilege('lcm_test_runtime', 'lcm', 'USAGE') AS schema_usage,
@@ -107,33 +132,135 @@ describe("PostgreSQL 18 machine and project identities", () => {
                  has_table_privilege('lcm_test_runtime', 'lcm.machines', 'INSERT') AS machines_insert,
                  has_table_privilege('lcm_test_runtime', 'lcm.machines', 'UPDATE') AS machines_update,
                  has_table_privilege('lcm_test_runtime', 'lcm.machines', 'DELETE') AS machines_delete,
+                 has_column_privilege('lcm_test_runtime', 'lcm.machines', 'identity_key', 'INSERT') AS machines_insert_identity_key,
+                 has_column_privilege('lcm_test_runtime', 'lcm.machines', 'display_name', 'INSERT') AS machines_insert_display_name,
+                 has_column_privilege('lcm_test_runtime', 'lcm.machines', 'machine_id', 'INSERT') AS machines_insert_machine_id,
+                 has_column_privilege('lcm_test_runtime', 'lcm.machines', 'display_name', 'UPDATE') AS machines_update_display_name,
+                 has_column_privilege('lcm_test_runtime', 'lcm.machines', 'last_seen_at', 'UPDATE') AS machines_update_last_seen_at,
+                 has_column_privilege('lcm_test_runtime', 'lcm.machines', 'identity_key', 'UPDATE') AS machines_update_identity_key,
+                 has_column_privilege('lcm_test_runtime', 'lcm.machines', 'machine_id', 'UPDATE') AS machines_update_machine_id,
+                 has_column_privilege('lcm_test_runtime', 'lcm.machines', 'registered_at', 'UPDATE') AS machines_update_registered_at,
                  has_table_privilege('lcm_test_runtime', 'lcm.projects', 'SELECT') AS projects_select,
                  has_table_privilege('lcm_test_runtime', 'lcm.projects', 'INSERT') AS projects_insert,
                  has_table_privilege('lcm_test_runtime', 'lcm.projects', 'UPDATE') AS projects_update,
                  has_table_privilege('lcm_test_runtime', 'lcm.projects', 'DELETE') AS projects_delete,
+                 has_column_privilege('lcm_test_runtime', 'lcm.projects', 'display_name', 'INSERT') AS projects_insert_display_name,
+                 has_column_privilege('lcm_test_runtime', 'lcm.projects', 'project_id', 'INSERT') AS projects_insert_project_id,
                  has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'SELECT') AS aliases_select,
                  has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'INSERT') AS aliases_insert,
                  has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'UPDATE') AS aliases_update,
                  has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'DELETE') AS aliases_delete,
-                 has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'TRUNCATE') AS aliases_truncate`,
+                 has_table_privilege('lcm_test_runtime', 'lcm.project_aliases', 'TRUNCATE') AS aliases_truncate,
+                 has_column_privilege('lcm_test_runtime', 'lcm.project_aliases', 'project_id', 'INSERT') AS aliases_insert_project_id,
+                 has_column_privilege('lcm_test_runtime', 'lcm.project_aliases', 'machine_id', 'INSERT') AS aliases_insert_machine_id,
+                 has_column_privilege('lcm_test_runtime', 'lcm.project_aliases', 'path', 'INSERT') AS aliases_insert_path,
+                 has_column_privilege('lcm_test_runtime', 'lcm.project_aliases', 'normalized_path', 'INSERT') AS aliases_insert_normalized_path,
+                 has_column_privilege('lcm_test_runtime', 'lcm.project_aliases', 'linked_at', 'INSERT') AS aliases_insert_linked_at,
+                 has_column_privilege('lcm_test_runtime', 'lcm.project_aliases', 'project_id', 'UPDATE') AS aliases_update_project_id,
+                 has_column_privilege('lcm_test_runtime', 'lcm.project_aliases', 'path', 'UPDATE') AS aliases_update_path,
+                 has_column_privilege('lcm_test_runtime', 'lcm.project_aliases', 'linked_at', 'UPDATE') AS aliases_update_linked_at,
+                 has_column_privilege('lcm_test_runtime', 'lcm.project_aliases', 'machine_id', 'UPDATE') AS aliases_update_machine_id,
+                 has_column_privilege('lcm_test_runtime', 'lcm.project_aliases', 'normalized_path', 'UPDATE') AS aliases_update_normalized_path`,
       }, { domain: "identity", operation: "inspectIdentityRuntimePrivileges" });
       expect(privileges.rows[0]).toEqual({
         schema_usage: true,
         schema_create: false,
         machines_select: true,
-        machines_insert: true,
-        machines_update: true,
+        machines_insert: false,
+        machines_update: false,
         machines_delete: false,
+        machines_insert_identity_key: true,
+        machines_insert_display_name: true,
+        machines_insert_machine_id: false,
+        machines_update_display_name: true,
+        machines_update_last_seen_at: true,
+        machines_update_identity_key: false,
+        machines_update_machine_id: false,
+        machines_update_registered_at: false,
         projects_select: true,
-        projects_insert: true,
+        projects_insert: false,
         projects_update: false,
         projects_delete: true,
+        projects_insert_display_name: true,
+        projects_insert_project_id: false,
         aliases_select: true,
-        aliases_insert: true,
-        aliases_update: true,
+        aliases_insert: false,
+        aliases_update: false,
         aliases_delete: true,
         aliases_truncate: false,
+        aliases_insert_project_id: true,
+        aliases_insert_machine_id: true,
+        aliases_insert_path: true,
+        aliases_insert_normalized_path: true,
+        aliases_insert_linked_at: false,
+        aliases_update_project_id: true,
+        aliases_update_path: true,
+        aliases_update_linked_at: true,
+        aliases_update_machine_id: false,
+        aliases_update_normalized_path: false,
       });
+
+      const forbiddenWrites = [
+        {
+          text: `INSERT INTO lcm.machines (machine_id, identity_key, display_name)
+                 VALUES ($1, $2, $3)`,
+          values: [
+            "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9089",
+            `machine:${"2".repeat(64)}`,
+            "Forbidden",
+          ],
+        },
+        {
+          text: "UPDATE lcm.machines SET identity_key = $1 WHERE machine_id = $2",
+          values: [`machine:${"1".repeat(64)}`, grantedMachine.machineId],
+        },
+        {
+          text: "UPDATE lcm.machines SET machine_id = $1 WHERE machine_id = $2",
+          values: ["018f22c4-6d2a-7f10-8a4c-6b8d3e5f9090", grantedMachine.machineId],
+        },
+        {
+          text: "UPDATE lcm.machines SET registered_at = statement_timestamp() WHERE machine_id = $1",
+          values: [grantedMachine.machineId],
+        },
+        {
+          text: "INSERT INTO lcm.projects (project_id, display_name) VALUES ($1, $2)",
+          values: ["018f22c4-6d2a-7f10-8a4c-6b8d3e5f9091", "Forbidden"],
+        },
+        {
+          text: "UPDATE lcm.projects SET display_name = $1 WHERE project_id = $2",
+          values: ["Forbidden", grantedProject.projectId],
+        },
+        {
+          text: "UPDATE lcm.project_aliases SET machine_id = $1 WHERE project_id = $2",
+          values: ["018f22c4-6d2a-7f10-8a4c-6b8d3e5f9092", grantedProject.projectId],
+        },
+        {
+          text: "UPDATE lcm.project_aliases SET normalized_path = $1 WHERE project_id = $2",
+          values: ["/work/forbidden", grantedProject.projectId],
+        },
+        {
+          text: `INSERT INTO lcm.project_aliases
+                   (project_id, machine_id, path, normalized_path, linked_at)
+                 VALUES ($1, $2, $3, $4, statement_timestamp())`,
+          values: [
+            grantedProject.projectId,
+            grantedMachine.machineId,
+            "/work/forbidden",
+            "/work/forbidden",
+          ],
+        },
+      ];
+      for (const [index, query] of forbiddenWrites.entries()) {
+        await expect(database.runtime.query(query, {
+          domain: "identity",
+          operation: `forbiddenIdentityWrite${index}`,
+          projectId: grantedProject.projectId,
+        })).rejects.toMatchObject({
+          backend: "postgresql",
+          domain: "identity",
+          operation: `forbiddenIdentityWrite${index}`,
+        });
+      }
     });
   });
 
@@ -501,6 +628,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
           }
         },
         linkProject: repository.linkProject.bind(repository),
+        linkProjectWithOwnership: repository.linkProjectWithOwnership.bind(repository),
         replaceProjectAlias: repository.replaceProjectAlias.bind(repository),
         replaceProjectAliases: repository.replaceProjectAliases.bind(repository),
         unlinkPath: repository.unlinkPath.bind(repository),
@@ -538,6 +666,46 @@ describe("PostgreSQL 18 machine and project identities", () => {
         if (originalUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = originalUserProfile;
       }
+    });
+  });
+
+  it("attributes a concurrent same-project link only to the transaction that inserted it", async () => {
+    await withPostgreSqlTestDatabase("identity-same-project-link-race", async (database) => {
+      await grantIdentityRuntimePrivileges(database);
+      const repository = new PostgreSqlIdentityRepository(database.runtime);
+      const machine = await repository.registerMachine(
+        `machine:${"8".repeat(64)}`,
+        "Machine link race",
+      );
+      const project = await repository.createProject({
+        machineId: machine.machineId,
+        displayName: "Link race target",
+        path: "/work/link-race-root",
+        normalizedPath: "/work/link-race-root",
+      });
+
+      const results = await Promise.all([
+        repository.linkProjectWithOwnership({
+          machineId: machine.machineId,
+          projectId: project.projectId,
+          path: "/work/link-race-a",
+          normalizedPath: "/work/link-race-alias",
+        }),
+        repository.linkProjectWithOwnership({
+          machineId: machine.machineId,
+          projectId: project.projectId,
+          path: "/work/link-race-b",
+          normalizedPath: "/work/link-race-alias",
+        }),
+      ]);
+      expect(results.map(({ inserted }) => inserted).sort()).toEqual([false, true]);
+      expect(new Set(results.map(({ alias }) => alias.path)).size).toBe(1);
+      const winningPath = results.find(({ inserted }) => inserted)!.alias.path;
+      await expect(repository.resolveProject(machine.machineId, "/work/link-race-alias"))
+        .resolves.toMatchObject({
+          projectId: project.projectId,
+          alias: { path: winningPath },
+        });
     });
   });
 });
