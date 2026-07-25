@@ -104,7 +104,10 @@ Direct `PostgreSqlNativeTranscriptRepository` ingestion applies the same
 Unicode-scalar contract to every string in transcript metadata, checkpoint
 keys and JSON, and sanitized payload JSON. Valid surrogate pairs and literal
 Unicode are preserved, while a lone high or low surrogate is rejected before
-PostgreSQL access or transaction entry.
+PostgreSQL access or transaction entry. Its public source-key boundary also
+requires a client-root-relative locator: absolute paths, leading backslashes,
+Windows drive prefixes, UNC paths, and slash- or backslash-separated `..`
+components fail before executor access.
 
 Message-producing records link only when the destination message has the exact
 expected session order, role, and scrubbed content. A missing or mismatched
@@ -128,9 +131,11 @@ apply.
 
 The scrubber rejects an invalid custom pattern, a collision between keys after
 redaction, and any residual match from the effective pattern set. It then
-canonicalizes the sanitized JSON and hashes that canonical form. The scrubber
-version binds the pipeline version to the effective-pattern digest so a pattern
-change is observable.
+canonicalizes the sanitized JSON, scans that complete representation again
+with the effective patterns, and only then hashes it. This complete-container
+scan detects structured key/value signatures that do not match either string
+in isolation. The scrubber version binds the pipeline version to the
+effective-pattern digest so a pattern change is observable.
 
 This boundary substantially reduces accidental secret transmission, but
 pattern-based redaction cannot identify every sensitive value. An
@@ -207,6 +212,15 @@ a divergent snapshot cannot regress or overwrite that checkpoint. Identical
 record retries still read back the existing immutable rows and count as
 skipped.
 
+LCM verifies the bound source again after every successful destination
+repository call, including record batches, blank checkpoint-only writes, and
+zero-byte checkpoints. A rewrite or append while the commit is pending
+therefore fails the current run even if that commit completed. The next run
+verifies or rescans and converges through ingest keys and checkpoint
+compare-and-swap. Repository failures remain primary; only a successfully
+resolved call, including a reconciled uncertain commit, is followed by this
+source fence.
+
 ## Local quarantine
 
 Unsafe records are not stored remotely. LCM writes only metadata to a private
@@ -232,6 +246,12 @@ adding a client identifier—or any payload—to quarantine rows. The stores are
 not synchronized to PostgreSQL. Backfill rejects a quarantine repository whose
 client namespace does not match the selected transcript format before opening
 the source or contacting the destination repository.
+
+Quarantine schema creation and migration take one SQLite `BEGIN IMMEDIATE`
+lock. Table and index creation are idempotent, so separate processes racing to
+open a new project/client store serialize safely and validate the committed
+schema before use. Migration failures roll back without retaining unsafe
+payload data.
 
 Reason codes are bounded to `invalid-utf8`, `binary-input`,
 `record-too-large`, `malformed-json`, `non-container-json`, `nul-character`,

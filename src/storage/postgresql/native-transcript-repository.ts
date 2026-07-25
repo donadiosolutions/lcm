@@ -1,4 +1,5 @@
 import type { QueryResultRow } from "pg";
+import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
   NATIVE_TRANSCRIPT_MAX_JSON_DEPTH,
@@ -29,6 +30,7 @@ const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const UUIDV7_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const WINDOWS_ABSOLUTE_PATH_PATTERN = /^(?:[a-zA-Z]:|[\\/])/u;
 
 const TRANSCRIPT_COLUMNS = `
   transcript.transcript_id,
@@ -370,6 +372,32 @@ function nonemptyString(
   const candidate = string(value, projectId, operation, field);
   if ((trim ? candidate.trim() : candidate).length === 0) {
     throw new PostgreSqlNativeTranscriptDataError(projectId, operation, field);
+  }
+  return candidate;
+}
+
+function relativeSourceLocator(
+  value: unknown,
+  projectId: string,
+  operation: string,
+  field: string,
+): string {
+  const candidate = nonemptyString(
+    value,
+    projectId,
+    operation,
+    field,
+  );
+  if (
+    isAbsolute(candidate)
+    || WINDOWS_ABSOLUTE_PATH_PATTERN.test(candidate)
+    || candidate.split(/[\\/]/u).includes("..")
+  ) {
+    throw new PostgreSqlNativeTranscriptDataError(
+      projectId,
+      operation,
+      field,
+    );
   }
   return candidate;
 }
@@ -1444,7 +1472,7 @@ implements
       "client_name",
       true,
     );
-    const sourceLocator = nonemptyString(
+    const sourceLocator = relativeSourceLocator(
       value.sourceLocator,
       this.projectId,
       operation,
@@ -1540,7 +1568,7 @@ implements
       "expected_client_name",
       true,
     );
-    const sourceLocator = nonemptyString(
+    const sourceLocator = relativeSourceLocator(
       expected.sourceLocator,
       this.projectId,
       operation,

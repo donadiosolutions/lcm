@@ -57,7 +57,7 @@ export const NATIVE_TRANSCRIPT_SCRUB_PIPELINE_VERSION =
   "native-json-scrub/v1";
 
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/u;
-const WINDOWS_ABSOLUTE_PATH_PATTERN = /^[a-zA-Z]:[\\/]/u;
+const WINDOWS_ABSOLUTE_PATH_PATTERN = /^(?:[a-zA-Z]:|[\\/])/u;
 const CHECKPOINT_VERSION = 1;
 
 export class NativeTranscriptConfigurationError extends Error {
@@ -176,8 +176,17 @@ export function createNativeTranscriptScrubber(
   )}`;
   return {
     scrubberVersion,
-    scrubJson: (value): JsonObject | JsonValue[] =>
-      scrubJsonValue(engine, value) as JsonObject | JsonValue[],
+    scrubJson: (value): JsonObject | JsonValue[] => {
+      const scrubbed = scrubJsonValue(
+        engine,
+        value,
+      ) as JsonObject | JsonValue[];
+      const canonical = canonicalNativeTranscriptJson(scrubbed);
+      if (engine.scrub(canonical) !== canonical) {
+        throw new NativeTranscriptRecordError("residual-secret");
+      }
+      return scrubbed;
+    },
   };
 }
 
@@ -1643,6 +1652,7 @@ export async function runNativeTranscriptBackfill(
         },
         quarantinedCount: quarantinedRecords.length,
       });
+      await assertUncommittedSourceUnchanged();
       importedCount += result.importedCount;
       skippedCount += result.skippedCount;
       quarantinedCount += result.quarantinedCount;
@@ -1717,6 +1727,7 @@ export async function runNativeTranscriptBackfill(
         },
         quarantinedCount: 0,
       });
+      await assertUncommittedSourceUnchanged();
       importedCount += result.importedCount;
       skippedCount += result.skippedCount;
       quarantinedCount += result.quarantinedCount;
@@ -1744,6 +1755,7 @@ export async function runNativeTranscriptBackfill(
         },
         quarantinedCount: 0,
       });
+      await assertUncommittedSourceUnchanged();
       importedCount += result.importedCount;
       skippedCount += result.skippedCount;
       quarantinedCount += result.quarantinedCount;

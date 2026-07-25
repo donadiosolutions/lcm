@@ -66,7 +66,7 @@ const DIGEST_PATTERN = /^[0-9a-f]{64}$/u;
 const DEFAULT_LIST_LIMIT = 100;
 const MAX_LIST_LIMIT = 1_000;
 const QUARANTINE_TABLE_SQL = `
-  CREATE TABLE transcript_quarantine (
+  CREATE TABLE IF NOT EXISTS transcript_quarantine (
     quarantine_id INTEGER PRIMARY KEY,
     source_locator TEXT NOT NULL CHECK (source_locator <> ''),
     source_ordinal INTEGER NOT NULL CHECK (source_ordinal >= 0),
@@ -171,25 +171,27 @@ function rowToRecord(
 }
 
 function ensureQuarantineSchema(db: DatabaseSync): void {
-  const existing = db.prepare(`
-    SELECT sql
-    FROM sqlite_master
-    WHERE type = 'table' AND name = 'transcript_quarantine'
-  `).get() as { sql?: unknown } | undefined;
-  if (!existing) {
-    db.exec(QUARANTINE_TABLE_SQL);
-    db.exec(QUARANTINE_INDEX_SQL);
-    return;
-  }
-  if (
-    typeof existing.sql === "string"
-    && existing.sql.includes("'nesting-too-deep'")
-  ) {
-    db.exec(QUARANTINE_INDEX_SQL);
-    return;
-  }
   db.exec("BEGIN IMMEDIATE");
   try {
+    const existing = db.prepare(`
+      SELECT sql
+      FROM sqlite_master
+      WHERE type = 'table' AND name = 'transcript_quarantine'
+    `).get() as { sql?: unknown } | undefined;
+    if (!existing) {
+      db.exec(QUARANTINE_TABLE_SQL);
+      db.exec(QUARANTINE_INDEX_SQL);
+      db.exec("COMMIT");
+      return;
+    }
+    if (
+      typeof existing.sql === "string"
+      && existing.sql.includes("'nesting-too-deep'")
+    ) {
+      db.exec(QUARANTINE_INDEX_SQL);
+      db.exec("COMMIT");
+      return;
+    }
     db.exec(`
       ALTER TABLE transcript_quarantine
       RENAME TO transcript_quarantine_legacy

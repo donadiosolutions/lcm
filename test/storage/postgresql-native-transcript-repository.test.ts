@@ -206,6 +206,56 @@ function scopedExecutor(
 }
 
 describe("PostgreSQL native transcript repository", () => {
+  it("requires a client-root-relative source locator before executor access", async () => {
+    for (const sourceLocator of [
+      "/absolute",
+      "\\absolute",
+      "\\\\server\\share",
+      "C:\\absolute",
+      "C:/absolute",
+      "C:relative",
+      "../outside",
+      "nested/../outside",
+      "nested\\..\\outside",
+    ]) {
+      const db = executor(successfulQuery);
+      const repository = new PostgreSqlNativeTranscriptRepository(
+        db,
+        projectId,
+      );
+      const key = {
+        machineId,
+        clientName: "codex",
+        sourceLocator,
+      };
+      await expect(repository.ingestBatch({
+        ...batch,
+        ...key,
+        expectedCheckpoint: null,
+      })).rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
+      await expect(repository.getCheckpoint(key))
+        .rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
+      await expect(repository.listBySource(key))
+        .rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
+      expect(db.query).not.toHaveBeenCalled();
+      expect(db.transaction).not.toHaveBeenCalled();
+    }
+
+    const db = executor(successfulQuery);
+    const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
+    for (const sourceLocator of [
+      "foo..bar",
+      "dir/.../file",
+      "資料/😀.jsonl",
+    ]) {
+      await expect(repository.listBySource({
+        machineId,
+        clientName: "codex",
+        sourceLocator,
+      })).resolves.toHaveLength(1);
+    }
+  });
+
   it("captures validated point-query properties exactly once", async () => {
     const db = executor(successfulQuery);
     const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);

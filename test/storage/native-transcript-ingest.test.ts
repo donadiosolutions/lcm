@@ -617,6 +617,16 @@ describe("native transcript scrub and JSONL reader", () => {
       reason: "residual-secret",
     });
 
+    const structuredCanary = "abcdefghijklmnopqrstuvwxyz123456";
+    const structured = await collect(byteChunks(
+      `{"algolia_api_key":"${structuredCanary}"}\n`,
+    ));
+    expect(structured[0]).toMatchObject({
+      kind: "quarantine",
+      reason: "residual-secret",
+    });
+    expect(JSON.stringify(structured)).not.toContain(structuredCanary);
+
     const specialCollision = await collect(byteChunks(
       '{"__proto__":1,"secret":2}\n',
     ), {
@@ -660,14 +670,33 @@ describe("native transcript scrub and JSONL reader", () => {
         projectPatterns: [],
       }),
     };
-    await expect(Array.fromAsync(readNativeTranscriptJsonl({
-      ...base,
-      sourceLocator: "../secret",
-    }))).rejects.toThrowError(NativeTranscriptConfigurationError);
-    await expect(Array.fromAsync(readNativeTranscriptJsonl({
-      ...base,
-      sourceLocator: "C:\\secret",
-    }))).rejects.toThrowError(NativeTranscriptConfigurationError);
+    for (const sourceLocator of [
+      "../secret",
+      "nested/../secret",
+      "nested\\..\\secret",
+      "/absolute",
+      "\\absolute",
+      "\\\\server\\share",
+      "C:\\secret",
+      "C:/secret",
+      "C:secret",
+    ]) {
+      await expect(Array.fromAsync(readNativeTranscriptJsonl({
+        ...base,
+        sourceLocator,
+      }))).rejects.toThrowError(NativeTranscriptConfigurationError);
+    }
+    for (const sourceLocator of [
+      "foo..bar",
+      "dir/.../file",
+      "資料/😀.jsonl",
+    ]) {
+      await expect(Array.fromAsync(readNativeTranscriptJsonl({
+        ...base,
+        bytes: byteChunks("{}"),
+        sourceLocator,
+      }))).resolves.toHaveLength(1);
+    }
     await expect(Array.fromAsync(readNativeTranscriptJsonl({
       ...base,
       nativeSessionId: "",
@@ -1192,6 +1221,169 @@ describe("filesystem native transcript source", () => {
       messageResolver: { resolveExact: vi.fn(async () => null) },
     })).rejects.toThrowError(NativeTranscriptSourceChangedError);
     expect(missingLocatorRepo.batches).toEqual([]);
+  });
+
+  it("fences a source rewrite or append after the destination commit", async () => {
+    for (const mutation of ["rewrite", "append"] as const) {
+      const root = temporaryDirectory();
+      const path = join(root, `${mutation}.jsonl`);
+      const original = '{"value":"one"}\n';
+      writeFileSync(path, original);
+      const repo = repository();
+      let releaseCommit!: () => void;
+      const commitGate = new Promise<void>((resolve) => {
+        releaseCommit = resolve;
+      });
+      let markCommitStarted!: () => void;
+      const commitStarted = new Promise<void>((resolve) => {
+        markCommitStarted = resolve;
+      });
+      vi.mocked(repo.ingestBatch).mockImplementationOnce(async (input) => {
+        repo.batches.push(input);
+        markCommitStarted();
+        await commitGate;
+        return {
+          importedCount: input.records.length,
+          skippedCount: 0,
+          quarantinedCount: input.quarantinedCount,
+          checkpoint: checkpoint(input.checkpoint.checkpoint),
+        };
+      });
+      const pending = runNativeTranscriptBackfill({
+        repository: repo,
+        quarantine: {
+          clientName: "claude-code",
+          quarantine: vi.fn(),
+          get: vi.fn(),
+          list: vi.fn(),
+          close: vi.fn(),
+        },
+        source: createFileNativeTranscriptSource(root, `${mutation}.jsonl`),
+        machineId: "machine",
+        format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+        nativeSessionId: "session-1",
+        sourceLocator: `${mutation}.jsonl`,
+        messageResolver: { resolveExact: vi.fn(async () => null) },
+      });
+      await commitStarted;
+      if (mutation === "append") {
+        writeFileSync(path, '{"value":"two"}\n', { flag: "a" });
+      } else {
+        writeFileSync(path, '{"value":"eno"}\n');
+      }
+      forceDistinctMtime(path);
+      releaseCommit();
+      await expect(pending).rejects.toThrowError(
+        NativeTranscriptSourceChangedError,
+      );
+      expect(repo.batches).toHaveLength(1);
+    }
+  });
+
+  it("fences checkpoint-only and empty-source writes after commit", async () => {
+    for (const testCase of [
+      { name: "blank", content: " \n" },
+      { name: "empty", content: "" },
+    ]) {
+      const root = temporaryDirectory();
+      const path = join(root, `${testCase.name}.jsonl`);
+      writeFileSync(path, testCase.content);
+      const repo = repository();
+      let releaseCommit!: () => void;
+      const commitGate = new Promise<void>((resolve) => {
+        releaseCommit = resolve;
+      });
+      let markCommitStarted!: () => void;
+      const commitStarted = new Promise<void>((resolve) => {
+        markCommitStarted = resolve;
+      });
+      vi.mocked(repo.ingestBatch).mockImplementationOnce(async (input) => {
+        repo.batches.push(input);
+        markCommitStarted();
+        await commitGate;
+        return {
+          importedCount: 0,
+          skippedCount: 0,
+          quarantinedCount: 0,
+          checkpoint: checkpoint(input.checkpoint.checkpoint),
+        };
+      });
+      const pending = runNativeTranscriptBackfill({
+        repository: repo,
+        quarantine: {
+          clientName: "claude-code",
+          quarantine: vi.fn(),
+          get: vi.fn(),
+          list: vi.fn(),
+          close: vi.fn(),
+        },
+        source: createFileNativeTranscriptSource(
+          root,
+          `${testCase.name}.jsonl`,
+        ),
+        machineId: "machine",
+        format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+        nativeSessionId: "session-1",
+        sourceLocator: `${testCase.name}.jsonl`,
+        messageResolver: { resolveExact: vi.fn(async () => null) },
+      });
+      await commitStarted;
+      writeFileSync(path, "{}\n", { flag: "a" });
+      forceDistinctMtime(path);
+      releaseCommit();
+      await expect(pending).rejects.toThrowError(
+        NativeTranscriptSourceChangedError,
+      );
+      expect(repo.batches).toHaveLength(1);
+      expect(repo.batches[0]?.records).toEqual([]);
+    }
+  });
+
+  it("preserves a repository failure when the source changes during commit", async () => {
+    const root = temporaryDirectory();
+    const path = join(root, "repository-failure.jsonl");
+    writeFileSync(path, '{"value":"one"}\n');
+    const repo = repository();
+    const repositoryFailure = new Error("commit outcome unknown");
+    let releaseCommit!: () => void;
+    const commitGate = new Promise<void>((resolve) => {
+      releaseCommit = resolve;
+    });
+    let markCommitStarted!: () => void;
+    const commitStarted = new Promise<void>((resolve) => {
+      markCommitStarted = resolve;
+    });
+    vi.mocked(repo.ingestBatch).mockImplementationOnce(async (input) => {
+      repo.batches.push(input);
+      markCommitStarted();
+      await commitGate;
+      throw repositoryFailure;
+    });
+    const pending = runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: createFileNativeTranscriptSource(
+        root,
+        "repository-failure.jsonl",
+      ),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "repository-failure.jsonl",
+      messageResolver: { resolveExact: vi.fn(async () => null) },
+    });
+    await commitStarted;
+    writeFileSync(path, '{"value":"two"}\n', { flag: "a" });
+    forceDistinctMtime(path);
+    releaseCommit();
+    await expect(pending).rejects.toBe(repositoryFailure);
+    expect(repo.batches).toHaveLength(1);
   });
 });
 
