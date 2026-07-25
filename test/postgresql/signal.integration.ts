@@ -195,6 +195,20 @@ describe("PostgreSQL harness signal teardown", () => {
     }
   }, 120_000);
 
+  it("terminates an active local consumer before graceful signal cleanup", async () => {
+    const probe = await launchSignalProbe(true);
+    const pid = await consumerPid(probe.runId);
+    try {
+      const completion = exited(probe.child);
+      probe.child.kill("SIGTERM");
+      await expect(completion).resolves.toEqual({ code: 143, signal: null });
+      await waitForPidExit(pid);
+      await expectNoResources(probe.runId);
+    } finally {
+      if (probe.child.exitCode === null && probe.child.signalCode === null) probe.child.kill("SIGKILL");
+    }
+  }, 45_000);
+
   it("propagates and sanitizes a real Docker inspection failure", async () => {
     const unavailableSocket = "/tmp/lcm-postgresql-harness-unavailable-cleanup.sock";
     const dockerRunner = async (args: string[]): Promise<{ stdout: string; stderr: string }> => {

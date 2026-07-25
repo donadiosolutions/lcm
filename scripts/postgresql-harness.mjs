@@ -143,6 +143,19 @@ export function createOwnerIdentity(pid = process.pid, dependencies = {}) {
   };
 }
 
+export function recordConsumerIdentity(path, pid, dependencies = {}) {
+  const createIdentity = dependencies.createIdentity ?? createOwnerIdentity;
+  const writeFile = dependencies.writeFile ?? writeFileSync;
+  let record;
+  try {
+    record = { version: 1, ...createIdentity(pid) };
+  } catch {
+    record = { version: 1, ambiguous: true };
+  }
+  writeFile(path, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  return record;
+}
+
 export function ownershipLabels(runId, kind, owner) {
   return {
     [RUN_LABEL]: runId,
@@ -319,21 +332,56 @@ export function createProcessLifecycle(processRunner = runProcess) {
 
   const run = (command, args, options) => {
     if (stopping) return Promise.reject(new Error("PostgreSQL harness setup is stopping"));
+    const entry = {
+      operation: undefined,
+      child: undefined,
+      terminateOnStop: options?.terminateOnStop === true,
+      escalation: undefined,
+    };
+    const processOptions = entry.terminateOnStop ? {
+      ...options,
+      onSpawn: (child) => {
+        entry.child = child;
+        options?.onSpawn?.(child);
+      },
+    } : options;
     let operation;
     try {
-      operation = Promise.resolve(processRunner(command, args, options));
+      operation = Promise.resolve(processRunner(command, args, processOptions));
     } catch (error) {
       operation = Promise.reject(error);
     }
-    active.add(operation);
-    const remove = () => active.delete(operation);
+    entry.operation = operation;
+    active.add(entry);
+    const remove = () => {
+      if (entry.escalation) clearTimeout(entry.escalation);
+      active.delete(entry);
+    };
     void operation.then(remove, remove);
     return operation;
   };
 
   const stop = async () => {
     stopping = true;
-    while (active.size > 0) await Promise.allSettled([...active]);
+    for (const entry of active) {
+      if (!entry.terminateOnStop || !entry.child) continue;
+      try {
+        entry.child.kill("SIGTERM");
+      } catch {
+        // The close/error event remains the authoritative settlement signal.
+      }
+      entry.escalation = setTimeout(() => {
+        try {
+          entry.child?.kill("SIGKILL");
+        } catch {
+          // The child may have exited between settlement and escalation.
+        }
+      }, 2_000);
+      entry.escalation.unref?.();
+    }
+    while (active.size > 0) {
+      await Promise.allSettled([...active].map((entry) => entry.operation));
+    }
   };
 
   return { run, stop };
@@ -865,13 +913,9 @@ async function runTests(context, ci, setupDocker = docker, testProcess = runProc
         env,
         secrets,
         processRunner: testProcess,
+        terminateOnStop: true,
         onSpawn: (child) => {
-          const consumer = createOwnerIdentity(child.pid);
-          writeFileSync(
-            consumerPath,
-            `${JSON.stringify({ version: 1, ...consumer })}\n`,
-            { mode: 0o600 },
-          );
+          recordConsumerIdentity(consumerPath, child.pid);
           if (context.consumerProbe) {
             process.stderr.write(`PostgreSQL harness consumer probe ready: ${context.runId}\n`);
           }

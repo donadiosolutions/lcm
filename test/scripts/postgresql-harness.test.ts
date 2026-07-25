@@ -22,6 +22,7 @@ import {
   isMissingDockerObjectError,
   ownershipLabels,
   readProcessBirthFingerprint,
+  recordConsumerIdentity,
   reclaimProvenOrphans,
   removeLabeled,
   removeOwnedResource,
@@ -100,6 +101,25 @@ describe("PostgreSQL harness utilities", () => {
       processProbe: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
       readFingerprint: vi.fn(),
     })).toBe("stale");
+  });
+
+  it("records explicit ambiguous consumer evidence when birth identity is unavailable", () => {
+    const writeFile = vi.fn();
+    const record = recordConsumerIdentity("/private/consumer-owner.json", 42, {
+      createIdentity: () => { throw new Error("unsupported"); },
+      writeFile,
+    });
+    expect(record).toEqual({ version: 1, ambiguous: true });
+    expect(writeFile).toHaveBeenCalledWith(
+      "/private/consumer-owner.json",
+      `${JSON.stringify(record)}\n`,
+      { mode: 0o600 },
+    );
+
+    expect(recordConsumerIdentity("/private/consumer-owner.json", 42, {
+      createIdentity: () => ({ pid: 42, birth: "darwin:stable" }),
+      writeFile: vi.fn(),
+    })).toEqual({ version: 1, pid: 42, birth: "darwin:stable" });
   });
 
   it("derives and validates every resource name from a random-style run ID", () => {
@@ -406,6 +426,26 @@ describe("PostgreSQL harness utilities", () => {
     expect(resourceExists).toBe(true);
     await expect(lifecycle.run("docker", ["volume", "create"]))
       .rejects.toThrow("setup is stopping");
+  });
+
+  it("terminates a tracked test consumer before waiting for setup quiescence", async () => {
+    let finish!: () => void;
+    const child = {
+      kill: vi.fn((signal: string) => {
+        expect(signal).toBe("SIGTERM");
+        finish();
+        return true;
+      }),
+    };
+    const lifecycle = createProcessLifecycle((_command, _args, options) => {
+      options.onSpawn(child);
+      return new Promise<void>((resolve) => { finish = resolve; });
+    });
+    const consumer = lifecycle.run("node", ["vitest"], { terminateOnStop: true });
+
+    await expect(lifecycle.stop()).resolves.toBeUndefined();
+    await expect(consumer).resolves.toBeUndefined();
+    expect(child.kill).toHaveBeenCalledOnce();
   });
 
   it.each([
