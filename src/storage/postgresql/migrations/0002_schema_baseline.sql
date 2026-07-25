@@ -161,7 +161,7 @@ CREATE TABLE lcm.message_parts (
     'text', 'reasoning', 'tool', 'patch', 'file', 'subtask', 'compaction',
     'step_start', 'step_finish', 'snapshot', 'agent', 'retry'
   )),
-  ordinal integer NOT NULL CHECK (ordinal >= 0),
+  ordinal bigint NOT NULL CHECK (ordinal >= 0),
   text_content text,
   is_ignored boolean,
   is_synthetic boolean,

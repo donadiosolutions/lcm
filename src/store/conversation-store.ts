@@ -33,6 +33,31 @@ export type CreateMessageInput = {
 
 export type AppendMessageInput = Omit<CreateMessageInput, "conversationId" | "seq">;
 
+function validateNonNegativeSafeInteger(value: number, field: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${field} must be a non-negative safe integer`);
+  }
+}
+
+function validateMessageInputs(inputs: readonly CreateMessageInput[]): void {
+  for (const input of inputs) {
+    validateNonNegativeSafeInteger(input.seq, "message seq");
+    validateNonNegativeSafeInteger(input.tokenCount, "message tokenCount");
+  }
+}
+
+function validateAppendTokenCounts(inputs: readonly AppendMessageInput[]): void {
+  for (const input of inputs) {
+    validateNonNegativeSafeInteger(input.tokenCount, "message tokenCount");
+  }
+}
+
+function validateMessagePartOrdinals(parts: readonly CreateMessagePartInput[]): void {
+  for (const part of parts) {
+    validateNonNegativeSafeInteger(part.ordinal, "message part ordinal");
+  }
+}
+
 export type MessageRecord = {
   messageId: MessageId;
   conversationId: ConversationId;
@@ -478,6 +503,7 @@ export class ConversationStore {
 
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
     this.assertDirectTransactionUsable();
+    validateMessageInputs([input]);
     const result = this.db
       .prepare(
         `INSERT INTO messages (conversation_id, seq, role, content, token_count)
@@ -504,12 +530,14 @@ export class ConversationStore {
     if (inputs.length === 0) {
       return [];
     }
+    validateMessageInputs(inputs);
     return this.withAtomicOperation(() => this.createMessagesBulkCore(inputs));
   }
 
   private createMessagesBulkCore(inputs: CreateMessageInput[]): MessageRecord[] {
     this.assertDirectTransactionUsable();
     if (inputs.length === 0) return [];
+    validateMessageInputs(inputs);
     const insertStmt = this.db.prepare(
       `INSERT INTO messages (conversation_id, seq, role, content, token_count)
        VALUES (?, ?, ?, ?, ?)`,
@@ -546,6 +574,7 @@ export class ConversationStore {
     if (inputs.length === 0) {
       return [];
     }
+    validateAppendTokenCounts(inputs);
     return this.withAtomicOperation(() =>
       this.appendMessagesCore(conversationId, inputs));
   }
@@ -556,6 +585,7 @@ export class ConversationStore {
   ): MessageRecord[] {
     this.assertDirectTransactionUsable();
     if (inputs.length === 0) return [];
+    validateAppendTokenCounts(inputs);
     const row = this.db
       .prepare(
         `SELECT MAX(seq) AS max_seq
@@ -672,6 +702,7 @@ export class ConversationStore {
     if (parts.length === 0) {
       return;
     }
+    validateMessagePartOrdinals(parts);
     return this.withAtomicOperation(() =>
       this.createMessagePartsCore(messageId, parts));
   }
@@ -682,6 +713,7 @@ export class ConversationStore {
   ): void {
     this.assertDirectTransactionUsable();
     if (parts.length === 0) return;
+    validateMessagePartOrdinals(parts);
     const stmt = this.db.prepare(
       `INSERT INTO message_parts (
          part_id,

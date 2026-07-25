@@ -257,23 +257,29 @@ the newest exact-text match ordered by `created_at DESC, conversation_id DESC`;
 the SHA-256 value is only a bounded lookup candidate and never replaces the
 exact `session_id` residual. Concurrent get-or-create calls for the same
 project and exact session are serialized by a transaction-scoped advisory lock
-and converge on that newest segment.
+and converge on that newest segment. The lock key casts the project ID through
+PostgreSQL's UUID type first, so equivalent uppercase and lowercase UUID text
+cannot select different locks.
 
 Conversation lists use `created_at, conversation_id` ascending. Messages use
 their conversation-scoped `seq` ascending, and message parts use `ordinal`
-ascending. These final identity tie-breakers are part of the repository
+ascending. PostgreSQL stores part ordinals as `bigint`; the adapter accepts
+nonnegative JavaScript safe integers and applies the same checked conversion
+when reading them. These final identity tie-breakers are part of the repository
 contract, so equal timestamps do not make pagination or selection
 nondeterministic.
 
 `appendMessages` allocates a whole batch while holding a row lock on the owning
 conversation. The first appended message uses sequence `0`; later batches use
-`MAX(seq) + 1` and receive a contiguous range. Explicit-sequence single and
-bulk creation remain available for replay and import. These two write modes
-may be used sequentially, but callers must not run append allocation and
-explicit-sequence creation concurrently for the same conversation: the row
-lock coordinates append allocators, while replay/import deliberately supplies
-its own sequence values. Concurrent append-only calls remain safe. Bulk
-message creation, part insertion, and multi-message deletion are atomic
+`MAX(seq) + 1` and receive a contiguous range. Append token counts must be
+nonnegative safe integers and are rejected before a transaction starts when
+invalid. Explicit-sequence single and bulk creation remain available for replay
+and import. These two write modes may be used sequentially, but callers must
+not run append allocation and explicit-sequence creation concurrently for the
+same conversation: the row lock coordinates append allocators, while
+replay/import deliberately supplies its own sequence values. Concurrent
+append-only calls remain safe. Bulk message creation, part insertion, and
+multi-message deletion are atomic
 operations: they either commit completely or leave no partial rows. When
 called inside a repository transaction they join that transaction instead of
 opening a nested one.
@@ -347,7 +353,7 @@ deletion.
 | --- | --- | --- |
 | `conversations` | Project-scoped source root. Project deletion is restricted; an explicit conversation deletion owns messages, summaries, context, and large-file metadata. Multiple rows may represent segments of one session. | Generated `bigint` primary key and scoped identity; exact nonnull session text, including whitespace-only and arbitrary-length caller values accepted by the shared contract; ordered timestamps and optional bootstrap time. `conversations_project_order_idx` supplies deterministic newest-first project ordering, while `conversations_session_lookup_idx` uses the fixed-width session SHA-256 candidate. Every lookup retains exact `session_id` equality as a collision residual. |
 | `messages` | Owned by a conversation and cascades with it. Coverage, context, and transcript provenance references restrict direct deletion until those relationships are handled. | Generated `bigint` primary key; scoped unique sequence and identity; nonnegative sequence and token count; four-role enum. The scoped sequence unique index provides conversation order and `messages_project_created_idx` provides stable project order; `messages_search_document_idx` and `messages_content_trgm_idx` provide FTS and substring/fuzzy access. |
-| `message_parts` | Owned by a message and cascades with it. | UUID primary key with a UUIDv7 default; unique scoped ordinal; exact nonnull session text; closed part-type enum; nonnegative ordinal and token fields; finite nonnegative cost. Nullable metadata is opaque text and round-trips unchanged. `message_parts_type_idx` supports scoped type/order access. |
+| `message_parts` | Owned by a message and cascades with it. | UUID primary key with a UUIDv7 default; unique scoped nonnegative `bigint` ordinal, checked by the adapter before JavaScript conversion; exact nonnull session text; closed part-type enum; nonnegative token fields; finite nonnegative cost. Nullable metadata is opaque text and round-trips unchanged. `message_parts_type_idx` supports scoped type/order access. |
 | `native_transcripts` | Project- and machine-scoped scrubbed source. Both roots restrict deletion. The #86 repository is append-only and exposes no pre-redaction or implicit deletion path. | UUIDv7-enforced primary key; nonblank client/format/version/session/scrubber/source fields; nonnegative source ordinal; 64-character lowercase SHA-256 content digest and ingest key; object-or-array JSON payload; idempotent `(project_id, machine_id, ingest_key)`; `ingested_at >= observed_at`. Source-order and fixed-width native-session digest indexes give deterministic provenance scans with exact-text residuals; `native_transcripts_payload_idx` supplies JSONB path containment. |
 | `transcript_messages` | Transcript-owned provenance join: deleting a transcript cascades its links, while the derived message side restricts deletion. | Scoped transcript and message foreign keys; unique message and source ordinal within a transcript; nonnegative source ordinal. `transcript_messages_message_idx` supports reverse provenance lookup. |
 

@@ -69,17 +69,23 @@ function makeStore(db: DatabaseSync): ConversationStore {
 function trackedDatabase(db: DatabaseSync): {
   database: DatabaseSync;
   statements: string[];
+  prepared: string[];
 } {
   const statements: string[] = [];
+  const prepared: string[] = [];
   return {
     database: {
       exec: (sql: string): void => {
         statements.push(sql);
         db.exec(sql);
       },
-      prepare: (sql: string) => db.prepare(sql),
+      prepare: (sql: string) => {
+        prepared.push(sql);
+        return db.prepare(sql);
+      },
     } as unknown as DatabaseSync,
     statements,
+    prepared,
   };
 }
 
@@ -282,7 +288,7 @@ describe("ConversationStore — message operations", () => {
 
   it("appendMessages allocates contiguous sequence numbers from zero", async () => {
     const initial = await store.appendMessages(conversationId, [
-      { role: "user", content: "first", tokenCount: 1 },
+      { role: "user", content: "first", tokenCount: 0 },
       { role: "assistant", content: "second", tokenCount: 2 },
     ]);
     const following = await store.appendMessages(conversationId, [
@@ -290,6 +296,7 @@ describe("ConversationStore — message operations", () => {
     ]);
 
     expect(initial.map((message) => message.seq)).toEqual([0, 1]);
+    expect(initial.map((message) => message.tokenCount)).toEqual([0, 2]);
     expect(following.map((message) => message.seq)).toEqual([2]);
     expect((await store.getMessages(conversationId)).map((message) => message.content))
       .toEqual(["first", "second", "third"]);
@@ -298,6 +305,130 @@ describe("ConversationStore — message operations", () => {
   it("appendMessages with an empty array is a no-op", async () => {
     await expect(store.appendMessages(conversationId, [])).resolves.toEqual([]);
     await expect(store.getMessages(conversationId)).resolves.toEqual([]);
+  });
+
+  it.each([
+    ["negative", -1],
+    ["fractional", 0.5],
+    ["NaN", Number.NaN],
+    ["infinite", Number.POSITIVE_INFINITY],
+    ["unsafe", Number.MAX_SAFE_INTEGER + 1],
+  ])("rejects %s message and part integers before issuing SQL", async (_label, invalid) => {
+    const tracked = trackedDatabase(makeDb());
+    const localStore = makeStore(tracked.database);
+    const conversation = await localStore.createConversation({ sessionId: "invalid-integers" });
+    const seed = await localStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 0,
+      role: "system",
+      content: "seed",
+      tokenCount: 0,
+    });
+    tracked.statements.length = 0;
+    tracked.prepared.length = 0;
+
+    await expect(localStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: invalid,
+      role: "user",
+      content: "invalid seq",
+      tokenCount: 0,
+    })).rejects.toThrow("message seq must be a non-negative safe integer");
+    await expect(localStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: "invalid tokens",
+      tokenCount: invalid,
+    })).rejects.toThrow("message tokenCount must be a non-negative safe integer");
+    await expect(localStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "valid prefix",
+        tokenCount: 0,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "invalid suffix",
+        tokenCount: invalid,
+      },
+    ])).rejects.toThrow("message tokenCount must be a non-negative safe integer");
+    await expect(localStore.appendMessages(conversation.conversationId, [
+      { role: "user", content: "valid prefix", tokenCount: 0 },
+      { role: "assistant", content: "invalid suffix", tokenCount: invalid },
+    ])).rejects.toThrow("message tokenCount must be a non-negative safe integer");
+    await expect(localStore.createMessageParts(seed.messageId, [
+      { sessionId: "invalid-integers", partType: "text", ordinal: 0 },
+      { sessionId: "invalid-integers", partType: "reasoning", ordinal: invalid },
+    ])).rejects.toThrow("message part ordinal must be a non-negative safe integer");
+
+    expect(tracked.statements).toEqual([]);
+    expect(tracked.prepared).toEqual([]);
+    expect((await localStore.getMessages(conversation.conversationId)).map(
+      (message) => message.content,
+    )).toEqual(["seed"]);
+    expect(await localStore.getMessageParts(seed.messageId)).toEqual([]);
+  });
+
+  it("round-trips maximum safe message and part integers", async () => {
+    const message = await store.createMessage({
+      conversationId,
+      seq: Number.MAX_SAFE_INTEGER,
+      role: "assistant",
+      content: "maximum safe",
+      tokenCount: Number.MAX_SAFE_INTEGER,
+    });
+    await store.createMessageParts(message.messageId, [{
+      sessionId: "msg-sess",
+      partType: "reasoning",
+      ordinal: Number.MAX_SAFE_INTEGER,
+    }]);
+
+    expect(message).toMatchObject({
+      seq: Number.MAX_SAFE_INTEGER,
+      tokenCount: Number.MAX_SAFE_INTEGER,
+    });
+    expect(await store.getMessageParts(message.messageId)).toMatchObject([{
+      ordinal: Number.MAX_SAFE_INTEGER,
+    }]);
+  });
+
+  it("keeps an outer transaction usable after a rejected negative append batch", async () => {
+    const tracked = trackedDatabase(makeDb());
+    const localStore = makeStore(tracked.database);
+    const peer = makeStore(tracked.database);
+    const conversation = await localStore.createConversation({
+      sessionId: "negative-append-transaction",
+    });
+    tracked.statements.length = 0;
+
+    await localStore.withTransaction(async () => {
+      await expect(peer.appendMessages(conversation.conversationId, [
+        { role: "user", content: "partial", tokenCount: 1 },
+        { role: "assistant", content: "invalid", tokenCount: -1 },
+      ])).rejects.toThrow("message tokenCount must be a non-negative safe integer");
+      await expect(peer.appendMessages(conversation.conversationId, [
+        { role: "user", content: "zero", tokenCount: 0 },
+        { role: "assistant", content: "positive", tokenCount: 2 },
+      ])).resolves.toMatchObject([
+        { seq: 0, tokenCount: 0 },
+        { seq: 1, tokenCount: 2 },
+      ]);
+    });
+
+    expect((await localStore.getMessages(conversation.conversationId)).map(
+      (message) => message.content,
+    )).toEqual(["zero", "positive"]);
+    expect(normalizedTransactionStatements(tracked.statements)).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_conversation_atomic",
+      "RELEASE SAVEPOINT lcm_conversation_atomic",
+      "COMMIT",
+    ]);
   });
 
 });

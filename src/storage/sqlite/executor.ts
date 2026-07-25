@@ -6,6 +6,7 @@ import { normalizeStorageError, StorageOperationError } from "../errors.js";
 type TransactionContext = {
   executor: SqliteExecutor;
   token: symbol;
+  savepointOrdinal: number;
 };
 
 const transactionContext = new AsyncLocalStorage<TransactionContext>();
@@ -29,7 +30,6 @@ export class SqliteExecutor {
   private readonly scopedAtomicTails = new Map<symbol, Promise<void>>();
   private readonly activeTokens = new Set<symbol>();
   private readonly failedTokens = new Set<symbol>();
-  private savepointOrdinal = 0;
   private poisoned = false;
 
   constructor(
@@ -164,7 +164,7 @@ export class SqliteExecutor {
         );
       }
       this.assertUsable(domain, operation);
-      return await this.atomicScoped(token, domain, operation, callback);
+      return await this.atomicScoped(active, domain, operation, callback);
     } finally {
       release();
       if (this.scopedAtomicTails.get(token) === tail) {
@@ -174,16 +174,33 @@ export class SqliteExecutor {
   }
 
   private async atomicScoped<T>(
-    token: symbol,
+    active: TransactionContext,
     domain: StorageDomain,
     operation: string,
     callback: () => T | Promise<T>,
   ): Promise<T> {
-    const savepoint = `lcm_atomic_${this.savepointOrdinal++}`;
+    if (
+      !Number.isSafeInteger(active.savepointOrdinal)
+      || active.savepointOrdinal < 0
+      || active.savepointOrdinal >= Number.MAX_SAFE_INTEGER
+    ) {
+      throw new StorageOperationError(
+        "STORAGE_OPERATION_FAILED",
+        "sqlite",
+        this.projectId,
+        domain,
+        operation,
+      );
+    }
+    const savepoint = `lcm_atomic_${active.savepointOrdinal}`;
+    // Transaction-local state restarts at zero for every BEGIN. Refuse an
+    // exhausted or corrupted counter rather than wrap to a name that a
+    // tolerated RELEASE failure may have left active.
+    active.savepointOrdinal += 1;
     this.db.exec(`SAVEPOINT ${savepoint}`);
     try {
       const result = await scopedAtomicContext.run(
-        { executor: this, token },
+        active,
         async (): Promise<T> => callback(),
       );
       this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
@@ -194,7 +211,7 @@ export class SqliteExecutor {
         this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
         rolledBack = true;
       } catch {
-        this.failedTokens.add(token);
+        this.failedTokens.add(active.token);
         this.poison();
       }
       if (rolledBack) {
@@ -234,7 +251,7 @@ export class SqliteExecutor {
       this.activeTokens.add(token);
       try {
         const result = await transactionContext.run(
-          { executor: this, token },
+          { executor: this, token, savepointOrdinal: 0 },
           async (): Promise<T> => callback(token),
         );
         if (this.failedTokens.has(token)) {

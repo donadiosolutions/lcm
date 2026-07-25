@@ -91,7 +91,7 @@ type MessagePartRow = QueryResultRow & {
   message_id: string | number | bigint;
   session_id: string;
   part_type: MessagePartType;
-  ordinal: number;
+  ordinal: string | number | bigint;
   text_content: string | null;
   tool_call_id: string | null;
   tool_name: string | null;
@@ -160,6 +160,19 @@ function safeInputInteger(
   return safeInteger(value, projectId, operation, field);
 }
 
+function safeNonnegativeInputInteger(
+  value: number,
+  projectId: string,
+  operation: string,
+  field: string,
+): number {
+  const candidate = safeInputInteger(value, projectId, operation, field);
+  if (candidate < 0) {
+    throw new PostgreSqlConversationDataError(projectId, operation, field);
+  }
+  return candidate;
+}
+
 function date(value: Date | string): Date {
   return value instanceof Date ? value : new Date(value);
 }
@@ -215,7 +228,7 @@ function messagePartFromRow(
     messageId: safeInteger(row.message_id, projectId, operation, "message_id"),
     sessionId: row.session_id,
     partType: row.part_type,
-    ordinal: row.ordinal,
+    ordinal: safeInteger(row.ordinal, projectId, operation, "ordinal"),
     textContent: row.text_content,
     toolCallId: row.tool_call_id,
     toolName: row.tool_name,
@@ -296,7 +309,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
       await transaction.query({
         text: `SELECT pg_catalog.pg_advisory_xact_lock(
                         pg_catalog.hashtextextended(
-                          $1::pg_catalog.text
+                            $1::pg_catalog.uuid::pg_catalog.text
                             OPERATOR(pg_catalog.||) ':conversation:'
                             OPERATOR(pg_catalog.||)
                               pg_catalog.encode(
@@ -361,6 +374,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
 
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
     const operation = "createMessage";
+    this.validateMessageInput(input, operation);
     return this.mappedWrite(operation, (transaction) =>
       this.createMessageWith(transaction, input, operation));
   }
@@ -368,6 +382,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
   async createMessagesBulk(inputs: CreateMessageInput[]): Promise<MessageRecord[]> {
     if (inputs.length === 0) return [];
     const operation = "createMessagesBulk";
+    for (const input of inputs) this.validateMessageInput(input, operation);
     return this.mappedWrite(operation, (transaction) =>
       this.createMessagesBulkWith(transaction, inputs, operation));
   }
@@ -387,9 +402,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     const operation = "appendMessages";
     if (inputs.length === 0) return [];
     safeInputInteger(conversationId, this.projectId, operation, "conversation_id");
-    for (const input of inputs) {
-      safeInputInteger(input.tokenCount, this.projectId, operation, "token_count");
-    }
+    for (const input of inputs) this.validateAppendMessageInput(input, operation);
     return this.contentionWrite(operation, async (transaction) => {
       await transaction.query({
         text: `SELECT conversation_id
@@ -535,14 +548,19 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     if (parts.length === 0) return;
     safeInputInteger(messageId, this.projectId, operation, "message_id");
     for (const part of parts) {
-      safeInputInteger(part.ordinal, this.projectId, operation, "ordinal");
+      safeNonnegativeInputInteger(
+        part.ordinal,
+        this.projectId,
+        operation,
+        "ordinal",
+      );
     }
     await this.executor.query({
       text: `WITH input AS (
                SELECT element.input_ordinal,
                       element.payload ->> 'session_id' AS session_id,
                       element.payload ->> 'part_type' AS part_type,
-                      (element.payload ->> 'ordinal')::pg_catalog.int4 AS ordinal,
+                      (element.payload ->> 'ordinal')::pg_catalog.int8 AS ordinal,
                       element.payload ->> 'text_content' AS text_content,
                       element.payload ->> 'tool_call_id' AS tool_call_id,
                       element.payload ->> 'tool_name' AS tool_name,
@@ -710,8 +728,20 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
       operation,
       "conversation_id",
     );
-    safeInputInteger(input.seq, this.projectId, operation, "seq");
-    safeInputInteger(input.tokenCount, this.projectId, operation, "token_count");
+    safeNonnegativeInputInteger(input.seq, this.projectId, operation, "seq");
+    this.validateAppendMessageInput(input, operation);
+  }
+
+  private validateAppendMessageInput(
+    input: AppendMessageInput,
+    operation: string,
+  ): void {
+    safeNonnegativeInputInteger(
+      input.tokenCount,
+      this.projectId,
+      operation,
+      "token_count",
+    );
   }
 
   private async createConversationWith(
@@ -756,7 +786,6 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     input: CreateMessageInput,
     operation: string,
   ): Promise<MessageRecord> {
-    this.validateMessageInput(input, operation);
     const result = await executor.query<MessageRow>({
       text: `INSERT INTO lcm.messages (
                project_id, conversation_id, seq, role, content, token_count
@@ -805,7 +834,6 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     inputs: CreateMessageInput[],
     operation: string,
   ): Promise<MessageRecord[]> {
-    for (const input of inputs) this.validateMessageInput(input, operation);
     const result = await executor.query<MessageRow>({
       text: `WITH input AS (
                SELECT element.input_ordinal,

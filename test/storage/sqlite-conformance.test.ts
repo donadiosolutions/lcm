@@ -69,6 +69,99 @@ describe("SQLite storage backend conformance", () => {
     expect(prepare).not.toHaveBeenCalled();
   });
 
+  it("keeps a scoped transaction usable after invalid conversation batch integers", async () => {
+    const root = createTemporaryDirectory("lcm-storage-invalid-conversation-integers-");
+    const identity = projectIdentity(root);
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath: join(root, "db.sqlite") }),
+    });
+    try {
+      const storage = await factory.openProject(identity);
+      const conversation = await storage.conversations.createConversation({
+        sessionId: "invalid-integers",
+      });
+      const seed = await storage.conversations.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "system",
+        content: "seed",
+        tokenCount: 0,
+      });
+
+      await storage.transaction(async (tx) => {
+        await expect(tx.conversations.createMessage({
+          conversationId: conversation.conversationId,
+          seq: -1,
+          role: "user",
+          content: "invalid direct",
+          tokenCount: 0,
+        })).rejects.toMatchObject({
+          code: "STORAGE_OPERATION_FAILED",
+          operation: "createMessage",
+        });
+        await expect(tx.conversations.createMessagesBulk([{
+          conversationId: conversation.conversationId,
+          seq: 1,
+          role: "user",
+          content: "bulk prefix",
+          tokenCount: 0,
+        }, {
+          conversationId: conversation.conversationId,
+          seq: 2,
+          role: "assistant",
+          content: "bulk invalid suffix",
+          tokenCount: -1,
+        }])).rejects.toMatchObject({
+          code: "STORAGE_OPERATION_FAILED",
+          operation: "createMessagesBulk",
+        });
+        await expect(tx.conversations.appendMessages(conversation.conversationId, [{
+          role: "user",
+          content: "append prefix",
+          tokenCount: 0,
+        }, {
+          role: "assistant",
+          content: "append invalid suffix",
+          tokenCount: -1,
+        }])).rejects.toMatchObject({
+          code: "STORAGE_OPERATION_FAILED",
+          operation: "appendMessages",
+        });
+        await expect(tx.conversations.createMessageParts(seed.messageId, [{
+          sessionId: "invalid-integers",
+          partType: "text",
+          ordinal: 0,
+        }, {
+          sessionId: "invalid-integers",
+          partType: "reasoning",
+          ordinal: -1,
+        }])).rejects.toMatchObject({
+          code: "STORAGE_OPERATION_FAILED",
+          operation: "createMessageParts",
+        });
+        await expect(tx.conversations.appendMessages(conversation.conversationId, [{
+          role: "user",
+          content: "zero",
+          tokenCount: 0,
+        }, {
+          role: "assistant",
+          content: "positive",
+          tokenCount: 2,
+        }])).resolves.toMatchObject([
+          { seq: 1, tokenCount: 0 },
+          { seq: 2, tokenCount: 2 },
+        ]);
+      });
+
+      expect((await storage.conversations.getMessages(conversation.conversationId)).map(
+        (message) => message.content,
+      )).toEqual(["seed", "zero", "positive"]);
+      expect(await storage.conversations.getMessageParts(seed.messageId)).toEqual([]);
+    } finally {
+      await factory.close();
+    }
+  });
+
   it("selects SQLite and exposes a cause-free staged PostgreSQL boundary", async () => {
     expect(createStorageBackendFactory({ backend: "sqlite" })).toBeInstanceOf(SqliteStorageBackendFactory);
     const factory = createStorageBackendFactory({
@@ -991,7 +1084,7 @@ describe("SQLite storage backend conformance", () => {
     )).resolves.toBe("open");
   });
 
-  it("serializes concurrent scoped savepoints and recovers the queue after rejection", async () => {
+  it("serializes concurrent scoped savepoints and resets their ordinal per transaction", async () => {
     const calls: string[] = [];
     const database = {
       exec: (sql: string): void => { calls.push(sql); },
@@ -1036,8 +1129,22 @@ describe("SQLite storage backend conformance", () => {
       await expect(second).resolves.toBe("second succeeded");
       return "committed";
     })).resolves.toBe("committed");
+    await expect(executor.transaction(async (token) => executor.runAtomicScoped(
+      token,
+      "conversations",
+      "appendMessages",
+      () => {
+        order.push("reset-enter");
+        return "reset succeeded";
+      },
+    ))).resolves.toBe("reset succeeded");
 
-    expect(order).toEqual(["first-enter", "first-fail", "second-enter"]);
+    expect(order).toEqual([
+      "first-enter",
+      "first-fail",
+      "second-enter",
+      "reset-enter",
+    ]);
     expect(calls).toEqual([
       "BEGIN IMMEDIATE",
       "SAVEPOINT lcm_atomic_0",
@@ -1046,12 +1153,56 @@ describe("SQLite storage backend conformance", () => {
       "SAVEPOINT lcm_atomic_1",
       "RELEASE SAVEPOINT lcm_atomic_1",
       "COMMIT",
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_atomic_0",
+      "RELEASE SAVEPOINT lcm_atomic_0",
+      "COMMIT",
     ]);
     await expect(executor.run(
       "conversations",
       "listConversations",
       () => "reusable",
     )).resolves.toBe("reusable");
+  });
+
+  it.each([
+    Number.NaN,
+    -1,
+    Number.MAX_SAFE_INTEGER,
+  ])("rejects unsafe transaction-local executor savepoint ordinal %s", async (ordinal) => {
+    const calls: string[] = [];
+    const database = {
+      exec: (sql: string): void => { calls.push(sql); },
+    } as unknown as DatabaseSync;
+    const executor = new SqliteExecutor(database, "safe-project");
+    const atomicExecutor = executor as unknown as {
+      atomicScoped<T>(
+        active: { executor: SqliteExecutor; token: symbol; savepointOrdinal: number },
+        domain: "conversations",
+        operation: string,
+        callback: () => T | Promise<T>,
+      ): Promise<T>;
+    };
+    const active = {
+      executor,
+      token: Symbol("unsafe-savepoint-ordinal"),
+      savepointOrdinal: ordinal,
+    };
+    let operationEntered = false;
+
+    await expect(atomicExecutor.atomicScoped(
+      active,
+      "conversations",
+      "appendMessages",
+      () => { operationEntered = true; },
+    )).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      domain: "conversations",
+      operation: "appendMessages",
+    });
+    expect(operationEntered).toBe(false);
+    expect(Object.is(active.savepointOrdinal, ordinal)).toBe(true);
+    expect(calls).toEqual([]);
   });
 
   it("rejects recursive same-token atomic scopes without deadlocking the queue", async () => {

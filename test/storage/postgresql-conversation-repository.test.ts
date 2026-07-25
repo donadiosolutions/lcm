@@ -176,6 +176,10 @@ describe("PostgreSQL conversation repository", () => {
     expect(sessionLookup).toMatchObject({ values: [projectId, "session-a"] });
     expect(sessionLookup.text).toContain("AND session_id = $2");
     expect(sessionLookup.text).toContain("ORDER BY created_at DESC, conversation_id DESC");
+    const advisoryLock = db.query.mock.calls.find(
+      ([config]) => config.text.includes("pg_advisory_xact_lock"),
+    )?.[0];
+    expect(advisoryLock?.text).toContain("$1::pg_catalog.uuid::pg_catalog.text");
     const paginated = db.query.mock.calls.find(
       ([config]) => config.text.includes("LIMIT $4"),
     )?.[0];
@@ -434,7 +438,7 @@ describe("PostgreSQL conversation repository", () => {
     const parts = Array.from({ length: inputCount }, (_, index) => ({
       sessionId: `session-${index}`,
       partType: index === inputCount - 1 ? "opaque-final" : "text",
-      ordinal: index,
+      ordinal: index === inputCount - 1 ? Number.MAX_SAFE_INTEGER : index,
       textContent: index === inputCount - 1 ? " opaque \u2603 " : undefined,
       metadata: index === inputCount - 1 ? " { not-json } " : undefined,
     }));
@@ -444,6 +448,9 @@ describe("PostgreSQL conversation repository", () => {
     const config = db.query.mock.calls[0]?.[0];
     expect(config.values).toHaveLength(3);
     expect(config.text).toContain("$3::pg_catalog.jsonb");
+    expect(config.text).toContain(
+      "(element.payload ->> 'ordinal')::pg_catalog.int8 AS ordinal",
+    );
     expect(config.text).not.toMatch(/\$(?:[4-9]|\d{2,})/u);
     expect(config.text).toContain("WITH ORDINALITY");
     expect(config.text).toContain("ORDER BY input.input_ordinal");
@@ -463,7 +470,7 @@ describe("PostgreSQL conversation repository", () => {
     expect(payload.at(-1)).toEqual({
       session_id: `session-${inputCount - 1}`,
       part_type: "opaque-final",
-      ordinal: inputCount - 1,
+      ordinal: Number.MAX_SAFE_INTEGER,
       text_content: " opaque \u2603 ",
       tool_call_id: null,
       tool_name: null,
@@ -808,7 +815,7 @@ describe("PostgreSQL conversation repository", () => {
       if (config.text.includes("COUNT(*)")) return result([{ count: 5n }]);
       if (config.text.includes("COALESCE(MAX")) return result([{ max_seq: "6" }]);
       if (config.text.includes("message_parts")) {
-        return result([{ ...partRow, message_id: 53n }]);
+        return result([{ ...partRow, message_id: 53n, ordinal: "7" }]);
       }
       if (config.text.includes("lcm.messages")) return result([safeRow]);
       return result([{
@@ -829,7 +836,10 @@ describe("PostgreSQL conversation repository", () => {
       seq: 3,
       tokenCount: 4,
     });
-    await expect(repository.getMessageParts(53)).resolves.toMatchObject([{ messageId: 53 }]);
+    await expect(repository.getMessageParts(53)).resolves.toMatchObject([{
+      messageId: 53,
+      ordinal: 7,
+    }]);
     await expect(repository.getMessageCount(42)).resolves.toBe(5);
     await expect(repository.getMaxSeq(42)).resolves.toBe(6);
   });
@@ -847,6 +857,8 @@ describe("PostgreSQL conversation repository", () => {
       repository.getMessageById(1), { ...messageRow, token_count: Number.POSITIVE_INFINITY }],
     ["message part id", "message_id", async (repository: PostgreSqlConversationRepository) =>
       repository.getMessageParts(1), { ...partRow, message_id: "9007199254740992" }],
+    ["message part ordinal", "ordinal", async (repository: PostgreSqlConversationRepository) =>
+      repository.getMessageParts(1), { ...partRow, ordinal: "9007199254740992" }],
     ["count", "count", async (repository: PostgreSqlConversationRepository) =>
       repository.getMessageCount(1), { count: "9007199254740992" }],
     ["maximum", "max_seq", async (repository: PostgreSqlConversationRepository) =>
@@ -892,12 +904,26 @@ describe("PostgreSQL conversation repository", () => {
       content: "x",
       tokenCount: 1,
     }), "seq"],
+    ["createMessage negative seq", () => repositoryForInputs().createMessage({
+      conversationId: 1,
+      seq: -1,
+      role: "user",
+      content: "x",
+      tokenCount: 1,
+    }), "seq"],
     ["createMessage tokens", () => repositoryForInputs().createMessage({
       conversationId: 1,
       seq: 0,
       role: "user",
       content: "x",
       tokenCount: Number.NaN,
+    }), "token_count"],
+    ["createMessage negative tokens", () => repositoryForInputs().createMessage({
+      conversationId: 1,
+      seq: 0,
+      role: "user",
+      content: "x",
+      tokenCount: -1,
     }), "token_count"],
     ["getMessages afterSeq", () => repositoryForInputs().getMessages(1, { afterSeq: 0.5 }), "after_seq"],
     ["getMessages limit", () => repositoryForInputs().getMessages(1, { limit: 1.5 }), "limit"],
@@ -906,11 +932,47 @@ describe("PostgreSQL conversation repository", () => {
       partType: "text",
       ordinal: 0.5,
     }]), "ordinal"],
+    ["createMessageParts negative ordinal", () => repositoryForInputs().createMessageParts(1, [{
+      sessionId: "a",
+      partType: "text",
+      ordinal: -1,
+    }]), "ordinal"],
+    ["appendMessages negative tokens", () => repositoryForInputs().appendMessages(1, [{
+      role: "user",
+      content: "negative tokens",
+      tokenCount: -1,
+    }]), "token_count"],
     ["deleteMessages", () => repositoryForInputs().deleteMessages([Number.NaN]), "message_id"],
   ])("rejects unsafe numeric input for %s", async (_case, invoke, field) => {
     const error = await invoke().catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(PostgreSqlConversationDataError);
     expect(error).toMatchObject({ field });
+  });
+
+  it("validates every explicit message batch before opening a transaction", async () => {
+    const db = executor(() => {
+      throw new Error("invalid batch must not query");
+    });
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+
+    await expect(repository.createMessagesBulk([
+      {
+        conversationId: 1,
+        seq: 0,
+        role: "user",
+        content: "valid first member",
+        tokenCount: 1,
+      },
+      {
+        conversationId: 1,
+        seq: -1,
+        role: "assistant",
+        content: "invalid second member",
+        tokenCount: 1,
+      },
+    ])).rejects.toMatchObject({ field: "seq" });
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(db.query).not.toHaveBeenCalled();
   });
 
   it("rejects append sequence overflow before inserting", async () => {

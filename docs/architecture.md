@@ -271,22 +271,27 @@ One runtime session can map to multiple **conversation segments**. Explicit
 creation starts a new segment; get-or-create finds the newest exact session
 match and creates one only when none exists. Equal creation timestamps are
 resolved by conversation ID, and concurrent PostgreSQL get-or-create calls for
-the same project and session converge under an advisory lock.
+the same project and session converge under an advisory lock. PostgreSQL
+canonicalizes the project UUID before deriving that lock key, so equivalent
+uppercase and lowercase UUID spellings cannot split the lock domain.
 
 Messages are stored with:
 
 - **seq** — Monotonically increasing sequence number within the conversation.
   Atomic append allocates contiguous values from `0`; explicit values remain
-  available for replay and import.
+  available for replay and import. Explicit sequence values are nonnegative
+  JavaScript safe integers.
 - **role** — `user`, `assistant`, `system`, or `tool`
 - **content** — Plain text extraction of the message
-- **tokenCount** — Estimated token count (~4 chars/token)
+- **tokenCount** — Nonnegative safe-integer estimated token count
+  (~4 chars/token)
 - **createdAt** — Insertion timestamp
 
 Each message also has **message_parts** — structured content blocks that preserve the original shape (text blocks, tool calls, tool results, reasoning, file content, etc.). This allows the assembler to reconstruct rich content when building model context, not just flat text.
 
 Conversation lists use creation time then conversation ID; messages use
-sequence; message parts use ordinal. Message pagination treats `afterSeq` as
+sequence; message parts use a nonnegative safe-integer ordinal stored as
+PostgreSQL `bigint`. Message pagination treats `afterSeq` as
 exclusive, an omitted or negative safe-integer limit as unlimited, zero as no
 rows, and a positive safe integer as the result bound. Bulk message writes, atomic append
 allocation, part writes, and multi-message deletion retain an operation-level
@@ -306,8 +311,10 @@ PostgreSQL get-or-create and contiguous-append short transactions establish
 stricter database default cannot retain a pre-lock snapshot and overlook the
 winning session segment or newly appended sequence range.
 PostgreSQL `bigint` values are converted to JavaScript numbers only after a
-safe-integer check, so an out-of-range identity, sequence, or count fails
-instead of losing precision. Generated conversation and message identities are
+safe-integer check, so an out-of-range identity, sequence, part ordinal, or
+count fails instead of losing precision. Message sequence, token-count, and
+part-ordinal batches are fully validated before their first SQL statement.
+Generated conversation and message identities are
 mapped before their write transaction commits, so an unsafe identity rolls the
 row back; generated message-part identities remain opaque UUID strings.
 

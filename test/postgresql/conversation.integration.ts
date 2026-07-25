@@ -289,7 +289,7 @@ describe("PostgreSQL 18 conversation repository", () => {
         await transaction.query({
           text: `SELECT pg_catalog.pg_advisory_xact_lock(
                           pg_catalog.hashtextextended(
-                            $1::pg_catalog.text
+                            $1::pg_catalog.uuid::pg_catalog.text
                               OPERATOR(pg_catalog.||) ':conversation:'
                               OPERATOR(pg_catalog.||)
                                 pg_catalog.encode(
@@ -340,6 +340,94 @@ describe("PostgreSQL 18 conversation repository", () => {
       expect(new Set(rows.map((row) => row.conversationId)).size).toBe(1);
       expect((await repository.listConversations()).filter(
         (row) => row.sessionId === "shared-race",
+      )).toHaveLength(1);
+    }, { defaultTransactionIsolation: "REPEATABLE READ" });
+  });
+
+  it("canonicalizes equivalent project UUID spellings before advisory locking", async () => {
+    await withPostgreSqlTestDatabase("conversation-project-lock-canonical", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation canonical project lock");
+      const sessionId = "canonical-project-race";
+      const insertBarrierKey = "8675309001";
+      await database.migrator.query({
+        text: `CREATE FUNCTION public.block_canonical_project_conversation_insert()
+               RETURNS trigger
+               LANGUAGE plpgsql
+               SECURITY DEFINER
+               SET search_path = pg_catalog
+               AS $function$
+               BEGIN
+                 IF NEW.session_id OPERATOR(pg_catalog.=) '${sessionId}' THEN
+                   PERFORM pg_catalog.pg_advisory_xact_lock(${insertBarrierKey});
+                 END IF;
+                 RETURN NEW;
+               END
+               $function$`,
+      }, { domain: "conversations", operation: "createCanonicalProjectInsertBarrier" });
+      await database.migrator.query({
+        text: `CREATE TRIGGER block_canonical_project_conversation_insert
+               BEFORE INSERT ON lcm.conversations
+               FOR EACH ROW
+               EXECUTE FUNCTION public.block_canonical_project_conversation_insert()`,
+      }, { domain: "conversations", operation: "installCanonicalProjectInsertBarrier" });
+
+      let releaseBarrier!: () => void;
+      let markBarrierHeld!: () => void;
+      const barrierRelease = new Promise<void>((resolve) => { releaseBarrier = resolve; });
+      const barrierHeld = new Promise<void>((resolve) => { markBarrierHeld = resolve; });
+      const blocker = database.migrator.transaction(async (transaction) => {
+        await transaction.query({
+          text: "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.int8)",
+          values: [insertBarrierKey],
+        }, { domain: "conversations", operation: "holdCanonicalProjectInsertBarrier" });
+        markBarrierHeld();
+        await barrierRelease;
+      }, { domain: "transaction", operation: "holdCanonicalProjectInsertBarrier" });
+      await barrierHeld;
+
+      const lowercaseRepository = new PostgreSqlConversationRepository(
+        database.runtime,
+        projectId.toLowerCase(),
+      );
+      const uppercaseRepository = new PostgreSqlConversationRepository(
+        database.runtime,
+        projectId.toUpperCase(),
+      );
+      const pendingRows = Promise.all([
+        lowercaseRepository.getOrCreateConversation(sessionId, "lowercase"),
+        uppercaseRepository.getOrCreateConversation(sessionId, "uppercase"),
+      ]);
+      let bothOperationsBlocked = false;
+      try {
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          const locks = await database.migrator.query<{ count: number }>({
+            text: `SELECT pg_catalog.count(*)::integer AS count
+                   FROM pg_catalog.pg_locks
+                   WHERE locktype = 'advisory'
+                     AND database = (
+                       SELECT oid
+                       FROM pg_catalog.pg_database
+                       WHERE datname = pg_catalog.current_database()
+                     )
+                     AND NOT granted`,
+          }, { domain: "conversations", operation: "inspectCanonicalProjectWaiters" });
+          if ((locks.rows[0]?.count ?? 0) >= 2) {
+            bothOperationsBlocked = true;
+            break;
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        releaseBarrier();
+        await blocker;
+      }
+      expect(bothOperationsBlocked).toBe(true);
+      const rows = await pendingRows;
+
+      expect(new Set(rows.map((row) => row.conversationId)).size).toBe(1);
+      expect((await lowercaseRepository.listConversations()).filter(
+        (row) => row.sessionId === sessionId,
       )).toHaveLength(1);
     }, { defaultTransactionIsolation: "REPEATABLE READ" });
   });
@@ -619,6 +707,79 @@ describe("PostgreSQL 18 conversation repository", () => {
       expect(await repository.getMessageById(insertedMessageId!)).toBeNull();
       expect(await repository.getMessageParts(insertedMessageId!)).toEqual([]);
       expect(await repository.getMessageById(victim.messageId)).not.toBeNull();
+    });
+  });
+
+  it("round-trips safe bigint part ordinals and rejects unsafe or negative values", async () => {
+    await withPostgreSqlTestDatabase("conversation-part-ordinals", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation part ordinals");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const conversation = await repository.createConversation({ sessionId: "part-ordinals" });
+      const [message] = await repository.appendMessages(conversation.conversationId, [{
+        role: "user",
+        content: "parts",
+        tokenCount: 1,
+      }]);
+      const runtimeRole = await database.runtime.query<{ role: string }>({
+        text: "SELECT CURRENT_USER AS role",
+      }, { domain: "conversations", operation: "inspectMessagePartRuntimeRole" });
+      expect(runtimeRole.rows).toEqual([{ role: "lcm_test_runtime" }]);
+
+      const ordinalColumn = await database.migrator.query<{ data_type: string }>({
+        text: `SELECT data_type
+               FROM information_schema.columns
+               WHERE table_schema = 'lcm'
+                 AND table_name = 'message_parts'
+                 AND column_name = 'ordinal'`,
+      }, { domain: "conversations", operation: "inspectMessagePartOrdinalType" });
+      expect(ordinalColumn.rows).toEqual([{ data_type: "bigint" }]);
+
+      await repository.createMessageParts(message.messageId, [{
+        sessionId: "part-ordinals",
+        partType: "text",
+        ordinal: Number.MAX_SAFE_INTEGER,
+        textContent: "maximum safe ordinal",
+      }]);
+      await expect(repository.getMessageParts(message.messageId)).resolves.toMatchObject([{
+        ordinal: Number.MAX_SAFE_INTEGER,
+        textContent: "maximum safe ordinal",
+      }]);
+
+      await database.migrator.query({
+        text: `INSERT INTO lcm.message_parts (
+                 project_id, conversation_id, message_id, session_id,
+                 part_type, ordinal, text_content
+               )
+               VALUES ($1, $2, $3, 'part-ordinals', 'reasoning', $4, 'unsafe')`,
+        values: [
+          projectId,
+          conversation.conversationId,
+          message.messageId,
+          String(Number.MAX_SAFE_INTEGER + 1),
+        ],
+      }, { domain: "conversations", operation: "seedUnsafeMessagePartOrdinal" });
+      await expect(repository.getMessageParts(message.messageId)).rejects.toMatchObject({
+        field: "ordinal",
+        operation: "getMessageParts",
+      });
+      await expect(repository.createMessageParts(message.messageId, [{
+        sessionId: "part-ordinals",
+        partType: "text",
+        ordinal: -1,
+      }])).rejects.toMatchObject({
+        field: "ordinal",
+        operation: "createMessageParts",
+      });
+      await expect(repository.appendMessages(conversation.conversationId, [{
+        role: "assistant",
+        content: "negative tokens",
+        tokenCount: -1,
+      }])).rejects.toMatchObject({
+        field: "token_count",
+        operation: "appendMessages",
+      });
+      expect(await repository.getMessageCount(conversation.conversationId)).toBe(1);
     });
   });
 
