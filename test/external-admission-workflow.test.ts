@@ -38,6 +38,10 @@ const policySource = readFileSync(
   new URL("../.github/scripts/external-admission-policy.mjs", import.meta.url),
   "utf8",
 );
+const greptileConfig = JSON.parse(readFileSync(
+  new URL("../greptile.json", import.meta.url),
+  "utf8",
+)) as { excludeAuthors: string[] };
 const evaluator = readFileSync(
   new URL("../.github/scripts/external-admission.sh", import.meta.url),
   "utf8",
@@ -96,7 +100,7 @@ describe("external admission workflow", () => {
       ref: "${{ github.workflow_sha }}",
       "persist-credentials": false,
       "sparse-checkout":
-        ".github/scripts/external-admission.sh\n.github/scripts/external-admission-policy.mjs\n",
+        ".github/scripts/external-admission.sh\n.github/scripts/external-admission-policy.mjs\ngreptile.json\n",
       "sparse-checkout-cone-mode": false,
     });
 
@@ -198,7 +202,7 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain('fetch_pull_request_files "$current_pr_number"');
     expect(evaluator).toContain('fetch_pull_request_files "$final_pr_number"');
     expect(evaluator).toContain(
-      'select_admission_requirement "$final_sensitive_diff" <<<"$final_pull_request"',
+      '"$final_sensitive_diff" "$final_changes_greptile_exclusion_policy"',
     );
     expect(evaluator).not.toContain(
       'select_admission_requirement "$sensitive_diff" <<<"$final_pull_request"',
@@ -215,9 +219,13 @@ describe("external admission workflow", () => {
     expect(policySource).toContain("vitest");
     expect(policySource).toContain("tsconfig");
     expect(evaluator).toContain('waiting_description="Waiting for Greptile review and DCO"');
-    expect(policySource).toContain('"dependabot[bot]"');
-    expect(policySource).toContain('"github-actions[bot]"');
+    expect(greptileConfig.excludeAuthors).toEqual([
+      "dependabot[bot]",
+      "github-actions[bot]",
+    ]);
     expect(policySource).toContain('type === "Bot"');
+    expect(policySource).toContain("excludedGreptileAuthorPattern");
+    expect(policySource).toContain("greptile exclusion-policy change");
     expect(evaluator.match(/select_admission_requirement/gu)).toHaveLength(4);
     expect(evaluator).toContain(
       'echo "Admission classification=$classification_name sensitive_diff=$sensitive_diff trusted_automation=$trusted_automation greptile_required=$greptile_required"',

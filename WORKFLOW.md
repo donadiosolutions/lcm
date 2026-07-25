@@ -47,13 +47,17 @@ request's authoritative `changed_files` count, so GitHub's file-list cap or an
 incomplete page cannot silently produce a coverage-neutral classification. A
 change to executable `.ts`, `.tsx`, `.mts`, or `.cts` TypeScript under `bin/`,
 `installer/`, or `src/`; trust-sensitive automation under `.github/actions/`,
-`.github/codeql/`, `.github/workflows/`, or `.github/scripts/`; or key coverage/build configuration (`package.json`, the
+`.github/codeql/`, `.github/workflows/`, or `.github/scripts/`; trusted root
+`greptile.json`; or key coverage/build configuration (`package.json`, the
 lockfile, Vitest config, or TypeScript config) normally requires authenticated
-`Greptile Review` and DCO successes on the PR's exact head SHA. Because Greptile
-excludes bot-authored pull requests, sensitive PRs authored by the exact
-`dependabot[bot]` or `github-actions[bot]` GitHub `Bot` identity instead require
-authenticated DCO and the exact-head `ci` check from the GitHub Actions app.
-The same CI-backed path applies to diffs with none of those sensitive paths.
+`Greptile Review` and DCO successes on the PR's exact head SHA. A sensitive PR
+instead requires authenticated DCO and exact-head canonical CI only when its
+author has the authoritative GitHub `Bot` type, its login explicitly matches
+trusted root `greptile.json` `excludeAuthors`, and neither its current nor
+previous filename is `greptile.json`. That exclusion-policy file is
+non-bypassable and always requires Greptile plus DCO. Exclusion patterns are
+case-insensitive and support `*` and `?`; `[`, `]`, and `!` are literal. The
+same CI-backed path applies to diffs with none of those sensitive paths.
 Only `pull_request` runs of the canonical CI workflow
 can wake the evaluator; push and synthetic merge-group runs are rejected before
 a runner starts. Every CI-backed path resolves the check's Actions run and requires
@@ -71,9 +75,9 @@ success, including fresh file classification, automation-author identity,
 check evaluation, and CI run validation; a closed, draft, ineligible,
 unassociated, or ambiguous commit remains
 pending. Commit-associated PRs, PR files, and check runs are all paginated and
-flattened before evaluation. The executable admission policy is sparsely
-checked out from the trusted workflow revision with persisted credentials
-disabled; it is never loaded from the untrusted PR head. Although a
+flattened before evaluation. The executable admission policy and root
+`greptile.json` are sparsely checked out from the trusted workflow revision
+with persisted credentials disabled; neither is loaded from the untrusted PR head. Although a
 `workflow_run` handler receives a write-capable token, this evaluator never
 downloads CI artifacts or caches and never checks out or executes PR-controlled
 content.
@@ -95,10 +99,10 @@ run against the synthetic commit before it may merge.
 
 Greptile is the authenticated review provider for coverable or trust-sensitive
 diffs from normal contributors and must report success on the exact PR head
-before external admission succeeds. The exact `dependabot[bot]` and
-`github-actions[bot]` GitHub `Bot` identities use the exact-head canonical CI
-path because Greptile excludes bot-authored PRs. CodeRabbit reports remain
-informational and best-effort and are not encoded as an admission requirement.
+before external admission succeeds. A GitHub `Bot` identity explicitly matched
+by trusted `greptile.json` uses exact-head canonical CI plus DCO unless the diff
+changes that config. CodeRabbit reports remain informational and best-effort and
+are not encoded as an admission requirement.
 
 ### Release Flow
 

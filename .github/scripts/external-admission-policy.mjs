@@ -13,6 +13,7 @@ export const CHECK_IDENTITIES = Object.freeze({
 
 export const ADMISSION_CLASSIFICATIONS = Object.freeze({
   greptileRequired: "greptile-required",
+  greptileExcludedAuthor: "greptile-excluded-author",
   coverageNeutral: "no-coverable-or-trust-sensitive-files",
 });
 
@@ -37,14 +38,10 @@ const GREPTILE_REQUIRED_PATHS = [
   /^(?:bin|installer|src)\/.+\.(?:[cm]?ts|tsx)$/u,
   /^\.github\/(?:actions|codeql|workflows|scripts)\/.+/u,
   /^package(?:-lock)?\.json$/u,
+  /^greptile\.json$/u,
   /^vitest(?:\.[^/]+)?\.config\.[cm]?[jt]s$/u,
   /^tsconfig(?:\.[^/]+)?\.json$/u,
 ];
-
-const TRUSTED_AUTOMATION_AUTHORS = new Set([
-  "dependabot[bot]",
-  "github-actions[bot]",
-]);
 
 function requireArray(value, label) {
   if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`);
@@ -54,6 +51,13 @@ function requireArray(value, label) {
 function requireNonEmptyString(value, label) {
   if (typeof value !== "string" || value.length === 0) {
     throw new TypeError(`${label} must be a non-empty string`);
+  }
+  return value;
+}
+
+function requireObject(value, label) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`);
   }
   return value;
 }
@@ -91,24 +95,99 @@ export function requiresGreptileForPath(path) {
   return GREPTILE_REQUIRED_PATHS.some((pattern) => pattern.test(path));
 }
 
-export function isTrustedAutomationPullRequest(pullRequest) {
+export function parseGreptileConfig(value) {
+  const config = requireObject(value, "greptile configuration");
+  if (config.excludeAuthors === undefined) return { excludeAuthors: [] };
+  return {
+    excludeAuthors: requireArray(config.excludeAuthors, "greptile excludeAuthors").map(
+      (pattern, index) => requireNonEmptyString(pattern, `greptile excludeAuthors[${index}]`),
+    ),
+  };
+}
+
+export function readGreptileConfig(path) {
+  requireNonEmptyString(path, "greptile configuration path");
+  let source;
+  try {
+    source = readFileSync(path, "utf8");
+  } catch {
+    throw new TypeError("unable to read greptile configuration");
+  }
+  try {
+    return parseGreptileConfig(JSON.parse(source));
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new TypeError("greptile configuration must contain valid JSON");
+    }
+    throw error;
+  }
+}
+
+function globToRegularExpression(pattern) {
+  let source = "^";
+  for (const character of pattern) {
+    if (character === "*") {
+      source += "[\\s\\S]*";
+    } else if (character === "?") {
+      source += "[\\s\\S]";
+    } else {
+      source += /[\\^$+?.()|{}\[\]]/u.test(character) ? `\\${character}` : character;
+    }
+  }
+  return new RegExp(`${source}$`, "iu");
+}
+
+export function matchesGreptileGlob(value, pattern) {
+  requireNonEmptyString(value, "Greptile match value");
+  requireNonEmptyString(pattern, "Greptile glob pattern");
+  return globToRegularExpression(pattern).test(value);
+}
+
+export function excludedGreptileAuthorPattern(author, config) {
+  requireNonEmptyString(author, "pull request author");
+  const { excludeAuthors } = parseGreptileConfig(config);
+  return excludeAuthors.find((pattern) => matchesGreptileGlob(author, pattern));
+}
+
+export function isTrustedAutomationPullRequest(pullRequest, greptileConfig) {
   if (pullRequest === null || typeof pullRequest !== "object" || Array.isArray(pullRequest)) {
     throw new TypeError("pull request must be an object");
   }
   const login = requireNonEmptyString(pullRequest.user?.login, "pull request user login");
   const type = requireNonEmptyString(pullRequest.user?.type, "pull request user type");
-  return type === "Bot" && TRUSTED_AUTOMATION_AUTHORS.has(login);
+  return type === "Bot"
+    && excludedGreptileAuthorPattern(login, greptileConfig) !== undefined;
 }
 
-export function selectAdmissionRequirement(pullRequest, sensitiveDiff) {
+export function selectAdmissionRequirement(
+  pullRequest,
+  sensitiveDiff,
+  changesGreptileExclusionPolicy,
+  greptileConfig,
+) {
   if (typeof sensitiveDiff !== "boolean") {
     throw new TypeError("sensitive diff must be a boolean");
   }
-  const trustedAutomation = isTrustedAutomationPullRequest(pullRequest);
+  if (typeof changesGreptileExclusionPolicy !== "boolean") {
+    throw new TypeError("greptile exclusion-policy change must be a boolean");
+  }
+  const excludedAuthorPattern = excludedGreptileAuthorPattern(
+    requireNonEmptyString(pullRequest?.user?.login, "pull request user login"),
+    greptileConfig,
+  );
+  const trustedAutomation = isTrustedAutomationPullRequest(pullRequest, greptileConfig);
+  const greptileRequired = sensitiveDiff
+    && (!trustedAutomation || changesGreptileExclusionPolicy);
   return {
+    classification: sensitiveDiff
+      ? (greptileRequired
+        ? ADMISSION_CLASSIFICATIONS.greptileRequired
+        : ADMISSION_CLASSIFICATIONS.greptileExcludedAuthor)
+      : ADMISSION_CLASSIFICATIONS.coverageNeutral,
     sensitiveDiff,
     trustedAutomation,
-    greptileRequired: sensitiveDiff && !trustedAutomation,
+    greptileRequired,
+    excludedAuthorPattern,
   };
 }
 
@@ -289,12 +368,20 @@ export function runPolicyCommand(command, args, input) {
   if (command === "classify-files" && args.length === 1) {
     return JSON.stringify(classifyPullRequestFiles(flattenPullRequestFilePages(payload), args[0]));
   }
-  if (command === "select-admission" && args.length === 1) {
-    const [sensitiveDiff] = args;
+  if (command === "select-admission" && args.length === 3) {
+    const [sensitiveDiff, changesGreptileExclusionPolicy, configPath] = args;
     if (sensitiveDiff !== "true" && sensitiveDiff !== "false") {
       throw new TypeError("sensitive-diff argument must be true or false");
     }
-    return JSON.stringify(selectAdmissionRequirement(payload, sensitiveDiff === "true"));
+    if (changesGreptileExclusionPolicy !== "true" && changesGreptileExclusionPolicy !== "false") {
+      throw new TypeError("greptile-exclusion-policy-change argument must be true or false");
+    }
+    return JSON.stringify(selectAdmissionRequirement(
+      payload,
+      sensitiveDiff === "true",
+      changesGreptileExclusionPolicy === "true",
+      readGreptileConfig(configPath),
+    ));
   }
   if (command === "evaluate-checks" && args.length === 4) {
     const [headSha, greptileRequired, repository, serverUrl] = args;
