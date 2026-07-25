@@ -742,9 +742,10 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
 
   // ── Settings ──
   const settingsPath = join(deps.homedir, ".claude", "settings.json");
+  const claudeSettingsExists = deps.existsSync(settingsPath);
   let settingsData: unknown = {};
   let settingsError: string | undefined;
-  if (deps.existsSync(settingsPath)) {
+  if (claudeSettingsExists) {
     try {
       settingsData = JSON.parse(deps.readFileSync(settingsPath, "utf-8"));
     } catch (error) {
@@ -754,7 +755,15 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
 
   let currentSettings: Record<string, unknown> | undefined;
   let lcmBinary: string | undefined;
-  if (settingsError) {
+  let claudeSettingsCleaned = false;
+  if (!claudeSettingsExists) {
+    results.push({
+      name: "hooks",
+      category: "Settings",
+      status: "pass",
+      message: "Claude Code integration is not installed",
+    });
+  } else if (settingsError) {
     results.push({
       name: "hooks",
       category: "Settings",
@@ -767,7 +776,11 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       const merged = mergeClaudeSettings(settingsData, lcmBinary) as Record<string, unknown>;
       const beforeHooks = (settingsData as Record<string, unknown>)?.hooks;
       if (JSON.stringify(beforeHooks) === JSON.stringify(merged.hooks)) {
-        currentSettings = settingsData as Record<string, unknown>;
+        if (JSON.stringify(settingsData) !== JSON.stringify(merged)) {
+          deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
+          claudeSettingsCleaned = true;
+        }
+        currentSettings = merged;
         results.push({
           name: "hooks",
           category: "Settings",
@@ -800,8 +813,12 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     ? { command: process.execPath, args: [lcmBinary, "mcp"] }
     : undefined;
   const mcpServers = currentSettings?.mcpServers as Record<string, unknown> | undefined;
-  if (expectedMcp && JSON.stringify(mcpServers?.lcm) === JSON.stringify(expectedMcp)) {
-    results.push({ name: "mcp-lcm", category: "Settings", status: "pass", message: "mcpServers.lcm uses the npm-installed runtime" });
+  if (!claudeSettingsExists) {
+    results.push({ name: "mcp-lcm", category: "Settings", status: "pass", message: "Claude Code integration is not installed" });
+  } else if (expectedMcp && JSON.stringify(mcpServers?.lcm) === JSON.stringify(expectedMcp)) {
+    results.push(claudeSettingsCleaned
+      ? { name: "mcp-lcm", category: "Settings", status: "warn", message: "Removed the legacy lossless-claude MCP registration", fixApplied: true }
+      : { name: "mcp-lcm", category: "Settings", status: "pass", message: "mcpServers.lcm uses the npm-installed runtime" });
   } else if (currentSettings && expectedMcp) {
     try {
       const merged = mergeClaudeSettings(currentSettings, lcmBinary!);
@@ -840,7 +857,11 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     ? (() => { try { return deps.readFileSync(lcmMdPath, "utf-8") !== LCM_MD_CONTENT; } catch { return true; } })()
     : false;
 
-  if (lcmMdExists && claudeMdHasRef && !lcmMdStale) {
+  if (!claudeSettingsExists) {
+    results.push({ name: "lcm-md", category: "Settings", status: "pass", message: "Claude Code integration is not installed" });
+  } else if (settingsError) {
+    results.push({ name: "lcm-md", category: "Settings", status: "fail", message: "lcm.md could not be validated because Claude settings are malformed" });
+  } else if (lcmMdExists && claudeMdHasRef && !lcmMdStale) {
     results.push({ name: "lcm-md", category: "Settings", status: "pass", message: "~/.claude/lcm.md installed and referenced in CLAUDE.md" });
   } else {
     try {

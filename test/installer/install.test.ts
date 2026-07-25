@@ -14,6 +14,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { legacyLcmCommand, legacyLcmMcpServerName } from "../../src/legacy-names.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../../src/daemon/config.js";
+import { removeManagedClaudeHooks } from "../../src/installer/settings.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -145,6 +146,46 @@ describe("mergeClaudeSettings", () => {
       matcher: "",
       hooks: [{ type: "command", command: canonicalHookCommand(binary, "restore") }],
     }]);
+  });
+
+  it("deduplicates and removes Windows canonical hooks with doubled quotes", () => {
+    const windowsCommand = canonicalHookCommand(
+      'C:\\npm\\"root"\\run"time"\\lcm.mjs',
+      "restore",
+      'C:\\node\\run"time"\\node.exe',
+      "win32",
+    );
+    const existing = {
+      hooks: {
+        SessionStart: [{
+          matcher: "",
+          hooks: [{ type: "command", command: windowsCommand }],
+        }],
+      },
+      mcpServers: { other: { command: "other" } },
+    };
+
+    const merged = mergeClaudeSettings(existing, binary);
+    expect(merged.hooks.SessionStart).toEqual([{
+      matcher: "",
+      hooks: [{ type: "command", command: canonicalHookCommand(binary, "restore") }],
+    }]);
+
+    const removed = removeManagedClaudeHooks(existing);
+    expect(removed).toEqual({ mcpServers: { other: { command: "other" } } });
+  });
+
+  it("preserves malformed Windows quote escaping", () => {
+    const malformed = '"C:\\node\\node.exe" "C:\\npm\\broken"quote\\lcm.mjs restore';
+    const existing = {
+      hooks: {
+        SessionStart: [{ hooks: [{ type: "command", command: malformed }] }],
+      },
+    };
+
+    expect(mergeClaudeSettings(existing, binary).hooks.SessionStart[0].hooks[0].command)
+      .toBe(malformed);
+    expect(removeManagedClaudeHooks(existing)).toEqual(existing);
   });
 
   it("REQUIRED_HOOKS contains exactly 6 expected events", () => {

@@ -3,7 +3,8 @@ import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
-import { REQUIRED_HOOKS } from "../../installer/install.js";
+import { mergeClaudeSettings, REQUIRED_HOOKS } from "../../installer/install.js";
+import { legacyLcmMcpServerName } from "../../src/legacy-names.js";
 import { LCM_MD_CONTENT } from "../../src/daemon/orientation.js";
 import { ensureDaemon } from "../../src/daemon/lifecycle.js";
 import { hashProjectPath, normalizeProjectPath } from "../../src/project-map.js";
@@ -126,6 +127,57 @@ describe("runDoctor lcm-md check", () => {
     expect(check?.status).toBe("warn");
     expect(check?.fixApplied).toBe(true);
     expect(written["/tmp/test-home/.claude/lcm.md"]).toBeDefined();
+  });
+});
+
+describe("runDoctor Claude integration ownership", () => {
+  it("persists legacy MCP cleanup when native hooks and the lcm MCP server are current", async () => {
+    const runtimePath = join(process.cwd(), "dist", "lcm.mjs");
+    const settings = mergeClaudeSettings({}, runtimePath);
+    settings.mcpServers = {
+      lcm: { command: process.execPath, args: [runtimePath, "mcp"] },
+      [legacyLcmMcpServerName()]: { command: "legacy" },
+      unrelated: { command: "preserved" },
+    };
+    const writes = vi.fn();
+
+    const results = await runDoctor(minimalDeps({
+      readFileSync: (path: string) => {
+        if (path.endsWith("settings.json")) return JSON.stringify(settings);
+        return minimalDeps().readFileSync(path);
+      },
+      writeFileSync: writes,
+    }));
+
+    const settingsWrite = writes.mock.calls.find(([path]) => path.endsWith("settings.json"));
+    expect(settingsWrite).toBeDefined();
+    const persisted = JSON.parse(settingsWrite![1]);
+    expect(persisted.mcpServers).toEqual({
+      lcm: { command: process.execPath, args: [runtimePath, "mcp"] },
+      unrelated: { command: "preserved" },
+    });
+    expect(results.find((result) => result.name === "hooks")?.status).toBe("pass");
+    expect(results.find((result) => result.name === "mcp-lcm")).toMatchObject({
+      status: "warn",
+      fixApplied: true,
+      message: "Removed the legacy lossless-claude MCP registration",
+    });
+  });
+
+  it("leaves an absent Claude integration read-only during Codex-only doctor runs", async () => {
+    const writes = vi.fn();
+    const results = await runDoctor(minimalDeps({
+      existsSync: (path: string) => !path.endsWith(".claude/settings.json"),
+      writeFileSync: writes,
+    }));
+
+    expect(writes.mock.calls.filter(([path]) => path.includes("/.claude/"))).toEqual([]);
+    for (const name of ["hooks", "mcp-lcm", "lcm-md"]) {
+      expect(results.find((result) => result.name === name)).toMatchObject({
+        status: "pass",
+        message: "Claude Code integration is not installed",
+      });
+    }
   });
 });
 

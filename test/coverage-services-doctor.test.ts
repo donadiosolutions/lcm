@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -708,6 +708,8 @@ describe("doctor service coverage", () => {
     try {
       mkdirSync(join(home, ".lcm"), { recursive: true });
       writeFileSync(join(home, ".lcm", "config.json"), JSON.stringify({ llm: { provider: "auto" } }));
+      mkdirSync(join(home, ".claude"), { recursive: true });
+      writeFileSync(join(home, ".claude", "settings.json"), "{}");
       mocks.spawnSync.mockReturnValue({ status: 1, stdout: "", stderr: "missing" });
       const results = await runDoctor({
         homedir: home,
@@ -717,6 +719,8 @@ describe("doctor service coverage", () => {
       expect(results.find((result) => result.name === "claude-process")?.status).toBe("fail");
       expect(results.find((result) => result.name === "codex-process")?.status).toBe("fail");
       expect(mocks.spawnSync.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(JSON.parse(readFileSync(join(home, ".claude", "settings.json"), "utf8")).hooks)
+        .toBeDefined();
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -1008,7 +1012,7 @@ describe("doctor service coverage", () => {
       readError: (path) => path.endsWith("settings.json") || path.endsWith("lcm.md") ? new Error("cannot read") : undefined,
     }));
     expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("fail");
-    expect(results.find((result) => result.name === "lcm-md")?.status).toBe("warn");
+    expect(results.find((result) => result.name === "lcm-md")?.status).toBe("fail");
   });
 
   it("covers passive-learning detailed boundaries", async () => {
