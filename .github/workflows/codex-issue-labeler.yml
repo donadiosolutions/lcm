@@ -462,6 +462,7 @@ jobs:
                     `Issue #${issueNumber} no longer has the bug label`,
                   );
                 }
+                const sourceCreatedAt = source.created_at;
                 const comments = await github.paginate(
                   github.rest.issues.listComments,
                   {

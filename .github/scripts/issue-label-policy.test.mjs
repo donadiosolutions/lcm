@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -147,6 +147,21 @@ test("gates duplicate triage on the reconciled live bug label", () => {
   assert.equal(requiresDuplicateTriage(["BUG", "p1-high"]), true);
   assert.equal(requiresDuplicateTriage(["enhancement", "p2-medium"]), false);
   assert.throws(() => requiresDuplicateTriage(null), /Labels must be an array/);
+});
+
+test("duplicate workflow binds source evidence identifiers in the embedded script", async () => {
+  const workflow = await readFile(
+    new URL("../workflows/codex-issue-labeler.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    workflow,
+    /const sourceCreatedAt = source\.created_at;/u,
+  );
+  assert.match(
+    workflow,
+    /source:\s*\{[\s\S]*?createdAt: sourceCreatedAt,[\s\S]*?\},[\s\S]*?sourceCreatedAt,/u,
+  );
 });
 
 test("rejects malformed groups, invalid labels, and empty required groups", () => {
