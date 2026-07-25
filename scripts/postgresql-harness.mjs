@@ -39,6 +39,12 @@ export const RESOURCE_KIND_LABEL = "com.donadiosolutions.lcm.postgresql-test-res
 export const OWNER_SCHEMA_VERSION = "2";
 export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
 export const MAX_DOCKER_REMOVE_ATTEMPTS = 3;
+export const HARNESS_CLEANUP_RETRY_DELAYS_MS = Object.freeze([
+  250,
+  500,
+  750,
+  1_000,
+]);
 export const DEFAULT_SIGNAL_PROBE_READINESS_TIMEOUT_MS = 90_000;
 export const MIN_SIGNAL_PROBE_READINESS_TIMEOUT_MS = 1_000;
 export const MAX_SIGNAL_PROBE_READINESS_TIMEOUT_MS = 300_000;
@@ -67,6 +73,49 @@ export function resolveSignalProbeReadinessTimeout(environment = process.env) {
 
 export function signalCleanupFailed(output) {
   return String(output).includes(SIGNAL_CLEANUP_FAILURE_MARKER);
+}
+
+export function createSignalCleanupDiagnosticParser() {
+  const marker = Buffer.from(SIGNAL_CLEANUP_FAILURE_MARKER);
+  const captured = Buffer.alloc(MAX_CAPTURED_OUTPUT_BYTES);
+  let markerTail = Buffer.alloc(0);
+  let capturedBytes = 0;
+  let markerFound = false;
+  const append = (bytes) => {
+    const length = Math.min(bytes.length, captured.length - capturedBytes);
+    if (length > 0) {
+      bytes.copy(captured, capturedBytes, 0, length);
+      capturedBytes += length;
+    }
+  };
+  return {
+    write(chunk) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      if (markerFound) {
+        append(bytes);
+        return;
+      }
+      const searchable = markerTail.length === 0
+        ? bytes
+        : Buffer.concat([markerTail, bytes]);
+      const markerIndex = searchable.indexOf(marker);
+      if (markerIndex >= 0) {
+        markerFound = true;
+        markerTail = Buffer.alloc(0);
+        append(searchable.subarray(markerIndex));
+        return;
+      }
+      const retainedBytes = Math.min(marker.length - 1, searchable.length);
+      markerTail = Buffer.from(searchable.subarray(searchable.length - retainedBytes));
+    },
+    diagnostic() {
+      if (!markerFound) return undefined;
+      return captured.subarray(0, capturedBytes).toString("utf8").replace(/\r?\n$/u, "");
+    },
+    retainedByteCount() {
+      return markerTail.length + capturedBytes;
+    },
+  };
 }
 
 export function writeHarnessDiagnostic(message, dependencies = {}) {
@@ -106,6 +155,14 @@ export async function completeSignalExit(signal, teardown, dependencies = {}) {
   dependencies.removeSignalHandlers?.();
   const exit = dependencies.exit ?? process.exit;
   exit(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143);
+}
+
+export function createSingleFlightOperation(operation) {
+  let operationPromise;
+  return () => {
+    operationPromise ??= operation();
+    return operationPromise;
+  };
 }
 
 export function createHarnessAllocationMarkerParser(runIds) {
@@ -1143,6 +1200,8 @@ export async function discoverHarnessRuns(dependencies = {}) {
 
 export async function reclaimProvenOrphans(dependencies = {}) {
   const dockerRunner = dependencies.dockerRunner ?? docker;
+  const removeDirectory = dependencies.removeDirectory
+    ?? ((path) => rmSync(path, { recursive: true, force: true }));
   const runs = await discoverHarnessRuns({ ...dependencies, dockerRunner });
   const failures = [];
   const ambiguousCount = runs.filter((run) => run.classification === "ambiguous").length;
@@ -1154,8 +1213,10 @@ export async function reclaimProvenOrphans(dependencies = {}) {
   }
   for (const run of runs) {
     if (run.classification !== "stale") continue;
+    const runFailures = [];
     const byKind = new Map(run.resources.map((resource) => [resource.kind, resource]));
     const database = byKind.get("database");
+    let databaseAbsent = false;
     if (database?.running) {
       try {
         await (dependencies.verifySentinel
@@ -1163,14 +1224,17 @@ export async function reclaimProvenOrphans(dependencies = {}) {
           : waitForContainerSentinel(createRunNames(run.runId), run.runId, dockerRunner));
       } catch (error) {
         if (!isMissingDockerObjectError(error, "container", database.name)) {
-          failures.push(error);
+          runFailures.push(error);
+          failures.push(...runFailures);
           continue;
         }
+        databaseAbsent = true;
       }
     }
     for (const kind of ["restore", "runner", "database", "data", "network"]) {
       const resource = byKind.get(kind);
       if (!resource) continue;
+      if (kind === "database" && databaseAbsent) continue;
       try {
         await removeOwnedResource(
           resource.type,
@@ -1179,10 +1243,19 @@ export async function reclaimProvenOrphans(dependencies = {}) {
           dockerRunner,
           dependencies,
         );
+        if (kind === "database") databaseAbsent = true;
       } catch (error) {
-        failures.push(error);
+        runFailures.push(error);
       }
     }
+    if (databaseAbsent && database?.harnessDirectory) {
+      try {
+        await removeDirectory(database.harnessDirectory);
+      } catch (error) {
+        runFailures.push(error);
+      }
+    }
+    failures.push(...runFailures);
   }
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) throw new AggregateError(failures, "PostgreSQL harness orphan recovery failed");
@@ -1271,32 +1344,77 @@ export async function cleanupHarnessResources(context, dependencies = {}) {
     ?? (() => verifyContainerSentinel(names, runId));
   const removeDirectory = dependencies.removeDirectory
     ?? ((path) => rmSync(path, { recursive: true, force: true }));
-  const failures = [];
-  const attempt = async (operation) => {
-    try {
-      await operation();
-      return true;
-    } catch (error) {
-      failures.push(error);
-      return false;
-    }
-  };
+  const retryDelays = dependencies.retryDelays ?? HARNESS_CLEANUP_RETRY_DELAYS_MS;
+  const delay = dependencies.delay
+    ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  let failures = [];
 
-  try {
+  for (let pass = 0; pass <= retryDelays.length; pass += 1) {
+    const passFailures = [];
+    const attempt = async (operation) => {
+      try {
+        await operation();
+        return true;
+      } catch (error) {
+        passFailures.push(error);
+        return false;
+      }
+    };
+
     await attempt(() => removeResource("container", names.restore));
     await attempt(() => removeResource("container", names.runner));
-    const containerOwned = !sentinelReady || await attempt(verifySentinel);
+    let containerOwned = !sentinelReady;
+    if (sentinelReady) {
+      try {
+        await verifySentinel();
+        containerOwned = true;
+      } catch (error) {
+        if (!isMissingDockerObjectError(error, "container", names.container)) {
+          passFailures.push(error);
+        }
+      }
+    }
     if (containerOwned) await attempt(() => removeResource("container", names.container));
     await attempt(() => removeResource("volume", names.volume));
     await attempt(() => removeResource("network", names.network));
-  } finally {
-    await attempt(() => removeDirectory(directory));
+
+    failures = passFailures;
+    if (failures.length === 0) break;
+    if (pass < retryDelays.length) await delay(retryDelays[pass]);
+  }
+
+  try {
+    await removeDirectory(directory);
+  } catch (error) {
+    failures.push(error);
   }
 
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) {
     throw new AggregateError(failures, "PostgreSQL harness cleanup failed");
   }
+}
+
+export function createHarnessCleanupOperations(context, dependencies = {}) {
+  const cleanupResources = dependencies.cleanupResources ?? cleanupHarnessResources;
+  const writeDiagnostic = dependencies.writeDiagnostic ?? writeHarnessDiagnostic;
+  const stop = dependencies.stop ?? (() => Promise.resolve());
+  const secrets = dependencies.secrets ?? [];
+  const cleanup = createSingleFlightOperation(
+    () => cleanupResources(context, dependencies.cleanupDependencies)
+      .catch(async (error) => {
+        const details = sanitizedHarnessErrorDetails(error, secrets);
+        await writeDiagnostic(`${SIGNAL_CLEANUP_FAILURE_MARKER} ${details}\n`);
+        throw error;
+      }),
+  );
+  const teardown = createSingleFlightOperation(
+    async () => {
+      await stop();
+      await cleanup();
+    },
+  );
+  return { cleanup, teardown };
 }
 
 async function runTests(context, ci, setupDocker = docker, testProcess = runProcess) {
@@ -1414,25 +1532,19 @@ export async function runHarness(options = {}) {
   const processLifecycle = createProcessLifecycle();
   const setupProcess = processLifecycle.run;
   const setupDocker = (args, processOptions) => setupProcess("docker", args, processOptions);
-  let cleanupPromise;
   let sentinelReady = false;
-  const cleanup = () => {
-    cleanupPromise ??= cleanupHarnessResources({ names, runId, directory, sentinelReady, owner })
-      .catch(async (error) => {
-        const details = sanitizedHarnessErrorDetails(error, secrets);
-        await writeHarnessDiagnostic(`${SIGNAL_CLEANUP_FAILURE_MARKER} ${details}\n`);
-        throw error;
-      });
-    return cleanupPromise;
-  };
-  let teardownPromise;
-  const teardown = () => {
-    teardownPromise ??= (async () => {
-      await processLifecycle.stop();
-      await cleanup();
-    })();
-    return teardownPromise;
-  };
+  const { teardown } = createHarnessCleanupOperations(
+    {
+      names,
+      runId,
+      directory,
+      get sentinelReady() {
+        return sentinelReady;
+      },
+      owner,
+    },
+    { stop: processLifecycle.stop, secrets },
+  );
   let exitSignal;
   let signalExitPromise;
   const removeSignalHandlers = () => {

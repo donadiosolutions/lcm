@@ -6,11 +6,11 @@ import {
   RUN_LABEL,
   auditHarnessRunResources,
   createHarnessAllocationMarkerParser,
+  createSignalCleanupDiagnosticParser,
   createRunNames,
   removeLabeled,
   resolveSignalProbeReadinessTimeout,
   sanitizeHarnessText,
-  signalCleanupFailed,
 } from "../../scripts/postgresql-harness.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -37,11 +37,12 @@ type ProbeMode = "harness" | "consumer" | "fork" | "allocation-failure";
 interface SignalProbe {
   readonly child: ChildProcess;
   readonly runId: string;
-  cleanupFailed(): boolean;
+  cleanupFailure(): string | undefined;
 }
 
 function expectSignalCleanupSucceeded(probe: SignalProbe): void {
-  expect(probe.cleanupFailed()).toBe(false);
+  const failure = probe.cleanupFailure();
+  expect(failure, failure ?? "PostgreSQL signal cleanup succeeded").toBeUndefined();
 }
 
 async function launchSignalProbe(mode: ProbeMode = "harness"): Promise<SignalProbe> {
@@ -56,9 +57,8 @@ async function launchSignalProbe(mode: ProbeMode = "harness"): Promise<SignalPro
     stdio: ["ignore", "ignore", "pipe"],
   });
   let readyMarkerTail = "";
-  let cleanupMarkerTail = "";
-  let observedCleanupFailure = false;
   const allocationParser = createHarnessAllocationMarkerParser(launchedRunIds);
+  const cleanupDiagnosticParser = createSignalCleanupDiagnosticParser();
   let readyResolve!: (runId: string) => void;
   let readyReject!: (error: Error) => void;
   const ready = new Promise<string>((resolve, reject) => {
@@ -72,11 +72,9 @@ async function launchSignalProbe(mode: ProbeMode = "harness"): Promise<SignalPro
   child.stderr?.on("data", (chunk) => {
     const output = String(chunk);
     allocationParser.write(output);
+    cleanupDiagnosticParser.write(chunk);
     const readyCandidate = `${readyMarkerTail}${output}`;
-    const cleanupCandidate = `${cleanupMarkerTail}${output}`;
     readyMarkerTail = readyCandidate.slice(-128);
-    cleanupMarkerTail = cleanupCandidate.slice(-128);
-    observedCleanupFailure ||= signalCleanupFailed(cleanupCandidate);
     const match = readyCandidate.match(
       mode === "consumer"
         ? /PostgreSQL harness consumer probe ready: ([0-9a-f]{32})/u
@@ -93,7 +91,11 @@ async function launchSignalProbe(mode: ProbeMode = "harness"): Promise<SignalPro
   });
   try {
     const runId = await ready;
-    return { child, runId, cleanupFailed: () => observedCleanupFailure };
+    return {
+      child,
+      runId,
+      cleanupFailure: () => cleanupDiagnosticParser.diagnostic(),
+    };
   } catch (error) {
     if (child.exitCode === null && child.signalCode === null) killChild(child, "SIGKILL");
     throw error;

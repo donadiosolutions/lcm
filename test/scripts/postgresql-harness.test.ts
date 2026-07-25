@@ -4,6 +4,7 @@ import { Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_SIGNAL_PROBE_READINESS_TIMEOUT_MS,
+  HARNESS_CLEANUP_RETRY_DELAYS_MS,
   HARNESS_ALLOCATION_MARKER,
   MAX_HARNESS_ALLOCATION_MARKER_LINE_LENGTH,
   MAX_CAPTURED_OUTPUT_BYTES,
@@ -26,9 +27,12 @@ import {
   cleanupHarnessResources,
   completeSignalExit,
   createHarnessAllocationMarkerParser,
+  createHarnessCleanupOperations,
   createOwnerIdentity,
   createProcessLifecycle,
   createRunNames,
+  createSignalCleanupDiagnosticParser,
+  createSingleFlightOperation,
   discoverHarnessRuns,
   harnessErrorDetails,
   isValidProcessBirthFingerprint,
@@ -90,6 +94,65 @@ describe("PostgreSQL harness utilities", () => {
     expect(signalCleanupFailed("PostgreSQL harness signal probe ready: abc")).toBe(false);
     expect(signalCleanupFailed(`${SIGNAL_CLEANUP_FAILURE_MARKER} sanitized failure`)).toBe(true);
     expect(signalCleanupFailed(new Error(`${SIGNAL_CLEANUP_FAILURE_MARKER} nested`))).toBe(true);
+  });
+
+  it("detects a cleanup-failure marker split across stderr chunks", () => {
+    const parser = createSignalCleanupDiagnosticParser();
+    const split = SIGNAL_CLEANUP_FAILURE_MARKER.length - 7;
+
+    parser.write(`ignored\n${SIGNAL_CLEANUP_FAILURE_MARKER.slice(0, split)}`);
+    expect(parser.diagnostic()).toBeUndefined();
+    parser.write(`${SIGNAL_CLEANUP_FAILURE_MARKER.slice(split)} split failure\n`);
+
+    expect(parser.diagnostic()).toBe(
+      `${SIGNAL_CLEANUP_FAILURE_MARKER} split failure`,
+    );
+  });
+
+  it("ignores more than the stderr capture limit before a cleanup-failure marker", () => {
+    const parser = createSignalCleanupDiagnosticParser();
+
+    parser.write(Buffer.alloc(MAX_CAPTURED_OUTPUT_BYTES + 256, "x"));
+    expect(parser.diagnostic()).toBeUndefined();
+    expect(parser.retainedByteCount()).toBeLessThan(SIGNAL_CLEANUP_FAILURE_MARKER.length);
+    parser.write(`${SIGNAL_CLEANUP_FAILURE_MARKER} late failure\n`);
+
+    expect(parser.diagnostic()).toBe(
+      `${SIGNAL_CLEANUP_FAILURE_MARKER} late failure`,
+    );
+  });
+
+  it("retains bounded multiline marker-relative cleanup diagnostics", () => {
+    const parser = createSignalCleanupDiagnosticParser();
+    const multiline = [
+      `${SIGNAL_CLEANUP_FAILURE_MARKER} PostgreSQL harness cleanup failed`,
+      "runner inspect failed",
+      "volume remove failed",
+    ].join("\n");
+
+    parser.write(multiline.slice(0, multiline.indexOf("runner")));
+    parser.write(`${multiline.slice(multiline.indexOf("runner"))}\n`);
+    parser.write("x".repeat(MAX_CAPTURED_OUTPUT_BYTES));
+    parser.write("ignored after the diagnostic bound");
+
+    const diagnostic = parser.diagnostic();
+    expect(diagnostic).toContain(multiline);
+    expect(Buffer.byteLength(diagnostic!)).toBe(MAX_CAPTURED_OUTPUT_BYTES);
+    expect(parser.retainedByteCount()).toBe(MAX_CAPTURED_OUTPUT_BYTES);
+  });
+
+  it("shares one in-flight operation across concurrent callers", async () => {
+    let finish!: () => void;
+    const operation = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const singleFlight = createSingleFlightOperation(operation);
+
+    const first = singleFlight();
+    const second = singleFlight();
+
+    expect(second).toBe(first);
+    expect(operation).toHaveBeenCalledOnce();
+    finish();
+    await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
   });
 
   it.each([
@@ -1111,6 +1174,7 @@ describe("PostgreSQL harness utilities", () => {
       return { stdout: "", stderr: "" };
     });
     const verifySentinel = vi.fn();
+    const removeDirectory = vi.fn();
 
     const runs = await reclaimProvenOrphans({
       dockerRunner,
@@ -1119,6 +1183,7 @@ describe("PostgreSQL harness utilities", () => {
       readScope: () => testOwnerScope,
       verifySentinel,
       resolveHarnessDirectory: () => "/private/harness",
+      removeDirectory,
       delay: vi.fn(),
     });
     expect(runs).toHaveLength(1);
@@ -1130,6 +1195,7 @@ describe("PostgreSQL harness utilities", () => {
       `volume:${names.volume}`,
       `network:${names.network}`,
     ]);
+    expect(removeDirectory).toHaveBeenCalledWith("/private/harness");
   });
 
   it("treats an exact container disappearance after discovery as idempotent recovery", async () => {
@@ -1185,6 +1251,7 @@ describe("PostgreSQL harness utilities", () => {
       records.delete(`container:${names.container}`);
       throw missingContainer;
     });
+    const removeDirectory = vi.fn();
 
     await expect(reclaimProvenOrphans({
       dockerRunner,
@@ -1193,6 +1260,7 @@ describe("PostgreSQL harness utilities", () => {
       readScope: () => testOwnerScope,
       verifySentinel,
       resolveHarnessDirectory: () => "/private/harness",
+      removeDirectory,
     })).resolves.toBeDefined();
 
     expect(verifySentinel).toHaveBeenCalledOnce();
@@ -1201,6 +1269,7 @@ describe("PostgreSQL harness utilities", () => {
       `network:${names.network}`,
     ]);
     expect(records).toEqual(new Map());
+    expect(removeDirectory).toHaveBeenCalledWith("/private/harness");
   });
 
   it("does not reinterpret a different missing container as the discovered resource disappearing", async () => {
@@ -1231,6 +1300,7 @@ describe("PostgreSQL harness utilities", () => {
       stdout: "",
       stderr: "Error response from daemon: No such container: different-container",
     });
+    const removeDirectory = vi.fn();
 
     await expect(reclaimProvenOrphans({
       dockerRunner,
@@ -1239,9 +1309,11 @@ describe("PostgreSQL harness utilities", () => {
       readScope: () => testOwnerScope,
       verifySentinel: vi.fn(async () => { throw sentinelFailure; }),
       resolveHarnessDirectory: () => "/private/harness",
+      removeDirectory,
     })).rejects.toBe(sentinelFailure);
 
     expect(dockerRunner.mock.calls.some(([args]) => args[1] === "rm")).toBe(false);
+    expect(removeDirectory).not.toHaveBeenCalled();
   });
 
   it("does not mutate live, legacy, malformed, unsupported, or permission-ambiguous runs", async () => {
@@ -1303,6 +1375,7 @@ describe("PostgreSQL harness utilities", () => {
       return { stdout: "", stderr: "" };
     });
     const verifySentinel = vi.fn(() => { throw new Error("stopped container cannot exec"); });
+    const removeDirectory = vi.fn();
 
     await expect(reclaimProvenOrphans({
       dockerRunner,
@@ -1311,9 +1384,118 @@ describe("PostgreSQL harness utilities", () => {
       readScope: () => testOwnerScope,
       verifySentinel,
       resolveHarnessDirectory: () => "/private/harness",
+      removeDirectory,
     })).resolves.toBeDefined();
     expect(verifySentinel).not.toHaveBeenCalled();
     expect(exists).toBe(false);
+    expect(removeDirectory).toHaveBeenCalledWith("/private/harness");
+  });
+
+  it("retains private recovery evidence when an orphan resource cannot be removed", async () => {
+    const runId = "7".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 97,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:970",
+      scope: testOwnerScope,
+    };
+    const labels = ownershipLabels(runId, "database", owner);
+    const removalFailure = new Error("database removal failed");
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[0] === "container" && args[1] === "ls") {
+        return { stdout: names.container, stderr: "" };
+      }
+      if (args[1] === "ls") return { stdout: "", stderr: "" };
+      if (args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify([{
+            Config: { Labels: labels },
+            State: { Running: true },
+            Mounts: [],
+          }]),
+          stderr: "",
+        };
+      }
+      throw removalFailure;
+    });
+    const removeDirectory = vi.fn();
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+      verifySentinel: vi.fn(),
+      resolveHarnessDirectory: () => "/private/harness",
+      removeDirectory,
+      delay: vi.fn(),
+    })).rejects.toBe(removalFailure);
+
+    expect(removeDirectory).not.toHaveBeenCalled();
+  });
+
+  it("erases the captured private directory after database removal despite a terminal companion failure", async () => {
+    const runId = "6".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 96,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:960",
+      scope: testOwnerScope,
+    };
+    const records = new Map([
+      [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+    ]);
+    const removalFailure = new Error("volume removal failed");
+    const events: string[] = [];
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        return {
+          stdout: [...records.keys()]
+            .filter((key) => key.startsWith(`${type}:`))
+            .map((key) => key.slice(type.length + 1))
+            .join("\n"),
+          stderr: "",
+        };
+      }
+      if (args[1] === "inspect") {
+        const type = args[0];
+        const labels = records.get(`${type}:${args[2]}`) ?? {};
+        return {
+          stdout: JSON.stringify([type === "container"
+            ? { Config: { Labels: labels }, State: { Running: true }, Mounts: [] }
+            : { Labels: labels }]),
+          stderr: "",
+        };
+      }
+      const type = args[0];
+      const name = args.at(-1)!;
+      events.push(`remove:${type}:${name}`);
+      if (type === "volume") throw removalFailure;
+      records.delete(`${type === "container" ? "container" : type}:${name}`);
+      return { stdout: "", stderr: "" };
+    });
+    const removeDirectory = vi.fn((path: string) => {
+      events.push(`directory:${path}`);
+    });
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+      verifySentinel: vi.fn(),
+      resolveHarnessDirectory: () => "/private/harness",
+      removeDirectory,
+      delay: vi.fn(),
+    })).rejects.toBe(removalFailure);
+
+    expect(records.has(`container:${names.container}`)).toBe(false);
+    expect(records.has(`volume:${names.volume}`)).toBe(true);
+    expect(removeDirectory).toHaveBeenCalledOnce();
+    expect(events.indexOf(`directory:/private/harness`))
+      .toBeGreaterThan(events.indexOf(`remove:container:${names.container}`));
   });
 
   it("reclaims a stopped previous-boot database after its temporary directory is gone", async () => {
@@ -1586,10 +1768,57 @@ describe("PostgreSQL harness utilities", () => {
     expect(removeResource).toHaveBeenCalledWith("container", names.container);
   });
 
-  it("preserves a single sentinel failure while continuing independent cleanup", async () => {
+  it("retries a transient sentinel failure and dependent Docker removals as a complete pass", async () => {
     const names = createRunNames("a".repeat(32));
     const sentinelFailure = new Error("sentinel failed");
-    const removeResource = vi.fn();
+    const events: string[] = [];
+    let pass = 1;
+    const verifySentinel = vi.fn(() => {
+      events.push(`verify:${pass}`);
+      if (pass === 1) throw sentinelFailure;
+    });
+    const removeResource = vi.fn((type: string, name: string) => {
+      events.push(`remove:${pass}:${type}:${name}`);
+      if (pass === 1 && (name === names.volume || name === names.network)) {
+        throw new Error(`${type} still in use`);
+      }
+    });
+    const delay = vi.fn(async (milliseconds: number) => {
+      events.push(`delay:${milliseconds}`);
+      pass += 1;
+    });
+    const removeDirectory = vi.fn((path: string) => { events.push(`directory:${path}`); });
+
+    await expect(cleanupHarnessResources({
+      names,
+      runId: "a".repeat(32),
+      directory: "/private/harness",
+      sentinelReady: true,
+    }, {
+      removeResource,
+      verifySentinel,
+      removeDirectory,
+      delay,
+    })).resolves.toBeUndefined();
+
+    expect(verifySentinel).toHaveBeenCalledTimes(2);
+    expect(delay).toHaveBeenCalledWith(HARNESS_CLEANUP_RETRY_DELAYS_MS[0]);
+    expect(events).not.toContain(`remove:1:container:${names.container}`);
+    expect(events).toContain(`remove:2:container:${names.container}`);
+    expect(events.at(-1)).toBe("directory:/private/harness");
+    expect(removeDirectory).toHaveBeenCalledWith("/private/harness");
+  });
+
+  it("retries a partial cleanup idempotently and discards the transient failure", async () => {
+    const names = createRunNames("a".repeat(32));
+    const databaseFailure = new Error("database removal is in progress");
+    const attempts = new Map<string, number>();
+    const removeResource = vi.fn((type: string, name: string) => {
+      const key = `${type}:${name}`;
+      attempts.set(key, (attempts.get(key) ?? 0) + 1);
+      if (name === names.container && attempts.get(key) === 1) throw databaseFailure;
+    });
+    const delay = vi.fn().mockResolvedValue(undefined);
     const removeDirectory = vi.fn();
 
     await expect(cleanupHarnessResources({
@@ -1599,14 +1828,89 @@ describe("PostgreSQL harness utilities", () => {
       sentinelReady: true,
     }, {
       removeResource,
-      verifySentinel: () => { throw sentinelFailure; },
+      verifySentinel: vi.fn(),
       removeDirectory,
+      delay,
+    })).resolves.toBeUndefined();
+
+    expect(attempts.get(`container:${names.container}`)).toBe(2);
+    expect(attempts.get(`volume:${names.volume}`)).toBe(2);
+    expect(attempts.get(`network:${names.network}`)).toBe(2);
+    expect(delay).toHaveBeenCalledOnce();
+    expect(removeDirectory).toHaveBeenCalledOnce();
+  });
+
+  it("converges when the database disappears after a later resource transiently fails", async () => {
+    const names = createRunNames("a".repeat(32));
+    const missingDatabase = Object.assign(new Error("docker failed"), {
+      code: 1,
+      stdout: "",
+      stderr: `Error response from daemon: No such container: ${names.container}`,
+    });
+    let pass = 1;
+    const verifySentinel = vi.fn(() => {
+      if (pass === 2) throw missingDatabase;
+    });
+    const removeResource = vi.fn((type: string, name: string) => {
+      if (pass === 1 && name === names.volume) throw new Error(`${type} still in use`);
+    });
+    const delay = vi.fn(async () => {
+      pass += 1;
+    });
+    const removeDirectory = vi.fn();
+
+    await expect(cleanupHarnessResources({
+      names,
+      runId: "a".repeat(32),
+      directory: "/private/harness",
+      sentinelReady: true,
+    }, {
+      removeResource,
+      verifySentinel,
+      removeDirectory,
+      delay,
+    })).resolves.toBeUndefined();
+
+    expect(verifySentinel).toHaveBeenCalledTimes(2);
+    expect(removeResource.mock.calls.filter(
+      ([type, name]) => type === "container" && name === names.container,
+    )).toHaveLength(1);
+    expect(delay).toHaveBeenCalledWith(HARNESS_CLEANUP_RETRY_DELAYS_MS[0]);
+    expect(removeDirectory).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["sentinel mismatch", new Error("sentinel ownership mismatch")],
+    ["ownership change", new Error("refusing to clean an unowned PostgreSQL harness container")],
+    ["different container disappearance", Object.assign(new Error("docker failed"), {
+      code: 1,
+      stdout: "",
+      stderr: "Error response from daemon: No such container: different-container",
+    })],
+  ])("keeps a persistent %s fail-closed through every cleanup pass", async (_scenario, sentinelFailure) => {
+    const names = createRunNames("a".repeat(32));
+    const verifySentinel = vi.fn(() => { throw sentinelFailure; });
+    const removeResource = vi.fn();
+    const delay = vi.fn().mockResolvedValue(undefined);
+    const removeDirectory = vi.fn();
+
+    await expect(cleanupHarnessResources({
+      names,
+      runId: "a".repeat(32),
+      directory: "/private/harness",
+      sentinelReady: true,
+    }, {
+      removeResource,
+      verifySentinel,
+      removeDirectory,
+      delay,
     })).rejects.toBe(sentinelFailure);
 
+    expect(verifySentinel).toHaveBeenCalledTimes(HARNESS_CLEANUP_RETRY_DELAYS_MS.length + 1);
     expect(removeResource).not.toHaveBeenCalledWith("container", names.container);
-    expect(removeResource).toHaveBeenCalledWith("volume", names.volume);
-    expect(removeResource).toHaveBeenCalledWith("network", names.network);
-    expect(removeDirectory).toHaveBeenCalledWith("/private/harness");
+    expect(delay.mock.calls.map(([milliseconds]) => milliseconds))
+      .toEqual(HARNESS_CLEANUP_RETRY_DELAYS_MS);
+    expect(removeDirectory).toHaveBeenCalledOnce();
   });
 
   it("aggregates independent cleanup failures and always removes the secret directory", async () => {
@@ -1621,13 +1925,19 @@ describe("PostgreSQL harness utilities", () => {
       if (name === names.volume) throw volumeFailure;
     });
     const removeDirectory = vi.fn(() => { throw directoryFailure; });
+    const delay = vi.fn().mockResolvedValue(undefined);
 
     const failure = await cleanupHarnessResources({
       names,
       runId: "a".repeat(32),
       directory: "/private/harness",
       sentinelReady: true,
-    }, { removeResource, verifySentinel: vi.fn(), removeDirectory }).catch((error: unknown) => error);
+    }, {
+      removeResource,
+      verifySentinel: vi.fn(),
+      removeDirectory,
+      delay,
+    }).catch((error: unknown) => error);
 
     expect(failure).toBeInstanceOf(AggregateError);
     expect((failure as AggregateError).errors).toEqual([runnerFailure, volumeFailure, directoryFailure]);
@@ -1637,14 +1947,95 @@ describe("PostgreSQL harness utilities", () => {
       "volume remove failed",
       "directory remove failed",
     ].join("\n"));
-    expect(attempts).toEqual([
+    const expectedPass = [
       `container:${names.restore}`,
       `container:${names.runner}`,
       `container:${names.container}`,
       `volume:${names.volume}`,
       `network:${names.network}`,
-    ]);
+    ];
+    expect(attempts).toEqual(
+      Array.from(
+        { length: HARNESS_CLEANUP_RETRY_DELAYS_MS.length + 1 },
+        () => expectedPass,
+      ).flat(),
+    );
+    expect(delay).toHaveBeenCalledTimes(HARNESS_CLEANUP_RETRY_DELAYS_MS.length);
     expect(removeDirectory).toHaveBeenCalledWith("/private/harness");
+  });
+
+  it("emits one terminal sanitized diagnostic for concurrent cleanup and signal-style callers", async () => {
+    const names = createRunNames("a".repeat(32));
+    const privatePath = "/private/harness-secret";
+    const password = "database-password";
+    const writeDiagnostic = vi.fn(async (_message: string) => undefined);
+    const delay = vi.fn(async (_milliseconds: number) => {
+      expect(writeDiagnostic).not.toHaveBeenCalled();
+    });
+    const removeResource = vi.fn((type: string, name: string) => {
+      expect(writeDiagnostic).not.toHaveBeenCalled();
+      throw Object.assign(new Error("docker failed"), {
+        stderr: [
+          `${type} ${name} removal failed with ${password}`,
+          `private evidence remained at ${privatePath}`,
+        ].join("\n"),
+      });
+    });
+    const removeDirectory = vi.fn((path: string) => {
+      expect(path).toBe(privatePath);
+      expect(writeDiagnostic).not.toHaveBeenCalled();
+    });
+    const cleanupResources = vi.fn(cleanupHarnessResources);
+    const stop = vi.fn(async () => undefined);
+    const operations = createHarnessCleanupOperations({
+      names,
+      runId: "a".repeat(32),
+      directory: privatePath,
+      sentinelReady: true,
+    }, {
+      cleanupResources,
+      cleanupDependencies: {
+        removeResource,
+        verifySentinel: vi.fn(),
+        removeDirectory,
+        delay,
+      },
+      secrets: [privatePath, password],
+      stop,
+      writeDiagnostic,
+    });
+
+    const results = await Promise.allSettled([
+      operations.cleanup(),
+      operations.teardown(),
+      operations.teardown(),
+    ]);
+
+    expect(results.every((result) => result.status === "rejected")).toBe(true);
+    expect(cleanupResources).toHaveBeenCalledOnce();
+    expect(stop).toHaveBeenCalledOnce();
+    expect(delay.mock.calls.map(([milliseconds]) => milliseconds))
+      .toEqual(HARNESS_CLEANUP_RETRY_DELAYS_MS);
+    expect(removeResource).toHaveBeenCalledTimes(
+      (HARNESS_CLEANUP_RETRY_DELAYS_MS.length + 1) * 5,
+    );
+    expect(removeDirectory).toHaveBeenCalledOnce();
+    expect(writeDiagnostic).toHaveBeenCalledOnce();
+
+    const diagnostic = writeDiagnostic.mock.calls[0]![0];
+    expect(diagnostic.startsWith(`${SIGNAL_CLEANUP_FAILURE_MARKER} `)).toBe(true);
+    expect(diagnostic.split(SIGNAL_CLEANUP_FAILURE_MARKER)).toHaveLength(2);
+    expect(diagnostic).toContain("PostgreSQL harness cleanup failed");
+    expect(diagnostic).toContain("removal failed");
+    expect(diagnostic).toContain("private evidence remained");
+    expect(diagnostic).toContain("[REDACTED]");
+    expect(diagnostic).not.toContain(privatePath);
+    expect(diagnostic).not.toContain(password);
+
+    const parser = createSignalCleanupDiagnosticParser();
+    parser.write(diagnostic);
+    expect(parser.diagnostic()).toContain("private evidence remained");
+    expect(parser.retainedByteCount()).toBeLessThanOrEqual(MAX_CAPTURED_OUTPUT_BYTES);
   });
 
   it("expands aggregate cleanup diagnostics before redacting signal-safe output", () => {

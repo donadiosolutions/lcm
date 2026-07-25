@@ -104,7 +104,13 @@ the generated name prefix, PostgreSQL major version, current role, private
 sentinel, and complete Docker ownership labels. SIGINT, SIGTERM, and SIGHUP use
 the same idempotent cleanup path and retain their conventional exit codes.
 Removal is bounded and retryable, and every attempt reinspects the exact labels
-before issuing an exact-name removal. Immediately after generating a run ID,
+before issuing an exact-name removal. If any Docker cleanup step fails, the
+harness repeats the complete idempotent cleanup pass up to four more times
+while its private recovery evidence is still available. A later successful
+pass discards transient failures; only terminal exhaustion emits the sanitized
+cleanup-failure marker. The private directory is removed once after cleanup
+converges or exhausts its retry budget so credentials are not retained.
+Immediately after generating a run ID,
 and before any Docker mutation for that run, the harness emits a categorical
 allocation marker containing only the cryptographic run ID. The signal suite
 registers that marker independently of readiness, so a setup or cleanup failure
@@ -132,7 +138,14 @@ an exactly owned stopped container can be removed without executing a sentinel
 that Docker cannot expose. If a sibling cleanup removes the exact discovered
 object during reconciliation, that exact-name disappearance is idempotent;
 companions still pass through ownership reinspection, while different names or
-ambiguous Docker failures remain fatal.
+ambiguous Docker failures remain fatal. Orphan recovery removes the previously
+verified private harness directory once the exact database container is proven
+absent, either through verified ownership removal or exact-name disappearance.
+Database ownership or removal uncertainty retains that directory as recovery
+evidence rather than stranding a running container without its
+surviving-consumer identity. Terminal failures removing companion runner,
+restore, volume, or network resources are still reported, but do not retain the
+private directory after database absence is proven.
 While local Vitest is active, a private bounded consumer record keeps its PID,
 birth fingerprint, and process scope with the run. A later harness preserves
 the run if that consumer survived its parent. Graceful harness termination
