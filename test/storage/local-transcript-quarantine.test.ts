@@ -16,6 +16,7 @@ import {
 import {
   localTranscriptQuarantinePath,
   openLocalTranscriptQuarantine,
+  TRANSCRIPT_QUARANTINE_SCHEMA_VERSION,
 } from "../../src/storage/local-transcript-quarantine.js";
 
 const temporaryDirectories: string[] = [];
@@ -99,6 +100,175 @@ describe("local transcript quarantine construction", () => {
     await repository.close();
     const [exitCode] = await childExit;
     expect(exitCode).toBe(0);
+  });
+
+  it("adopts an exact unversioned schema and repairs its missing index", async () => {
+    const home = temporaryDirectory();
+    const dbPath = localTranscriptQuarantinePath(
+      "unversioned-current",
+      "claude-code",
+      home,
+    );
+    const created = openLocalTranscriptQuarantine(
+      "unversioned-current",
+      "claude-code",
+      home,
+    );
+    await created.close();
+    const unversioned = new DatabaseSync(dbPath);
+    unversioned.exec(`
+      PRAGMA user_version = 0;
+      DROP INDEX transcript_quarantine_created_idx;
+    `);
+    unversioned.close();
+
+    const adopted = openLocalTranscriptQuarantine(
+      "unversioned-current",
+      "claude-code",
+      home,
+    );
+    await adopted.close();
+    const inspector = new DatabaseSync(dbPath);
+    expect(inspector.prepare("PRAGMA user_version").get()).toEqual(
+      expect.objectContaining({
+        user_version: TRANSCRIPT_QUARANTINE_SCHEMA_VERSION,
+      }),
+    );
+    expect(inspector.prepare(`
+      SELECT sql
+      FROM sqlite_master
+      WHERE type = 'index'
+        AND name = 'transcript_quarantine_created_idx'
+    `).get()).toEqual(expect.objectContaining({
+      sql: expect.stringContaining("quarantined_at DESC"),
+    }));
+    inspector.close();
+
+    const current = openLocalTranscriptQuarantine(
+      "unversioned-current",
+      "claude-code",
+      home,
+    );
+    await current.close();
+  });
+
+  it("rejects unsupported versions and versioned or unversioned drift", async () => {
+    const home = temporaryDirectory();
+    const createDrift = (
+      projectId: string,
+      version: number,
+    ): string => {
+      const dbPath = localTranscriptQuarantinePath(
+        projectId,
+        "claude-code",
+        home,
+      );
+      mkdirSync(dirname(dbPath), { recursive: true });
+      const db = new DatabaseSync(dbPath);
+      db.exec(`
+        CREATE TABLE transcript_quarantine (wrong INTEGER) STRICT;
+        PRAGMA user_version = ${version};
+      `);
+      db.close();
+      return dbPath;
+    };
+
+    const futureVersion = TRANSCRIPT_QUARANTINE_SCHEMA_VERSION + 1;
+    const futurePath = createDrift("future-version", futureVersion);
+    expect(() => openLocalTranscriptQuarantine(
+      "future-version",
+      "claude-code",
+      home,
+    )).toThrowError(expect.objectContaining({
+      code: "STORAGE_OPERATION_FAILED",
+    }));
+    const future = new DatabaseSync(futurePath);
+    expect(future.prepare("PRAGMA user_version").get()).toEqual(
+      expect.objectContaining({ user_version: futureVersion }),
+    );
+    future.close();
+
+    const missingTablePath = localTranscriptQuarantinePath(
+      "versioned-missing-table",
+      "claude-code",
+      home,
+    );
+    mkdirSync(dirname(missingTablePath), { recursive: true });
+    const missingTable = new DatabaseSync(missingTablePath);
+    missingTable.exec(
+      `PRAGMA user_version = ${TRANSCRIPT_QUARANTINE_SCHEMA_VERSION}`,
+    );
+    missingTable.close();
+    expect(() => openLocalTranscriptQuarantine(
+      "versioned-missing-table",
+      "claude-code",
+      home,
+    )).toThrowError(expect.objectContaining({
+      code: "STORAGE_OPERATION_FAILED",
+    }));
+
+    for (const [projectId, version] of [
+      ["versioned-drift", TRANSCRIPT_QUARANTINE_SCHEMA_VERSION],
+      ["unversioned-drift", 0],
+      ["negative-version", -1],
+    ] as const) {
+      const dbPath = createDrift(projectId, version);
+      expect(() => openLocalTranscriptQuarantine(
+        projectId,
+        "claude-code",
+        home,
+      )).toThrowError(expect.objectContaining({
+        code: "STORAGE_OPERATION_FAILED",
+      }));
+      const inspector = new DatabaseSync(dbPath);
+      expect(inspector.prepare("PRAGMA user_version").get()).toEqual(
+        expect.objectContaining({ user_version: version }),
+      );
+      expect(inspector.prepare(`
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'transcript_quarantine'
+      `).get()).toEqual(expect.objectContaining({
+        sql: expect.stringContaining("wrong INTEGER"),
+      }));
+      inspector.close();
+    }
+
+    for (const [projectId, replacementSql] of [
+      [
+        "versioned-index-drift",
+        `DROP INDEX transcript_quarantine_created_idx;
+         CREATE INDEX transcript_quarantine_created_idx
+         ON transcript_quarantine (source_locator);`,
+      ],
+      [
+        "versioned-extra-index",
+        `CREATE INDEX transcript_quarantine_unexpected_idx
+         ON transcript_quarantine (source_locator);`,
+      ],
+    ] as const) {
+      const dbPath = localTranscriptQuarantinePath(
+        projectId,
+        "claude-code",
+        home,
+      );
+      const valid = openLocalTranscriptQuarantine(
+        projectId,
+        "claude-code",
+        home,
+      );
+      await valid.close();
+      const drifted = new DatabaseSync(dbPath);
+      drifted.exec(replacementSql);
+      drifted.close();
+      expect(() => openLocalTranscriptQuarantine(
+        projectId,
+        "claude-code",
+        home,
+      )).toThrowError(expect.objectContaining({
+        code: "STORAGE_OPERATION_FAILED",
+      }));
+    }
   });
 
   it("releases the exact pooled connection when schema migration fails", () => {

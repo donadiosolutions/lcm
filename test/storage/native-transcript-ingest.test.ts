@@ -34,6 +34,7 @@ import {
   openLocalTranscriptQuarantine,
   SQLiteLocalTranscriptQuarantineRepository,
   TRANSCRIPT_QUARANTINE_REASONS,
+  TRANSCRIPT_QUARANTINE_SCHEMA_VERSION,
 } from "../../src/storage/local-transcript-quarantine.js";
 import {
   canonicalNativeTranscriptJson,
@@ -184,6 +185,49 @@ function source(content: string): NativeTranscriptByteSource {
       assertUnchanged: vi.fn(async () => undefined),
       close: vi.fn(async () => undefined),
     })),
+  };
+}
+
+function mutableRangeSource(content: string): {
+  readonly source: NativeTranscriptByteSource;
+  rewrite(replacement: string): void;
+} {
+  const snapshotBytes = Buffer.from(content);
+  let currentBytes = Buffer.from(snapshotBytes);
+  return {
+    source: {
+      openSnapshot: vi.fn(async () => ({
+        metadata: {
+          sizeBytes: snapshotBytes.byteLength,
+          modifiedAtMs: 123,
+          changedAtMs: 456,
+        },
+        stream: () => byteChunks(snapshotBytes),
+        digestPrefix: vi.fn(async (length: number) =>
+          digest(currentBytes.subarray(0, length))),
+        assertByteRangesUnchanged: vi.fn(async (ranges) => {
+          for (const range of ranges) {
+            if (
+              digest(currentBytes.subarray(
+                range.startByteOffset,
+                range.endByteOffset,
+              )) !== range.rangeSha256
+            ) {
+              throw new NativeTranscriptSourceChangedError();
+            }
+          }
+        }),
+        assertUnchanged: vi.fn(async () => undefined),
+        close: vi.fn(async () => undefined),
+      })),
+    },
+    rewrite: (replacement: string): void => {
+      const replacementBytes = Buffer.from(replacement);
+      if (replacementBytes.byteLength !== snapshotBytes.byteLength) {
+        throw new Error("replacement must preserve source size");
+      }
+      currentBytes = replacementBytes;
+    },
   };
 }
 
@@ -1444,6 +1488,175 @@ describe("filesystem native transcript source", () => {
     expect(repo.batches).toHaveLength(1);
   });
 
+  it("fences every earlier committed range during a later resolver", async () => {
+    const first =
+      '{"message":{"role":"user","content":"first"}}\n';
+    const changedFirst =
+      '{"message":{"role":"user","content":"tsrif"}}\n';
+    const second =
+      '{"message":{"role":"assistant","content":"second"}}\n';
+    const mutable = mutableRangeSource(first + second);
+    const repo = repository();
+    let releaseSecondResolver!: () => void;
+    const secondResolverGate = new Promise<void>((resolve) => {
+      releaseSecondResolver = resolve;
+    });
+    let markSecondResolverStarted!: () => void;
+    const secondResolverStarted = new Promise<void>((resolve) => {
+      markSecondResolverStarted = resolve;
+    });
+    let resolverCalls = 0;
+    const pending = runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: mutable.source,
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      batchSize: 1,
+      messageResolver: {
+        resolveExact: vi.fn(async () => {
+          resolverCalls += 1;
+          if (resolverCalls === 2) {
+            markSecondResolverStarted();
+            await secondResolverGate;
+          }
+          return { conversationId: 1, messageId: resolverCalls };
+        }),
+      },
+    });
+    await secondResolverStarted;
+    mutable.rewrite(changedFirst + second);
+    releaseSecondResolver();
+    await expect(pending).rejects.toThrowError(
+      NativeTranscriptSourceChangedError,
+    );
+    expect(repo.batches).toHaveLength(1);
+    expect(repo.batches[0]?.checkpoint.checkpoint).toMatchObject({
+      byteOffset: Buffer.byteLength(first),
+      prefixSha256: digest(first),
+    });
+  });
+
+  it("fences earlier committed ranges after a later record commit", async () => {
+    const first = '{"event":"first"}\n';
+    const changedFirst = '{"event":"tsrif"}\n';
+    const second = '{"event":"second"}\n';
+    const mutable = mutableRangeSource(first + second);
+    const repo = repository();
+    let releaseSecondCommit!: () => void;
+    const secondCommitGate = new Promise<void>((resolve) => {
+      releaseSecondCommit = resolve;
+    });
+    let markSecondCommitStarted!: () => void;
+    const secondCommitStarted = new Promise<void>((resolve) => {
+      markSecondCommitStarted = resolve;
+    });
+    let commitCalls = 0;
+    vi.mocked(repo.ingestBatch).mockImplementation(async (input) => {
+      repo.batches.push(input);
+      commitCalls += 1;
+      if (commitCalls === 2) {
+        markSecondCommitStarted();
+        await secondCommitGate;
+      }
+      return {
+        importedCount: input.records.length,
+        skippedCount: 0,
+        quarantinedCount: input.quarantinedCount,
+        checkpoint: checkpoint(input.checkpoint.checkpoint),
+      };
+    });
+    const pending = runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: mutable.source,
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      batchSize: 1,
+      messageResolver: { resolveExact: vi.fn(async () => null) },
+    });
+    await secondCommitStarted;
+    mutable.rewrite(changedFirst + second);
+    releaseSecondCommit();
+    await expect(pending).rejects.toThrowError(
+      NativeTranscriptSourceChangedError,
+    );
+    expect(repo.batches).toHaveLength(2);
+    expect(repo.batches[1]?.records).toHaveLength(1);
+  });
+
+  it("fences earlier committed ranges after a later checkpoint-only commit", async () => {
+    const first = '{"event":"first"}\n';
+    const changedFirst = '{"event":"tsrif"}\n';
+    const blankTail = " \n";
+    const mutable = mutableRangeSource(first + blankTail);
+    const repo = repository();
+    let releaseTailCommit!: () => void;
+    const tailCommitGate = new Promise<void>((resolve) => {
+      releaseTailCommit = resolve;
+    });
+    let markTailCommitStarted!: () => void;
+    const tailCommitStarted = new Promise<void>((resolve) => {
+      markTailCommitStarted = resolve;
+    });
+    let commitCalls = 0;
+    vi.mocked(repo.ingestBatch).mockImplementation(async (input) => {
+      repo.batches.push(input);
+      commitCalls += 1;
+      if (commitCalls === 2) {
+        markTailCommitStarted();
+        await tailCommitGate;
+      }
+      return {
+        importedCount: input.records.length,
+        skippedCount: 0,
+        quarantinedCount: input.quarantinedCount,
+        checkpoint: checkpoint(input.checkpoint.checkpoint),
+      };
+    });
+    const pending = runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: mutable.source,
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      batchSize: 1,
+      messageResolver: { resolveExact: vi.fn(async () => null) },
+    });
+    await tailCommitStarted;
+    mutable.rewrite(changedFirst + blankTail);
+    releaseTailCommit();
+    await expect(pending).rejects.toThrowError(
+      NativeTranscriptSourceChangedError,
+    );
+    expect(repo.batches).toHaveLength(2);
+    expect(repo.batches[1]?.records).toEqual([]);
+  });
+
   it("fences a replayed prefix mutation before destination access", async () => {
     const root = temporaryDirectory();
     const path = join(root, "prefix-before-commit.jsonl");
@@ -1843,6 +2056,241 @@ describe("native transcript backfill coordinator", () => {
       messageResolver: { resolveExact: vi.fn(async () => null) },
     } as never)).rejects.toMatchObject({ code: "invalid-input" });
     expect(byteSource.openSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("snapshots every caller-owned option and dependency method before awaiting", async () => {
+    const content = [
+      '{"message":{"role":"user","content":"canary_123"}}',
+      '{"bad":}',
+    ].join("\n");
+    const baseSource = source(content);
+    let releaseOpen!: () => void;
+    const openGate = new Promise<void>((resolve) => {
+      releaseOpen = resolve;
+    });
+    let markOpenStarted!: () => void;
+    const openStarted = new Promise<void>((resolve) => {
+      markOpenStarted = resolve;
+    });
+    const initialOpenSnapshot = vi.fn(async () => {
+      markOpenStarted();
+      await openGate;
+      return baseSource.openSnapshot();
+    });
+    const sourceDependency = { openSnapshot: initialOpenSnapshot };
+
+    let releaseResolver!: () => void;
+    const resolverGate = new Promise<void>((resolve) => {
+      releaseResolver = resolve;
+    });
+    let markResolverStarted!: () => void;
+    const resolverStarted = new Promise<void>((resolve) => {
+      markResolverStarted = resolve;
+    });
+    const initialResolveExact = vi.fn(async () => {
+      markResolverStarted();
+      await resolverGate;
+      return { conversationId: 7, messageId: 9 };
+    });
+    const resolverDependency = { resolveExact: initialResolveExact };
+
+    const repo = repository();
+    let releaseRepository!: () => void;
+    const repositoryGate = new Promise<void>((resolve) => {
+      releaseRepository = resolve;
+    });
+    let markRepositoryStarted!: () => void;
+    const repositoryStarted = new Promise<void>((resolve) => {
+      markRepositoryStarted = resolve;
+    });
+    vi.mocked(repo.ingestBatch).mockImplementation(async (input) => {
+      repo.batches.push(input);
+      markRepositoryStarted();
+      await repositoryGate;
+      return {
+        importedCount: input.records.length,
+        skippedCount: 0,
+        quarantinedCount: input.quarantinedCount,
+        checkpoint: checkpoint(input.checkpoint.checkpoint),
+      };
+    });
+
+    const initialQuarantine = vi.fn(async (input) => ({
+      quarantineId: 1,
+      ...input,
+    }));
+    const quarantineDependency = {
+      clientName: "claude-code" as const,
+      quarantine: initialQuarantine,
+      get: vi.fn(),
+      list: vi.fn(),
+      close: vi.fn(),
+    };
+    const initialMap = vi.fn((_format, payload, sourceOrdinal) => [{
+      role: "user" as const,
+      content: (
+        (payload as JsonObject).message as JsonObject
+      ).content as string,
+      sourceOrdinal,
+    }]);
+    const mapperDependency = { map: initialMap };
+    const initialClock = vi.fn(
+      () => new Date("2026-07-25T12:00:00.000Z"),
+    );
+    const format = {
+      clientName: "claude-code",
+      formatName: "claude-jsonl",
+      formatVersion: "v1",
+    };
+    const globalPatterns = ["canary_[0-9]+"];
+    const projectPatterns = ["project_never_matches"];
+    const mutableOptions: Record<string, unknown> = {
+      repository: repo,
+      quarantine: quarantineDependency,
+      source: sourceDependency,
+      machineId: "machine-initial",
+      format,
+      nativeSessionId: "session-initial",
+      sourceLocator: "sessions/initial.jsonl",
+      globalPatterns,
+      projectPatterns,
+      pipelineVersion: "pipeline/initial",
+      messageMapper: mapperDependency,
+      messageResolver: resolverDependency,
+      batchSize: 2,
+      clock: initialClock,
+      maxRecordBytes: 1_024,
+    };
+    const pending = runNativeTranscriptBackfillCore(
+      mutableOptions as unknown as NativeTranscriptBackfillOptions,
+    );
+    await openStarted;
+
+    mutableOptions.machineId = "machine-during-open";
+    mutableOptions.nativeSessionId = "session-during-open";
+    mutableOptions.sourceLocator = "sessions/during-open.jsonl";
+    mutableOptions.pipelineVersion = "pipeline/during-open";
+    mutableOptions.batchSize = 1;
+    mutableOptions.maxRecordBytes = 1;
+    mutableOptions.clock = () => new Date("2030-01-01T00:00:00.000Z");
+    Object.assign(format, {
+      clientName: "codex",
+      formatName: "codex-jsonl",
+    });
+    globalPatterns[0] = "mutated_pattern";
+    projectPatterns.push("canary_[0-9]+");
+    Object.assign(repo, {
+      getCheckpoint: vi.fn(async () => {
+        throw new Error("mutated repository get");
+      }),
+      ingestBatch: vi.fn(async () => {
+        throw new Error("mutated repository ingest");
+      }),
+    });
+    Object.assign(quarantineDependency, {
+      clientName: "codex",
+      quarantine: vi.fn(async () => {
+        throw new Error("mutated quarantine");
+      }),
+    });
+    Object.assign(sourceDependency, {
+      openSnapshot: vi.fn(async () => {
+        throw new Error("mutated source");
+      }),
+    });
+    Object.assign(resolverDependency, {
+      resolveExact: vi.fn(async () => {
+        throw new Error("mutated resolver");
+      }),
+    });
+    Object.assign(mapperDependency, {
+      map: vi.fn(() => {
+        throw new Error("mutated mapper");
+      }),
+    });
+    releaseOpen();
+
+    await resolverStarted;
+    mutableOptions.sourceLocator = "sessions/during-resolver.jsonl";
+    Object.assign(format, { formatVersion: "mutated-version" });
+    globalPatterns.push("during_resolver");
+    releaseResolver();
+
+    await repositoryStarted;
+    mutableOptions.machineId = "machine-during-repository";
+    mutableOptions.nativeSessionId = "session-during-repository";
+    Object.assign(format, { clientName: "mutated-client" });
+    projectPatterns[0] = "during_repository";
+    releaseRepository();
+
+    await expect(pending).resolves.toMatchObject({
+      importedCount: 1,
+      quarantinedCount: 1,
+    });
+    expect(initialOpenSnapshot).toHaveBeenCalledTimes(1);
+    expect(initialMap).toHaveBeenCalledWith(
+      {
+        clientName: "claude-code",
+        formatName: "claude-jsonl",
+        formatVersion: "v1",
+      },
+      {
+        message: {
+          role: "user",
+          content: "[REDACTED]",
+        },
+      },
+      0,
+    );
+    expect(initialResolveExact).toHaveBeenCalledWith({
+      nativeSessionId: "session-initial",
+      sessionSequence: 0,
+      role: "user",
+      content: "[REDACTED]",
+    });
+    expect(initialQuarantine).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceLocator: "sessions/initial.jsonl",
+        sourceOrdinal: 1,
+        reason: "malformed-json",
+      }),
+    );
+    expect(initialClock).toHaveBeenCalledTimes(2);
+    expect(repo.batches).toEqual([
+      expect.objectContaining({
+        machineId: "machine-initial",
+        clientName: "claude-code",
+        sourceLocator: "sessions/initial.jsonl",
+        records: [
+          expect.objectContaining({
+            formatName: "claude-jsonl",
+            formatVersion: "v1",
+            nativeSessionId: "session-initial",
+            observedAt: new Date("2026-07-25T12:00:00.000Z"),
+            nativePayload: {
+              message: {
+                role: "user",
+                content: "[REDACTED]",
+              },
+            },
+            messageLinks: [{
+              conversationId: 7,
+              messageId: 9,
+              sourceOrdinal: 0,
+            }],
+          }),
+        ],
+        checkpoint: {
+          lastSourceOrdinal: 1,
+          checkpoint: expect.objectContaining({
+            scrubberVersion: expect.stringMatching(
+              /^pipeline\/initial:[0-9a-f]{64}$/u,
+            ),
+          }),
+        },
+        quarantinedCount: 1,
+      }),
+    ]);
   });
 
   it("batches valid records, exact links, and metadata-only quarantines", async () => {
@@ -3001,6 +3449,23 @@ describe("native transcript backfill coordinator", () => {
       batchSize: 1_001,
       messageResolver: { resolveExact: vi.fn(async () => null) },
     })).rejects.toThrowError(NativeTranscriptConfigurationError);
+    for (const invalid of [
+      null,
+      {
+        ...base,
+        pipelineVersion: 1,
+        messageResolver: { resolveExact: vi.fn(async () => null) },
+      },
+      {
+        ...base,
+        format: null,
+        messageResolver: { resolveExact: vi.fn(async () => null) },
+      },
+    ]) {
+      await expect(runNativeTranscriptBackfillCore(
+        invalid as never,
+      )).rejects.toThrowError(NativeTranscriptConfigurationError);
+    }
     await expect(runNativeTranscriptBackfill({
       ...base,
       messageResolver: { resolveExact: vi.fn(async () => null) },
@@ -3120,6 +3585,13 @@ describe("local transcript quarantine", () => {
     expect(statSync(dirname(path)).mode & 0o777).toBe(0o700);
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(lstatSync(path).isFile()).toBe(true);
+    const versionInspector = new DatabaseSync(path);
+    expect(versionInspector.prepare("PRAGMA user_version").get()).toEqual(
+      expect.objectContaining({
+        user_version: TRANSCRIPT_QUARANTINE_SCHEMA_VERSION,
+      }),
+    );
+    versionInspector.close();
     await codexRepo.close();
     await repo.close();
     await repo.close();
@@ -3234,6 +3706,13 @@ describe("local transcript quarantine", () => {
       "claude-code",
       home,
     );
+    const migratedVersion = new DatabaseSync(path);
+    expect(migratedVersion.prepare("PRAGMA user_version").get()).toEqual(
+      expect.objectContaining({
+        user_version: TRANSCRIPT_QUARANTINE_SCHEMA_VERSION,
+      }),
+    );
+    migratedVersion.close();
     expect(await migrated.list()).toEqual([
       expect.objectContaining({
         sourceLocator: "legacy.jsonl",
@@ -3264,42 +3743,127 @@ describe("local transcript quarantine", () => {
     await reopened.close();
   });
 
-  it("rolls back quarantine schema migration failures", () => {
-    const exec = vi.fn((sql: string) => {
-      if (sql.includes("ALTER TABLE")) throw new Error("migration failed");
-    });
-    const oldSchemaDb = {
-      exec,
-      prepare: vi.fn(() => ({
-        get: vi.fn(() => ({ sql: "CREATE TABLE transcript_quarantine (...)" })),
-      })),
-    };
+  it("rolls back quarantine schema, version, and data migration failures", () => {
+    const path = join(temporaryDirectory(), "rollback.db");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE transcript_quarantine (
+        quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_locator TEXT NOT NULL,
+        source_ordinal INTEGER NOT NULL CHECK (source_ordinal >= 0),
+        reason TEXT NOT NULL CHECK (reason IN (
+          'malformed-json',
+          'non-container-json',
+          'invalid-utf8',
+          'binary-input',
+          'nul-character',
+          'record-too-large',
+          'redacted-key-collision',
+          'residual-secret'
+        )),
+        content_sha256 TEXT NOT NULL CHECK (
+          length(content_sha256) = 64
+          AND content_sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+        quarantined_at TEXT NOT NULL,
+        UNIQUE (source_locator, source_ordinal, content_sha256)
+      );
+      INSERT INTO transcript_quarantine (
+        source_locator,
+        source_ordinal,
+        reason,
+        content_sha256,
+        quarantined_at
+      ) VALUES (
+        '',
+        0,
+        'malformed-json',
+        '${"a".repeat(64)}',
+        '2026-07-25T12:00:00.000Z'
+      );
+    `);
+    legacy.close();
+    const failing = new DatabaseSync(path);
     expect(() => new SQLiteLocalTranscriptQuarantineRepository(
-      ":memory:migration",
-      oldSchemaDb as never,
+      path,
+      failing,
       "claude-code",
-    )).toThrow("migration failed");
-    expect(exec).toHaveBeenCalledWith("BEGIN IMMEDIATE");
-    expect(exec).toHaveBeenCalledWith("ROLLBACK");
+    )).toThrow();
+    failing.close();
+    const inspector = new DatabaseSync(path);
+    expect(inspector.prepare("PRAGMA user_version").get()).toEqual(
+      expect.objectContaining({ user_version: 0 }),
+    );
+    expect(inspector.prepare(`
+      SELECT sql
+      FROM sqlite_master
+      WHERE type = 'table' AND name = 'transcript_quarantine'
+    `).get()).toEqual(expect.objectContaining({
+      sql: expect.stringContaining("AUTOINCREMENT"),
+    }));
+    expect(inspector.prepare(`
+      SELECT source_locator
+      FROM transcript_quarantine
+    `).get()).toEqual({ source_locator: "" });
+    inspector.close();
 
+    const original = new Error("original");
     const rollbackFailureDb = {
       exec: vi.fn((sql: string) => {
-        if (sql.includes("ALTER TABLE")) throw new Error("original");
         if (sql === "ROLLBACK") throw new Error("rollback");
       }),
-      prepare: oldSchemaDb.prepare,
+      prepare: vi.fn(() => ({
+        get: vi.fn(() => {
+          throw original;
+        }),
+      })),
     };
     expect(() => new SQLiteLocalTranscriptQuarantineRepository(
       ":memory:rollback-failure",
       rollbackFailureDb as never,
       "claude-code",
-    )).toThrow("original");
+    )).toThrow(original);
+    expect(rollbackFailureDb.exec).toHaveBeenCalledWith("ROLLBACK");
+
+    for (const [name, prepare] of [
+      [
+        "invalid-version",
+        vi.fn(() => ({
+          get: vi.fn(() => ({ user_version: "1" })),
+        })),
+      ],
+      [
+        "invalid-schema-sql",
+        vi.fn((sql: string) => ({
+          get: vi.fn(() =>
+            sql.includes("PRAGMA user_version")
+              ? { user_version: 0 }
+              : { sql: 42 }),
+        })),
+      ],
+    ] as const) {
+      const exec = vi.fn();
+      expect(() => new SQLiteLocalTranscriptQuarantineRepository(
+        `:memory:${name}`,
+        { exec, prepare } as never,
+        "claude-code",
+      )).toThrowError(expect.objectContaining({
+        code: "STORAGE_OPERATION_FAILED",
+      }));
+      expect(exec).toHaveBeenCalledWith("ROLLBACK");
+    }
   });
 
   it("fails closed if an injected database returns corrupt rows", async () => {
-    const fakeDb = {
-      exec: vi.fn(),
-      prepare: vi.fn((sql: string) => ({
+    const corruptDb = new DatabaseSync(":memory:");
+    const repo = new SQLiteLocalTranscriptQuarantineRepository(
+      ":memory:corrupt",
+      corruptDb,
+      "claude-code",
+    );
+    Object.defineProperty(corruptDb, "prepare", {
+      configurable: true,
+      value: vi.fn((sql: string) => ({
         run: vi.fn(),
         get: vi.fn(() => sql.includes("WHERE quarantine_id")
           ? {
@@ -3320,12 +3884,7 @@ describe("local transcript quarantine", () => {
           quarantined_at: new Date().toISOString(),
         }]),
       })),
-    };
-    const repo = new SQLiteLocalTranscriptQuarantineRepository(
-      ":memory:",
-      fakeDb as never,
-      "claude-code",
-    );
+    });
     await expect(repo.get(1)).rejects.toMatchObject({
       code: "STORAGE_OPERATION_FAILED",
     });
@@ -3333,9 +3892,15 @@ describe("local transcript quarantine", () => {
       code: "STORAGE_OPERATION_FAILED",
     });
 
-    const invalidDateDb = {
-      exec: vi.fn(),
-      prepare: vi.fn(() => ({
+    const invalidDateDb = new DatabaseSync(":memory:");
+    const invalidDateRepo = new SQLiteLocalTranscriptQuarantineRepository(
+      ":memory:invalid-date",
+      invalidDateDb,
+      "claude-code",
+    );
+    Object.defineProperty(invalidDateDb, "prepare", {
+      configurable: true,
+      value: vi.fn(() => ({
         get: vi.fn(() => undefined),
         all: vi.fn(() => [{
           quarantine_id: 1,
@@ -3346,28 +3911,24 @@ describe("local transcript quarantine", () => {
           quarantined_at: "not-a-date",
         }]),
       })),
-    };
-    const invalidDateRepo = new SQLiteLocalTranscriptQuarantineRepository(
-      ":memory:invalid-date",
-      invalidDateDb as never,
-      "claude-code",
-    );
+    });
     await expect(invalidDateRepo.list()).rejects.toMatchObject({
       code: "STORAGE_OPERATION_FAILED",
     });
 
-    const missingRowDb = {
-      exec: vi.fn(),
-      prepare: vi.fn(() => ({
+    const missingRowDb = new DatabaseSync(":memory:");
+    const missingRowRepo = new SQLiteLocalTranscriptQuarantineRepository(
+      ":memory:missing",
+      missingRowDb,
+      "claude-code",
+    );
+    Object.defineProperty(missingRowDb, "prepare", {
+      configurable: true,
+      value: vi.fn(() => ({
         run: vi.fn(),
         get: vi.fn(() => undefined),
       })),
-    };
-    const missingRowRepo = new SQLiteLocalTranscriptQuarantineRepository(
-      ":memory:missing",
-      missingRowDb as never,
-      "claude-code",
-    );
+    });
     await expect(missingRowRepo.quarantine({
       sourceLocator: "source",
       sourceOrdinal: 0,
@@ -3375,5 +3936,8 @@ describe("local transcript quarantine", () => {
       contentSha256: "a".repeat(64),
       quarantinedAt: new Date(),
     })).rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
+    corruptDb.close();
+    invalidDateDb.close();
+    missingRowDb.close();
   });
 });

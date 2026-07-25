@@ -33,6 +33,14 @@ provides the built-in Claude/Codex mapper. Callers may inject a mapper, while
 the exact resolver is required. These are programmatic APIs, not daemon routes
 or CLI commands.
 
+`runNativeTranscriptBackfill()` snapshots and validates its complete caller
+configuration before opening the source. Format fields, pattern arrays,
+identifiers, limits, clock, and the source, repository, quarantine, resolver,
+and mapper methods are pinned to that invocation. Mutating or replacing the
+caller's option object, nested format object, arrays, or dependency methods
+after the returned promise starts cannot change the stored provenance,
+scrubber, linkage, checkpoint, or quarantine namespace.
+
 Create a new exact resolver for each backfill. On first use for a native
 session, it materializes one immutable destination snapshot: matching
 conversations are ordered by creation time and then conversation ID, each
@@ -205,11 +213,14 @@ checkpointed source to empty therefore replaces the old checkpoint without
 deleting stored transcript rows. Rerunning against an already exact empty
 checkpoint does not write it again.
 
-The verified prefix remains a separate protected byte range for the entire
-run. LCM rehashes it before and after every successful destination call even
-after suffix ranges have committed and been cleared. A same-size rewrite of
-only the replayed prefix therefore cannot hide behind coalesced filesystem
-timestamps.
+The verified prior prefix remains a separate protected byte range for the
+entire run. Every suffix range committed during the current run is also
+retained cumulatively, separately from the current uncommitted ranges. LCM
+rehashes all three sets before and after every later destination call,
+including checkpoint-only progress. A range moves into the cumulative set only
+after its destination call succeeds and the post-commit source fence passes.
+A same-size rewrite of the replayed prefix or any earlier current-run batch
+therefore cannot hide behind coalesced filesystem timestamps.
 
 `createFileNativeTranscriptSource()` binds one backfill to an opened file
 descriptor after verifying that the locator is client-root-relative, the
@@ -285,10 +296,16 @@ client namespace does not match the selected transcript format before opening
 the source or contacting the destination repository.
 
 Quarantine schema creation and migration take one SQLite `BEGIN IMMEDIATE`
-lock. Table and index creation are idempotent, so separate processes racing to
-open a new project/client store serialize safely and validate the committed
-schema before use. Migration failures roll back without retaining unsafe
-payload data.
+lock. Schema version `1` is recorded with `PRAGMA user_version` in that same
+transaction. LCM validates the complete strict table definition, columns,
+privacy checks, unique key, managed index definition, and index column order
+before use. It can adopt an exact unversioned current schema, repair only a
+missing managed index, and migrate the exact unreleased legacy reason schema.
+Unsupported versions or other schema drift fail closed. Table changes,
+including future reason-code changes, require a schema-version bump and an
+explicit migration. Separate processes racing to open a new project/client
+store serialize safely; migration failures roll back the version, schema, and
+existing metadata rows together without retaining unsafe payload data.
 
 Reason codes are bounded to `invalid-utf8`, `binary-input`,
 `record-too-large`, `malformed-json`, `non-container-json`, `nul-character`,

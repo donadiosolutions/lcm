@@ -270,13 +270,17 @@ function assertFormat(format: NativeTranscriptFormat): void {
   if (!supported) throw new NativeTranscriptConfigurationError("invalid-input");
 }
 
-function assertNonemptyText(value: string): void {
-  if (value.length === 0 || value.includes("\0")) {
+function assertNonemptyText(value: unknown): asserts value is string {
+  if (
+    typeof value !== "string"
+    || value.length === 0
+    || value.includes("\0")
+  ) {
     throw new NativeTranscriptConfigurationError("invalid-input");
   }
 }
 
-function assertSourceLocator(value: string): void {
+function assertSourceLocator(value: unknown): asserts value is string {
   assertNonemptyText(value);
   if (
     isAbsolute(value)
@@ -1419,6 +1423,156 @@ export interface NativeTranscriptBackfillResult {
   readonly rescanned: boolean;
 }
 
+interface NativeTranscriptBackfillSnapshot {
+  readonly repository: Pick<
+    NativeTranscriptRepository,
+    "getCheckpoint" | "ingestBatch"
+  >;
+  readonly quarantine: Pick<
+    LocalTranscriptQuarantineRepository,
+    "clientName" | "quarantine"
+  >;
+  readonly source: Pick<NativeTranscriptByteSource, "openSnapshot">;
+  readonly machineId: string;
+  readonly format: NativeTranscriptFormat;
+  readonly nativeSessionId: string;
+  readonly sourceLocator: string;
+  readonly globalPatterns: readonly string[];
+  readonly projectPatterns: readonly string[];
+  readonly pipelineVersion: string | undefined;
+  readonly messageMapper: NativeTranscriptMessageMapper;
+  readonly hasCustomMessageMapper: boolean;
+  readonly messageResolver: ExactNativeTranscriptMessageResolver;
+  readonly batchSize: number;
+  readonly clock: (() => Date) | undefined;
+  readonly maxRecordBytes: number | undefined;
+}
+
+function snapshotNativeTranscriptBackfillOptions(
+  options: NativeTranscriptBackfillOptions,
+): NativeTranscriptBackfillSnapshot {
+  if (options === null || typeof options !== "object") {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const machineId = options.machineId;
+  const nativeSessionId = options.nativeSessionId;
+  const sourceLocator = options.sourceLocator;
+  const pipelineVersion = options.pipelineVersion;
+  const batchSize =
+    options.batchSize ?? NATIVE_TRANSCRIPT_DEFAULT_BATCH_SIZE;
+  const maxRecordBytes = options.maxRecordBytes;
+  const clock = options.clock;
+  assertNonemptyText(machineId);
+  assertNonemptyText(nativeSessionId);
+  assertSourceLocator(sourceLocator);
+  if (
+    pipelineVersion !== undefined
+    && typeof pipelineVersion !== "string"
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  if (
+    !Number.isSafeInteger(batchSize)
+    || batchSize < 1
+    || batchSize > NATIVE_TRANSCRIPT_MAX_BATCH_SIZE
+    || (
+      maxRecordBytes !== undefined
+      && (!Number.isSafeInteger(maxRecordBytes) || maxRecordBytes < 1)
+    )
+    || (clock !== undefined && typeof clock !== "function")
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+
+  const callerFormat = options.format;
+  if (callerFormat === null || typeof callerFormat !== "object") {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const format = Object.freeze({
+    clientName: callerFormat.clientName,
+    formatName: callerFormat.formatName,
+    formatVersion: callerFormat.formatVersion,
+  }) as NativeTranscriptFormat;
+  assertFormat(format);
+
+  const globalPatterns = options.globalPatterns;
+  const projectPatterns = options.projectPatterns;
+  if (
+    !Array.isArray(globalPatterns)
+    || !Array.isArray(projectPatterns)
+    || globalPatterns.some((pattern) => typeof pattern !== "string")
+    || projectPatterns.some((pattern) => typeof pattern !== "string")
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+
+  const repository = options.repository;
+  const quarantine = options.quarantine;
+  const source = options.source;
+  const messageResolver = options.messageResolver;
+  const callerMapper = options.messageMapper;
+  if (
+    repository === null
+    || typeof repository !== "object"
+    || typeof repository.getCheckpoint !== "function"
+    || typeof repository.ingestBatch !== "function"
+    || quarantine === null
+    || typeof quarantine !== "object"
+    || typeof quarantine.quarantine !== "function"
+    || source === null
+    || typeof source !== "object"
+    || typeof source.openSnapshot !== "function"
+    || messageResolver === null
+    || typeof messageResolver !== "object"
+    || typeof messageResolver.resolveExact !== "function"
+    || (
+      callerMapper !== undefined
+      && (
+        callerMapper === null
+        || typeof callerMapper !== "object"
+        || typeof callerMapper.map !== "function"
+      )
+    )
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const clientName = quarantine.clientName;
+  if (clientName !== format.clientName) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const mapper = callerMapper ?? createNativeTranscriptMessageMapper();
+  return Object.freeze({
+    repository: Object.freeze({
+      getCheckpoint: repository.getCheckpoint.bind(repository),
+      ingestBatch: repository.ingestBatch.bind(repository),
+    }),
+    quarantine: Object.freeze({
+      clientName,
+      quarantine: quarantine.quarantine.bind(quarantine),
+    }),
+    source: Object.freeze({
+      openSnapshot: source.openSnapshot.bind(source),
+    }),
+    machineId,
+    format,
+    nativeSessionId,
+    sourceLocator,
+    globalPatterns: Object.freeze([...globalPatterns]),
+    projectPatterns: Object.freeze([...projectPatterns]),
+    pipelineVersion,
+    messageMapper: Object.freeze({
+      map: mapper.map.bind(mapper),
+    }),
+    hasCustomMessageMapper: callerMapper !== undefined,
+    messageResolver: Object.freeze({
+      resolveExact: messageResolver.resolveExact.bind(messageResolver),
+    }),
+    batchSize,
+    clock,
+    maxRecordBytes,
+  });
+}
+
 function assertMetadata(
   metadata: NativeTranscriptSourceMetadata,
 ): NativeTranscriptSourceMetadata {
@@ -1500,42 +1654,22 @@ function mappedMessageCandidates(
 export async function runNativeTranscriptBackfill(
   options: NativeTranscriptBackfillOptions,
 ): Promise<NativeTranscriptBackfillResult> {
-  assertNonemptyText(options.machineId);
-  assertFormat(options.format);
-  if (options.quarantine.clientName !== options.format.clientName) {
-    throw new NativeTranscriptConfigurationError("invalid-input");
-  }
-  assertNonemptyText(options.nativeSessionId);
-  assertSourceLocator(options.sourceLocator);
-  const batchSize =
-    options.batchSize ?? NATIVE_TRANSCRIPT_DEFAULT_BATCH_SIZE;
-  if (
-    !Number.isSafeInteger(batchSize)
-    || batchSize < 1
-    || batchSize > NATIVE_TRANSCRIPT_MAX_BATCH_SIZE
-  ) {
-    throw new NativeTranscriptConfigurationError("invalid-input");
-  }
+  const config = snapshotNativeTranscriptBackfillOptions(options);
   // Constructing the scrubber validates every custom pattern before source,
   // quarantine, resolver, or destination access.
   const scrubber = createNativeTranscriptScrubber({
-    globalPatterns: options.globalPatterns,
-    projectPatterns: options.projectPatterns,
-    pipelineVersion: options.pipelineVersion,
+    globalPatterns: config.globalPatterns,
+    projectPatterns: config.projectPatterns,
+    pipelineVersion: config.pipelineVersion,
   });
-  if (!options.messageResolver) {
-    throw new NativeTranscriptConfigurationError("invalid-input");
-  }
-  const mapper =
-    options.messageMapper ?? createNativeTranscriptMessageMapper();
-  const snapshot = await options.source.openSnapshot();
+  const snapshot = await config.source.openSnapshot();
   try {
     const metadata = assertMetadata(snapshot.metadata);
     await snapshot.assertUnchanged();
-    const previous = await options.repository.getCheckpoint({
-      machineId: options.machineId,
-      clientName: options.format.clientName,
-      sourceLocator: options.sourceLocator,
+    const previous = await config.repository.getCheckpoint({
+      machineId: config.machineId,
+      clientName: config.format.clientName,
+      sourceLocator: config.sourceLocator,
     });
     let expectedCheckpoint: NativeTranscriptCheckpointRecord | null = previous;
     const candidateOffset = previous
@@ -1560,6 +1694,7 @@ export async function runNativeTranscriptBackfill(
     let quarantinedCount = 0;
     let batch: NativeTranscriptReadOutcome[] = [];
     let uncommittedRanges: NativeTranscriptByteRangeDigest[] = [];
+    const committedThisRunRanges: NativeTranscriptByteRangeDigest[] = [];
     const protectedPrefixRange: NativeTranscriptByteRangeDigest | null =
       resumedFromByteOffset > 0 && previous
         ? Object.freeze({
@@ -1583,13 +1718,19 @@ export async function runNativeTranscriptBackfill(
       };
     } = {};
 
-    const assertUncommittedSourceUnchanged = async (): Promise<void> => {
+    const assertTrackedSourceUnchanged = async (): Promise<void> => {
       await snapshot.assertUnchanged();
       if (protectedPrefixRange) {
         await snapshot.assertByteRangesUnchanged([protectedPrefixRange]);
       }
+      await snapshot.assertByteRangesUnchanged(committedThisRunRanges);
       await snapshot.assertByteRangesUnchanged(uncommittedRanges);
       await snapshot.assertUnchanged();
+    };
+
+    const promoteUncommittedRanges = (): void => {
+      committedThisRunRanges.push(...uncommittedRanges);
+      uncommittedRanges = [];
     };
 
     const applyQuarantineSequence = (): void => {
@@ -1614,7 +1755,7 @@ export async function runNativeTranscriptBackfill(
           nextSessionSequence: mappedNextSessionSequence,
         };
       }
-      if (options.messageMapper || candidates.length !== 1) {
+      if (config.hasCustomMessageMapper || candidates.length !== 1) {
         throw new NativeTranscriptLinkError(record.sourceOrdinal);
       }
       const lastCandidateSequence =
@@ -1630,7 +1771,7 @@ export async function runNativeTranscriptBackfill(
         sessionSequence <= lastCandidateSequence;
         sessionSequence += 1
       ) {
-        const resolved = await options.messageResolver.resolveExact({
+        const resolved = await config.messageResolver.resolveExact({
           nativeSessionId: record.nativeSessionId,
           sessionSequence,
           role: candidate.role,
@@ -1659,7 +1800,7 @@ export async function runNativeTranscriptBackfill(
         (outcome): outcome is QuarantinedNativeTranscriptRecord =>
           outcome.kind === "quarantine",
       );
-      await assertUncommittedSourceUnchanged();
+      await assertTrackedSourceUnchanged();
       const records: CreateNativeTranscriptInput[] = [];
       for (const outcome of batch) {
         if (outcome.kind === "quarantine") {
@@ -1669,8 +1810,8 @@ export async function runNativeTranscriptBackfill(
         const record = outcome;
         const mapped = mappedMessageCandidates(
           record,
-          options.format,
-          mapper,
+          config.format,
+          config.messageMapper,
           nextSessionSequence,
         );
         const sequenceResolution = await resolvePendingSequence(
@@ -1681,7 +1822,7 @@ export async function runNativeTranscriptBackfill(
         const resolvedLinks = sequenceResolution.links ?? await messageLinks(
           record,
           mapped.candidates,
-          options.messageResolver,
+          config.messageResolver,
         );
         nextSessionSequence = sequenceResolution.nextSessionSequence;
         records.push({
@@ -1697,21 +1838,21 @@ export async function runNativeTranscriptBackfill(
           messageLinks: resolvedLinks,
         });
       }
-      await assertUncommittedSourceUnchanged();
+      await assertTrackedSourceUnchanged();
       for (const record of quarantinedRecords) {
-        await options.quarantine.quarantine({
-          sourceLocator: options.sourceLocator,
+        await config.quarantine.quarantine({
+          sourceLocator: config.sourceLocator,
           sourceOrdinal: record.sourceOrdinal,
           reason: record.reason,
           contentSha256: record.contentSha256,
           quarantinedAt: record.quarantinedAt,
         });
       }
-      await assertUncommittedSourceUnchanged();
-      const result = await options.repository.ingestBatch({
-        machineId: options.machineId,
-        clientName: options.format.clientName,
-        sourceLocator: options.sourceLocator,
+      await assertTrackedSourceUnchanged();
+      const result = await config.repository.ingestBatch({
+        machineId: config.machineId,
+        clientName: config.format.clientName,
+        sourceLocator: config.sourceLocator,
         expectedCheckpoint,
         records,
         checkpoint: {
@@ -1724,24 +1865,24 @@ export async function runNativeTranscriptBackfill(
         },
         quarantinedCount: quarantinedRecords.length,
       });
-      await assertUncommittedSourceUnchanged();
+      await assertTrackedSourceUnchanged();
+      promoteUncommittedRanges();
       importedCount += result.importedCount;
       skippedCount += result.skippedCount;
       quarantinedCount += result.quarantinedCount;
       expectedCheckpoint = result.checkpoint;
       committedByteOffset = last.endByteOffset;
       batch = [];
-      uncommittedRanges = [];
     };
 
     const outcomes = readNativeTranscriptJsonl({
       bytes: snapshot.stream(),
-      format: options.format,
-      nativeSessionId: options.nativeSessionId,
-      sourceLocator: options.sourceLocator,
+      format: config.format,
+      nativeSessionId: config.nativeSessionId,
+      sourceLocator: config.sourceLocator,
       scrubber,
-      clock: options.clock,
-      maxRecordBytes: options.maxRecordBytes,
+      clock: config.clock,
+      maxRecordBytes: config.maxRecordBytes,
       progressStartByteOffset: committedByteOffset,
       onProgress: (progress) => {
         progressState.latest = progress;
@@ -1757,8 +1898,8 @@ export async function runNativeTranscriptBackfill(
         if (outcome.kind === "record") {
           const mapped = mappedMessageCandidates(
             outcome,
-            options.format,
-            mapper,
+            config.format,
+            config.messageMapper,
             nextSessionSequence,
           );
           const sequenceResolution = await resolvePendingSequence(
@@ -1774,7 +1915,7 @@ export async function runNativeTranscriptBackfill(
       }
       lastSourceOrdinal = outcome.sourceOrdinal;
       batch.push(outcome);
-      if (batch.length === batchSize) await flush();
+      if (batch.length === config.batchSize) await flush();
     }
     await flush();
     const latestProgress = progressState.latest;
@@ -1782,11 +1923,11 @@ export async function runNativeTranscriptBackfill(
       latestProgress
       && latestProgress.endByteOffset > committedByteOffset
     ) {
-      await assertUncommittedSourceUnchanged();
-      const result = await options.repository.ingestBatch({
-        machineId: options.machineId,
-        clientName: options.format.clientName,
-        sourceLocator: options.sourceLocator,
+      await assertTrackedSourceUnchanged();
+      const result = await config.repository.ingestBatch({
+        machineId: config.machineId,
+        clientName: config.format.clientName,
+        sourceLocator: config.sourceLocator,
         expectedCheckpoint,
         records: [],
         checkpoint: {
@@ -1799,11 +1940,11 @@ export async function runNativeTranscriptBackfill(
         },
         quarantinedCount: 0,
       });
-      await assertUncommittedSourceUnchanged();
+      await assertTrackedSourceUnchanged();
+      promoteUncommittedRanges();
       importedCount += result.importedCount;
       skippedCount += result.skippedCount;
       quarantinedCount += result.quarantinedCount;
-      uncommittedRanges = [];
     }
     const emptyCheckpoint = checkpointJson({
       endByteOffset: 0,
@@ -1814,11 +1955,11 @@ export async function runNativeTranscriptBackfill(
       && canonicalNativeTranscriptJson(previous.checkpoint)
         === canonicalNativeTranscriptJson(emptyCheckpoint);
     if (metadata.sizeBytes === 0 && !emptyCheckpointIsExact) {
-      await assertUncommittedSourceUnchanged();
-      const result = await options.repository.ingestBatch({
-        machineId: options.machineId,
-        clientName: options.format.clientName,
-        sourceLocator: options.sourceLocator,
+      await assertTrackedSourceUnchanged();
+      const result = await config.repository.ingestBatch({
+        machineId: config.machineId,
+        clientName: config.format.clientName,
+        sourceLocator: config.sourceLocator,
         expectedCheckpoint,
         records: [],
         checkpoint: {
@@ -1827,7 +1968,7 @@ export async function runNativeTranscriptBackfill(
         },
         quarantinedCount: 0,
       });
-      await assertUncommittedSourceUnchanged();
+      await assertTrackedSourceUnchanged();
       importedCount += result.importedCount;
       skippedCount += result.skippedCount;
       quarantinedCount += result.quarantinedCount;

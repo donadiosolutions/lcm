@@ -56,6 +56,7 @@ export {
   openLocalTranscriptQuarantine,
   SQLiteLocalTranscriptQuarantineRepository,
   TRANSCRIPT_QUARANTINE_REASONS,
+  TRANSCRIPT_QUARANTINE_SCHEMA_VERSION,
   type LocalTranscriptQuarantineInput,
   type LocalTranscriptQuarantineListOptions,
   type LocalTranscriptQuarantineRecord,
