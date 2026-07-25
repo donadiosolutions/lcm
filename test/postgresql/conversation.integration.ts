@@ -269,19 +269,79 @@ describe("PostgreSQL 18 conversation repository", () => {
     });
   });
 
-  it("converges concurrent get-or-create calls on one newest segment", async () => {
+  it("converges lock-waiting get-or-create calls under a REPEATABLE READ default", async () => {
     await withPostgreSqlTestDatabase("conversation-get-or-create-race", async (database) => {
       await grantConversationRuntimePrivileges(database);
       const projectId = await createProject(database, "Conversation race");
       const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
-      const rows = await Promise.all(Array.from({ length: 16 }, (_, index) =>
-        repository.getOrCreateConversation("shared-race", `candidate-${index}`)));
+      const configured = await database.runtime.query<{
+        default_transaction_isolation: string;
+      }>({
+        text: "SHOW default_transaction_isolation",
+      }, { domain: "conversations", operation: "inspectConversationIsolationDefault" });
+      expect(configured.rows[0]?.default_transaction_isolation).toBe("repeatable read");
+
+      let releaseBlocker!: () => void;
+      let markBlockerHeld!: () => void;
+      const blockerRelease = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+      const blockerHeld = new Promise<void>((resolve) => { markBlockerHeld = resolve; });
+      const blocker = database.migrator.transaction(async (transaction) => {
+        await transaction.query({
+          text: `SELECT pg_catalog.pg_advisory_xact_lock(
+                          pg_catalog.hashtextextended(
+                            $1::pg_catalog.text
+                              OPERATOR(pg_catalog.||) ':conversation:'
+                              OPERATOR(pg_catalog.||)
+                                pg_catalog.encode(
+                                  public.digest($2::pg_catalog.text, 'sha256'),
+                                  'hex'
+                                ),
+                            0
+                          )
+                        )`,
+          values: [projectId, "shared-race"],
+        }, { domain: "conversations", operation: "holdConversationAdvisoryLock" });
+        markBlockerHeld();
+        await blockerRelease;
+      }, { domain: "transaction", operation: "holdConversationAdvisoryLock" });
+      await blockerHeld;
+
+      const pendingRows = Promise.all([
+        repository.getOrCreateConversation("shared-race", "candidate-0"),
+        repository.getOrCreateConversation("shared-race", "candidate-1"),
+      ]);
+      let bothBlocked = false;
+      try {
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          const locks = await database.migrator.query<{ count: number }>({
+            text: `SELECT pg_catalog.count(*)::integer AS count
+                   FROM pg_catalog.pg_locks
+                   WHERE locktype = 'advisory'
+                     AND database = (
+                       SELECT oid
+                       FROM pg_catalog.pg_database
+                       WHERE datname = pg_catalog.current_database()
+                     )
+                     AND NOT granted`,
+          }, { domain: "conversations", operation: "inspectConversationAdvisoryWaiters" });
+          if ((locks.rows[0]?.count ?? 0) >= 2) {
+            bothBlocked = true;
+            break;
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        releaseBlocker();
+        await blocker;
+      }
+      expect(bothBlocked).toBe(true);
+      const rows = await pendingRows;
 
       expect(new Set(rows.map((row) => row.conversationId)).size).toBe(1);
       expect((await repository.listConversations()).filter(
         (row) => row.sessionId === "shared-race",
       )).toHaveLength(1);
-    });
+    }, { defaultTransactionIsolation: "REPEATABLE READ" });
   });
 
   it("allocates concurrent append batches contiguously without interleaving", async () => {

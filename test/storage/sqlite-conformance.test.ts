@@ -962,6 +962,156 @@ describe("SQLite storage backend conformance", () => {
     )).resolves.toBe("open");
   });
 
+  it("serializes concurrent scoped savepoints and recovers the queue after rejection", async () => {
+    const calls: string[] = [];
+    const database = {
+      exec: (sql: string): void => { calls.push(sql); },
+    } as unknown as DatabaseSync;
+    const executor = new SqliteExecutor(database, "safe-project");
+    let releaseFirst!: () => void;
+    let markFirstEntered!: () => void;
+    const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const firstEntered = new Promise<void>((resolve) => { markFirstEntered = resolve; });
+    const order: string[] = [];
+
+    await expect(executor.transaction(async (token) => {
+      const first = executor.runAtomicScoped(
+        token,
+        "conversations",
+        "createMessagesBulk",
+        async () => {
+          order.push("first-enter");
+          markFirstEntered();
+          await firstRelease;
+          order.push("first-fail");
+          throw new Error("first batch failed");
+        },
+      );
+      await firstEntered;
+      const second = executor.runAtomicScoped(
+        token,
+        "conversations",
+        "createMessageParts",
+        () => {
+          order.push("second-enter");
+          return "second succeeded";
+        },
+      );
+      await Promise.resolve();
+      expect(order).toEqual(["first-enter"]);
+      releaseFirst();
+      await expect(first).rejects.toMatchObject({
+        domain: "conversations",
+        operation: "createMessagesBulk",
+      });
+      await expect(second).resolves.toBe("second succeeded");
+      return "committed";
+    })).resolves.toBe("committed");
+
+    expect(order).toEqual(["first-enter", "first-fail", "second-enter"]);
+    expect(calls).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_atomic_0",
+      "ROLLBACK TO SAVEPOINT lcm_atomic_0",
+      "RELEASE SAVEPOINT lcm_atomic_0",
+      "SAVEPOINT lcm_atomic_1",
+      "RELEASE SAVEPOINT lcm_atomic_1",
+      "COMMIT",
+    ]);
+    await expect(executor.run(
+      "conversations",
+      "listConversations",
+      () => "reusable",
+    )).resolves.toBe("reusable");
+  });
+
+  it("rejects recursive same-token atomic scopes without deadlocking the queue", async () => {
+    const calls: string[] = [];
+    const database = {
+      exec: (sql: string): void => { calls.push(sql); },
+    } as unknown as DatabaseSync;
+    const executor = new SqliteExecutor(database, "safe-project");
+    let nestedCallbackEntered = false;
+
+    await expect(executor.transaction(async (token) => executor.runAtomicScoped(
+      token,
+      "conversations",
+      "createMessagesBulk",
+      async () => {
+        const nestedFailure = await executor.runAtomicScoped(
+          token,
+          "conversations",
+          "deleteMessages",
+          () => { nestedCallbackEntered = true; },
+        ).catch((error: unknown) => error);
+        expect(nestedFailure).toMatchObject({
+          code: "STORAGE_TRANSACTION_SCOPE",
+          domain: "conversations",
+          operation: "deleteMessages",
+        });
+        expect(JSON.stringify(nestedFailure)).not.toContain("cause");
+        return "outer completed";
+      },
+    ))).resolves.toBe("outer completed");
+
+    expect(nestedCallbackEntered).toBe(false);
+    expect(calls).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_atomic_0",
+      "RELEASE SAVEPOINT lcm_atomic_0",
+      "COMMIT",
+    ]);
+  });
+
+  it("revalidates a queued scoped savepoint before touching SQLite", async () => {
+    const calls: string[] = [];
+    const database = {
+      exec: (sql: string): void => { calls.push(sql); },
+    } as unknown as DatabaseSync;
+    const executor = new SqliteExecutor(database, "safe-project");
+    let releaseFirst!: () => void;
+    let markFirstEntered!: () => void;
+    const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const firstEntered = new Promise<void>((resolve) => { markFirstEntered = resolve; });
+
+    await executor.transaction(async (token) => {
+      const first = executor.runAtomicScoped(
+        token,
+        "conversations",
+        "createMessagesBulk",
+        async () => {
+          markFirstEntered();
+          await firstRelease;
+        },
+      );
+      await firstEntered;
+      const queued = executor.runAtomicScoped(
+        token,
+        "conversations",
+        "deleteMessages",
+        () => undefined,
+      );
+      const activeTokens = (
+        executor as unknown as { activeTokens: Set<symbol> }
+      ).activeTokens;
+      activeTokens.delete(token);
+      releaseFirst();
+      await first;
+      await expect(queued).rejects.toMatchObject({
+        code: "STORAGE_TRANSACTION_SCOPE",
+        operation: "deleteMessages",
+      });
+      activeTokens.add(token);
+    });
+
+    expect(calls).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_atomic_0",
+      "RELEASE SAVEPOINT lcm_atomic_0",
+      "COMMIT",
+    ]);
+  });
+
   it("rejects atomic roots and every invalid scoped-atomic transaction context", async () => {
     const firstDatabase = { exec: vi.fn() } as unknown as DatabaseSync;
     const secondDatabase = { exec: vi.fn() } as unknown as DatabaseSync;

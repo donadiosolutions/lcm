@@ -281,6 +281,62 @@ export function defineCoreStorageConformance(
     expect((await storage.conversations.getMessages(atomicConversation.conversationId))
       .map((row) => row.content)).toEqual(["parts"]);
 
+    await storage.transaction(async (tx) => {
+      await Promise.all([
+        tx.conversations.createMessagesBulk([{
+          conversationId: atomicConversation.conversationId,
+          seq: 1,
+          role: "user",
+          content: "concurrent commit a",
+          tokenCount: 2,
+        }]),
+        tx.conversations.createMessagesBulk([{
+          conversationId: atomicConversation.conversationId,
+          seq: 2,
+          role: "assistant",
+          content: "concurrent commit b",
+          tokenCount: 2,
+        }]),
+      ]);
+    });
+    expect((await storage.conversations.getMessages(atomicConversation.conversationId))
+      .map((row) => row.content)).toEqual([
+      "parts",
+      "concurrent commit a",
+      "concurrent commit b",
+    ]);
+
+    await expect(storage.transaction(async (tx) => {
+      await Promise.all([
+        tx.conversations.createMessagesBulk([{
+          conversationId: atomicConversation.conversationId,
+          seq: 3,
+          role: "user",
+          content: "must roll back with concurrent peer",
+          tokenCount: 2,
+        }]),
+        tx.conversations.createMessagesBulk([{
+          conversationId: atomicConversation.conversationId,
+          seq: 4,
+          role: "assistant",
+          content: "duplicate concurrent a",
+          tokenCount: 2,
+        }, {
+          conversationId: atomicConversation.conversationId,
+          seq: 4,
+          role: "tool",
+          content: "duplicate concurrent b",
+          tokenCount: 2,
+        }]),
+      ]);
+    })).rejects.toMatchObject({ domain: "conversations" });
+    expect((await storage.conversations.getMessages(atomicConversation.conversationId))
+      .map((row) => row.content)).toEqual([
+      "parts",
+      "concurrent commit a",
+      "concurrent commit b",
+    ]);
+
     const contextConversation = await storage.conversations.createConversation({ sessionId: "context-rollback" });
     const contextMessage = await storage.conversations.createMessage({
       conversationId: contextConversation.conversationId,

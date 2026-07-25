@@ -9,6 +9,7 @@ type TransactionContext = {
 };
 
 const transactionContext = new AsyncLocalStorage<TransactionContext>();
+const scopedAtomicContext = new AsyncLocalStorage<TransactionContext>();
 const executors = new WeakMap<DatabaseSync, SqliteExecutor>();
 
 export function sqliteExecutorFor(
@@ -25,6 +26,7 @@ export function sqliteExecutorFor(
 
 export class SqliteExecutor {
   private tail: Promise<void> = Promise.resolve();
+  private readonly scopedAtomicTails = new Map<symbol, Promise<void>>();
   private readonly activeTokens = new Set<symbol>();
   private readonly failedTokens = new Set<symbol>();
   private savepointOrdinal = 0;
@@ -121,11 +123,69 @@ export class SqliteExecutor {
         operation,
       );
     }
+    const scopedAtomic = scopedAtomicContext.getStore();
+    if (scopedAtomic?.executor === this && scopedAtomic.token === token) {
+      throw new StorageOperationError(
+        "STORAGE_TRANSACTION_SCOPE",
+        "sqlite",
+        this.projectId,
+        domain,
+        operation,
+      );
+    }
     this.assertUsable(domain, operation);
+    return this.enqueueScopedAtomic(token, domain, operation, callback);
+  }
+
+  private async enqueueScopedAtomic<T>(
+    token: symbol,
+    domain: StorageDomain,
+    operation: string,
+    callback: () => T | Promise<T>,
+  ): Promise<T> {
+    const previous = this.scopedAtomicTails.get(token) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve): void => { release = resolve; });
+    const tail = previous.then((): Promise<void> => current);
+    this.scopedAtomicTails.set(token, tail);
+    await previous;
+    try {
+      // Promise.all branches share the transaction token but must not overlap
+      // SQLite savepoint lifecycles. Revalidate after waiting so queued work
+      // cannot escape a transaction whose callback has already completed.
+      const active = transactionContext.getStore();
+      if (active?.executor !== this || active.token !== token || !this.activeTokens.has(token)) {
+        throw new StorageOperationError(
+          "STORAGE_TRANSACTION_SCOPE",
+          "sqlite",
+          this.projectId,
+          domain,
+          operation,
+        );
+      }
+      this.assertUsable(domain, operation);
+      return await this.atomicScoped(token, domain, operation, callback);
+    } finally {
+      release();
+      if (this.scopedAtomicTails.get(token) === tail) {
+        this.scopedAtomicTails.delete(token);
+      }
+    }
+  }
+
+  private async atomicScoped<T>(
+    token: symbol,
+    domain: StorageDomain,
+    operation: string,
+    callback: () => T | Promise<T>,
+  ): Promise<T> {
     const savepoint = `lcm_atomic_${this.savepointOrdinal++}`;
     this.db.exec(`SAVEPOINT ${savepoint}`);
     try {
-      const result = await callback();
+      const result = await scopedAtomicContext.run(
+        { executor: this, token },
+        async (): Promise<T> => callback(),
+      );
       this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
       return result;
     } catch (error) {

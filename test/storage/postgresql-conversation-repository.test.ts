@@ -75,6 +75,7 @@ const partRow = {
 describe("PostgreSQL conversation repository", () => {
   it("implements every read and write with parameterized project-scoped SQL", async () => {
     const db = executor((config) => {
+      if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") return result([]);
       if (config.text.includes("pg_advisory_xact_lock")) return result([{ pg_advisory_xact_lock: null }]);
       if (config.text.includes("MAX(seq) AS max_seq")) return result([{ max_seq: null }]);
       if (config.text.includes("COUNT(*) AS count") || config.text.includes("COUNT(message.message_id)")) {
@@ -183,6 +184,10 @@ describe("PostgreSQL conversation repository", () => {
   it("creates a missing get-or-create segment after taking the advisory lock", async () => {
     const order: string[] = [];
     const db = executor((config) => {
+      if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        order.push("isolation");
+        return result([]);
+      }
       if (config.text.includes("pg_advisory_xact_lock")) {
         order.push("lock");
         return result([{ pg_advisory_xact_lock: null }]);
@@ -203,9 +208,30 @@ describe("PostgreSQL conversation repository", () => {
       sessionId: "new-session",
       title: null,
     });
-    expect(order).toEqual(["lock", "lookup", "insert"]);
-    expect(db.query.mock.calls[0][0]).toMatchObject({
+    expect(order).toEqual(["isolation", "lock", "lookup", "insert"]);
+    expect(db.query.mock.calls[0][0]).toEqual({
+      text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    });
+    expect(db.query.mock.calls[1][0]).toMatchObject({
       values: [projectId, "new-session"],
+    });
+  });
+
+  it("fails closed before locking when the isolation fence cannot be established", async () => {
+    const db = executor((config) => {
+      if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        throw Object.assign(new Error("isolation unavailable"), { code: "0A000" });
+      }
+      throw new Error(`unexpected SQL after isolation failure: ${config.text}`);
+    });
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+
+    await expect(repository.getOrCreateConversation("session-a"))
+      .rejects.toMatchObject({ code: "0A000" });
+    expect(db.transaction).toHaveBeenCalledTimes(1);
+    expect(db.query).toHaveBeenCalledOnce();
+    expect(db.query.mock.calls[0][0]).toEqual({
+      text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
     });
   });
 
@@ -525,6 +551,46 @@ describe("PostgreSQL conversation repository", () => {
     await expect(new PostgreSqlConversationRepository(exhausted, projectId)
       .getOrCreateConversation("session-a")).rejects.toMatchObject({ code: "40001" });
     expect(exhausted.transaction).toHaveBeenCalledTimes(3);
+  });
+
+  it("re-establishes READ COMMITTED before every retried get-or-create attempt", async () => {
+    const statements: string[][] = [];
+    let attempt = -1;
+    const db = executor((config) => {
+      statements[attempt].push(
+        config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+          ? "isolation"
+          : config.text.includes("pg_advisory_xact_lock")
+            ? "lock"
+            : "lookup",
+      );
+      if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED" && attempt < 2) {
+        throw Object.assign(
+          new Error("retry isolation setup"),
+          { code: attempt === 0 ? "40001" : "40P01" },
+        );
+      }
+      if (config.text.includes("pg_advisory_xact_lock")) {
+        return result([{ pg_advisory_xact_lock: null }]);
+      }
+      return result([conversationRow]);
+    });
+    db.transaction.mockImplementation(async (
+      callback: Parameters<PostgreSqlConversationExecutor["transaction"]>[0],
+    ) => {
+      attempt += 1;
+      statements.push([]);
+      return callback(db);
+    });
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+
+    await expect(repository.getOrCreateConversation("session-a"))
+      .resolves.toMatchObject({ conversationId: 41 });
+    expect(statements).toEqual([
+      ["isolation"],
+      ["isolation"],
+      ["isolation", "lock", "lookup"],
+    ]);
   });
 
   it("never retries non-contention failures or ambiguous commits", async () => {

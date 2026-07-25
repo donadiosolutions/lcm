@@ -283,6 +283,9 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
   ): Promise<ConversationRecord> {
     return this.shortTransaction("getOrCreateConversation", async (transaction) => {
       await transaction.query({
+        text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+      }, this.context("getOrCreateConversation"));
+      await transaction.query({
         text: `SELECT pg_catalog.pg_advisory_xact_lock(
                         pg_catalog.hashtextextended(
                           $1::pg_catalog.text
