@@ -258,6 +258,116 @@ describe("PostgreSQL conversation repository", () => {
     expect(db.transaction).not.toHaveBeenCalled();
   });
 
+  it("keeps message bulk and append inputs within a constant bind count", async () => {
+    const db = executor((config) => {
+      if (config.text.includes("FOR UPDATE")) return result([{ conversation_id: "41" }]);
+      if (config.text.includes("MAX(seq) AS max_seq")) return result([{ max_seq: null }]);
+      return result([]);
+    });
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+    const inputCount = 10_924;
+    const bulkInputs = Array.from({ length: inputCount }, (_, index) => ({
+      conversationId: 41,
+      seq: index,
+      role: "user",
+      content: index === inputCount - 1 ? " opaque \u2603 " : `message-${index}`,
+      tokenCount: index,
+    }));
+
+    await expect(repository.createMessagesBulk(bulkInputs)).resolves.toEqual([]);
+    await expect(repository.appendMessages(
+      41,
+      bulkInputs.map(({ role, content, tokenCount }) => ({ role, content, tokenCount })),
+    )).resolves.toEqual([]);
+
+    const payloadQueries = db.query.mock.calls
+      .map(([config]) => config)
+      .filter((config) => config.text.includes("jsonb_array_elements"));
+    expect(payloadQueries).toHaveLength(2);
+    for (const config of payloadQueries) {
+      expect(config.values).toHaveLength(2);
+      expect(config.text).toContain("$2::pg_catalog.jsonb");
+      expect(config.text).not.toMatch(/\$(?:[3-9]|\d{2,})/u);
+      expect(config.text).toContain("WITH ORDINALITY");
+      expect(config.text).toContain("ORDER BY input.input_ordinal");
+    }
+
+    const bulkPayload = JSON.parse(payloadQueries[0]?.values?.[1] as string) as Array<
+      Record<string, unknown>
+    >;
+    expect(bulkPayload).toHaveLength(inputCount);
+    expect(bulkPayload[0]).toEqual({
+      conversation_id: 41,
+      seq: 0,
+      role: "user",
+      content: "message-0",
+      token_count: 0,
+    });
+    expect(bulkPayload.at(-1)).toEqual({
+      conversation_id: 41,
+      seq: inputCount - 1,
+      role: "user",
+      content: " opaque \u2603 ",
+      token_count: inputCount - 1,
+    });
+
+    const appendPayload = JSON.parse(payloadQueries[1]?.values?.[1] as string) as Array<
+      Record<string, unknown>
+    >;
+    expect(appendPayload).toHaveLength(inputCount);
+    expect(appendPayload[0]).toMatchObject({ seq: 0 });
+    expect(appendPayload.at(-1)).toMatchObject({
+      seq: inputCount - 1,
+      content: " opaque \u2603 ",
+    });
+  });
+
+  it("keeps large ordered message-part inputs within a constant bind count", async () => {
+    const db = executor(() => result([]));
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+    const inputCount = 7_283;
+    const parts = Array.from({ length: inputCount }, (_, index) => ({
+      sessionId: `session-${index}`,
+      partType: index === inputCount - 1 ? "opaque-final" : "text",
+      ordinal: index,
+      textContent: index === inputCount - 1 ? " opaque \u2603 " : undefined,
+      metadata: index === inputCount - 1 ? " { not-json } " : undefined,
+    }));
+
+    await expect(repository.createMessageParts(51, parts)).resolves.toBeUndefined();
+
+    const config = db.query.mock.calls[0]?.[0];
+    expect(config.values).toHaveLength(3);
+    expect(config.text).toContain("$3::pg_catalog.jsonb");
+    expect(config.text).not.toMatch(/\$(?:[4-9]|\d{2,})/u);
+    expect(config.text).toContain("WITH ORDINALITY");
+    expect(config.text).toContain("ORDER BY input.input_ordinal");
+    const payload = JSON.parse(config.values?.[2] as string) as Array<Record<string, unknown>>;
+    expect(payload).toHaveLength(inputCount);
+    expect(payload[0]).toEqual({
+      session_id: "session-0",
+      part_type: "text",
+      ordinal: 0,
+      text_content: null,
+      tool_call_id: null,
+      tool_name: null,
+      tool_input: null,
+      tool_output: null,
+      metadata: null,
+    });
+    expect(payload.at(-1)).toEqual({
+      session_id: `session-${inputCount - 1}`,
+      part_type: "opaque-final",
+      ordinal: inputCount - 1,
+      text_content: " opaque \u2603 ",
+      tool_call_id: null,
+      tool_name: null,
+      tool_input: null,
+      tool_output: null,
+      metadata: " { not-json } ",
+    });
+  });
+
   it("maps every PostgreSQL bigint representation only when safely integral", async () => {
     const safeRow = {
       ...messageRow,

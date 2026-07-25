@@ -32,6 +32,23 @@ function makeStore(db: DatabaseSync): ConversationStore {
   return new ConversationStore(db, { fts5Available: false });
 }
 
+function trackedDatabase(db: DatabaseSync): {
+  database: DatabaseSync;
+  statements: string[];
+} {
+  const statements: string[] = [];
+  return {
+    database: {
+      exec: (sql: string): void => {
+        statements.push(sql);
+        db.exec(sql);
+      },
+      prepare: (sql: string) => db.prepare(sql),
+    } as unknown as DatabaseSync,
+    statements,
+  };
+}
+
 // ── Conversation CRUD ─────────────────────────────────────────────────────────
 
 describe("ConversationStore — conversation CRUD", () => {
@@ -436,6 +453,124 @@ describe("ConversationStore — withTransaction", () => {
 
     // Message should not exist after rollback
     expect(await store.getMessageCount(conv.conversationId)).toBe(0);
+  });
+
+  it("reuses one same-database transaction for every public atomic batch method", async () => {
+    const tracked = trackedDatabase(makeDb());
+    const store = makeStore(tracked.database);
+    const peer = makeStore(tracked.database);
+    const conversation = await store.createConversation({ sessionId: "tx-atomic-commit" });
+    const seeded = await store.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 0,
+      role: "system",
+      content: "delete me",
+      tokenCount: 1,
+    });
+
+    await expect(store.withTransaction(async () => {
+      const [bulk] = await peer.createMessagesBulk([{
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "bulk",
+        tokenCount: 1,
+      }]);
+      const [appended] = await peer.appendMessages(conversation.conversationId, [{
+        role: "assistant",
+        content: "append",
+        tokenCount: 1,
+      }]);
+      await peer.createMessageParts(bulk.messageId, [{
+        sessionId: "tx-atomic-commit",
+        partType: "text",
+        ordinal: 0,
+        textContent: "part",
+      }]);
+      await expect(peer.deleteMessages([seeded.messageId])).resolves.toBe(1);
+      return [bulk.seq, appended.seq];
+    })).resolves.toEqual([1, 2]);
+
+    expect(tracked.statements).toEqual(["BEGIN IMMEDIATE", "COMMIT"]);
+    expect((await store.getMessages(conversation.conversationId)).map((message) => message.seq))
+      .toEqual([1, 2]);
+    expect(await store.getMessageParts(
+      (await store.getMessages(conversation.conversationId))[0]!.messageId,
+    )).toMatchObject([{ textContent: "part" }]);
+  });
+
+  it("rolls back every public atomic batch method inside withTransaction", async () => {
+    const store = makeStore(makeDb());
+    const conversation = await store.createConversation({ sessionId: "tx-atomic-rollback" });
+    const seeded = await store.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 0,
+      role: "system",
+      content: "keep me",
+      tokenCount: 1,
+    });
+
+    await expect(store.withTransaction(async () => {
+      await store.createMessagesBulk([{
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "bulk",
+        tokenCount: 1,
+      }]);
+      await store.appendMessages(conversation.conversationId, [{
+        role: "assistant",
+        content: "append",
+        tokenCount: 1,
+      }]);
+      await store.createMessageParts(seeded.messageId, [{
+        sessionId: "tx-atomic-rollback",
+        partType: "text",
+        ordinal: 0,
+        textContent: "rolled back",
+      }]);
+      await store.deleteMessages([seeded.messageId]);
+      throw new Error("rollback all atomic methods");
+    })).rejects.toThrow("rollback all atomic methods");
+
+    expect((await store.getMessages(conversation.conversationId)).map((message) => message.messageId))
+      .toEqual([seeded.messageId]);
+    await expect(store.getMessageParts(seeded.messageId)).resolves.toEqual([]);
+  });
+
+  it("opens separate transactions for another database and a stale async context", async () => {
+    const firstTracked = trackedDatabase(makeDb());
+    const secondTracked = trackedDatabase(makeDb());
+    const first = makeStore(firstTracked.database);
+    const second = makeStore(secondTracked.database);
+
+    await first.withTransaction(() => second.withTransaction(() => "separate"));
+    expect(firstTracked.statements).toEqual(["BEGIN IMMEDIATE", "COMMIT"]);
+    expect(secondTracked.statements).toEqual(["BEGIN IMMEDIATE", "COMMIT"]);
+
+    const conversation = await first.createConversation({ sessionId: "stale-context" });
+    let releaseLate!: () => void;
+    const lateGate = new Promise<void>((resolve) => { releaseLate = resolve; });
+    let lateWrite = Promise.resolve([] as Awaited<ReturnType<typeof first.createMessagesBulk>>);
+    await first.withTransaction(() => {
+      lateWrite = lateGate.then(() => first.createMessagesBulk([{
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "late",
+        tokenCount: 1,
+      }]));
+    });
+    releaseLate();
+    await expect(lateWrite).resolves.toHaveLength(1);
+    expect(firstTracked.statements).toEqual([
+      "BEGIN IMMEDIATE",
+      "COMMIT",
+      "BEGIN IMMEDIATE",
+      "COMMIT",
+      "BEGIN IMMEDIATE",
+      "COMMIT",
+    ]);
   });
 
   it("serializes async transactions sharing a database handle", async () => {

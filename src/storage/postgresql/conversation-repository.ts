@@ -223,29 +223,28 @@ function placeholders(
   }).join(", ");
 }
 
-function messageInputValues(inputs: readonly CreateMessageInput[]): unknown[] {
-  return inputs.flatMap((input, ordinal) => [
-    ordinal,
-    input.conversationId,
-    input.seq,
-    input.role,
-    input.content,
-    input.tokenCount,
-  ]);
+function messageInputJson(inputs: readonly CreateMessageInput[]): string {
+  return JSON.stringify(inputs.map((input) => ({
+    conversation_id: input.conversationId,
+    seq: input.seq,
+    role: input.role,
+    content: input.content,
+    token_count: input.tokenCount,
+  })));
 }
 
-function messagePartInputValues(parts: readonly CreateMessagePartInput[]): unknown[] {
-  return parts.flatMap((part) => [
-    part.sessionId,
-    part.partType,
-    part.ordinal,
-    part.textContent ?? null,
-    part.toolCallId ?? null,
-    part.toolName ?? null,
-    part.toolInput ?? null,
-    part.toolOutput ?? null,
-    part.metadata ?? null,
-  ]);
+function messagePartInputJson(parts: readonly CreateMessagePartInput[]): string {
+  return JSON.stringify(parts.map((part) => ({
+    session_id: part.sessionId,
+    part_type: part.partType,
+    ordinal: part.ordinal,
+    text_content: part.textContent ?? null,
+    tool_call_id: part.toolCallId ?? null,
+    tool_name: part.toolName ?? null,
+    tool_input: part.toolInput ?? null,
+    tool_output: part.toolOutput ?? null,
+    metadata: part.metadata ?? null,
+  })));
 }
 
 export class PostgreSqlConversationRepository implements ConversationRepository {
@@ -549,21 +548,20 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
       safeInputInteger(part.ordinal, this.projectId, operation, "ordinal");
     }
     await this.executor.query({
-      text: `WITH input (
-               session_id, part_type, ordinal, text_content, tool_call_id,
-               tool_name, tool_input, tool_output, metadata
-             ) AS (
-               VALUES ${placeholders(parts.length, [
-                 "pg_catalog.text",
-                 "pg_catalog.text",
-                 "pg_catalog.int4",
-                 "pg_catalog.text",
-                 "pg_catalog.text",
-                 "pg_catalog.text",
-                 "pg_catalog.text",
-                 "pg_catalog.text",
-                 "pg_catalog.text",
-               ], 3)}
+      text: `WITH input AS (
+               SELECT element.input_ordinal,
+                      element.payload ->> 'session_id' AS session_id,
+                      element.payload ->> 'part_type' AS part_type,
+                      (element.payload ->> 'ordinal')::pg_catalog.int4 AS ordinal,
+                      element.payload ->> 'text_content' AS text_content,
+                      element.payload ->> 'tool_call_id' AS tool_call_id,
+                      element.payload ->> 'tool_name' AS tool_name,
+                      element.payload ->> 'tool_input' AS tool_input,
+                      element.payload ->> 'tool_output' AS tool_output,
+                      element.payload ->> 'metadata' AS metadata
+               FROM pg_catalog.jsonb_array_elements(
+                 $3::pg_catalog.jsonb
+               ) WITH ORDINALITY AS element(payload, input_ordinal)
              )
              INSERT INTO lcm.message_parts (
                project_id, conversation_id, message_id, session_id, part_type,
@@ -581,8 +579,8 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
                     input.text_content, input.tool_call_id, input.tool_name,
                     input.tool_input, input.tool_output, input.metadata
              FROM input
-             ORDER BY input.ordinal`,
-      values: [this.projectId, messageId, ...messagePartInputValues(parts)],
+             ORDER BY input.input_ordinal`,
+      values: [this.projectId, messageId, messagePartInputJson(parts)],
     }, this.context(operation));
   }
 
@@ -786,17 +784,18 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     if (inputs.length === 0) return [];
     for (const input of inputs) this.validateMessageInput(input, operation);
     const result = await executor.query<MessageRow>({
-      text: `WITH input (
-               ordinal, conversation_id, seq, role, content, token_count
-             ) AS (
-               VALUES ${placeholders(inputs.length, [
-                 "pg_catalog.int4",
-                 "pg_catalog.int8",
-                 "pg_catalog.int8",
-                 "pg_catalog.text",
-                 "pg_catalog.text",
-                 "pg_catalog.int8",
-               ], 2)}
+      text: `WITH input AS (
+               SELECT element.input_ordinal,
+                      (element.payload ->> 'conversation_id')::pg_catalog.int8
+                        AS conversation_id,
+                      (element.payload ->> 'seq')::pg_catalog.int8 AS seq,
+                      element.payload ->> 'role' AS role,
+                      element.payload ->> 'content' AS content,
+                      (element.payload ->> 'token_count')::pg_catalog.int8
+                        AS token_count
+               FROM pg_catalog.jsonb_array_elements(
+                 $2::pg_catalog.jsonb
+               ) WITH ORDINALITY AS element(payload, input_ordinal)
              ),
              inserted AS (
                INSERT INTO lcm.messages (
@@ -805,7 +804,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
                SELECT $1, input.conversation_id, input.seq, input.role,
                       input.content, input.token_count
                FROM input
-               ORDER BY input.ordinal
+               ORDER BY input.input_ordinal
                RETURNING ${MESSAGE_COLUMNS}
              )
              SELECT ${MESSAGE_COLUMNS.split(", ").map((column) =>
@@ -813,9 +812,9 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
              FROM inserted
              INNER JOIN input
                ON input.conversation_id = inserted.conversation_id
-              AND input.seq = inserted.seq
-             ORDER BY input.ordinal`,
-      values: [this.projectId, ...messageInputValues(inputs)],
+               AND input.seq = inserted.seq
+             ORDER BY input.input_ordinal`,
+      values: [this.projectId, messageInputJson(inputs)],
     }, this.context(operation));
     return result.rows.map((row) => messageFromRow(row, this.projectId, operation));
   }

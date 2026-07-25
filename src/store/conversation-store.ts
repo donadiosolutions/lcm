@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
@@ -153,6 +154,11 @@ interface MaxSeqRow {
 }
 
 const transactionQueues = new WeakMap<DatabaseSync, Promise<void>>();
+const activeDirectTransactions = new Set<symbol>();
+const directTransactionContext = new AsyncLocalStorage<{
+  db: DatabaseSync;
+  token: symbol;
+}>();
 
 // ── Row mappers ───────────────────────────────────────────────────────────────
 
@@ -221,16 +227,28 @@ export class ConversationStore {
   // ── Transaction helpers ──────────────────────────────────────────────────
 
   async withTransaction<T>(operation: () => Promise<T> | T): Promise<T> {
+    const active = directTransactionContext.getStore();
+    if (
+      active?.db === this.db
+      && activeDirectTransactions.has(active.token)
+    ) {
+      return operation();
+    }
     const previous = transactionQueues.get(this.db) ?? Promise.resolve();
     let release!: () => void;
     const current = new Promise<void>((resolve) => { release = resolve; });
     const queued = previous.then(() => current);
     transactionQueues.set(this.db, queued);
     await previous;
+    const token = Symbol("conversation-store-transaction");
     try {
       this.db.exec("BEGIN IMMEDIATE");
+      activeDirectTransactions.add(token);
       try {
-        const result = await operation();
+        const result = await directTransactionContext.run(
+          { db: this.db, token },
+          operation,
+        );
         this.db.exec("COMMIT");
         return result;
       } catch (error) {
@@ -238,6 +256,7 @@ export class ConversationStore {
         throw error;
       }
     } finally {
+      activeDirectTransactions.delete(token);
       release();
       if (transactionQueues.get(this.db) === queued) transactionQueues.delete(this.db);
     }
