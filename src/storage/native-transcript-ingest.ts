@@ -1433,7 +1433,11 @@ export async function runNativeTranscriptBackfill(
     let batch: NativeTranscriptReadOutcome[] = [];
     let uncommittedRanges: NativeTranscriptByteRangeDigest[] = [];
     let committedByteOffset = resumedFromByteOffset;
+    // Source size is a safe integer, each physical record consumes at least
+    // one byte, and mapper results are bounded by JavaScript array length.
+    // Therefore these counters cannot overflow while ingesting one snapshot.
     let nextSessionSequence = 0;
+    let pendingQuarantinedRecords = 0;
     let lastSourceOrdinal =
       resumedFromByteOffset > 0 && previous ? previous.lastSourceOrdinal : 0;
     const progressState: {
@@ -1449,27 +1453,98 @@ export async function runNativeTranscriptBackfill(
       await snapshot.assertUnchanged();
     };
 
+    const applyQuarantineSequence = (): void => {
+      pendingQuarantinedRecords += 1;
+    };
+
+    const resolvePendingSequence = async (
+      record: PreparedNativeTranscriptRecord,
+      candidates: readonly (
+        NativeTranscriptMessageCandidate & {
+          readonly sessionSequence: number;
+        }
+      )[],
+      mappedNextSessionSequence: number,
+    ): Promise<{
+      readonly links: CreateNativeTranscriptMessageLinkInput[] | null;
+      readonly nextSessionSequence: number;
+    }> => {
+      if (pendingQuarantinedRecords === 0 || candidates.length === 0) {
+        return {
+          links: null,
+          nextSessionSequence: mappedNextSessionSequence,
+        };
+      }
+      if (options.messageMapper || candidates.length !== 1) {
+        throw new NativeTranscriptLinkError(record.sourceOrdinal);
+      }
+      const lastCandidateSequence =
+        nextSessionSequence + pendingQuarantinedRecords;
+      const candidate = candidates[0]!;
+      let match: {
+        readonly conversationId: number;
+        readonly messageId: number;
+        readonly sessionSequence: number;
+      } | null = null;
+      for (
+        let sessionSequence = nextSessionSequence;
+        sessionSequence <= lastCandidateSequence;
+        sessionSequence += 1
+      ) {
+        const resolved = await options.messageResolver.resolveExact({
+          nativeSessionId: record.nativeSessionId,
+          sessionSequence,
+          role: candidate.role,
+          content: candidate.content,
+        });
+        if (!resolved) continue;
+        if (match) throw new NativeTranscriptLinkError(record.sourceOrdinal);
+        match = { ...resolved, sessionSequence };
+      }
+      if (!match) throw new NativeTranscriptLinkError(record.sourceOrdinal);
+      pendingQuarantinedRecords = 0;
+      return {
+        links: [{
+          conversationId: match.conversationId,
+          messageId: match.messageId,
+          sourceOrdinal: candidate.sourceOrdinal,
+        }],
+        nextSessionSequence: match.sessionSequence + 1,
+      };
+    };
+
     const flush = async (): Promise<void> => {
       if (batch.length === 0) return;
       const last = batch.at(-1)!;
-      const validRecords = batch.filter(
-        (outcome): outcome is PreparedNativeTranscriptRecord =>
-          outcome.kind === "record",
-      );
       const quarantinedRecords = batch.filter(
         (outcome): outcome is QuarantinedNativeTranscriptRecord =>
           outcome.kind === "quarantine",
       );
       await assertUncommittedSourceUnchanged();
       const records: CreateNativeTranscriptInput[] = [];
-      for (const record of validRecords) {
+      for (const outcome of batch) {
+        if (outcome.kind === "quarantine") {
+          applyQuarantineSequence();
+          continue;
+        }
+        const record = outcome;
         const mapped = mappedMessageCandidates(
           record,
           options.format,
           mapper,
           nextSessionSequence,
         );
-        nextSessionSequence = mapped.nextSessionSequence;
+        const sequenceResolution = await resolvePendingSequence(
+          record,
+          mapped.candidates,
+          mapped.nextSessionSequence,
+        );
+        const resolvedLinks = sequenceResolution.links ?? await messageLinks(
+          record,
+          mapped.candidates,
+          options.messageResolver,
+        );
+        nextSessionSequence = sequenceResolution.nextSessionSequence;
         records.push({
           formatName: record.formatName,
           formatVersion: record.formatVersion,
@@ -1480,11 +1555,7 @@ export async function runNativeTranscriptBackfill(
           contentSha256: record.contentSha256,
           ingestKey: record.ingestKey,
           nativePayload: record.nativePayload,
-          messageLinks: await messageLinks(
-            record,
-            mapped.candidates,
-            options.messageResolver,
-          ),
+          messageLinks: resolvedLinks,
         });
       }
       await assertUncommittedSourceUnchanged();
@@ -1546,7 +1617,14 @@ export async function runNativeTranscriptBackfill(
             mapper,
             nextSessionSequence,
           );
-          nextSessionSequence = mapped.nextSessionSequence;
+          const sequenceResolution = await resolvePendingSequence(
+            outcome,
+            mapped.candidates,
+            mapped.nextSessionSequence,
+          );
+          nextSessionSequence = sequenceResolution.nextSessionSequence;
+        } else {
+          applyQuarantineSequence();
         }
         continue;
       }

@@ -48,6 +48,7 @@ import {
   readNativeTranscriptJsonl,
   runNativeTranscriptBackfill as runNativeTranscriptBackfillCore,
   SUPPORTED_NATIVE_TRANSCRIPT_FORMATS,
+  type NativeTranscriptBackfillResult,
   type NativeTranscriptByteSource,
   type NativeTranscriptReadOutcome,
 } from "../../src/storage/native-transcript-ingest.js";
@@ -1475,6 +1476,199 @@ describe("native transcript backfill coordinator", () => {
       }),
     );
     expect(JSON.stringify(quarantined.mock.calls)).not.toContain('{"bad":}');
+  });
+
+  it("preserves a quarantined message position before an identical later message", async () => {
+    const collision =
+      '{"message":{"role":"user","content":"same"},'
+      + '"canary_secret":"a","[REDACTED]":"b"}\n';
+    const later =
+      '{"message":{"role":"user","content":"same"}}\n';
+    const repo = repository();
+    const quarantine = vi.fn();
+    const resolveExact = vi.fn(async (input) =>
+      input.sessionSequence === 1
+        ? {
+            conversationId: 4,
+            messageId: input.sessionSequence + 10,
+          }
+        : null);
+    await runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine,
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: source(collision + later),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      globalPatterns: ["canary_secret"],
+      messageResolver: { resolveExact },
+    });
+    expect(resolveExact.mock.calls.map(([input]) => input.sessionSequence))
+      .toEqual([0, 1]);
+    expect(repo.batches[0]?.records[0]?.messageLinks).toEqual([{
+      conversationId: 4,
+      messageId: 11,
+      sourceOrdinal: 1,
+    }]);
+    expect(quarantine).toHaveBeenCalledTimes(1);
+    expect(quarantine).toHaveBeenCalledWith(expect.objectContaining({
+      sourceOrdinal: 0,
+      reason: "redacted-key-collision",
+    }));
+    expect(JSON.stringify([repo.batches, quarantine.mock.calls]))
+      .not.toContain("canary_secret");
+  });
+
+  it("fails closed before resolver access for custom mapping after an unknown quarantine", async () => {
+    const repo = repository();
+    const resolveExact = vi.fn();
+    await expect(runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: source('{"bad":}\n{"message":"anchor"}\n'),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      batchSize: 1,
+      messageMapper: {
+        map: (_format, payload, sourceOrdinal) =>
+          (payload as JsonObject).message === "anchor"
+            ? [{ role: "user", content: "anchor", sourceOrdinal }]
+            : [],
+      },
+      messageResolver: { resolveExact },
+    })).rejects.toBeInstanceOf(NativeTranscriptLinkError);
+    expect(resolveExact).not.toHaveBeenCalled();
+    expect(repo.batches).toHaveLength(1);
+  });
+
+  it("requires one unique destination position after unknown quarantines", async () => {
+    const content = [
+      '{"bad":}',
+      '{"message":{"role":"user","content":"anchor"}}',
+    ].join("\n");
+    const run = async (
+      matchingSequences: readonly number[],
+    ): Promise<{
+      readonly repo: ReturnType<typeof repository>;
+      readonly resolveExact: ReturnType<typeof vi.fn>;
+      readonly result: Promise<NativeTranscriptBackfillResult>;
+    }> => {
+      const repo = repository();
+      const resolveExact = vi.fn(async (input) =>
+        matchingSequences.includes(input.sessionSequence)
+          ? {
+              conversationId: 4,
+              messageId: input.sessionSequence + 10,
+            }
+          : null);
+      return {
+        repo,
+        resolveExact,
+        result: runNativeTranscriptBackfill({
+          repository: repo,
+          quarantine: {
+            clientName: "claude-code",
+            quarantine: vi.fn(),
+            get: vi.fn(),
+            list: vi.fn(),
+            close: vi.fn(),
+          },
+          source: source(content),
+          machineId: "machine",
+          format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+          nativeSessionId: "session-1",
+          sourceLocator: "sessions/session.jsonl",
+          batchSize: 1,
+          messageResolver: { resolveExact },
+        }),
+      };
+    };
+
+    const unique = await run([1]);
+    await expect(unique.result).resolves.toMatchObject({
+      importedCount: 1,
+      quarantinedCount: 1,
+    });
+    expect(unique.repo.batches).toHaveLength(2);
+    expect(unique.repo.batches[1]?.records[0]?.messageLinks).toEqual([{
+      conversationId: 4,
+      messageId: 11,
+      sourceOrdinal: 1,
+    }]);
+
+    const absent = await run([]);
+    await expect(absent.result).rejects.toBeInstanceOf(
+      NativeTranscriptLinkError,
+    );
+    expect(absent.resolveExact).toHaveBeenCalledTimes(2);
+    expect(absent.repo.batches).toHaveLength(1);
+
+    const duplicate = await run([0, 1]);
+    await expect(duplicate.result).rejects.toBeInstanceOf(
+      NativeTranscriptLinkError,
+    );
+    expect(duplicate.resolveExact).toHaveBeenCalledTimes(2);
+    expect(duplicate.repo.batches).toHaveLength(1);
+  });
+
+  it("replays a trailing unknown quarantine before an appended anchor", async () => {
+    const quarantinedPrefix = '{"bad":}\n';
+    const appended =
+      '{"message":{"role":"assistant","content":"anchor"}}\n';
+    const previous = checkpoint({
+      version: 1,
+      byteOffset: Buffer.byteLength(quarantinedPrefix),
+      prefixSha256: digest(quarantinedPrefix),
+      source: {
+        sizeBytes: Buffer.byteLength(quarantinedPrefix),
+        modifiedAtMs: 1,
+        changedAtMs: 1,
+      },
+    });
+    const repo = repository(previous);
+    const resolveExact = vi.fn(async (input) =>
+      input.sessionSequence === 1
+        ? { conversationId: 7, messageId: 9 }
+        : null);
+    await runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: source(quarantinedPrefix + appended),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      messageResolver: { resolveExact },
+    });
+    expect(resolveExact.mock.calls.map(([input]) => input.sessionSequence))
+      .toEqual([0, 1]);
+    expect(repo.batches[0]?.expectedCheckpoint).toBe(previous);
+    expect(repo.batches[0]?.records[0]?.messageLinks).toEqual([{
+      conversationId: 7,
+      messageId: 9,
+      sourceOrdinal: 1,
+    }]);
   });
 
   it("quarantines over-depth input locally before an empty-record checkpoint batch", async () => {

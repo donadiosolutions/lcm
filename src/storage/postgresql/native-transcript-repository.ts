@@ -55,7 +55,9 @@ const TRANSCRIPT_COLUMNS = `
                  'message_id', link.message_id,
                  'source_ordinal', link.source_ordinal
                )
-               ORDER BY link.source_ordinal, link.message_id
+               ORDER BY link.source_ordinal,
+                        link.message_id,
+                        link.conversation_id
              )
       FROM lcm.transcript_messages AS link
       WHERE link.project_id = transcript.project_id
@@ -246,7 +248,116 @@ function string(
   if (typeof value !== "string" || value.includes("\0")) {
     throw new PostgreSqlNativeTranscriptDataError(projectId, operation, field);
   }
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!Number.isInteger(next) || next < 0xdc00 || next > 0xdfff) {
+        throw new PostgreSqlNativeTranscriptDataError(
+          projectId,
+          operation,
+          field,
+        );
+      }
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      throw new PostgreSqlNativeTranscriptDataError(
+        projectId,
+        operation,
+        field,
+      );
+    }
+  }
   return value;
+}
+
+function dataObject(
+  value: unknown,
+  projectId: string,
+  operation: string,
+  field: string,
+): Record<string, unknown> {
+  if (
+    value === null
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw new PostgreSqlNativeTranscriptDataError(
+      projectId,
+      operation,
+      field,
+    );
+  }
+  const result: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") {
+      throw new PostgreSqlNativeTranscriptDataError(
+        projectId,
+        operation,
+        field,
+      );
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+    if (!descriptor.enumerable || !("value" in descriptor)) {
+      throw new PostgreSqlNativeTranscriptDataError(
+        projectId,
+        operation,
+        field,
+      );
+    }
+    Object.defineProperty(result, key, {
+      configurable: true,
+      enumerable: true,
+      value: descriptor.value,
+      writable: true,
+    });
+  }
+  return result;
+}
+
+function dataArray(
+  value: unknown,
+  projectId: string,
+  operation: string,
+  field: string,
+): readonly unknown[] {
+  if (!Array.isArray(value)) {
+    throw new PostgreSqlNativeTranscriptDataError(
+      projectId,
+      operation,
+      field,
+    );
+  }
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== value.length + 1
+    || keys.some((key) =>
+      typeof key !== "string"
+      || (key !== "length" && !/^(?:0|[1-9]\d*)$/u.test(key)))
+  ) {
+    throw new PostgreSqlNativeTranscriptDataError(
+      projectId,
+      operation,
+      field,
+    );
+  }
+  const result: unknown[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(
+      value,
+      String(index),
+    );
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      throw new PostgreSqlNativeTranscriptDataError(
+        projectId,
+        operation,
+        field,
+      );
+    }
+    result.push(descriptor.value);
+  }
+  return result;
 }
 
 function nonemptyString(
@@ -336,14 +447,28 @@ function jsonValue(
   seen.add(value);
   try {
     if (Array.isArray(value)) {
-      return value.map((element) =>
-        jsonValue(element, projectId, operation, field, seen, depth + 1));
-    }
-    if (Object.getPrototypeOf(value) !== Object.prototype) {
-      throw new PostgreSqlNativeTranscriptDataError(projectId, operation, field);
+      return Object.freeze(dataArray(
+        value,
+        projectId,
+        operation,
+        field,
+      ).map((element) =>
+        jsonValue(
+          element,
+          projectId,
+          operation,
+          field,
+          seen,
+          depth + 1,
+        ))) as unknown as JsonValue[];
     }
     const normalized: Record<string, JsonValue> = {};
-    for (const [key, element] of Object.entries(value)) {
+    for (const [key, element] of Object.entries(dataObject(
+      value,
+      projectId,
+      operation,
+      field,
+    ))) {
       string(key, projectId, operation, field);
       Object.defineProperty(normalized, key, {
         configurable: true,
@@ -359,7 +484,7 @@ function jsonValue(
         writable: true,
       });
     }
-    return normalized;
+    return Object.freeze(normalized);
   } finally {
     seen.delete(value);
   }
@@ -847,7 +972,7 @@ implements
     readonly nativeSessionId: string;
   }): Promise<NativeTranscriptRecord[]> {
     const operation = "listByNativeSession";
-    nonemptyString(
+    const nativeSessionId = nonemptyString(
       input.nativeSessionId,
       this.projectId,
       operation,
@@ -862,7 +987,7 @@ implements
                    public.digest($2, 'sha256')
                AND transcript.native_session_id = $2
              ORDER BY transcript.observed_at, transcript.transcript_id`,
-      values: [this.projectId, input.nativeSessionId],
+      values: [this.projectId, nativeSessionId],
     });
   }
 
@@ -893,13 +1018,13 @@ implements
     readonly messageId: number;
   }): Promise<NativeTranscriptRecord[]> {
     const operation = "listByMessage";
-    nonnegativeInteger(
+    const conversationId = nonnegativeInteger(
       input.conversationId,
       this.projectId,
       operation,
       "conversation_id",
     );
-    nonnegativeInteger(
+    const messageId = nonnegativeInteger(
       input.messageId,
       this.projectId,
       operation,
@@ -915,7 +1040,7 @@ implements
                AND selected_link.conversation_id = $2
                AND selected_link.message_id = $3
              ORDER BY selected_link.source_ordinal, transcript.transcript_id`,
-      values: [this.projectId, input.conversationId, input.messageId],
+      values: [this.projectId, conversationId, messageId],
     });
   }
 
@@ -1300,68 +1425,102 @@ implements
     input: NativeTranscriptCheckpointKey,
     operation: string,
   ): NativeTranscriptCheckpointKey {
+    const value = dataObject(
+      input,
+      this.projectId,
+      operation,
+      "checkpoint_key",
+    );
     const machineId = uuid(
-      input.machineId,
+      value.machineId,
       this.projectId,
       operation,
       "machine_id",
     );
-    nonemptyString(
-      input.clientName,
+    const clientName = nonemptyString(
+      value.clientName,
       this.projectId,
       operation,
       "client_name",
       true,
     );
-    nonemptyString(
-      input.sourceLocator,
+    const sourceLocator = nonemptyString(
+      value.sourceLocator,
       this.projectId,
       operation,
       "source_locator",
     );
-    return { ...input, machineId };
+    return Object.freeze({ machineId, clientName, sourceLocator });
   }
 
   private validateBatch(
     input: NativeTranscriptBatchInput,
     operation: string,
   ): NativeTranscriptBatchInput {
-    const key = this.validateKey(input, operation);
-    const expectedCheckpoint = input.expectedCheckpoint === null
+    const value = dataObject(
+      input,
+      this.projectId,
+      operation,
+      "batch",
+    );
+    const key = this.validateKey(value as unknown as NativeTranscriptCheckpointKey, operation);
+    const expectedCheckpoint = value.expectedCheckpoint === null
       ? null
       : this.validateExpectedCheckpoint(
-          { ...input, ...key },
+          value.expectedCheckpoint,
+          key,
           operation,
         );
-    nonnegativeInteger(
-      input.quarantinedCount,
+    const quarantinedCount = nonnegativeInteger(
+      value.quarantinedCount,
       this.projectId,
       operation,
       "quarantined_count",
     );
-    nonnegativeInteger(
-      input.checkpoint.lastSourceOrdinal,
+    const checkpointInput = dataObject(
+      value.checkpoint,
+      this.projectId,
+      operation,
+      "checkpoint_target",
+    );
+    const lastSourceOrdinal = nonnegativeInteger(
+      checkpointInput.lastSourceOrdinal,
       this.projectId,
       operation,
       "last_source_ordinal",
     );
-    jsonObject(
-      input.checkpoint.checkpoint,
+    const checkpoint = jsonObject(
+      checkpointInput.checkpoint,
       this.projectId,
       operation,
       "checkpoint",
     );
-    for (const record of input.records) {
-      this.validateRecord(record, operation);
-    }
-    return { ...input, ...key, expectedCheckpoint };
+    const records = Object.freeze(dataArray(
+      value.records,
+      this.projectId,
+      operation,
+      "records",
+    ).map((record) => this.validateRecord(record, operation)));
+    return Object.freeze({
+      ...key,
+      expectedCheckpoint,
+      records,
+      checkpoint: Object.freeze({ lastSourceOrdinal, checkpoint }),
+      quarantinedCount,
+    });
   }
 
   private validateExpectedCheckpoint(
-    input: NativeTranscriptBatchInput,
+    input: unknown,
+    key: NativeTranscriptCheckpointKey,
     operation: string,
   ): NativeTranscriptCheckpointRecord {
-    const expected = input.expectedCheckpoint!;
+    const expected = dataObject(
+      input,
+      this.projectId,
+      operation,
+      "expected_checkpoint",
+    );
     const projectId = uuid(
       expected.projectId,
       this.projectId,
@@ -1374,60 +1533,60 @@ implements
       operation,
       "expected_machine_id",
     );
-    nonemptyString(
+    const clientName = nonemptyString(
       expected.clientName,
       this.projectId,
       operation,
       "expected_client_name",
       true,
     );
-    nonemptyString(
+    const sourceLocator = nonemptyString(
       expected.sourceLocator,
       this.projectId,
       operation,
       "expected_source_locator",
     );
-    nonnegativeInteger(
+    const lastSourceOrdinal = nonnegativeInteger(
       expected.lastSourceOrdinal,
       this.projectId,
       operation,
       "expected_last_source_ordinal",
     );
-    nonnegativeInteger(
+    const importedCount = nonnegativeInteger(
       expected.importedCount,
       this.projectId,
       operation,
       "expected_imported_count",
     );
-    nonnegativeInteger(
+    const skippedCount = nonnegativeInteger(
       expected.skippedCount,
       this.projectId,
       operation,
       "expected_skipped_count",
     );
-    nonnegativeInteger(
+    const quarantinedCount = nonnegativeInteger(
       expected.quarantinedCount,
       this.projectId,
       operation,
       "expected_quarantined_count",
     );
-    jsonObject(
+    const checkpoint = jsonObject(
       expected.checkpoint,
       this.projectId,
       operation,
       "expected_checkpoint",
     );
-    date(
+    const updatedAt = Object.freeze(date(
       expected.updatedAt,
       this.projectId,
       operation,
       "expected_updated_at",
-    );
+    ));
     if (
       projectId !== this.projectId
-      || machineId !== input.machineId
-      || expected.clientName !== input.clientName
-      || expected.sourceLocator !== input.sourceLocator
+      || machineId !== key.machineId
+      || clientName !== key.clientName
+      || sourceLocator !== key.sourceLocator
     ) {
       throw new PostgreSqlNativeTranscriptDataError(
         this.projectId,
@@ -1435,76 +1594,134 @@ implements
         "expected_checkpoint_key",
       );
     }
-    return { ...expected, projectId, machineId };
+    return Object.freeze({
+      projectId,
+      machineId,
+      clientName,
+      sourceLocator,
+      lastSourceOrdinal,
+      importedCount,
+      skippedCount,
+      quarantinedCount,
+      checkpoint,
+      updatedAt,
+    });
   }
 
   private validateRecord(
-    input: CreateNativeTranscriptInput,
+    input: unknown,
     operation: string,
-  ): void {
-    nonemptyString(
-      input.formatName,
+  ): CreateNativeTranscriptInput {
+    const value = dataObject(
+      input,
+      this.projectId,
+      operation,
+      "record",
+    );
+    const formatName = nonemptyString(
+      value.formatName,
       this.projectId,
       operation,
       "format_name",
       true,
     );
-    nonemptyString(
-      input.formatVersion,
+    const formatVersion = nonemptyString(
+      value.formatVersion,
       this.projectId,
       operation,
       "format_version",
       true,
     );
-    nonemptyString(
-      input.nativeSessionId,
+    const nativeSessionId = nonemptyString(
+      value.nativeSessionId,
       this.projectId,
       operation,
       "native_session_id",
       true,
     );
-    nonnegativeInteger(
-      input.sourceOrdinal,
+    const sourceOrdinal = nonnegativeInteger(
+      value.sourceOrdinal,
       this.projectId,
       operation,
       "source_ordinal",
     );
-    date(input.observedAt, this.projectId, operation, "observed_at");
-    nonemptyString(
-      input.scrubberVersion,
+    const observedAt = Object.freeze(date(
+      value.observedAt,
+      this.projectId,
+      operation,
+      "observed_at",
+    ));
+    const scrubberVersion = nonemptyString(
+      value.scrubberVersion,
       this.projectId,
       operation,
       "scrubber_version",
       true,
     );
-    digest(
-      input.contentSha256,
+    const contentSha256 = digest(
+      value.contentSha256,
       this.projectId,
       operation,
       "content_sha256",
     );
-    digest(input.ingestKey, this.projectId, operation, "ingest_key");
-    nativePayload(input.nativePayload, this.projectId, operation);
-    for (const link of input.messageLinks ?? []) {
-      nonnegativeInteger(
-        link.conversationId,
-        this.projectId,
-        operation,
-        "conversation_id",
-      );
-      nonnegativeInteger(
-        link.messageId,
-        this.projectId,
-        operation,
-        "message_id",
-      );
-      nonnegativeInteger(
-        link.sourceOrdinal,
-        this.projectId,
-        operation,
-        "link_source_ordinal",
-      );
-    }
+    const ingestKey = digest(
+      value.ingestKey,
+      this.projectId,
+      operation,
+      "ingest_key",
+    );
+    const payload = nativePayload(
+      value.nativePayload,
+      this.projectId,
+      operation,
+    );
+    const messageLinks = value.messageLinks === undefined
+      ? undefined
+      : Object.freeze(dataArray(
+          value.messageLinks,
+          this.projectId,
+          operation,
+          "message_links",
+        ).map((link) => {
+          const candidate = dataObject(
+            link,
+            this.projectId,
+            operation,
+            "message_link",
+          );
+          return Object.freeze({
+            conversationId: nonnegativeInteger(
+              candidate.conversationId,
+              this.projectId,
+              operation,
+              "conversation_id",
+            ),
+            messageId: nonnegativeInteger(
+              candidate.messageId,
+              this.projectId,
+              operation,
+              "message_id",
+            ),
+            sourceOrdinal: nonnegativeInteger(
+              candidate.sourceOrdinal,
+              this.projectId,
+              operation,
+              "link_source_ordinal",
+            ),
+          });
+        }));
+    return Object.freeze({
+      formatName,
+      formatVersion,
+      nativeSessionId,
+      sourceOrdinal,
+      observedAt,
+      scrubberVersion,
+      contentSha256,
+      ingestKey,
+      nativePayload: payload,
+      messageLinks,
+    });
   }
 
   private context(operation: string): PostgreSqlNativeTranscriptContext {

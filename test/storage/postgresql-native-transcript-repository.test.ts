@@ -206,6 +206,56 @@ function scopedExecutor(
 }
 
 describe("PostgreSQL native transcript repository", () => {
+  it("captures validated point-query properties exactly once", async () => {
+    const db = executor(successfulQuery);
+    const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
+    const sessionReads = vi.fn()
+      .mockReturnValueOnce("session-a")
+      .mockReturnValue("unsafe-session");
+    const nativeSessionInput = {} as { readonly nativeSessionId: string };
+    Object.defineProperty(nativeSessionInput, "nativeSessionId", {
+      enumerable: true,
+      get: sessionReads,
+    });
+
+    await expect(repository.listByNativeSession(nativeSessionInput))
+      .resolves.toHaveLength(1);
+    expect(sessionReads).toHaveBeenCalledTimes(1);
+    expect(db.query).toHaveBeenLastCalledWith(expect.objectContaining({
+      values: [projectId, "session-a"],
+    }), expect.any(Object));
+
+    const conversationReads = vi.fn()
+      .mockReturnValueOnce(41)
+      .mockReturnValue(-1);
+    const messageReads = vi.fn()
+      .mockReturnValueOnce(51)
+      .mockReturnValue(-1);
+    const messageInput = {} as {
+      readonly conversationId: number;
+      readonly messageId: number;
+    };
+    Object.defineProperties(messageInput, {
+      conversationId: {
+        enumerable: true,
+        get: conversationReads,
+      },
+      messageId: {
+        enumerable: true,
+        get: messageReads,
+      },
+    });
+
+    await expect(repository.listByMessage(messageInput))
+      .resolves.toHaveLength(1);
+    expect(conversationReads).toHaveBeenCalledTimes(1);
+    expect(messageReads).toHaveBeenCalledTimes(1);
+    expect(db.query).toHaveBeenLastCalledWith(expect.objectContaining({
+      values: [projectId, 41, 51],
+    }), expect.any(Object));
+    expect(JSON.stringify(db.query.mock.calls)).not.toContain("unsafe-session");
+  });
+
   it("atomically imports records and exposes every provenance query", async () => {
     const db = executor(successfulQuery);
     const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
@@ -275,6 +325,146 @@ describe("PostgreSQL native transcript repository", () => {
       "source_ordinal, observed_at, ingested_at, scrubber_version",
     );
     expect(transcriptInsert?.text).toContain("$7, $8, $9, $9, $10");
+    expect(db.query.mock.calls.find(([config]) =>
+      config.text.includes("jsonb_agg"))?.[0].text).toContain(
+        "link.source_ordinal,\n                        link.message_id,\n                        link.conversation_id",
+      );
+  });
+
+  it("snapshots mutable batches before the transaction and rejects accessors", async () => {
+    let releaseTransaction!: () => void;
+    const transactionGate = new Promise<void>((resolve) => {
+      releaseTransaction = resolve;
+    });
+    const db = executor(successfulQuery);
+    db.transaction.mockImplementationOnce(async (callback) => {
+      await transactionGate;
+      return callback(db);
+    });
+    const mutablePayload = {
+      type: "message",
+      nested: { value: "original" },
+    };
+    const mutableLink = {
+      conversationId: 41,
+      messageId: 51,
+      sourceOrdinal: 0,
+    };
+    const mutableCheckpoint = {
+      byteOffset: 42,
+      nested: { value: "original" },
+    };
+    const observedAt = new Date("2026-01-01T00:00:00.000Z");
+    const mutableBatch: NativeTranscriptBatchInput = {
+      ...batch,
+      records: [{
+        ...batch.records[0]!,
+        observedAt,
+        nativePayload: mutablePayload,
+        messageLinks: [mutableLink],
+      }],
+      checkpoint: {
+        ...batch.checkpoint,
+        checkpoint: mutableCheckpoint,
+      },
+    };
+    const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
+    const pending = repository.ingestBatch(mutableBatch);
+    observedAt.setUTCFullYear(2030);
+    mutablePayload.nested.value = "mutated";
+    mutableLink.messageId = 999;
+    mutableCheckpoint.byteOffset = 999;
+    mutableCheckpoint.nested.value = "mutated";
+    releaseTransaction();
+    await expect(pending).resolves.toMatchObject({ importedCount: 1 });
+
+    const transcriptInsert = db.query.mock.calls.find(([config]) =>
+      config.text.includes("INSERT INTO lcm.native_transcripts"))?.[0];
+    expect(transcriptInsert?.values?.[8]).toEqual(
+      new Date("2026-01-01T00:00:00.000Z"),
+    );
+    expect(transcriptInsert?.values?.[12]).toBe(JSON.stringify({
+      type: "message",
+      nested: { value: "original" },
+    }));
+    const linkInsert = db.query.mock.calls.find(([config]) =>
+      config.text.includes("INSERT INTO lcm.transcript_messages"))?.[0];
+    expect(linkInsert?.values?.[3]).toBe(51);
+    const checkpointUpdate = db.query.mock.calls.find(([config]) =>
+      config.text.includes("UPDATE lcm.ingest_checkpoints"))?.[0];
+    expect(checkpointUpdate?.values?.[8]).toBe(JSON.stringify({
+      byteOffset: 42,
+      nested: { value: "original" },
+    }));
+
+    const accessor = vi.fn(() => ({ unsafe: true }));
+    const accessorPayload = {};
+    Object.defineProperty(accessorPayload, "secret", {
+      enumerable: true,
+      get: accessor,
+    });
+    await expect(repository.ingestBatch({
+      ...batch,
+      records: [{
+        ...batch.records[0]!,
+        nativePayload: accessorPayload as never,
+      }],
+    })).rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
+    expect(accessor).not.toHaveBeenCalled();
+    expect(db.transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects lone surrogates at every text boundary and accepts valid pairs", async () => {
+    const db = executor(successfulQuery);
+    const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
+    const invalid = [
+      { ...batch, clientName: "bad\ud800" },
+      { ...batch, sourceLocator: "bad\udc00" },
+      {
+        ...batch,
+        records: [{
+          ...batch.records[0]!,
+          nativeSessionId: "bad\ud800",
+        }],
+      },
+      {
+        ...batch,
+        records: [{
+          ...batch.records[0]!,
+          nativePayload: { value: "bad\ud800" },
+        }],
+      },
+      {
+        ...batch,
+        records: [{
+          ...batch.records[0]!,
+          nativePayload: { ["bad\udc00"]: "value" },
+        }],
+      },
+      {
+        ...batch,
+        checkpoint: {
+          ...batch.checkpoint,
+          checkpoint: { value: "bad\udc00" },
+        },
+      },
+    ] satisfies NativeTranscriptBatchInput[];
+    for (const candidate of invalid) {
+      await expect(repository.ingestBatch(candidate))
+        .rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
+    }
+    expect(db.transaction).not.toHaveBeenCalled();
+
+    await expect(repository.ingestBatch({
+      ...batch,
+      sourceLocator: "sessions/\ud83d\ude00.jsonl",
+      records: [{
+        ...batch.records[0]!,
+        nativePayload: {
+          ["key-\ud83d\ude00"]: "value-\ud83d\ude00",
+        },
+      }],
+    })).resolves.toMatchObject({ importedCount: 1 });
   });
 
   it("canonicalizes caller UUIDs across readback and multi-batch checkpoints", async () => {
@@ -1132,11 +1322,40 @@ describe("PostgreSQL native transcript repository", () => {
       ...batch,
       records: [{ ...batch.records[0], nativePayload: cyclic as never }],
     });
+    const symbolPayload = { safe: true };
+    Object.defineProperty(symbolPayload, Symbol("hidden"), {
+      enumerable: true,
+      value: "hidden",
+    });
+    invalidBatches.push({
+      ...batch,
+      records: [{
+        ...batch.records[0],
+        nativePayload: symbolPayload as never,
+      }],
+    }, {
+      ...batch,
+      records: {} as never,
+    });
+    const extraRecords = [...batch.records];
+    Object.defineProperty(extraRecords, "extra", {
+      enumerable: true,
+      value: "extra",
+    });
+    invalidBatches.push({ ...batch, records: extraRecords });
+    const accessorRecords = [...batch.records];
+    const recordAccessor = vi.fn(() => batch.records[0]);
+    Object.defineProperty(accessorRecords, "0", {
+      enumerable: true,
+      get: recordAccessor,
+    });
+    invalidBatches.push({ ...batch, records: accessorRecords });
 
     for (const invalid of invalidBatches) {
       await expect(repository.ingestBatch(invalid))
         .rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
     }
+    expect(recordAccessor).not.toHaveBeenCalled();
     await expect(repository.getById("not-a-uuid"))
       .rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
     await expect(repository.listByNativeSession({ nativeSessionId: " " }))

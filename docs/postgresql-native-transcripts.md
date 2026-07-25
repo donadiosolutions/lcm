@@ -85,6 +85,12 @@ Programmatic callers use `NativeTranscriptRepository.ingestBatch()`,
 `PostgreSqlNativeTranscriptRepository` explicitly during this staged phase;
 the repository is not part of `ProjectStorage`.
 
+Direct `PostgreSqlNativeTranscriptRepository` ingestion applies the same
+Unicode-scalar contract to every string in transcript metadata, checkpoint
+keys and JSON, and sanitized payload JSON. Valid surrogate pairs and literal
+Unicode are preserved, while a lone high or low surrogate is rejected before
+PostgreSQL access or transaction entry.
+
 Message-producing records link only when the destination message has the exact
 expected session order, role, and scrubbed content. A missing or mismatched
 message aborts the destination transaction and does not advance the
@@ -209,6 +215,15 @@ the source or active sensitive patterns, then rerun the explicit backfill—the
 source transcript remains read-only. Lossy numeric spellings and lone Unicode
 surrogates use `malformed-json`; their source bytes remain local and only the
 normal metadata fields are quarantined.
+
+Each quarantined physical record creates one unresolved session-order
+position. The next safe record that the built-in mapper recognizes as a
+message probes every exact destination position across that bounded window and
+continues only when exactly one position matches its role and scrubbed
+content. Zero or multiple matches, or a custom-mapper message after any
+quarantine, fail closed while preserving the prior committed checkpoint. This
+ordering state contains only counts; unsafe source payloads are never retained
+or exposed to the mapper, resolver, quarantine row, or remote repository.
 
 ## PostgreSQL privileges
 
