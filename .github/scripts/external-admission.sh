@@ -46,9 +46,10 @@ fetch_associated_pull_requests() {
 }
 
 fetch_pull_request_files() {
+  local pull_request_number="$1"
   gh api --paginate --slurp \
     -H "X-GitHub-Api-Version: 2022-11-28" \
-    "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100"
+    "repos/$REPOSITORY/pulls/$pull_request_number/files?per_page=100"
 }
 
 classify_pull_request_files() {
@@ -118,7 +119,7 @@ if ! pull_request_is_eligible <<<"$pull_request"; then
 fi
 
 changed_file_count="$(jq -r '.changed_files' <<<"$pull_request")"
-file_pages="$(fetch_pull_request_files)"
+file_pages="$(fetch_pull_request_files "$PR_NUMBER")"
 classification="$(classify_pull_request_files "$changed_file_count" <<<"$file_pages")"
 sensitive_diff="$(jq -r '.greptileRequired' <<<"$classification")"
 admission_requirement="$(
@@ -205,7 +206,7 @@ if ! pull_request_is_eligible <<<"$current_pull_request"; then
 fi
 
 current_changed_file_count="$(jq -r '.changed_files' <<<"$current_pull_request")"
-current_file_pages="$(fetch_pull_request_files)"
+current_file_pages="$(fetch_pull_request_files "$current_pr_number")"
 current_classification="$(
   classify_pull_request_files "$current_changed_file_count" <<<"$current_file_pages"
 )"
@@ -301,8 +302,21 @@ if ! pull_request_is_eligible <<<"$final_pull_request"; then
   trap - EXIT INT TERM
   exit 0
 fi
+final_changed_file_count="$(jq -r '.changed_files' <<<"$final_pull_request")"
+final_file_pages="$(fetch_pull_request_files "$final_pr_number")"
+final_classification="$(
+  classify_pull_request_files "$final_changed_file_count" <<<"$final_file_pages"
+)"
+if [[ "$(jq -r '.classification' <<<"$final_classification")" != "$classification_name" ]]; then
+  post_admission_status pending \
+    "Pull request file classification changed during final validation"
+  echo "Final pull request file classification changed; admission remains pending."
+  trap - EXIT INT TERM
+  exit 0
+fi
+final_sensitive_diff="$(jq -r '.greptileRequired' <<<"$final_classification")"
 final_admission_requirement="$(
-  select_admission_requirement "$sensitive_diff" <<<"$final_pull_request"
+  select_admission_requirement "$final_sensitive_diff" <<<"$final_pull_request"
 )"
 final_trusted_automation="$(
   jq -r '.trustedAutomation' <<<"$final_admission_requirement"

@@ -174,7 +174,7 @@ describe("external admission workflow", () => {
 
   it("paginates every collection and repeats exact pull-request eligibility", () => {
     expect(evaluator).toContain("commits/$HEAD_SHA/pulls?per_page=100");
-    expect(evaluator).toContain("pulls/$PR_NUMBER/files?per_page=100");
+    expect(evaluator).toContain("pulls/$pull_request_number/files?per_page=100");
     expect(evaluator).toContain("check-runs?filter=latest&per_page=100");
     expect(evaluator.match(/gh api --paginate --slurp/gu)).toHaveLength(4);
     expect(evaluator.match(/fetch_associated_pull_requests/gu)).toHaveLength(4);
@@ -184,11 +184,24 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain("external-admission-policy.mjs evaluate-checks");
     expect(evaluator).toContain('changed_file_count="$(jq -r \'.changed_files\'');
     expect(evaluator).toContain('current_changed_file_count="$(jq -r \'.changed_files\'');
+    expect(evaluator).toContain('final_changed_file_count="$(jq -r \'.changed_files\'');
     expect(evaluator).toContain(
       'classify_pull_request_files "$changed_file_count" <<<"$file_pages"',
     );
     expect(evaluator).toContain(
       'classify_pull_request_files "$current_changed_file_count" <<<"$current_file_pages"',
+    );
+    expect(evaluator).toContain(
+      'classify_pull_request_files "$final_changed_file_count" <<<"$final_file_pages"',
+    );
+    expect(evaluator).toContain('fetch_pull_request_files "$PR_NUMBER"');
+    expect(evaluator).toContain('fetch_pull_request_files "$current_pr_number"');
+    expect(evaluator).toContain('fetch_pull_request_files "$final_pr_number"');
+    expect(evaluator).toContain(
+      'select_admission_requirement "$final_sensitive_diff" <<<"$final_pull_request"',
+    );
+    expect(evaluator).not.toContain(
+      'select_admission_requirement "$sensitive_diff" <<<"$final_pull_request"',
     );
     expect(policySource).toContain("pull request file audit count does not match changed_files");
   });
@@ -260,6 +273,8 @@ describe("external admission workflow", () => {
       "current_ci_run=",
       "final_matching_prs=",
       "final_pull_request=",
+      "final_file_pages=",
+      "final_classification=",
       "final_admission_requirement=",
     ]) {
       const markerIndex = evaluator.lastIndexOf(marker);
