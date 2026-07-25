@@ -220,6 +220,9 @@ describe("external admission workflow", () => {
     expect(policySource).toContain('type === "Bot"');
     expect(evaluator.match(/select_admission_requirement/gu)).toHaveLength(4);
     expect(evaluator).toContain(
+      'echo "Admission classification=$classification_name sensitive_diff=$sensitive_diff trusted_automation=$trusted_automation greptile_required=$greptile_required"',
+    );
+    expect(evaluator).toContain(
       'waiting_description="Waiting for trusted CI and DCO for automated PR"',
     );
     expect(evaluator).toContain(

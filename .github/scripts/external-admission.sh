@@ -128,7 +128,7 @@ admission_requirement="$(
 trusted_automation="$(jq -r '.trustedAutomation' <<<"$admission_requirement")"
 greptile_required="$(jq -r '.greptileRequired' <<<"$admission_requirement")"
 classification_name="$(jq -r '.classification' <<<"$classification")"
-echo "Admission classification=$classification_name trusted_automation=$trusted_automation"
+echo "Admission classification=$classification_name sensitive_diff=$sensitive_diff trusted_automation=$trusted_automation greptile_required=$greptile_required"
 
 if [[ "$greptile_required" == true ]]; then
   waiting_description="Waiting for Greptile review and DCO"
