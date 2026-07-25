@@ -868,6 +868,127 @@ describe("SQLite storage backend conformance", () => {
     executor.poison();
   });
 
+  it("rolls back and poisons an outer transaction when scoped savepoint recovery fails", async () => {
+    const calls: string[] = [];
+    const onPoison = vi.fn();
+    const database = {
+      exec: (sql: string): void => {
+        calls.push(sql);
+        if (sql.startsWith("ROLLBACK TO SAVEPOINT")) {
+          throw new Error("savepoint rollback /secret/path");
+        }
+      },
+    } as unknown as DatabaseSync;
+    const executor = new SqliteExecutor(database, "safe-project", onPoison);
+
+    await expect(executor.transaction(async (token) => {
+      await expect(executor.runAtomicScoped(
+        token,
+        "conversations",
+        "createMessagesBulk",
+        () => { throw new Error("batch failure /secret/path"); },
+      )).rejects.toMatchObject({
+        code: "STORAGE_OPERATION_FAILED",
+        domain: "conversations",
+        operation: "createMessagesBulk",
+      });
+      // Even though the callback catches the operation failure, the failed
+      // savepoint recovery must prevent an outer COMMIT.
+      return "caught";
+    })).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      domain: "transaction",
+      operation: "transaction",
+    });
+    expect(calls).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_atomic_0",
+      "ROLLBACK TO SAVEPOINT lcm_atomic_0",
+      "ROLLBACK",
+    ]);
+    expect(calls).not.toContain("COMMIT");
+    expect(onPoison).toHaveBeenCalledOnce();
+    await expect(executor.run("conversations", "listConversations", () => undefined))
+      .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
+  });
+
+  it("rejects atomic roots and every invalid scoped-atomic transaction context", async () => {
+    const firstDatabase = { exec: vi.fn() } as unknown as DatabaseSync;
+    const secondDatabase = { exec: vi.fn() } as unknown as DatabaseSync;
+    const first = new SqliteExecutor(firstDatabase, "first-project");
+    const second = new SqliteExecutor(secondDatabase, "second-project");
+
+    await expect(first.runAtomicScoped(
+      Symbol("missing-context"),
+      "conversations",
+      "createMessagesBulk",
+      () => undefined,
+    )).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+
+    await first.transaction(async (token) => {
+      await expect(first.runAtomic(
+        "conversations",
+        "createMessagesBulk",
+        () => undefined,
+      )).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+      await expect(second.runAtomicScoped(
+        token,
+        "conversations",
+        "createMessagesBulk",
+        () => undefined,
+      )).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+      await expect(first.runAtomicScoped(
+        Symbol("wrong-token"),
+        "conversations",
+        "createMessagesBulk",
+        () => undefined,
+      )).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+
+      const activeTokens = (
+        first as unknown as { activeTokens: Set<symbol> }
+      ).activeTokens;
+      activeTokens.delete(token);
+      await expect(first.runAtomicScoped(
+        token,
+        "conversations",
+        "createMessagesBulk",
+        () => undefined,
+      )).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+      activeTokens.add(token);
+    });
+  });
+
+  it("poisons a root atomic executor when rollback fails and preserves the sanitized operation", async () => {
+    const calls: string[] = [];
+    const onPoison = vi.fn();
+    const database = {
+      exec: (sql: string): void => {
+        calls.push(sql);
+        if (sql === "ROLLBACK") throw new Error("rollback /secret/atomic.db");
+      },
+    } as unknown as DatabaseSync;
+    const executor = new SqliteExecutor(database, "safe-project", onPoison);
+
+    const failure = await executor.runAtomic(
+      "conversations",
+      "createMessagesBulk",
+      () => { throw new Error("driver /secret/messages.jsonl"); },
+    ).catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      backend: "sqlite",
+      projectId: "safe-project",
+      domain: "conversations",
+      operation: "createMessagesBulk",
+    });
+    expect(JSON.stringify(failure)).not.toContain("/secret/");
+    expect(calls).toEqual(["BEGIN IMMEDIATE", "ROLLBACK"]);
+    expect(calls).not.toContain("COMMIT");
+    expect(onPoison).toHaveBeenCalledOnce();
+    await expect(executor.run("conversations", "listConversations", () => undefined))
+      .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
+  });
+
   it("prioritizes transaction-scope contracts over a poisoned executor", async () => {
     const liveDatabase = { exec: vi.fn() } as unknown as DatabaseSync;
     const poisonedDatabase = { exec: vi.fn() } as unknown as DatabaseSync;

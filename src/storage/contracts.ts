@@ -1,5 +1,6 @@
 import type { ProjectIdentity } from "../project-map.js";
 import type {
+  AppendMessageInput,
   ConversationId,
   ConversationRecord,
   CreateConversationInput,
@@ -65,6 +66,10 @@ export interface ConversationRepository {
   listConversations(): Promise<ConversationRecord[]>;
   createMessage(input: CreateMessageInput): Promise<MessageRecord>;
   createMessagesBulk(inputs: CreateMessageInput[]): Promise<MessageRecord[]>;
+  appendMessages(
+    conversationId: ConversationId,
+    inputs: AppendMessageInput[],
+  ): Promise<MessageRecord[]>;
   getMessages(conversationId: ConversationId, options?: { afterSeq?: number; limit?: number }): Promise<MessageRecord[]>;
   getLastMessage(conversationId: ConversationId): Promise<MessageRecord | null>;
   hasMessage(conversationId: ConversationId, role: MessageRole, content: string): Promise<boolean>;

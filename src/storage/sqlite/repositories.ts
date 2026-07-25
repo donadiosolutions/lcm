@@ -14,6 +14,7 @@ export type RepositoryInvoker = <T>(
   domain: StorageDomain,
   operation: string,
   callback: () => T | Promise<T>,
+  atomic?: boolean,
 ) => Promise<T>;
 
 export interface SqliteRepositoryStores {
@@ -72,18 +73,19 @@ export function createSqliteRepositories(
       markConversationBootstrapped: (id) => invoke("conversations", "markConversationBootstrapped", () => conversations.markConversationBootstrapped(id)),
       listConversations: () => invoke("conversations", "listConversations", () => conversations.listConversations()),
       createMessage: (input) => invoke("conversations", "createMessage", () => conversations.createMessage(input)),
-      createMessagesBulk: (inputs) => invoke("conversations", "createMessagesBulk", () => conversations.createMessagesBulk(inputs)),
+      createMessagesBulk: (inputs) => invoke("conversations", "createMessagesBulk", () => conversations.createMessagesBulk(inputs, true), true),
+      appendMessages: (id, inputs) => invoke("conversations", "appendMessages", () => conversations.appendMessages(id, inputs, true), true),
       getMessages: (id, options) => invoke("conversations", "getMessages", () => conversations.getMessages(id, options)),
       getLastMessage: (id) => invoke("conversations", "getLastMessage", () => conversations.getLastMessage(id)),
       hasMessage: (id, role, content) => invoke("conversations", "hasMessage", () => conversations.hasMessage(id, role, content)),
       countMessagesByIdentity: (id, role, content) => invoke("conversations", "countMessagesByIdentity", () => conversations.countMessagesByIdentity(id, role, content)),
       getMessageById: (id) => invoke("conversations", "getMessageById", () => conversations.getMessageById(id)),
-      createMessageParts: (id, parts) => invoke("conversations", "createMessageParts", () => conversations.createMessageParts(id, parts)),
+      createMessageParts: (id, parts) => invoke("conversations", "createMessageParts", () => conversations.createMessageParts(id, parts, true), true),
       getMessageParts: (id) => invoke("conversations", "getMessageParts", () => conversations.getMessageParts(id)),
       getMessageCount: (id) => invoke("conversations", "getMessageCount", () => conversations.getMessageCount(id)),
       getMessageCountBySessionId: (sessionId) => invoke("conversations", "getMessageCountBySessionId", () => conversations.getMessageCountBySessionId(sessionId)),
       getMaxSeq: (id) => invoke("conversations", "getMaxSeq", () => conversations.getMaxSeq(id)),
-      deleteMessages: (ids) => invoke("conversations", "deleteMessages", () => conversations.deleteMessages(ids)),
+      deleteMessages: (ids) => invoke("conversations", "deleteMessages", () => conversations.deleteMessages(ids, true), true),
     },
     summaries: {
       insertSummary: (input) => invoke("summaries", "insertSummary", () => summaries.insertSummary(input)),

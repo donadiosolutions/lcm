@@ -223,6 +223,27 @@ describe("ConversationStore — message operations", () => {
     const records = await store.createMessagesBulk([]);
     expect(records).toEqual([]);
   });
+
+  it("appendMessages allocates contiguous sequence numbers from zero", async () => {
+    const initial = await store.appendMessages(conversationId, [
+      { role: "user", content: "first", tokenCount: 1 },
+      { role: "assistant", content: "second", tokenCount: 2 },
+    ]);
+    const following = await store.appendMessages(conversationId, [
+      { role: "tool", content: "third", tokenCount: 3 },
+    ]);
+
+    expect(initial.map((message) => message.seq)).toEqual([0, 1]);
+    expect(following.map((message) => message.seq)).toEqual([2]);
+    expect((await store.getMessages(conversationId)).map((message) => message.content))
+      .toEqual(["first", "second", "third"]);
+  });
+
+  it("appendMessages with an empty array is a no-op", async () => {
+    await expect(store.appendMessages(conversationId, [])).resolves.toEqual([]);
+    await expect(store.getMessages(conversationId)).resolves.toEqual([]);
+  });
+
 });
 
 // ── Message parts ─────────────────────────────────────────────────────────────
@@ -281,6 +302,7 @@ describe("ConversationStore — message parts", () => {
     const parts = await store.getMessageParts(msg.messageId);
     expect(parts).toHaveLength(0);
   });
+
 });
 
 // ── deleteMessages ────────────────────────────────────────────────────────────
@@ -306,6 +328,7 @@ describe("ConversationStore — deleteMessages", () => {
     expect(deleted).toBe(1);
     expect(await store.getMessageById(msg.messageId)).toBeNull();
   });
+
 });
 
 // ── searchMessages — regex mode ───────────────────────────────────────────────

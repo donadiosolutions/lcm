@@ -1,12 +1,14 @@
 # PostgreSQL development
 
 LCM's PostgreSQL runtime, migration runner, and complete PostgreSQL 18 schema
-baseline are internal until the domain adapters tracked by #84-#91 satisfy the
-shared storage contracts and #92 enables cutover. SQLite remains the default,
-and the application factory deliberately rejects `storage.backend=postgresql`
-during this stage. See the [PostgreSQL schema reference](postgresql-schema.md)
-for tables, integrity rules, index families, extension prerequisites, retention,
-and backup implications.
+baseline remain staged until the domain adapters tracked by #86-#91 satisfy the
+shared storage contracts and #92 enables cutover. Machine/project identity and
+the conversation repository are implemented, but SQLite remains the default
+domain backend and the daemon/CLI do not route conversation traffic to
+PostgreSQL during this stage. See the
+[PostgreSQL schema reference](postgresql-schema.md) for tables, repository
+ordering and atomicity, integrity rules, index families, extension
+prerequisites, retention, and backup implications.
 
 ## Run the conformance harness
 
@@ -229,12 +231,13 @@ with both row-level-security flags disabled and no inheritance or partition
 parent/child relationships, and fingerprints the complete
 effective ACL of every allowlisted table and identity sequence. ACL comparison
 expands PostgreSQL default ACLs when the
-stored ACL is null and normalizes only the owning role, so explicit owner-only
-ACLs compare equal to defaults while `PUBLIC`, named-role, privilege,
-grant-option, foreign-grantor, and missing-owner drift fail closed.
+stored ACL is null and normalizes the owning role plus only the exact reviewed
+identity- and conversation-runtime shapes. Explicit owner-only ACLs compare
+equal to defaults, while `PUBLIC`, out-of-shape named-role privileges, grant
+options, foreign grantors, and missing-owner drift fail closed.
 The separate 220-column ACL group includes one canonical identity row for
 every ordinary and generated column even when `attacl` is null, then expands
-all explicit column grants with the same owner-only normalization.
+all explicit column grants with the same reviewed-shape normalization.
 Constraint fingerprints include the owning table and constraint name as well
 as type, definition, and internal-trigger state; renaming or swapping
 same-type constraints is drift.
@@ -267,6 +270,40 @@ artifact or database from a known-good backup, then retry. A failed pending
 migration rolls back its SQL and ledger insert together and can be retried only
 after its underlying SQL or schema prerequisite is corrected in a new
 migration.
+
+## Apply runtime grants
+
+Use separate migration and runtime roles. After the migrator has applied the
+packaged schema, apply only the reviewed scripts for repositories enabled in
+that runtime:
+
+```bash
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file=docs/postgresql-runtime-identity-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file=docs/postgresql-runtime-conversation-grants.sql
+```
+
+Replace `lcm_runtime` with the existing runtime role. The scripts quote the
+role as an identifier, stop on the first error, and apply their grants in one
+transaction. The conversation script grants schema usage; reads required by
+project-scoped conversation operations; column-limited inserts and bootstrap
+updates; deletion only for messages and their active context references; and
+`USAGE` only on the two generated identity sequences. Message insertion also
+receives exact `EXECUTE` access to `lcm.normalize_search_text(text)` because
+PostgreSQL evaluates the stored generated search document under the inserting
+role and `PUBLIC` execution is intentionally revoked. The script does not grant
+schema creation, migration-ledger access, table ownership, `TRUNCATE`,
+arbitrary updates, sequence mutation, or access to unrelated domain objects.
+
+Applying the conversation grants does not activate the PostgreSQL backend.
+Daemon/CLI routing remains gated by #224 and the #92 cutover. Re-run migration
+readiness after changing grants: the schema fingerprint accepts only the exact
+reviewed runtime-role privilege shapes and fails closed on additional,
+grantable, `PUBLIC`, or foreign-grantor privileges.
 
 ## Managed-service operation
 

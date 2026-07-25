@@ -30,6 +30,8 @@ export type CreateMessageInput = {
   tokenCount: number;
 };
 
+export type AppendMessageInput = Omit<CreateMessageInput, "conversationId" | "seq">;
+
 export type MessageRecord = {
   messageId: MessageId;
   conversationId: ConversationId;
@@ -275,7 +277,7 @@ export class ConversationStore {
         `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
        FROM conversations
        WHERE session_id = ?
-       ORDER BY created_at DESC
+       ORDER BY created_at DESC, conversation_id DESC
        LIMIT 1`,
       )
       .get(sessionId) as unknown as ConversationRow | undefined;
@@ -307,7 +309,7 @@ export class ConversationStore {
       .prepare(
         `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
        FROM conversations
-       ORDER BY created_at`,
+       ORDER BY created_at, conversation_id`,
       )
       .all() as unknown as ConversationRow[];
     return rows.map(toConversationRecord);
@@ -337,9 +339,15 @@ export class ConversationStore {
     return toMessageRecord(row);
   }
 
-  async createMessagesBulk(inputs: CreateMessageInput[]): Promise<MessageRecord[]> {
+  async createMessagesBulk(
+    inputs: CreateMessageInput[],
+    withinAtomicOperation = false,
+  ): Promise<MessageRecord[]> {
     if (inputs.length === 0) {
       return [];
+    }
+    if (!withinAtomicOperation) {
+      return this.withTransaction(() => this.createMessagesBulk(inputs, true));
     }
     const insertStmt = this.db.prepare(
       `INSERT INTO messages (conversation_id, seq, role, content, token_count)
@@ -367,6 +375,33 @@ export class ConversationStore {
     }
 
     return records;
+  }
+
+  async appendMessages(
+    conversationId: ConversationId,
+    inputs: AppendMessageInput[],
+    withinAtomicOperation = false,
+  ): Promise<MessageRecord[]> {
+    if (inputs.length === 0) {
+      return [];
+    }
+    if (!withinAtomicOperation) {
+      return this.withTransaction(() =>
+        this.appendMessages(conversationId, inputs, true));
+    }
+    const row = this.db
+      .prepare(
+        `SELECT MAX(seq) AS max_seq
+         FROM messages
+         WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as unknown as { max_seq: number | null } | undefined;
+    const nextSeq = (row?.max_seq ?? -1) + 1;
+    return this.createMessagesBulk(inputs.map((input, offset) => ({
+      ...input,
+      conversationId,
+      seq: nextSeq + offset,
+    })), true);
   }
 
   async getMessages(
@@ -457,9 +492,17 @@ export class ConversationStore {
     return row ? toMessageRecord(row) : null;
   }
 
-  async createMessageParts(messageId: MessageId, parts: CreateMessagePartInput[]): Promise<void> {
+  async createMessageParts(
+    messageId: MessageId,
+    parts: CreateMessagePartInput[],
+    withinAtomicOperation = false,
+  ): Promise<void> {
     if (parts.length === 0) {
       return;
+    }
+    if (!withinAtomicOperation) {
+      return this.withTransaction(() =>
+        this.createMessageParts(messageId, parts, true));
     }
 
     const stmt = this.db.prepare(
@@ -556,9 +599,15 @@ export class ConversationStore {
    * Skips messages referenced in summary_messages (already compacted) to avoid
    * breaking the summary DAG. Returns the count of actually deleted messages.
    */
-  async deleteMessages(messageIds: MessageId[]): Promise<number> {
+  async deleteMessages(
+    messageIds: MessageId[],
+    withinAtomicOperation = false,
+  ): Promise<number> {
     if (messageIds.length === 0) {
       return 0;
+    }
+    if (!withinAtomicOperation) {
+      return this.withTransaction(() => this.deleteMessages(messageIds, true));
     }
 
     let deleted = 0;

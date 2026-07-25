@@ -4,6 +4,7 @@ import { StorageOperationError } from "../../src/storage/errors.js";
 import { createRetrievalEngine, RetrievalEngine } from "../../src/retrieval.js";
 import { deduplicateAndInsert } from "../../src/promotion/dedup.js";
 import type { ProjectIdentity } from "../../src/project-map.js";
+import { exerciseConversationRepositoryConformance } from "./conversation-conformance.js";
 
 export interface StorageContractHarness {
   factory: StorageBackendFactory;
@@ -18,67 +19,8 @@ export function defineCoreStorageConformance(
     const harness = createHarness();
     const storage = await harness.open("core");
     expect(createRetrievalEngine(storage)).toBeInstanceOf(RetrievalEngine);
-    const first = await storage.conversations.createConversation({ sessionId: "session-a", title: "A" });
-    const second = await storage.conversations.createConversation({ sessionId: "session-b" });
-    expect((await storage.conversations.listConversations()).map((row) => row.conversationId)).toEqual([
-      first.conversationId,
-      second.conversationId,
-    ]);
-    expect(await storage.conversations.getConversation(first.conversationId)).toMatchObject({ title: "A" });
-    expect(await storage.conversations.getConversation(999_999)).toBeNull();
-    expect(await storage.conversations.getConversationBySessionId("session-a")).toMatchObject({ sessionId: "session-a" });
-    expect(await storage.conversations.getConversationBySessionId("missing")).toBeNull();
-    expect((await storage.conversations.getOrCreateConversation("session-a")).conversationId).toBe(first.conversationId);
-    expect((await storage.conversations.getOrCreateConversation("session-c", "C")).title).toBe("C");
-    await storage.conversations.markConversationBootstrapped(first.conversationId);
-    expect((await storage.conversations.getConversation(first.conversationId))?.bootstrappedAt).toBeInstanceOf(Date);
-
-    const messages = await storage.conversations.createMessagesBulk([
-      { conversationId: first.conversationId, seq: 0, role: "user", content: "alpha needle", tokenCount: 2 },
-      { conversationId: first.conversationId, seq: 1, role: "assistant", content: "beta needle", tokenCount: 3 },
-    ]);
-    const third = await storage.conversations.createMessage({
-      conversationId: first.conversationId,
-      seq: 2,
-      role: "tool",
-      content: "gamma",
-      tokenCount: 4,
-    });
-    expect(await storage.conversations.createMessagesBulk([])).toEqual([]);
-    expect((await storage.conversations.getMessages(first.conversationId)).map((row) => row.seq)).toEqual([0, 1, 2]);
-    expect((await storage.conversations.getMessages(first.conversationId, { afterSeq: 0, limit: 1 }))[0]?.seq).toBe(1);
-    expect((await storage.conversations.getLastMessage(first.conversationId))?.messageId).toBe(third.messageId);
-    expect(await storage.conversations.getLastMessage(second.conversationId)).toBeNull();
-    expect(await storage.conversations.hasMessage(first.conversationId, "user", "alpha needle")).toBe(true);
-    expect(await storage.conversations.countMessagesByIdentity(first.conversationId, "user", "alpha needle")).toBe(1);
-    expect((await storage.conversations.getMessageById(messages[0].messageId))?.seq).toBe(0);
-    expect(await storage.conversations.getMessageById(999_999)).toBeNull();
-    const opaquePartMetadata = "  { \"not\": valid-json }\nscalar  ";
-    await storage.conversations.createMessageParts(messages[0].messageId, [{
-      sessionId: "session-a",
-      partType: "text",
-      ordinal: 0,
-      textContent: "alpha",
-      metadata: opaquePartMetadata,
-    }]);
-    await storage.conversations.createMessageParts(messages[0].messageId, []);
-    expect(await storage.conversations.getMessageParts(messages[0].messageId)).toMatchObject([{
-      ordinal: 0,
-      textContent: "alpha",
-      metadata: opaquePartMetadata,
-    }]);
-    expect(await storage.conversations.getMessageCount(first.conversationId)).toBe(3);
-    const split = await storage.conversations.createConversation({ sessionId: "session-a", title: "split" });
-    await storage.conversations.createMessage({
-      conversationId: split.conversationId,
-      seq: 0,
-      role: "user",
-      content: "split message",
-      tokenCount: 2,
-    });
-    expect(await storage.conversations.getMessageCountBySessionId("session-a")).toBe(4);
-    expect(await storage.conversations.getMessageCountBySessionId("missing")).toBe(0);
-    expect(await storage.conversations.getMaxSeq(first.conversationId)).toBe(2);
+    const { first, second, messages, third } =
+      await exerciseConversationRepositoryConformance(storage.conversations);
 
     await storage.context.appendContextMessages(first.conversationId, messages.map((row) => row.messageId));
     await storage.context.appendContextMessage(first.conversationId, third.messageId);
@@ -268,9 +210,14 @@ export function defineCoreStorageConformance(
     const storage = await harness.open("transactions");
     await storage.transaction(async (tx) => {
       const conversation = await tx.conversations.createConversation({ sessionId: "committed" });
-      await tx.conversations.createMessage({ conversationId: conversation.conversationId, seq: 0, role: "user", content: "ok", tokenCount: 1 });
+      await tx.conversations.appendMessages(conversation.conversationId, [
+        { role: "user", content: "ok", tokenCount: 1 },
+        { role: "assistant", content: "still ok", tokenCount: 2 },
+      ]);
     });
-    expect(await storage.conversations.getConversationBySessionId("committed")).not.toBeNull();
+    const committed = await storage.conversations.getConversationBySessionId("committed");
+    expect(committed).not.toBeNull();
+    expect(await storage.conversations.getMessageCount(committed!.conversationId)).toBe(2);
 
     await expect(storage.transaction(async (tx) => {
       const conversation = await tx.conversations.createConversation({ sessionId: "rolled-back" });
@@ -283,6 +230,56 @@ export function defineCoreStorageConformance(
       });
     })).rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED", domain: "conversations" });
     expect(await storage.conversations.getConversationBySessionId("rolled-back")).toBeNull();
+
+    const atomicConversation = await storage.conversations.createConversation({ sessionId: "atomic-methods" });
+    await expect(storage.conversations.createMessagesBulk([
+      {
+        conversationId: atomicConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "must roll back",
+        tokenCount: 1,
+      },
+      {
+        conversationId: atomicConversation.conversationId,
+        seq: 0,
+        role: "assistant",
+        content: "duplicate sequence",
+        tokenCount: 1,
+      },
+    ])).rejects.toMatchObject({ domain: "conversations" });
+    expect(await storage.conversations.getMessages(atomicConversation.conversationId)).toEqual([]);
+
+    const partsMessage = await storage.conversations.createMessage({
+      conversationId: atomicConversation.conversationId,
+      seq: 0,
+      role: "assistant",
+      content: "parts",
+      tokenCount: 1,
+    });
+    await expect(storage.conversations.createMessageParts(partsMessage.messageId, [
+      { sessionId: "atomic-methods", partType: "text", ordinal: 0, textContent: "must roll back" },
+      { sessionId: "atomic-methods", partType: "reasoning", ordinal: 0, textContent: "duplicate ordinal" },
+    ])).rejects.toMatchObject({ domain: "conversations" });
+    expect(await storage.conversations.getMessageParts(partsMessage.messageId)).toEqual([]);
+
+    await expect(storage.transaction(async (tx) => {
+      await tx.conversations.appendMessages(atomicConversation.conversationId, [
+        { role: "user", content: "outer transaction", tokenCount: 2 },
+      ]);
+      await tx.conversations.createMessagesBulk([
+        {
+          conversationId: atomicConversation.conversationId,
+          seq: 2,
+          role: "assistant",
+          content: "outer bulk",
+          tokenCount: 2,
+        },
+      ]);
+      throw new Error("force outer rollback");
+    })).rejects.toMatchObject({ domain: "transaction" });
+    expect((await storage.conversations.getMessages(atomicConversation.conversationId))
+      .map((row) => row.content)).toEqual(["parts"]);
 
     const contextConversation = await storage.conversations.createConversation({ sessionId: "context-rollback" });
     const contextMessage = await storage.conversations.createMessage({

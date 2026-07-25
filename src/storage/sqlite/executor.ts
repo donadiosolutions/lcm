@@ -26,6 +26,8 @@ export function sqliteExecutorFor(
 export class SqliteExecutor {
   private tail: Promise<void> = Promise.resolve();
   private readonly activeTokens = new Set<symbol>();
+  private readonly failedTokens = new Set<symbol>();
+  private savepointOrdinal = 0;
   private poisoned = false;
 
   constructor(
@@ -84,6 +86,65 @@ export class SqliteExecutor {
     }
   }
 
+  async runAtomic<T>(
+    domain: StorageDomain,
+    operation: string,
+    callback: () => T | Promise<T>,
+  ): Promise<T> {
+    const active = transactionContext.getStore();
+    if (active) {
+      throw new StorageOperationError(
+        "STORAGE_TRANSACTION_SCOPE",
+        "sqlite",
+        this.projectId,
+        domain,
+        operation,
+      );
+    }
+    this.assertUsable(domain, operation);
+    return this.enqueue(domain, operation, () => this.atomicRoot(callback));
+  }
+
+  async runAtomicScoped<T>(
+    token: symbol,
+    domain: StorageDomain,
+    operation: string,
+    callback: () => T | Promise<T>,
+  ): Promise<T> {
+    const active = transactionContext.getStore();
+    if (active?.executor !== this || active.token !== token || !this.activeTokens.has(token)) {
+      throw new StorageOperationError(
+        "STORAGE_TRANSACTION_SCOPE",
+        "sqlite",
+        this.projectId,
+        domain,
+        operation,
+      );
+    }
+    this.assertUsable(domain, operation);
+    const savepoint = `lcm_atomic_${this.savepointOrdinal++}`;
+    this.db.exec(`SAVEPOINT ${savepoint}`);
+    try {
+      const result = await callback();
+      this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      } catch {
+        this.failedTokens.add(token);
+        this.poison();
+      }
+      throw normalizeStorageError(error, {
+        backend: "sqlite",
+        projectId: this.projectId,
+        domain,
+        operation,
+      });
+    }
+  }
+
   async transaction<T>(callback: (token: symbol) => Promise<T>): Promise<T> {
     const active = transactionContext.getStore();
     if (active) {
@@ -106,6 +167,15 @@ export class SqliteExecutor {
           { executor: this, token },
           async (): Promise<T> => callback(token),
         );
+        if (this.failedTokens.has(token)) {
+          throw new StorageOperationError(
+            "STORAGE_OPERATION_FAILED",
+            "sqlite",
+            this.projectId,
+            "transaction",
+            "transaction",
+          );
+        }
         this.db.exec("COMMIT");
         return result;
       } catch (error) {
@@ -119,6 +189,7 @@ export class SqliteExecutor {
         throw error;
       } finally {
         this.activeTokens.delete(token);
+        this.failedTokens.delete(token);
       }
     });
   }
@@ -149,6 +220,22 @@ export class SqliteExecutor {
       domain,
       operation,
     );
+  }
+
+  private async atomicRoot<T>(callback: () => T | Promise<T>): Promise<T> {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = await callback();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        this.poison();
+      }
+      throw error;
+    }
   }
 
   private async enqueue<T>(

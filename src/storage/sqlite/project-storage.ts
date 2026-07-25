@@ -46,9 +46,11 @@ export class SqliteProjectStorage implements ProjectStorage {
     const repositories = createSqliteRepositories(
       this.stores,
       this.projectId,
-      async (domain, operation, callback) => {
+      async (domain, operation, callback, atomic) => {
         this.assertOpen(domain, operation);
-        return this.executor.run(domain, operation, callback);
+        return atomic
+          ? this.executor.runAtomic(domain, operation, callback)
+          : this.executor.run(domain, operation, callback);
       },
     );
     this.conversations = repositories.conversations;
@@ -70,8 +72,10 @@ export class SqliteProjectStorage implements ProjectStorage {
       const repositories = createSqliteRepositories(
         this.stores,
         this.projectId,
-        (domain, operation, operationCallback) =>
-          this.executor.runScoped(token, domain, operation, operationCallback),
+        (domain, operation, operationCallback, atomic) =>
+          atomic
+            ? this.executor.runAtomicScoped(token, domain, operation, operationCallback)
+            : this.executor.runScoped(token, domain, operation, operationCallback),
       );
       return callback(repositories);
     });

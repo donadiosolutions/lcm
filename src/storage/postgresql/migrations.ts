@@ -1648,6 +1648,42 @@ export async function runPostgreSqlMigrations(
                          AND privilege.privilege_type OPERATOR(pg_catalog.=)
                            ANY (ARRAY['SELECT', 'DELETE']::pg_catalog.text[])
                        )
+                       OR (
+                         acl_relations.object_identity OPERATOR(pg_catalog.=)
+                           'table|conversations'
+                         AND privilege.privilege_type OPERATOR(pg_catalog.=) 'SELECT'
+                       )
+                       OR (
+                         acl_relations.object_identity OPERATOR(pg_catalog.=)
+                           ANY (
+                             ARRAY[
+                               'table|messages',
+                               'table|context_items'
+                             ]::pg_catalog.text[]
+                           )
+                         AND privilege.privilege_type OPERATOR(pg_catalog.=)
+                           ANY (ARRAY['SELECT', 'DELETE']::pg_catalog.text[])
+                       )
+                       OR (
+                         acl_relations.object_identity OPERATOR(pg_catalog.=)
+                           ANY (
+                             ARRAY[
+                               'table|message_parts',
+                               'table|summary_messages'
+                             ]::pg_catalog.text[]
+                           )
+                         AND privilege.privilege_type OPERATOR(pg_catalog.=) 'SELECT'
+                       )
+                       OR (
+                         acl_relations.object_identity OPERATOR(pg_catalog.=)
+                           ANY (
+                             ARRAY[
+                               'sequence|conversations_conversation_id_seq',
+                               'sequence|messages_message_id_seq'
+                             ]::pg_catalog.text[]
+                           )
+                         AND privilege.privilege_type OPERATOR(pg_catalog.=) 'USAGE'
+                       )
                      )
                    )
                ),
@@ -1740,6 +1776,68 @@ export async function runPostgreSqlMigrations(
                                   AND privilege.privilege_type OPERATOR(pg_catalog.=) 'UPDATE'
                                 )
                               )
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=) 'conversations'
+                              AND (
+                                (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'session_id',
+                                        'title'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                                )
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'bootstrapped_at',
+                                        'updated_at'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type OPERATOR(pg_catalog.=) 'UPDATE'
+                                )
+                              )
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=) 'messages'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'project_id',
+                                    'conversation_id',
+                                    'seq',
+                                    'role',
+                                    'content',
+                                    'token_count'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=) 'message_parts'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'project_id',
+                                    'conversation_id',
+                                    'message_id',
+                                    'session_id',
+                                    'part_type',
+                                    'ordinal',
+                                    'text_content',
+                                    'tool_call_id',
+                                    'tool_name',
+                                    'tool_input',
+                                    'tool_output',
+                                    'metadata'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
                             )
                           ),
                           false

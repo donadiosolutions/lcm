@@ -6,10 +6,12 @@ This reference describes the durable PostgreSQL baseline introduced by
 keys. This is a schema and readiness contract, not an enabled
 application backend. SQLite remains the authoritative production adapter.
 PostgreSQL machine and project identity operations are enabled by issue #84.
-Managed daemons may start with PostgreSQL selected so those operations are
-available, but storage-backed health, status, statistics, and data routes remain
-fail-closed until the domain repositories in issues #85–#91 pass conformance
-and the cutover work in #92 explicitly enables the backend.
+The conversation, message, and message-part adapter added by issue #85 is
+available for repository conformance but is not routed through the daemon or
+CLI. Managed daemons may start with PostgreSQL selected so identity operations
+are available, but storage-backed health, status, statistics, and data routes
+remain fail-closed until the domain repositories in issues #86–#91 pass
+conformance and the cutover work in #92 explicitly enables the backend.
 
 The design is single-user and multi-machine. Project scoping prevents accidental
 cross-project relationships; it is not a tenant or authorization boundary and
@@ -111,10 +113,10 @@ does not add row-level security.
   parent/child relationship involving a managed table. Relation ACL
   fingerprints expand the effective ACL, including PostgreSQL's default ACL
   when `relacl` is null. They normalize the owning role and exact non-grantable
-  identity-repository privilege shapes granted to named runtime roles by the
-  documented script. Any `PUBLIC`, grantable, foreign-grantor, missing-owner,
-  or privilege outside that allowlist on an allowlisted table or identity
-  sequence therefore fails closed.
+  identity- and conversation-repository privilege shapes granted to named
+  runtime roles by the documented scripts. Any `PUBLIC`, grantable,
+  foreign-grantor, missing-owner, or privilege outside that allowlist on an
+  allowlisted table or identity sequence therefore fails closed.
   Column ACL fingerprints retain every allowlisted column even when `attacl`
   is null and expand every explicit entry. They normalize only the script's
   exact insert and update column-grant shapes for named runtime roles; any
@@ -239,6 +241,46 @@ generated full-text and trigram index maintenance before enabling high-volume
 ingest. The measured workload should include representative content sizes,
 languages, concurrency, and the oversized-payload routing path; issue #83 does
 not claim a throughput budget for future repository implementations.
+
+## Conversation repository contract
+
+A session can contain more than one conversation segment. Creating a
+conversation explicitly always creates a new segment. Session lookup returns
+the newest exact-text match ordered by `created_at DESC, conversation_id DESC`;
+the SHA-256 value is only a bounded lookup candidate and never replaces the
+exact `session_id` residual. Concurrent get-or-create calls for the same
+project and exact session are serialized by a transaction-scoped advisory lock
+and converge on that newest segment.
+
+Conversation lists use `created_at, conversation_id` ascending. Messages use
+their conversation-scoped `seq` ascending, and message parts use `ordinal`
+ascending. These final identity tie-breakers are part of the repository
+contract, so equal timestamps do not make pagination or selection
+nondeterministic.
+
+`appendMessages` allocates a whole batch while holding a row lock on the owning
+conversation. The first appended message uses sequence `0`; later batches use
+`MAX(seq) + 1` and receive a contiguous range. Explicit-sequence single and
+bulk creation remain available for replay and import. Bulk message creation,
+part insertion, and multi-message deletion are atomic operations: they either
+commit completely or leave no partial rows. When called inside a repository
+transaction they join that transaction instead of opening a nested one.
+Only serialization failures (`40001`) and deadlocks (`40P01`) are retried, with
+at most three attempts; a commit whose outcome is uncertain is never replayed
+automatically.
+
+Message deletion retains the SQLite summary-protection rule. A message
+referenced by `summary_messages` is skipped, while an eligible message is
+removed from active `context_items` before the message is deleted. Owned
+`message_parts` then disappear through the existing cascade. The complete
+multi-ID operation is atomic, including the skipped-message decisions.
+
+PostgreSQL exposes generated `bigint` identities, sequence values, and counts
+as text through the driver. The adapter accepts them only when conversion
+produces a JavaScript safe integer; values outside
+`Number.MIN_SAFE_INTEGER` through `Number.MAX_SAFE_INTEGER` fail with a
+sanitized storage error instead of being rounded. Nonnegative domain checks
+remain independently enforced by the schema.
 
 ## Ownership, deletion, and retention
 
@@ -476,8 +518,11 @@ LCM-owned `lcm.simple_v1` dictionary with 19 explicit token mappings. Its
 catalog fingerprint covers the parser OID, ordered token mappings, dictionary
 template/options and ownership, plus the complete
 `lcm.normalize_search_text(text)` definition, owner, security mode, and
-per-function configuration; no runtime role owns any of these objects. All
-stored vectors and query constructors must name `lcm.search_v1`.
+per-function configuration. Its ACL accepts the owning role plus non-`PUBLIC`
+runtime roles only when every entry is owner-granted, non-grantable `EXECUTE`;
+`PUBLIC`, grant-option, foreign-grantor, and other privilege shapes fail closed.
+No runtime role owns any of these objects. All stored vectors and query
+constructors must name `lcm.search_v1`.
 
 Changing the text-search configuration or normalization rules requires a new
 immutable migration; updating `unaccent` alone does not adopt new mappings.
@@ -540,15 +585,21 @@ identifier-quoted transfer guidance. Missing, malformed, or contradictory
 ownership catalog values fail closed without exposing the existing owner,
 connection details, or raw database errors.
 
-After schema creation, an administrator grants the issue #84 identity
-repository only its exact runtime privileges with the reviewed
+After schema creation, an administrator grants each implemented repository
+only its exact runtime privileges with the reviewed
 [`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql)
-script:
+and
+[`postgresql-runtime-conversation-grants.sql`](postgresql-runtime-conversation-grants.sql)
+scripts:
 
 ```bash
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file docs/postgresql-runtime-identity-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-conversation-grants.sql
 ```
 
 Replace `lcm_runtime` with the deployment's runtime role. The script grants
@@ -566,6 +617,19 @@ Without these grants, machine registration and project pairing fail closed
 with a sanitized PostgreSQL operation error. Migrations intentionally do not
 apply runtime grants because the migration role cannot safely infer a
 deployment's runtime role.
+
+The conversation script grants reads on conversations, messages, parts, and the
+two relationship tables needed for summary-protected deletion. Inserts are
+limited to repository-writable columns; updates are limited to conversation
+bootstrap timestamps; deletion is limited to messages and their active context
+references. The only sequence privilege is `USAGE` on the generated
+conversation and message identity sequences. Part deletion occurs through the
+message cascade, so the runtime receives no direct `DELETE` on
+`message_parts`. Message inserts evaluate the stored generated
+`search_document`, so the script also grants exact `EXECUTE` on
+`lcm.normalize_search_text(text)`; `PUBLIC` execution remains revoked.
+Applying these grants permits direct repository use and conformance testing
+only; daemon and CLI routing remain staged behind #224 and #92.
 
 Migration privilege hardening is likewise confined to LCM-owned objects: it
 does not change ACLs on unknown objects already present in `lcm`. If an
