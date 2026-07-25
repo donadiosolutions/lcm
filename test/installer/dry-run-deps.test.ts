@@ -85,6 +85,27 @@ describe("DryRunServiceDeps", () => {
     expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("[dry-run] would run: sh"));
   });
 
+  it("runs both Claude plugin inventory commands read-only and simulates near-matches", () => {
+    const deps = new DryRunServiceDeps();
+
+    deps.spawnSync("claude", ["plugin", "list", "--json"], { encoding: "utf-8" });
+    deps.spawnSync("claude", ["plugin", "marketplace", "list", "--json"], { encoding: "utf-8" });
+
+    expect(logSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[dry-run] would run: claude plugin list"),
+    );
+    expect(logSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[dry-run] would run: claude plugin marketplace list"),
+    );
+
+    expect(deps.spawnSync("claude", ["config", "list"]).status).toBe(0);
+    expect(deps.spawnSync("claude", ["plugin", "status"]).status).toBe(0);
+    expect(deps.spawnSync("claude", ["plugin", "marketplace", "status"]).status).toBe(0);
+    expect(logSpy).toHaveBeenCalledWith("[dry-run] would run: claude config list");
+    expect(logSpy).toHaveBeenCalledWith("[dry-run] would run: claude plugin status");
+    expect(logSpy).toHaveBeenCalledWith("[dry-run] would run: claude plugin marketplace status");
+  });
+
   // ── spawnSync — setup.sh special case ────────────────────────────────────
 
   it("spawnSync for 'bash setup.sh' actually runs setup.sh with XGH_DRY_RUN=1", () => {

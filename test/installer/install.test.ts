@@ -8,6 +8,7 @@ import {
   parseInstalledClaudePlugins,
   migrateClaudeMarketplacePlugins,
   canonicalHookCommand,
+  hasManagedClaudeSettings,
   type ServiceDeps,
 } from "../../installer/install.js";
 import { homedir } from "node:os";
@@ -77,6 +78,36 @@ describe("mergeClaudeSettings", () => {
     )).toContain('""quoted""');
     expect(() => canonicalHookCommand(binary, "restore", "node"))
       .toThrow("Node executable path must be absolute");
+  });
+
+  it("deduplicates canonical POSIX hooks whose absolute paths contain apostrophes", () => {
+    const apostropheRuntime = "/opt/npm/owner's/lcm.mjs";
+    const apostropheNode = "/opt/node's/bin/node";
+    const first = mergeClaudeSettings({}, apostropheRuntime, apostropheNode);
+    const second = mergeClaudeSettings(first, apostropheRuntime, apostropheNode);
+
+    expect(second).toEqual(first);
+    for (const { event } of REQUIRED_HOOKS) {
+      expect(second.hooks[event]).toHaveLength(1);
+      expect(second.hooks[event][0].hooks).toHaveLength(1);
+    }
+  });
+
+  it("detects only managed hook or MCP markers and validates their containers", () => {
+    expect(hasManagedClaudeSettings({ theme: "dark", mcpServers: { unrelated: {} } })).toBe(false);
+    expect(hasManagedClaudeSettings({ mcpServers: { lcm: {} } })).toBe(true);
+    expect(hasManagedClaudeSettings({
+      hooks: { SessionStart: [{ hooks: [{ command: "lcm restore" }] }] },
+    })).toBe(true);
+    expect(hasManagedClaudeSettings({
+      hooks: { SessionStart: [null, "custom", { other: true }, { hooks: [{ command: "other" }, { command: 42 }] }] },
+    })).toBe(false);
+    expect(() => hasManagedClaudeSettings(null)).toThrow("must contain a JSON object");
+    expect(() => hasManagedClaudeSettings({ mcpServers: [] })).toThrow("mcpServers must be");
+    expect(() => hasManagedClaudeSettings({ hooks: [] })).toThrow("hooks must be");
+    expect(() => hasManagedClaudeSettings({ hooks: { Stop: "invalid" } })).toThrow("hooks.Stop must be");
+    expect(() => hasManagedClaudeSettings({ hooks: { Stop: [{ hooks: "invalid" }] } }))
+      .toThrow("entry hooks must be");
   });
 
   it("replaces legacy hooks while preserving MCP and unrelated hooks", () => {
@@ -353,6 +384,30 @@ describe("Claude Marketplace migration", () => {
     expect(spawnSync).toHaveBeenCalledTimes(4);
   });
 
+  it("dry-run queries verified plugins and reports removals without mutating Claude", () => {
+    const plugin = JSON.stringify([{ id: "lcm@current", scope: "project", projectPath: "/work/p" }]);
+    const marketplaces = JSON.stringify([{ name: "current", repo: "DonadioSolutions/LCM" }]);
+    const spawnSync = vi.fn()
+      .mockReturnValueOnce({ status: 0, stdout: plugin })
+      .mockReturnValueOnce({ status: 0, stdout: marketplaces });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      migrateClaudeMarketplacePlugins({ spawnSync: spawnSync as any, dryRun: true }, "/work/default");
+      expect(spawnSync).toHaveBeenCalledTimes(2);
+      expect(spawnSync).not.toHaveBeenCalledWith(
+        "claude",
+        expect.arrayContaining(["uninstall"]),
+        expect.anything(),
+      );
+      expect(logSpy).toHaveBeenCalledWith(
+        "[dry-run] would uninstall Claude Marketplace plugin lcm@current "
+        + "(project, donadiosolutions/lcm) in /work/p",
+      );
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   it("fails closed on malformed output, uninstall failure, and a remaining plugin", () => {
     expect(() => parseInstalledClaudePlugins("{")).toThrow("malformed JSON");
     expect(() => parseInstalledClaudePlugins("{}")).toThrow("unsupported shape");
@@ -535,6 +590,46 @@ describe("install", () => {
 
     await expect(install(deps)).rejects.toThrow("chmod failed");
     expect(deps.runDoctor).not.toHaveBeenCalled();
+  });
+
+  it("does not inspect or remove Marketplace plugins when config preparation fails", async () => {
+    const spawnSync = vi.fn();
+    const deps = makeDeps({
+      spawnSync: spawnSync as any,
+      existsSync: vi.fn().mockReturnValue(false),
+      writeFileSync: vi.fn((path: string) => {
+        if (path.endsWith("config.json")) throw new Error("preparation failed");
+      }),
+    });
+
+    await expect(install(deps)).rejects.toThrow("preparation failed");
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it("persists wizard configuration before uninstalling a recognized Marketplace plugin", async () => {
+    const events: string[] = [];
+    const plugin = JSON.stringify([{ id: "lcm@legacy", scope: "user" }]);
+    const marketplaces = JSON.stringify([{ name: "legacy", repo: "lossless-claude/lcm" }]);
+    const spawnSync = vi.fn()
+      .mockImplementationOnce(() => ({ status: 0, stdout: plugin }))
+      .mockImplementationOnce(() => ({ status: 0, stdout: marketplaces }))
+      .mockImplementationOnce(() => {
+        events.push("uninstall");
+        return { status: 0, stdout: "" };
+      })
+      .mockImplementationOnce(() => ({ status: 0, stdout: "[]" }));
+    const deps = makeDeps({
+      spawnSync: spawnSync as any,
+      existsSync: vi.fn().mockReturnValue(false),
+      writeFileSync: vi.fn((path: string) => {
+        if (path.endsWith("config.json")) events.push("config");
+      }),
+    });
+
+    await install(deps);
+
+    expect(events[0]).toBe("config");
+    expect(events.indexOf("uninstall")).toBeGreaterThan(events.indexOf("config"));
   });
 
   it("fails before mutation for a relative executable or malformed Claude settings", async () => {

@@ -3,7 +3,7 @@ import { homedir, platform } from "node:os";
 import { join, dirname } from "node:path";
 import { spawnSync, spawn } from "node:child_process";
 import type { CheckResult, DoctorDeps } from "./types.js";
-import { mergeClaudeSettings, REQUIRED_HOOKS, ensureLcmMd } from "../../installer/install.js";
+import { hasManagedClaudeSettings, mergeClaudeSettings, REQUIRED_HOOKS, ensureLcmMd } from "../../installer/install.js";
 import { NATIVE_PATTERNS, ScrubEngine, readGitleaksSyncDate } from "../scrub.js";
 import { GITLEAKS_PATTERNS } from "../generated-patterns.js";
 import { projectDir } from "../daemon/project.js";
@@ -745,9 +745,11 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   const claudeSettingsExists = deps.existsSync(settingsPath);
   let settingsData: unknown = {};
   let settingsError: string | undefined;
+  let claudeSettingsManaged = false;
   if (claudeSettingsExists) {
     try {
       settingsData = JSON.parse(deps.readFileSync(settingsPath, "utf-8"));
+      claudeSettingsManaged = hasManagedClaudeSettings(settingsData);
     } catch (error) {
       settingsError = error instanceof Error ? error.message : String(error);
     }
@@ -756,7 +758,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   let currentSettings: Record<string, unknown> | undefined;
   let lcmBinary: string | undefined;
   let claudeSettingsCleaned = false;
-  if (!claudeSettingsExists) {
+  if (!claudeSettingsExists || (!settingsError && !claudeSettingsManaged)) {
     results.push({
       name: "hooks",
       category: "Settings",
@@ -813,7 +815,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     ? { command: process.execPath, args: [lcmBinary, "mcp"] }
     : undefined;
   const mcpServers = currentSettings?.mcpServers as Record<string, unknown> | undefined;
-  if (!claudeSettingsExists) {
+  if (!claudeSettingsExists || (!settingsError && !claudeSettingsManaged)) {
     results.push({ name: "mcp-lcm", category: "Settings", status: "pass", message: "Claude Code integration is not installed" });
   } else if (expectedMcp && JSON.stringify(mcpServers?.lcm) === JSON.stringify(expectedMcp)) {
     results.push(claudeSettingsCleaned
@@ -857,7 +859,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     ? (() => { try { return deps.readFileSync(lcmMdPath, "utf-8") !== LCM_MD_CONTENT; } catch { return true; } })()
     : false;
 
-  if (!claudeSettingsExists) {
+  if (!claudeSettingsExists || (!settingsError && !claudeSettingsManaged)) {
     results.push({ name: "lcm-md", category: "Settings", status: "pass", message: "Claude Code integration is not installed" });
   } else if (settingsError) {
     results.push({ name: "lcm-md", category: "Settings", status: "fail", message: "lcm.md could not be validated because Claude settings are malformed" });

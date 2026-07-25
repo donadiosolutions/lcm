@@ -7,7 +7,7 @@ import { lcmHomeDir } from "../src/runtime-paths.js";
 import { atomicWritePrivateFile } from "../src/security-files.js";
 import { packageExecutable, packageRootFor } from "../src/runtime-root.js";
 import { mergeClaudeSettings } from "../src/installer/settings.js";
-export { REQUIRED_HOOKS, canonicalHookCommand, mergeClaudeSettings } from "../src/installer/settings.js";
+export { REQUIRED_HOOKS, canonicalHookCommand, hasManagedClaudeSettings, mergeClaudeSettings } from "../src/installer/settings.js";
 
 export interface ServiceDeps {
   spawnSync: (cmd: string, args: string[], opts?: SpawnSyncOptionsWithStringEncoding) => SpawnSyncReturns<string>;
@@ -25,6 +25,7 @@ export interface ServiceDeps {
   skillSourceDir?: string;
   cwd?: string;
   binaryPath?: string;
+  dryRun?: boolean;
   promptUser: (question: string) => Promise<string>;
   ensureDaemon?: (opts: { port: number; pidFilePath: string; spawnTimeoutMs: number }) => Promise<{ connected: boolean }>;
   runDoctor?: () => Promise<Array<{ name: string; status: string; category?: string; message?: string }>>;
@@ -132,7 +133,7 @@ export function parseInstalledClaudePlugins(
 }
 
 export function migrateClaudeMarketplacePlugins(
-  deps: Pick<ServiceDeps, "spawnSync">,
+  deps: Pick<ServiceDeps, "spawnSync" | "dryRun">,
   cwd: string,
 ): void {
   const list = deps.spawnSync("claude", ["plugin", "list", "--json"], { encoding: "utf-8", cwd });
@@ -151,6 +152,13 @@ export function migrateClaudeMarketplacePlugins(
   const installed = parseInstalledClaudePlugins(list.stdout, marketplaces.stdout);
   for (const plugin of installed) {
     const pluginCwd = plugin.cwd ?? cwd;
+    if (deps.dryRun) {
+      console.log(
+        `[dry-run] would uninstall Claude Marketplace plugin ${plugin.identifier} `
+        + `(${plugin.scope}, ${plugin.repository}) in ${pluginCwd}`,
+      );
+      continue;
+    }
     const removal = deps.spawnSync("claude", [
       "plugin", "uninstall", plugin.identifier,
       "--scope", plugin.scope,
@@ -166,6 +174,7 @@ export function migrateClaudeMarketplacePlugins(
       + "remove it manually before running lcm install",
     );
   }
+  if (deps.dryRun) return;
   const verify = deps.spawnSync("claude", ["plugin", "list", "--json"], { encoding: "utf-8", cwd });
   if (verify.status !== 0) throw new Error("Could not verify Claude Marketplace plugin removal");
   const remaining = parseJsonArray(verify.stdout, "Claude plugin list")
@@ -429,8 +438,6 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   // Validate settings before making any migration or installation changes.
   readMergedClaudeSettings(deps, settingsPath, lcmBin);
 
-  migrateClaudeMarketplacePlugins(deps, deps.cwd ?? process.cwd());
-
   // 1-3. Core setup (config + settings cleanup + daemon)
   // ensureCore handles: creating config.json, merging settings.json hooks, and starting daemon
   // For install, we inject summarizer config into the default config if creating fresh
@@ -446,6 +453,8 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     try { deps.chmodSync?.(configPath, 0o600); } catch { /* best-effort */ }
     console.log(`Created ${configPath}`);
   }
+
+  migrateClaudeMarketplacePlugins(deps, deps.cwd ?? process.cwd());
 
   // ensureCore will:
   // - Skip config creation (already exists or just created above)

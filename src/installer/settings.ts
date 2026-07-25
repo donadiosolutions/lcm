@@ -44,12 +44,15 @@ function isManagedCommand(value: unknown, command: string): boolean {
   const suffix = ` ${command}`;
   if (!trimmed.endsWith(suffix)) return false;
   const executable = trimmed.slice(0, -suffix.length).trimEnd();
-  const executableMatch = /(?:^|\s)(?:"((?:\\?""|\\.|[^"\\])+)"|'([^']+)'|([^"'\s]+))$/.exec(executable);
-  if (!executableMatch) return false;
-  const executablePath = (executableMatch[1] ?? executableMatch[2] ?? executableMatch[3])
-    .replaceAll('""', '"')
-    .replaceAll('\\"', '"')
-    .replaceAll("\\\\", "\\");
+  const singleQuotedMatch = /(?:^|\s)'((?:[^']|'\\'')*)'$/.exec(executable);
+  const executableMatch = /(?:^|\s)(?:"((?:\\?""|\\.|[^"\\])+)"|([^"'\s]+))$/.exec(executable);
+  if (!singleQuotedMatch && !executableMatch) return false;
+  const executablePath = singleQuotedMatch
+    ? singleQuotedMatch[1].replaceAll("'\\''", "'")
+    : (executableMatch![1] ?? executableMatch![2])
+      .replaceAll('""', '"')
+      .replaceAll('\\"', '"')
+      .replaceAll("\\\\", "\\");
   return /(^|[\\/])lcm(?:\.mjs)?$/.test(executablePath);
 }
 
@@ -58,6 +61,34 @@ function asSettingsObject(existing: unknown): Record<string, any> {
     throw new Error("Claude settings must contain a JSON object");
   }
   return structuredClone(existing) as Record<string, any>;
+}
+
+export function hasManagedClaudeSettings(existing: unknown): boolean {
+  const settings = asSettingsObject(existing);
+  if (settings.mcpServers !== undefined &&
+      (settings.mcpServers === null || typeof settings.mcpServers !== "object" || Array.isArray(settings.mcpServers))) {
+    throw new Error("Claude settings mcpServers must be a JSON object");
+  }
+  if (settings.mcpServers?.lcm !== undefined ||
+      settings.mcpServers?.[legacyLcmMcpServerName()] !== undefined) return true;
+
+  if (settings.hooks === undefined) return false;
+  if (settings.hooks === null || typeof settings.hooks !== "object" || Array.isArray(settings.hooks)) {
+    throw new Error("Claude settings hooks must be a JSON object");
+  }
+  for (const { event, command } of REQUIRED_HOOKS) {
+    const entries = settings.hooks[event];
+    if (entries === undefined) continue;
+    if (!Array.isArray(entries)) throw new Error(`Claude settings hooks.${event} must be an array`);
+    for (const entry of entries) {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry) || entry.hooks === undefined) continue;
+      if (!Array.isArray(entry.hooks)) {
+        throw new Error(`Claude settings hooks.${event} entry hooks must be an array`);
+      }
+      if (entry.hooks.some((hook: any) => isManagedCommand(hook?.command, command))) return true;
+    }
+  }
+  return false;
 }
 
 export function mergeClaudeSettings(existing: unknown, runtimePath: string, nodePath = process.execPath): any {

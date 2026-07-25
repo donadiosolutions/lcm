@@ -31,7 +31,7 @@ it("normalizes a merge result without an MCP servers object", async () => {
     existsSync: () => true,
     readFileSync: (path: string) => {
       if (path.endsWith("config.json")) return "{}";
-      if (path.endsWith("settings.json")) return "{}";
+      if (path.endsWith("settings.json")) return JSON.stringify({ mcpServers: { lcm: {} } });
       if (path.endsWith("package.json")) return JSON.stringify({ version: "1.2.3" });
       if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n@lcm.md\n<!-- lcm:end -->";
       if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;

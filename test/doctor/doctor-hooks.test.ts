@@ -63,7 +63,7 @@ describe("doctor hook validation", () => {
   });
 
   it("re-adds mcpServers.lcm when missing from settings.json", async () => {
-    const settings = JSON.stringify({ theme: "dark", mcpServers: {} });
+    const settings = JSON.stringify({ ...mergeClaudeSettings({}, BINARY), theme: "dark", mcpServers: {} });
     const writtenFiles = new Map<string, string>();
     const results = await runDoctor({
       existsSync: () => true,
@@ -84,6 +84,31 @@ describe("doctor hook validation", () => {
     const written = JSON.parse(settingsWritten!);
     expect(written.mcpServers?.lcm).toBeDefined();
     expect(written.theme).toBe("dark");
+  });
+
+  it("does not adopt unrelated Claude settings as a managed LCM installation", async () => {
+    const settings = JSON.stringify({
+      theme: "dark",
+      hooks: { SessionStart: [{ hooks: [{ command: "other restore" }] }] },
+      mcpServers: { unrelated: { command: "other" } },
+    });
+    const writeFileSync = vi.fn();
+    const results = await runDoctor({
+      existsSync: () => true,
+      readFileSync: (p: string) => baseReadFileSync(p, settings),
+      writeFileSync,
+      mkdirSync: vi.fn(),
+      spawnSync: () => ({ status: 0, stdout: "/usr/local/bin/lcm\n", stderr: "" }),
+      fetch: vi.fn().mockResolvedValue({ ok: false }),
+      homedir: "/tmp/test-home",
+      platform: "darwin",
+    });
+
+    expect(writeFileSync).not.toHaveBeenCalled();
+    for (const name of ["hooks", "mcp-lcm", "lcm-md"]) {
+      expect(results.find((result) => result.name === name)?.message)
+        .toBe("Claude Code integration is not installed");
+    }
   });
 
   it("reports a native MCP repair write failure", async () => {

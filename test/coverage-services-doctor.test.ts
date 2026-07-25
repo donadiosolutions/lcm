@@ -709,7 +709,7 @@ describe("doctor service coverage", () => {
       mkdirSync(join(home, ".lcm"), { recursive: true });
       writeFileSync(join(home, ".lcm", "config.json"), JSON.stringify({ llm: { provider: "auto" } }));
       mkdirSync(join(home, ".claude"), { recursive: true });
-      writeFileSync(join(home, ".claude", "settings.json"), "{}");
+      writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ mcpServers: { lcm: {} } }));
       mocks.spawnSync.mockReturnValue({ status: 1, stdout: "", stderr: "missing" });
       const results = await runDoctor({
         homedir: home,
@@ -1000,7 +1000,7 @@ describe("doctor service coverage", () => {
     expect(results.find((result) => result.name === "lcm-md")?.status).toBe("fail");
 
     results = await runDoctor(makeDeps({
-      settings: {},
+      settings: { mcpServers: { lcm: {} } },
       claudeMd: "no managed block",
       lcmMd: "stale",
       readError: (path) => path.endsWith("CLAUDE.md") ? new Error("cannot read claude") : undefined,
@@ -1107,7 +1107,7 @@ describe("doctor service coverage", () => {
 
   it("covers multiple duplicate hook repair failure and lcm.md patch-only/non-Error repair paths", async () => {
     const hooks: Record<string, unknown[]> = {};
-    for (const { event, command } of REQUIRED_HOOKS) hooks[event] = [{ hooks: [{ command }] }];
+    for (const { event, command } of REQUIRED_HOOKS) hooks[event] = [{ hooks: [{ command: `lcm ${command}` }] }];
     let results = await runDoctor(makeDeps({ settings: { hooks }, writeError: "plain write failure" }));
     expect(results.find((result) => result.name === "hooks")?.message).toContain("Could not manage native Claude Code hooks");
 
@@ -1198,7 +1198,7 @@ describe("doctor service coverage", () => {
     validation = { ok: true, fixApplied: false, warnings: [], errors: [], path: mapPath, map: { one: {} } };
     expect((await isolated.runDoctor(makeDeps())).find((result) => result.name === "project-map")?.message).toContain("1 mapped project");
     validation = { ok: true, fixApplied: false, warnings: [], errors: [], path: mapPath, map: { one: {}, two: {} } };
-    const finalResults = await isolated.runDoctor(makeDeps({ settings: {} }));
+    const finalResults = await isolated.runDoctor(makeDeps({ settings: { mcpServers: { lcm: {} } } }));
     expect(finalResults.find((result) => result.name === "project-map")?.message).toContain("2 mapped projects");
     expect(finalResults.find((result) => result.name === "secret-detection")?.status).toBe("fail");
     expect(finalResults.find((result) => result.name === "mcp-lcm")?.status).toBe("warn");
