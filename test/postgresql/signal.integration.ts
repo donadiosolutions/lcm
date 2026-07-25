@@ -19,8 +19,12 @@ function killChild(child: ChildProcess, signal: NodeJS.Signals): void {
   }
 }
 
-async function launchSignalProbe(consumer = false): Promise<{ child: ChildProcess; runId: string }> {
-  const flag = consumer ? "--consumer-signal-probe" : "--signal-probe";
+type ProbeMode = "harness" | "consumer" | "fork";
+
+async function launchSignalProbe(mode: ProbeMode = "harness"): Promise<{ child: ChildProcess; runId: string }> {
+  const flag = mode === "consumer"
+    ? "--consumer-signal-probe"
+    : mode === "fork" ? "--fork-consumer-signal-probe" : "--signal-probe";
   const child = spawn(process.execPath, ["scripts/postgresql-harness.mjs", flag], {
     cwd: process.cwd(),
     env: process.env,
@@ -40,9 +44,11 @@ async function launchSignalProbe(consumer = false): Promise<{ child: ChildProces
   child.stderr?.on("data", (chunk) => {
     stderr += String(chunk);
     const match = stderr.match(
-      consumer
+      mode === "consumer"
         ? /PostgreSQL harness consumer probe ready: ([0-9a-f]{32})/u
-        : /PostgreSQL harness signal probe ready: ([0-9a-f]{32})/u,
+        : mode === "fork"
+          ? /PostgreSQL harness fork consumer probe ready: ([0-9a-f]{32})/u
+          : /PostgreSQL harness signal probe ready: ([0-9a-f]{32})/u,
     );
     if (match) readyResolve(match[1]);
   });
@@ -107,11 +113,20 @@ async function expectResources(runId: string): Promise<void> {
   }
 }
 
-async function consumerPid(runId: string): Promise<number> {
+async function harnessDirectory(runId: string): Promise<string> {
   const { stdout } = await execFileAsync("docker", ["container", "inspect", createRunNames(runId).container]);
   const record = JSON.parse(stdout)[0] as { Mounts: Array<{ Destination: string; Source: string }> };
-  const directory = record.Mounts.find((mount) => mount.Destination === "/run/lcm-harness")!.Source;
+  return record.Mounts.find((mount) => mount.Destination === "/run/lcm-harness")!.Source;
+}
+
+async function consumerPid(runId: string): Promise<number> {
+  const directory = await harnessDirectory(runId);
   return (JSON.parse(readFileSync(`${directory}/consumer-owner.json`, "utf8")) as { pid: number }).pid;
+}
+
+async function forkWorkerPid(runId: string): Promise<number> {
+  const directory = await harnessDirectory(runId);
+  return Number(readFileSync(`${directory}/fork-worker.pid`, "utf8").trim());
 }
 
 async function waitForPidExit(pid: number): Promise<void> {
@@ -187,7 +202,7 @@ describe("PostgreSQL harness signal teardown", () => {
   }, 90_000);
 
   it("preserves a surviving local test consumer until that exact process exits", async () => {
-    const first = await launchSignalProbe(true);
+    const first = await launchSignalProbe("consumer");
     const firstCompletion = exited(first.child);
     killChild(first.child, "SIGKILL");
     await expect(firstCompletion).resolves.toEqual({ code: null, signal: "SIGKILL" });
@@ -216,8 +231,22 @@ describe("PostgreSQL harness signal teardown", () => {
   }, 120_000);
 
   it("terminates an active local consumer before graceful signal cleanup", async () => {
-    const probe = await launchSignalProbe(true);
+    const probe = await launchSignalProbe("consumer");
     const pid = await consumerPid(probe.runId);
+    try {
+      const completion = exited(probe.child);
+      killChild(probe.child, "SIGTERM");
+      await expect(completion).resolves.toEqual({ code: 143, signal: null });
+      await waitForPidExit(pid);
+      await expectNoResources(probe.runId);
+    } finally {
+      if (probe.child.exitCode === null && probe.child.signalCode === null) killChild(probe.child, "SIGKILL");
+    }
+  }, 45_000);
+
+  it("terminates a persistent Vitest fork worker before cleanup", async () => {
+    const probe = await launchSignalProbe("fork");
+    const pid = await forkWorkerPid(probe.runId);
     try {
       const completion = exited(probe.child);
       killChild(probe.child, "SIGTERM");

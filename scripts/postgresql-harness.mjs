@@ -127,6 +127,9 @@ export function readOwnerScopeFingerprint(dependencies = {}) {
     }
     return `linux:${hashedIdentity(machineId)}:${bootId}:${pidNamespace}`;
   }
+  if (currentPlatform !== "darwin" && currentPlatform !== "win32") {
+    throw new Error("unsupported PostgreSQL harness process scope platform");
+  }
   const command = currentPlatform === "win32" ? "powershell.exe" : "sysctl";
   const args = currentPlatform === "win32"
     ? [
@@ -334,6 +337,7 @@ export function runProcess(command, args, options = {}) {
     const spawnProcess = options.spawnProcess ?? spawn;
     const child = spawnProcess(command, args, {
       cwd: options.cwd,
+      detached: options.detached === true,
       env: options.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -444,9 +448,28 @@ export async function runSanitizedProcess(command, args, options = {}) {
   }
 }
 
-export function createProcessLifecycle(processRunner = runProcess) {
+export function createProcessLifecycle(processRunner = runProcess, dependencies = {}) {
   const active = new Set();
   let stopping = false;
+  const currentPlatform = dependencies.platform?.() ?? platform();
+  const signalProcess = dependencies.signalProcess ?? ((pid, signal) => process.kill(pid, signal));
+  const terminateWindowsTree = dependencies.terminateWindowsTree ?? ((pid, force) => {
+    execFileSync("taskkill.exe", [
+      "/PID", String(pid), "/T", ...(force ? ["/F"] : []),
+    ], { windowsHide: true, stdio: "ignore" });
+  });
+
+  const signalEntry = (entry, signal) => {
+    if (!entry.processTree || !Number.isSafeInteger(entry.child?.pid) || entry.child.pid <= 0) {
+      entry.child?.kill(signal);
+      return;
+    }
+    if (currentPlatform === "win32") {
+      terminateWindowsTree(entry.child.pid, signal === "SIGKILL");
+      return;
+    }
+    signalProcess(-entry.child.pid, signal);
+  };
 
   const run = (command, args, options) => {
     if (stopping) return Promise.reject(new Error("PostgreSQL harness setup is stopping"));
@@ -454,10 +477,12 @@ export function createProcessLifecycle(processRunner = runProcess) {
       operation: undefined,
       child: undefined,
       terminateOnStop: options?.terminateOnStop === true,
+      processTree: options?.terminateProcessTree === true,
       escalation: undefined,
     };
     const processOptions = entry.terminateOnStop ? {
       ...options,
+      detached: entry.processTree && currentPlatform !== "win32",
       onSpawn: (child) => {
         entry.child = child;
         options?.onSpawn?.(child);
@@ -484,13 +509,13 @@ export function createProcessLifecycle(processRunner = runProcess) {
     for (const entry of active) {
       if (!entry.terminateOnStop || !entry.child) continue;
       try {
-        entry.child.kill("SIGTERM");
+        signalEntry(entry, "SIGTERM");
       } catch {
         // The close/error event remains the authoritative settlement signal.
       }
       entry.escalation = setTimeout(() => {
         try {
-          entry.child?.kill("SIGKILL");
+          signalEntry(entry, "SIGKILL");
         } catch {
           // The child may have exited between settlement and escalation.
         }
@@ -1078,6 +1103,11 @@ async function runTests(context, ci, setupDocker = docker, testProcess = runProc
   }
   if (!ci) {
     const consumerPath = join(context.directory, consumerOwnerFile);
+    const workerPidPath = join(context.directory, "fork-worker.pid");
+    if (context.forkConsumerProbe) {
+      env.LCM_TEST_POSTGRES_FORK_PROBE = "true";
+      env.LCM_TEST_POSTGRES_FORK_WORKER_PID_FILE = workerPidPath;
+    }
     const testArguments = context.consumerProbe
       ? ["-e", "setInterval(() => undefined, 1_000)"]
       : [
@@ -1092,9 +1122,23 @@ async function runTests(context, ci, setupDocker = docker, testProcess = runProc
         secrets,
         processRunner: testProcess,
         terminateOnStop: true,
+        terminateProcessTree: true,
         onSpawn: (child) => {
           recordConsumerIdentity(consumerPath, child.pid);
-          if (context.consumerProbe) {
+          if (context.forkConsumerProbe) {
+            const readiness = setInterval(() => {
+              try {
+                const workerPid = String(readFileSync(workerPidPath, "utf8")).trim();
+                if (!/^[1-9][0-9]*$/u.test(workerPid)) return;
+                clearInterval(readiness);
+                process.stderr.write(`PostgreSQL harness fork consumer probe ready: ${context.runId}\n`);
+              } catch (error) {
+                if (error?.code !== "ENOENT") clearInterval(readiness);
+              }
+            }, 25);
+            readiness.unref?.();
+            child.once("close", () => clearInterval(readiness));
+          } else if (context.consumerProbe) {
             process.stderr.write(`PostgreSQL harness consumer probe ready: ${context.runId}\n`);
           }
         },
@@ -1306,7 +1350,17 @@ export async function runHarness(options = {}) {
     try {
       if (options.runTests) await options.runTests({ runId, names, directory, environment }, ci);
       else await runTests(
-        { runId, names, directory, environment, secrets, owner, consumerProbe: options.consumerProbe },
+        {
+          runId,
+          names,
+          directory,
+          environment,
+          secrets,
+          owner,
+          consumerProbe: options.consumerProbe,
+          forkConsumerProbe: options.forkConsumerProbe,
+        },
+        // A fork probe uses the normal Vitest command with a fixture-only config include.
         ci,
         setupDocker,
         setupProcess,
@@ -1331,10 +1385,15 @@ export async function runHarness(options = {}) {
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const signalProbe = process.argv.includes("--signal-probe");
   const consumerProbe = process.argv.includes("--consumer-signal-probe");
+  const forkConsumerProbe = process.argv.includes("--fork-consumer-signal-probe");
   runHarness(signalProbe ? {
     runTests: async ({ runId }) => {
       process.stderr.write(`PostgreSQL harness signal probe ready: ${runId}\n`);
       await new Promise(() => { setInterval(() => undefined, 1_000); });
     },
-  } : { consumerProbe, ci: consumerProbe ? false : undefined }).catch(() => { process.exitCode = 1; });
+  } : {
+    consumerProbe,
+    forkConsumerProbe,
+    ci: consumerProbe || forkConsumerProbe ? false : undefined,
+  }).catch(() => { process.exitCode = 1; });
 }

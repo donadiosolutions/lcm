@@ -72,8 +72,10 @@ an exactly owned stopped container can be removed without executing a sentinel
 that Docker cannot expose.
 While local Vitest is active, a private bounded consumer record keeps its PID,
 birth fingerprint, and process scope with the run. A later harness preserves
-the run if that consumer survived its parent. CI similarly preserves a run
-while its labeled runner or restore container is still running.
+the run if that consumer survived its parent. Graceful harness termination
+signals the complete local Vitest process group, including fork workers, before
+database cleanup. CI similarly preserves a run while its labeled runner or
+restore container is still running.
 
 A failed ownership or database-sentinel guard intentionally leaves resources
 for inspection. Never delete them by a broad name glob. Inspect the exact

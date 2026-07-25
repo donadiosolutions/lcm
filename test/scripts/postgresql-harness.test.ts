@@ -151,6 +151,10 @@ describe("PostgreSQL harness utilities", () => {
       `^linux:[0-9a-f]{64}:${testBootId}:pid:\\[4026531836\\]$`,
       "u",
     ));
+    expect(() => readOwnerScopeFingerprint({
+      platform: () => "freebsd",
+      execFile: vi.fn(),
+    })).toThrow("unsupported PostgreSQL harness process scope platform");
   });
 
   it("records explicit ambiguous consumer evidence when birth identity is unavailable", () => {
@@ -311,6 +315,7 @@ describe("PostgreSQL harness utilities", () => {
     });
     expect(spawnProcess).toHaveBeenCalledWith("docker", ["inspect", "owned"], {
       cwd: undefined,
+      detached: false,
       env: undefined,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -331,6 +336,7 @@ describe("PostgreSQL harness utilities", () => {
     await expect(operation).resolves.toMatchObject({ stdout: "", stderr: "" });
     expect(spawnProcess).toHaveBeenCalledWith("docker", ["start", "--attach", "owned"], {
       cwd: undefined,
+      detached: false,
       env: undefined,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -533,6 +539,33 @@ describe("PostgreSQL harness utilities", () => {
     await expect(lifecycle.stop()).resolves.toBeUndefined();
     await expect(consumer).resolves.toBeUndefined();
     expect(child.kill).toHaveBeenCalledOnce();
+  });
+
+  it("terminates the complete detached consumer process group", async () => {
+    let finish!: () => void;
+    const child = { pid: 321, kill: vi.fn() };
+    const signalProcess = vi.fn((pid: number, signal: string) => {
+      expect(pid).toBe(-321);
+      expect(signal).toBe("SIGTERM");
+      finish();
+    });
+    const lifecycle = createProcessLifecycle((_command, _args, options) => {
+      expect(options.detached).toBe(true);
+      options.onSpawn(child);
+      return new Promise<void>((resolve) => { finish = resolve; });
+    }, {
+      platform: () => "linux",
+      signalProcess,
+    });
+    const consumer = lifecycle.run("node", ["vitest"], {
+      terminateOnStop: true,
+      terminateProcessTree: true,
+    });
+
+    await expect(lifecycle.stop()).resolves.toBeUndefined();
+    await expect(consumer).resolves.toBeUndefined();
+    expect(signalProcess).toHaveBeenCalledWith(-321, "SIGTERM");
+    expect(child.kill).not.toHaveBeenCalled();
   });
 
   it.each([
