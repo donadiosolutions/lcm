@@ -155,10 +155,38 @@ interface MaxSeqRow {
 
 const transactionQueues = new WeakMap<DatabaseSync, Promise<void>>();
 const activeDirectTransactions = new Set<symbol>();
-const directTransactionContext = new AsyncLocalStorage<{
+const failedDirectTransactions = new Set<symbol>();
+type DirectTransactionContext = {
   db: DatabaseSync;
   token: symbol;
-}>();
+};
+const directTransactionContext = new AsyncLocalStorage<DirectTransactionContext>();
+const directAtomicContext = new AsyncLocalStorage<DirectTransactionContext>();
+const directAtomicTails = new Map<symbol, Promise<void>>();
+let directAtomicOrdinal = 0;
+
+/** @internal SQLite repository seam; not exported from the public store module. */
+export interface ConversationStoreAtomicCore {
+  createMessagesBulk(inputs: CreateMessageInput[]): MessageRecord[];
+  appendMessages(
+    conversationId: ConversationId,
+    inputs: AppendMessageInput[],
+  ): MessageRecord[];
+  createMessageParts(messageId: MessageId, parts: CreateMessagePartInput[]): void;
+  deleteMessages(messageIds: MessageId[]): number;
+}
+
+const conversationStoreAtomicCores =
+  new WeakMap<ConversationStore, ConversationStoreAtomicCore>();
+
+/** @internal Used only when an outer SQLite executor already owns atomicity. */
+export function getConversationStoreAtomicCore(
+  store: ConversationStore,
+): ConversationStoreAtomicCore {
+  const core = conversationStoreAtomicCores.get(store);
+  if (!core) throw new Error("conversation store atomic core is unavailable");
+  return core;
+}
 
 // ── Row mappers ───────────────────────────────────────────────────────────────
 
@@ -222,6 +250,14 @@ export class ConversationStore {
     options?: { fts5Available?: boolean },
   ) {
     this.fts5Available = options?.fts5Available ?? true;
+    conversationStoreAtomicCores.set(this, {
+      createMessagesBulk: (inputs) => this.createMessagesBulkCore(inputs),
+      appendMessages: (conversationId, inputs) =>
+        this.appendMessagesCore(conversationId, inputs),
+      createMessageParts: (messageId, parts) =>
+        this.createMessagePartsCore(messageId, parts),
+      deleteMessages: (messageIds) => this.deleteMessagesCore(messageIds),
+    });
   }
 
   // ── Transaction helpers ──────────────────────────────────────────────────
@@ -249,6 +285,14 @@ export class ConversationStore {
           { db: this.db, token },
           operation,
         );
+        let pendingAtomic = directAtomicTails.get(token);
+        while (pendingAtomic) {
+          await pendingAtomic;
+          pendingAtomic = directAtomicTails.get(token);
+        }
+        if (failedDirectTransactions.has(token)) {
+          throw new Error("conversation transaction savepoint recovery failed");
+        }
         this.db.exec("COMMIT");
         return result;
       } catch (error) {
@@ -257,8 +301,70 @@ export class ConversationStore {
       }
     } finally {
       activeDirectTransactions.delete(token);
+      failedDirectTransactions.delete(token);
       release();
       if (transactionQueues.get(this.db) === queued) transactionQueues.delete(this.db);
+    }
+  }
+
+  private async withAtomicOperation<T>(
+    operation: () => Promise<T> | T,
+  ): Promise<T> {
+    const active = directTransactionContext.getStore();
+    if (
+      active?.db !== this.db
+      || !activeDirectTransactions.has(active.token)
+    ) {
+      return this.withTransaction(operation);
+    }
+    const nested = directAtomicContext.getStore();
+    if (nested?.db === this.db && nested.token === active.token) {
+      throw new Error("nested atomic conversation operation is not supported");
+    }
+
+    const previous = directAtomicTails.get(active.token) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    const queued = previous.then(() => current);
+    directAtomicTails.set(active.token, queued);
+    await previous;
+    try {
+      return await this.runDirectAtomic(active, operation);
+    } finally {
+      release();
+      if (directAtomicTails.get(active.token) === queued) {
+        directAtomicTails.delete(active.token);
+      }
+    }
+  }
+
+  private async runDirectAtomic<T>(
+    active: DirectTransactionContext,
+    operation: () => Promise<T> | T,
+  ): Promise<T> {
+    const savepoint = `lcm_conversation_atomic_${directAtomicOrdinal++}`;
+    this.db.exec(`SAVEPOINT ${savepoint}`);
+    try {
+      const result = await directAtomicContext.run(active, operation);
+      this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      return result;
+    } catch (error) {
+      let rolledBack = false;
+      try {
+        this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        rolledBack = true;
+      } catch {
+        failedDirectTransactions.add(active.token);
+      }
+      if (rolledBack) {
+        try {
+          this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        } catch {
+          // ROLLBACK TO restored the operation boundary. The outer
+          // transaction can discard the remaining savepoint bookkeeping.
+        }
+      }
+      throw error;
     }
   }
 
@@ -358,16 +464,15 @@ export class ConversationStore {
     return toMessageRecord(row);
   }
 
-  async createMessagesBulk(
-    inputs: CreateMessageInput[],
-    withinAtomicOperation = false,
-  ): Promise<MessageRecord[]> {
+  async createMessagesBulk(inputs: CreateMessageInput[]): Promise<MessageRecord[]> {
     if (inputs.length === 0) {
       return [];
     }
-    if (!withinAtomicOperation) {
-      return this.withTransaction(() => this.createMessagesBulk(inputs, true));
-    }
+    return this.withAtomicOperation(() => this.createMessagesBulkCore(inputs));
+  }
+
+  private createMessagesBulkCore(inputs: CreateMessageInput[]): MessageRecord[] {
+    if (inputs.length === 0) return [];
     const insertStmt = this.db.prepare(
       `INSERT INTO messages (conversation_id, seq, role, content, token_count)
        VALUES (?, ?, ?, ?, ?)`,
@@ -399,15 +504,19 @@ export class ConversationStore {
   async appendMessages(
     conversationId: ConversationId,
     inputs: AppendMessageInput[],
-    withinAtomicOperation = false,
   ): Promise<MessageRecord[]> {
     if (inputs.length === 0) {
       return [];
     }
-    if (!withinAtomicOperation) {
-      return this.withTransaction(() =>
-        this.appendMessages(conversationId, inputs, true));
-    }
+    return this.withAtomicOperation(() =>
+      this.appendMessagesCore(conversationId, inputs));
+  }
+
+  private appendMessagesCore(
+    conversationId: ConversationId,
+    inputs: AppendMessageInput[],
+  ): MessageRecord[] {
+    if (inputs.length === 0) return [];
     const row = this.db
       .prepare(
         `SELECT MAX(seq) AS max_seq
@@ -416,11 +525,11 @@ export class ConversationStore {
       )
       .get(conversationId) as unknown as { max_seq: number | null } | undefined;
     const nextSeq = (row?.max_seq ?? -1) + 1;
-    return this.createMessagesBulk(inputs.map((input, offset) => ({
+    return this.createMessagesBulkCore(inputs.map((input, offset) => ({
       ...input,
       conversationId,
       seq: nextSeq + offset,
-    })), true);
+    })));
   }
 
   async getMessages(
@@ -514,16 +623,19 @@ export class ConversationStore {
   async createMessageParts(
     messageId: MessageId,
     parts: CreateMessagePartInput[],
-    withinAtomicOperation = false,
   ): Promise<void> {
     if (parts.length === 0) {
       return;
     }
-    if (!withinAtomicOperation) {
-      return this.withTransaction(() =>
-        this.createMessageParts(messageId, parts, true));
-    }
+    return this.withAtomicOperation(() =>
+      this.createMessagePartsCore(messageId, parts));
+  }
 
+  private createMessagePartsCore(
+    messageId: MessageId,
+    parts: CreateMessagePartInput[],
+  ): void {
+    if (parts.length === 0) return;
     const stmt = this.db.prepare(
       `INSERT INTO message_parts (
          part_id,
@@ -618,17 +730,15 @@ export class ConversationStore {
    * Skips messages referenced in summary_messages (already compacted) to avoid
    * breaking the summary DAG. Returns the count of actually deleted messages.
    */
-  async deleteMessages(
-    messageIds: MessageId[],
-    withinAtomicOperation = false,
-  ): Promise<number> {
+  async deleteMessages(messageIds: MessageId[]): Promise<number> {
     if (messageIds.length === 0) {
       return 0;
     }
-    if (!withinAtomicOperation) {
-      return this.withTransaction(() => this.deleteMessages(messageIds, true));
-    }
+    return this.withAtomicOperation(() => this.deleteMessagesCore(messageIds));
+  }
 
+  private deleteMessagesCore(messageIds: MessageId[]): number {
+    if (messageIds.length === 0) return 0;
     let deleted = 0;
     for (const messageId of messageIds) {
       // Skip if referenced by a summary (ON DELETE RESTRICT would fail anyway)

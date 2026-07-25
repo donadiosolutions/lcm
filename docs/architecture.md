@@ -286,13 +286,20 @@ Messages are stored with:
 Each message also has **message_parts** — structured content blocks that preserve the original shape (text blocks, tool calls, tool results, reasoning, file content, etc.). This allows the assembler to reconstruct rich content when building model context, not just flat text.
 
 Conversation lists use creation time then conversation ID; messages use
-sequence; message parts use ordinal. Bulk message writes, part writes, and
-multi-message deletion are atomic whether called directly or inside an existing
-repository transaction. Deletion skips summarized messages, removes eligible
-message references from active context, and relies on the owned-part cascade.
+sequence; message parts use ordinal. Bulk message writes, atomic append
+allocation, part writes, and multi-message deletion retain an operation-level
+rollback boundary whether called directly, inside an existing repository
+transaction, or from a same-handle `ConversationStore.withTransaction()`
+callback that catches the operation failure and commits other work. Deletion
+skips summarized messages, removes eligible message references from active
+context, and relies on the owned-part cascade. Unbounded PostgreSQL batches
+use a constant number of bind parameters and typed set-valued expansion rather
+than one placeholder per input.
 PostgreSQL `bigint` values are converted to JavaScript numbers only after a
 safe-integer check, so an out-of-range identity, sequence, or count fails
-instead of losing precision.
+instead of losing precision. Generated conversation and message identities are
+mapped before their write transaction commits, so an unsafe identity rolls the
+row back; generated message-part identities remain opaque UUID strings.
 
 ### The summary DAG
 

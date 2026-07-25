@@ -431,6 +431,7 @@ describe("PostgreSQL 18 conversation repository", () => {
       expect(await repository.deleteMessages([
         protectedMessage.messageId,
         eligibleMessage.messageId,
+        eligibleMessage.messageId,
       ])).toBe(1);
       expect(await repository.getMessageById(protectedMessage.messageId)).not.toBeNull();
       expect(await repository.getMessageParts(protectedMessage.messageId)).toHaveLength(1);
@@ -570,6 +571,124 @@ describe("PostgreSQL 18 conversation repository", () => {
         .rejects.toMatchObject({ domain: "conversations" });
       expect(await repository.getMessageById(firstDelete.messageId)).not.toBeNull();
       expect(await repository.getMessageById(secondDelete.messageId)).not.toBeNull();
+    });
+  });
+
+  it("rejects unsafe generated bigint identities without residual writes", async () => {
+    await withPostgreSqlTestDatabase("conversation-unsafe-identities", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation unsafe identities");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const safeConversation = await repository.createConversation({
+        sessionId: "safe-identity-owner",
+      });
+      const beforeMaximumSafeInteger = String(Number.MAX_SAFE_INTEGER - 1);
+
+      await database.migrator.query({
+        text: `SELECT pg_catalog.setval(
+                 'lcm.conversations_conversation_id_seq'::pg_catalog.regclass,
+                 $1::pg_catalog.int8,
+                 true
+               )`,
+        values: [beforeMaximumSafeInteger],
+      }, { domain: "conversations", operation: "forceUnsafeConversationIdentity" });
+      const maximumSafeConversation = await repository.createConversation({
+        sessionId: "maximum-safe-generated-conversation",
+      });
+      expect(maximumSafeConversation.conversationId).toBe(Number.MAX_SAFE_INTEGER);
+      await expect(repository.createConversation({
+        sessionId: "unsafe-generated-conversation",
+      })).rejects.toMatchObject({
+        backend: "postgresql",
+        domain: "conversations",
+        operation: "createConversation",
+        projectId,
+      });
+
+      await database.migrator.query({
+        text: `SELECT pg_catalog.setval(
+                 'lcm.messages_message_id_seq'::pg_catalog.regclass,
+                 $1::pg_catalog.int8,
+                 true
+               )`,
+        values: [beforeMaximumSafeInteger],
+      }, { domain: "conversations", operation: "forceUnsafeMessageIdentity" });
+      const maximumSafeMessage = await repository.createMessage({
+        conversationId: safeConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "maximum-safe-generated-message",
+        tokenCount: 1,
+      });
+      expect(maximumSafeMessage.messageId).toBe(Number.MAX_SAFE_INTEGER);
+      await expect(repository.createMessage({
+        conversationId: safeConversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "unsafe-generated-single",
+        tokenCount: 1,
+      })).rejects.toMatchObject({
+        backend: "postgresql",
+        domain: "conversations",
+        operation: "createMessage",
+        projectId,
+      });
+      await expect(repository.createMessagesBulk([
+        {
+          conversationId: safeConversation.conversationId,
+          seq: 1,
+          role: "user",
+          content: "unsafe-generated-bulk-first",
+          tokenCount: 1,
+        },
+        {
+          conversationId: safeConversation.conversationId,
+          seq: 2,
+          role: "assistant",
+          content: "unsafe-generated-bulk-second",
+          tokenCount: 1,
+        },
+      ])).rejects.toMatchObject({
+        backend: "postgresql",
+        domain: "conversations",
+        operation: "createMessagesBulk",
+        projectId,
+      });
+      await expect(repository.appendMessages(safeConversation.conversationId, [{
+        role: "user",
+        content: "unsafe-generated-append",
+        tokenCount: 1,
+      }])).rejects.toMatchObject({
+        backend: "postgresql",
+        domain: "conversations",
+        operation: "appendMessages",
+        projectId,
+      });
+
+      const residuals = await database.migrator.query<{
+        conversation_count: string;
+        message_count: string;
+      }>({
+        text: `SELECT
+                 (
+                   SELECT COUNT(*)
+                   FROM lcm.conversations
+                   WHERE project_id = $1
+                     AND session_id = 'unsafe-generated-conversation'
+                 ) AS conversation_count,
+                 (
+                   SELECT COUNT(*)
+                   FROM lcm.messages
+                   WHERE project_id = $1
+                     AND content LIKE 'unsafe-generated-%'
+                 ) AS message_count`,
+        values: [projectId],
+      }, { domain: "conversations", operation: "inspectUnsafeIdentityResiduals" });
+      expect(residuals.rows[0]).toEqual({
+        conversation_count: "0",
+        message_count: "0",
+      });
+      expect(await repository.getConversation(safeConversation.conversationId)).not.toBeNull();
     });
   });
 });

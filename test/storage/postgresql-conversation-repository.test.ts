@@ -394,6 +394,108 @@ describe("PostgreSQL conversation repository", () => {
     });
   });
 
+  it("keeps deletion within a constant bind count above PostgreSQL's limit", async () => {
+    const db = executor(() => result([{ count: "0" }]));
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+    const messageIds = Array.from({ length: 65_536 }, (_, index) => index + 1);
+
+    await expect(repository.deleteMessages(messageIds)).resolves.toBe(0);
+
+    const config = db.query.mock.calls[0]?.[0];
+    expect(config.values).toHaveLength(2);
+    expect(config.values?.[1]).toEqual(messageIds);
+    expect(config.text).toContain("$2::pg_catalog.int8[]");
+    expect(config.text).toContain("pg_catalog.unnest");
+    expect(config.text).toContain("WITH ORDINALITY");
+    expect(config.text).not.toMatch(/\$(?:[3-9]|\d{2,})/u);
+    expect((config.values?.[1] as number[])[0]).toBe(1);
+    expect((config.values?.[1] as number[]).at(-1)).toBe(65_536);
+  });
+
+  it.each([
+    [
+      "createConversation",
+      conversationRow,
+      (repository: PostgreSqlConversationRepository) =>
+        repository.createConversation({ sessionId: "unsafe-generated-conversation" }),
+      "conversation_id",
+    ],
+    [
+      "createMessage",
+      messageRow,
+      (repository: PostgreSqlConversationRepository) => repository.createMessage({
+        conversationId: 41,
+        seq: 0,
+        role: "user",
+        content: "unsafe-generated-message",
+        tokenCount: 1,
+      }),
+      "message_id",
+    ],
+    [
+      "createMessagesBulk",
+      messageRow,
+      (repository: PostgreSqlConversationRepository) => repository.createMessagesBulk([{
+        conversationId: 41,
+        seq: 0,
+        role: "user",
+        content: "unsafe-generated-bulk",
+        tokenCount: 1,
+      }]),
+      "message_id",
+    ],
+  ])("rolls back %s when generated identity mapping is unsafe", async (
+    _operation,
+    safeRow,
+    invoke,
+    field,
+  ) => {
+    const unsafeRow = {
+      ...safeRow,
+      [field]: String(Number.MAX_SAFE_INTEGER + 1),
+    };
+    let residualWrites = 0;
+    const query = vi.fn(() => {
+      residualWrites += 1;
+      return result([unsafeRow]);
+    });
+    const db = { query } as unknown as PostgreSqlConversationExecutor & {
+      query: ReturnType<typeof vi.fn>;
+      transaction: ReturnType<typeof vi.fn>;
+    };
+    db.transaction = vi.fn(async (
+      callback: Parameters<PostgreSqlConversationExecutor["transaction"]>[0],
+    ) => {
+      const before = residualWrites;
+      try {
+        return await callback(db);
+      } catch (error) {
+        residualWrites = before;
+        throw error;
+      }
+    });
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+
+    await expect(invoke(repository)).rejects.toMatchObject({ field });
+    expect(db.transaction).toHaveBeenCalledTimes(1);
+    expect(residualWrites).toBe(0);
+  });
+
+  it("maps direct writes inside an existing transaction executor", async () => {
+    const query = vi.fn(() => result([messageRow]));
+    const scoped = { query } as unknown as PostgreSqlConversationExecutor;
+    const repository = new PostgreSqlConversationRepository(scoped, projectId);
+
+    await expect(repository.createMessagesBulk([{
+      conversationId: 41,
+      seq: 0,
+      role: "user",
+      content: "already transactional",
+      tokenCount: 1,
+    }])).resolves.toMatchObject([{ messageId: 51 }]);
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
   it("maps every PostgreSQL bigint representation only when safely integral", async () => {
     const safeRow = {
       ...messageRow,
@@ -594,6 +696,31 @@ describe("PostgreSQL conversation repository", () => {
   });
 
   it("never retries non-contention failures or ambiguous commits", async () => {
+    const directContention = executor(() => result([]));
+    directContention.transaction.mockRejectedValue(
+      Object.assign(new Error("serialization"), { code: "40001" }),
+    );
+    await expect(new PostgreSqlConversationRepository(directContention, projectId)
+      .createConversation({ sessionId: "direct-contention" }))
+      .rejects.toMatchObject({ code: "40001" });
+    expect(directContention.transaction).toHaveBeenCalledTimes(1);
+
+    const directAmbiguous = executor(() => result([]));
+    directAmbiguous.transaction.mockRejectedValue(new PostgreSqlCommitOutcomeUnknownError({
+      domain: "conversations",
+      operation: "createMessagesBulk",
+      projectId,
+    }));
+    await expect(new PostgreSqlConversationRepository(directAmbiguous, projectId)
+      .createMessagesBulk([{
+        conversationId: 1,
+        seq: 0,
+        role: "user",
+        content: "ambiguous",
+        tokenCount: 1,
+      }])).rejects.toBeInstanceOf(PostgreSqlCommitOutcomeUnknownError);
+    expect(directAmbiguous.transaction).toHaveBeenCalledTimes(1);
+
     const ordinary = executor(() => result([]));
     ordinary.transaction.mockRejectedValue(
       Object.assign(new Error("connection unavailable"), { code: "53300" }),

@@ -12,6 +12,10 @@ import { normalizeStorageError, StorageOperationError } from "../../src/storage/
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import { SqliteExecutor } from "../../src/storage/sqlite/executor.js";
 import { assertSqliteReady } from "../../src/storage/sqlite/health.js";
+import {
+  createSqliteRepositories,
+  createSqliteRepositoryStores,
+} from "../../src/storage/sqlite/repositories.js";
 import { closeLcmConnection, getPoolStats, isLcmConnectionOpen } from "../../src/db/connection.js";
 import { createTemporaryDirectory } from "../fixtures/runtime.js";
 import { defineCoreStorageConformance, type StorageContractHarness } from "./conformance.js";
@@ -39,6 +43,31 @@ function harness(): StorageContractHarness {
 
 describe("SQLite storage backend conformance", () => {
   defineCoreStorageConformance(harness);
+
+  it("keeps empty repository atomic operations callback-statement-free", async () => {
+    const prepare = vi.fn(() => {
+      throw new Error("empty atomic operations must not prepare statements");
+    });
+    const db = { prepare } as unknown as DatabaseSync;
+    const stores = createSqliteRepositoryStores(db, { fts5Available: false });
+    const invoke = vi.fn(async (
+      _domain: unknown,
+      _operation: unknown,
+      callback: () => unknown,
+      atomic?: boolean,
+    ) => {
+      expect(atomic).toBe(true);
+      return callback();
+    });
+    const repositories = createSqliteRepositories(stores, "safe-project", invoke);
+
+    await expect(repositories.conversations.createMessagesBulk([])).resolves.toEqual([]);
+    await expect(repositories.conversations.appendMessages(1, [])).resolves.toEqual([]);
+    await expect(repositories.conversations.createMessageParts(1, [])).resolves.toBeUndefined();
+    await expect(repositories.conversations.deleteMessages([])).resolves.toBe(0);
+    expect(invoke).toHaveBeenCalledTimes(4);
+    expect(prepare).not.toHaveBeenCalled();
+  });
 
   it("selects SQLite and exposes a cause-free staged PostgreSQL boundary", async () => {
     expect(createStorageBackendFactory({ backend: "sqlite" })).toBeInstanceOf(SqliteStorageBackendFactory);

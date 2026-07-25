@@ -211,18 +211,6 @@ function sqlState(error: unknown): string | null {
   return typeof code === "string" && /^[0-9A-Z]{5}$/u.test(code) ? code : null;
 }
 
-function placeholders(
-  rowCount: number,
-  casts: readonly string[],
-  start = 1,
-): string {
-  return Array.from({ length: rowCount }, (_, rowIndex) => {
-    const offset = start + rowIndex * casts.length;
-    return `(${casts.map((cast, columnIndex) =>
-      `$${offset + columnIndex}::${cast}`).join(", ")})`;
-  }).join(", ");
-}
-
 function messageInputJson(inputs: readonly CreateMessageInput[]): string {
   return JSON.stringify(inputs.map((input) => ({
     conversation_id: input.conversationId,
@@ -254,7 +242,9 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
   ) {}
 
   async createConversation(input: CreateConversationInput): Promise<ConversationRecord> {
-    return this.createConversationWith(this.executor, input, "createConversation");
+    const operation = "createConversation";
+    return this.mappedWrite(operation, (transaction) =>
+      this.createConversationWith(transaction, input, operation));
   }
 
   async getConversation(
@@ -353,37 +343,15 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
 
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
     const operation = "createMessage";
-    this.validateMessageInput(input, operation);
-    const result = await this.executor.query<MessageRow>({
-      text: `INSERT INTO lcm.messages (
-               project_id, conversation_id, seq, role, content, token_count
-             )
-             VALUES ($1, $2, $3, $4, $5, $6)
-             RETURNING ${MESSAGE_COLUMNS}`,
-      values: [
-        this.projectId,
-        input.conversationId,
-        input.seq,
-        input.role,
-        input.content,
-        input.tokenCount,
-      ],
-    }, this.context(operation));
-    const row = result.rows[0];
-    if (!row) throw new PostgreSqlConversationDataError(
-      this.projectId,
-      operation,
-      "message",
-    );
-    return messageFromRow(row, this.projectId, operation);
+    return this.mappedWrite(operation, (transaction) =>
+      this.createMessageWith(transaction, input, operation));
   }
 
   async createMessagesBulk(inputs: CreateMessageInput[]): Promise<MessageRecord[]> {
-    return this.createMessagesBulkWith(
-      this.executor,
-      inputs,
-      "createMessagesBulk",
-    );
+    if (inputs.length === 0) return [];
+    const operation = "createMessagesBulk";
+    return this.mappedWrite(operation, (transaction) =>
+      this.createMessagesBulkWith(transaction, inputs, operation));
   }
 
   /**
@@ -657,12 +625,11 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
       safeInputInteger(messageId, this.projectId, operation, "message_id");
     }
     const result = await this.executor.query<CountRow>({
-      text: `WITH requested (message_id) AS (
-               VALUES ${placeholders(
-                 messageIds.length,
-                 ["pg_catalog.int8"],
-                 2,
-               )}
+      text: `WITH requested AS (
+               SELECT requested.message_id, requested.input_ordinal
+               FROM pg_catalog.unnest(
+                 $2::pg_catalog.int8[]
+               ) WITH ORDINALITY AS requested(message_id, input_ordinal)
              ),
              deletable AS (
                SELECT message.message_id
@@ -695,7 +662,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
              )
              SELECT COUNT(*) AS count
              FROM deleted_messages`,
-      values: [this.projectId, ...messageIds],
+      values: [this.projectId, messageIds],
     }, this.context(operation));
     return this.count(result.rows[0], operation);
   }
@@ -760,6 +727,36 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     return row ? conversationFromRow(row, this.projectId, operation) : null;
   }
 
+  private async createMessageWith(
+    executor: PostgreSqlQueryExecutor,
+    input: CreateMessageInput,
+    operation: string,
+  ): Promise<MessageRecord> {
+    this.validateMessageInput(input, operation);
+    const result = await executor.query<MessageRow>({
+      text: `INSERT INTO lcm.messages (
+               project_id, conversation_id, seq, role, content, token_count
+             )
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING ${MESSAGE_COLUMNS}`,
+      values: [
+        this.projectId,
+        input.conversationId,
+        input.seq,
+        input.role,
+        input.content,
+        input.tokenCount,
+      ],
+    }, this.context(operation));
+    const row = result.rows[0];
+    if (!row) throw new PostgreSqlConversationDataError(
+      this.projectId,
+      operation,
+      "message",
+    );
+    return messageFromRow(row, this.projectId, operation);
+  }
+
   private async getConversationBySessionIdWith(
     executor: PostgreSqlQueryExecutor,
     sessionId: string,
@@ -784,7 +781,6 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     inputs: CreateMessageInput[],
     operation: string,
   ): Promise<MessageRecord[]> {
-    if (inputs.length === 0) return [];
     for (const input of inputs) this.validateMessageInput(input, operation);
     const result = await executor.query<MessageRow>({
       text: `WITH input AS (
@@ -820,6 +816,15 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
       values: [this.projectId, messageInputJson(inputs)],
     }, this.context(operation));
     return result.rows.map((row) => messageFromRow(row, this.projectId, operation));
+  }
+
+  private mappedWrite<T>(
+    operation: string,
+    callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
+  ): Promise<T> {
+    return typeof this.executor.transaction === "function"
+      ? this.executor.transaction(callback, this.context(operation))
+      : callback(this.executor);
   }
 
   private async shortTransaction<T>(

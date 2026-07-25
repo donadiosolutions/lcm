@@ -2,7 +2,11 @@ import type { DatabaseSync } from "node:sqlite";
 import { PromotedStore, parsePromotedTags, type PromotedRow } from "../../db/promoted.js";
 import { RecallStore } from "../../db/recall.js";
 import { upsertRedactionCounts } from "../../db/redaction-stats.js";
-import { ConversationStore } from "../../store/conversation-store.js";
+import {
+  ConversationStore,
+  getConversationStoreAtomicCore,
+  type ConversationStoreAtomicCore,
+} from "../../store/conversation-store.js";
 import { SummaryStore } from "../../store/summary-store.js";
 import type {
   ProjectRepositories,
@@ -20,6 +24,7 @@ export type RepositoryInvoker = <T>(
 export interface SqliteRepositoryStores {
   db: DatabaseSync;
   conversations: ConversationStore;
+  conversationAtomic: ConversationStoreAtomicCore;
   summaries: SummaryStore;
   promoted: PromotedStore;
   recall: RecallStore;
@@ -29,9 +34,11 @@ export function createSqliteRepositoryStores(
   db: DatabaseSync,
   options?: { fts5Available?: boolean },
 ): SqliteRepositoryStores {
+  const conversations = new ConversationStore(db, options);
   return {
     db,
-    conversations: new ConversationStore(db, options),
+    conversations,
+    conversationAtomic: getConversationStoreAtomicCore(conversations),
     summaries: new SummaryStore(db, options),
     promoted: new PromotedStore(db, options?.fts5Available),
     recall: new RecallStore(db),
@@ -59,6 +66,7 @@ export function createSqliteRepositories(
   invoke: RepositoryInvoker,
 ): ProjectRepositories {
   const conversations = stores.conversations;
+  const conversationAtomic = stores.conversationAtomic;
   const summaries = stores.summaries;
   const promoted = stores.promoted;
   const recall = stores.recall;
@@ -73,19 +81,19 @@ export function createSqliteRepositories(
       markConversationBootstrapped: (id) => invoke("conversations", "markConversationBootstrapped", () => conversations.markConversationBootstrapped(id)),
       listConversations: () => invoke("conversations", "listConversations", () => conversations.listConversations()),
       createMessage: (input) => invoke("conversations", "createMessage", () => conversations.createMessage(input)),
-      createMessagesBulk: (inputs) => invoke("conversations", "createMessagesBulk", () => conversations.createMessagesBulk(inputs, true), true),
-      appendMessages: (id, inputs) => invoke("conversations", "appendMessages", () => conversations.appendMessages(id, inputs, true), true),
+      createMessagesBulk: (inputs) => invoke("conversations", "createMessagesBulk", () => conversationAtomic.createMessagesBulk(inputs), true),
+      appendMessages: (id, inputs) => invoke("conversations", "appendMessages", () => conversationAtomic.appendMessages(id, inputs), true),
       getMessages: (id, options) => invoke("conversations", "getMessages", () => conversations.getMessages(id, options)),
       getLastMessage: (id) => invoke("conversations", "getLastMessage", () => conversations.getLastMessage(id)),
       hasMessage: (id, role, content) => invoke("conversations", "hasMessage", () => conversations.hasMessage(id, role, content)),
       countMessagesByIdentity: (id, role, content) => invoke("conversations", "countMessagesByIdentity", () => conversations.countMessagesByIdentity(id, role, content)),
       getMessageById: (id) => invoke("conversations", "getMessageById", () => conversations.getMessageById(id)),
-      createMessageParts: (id, parts) => invoke("conversations", "createMessageParts", () => conversations.createMessageParts(id, parts, true), true),
+      createMessageParts: (id, parts) => invoke("conversations", "createMessageParts", () => conversationAtomic.createMessageParts(id, parts), true),
       getMessageParts: (id) => invoke("conversations", "getMessageParts", () => conversations.getMessageParts(id)),
       getMessageCount: (id) => invoke("conversations", "getMessageCount", () => conversations.getMessageCount(id)),
       getMessageCountBySessionId: (sessionId) => invoke("conversations", "getMessageCountBySessionId", () => conversations.getMessageCountBySessionId(sessionId)),
       getMaxSeq: (id) => invoke("conversations", "getMaxSeq", () => conversations.getMaxSeq(id)),
-      deleteMessages: (ids) => invoke("conversations", "deleteMessages", () => conversations.deleteMessages(ids, true), true),
+      deleteMessages: (ids) => invoke("conversations", "deleteMessages", () => conversationAtomic.deleteMessages(ids), true),
     },
     summaries: {
       insertSummary: (input) => invoke("summaries", "insertSummary", () => summaries.insertSummary(input)),

@@ -5,7 +5,41 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { getLcmConnection, closeLcmConnection } from "../../src/db/connection.js";
 import { runLcmMigrations } from "../../src/db/migration.js";
-import { ConversationStore } from "../../src/store/conversation-store.js";
+import {
+  ConversationStore,
+  getConversationStoreAtomicCore,
+  type AppendMessageInput,
+  type ConversationId,
+  type CreateMessageInput,
+  type CreateMessagePartInput,
+  type MessageId,
+} from "../../src/store/conversation-store.js";
+
+type ExactParameters<Actual, Expected> =
+  Actual extends Expected
+    ? Expected extends Actual
+      ? true
+      : false
+    : false;
+
+const publicAtomicParameterContract: [
+  ExactParameters<
+    Parameters<ConversationStore["createMessagesBulk"]>,
+    [inputs: CreateMessageInput[]]
+  >,
+  ExactParameters<
+    Parameters<ConversationStore["appendMessages"]>,
+    [conversationId: ConversationId, inputs: AppendMessageInput[]]
+  >,
+  ExactParameters<
+    Parameters<ConversationStore["createMessageParts"]>,
+    [messageId: MessageId, parts: CreateMessagePartInput[]]
+  >,
+  ExactParameters<
+    Parameters<ConversationStore["deleteMessages"]>,
+    [messageIds: MessageId[]]
+  >,
+] = [true, true, true, true];
 
 const tempDirs: string[] = [];
 
@@ -47,6 +81,11 @@ function trackedDatabase(db: DatabaseSync): {
     } as unknown as DatabaseSync,
     statements,
   };
+}
+
+function normalizedTransactionStatements(statements: readonly string[]): string[] {
+  return statements.map((statement) =>
+    statement.replace(/lcm_conversation_atomic_[0-9]+/gu, "lcm_conversation_atomic"));
 }
 
 // ── Conversation CRUD ─────────────────────────────────────────────────────────
@@ -418,6 +457,36 @@ describe("ConversationStore — searchMessages regex", () => {
 // ── withTransaction ───────────────────────────────────────────────────────────
 
 describe("ConversationStore — withTransaction", () => {
+  it("exposes contract-shaped atomic methods without a public bypass flag", () => {
+    const store = makeStore(makeDb());
+
+    expect(publicAtomicParameterContract).toEqual([true, true, true, true]);
+    expect([
+      store.createMessagesBulk.length,
+      store.appendMessages.length,
+      store.createMessageParts.length,
+      store.deleteMessages.length,
+    ]).toEqual([1, 2, 2, 1]);
+    expect(Object.keys(getConversationStoreAtomicCore(store)).sort()).toEqual([
+      "appendMessages",
+      "createMessageParts",
+      "createMessagesBulk",
+      "deleteMessages",
+    ]);
+    expect(() => getConversationStoreAtomicCore(
+      Object.create(ConversationStore.prototype) as ConversationStore,
+    )).toThrow("conversation store atomic core is unavailable");
+  });
+
+  it("reuses a live same-handle direct transaction for nested transaction helpers", async () => {
+    const tracked = trackedDatabase(makeDb());
+    const store = makeStore(tracked.database);
+
+    await expect(store.withTransaction(() =>
+      store.withTransaction(() => "same transaction"))).resolves.toBe("same transaction");
+    expect(tracked.statements).toEqual(["BEGIN IMMEDIATE", "COMMIT"]);
+  });
+
   it("commits and returns a successful operation result", async () => {
     const store = makeStore(makeDb());
     const conversation = await store.createConversation({ sessionId: "tx-commit" });
@@ -491,7 +560,18 @@ describe("ConversationStore — withTransaction", () => {
       return [bulk.seq, appended.seq];
     })).resolves.toEqual([1, 2]);
 
-    expect(tracked.statements).toEqual(["BEGIN IMMEDIATE", "COMMIT"]);
+    expect(normalizedTransactionStatements(tracked.statements)).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_conversation_atomic",
+      "RELEASE SAVEPOINT lcm_conversation_atomic",
+      "SAVEPOINT lcm_conversation_atomic",
+      "RELEASE SAVEPOINT lcm_conversation_atomic",
+      "SAVEPOINT lcm_conversation_atomic",
+      "RELEASE SAVEPOINT lcm_conversation_atomic",
+      "SAVEPOINT lcm_conversation_atomic",
+      "RELEASE SAVEPOINT lcm_conversation_atomic",
+      "COMMIT",
+    ]);
     expect((await store.getMessages(conversation.conversationId)).map((message) => message.seq))
       .toEqual([1, 2]);
     expect(await store.getMessageParts(
@@ -536,6 +616,411 @@ describe("ConversationStore — withTransaction", () => {
     expect((await store.getMessages(conversation.conversationId)).map((message) => message.messageId))
       .toEqual([seeded.messageId]);
     await expect(store.getMessageParts(seeded.messageId)).resolves.toEqual([]);
+  });
+
+  it.each([
+    "createMessagesBulk",
+    "appendMessages",
+    "createMessageParts",
+    "deleteMessages",
+  ] as const)(
+    "rolls back a caught partial %s failure while committing unrelated outer work",
+    async (operation) => {
+      const tracked = trackedDatabase(makeDb());
+      const store = makeStore(tracked.database);
+      const peer = makeStore(tracked.database);
+      const conversation = await store.createConversation({
+        sessionId: `caught-${operation}`,
+      });
+      const seeded = await store.createMessagesBulk([
+        {
+          conversationId: conversation.conversationId,
+          seq: 0,
+          role: "system",
+          content: "parts target",
+          tokenCount: 1,
+        },
+        {
+          conversationId: conversation.conversationId,
+          seq: 1,
+          role: "user",
+          content: "first delete target",
+          tokenCount: 1,
+        },
+        {
+          conversationId: conversation.conversationId,
+          seq: 2,
+          role: "assistant",
+          content: "second delete target",
+          tokenCount: 1,
+        },
+      ]);
+      if (operation === "deleteMessages") {
+        tracked.database.exec(
+          `CREATE TRIGGER fail_caught_delete
+           BEFORE DELETE ON messages
+           WHEN OLD.message_id = ${seeded[2].messageId}
+           BEGIN
+             SELECT RAISE(ABORT, 'injected delete failure');
+           END`,
+        );
+      }
+      tracked.statements.length = 0;
+      let caught = false;
+
+      await expect(store.withTransaction(async () => {
+        try {
+          switch (operation) {
+            case "createMessagesBulk":
+              await peer.createMessagesBulk([
+                {
+                  conversationId: conversation.conversationId,
+                  seq: 3,
+                  role: "user",
+                  content: "partial bulk",
+                  tokenCount: 1,
+                },
+                {
+                  conversationId: conversation.conversationId,
+                  seq: 4,
+                  role: "invalid" as "assistant",
+                  content: "invalid bulk",
+                  tokenCount: 1,
+                },
+              ]);
+              break;
+            case "appendMessages":
+              await peer.appendMessages(conversation.conversationId, [
+                { role: "user", content: "partial append", tokenCount: 1 },
+                {
+                  role: "invalid" as "assistant",
+                  content: "invalid append",
+                  tokenCount: 1,
+                },
+              ]);
+              break;
+            case "createMessageParts":
+              await peer.createMessageParts(seeded[0].messageId, [
+                {
+                  sessionId: `caught-${operation}`,
+                  partType: "text",
+                  ordinal: 0,
+                  textContent: "partial part",
+                },
+                {
+                  sessionId: `caught-${operation}`,
+                  partType: "reasoning",
+                  ordinal: 0,
+                  textContent: "duplicate part",
+                },
+              ]);
+              break;
+            case "deleteMessages":
+              await peer.deleteMessages([
+                seeded[1].messageId,
+                seeded[2].messageId,
+              ]);
+              break;
+          }
+        } catch {
+          caught = true;
+        }
+        await peer.createMessage({
+          conversationId: conversation.conversationId,
+          seq: 10,
+          role: "tool",
+          content: `sentinel-${operation}`,
+          tokenCount: 1,
+        });
+      })).resolves.toBeUndefined();
+
+      expect(caught).toBe(true);
+      expect(normalizedTransactionStatements(tracked.statements)).toEqual([
+        "BEGIN IMMEDIATE",
+        "SAVEPOINT lcm_conversation_atomic",
+        "ROLLBACK TO SAVEPOINT lcm_conversation_atomic",
+        "RELEASE SAVEPOINT lcm_conversation_atomic",
+        "COMMIT",
+      ]);
+      const messages = await store.getMessages(conversation.conversationId);
+      expect(messages.map((message) => message.messageId)).toEqual([
+        seeded[0].messageId,
+        seeded[1].messageId,
+        seeded[2].messageId,
+        messages[3].messageId,
+      ]);
+      expect(messages.map((message) => message.content)).toEqual([
+        "parts target",
+        "first delete target",
+        "second delete target",
+        `sentinel-${operation}`,
+      ]);
+      await expect(store.getMessageParts(seeded[0].messageId)).resolves.toEqual([]);
+    },
+  );
+
+  it("serializes concurrent direct atomic scopes and drains them before commit", async () => {
+    const tracked = trackedDatabase(makeDb());
+    const store = makeStore(tracked.database);
+    const peer = makeStore(tracked.database);
+    const conversation = await store.createConversation({ sessionId: "direct-concurrent" });
+    tracked.statements.length = 0;
+
+    await store.withTransaction(async () => {
+      const outcomes = await Promise.allSettled([
+        peer.createMessagesBulk([
+          {
+            conversationId: conversation.conversationId,
+            seq: 0,
+            role: "user",
+            content: "rolled back concurrent partial",
+            tokenCount: 1,
+          },
+          {
+            conversationId: conversation.conversationId,
+            seq: 1,
+            role: "invalid" as "assistant",
+            content: "invalid concurrent",
+            tokenCount: 1,
+          },
+        ]),
+        peer.createMessagesBulk([{
+          conversationId: conversation.conversationId,
+          seq: 2,
+          role: "assistant",
+          content: "committed concurrent peer",
+          tokenCount: 1,
+        }]),
+      ]);
+      expect(outcomes.map((outcome) => outcome.status)).toEqual(["rejected", "fulfilled"]);
+    });
+
+    expect((await store.getMessages(conversation.conversationId)).map(
+      (message) => message.content,
+    )).toEqual(["committed concurrent peer"]);
+    expect(normalizedTransactionStatements(tracked.statements)).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_conversation_atomic",
+      "ROLLBACK TO SAVEPOINT lcm_conversation_atomic",
+      "RELEASE SAVEPOINT lcm_conversation_atomic",
+      "SAVEPOINT lcm_conversation_atomic",
+      "RELEASE SAVEPOINT lcm_conversation_atomic",
+      "COMMIT",
+    ]);
+  });
+
+  it("rejects recursive direct atomic scopes without deadlocking", async () => {
+    const tracked = trackedDatabase(makeDb());
+    const store = makeStore(tracked.database);
+    const peer = makeStore(tracked.database);
+    const conversation = await store.createConversation({ sessionId: "direct-recursive" });
+    const atomicStore = store as unknown as {
+      withAtomicOperation<T>(operation: () => Promise<T> | T): Promise<T>;
+    };
+    tracked.statements.length = 0;
+    let nestedWriteEntered = false;
+
+    await store.withTransaction(async () => atomicStore.withAtomicOperation(async () => {
+      const failure = await peer.createMessagesBulk([{
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "must not enter",
+        tokenCount: 1,
+      }]).then(
+        () => { nestedWriteEntered = true; },
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe(
+        "nested atomic conversation operation is not supported",
+      );
+      return "outer completed";
+    }));
+
+    expect(nestedWriteEntered).toBe(false);
+    expect(await store.getMessages(conversation.conversationId)).toEqual([]);
+    expect(normalizedTransactionStatements(tracked.statements)).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_conversation_atomic",
+      "RELEASE SAVEPOINT lcm_conversation_atomic",
+      "COMMIT",
+    ]);
+  });
+
+  it("drains a started direct atomic scope before committing its transaction", async () => {
+    const tracked = trackedDatabase(makeDb());
+    const store = makeStore(tracked.database);
+    const atomicStore = store as unknown as {
+      withAtomicOperation<T>(operation: () => Promise<T> | T): Promise<T>;
+    };
+    let releaseAtomic!: () => void;
+    let markAtomicEntered!: () => void;
+    const atomicRelease = new Promise<void>((resolve) => { releaseAtomic = resolve; });
+    const atomicEntered = new Promise<void>((resolve) => { markAtomicEntered = resolve; });
+    let atomicSettled = false;
+    let startedAtomic = Promise.resolve();
+
+    await store.withTransaction(async () => {
+      startedAtomic = atomicStore.withAtomicOperation(async () => {
+        markAtomicEntered();
+        await atomicRelease;
+        atomicSettled = true;
+      });
+      await atomicEntered;
+      queueMicrotask(releaseAtomic);
+    });
+
+    await startedAtomic;
+    expect(atomicSettled).toBe(true);
+    expect(normalizedTransactionStatements(tracked.statements)).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_conversation_atomic",
+      "RELEASE SAVEPOINT lcm_conversation_atomic",
+      "COMMIT",
+    ]);
+  });
+
+  it("keeps empty direct atomic methods as savepoint-free no-ops", async () => {
+    const tracked = trackedDatabase(makeDb());
+    const store = makeStore(tracked.database);
+    const peer = makeStore(tracked.database);
+    const conversation = await store.createConversation({ sessionId: "direct-empty" });
+    const message = await store.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 0,
+      role: "system",
+      content: "unchanged",
+      tokenCount: 1,
+    });
+    tracked.statements.length = 0;
+
+    await store.withTransaction(async () => {
+      await expect(peer.createMessagesBulk([])).resolves.toEqual([]);
+      await expect(peer.appendMessages(conversation.conversationId, [])).resolves.toEqual([]);
+      await expect(peer.createMessageParts(message.messageId, [])).resolves.toBeUndefined();
+      await expect(peer.deleteMessages([])).resolves.toBe(0);
+    });
+
+    expect(tracked.statements).toEqual(["BEGIN IMMEDIATE", "COMMIT"]);
+  });
+
+  it("fences outer commit when direct savepoint rollback fails", async () => {
+    const raw = makeDb();
+    const statements: string[] = [];
+    const database = {
+      exec: (sql: string): void => {
+        statements.push(sql);
+        if (sql.startsWith("ROLLBACK TO SAVEPOINT")) {
+          throw new Error("injected savepoint rollback failure");
+        }
+        raw.exec(sql);
+      },
+      prepare: (sql: string) => raw.prepare(sql),
+    } as unknown as DatabaseSync;
+    const store = makeStore(database);
+    const conversation = await store.createConversation({ sessionId: "direct-rollback-failure" });
+
+    await expect(store.withTransaction(async () => {
+      await store.createMessagesBulk([
+        {
+          conversationId: conversation.conversationId,
+          seq: 0,
+          role: "user",
+          content: "partial before rollback failure",
+          tokenCount: 1,
+        },
+        {
+          conversationId: conversation.conversationId,
+          seq: 1,
+          role: "invalid" as "assistant",
+          content: "invalid",
+          tokenCount: 1,
+        },
+      ]).catch(() => undefined);
+      await store.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 10,
+        role: "tool",
+        content: "outer sentinel must roll back",
+        tokenCount: 1,
+      });
+    })).rejects.toThrow("conversation transaction savepoint recovery failed");
+
+    expect(normalizedTransactionStatements(statements)).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_conversation_atomic",
+      "ROLLBACK TO SAVEPOINT lcm_conversation_atomic",
+      "ROLLBACK",
+    ]);
+    expect(statements).not.toContain("COMMIT");
+    await expect(store.getMessages(conversation.conversationId)).resolves.toEqual([]);
+  });
+
+  it("commits after rollback succeeds even if savepoint cleanup release fails", async () => {
+    const raw = makeDb();
+    const statements: string[] = [];
+    let rolledBack = false;
+    let rejectCleanupRelease = true;
+    const database = {
+      exec: (sql: string): void => {
+        statements.push(sql);
+        if (sql.startsWith("ROLLBACK TO SAVEPOINT")) {
+          raw.exec(sql);
+          rolledBack = true;
+          return;
+        }
+        if (
+          rolledBack
+          && rejectCleanupRelease
+          && sql.startsWith("RELEASE SAVEPOINT")
+        ) {
+          rejectCleanupRelease = false;
+          throw new Error("injected cleanup release failure");
+        }
+        raw.exec(sql);
+      },
+      prepare: (sql: string) => raw.prepare(sql),
+    } as unknown as DatabaseSync;
+    const store = makeStore(database);
+    const conversation = await store.createConversation({ sessionId: "direct-release-failure" });
+
+    await expect(store.withTransaction(async () => {
+      await store.createMessagesBulk([
+        {
+          conversationId: conversation.conversationId,
+          seq: 0,
+          role: "user",
+          content: "partial before cleanup failure",
+          tokenCount: 1,
+        },
+        {
+          conversationId: conversation.conversationId,
+          seq: 1,
+          role: "invalid" as "assistant",
+          content: "invalid",
+          tokenCount: 1,
+        },
+      ]).catch(() => undefined);
+      await store.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 10,
+        role: "tool",
+        content: "committed outer sentinel",
+        tokenCount: 1,
+      });
+    })).resolves.toBeUndefined();
+
+    expect(normalizedTransactionStatements(statements)).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_conversation_atomic",
+      "ROLLBACK TO SAVEPOINT lcm_conversation_atomic",
+      "RELEASE SAVEPOINT lcm_conversation_atomic",
+      "COMMIT",
+    ]);
+    expect((await store.getMessages(conversation.conversationId)).map(
+      (message) => message.content,
+    )).toEqual(["committed outer sentinel"]);
   });
 
   it("opens separate transactions for another database and a stale async context", async () => {
