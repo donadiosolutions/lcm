@@ -321,10 +321,19 @@ row lock and fail closed otherwise. Call them from an outer transaction begun
 at `READ COMMITTED`, or use a root repository that creates the short
 transaction itself; PostgreSQL cannot repair a stronger isolation level after
 the outer transaction has already executed a statement. All scoped
-conversation operations share one executor-level FIFO, and mapped writes,
-bootstrap marking, and message-part insertion add operation savepoints, so a
-read cannot observe a transient row and a rollback cannot silently undo another
-method whose promise already resolved.
+conversation operations share one executor-level FIFO. Mapped writes,
+bootstrap marking, and message-part insertion use the runtime's first-class
+savepoint callback: the runtime owns generated savepoint identifiers and
+control SQL, supplies a temporary inner query executor, drains its queue, and
+uses async-context provenance to reject outer-executor or nested-savepoint use
+from inside that callback. Independent sibling operations arriving while the
+callback is active remain on the outer FIFO and run afterward; captured inner
+executors are fenced when the callback settles. Only ordinary statement or
+mapping failures can recover, and only after both `ROLLBACK TO` and `RELEASE`
+succeed. Open, control, connection, and abort failures poison the outer
+transaction so it rolls back. This prevents a read from observing a transient
+row and prevents rollback from silently undoing another method whose promise
+already resolved.
 PostgreSQL `bigint` values are converted to JavaScript numbers only after a
 safe-integer check, so an out-of-range identity, sequence, part ordinal, or
 count fails instead of losing precision. Message sequence, token-count, and

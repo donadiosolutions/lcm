@@ -34,6 +34,16 @@ export interface PostgreSqlQueryExecutor {
   ): Promise<QueryResult<R>>;
 }
 
+export interface PostgreSqlTransactionScopeExecutor
+  extends PostgreSqlQueryExecutor {
+  readonly transactionScope: "active";
+
+  savepoint<T>(
+    callback: (savepoint: PostgreSqlQueryExecutor) => Promise<T>,
+    options: PostgreSqlQueryOptions,
+  ): Promise<T>;
+}
+
 export interface PostgreSqlMigration {
   readonly id: string;
   readonly filename: string;

@@ -287,9 +287,16 @@ multi-message deletion are atomic
 operations: they either commit completely or leave no partial rows. When
 called inside a repository transaction they join that transaction instead of
 opening a nested one. Every scoped operation uses the same executor-level FIFO;
-mapped writes, bootstrap marking, and part insertion add savepoints so reads
-cannot observe their transient rows and savepoints cannot overlap. Scoped
-get-or-create and append first verify the effective transaction isolation is
+mapped writes, bootstrap marking, and part insertion use runtime-owned
+savepoint callbacks with generated identifiers, private control SQL, a drained
+temporary inner executor, and async-context fencing of outer or nested scope
+use from inside the callback. Independent sibling operations queue behind the
+complete savepoint lifecycle, while captured inner executors reject after the
+callback settles. Ordinary statement and mapping failures recover only when
+both `ROLLBACK TO` and `RELEASE` succeed; open, control, connection, and abort
+failures poison the outer transaction. Reads therefore cannot observe
+transient rows and savepoints cannot overlap. Scoped get-or-create and append
+first verify the effective transaction isolation is
 exactly `READ COMMITTED`; missing, malformed, or stronger isolation fails with
 a sanitized storage error before any advisory lock, row lock, or write. Begin
 the outer transaction at `READ COMMITTED`, or call these methods through a root

@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { getLcmConnection, closeLcmConnection } from "../../src/db/connection.js";
 import { runLcmMigrations } from "../../src/db/migration.js";
@@ -775,6 +775,7 @@ describe("ConversationStore — searchMessages regex", () => {
 describe("ConversationStore — withTransaction", () => {
   it("exposes contract-shaped atomic methods without a public bypass flag", () => {
     const store = makeStore(makeDb());
+    const atomicCore = getConversationStoreAtomicCore(store);
 
     expect(publicAtomicParameterContract).toEqual([true, true, true, true]);
     expect([
@@ -783,15 +784,33 @@ describe("ConversationStore — withTransaction", () => {
       store.createMessageParts.length,
       store.deleteMessages.length,
     ]).toEqual([1, 2, 2, 1]);
-    expect(Object.keys(getConversationStoreAtomicCore(store)).sort()).toEqual([
+    expect(Object.keys(atomicCore).sort()).toEqual([
       "appendMessages",
       "createMessageParts",
       "createMessagesBulk",
       "deleteMessages",
     ]);
+    expect(atomicCore.createMessagesBulk([])).toEqual([]);
+    expect(atomicCore.appendMessages(1, [])).toEqual([]);
+    expect(atomicCore.createMessageParts(1, [])).toBeUndefined();
+    expect(atomicCore.deleteMessages([])).toBe(0);
     expect(() => getConversationStoreAtomicCore(
       Object.create(ConversationStore.prototype) as ConversationStore,
     )).toThrow("conversation store atomic core is unavailable");
+  });
+
+  it("keeps empty internal atomic-core operations SQL-free", () => {
+    const prepare = vi.fn(() => {
+      throw new Error("empty atomic-core operations must not prepare SQL");
+    });
+    const store = makeStore({ prepare } as unknown as DatabaseSync);
+    const atomicCore = getConversationStoreAtomicCore(store);
+
+    expect(atomicCore.createMessagesBulk([])).toEqual([]);
+    expect(atomicCore.appendMessages(1, [])).toEqual([]);
+    expect(atomicCore.createMessageParts(1, [])).toBeUndefined();
+    expect(atomicCore.deleteMessages([])).toBe(0);
+    expect(prepare).not.toHaveBeenCalled();
   });
 
   it("reuses a live same-handle direct transaction for nested transaction helpers", async () => {

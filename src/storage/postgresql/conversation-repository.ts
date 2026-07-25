@@ -17,6 +17,7 @@ import { StorageOperationError } from "../errors.js";
 import type {
   PostgreSqlOperationContext,
   PostgreSqlQueryExecutor,
+  PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
 import {
   PostgreSqlCommitOutcomeUnknownError,
@@ -25,7 +26,6 @@ import {
 
 const MAX_SHORT_TRANSACTION_ATTEMPTS = 3;
 const SHORT_TRANSACTION_RETRY_SQLSTATES = new Set(["40001", "40P01"]);
-const MAX_SAVEPOINT_ORDINAL = Number.MAX_SAFE_INTEGER;
 
 const CONVERSATION_COLUMNS =
   "conversation_id, session_id, title, bootstrapped_at, created_at, updated_at";
@@ -43,15 +43,13 @@ type PostgreSqlConversationTransactionContext = PostgreSqlOperationContext & {
 
 export interface PostgreSqlConversationExecutor extends PostgreSqlQueryExecutor {
   transaction<T>(
-    callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
+    callback: (transaction: PostgreSqlTransactionScopeExecutor) => Promise<T>,
     options: PostgreSqlConversationTransactionContext,
   ): Promise<T>;
 }
 
 export interface PostgreSqlConversationScopedExecutor
-  extends PostgreSqlQueryExecutor {
-  readonly transactionScope: "active";
-}
+  extends PostgreSqlTransactionScopeExecutor {}
 
 type PostgreSqlConversationRepositoryExecutor =
   | PostgreSqlConversationExecutor
@@ -59,7 +57,6 @@ type PostgreSqlConversationRepositoryExecutor =
 
 type ScopedExecutorState = {
   tail: Promise<void>;
-  savepointOrdinal: number;
 };
 
 const scopedExecutorStates = new WeakMap<
@@ -1021,35 +1018,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
   ): Promise<T> {
     return this.scopedSerialized(operation, async (executor) => {
-      const state = this.scopedExecutorState(executor);
-      // The FIFO guarantees the preceding savepoint has been released, so the
-      // bounded ordinal can safely wrap without colliding with an active name.
-      state.savepointOrdinal =
-        (state.savepointOrdinal % MAX_SAVEPOINT_ORDINAL) + 1;
-      const savepoint = `lcm_conversation_repository_${state.savepointOrdinal}`;
-      await executor.query({
-        text: `SAVEPOINT ${savepoint}`,
-      }, this.context(operation));
-      try {
-        const result = await callback(executor);
-        await executor.query({
-          text: `RELEASE SAVEPOINT ${savepoint}`,
-        }, this.context(operation));
-        return result;
-      } catch (error) {
-        try {
-          await executor.query({
-            text: `ROLLBACK TO SAVEPOINT ${savepoint}`,
-          }, this.context(operation));
-          await executor.query({
-            text: `RELEASE SAVEPOINT ${savepoint}`,
-          }, this.context(operation));
-        } catch {
-          // PostgreSqlRuntime records any failed scoped query and rolls the
-          // caller's transaction back even if its callback catches this error.
-        }
-        throw error;
-      }
+      return executor.savepoint(callback, this.context(operation));
     });
   }
 
@@ -1057,7 +1026,11 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     operation: string,
     callback: (executor: PostgreSqlConversationScopedExecutor) => Promise<T>,
   ): Promise<T> {
-    if (this.executor.transactionScope !== "active") {
+    if (
+      this.executor.transactionScope !== "active"
+      || !("savepoint" in this.executor)
+      || typeof this.executor.savepoint !== "function"
+    ) {
       return Promise.reject(new StorageOperationError(
         "STORAGE_TRANSACTION_SCOPE",
         "postgresql",
@@ -1080,7 +1053,6 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     if (existing) return existing;
     const created = {
       tail: Promise.resolve(),
-      savepointOrdinal: 0,
     };
     scopedExecutorStates.set(executor, created);
     return created;

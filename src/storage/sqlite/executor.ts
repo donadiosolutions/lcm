@@ -197,7 +197,19 @@ export class SqliteExecutor {
     // exhausted or corrupted counter rather than wrap to a name that a
     // tolerated RELEASE failure may have left active.
     active.savepointOrdinal += 1;
-    this.db.exec(`SAVEPOINT ${savepoint}`);
+    try {
+      this.db.exec(`SAVEPOINT ${savepoint}`);
+    } catch (error) {
+      // The callback and its writes have not started. Normalize the driver
+      // failure, but leave a caller that catches it free to continue using an
+      // otherwise healthy outer transaction.
+      throw normalizeStorageError(error, {
+        backend: "sqlite",
+        projectId: this.projectId,
+        domain,
+        operation,
+      });
+    }
     try {
       const result = await scopedAtomicContext.run(
         active,

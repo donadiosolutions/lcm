@@ -710,6 +710,82 @@ describe("PostgreSQL 18 conversation repository", () => {
     });
   });
 
+  it("recovers a caught scoped constraint failure and commits later work", async () => {
+    await withPostgreSqlTestDatabase("conversation-scoped-constraint", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation scoped constraint");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const conversation = await repository.createConversation({
+        sessionId: "scoped-constraint",
+      });
+      await repository.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "existing",
+        tokenCount: 1,
+      });
+
+      await database.runtime.transaction(async (transaction) => {
+        const scoped = new PostgreSqlConversationRepository(
+          transaction as PostgreSqlConversationScopedExecutor,
+          projectId,
+        );
+        await expect(scoped.createMessagesBulk([
+          {
+            conversationId: conversation.conversationId,
+            seq: 1,
+            role: "assistant",
+            content: "rolled back first member",
+            tokenCount: 1,
+          },
+          {
+            conversationId: conversation.conversationId,
+            seq: 0,
+            role: "assistant",
+            content: "duplicate sequence",
+            tokenCount: 1,
+          },
+        ])).rejects.toMatchObject({
+          backend: "postgresql",
+          domain: "conversations",
+          operation: "createMessagesBulk",
+          projectId,
+        });
+        await scoped.createMessage({
+          conversationId: conversation.conversationId,
+          seq: 1,
+          role: "assistant",
+          content: "committed after recovery",
+          tokenCount: 1,
+        });
+        await scoped.markConversationBootstrapped(conversation.conversationId);
+      }, {
+        domain: "conversations",
+        operation: "recoverScopedConstraint",
+        projectId,
+      });
+
+      expect(await repository.hasMessage(
+        conversation.conversationId,
+        "assistant",
+        "rolled back first member",
+      )).toBe(false);
+      expect(await repository.hasMessage(
+        conversation.conversationId,
+        "assistant",
+        "duplicate sequence",
+      )).toBe(false);
+      expect(await repository.hasMessage(
+        conversation.conversationId,
+        "assistant",
+        "committed after recovery",
+      )).toBe(true);
+      expect(await repository.getConversation(conversation.conversationId))
+        .toMatchObject({ bootstrappedAt: expect.any(Date) });
+    });
+  });
+
   it("round-trips safe bigint part ordinals and rejects unsafe or negative values", async () => {
     await withPostgreSqlTestDatabase("conversation-part-ordinals", async (database) => {
       await grantConversationRuntimePrivileges(database);

@@ -102,31 +102,39 @@ export function createSqliteRepositories(
       markConversationBootstrapped: (id) => invoke("conversations", "markConversationBootstrapped", () => conversations.markConversationBootstrapped(id)),
       listConversations: () => invoke("conversations", "listConversations", () => conversations.listConversations()),
       createMessage: (input) => invoke("conversations", "createMessage", () => conversations.createMessage(input)),
-      createMessagesBulk: (inputs) => prevalidatedConversationOperation(
-        "createMessagesBulk",
-        () => validateConversationMessageBatch(inputs),
-        () => invoke("conversations", "createMessagesBulk", () => conversationAtomic.createMessagesBulk(inputs), true),
-      ),
-      appendMessages: (id, inputs) => prevalidatedConversationOperation(
-        "appendMessages",
-        () => validateConversationAppendBatch(inputs),
-        () => invoke("conversations", "appendMessages", () => conversationAtomic.appendMessages(id, inputs), true),
-      ),
+      createMessagesBulk: (inputs) => inputs.length === 0
+        ? Promise.resolve([])
+        : prevalidatedConversationOperation(
+            "createMessagesBulk",
+            () => validateConversationMessageBatch(inputs),
+            () => invoke("conversations", "createMessagesBulk", () => conversationAtomic.createMessagesBulk(inputs), true),
+          ),
+      appendMessages: (id, inputs) => inputs.length === 0
+        ? Promise.resolve([])
+        : prevalidatedConversationOperation(
+            "appendMessages",
+            () => validateConversationAppendBatch(inputs),
+            () => invoke("conversations", "appendMessages", () => conversationAtomic.appendMessages(id, inputs), true),
+          ),
       getMessages: (id, options) => invoke("conversations", "getMessages", () => conversations.getMessages(id, options)),
       getLastMessage: (id) => invoke("conversations", "getLastMessage", () => conversations.getLastMessage(id)),
       hasMessage: (id, role, content) => invoke("conversations", "hasMessage", () => conversations.hasMessage(id, role, content)),
       countMessagesByIdentity: (id, role, content) => invoke("conversations", "countMessagesByIdentity", () => conversations.countMessagesByIdentity(id, role, content)),
       getMessageById: (id) => invoke("conversations", "getMessageById", () => conversations.getMessageById(id)),
-      createMessageParts: (id, parts) => prevalidatedConversationOperation(
-        "createMessageParts",
-        () => validateConversationPartBatch(parts),
-        () => invoke("conversations", "createMessageParts", () => conversationAtomic.createMessageParts(id, parts), true),
-      ),
+      createMessageParts: (id, parts) => parts.length === 0
+        ? Promise.resolve()
+        : prevalidatedConversationOperation(
+            "createMessageParts",
+            () => validateConversationPartBatch(parts),
+            () => invoke("conversations", "createMessageParts", () => conversationAtomic.createMessageParts(id, parts), true),
+          ),
       getMessageParts: (id) => invoke("conversations", "getMessageParts", () => conversations.getMessageParts(id)),
       getMessageCount: (id) => invoke("conversations", "getMessageCount", () => conversations.getMessageCount(id)),
       getMessageCountBySessionId: (sessionId) => invoke("conversations", "getMessageCountBySessionId", () => conversations.getMessageCountBySessionId(sessionId)),
       getMaxSeq: (id) => invoke("conversations", "getMaxSeq", () => conversations.getMaxSeq(id)),
-      deleteMessages: (ids) => invoke("conversations", "deleteMessages", () => conversationAtomic.deleteMessages(ids), true),
+      deleteMessages: (ids) => ids.length === 0
+        ? Promise.resolve(0)
+        : invoke("conversations", "deleteMessages", () => conversationAtomic.deleteMessages(ids), true),
     },
     summaries: {
       insertSummary: (input) => invoke("summaries", "insertSummary", () => summaries.insertSummary(input)),

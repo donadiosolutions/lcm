@@ -44,20 +44,14 @@ function harness(): StorageContractHarness {
 describe("SQLite storage backend conformance", () => {
   defineCoreStorageConformance(harness);
 
-  it("keeps empty repository atomic operations callback-statement-free", async () => {
+  it("short-circuits empty repository atomic operations before invoking the executor", async () => {
     const prepare = vi.fn(() => {
       throw new Error("empty atomic operations must not prepare statements");
     });
     const db = { prepare } as unknown as DatabaseSync;
     const stores = createSqliteRepositoryStores(db, { fts5Available: false });
-    const invoke = vi.fn(async (
-      _domain: unknown,
-      _operation: unknown,
-      callback: () => unknown,
-      atomic?: boolean,
-    ) => {
-      expect(atomic).toBe(true);
-      return callback();
+    const invoke = vi.fn(async () => {
+      throw new Error("empty atomic operations must not invoke the executor");
     });
     const repositories = createSqliteRepositories(stores, "safe-project", invoke);
 
@@ -65,8 +59,48 @@ describe("SQLite storage backend conformance", () => {
     await expect(repositories.conversations.appendMessages(1, [])).resolves.toEqual([]);
     await expect(repositories.conversations.createMessageParts(1, [])).resolves.toBeUndefined();
     await expect(repositories.conversations.deleteMessages([])).resolves.toBe(0);
-    expect(invoke).toHaveBeenCalledTimes(4);
+    expect(invoke).not.toHaveBeenCalled();
     expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it("returns empty atomic no-ops while the SQLite executor is locked", async () => {
+    const root = createTemporaryDirectory("lcm-storage-empty-locked-");
+    const identity = projectIdentity(root);
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath: join(root, "db.sqlite") }),
+    });
+    let releaseTransaction = (): void => undefined;
+    let lockedTransaction: Promise<void> | undefined;
+    try {
+      const storage = await factory.openProject(identity);
+      let markLocked!: () => void;
+      const locked = new Promise<void>((resolve) => { markLocked = resolve; });
+      const release = new Promise<void>((resolve) => { releaseTransaction = resolve; });
+      lockedTransaction = storage.transaction(async () => {
+        markLocked();
+        await release;
+      });
+      await locked;
+
+      let settled = false;
+      const emptyOperations = Promise.all([
+        storage.conversations.createMessagesBulk([]),
+        storage.conversations.appendMessages(1, []),
+        storage.conversations.createMessageParts(1, []),
+        storage.conversations.deleteMessages([]),
+      ]).then((results) => {
+        settled = true;
+        return results;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(settled).toBe(true);
+      await expect(emptyOperations).resolves.toEqual([[], [], undefined, 0]);
+    } finally {
+      releaseTransaction();
+      await lockedTransaction;
+      await factory.close();
+    }
   });
 
   it("prevalidates conversation batches before invoking the SQLite executor", async () => {
@@ -1068,6 +1102,152 @@ describe("SQLite storage backend conformance", () => {
     await expect(executor.run("conversations", "listConversations", () => undefined))
       .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
     executor.poison();
+  });
+
+  it("allows caught savepoint-open failures to release the FIFO and commit later work", async () => {
+    const calls: string[] = [];
+    const onPoison = vi.fn();
+    let openFailed = false;
+    const database = {
+      exec: (sql: string): void => {
+        calls.push(sql);
+        if (sql.startsWith("SAVEPOINT") && !openFailed) {
+          openFailed = true;
+          throw new Error("savepoint open /secret/path");
+        }
+      },
+    } as unknown as DatabaseSync;
+    const executor = new SqliteExecutor(database, "safe-project", onPoison);
+    let firstCallbackEntered = false;
+    let secondCallbackEntered = false;
+
+    await expect(executor.transaction(async (token) => {
+      const first = executor.runAtomicScoped(
+        token,
+        "conversations",
+        "createMessagesBulk",
+        () => { firstCallbackEntered = true; },
+      ).catch((error: unknown) => error);
+      const queued = executor.runAtomicScoped(
+        token,
+        "conversations",
+        "createMessageParts",
+        () => {
+          secondCallbackEntered = true;
+          return "queued succeeded";
+        },
+      );
+      const [firstFailure, queuedResult] = await Promise.all([first, queued]);
+
+      expect(firstFailure).toMatchObject({
+        code: "STORAGE_OPERATION_FAILED",
+        domain: "conversations",
+        operation: "createMessagesBulk",
+      });
+      expect(JSON.stringify(firstFailure)).not.toContain("/secret/");
+      expect(queuedResult).toBe("queued succeeded");
+      return "caught";
+    })).resolves.toBe("caught");
+
+    expect(firstCallbackEntered).toBe(false);
+    expect(secondCallbackEntered).toBe(true);
+    expect(calls).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_atomic_0",
+      "SAVEPOINT lcm_atomic_1",
+      "RELEASE SAVEPOINT lcm_atomic_1",
+      "COMMIT",
+    ]);
+    expect(calls.some((sql) => sql.startsWith("ROLLBACK"))).toBe(false);
+    expect(onPoison).not.toHaveBeenCalled();
+    expect((
+      executor as unknown as { scopedAtomicTails: Map<symbol, Promise<void>> }
+    ).scopedAtomicTails.size).toBe(0);
+    await expect(executor.run("conversations", "listConversations", () => "usable"))
+      .resolves.toBe("usable");
+  });
+
+  it("uses only outer rollback for an uncaught savepoint-open failure", async () => {
+    const calls: string[] = [];
+    const onPoison = vi.fn();
+    const database = {
+      exec: (sql: string): void => {
+        calls.push(sql);
+        if (sql.startsWith("SAVEPOINT")) {
+          throw new Error("savepoint open /secret/path");
+        }
+      },
+    } as unknown as DatabaseSync;
+    const executor = new SqliteExecutor(database, "safe-project", onPoison);
+    let callbackEntered = false;
+
+    const failure = await executor.transaction(async (token) => executor.runAtomicScoped(
+      token,
+      "conversations",
+      "appendMessages",
+      () => { callbackEntered = true; },
+    )).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      domain: "conversations",
+      operation: "appendMessages",
+    });
+    expect(JSON.stringify(failure)).not.toContain("/secret/");
+    expect(callbackEntered).toBe(false);
+    expect(calls).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_atomic_0",
+      "ROLLBACK",
+    ]);
+    expect(calls.some((sql) =>
+      sql.startsWith("ROLLBACK TO") || sql.startsWith("RELEASE"))).toBe(false);
+    expect(onPoison).not.toHaveBeenCalled();
+    await expect(executor.run("conversations", "listConversations", () => "usable"))
+      .resolves.toBe("usable");
+  });
+
+  it("poisons only when outer rollback fails after a savepoint-open failure", async () => {
+    const calls: string[] = [];
+    const onPoison = vi.fn();
+    const database = {
+      exec: (sql: string): void => {
+        calls.push(sql);
+        if (sql.startsWith("SAVEPOINT")) {
+          throw new Error("savepoint open /secret/path");
+        }
+        if (sql === "ROLLBACK") {
+          throw new Error("outer rollback /secret/path");
+        }
+      },
+    } as unknown as DatabaseSync;
+    const executor = new SqliteExecutor(database, "safe-project", onPoison);
+    let callbackEntered = false;
+
+    const failure = await executor.transaction(async (token) => executor.runAtomicScoped(
+      token,
+      "conversations",
+      "deleteMessages",
+      () => { callbackEntered = true; },
+    )).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      domain: "conversations",
+      operation: "deleteMessages",
+    });
+    expect(JSON.stringify(failure)).not.toContain("/secret/");
+    expect(callbackEntered).toBe(false);
+    expect(calls).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_atomic_0",
+      "ROLLBACK",
+    ]);
+    expect(calls.some((sql) =>
+      sql.startsWith("ROLLBACK TO") || sql.startsWith("RELEASE"))).toBe(false);
+    expect(onPoison).toHaveBeenCalledOnce();
+    await expect(executor.run("conversations", "listConversations", () => undefined))
+      .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
   });
 
   it("rolls back and poisons an outer transaction when scoped savepoint recovery fails", async () => {

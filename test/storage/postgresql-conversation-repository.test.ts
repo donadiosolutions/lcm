@@ -40,6 +40,39 @@ function executor(
   return db;
 }
 
+function scopedExecutor(
+  query: ReturnType<typeof vi.fn>,
+): PostgreSqlConversationScopedExecutor {
+  let savepointOrdinal = 0;
+  return {
+    transactionScope: "active",
+    query,
+    savepoint: async (callback, options) => {
+      savepointOrdinal += 1;
+      const savepoint = `lcm_conversation_repository_${savepointOrdinal}`;
+      await query({ text: `SAVEPOINT ${savepoint}` }, options);
+      const inner = { query };
+      try {
+        const value = await callback(inner);
+        await query({ text: `RELEASE SAVEPOINT ${savepoint}` }, options);
+        return value;
+      } catch (error) {
+        try {
+          await query({
+            text: `ROLLBACK TO SAVEPOINT ${savepoint}`,
+          }, options);
+          await query({
+            text: `RELEASE SAVEPOINT ${savepoint}`,
+          }, options);
+        } catch {
+          // Runtime failure-state behavior is covered by runtime-specific tests.
+        }
+        throw error;
+      }
+    },
+  };
+}
+
 const conversationRow = {
   conversation_id: "41",
   session_id: "session-a",
@@ -582,10 +615,7 @@ describe("PostgreSQL conversation repository", () => {
       config.text.includes("INSERT INTO lcm.messages")
         ? result([messageRow])
         : result([]));
-    const scoped: PostgreSqlConversationScopedExecutor = {
-      transactionScope: "active",
-      query,
-    };
+    const scoped = scopedExecutor(query);
     const repository = new PostgreSqlConversationRepository(scoped, projectId);
 
     await expect(repository.createMessagesBulk([{
@@ -627,10 +657,7 @@ describe("PostgreSQL conversation repository", () => {
         seq: insertCount - 1,
       }]);
     });
-    const scoped: PostgreSqlConversationScopedExecutor = {
-      transactionScope: "active",
-      query,
-    };
+    const scoped = scopedExecutor(query);
     const firstRepository = new PostgreSqlConversationRepository(scoped, projectId);
     const secondRepository = new PostgreSqlConversationRepository(scoped, projectId);
 
@@ -682,10 +709,7 @@ describe("PostgreSQL conversation repository", () => {
       if (config.text.includes("INSERT INTO lcm.messages")) return result([messageRow]);
       return result([]);
     });
-    const scoped: PostgreSqlConversationScopedExecutor = {
-      transactionScope: "active",
-      query,
-    };
+    const scoped = scopedExecutor(query);
     const repository = new PostgreSqlConversationRepository(scoped, projectId);
 
     await expect(repository.getOrCreateConversation("session-a"))
@@ -718,10 +742,7 @@ describe("PostgreSQL conversation repository", () => {
       config.text.includes("transaction_isolation")
         ? result([{ transaction_isolation: "repeatable read" }])
         : result([]));
-    const scoped: PostgreSqlConversationScopedExecutor = {
-      transactionScope: "active",
-      query,
-    };
+    const scoped = scopedExecutor(query);
     const repository = new PostgreSqlConversationRepository(scoped, projectId);
 
     for (const [operation, invoke] of [
@@ -777,10 +798,10 @@ describe("PostgreSQL conversation repository", () => {
       config.text.includes("transaction_isolation")
         ? result(rows)
         : result([]));
-    const repository = new PostgreSqlConversationRepository({
-      transactionScope: "active",
-      query,
-    }, projectId);
+    const repository = new PostgreSqlConversationRepository(
+      scopedExecutor(query),
+      projectId,
+    );
 
     const error = await repository.getOrCreateConversation("isolation-state")
       .catch((caught: unknown) => caught);
@@ -801,10 +822,16 @@ describe("PostgreSQL conversation repository", () => {
     )).toBe(false);
   });
 
-  it("rejects an unmarked query-only executor before issuing a savepoint", async () => {
+  it.each([
+    ["unmarked", {}],
+    ["marked without runtime savepoint capability", { transactionScope: "active" }],
+  ])("rejects a %s query-only executor before issuing SQL", async (
+    _case,
+    marker,
+  ) => {
     const query = vi.fn(() => result([messageRow]));
     const repository = new PostgreSqlConversationRepository(
-      { query } as unknown as PostgreSqlConversationScopedExecutor,
+      { ...marker, query } as unknown as PostgreSqlConversationScopedExecutor,
       projectId,
     );
 
@@ -832,10 +859,7 @@ describe("PostgreSQL conversation repository", () => {
       insert += 1;
       return result([insert === 1 ? unsafeMessage : messageRow]);
     });
-    const scoped: PostgreSqlConversationScopedExecutor = {
-      transactionScope: "active",
-      query,
-    };
+    const scoped = scopedExecutor(query);
     const repository = new PostgreSqlConversationRepository(scoped, projectId);
 
     await expect(repository.createMessage({
@@ -877,10 +901,10 @@ describe("PostgreSQL conversation repository", () => {
         ? result([unsafeMessage])
         : result([]);
     });
-    const repository = new PostgreSqlConversationRepository({
-      transactionScope: "active",
-      query,
-    }, projectId);
+    const repository = new PostgreSqlConversationRepository(
+      scopedExecutor(query),
+      projectId,
+    );
 
     await expect(repository.createMessage({
       conversationId: 41,
@@ -930,10 +954,7 @@ describe("PostgreSQL conversation repository", () => {
       }
       return result([]);
     });
-    const scoped: PostgreSqlConversationScopedExecutor = {
-      transactionScope: "active",
-      query,
-    };
+    const scoped = scopedExecutor(query);
     const unsafeRepository = new PostgreSqlConversationRepository(scoped, projectId);
     const bootstrapRepository = new PostgreSqlConversationRepository(scoped, projectId);
     const partsRepository = new PostgreSqlConversationRepository(scoped, projectId);
@@ -1011,10 +1032,7 @@ describe("PostgreSQL conversation repository", () => {
       }
       return result([]);
     });
-    const scoped: PostgreSqlConversationScopedExecutor = {
-      transactionScope: "active",
-      query,
-    };
+    const scoped = scopedExecutor(query);
     const writer = new PostgreSqlConversationRepository(scoped, projectId);
     const reader = new PostgreSqlConversationRepository(scoped, projectId);
 
