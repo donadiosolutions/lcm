@@ -1,7 +1,21 @@
 #!/usr/bin/env node
 import { randomBytes } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  fstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,6 +42,7 @@ const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const initScript = join(repositoryRoot, "test", "postgresql", "init.sh");
 const cachedRunInitScript = join(repositoryRoot, "test", "postgresql", "cached-run-init.sh");
 const bootIdPattern = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const bootIdRegex = new RegExp(`^${bootIdPattern}$`, "u");
 const processBirthPattern = /^[^\u0000-\u001f\u007f]{1,160}$/u;
 const consumerOwnerFile = "consumer-owner.json";
 
@@ -79,7 +94,7 @@ export function readProcessBirthFingerprint(pid, dependencies = {}) {
       throw new Error("unsupported PostgreSQL harness process identity evidence", { cause: error });
     }
     const closingParenthesis = stat.lastIndexOf(")");
-    if (!(new RegExp(`^${bootIdPattern}$`, "u")).test(bootId) || closingParenthesis < 1) {
+    if (!bootIdRegex.test(bootId) || closingParenthesis < 1) {
       throw new Error("unsupported PostgreSQL harness process identity evidence");
     }
     const fieldsAfterCommand = stat.slice(closingParenthesis + 1).trim().split(/\s+/u);
@@ -500,32 +515,50 @@ function harnessDirectoryFromRecord(record) {
 }
 
 function readConsumerOwner(directory, dependencies = {}) {
-  const inspectPath = dependencies.lstat ?? lstatSync;
-  const readFile = dependencies.readFile ?? readFileSync;
+  const openFile = dependencies.open ?? openSync;
+  const inspectFile = dependencies.fstat ?? fstatSync;
+  const readFile = dependencies.read ?? readSync;
+  const closeFile = dependencies.close ?? closeSync;
   const path = join(directory, consumerOwnerFile);
-  let status;
+  let descriptor;
   try {
-    status = inspectPath(path);
-  } catch (error) {
-    if (error?.code === "ENOENT") return undefined;
-    throw error;
+    try {
+      descriptor = openFile(
+        path,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+    } catch (error) {
+      if (error?.code === "ENOENT") return undefined;
+      throw new Error("PostgreSQL harness consumer identity could not be opened securely", { cause: error });
+    }
+    const status = inspectFile(descriptor);
+    if (!status.isFile() || (status.mode & 0o077) !== 0 || status.size > 1024) {
+      throw new Error("invalid PostgreSQL harness consumer identity evidence");
+    }
+    const contents = Buffer.alloc(1025);
+    let offset = 0;
+    while (offset < contents.length) {
+      const bytesRead = readFile(descriptor, contents, offset, contents.length - offset, null);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > 1024) throw new Error("invalid PostgreSQL harness consumer identity evidence");
+    let value;
+    try {
+      value = JSON.parse(contents.subarray(0, offset).toString("utf8"));
+    } catch (error) {
+      throw new Error("invalid PostgreSQL harness consumer identity evidence", { cause: error });
+    }
+    if (value?.version !== 1
+      || !Number.isSafeInteger(value.pid)
+      || value.pid <= 0
+      || !processBirthPattern.test(value.birth ?? "")) {
+      throw new Error("invalid PostgreSQL harness consumer identity evidence");
+    }
+    return { pid: value.pid, birth: value.birth };
+  } finally {
+    if (descriptor !== undefined) closeFile(descriptor);
   }
-  if (!status.isFile() || status.isSymbolicLink() || status.size > 1024) {
-    throw new Error("invalid PostgreSQL harness consumer identity evidence");
-  }
-  let value;
-  try {
-    value = JSON.parse(String(readFile(path, "utf8")));
-  } catch (error) {
-    throw new Error("invalid PostgreSQL harness consumer identity evidence", { cause: error });
-  }
-  if (value?.version !== 1
-    || !Number.isSafeInteger(value.pid)
-    || value.pid <= 0
-    || !processBirthPattern.test(value.birth ?? "")) {
-    throw new Error("invalid PostgreSQL harness consumer identity evidence");
-  }
-  return { pid: value.pid, birth: value.birth };
 }
 
 export function classifyOwnerIdentity(owner, dependencies = {}) {
@@ -607,10 +640,14 @@ export async function discoverHarnessRuns(dependencies = {}) {
       ? (dependencies.resolveHarnessDirectory?.(record) ?? harnessDirectoryFromRecord(record))
       : undefined;
     if (ownership.kind === "database" && !harnessDirectory) run.classification = "ambiguous";
-    run.resources.push({ ...resource, kind: ownership.kind, labels: expectedLabels, harnessDirectory });
-    if (resource.type === "container") {
-      run.resources.at(-1).running = record?.State?.Running;
-    }
+    const resourceEntry = {
+      ...resource,
+      kind: ownership.kind,
+      labels: expectedLabels,
+      harnessDirectory,
+      ...(resource.type === "container" ? { running: record?.State?.Running } : {}),
+    };
+    run.resources.push(resourceEntry);
     runs.set(ownership.runId, run);
   }
   const ambiguousPrefixes = [...runs.values()]
@@ -1071,5 +1108,5 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       process.stderr.write(`PostgreSQL harness signal probe ready: ${runId}\n`);
       await new Promise(() => { setInterval(() => undefined, 1_000); });
     },
-  } : { consumerProbe }).catch(() => { process.exitCode = 1; });
+  } : { consumerProbe, ci: consumerProbe ? false : undefined }).catch(() => { process.exitCode = 1; });
 }

@@ -25,7 +25,10 @@ async function launchSignalProbe(consumer = false): Promise<{ child: ChildProces
     readyResolve = resolve;
     readyReject = reject;
   });
-  const timeout = setTimeout(() => readyReject(new Error("signal probe readiness timed out")), 30_000);
+  const timeout = setTimeout(
+    () => readyReject(new Error(`signal probe readiness timed out: ${stderr}`)),
+    30_000,
+  );
   child.stderr?.on("data", (chunk) => {
     stderr += String(chunk);
     const match = stderr.match(

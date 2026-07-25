@@ -803,15 +803,46 @@ describe("PostgreSQL harness utilities", () => {
         stderr: "",
       };
     });
+    let consumerRead = false;
     const consumerRun = await discoverHarnessRuns({
       dockerRunner: databaseRunner,
       resolveHarnessDirectory: () => "/private/harness",
       processProbe: vi.fn(),
       readFingerprint: (pid: number) => pid === consumer.pid ? consumer.birth : "reused",
-      lstat: () => ({ isFile: () => true, isSymbolicLink: () => false, size: 100 }),
-      readFile: () => JSON.stringify({ version: 1, ...consumer }),
+      open: () => 9,
+      fstat: () => ({ isFile: () => true, mode: 0o100600, size: 100 }),
+      read: (_descriptor: number, buffer: Buffer) => {
+        if (consumerRead) return 0;
+        consumerRead = true;
+        const content = Buffer.from(JSON.stringify({ version: 1, ...consumer }));
+        content.copy(buffer);
+        return content.length;
+      },
+      close: vi.fn(),
     });
     expect(consumerRun[0].classification).toBe("live");
+
+    const symlinkRefusal = await discoverHarnessRuns({
+      dockerRunner: databaseRunner,
+      resolveHarnessDirectory: () => "/private/harness",
+      processProbe: vi.fn(),
+      readFingerprint: () => "reused",
+      open: () => { throw Object.assign(new Error("symlink"), { code: "ELOOP" }); },
+    });
+    expect(symlinkRefusal[0].classification).toBe("ambiguous");
+
+    const close = vi.fn();
+    const permissionRefusal = await discoverHarnessRuns({
+      dockerRunner: databaseRunner,
+      resolveHarnessDirectory: () => "/private/harness",
+      processProbe: vi.fn(),
+      readFingerprint: () => "reused",
+      open: () => 10,
+      fstat: () => ({ isFile: () => true, mode: 0o100644, size: 100 }),
+      close,
+    });
+    expect(permissionRefusal[0].classification).toBe("ambiguous");
+    expect(close).toHaveBeenCalledWith(10);
   });
 
   it("pins container-mounted and checksummed PostgreSQL files to LF", () => {
