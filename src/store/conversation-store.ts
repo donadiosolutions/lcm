@@ -371,17 +371,14 @@ export class ConversationStore {
           { db: this.db, token, atomicOrdinal: 0 },
           operation,
         );
-        let pendingAtomic = directAtomicTails.get(token);
-        while (pendingAtomic) {
-          await pendingAtomic;
-          pendingAtomic = directAtomicTails.get(token);
-        }
+        await this.drainDirectAtomicOperations(token);
         if (failedDirectTransactions.has(token)) {
           throw new Error("conversation transaction savepoint recovery failed");
         }
         this.db.exec("COMMIT");
         return result;
       } catch (error) {
+        await this.drainDirectAtomicOperations(token);
         this.recoverDirectTransaction();
         throw error;
       }
@@ -390,6 +387,14 @@ export class ConversationStore {
       failedDirectTransactions.delete(token);
       release();
       if (transactionQueues.get(this.db) === queued) transactionQueues.delete(this.db);
+    }
+  }
+
+  private async drainDirectAtomicOperations(token: symbol): Promise<void> {
+    let pendingAtomic = directAtomicTails.get(token);
+    while (pendingAtomic) {
+      await pendingAtomic;
+      pendingAtomic = directAtomicTails.get(token);
     }
   }
 

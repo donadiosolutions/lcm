@@ -26,6 +26,8 @@ import {
 
 const MAX_SHORT_TRANSACTION_ATTEMPTS = 3;
 const SHORT_TRANSACTION_RETRY_SQLSTATES = new Set(["40001", "40P01"]);
+const MIN_SAFE_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
+const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 
 const CONVERSATION_COLUMNS =
   "conversation_id, session_id, title, bootstrapped_at, created_at, updated_at";
@@ -136,20 +138,18 @@ function safeInteger(
   operation: string,
   field: string,
 ): number {
-  let candidate: number;
   if (typeof value === "number") {
-    candidate = value;
-  } else if (typeof value === "bigint") {
-    candidate = Number(value);
-  } else if (/^-?\d+$/u.test(value)) {
-    candidate = Number(value);
-  } else {
+    if (Number.isSafeInteger(value)) return value;
     throw new PostgreSqlConversationDataError(projectId, operation, field);
   }
-  if (!Number.isSafeInteger(candidate)) {
+  if (typeof value === "string" && !/^-?\d+$/u.test(value)) {
     throw new PostgreSqlConversationDataError(projectId, operation, field);
   }
-  return candidate;
+  const candidate = typeof value === "bigint" ? value : BigInt(value);
+  if (candidate < MIN_SAFE_BIGINT || candidate > MAX_SAFE_BIGINT) {
+    throw new PostgreSqlConversationDataError(projectId, operation, field);
+  }
+  return Number(candidate);
 }
 
 function safeInputInteger(

@@ -1434,6 +1434,168 @@ describe("ConversationStore — withTransaction", () => {
     ]);
   });
 
+  it("drains a started direct atomic scope before rollback and releases the queue", async () => {
+    const raw = makeDb();
+    const statements: string[] = [];
+    const atomicSqlAfterRollback: string[] = [];
+    let rollbackSeen = false;
+    const database = {
+      exec: (sql: string): void => {
+        statements.push(sql);
+        if (
+          rollbackSeen
+          && (
+            sql.startsWith("SAVEPOINT")
+            || sql.startsWith("ROLLBACK TO SAVEPOINT")
+            || sql.startsWith("RELEASE SAVEPOINT")
+          )
+        ) {
+          atomicSqlAfterRollback.push(sql);
+        }
+        raw.exec(sql);
+        if (sql === "ROLLBACK") rollbackSeen = true;
+      },
+      prepare: (sql: string) => raw.prepare(sql),
+      get isTransaction(): boolean {
+        return raw.isTransaction;
+      },
+    } as unknown as DatabaseSync;
+    const store = makeStore(database);
+    const atomicStore = store as unknown as {
+      withAtomicOperation<T>(operation: () => Promise<T> | T): Promise<T>;
+    };
+    const original = new Error("outer operation failed");
+    let releaseAtomic!: () => void;
+    let markAtomicEntered!: () => void;
+    let markOuterThrowing!: () => void;
+    const atomicRelease = new Promise<void>((resolve) => { releaseAtomic = resolve; });
+    const atomicEntered = new Promise<void>((resolve) => { markAtomicEntered = resolve; });
+    const outerThrowing = new Promise<void>((resolve) => { markOuterThrowing = resolve; });
+    let atomicSettled = false;
+    let outerSettled = false;
+    let queuedEntered = false;
+    let startedAtomic = Promise.resolve();
+
+    const transaction = store.withTransaction(async () => {
+      startedAtomic = atomicStore.withAtomicOperation(async () => {
+        markAtomicEntered();
+        await atomicRelease;
+        atomicSettled = true;
+      });
+      await atomicEntered;
+      markOuterThrowing();
+      throw original;
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    ).finally(() => {
+      outerSettled = true;
+    });
+    await outerThrowing;
+    await Promise.resolve();
+    const queued = store.withTransaction(() => {
+      queuedEntered = true;
+      return "queue released";
+    });
+
+    expect(outerSettled).toBe(false);
+    expect(queuedEntered).toBe(false);
+    expect(statements).not.toContain("ROLLBACK");
+    releaseAtomic();
+
+    const observed = await transaction;
+    expect(observed).toBe(original);
+    await startedAtomic;
+    expect(atomicSettled).toBe(true);
+    await expect(queued).resolves.toBe("queue released");
+    expect(atomicSqlAfterRollback).toEqual([]);
+    expect(normalizedTransactionStatements(statements)).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_conversation_atomic",
+      "RELEASE SAVEPOINT lcm_conversation_atomic",
+      "ROLLBACK",
+      "BEGIN IMMEDIATE",
+      "COMMIT",
+    ]);
+  });
+
+  it("preserves the outer failure after a drained atomic failure and fences rollback failure", async () => {
+    const raw = makeDb();
+    const statements: string[] = [];
+    let prepareCalls = 0;
+    const database = {
+      exec: (sql: string): void => {
+        statements.push(sql);
+        if (sql === "ROLLBACK") {
+          throw new Error("rollback /private/drain-secret");
+        }
+        raw.exec(sql);
+      },
+      prepare: (sql: string) => {
+        prepareCalls += 1;
+        return raw.prepare(sql);
+      },
+      get isTransaction(): boolean {
+        return raw.isTransaction;
+      },
+    } as unknown as DatabaseSync;
+    const store = makeStore(database);
+    const peer = makeStore(database);
+    const atomicStore = store as unknown as {
+      withAtomicOperation<T>(operation: () => Promise<T> | T): Promise<T>;
+    };
+    const original = new Error("original outer failure");
+    const atomicError = new Error("handled atomic failure");
+    let releaseAtomic!: () => void;
+    let markAtomicEntered!: () => void;
+    let markOuterThrowing!: () => void;
+    const atomicRelease = new Promise<void>((resolve) => { releaseAtomic = resolve; });
+    const atomicEntered = new Promise<void>((resolve) => { markAtomicEntered = resolve; });
+    const outerThrowing = new Promise<void>((resolve) => { markOuterThrowing = resolve; });
+    let handledAtomic = Promise.resolve<unknown>(undefined);
+
+    const transaction = store.withTransaction(async () => {
+      handledAtomic = atomicStore.withAtomicOperation(async () => {
+        markAtomicEntered();
+        await atomicRelease;
+        throw atomicError;
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await atomicEntered;
+      markOuterThrowing();
+      throw original;
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await outerThrowing;
+    await Promise.resolve();
+    const queued = expect(store.withTransaction(() => "must not enter"))
+      .rejects.toThrow("conversation store transaction state is unavailable");
+    releaseAtomic();
+
+    const observed = await transaction;
+    expect(observed).toBe(original);
+    expect(String(observed)).not.toContain("drain-secret");
+    await expect(handledAtomic).resolves.toBe(atomicError);
+    await queued;
+    const prepareCallsBeforeFenceCheck = prepareCalls;
+    await expect(peer.createConversation({ sessionId: "must-not-write-after-drain" }))
+      .rejects.toThrow("conversation store transaction state is unavailable");
+    expect(prepareCalls).toBe(prepareCallsBeforeFenceCheck);
+    expect(normalizedTransactionStatements(statements)).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_conversation_atomic",
+      "ROLLBACK TO SAVEPOINT lcm_conversation_atomic",
+      "RELEASE SAVEPOINT lcm_conversation_atomic",
+      "ROLLBACK",
+      "ROLLBACK",
+    ]);
+    raw.exec("ROLLBACK");
+  });
+
   it("keeps empty direct atomic methods as savepoint-free no-ops", async () => {
     const tracked = trackedDatabase(makeDb());
     const store = makeStore(tracked.database);

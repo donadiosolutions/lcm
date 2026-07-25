@@ -1105,6 +1105,55 @@ describe("PostgreSQL conversation repository", () => {
   });
 
   it.each([
+    ["maximum string", String(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER],
+    ["minimum string", String(Number.MIN_SAFE_INTEGER), Number.MIN_SAFE_INTEGER],
+    ["maximum bigint", BigInt(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER],
+    ["minimum bigint", BigInt(Number.MIN_SAFE_INTEGER), Number.MIN_SAFE_INTEGER],
+    ["maximum number", Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
+    ["minimum number", Number.MIN_SAFE_INTEGER, Number.MIN_SAFE_INTEGER],
+    ["leading-zero string", "00000042", 42],
+    ["negative-zero string", "-0", 0],
+  ])("maps an exact safe bigint %s", async (_case, value, expected) => {
+    const repository = new PostgreSqlConversationRepository(
+      executor(() => result([{ count: value }])),
+      projectId,
+    );
+
+    await expect(repository.getMessageCount(1)).resolves.toBe(expected);
+  });
+
+  it.each([
+    ["maximum plus one string", "9007199254740992"],
+    ["minimum minus one string", "-9007199254740992"],
+    ["maximum plus one bigint", 9007199254740992n],
+    ["minimum minus one bigint", -9007199254740992n],
+    ["very large positive string", "9999999999999999999999999999999999999999"],
+    ["very large negative string", "-9999999999999999999999999999999999999999"],
+    ["positive exponent", "1e3"],
+    ["negative exponent", "-1e3"],
+    ["decimal", "1.0"],
+    ["leading plus", "+1"],
+    ["empty string", ""],
+    ["whitespace", " 1 "],
+    ["unsafe positive number", Number.MAX_SAFE_INTEGER + 1],
+    ["unsafe negative number", Number.MIN_SAFE_INTEGER - 1],
+    ["fractional number", 1.5],
+    ["NaN", Number.NaN],
+    ["positive infinity", Number.POSITIVE_INFINITY],
+    ["negative infinity", Number.NEGATIVE_INFINITY],
+  ])("rejects an inexact or malformed bigint %s", async (_case, value) => {
+    const repository = new PostgreSqlConversationRepository(
+      executor(() => result([{ count: value }])),
+      projectId,
+    );
+
+    await expect(repository.getMessageCount(1)).rejects.toMatchObject({
+      field: "count",
+      operation: "getMessageCount",
+    });
+  });
+
+  it.each([
     ["conversation row", "conversation_id", async (repository: PostgreSqlConversationRepository) =>
       repository.getConversation(1), { ...conversationRow, conversation_id: "9007199254740992" }],
     ["message id", "message_id", async (repository: PostgreSqlConversationRepository) =>

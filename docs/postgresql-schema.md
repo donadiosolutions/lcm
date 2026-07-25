@@ -318,11 +318,13 @@ removed from active `context_items` before the message is deleted. Owned
 multi-ID operation is atomic, including the skipped-message decisions.
 
 PostgreSQL exposes generated `bigint` identities, sequence values, and counts
-as text through the driver. The adapter accepts them only when conversion
-produces a JavaScript safe integer; values outside
-`Number.MIN_SAFE_INTEGER` through `Number.MAX_SAFE_INTEGER` fail with a
-sanitized storage error instead of being rounded. Nonnegative domain checks
-remain independently enforced by the schema.
+as text through the driver. The adapter parses decimal strings and native
+bigints exactly, checks them against bigint forms of
+`Number.MIN_SAFE_INTEGER` and `Number.MAX_SAFE_INTEGER`, and only then converts
+them to JavaScript numbers. Malformed, fractional, exponent-form, or
+out-of-range values fail with a sanitized storage error instead of being
+rounded. Nonnegative domain checks remain independently enforced by the
+schema.
 
 ## Ownership, deletion, and retention
 

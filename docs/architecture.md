@@ -335,8 +335,10 @@ transaction so it rolls back. This prevents a read from observing a transient
 row and prevents rollback from silently undoing another method whose promise
 already resolved.
 PostgreSQL `bigint` values are converted to JavaScript numbers only after a
-safe-integer check, so an out-of-range identity, sequence, part ordinal, or
-count fails instead of losing precision. Message sequence, token-count, and
+safe-integer check. Decimal driver strings and native bigints are parsed and
+range-checked as `bigint` before `Number` conversion, so malformed or
+out-of-range identities, sequences, token counts, part ordinals, or counts fail
+instead of rounding or losing precision. Message sequence, token-count, and
 part-ordinal batches are fully validated before their first SQL statement.
 Generated conversation and message identities are
 mapped before their write transaction commits, so an unsafe identity rolls the
