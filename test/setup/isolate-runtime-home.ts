@@ -1,7 +1,6 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll } from "vitest";
 
 const stateKey = Symbol.for("lcm.vitest.runtimeHome");
 
@@ -47,7 +46,3 @@ if (!state.cleanupRegistered) {
     rmSync(state.testHome, { recursive: true, force: true });
   });
 }
-
-afterAll(() => {
-  rmSync(state.testHome, { recursive: true, force: true });
-});

@@ -13,6 +13,7 @@ interface ScrubCacheEntry {
 
 const SCRUB_CACHE_MAX = 100;
 const scrubCache = new Map<string, ScrubCacheEntry>();
+let scrubCacheMax = SCRUB_CACHE_MAX;
 
 function projectPatternsMtime(projDir: string): number {
   try {
@@ -39,7 +40,7 @@ async function getScrubber(patterns: string[], projDir: string): Promise<ScrubEn
 
   const engine = await ScrubEngine.forProject(patterns, projDir);
   scrubCache.delete(projDir);
-  if (scrubCache.size >= SCRUB_CACHE_MAX) {
+  if (scrubCache.size >= scrubCacheMax) {
     scrubCache.delete(scrubCache.keys().next().value as string);
   }
   scrubCache.set(projDir, {
@@ -52,6 +53,12 @@ async function getScrubber(patterns: string[], projDir: string): Promise<ScrubEn
 
 export function clearEventScrubberCacheForTesting(): void {
   scrubCache.clear();
+  scrubCacheMax = SCRUB_CACHE_MAX;
+}
+
+export function _setEventScrubberCacheMaxForTesting(maxEntries: number): void {
+  scrubCache.clear();
+  scrubCacheMax = maxEntries;
 }
 
 export async function scrubExtractedEvents(
