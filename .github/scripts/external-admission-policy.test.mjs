@@ -1,16 +1,23 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
   ADMISSION_CLASSIFICATIONS,
   CHECK_IDENTITIES,
+  admissionDecision,
   classifyPullRequestFiles,
+  excludedGreptileAuthorPattern,
   evaluateAdmissionChecks,
   evaluateCiActionsRun,
   flattenCheckRunPages,
   flattenPullRequestFilePages,
   isTrustedAutomationPullRequest,
+  matchesGreptileGlob,
   parseActionsRunId,
+  parseGreptileConfig,
   requiresGreptileForPath,
   runPolicyCommand,
   selectAdmissionRequirement,
@@ -47,6 +54,7 @@ test("classifies every coverable and trust-sensitive path family", () => {
     ".github/workflows/ci.yml",
     ".github/actions/setup/action.yml",
     ".github/scripts/external-admission-policy.mjs",
+    "greptile.json",
     "package.json",
     "package-lock.json",
     "vitest.config.ts",
@@ -76,8 +84,15 @@ test("keeps documentation, tests, and unrelated metadata coverage-neutral", () =
 });
 
 test("trusts only exact GitHub bot identities used by repository automation", () => {
+  const greptileConfig = {
+    excludeAuthors: ["dependabot[bot]", "github-actions[bot]"],
+  };
   for (const login of ["dependabot[bot]", "github-actions[bot]"]) {
-    assert.equal(isTrustedAutomationPullRequest({ user: { login, type: "Bot" } }), true, login);
+    assert.equal(
+      isTrustedAutomationPullRequest({ user: { login, type: "Bot" } }, greptileConfig),
+      true,
+      login,
+    );
   }
   for (const user of [
     { login: "dependabot[bot]", type: "User" },
@@ -85,11 +100,15 @@ test("trusts only exact GitHub bot identities used by repository automation", ()
     { login: "renovate[bot]", type: "Bot" },
     { login: "bcdonadio", type: "User" },
   ]) {
-    assert.equal(isTrustedAutomationPullRequest({ user }), false, JSON.stringify(user));
+    assert.equal(
+      isTrustedAutomationPullRequest({ user }, greptileConfig),
+      false,
+      JSON.stringify(user),
+    );
   }
   for (const pullRequest of [undefined, null, [], {}, { user: {} }]) {
     assert.throws(
-      () => isTrustedAutomationPullRequest(pullRequest),
+      () => isTrustedAutomationPullRequest(pullRequest, greptileConfig),
       /pull request|user/u,
       String(pullRequest),
     );
@@ -99,22 +118,121 @@ test("trusts only exact GitHub bot identities used by repository automation", ()
 test("selects Greptile or CI from sensitive classification and authoritative identity", () => {
   const human = { user: { login: "bcdonadio", type: "User" } };
   const dependabot = { user: { login: "dependabot[bot]", type: "Bot" } };
-  assert.deepEqual(selectAdmissionRequirement(human, true), {
+  const greptileConfig = { excludeAuthors: ["dependabot[bot]"] };
+  assert.deepEqual(selectAdmissionRequirement(human, true, false, greptileConfig), {
+    classification: ADMISSION_CLASSIFICATIONS.greptileRequired,
     sensitiveDiff: true,
     trustedAutomation: false,
     greptileRequired: true,
+    excludedAuthorPattern: undefined,
   });
-  assert.deepEqual(selectAdmissionRequirement(dependabot, true), {
+  assert.deepEqual(selectAdmissionRequirement(dependabot, true, false, greptileConfig), {
+    classification: ADMISSION_CLASSIFICATIONS.greptileExcludedAuthor,
     sensitiveDiff: true,
     trustedAutomation: true,
     greptileRequired: false,
+    excludedAuthorPattern: "dependabot[bot]",
   });
-  assert.deepEqual(selectAdmissionRequirement(dependabot, false), {
+  assert.deepEqual(selectAdmissionRequirement(dependabot, false, false, greptileConfig), {
+    classification: ADMISSION_CLASSIFICATIONS.coverageNeutral,
     sensitiveDiff: false,
     trustedAutomation: true,
     greptileRequired: false,
+    excludedAuthorPattern: "dependabot[bot]",
   });
-  assert.throws(() => selectAdmissionRequirement(human, "true"), /must be a boolean/u);
+  assert.deepEqual(selectAdmissionRequirement(dependabot, true, true, greptileConfig), {
+    classification: ADMISSION_CLASSIFICATIONS.greptileRequired,
+    sensitiveDiff: true,
+    trustedAutomation: true,
+    greptileRequired: true,
+    excludedAuthorPattern: "dependabot[bot]",
+  });
+  assert.throws(
+    () => selectAdmissionRequirement(human, "true", false, greptileConfig),
+    /must be a boolean/u,
+  );
+  assert.throws(
+    () => selectAdmissionRequirement(human, true, "false", greptileConfig),
+    /must be a boolean/u,
+  );
+});
+
+test("compares only decision-driving fields across reordered file audits", () => {
+  const requirement = {
+    classification: ADMISSION_CLASSIFICATIONS.greptileExcludedAuthor,
+    greptileRequired: false,
+    excludedAuthorPattern: "dependabot[bot]",
+    sensitiveDiff: true,
+    trustedAutomation: true,
+    auditedPaths: ["package-lock.json", "docs/changelog.md"],
+  };
+  assert.deepEqual(admissionDecision({
+    ...requirement,
+    auditedPaths: [...requirement.auditedPaths].reverse(),
+  }), admissionDecision(requirement));
+
+  for (const changedDecision of [
+    { ...requirement, classification: ADMISSION_CLASSIFICATIONS.greptileRequired },
+    { ...requirement, greptileRequired: true },
+    { ...requirement, excludedAuthorPattern: null },
+  ]) {
+    assert.notDeepEqual(admissionDecision(changedDecision), admissionDecision(requirement));
+  }
+  assert.deepEqual(admissionDecision({
+    classification: ADMISSION_CLASSIFICATIONS.coverageNeutral,
+    greptileRequired: false,
+  }), {
+    classification: ADMISSION_CLASSIFICATIONS.coverageNeutral,
+    greptileRequired: false,
+    excludedAuthorPattern: null,
+  });
+  assert.throws(() => admissionDecision({
+    classification: ADMISSION_CLASSIFICATIONS.coverageNeutral,
+    greptileRequired: "false",
+  }), /greptileRequired/u);
+});
+
+test("matches Greptile excluded-author globs while requiring GitHub Bot type", () => {
+  assert.equal(matchesGreptileGlob("Dependabot[Bot]", "dependabot[bot]"), true);
+  assert.equal(matchesGreptileGlob("release-bot", "*-bot"), true);
+  assert.equal(matchesGreptileGlob("bot", "?ot"), true);
+  assert.equal(matchesGreptileGlob("!abot", "!abot"), true);
+  assert.equal(matchesGreptileGlob("abot", "!abot"), false);
+  assert.equal(matchesGreptileGlob("dependabotb", "dependabot[bot]"), false);
+  assert.equal(excludedGreptileAuthorPattern("DEPENDABOT[BOT]", {
+    excludeAuthors: ["dependabot[bot]"],
+  }), "dependabot[bot]");
+  assert.equal(isTrustedAutomationPullRequest({
+    user: { login: "release-bot", type: "User" },
+  }, { excludeAuthors: ["*-bot"] }), false);
+});
+
+test("fails closed when the trusted Greptile configuration is malformed", () => {
+  for (const config of [null, [], { excludeAuthors: "dependabot[bot]" }, {
+    excludeAuthors: ["dependabot[bot]", 1],
+  }, { excludeAuthors: [""] }]) {
+    assert.throws(() => parseGreptileConfig(config), /greptile/u);
+    assert.throws(() => selectAdmissionRequirement({
+      user: { login: "dependabot[bot]", type: "Bot" },
+    }, true, false, config), /greptile/u);
+  }
+});
+
+test("fails closed when the checked-out Greptile configuration cannot be parsed", () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "lcm-greptile-config-"));
+  const configPath = join(temporaryDirectory, "greptile.json");
+  try {
+    writeFileSync(configPath, "{", "utf8");
+    assert.throws(() => runPolicyCommand("select-admission", [
+      "true",
+      "false",
+      configPath,
+    ], JSON.stringify({
+      user: { login: "dependabot[bot]", type: "Bot" },
+    })), /valid JSON/u);
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
 });
 
 test("audits both current and previous rename paths without duplicates", () => {
@@ -443,13 +561,29 @@ test("exposes the complete policy through its deterministic CLI command seam", (
   assert.equal(evaluation.ready, true);
   assert.equal(evaluation.ciRunId, "123");
   assert.deepEqual(JSON.parse(runPolicyCommand(
+    "admission-decision",
+    [],
+    JSON.stringify({
+      classification: ADMISSION_CLASSIFICATIONS.greptileExcludedAuthor,
+      greptileRequired: false,
+      excludedAuthorPattern: "dependabot[bot]",
+      auditedPaths: ["second", "first"],
+    }),
+  )), {
+    classification: ADMISSION_CLASSIFICATIONS.greptileExcludedAuthor,
+    greptileRequired: false,
+    excludedAuthorPattern: "dependabot[bot]",
+  });
+  assert.deepEqual(JSON.parse(runPolicyCommand(
     "select-admission",
-    ["true"],
+    ["true", "false", "greptile.json"],
     JSON.stringify({ user: { login: "dependabot[bot]", type: "Bot" } }),
   )), {
+    classification: ADMISSION_CLASSIFICATIONS.greptileExcludedAuthor,
     sensitiveDiff: true,
     trustedAutomation: true,
     greptileRequired: false,
+    excludedAuthorPattern: "dependabot[bot]",
   });
 
   const run = {
@@ -478,7 +612,10 @@ test("exposes the complete policy through its deterministic CLI command seam", (
     "https://github.com",
   ], "{}"), /true or false/u);
   assert.throws(() => runPolicyCommand("select-admission", [
-    "maybe",
+    "maybe", "false", "greptile.json",
+  ], "{}"), /true or false/u);
+  assert.throws(() => runPolicyCommand("select-admission", [
+    "true", "maybe", "greptile.json",
   ], "{}"), /true or false/u);
   assert.throws(() => runPolicyCommand("unknown", [], "{}"), /unknown policy command/u);
   assert.throws(() => runPolicyCommand("classify-files", ["1"], ""), /non-empty/u);

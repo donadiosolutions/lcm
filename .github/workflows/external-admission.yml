@@ -121,6 +121,7 @@ jobs:
           sparse-checkout: |
             .github/scripts/external-admission.sh
             .github/scripts/external-admission-policy.mjs
+            greptile.json
           sparse-checkout-cone-mode: false
 
       - name: Set up Node.js

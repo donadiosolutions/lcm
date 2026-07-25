@@ -63,14 +63,42 @@ and the `external-admission` status on `HEAD_SHA`.
 - **Success:** one fresh and final exact-SHA snapshot proves authenticated
   Greptile plus DCO success for sensitive changes from normal contributors, or
   authenticated canonical CI plus DCO success for either coverage-neutral
-  changes or sensitive changes authored by the exact `dependabot[bot]` or
-  `github-actions[bot]` GitHub `Bot` identity. Those two automation identities
-  use CI because Greptile is configured to exclude bot-authored pull requests.
-  The CI check must resolve to a successful canonical pull-request workflow run
-  for the same repository and head SHA.
+  changes or sensitive changes authored by an authoritative GitHub `Bot` whose
+  login is explicitly excluded by trusted root `greptile.json`. The CI check
+  must resolve to a successful canonical pull-request workflow run for the same
+  repository and head SHA.
 - **Failure:** a required check is terminally unsuccessful, CI provenance is
   invalid, or evaluation encounters an API or policy error. Inspect the linked
   workflow run before retrying.
+
+## Greptile author exclusions
+
+The repository-root [`greptile.json`](../greptile.json) lists authors that
+Greptile itself excludes from review. External admission reads that file only
+from the trusted workflow revision, never from the pull request head. The
+current configuration excludes `dependabot[bot]` and `github-actions[bot]`.
+
+An excluded login bypasses Greptile only when GitHub identifies the
+authoritative pull-request author as type `Bot`. A human account with a matching
+login remains on the Greptile path.
+
+Because it controls this exception, changing `greptile.json` is itself a
+non-bypassable trust-sensitive diff. It requires authenticated Greptile Review
+plus DCO on the exact PR head for every author, including an author excluded by
+the current trusted configuration. This also applies when `greptile.json` is a
+rename's `previous_filename`.
+
+For another coverable or trust-sensitive diff, an excluded GitHub Bot follows
+the exact-head canonical CI plus DCO path. Other authors require authenticated
+Greptile Review plus DCO. The evaluator re-reads the current PR identity,
+changed-file classification, and trusted configuration before it posts
+success.
+
+Author matching is case-insensitive. The supported Greptile-compatible glob
+syntax is `*` and `?`; `[`, `]`, and `!` are literal characters, so
+`dependabot[bot]` matches the GitHub bot login rather than a character class.
+A missing, unreadable, invalid-JSON, or malformed `excludeAuthors` value fails
+admission closed rather than granting an exclusion.
 
 An invalid or missing SHA fails before a status can be safely written. The
 workflow normalizes a valid hexadecimal payload SHA to lowercase before status
@@ -81,9 +109,10 @@ writes, PR association, and policy comparisons.
 `repository_dispatch` runs this workflow only when the workflow file exists on
 the repository's default branch. GitHub sets the run ref to the default branch
 and the run SHA to its latest commit; callers cannot choose another branch or
-tag. The executable policy is sparsely checked out from `github.workflow_sha`
-with credentials disabled. The client payload supplies only the commit SHA to
-evaluate and is never used as a checkout ref or executed as code.
+tag. The executable policy and root `greptile.json` are sparsely checked out
+from `github.workflow_sha` with credentials disabled. The client payload
+supplies only the commit SHA to evaluate and is never used as a checkout ref or
+executed as code.
 
 Do not add or use `workflow_dispatch` for this recovery path. Its caller can
 select a branch or tag containing a different workflow revision, which is not
