@@ -543,7 +543,7 @@ export async function reclaimProvenOrphans(dependencies = {}) {
       try {
         await (dependencies.verifySentinel
           ? dependencies.verifySentinel(createRunNames(run.runId), run.runId, dockerRunner)
-          : verifyContainerSentinel(createRunNames(run.runId), run.runId, dockerRunner));
+          : waitForContainerSentinel(createRunNames(run.runId), run.runId, dockerRunner));
       } catch (error) {
         failures.push(error);
         continue;

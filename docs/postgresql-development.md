@@ -60,6 +60,9 @@ Legacy labels, malformed or incomplete records, inconsistent owners, denied
 `/proc` evidence, and unsupported identity evidence are ambiguous and remain
 untouched. This permits a later run to recover resources after an uncatchable
 SIGKILL without using resource age, broad name matching, or global pruning.
+A running stale database must make its sentinel observable before recovery;
+an exactly owned stopped container can be removed without executing a sentinel
+that Docker cannot expose.
 
 A failed ownership or database-sentinel guard intentionally leaves resources
 for inspection. Never delete them by a broad name glob. Inspect the exact
