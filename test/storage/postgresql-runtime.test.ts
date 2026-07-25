@@ -11,6 +11,7 @@ import { StorageOperationError } from "../../src/storage/errors.js";
 import type {
   PostgreSqlConnectionSettings,
   PostgreSqlQueryExecutor,
+  PostgreSqlTransactionScopeExecutor,
 } from "../../src/storage/postgresql/contracts.js";
 import {
   PostgreSqlRuntime,
@@ -217,6 +218,7 @@ describe("PostgreSQL runtime", () => {
   it("commits successful transactions and rolls back failed transactions", async () => {
     const f = fixtures((input) => typeof input === "string" ? result([]) : result([{ value: 2 }]));
     await expect(f.runtime.transaction(async (transaction) => {
+      expect(transaction.transactionScope).toBe("active");
       const selected = await transaction.query<{ value: number }>({ text: "SELECT 2 AS value" }, {
         domain: "sessions", operation: "inside",
       });
@@ -250,6 +252,498 @@ describe("PostgreSQL runtime", () => {
     });
     expect(queryFailure.query).toHaveBeenCalledWith("ROLLBACK");
     expect(queryFailure.release).toHaveBeenCalledWith(false);
+  });
+
+  it("recovers an eligible failed statement through a runtime-owned savepoint", async () => {
+    const f = fixtures((input) => {
+      if (
+        typeof input === "object"
+        && input !== null
+        && "text" in input
+        && input.text === "INSERT duplicate"
+      ) {
+        throw Object.assign(new Error("constraint secret"), { code: "23505" });
+      }
+      return result([]);
+    });
+
+    await expect(f.runtime.transaction(async (transaction) => {
+      const scoped = transaction as PostgreSqlTransactionScopeExecutor;
+      await expect(scoped.savepoint(
+        (inner) => inner.query({
+          text: "INSERT duplicate",
+        }, { domain: "conversations", operation: "duplicate" }),
+        { domain: "conversations", operation: "savepoint" },
+      ))
+        .rejects.toMatchObject({ sqlState: "23505" });
+      await transaction.query({
+        text: "UPDATE unrelated",
+      }, { domain: "conversations", operation: "unrelated" });
+      return "recovered";
+    }, { domain: "transaction", operation: "recoverTransaction" }))
+      .resolves.toBe("recovered");
+
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      "SAVEPOINT lcm_runtime_repository_1",
+      { text: "INSERT duplicate" },
+      "ROLLBACK TO SAVEPOINT lcm_runtime_repository_1",
+      "RELEASE SAVEPOINT lcm_runtime_repository_1",
+      { text: "UPDATE unrelated" },
+      "COMMIT",
+    ]);
+    expect(f.release).toHaveBeenCalledWith(false);
+  });
+
+  it("recovers mapping failures without a recorded SQL failure", async () => {
+    const f = fixtures();
+    const mappingError = new Error("mapping failed");
+
+    await expect(f.runtime.transaction(async (transaction) => {
+      const scoped = transaction as PostgreSqlTransactionScopeExecutor;
+      await expect(scoped.savepoint(async (inner) => {
+        await inner.query({
+          text: "INSERT mapped",
+        }, { domain: "conversations", operation: "mapped" });
+        throw mappingError;
+      }, { domain: "conversations", operation: "recoverMapping" }))
+        .rejects.toBe(mappingError);
+      await transaction.query({
+        text: "UPDATE unrelated",
+      }, { domain: "conversations", operation: "unrelated" });
+    }, { domain: "transaction", operation: "recoverMappingTransaction" }))
+      .resolves.toBeUndefined();
+
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      "SAVEPOINT lcm_runtime_repository_1",
+      { text: "INSERT mapped" },
+      "ROLLBACK TO SAVEPOINT lcm_runtime_repository_1",
+      "RELEASE SAVEPOINT lcm_runtime_repository_1",
+      { text: "UPDATE unrelated" },
+      "COMMIT",
+    ]);
+  });
+
+  it("fails closed when runtime savepoint recovery cleanup fails", async () => {
+    const f = fixtures((input) => {
+      if (
+        typeof input === "object"
+        && input !== null
+        && "text" in input
+        && input.text === "INSERT duplicate"
+      ) {
+        throw Object.assign(new Error("constraint secret"), { code: "23505" });
+      }
+      if (input === "ROLLBACK TO SAVEPOINT lcm_runtime_repository_1") {
+        throw Object.assign(new Error("rollback secret"), { code: "XX000" });
+      }
+      return result([]);
+    });
+
+    await expect(f.runtime.transaction(async (transaction) => {
+      const scoped = transaction as PostgreSqlTransactionScopeExecutor;
+      const original = await scoped.savepoint(
+        (inner) => inner.query({
+          text: "INSERT duplicate",
+        }, { domain: "conversations", operation: "duplicate" }),
+        { domain: "conversations", operation: "recover" },
+      )
+        .catch((error: unknown) => error);
+      expect(original).toMatchObject({ operation: "duplicate" });
+      await expect(transaction.query({
+        text: "UPDATE unrelated",
+      }, { domain: "conversations", operation: "unrelated" }))
+        .rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+      throw original;
+    }, { domain: "transaction", operation: "failedRecovery" }))
+      .rejects.toMatchObject({ operation: "recover", sqlState: "XX000" });
+
+    expect(f.query).toHaveBeenCalledWith(
+      "ROLLBACK TO SAVEPOINT lcm_runtime_repository_1",
+    );
+    expect(f.query).not.toHaveBeenCalledWith(
+      "RELEASE SAVEPOINT lcm_runtime_repository_1",
+    );
+    expect(f.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(f.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).toHaveBeenCalledWith(false);
+  });
+
+  it("never recovers a failed connection query", async () => {
+    const failure = Object.assign(
+      new Error("connection secret"),
+      { code: "08006" },
+    );
+    const f = fixtures((input) => {
+      if (
+        typeof input === "object"
+        && input !== null
+        && "text" in input
+        && input.text === "INSERT failed"
+      ) {
+        if (failure.code === "57014") controller.abort();
+        throw failure;
+      }
+      return result([]);
+    });
+
+    await expect(f.runtime.transaction(async (transaction) => {
+      const scoped = transaction as PostgreSqlTransactionScopeExecutor;
+      const original = await scoped.savepoint(
+        (inner) => inner.query({
+          text: "INSERT failed",
+        }, {
+          domain: "conversations",
+          operation: "failed",
+        }),
+        { domain: "conversations", operation: "recover" },
+      ).catch((error: unknown) => error);
+      throw original;
+    }, { domain: "transaction", operation: "nonrecoverable" }))
+      .rejects.toMatchObject({ operation: "failed" });
+
+    expect(f.query).not.toHaveBeenCalledWith(
+      "ROLLBACK TO SAVEPOINT lcm_runtime_repository_1",
+    );
+    expect(f.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("never recovers an aborted savepoint operation", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const f = fixtures();
+    const callback = vi.fn(async () => undefined);
+
+    await expect(f.runtime.transaction(async (transaction) => {
+      const scoped = transaction as PostgreSqlTransactionScopeExecutor;
+      return scoped.savepoint(callback, {
+        domain: "conversations",
+        operation: "abortedSavepoint",
+        signal: controller.signal,
+      });
+    }, { domain: "transaction", operation: "abortOuter" }))
+      .rejects.toMatchObject({ operation: "abortedSavepoint" });
+
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.query).not.toHaveBeenCalledWith(
+      "SAVEPOINT lcm_runtime_repository_1",
+    );
+    expect(f.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it.each(["failure", "success"] as const)(
+    "fails the outer transaction when a savepoint signal aborts after callback %s",
+    async (outcome) => {
+      const controller = new AbortController();
+      const mappingError = new Error("mapping failed");
+      const f = fixtures();
+
+      await expect(f.runtime.transaction(async (transaction) => {
+        const scoped = transaction as PostgreSqlTransactionScopeExecutor;
+        return scoped.savepoint(async () => {
+          controller.abort();
+          if (outcome === "failure") throw mappingError;
+          return "must not commit";
+        }, {
+          domain: "conversations",
+          operation: `abortAfterCallback${outcome}`,
+          signal: controller.signal,
+        });
+      }, { domain: "transaction", operation: "abortAfterSavepointCallback" }))
+        .rejects.toMatchObject({
+          operation: `abortAfterCallback${outcome}`,
+        });
+
+      expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+        "BEGIN",
+        "SAVEPOINT lcm_runtime_repository_1",
+      ]);
+      expect(f.release).toHaveBeenCalledWith(true);
+    },
+  );
+
+  it("fails closed when releasing a successful savepoint fails", async () => {
+    const f = fixtures((input) => {
+      if (input === "RELEASE SAVEPOINT lcm_runtime_repository_1") {
+        throw Object.assign(new Error("release secret"), { code: "XX000" });
+      }
+      return result([]);
+    });
+
+    await expect(f.runtime.transaction(async (transaction) => {
+      const scoped = transaction as PostgreSqlTransactionScopeExecutor;
+      return scoped.savepoint(
+        async () => "saved",
+        { domain: "conversations", operation: "releaseFailure" },
+      );
+    }, { domain: "transaction", operation: "releaseFailureOuter" }))
+      .rejects.toMatchObject({
+        operation: "releaseFailure",
+        sqlState: "XX000",
+      });
+
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      "SAVEPOINT lcm_runtime_repository_1",
+      "RELEASE SAVEPOINT lcm_runtime_repository_1",
+      "ROLLBACK",
+    ]);
+    expect(f.release).toHaveBeenCalledWith(false);
+  });
+
+  it("fails closed when opening a savepoint fails", async () => {
+    const f = fixtures((input) => {
+      if (input === "SAVEPOINT lcm_runtime_repository_1") {
+        throw Object.assign(new Error("savepoint secret"), { code: "XX000" });
+      }
+      return result([]);
+    });
+
+    await expect(f.runtime.transaction(async (transaction) => {
+      const scoped = transaction as PostgreSqlTransactionScopeExecutor;
+      return scoped.savepoint(
+        async () => "never called",
+        { domain: "conversations", operation: "openSavepointFailure" },
+      );
+    }, { domain: "transaction", operation: "openSavepointFailureOuter" }))
+      .rejects.toMatchObject({
+        operation: "openSavepointFailure",
+        sqlState: "XX000",
+      });
+
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      "SAVEPOINT lcm_runtime_repository_1",
+      "ROLLBACK",
+    ]);
+    expect(f.release).toHaveBeenCalledWith(false);
+  });
+
+  it("destroys the client when an outer abort races savepoint open failure", async () => {
+    const controller = new AbortController();
+    const f = fixtures((input) => {
+      if (input === "SAVEPOINT lcm_runtime_repository_1") {
+        controller.abort();
+        throw Object.assign(new Error("savepoint secret"), { code: "XX000" });
+      }
+      return result([]);
+    });
+
+    await expect(f.runtime.transaction(async (transaction) => {
+      const scoped = transaction as PostgreSqlTransactionScopeExecutor;
+      return scoped.savepoint(
+        async () => "never called",
+        { domain: "conversations", operation: "racingOpenFailure" },
+      );
+    }, {
+      domain: "transaction",
+      operation: "racingOuterAbort",
+      signal: controller.signal,
+    })).rejects.toMatchObject({
+      operation: "racingOpenFailure",
+      sqlState: "XX000",
+    });
+
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      "SAVEPOINT lcm_runtime_repository_1",
+    ]);
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("fences a savepoint queued behind a failing outer query", async () => {
+    let failOuter!: (error: Error) => void;
+    const outerResult = new Promise<QueryResult<QueryResultRow>>(
+      (_resolve, reject) => {
+        failOuter = reject;
+      },
+    );
+    const f = fixtures((input) =>
+      typeof input === "object" && input !== null && "text" in input
+        ? outerResult
+        : result([]));
+    let queuedSavepoint!: Promise<unknown>;
+
+    const pending = f.runtime.transaction(async (transaction) => {
+      const scoped = transaction as PostgreSqlTransactionScopeExecutor;
+      const outer = transaction.query(
+        { text: "SELECT failing outer" },
+        { domain: "conversations", operation: "failingOuter" },
+      );
+      queuedSavepoint = scoped.savepoint(
+        async () => "must not run",
+        { domain: "conversations", operation: "queuedSavepoint" },
+      );
+      void queuedSavepoint.catch(() => undefined);
+      failOuter(Object.assign(new Error("constraint secret"), { code: "23505" }));
+      await outer.catch(() => undefined);
+      await queuedSavepoint.catch(() => undefined);
+    }, { domain: "transaction", operation: "queuedAfterFailure" });
+
+    await expect(pending).rejects.toMatchObject({
+      operation: "failingOuter",
+      sqlState: "23505",
+    });
+    await expect(queuedSavepoint).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE",
+      operation: "queuedSavepoint",
+    });
+    expect(f.query).not.toHaveBeenCalledWith(
+      "SAVEPOINT lcm_runtime_repository_1",
+    );
+  });
+
+  it("fences inner queries queued behind a failed savepoint query", async () => {
+    let failInner!: (error: Error) => void;
+    const innerResult = new Promise<QueryResult<QueryResultRow>>(
+      (_resolve, reject) => {
+        failInner = reject;
+      },
+    );
+    const f = fixtures((input) =>
+      typeof input === "object"
+        && input !== null
+        && "text" in input
+        && input.text === "INSERT failing inner"
+        ? innerResult
+        : result([]));
+    let queuedInner!: Promise<unknown>;
+
+    await expect(f.runtime.transaction(async (transaction) => {
+      const scoped = transaction as PostgreSqlTransactionScopeExecutor;
+      await expect(scoped.savepoint(async (inner) => {
+        const first = inner.query(
+          { text: "INSERT failing inner" },
+          { domain: "conversations", operation: "failingInner" },
+        );
+        queuedInner = inner.query(
+          { text: "SELECT queued inner" },
+          { domain: "conversations", operation: "queuedInner" },
+        );
+        void queuedInner.catch(() => undefined);
+        failInner(Object.assign(
+          new Error("constraint secret"),
+          { code: "23505" },
+        ));
+        await first.catch(() => undefined);
+        await queuedInner.catch(() => undefined);
+      }, { domain: "conversations", operation: "innerQueue" }))
+        .rejects.toMatchObject({
+          operation: "failingInner",
+          sqlState: "23505",
+        });
+      await transaction.query(
+        { text: "UPDATE after inner recovery" },
+        { domain: "conversations", operation: "afterInnerRecovery" },
+      );
+    }, { domain: "transaction", operation: "innerQueueOuter" }))
+      .resolves.toBeUndefined();
+
+    await expect(queuedInner).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE",
+      operation: "queuedInner",
+    });
+    expect(f.query).not.toHaveBeenCalledWith({
+      text: "SELECT queued inner",
+    });
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      "SAVEPOINT lcm_runtime_repository_1",
+      { text: "INSERT failing inner" },
+      "ROLLBACK TO SAVEPOINT lcm_runtime_repository_1",
+      "RELEASE SAVEPOINT lcm_runtime_repository_1",
+      { text: "UPDATE after inner recovery" },
+      "COMMIT",
+    ]);
+  });
+
+  it("serializes savepoints with outer queries and fences nested or captured scopes", async () => {
+    const f = fixtures();
+    let captured!: PostgreSqlQueryExecutor;
+    let reportEntered!: () => void;
+    let releaseFirst!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      reportEntered = resolve;
+    });
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    await expect(f.runtime.transaction(async (transaction) => {
+      const scoped = transaction as PostgreSqlTransactionScopeExecutor;
+      await transaction.query(
+        { text: "SELECT before" },
+        { domain: "conversations", operation: "before" },
+      );
+      const operation = scoped.savepoint(async (inner) => {
+        captured = inner;
+        await expect(transaction.query(
+          { text: "SELECT outer nested" },
+          { domain: "conversations", operation: "outerNested" },
+        )).rejects.toMatchObject({
+          code: "STORAGE_TRANSACTION_SCOPE",
+          operation: "outerNested",
+        });
+        await expect(scoped.savepoint(
+          async () => undefined,
+          { domain: "conversations", operation: "nestedSavepoint" },
+        )).rejects.toMatchObject({
+          code: "STORAGE_TRANSACTION_SCOPE",
+          operation: "nestedSavepoint",
+        });
+        reportEntered();
+        await firstGate;
+        void inner.query(
+          { text: "SELECT inner" },
+          { domain: "conversations", operation: "inner" },
+        );
+        return "saved";
+      }, { domain: "conversations", operation: "savepoint" });
+      await entered;
+      const siblingQuery = transaction.query(
+        { text: "SELECT sibling" },
+        { domain: "conversations", operation: "sibling" },
+      );
+      const siblingSavepoint = scoped.savepoint(
+        async () => "second",
+        { domain: "conversations", operation: "siblingSavepoint" },
+      );
+      await Promise.resolve();
+      expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+        "BEGIN",
+        { text: "SELECT before" },
+        "SAVEPOINT lcm_runtime_repository_1",
+      ]);
+      releaseFirst();
+      await expect(Promise.all([
+        operation,
+        siblingQuery,
+        siblingSavepoint,
+      ])).resolves.toMatchObject(["saved", {}, "second"]);
+      await expect(captured.query(
+        { text: "SELECT escaped" },
+        { domain: "conversations", operation: "escapedInner" },
+      )).rejects.toMatchObject({
+        code: "STORAGE_TRANSACTION_SCOPE",
+        operation: "escapedInner",
+      });
+    }, { domain: "transaction", operation: "safeControlPath" }))
+      .resolves.toBeUndefined();
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      { text: "SELECT before" },
+      "SAVEPOINT lcm_runtime_repository_1",
+      { text: "SELECT inner" },
+      "RELEASE SAVEPOINT lcm_runtime_repository_1",
+      { text: "SELECT sibling" },
+      "SAVEPOINT lcm_runtime_repository_2",
+      "RELEASE SAVEPOINT lcm_runtime_repository_2",
+      "COMMIT",
+    ]);
   });
 
   it("honors omitted transaction options across success and failure paths", async () => {

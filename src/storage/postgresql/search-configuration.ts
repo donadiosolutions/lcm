@@ -92,6 +92,41 @@ export async function inspectPostgreSqlSearchConfiguration(
                       procedure.proowner OPERATOR(pg_catalog.=) namespace.nspowner
                     ) AS function_owned,
                     pg_catalog.bool_and(NOT procedure.prosecdef) AS function_invoker,
+                    pg_catalog.bool_and(
+                      EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.aclexplode(
+                          COALESCE(
+                            procedure.proacl,
+                            pg_catalog.acldefault('f', procedure.proowner)
+                          )
+                        ) AS owner_privilege
+                        WHERE owner_privilege.grantee
+                                OPERATOR(pg_catalog.=) procedure.proowner
+                          AND owner_privilege.grantor
+                                OPERATOR(pg_catalog.=) procedure.proowner
+                          AND owner_privilege.privilege_type
+                                OPERATOR(pg_catalog.=) 'EXECUTE'
+                          AND owner_privilege.is_grantable
+                                OPERATOR(pg_catalog.=) false
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.aclexplode(
+                          COALESCE(
+                            procedure.proacl,
+                            pg_catalog.acldefault('f', procedure.proowner)
+                          )
+                        ) AS privilege
+                        WHERE privilege.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid
+                           OR privilege.grantor
+                                OPERATOR(pg_catalog.<>) procedure.proowner
+                           OR privilege.privilege_type
+                                OPERATOR(pg_catalog.<>) 'EXECUTE'
+                           OR privilege.is_grantable
+                                OPERATOR(pg_catalog.<>) false
+                      )
+                    ) AS function_acl_ready,
                     pg_catalog.min(
                       COALESCE(pg_catalog.array_to_string(procedure.proconfig, E'\\n'), '')
                     ) AS function_config
@@ -135,7 +170,8 @@ export async function inspectPostgreSqlSearchConfiguration(
                   configuration_contract.mapping_count::text AS object_count,
                   COALESCE(
                     configuration_contract.configuration_owned
-                    AND function_contract.function_owned,
+                    AND function_contract.function_owned
+                    AND function_contract.function_acl_ready,
                     false
                   ) AS ownership_ready
            FROM configuration_contract

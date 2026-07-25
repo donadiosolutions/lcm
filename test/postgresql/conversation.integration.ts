@@ -1,0 +1,1206 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { beforeAll, describe, expect, it } from "vitest";
+import {
+  type PostgreSqlConversationScopedExecutor,
+  PostgreSqlConversationRepository,
+} from "../../src/storage/postgresql/conversation-repository.js";
+import {
+  assertHarnessReady,
+  type PostgreSqlTestDatabase,
+  withPostgreSqlTestDatabase,
+} from "./harness.js";
+import { exerciseConversationRepositoryConformance } from "../storage/conversation-conformance.js";
+
+beforeAll(assertHarnessReady);
+
+async function grantConversationRuntimePrivileges(
+  database: PostgreSqlTestDatabase,
+): Promise<void> {
+  const template = readFileSync(
+    join(process.cwd(), "docs", "postgresql-runtime-conversation-grants.sql"),
+    "utf8",
+  );
+  const sql = template
+    .split("\n")
+    .filter((line) => !line.startsWith("\\"))
+    .join("\n")
+    .replaceAll(':"lcm_runtime_role"', '"lcm_test_runtime"');
+  await database.migrator.query({ text: sql }, {
+    domain: "conversations",
+    operation: "grantConversationRuntimePrivileges",
+  });
+}
+
+async function createProject(
+  database: PostgreSqlTestDatabase,
+  label: string,
+): Promise<string> {
+  const result = await database.migrator.query<{ project_id: string }>({
+    text: `INSERT INTO lcm.projects (identity_key, display_name)
+           VALUES ($1, $2)
+           RETURNING project_id`,
+    values: [createHash("sha256").update(label).digest("hex"), label],
+  }, { domain: "identity", operation: "createConversationTestProject" });
+  return result.rows[0].project_id;
+}
+
+describe("PostgreSQL 18 conversation repository", () => {
+  it("requires the reviewed grants and preserves their least-privilege boundary", async () => {
+    await withPostgreSqlTestDatabase("conversation-grants", async (database) => {
+      const projectId = await createProject(database, "Conversation grants");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      await expect(repository.createConversation({ sessionId: "denied-secret" }))
+        .rejects.toMatchObject({
+          backend: "postgresql",
+          domain: "conversations",
+          operation: "createConversation",
+          projectId,
+        });
+
+      await grantConversationRuntimePrivileges(database);
+      await expect(repository.createConversation({ sessionId: "granted" }))
+        .resolves.toMatchObject({ sessionId: "granted" });
+
+      const privileges = await database.migrator.query<{
+        schema_usage: boolean;
+        schema_create: boolean;
+        conversations_select: boolean;
+        conversations_insert: boolean;
+        conversations_title_insert: boolean;
+        conversations_title_update: boolean;
+        conversations_sequence_usage: boolean;
+        conversations_sequence_select: boolean;
+        messages_select: boolean;
+        messages_delete: boolean;
+        messages_insert: boolean;
+        messages_content_insert: boolean;
+        messages_content_update: boolean;
+        messages_sequence_usage: boolean;
+        parts_select: boolean;
+        parts_insert: boolean;
+        parts_metadata_insert: boolean;
+        parts_delete: boolean;
+        summaries_select: boolean;
+        summaries_delete: boolean;
+        context_select: boolean;
+        context_delete: boolean;
+        context_update: boolean;
+        normalize_execute: boolean;
+        normalize_public_execute: boolean;
+        normalize_grant_option: boolean;
+        normalize_foreign_grantor: boolean;
+      }>({
+        text: `SELECT
+                 has_schema_privilege('lcm_test_runtime', 'lcm', 'USAGE') AS schema_usage,
+                 has_schema_privilege('lcm_test_runtime', 'lcm', 'CREATE') AS schema_create,
+                 has_table_privilege('lcm_test_runtime', 'lcm.conversations', 'SELECT') AS conversations_select,
+                 has_table_privilege('lcm_test_runtime', 'lcm.conversations', 'INSERT') AS conversations_insert,
+                 has_column_privilege('lcm_test_runtime', 'lcm.conversations', 'title', 'INSERT') AS conversations_title_insert,
+                 has_column_privilege('lcm_test_runtime', 'lcm.conversations', 'title', 'UPDATE') AS conversations_title_update,
+                 has_sequence_privilege('lcm_test_runtime', 'lcm.conversations_conversation_id_seq', 'USAGE') AS conversations_sequence_usage,
+                 has_sequence_privilege('lcm_test_runtime', 'lcm.conversations_conversation_id_seq', 'SELECT') AS conversations_sequence_select,
+                 has_table_privilege('lcm_test_runtime', 'lcm.messages', 'SELECT') AS messages_select,
+                 has_table_privilege('lcm_test_runtime', 'lcm.messages', 'DELETE') AS messages_delete,
+                 has_table_privilege('lcm_test_runtime', 'lcm.messages', 'INSERT') AS messages_insert,
+                 has_column_privilege('lcm_test_runtime', 'lcm.messages', 'content', 'INSERT') AS messages_content_insert,
+                 has_column_privilege('lcm_test_runtime', 'lcm.messages', 'content', 'UPDATE') AS messages_content_update,
+                 has_sequence_privilege('lcm_test_runtime', 'lcm.messages_message_id_seq', 'USAGE') AS messages_sequence_usage,
+                 has_table_privilege('lcm_test_runtime', 'lcm.message_parts', 'SELECT') AS parts_select,
+                 has_table_privilege('lcm_test_runtime', 'lcm.message_parts', 'INSERT') AS parts_insert,
+                 has_column_privilege('lcm_test_runtime', 'lcm.message_parts', 'metadata', 'INSERT') AS parts_metadata_insert,
+                 has_table_privilege('lcm_test_runtime', 'lcm.message_parts', 'DELETE') AS parts_delete,
+                 has_table_privilege('lcm_test_runtime', 'lcm.summary_messages', 'SELECT') AS summaries_select,
+                 has_table_privilege('lcm_test_runtime', 'lcm.summary_messages', 'DELETE') AS summaries_delete,
+                 has_table_privilege('lcm_test_runtime', 'lcm.context_items', 'SELECT') AS context_select,
+                 has_table_privilege('lcm_test_runtime', 'lcm.context_items', 'DELETE') AS context_delete,
+                 has_table_privilege('lcm_test_runtime', 'lcm.context_items', 'UPDATE') AS context_update,
+                 has_function_privilege(
+                   'lcm_test_runtime',
+                   'lcm.normalize_search_text(text)',
+                   'EXECUTE'
+                 ) AS normalize_execute,
+                 has_function_privilege(
+                   'public',
+                   'lcm.normalize_search_text(text)',
+                   'EXECUTE'
+                 ) AS normalize_public_execute,
+                 EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_proc AS procedure
+                   CROSS JOIN LATERAL pg_catalog.aclexplode(procedure.proacl) AS privilege
+                   WHERE procedure.oid = 'lcm.normalize_search_text(text)'::pg_catalog.regprocedure
+                     AND privilege.grantee = 'lcm_test_runtime'::pg_catalog.regrole
+                     AND privilege.is_grantable
+                 ) AS normalize_grant_option,
+                 EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_proc AS procedure
+                   CROSS JOIN LATERAL pg_catalog.aclexplode(procedure.proacl) AS privilege
+                   WHERE procedure.oid = 'lcm.normalize_search_text(text)'::pg_catalog.regprocedure
+                     AND privilege.grantee = 'lcm_test_runtime'::pg_catalog.regrole
+                     AND privilege.grantor <> procedure.proowner
+                 ) AS normalize_foreign_grantor`,
+      }, { domain: "conversations", operation: "inspectConversationRuntimePrivileges" });
+      expect(privileges.rows[0]).toEqual({
+        schema_usage: true,
+        schema_create: false,
+        conversations_select: true,
+        conversations_insert: false,
+        conversations_title_insert: true,
+        conversations_title_update: false,
+        conversations_sequence_usage: true,
+        conversations_sequence_select: false,
+        messages_select: true,
+        messages_delete: true,
+        messages_insert: false,
+        messages_content_insert: true,
+        messages_content_update: false,
+        messages_sequence_usage: true,
+        parts_select: true,
+        parts_insert: false,
+        parts_metadata_insert: true,
+        parts_delete: false,
+        summaries_select: true,
+        summaries_delete: false,
+        context_select: true,
+        context_delete: true,
+        context_update: false,
+        normalize_execute: true,
+        normalize_public_execute: false,
+        normalize_grant_option: false,
+        normalize_foreign_grantor: false,
+      });
+    });
+  });
+
+  it("passes the shared conversation repository contract and cascades eligible deletion", async () => {
+    await withPostgreSqlTestDatabase("conversation-round-trip", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation round trip");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const { messages, third } =
+        await exerciseConversationRepositoryConformance(repository);
+
+      expect(await repository.deleteMessages([messages[0].messageId, third.messageId])).toBe(2);
+      expect(await repository.deleteMessages([])).toBe(0);
+      expect(await repository.getMessageById(messages[0].messageId)).toBeNull();
+      expect(await repository.getMessageParts(messages[0].messageId)).toEqual([]);
+    });
+  });
+
+  it("isolates every lookup and mutation by project", async () => {
+    await withPostgreSqlTestDatabase("conversation-projects", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const firstProject = await createProject(database, "Conversation project A");
+      const secondProject = await createProject(database, "Conversation project B");
+      const first = new PostgreSqlConversationRepository(database.runtime, firstProject);
+      const second = new PostgreSqlConversationRepository(database.runtime, secondProject);
+      const firstConversation = await first.createConversation({ sessionId: "shared-session" });
+      const secondConversation = await second.createConversation({ sessionId: "shared-session" });
+      const firstMessage = await first.createMessage({
+        conversationId: firstConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first project",
+        tokenCount: 2,
+      });
+      const secondMessage = await second.createMessage({
+        conversationId: secondConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "second project",
+        tokenCount: 2,
+      });
+
+      expect((await first.getConversationBySessionId("shared-session"))?.conversationId)
+        .toBe(firstConversation.conversationId);
+      expect((await second.getConversationBySessionId("shared-session"))?.conversationId)
+        .toBe(secondConversation.conversationId);
+      expect(await first.getConversation(secondConversation.conversationId)).toBeNull();
+      expect(await first.getMessageById(secondMessage.messageId)).toBeNull();
+      expect(await first.getMessageCountBySessionId("shared-session")).toBe(1);
+      expect(await first.deleteMessages([secondMessage.messageId])).toBe(0);
+      expect(await second.getMessageById(secondMessage.messageId)).not.toBeNull();
+      expect(await first.getMessageById(firstMessage.messageId)).not.toBeNull();
+    });
+  });
+
+  it("uses the exact session residual and stable newest-segment tie ordering", async () => {
+    await withPostgreSqlTestDatabase("conversation-session-order", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation session ordering");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const older = await repository.createConversation({ sessionId: "tie-session", title: "older" });
+      const newer = await repository.createConversation({ sessionId: "tie-session", title: "newer" });
+      await database.migrator.query({
+        text: `UPDATE lcm.conversations
+               SET created_at = '2026-01-01T00:00:00.000Z',
+                   updated_at = '2026-01-01T00:00:00.000Z'
+               WHERE project_id = $1 AND conversation_id = ANY($2::bigint[])`,
+        values: [projectId, [older.conversationId, newer.conversationId]],
+      }, { domain: "conversations", operation: "forceConversationTimestampTie" });
+      expect((await repository.getConversationBySessionId("tie-session"))?.conversationId)
+        .toBe(newer.conversationId);
+      expect((await repository.getOrCreateConversation("tie-session"))?.conversationId)
+        .toBe(newer.conversationId);
+
+      const target = await repository.createConversation({ sessionId: "exact-target" });
+      const collision = await repository.createConversation({ sessionId: "hash-collision-decoy" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.conversations
+               ALTER COLUMN session_id_sha256 DROP EXPRESSION`,
+      }, { domain: "conversations", operation: "allowConversationHashCollisionFixture" });
+      await database.migrator.query({
+        text: `UPDATE lcm.conversations AS decoy
+               SET session_id_sha256 = target.session_id_sha256,
+                   created_at = target.created_at + interval '1 second',
+                   updated_at = target.updated_at + interval '1 second'
+               FROM lcm.conversations AS target
+               WHERE decoy.project_id = $1
+                 AND decoy.conversation_id = $2
+                 AND target.project_id = $1
+                 AND target.conversation_id = $3`,
+        values: [projectId, collision.conversationId, target.conversationId],
+      }, { domain: "conversations", operation: "forceConversationHashCollision" });
+      expect((await repository.getConversationBySessionId("exact-target"))?.conversationId)
+        .toBe(target.conversationId);
+    });
+  });
+
+  it("converges lock-waiting get-or-create calls under a REPEATABLE READ default", async () => {
+    await withPostgreSqlTestDatabase("conversation-get-or-create-race", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation race");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const configured = await database.runtime.query<{
+        default_transaction_isolation: string;
+      }>({
+        text: "SHOW default_transaction_isolation",
+      }, { domain: "conversations", operation: "inspectConversationIsolationDefault" });
+      expect(configured.rows[0]?.default_transaction_isolation).toBe("repeatable read");
+
+      let releaseBlocker!: () => void;
+      let markBlockerHeld!: () => void;
+      const blockerRelease = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+      const blockerHeld = new Promise<void>((resolve) => { markBlockerHeld = resolve; });
+      const blocker = database.migrator.transaction(async (transaction) => {
+        await transaction.query({
+          text: `SELECT pg_catalog.pg_advisory_xact_lock(
+                          pg_catalog.hashtextextended(
+                            $1::pg_catalog.uuid::pg_catalog.text
+                              OPERATOR(pg_catalog.||) ':conversation:'
+                              OPERATOR(pg_catalog.||)
+                                pg_catalog.encode(
+                                  public.digest($2::pg_catalog.text, 'sha256'),
+                                  'hex'
+                                ),
+                            0
+                          )
+                        )`,
+          values: [projectId, "shared-race"],
+        }, { domain: "conversations", operation: "holdConversationAdvisoryLock" });
+        markBlockerHeld();
+        await blockerRelease;
+      }, { domain: "transaction", operation: "holdConversationAdvisoryLock" });
+      await blockerHeld;
+
+      const pendingRows = Promise.all([
+        repository.getOrCreateConversation("shared-race", "candidate-0"),
+        repository.getOrCreateConversation("shared-race", "candidate-1"),
+      ]);
+      let bothBlocked = false;
+      try {
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          const locks = await database.migrator.query<{ count: number }>({
+            text: `SELECT pg_catalog.count(*)::integer AS count
+                   FROM pg_catalog.pg_locks
+                   WHERE locktype = 'advisory'
+                     AND database = (
+                       SELECT oid
+                       FROM pg_catalog.pg_database
+                       WHERE datname = pg_catalog.current_database()
+                     )
+                     AND NOT granted`,
+          }, { domain: "conversations", operation: "inspectConversationAdvisoryWaiters" });
+          if ((locks.rows[0]?.count ?? 0) >= 2) {
+            bothBlocked = true;
+            break;
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        releaseBlocker();
+        await blocker;
+      }
+      expect(bothBlocked).toBe(true);
+      const rows = await pendingRows;
+
+      expect(new Set(rows.map((row) => row.conversationId)).size).toBe(1);
+      expect((await repository.listConversations()).filter(
+        (row) => row.sessionId === "shared-race",
+      )).toHaveLength(1);
+    }, { defaultTransactionIsolation: "REPEATABLE READ" });
+  });
+
+  it("canonicalizes equivalent project UUID spellings before advisory locking", async () => {
+    await withPostgreSqlTestDatabase("conversation-project-lock-canonical", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation canonical project lock");
+      const sessionId = "canonical-project-race";
+      const insertBarrierKey = "8675309001";
+      await database.migrator.query({
+        text: `CREATE FUNCTION public.block_canonical_project_conversation_insert()
+               RETURNS trigger
+               LANGUAGE plpgsql
+               SECURITY DEFINER
+               SET search_path = pg_catalog
+               AS $function$
+               BEGIN
+                 IF NEW.session_id OPERATOR(pg_catalog.=) '${sessionId}' THEN
+                   PERFORM pg_catalog.pg_advisory_xact_lock(${insertBarrierKey});
+                 END IF;
+                 RETURN NEW;
+               END
+               $function$`,
+      }, { domain: "conversations", operation: "createCanonicalProjectInsertBarrier" });
+      await database.migrator.query({
+        text: `CREATE TRIGGER block_canonical_project_conversation_insert
+               BEFORE INSERT ON lcm.conversations
+               FOR EACH ROW
+               EXECUTE FUNCTION public.block_canonical_project_conversation_insert()`,
+      }, { domain: "conversations", operation: "installCanonicalProjectInsertBarrier" });
+
+      let releaseBarrier!: () => void;
+      let markBarrierHeld!: () => void;
+      const barrierRelease = new Promise<void>((resolve) => { releaseBarrier = resolve; });
+      const barrierHeld = new Promise<void>((resolve) => { markBarrierHeld = resolve; });
+      const blocker = database.migrator.transaction(async (transaction) => {
+        await transaction.query({
+          text: "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.int8)",
+          values: [insertBarrierKey],
+        }, { domain: "conversations", operation: "holdCanonicalProjectInsertBarrier" });
+        markBarrierHeld();
+        await barrierRelease;
+      }, { domain: "transaction", operation: "holdCanonicalProjectInsertBarrier" });
+      await barrierHeld;
+
+      const lowercaseRepository = new PostgreSqlConversationRepository(
+        database.runtime,
+        projectId.toLowerCase(),
+      );
+      const uppercaseRepository = new PostgreSqlConversationRepository(
+        database.runtime,
+        projectId.toUpperCase(),
+      );
+      const pendingRows = Promise.all([
+        lowercaseRepository.getOrCreateConversation(sessionId, "lowercase"),
+        uppercaseRepository.getOrCreateConversation(sessionId, "uppercase"),
+      ]);
+      let bothOperationsBlocked = false;
+      try {
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          const locks = await database.migrator.query<{ count: number }>({
+            text: `SELECT pg_catalog.count(*)::integer AS count
+                   FROM pg_catalog.pg_locks
+                   WHERE locktype = 'advisory'
+                     AND database = (
+                       SELECT oid
+                       FROM pg_catalog.pg_database
+                       WHERE datname = pg_catalog.current_database()
+                     )
+                     AND NOT granted`,
+          }, { domain: "conversations", operation: "inspectCanonicalProjectWaiters" });
+          if ((locks.rows[0]?.count ?? 0) >= 2) {
+            bothOperationsBlocked = true;
+            break;
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        releaseBarrier();
+        await blocker;
+      }
+      expect(bothOperationsBlocked).toBe(true);
+      const rows = await pendingRows;
+
+      expect(new Set(rows.map((row) => row.conversationId)).size).toBe(1);
+      expect((await lowercaseRepository.listConversations()).filter(
+        (row) => row.sessionId === sessionId,
+      )).toHaveLength(1);
+    }, { defaultTransactionIsolation: "REPEATABLE READ" });
+  });
+
+  it("allocates concurrent append batches contiguously without interleaving", async () => {
+    await withPostgreSqlTestDatabase("conversation-append-race", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation append race");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const conversation = await repository.createConversation({ sessionId: "append-race" });
+      const batches = await Promise.all(Array.from({ length: 8 }, (_, batch) =>
+        repository.appendMessages(conversation.conversationId, [
+          { role: "user", content: `${batch}-a`, tokenCount: 1 },
+          { role: "assistant", content: `${batch}-b`, tokenCount: 1 },
+          { role: "tool", content: `${batch}-c`, tokenCount: 1 },
+        ])));
+
+      expect((await repository.getMessages(conversation.conversationId))
+        .map((message) => message.seq)).toEqual(Array.from({ length: 24 }, (_, index) => index));
+      for (const batch of batches) {
+        expect(batch.map((message) => message.seq)).toEqual([
+          batch[0].seq,
+          batch[0].seq + 1,
+          batch[0].seq + 2,
+        ]);
+      }
+    });
+  });
+
+  it("refreshes a lock-waiting append snapshot under a REPEATABLE READ default", async () => {
+    await withPostgreSqlTestDatabase("conversation-append-repeatable-read", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation append repeatable read");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const conversation = await repository.createConversation({
+        sessionId: "append-repeatable-read",
+      });
+      const configured = await database.runtime.query<{
+        default_transaction_isolation: string;
+      }>({
+        text: "SHOW default_transaction_isolation",
+      }, { domain: "conversations", operation: "inspectAppendIsolationDefault" });
+      expect(configured.rows[0]?.default_transaction_isolation).toBe("repeatable read");
+
+      let releaseBlocker!: () => void;
+      let markBlockerHeld!: () => void;
+      const blockerRelease = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+      const blockerHeld = new Promise<void>((resolve) => { markBlockerHeld = resolve; });
+      const blocker = database.migrator.transaction(async (transaction) => {
+        await transaction.query({
+          text: `SELECT conversation_id
+                 FROM lcm.conversations
+                 WHERE project_id = $1
+                   AND conversation_id = $2
+                 FOR UPDATE`,
+          values: [projectId, conversation.conversationId],
+        }, { domain: "conversations", operation: "holdAppendConversationLock" });
+        markBlockerHeld();
+        await blockerRelease;
+      }, { domain: "transaction", operation: "holdAppendConversationLock" });
+      await blockerHeld;
+
+      const pendingAppends = Promise.all([
+        repository.appendMessages(conversation.conversationId, [
+          { role: "user", content: "two-0", tokenCount: 1 },
+          { role: "assistant", content: "two-1", tokenCount: 1 },
+        ]),
+        repository.appendMessages(conversation.conversationId, [
+          { role: "user", content: "three-0", tokenCount: 1 },
+          { role: "assistant", content: "three-1", tokenCount: 1 },
+          { role: "tool", content: "three-2", tokenCount: 1 },
+        ]),
+      ]);
+      let bothBlocked = false;
+      let observedLocks: readonly {
+        readonly pid: number;
+        readonly locktype: string | null;
+        readonly mode: string | null;
+      }[] = [];
+      try {
+        for (let attempt = 0; attempt < 160; attempt += 1) {
+          const locks = await database.migrator.query<{
+            pid: number;
+            locktype: string | null;
+            mode: string | null;
+          }>({
+            text: `SELECT activity.pid,
+                          locks.locktype,
+                          locks.mode
+                   FROM pg_catalog.pg_stat_activity AS activity
+                   LEFT JOIN pg_catalog.pg_locks AS locks
+                     ON locks.pid = activity.pid
+                    AND NOT locks.granted
+                   WHERE activity.datname = pg_catalog.current_database()
+                     AND activity.pid <> pg_catalog.pg_backend_pid()
+                     AND activity.usename = 'lcm_test_runtime'
+                   ORDER BY activity.pid, locks.locktype, locks.mode`,
+          }, { domain: "conversations", operation: "inspectAppendRowLockWaiter" });
+          observedLocks = locks.rows;
+          if (new Set(
+            observedLocks
+              .filter((row) => row.locktype !== null)
+              .map((row) => row.pid),
+          ).size >= 2) {
+            bothBlocked = true;
+            break;
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        releaseBlocker();
+        await blocker;
+      }
+      expect(
+        bothBlocked,
+        `expected two runtime lock waiters; observed ${JSON.stringify(observedLocks)}`,
+      ).toBe(true);
+      const appended = await pendingAppends;
+
+      expect(appended.map((batch) => batch.length).sort()).toEqual([2, 3]);
+      for (const batch of appended) {
+        expect(batch.map((message) => message.seq)).toEqual(
+          Array.from({ length: batch.length }, (_, offset) => batch[0].seq + offset),
+        );
+      }
+      expect((await repository.getMessages(conversation.conversationId))
+        .map((message) => message.seq)).toEqual([0, 1, 2, 3, 4]);
+    }, { defaultTransactionIsolation: "REPEATABLE READ" });
+  });
+
+  it("protects summarized messages while deleting eligible context and owned parts", async () => {
+    await withPostgreSqlTestDatabase("conversation-protected-delete", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation protected deletion");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const conversation = await repository.createConversation({ sessionId: "protected-delete" });
+      const [protectedMessage, eligibleMessage] = await repository.appendMessages(
+        conversation.conversationId,
+        [
+          { role: "user", content: "summarized", tokenCount: 1 },
+          { role: "assistant", content: "eligible", tokenCount: 1 },
+        ],
+      );
+      await repository.createMessageParts(protectedMessage.messageId, [{
+        sessionId: "protected-delete",
+        partType: "text",
+        ordinal: 0,
+        textContent: "protected part",
+      }]);
+      await repository.createMessageParts(eligibleMessage.messageId, [{
+        sessionId: "protected-delete",
+        partType: "text",
+        ordinal: 0,
+        textContent: "eligible part",
+      }]);
+
+      const summary = await database.migrator.query<{ summary_key: string }>({
+        text: `INSERT INTO lcm.summaries (
+                 summary_id, project_id, conversation_id, kind, content, token_count
+               )
+               VALUES ($1, $2, $3, 'leaf', $4, 1)
+               RETURNING summary_key`,
+        values: [
+          "protected-delete-summary",
+          projectId,
+          conversation.conversationId,
+          "summary",
+        ],
+      }, { domain: "summaries", operation: "createProtectedDeletionSummaryFixture" });
+      await database.migrator.query({
+        text: `INSERT INTO lcm.summary_messages (
+                 project_id, conversation_id, summary_key, message_id, ordinal
+               )
+               VALUES ($1, $2, $3, $4, 0)`,
+        values: [
+          projectId,
+          conversation.conversationId,
+          summary.rows[0].summary_key,
+          protectedMessage.messageId,
+        ],
+      }, { domain: "summaries", operation: "linkProtectedDeletionSummaryFixture" });
+      await database.migrator.query({
+        text: `INSERT INTO lcm.context_items (
+                 project_id, conversation_id, ordinal, item_type, message_id
+               )
+               VALUES ($1, $2, 0, 'message', $3)`,
+        values: [projectId, conversation.conversationId, eligibleMessage.messageId],
+      }, { domain: "context", operation: "createProtectedDeletionContextFixture" });
+
+      expect(await repository.deleteMessages([
+        protectedMessage.messageId,
+        eligibleMessage.messageId,
+        eligibleMessage.messageId,
+      ])).toBe(1);
+      expect(await repository.getMessageById(protectedMessage.messageId)).not.toBeNull();
+      expect(await repository.getMessageParts(protectedMessage.messageId)).toHaveLength(1);
+      expect(await repository.getMessageById(eligibleMessage.messageId)).toBeNull();
+      expect(await repository.getMessageParts(eligibleMessage.messageId)).toEqual([]);
+
+      const residuals = await database.migrator.query<{
+        protected_link_count: string;
+        eligible_context_count: string;
+      }>({
+        text: `SELECT
+                 (
+                   SELECT COUNT(*)
+                   FROM lcm.summary_messages
+                   WHERE project_id = $1 AND message_id = $2
+                 ) AS protected_link_count,
+                 (
+                   SELECT COUNT(*)
+                   FROM lcm.context_items
+                   WHERE project_id = $1 AND message_id = $3
+                 ) AS eligible_context_count`,
+        values: [projectId, protectedMessage.messageId, eligibleMessage.messageId],
+      }, { domain: "conversations", operation: "inspectProtectedDeletionResiduals" });
+      expect(residuals.rows[0]).toEqual({
+        protected_link_count: "1",
+        eligible_context_count: "0",
+      });
+    });
+  });
+
+  it("keeps bulk, parts, and delete changes inside an existing runtime transaction", async () => {
+    await withPostgreSqlTestDatabase("conversation-existing-transaction", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation existing transaction");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const conversation = await repository.createConversation({ sessionId: "existing-transaction" });
+      const victim = await repository.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "must survive rollback",
+        tokenCount: 1,
+      });
+      let insertedMessageId: number | undefined;
+
+      await expect(database.runtime.transaction(async (transaction) => {
+        // Binding the staged repository to the explicitly marked, already-open
+        // executor proves its operation savepoints join the caller's transaction
+        // without requiring a ProjectStorage adapter.
+        const transactionalRepository = new PostgreSqlConversationRepository(
+          transaction as PostgreSqlConversationScopedExecutor,
+          projectId,
+        );
+        const inserted = await transactionalRepository.createMessagesBulk([
+          {
+            conversationId: conversation.conversationId,
+            seq: 1,
+            role: "assistant",
+            content: "must roll back",
+            tokenCount: 1,
+          },
+        ]);
+        insertedMessageId = inserted[0].messageId;
+        await transactionalRepository.createMessageParts(inserted[0].messageId, [{
+          sessionId: "existing-transaction",
+          partType: "text",
+          ordinal: 0,
+          textContent: "must roll back",
+        }]);
+        expect(await transactionalRepository.deleteMessages([victim.messageId])).toBe(1);
+        throw new Error("force caller rollback");
+      }, {
+        domain: "conversations",
+        operation: "rollbackConversationMethods",
+        projectId,
+      })).rejects.toMatchObject({
+        backend: "postgresql",
+        domain: "conversations",
+        operation: "rollbackConversationMethods",
+        projectId,
+      });
+
+      expect(insertedMessageId).toBeDefined();
+      expect(await repository.getMessageById(insertedMessageId!)).toBeNull();
+      expect(await repository.getMessageParts(insertedMessageId!)).toEqual([]);
+      expect(await repository.getMessageById(victim.messageId)).not.toBeNull();
+    });
+  });
+
+  it("recovers a caught scoped constraint failure and commits later work", async () => {
+    await withPostgreSqlTestDatabase("conversation-scoped-constraint", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation scoped constraint");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const conversation = await repository.createConversation({
+        sessionId: "scoped-constraint",
+      });
+      await repository.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "existing",
+        tokenCount: 1,
+      });
+
+      await database.runtime.transaction(async (transaction) => {
+        const scoped = new PostgreSqlConversationRepository(
+          transaction as PostgreSqlConversationScopedExecutor,
+          projectId,
+        );
+        await expect(scoped.createMessagesBulk([
+          {
+            conversationId: conversation.conversationId,
+            seq: 1,
+            role: "assistant",
+            content: "rolled back first member",
+            tokenCount: 1,
+          },
+          {
+            conversationId: conversation.conversationId,
+            seq: 0,
+            role: "assistant",
+            content: "duplicate sequence",
+            tokenCount: 1,
+          },
+        ])).rejects.toMatchObject({
+          backend: "postgresql",
+          domain: "conversations",
+          operation: "createMessagesBulk",
+          projectId,
+        });
+        await scoped.createMessage({
+          conversationId: conversation.conversationId,
+          seq: 1,
+          role: "assistant",
+          content: "committed after recovery",
+          tokenCount: 1,
+        });
+        await scoped.markConversationBootstrapped(conversation.conversationId);
+      }, {
+        domain: "conversations",
+        operation: "recoverScopedConstraint",
+        projectId,
+      });
+
+      expect(await repository.hasMessage(
+        conversation.conversationId,
+        "assistant",
+        "rolled back first member",
+      )).toBe(false);
+      expect(await repository.hasMessage(
+        conversation.conversationId,
+        "assistant",
+        "duplicate sequence",
+      )).toBe(false);
+      expect(await repository.hasMessage(
+        conversation.conversationId,
+        "assistant",
+        "committed after recovery",
+      )).toBe(true);
+      expect(await repository.getConversation(conversation.conversationId))
+        .toMatchObject({ bootstrappedAt: expect.any(Date) });
+    });
+  });
+
+  it("round-trips safe bigint part ordinals and rejects unsafe or negative values", async () => {
+    await withPostgreSqlTestDatabase("conversation-part-ordinals", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation part ordinals");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const conversation = await repository.createConversation({ sessionId: "part-ordinals" });
+      const [message] = await repository.appendMessages(conversation.conversationId, [{
+        role: "user",
+        content: "parts",
+        tokenCount: 1,
+      }]);
+      const runtimeRole = await database.runtime.query<{ role: string }>({
+        text: "SELECT CURRENT_USER AS role",
+      }, { domain: "conversations", operation: "inspectMessagePartRuntimeRole" });
+      expect(runtimeRole.rows).toEqual([{ role: "lcm_test_runtime" }]);
+
+      const ordinalColumn = await database.migrator.query<{ data_type: string }>({
+        text: `SELECT data_type
+               FROM information_schema.columns
+               WHERE table_schema = 'lcm'
+                 AND table_name = 'message_parts'
+                 AND column_name = 'ordinal'`,
+      }, { domain: "conversations", operation: "inspectMessagePartOrdinalType" });
+      expect(ordinalColumn.rows).toEqual([{ data_type: "bigint" }]);
+
+      await repository.createMessageParts(message.messageId, [{
+        sessionId: "part-ordinals",
+        partType: "text",
+        ordinal: Number.MAX_SAFE_INTEGER,
+        textContent: "maximum safe ordinal",
+      }]);
+      await expect(repository.getMessageParts(message.messageId)).resolves.toMatchObject([{
+        ordinal: Number.MAX_SAFE_INTEGER,
+        textContent: "maximum safe ordinal",
+      }]);
+
+      await database.migrator.query({
+        text: `INSERT INTO lcm.message_parts (
+                 project_id, conversation_id, message_id, session_id,
+                 part_type, ordinal, text_content
+               )
+               VALUES ($1, $2, $3, 'part-ordinals', 'reasoning', $4, 'unsafe')`,
+        values: [
+          projectId,
+          conversation.conversationId,
+          message.messageId,
+          String(Number.MAX_SAFE_INTEGER + 1),
+        ],
+      }, { domain: "conversations", operation: "seedUnsafeMessagePartOrdinal" });
+      await expect(repository.getMessageParts(message.messageId)).rejects.toMatchObject({
+        field: "ordinal",
+        operation: "getMessageParts",
+      });
+      await expect(repository.createMessageParts(message.messageId, [{
+        sessionId: "part-ordinals",
+        partType: "text",
+        ordinal: -1,
+      }])).rejects.toMatchObject({
+        field: "ordinal",
+        operation: "createMessageParts",
+      });
+      await expect(repository.appendMessages(conversation.conversationId, [{
+        role: "assistant",
+        content: "negative tokens",
+        tokenCount: -1,
+      }])).rejects.toMatchObject({
+        field: "token_count",
+        operation: "appendMessages",
+      });
+      expect(await repository.getMessageCount(conversation.conversationId)).toBe(1);
+    });
+  });
+
+  it("reuses an active runtime transaction for get-or-create and append", async () => {
+    await withPostgreSqlTestDatabase("conversation-scoped-contention", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation scoped contention");
+      let conversationId: number | undefined;
+
+      await database.runtime.transaction(async (transaction) => {
+        await transaction.query({ text: "SELECT 1" }, {
+          domain: "conversations",
+          operation: "callerStatementBeforeRepository",
+          projectId,
+        });
+        const repository = new PostgreSqlConversationRepository(
+          transaction as PostgreSqlConversationScopedExecutor,
+          projectId,
+        );
+        const conversation = await repository.getOrCreateConversation(
+          "scoped-contention",
+          "Scoped",
+        );
+        conversationId = conversation.conversationId;
+        await expect(repository.appendMessages(conversation.conversationId, [
+          { role: "user", content: "first", tokenCount: 1 },
+          { role: "assistant", content: "second", tokenCount: 1 },
+        ])).resolves.toMatchObject([{ seq: 0 }, { seq: 1 }]);
+      }, {
+        domain: "conversations",
+        operation: "reuseConversationTransaction",
+        projectId,
+      });
+
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      expect(await repository.getConversationBySessionId("scoped-contention"))
+        .toMatchObject({ conversationId });
+      expect(await repository.getMessages(conversationId!))
+        .toMatchObject([{ seq: 0 }, { seq: 1 }]);
+    });
+  });
+
+  it("fails scoped contention operations closed after a prior REPEATABLE READ statement", async () => {
+    await withPostgreSqlTestDatabase("conversation-scoped-isolation", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation scoped isolation");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const conversation = await repository.createConversation({
+        sessionId: "scoped-isolation-owner",
+      });
+      await repository.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "existing",
+        tokenCount: 1,
+      });
+
+      await database.runtime.transaction(async (transaction) => {
+        await transaction.query({ text: "SELECT 1" }, {
+          domain: "conversations",
+          operation: "establishScopedRepeatableReadSnapshot",
+          projectId,
+        });
+        const scoped = new PostgreSqlConversationRepository(
+          transaction as PostgreSqlConversationScopedExecutor,
+          projectId,
+        );
+        for (const [operation, invoke] of [
+          [
+            "getOrCreateConversation",
+            () => scoped.getOrCreateConversation("scoped-isolation-new"),
+          ],
+          [
+            "appendMessages",
+            () => scoped.appendMessages(conversation.conversationId, [{
+              role: "assistant",
+              content: "must not append",
+              tokenCount: 1,
+            }]),
+          ],
+        ] as const) {
+          const error = await invoke().catch((caught: unknown) => caught);
+          expect(error).toMatchObject({
+            backend: "postgresql",
+            domain: "conversations",
+            field: "transaction_isolation",
+            operation,
+            projectId,
+          });
+          expect(error).not.toHaveProperty("cause");
+        }
+        await scoped.markConversationBootstrapped(conversation.conversationId);
+      }, {
+        domain: "conversations",
+        operation: "rejectScopedRepeatableReadContention",
+        projectId,
+      });
+
+      expect(await repository.getConversationBySessionId("scoped-isolation-new"))
+        .toBeNull();
+      expect(await repository.getMessages(conversation.conversationId))
+        .toMatchObject([{ content: "existing", seq: 0 }]);
+      expect(await repository.getConversation(conversation.conversationId))
+        .toMatchObject({ bootstrappedAt: expect.any(Date) });
+    }, { defaultTransactionIsolation: "REPEATABLE READ" });
+  });
+
+  it("rolls back caught scoped mapping failures without poisoning the caller transaction", async () => {
+    await withPostgreSqlTestDatabase("conversation-scoped-mapping", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation scoped mapping");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const safeConversation = await repository.createConversation({
+        sessionId: "scoped-safe-owner",
+      });
+      const beforeMaximumSafeInteger = String(Number.MAX_SAFE_INTEGER - 1);
+
+      await database.migrator.query({
+        text: `SELECT pg_catalog.setval(
+                 'lcm.conversations_conversation_id_seq'::pg_catalog.regclass,
+                 $1::pg_catalog.int8,
+                 true
+               )`,
+        values: [beforeMaximumSafeInteger],
+      }, { domain: "conversations", operation: "forceScopedUnsafeConversationIdentity" });
+      await repository.createConversation({ sessionId: "scoped-maximum-safe-conversation" });
+      await database.migrator.query({
+        text: `SELECT pg_catalog.setval(
+                 'lcm.messages_message_id_seq'::pg_catalog.regclass,
+                 $1::pg_catalog.int8,
+                 true
+               )`,
+        values: [beforeMaximumSafeInteger],
+      }, { domain: "conversations", operation: "forceScopedUnsafeMessageIdentity" });
+      await repository.createMessage({
+        conversationId: safeConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "scoped-maximum-safe-message",
+        tokenCount: 1,
+      });
+
+      await database.runtime.transaction(async (transaction) => {
+        const scoped = new PostgreSqlConversationRepository(
+          transaction as PostgreSqlConversationScopedExecutor,
+          projectId,
+        );
+        await expect(scoped.createConversation({
+          sessionId: "scoped-unsafe-conversation",
+        })).rejects.toMatchObject({ field: "conversation_id" });
+        await expect(scoped.createMessagesBulk([{
+          conversationId: safeConversation.conversationId,
+          seq: 1,
+          role: "assistant",
+          content: "scoped-unsafe-message",
+          tokenCount: 1,
+        }])).rejects.toMatchObject({ field: "message_id" });
+        await scoped.markConversationBootstrapped(safeConversation.conversationId);
+      }, {
+        domain: "conversations",
+        operation: "catchScopedMappingFailures",
+        projectId,
+      });
+
+      expect(await repository.getConversationBySessionId("scoped-unsafe-conversation"))
+        .toBeNull();
+      expect(await repository.hasMessage(
+        safeConversation.conversationId,
+        "assistant",
+        "scoped-unsafe-message",
+      )).toBe(false);
+      expect(await repository.getConversation(safeConversation.conversationId))
+        .toMatchObject({ bootstrappedAt: expect.any(Date) });
+    });
+  });
+
+  it("rolls back bulk messages, parts, and multi-message deletion on mid-batch failures", async () => {
+    await withPostgreSqlTestDatabase("conversation-atomicity", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation atomicity");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const conversation = await repository.createConversation({ sessionId: "atomic" });
+
+      await expect(repository.createMessagesBulk([
+        { conversationId: conversation.conversationId, seq: 0, role: "user", content: "first", tokenCount: 1 },
+        { conversationId: conversation.conversationId, seq: 0, role: "assistant", content: "duplicate", tokenCount: 1 },
+      ])).rejects.toMatchObject({ domain: "conversations" });
+      expect(await repository.getMessages(conversation.conversationId)).toEqual([]);
+
+      const [partsMessage, firstDelete, secondDelete] = await repository.appendMessages(
+        conversation.conversationId,
+        [
+          { role: "assistant", content: "parts", tokenCount: 1 },
+          { role: "user", content: "first delete", tokenCount: 1 },
+          { role: "user", content: "second delete", tokenCount: 1 },
+        ],
+      );
+      await expect(repository.createMessageParts(partsMessage.messageId, [
+        { sessionId: "atomic", partType: "text", ordinal: 0, textContent: "first" },
+        { sessionId: "atomic", partType: "reasoning", ordinal: 0, textContent: "duplicate" },
+      ])).rejects.toMatchObject({ domain: "conversations" });
+      expect(await repository.getMessageParts(partsMessage.messageId)).toEqual([]);
+
+      await database.migrator.query({
+        text: `CREATE FUNCTION public.fail_selected_message_delete()
+               RETURNS trigger
+               LANGUAGE plpgsql
+               SECURITY DEFINER
+               SET search_path = pg_catalog
+               AS $function$
+               BEGIN
+                 IF OLD.message_id = ${secondDelete.messageId} THEN
+                   RAISE EXCEPTION 'injected delete failure';
+                 END IF;
+                 RETURN OLD;
+               END
+               $function$;
+               REVOKE ALL ON FUNCTION public.fail_selected_message_delete() FROM PUBLIC;
+               CREATE TRIGGER fail_selected_message_delete
+               BEFORE DELETE ON lcm.messages
+               FOR EACH ROW EXECUTE FUNCTION public.fail_selected_message_delete()`,
+      }, { domain: "conversations", operation: "installDeleteFailureTrigger" });
+      await expect(repository.deleteMessages([firstDelete.messageId, secondDelete.messageId]))
+        .rejects.toMatchObject({ domain: "conversations" });
+      expect(await repository.getMessageById(firstDelete.messageId)).not.toBeNull();
+      expect(await repository.getMessageById(secondDelete.messageId)).not.toBeNull();
+    });
+  });
+
+  it("rejects unsafe generated bigint identities without residual writes", async () => {
+    await withPostgreSqlTestDatabase("conversation-unsafe-identities", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation unsafe identities");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const safeConversation = await repository.createConversation({
+        sessionId: "safe-identity-owner",
+      });
+      const beforeMaximumSafeInteger = String(Number.MAX_SAFE_INTEGER - 1);
+
+      await database.migrator.query({
+        text: `SELECT pg_catalog.setval(
+                 'lcm.conversations_conversation_id_seq'::pg_catalog.regclass,
+                 $1::pg_catalog.int8,
+                 true
+               )`,
+        values: [beforeMaximumSafeInteger],
+      }, { domain: "conversations", operation: "forceUnsafeConversationIdentity" });
+      const maximumSafeConversation = await repository.createConversation({
+        sessionId: "maximum-safe-generated-conversation",
+      });
+      expect(maximumSafeConversation.conversationId).toBe(Number.MAX_SAFE_INTEGER);
+      await expect(repository.createConversation({
+        sessionId: "unsafe-generated-conversation",
+      })).rejects.toMatchObject({
+        backend: "postgresql",
+        domain: "conversations",
+        operation: "createConversation",
+        projectId,
+      });
+
+      await database.migrator.query({
+        text: `SELECT pg_catalog.setval(
+                 'lcm.messages_message_id_seq'::pg_catalog.regclass,
+                 $1::pg_catalog.int8,
+                 true
+               )`,
+        values: [beforeMaximumSafeInteger],
+      }, { domain: "conversations", operation: "forceUnsafeMessageIdentity" });
+      const maximumSafeMessage = await repository.createMessage({
+        conversationId: safeConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "maximum-safe-generated-message",
+        tokenCount: 1,
+      });
+      expect(maximumSafeMessage.messageId).toBe(Number.MAX_SAFE_INTEGER);
+      await expect(repository.createMessage({
+        conversationId: safeConversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "unsafe-generated-single",
+        tokenCount: 1,
+      })).rejects.toMatchObject({
+        backend: "postgresql",
+        domain: "conversations",
+        operation: "createMessage",
+        projectId,
+      });
+      await expect(repository.createMessagesBulk([
+        {
+          conversationId: safeConversation.conversationId,
+          seq: 1,
+          role: "user",
+          content: "unsafe-generated-bulk-first",
+          tokenCount: 1,
+        },
+        {
+          conversationId: safeConversation.conversationId,
+          seq: 2,
+          role: "assistant",
+          content: "unsafe-generated-bulk-second",
+          tokenCount: 1,
+        },
+      ])).rejects.toMatchObject({
+        backend: "postgresql",
+        domain: "conversations",
+        operation: "createMessagesBulk",
+        projectId,
+      });
+      await expect(repository.appendMessages(safeConversation.conversationId, [{
+        role: "user",
+        content: "unsafe-generated-append",
+        tokenCount: 1,
+      }])).rejects.toMatchObject({
+        backend: "postgresql",
+        domain: "conversations",
+        operation: "appendMessages",
+        projectId,
+      });
+
+      const residuals = await database.migrator.query<{
+        conversation_count: string;
+        message_count: string;
+      }>({
+        text: `SELECT
+                 (
+                   SELECT COUNT(*)
+                   FROM lcm.conversations
+                   WHERE project_id = $1
+                     AND session_id = 'unsafe-generated-conversation'
+                 ) AS conversation_count,
+                 (
+                   SELECT COUNT(*)
+                   FROM lcm.messages
+                   WHERE project_id = $1
+                     AND content LIKE 'unsafe-generated-%'
+                 ) AS message_count`,
+        values: [projectId],
+      }, { domain: "conversations", operation: "inspectUnsafeIdentityResiduals" });
+      expect(residuals.rows[0]).toEqual({
+        conversation_count: "0",
+        message_count: "0",
+      });
+      expect(await repository.getConversation(safeConversation.conversationId)).not.toBeNull();
+    });
+  });
+});

@@ -6,10 +6,12 @@ This reference describes the durable PostgreSQL baseline introduced by
 keys. This is a schema and readiness contract, not an enabled
 application backend. SQLite remains the authoritative production adapter.
 PostgreSQL machine and project identity operations are enabled by issue #84.
-Managed daemons may start with PostgreSQL selected so those operations are
-available, but storage-backed health, status, statistics, and data routes remain
-fail-closed until the domain repositories in issues #85–#91 pass conformance
-and the cutover work in #92 explicitly enables the backend.
+The conversation, message, and message-part adapter added by issue #85 is
+available for repository conformance but is not routed through the daemon or
+CLI. Managed daemons may start with PostgreSQL selected so identity operations
+are available, but storage-backed health, status, statistics, and data routes
+remain fail-closed until the domain repositories in issues #86–#91 pass
+conformance and the cutover work in #92 explicitly enables the backend.
 
 The design is single-user and multi-machine. Project scoping prevents accidental
 cross-project relationships; it is not a tenant or authorization boundary and
@@ -111,10 +113,10 @@ does not add row-level security.
   parent/child relationship involving a managed table. Relation ACL
   fingerprints expand the effective ACL, including PostgreSQL's default ACL
   when `relacl` is null. They normalize the owning role and exact non-grantable
-  identity-repository privilege shapes granted to named runtime roles by the
-  documented script. Any `PUBLIC`, grantable, foreign-grantor, missing-owner,
-  or privilege outside that allowlist on an allowlisted table or identity
-  sequence therefore fails closed.
+  identity- and conversation-repository privilege shapes granted to named
+  runtime roles by the documented scripts. Any `PUBLIC`, grantable,
+  foreign-grantor, missing-owner, or privilege outside that allowlist on an
+  allowlisted table or identity sequence therefore fails closed.
   Column ACL fingerprints retain every allowlisted column even when `attacl`
   is null and expand every explicit entry. They normalize only the script's
   exact insert and update column-grant shapes for named runtime roles; any
@@ -221,24 +223,108 @@ does not add row-level security.
 Issue #83 stores the complete content supplied for indexed messages, summaries,
 and promoted memories. It does not silently truncate content before generating
 the normalized `tsvector` or trigram index entries. PostgreSQL full-text search
-does not index a lexeme that reaches its implementation-specific per-lexeme
-size limit, so adapters must not assume that every arbitrarily large token is
-searchable. The exact byte boundary is a PostgreSQL implementation and encoding
-detail, not a stable LCM schema constant.
+does not index a lexeme that reaches its per-lexeme size limit. The
+[PostgreSQL 18 full-text limitations](https://www.postgresql.org/docs/18/textsearch-limitations.html)
+describe this as shorter than 2 KiB. In the pinned PostgreSQL 18 source,
+`MAXSTRLEN` is 2,047 and the parser omits a token whose byte length is greater
+than or equal to that value. The largest safe parsed lexeme is therefore 2,046
+UTF-8 bytes. That boundary applies after `lcm.normalize_search_text(text)` and
+PostgreSQL text parsing; a raw-content character or whitespace limit is not an
+equivalent test.
 
-Before enabling their write paths, issues #84–#91 must establish and test a
-searchable-content bound against the pinned PostgreSQL 18 runtime. Input beyond
-that bound must be rejected as searchable content or routed without data loss
-to the appropriate `message_parts` or `large_files` representation, with a
-bounded searchable summary or reference where the repository contract requires
-one. Truncating the canonical message, summary, or promoted-memory content is
-not an acceptable fallback.
+Issue #85 preserves canonical message content and provides write conformance,
+but lexical indexing is explicitly outside its scope. Its writes do not promise
+that every oversized normalized parser token is retrievable through full-text
+search, and they do not truncate canonical content to create that impression.
+Issue #89 must pin the 2,046-byte post-normalization/parser boundary with the
+PostgreSQL 18 UTF-8 harness, then define rejection or lossless routing through
+`message_parts` or `large_files` before #224 activates PostgreSQL application
+writes. Future searchable write adapters in #86–#91 must make the same decision
+for their own fields rather than applying a database-independent raw-token
+approximation.
 
 Those adapters must also benchmark the write cost of pinned normalization plus
 generated full-text and trigram index maintenance before enabling high-volume
 ingest. The measured workload should include representative content sizes,
 languages, concurrency, and the oversized-payload routing path; issue #83 does
 not claim a throughput budget for future repository implementations.
+
+## Conversation repository contract
+
+A session can contain more than one conversation segment. Creating a
+conversation explicitly always creates a new segment. Session lookup returns
+the newest exact-text match ordered by `created_at DESC, conversation_id DESC`;
+the SHA-256 value is only a bounded lookup candidate and never replaces the
+exact `session_id` residual. Concurrent get-or-create calls for the same
+project and exact session are serialized by a transaction-scoped advisory lock
+and converge on that newest segment. The lock key casts the project ID through
+PostgreSQL's UUID type first, so equivalent uppercase and lowercase UUID text
+cannot select different locks.
+
+Conversation lists use `created_at, conversation_id` ascending. Messages use
+their conversation-scoped `seq` ascending, and message parts use `ordinal`
+ascending. PostgreSQL stores part ordinals as `bigint`; the adapter accepts
+nonnegative JavaScript safe integers and applies the same checked conversion
+when reading them. These final identity tie-breakers are part of the repository
+contract, so equal timestamps do not make pagination or selection
+nondeterministic.
+
+`appendMessages` allocates a whole batch while holding a row lock on the owning
+conversation. The first appended message uses sequence `0`; later batches use
+`MAX(seq) + 1` and receive a contiguous range. Append token counts must be
+nonnegative safe integers and are rejected before a transaction starts when
+invalid. Conversation session/title text, message content, and every
+message-part text field are rejected before transaction or query entry when
+they contain U+0000 (NUL); metadata receives only this check and otherwise
+remains opaque. Explicit-sequence single and bulk creation remain available for
+replay and import. These two write modes may
+be used sequentially, but callers must
+not run append allocation and explicit-sequence creation concurrently for the
+same conversation: the row lock coordinates append allocators, while
+replay/import deliberately supplies its own sequence values. Concurrent
+append-only calls remain safe. Bulk message creation, part insertion, and
+multi-message deletion are atomic
+operations: they either commit completely or leave no partial rows. When
+called inside a repository transaction they join that transaction instead of
+opening a nested one. Every scoped operation uses the same executor-level FIFO;
+mapped writes, bootstrap marking, and part insertion use runtime-owned
+savepoint callbacks with generated identifiers, private control SQL, a drained
+temporary inner executor, and async-context fencing of outer or nested scope
+use from inside the callback. Independent sibling operations queue behind the
+complete savepoint lifecycle, while captured inner executors reject after the
+callback settles. Ordinary statement and mapping failures recover only when
+both `ROLLBACK TO` and `RELEASE` succeed; open, control, connection, and abort
+failures poison the outer transaction. Reads therefore cannot observe
+transient rows and savepoints cannot overlap. Scoped get-or-create and append
+first verify the effective transaction isolation is
+exactly `READ COMMITTED`; missing, malformed, or stronger isolation fails with
+a sanitized storage error before any advisory lock, row lock, or write. Begin
+the outer transaction at `READ COMMITTED`, or call these methods through a root
+repository that creates its own short transaction; a scoped repository cannot
+change isolation after the outer transaction has executed a statement.
+Only serialization failures (`40001`) and deadlocks (`40P01`) are retried, with
+at most three attempts; a commit whose outcome is uncertain is never replayed
+automatically.
+
+`getMaxSeq` preserves SQLite's legacy return value of `0` for an empty
+conversation. A conversation containing only sequence `0` has the same
+maximum, so `0` is not an emptiness signal; callers must use `getMessageCount`
+when they need to distinguish those states.
+
+Message deletion retains the SQLite summary-protection rule. A message
+referenced by `summary_messages` is skipped, while an eligible message is
+removed from active `context_items` before the message is deleted. Owned
+`message_parts` then disappear through the existing cascade. The complete
+multi-ID operation is atomic, including the skipped-message decisions.
+
+PostgreSQL exposes generated `bigint` identities, sequence values, and counts
+as text through the driver. The adapter parses decimal strings and native
+bigints exactly, checks them against bigint forms of
+`Number.MIN_SAFE_INTEGER` and `Number.MAX_SAFE_INTEGER`, and only then converts
+them to JavaScript numbers. Malformed, fractional, exponent-form, or
+out-of-range values fail with a sanitized storage error instead of being
+rounded. Nonnegative domain checks remain independently enforced by the
+schema.
 
 ## Ownership, deletion, and retention
 
@@ -288,7 +374,7 @@ deletion.
 | --- | --- | --- |
 | `conversations` | Project-scoped source root. Project deletion is restricted; an explicit conversation deletion owns messages, summaries, context, and large-file metadata. Multiple rows may represent segments of one session. | Generated `bigint` primary key and scoped identity; exact nonnull session text, including whitespace-only and arbitrary-length caller values accepted by the shared contract; ordered timestamps and optional bootstrap time. `conversations_project_order_idx` supplies deterministic newest-first project ordering, while `conversations_session_lookup_idx` uses the fixed-width session SHA-256 candidate. Every lookup retains exact `session_id` equality as a collision residual. |
 | `messages` | Owned by a conversation and cascades with it. Coverage, context, and transcript provenance references restrict direct deletion until those relationships are handled. | Generated `bigint` primary key; scoped unique sequence and identity; nonnegative sequence and token count; four-role enum. The scoped sequence unique index provides conversation order and `messages_project_created_idx` provides stable project order; `messages_search_document_idx` and `messages_content_trgm_idx` provide FTS and substring/fuzzy access. |
-| `message_parts` | Owned by a message and cascades with it. | UUID primary key with a UUIDv7 default; unique scoped ordinal; exact nonnull session text; closed part-type enum; nonnegative ordinal and token fields; finite nonnegative cost. Nullable metadata is opaque text and round-trips unchanged. `message_parts_type_idx` supports scoped type/order access. |
+| `message_parts` | Owned by a message and cascades with it. | UUID primary key with a UUIDv7 default; unique scoped nonnegative `bigint` ordinal, checked by the adapter before JavaScript conversion; exact nonnull session text; closed part-type enum; nonnegative token fields; finite nonnegative cost. Nullable metadata is opaque text and round-trips unchanged. `message_parts_type_idx` supports scoped type/order access. |
 | `native_transcripts` | Project- and machine-scoped scrubbed source. Both roots restrict deletion. The #86 repository is append-only and exposes no pre-redaction or implicit deletion path. | UUIDv7-enforced primary key; nonblank client/format/version/session/scrubber/source fields; nonnegative source ordinal; 64-character lowercase SHA-256 content digest and ingest key; object-or-array JSON payload; idempotent `(project_id, machine_id, ingest_key)`; `ingested_at >= observed_at`. Source-order and fixed-width native-session digest indexes give deterministic provenance scans with exact-text residuals; `native_transcripts_payload_idx` supplies JSONB path containment. |
 | `transcript_messages` | Transcript-owned provenance join: deleting a transcript cascades its links, while the derived message side restricts deletion. | Scoped transcript and message foreign keys; unique message and source ordinal within a transcript; nonnegative source ordinal. `transcript_messages_message_idx` supports reverse provenance lookup. |
 
@@ -476,8 +562,11 @@ LCM-owned `lcm.simple_v1` dictionary with 19 explicit token mappings. Its
 catalog fingerprint covers the parser OID, ordered token mappings, dictionary
 template/options and ownership, plus the complete
 `lcm.normalize_search_text(text)` definition, owner, security mode, and
-per-function configuration; no runtime role owns any of these objects. All
-stored vectors and query constructors must name `lcm.search_v1`.
+per-function configuration. Its ACL accepts the owning role plus non-`PUBLIC`
+runtime roles only when every entry is owner-granted, non-grantable `EXECUTE`;
+`PUBLIC`, grant-option, foreign-grantor, and other privilege shapes fail closed.
+No runtime role owns any of these objects. All stored vectors and query
+constructors must name `lcm.search_v1`.
 
 Changing the text-search configuration or normalization rules requires a new
 immutable migration; updating `unaccent` alone does not adopt new mappings.
@@ -540,15 +629,21 @@ identifier-quoted transfer guidance. Missing, malformed, or contradictory
 ownership catalog values fail closed without exposing the existing owner,
 connection details, or raw database errors.
 
-After schema creation, an administrator grants the issue #84 identity
-repository only its exact runtime privileges with the reviewed
+After schema creation, an administrator grants each implemented repository
+only its exact runtime privileges with the reviewed
 [`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql)
-script:
+and
+[`postgresql-runtime-conversation-grants.sql`](postgresql-runtime-conversation-grants.sql)
+scripts:
 
 ```bash
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file docs/postgresql-runtime-identity-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-conversation-grants.sql
 ```
 
 Replace `lcm_runtime` with the deployment's runtime role. The script grants
@@ -566,6 +661,19 @@ Without these grants, machine registration and project pairing fail closed
 with a sanitized PostgreSQL operation error. Migrations intentionally do not
 apply runtime grants because the migration role cannot safely infer a
 deployment's runtime role.
+
+The conversation script grants reads on conversations, messages, parts, and the
+two relationship tables needed for summary-protected deletion. Inserts are
+limited to repository-writable columns; updates are limited to conversation
+bootstrap timestamps; deletion is limited to messages and their active context
+references. The only sequence privilege is `USAGE` on the generated
+conversation and message identity sequences. Part deletion occurs through the
+message cascade, so the runtime receives no direct `DELETE` on
+`message_parts`. Message inserts evaluate the stored generated
+`search_document`, so the script also grants exact `EXECUTE` on
+`lcm.normalize_search_text(text)`; `PUBLIC` execution remains revoked.
+Applying these grants permits direct repository use and conformance testing
+only; daemon and CLI routing remain staged behind #224 and #92.
 
 Migration privilege hardening is likewise confined to LCM-owned objects: it
 does not change ACLs on unknown objects already present in `lcm`. If an

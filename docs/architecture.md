@@ -19,7 +19,9 @@ and hostname validation, sanitized SQLSTATE errors, abort cancellation,
 transactional migrations, extension readiness, and the complete durable schema
 baseline. Machine and project identity operations use that runtime directly.
 The general application storage factory remains staged while the domain
-adapters tracked by #85-#91 implement the shared repository contracts. With
+adapters tracked by #86-#91 implement the remaining shared repository
+contracts. The PostgreSQL conversation adapter is available to conformance
+tests but is not selected by daemon or CLI composition. With
 PostgreSQL selected, the daemon still opens its loopback listener and exposes
 an authenticated `/health` response with HTTP `503`, backend
 `postgresql`, and storage status `unavailable`; storage-backed routes also
@@ -39,14 +41,15 @@ message, traverse summary lineage, or record recall feedback—without exposing 
 SQL connection, statement, transaction object, placeholder syntax, or other
 backend-specific primitive.
 
-SQLite is the authoritative implementation of these contracts and remains the
-zero-configuration default. The reusable conformance suite is backend-neutral,
-while SQLite remains its only production domain adapter today. The PostgreSQL
-runtime, migration runner, identity repository, and isolated test-database
-lease are shared foundations; they do not enable the remaining domain
-repositories. Until all PostgreSQL domain adapters and rollout gates land,
-selecting `postgresql` leaves general storage routes explicitly unavailable
-behind the staged loopback daemon rather than falling back to SQLite.
+SQLite remains the zero-configuration production default. The reusable
+conformance suite is backend-neutral, and the PostgreSQL conversation adapter
+now implements the same conversation, message, and message-part contract.
+That adapter, the PostgreSQL runtime, migration runner, identity repository,
+and isolated test-database lease are shared foundations; they do not enable
+daemon or CLI routing. Until all PostgreSQL domain adapters and rollout gates
+land, selecting `postgresql` leaves general storage routes explicitly
+unavailable behind the staged loopback daemon rather than falling back to
+SQLite.
 
 ### PostgreSQL runtime and migrations
 
@@ -115,11 +118,12 @@ collation metadata; generated columns retain their formatted type, nullability,
 generated state, fully deparsed expression, and resolved collation. Tables must remain permanent with
 row-level security neither enabled nor forced, and cannot participate in
 inheritance or partition parent/child relationships.
-Effective relation ACLs normalize only the owner, so added `PUBLIC` or named
-role privileges and grant options fail closed while null and explicit
-owner-only defaults compare equally.
-Column ACL fingerprints preserve every no-ACL identity and reject any explicit
-column grant drift.
+Effective relation ACLs normalize the owner plus only the exact reviewed
+identity- and conversation-runtime grant shapes. Added `PUBLIC`,
+out-of-shape named-role privileges, foreign grantors, or grant options fail
+closed while null and explicit owner-only defaults compare equally. Column ACL
+fingerprints preserve every no-ACL identity and accept only the reviewed
+column-limited runtime writes.
 Identity sequences retain permanent persistence, allocation parameters,
 internal dependency, and owning table/column. Migration transactions pin
 `quote_all_identifiers = off` before catalog deparsing. Unknown operator-created
@@ -129,8 +133,11 @@ generated identity sequences, or the search-normalization, summary-identity,
 large-file-identity, and session-ingest-identity functions; unknown
 pre-existing object ACLs are preserved. The normalization function is created
 without replacement, so a same-signature collision fails and rolls back the
-pending migration rather than overwriting operator code. Runtime domain grants
-remain absent until their owning adapters land.
+pending migration rather than overwriting operator code. Runtime grants remain
+absent until their owning adapters land and an administrator applies the
+corresponding reviewed script. Normalization-function ACL readiness accepts
+only the owner plus non-`PUBLIC` runtime roles whose entries are
+non-grantable, owner-granted `EXECUTE`; broader privilege shapes fail closed.
 The three advisory-locked exact-identity triggers require `READ COMMITTED`
 isolation so their post-lock residual query receives a fresh snapshot; they
 fail closed under `REPEATABLE READ` and `SERIALIZABLE`. Recurring readiness
@@ -260,16 +267,82 @@ does not expose its SQLite handle to callers.
 
 ### Conversations and messages
 
-Every Claude Code session maps to a **conversation**. The first time a session ingests a message, LCM creates a conversation record keyed by the runtime session ID.
+One runtime session can map to multiple **conversation segments**. Explicit
+creation starts a new segment; get-or-create finds the newest exact session
+match and creates one only when none exists. Equal creation timestamps are
+resolved by conversation ID, and concurrent PostgreSQL get-or-create calls for
+the same project and session converge under an advisory lock. PostgreSQL
+canonicalizes the project UUID before deriving that lock key, so equivalent
+uppercase and lowercase UUID spellings cannot split the lock domain.
 
 Messages are stored with:
-- **seq** — Monotonically increasing sequence number within the conversation
+
+- **seq** — Monotonically increasing sequence number within the conversation.
+  Atomic append allocates contiguous values from `0`; explicit values remain
+  available for replay and import. Explicit sequence values are nonnegative
+  JavaScript safe integers.
 - **role** — `user`, `assistant`, `system`, or `tool`
 - **content** — Plain text extraction of the message
-- **tokenCount** — Estimated token count (~4 chars/token)
+- **tokenCount** — Nonnegative safe-integer estimated token count
+  (~4 chars/token)
 - **createdAt** — Insertion timestamp
 
 Each message also has **message_parts** — structured content blocks that preserve the original shape (text blocks, tool calls, tool results, reasoning, file content, etc.). This allows the assembler to reconstruct rich content when building model context, not just flat text.
+
+Conversation lists use creation time then conversation ID; messages use
+sequence; message parts use a nonnegative safe-integer ordinal stored as
+PostgreSQL `bigint`. Message pagination treats `afterSeq` as
+exclusive, an omitted or negative safe-integer limit as unlimited, zero as no
+rows, and a positive safe integer as the result bound. Bulk message writes, atomic append
+allocation, part writes, and multi-message deletion retain an operation-level
+rollback boundary whether called directly, inside an existing repository
+transaction, or from a same-handle `ConversationStore.withTransaction()`
+callback that catches the operation failure and commits other work. Deletion
+skips summarized messages, removes eligible message references from active
+context, and relies on the owned-part cascade. Unbounded PostgreSQL batches
+use a constant number of bind parameters and typed set-valued expansion rather
+than one placeholder per input. Both adapters reject embedded U+0000 before
+database access for every conversation-domain text input: session and title
+values, session lookups, message content writes and exact-content lookups,
+message-part text fields (including metadata), and message search queries where
+supported. Part metadata is checked only for U+0000 and is otherwise preserved
+as opaque text. Issue #85 preserves canonical message content
+without claiming that every oversized post-normalization parser token is
+lexically retrievable. The pinned PostgreSQL 18 safe parsed-lexeme maximum is
+2,046 UTF-8 bytes; #89 must implement and test lossless handling at that
+post-normalization boundary before #224 enables PostgreSQL application writes.
+PostgreSQL get-or-create and contiguous-append short transactions establish
+`READ COMMITTED` before their first advisory or row lock on every retry, so a
+stricter database default cannot retain a pre-lock snapshot and overlook the
+winning session segment or newly appended sequence range.
+When those contention methods join an existing transaction, they verify its
+effective isolation is already `READ COMMITTED` before taking any advisory or
+row lock and fail closed otherwise. Call them from an outer transaction begun
+at `READ COMMITTED`, or use a root repository that creates the short
+transaction itself; PostgreSQL cannot repair a stronger isolation level after
+the outer transaction has already executed a statement. All scoped
+conversation operations share one executor-level FIFO. Mapped writes,
+bootstrap marking, and message-part insertion use the runtime's first-class
+savepoint callback: the runtime owns generated savepoint identifiers and
+control SQL, supplies a temporary inner query executor, drains its queue, and
+uses async-context provenance to reject outer-executor or nested-savepoint use
+from inside that callback. Independent sibling operations arriving while the
+callback is active remain on the outer FIFO and run afterward; captured inner
+executors are fenced when the callback settles. Only ordinary statement or
+mapping failures can recover, and only after both `ROLLBACK TO` and `RELEASE`
+succeed. Open, control, connection, and abort failures poison the outer
+transaction so it rolls back. This prevents a read from observing a transient
+row and prevents rollback from silently undoing another method whose promise
+already resolved.
+PostgreSQL `bigint` values are converted to JavaScript numbers only after a
+safe-integer check. Decimal driver strings and native bigints are parsed and
+range-checked as `bigint` before `Number` conversion, so malformed or
+out-of-range identities, sequences, token counts, part ordinals, or counts fail
+instead of rounding or losing precision. Message sequence, token-count, and
+part-ordinal batches are fully validated before their first SQL statement.
+Generated conversation and message identities are
+mapped before their write transaction commits, so an unsafe identity rolls the
+row back; generated message-part identities remain opaque UUID strings.
 
 ### The summary DAG
 

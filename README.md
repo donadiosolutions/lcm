@@ -353,18 +353,21 @@ provider requirements, and deeper operational guidance.
 SQLite remains the zero-configuration storage backend. LCM also validates the
 configuration and verified-TLS prerequisites for an explicit remote-primary
 PostgreSQL selection and includes an internal PostgreSQL 18 pool, migration
-runner, schema baseline, and isolated conformance harness. PostgreSQL domain
-repositories remain staged in #84-#91, with activation in #92, so selecting
-`postgresql` starts the daemon with an explicitly unavailable storage factory
-instead of falling back to SQLite. The health endpoint reports `503` and
-unavailable storage; status and statistics routes return fixed `503` responses,
-and SQLite background scans remain disabled. Project routes first validate
-machine registration and the explicit project binding, then fail safely at the
+runner, schema baseline, and isolated conformance harness. Machine/project
+identity is enabled, and the PostgreSQL conversation adapter is available to
+conformance tests, but the remaining repositories in #86-#91 and application
+routing remain staged until #92/#224. Selecting `postgresql` therefore starts
+the daemon with an explicitly unavailable storage factory instead of falling
+back to SQLite. The health endpoint reports `503` and unavailable storage;
+status and statistics routes return fixed `503` responses, and SQLite
+background scans remain disabled. Project routes first validate machine
+registration and the explicit project binding, then fail safely at the
 unavailable repository boundary. Connection credentials stay out of JSON and
 effective configuration output. Provision the schema as its migration owner
-with `lcm postgres migrate`, then apply the
-[exact identity runtime grants](docs/postgresql-runtime-identity-grants.sql)
-before machine registration. See [storage backend configuration](docs/configuration.md#storage-backend)
+with `lcm postgres migrate`, then apply the reviewed
+[identity](docs/postgresql-runtime-identity-grants.sql) and
+[conversation](docs/postgresql-runtime-conversation-grants.sql) runtime grants
+needed by the repositories in use. See [storage backend configuration](docs/configuration.md#storage-backend)
 for operators, the [PostgreSQL schema reference](docs/postgresql-schema.md) for
 the 23-table data and namespace-aware extension contract, and the
 [storage repository architecture](docs/architecture.md#storage-repository-architecture)

@@ -59,12 +59,39 @@ describe("PostgreSQL text-search configuration readiness", () => {
       "proargtypes",
       "function_owner",
       "function_security_invoker",
+      "function_acl_ready",
       "function_config",
       "prosecdef",
       "proconfig",
+      "pg_catalog.aclexplode",
+      "pg_catalog.acldefault",
     ]) expect(inspectionSql).toContain(catalogField);
     expect(inspectionSql).toContain("pg_catalog.count(maptokentype) AS mapping_count");
     expect(inspectionSql).toContain("FILTER (WHERE maptokentype IS NOT NULL) AS mappings");
+    expect(inspectionSql).toContain(
+      "owner_privilege.grantee\n                                OPERATOR(pg_catalog.=) procedure.proowner",
+    );
+    expect(inspectionSql).toContain(
+      "owner_privilege.grantor\n                                OPERATOR(pg_catalog.=) procedure.proowner",
+    );
+    expect(inspectionSql).toContain(
+      "owner_privilege.privilege_type\n                                OPERATOR(pg_catalog.=) 'EXECUTE'",
+    );
+    expect(inspectionSql).toContain(
+      "owner_privilege.is_grantable\n                                OPERATOR(pg_catalog.=) false",
+    );
+    expect(inspectionSql).toContain(
+      "privilege.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid",
+    );
+    expect(inspectionSql).toContain(
+      "privilege.grantor\n                                OPERATOR(pg_catalog.<>) procedure.proowner",
+    );
+    expect(inspectionSql).toContain(
+      "privilege.privilege_type\n                                OPERATOR(pg_catalog.<>) 'EXECUTE'",
+    );
+    expect(inspectionSql).toContain(
+      "privilege.is_grantable\n                                OPERATOR(pg_catalog.<>) false",
+    );
 
     const direct = executor({
       actual_sha256: POSTGRESQL_SEARCH_CONFIGURATION_SHA256,
@@ -104,6 +131,19 @@ describe("PostgreSQL text-search configuration readiness", () => {
       expected: {
         actualSha256: POSTGRESQL_SEARCH_CONFIGURATION_SHA256,
         objectCount: 0,
+        ownershipReady: false,
+      },
+    },
+    {
+      label: "function ACL drift",
+      row: {
+        actual_sha256: POSTGRESQL_SEARCH_CONFIGURATION_SHA256,
+        object_count: "19",
+        ownership_ready: false,
+      },
+      expected: {
+        actualSha256: POSTGRESQL_SEARCH_CONFIGURATION_SHA256,
+        objectCount: 19,
         ownershipReady: false,
       },
     },

@@ -190,11 +190,12 @@ not contain a `storage` object continue to use the per-project databases under
 
 The PostgreSQL configuration, internal PostgreSQL 18 runtime, and schema
 baseline are available for development and adapter conformance. Machine and
-project identity operations are enabled by #84. The remaining storage/domain
-repositories in #85-#91 stay staged until the #92 cutover, so a valid
-`postgresql` selection starts the managed daemon, but other storage-backed
-routes remain unavailable and return a sanitized `503` until those
-repositories are activated. Managed start/restart recognizes that authenticated staged response
+project identity operations are enabled by #84. The conversation adapter from
+#85 is available for conformance but is not routed through the daemon or CLI.
+The remaining storage/domain repositories in #86-#91 stay staged until the #92
+cutover, so a valid `postgresql` selection starts the managed daemon, but other
+storage-backed routes remain unavailable and return a sanitized `503` until
+those repositories are activated. Managed start/restart recognizes that authenticated staged response
 as daemon readiness; it does not treat PostgreSQL storage as ready and never
 falls back to SQLite after an explicit PostgreSQL selection. The internal readiness contract also requires
 the parity extensions at their current default versions in the `public` schema;
@@ -765,7 +766,11 @@ sqlite3 ~/.lcm/projects/<hash>/db.sqlite ".backup /tmp/lcm-backup.sqlite"
 
 ## Per-agent configuration
 
-In multi-agent Claude Code setups, each agent uses the same LCM database but has its own conversations (keyed by session ID). The plugin config applies globally; per-agent overrides use environment variables set in the agent's config.
+In multi-agent Claude Code setups, each agent uses the same LCM database but
+has its own conversation segments associated with its session ID. A session
+may have multiple segments; LCM selects the newest one for get-or-create
+operations. The plugin config applies globally; per-agent overrides use
+environment variables set in the agent's config.
 
 ## Disabling LCM
 

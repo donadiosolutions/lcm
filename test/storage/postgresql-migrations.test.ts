@@ -384,12 +384,15 @@ describe("PostgreSQL migration runner", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "3f2dd30cc533899a31f6415fef49c377e82523315ce8fc3e87253f5351ec0a8f" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "c914eef06f8d8a46ffc03c48377b8583fee6d07b327e7550acab2b70757027ed" }),
       expect.objectContaining({ id: "0003_machine_identity_key", sha256: "bdc38d19bde5825eb1d59e9044769cbf9cac52be5c9fe34237f93ec347c3807b" }),
       expect.objectContaining({ id: "0004_machine_display_name", sha256: "f12b4e5493da187e4c8cd4083766010b896961225cadd6fe568e4e99264e3421" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
+    );
+    expect(migrations[1]?.sql).toMatch(
+      /CREATE TABLE lcm\.message_parts \([\s\S]*?ordinal bigint NOT NULL CHECK \(ordinal >= 0\)/u,
     );
     expect(migrations[1]?.sql).toContain(
       `catalog SHA-256 ${POSTGRESQL_SEARCH_CONFIGURATION_SHA256}`,

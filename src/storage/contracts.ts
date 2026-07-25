@@ -1,5 +1,6 @@
 import type { ProjectIdentity } from "../project-map.js";
 import type {
+  AppendMessageInput,
   ConversationId,
   ConversationRecord,
   CreateConversationInput,
@@ -57,14 +58,47 @@ export interface StorageHealth {
 }
 
 export interface ConversationRepository {
+  /**
+   * Conversation-domain text inputs reject embedded U+0000 before database
+   * access so SQLite and PostgreSQL expose the same text contract.
+   */
   createConversation(input: CreateConversationInput): Promise<ConversationRecord>;
   getConversation(conversationId: ConversationId): Promise<ConversationRecord | null>;
   getConversationBySessionId(sessionId: string): Promise<ConversationRecord | null>;
   getOrCreateConversation(sessionId: string, title?: string): Promise<ConversationRecord>;
   markConversationBootstrapped(conversationId: ConversationId): Promise<void>;
   listConversations(): Promise<ConversationRecord[]>;
+  /**
+   * Create one explicit sequence value for replay/import.
+   *
+   * Callers must not run explicit-sequence writes concurrently with
+   * appendMessages for the same conversation.
+   */
   createMessage(input: CreateMessageInput): Promise<MessageRecord>;
+  /**
+   * Atomically create explicit sequence values for replay/import.
+   *
+   * Callers must not run explicit-sequence writes concurrently with
+   * appendMessages for the same conversation.
+   */
   createMessagesBulk(inputs: CreateMessageInput[]): Promise<MessageRecord[]>;
+  /**
+   * Atomically allocate and insert the next contiguous sequence range.
+   *
+   * Concurrent appendMessages calls are serialized per conversation. Callers
+   * must not concurrently mix this allocator with explicit-sequence writes
+   * for the same conversation.
+   */
+  appendMessages(
+    conversationId: ConversationId,
+    inputs: AppendMessageInput[],
+  ): Promise<MessageRecord[]>;
+  /**
+   * Read messages after an exclusive sequence checkpoint.
+   *
+   * An undefined limit or any negative safe integer is unlimited, zero returns
+   * no rows, and a positive safe integer bounds the result.
+   */
   getMessages(conversationId: ConversationId, options?: { afterSeq?: number; limit?: number }): Promise<MessageRecord[]>;
   getLastMessage(conversationId: ConversationId): Promise<MessageRecord | null>;
   hasMessage(conversationId: ConversationId, role: MessageRole, content: string): Promise<boolean>;
@@ -74,6 +108,13 @@ export interface ConversationRepository {
   getMessageParts(messageId: MessageId): Promise<MessagePartRecord[]>;
   getMessageCount(conversationId: ConversationId): Promise<number>;
   getMessageCountBySessionId(sessionId: string): Promise<number>;
+  /**
+   * Return the highest sequence, preserving the legacy value 0 when empty.
+   *
+   * Because a non-empty conversation whose first message has seq 0 also
+   * returns 0, use getMessageCount when testing whether a conversation is
+   * empty.
+   */
   getMaxSeq(conversationId: ConversationId): Promise<number>;
   deleteMessages(messageIds: MessageId[]): Promise<number>;
 }

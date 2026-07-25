@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Client, Pool, Query, type ClientConfig, type PoolClient, type PoolConfig, type QueryConfig, type QueryResult, type QueryResultRow } from "pg";
 import { StorageOperationError } from "../errors.js";
 import type {
@@ -6,6 +7,7 @@ import type {
   PostgreSqlQueryExecutor,
   PostgreSqlQueryOptions,
   PostgreSqlRuntimeHealth,
+  PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
 import { buildPostgreSqlClientConfig } from "./client-config.js";
 import {
@@ -45,6 +47,8 @@ const DEFAULT_POSTGRESQL_TRANSACTION_CONTEXT = {
   domain: "transaction",
   operation: "transaction",
 } as const satisfies PostgreSqlOperationContext;
+
+const savepointExecutionContext = new AsyncLocalStorage<object>();
 
 type HealthRow = {
   server_encoding: unknown;
@@ -157,7 +161,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
   }
 
   async transaction<T>(
-    callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
+    callback: (transaction: PostgreSqlTransactionScopeExecutor) => Promise<T>,
     options: PostgreSqlOperationContext & { signal?: AbortSignal } = DEFAULT_POSTGRESQL_TRANSACTION_CONTEXT,
   ): Promise<T> {
     this.assertOpen(options);
@@ -178,43 +182,235 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       let acceptingQueries = true;
       let transactionFailed = false;
       let transactionFailure: StorageOperationError | undefined;
+      let savepointOrdinal = 0;
       let queryQueue = Promise.resolve();
-      const transaction: PostgreSqlQueryExecutor = {
+      const savepointScopeToken = {};
+      const scopeError = (
+        queryOptions: PostgreSqlOperationContext,
+      ): StorageOperationError => new StorageOperationError(
+        "STORAGE_TRANSACTION_SCOPE",
+        "postgresql",
+        queryOptions.projectId ?? options.projectId,
+        queryOptions.domain,
+        queryOptions.operation,
+      );
+      const recordFatalFailure = (
+        error: unknown,
+        failureOptions: PostgreSqlQueryOptions,
+        forceDestroy = false,
+      ): StorageOperationError => {
+        const connectionFailure = isPostgreSqlConnectionError(error);
+        if (
+          forceDestroy
+          || failureOptions.signal?.aborted === true
+          || options.signal?.aborted === true
+          || connectionFailure
+        ) {
+          destroy = true;
+        }
+        const normalized = normalizePostgreSqlError(error, failureOptions);
+        transactionFailed = true;
+        transactionFailure ??= normalized;
+        return normalized;
+      };
+      const transaction: PostgreSqlTransactionScopeExecutor = {
+        transactionScope: "active",
         query: async <R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
           config: QueryConfig<I>,
           queryOptions: PostgreSqlQueryOptions,
         ) => {
-          if (!acceptingQueries || transactionFailed) {
-            throw new StorageOperationError(
-              "STORAGE_TRANSACTION_SCOPE",
-              "postgresql",
-              queryOptions.projectId ?? options.projectId,
-              queryOptions.domain,
-              queryOptions.operation,
-            );
+          if (
+            !acceptingQueries
+            || transactionFailed
+            || savepointExecutionContext.getStore() === savepointScopeToken
+          ) {
+            throw scopeError(queryOptions);
           }
           const execute = queryQueue.then(async () => {
             if (transactionFailed) {
-              throw new StorageOperationError(
-                "STORAGE_TRANSACTION_SCOPE",
-                "postgresql",
-                queryOptions.projectId ?? options.projectId,
-                queryOptions.domain,
-                queryOptions.operation,
-              );
+              throw scopeError(queryOptions);
             }
             const combinedSignal = combineAbortSignals(queryOptions.signal, options.signal);
             const effectiveOptions = { ...queryOptions, signal: combinedSignal.signal };
             try {
               return await this.queryClient<R, I>(client!, config, effectiveOptions);
             } catch (error) {
-              transactionFailed = true;
-              if (effectiveOptions.signal?.aborted || isPostgreSqlConnectionError(error)) destroy = true;
-              const normalized = normalizePostgreSqlError(error, effectiveOptions);
-              transactionFailure ??= normalized;
-              throw normalized;
+              throw recordFatalFailure(error, effectiveOptions);
             } finally {
               combinedSignal.dispose();
+            }
+          });
+          queryQueue = execute.then(() => undefined, () => undefined);
+          return execute;
+        },
+        savepoint: async <R>(
+          callback: (savepoint: PostgreSqlQueryExecutor) => Promise<R>,
+          savepointOptions: PostgreSqlQueryOptions,
+        ): Promise<R> => {
+          if (
+            !acceptingQueries
+            || transactionFailed
+            || savepointExecutionContext.getStore() === savepointScopeToken
+          ) {
+            throw scopeError(savepointOptions);
+          }
+          const execute = queryQueue.then(async () => {
+            if (transactionFailed) {
+              throw scopeError(savepointOptions);
+            }
+            if (savepointOptions.signal?.aborted || options.signal?.aborted) {
+              const failure = aborted({
+                ...savepointOptions,
+                projectId: savepointOptions.projectId ?? options.projectId,
+              });
+              throw recordFatalFailure(failure, savepointOptions, true);
+            }
+            savepointOrdinal =
+              (savepointOrdinal % Number.MAX_SAFE_INTEGER) + 1;
+            const savepoint =
+              `lcm_runtime_repository_${savepointOrdinal}`;
+            try {
+              try {
+                await client!.query(`SAVEPOINT ${savepoint}`);
+              } catch (error) {
+                throw recordFatalFailure(error, savepointOptions);
+              }
+
+              let acceptingSavepointQueries = true;
+              let savepointFailed = false;
+              let savepointFailure: StorageOperationError | undefined;
+              let savepointFailureRecoverable = false;
+              let savepointQueryQueue = Promise.resolve();
+              const inner: PostgreSqlQueryExecutor = {
+                query: async <
+                  QueryRow extends QueryResultRow = QueryResultRow,
+                  QueryInput extends unknown[] = unknown[],
+                >(
+                  config: QueryConfig<QueryInput>,
+                  queryOptions: PostgreSqlQueryOptions,
+                ): Promise<QueryResult<QueryRow>> => {
+                  if (!acceptingSavepointQueries || savepointFailed) {
+                    throw scopeError(queryOptions);
+                  }
+                  const queryExecute = savepointQueryQueue.then(async () => {
+                    if (savepointFailed) throw scopeError(queryOptions);
+                    const savepointCombinedSignal = combineAbortSignals(
+                      queryOptions.signal,
+                      savepointOptions.signal,
+                    );
+                    const combinedSignal = combineAbortSignals(
+                      savepointCombinedSignal.signal,
+                      options.signal,
+                    );
+                    const effectiveOptions = {
+                      ...queryOptions,
+                      signal: combinedSignal.signal,
+                    };
+                    try {
+                      return await this.queryClient<QueryRow, QueryInput>(
+                        client!,
+                        config,
+                        effectiveOptions,
+                      );
+                    } catch (error) {
+                      const connectionFailure =
+                        isPostgreSqlConnectionError(error);
+                      const queryAborted =
+                        effectiveOptions.signal?.aborted === true;
+                      const normalized = normalizePostgreSqlError(
+                        error,
+                        effectiveOptions,
+                      );
+                      savepointFailed = true;
+                      savepointFailure ??= normalized;
+                      savepointFailureRecoverable =
+                        !queryAborted && !connectionFailure;
+                      if (!savepointFailureRecoverable) {
+                        recordFatalFailure(
+                          normalized,
+                          effectiveOptions,
+                          queryAborted || connectionFailure,
+                        );
+                      }
+                      throw normalized;
+                    } finally {
+                      combinedSignal.dispose();
+                      savepointCombinedSignal.dispose();
+                    }
+                  });
+                  savepointQueryQueue = queryExecute.then(
+                    () => undefined,
+                    () => undefined,
+                  );
+                  return queryExecute;
+                },
+              };
+              let callbackOutcome!:
+                | { readonly succeeded: true; readonly result: R }
+                | { readonly succeeded: false; readonly error: unknown };
+              try {
+                callbackOutcome = {
+                  succeeded: true,
+                  result: await savepointExecutionContext.run(
+                    savepointScopeToken,
+                    () => callback(inner),
+                  ),
+                };
+              } catch (error) {
+                callbackOutcome = { succeeded: false, error };
+              } finally {
+                acceptingSavepointQueries = false;
+              }
+              await savepointQueryQueue;
+
+              const rollbackSavepoint = async (
+                original: unknown,
+              ): Promise<never> => {
+                if (savepointOptions.signal?.aborted || options.signal?.aborted) {
+                  const failure = aborted({
+                    ...savepointOptions,
+                    projectId:
+                      savepointOptions.projectId ?? options.projectId,
+                  });
+                  throw recordFatalFailure(
+                    failure,
+                    savepointOptions,
+                    true,
+                  );
+                }
+                try {
+                  await client!.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+                  await client!.query(`RELEASE SAVEPOINT ${savepoint}`);
+                } catch (error) {
+                  recordFatalFailure(error, savepointOptions);
+                  throw original;
+                }
+                throw original;
+              };
+              if (savepointFailure) {
+                if (!savepointFailureRecoverable) throw savepointFailure;
+                return rollbackSavepoint(savepointFailure);
+              }
+              if (!callbackOutcome.succeeded) {
+                return rollbackSavepoint(callbackOutcome.error);
+              }
+
+              if (savepointOptions.signal?.aborted || options.signal?.aborted) {
+                const failure = aborted({
+                  ...savepointOptions,
+                  projectId:
+                    savepointOptions.projectId ?? options.projectId,
+                });
+                throw recordFatalFailure(failure, savepointOptions, true);
+              }
+              try {
+                await client!.query(`RELEASE SAVEPOINT ${savepoint}`);
+              } catch (error) {
+                throw recordFatalFailure(error, savepointOptions);
+              }
+              return callbackOutcome.result;
+            } catch (error) {
+              throw error;
             }
           });
           queryQueue = execute.then(() => undefined, () => undefined);

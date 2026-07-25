@@ -156,6 +156,8 @@ export interface PostgreSqlTestDatabaseOptions {
   readonly adminSearchPath?: string;
   /** Test-only database encoding for readiness rejection coverage. */
   readonly serverEncoding?: "UTF8" | "LATIN1";
+  /** Test-only database default used to exercise repository isolation fences. */
+  readonly defaultTransactionIsolation?: "READ COMMITTED" | "REPEATABLE READ";
 }
 
 export async function createPostgreSqlTestDatabase(
@@ -294,6 +296,17 @@ export async function createPostgreSqlTestDatabase(
         text: "GRANT USAGE ON SCHEMA lcm TO lcm_test_runtime",
       }, { domain: "factory", operation: "grantRuntimeBaseline" });
     }
+    if (options.defaultTransactionIsolation !== undefined) {
+      const isolation = options.defaultTransactionIsolation === "REPEATABLE READ"
+        ? "repeatable read"
+        : "read committed";
+      await databaseAdmin.query({
+        text: `ALTER DATABASE ${identifier} SET default_transaction_isolation = '${isolation}'`,
+      }, {
+        domain: "factory",
+        operation: "setDefaultTransactionIsolation",
+      });
+    }
     await closeDatabaseAdmin();
   } catch (error) {
     await Promise.allSettled([closeDatabaseAdmin(), dropOwnedDatabase()]);
@@ -320,8 +333,9 @@ export async function createPostgreSqlTestDatabase(
 export async function withPostgreSqlTestDatabase<T>(
   label: string,
   callback: (database: PostgreSqlTestDatabase) => Promise<T>,
+  options: PostgreSqlTestDatabaseOptions = {},
 ): Promise<T> {
-  const database = await createPostgreSqlTestDatabase(label);
+  const database = await createPostgreSqlTestDatabase(label, options);
   try {
     return await callback(database);
   } finally {

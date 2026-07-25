@@ -21,10 +21,27 @@ export interface PostgreSqlQueryOptions extends PostgreSqlOperationContext {
 }
 
 export interface PostgreSqlQueryExecutor {
+  /**
+   * Present only on the query executor supplied to a live runtime transaction.
+   * Repositories use this provenance marker before issuing transaction-scoped
+   * commands such as SAVEPOINT.
+   */
+  readonly transactionScope?: "active";
+
   query<R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
     config: QueryConfig<I>,
     options: PostgreSqlQueryOptions,
   ): Promise<QueryResult<R>>;
+}
+
+export interface PostgreSqlTransactionScopeExecutor
+  extends PostgreSqlQueryExecutor {
+  readonly transactionScope: "active";
+
+  savepoint<T>(
+    callback: (savepoint: PostgreSqlQueryExecutor) => Promise<T>,
+    options: PostgreSqlQueryOptions,
+  ): Promise<T>;
 }
 
 export interface PostgreSqlMigration {
