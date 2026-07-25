@@ -46,14 +46,20 @@ fetch_associated_pull_requests() {
 }
 
 fetch_pull_request_files() {
+  local pull_request_number="$1"
   gh api --paginate --slurp \
     -H "X-GitHub-Api-Version: 2022-11-28" \
-    "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100"
+    "repos/$REPOSITORY/pulls/$pull_request_number/files?per_page=100"
 }
 
 classify_pull_request_files() {
   local expected_count="$1"
   node .github/scripts/external-admission-policy.mjs classify-files "$expected_count"
+}
+
+select_admission_requirement() {
+  local sensitive_diff="$1"
+  node .github/scripts/external-admission-policy.mjs select-admission "$sensitive_diff"
 }
 
 evaluate_check_runs() {
@@ -113,15 +119,23 @@ if ! pull_request_is_eligible <<<"$pull_request"; then
 fi
 
 changed_file_count="$(jq -r '.changed_files' <<<"$pull_request")"
-file_pages="$(fetch_pull_request_files)"
+file_pages="$(fetch_pull_request_files "$PR_NUMBER")"
 classification="$(classify_pull_request_files "$changed_file_count" <<<"$file_pages")"
-greptile_required="$(jq -r '.greptileRequired' <<<"$classification")"
+sensitive_diff="$(jq -r '.greptileRequired' <<<"$classification")"
+admission_requirement="$(
+  select_admission_requirement "$sensitive_diff" <<<"$pull_request"
+)"
+trusted_automation="$(jq -r '.trustedAutomation' <<<"$admission_requirement")"
+greptile_required="$(jq -r '.greptileRequired' <<<"$admission_requirement")"
 classification_name="$(jq -r '.classification' <<<"$classification")"
-echo "Admission classification=$classification_name"
+echo "Admission classification=$classification_name sensitive_diff=$sensitive_diff trusted_automation=$trusted_automation greptile_required=$greptile_required"
 
 if [[ "$greptile_required" == true ]]; then
   waiting_description="Waiting for Greptile review and DCO"
   success_description="Greptile review and DCO passed"
+elif [[ "$sensitive_diff" == true && "$trusted_automation" == true ]]; then
+  waiting_description="Waiting for trusted CI and DCO for automated PR"
+  success_description="CI and DCO passed for trusted automated PR"
 else
   waiting_description="Waiting for trusted CI and DCO"
   success_description="CI and DCO passed for coverage-neutral diff"
@@ -192,7 +206,7 @@ if ! pull_request_is_eligible <<<"$current_pull_request"; then
 fi
 
 current_changed_file_count="$(jq -r '.changed_files' <<<"$current_pull_request")"
-current_file_pages="$(fetch_pull_request_files)"
+current_file_pages="$(fetch_pull_request_files "$current_pr_number")"
 current_classification="$(
   classify_pull_request_files "$current_changed_file_count" <<<"$current_file_pages"
 )"
@@ -200,6 +214,24 @@ if [[ "$(jq -r '.classification' <<<"$current_classification")" != "$classificat
   post_admission_status pending \
     "Pull request file classification changed during admission"
   echo "Pull request file classification changed; admission remains pending."
+  trap - EXIT INT TERM
+  exit 0
+fi
+current_sensitive_diff="$(jq -r '.greptileRequired' <<<"$current_classification")"
+current_admission_requirement="$(
+  select_admission_requirement "$current_sensitive_diff" <<<"$current_pull_request"
+)"
+current_trusted_automation="$(
+  jq -r '.trustedAutomation' <<<"$current_admission_requirement"
+)"
+current_greptile_required="$(
+  jq -r '.greptileRequired' <<<"$current_admission_requirement"
+)"
+if [[ "$current_trusted_automation" != "$trusted_automation" ||
+      "$current_greptile_required" != "$greptile_required" ]]; then
+  post_admission_status pending \
+    "Pull request admission identity changed during evaluation"
+  echo "Pull request admission identity changed; admission remains pending."
   trap - EXIT INT TERM
   exit 0
 fi
@@ -267,6 +299,36 @@ if ! pull_request_is_eligible <<<"$final_pull_request"; then
   post_admission_status pending \
     "Pull request is no longer eligible for admission"
   echo "Final pull request eligibility changed; admission remains pending."
+  trap - EXIT INT TERM
+  exit 0
+fi
+final_changed_file_count="$(jq -r '.changed_files' <<<"$final_pull_request")"
+final_file_pages="$(fetch_pull_request_files "$final_pr_number")"
+final_classification="$(
+  classify_pull_request_files "$final_changed_file_count" <<<"$final_file_pages"
+)"
+if [[ "$(jq -r '.classification' <<<"$final_classification")" != "$classification_name" ]]; then
+  post_admission_status pending \
+    "Pull request file classification changed during final validation"
+  echo "Final pull request file classification changed; admission remains pending."
+  trap - EXIT INT TERM
+  exit 0
+fi
+final_sensitive_diff="$(jq -r '.greptileRequired' <<<"$final_classification")"
+final_admission_requirement="$(
+  select_admission_requirement "$final_sensitive_diff" <<<"$final_pull_request"
+)"
+final_trusted_automation="$(
+  jq -r '.trustedAutomation' <<<"$final_admission_requirement"
+)"
+final_greptile_required="$(
+  jq -r '.greptileRequired' <<<"$final_admission_requirement"
+)"
+if [[ "$final_trusted_automation" != "$trusted_automation" ||
+      "$final_greptile_required" != "$greptile_required" ]]; then
+  post_admission_status pending \
+    "Pull request admission identity changed during final validation"
+  echo "Final pull request admission identity changed; admission remains pending."
   trap - EXIT INT TERM
   exit 0
 fi

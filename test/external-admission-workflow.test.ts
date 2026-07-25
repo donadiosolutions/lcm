@@ -174,25 +174,39 @@ describe("external admission workflow", () => {
 
   it("paginates every collection and repeats exact pull-request eligibility", () => {
     expect(evaluator).toContain("commits/$HEAD_SHA/pulls?per_page=100");
-    expect(evaluator).toContain("pulls/$PR_NUMBER/files?per_page=100");
+    expect(evaluator).toContain("pulls/$pull_request_number/files?per_page=100");
     expect(evaluator).toContain("check-runs?filter=latest&per_page=100");
     expect(evaluator.match(/gh api --paginate --slurp/gu)).toHaveLength(4);
     expect(evaluator.match(/fetch_associated_pull_requests/gu)).toHaveLength(4);
     expect(evaluator.match(/pull_request_is_eligible/gu)).toHaveLength(4);
     expect(evaluator).toContain("external-admission-policy.mjs classify-files");
+    expect(evaluator).toContain("external-admission-policy.mjs select-admission");
     expect(evaluator).toContain("external-admission-policy.mjs evaluate-checks");
     expect(evaluator).toContain('changed_file_count="$(jq -r \'.changed_files\'');
     expect(evaluator).toContain('current_changed_file_count="$(jq -r \'.changed_files\'');
+    expect(evaluator).toContain('final_changed_file_count="$(jq -r \'.changed_files\'');
     expect(evaluator).toContain(
       'classify_pull_request_files "$changed_file_count" <<<"$file_pages"',
     );
     expect(evaluator).toContain(
       'classify_pull_request_files "$current_changed_file_count" <<<"$current_file_pages"',
     );
+    expect(evaluator).toContain(
+      'classify_pull_request_files "$final_changed_file_count" <<<"$final_file_pages"',
+    );
+    expect(evaluator).toContain('fetch_pull_request_files "$PR_NUMBER"');
+    expect(evaluator).toContain('fetch_pull_request_files "$current_pr_number"');
+    expect(evaluator).toContain('fetch_pull_request_files "$final_pr_number"');
+    expect(evaluator).toContain(
+      'select_admission_requirement "$final_sensitive_diff" <<<"$final_pull_request"',
+    );
+    expect(evaluator).not.toContain(
+      'select_admission_requirement "$sensitive_diff" <<<"$final_pull_request"',
+    );
     expect(policySource).toContain("pull request file audit count does not match changed_files");
   });
 
-  it("requires authenticated Greptile for coverable or trust-sensitive paths", () => {
+  it("requires Greptile for sensitive human PRs and trusted CI for exact automation identities", () => {
     expect(policySource).toContain("file.previous_filename");
     expect(policySource).toMatch(/bin\|installer\|src/u);
     expect(policySource).toContain("[cm]?ts|tsx");
@@ -201,9 +215,22 @@ describe("external admission workflow", () => {
     expect(policySource).toContain("vitest");
     expect(policySource).toContain("tsconfig");
     expect(evaluator).toContain('waiting_description="Waiting for Greptile review and DCO"');
+    expect(policySource).toContain('"dependabot[bot]"');
+    expect(policySource).toContain('"github-actions[bot]"');
+    expect(policySource).toContain('type === "Bot"');
+    expect(evaluator.match(/select_admission_requirement/gu)).toHaveLength(4);
+    expect(evaluator).toContain(
+      'echo "Admission classification=$classification_name sensitive_diff=$sensitive_diff trusted_automation=$trusted_automation greptile_required=$greptile_required"',
+    );
+    expect(evaluator).toContain(
+      'waiting_description="Waiting for trusted CI and DCO for automated PR"',
+    );
+    expect(evaluator).toContain(
+      'success_description="CI and DCO passed for trusted automated PR"',
+    );
   });
 
-  it("validates successful neutral CI against exact Actions run metadata", () => {
+  it("validates every CI-backed admission against exact Actions run metadata", () => {
     expect(evaluator).toContain("repos/$REPOSITORY/actions/runs/$ci_run_id");
     expect(evaluator).toContain("external-admission-policy.mjs evaluate-ci-run");
     expect(policySource).toContain('run.event === "pull_request"');
@@ -243,11 +270,15 @@ describe("external admission workflow", () => {
       "current_matching_prs=",
       "current_pull_request=",
       "current_file_pages=",
+      "current_admission_requirement=",
       "current_check_run_pages=",
       "current_evaluation=",
       "current_ci_run=",
       "final_matching_prs=",
       "final_pull_request=",
+      "final_file_pages=",
+      "final_classification=",
+      "final_admission_requirement=",
     ]) {
       const markerIndex = evaluator.lastIndexOf(marker);
       expect(markerIndex, marker).toBeGreaterThan(0);

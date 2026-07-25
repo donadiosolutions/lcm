@@ -41,6 +41,11 @@ const GREPTILE_REQUIRED_PATHS = [
   /^tsconfig(?:\.[^/]+)?\.json$/u,
 ];
 
+const TRUSTED_AUTOMATION_AUTHORS = new Set([
+  "dependabot[bot]",
+  "github-actions[bot]",
+]);
+
 function requireArray(value, label) {
   if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`);
   return value;
@@ -84,6 +89,27 @@ export function flattenCheckRunPages(pages) {
 export function requiresGreptileForPath(path) {
   requireNonEmptyString(path, "pull request path");
   return GREPTILE_REQUIRED_PATHS.some((pattern) => pattern.test(path));
+}
+
+export function isTrustedAutomationPullRequest(pullRequest) {
+  if (pullRequest === null || typeof pullRequest !== "object" || Array.isArray(pullRequest)) {
+    throw new TypeError("pull request must be an object");
+  }
+  const login = requireNonEmptyString(pullRequest.user?.login, "pull request user login");
+  const type = requireNonEmptyString(pullRequest.user?.type, "pull request user type");
+  return type === "Bot" && TRUSTED_AUTOMATION_AUTHORS.has(login);
+}
+
+export function selectAdmissionRequirement(pullRequest, sensitiveDiff) {
+  if (typeof sensitiveDiff !== "boolean") {
+    throw new TypeError("sensitive diff must be a boolean");
+  }
+  const trustedAutomation = isTrustedAutomationPullRequest(pullRequest);
+  return {
+    sensitiveDiff,
+    trustedAutomation,
+    greptileRequired: sensitiveDiff && !trustedAutomation,
+  };
 }
 
 export function classifyPullRequestFiles(files, expectedCount) {
@@ -262,6 +288,13 @@ export function runPolicyCommand(command, args, input) {
 
   if (command === "classify-files" && args.length === 1) {
     return JSON.stringify(classifyPullRequestFiles(flattenPullRequestFilePages(payload), args[0]));
+  }
+  if (command === "select-admission" && args.length === 1) {
+    const [sensitiveDiff] = args;
+    if (sensitiveDiff !== "true" && sensitiveDiff !== "false") {
+      throw new TypeError("sensitive-diff argument must be true or false");
+    }
+    return JSON.stringify(selectAdmissionRequirement(payload, sensitiveDiff === "true"));
   }
   if (command === "evaluate-checks" && args.length === 4) {
     const [headSha, greptileRequired, repository, serverUrl] = args;

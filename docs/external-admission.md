@@ -60,9 +60,14 @@ and the `external-admission` status on `HEAD_SHA`.
   evaluation. It remains pending when required evidence is incomplete,
   transient, changed during evaluation, or cannot identify exactly one open,
   non-draft PR targeting `main` at that SHA.
-- **Success:** one fresh and final exact-SHA snapshot proves either authenticated
-  Greptile plus DCO success for sensitive changes, or authenticated canonical CI
-  plus DCO success for coverage-neutral changes.
+- **Success:** one fresh and final exact-SHA snapshot proves authenticated
+  Greptile plus DCO success for sensitive changes from normal contributors, or
+  authenticated canonical CI plus DCO success for either coverage-neutral
+  changes or sensitive changes authored by the exact `dependabot[bot]` or
+  `github-actions[bot]` GitHub `Bot` identity. Those two automation identities
+  use CI because Greptile is configured to exclude bot-authored pull requests.
+  The CI check must resolve to a successful canonical pull-request workflow run
+  for the same repository and head SHA.
 - **Failure:** a required check is terminally unsuccessful, CI provenance is
   invalid, or evaluation encounters an API or policy error. Inspect the linked
   workflow run before retrying.

@@ -48,12 +48,15 @@ incomplete page cannot silently produce a coverage-neutral classification. A
 change to executable `.ts`, `.tsx`, `.mts`, or `.cts` TypeScript under `bin/`,
 `installer/`, or `src/`; trust-sensitive automation under `.github/actions/`,
 `.github/codeql/`, `.github/workflows/`, or `.github/scripts/`; or key coverage/build configuration (`package.json`, the
-lockfile, Vitest config, or TypeScript config) requires authenticated
-`Greptile Review` and DCO successes on the PR's exact head SHA. A diff with none
-of those paths requires authenticated DCO and the exact-head `ci` check from
-the GitHub Actions app. Only `pull_request` runs of the canonical CI workflow
+lockfile, Vitest config, or TypeScript config) normally requires authenticated
+`Greptile Review` and DCO successes on the PR's exact head SHA. Because Greptile
+excludes bot-authored pull requests, sensitive PRs authored by the exact
+`dependabot[bot]` or `github-actions[bot]` GitHub `Bot` identity instead require
+authenticated DCO and the exact-head `ci` check from the GitHub Actions app.
+The same CI-backed path applies to diffs with none of those sensitive paths.
+Only `pull_request` runs of the canonical CI workflow
 can wake the evaluator; push and synthetic merge-group runs are rejected before
-a runner starts. The neutral path resolves the check's Actions run and requires
+a runner starts. Every CI-backed path resolves the check's Actions run and requires
 a successful terminal `pull_request` run of `.github/workflows/ci.yml` for the
 same repository and head SHA. An aggregate `ci` check may succeed while a
 trailing workflow job is still running, so documented transient run states
@@ -64,8 +67,9 @@ successful admission with `pending` before the PR-association lookup. This is
 necessary because GitHub may omit closed unmerged PRs from a commit's PR
 associations. The handler admits only one open, non-draft, main-targeting PR at
 the exact event SHA and repeats that validation immediately before publishing
-success, including fresh file classification, check evaluation, and neutral CI
-run validation; a closed, draft, ineligible, unassociated, or ambiguous commit remains
+success, including fresh file classification, automation-author identity,
+check evaluation, and CI run validation; a closed, draft, ineligible,
+unassociated, or ambiguous commit remains
 pending. Commit-associated PRs, PR files, and check runs are all paginated and
 flattened before evaluation. The executable admission policy is sparsely
 checked out from the trusted workflow revision with persisted credentials
@@ -90,9 +94,11 @@ analyses, the security-extended CodeQL analysis, and both Socket checks still
 run against the synthetic commit before it may merge.
 
 Greptile is the authenticated review provider for coverable or trust-sensitive
-diffs and must report success on the exact PR head before external admission
-succeeds. CodeRabbit reports remain informational and best-effort and are not
-encoded as an admission requirement.
+diffs from normal contributors and must report success on the exact PR head
+before external admission succeeds. The exact `dependabot[bot]` and
+`github-actions[bot]` GitHub `Bot` identities use the exact-head canonical CI
+path because Greptile excludes bot-authored PRs. CodeRabbit reports remain
+informational and best-effort and are not encoded as an admission requirement.
 
 ### Release Flow
 
@@ -114,7 +120,7 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 | Workflow                             | Trigger                                                                              | Purpose                                                                                 |
 | ------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
-| `external-admission.yml`             | Authenticated Greptile/DCO checks, canonical PR CI lifecycle, default-branch exact-SHA repository dispatch | Statelessly require Greptile+DCO for sensitive diffs or trusted CI+DCO for neutral diffs |
+| `external-admission.yml`             | Authenticated Greptile/DCO checks, canonical PR CI lifecycle, default-branch exact-SHA repository dispatch | Statelessly require Greptile+DCO for sensitive human diffs or trusted CI+DCO for neutral and allowlisted bot-authored diffs |
 | `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
 | `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
 | `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
