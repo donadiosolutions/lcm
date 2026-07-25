@@ -25,6 +25,14 @@ describe("DryRunServiceDeps", () => {
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining(`[dry-run] would write: ${path}`));
   });
 
+  it("copyFileSync previews the source and destination", () => {
+    const deps = new DryRunServiceDeps();
+    deps.copyFileSync("/templates/source.md", "/commands/destination.md");
+    expect(logSpy).toHaveBeenCalledWith(
+      "[dry-run] would copy: /templates/source.md -> /commands/destination.md",
+    );
+  });
+
   // ── mkdirSync ─────────────────────────────────────────────────────────────
 
   it("mkdirSync prints [dry-run] would create when dir does not exist", () => {

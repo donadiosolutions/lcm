@@ -503,7 +503,10 @@ describe("install", () => {
     let settingsReads = 0;
     const deps = makeDeps({
       existsSync: vi.fn((path: string) =>
-        path.endsWith("config.json") || path === "/templates/commands" || path === settingsPath),
+        path.endsWith("config.json")
+        || path === "/templates/commands"
+        || path === "/templates/skills"
+        || path === settingsPath),
       readFileSync: vi.fn((path: string) => {
         if (path.endsWith("package.json")) return JSON.stringify({ version: "1.4.0" });
         if (path === settingsPath) return settingsReads++ === 0 ? "{}" : "null";
@@ -513,11 +516,12 @@ describe("install", () => {
       rmSync: rmSync as any,
       copyFileSync: copyFileSync as any,
       commandsSourceDir: "/templates/commands",
+      skillSourceDir: "/templates/skills",
     });
 
     await install(deps);
     expect(rmSync).not.toHaveBeenCalled();
-    expect(copyFileSync).toHaveBeenCalledTimes(2);
+    expect(copyFileSync).toHaveBeenCalledTimes(4);
     const settingsWrite = vi.mocked(deps.writeFileSync).mock.calls.filter(([path]) => path === settingsPath).at(-1);
     expect(JSON.parse(settingsWrite![1]).mcpServers.lcm).toBeDefined();
   });
