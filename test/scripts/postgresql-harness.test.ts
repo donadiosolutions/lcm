@@ -117,9 +117,9 @@ describe("PostgreSQL harness utilities", () => {
     );
 
     expect(recordConsumerIdentity("/private/consumer-owner.json", 42, {
-      createIdentity: () => ({ pid: 42, birth: "darwin:stable" }),
+      createIdentity: () => ({ pid: 42, birth: "darwin:Fri Jul 24 21:00:00 2026" }),
       writeFile: vi.fn(),
-    })).toEqual({ version: 1, pid: 42, birth: "darwin:stable" });
+    })).toEqual({ version: 1, pid: 42, birth: "darwin:Fri Jul 24 21:00:00 2026" });
   });
 
   it("derives and validates every resource name from a random-style run ID", () => {
@@ -515,7 +515,7 @@ describe("PostgreSQL harness utilities", () => {
     const runId = "a".repeat(32);
     const owner = {
       pid: 42,
-      birth: "12345678-1234-1234-1234-123456789abc:100",
+      birth: "linux:12345678-1234-1234-1234-123456789abc:100",
     };
     const labels = ownershipLabels(runId, "database", owner);
     const removalFailure = Object.assign(new Error("resource busy"), {
@@ -565,14 +565,17 @@ describe("PostgreSQL harness utilities", () => {
       [`network:${createRunNames(liveRunId).network}`, ownershipLabels(
         liveRunId,
         "network",
-        { pid: 41, birth: `${bootId}:100` },
+        { pid: 41, birth: `linux:${bootId}:100` },
       )],
       [`volume:${createRunNames(staleRunId).volume}`, ownershipLabels(
         staleRunId,
         "data",
-        { pid: 42, birth: `${bootId}:200` },
+        { pid: 42, birth: `linux:${bootId}:200` },
       )],
-      [`volume:${createRunNames(legacyRunId).volume}`, { [RUN_LABEL]: legacyRunId }],
+      [`volume:${createRunNames(legacyRunId).volume}`, {
+        ...ownershipLabels(legacyRunId, "data", { pid: 43, birth: `linux:${bootId}:400` }),
+        [OWNER_BIRTH_LABEL]: "malformed",
+      }],
     ]);
     const dockerRunner = vi.fn(async (args: string[]) => {
       if (args[1] === "ls") {
@@ -593,7 +596,7 @@ describe("PostgreSQL harness utilities", () => {
     const runs = await discoverHarnessRuns({
       dockerRunner,
       processProbe: vi.fn(),
-      readFingerprint: (pid: number) => pid === 41 ? `${bootId}:100` : `${bootId}:999`,
+      readFingerprint: (pid: number) => pid === 41 ? `linux:${bootId}:100` : `linux:${bootId}:999`,
     });
     expect(runs.map((run) => [run.runId, run.classification])).toEqual([
       [liveRunId, "live"],
@@ -603,12 +606,12 @@ describe("PostgreSQL harness utilities", () => {
 
     records.set(
       `container:${createRunNames(liveRunId).runner}`,
-      ownershipLabels(liveRunId, "runner", { pid: 99, birth: `${bootId}:300` }),
+      ownershipLabels(liveRunId, "runner", { pid: 99, birth: `linux:${bootId}:300` }),
     );
     const inconsistent = await discoverHarnessRuns({
       dockerRunner,
       processProbe: vi.fn(),
-      readFingerprint: () => `${bootId}:100`,
+      readFingerprint: () => `linux:${bootId}:100`,
     });
     expect(inconsistent.find((run) => run.runId === liveRunId)?.classification).toBe("ambiguous");
   });
@@ -618,7 +621,7 @@ describe("PostgreSQL harness utilities", () => {
     const names = createRunNames(runId);
     const owner = {
       pid: 77,
-      birth: "12345678-1234-1234-1234-123456789abc:700",
+      birth: "linux:12345678-1234-1234-1234-123456789abc:700",
     };
     const records = new Map([
       [`container:${names.restore}`, ownershipLabels(runId, "restore", owner)],
@@ -685,7 +688,7 @@ describe("PostgreSQL harness utilities", () => {
     const names = createRunNames(runId);
     const owner = {
       pid: 88,
-      birth: "12345678-1234-1234-1234-123456789abc:800",
+      birth: "linux:12345678-1234-1234-1234-123456789abc:800",
     };
     const labels = ownershipLabels(runId, "network", owner);
     const dockerRunner = vi.fn(async (args: string[]) => {
@@ -717,7 +720,7 @@ describe("PostgreSQL harness utilities", () => {
     const names = createRunNames(runId);
     const owner = {
       pid: 91,
-      birth: "12345678-1234-1234-1234-123456789abc:900",
+      birth: "linux:12345678-1234-1234-1234-123456789abc:900",
     };
     const labels = ownershipLabels(runId, "database", owner);
     let exists = true;
@@ -786,7 +789,7 @@ describe("PostgreSQL harness utilities", () => {
     const names = createRunNames(staleRunId);
     const owner = {
       pid: 92,
-      birth: "12345678-1234-1234-1234-123456789abc:920",
+      birth: "linux:12345678-1234-1234-1234-123456789abc:920",
     };
     const labels = ownershipLabels(staleRunId, "network", owner);
     const inspectionFailure = Object.assign(new Error("denied"), {
@@ -829,8 +832,8 @@ describe("PostgreSQL harness utilities", () => {
   it("taints companions from a malformed canonical name and preserves active workers and consumers", async () => {
     const runId = "2".repeat(32);
     const names = createRunNames(runId);
-    const owner = { pid: 100, birth: "linux:boot:100" };
-    const consumer = { pid: 101, birth: "darwin:consumer-start" };
+    const owner = { pid: 100, birth: "linux:12345678-1234-1234-1234-123456789abc:100" };
+    const consumer = { pid: 101, birth: "darwin:Fri Jul 24 21:00:00 2026" };
     const records = new Map([
       [`network:${names.network}`, { [RUN_LABEL]: "malformed" }],
       [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],

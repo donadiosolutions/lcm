@@ -44,7 +44,16 @@ const cachedRunInitScript = join(repositoryRoot, "test", "postgresql", "cached-r
 const bootIdPattern = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const bootIdRegex = new RegExp(`^${bootIdPattern}$`, "u");
 const linuxBirthRegex = new RegExp(`^linux:(${bootIdPattern}):`, "u");
-const processBirthPattern = /^[^\u0000-\u001f\u007f]{1,160}$/u;
+const darwinDayPattern = "(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)";
+const darwinMonthPattern = "(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)";
+const dateDayPattern = "(?:0[1-9]|[12][0-9]|3[01])";
+const timePattern = "(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]";
+const processBirthPattern = new RegExp(
+  `^(?:linux:${bootIdPattern}:[1-9][0-9]*`
+  + `|darwin:${darwinDayPattern} ${darwinMonthPattern} (?: [1-9]|[12][0-9]|3[01]) ${timePattern} [0-9]{4}`
+  + `|win32:[0-9]{4}-(?:0[1-9]|1[0-2])-${dateDayPattern}T${timePattern}\\.[0-9]{7}Z)$`,
+  "u",
+);
 const consumerOwnerFile = "consumer-owner.json";
 
 export function createRunNames(runId) {
