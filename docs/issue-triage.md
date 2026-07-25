@@ -3,7 +3,9 @@
 New issues are queued for automated classification by the Codex issue labeler.
 The labeler runs every five minutes, processes the ten queued issues with the
 oldest creation timestamps, and reconciles the labels it owns with the issue's
-title and body. Labels owned by people or other workflows are preserved.
+title and body. Labels owned by people or other workflows are preserved. After
+label reconciliation, issues whose live labels contain `bug` receive a second
+Codex pass that searches for and closes only high-confidence duplicates.
 
 ## Add a managed label
 
@@ -39,15 +41,52 @@ group, so only one processor runs at a time. A run handles at most ten issues,
 oldest first, including an issue that closed while waiting in the queue; later
 issues remain queued for a subsequent run.
 
-The workflow validates the complete model response before changing any issue.
-It then processes each issue independently. For each successful issue it adds
-and removes only changed managed labels, preserves every unmanaged label, and
-removes `needs-codex-triage` last. If an issue fails, its queue label remains so
-a later run can retry it. Removing the queue label manually before application
-cancels automated changes for that issue.
+The workflow validates the complete label-classification response before
+changing any issue. It then processes each issue independently, adds and
+removes only changed managed labels, and preserves every unmanaged label.
+
+After reconciliation, the workflow refetches each issue and checks its live
+labels case-insensitively:
+
+- A non-bug is dequeued immediately. It is not searched for duplicate
+  candidates and does not consume a second Codex request.
+- A bug retains `needs-codex-triage` while the duplicate stage runs. This
+  includes an issue whose manual `bug` label survives reconciliation and an
+  issue that Codex has just classified as a bug.
+
+If either stage fails, the affected issue's queue label remains so a later run
+can retry it. Removing the queue label manually before either application step
+cancels subsequent automated changes for that issue.
 
 Codex reconciliation can replace the immediate `p3-low` default with the
 appropriate managed priority.
+
+## Duplicate bug handling
+
+For each reconciled bug, the workflow uses GitHub's authenticated hybrid issue
+search to collect at most eight older issue candidates from both open and
+closed history. Pull requests, the source issue, and newer issues are excluded.
+Candidate titles and bodies are bounded before they reach Codex.
+
+The second Codex request is intentionally conservative. A candidate is a
+duplicate only when it reports the same underlying defect. Related symptoms,
+components, or goals are not enough. When equivalent open and closed candidates
+exist, Codex must prefer the open issue. A closed issue is eligible only when no
+equivalent open issue exists.
+
+For a high-confidence duplicate, the workflow:
+
+1. Adds the existing unmanaged `duplicate` label.
+2. Comments `Duplicate of #N.` to create a visible link and backlink.
+3. Closes the duplicate as **not planned**.
+4. Removes `needs-codex-triage` last.
+
+Issue title and body fingerprints are checked again immediately before these
+writes. Edited or unverifiable issues fail closed and remain queued. The link
+comment contains a hidden workflow marker, so a retry cannot create duplicate
+comments. Conflicting automated markers fail safely. If a person closes the
+issue before application and no workflow marker exists, the workflow preserves
+that closure without adding its own duplicate link or label.
 
 ## Security and credentials
 
@@ -56,26 +95,29 @@ The repository secret must be named `OPENAI_API_KEY`. An API key uses OpenAI
 Platform API billing; a ChatGPT subscription session or credential is not used
 by GitHub Actions.
 
-The workflow deliberately separates collection, classification, and label
-application:
+The workflow deliberately separates both collection/classification stages from
+their write-capable application stages:
 
 - Collection checks out trusted repository policy code, reads public issue
   content, bounds it, and fetches live label descriptions without receiving the
   OpenAI secret.
-- Classification receives only the generated prompt and exact JSON Schema. It
-  performs no checkout, has read-only Codex permissions, drops `sudo`, and runs
-  the Codex Action as the final step in its job.
-- Application runs on a fresh runner without the OpenAI secret, validates the
-  structured result, and performs the least-privilege issue-label mutations.
+- Each classification job receives only its generated prompt and exact JSON
+  Schema. It performs no checkout, has read-only Codex permissions, drops
+  `sudo`, and runs the Codex Action as the final step in its job.
+- Each application job runs on a fresh runner without the OpenAI secret,
+  validates the structured result, and performs least-privilege issue
+  mutations.
 
-Issue titles and bodies are untrusted model input. The generated prompt marks
-them as data and tells Codex to ignore instructions inside them. GitHub label
-descriptions are repository-maintainer-controlled guidance. Rotate
-`OPENAI_API_KEY` immediately if its exposure is suspected.
+Source and candidate issue titles and bodies are untrusted model input. The
+generated prompts mark them as data and tell Codex to ignore instructions
+inside them. GitHub label descriptions are repository-maintainer-controlled
+guidance. Rotate `OPENAI_API_KEY` immediately if its exposure is suspected.
 
 ## Operations
 
 Use **Actions > Codex issue labeler > Run workflow** to process the current
 queue without waiting for the next scheduled run. An empty queue exits without
-calling OpenAI. Workflow logs identify configuration errors, malformed model
-output, missing issue results, and per-issue GitHub API failures.
+calling OpenAI. A queue with no reconciled bugs makes only the label
+classification request. Workflow logs identify configuration errors, malformed
+model output, missing issue results, stale fingerprints, conflicting duplicate
+markers, and per-issue GitHub API failures.

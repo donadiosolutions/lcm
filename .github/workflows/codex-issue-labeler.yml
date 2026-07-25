@@ -14,6 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  DUPLICATE_LABEL: duplicate
   QUEUE_LABEL: needs-codex-triage
 
 jobs:
@@ -155,7 +156,8 @@ jobs:
             const repositoryLabelMap = new Map(
               repositoryLabels.map((label) => [label.name, label]),
             );
-            const missingLabels = managedNames.filter(
+            const requiredLabels = [...managedNames, process.env.DUPLICATE_LABEL];
+            const missingLabels = requiredLabels.filter(
               (name) => !repositoryLabelMap.has(name),
             );
             if (missingLabels.length > 0) {
@@ -240,13 +242,16 @@ jobs:
           # which has no repository collaborator record for the action to check.
           allow-users: github-merge-queue
 
-  apply:
+  apply-labels:
     needs: [collect, classify]
     if: ${{ needs.collect.outputs.has_work == 'true' && needs.classify.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: write
+    outputs:
+      bug_issue_numbers: ${{ steps.apply.outputs.bug_issue_numbers }}
+      has_bugs: ${{ steps.apply.outputs.has_bugs }}
     steps:
       - name: Checkout trusted workflow code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -254,6 +259,7 @@ jobs:
           persist-credentials: false
 
       - name: Validate and apply classifications
+        id: apply
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           CLASSIFICATION_RESULT: ${{ needs.classify.outputs.result }}
@@ -270,6 +276,7 @@ jobs:
               includesLabelIgnoreCase,
               loadManagedLabelConfig,
               removeIssueLabelIfPresent,
+              requiresDuplicateTriage,
               validateClassificationResult,
             } = await import(policyUrl);
 
@@ -288,6 +295,7 @@ jobs:
               expectedIssueNumbers,
             );
 
+            const bugIssueNumbers = [];
             const failures = [];
             for (const classification of classifications) {
               const issueNumber = classification.issueNumber;
@@ -329,14 +337,31 @@ jobs:
                   );
                 }
 
-                await removeIssueLabelIfPresent(
-                  github,
-                  context.repo,
-                  issueNumber,
-                  process.env.QUEUE_LABEL,
+                const { data: reconciledIssue } = await github.rest.issues.get({
+                  ...context.repo,
+                  issue_number: issueNumber,
+                });
+                const reconciledLabels = reconciledIssue.labels.map((label) =>
+                  typeof label === "string" ? label : label.name,
                 );
+                if (requiresDuplicateTriage(reconciledLabels)) {
+                  bugIssueNumbers.push(issueNumber);
+                  core.info(
+                    `Reconciled bug #${issueNumber}; retaining ${process.env.QUEUE_LABEL} for duplicate triage.`,
+                  );
+                } else {
+                  await removeIssueLabelIfPresent(
+                    github,
+                    context.repo,
+                    issueNumber,
+                    process.env.QUEUE_LABEL,
+                  );
+                  core.info(
+                    `Reconciled non-bug #${issueNumber}; duplicate triage is not applicable.`,
+                  );
+                }
                 core.info(
-                  `Reconciled #${issueNumber}: added [${add.join(", ")}], removed [${remove.join(", ")}].`,
+                  `Label changes for #${issueNumber}: added [${add.join(", ")}], removed [${remove.join(", ")}].`,
                 );
               } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
@@ -345,8 +370,369 @@ jobs:
               }
             }
 
+            core.setOutput("bug_issue_numbers", JSON.stringify(bugIssueNumbers));
+            core.setOutput("has_bugs", bugIssueNumbers.length > 0 ? "true" : "false");
             if (failures.length > 0) {
               core.setFailed(
                 `Failed to reconcile ${failures.length} issue(s): ${failures.join("; ")}`,
+              );
+            }
+
+  collect-duplicates:
+    needs: apply-labels
+    if: ${{ needs.apply-labels.outputs.has_bugs == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      evidence: ${{ steps.collect.outputs.evidence }}
+      prompt: ${{ steps.collect.outputs.prompt }}
+      schema: ${{ steps.collect.outputs.schema }}
+    steps:
+      - name: Checkout trusted workflow code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Search duplicate candidates for reconciled bugs
+        id: collect
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          BUG_ISSUE_NUMBERS: ${{ needs.apply-labels.outputs.bug_issue_numbers }}
+        with:
+          script: |
+            const { join } = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const policyUrl = pathToFileURL(
+              join(process.env.GITHUB_WORKSPACE, ".github/scripts/issue-label-policy.mjs"),
+            ).href;
+            const {
+              buildDuplicatePrompt,
+              buildDuplicateSchema,
+              buildDuplicateSearchQuery,
+              includesLabelIgnoreCase,
+              issueContentFingerprint,
+              requiresDuplicateTriage,
+            } = await import(policyUrl);
+
+            const issueNumbers = JSON.parse(process.env.BUG_ISSUE_NUMBERS);
+            const duplicateIssues = [];
+            const evidence = [];
+            for (const issueNumber of issueNumbers) {
+              const { data: source } = await github.rest.issues.get({
+                ...context.repo,
+                issue_number: issueNumber,
+              });
+              if (source.pull_request) {
+                throw new Error(`Queued bug #${issueNumber} is a pull request`);
+              }
+              const sourceLabels = source.labels.map((label) =>
+                typeof label === "string" ? label : label.name,
+              );
+              if (!includesLabelIgnoreCase(sourceLabels, process.env.QUEUE_LABEL)) {
+                throw new Error(
+                  `Bug #${issueNumber} is no longer queued for duplicate triage`,
+                );
+              }
+              if (!requiresDuplicateTriage(sourceLabels)) {
+                throw new Error(
+                  `Issue #${issueNumber} no longer has the bug label`,
+                );
+              }
+
+              const query = buildDuplicateSearchQuery(
+                context.repo.owner,
+                context.repo.repo,
+                source,
+              );
+              const queryPrefix =
+                `repo:${context.repo.owner}/${context.repo.repo} is:issue`;
+              let searchItems = [];
+              if (query !== queryPrefix) {
+                const { data: searchResult } = await github.request(
+                  "GET /search/issues",
+                  {
+                    q: query,
+                    advanced_search: true,
+                    search_type: "hybrid",
+                    per_page: 20,
+                    headers: {
+                      "X-GitHub-Api-Version": "2026-03-10",
+                    },
+                  },
+                );
+                searchItems = searchResult.items;
+              }
+
+              const sourceCreatedAt = source.created_at;
+              const sourceTimestamp = Date.parse(sourceCreatedAt);
+              const candidates = searchItems
+                .filter((candidate) => {
+                  if (candidate.pull_request || candidate.number === issueNumber) {
+                    return false;
+                  }
+                  const candidateTimestamp = Date.parse(candidate.created_at);
+                  return candidateTimestamp < sourceTimestamp
+                    || (
+                      candidateTimestamp === sourceTimestamp
+                      && candidate.number < issueNumber
+                    );
+                })
+                .slice(0, 8)
+                .map((candidate) => ({
+                  number: candidate.number,
+                  title: candidate.title,
+                  body: candidate.body ?? "",
+                  state: candidate.state,
+                  stateReason: candidate.state_reason ?? "",
+                  createdAt: candidate.created_at,
+                  fingerprint: issueContentFingerprint(candidate),
+                }));
+
+              duplicateIssues.push({
+                source: {
+                  number: issueNumber,
+                  title: source.title,
+                  body: source.body ?? "",
+                  state: source.state,
+                  createdAt: sourceCreatedAt,
+                },
+                candidates,
+              });
+              evidence.push({
+                issueNumber,
+                sourceFingerprint: issueContentFingerprint(source),
+                sourceCreatedAt,
+                candidates: candidates.map((candidate) => ({
+                  number: candidate.number,
+                  fingerprint: candidate.fingerprint,
+                  createdAt: candidate.createdAt,
+                })),
+              });
+              core.info(
+                `Prepared ${candidates.length} duplicate candidate(s) for bug #${issueNumber}.`,
+              );
+            }
+
+            core.setOutput("evidence", JSON.stringify(evidence));
+            core.setOutput("prompt", buildDuplicatePrompt(duplicateIssues));
+            core.setOutput(
+              "schema",
+              JSON.stringify(buildDuplicateSchema(evidence)),
+            );
+
+  classify-duplicates:
+    needs: [apply-labels, collect-duplicates]
+    if: ${{ needs.apply-labels.outputs.has_bugs == 'true' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      result: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - name: Identify duplicate bugs with Codex
+        id: codex
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.10
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: ${{ needs.collect-duplicates.outputs.prompt }}
+          output-schema: ${{ needs.collect-duplicates.outputs.schema }}
+          codex-version: 0.144.6
+          model: gpt-5.6-luna
+          effort: low
+          permission-profile: ":read-only"
+          safety-strategy: drop-sudo
+          allow-users: github-merge-queue
+
+  apply-duplicates:
+    needs: [apply-labels, collect-duplicates, classify-duplicates]
+    if: ${{ needs.apply-labels.outputs.has_bugs == 'true' && needs.classify-duplicates.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout trusted workflow code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Validate and apply duplicate decisions
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          DUPLICATE_EVIDENCE: ${{ needs.collect-duplicates.outputs.evidence }}
+          DUPLICATE_RESULT: ${{ needs.classify-duplicates.outputs.result }}
+        with:
+          script: |
+            const { join } = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const policyUrl = pathToFileURL(
+              join(process.env.GITHUB_WORKSPACE, ".github/scripts/issue-label-policy.mjs"),
+            ).href;
+            const {
+              duplicateCommentBody,
+              findDuplicateCommentTarget,
+              includesLabelIgnoreCase,
+              issueContentFingerprint,
+              parseAndValidateDuplicateResult,
+              removeIssueLabelIfPresent,
+              requiresDuplicateTriage,
+            } = await import(policyUrl);
+
+            const evidence = JSON.parse(process.env.DUPLICATE_EVIDENCE);
+            const decisions = parseAndValidateDuplicateResult(
+              process.env.DUPLICATE_RESULT,
+              evidence,
+            );
+            const evidenceByIssue = new Map(
+              evidence.map((candidateSet) => [
+                candidateSet.issueNumber,
+                candidateSet,
+              ]),
+            );
+
+            const failures = [];
+            for (const decision of decisions) {
+              const issueNumber = decision.issueNumber;
+              try {
+                const { data: source } = await github.rest.issues.get({
+                  ...context.repo,
+                  issue_number: issueNumber,
+                });
+                const sourceLabels = source.labels.map((label) =>
+                  typeof label === "string" ? label : label.name,
+                );
+                if (!includesLabelIgnoreCase(sourceLabels, process.env.QUEUE_LABEL)) {
+                  core.info(
+                    `Skipping #${issueNumber}: duplicate triage was manually cancelled.`,
+                  );
+                  continue;
+                }
+                if (!requiresDuplicateTriage(sourceLabels)) {
+                  await removeIssueLabelIfPresent(
+                    github,
+                    context.repo,
+                    issueNumber,
+                    process.env.QUEUE_LABEL,
+                  );
+                  core.info(
+                    `Dequeued #${issueNumber} without duplicate actions because it is no longer a bug.`,
+                  );
+                  continue;
+                }
+
+                const candidateSet = evidenceByIssue.get(issueNumber);
+                if (
+                  issueContentFingerprint(source)
+                  !== candidateSet.sourceFingerprint
+                ) {
+                  throw new Error(
+                    `Bug #${issueNumber} changed after duplicate collection`,
+                  );
+                }
+
+                if (decision.duplicateOf.length === 0) {
+                  await removeIssueLabelIfPresent(
+                    github,
+                    context.repo,
+                    issueNumber,
+                    process.env.QUEUE_LABEL,
+                  );
+                  core.info(`No high-confidence duplicate found for bug #${issueNumber}.`);
+                  continue;
+                }
+
+                const canonicalNumber = decision.duplicateOf[0];
+                const canonicalEvidence = candidateSet.candidates.find(
+                  (candidate) => candidate.number === canonicalNumber,
+                );
+                const { data: canonical } = await github.rest.issues.get({
+                  ...context.repo,
+                  issue_number: canonicalNumber,
+                });
+                if (canonical.pull_request) {
+                  throw new Error(
+                    `Canonical target #${canonicalNumber} is a pull request`,
+                  );
+                }
+                if (
+                  issueContentFingerprint(canonical)
+                  !== canonicalEvidence.fingerprint
+                ) {
+                  throw new Error(
+                    `Canonical issue #${canonicalNumber} changed after duplicate collection`,
+                  );
+                }
+
+                const comments = await github.paginate(
+                  github.rest.issues.listComments,
+                  {
+                    ...context.repo,
+                    issue_number: issueNumber,
+                    per_page: 100,
+                  },
+                );
+                const markedCanonical = findDuplicateCommentTarget(comments);
+                if (
+                  markedCanonical !== null
+                  && markedCanonical !== canonicalNumber
+                ) {
+                  throw new Error(
+                    `Existing automated duplicate marker targets #${markedCanonical}, not #${canonicalNumber}`,
+                  );
+                }
+
+                if (source.state !== "open" && markedCanonical === null) {
+                  await removeIssueLabelIfPresent(
+                    github,
+                    context.repo,
+                    issueNumber,
+                    process.env.QUEUE_LABEL,
+                  );
+                  core.info(
+                    `Preserved human closure of #${issueNumber} without automated duplicate actions.`,
+                  );
+                  continue;
+                }
+
+                if (!includesLabelIgnoreCase(sourceLabels, process.env.DUPLICATE_LABEL)) {
+                  await github.rest.issues.addLabels({
+                    ...context.repo,
+                    issue_number: issueNumber,
+                    labels: [process.env.DUPLICATE_LABEL],
+                  });
+                }
+                if (markedCanonical === null) {
+                  await github.rest.issues.createComment({
+                    ...context.repo,
+                    issue_number: issueNumber,
+                    body: duplicateCommentBody(canonicalNumber),
+                  });
+                }
+                await github.rest.issues.update({
+                  ...context.repo,
+                  issue_number: issueNumber,
+                  state: "closed",
+                  state_reason: "not_planned",
+                });
+                await removeIssueLabelIfPresent(
+                  github,
+                  context.repo,
+                  issueNumber,
+                  process.env.QUEUE_LABEL,
+                );
+                core.info(
+                  `Closed bug #${issueNumber} as a duplicate of #${canonicalNumber}.`,
+                );
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                failures.push(`#${issueNumber}: ${message}`);
+                core.error(`Failed duplicate triage for #${issueNumber}: ${message}`);
+              }
+            }
+
+            if (failures.length > 0) {
+              core.setFailed(
+                `Failed duplicate triage for ${failures.length} issue(s): ${failures.join("; ")}`,
               );
             }
