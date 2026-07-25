@@ -1,0 +1,1325 @@
+import { createHash } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
+import { dirname, isAbsolute, join, sep } from "node:path";
+import { GITLEAKS_PATTERNS } from "../generated-patterns.js";
+import { NATIVE_PATTERNS, ScrubEngine } from "../scrub.js";
+import type { MessageRole } from "../store/conversation-store.js";
+import type {
+  ConversationRepository,
+  JsonObject,
+  JsonValue,
+  NativeTranscriptCheckpointRecord,
+  NativeTranscriptRepository,
+} from "./contracts.js";
+import { NATIVE_TRANSCRIPT_MAX_JSON_DEPTH } from "./contracts.js";
+export { NATIVE_TRANSCRIPT_MAX_JSON_DEPTH } from "./contracts.js";
+import type {
+  LocalTranscriptQuarantineRepository,
+  TranscriptQuarantineReason,
+} from "./local-transcript-quarantine.js";
+
+export interface NativeTranscriptFormat {
+  readonly clientName: "claude-code" | "codex";
+  readonly formatName: "claude-jsonl" | "codex-jsonl";
+  readonly formatVersion: "v1";
+}
+
+export const CLAUDE_NATIVE_TRANSCRIPT_FORMAT = {
+  clientName: "claude-code",
+  formatName: "claude-jsonl",
+  formatVersion: "v1",
+} as const satisfies NativeTranscriptFormat;
+
+export const CODEX_NATIVE_TRANSCRIPT_FORMAT = {
+  clientName: "codex",
+  formatName: "codex-jsonl",
+  formatVersion: "v1",
+} as const satisfies NativeTranscriptFormat;
+
+export const SUPPORTED_NATIVE_TRANSCRIPT_FORMATS = [
+  CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+  CODEX_NATIVE_TRANSCRIPT_FORMAT,
+] as const;
+
+export const NATIVE_TRANSCRIPT_MAX_RECORD_BYTES = 10 * 1024 * 1024;
+export const NATIVE_TRANSCRIPT_DEFAULT_BATCH_SIZE = 100;
+export const NATIVE_TRANSCRIPT_MAX_BATCH_SIZE = 1_000;
+export const NATIVE_TRANSCRIPT_SCRUB_PIPELINE_VERSION =
+  "native-json-scrub/v1";
+
+const DIGEST_PATTERN = /^[0-9a-f]{64}$/u;
+const WINDOWS_ABSOLUTE_PATH_PATTERN = /^[a-zA-Z]:[\\/]/u;
+const CHECKPOINT_VERSION = 1;
+
+export class NativeTranscriptConfigurationError extends Error {
+  constructor(readonly code: "invalid-patterns" | "invalid-input") {
+    super(`native transcript configuration failed: ${code}`);
+    this.name = "NativeTranscriptConfigurationError";
+  }
+}
+
+export class NativeTranscriptLinkError extends Error {
+  constructor(readonly sourceOrdinal: number) {
+    super("native transcript message linkage failed");
+    this.name = "NativeTranscriptLinkError";
+  }
+}
+
+class NativeTranscriptRecordError extends Error {
+  constructor(readonly reason: TranscriptQuarantineReason) {
+    super("native transcript record validation failed");
+    this.name = "NativeTranscriptRecordError";
+  }
+}
+
+export interface NativeTranscriptScrubber {
+  readonly scrubberVersion: string;
+  scrubJson(value: JsonObject | JsonValue[]): JsonObject | JsonValue[];
+}
+
+export interface NativeTranscriptScrubberOptions {
+  readonly globalPatterns?: readonly string[];
+  readonly projectPatterns?: readonly string[];
+  readonly pipelineVersion?: string;
+}
+
+function sha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function effectivePatternDigest(
+  globalPatterns: readonly string[],
+  projectPatterns: readonly string[],
+): string {
+  return sha256(JSON.stringify({
+    gitleaks: GITLEAKS_PATTERNS.map(({ regex, flags }) => [regex, flags]),
+    native: NATIVE_PATTERNS,
+    global: globalPatterns,
+    project: projectPatterns,
+  }));
+}
+
+function assertNoNul(value: string): void {
+  if (value.includes("\0")) {
+    throw new NativeTranscriptRecordError("nul-character");
+  }
+}
+
+function scrubString(engine: ScrubEngine, value: string): string {
+  assertNoNul(value);
+  const scrubbed = engine.scrub(value);
+  assertNoNul(scrubbed);
+  if (engine.scrub(scrubbed) !== scrubbed) {
+    throw new NativeTranscriptRecordError("residual-secret");
+  }
+  return scrubbed;
+}
+
+function scrubJsonValue(engine: ScrubEngine, value: JsonValue): JsonValue {
+  if (typeof value === "string") return scrubString(engine, value);
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => scrubJsonValue(engine, item));
+  }
+  const result: Record<string, JsonValue> = {};
+  for (const [key, item] of Object.entries(value)) {
+    const scrubbedKey = scrubString(engine, key);
+    if (Object.hasOwn(result, scrubbedKey)) {
+      throw new NativeTranscriptRecordError("redacted-key-collision");
+    }
+    Object.defineProperty(result, scrubbedKey, {
+      configurable: true,
+      enumerable: true,
+      value: scrubJsonValue(engine, item),
+      writable: true,
+    });
+  }
+  return result;
+}
+
+export function createNativeTranscriptScrubber(
+  options: NativeTranscriptScrubberOptions = {},
+): NativeTranscriptScrubber {
+  const globalPatterns = [...(options.globalPatterns ?? [])];
+  const projectPatterns = [...(options.projectPatterns ?? [])];
+  const pipelineVersion =
+    options.pipelineVersion ?? NATIVE_TRANSCRIPT_SCRUB_PIPELINE_VERSION;
+  if (pipelineVersion.trim().length === 0 || pipelineVersion.includes("\0")) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const engine = new ScrubEngine(globalPatterns, projectPatterns);
+  if (engine.invalidPatterns.length > 0) {
+    throw new NativeTranscriptConfigurationError("invalid-patterns");
+  }
+  const scrubberVersion = `${pipelineVersion}:${effectivePatternDigest(
+    globalPatterns,
+    projectPatterns,
+  )}`;
+  return {
+    scrubberVersion,
+    scrubJson: (value): JsonObject | JsonValue[] =>
+      scrubJsonValue(engine, value) as JsonObject | JsonValue[],
+  };
+}
+
+export function canonicalNativeTranscriptJson(value: JsonValue): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalNativeTranscriptJson).join(",")}]`;
+  }
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) =>
+      `${JSON.stringify(key)}:${canonicalNativeTranscriptJson(value[key])}`)
+    .join(",")}}`;
+}
+
+function assertFormat(format: NativeTranscriptFormat): void {
+  const supported = SUPPORTED_NATIVE_TRANSCRIPT_FORMATS.some(
+    (candidate) =>
+      candidate.clientName === format.clientName
+      && candidate.formatName === format.formatName
+      && candidate.formatVersion === format.formatVersion,
+  );
+  if (!supported) throw new NativeTranscriptConfigurationError("invalid-input");
+}
+
+function assertNonemptyText(value: string): void {
+  if (value.length === 0 || value.includes("\0")) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+}
+
+function assertSourceLocator(value: string): void {
+  assertNonemptyText(value);
+  if (
+    isAbsolute(value)
+    || WINDOWS_ABSOLUTE_PATH_PATTERN.test(value)
+    || value.split(/[\\/]/u).includes("..")
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+}
+
+function assertSafeNonnegative(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+}
+
+export interface PreparedNativeTranscriptRecord {
+  readonly kind: "record";
+  readonly sourceOrdinal: number;
+  readonly endByteOffset: number;
+  readonly prefixSha256: string;
+  readonly formatName: NativeTranscriptFormat["formatName"];
+  readonly formatVersion: NativeTranscriptFormat["formatVersion"];
+  readonly nativeSessionId: string;
+  readonly observedAt: Date;
+  readonly scrubberVersion: string;
+  readonly contentSha256: string;
+  readonly ingestKey: string;
+  readonly nativePayload: JsonObject | JsonValue[];
+}
+
+export interface QuarantinedNativeTranscriptRecord {
+  readonly kind: "quarantine";
+  readonly sourceOrdinal: number;
+  readonly endByteOffset: number;
+  readonly prefixSha256: string;
+  readonly reason: TranscriptQuarantineReason;
+  readonly contentSha256: string;
+  readonly quarantinedAt: Date;
+}
+
+export type NativeTranscriptReadOutcome =
+  | PreparedNativeTranscriptRecord
+  | QuarantinedNativeTranscriptRecord;
+
+export interface NativeTranscriptJsonlReadOptions {
+  readonly bytes: AsyncIterable<Uint8Array>;
+  readonly format: NativeTranscriptFormat;
+  readonly nativeSessionId: string;
+  readonly sourceLocator: string;
+  readonly scrubber: NativeTranscriptScrubber;
+  readonly clock?: () => Date;
+  /** @internal Allows bounded unit tests without allocating ten MiB. */
+  readonly maxRecordBytes?: number;
+  /** Reports consumed record or blank-line boundaries without payload data. */
+  readonly onProgress?: (progress: {
+    readonly endByteOffset: number;
+    readonly prefixSha256: string;
+  }) => void;
+}
+
+function ingestKey(
+  format: NativeTranscriptFormat,
+  nativeSessionId: string,
+  sourceLocator: string,
+  contentSha256: string,
+  occurrence: number,
+): string {
+  return sha256(JSON.stringify([
+    format.clientName,
+    format.formatName,
+    format.formatVersion,
+    nativeSessionId,
+    sourceLocator,
+    contentSha256,
+    occurrence,
+  ]));
+}
+
+function parsedContainer(text: string): JsonObject | JsonValue[] {
+  let parsed: JsonValue;
+  try {
+    parsed = JSON.parse(text) as JsonValue;
+  } catch {
+    throw new NativeTranscriptRecordError("malformed-json");
+  }
+  if (parsed === null || typeof parsed !== "object") {
+    throw new NativeTranscriptRecordError("non-container-json");
+  }
+  return parsed as JsonObject | JsonValue[];
+}
+
+function assertJsonTreeSafe(root: JsonObject | JsonValue[]): void {
+  const pending: Array<{ value: JsonValue; depth: number }> = [{
+    value: root,
+    depth: 1,
+  }];
+  while (pending.length > 0) {
+    const candidate = pending.pop()!;
+    if (
+      typeof candidate.value === "number"
+      && !Number.isFinite(candidate.value)
+    ) {
+      throw new NativeTranscriptRecordError("malformed-json");
+    }
+    if (
+      candidate.value === null
+      || typeof candidate.value !== "object"
+    ) {
+      continue;
+    }
+    if (candidate.depth > NATIVE_TRANSCRIPT_MAX_JSON_DEPTH) {
+      throw new NativeTranscriptRecordError("nesting-too-deep");
+    }
+    const children = Array.isArray(candidate.value)
+      ? candidate.value
+      : Object.values(candidate.value);
+    for (const value of children) {
+      pending.push({ value, depth: candidate.depth + 1 });
+    }
+  }
+}
+
+function decodeRecord(bytes: Uint8Array): string {
+  if (bytes.includes(0)) {
+    throw new NativeTranscriptRecordError("binary-input");
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new NativeTranscriptRecordError("invalid-utf8");
+  }
+}
+
+type RecordAccumulator = {
+  readonly parts: Buffer[];
+  readonly rawHash: ReturnType<typeof createHash>;
+  byteLength: number;
+  oversized: boolean;
+};
+
+function newAccumulator(): RecordAccumulator {
+  return {
+    parts: [],
+    rawHash: createHash("sha256"),
+    byteLength: 0,
+    oversized: false,
+  };
+}
+
+function appendRecordBytes(
+  accumulator: RecordAccumulator,
+  bytes: Uint8Array,
+  maxRecordBytes: number,
+): void {
+  accumulator.rawHash.update(bytes);
+  accumulator.byteLength += bytes.byteLength;
+  if (accumulator.oversized) return;
+  if (accumulator.byteLength > maxRecordBytes) {
+    accumulator.oversized = true;
+    accumulator.parts.length = 0;
+    return;
+  }
+  if (bytes.byteLength > 0) accumulator.parts.push(Buffer.from(bytes));
+}
+
+function accumulatedBytes(accumulator: RecordAccumulator): Buffer {
+  const bytes = Buffer.concat(accumulator.parts, accumulator.byteLength);
+  return bytes.at(-1) === 0x0d ? bytes.subarray(0, -1) : bytes;
+}
+
+function isJsonlBlank(bytes: Uint8Array): boolean {
+  return bytes.every((byte) =>
+    byte === 0x09 || byte === 0x0d || byte === 0x20);
+}
+
+function quarantineOutcome(
+  sourceOrdinal: number,
+  endByteOffset: number,
+  prefixSha256: string,
+  reason: TranscriptQuarantineReason,
+  contentSha256: string,
+  clock: () => Date,
+): QuarantinedNativeTranscriptRecord {
+  const quarantinedAt = clock();
+  if (!Number.isFinite(quarantinedAt.getTime())) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  return {
+    kind: "quarantine",
+    sourceOrdinal,
+    endByteOffset,
+    prefixSha256,
+    reason,
+    contentSha256,
+    quarantinedAt,
+  };
+}
+
+export async function* readNativeTranscriptJsonl(
+  options: NativeTranscriptJsonlReadOptions,
+): AsyncGenerator<NativeTranscriptReadOutcome> {
+  assertFormat(options.format);
+  assertNonemptyText(options.nativeSessionId);
+  assertSourceLocator(options.sourceLocator);
+  const maxRecordBytes =
+    options.maxRecordBytes ?? NATIVE_TRANSCRIPT_MAX_RECORD_BYTES;
+  if (!Number.isSafeInteger(maxRecordBytes) || maxRecordBytes < 1) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const clock = options.clock ?? (() => new Date());
+  const prefixHash = createHash("sha256");
+  const occurrences = new Map<string, number>();
+  let accumulator = newAccumulator();
+  let sourceOrdinal = 0;
+  let byteOffset = 0;
+
+  const finishRecord = (
+    endByteOffset: number,
+  ): NativeTranscriptReadOutcome | null => {
+    const prefixSha256 = prefixHash.copy().digest("hex");
+    options.onProgress?.({ endByteOffset, prefixSha256 });
+    if (accumulator.oversized) {
+      const outcome = quarantineOutcome(
+        sourceOrdinal,
+        endByteOffset,
+        prefixSha256,
+        "record-too-large",
+        accumulator.rawHash.copy().digest("hex"),
+        clock,
+      );
+      sourceOrdinal += 1;
+      return outcome;
+    }
+    const bytes = accumulatedBytes(accumulator);
+    if (isJsonlBlank(bytes)) return null;
+    const rawDigest = accumulator.rawHash.copy().digest("hex");
+    try {
+      const parsed = parsedContainer(decodeRecord(bytes));
+      assertJsonTreeSafe(parsed);
+      const nativePayload = options.scrubber.scrubJson(parsed);
+      const contentSha256 = sha256(
+        canonicalNativeTranscriptJson(nativePayload),
+      );
+      const occurrence = (occurrences.get(contentSha256) ?? 0) + 1;
+      occurrences.set(contentSha256, occurrence);
+      const observedAt = clock();
+      if (!Number.isFinite(observedAt.getTime())) {
+        throw new NativeTranscriptConfigurationError("invalid-input");
+      }
+      const outcome: PreparedNativeTranscriptRecord = {
+        kind: "record",
+        sourceOrdinal,
+        endByteOffset,
+        prefixSha256,
+        formatName: options.format.formatName,
+        formatVersion: options.format.formatVersion,
+        nativeSessionId: options.nativeSessionId,
+        observedAt,
+        scrubberVersion: options.scrubber.scrubberVersion,
+        contentSha256,
+        ingestKey: ingestKey(
+          options.format,
+          options.nativeSessionId,
+          options.sourceLocator,
+          contentSha256,
+          occurrence,
+        ),
+        nativePayload,
+      };
+      sourceOrdinal += 1;
+      return outcome;
+    } catch (error) {
+      if (!(error instanceof NativeTranscriptRecordError)) throw error;
+      const outcome = quarantineOutcome(
+        sourceOrdinal,
+        endByteOffset,
+        prefixSha256,
+        error.reason,
+        rawDigest,
+        clock,
+      );
+      sourceOrdinal += 1;
+      return outcome;
+    }
+  };
+
+  for await (const chunk of options.bytes) {
+    if (!(chunk instanceof Uint8Array)) {
+      throw new NativeTranscriptConfigurationError("invalid-input");
+    }
+    let start = 0;
+    for (let index = 0; index < chunk.byteLength; index += 1) {
+      if (chunk[index] !== 0x0a) continue;
+      const segment = chunk.subarray(start, index);
+      appendRecordBytes(accumulator, segment, maxRecordBytes);
+      prefixHash.update(segment);
+      prefixHash.update(Uint8Array.of(0x0a));
+      byteOffset += segment.byteLength + 1;
+      const outcome = finishRecord(byteOffset);
+      accumulator = newAccumulator();
+      if (outcome) yield outcome;
+      start = index + 1;
+    }
+    const remainder = chunk.subarray(start);
+    appendRecordBytes(accumulator, remainder, maxRecordBytes);
+    prefixHash.update(remainder);
+    byteOffset += remainder.byteLength;
+  }
+  if (accumulator.byteLength > 0) {
+    const outcome = finishRecord(byteOffset);
+    if (outcome) yield outcome;
+  }
+}
+
+export interface NativeTranscriptSourceMetadata {
+  readonly sizeBytes: number;
+  readonly modifiedAtMs: number;
+  /** Descriptor ctime change cookie used only for in-run mutation fencing. */
+  readonly changedAtMs: number;
+}
+
+export interface NativeTranscriptSourceSnapshot {
+  readonly metadata: NativeTranscriptSourceMetadata;
+  digestPrefix(byteLength: number): Promise<string>;
+  stream(): AsyncIterable<Uint8Array>;
+  assertUnchanged(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface NativeTranscriptByteSource {
+  openSnapshot(): Promise<NativeTranscriptSourceSnapshot>;
+}
+
+export class NativeTranscriptSourceChangedError extends Error {
+  constructor() {
+    super("native transcript source changed during backfill");
+    this.name = "NativeTranscriptSourceChangedError";
+  }
+}
+
+function isContainedPath(root: string, candidate: string): boolean {
+  const prefix = root.endsWith(sep) ? root : `${root}${sep}`;
+  return candidate === root || candidate.startsWith(prefix);
+}
+
+function openValidatedSourceFile(
+  rootPath: string,
+  sourcePath: string,
+  afterOpen?: () => void,
+): {
+  fd: number;
+  device: number;
+  inode: number;
+  mode: number;
+  userId: number;
+  groupId: number;
+  sizeBytes: number;
+  modifiedAtMs: number;
+  changedAtMs: number;
+} {
+  const realRoot = realpathSync(rootPath);
+  const realParent = realpathSync(dirname(sourcePath));
+  if (!isContainedPath(realRoot, realParent)) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const fd = openSync(
+    sourcePath,
+    constants.O_RDONLY | constants.O_NOFOLLOW,
+  );
+  try {
+    const descriptorStat = fstatSync(fd);
+    if (!descriptorStat.isFile()) {
+      throw new NativeTranscriptConfigurationError("invalid-input");
+    }
+    afterOpen?.();
+    const openedPath = realpathSync(sourcePath);
+    const currentStat = statSync(openedPath);
+    if (
+      !isContainedPath(realRoot, openedPath)
+      || currentStat.dev !== descriptorStat.dev
+      || currentStat.ino !== descriptorStat.ino
+    ) {
+      throw new NativeTranscriptConfigurationError("invalid-input");
+    }
+    return {
+      fd,
+      device: descriptorStat.dev,
+      inode: descriptorStat.ino,
+      mode: descriptorStat.mode,
+      userId: descriptorStat.uid,
+      groupId: descriptorStat.gid,
+      sizeBytes: descriptorStat.size,
+      modifiedAtMs: descriptorStat.mtimeMs,
+      changedAtMs: descriptorStat.ctimeMs,
+    };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+export function createFileNativeTranscriptSource(
+  clientRoot: string,
+  sourceLocator: string,
+  options: {
+    /** @internal Deterministic streaming seam for unit tests. */
+    readonly chunkBytes?: number;
+    /** @internal Deterministic descriptor-race seam for unit tests. */
+    readonly _afterOpenForTesting?: () => void;
+    /** @internal Runs after the bound snapshot has been created. */
+    readonly _afterSnapshotOpenForTesting?: () => void;
+    /** @internal Deterministic prefix-verification mutation seam. */
+    readonly _beforeDigestPrefixForTesting?: () => void;
+    /** @internal Deterministic pre-stream mutation seam. */
+    readonly _beforeStreamForTesting?: () => void;
+    /** @internal Deterministic mid-stream mutation seam. */
+    readonly _afterChunkForTesting?: (chunkOrdinal: number) => void;
+  } = {},
+): NativeTranscriptByteSource {
+  assertSourceLocator(sourceLocator);
+  const chunkBytes = options.chunkBytes ?? 64 * 1024;
+  if (!Number.isSafeInteger(chunkBytes) || chunkBytes < 1) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const sourcePath = join(clientRoot, sourceLocator);
+  return {
+    openSnapshot: async (): Promise<NativeTranscriptSourceSnapshot> => {
+      const opened = openValidatedSourceFile(
+        clientRoot,
+        sourcePath,
+        options._afterOpenForTesting,
+      );
+      let closed = false;
+      const metadata = {
+        sizeBytes: opened.sizeBytes,
+        modifiedAtMs: opened.modifiedAtMs,
+        changedAtMs: opened.changedAtMs,
+      };
+      const assertOpen = (): void => {
+        if (closed) {
+          throw new NativeTranscriptConfigurationError("invalid-input");
+        }
+      };
+      const assertUnchanged = (): void => {
+        assertOpen();
+        const current = fstatSync(opened.fd);
+        const descriptorChanged =
+          current.dev !== opened.device
+          || current.ino !== opened.inode
+          || current.mode !== opened.mode
+          || current.uid !== opened.userId
+          || current.gid !== opened.groupId
+          || current.size !== opened.sizeBytes
+          || current.mtimeMs !== opened.modifiedAtMs;
+        if (descriptorChanged) {
+          throw new NativeTranscriptSourceChangedError();
+        }
+        if (current.ctimeMs !== opened.changedAtMs) {
+          let locatorStillNamesOpenedFile = true;
+          try {
+            const locatorStat = statSync(sourcePath);
+            locatorStillNamesOpenedFile =
+              locatorStat.dev === opened.device
+              && locatorStat.ino === opened.inode;
+          } catch {
+            // A missing or unreadable locator does not prove atomic replacement.
+          }
+          if (locatorStillNamesOpenedFile) {
+            throw new NativeTranscriptSourceChangedError();
+          }
+        }
+      };
+      const snapshot: NativeTranscriptSourceSnapshot = {
+        metadata,
+        assertUnchanged: async (): Promise<void> => assertUnchanged(),
+        digestPrefix: async (byteLength: number): Promise<string> => {
+          assertOpen();
+          assertSafeNonnegative(byteLength);
+          options._beforeDigestPrefixForTesting?.();
+          if (byteLength > opened.sizeBytes) {
+            throw new NativeTranscriptConfigurationError("invalid-input");
+          }
+          const hash = createHash("sha256");
+          const buffer = Buffer.allocUnsafe(
+            Math.max(1, Math.min(chunkBytes, byteLength)),
+          );
+          let remaining = byteLength;
+          let position = 0;
+          while (remaining > 0) {
+            const bytesRead = readSync(
+              opened.fd,
+              buffer,
+              0,
+              Math.min(buffer.byteLength, remaining),
+              position,
+            );
+            if (bytesRead === 0) {
+              throw new NativeTranscriptSourceChangedError();
+            }
+            hash.update(buffer.subarray(0, bytesRead));
+            remaining -= bytesRead;
+            position += bytesRead;
+          }
+          return hash.digest("hex");
+        },
+        stream: async function* (): AsyncGenerator<Uint8Array> {
+          assertOpen();
+          options._beforeStreamForTesting?.();
+          const buffer = Buffer.allocUnsafe(chunkBytes);
+          let position = 0;
+          let chunkOrdinal = 0;
+          while (position < opened.sizeBytes) {
+            const bytesRead = readSync(
+              opened.fd,
+              buffer,
+              0,
+              Math.min(buffer.byteLength, opened.sizeBytes - position),
+              position,
+            );
+            if (bytesRead === 0) {
+              throw new NativeTranscriptSourceChangedError();
+            }
+            position += bytesRead;
+            const chunk = Buffer.from(buffer.subarray(0, bytesRead));
+            options._afterChunkForTesting?.(chunkOrdinal);
+            chunkOrdinal += 1;
+            yield chunk;
+          }
+        },
+        close: async (): Promise<void> => {
+          if (closed) return;
+          closed = true;
+          closeSync(opened.fd);
+        },
+      };
+      try {
+        options._afterSnapshotOpenForTesting?.();
+        return snapshot;
+      } catch (error) {
+        await snapshot.close();
+        throw error;
+      }
+    },
+  };
+}
+
+export interface NativeTranscriptMessageCandidate {
+  readonly sessionSequence: number;
+  readonly role: MessageRole;
+  readonly content: string;
+  readonly sourceOrdinal: number;
+}
+
+export interface NativeTranscriptMessageMapper {
+  map(
+    format: NativeTranscriptFormat,
+    payload: JsonObject | JsonValue[],
+    sourceOrdinal: number,
+  ): readonly NativeTranscriptMessageCandidate[];
+}
+
+const MESSAGE_ROLES = new Set<MessageRole>([
+  "system",
+  "user",
+  "assistant",
+  "tool",
+]);
+
+function isMessageRole(value: unknown): value is MessageRole {
+  return typeof value === "string"
+    && MESSAGE_ROLES.has(value as MessageRole);
+}
+
+function object(value: JsonValue | undefined): JsonObject | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : null;
+}
+
+function cloneJsonValue(value: JsonValue): JsonValue {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(cloneJsonValue);
+  const result: Record<string, JsonValue> = {};
+  for (const [key, item] of Object.entries(value)) {
+    Object.defineProperty(result, key, {
+      configurable: true,
+      enumerable: true,
+      value: cloneJsonValue(item),
+      writable: true,
+    });
+  }
+  return result;
+}
+
+function cloneNativePayload(
+  value: JsonObject | JsonValue[],
+): JsonObject | JsonValue[] {
+  return cloneJsonValue(value) as JsonObject | JsonValue[];
+}
+
+function claudeText(value: JsonValue | undefined): string {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return "";
+  return value.map((item) => {
+    const block = object(item);
+    if (!block) return "";
+    if (block.type === "text" && typeof block.text === "string") {
+      return block.text;
+    }
+    return block.type === "tool_result"
+      ? claudeText(block.content)
+      : "";
+  }).filter(Boolean).join("\n");
+}
+
+function codexText(value: JsonValue | undefined): string {
+  if (typeof value === "string") return value.trim();
+  if (!Array.isArray(value)) return "";
+  return value.map((item) => {
+    const block = object(item);
+    if (
+      block
+      && (
+        block.type === "input_text"
+        || block.type === "output_text"
+        || block.type === "text"
+      )
+      && typeof block.text === "string"
+    ) {
+      return block.text;
+    }
+    return "";
+  }).filter(Boolean).join("\n").trim();
+}
+
+/**
+ * Maps the supported sanitized client-native message records exactly as the
+ * existing #85 Claude and Codex transcript parsers do.
+ */
+export function createNativeTranscriptMessageMapper():
+  NativeTranscriptMessageMapper {
+  let sessionSequence = 0;
+  return {
+    map: (format, payload): readonly NativeTranscriptMessageCandidate[] => {
+      const root = object(payload);
+      if (!root) return [];
+      let role: JsonValue | undefined;
+      let content = "";
+      if (format.clientName === "claude-code") {
+        const message = object(root.message);
+        role = message?.role;
+        if (
+          role !== "user"
+          && role !== "assistant"
+          && role !== "system"
+        ) {
+          return [];
+        }
+        content = claudeText(message?.content);
+      } else {
+        if (root.type !== "response_item") return [];
+        const message = object(root.payload);
+        if (message?.type !== "message") return [];
+        role = message.role;
+        if (role !== "user" && role !== "assistant") return [];
+        content = codexText(message.content);
+      }
+      if (content.trim().length === 0) return [];
+      const candidate: NativeTranscriptMessageCandidate = {
+        sessionSequence,
+        role,
+        content,
+        sourceOrdinal: 0,
+      };
+      sessionSequence += 1;
+      return [candidate];
+    },
+  };
+}
+
+export interface ExactNativeTranscriptMessageResolver {
+  resolveExact(input: {
+    readonly nativeSessionId: string;
+    readonly sessionSequence: number;
+    readonly role: MessageRole;
+    readonly content: string;
+  }): Promise<{
+    readonly conversationId: number;
+    readonly messageId: number;
+  } | null>;
+}
+
+/**
+ * Resolve one sanitized native message against the exact #85 session-wide
+ * message order without wiring transcript backfill into normal daemon or CLI
+ * ingestion.
+ *
+ * Create one resolver per backfill. It materializes and caches one immutable
+ * repository snapshot per native session so records in the same source cannot
+ * observe different destination views.
+ *
+ * A session can span multiple conversations. Conversations are ordered by
+ * creation time and then conversation ID, while each conversation must expose
+ * a contiguous zero-based message sequence. This makes the session-wide order
+ * deterministic and fails closed on inconsistent repository data.
+ */
+export function createExactNativeTranscriptMessageResolver(
+  conversations: ConversationRepository,
+): ExactNativeTranscriptMessageResolver {
+  type ResolvedMessage = {
+    readonly conversationId: number;
+    readonly messageId: number;
+    readonly role: MessageRole;
+    readonly content: string;
+  };
+  const snapshots = new Map<string, Promise<readonly ResolvedMessage[] | null>>();
+  const loadSnapshot = async (
+    nativeSessionId: string,
+  ): Promise<readonly ResolvedMessage[] | null> => {
+    const sessionConversations = (await conversations.listConversations())
+      .filter((conversation) => conversation.sessionId === nativeSessionId)
+      .sort((left, right) =>
+        left.createdAt.getTime() - right.createdAt.getTime()
+        || left.conversationId - right.conversationId
+      );
+    if (sessionConversations.length === 0) return null;
+
+    const seenConversationIds = new Set<number>();
+    const sessionMessages: ResolvedMessage[] = [];
+    for (const conversation of sessionConversations) {
+      if (
+        seenConversationIds.has(conversation.conversationId)
+        || !Number.isFinite(conversation.createdAt.getTime())
+      ) {
+        return null;
+      }
+      seenConversationIds.add(conversation.conversationId);
+      const messages = await conversations.getMessages(
+        conversation.conversationId,
+      );
+      if (
+        messages.some((message, index) =>
+          message.conversationId !== conversation.conversationId
+          || message.seq !== index
+        )
+      ) {
+        return null;
+      }
+      sessionMessages.push(...messages.map((message) => ({
+        conversationId: message.conversationId,
+        messageId: message.messageId,
+        role: message.role,
+        content: message.content,
+      })));
+    }
+    return sessionMessages;
+  };
+
+  return {
+    resolveExact: async (input) => {
+      if (
+        !Number.isSafeInteger(input.sessionSequence)
+        || input.sessionSequence < 0
+        || !isMessageRole(input.role)
+        || input.nativeSessionId.length === 0
+        || input.nativeSessionId.includes("\0")
+        || input.content.includes("\0")
+      ) {
+        return null;
+      }
+      let snapshot = snapshots.get(input.nativeSessionId);
+      if (!snapshot) {
+        snapshot = loadSnapshot(input.nativeSessionId);
+        snapshots.set(input.nativeSessionId, snapshot);
+      }
+      const sessionMessages = await snapshot;
+      if (!sessionMessages) return null;
+      const message = sessionMessages[input.sessionSequence];
+      if (
+        !message
+        || message.role !== input.role
+        || message.content !== input.content
+      ) {
+        return null;
+      }
+      return {
+        conversationId: message.conversationId,
+        messageId: message.messageId,
+      };
+    },
+  };
+}
+
+type TranscriptCheckpointJson = JsonObject & {
+  version: number;
+  byteOffset: number;
+  prefixSha256: string;
+  source: JsonObject;
+};
+
+function checkpointJson(
+  progress: {
+    readonly endByteOffset: number;
+    readonly prefixSha256: string;
+  },
+  metadata: NativeTranscriptSourceMetadata,
+): TranscriptCheckpointJson {
+  return {
+    version: CHECKPOINT_VERSION,
+    byteOffset: progress.endByteOffset,
+    prefixSha256: progress.prefixSha256,
+    source: {
+      sizeBytes: metadata.sizeBytes,
+      modifiedAtMs: metadata.modifiedAtMs,
+      changedAtMs: metadata.changedAtMs,
+    },
+  };
+}
+
+function resumableByteOffset(
+  checkpoint: JsonObject,
+  metadata: NativeTranscriptSourceMetadata,
+): number | null {
+  const source = checkpoint.source;
+  if (
+    checkpoint.version !== CHECKPOINT_VERSION
+    || !Number.isSafeInteger(checkpoint.byteOffset)
+    || (checkpoint.byteOffset as number) < 0
+    || typeof checkpoint.prefixSha256 !== "string"
+    || !DIGEST_PATTERN.test(checkpoint.prefixSha256)
+    || source === null
+    || typeof source !== "object"
+    || Array.isArray(source)
+    || !Number.isSafeInteger(source.sizeBytes)
+    || !Number.isFinite(source.modifiedAtMs)
+    || !Number.isFinite(source.changedAtMs)
+    || (checkpoint.byteOffset as number) > metadata.sizeBytes
+  ) {
+    return null;
+  }
+  return checkpoint.byteOffset as number;
+}
+
+export interface NativeTranscriptBackfillOptions {
+  readonly repository: NativeTranscriptRepository;
+  readonly quarantine: LocalTranscriptQuarantineRepository;
+  readonly source: NativeTranscriptByteSource;
+  readonly machineId: string;
+  readonly format: NativeTranscriptFormat;
+  readonly nativeSessionId: string;
+  readonly sourceLocator: string;
+  readonly globalPatterns?: readonly string[];
+  readonly projectPatterns?: readonly string[];
+  readonly pipelineVersion?: string;
+  readonly messageMapper?: NativeTranscriptMessageMapper;
+  readonly messageResolver: ExactNativeTranscriptMessageResolver;
+  readonly batchSize?: number;
+  readonly clock?: () => Date;
+  /** @internal Allows bounded unit tests without allocating ten MiB. */
+  readonly maxRecordBytes?: number;
+}
+
+export interface NativeTranscriptBackfillResult {
+  readonly importedCount: number;
+  readonly skippedCount: number;
+  readonly quarantinedCount: number;
+  readonly resumedFromByteOffset: number;
+  readonly rescanned: boolean;
+}
+
+function assertMetadata(
+  metadata: NativeTranscriptSourceMetadata,
+): NativeTranscriptSourceMetadata {
+  assertSafeNonnegative(metadata.sizeBytes);
+  if (!Number.isFinite(metadata.modifiedAtMs) || metadata.modifiedAtMs < 0) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  if (!Number.isFinite(metadata.changedAtMs) || metadata.changedAtMs < 0) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  return metadata;
+}
+
+async function messageLinks(
+  record: PreparedNativeTranscriptRecord,
+  format: NativeTranscriptFormat,
+  mapper: NativeTranscriptMessageMapper,
+  resolver: ExactNativeTranscriptMessageResolver,
+): Promise<Array<{
+  conversationId: number;
+  messageId: number;
+  sourceOrdinal: number;
+}>> {
+  const candidates = mappedMessageCandidates(record, format, mapper);
+  const links = [];
+  for (const candidate of candidates) {
+    const resolved = await resolver.resolveExact({
+      nativeSessionId: record.nativeSessionId,
+      sessionSequence: candidate.sessionSequence,
+      role: candidate.role,
+      content: candidate.content,
+    });
+    if (!resolved) throw new NativeTranscriptLinkError(record.sourceOrdinal);
+    assertSafeNonnegative(resolved.conversationId);
+    assertSafeNonnegative(resolved.messageId);
+    links.push({
+      conversationId: resolved.conversationId,
+      messageId: resolved.messageId,
+      sourceOrdinal: candidate.sourceOrdinal,
+    });
+  }
+  return links;
+}
+
+function mappedMessageCandidates(
+  record: PreparedNativeTranscriptRecord,
+  format: NativeTranscriptFormat,
+  mapper: NativeTranscriptMessageMapper,
+): readonly NativeTranscriptMessageCandidate[] {
+  const candidates = mapper.map(
+    format,
+    cloneNativePayload(record.nativePayload),
+    record.sourceOrdinal,
+  );
+  for (const candidate of candidates) {
+    assertSafeNonnegative(candidate.sessionSequence);
+    assertSafeNonnegative(candidate.sourceOrdinal);
+    if (
+      !isMessageRole(candidate.role)
+      || typeof candidate.content !== "string"
+      || candidate.content.includes("\0")
+    ) {
+      throw new NativeTranscriptConfigurationError("invalid-input");
+    }
+  }
+  return candidates;
+}
+
+export async function runNativeTranscriptBackfill(
+  options: NativeTranscriptBackfillOptions,
+): Promise<NativeTranscriptBackfillResult> {
+  assertNonemptyText(options.machineId);
+  assertFormat(options.format);
+  assertNonemptyText(options.nativeSessionId);
+  assertSourceLocator(options.sourceLocator);
+  const batchSize =
+    options.batchSize ?? NATIVE_TRANSCRIPT_DEFAULT_BATCH_SIZE;
+  if (
+    !Number.isSafeInteger(batchSize)
+    || batchSize < 1
+    || batchSize > NATIVE_TRANSCRIPT_MAX_BATCH_SIZE
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  // Constructing the scrubber validates every custom pattern before source,
+  // quarantine, resolver, or destination access.
+  const scrubber = createNativeTranscriptScrubber({
+    globalPatterns: options.globalPatterns,
+    projectPatterns: options.projectPatterns,
+    pipelineVersion: options.pipelineVersion,
+  });
+  if (!options.messageResolver) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const mapper =
+    options.messageMapper ?? createNativeTranscriptMessageMapper();
+  const snapshot = await options.source.openSnapshot();
+  try {
+  const metadata = assertMetadata(snapshot.metadata);
+  await snapshot.assertUnchanged();
+  const previous = await options.repository.getCheckpoint({
+    machineId: options.machineId,
+    clientName: options.format.clientName,
+    sourceLocator: options.sourceLocator,
+  });
+  let expectedCheckpoint: NativeTranscriptCheckpointRecord | null = previous;
+  const candidateOffset = previous
+    ? resumableByteOffset(previous.checkpoint, metadata)
+    : null;
+  let prefixMatches = false;
+  if (candidateOffset !== null) {
+    await snapshot.assertUnchanged();
+    prefixMatches = await snapshot.digestPrefix(candidateOffset)
+      === previous?.checkpoint.prefixSha256;
+    await snapshot.assertUnchanged();
+  }
+  const resumedFromByteOffset =
+    prefixMatches && candidateOffset !== null ? candidateOffset : 0;
+  const rescanned = previous !== null && resumedFromByteOffset === 0;
+  let importedCount = 0;
+  let skippedCount = 0;
+  let quarantinedCount = 0;
+  let batch: NativeTranscriptReadOutcome[] = [];
+  let committedByteOffset = resumedFromByteOffset;
+  let lastSourceOrdinal =
+    resumedFromByteOffset > 0 && previous ? previous.lastSourceOrdinal : 0;
+  const progressState: {
+    latest?: {
+      readonly endByteOffset: number;
+      readonly prefixSha256: string;
+    };
+  } = {};
+
+  const flush = async (): Promise<void> => {
+    if (batch.length === 0) return;
+    const last = batch.at(-1)!;
+    const validRecords = batch.filter(
+      (outcome): outcome is PreparedNativeTranscriptRecord =>
+        outcome.kind === "record",
+    );
+    const quarantinedRecords = batch.filter(
+      (outcome): outcome is QuarantinedNativeTranscriptRecord =>
+        outcome.kind === "quarantine",
+    );
+    await snapshot.assertUnchanged();
+    const records = [];
+    for (const record of validRecords) {
+      records.push({
+        formatName: record.formatName,
+        formatVersion: record.formatVersion,
+        nativeSessionId: record.nativeSessionId,
+        sourceOrdinal: record.sourceOrdinal,
+        observedAt: record.observedAt,
+        scrubberVersion: record.scrubberVersion,
+        contentSha256: record.contentSha256,
+        ingestKey: record.ingestKey,
+        nativePayload: record.nativePayload,
+        messageLinks: await messageLinks(
+          record,
+          options.format,
+          mapper,
+          options.messageResolver,
+        ),
+      });
+    }
+    await snapshot.assertUnchanged();
+    for (const record of quarantinedRecords) {
+      await options.quarantine.quarantine({
+        sourceLocator: options.sourceLocator,
+        sourceOrdinal: record.sourceOrdinal,
+        reason: record.reason,
+        contentSha256: record.contentSha256,
+        quarantinedAt: record.quarantinedAt,
+      });
+    }
+    await snapshot.assertUnchanged();
+    const result = await options.repository.ingestBatch({
+      machineId: options.machineId,
+      clientName: options.format.clientName,
+      sourceLocator: options.sourceLocator,
+      expectedCheckpoint,
+      records,
+      checkpoint: {
+        lastSourceOrdinal: last.sourceOrdinal,
+        checkpoint: checkpointJson(last, metadata),
+      },
+      quarantinedCount: quarantinedRecords.length,
+    });
+    importedCount += result.importedCount;
+    skippedCount += result.skippedCount;
+    quarantinedCount += result.quarantinedCount;
+    expectedCheckpoint = result.checkpoint;
+    committedByteOffset = last.endByteOffset;
+    batch = [];
+  };
+
+  const outcomes = readNativeTranscriptJsonl({
+    bytes: snapshot.stream(),
+    format: options.format,
+    nativeSessionId: options.nativeSessionId,
+    sourceLocator: options.sourceLocator,
+    scrubber,
+    clock: options.clock,
+    maxRecordBytes: options.maxRecordBytes,
+    onProgress: (progress) => {
+      progressState.latest = progress;
+    },
+  });
+  for await (const outcome of outcomes) {
+    if (outcome.endByteOffset <= resumedFromByteOffset) {
+      if (outcome.kind === "record") {
+        mappedMessageCandidates(outcome, options.format, mapper);
+      }
+      continue;
+    }
+    lastSourceOrdinal = outcome.sourceOrdinal;
+    batch.push(outcome);
+    if (batch.length === batchSize) await flush();
+  }
+  await flush();
+  const latestProgress = progressState.latest;
+  if (
+    latestProgress
+    && latestProgress.endByteOffset > committedByteOffset
+  ) {
+    await snapshot.assertUnchanged();
+    const result = await options.repository.ingestBatch({
+      machineId: options.machineId,
+      clientName: options.format.clientName,
+      sourceLocator: options.sourceLocator,
+      expectedCheckpoint,
+      records: [],
+      checkpoint: {
+        lastSourceOrdinal,
+        checkpoint: checkpointJson(latestProgress, metadata),
+      },
+      quarantinedCount: 0,
+    });
+    importedCount += result.importedCount;
+    skippedCount += result.skippedCount;
+    quarantinedCount += result.quarantinedCount;
+  }
+  return {
+    importedCount,
+    skippedCount,
+    quarantinedCount,
+    resumedFromByteOffset,
+    rescanned,
+  };
+  } finally {
+    await snapshot.close();
+  }
+}

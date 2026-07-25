@@ -1,11 +1,12 @@
 # PostgreSQL development
 
 LCM's PostgreSQL runtime, migration runner, and complete PostgreSQL 18 schema
-baseline remain staged until the domain adapters tracked by #86-#91 satisfy the
-shared storage contracts and #92 enables cutover. Machine/project identity and
-the conversation repository are implemented, but SQLite remains the default
-domain backend and the daemon/CLI do not route conversation traffic to
-PostgreSQL during this stage. See the
+baseline remain staged until the remaining domain adapters satisfy the shared
+storage contracts and #92 enables cutover. Machine/project identity, the
+conversation repository, and the native-transcript repository are implemented,
+but SQLite remains the default domain backend. Native-transcript use is limited
+to explicit programmatic backfill and conformance; daemon/CLI activation remains
+#224. See the
 [PostgreSQL schema reference](postgresql-schema.md) for tables, repository
 ordering and atomicity, integrity rules, index families, extension
 prerequisites, retention, and backup implications.
@@ -393,6 +394,10 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file=docs/postgresql-runtime-conversation-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file=docs/postgresql-runtime-transcript-grants.sql
 ```
 
 Replace `lcm_runtime` with the existing runtime role. The scripts quote the
@@ -407,7 +412,14 @@ role and `PUBLIC` execution is intentionally revoked. The script does not grant
 schema creation, migration-ledger access, table ownership, `TRUNCATE`,
 arbitrary updates, sequence mutation, or access to unrelated domain objects.
 
-Applying the conversation grants does not activate the PostgreSQL backend.
+The transcript script grants schema `USAGE`; `SELECT` and column-limited
+`INSERT` on `native_transcripts` and `transcript_messages`; and `SELECT`,
+identity-column `INSERT`, and checkpoint-field-only `UPDATE` on
+`ingest_checkpoints`. It does not grant writes to generated transcript fields,
+payload updates, `DELETE`, `TRUNCATE`, sequence or function privileges, or
+access to unrelated repository tables.
+
+Applying these repository grants does not activate the PostgreSQL backend.
 Daemon/CLI routing remains gated by #224 and the #92 cutover. Re-run migration
 readiness after changing grants: the schema fingerprint accepts only the exact
 reviewed runtime-role privilege shapes and fails closed on additional,

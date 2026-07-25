@@ -375,23 +375,28 @@ configuration and verified-TLS prerequisites for an explicit remote-primary
 PostgreSQL selection and includes an internal PostgreSQL 18 pool, migration
 runner, schema baseline, and isolated conformance harness. Machine/project
 identity is enabled, and the PostgreSQL conversation adapter is available to
-conformance tests, but the remaining repositories in #86-#91 and application
-routing remain staged until #92/#224. Selecting `postgresql` therefore starts
-the daemon with an explicitly unavailable storage factory instead of falling
-back to SQLite. The health endpoint reports `503` and unavailable storage;
-status and statistics routes return fixed `503` responses, and SQLite
+conformance tests. The native-transcript repository from #86 is available for
+explicit backfill and adapter conformance, but normal daemon/CLI activation and
+the remaining repositories stay staged until #92/#224. Selecting `postgresql`
+therefore starts the daemon with an explicitly unavailable storage factory
+instead of falling back to SQLite. The health endpoint reports `503` and
+unavailable storage; status and statistics routes return fixed `503` responses, and SQLite
 background scans remain disabled. Project routes first validate machine
 registration and the explicit project binding, then fail safely at the
 unavailable repository boundary. Connection credentials stay out of JSON and
 effective configuration output. Provision the schema as its migration owner
 with `lcm postgres migrate`, then apply the reviewed
 [identity](docs/postgresql-runtime-identity-grants.sql) and
-[conversation](docs/postgresql-runtime-conversation-grants.sql) runtime grants
-needed by the repositories in use. See [storage backend configuration](docs/configuration.md#storage-backend)
+[conversation](docs/postgresql-runtime-conversation-grants.sql) runtime grants,
+plus the separate
+[native-transcript](docs/postgresql-runtime-transcript-grants.sql) grants when
+that repository is used. See [storage backend configuration](docs/configuration.md#storage-backend)
 for operators, the [PostgreSQL schema reference](docs/postgresql-schema.md) for
 the 23-table data and namespace-aware extension contract, and the
 [storage repository architecture](docs/architecture.md#storage-repository-architecture)
 for repository ownership, lifetimes, transactions, and the local-outbox boundary.
+The [native-transcript guide](docs/postgresql-native-transcripts.md) defines
+sanitized “raw” records, provenance, checkpoints, quarantine, and rollback.
 
 ## Development
 
