@@ -11,7 +11,9 @@ import {
   type PostgreSqlTestDatabase,
   withPostgreSqlTestDatabase,
 } from "./harness.js";
-import { exerciseConversationRepositoryConformance } from "../storage/conversation-conformance.js";
+import {
+  POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE,
+} from "../storage/postgresql-conformance-manifest.js";
 
 beforeAll(assertHarnessReady);
 
@@ -181,7 +183,7 @@ describe("PostgreSQL 18 conversation repository", () => {
       const projectId = await createProject(database, "Conversation round trip");
       const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
       const { messages, third } =
-        await exerciseConversationRepositoryConformance(repository);
+        await POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE.conversations.exercise(repository);
 
       expect(await repository.deleteMessages([messages[0].messageId, third.messageId])).toBe(2);
       expect(await repository.deleteMessages([])).toBe(0);
