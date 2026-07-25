@@ -241,10 +241,10 @@ describe("external admission workflow", () => {
       'admission_decision_fingerprint="$(admission_decision <<<"$admission_requirement")"',
     );
     expect(evaluator).toContain(
-      'current_admission_decision_fingerprint" != "$admission_decision_fingerprint"',
+      '$current_admission_decision_fingerprint" != "$admission_decision_fingerprint"',
     );
     expect(evaluator).toContain(
-      'final_admission_decision_fingerprint" != "$admission_decision_fingerprint"',
+      '$final_admission_decision_fingerprint" != "$admission_decision_fingerprint"',
     );
   });
 
