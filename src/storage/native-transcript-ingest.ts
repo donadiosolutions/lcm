@@ -551,14 +551,17 @@ function openValidatedSourceFile(
   afterOpen?: () => void,
 ): {
   fd: number;
-  device: number;
-  inode: number;
-  mode: number;
-  userId: number;
-  groupId: number;
+  device: bigint;
+  inode: bigint;
+  mode: bigint;
+  userId: bigint;
+  groupId: bigint;
   sizeBytes: number;
+  sizeBytesExact: bigint;
   modifiedAtMs: number;
+  modifiedAtNs: bigint;
   changedAtMs: number;
+  changedAtNs: bigint;
 } {
   const realRoot = realpathSync(rootPath);
   const realParent = realpathSync(dirname(sourcePath));
@@ -570,13 +573,15 @@ function openValidatedSourceFile(
     constants.O_RDONLY | constants.O_NOFOLLOW,
   );
   try {
-    const descriptorStat = fstatSync(fd);
+    const descriptorStat = fstatSync(fd, { bigint: true });
     if (!descriptorStat.isFile()) {
       throw new NativeTranscriptConfigurationError("invalid-input");
     }
+    const sizeBytes = Number(descriptorStat.size);
+    assertSafeNonnegative(sizeBytes);
     afterOpen?.();
     const openedPath = realpathSync(sourcePath);
-    const currentStat = statSync(openedPath);
+    const currentStat = statSync(openedPath, { bigint: true });
     if (
       !isContainedPath(realRoot, openedPath)
       || currentStat.dev !== descriptorStat.dev
@@ -591,9 +596,12 @@ function openValidatedSourceFile(
       mode: descriptorStat.mode,
       userId: descriptorStat.uid,
       groupId: descriptorStat.gid,
-      sizeBytes: descriptorStat.size,
-      modifiedAtMs: descriptorStat.mtimeMs,
-      changedAtMs: descriptorStat.ctimeMs,
+      sizeBytes,
+      sizeBytesExact: descriptorStat.size,
+      modifiedAtMs: Number(descriptorStat.mtimeNs) / 1_000_000,
+      modifiedAtNs: descriptorStat.mtimeNs,
+      changedAtMs: Number(descriptorStat.ctimeNs) / 1_000_000,
+      changedAtNs: descriptorStat.ctimeNs,
     };
   } catch (error) {
     closeSync(fd);
@@ -645,22 +653,22 @@ export function createFileNativeTranscriptSource(
       };
       const assertUnchanged = (): void => {
         assertOpen();
-        const current = fstatSync(opened.fd);
+        const current = fstatSync(opened.fd, { bigint: true });
         const descriptorChanged =
           current.dev !== opened.device
           || current.ino !== opened.inode
           || current.mode !== opened.mode
           || current.uid !== opened.userId
           || current.gid !== opened.groupId
-          || current.size !== opened.sizeBytes
-          || current.mtimeMs !== opened.modifiedAtMs;
+          || current.size !== opened.sizeBytesExact
+          || current.mtimeNs !== opened.modifiedAtNs;
         if (descriptorChanged) {
           throw new NativeTranscriptSourceChangedError();
         }
-        if (current.ctimeMs !== opened.changedAtMs) {
+        if (current.ctimeNs !== opened.changedAtNs) {
           let locatorStillNamesOpenedFile = true;
           try {
-            const locatorStat = statSync(sourcePath);
+            const locatorStat = statSync(sourcePath, { bigint: true });
             locatorStillNamesOpenedFile =
               locatorStat.dev === opened.device
               && locatorStat.ino === opened.inode;

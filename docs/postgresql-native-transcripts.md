@@ -126,12 +126,15 @@ path replacement therefore cannot switch the bytes underneath a running
 backfill. Descriptor identity, ownership/mode, size, modification time, and a
 ctime change cookie detect changes to that bound source before prefix
 validation and again before destination batches and checkpoint-only progress
-writes. A ctime-only change is tolerated only when the locator now resolves to
-a different inode while every stable property of the bound descriptor is
-unchanged, which is the supported atomic-replacement case. If the locator
-still identifies the opened inode—or cannot be resolved—the ctime change fails
-closed. This also catches a same-size in-place rewrite whose modification time
-was restored. A changed source never advances that batch.
+writes. Live descriptor comparisons use the filesystem's exact nanosecond
+`mtime` and `ctime` values; checkpoint JSON records their numeric millisecond
+representations as source metadata. A ctime-only change is tolerated only when
+the locator now resolves to a different inode while every stable property of
+the bound descriptor is unchanged, which is the supported atomic-replacement
+case. If the locator still identifies the opened inode—or cannot be
+resolved—the ctime change fails closed. This also catches a same-size in-place
+rewrite whose modification time was restored. A changed source never advances
+that batch.
 
 If the completed prefix changed—including a reorder—LCM rescans from the
 beginning and relies on deterministic ingest keys to skip records already

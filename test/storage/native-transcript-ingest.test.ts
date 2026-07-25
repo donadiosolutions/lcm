@@ -89,6 +89,23 @@ function digest(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function mutateAfterCtimeTick(
+  path: string,
+  baselineCtimeNs: bigint,
+  mutate: () => void,
+): void {
+  const waitState = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + 3_000;
+  do {
+    mutate();
+    if (statSync(path, { bigint: true }).ctimeNs !== baselineCtimeNs) {
+      return;
+    }
+    Atomics.wait(waitState, 0, 0, 10);
+  } while (Date.now() < deadline);
+  throw new Error("filesystem did not expose a new ctime change cookie");
+}
+
 function nestedJson(
   depth: number,
   kind: "array" | "object" | "mixed",
@@ -769,6 +786,9 @@ describe("filesystem native transcript source", () => {
     expect(truncateRepo.batches).toEqual([]);
 
     writeFileSync(path, first + second);
+    const forcedRewriteMtime = new Date(
+      statSync(path).mtimeMs + 2_000,
+    );
     const rewriteRepo = repository();
     await expect(runNativeTranscriptBackfill({
       repository: rewriteRepo,
@@ -781,7 +801,10 @@ describe("filesystem native transcript source", () => {
       source: createFileNativeTranscriptSource(root, "source.jsonl", {
         chunkBytes: Buffer.byteLength(first),
         _afterChunkForTesting: (ordinal) => {
-          if (ordinal === 0) writeFileSync(path, second + first);
+          if (ordinal === 0) {
+            writeFileSync(path, second + first);
+            utimesSync(path, forcedRewriteMtime, forcedRewriteMtime);
+          }
         },
       }),
       machineId: "machine",
@@ -795,6 +818,7 @@ describe("filesystem native transcript source", () => {
     const fixedTime = new Date("2026-07-25T12:00:00.000Z");
     writeFileSync(path, first + second);
     utimesSync(path, fixedTime, fixedTime);
+    const baselineCtimeNs = statSync(path, { bigint: true }).ctimeNs;
     const restoredMtimeRepo = repository();
     await expect(runNativeTranscriptBackfill({
       repository: restoredMtimeRepo,
@@ -806,8 +830,10 @@ describe("filesystem native transcript source", () => {
       },
       source: createFileNativeTranscriptSource(root, "source.jsonl", {
         _beforeStreamForTesting: () => {
-          writeFileSync(path, second + first);
-          utimesSync(path, fixedTime, fixedTime);
+          mutateAfterCtimeTick(path, baselineCtimeNs, () => {
+            writeFileSync(path, second + first);
+            utimesSync(path, fixedTime, fixedTime);
+          });
         },
       }),
       machineId: "machine",
