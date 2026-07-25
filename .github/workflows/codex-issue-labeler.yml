@@ -387,6 +387,7 @@ jobs:
       issues: read
     outputs:
       evidence: ${{ steps.collect.outputs.evidence }}
+      has_issues: ${{ steps.collect.outputs.has_issues }}
       prompt: ${{ steps.collect.outputs.prompt }}
       schema: ${{ steps.collect.outputs.schema }}
     steps:
@@ -412,118 +413,149 @@ jobs:
               buildDuplicateSchema,
               buildDuplicateSearchQuery,
               fetchDuplicateCandidates,
+              findDuplicateCommentTarget,
               includesLabelIgnoreCase,
               issueContentFingerprint,
+              prioritizeMarkedDuplicateCandidate,
               requiresDuplicateTriage,
             } = await import(policyUrl);
 
             const issueNumbers = JSON.parse(process.env.BUG_ISSUE_NUMBERS);
             const duplicateIssues = [];
             const evidence = [];
+            const failures = [];
             for (const issueNumber of issueNumbers) {
-              const { data: source } = await github.rest.issues.get({
-                ...context.repo,
-                issue_number: issueNumber,
-              });
-              if (source.pull_request) {
-                throw new Error(`Queued bug #${issueNumber} is a pull request`);
-              }
-              const sourceLabels = source.labels.map((label) =>
-                typeof label === "string" ? label : label.name,
-              );
-              if (!includesLabelIgnoreCase(sourceLabels, process.env.QUEUE_LABEL)) {
-                throw new Error(
-                  `Bug #${issueNumber} is no longer queued for duplicate triage`,
+              try {
+                const { data: source } = await github.rest.issues.get({
+                  ...context.repo,
+                  issue_number: issueNumber,
+                });
+                if (source.pull_request) {
+                  throw new Error(`Queued bug #${issueNumber} is a pull request`);
+                }
+                const sourceLabels = source.labels.map((label) =>
+                  typeof label === "string" ? label : label.name,
                 );
-              }
-              if (!requiresDuplicateTriage(sourceLabels)) {
-                throw new Error(
-                  `Issue #${issueNumber} no longer has the bug label`,
-                );
-              }
-
-              const query = buildDuplicateSearchQuery(
-                context.repo.owner,
-                context.repo.repo,
-                source,
-              );
-              const queryPrefix =
-                `repo:${context.repo.owner}/${context.repo.repo} is:issue`;
-              let searchItems = [];
-              if (query !== queryPrefix) {
-                const { data: searchResult } = await github.request(
-                  "GET /search/issues",
+                if (!includesLabelIgnoreCase(sourceLabels, process.env.QUEUE_LABEL)) {
+                  core.info(
+                    `Skipping #${issueNumber}: duplicate triage was manually cancelled.`,
+                  );
+                  continue;
+                }
+                if (!requiresDuplicateTriage(sourceLabels)) {
+                  throw new Error(
+                    `Issue #${issueNumber} no longer has the bug label`,
+                  );
+                }
+                const comments = await github.paginate(
+                  github.rest.issues.listComments,
                   {
-                    q: query,
-                    advanced_search: true,
-                    search_type: "hybrid",
-                    per_page: 20,
-                    headers: {
-                      "X-GitHub-Api-Version": "2026-03-10",
-                    },
+                    ...context.repo,
+                    issue_number: issueNumber,
+                    per_page: 100,
                   },
                 );
-                searchItems = searchResult.items;
+                const markedCanonical = findDuplicateCommentTarget(comments);
+
+                const query = buildDuplicateSearchQuery(
+                  context.repo.owner,
+                  context.repo.repo,
+                  source,
+                );
+                const queryPrefix =
+                  `repo:${context.repo.owner}/${context.repo.repo} is:issue`;
+                let searchItems = [];
+                if (query !== queryPrefix) {
+                  const { data: searchResult } = await github.request(
+                    "GET /search/issues",
+                    {
+                      q: query,
+                      advanced_search: true,
+                      search_type: "hybrid",
+                      per_page: 20,
+                      headers: {
+                        "X-GitHub-Api-Version": "2026-03-10",
+                      },
+                    },
+                  );
+                  searchItems = searchResult.items;
+                }
+
+                const sourceCreatedAt = source.created_at;
+                const sourceTimestamp = Date.parse(sourceCreatedAt);
+                const selectedCandidateNumbers =
+                  prioritizeMarkedDuplicateCandidate(
+                    searchItems
+                      .filter((candidate) => {
+                        if (
+                          candidate.pull_request
+                          || candidate.number === issueNumber
+                        ) {
+                          return false;
+                        }
+                        const candidateTimestamp = Date.parse(candidate.created_at);
+                        return candidateTimestamp < sourceTimestamp
+                          || (
+                            candidateTimestamp === sourceTimestamp
+                            && candidate.number < issueNumber
+                          );
+                      })
+                      .map((candidate) => candidate.number),
+                    markedCanonical,
+                  );
+                const candidates = await fetchDuplicateCandidates(
+                  github,
+                  context.repo,
+                  source,
+                  selectedCandidateNumbers,
+                );
+
+                duplicateIssues.push({
+                  source: {
+                    number: issueNumber,
+                    title: source.title,
+                    body: source.body ?? "",
+                    state: source.state,
+                    createdAt: sourceCreatedAt,
+                  },
+                  candidates,
+                });
+                evidence.push({
+                  issueNumber,
+                  sourceFingerprint: issueContentFingerprint(source),
+                  sourceCreatedAt,
+                  candidates: candidates.map((candidate) => ({
+                    number: candidate.number,
+                    fingerprint: candidate.fingerprint,
+                    createdAt: candidate.createdAt,
+                  })),
+                });
+                core.info(
+                  `Prepared ${candidates.length} duplicate candidate(s) for bug #${issueNumber}.`,
+                );
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                failures.push(`#${issueNumber}: ${message}`);
+                core.error(`Failed duplicate collection for #${issueNumber}: ${message}`);
               }
-
-              const sourceCreatedAt = source.created_at;
-              const sourceTimestamp = Date.parse(sourceCreatedAt);
-              const selectedCandidateNumbers = searchItems
-                .filter((candidate) => {
-                  if (candidate.pull_request || candidate.number === issueNumber) {
-                    return false;
-                  }
-                  const candidateTimestamp = Date.parse(candidate.created_at);
-                  return candidateTimestamp < sourceTimestamp
-                    || (
-                      candidateTimestamp === sourceTimestamp
-                      && candidate.number < issueNumber
-                    );
-                })
-                .slice(0, 8)
-                .map((candidate) => candidate.number);
-              const candidates = await fetchDuplicateCandidates(
-                github,
-                context.repo,
-                source,
-                selectedCandidateNumbers,
-              );
-
-              duplicateIssues.push({
-                source: {
-                  number: issueNumber,
-                  title: source.title,
-                  body: source.body ?? "",
-                  state: source.state,
-                  createdAt: sourceCreatedAt,
-                },
-                candidates,
-              });
-              evidence.push({
-                issueNumber,
-                sourceFingerprint: issueContentFingerprint(source),
-                sourceCreatedAt,
-                candidates: candidates.map((candidate) => ({
-                  number: candidate.number,
-                  fingerprint: candidate.fingerprint,
-                  createdAt: candidate.createdAt,
-                })),
-              });
-              core.info(
-                `Prepared ${candidates.length} duplicate candidate(s) for bug #${issueNumber}.`,
-              );
             }
 
             core.setOutput("evidence", JSON.stringify(evidence));
+            core.setOutput("has_issues", evidence.length > 0 ? "true" : "false");
             core.setOutput("prompt", buildDuplicatePrompt(duplicateIssues));
             core.setOutput(
               "schema",
               JSON.stringify(buildDuplicateSchema(evidence)),
             );
+            if (failures.length > 0) {
+              core.setFailed(
+                `Failed duplicate collection for ${failures.length} issue(s): ${failures.join("; ")}`,
+              );
+            }
 
   classify-duplicates:
     needs: [apply-labels, collect-duplicates]
-    if: ${{ needs.apply-labels.outputs.has_bugs == 'true' }}
+    if: ${{ always() && needs.apply-labels.result == 'success' && needs.apply-labels.outputs.has_bugs == 'true' && needs.collect-duplicates.outputs.has_issues == 'true' }}
     runs-on: ubuntu-latest
     permissions: {}
     outputs:
@@ -545,7 +577,7 @@ jobs:
 
   apply-duplicates:
     needs: [apply-labels, collect-duplicates, classify-duplicates]
-    if: ${{ needs.apply-labels.outputs.has_bugs == 'true' && needs.classify-duplicates.result == 'success' }}
+    if: ${{ always() && needs.apply-labels.result == 'success' && needs.apply-labels.outputs.has_bugs == 'true' && needs.classify-duplicates.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -570,11 +602,13 @@ jobs:
             ).href;
             const {
               duplicateCommentBody,
+              fetchDuplicateCandidates,
               findDuplicateCommentTarget,
               includesLabelIgnoreCase,
               issueContentFingerprint,
               parseAndValidateDuplicateResult,
               removeIssueLabelIfPresent,
+              resolveDuplicateCanonicalTarget,
               requiresDuplicateTriage,
             } = await import(policyUrl);
 
@@ -620,6 +654,15 @@ jobs:
                   continue;
                 }
 
+                const comments = await github.paginate(
+                  github.rest.issues.listComments,
+                  {
+                    ...context.repo,
+                    issue_number: issueNumber,
+                    per_page: 100,
+                  },
+                );
+                const markedCanonical = findDuplicateCommentTarget(comments);
                 const candidateSet = evidenceByIssue.get(issueNumber);
                 if (
                   issueContentFingerprint(source)
@@ -630,7 +673,11 @@ jobs:
                   );
                 }
 
-                if (decision.duplicateOf.length === 0) {
+                const canonicalNumber = resolveDuplicateCanonicalTarget(
+                  decision.duplicateOf,
+                  markedCanonical,
+                );
+                if (canonicalNumber === null) {
                   await removeIssueLabelIfPresent(
                     github,
                     context.repo,
@@ -641,43 +688,25 @@ jobs:
                   continue;
                 }
 
-                const canonicalNumber = decision.duplicateOf[0];
                 const canonicalEvidence = candidateSet.candidates.find(
                   (candidate) => candidate.number === canonicalNumber,
                 );
-                const { data: canonical } = await github.rest.issues.get({
-                  ...context.repo,
-                  issue_number: canonicalNumber,
-                });
-                if (canonical.pull_request) {
+                if (!canonicalEvidence) {
                   throw new Error(
-                    `Canonical target #${canonicalNumber} is a pull request`,
+                    `Canonical issue #${canonicalNumber} was not validated during duplicate collection`,
                   );
                 }
+                const [canonical] = await fetchDuplicateCandidates(
+                  github,
+                  context.repo,
+                  source,
+                  [canonicalNumber],
+                );
                 if (
-                  issueContentFingerprint(canonical)
-                  !== canonicalEvidence.fingerprint
+                  canonical.fingerprint !== canonicalEvidence.fingerprint
                 ) {
                   throw new Error(
                     `Canonical issue #${canonicalNumber} changed after duplicate collection`,
-                  );
-                }
-
-                const comments = await github.paginate(
-                  github.rest.issues.listComments,
-                  {
-                    ...context.repo,
-                    issue_number: issueNumber,
-                    per_page: 100,
-                  },
-                );
-                const markedCanonical = findDuplicateCommentTarget(comments);
-                if (
-                  markedCanonical !== null
-                  && markedCanonical !== canonicalNumber
-                ) {
-                  throw new Error(
-                    `Existing automated duplicate marker targets #${markedCanonical}, not #${canonicalNumber}`,
                   );
                 }
 

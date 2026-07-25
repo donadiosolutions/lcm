@@ -487,7 +487,7 @@ export function buildDuplicateSearchQuery(
   let query = prefix;
   for (const term of uniqueTerms) {
     const literalTerm = `"${term}"`;
-    if (`${query} ${literalTerm}`.length > maxLength) break;
+    if (`${query} ${literalTerm}`.length > maxLength) continue;
     query += ` ${literalTerm}`;
   }
   return query;
@@ -769,6 +769,65 @@ export function duplicateCommentBody(canonicalIssueNumber) {
     "Canonical issue number",
   );
   return `${duplicateCommentMarker(issueNumber)}\nDuplicate of #${issueNumber}.`;
+}
+
+export function resolveDuplicateCanonicalTarget(
+  duplicateOf,
+  markedCanonical,
+) {
+  if (!Array.isArray(duplicateOf) || duplicateOf.length > 1) {
+    throw new TypeError("Duplicate decision must contain at most one issue number");
+  }
+  const selectedCanonical = duplicateOf.length === 1
+    ? assertPositiveIssueNumber(duplicateOf[0], "Selected canonical issue number")
+    : null;
+  if (markedCanonical !== null) {
+    assertPositiveIssueNumber(markedCanonical, "Marked canonical issue number");
+  }
+  if (
+    selectedCanonical !== null
+    && markedCanonical !== null
+    && selectedCanonical !== markedCanonical
+  ) {
+    throw new Error(
+      `Existing automated duplicate marker targets #${markedCanonical}, not #${selectedCanonical}`,
+    );
+  }
+  return markedCanonical ?? selectedCanonical;
+}
+
+export function prioritizeMarkedDuplicateCandidate(
+  candidateNumbers,
+  markedCanonical,
+  { maxCandidates = 8 } = {},
+) {
+  if (!Array.isArray(candidateNumbers)) {
+    throw new TypeError("Duplicate candidate numbers must be an array");
+  }
+  if (!Number.isSafeInteger(maxCandidates) || maxCandidates <= 0) {
+    throw new TypeError("Maximum duplicate candidates must be a positive integer");
+  }
+  const prioritized = [];
+  const seen = new Set();
+  if (markedCanonical !== null) {
+    const number = assertPositiveIssueNumber(
+      markedCanonical,
+      "Marked canonical issue number",
+    );
+    prioritized.push(number);
+    seen.add(number);
+  }
+  for (const [index, value] of candidateNumbers.entries()) {
+    if (prioritized.length >= maxCandidates) break;
+    const number = assertPositiveIssueNumber(
+      value,
+      `Duplicate candidate number at index ${index}`,
+    );
+    if (seen.has(number)) continue;
+    prioritized.push(number);
+    seen.add(number);
+  }
+  return prioritized;
 }
 
 export function findDuplicateCommentTarget(

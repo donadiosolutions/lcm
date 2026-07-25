@@ -20,8 +20,10 @@ import {
   managedLabelNames,
   parseAndValidateClassification,
   parseAndValidateDuplicateResult,
+  prioritizeMarkedDuplicateCandidate,
   reconcileLabels,
   removeIssueLabelIfPresent,
+  resolveDuplicateCanonicalTarget,
   requiresDuplicateTriage,
   validateClassificationResult,
   validateManagedLabelConfig,
@@ -456,6 +458,18 @@ test("builds bounded repository-scoped duplicate search queries", () => {
   );
   assert.equal(operatorQuery.includes(" OR "), false);
   assert.equal(
+    buildDuplicateSearchQuery(
+      "owner",
+      "repo",
+      {
+        title: `${"oversized".repeat(10)} later`,
+        body: "",
+      },
+      { maxLength: 64 },
+    ),
+    'repo:owner/repo is:issue "later"',
+  );
+  assert.equal(
     buildDuplicateSearchQuery("owner", "repo", { title: "", body: "" }),
     "repo:owner/repo is:issue",
   );
@@ -693,5 +707,43 @@ test("creates and recognizes only trusted automated duplicate markers", () => {
   assert.throws(
     () => findDuplicateCommentTarget([], ""),
     /non-empty string/,
+  );
+});
+
+test("resumes a marked duplicate target and rejects conflicting decisions", () => {
+  assert.equal(resolveDuplicateCanonicalTarget([], null), null);
+  assert.equal(resolveDuplicateCanonicalTarget([12], null), 12);
+  assert.equal(resolveDuplicateCanonicalTarget([], 12), 12);
+  assert.equal(resolveDuplicateCanonicalTarget([12], 12), 12);
+  assert.throws(
+    () => resolveDuplicateCanonicalTarget([8], 12),
+    /marker targets #12, not #8/,
+  );
+  assert.throws(
+    () => resolveDuplicateCanonicalTarget([8, 12], null),
+    /at most one/,
+  );
+  assert.throws(
+    () => resolveDuplicateCanonicalTarget([], 0),
+    /positive integer/,
+  );
+});
+
+test("prioritizes a marked canonical within the candidate bound", () => {
+  assert.deepEqual(
+    prioritizeMarkedDuplicateCandidate([12, 8, 4], 8, { maxCandidates: 2 }),
+    [8, 12],
+  );
+  assert.deepEqual(
+    prioritizeMarkedDuplicateCandidate([12, 8], null, { maxCandidates: 1 }),
+    [12],
+  );
+  assert.throws(
+    () => prioritizeMarkedDuplicateCandidate(null, 8),
+    /must be an array/,
+  );
+  assert.throws(
+    () => prioritizeMarkedDuplicateCandidate([12], 0),
+    /positive integer/,
   );
 });

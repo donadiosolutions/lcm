@@ -55,8 +55,11 @@ labels case-insensitively:
   issue that Codex has just classified as a bug.
 
 If either stage fails, the affected issue's queue label remains so a later run
-can retry it. Removing the queue label manually before either application step
-cancels subsequent automated changes for that issue.
+can retry it. Duplicate candidate collection is isolated per issue: valid bugs
+continue through classification and application even when another bug fails
+collection, while the failed bug remains queued and the workflow reports the
+failure. Removing the queue label manually before either duplicate collection
+or an application step cancels subsequent automated changes for that issue.
 
 Codex reconciliation can replace the immediate `p3-low` default with the
 appropriate managed priority.
@@ -84,9 +87,16 @@ For a high-confidence duplicate, the workflow:
 Issue title and body fingerprints are checked again immediately before these
 writes. Edited or unverifiable issues fail closed and remain queued. The link
 comment contains a hidden workflow marker, so a retry cannot create duplicate
-comments. Conflicting automated markers fail safely. If a person closes the
-issue before application and no workflow marker exists, the workflow preserves
-that closure without adding its own duplicate link or label.
+comments. If a partial run created that marker but did not finish closing the
+issue, a retry refetches and validates the recorded canonical target and
+finishes the marked closure even when the new model result is empty, provided
+the source issue still has the live `bug` label. Removing `bug` before
+application always dequeues the source without duplicate actions, even when a
+trusted marker exists.
+Conflicting or stale automated markers fail safely and leave the issue queued.
+If a person closes the issue before application and no workflow marker exists,
+the workflow preserves that closure without adding its own duplicate link or
+label.
 
 ## Security and credentials
 
