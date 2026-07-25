@@ -153,8 +153,13 @@ function readJsonObject(filePath: string): Record<string, unknown> {
 }
 
 function removeClaudeHooks(filePath: string): boolean {
-  if (!existsSync(filePath)) return false;
-  const existing = readJsonObject(filePath);
+  let existing: Record<string, unknown>;
+  try {
+    existing = readJsonObject(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
   const cleaned = removeManagedClaudeSettings(existing);
   if (JSON.stringify(existing) === JSON.stringify(cleaned)) return false;
   writeFileSync(filePath, JSON.stringify(cleaned, null, 2) + "\n");

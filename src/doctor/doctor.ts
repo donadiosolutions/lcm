@@ -811,7 +811,6 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       merged.mcpServers.lcm = expectedMcp;
       deps.mkdirSync(dirname(settingsPath), { recursive: true });
       deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
-      currentSettings = merged;
       results.push({ name: "mcp-lcm", category: "Settings", status: "warn", message: "mcpServers.lcm was missing or stale — repaired automatically", fixApplied: true });
     } catch {
       results.push({ name: "mcp-lcm", category: "Settings", status: "fail", message: "mcpServers.lcm could not be repaired — run: lcm install" });
