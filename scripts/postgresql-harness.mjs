@@ -236,7 +236,11 @@ export function runProcess(command, args, options = {}) {
     try {
       options.onSpawn?.(child);
     } catch (error) {
-      child.kill();
+      try {
+        child.kill();
+      } catch {
+        // Preserve the setup failure when the child exits before best-effort termination.
+      }
       throw error;
     }
     const maxCapturedOutputBytes = MAX_CAPTURED_OUTPUT_BYTES;

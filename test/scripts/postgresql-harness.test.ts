@@ -262,6 +262,19 @@ describe("PostgreSQL harness utilities", () => {
     });
   });
 
+  it("preserves an onSpawn failure when best-effort child termination also fails", async () => {
+    const onSpawnFailure = new Error("consumer registration failed");
+    const child = {
+      kill: vi.fn(() => { throw Object.assign(new Error("already exited"), { code: "ESRCH" }); }),
+    };
+
+    await expect(runProcess("node", ["vitest"], {
+      spawnProcess: () => child,
+      onSpawn: () => { throw onSpawnFailure; },
+    })).rejects.toBe(onSpawnFailure);
+    expect(child.kill).toHaveBeenCalledOnce();
+  });
+
   it("bounds stream tails and settles only once across error, close, and kill paths", async () => {
     const failedChild = Object.assign(new EventEmitter(), {
       stdout: new EventEmitter(),

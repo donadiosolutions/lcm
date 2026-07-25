@@ -11,6 +11,14 @@ import {
 
 const execFileAsync = promisify(execFile);
 
+function killChild(child: ChildProcess, signal: NodeJS.Signals): void {
+  try {
+    child.kill(signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+}
+
 async function launchSignalProbe(consumer = false): Promise<{ child: ChildProcess; runId: string }> {
   const flag = consumer ? "--consumer-signal-probe" : "--signal-probe";
   const child = spawn(process.execPath, ["scripts/postgresql-harness.mjs", flag], {
@@ -45,7 +53,7 @@ async function launchSignalProbe(consumer = false): Promise<{ child: ChildProces
   try {
     return { child, runId: await ready };
   } catch (error) {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    if (child.exitCode === null && child.signalCode === null) killChild(child, "SIGKILL");
     throw error;
   } finally {
     clearTimeout(timeout);
@@ -56,9 +64,9 @@ async function runSignalProbe(signal: "SIGHUP" | "SIGINT" | "SIGTERM"): Promise<
   const { child, runId } = await launchSignalProbe();
   try {
     const completion = exited(child);
-    child.kill(signal);
+    killChild(child, signal);
     await new Promise((resolve) => setTimeout(resolve, 50));
-    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+    if (child.exitCode === null && child.signalCode === null) killChild(child, signal);
     const exit = await completion;
     expect(exit).toEqual({
       code: signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143,
@@ -66,7 +74,7 @@ async function runSignalProbe(signal: "SIGHUP" | "SIGINT" | "SIGTERM"): Promise<
     });
     await expectNoResources(runId);
   } finally {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    if (child.exitCode === null && child.signalCode === null) killChild(child, "SIGKILL");
   }
 }
 
@@ -120,6 +128,18 @@ async function waitForPidExit(pid: number): Promise<void> {
 }
 
 describe("PostgreSQL harness signal teardown", () => {
+  it("ignores only an ESRCH race while signaling a child", () => {
+    const exitedChild = {
+      kill: () => { throw Object.assign(new Error("already exited"), { code: "ESRCH" }); },
+    } as unknown as ChildProcess;
+    const deniedChild = {
+      kill: () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); },
+    } as unknown as ChildProcess;
+
+    expect(() => killChild(exitedChild, "SIGTERM")).not.toThrow();
+    expect(() => killChild(deniedChild, "SIGTERM")).toThrow("denied");
+  });
+
   it("cleans every labeled resource on SIGINT", () => runSignalProbe("SIGINT"), 45_000);
   it("cleans every labeled resource on SIGTERM", () => runSignalProbe("SIGTERM"), 45_000);
   it("cleans every labeled resource on SIGHUP", () => runSignalProbe("SIGHUP"), 45_000);
@@ -127,18 +147,18 @@ describe("PostgreSQL harness signal teardown", () => {
   it("reclaims a SIGKILL orphan before the next run allocates resources", async () => {
     const first = await launchSignalProbe();
     const firstCompletion = exited(first.child);
-    first.child.kill("SIGKILL");
+    killChild(first.child, "SIGKILL");
     await expect(firstCompletion).resolves.toEqual({ code: null, signal: "SIGKILL" });
 
     const second = await launchSignalProbe();
     try {
       await expectNoResources(first.runId);
       const secondCompletion = exited(second.child);
-      second.child.kill("SIGTERM");
+      killChild(second.child, "SIGTERM");
       await expect(secondCompletion).resolves.toEqual({ code: 143, signal: null });
       await expectNoResources(second.runId);
     } finally {
-      if (second.child.exitCode === null && second.child.signalCode === null) second.child.kill("SIGKILL");
+      if (second.child.exitCode === null && second.child.signalCode === null) killChild(second.child, "SIGKILL");
     }
   }, 90_000);
 
@@ -149,27 +169,27 @@ describe("PostgreSQL harness signal teardown", () => {
       second = await launchSignalProbe();
       await expectResources(first.runId);
       const secondCompletion = exited(second.child);
-      second.child.kill("SIGTERM");
+      killChild(second.child, "SIGTERM");
       await expect(secondCompletion).resolves.toEqual({ code: 143, signal: null });
       await expectNoResources(second.runId);
       await expectResources(first.runId);
 
       const firstCompletion = exited(first.child);
-      first.child.kill("SIGTERM");
+      killChild(first.child, "SIGTERM");
       await expect(firstCompletion).resolves.toEqual({ code: 143, signal: null });
       await expectNoResources(first.runId);
     } finally {
       if (second && second.child.exitCode === null && second.child.signalCode === null) {
-        second.child.kill("SIGKILL");
+        killChild(second.child, "SIGKILL");
       }
-      if (first.child.exitCode === null && first.child.signalCode === null) first.child.kill("SIGKILL");
+      if (first.child.exitCode === null && first.child.signalCode === null) killChild(first.child, "SIGKILL");
     }
   }, 90_000);
 
   it("preserves a surviving local test consumer until that exact process exits", async () => {
     const first = await launchSignalProbe(true);
     const firstCompletion = exited(first.child);
-    first.child.kill("SIGKILL");
+    killChild(first.child, "SIGKILL");
     await expect(firstCompletion).resolves.toEqual({ code: null, signal: "SIGKILL" });
 
     const second = await launchSignalProbe();
@@ -181,17 +201,17 @@ describe("PostgreSQL harness signal teardown", () => {
       await waitForPidExit(pid);
 
       const secondCompletion = exited(second.child);
-      second.child.kill("SIGTERM");
+      killChild(second.child, "SIGTERM");
       await expect(secondCompletion).resolves.toEqual({ code: 143, signal: null });
 
       third = await launchSignalProbe();
       await expectNoResources(first.runId);
       const thirdCompletion = exited(third.child);
-      third.child.kill("SIGTERM");
+      killChild(third.child, "SIGTERM");
       await expect(thirdCompletion).resolves.toEqual({ code: 143, signal: null });
     } finally {
-      if (third && third.child.exitCode === null && third.child.signalCode === null) third.child.kill("SIGKILL");
-      if (second.child.exitCode === null && second.child.signalCode === null) second.child.kill("SIGKILL");
+      if (third && third.child.exitCode === null && third.child.signalCode === null) killChild(third.child, "SIGKILL");
+      if (second.child.exitCode === null && second.child.signalCode === null) killChild(second.child, "SIGKILL");
     }
   }, 120_000);
 
@@ -200,12 +220,12 @@ describe("PostgreSQL harness signal teardown", () => {
     const pid = await consumerPid(probe.runId);
     try {
       const completion = exited(probe.child);
-      probe.child.kill("SIGTERM");
+      killChild(probe.child, "SIGTERM");
       await expect(completion).resolves.toEqual({ code: 143, signal: null });
       await waitForPidExit(pid);
       await expectNoResources(probe.runId);
     } finally {
-      if (probe.child.exitCode === null && probe.child.signalCode === null) probe.child.kill("SIGKILL");
+      if (probe.child.exitCode === null && probe.child.signalCode === null) killChild(probe.child, "SIGKILL");
     }
   }, 45_000);
 
