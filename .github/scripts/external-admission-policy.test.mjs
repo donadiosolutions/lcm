@@ -9,9 +9,11 @@ import {
   evaluateCiActionsRun,
   flattenCheckRunPages,
   flattenPullRequestFilePages,
+  isTrustedAutomationPullRequest,
   parseActionsRunId,
   requiresGreptileForPath,
   runPolicyCommand,
+  selectAdmissionRequirement,
 } from "./external-admission-policy.mjs";
 
 const HEAD_SHA = "a".repeat(40);
@@ -71,6 +73,48 @@ test("keeps documentation, tests, and unrelated metadata coverage-neutral", () =
   ]) {
     assert.equal(requiresGreptileForPath(path), false, path);
   }
+});
+
+test("trusts only exact GitHub bot identities used by repository automation", () => {
+  for (const login of ["dependabot[bot]", "github-actions[bot]"]) {
+    assert.equal(isTrustedAutomationPullRequest({ user: { login, type: "Bot" } }), true, login);
+  }
+  for (const user of [
+    { login: "dependabot[bot]", type: "User" },
+    { login: "github-actions[bot]", type: "User" },
+    { login: "renovate[bot]", type: "Bot" },
+    { login: "bcdonadio", type: "User" },
+  ]) {
+    assert.equal(isTrustedAutomationPullRequest({ user }), false, JSON.stringify(user));
+  }
+  for (const pullRequest of [undefined, null, [], {}, { user: {} }]) {
+    assert.throws(
+      () => isTrustedAutomationPullRequest(pullRequest),
+      /pull request|user/u,
+      String(pullRequest),
+    );
+  }
+});
+
+test("selects Greptile or CI from sensitive classification and authoritative identity", () => {
+  const human = { user: { login: "bcdonadio", type: "User" } };
+  const dependabot = { user: { login: "dependabot[bot]", type: "Bot" } };
+  assert.deepEqual(selectAdmissionRequirement(human, true), {
+    sensitiveDiff: true,
+    trustedAutomation: false,
+    greptileRequired: true,
+  });
+  assert.deepEqual(selectAdmissionRequirement(dependabot, true), {
+    sensitiveDiff: true,
+    trustedAutomation: true,
+    greptileRequired: false,
+  });
+  assert.deepEqual(selectAdmissionRequirement(dependabot, false), {
+    sensitiveDiff: false,
+    trustedAutomation: true,
+    greptileRequired: false,
+  });
+  assert.throws(() => selectAdmissionRequirement(human, "true"), /must be a boolean/u);
 });
 
 test("audits both current and previous rename paths without duplicates", () => {
@@ -398,6 +442,15 @@ test("exposes the complete policy through its deterministic CLI command seam", (
   ] }] )));
   assert.equal(evaluation.ready, true);
   assert.equal(evaluation.ciRunId, "123");
+  assert.deepEqual(JSON.parse(runPolicyCommand(
+    "select-admission",
+    ["true"],
+    JSON.stringify({ user: { login: "dependabot[bot]", type: "Bot" } }),
+  )), {
+    sensitiveDiff: true,
+    trustedAutomation: true,
+    greptileRequired: false,
+  });
 
   const run = {
     id: 123,
@@ -423,6 +476,9 @@ test("exposes the complete policy through its deterministic CLI command seam", (
     "maybe",
     REPOSITORY,
     "https://github.com",
+  ], "{}"), /true or false/u);
+  assert.throws(() => runPolicyCommand("select-admission", [
+    "maybe",
   ], "{}"), /true or false/u);
   assert.throws(() => runPolicyCommand("unknown", [], "{}"), /unknown policy command/u);
   assert.throws(() => runPolicyCommand("classify-files", ["1"], ""), /non-empty/u);
