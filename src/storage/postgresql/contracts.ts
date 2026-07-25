@@ -21,6 +21,13 @@ export interface PostgreSqlQueryOptions extends PostgreSqlOperationContext {
 }
 
 export interface PostgreSqlQueryExecutor {
+  /**
+   * Present only on the query executor supplied to a live runtime transaction.
+   * Repositories use this provenance marker before issuing transaction-scoped
+   * commands such as SAVEPOINT.
+   */
+  readonly transactionScope?: "active";
+
   query<R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
     config: QueryConfig<I>,
     options: PostgreSqlQueryOptions,

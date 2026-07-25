@@ -4,6 +4,7 @@ import type { PostgreSqlQueryOptions } from "../../src/storage/postgresql/contra
 import {
   PostgreSqlConversationDataError,
   type PostgreSqlConversationExecutor,
+  type PostgreSqlConversationScopedExecutor,
   PostgreSqlConversationRepository,
 } from "../../src/storage/postgresql/conversation-repository.js";
 import {
@@ -525,6 +526,13 @@ describe("PostgreSQL conversation repository", () => {
       }]),
       "message_id",
     ],
+    [
+      "deleteMessages",
+      { count: "0" },
+      (repository: PostgreSqlConversationRepository) =>
+        repository.deleteMessages([51]),
+      "count",
+    ],
   ])("rolls back %s when generated identity mapping is unsafe", async (
     _operation,
     safeRow,
@@ -562,9 +570,15 @@ describe("PostgreSQL conversation repository", () => {
     expect(residualWrites).toBe(0);
   });
 
-  it("maps direct writes inside an existing transaction executor", async () => {
-    const query = vi.fn(() => result([messageRow]));
-    const scoped = { query } as unknown as PostgreSqlConversationExecutor;
+  it("maps direct writes inside an explicitly marked transaction scope", async () => {
+    const query = vi.fn((config: QueryConfig<unknown[]>) =>
+      config.text.includes("INSERT INTO lcm.messages")
+        ? result([messageRow])
+        : result([]));
+    const scoped: PostgreSqlConversationScopedExecutor = {
+      transactionScope: "active",
+      query,
+    };
     const repository = new PostgreSqlConversationRepository(scoped, projectId);
 
     await expect(repository.createMessagesBulk([{
@@ -574,7 +588,212 @@ describe("PostgreSQL conversation repository", () => {
       content: "already transactional",
       tokenCount: 1,
     }])).resolves.toMatchObject([{ messageId: 51 }]);
-    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls.map(([config]) => config.text)).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("INSERT INTO lcm.messages"),
+      "RELEASE SAVEPOINT lcm_conversation_repository_1",
+    ]);
+  });
+
+  it("serializes concurrent scoped writes across repositories sharing one executor", async () => {
+    const statements: string[] = [];
+    let unblockFirstInsert!: () => void;
+    let reportFirstInsert!: () => void;
+    const firstInsertBlocked = new Promise<void>((resolve) => {
+      reportFirstInsert = resolve;
+    });
+    const firstInsertGate = new Promise<void>((resolve) => {
+      unblockFirstInsert = resolve;
+    });
+    let insertCount = 0;
+    const query = vi.fn(async (config: QueryConfig<unknown[]>) => {
+      statements.push(config.text);
+      if (!config.text.includes("INSERT INTO lcm.messages")) return result([]);
+      insertCount += 1;
+      if (insertCount === 1) {
+        reportFirstInsert();
+        await firstInsertGate;
+      }
+      return result([{
+        ...messageRow,
+        message_id: String(50 + insertCount),
+        seq: insertCount - 1,
+      }]);
+    });
+    const scoped: PostgreSqlConversationScopedExecutor = {
+      transactionScope: "active",
+      query,
+    };
+    const firstRepository = new PostgreSqlConversationRepository(scoped, projectId);
+    const secondRepository = new PostgreSqlConversationRepository(scoped, projectId);
+
+    const first = firstRepository.createMessage({
+      conversationId: 41,
+      seq: 0,
+      role: "user",
+      content: "first",
+      tokenCount: 1,
+    });
+    const second = secondRepository.createMessage({
+      conversationId: 41,
+      seq: 1,
+      role: "assistant",
+      content: "second",
+      tokenCount: 1,
+    });
+    await firstInsertBlocked;
+    expect(statements).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("INSERT INTO lcm.messages"),
+    ]);
+
+    unblockFirstInsert();
+    await expect(Promise.all([first, second])).resolves.toMatchObject([
+      { messageId: 51, seq: 0 },
+      { messageId: 52, seq: 1 },
+    ]);
+    expect(statements).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("INSERT INTO lcm.messages"),
+      "RELEASE SAVEPOINT lcm_conversation_repository_1",
+      "SAVEPOINT lcm_conversation_repository_2",
+      expect.stringContaining("INSERT INTO lcm.messages"),
+      "RELEASE SAVEPOINT lcm_conversation_repository_2",
+    ]);
+  });
+
+  it("reuses an active scope for contention operations without retry or isolation setup", async () => {
+    const query = vi.fn((config: QueryConfig<unknown[]>) => {
+      if (config.text.includes("session_id_sha256")) return result([conversationRow]);
+      if (config.text.includes("FOR UPDATE")) {
+        return result([{ conversation_id: conversationRow.conversation_id }]);
+      }
+      if (config.text.includes("MAX(seq) AS max_seq")) return result([{ max_seq: null }]);
+      if (config.text.includes("INSERT INTO lcm.messages")) return result([messageRow]);
+      return result([]);
+    });
+    const scoped: PostgreSqlConversationScopedExecutor = {
+      transactionScope: "active",
+      query,
+    };
+    const repository = new PostgreSqlConversationRepository(scoped, projectId);
+
+    await expect(repository.getOrCreateConversation("session-a"))
+      .resolves.toMatchObject({ conversationId: 41 });
+    await expect(repository.appendMessages(41, [{
+      role: "user",
+      content: "scoped append",
+      tokenCount: 1,
+    }])).resolves.toMatchObject([{ seq: 0 }]);
+
+    const statements = query.mock.calls.map(([config]) => config.text);
+    expect(statements).not.toContain("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+    expect(statements).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("pg_advisory_xact_lock"),
+      expect.stringContaining("session_id_sha256"),
+      "RELEASE SAVEPOINT lcm_conversation_repository_1",
+      "SAVEPOINT lcm_conversation_repository_2",
+      expect.stringContaining("FOR UPDATE"),
+      expect.stringContaining("MAX(seq) AS max_seq"),
+      expect.stringContaining("INSERT INTO lcm.messages"),
+      "RELEASE SAVEPOINT lcm_conversation_repository_2",
+    ]);
+  });
+
+  it("rejects an unmarked query-only executor before issuing a savepoint", async () => {
+    const query = vi.fn(() => result([messageRow]));
+    const repository = new PostgreSqlConversationRepository(
+      { query } as unknown as PostgreSqlConversationScopedExecutor,
+      projectId,
+    );
+
+    await expect(repository.createMessage({
+      conversationId: 41,
+      seq: 0,
+      role: "user",
+      content: "not proven transactional",
+      tokenCount: 1,
+    })).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE",
+      operation: "createMessage",
+    });
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("rolls scoped mapping failures back to a serialized operation savepoint", async () => {
+    const unsafeMessage = {
+      ...messageRow,
+      message_id: String(Number.MAX_SAFE_INTEGER + 1),
+    };
+    let insert = 0;
+    const query = vi.fn((config: QueryConfig<unknown[]>) => {
+      if (!config.text.includes("INSERT INTO lcm.messages")) return result([]);
+      insert += 1;
+      return result([insert === 1 ? unsafeMessage : messageRow]);
+    });
+    const scoped: PostgreSqlConversationScopedExecutor = {
+      transactionScope: "active",
+      query,
+    };
+    const repository = new PostgreSqlConversationRepository(scoped, projectId);
+
+    await expect(repository.createMessage({
+      conversationId: 41,
+      seq: 0,
+      role: "user",
+      content: "unsafe",
+      tokenCount: 1,
+    })).rejects.toMatchObject({ field: "message_id" });
+    await expect(repository.createMessage({
+      conversationId: 41,
+      seq: 1,
+      role: "assistant",
+      content: "safe",
+      tokenCount: 1,
+    })).resolves.toMatchObject({ messageId: 51 });
+
+    expect(query.mock.calls.map(([config]) => config.text)).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("INSERT INTO lcm.messages"),
+      "ROLLBACK TO SAVEPOINT lcm_conversation_repository_1",
+      "RELEASE SAVEPOINT lcm_conversation_repository_1",
+      "SAVEPOINT lcm_conversation_repository_2",
+      expect.stringContaining("INSERT INTO lcm.messages"),
+      "RELEASE SAVEPOINT lcm_conversation_repository_2",
+    ]);
+  });
+
+  it("preserves the scoped operation error when savepoint recovery itself fails", async () => {
+    const unsafeMessage = {
+      ...messageRow,
+      message_id: String(Number.MAX_SAFE_INTEGER + 1),
+    };
+    const query = vi.fn((config: QueryConfig<unknown[]>) => {
+      if (config.text.startsWith("ROLLBACK TO SAVEPOINT")) {
+        throw new Error("rollback transport failure");
+      }
+      return config.text.includes("INSERT INTO lcm.messages")
+        ? result([unsafeMessage])
+        : result([]);
+    });
+    const repository = new PostgreSqlConversationRepository({
+      transactionScope: "active",
+      query,
+    }, projectId);
+
+    await expect(repository.createMessage({
+      conversationId: 41,
+      seq: 0,
+      role: "user",
+      content: "unsafe",
+      tokenCount: 1,
+    })).rejects.toMatchObject({ field: "message_id" });
+    expect(query.mock.calls.map(([config]) => config.text)).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("INSERT INTO lcm.messages"),
+      "ROLLBACK TO SAVEPOINT lcm_conversation_repository_1",
+    ]);
   });
 
   it("maps every PostgreSQL bigint representation only when safely integral", async () => {

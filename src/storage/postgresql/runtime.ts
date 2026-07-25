@@ -180,6 +180,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       let transactionFailure: StorageOperationError | undefined;
       let queryQueue = Promise.resolve();
       const transaction: PostgreSqlQueryExecutor = {
+        transactionScope: "active",
         query: async <R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
           config: QueryConfig<I>,
           queryOptions: PostgreSqlQueryOptions,

@@ -25,6 +25,7 @@ import {
 
 const MAX_SHORT_TRANSACTION_ATTEMPTS = 3;
 const SHORT_TRANSACTION_RETRY_SQLSTATES = new Set(["40001", "40P01"]);
+const MAX_SAVEPOINT_ORDINAL = Number.MAX_SAFE_INTEGER;
 
 const CONVERSATION_COLUMNS =
   "conversation_id, session_id, title, bootstrapped_at, created_at, updated_at";
@@ -46,6 +47,25 @@ export interface PostgreSqlConversationExecutor extends PostgreSqlQueryExecutor 
     options: PostgreSqlConversationTransactionContext,
   ): Promise<T>;
 }
+
+export interface PostgreSqlConversationScopedExecutor
+  extends PostgreSqlQueryExecutor {
+  readonly transactionScope: "active";
+}
+
+type PostgreSqlConversationRepositoryExecutor =
+  | PostgreSqlConversationExecutor
+  | PostgreSqlConversationScopedExecutor;
+
+type ScopedExecutorState = {
+  tail: Promise<void>;
+  savepointOrdinal: number;
+};
+
+const scopedExecutorStates = new WeakMap<
+  PostgreSqlConversationScopedExecutor,
+  ScopedExecutorState
+>();
 
 type ConversationRow = QueryResultRow & {
   conversation_id: string | number | bigint;
@@ -237,7 +257,7 @@ function messagePartInputJson(parts: readonly CreateMessagePartInput[]): string 
 
 export class PostgreSqlConversationRepository implements ConversationRepository {
   constructor(
-    private readonly executor: PostgreSqlConversationExecutor,
+    private readonly executor: PostgreSqlConversationRepositoryExecutor,
     readonly projectId: string,
   ) {}
 
@@ -271,10 +291,8 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     sessionId: string,
     title?: string,
   ): Promise<ConversationRecord> {
-    return this.shortTransaction("getOrCreateConversation", async (transaction) => {
-      await transaction.query({
-        text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-      }, this.context("getOrCreateConversation"));
+    const operation = "getOrCreateConversation";
+    return this.contentionWrite(operation, async (transaction) => {
       await transaction.query({
         text: `SELECT pg_catalog.pg_advisory_xact_lock(
                         pg_catalog.hashtextextended(
@@ -289,16 +307,16 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
                         )
                       )`,
         values: [this.projectId, sessionId],
-      }, this.context("getOrCreateConversation"));
+      }, this.context(operation));
       const existing = await this.getConversationBySessionIdWith(
         transaction,
         sessionId,
-        "getOrCreateConversation",
+        operation,
       );
       return existing ?? this.createConversationWith(
         transaction,
         { sessionId, title },
-        "getOrCreateConversation",
+        operation,
       );
     });
   }
@@ -372,10 +390,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     for (const input of inputs) {
       safeInputInteger(input.tokenCount, this.projectId, operation, "token_count");
     }
-    return this.shortTransaction(operation, async (transaction) => {
-      await transaction.query({
-        text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-      }, this.context(operation));
+    return this.contentionWrite(operation, async (transaction) => {
       await transaction.query({
         text: `SELECT conversation_id
                FROM lcm.conversations
@@ -628,8 +643,9 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     for (const messageId of messageIds) {
       safeInputInteger(messageId, this.projectId, operation, "message_id");
     }
-    const result = await this.executor.query<CountRow>({
-      text: `WITH requested AS (
+    return this.mappedWrite(operation, async (transaction) => {
+      const result = await transaction.query<CountRow>({
+        text: `WITH requested AS (
                SELECT requested.message_id, requested.input_ordinal
                FROM pg_catalog.unnest(
                  $2::pg_catalog.int8[]
@@ -669,9 +685,10 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
              )
              SELECT COUNT(*) AS count
              FROM deleted_messages`,
-      values: [this.projectId, messageIds],
-    }, this.context(operation));
-    return this.count(result.rows[0], operation);
+        values: [this.projectId, messageIds],
+      }, this.context(operation));
+      return this.count(result.rows[0], operation);
+    });
   }
 
   private context(operation: string): PostgreSqlConversationTransactionContext {
@@ -829,19 +846,106 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     operation: string,
     callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
   ): Promise<T> {
-    return typeof this.executor.transaction === "function"
-      ? this.executor.transaction(callback, this.context(operation))
-      : callback(this.executor);
+    const root = this.rootExecutor();
+    return root
+      ? root.transaction(callback, this.context(operation))
+      : this.scopedAtomic(operation, callback);
+  }
+
+  private contentionWrite<T>(
+    operation: string,
+    callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
+  ): Promise<T> {
+    const root = this.rootExecutor();
+    if (!root) {
+      return this.scopedAtomic(operation, callback);
+    }
+    return this.shortTransaction(root, operation, async (transaction) => {
+      await transaction.query({
+        text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+      }, this.context(operation));
+      return callback(transaction);
+    });
+  }
+
+  private rootExecutor(): PostgreSqlConversationExecutor | null {
+    return "transaction" in this.executor
+      && typeof this.executor.transaction === "function"
+      ? this.executor
+      : null;
+  }
+
+  private scopedAtomic<T>(
+    operation: string,
+    callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
+  ): Promise<T> {
+    if (this.executor.transactionScope !== "active") {
+      return Promise.reject(new StorageOperationError(
+        "STORAGE_TRANSACTION_SCOPE",
+        "postgresql",
+        this.projectId,
+        "conversations",
+        operation,
+      ));
+    }
+    const executor = this.executor as PostgreSqlConversationScopedExecutor;
+    const state = this.scopedExecutorState(executor);
+    const execute = state.tail.then(async () => {
+      // The FIFO guarantees the preceding savepoint has been released, so the
+      // bounded ordinal can safely wrap without colliding with an active name.
+      state.savepointOrdinal =
+        (state.savepointOrdinal % MAX_SAVEPOINT_ORDINAL) + 1;
+      const savepoint = `lcm_conversation_repository_${state.savepointOrdinal}`;
+      await executor.query({
+        text: `SAVEPOINT ${savepoint}`,
+      }, this.context(operation));
+      try {
+        const result = await callback(executor);
+        await executor.query({
+          text: `RELEASE SAVEPOINT ${savepoint}`,
+        }, this.context(operation));
+        return result;
+      } catch (error) {
+        try {
+          await executor.query({
+            text: `ROLLBACK TO SAVEPOINT ${savepoint}`,
+          }, this.context(operation));
+          await executor.query({
+            text: `RELEASE SAVEPOINT ${savepoint}`,
+          }, this.context(operation));
+        } catch {
+          // PostgreSqlRuntime records any failed scoped query and rolls the
+          // caller's transaction back even if its callback catches this error.
+        }
+        throw error;
+      }
+    });
+    state.tail = execute.then(() => undefined, () => undefined);
+    return execute;
+  }
+
+  private scopedExecutorState(
+    executor: PostgreSqlConversationScopedExecutor,
+  ): ScopedExecutorState {
+    const existing = scopedExecutorStates.get(executor);
+    if (existing) return existing;
+    const created = {
+      tail: Promise.resolve(),
+      savepointOrdinal: 0,
+    };
+    scopedExecutorStates.set(executor, created);
+    return created;
   }
 
   private async shortTransaction<T>(
+    root: PostgreSqlConversationExecutor,
     operation: string,
     callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
   ): Promise<T> {
     let attempt = 1;
     while (true) {
       try {
-        return await this.executor.transaction(
+        return await root.transaction(
           callback,
           this.context(operation),
         );

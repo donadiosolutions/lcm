@@ -217,6 +217,7 @@ describe("PostgreSQL runtime", () => {
   it("commits successful transactions and rolls back failed transactions", async () => {
     const f = fixtures((input) => typeof input === "string" ? result([]) : result([{ value: 2 }]));
     await expect(f.runtime.transaction(async (transaction) => {
+      expect(transaction.transactionScope).toBe("active");
       const selected = await transaction.query<{ value: number }>({ text: "SELECT 2 AS value" }, {
         domain: "sessions", operation: "inside",
       });

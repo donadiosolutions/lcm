@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
-  type PostgreSqlConversationExecutor,
+  type PostgreSqlConversationScopedExecutor,
   PostgreSqlConversationRepository,
 } from "../../src/storage/postgresql/conversation-repository.js";
 import {
@@ -579,11 +579,11 @@ describe("PostgreSQL 18 conversation repository", () => {
       let insertedMessageId: number | undefined;
 
       await expect(database.runtime.transaction(async (transaction) => {
-        // These methods are query-only, single-statement operations. Binding
-        // the staged repository to the already-open executor proves they join
-        // the caller's transaction without requiring a ProjectStorage adapter.
+        // Binding the staged repository to the explicitly marked, already-open
+        // executor proves its operation savepoints join the caller's transaction
+        // without requiring a ProjectStorage adapter.
         const transactionalRepository = new PostgreSqlConversationRepository(
-          transaction as PostgreSqlConversationExecutor,
+          transaction as PostgreSqlConversationScopedExecutor,
           projectId,
         );
         const inserted = await transactionalRepository.createMessagesBulk([
@@ -619,6 +619,114 @@ describe("PostgreSQL 18 conversation repository", () => {
       expect(await repository.getMessageById(insertedMessageId!)).toBeNull();
       expect(await repository.getMessageParts(insertedMessageId!)).toEqual([]);
       expect(await repository.getMessageById(victim.messageId)).not.toBeNull();
+    });
+  });
+
+  it("reuses an active runtime transaction for get-or-create and append", async () => {
+    await withPostgreSqlTestDatabase("conversation-scoped-contention", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation scoped contention");
+      let conversationId: number | undefined;
+
+      await database.runtime.transaction(async (transaction) => {
+        await transaction.query({ text: "SELECT 1" }, {
+          domain: "conversations",
+          operation: "callerStatementBeforeRepository",
+          projectId,
+        });
+        const repository = new PostgreSqlConversationRepository(
+          transaction as PostgreSqlConversationScopedExecutor,
+          projectId,
+        );
+        const conversation = await repository.getOrCreateConversation(
+          "scoped-contention",
+          "Scoped",
+        );
+        conversationId = conversation.conversationId;
+        await expect(repository.appendMessages(conversation.conversationId, [
+          { role: "user", content: "first", tokenCount: 1 },
+          { role: "assistant", content: "second", tokenCount: 1 },
+        ])).resolves.toMatchObject([{ seq: 0 }, { seq: 1 }]);
+      }, {
+        domain: "conversations",
+        operation: "reuseConversationTransaction",
+        projectId,
+      });
+
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      expect(await repository.getConversationBySessionId("scoped-contention"))
+        .toMatchObject({ conversationId });
+      expect(await repository.getMessages(conversationId!))
+        .toMatchObject([{ seq: 0 }, { seq: 1 }]);
+    });
+  });
+
+  it("rolls back caught scoped mapping failures without poisoning the caller transaction", async () => {
+    await withPostgreSqlTestDatabase("conversation-scoped-mapping", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation scoped mapping");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const safeConversation = await repository.createConversation({
+        sessionId: "scoped-safe-owner",
+      });
+      const beforeMaximumSafeInteger = String(Number.MAX_SAFE_INTEGER - 1);
+
+      await database.migrator.query({
+        text: `SELECT pg_catalog.setval(
+                 'lcm.conversations_conversation_id_seq'::pg_catalog.regclass,
+                 $1::pg_catalog.int8,
+                 true
+               )`,
+        values: [beforeMaximumSafeInteger],
+      }, { domain: "conversations", operation: "forceScopedUnsafeConversationIdentity" });
+      await repository.createConversation({ sessionId: "scoped-maximum-safe-conversation" });
+      await database.migrator.query({
+        text: `SELECT pg_catalog.setval(
+                 'lcm.messages_message_id_seq'::pg_catalog.regclass,
+                 $1::pg_catalog.int8,
+                 true
+               )`,
+        values: [beforeMaximumSafeInteger],
+      }, { domain: "conversations", operation: "forceScopedUnsafeMessageIdentity" });
+      await repository.createMessage({
+        conversationId: safeConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "scoped-maximum-safe-message",
+        tokenCount: 1,
+      });
+
+      await database.runtime.transaction(async (transaction) => {
+        const scoped = new PostgreSqlConversationRepository(
+          transaction as PostgreSqlConversationScopedExecutor,
+          projectId,
+        );
+        await expect(scoped.createConversation({
+          sessionId: "scoped-unsafe-conversation",
+        })).rejects.toMatchObject({ field: "conversation_id" });
+        await expect(scoped.createMessagesBulk([{
+          conversationId: safeConversation.conversationId,
+          seq: 1,
+          role: "assistant",
+          content: "scoped-unsafe-message",
+          tokenCount: 1,
+        }])).rejects.toMatchObject({ field: "message_id" });
+        await scoped.markConversationBootstrapped(safeConversation.conversationId);
+      }, {
+        domain: "conversations",
+        operation: "catchScopedMappingFailures",
+        projectId,
+      });
+
+      expect(await repository.getConversationBySessionId("scoped-unsafe-conversation"))
+        .toBeNull();
+      expect(await repository.hasMessage(
+        safeConversation.conversationId,
+        "assistant",
+        "scoped-unsafe-message",
+      )).toBe(false);
+      expect(await repository.getConversation(safeConversation.conversationId))
+        .toMatchObject({ bootstrappedAt: expect.any(Date) });
     });
   });
 
