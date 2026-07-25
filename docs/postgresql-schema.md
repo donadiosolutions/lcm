@@ -223,18 +223,25 @@ does not add row-level security.
 Issue #83 stores the complete content supplied for indexed messages, summaries,
 and promoted memories. It does not silently truncate content before generating
 the normalized `tsvector` or trigram index entries. PostgreSQL full-text search
-does not index a lexeme that reaches its implementation-specific per-lexeme
-size limit, so adapters must not assume that every arbitrarily large token is
-searchable. The exact byte boundary is a PostgreSQL implementation and encoding
-detail, not a stable LCM schema constant.
+does not index a lexeme that reaches its per-lexeme size limit. The
+[PostgreSQL 18 full-text limitations](https://www.postgresql.org/docs/18/textsearch-limitations.html)
+describe this as shorter than 2 KiB. In the pinned PostgreSQL 18 source,
+`MAXSTRLEN` is 2,047 and the parser omits a token whose byte length is greater
+than or equal to that value. The largest safe parsed lexeme is therefore 2,046
+UTF-8 bytes. That boundary applies after `lcm.normalize_search_text(text)` and
+PostgreSQL text parsing; a raw-content character or whitespace limit is not an
+equivalent test.
 
-Before enabling their write paths, issues #84–#91 must establish and test a
-searchable-content bound against the pinned PostgreSQL 18 runtime. Input beyond
-that bound must be rejected as searchable content or routed without data loss
-to the appropriate `message_parts` or `large_files` representation, with a
-bounded searchable summary or reference where the repository contract requires
-one. Truncating the canonical message, summary, or promoted-memory content is
-not an acceptable fallback.
+Issue #85 preserves canonical message content and provides write conformance,
+but lexical indexing is explicitly outside its scope. Its writes do not promise
+that every oversized normalized parser token is retrievable through full-text
+search, and they do not truncate canonical content to create that impression.
+Issue #89 must pin the 2,046-byte post-normalization/parser boundary with the
+PostgreSQL 18 UTF-8 harness, then define rejection or lossless routing through
+`message_parts` or `large_files` before #224 activates PostgreSQL application
+writes. Future searchable write adapters in #86–#91 must make the same decision
+for their own fields rather than applying a database-independent raw-token
+approximation.
 
 Those adapters must also benchmark the write cost of pinned normalization plus
 generated full-text and trigram index maintenance before enabling high-volume

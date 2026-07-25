@@ -10,6 +10,12 @@ PostgreSQL during this stage. See the
 ordering and atomicity, integrity rules, index families, extension
 prerequisites, retention, and backup implications.
 
+Issue #85 preserves canonical message content but does not implement lexical
+query or oversized-lexeme routing. PostgreSQL 18's source-level safe parsed
+lexeme maximum is 2,046 UTF-8 bytes after normalization and parsing, not a raw
+whitespace-token limit. Issue #89 must pin that matrix in the real harness and
+define lossless handling before #224 enables PostgreSQL daemon/CLI writes.
+
 ## Run the conformance harness
 
 Docker and the runner-provided OpenSSL must be available. From a clean checkout

@@ -284,6 +284,23 @@ describe("PostgreSQL conversation repository", () => {
     expect(db.transaction).not.toHaveBeenCalled();
   });
 
+  it("omits LIMIT for negative sentinels and binds zero or positive limits", async () => {
+    const db = executor(() => result([messageRow]));
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+
+    await repository.getMessages(41, { afterSeq: 0, limit: -1 });
+    await repository.getMessages(41, { afterSeq: 0, limit: 0 });
+    await repository.getMessages(41, { afterSeq: 0, limit: 2 });
+
+    const [unlimited, zero, positive] = db.query.mock.calls.map(([config]) => config);
+    expect(unlimited?.text).not.toContain("LIMIT");
+    expect(unlimited?.values).toEqual([projectId, 41, 0]);
+    expect(zero?.text).toContain("LIMIT $4");
+    expect(zero?.values).toEqual([projectId, 41, 0, 0]);
+    expect(positive?.text).toContain("LIMIT $4");
+    expect(positive?.values).toEqual([projectId, 41, 0, 2]);
+  });
+
   it("keeps message bulk and append inputs within a constant bind count", async () => {
     const db = executor((config) => {
       if (config.text.includes("FOR UPDATE")) return result([{ conversation_id: "41" }]);

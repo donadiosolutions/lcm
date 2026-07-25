@@ -81,6 +81,11 @@ export async function exerciseConversationRepositoryConformance(
     .toEqual([0, 1, 2, 3, 4]);
   expect((await repository.getMessages(
     first.conversationId,
+    { afterSeq: 1, limit: -1 },
+  )).map((row) => row.seq)).toEqual([2, 3, 4]);
+  expect(await repository.getMessages(first.conversationId, { limit: 0 })).toEqual([]);
+  expect((await repository.getMessages(
+    first.conversationId,
     { afterSeq: 0, limit: 1 },
   ))[0]?.seq).toBe(1);
   expect((await repository.getLastMessage(first.conversationId))?.messageId)

@@ -89,6 +89,12 @@ export interface ConversationRepository {
     conversationId: ConversationId,
     inputs: AppendMessageInput[],
   ): Promise<MessageRecord[]>;
+  /**
+   * Read messages after an exclusive sequence checkpoint.
+   *
+   * An undefined limit or any negative safe integer is unlimited, zero returns
+   * no rows, and a positive safe integer bounds the result.
+   */
   getMessages(conversationId: ConversationId, options?: { afterSeq?: number; limit?: number }): Promise<MessageRecord[]>;
   getLastMessage(conversationId: ConversationId): Promise<MessageRecord | null>;
   hasMessage(conversationId: ConversationId, role: MessageRole, content: string): Promise<boolean>;

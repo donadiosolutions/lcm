@@ -423,8 +423,9 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
       safeInputInteger(options.limit, this.projectId, operation, "limit");
     }
     const values: unknown[] = [this.projectId, conversationId, afterSeq];
-    const limit = options?.limit === undefined ? "" : " LIMIT $4";
-    if (options?.limit !== undefined) values.push(options.limit);
+    const hasBoundedLimit = options?.limit !== undefined && options.limit >= 0;
+    const limit = hasBoundedLimit ? " LIMIT $4" : "";
+    if (hasBoundedLimit) values.push(options.limit);
     const result = await this.executor.query<MessageRow>({
       text: `SELECT ${MESSAGE_COLUMNS}
              FROM lcm.messages
