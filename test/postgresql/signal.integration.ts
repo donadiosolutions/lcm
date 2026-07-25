@@ -142,6 +142,16 @@ async function waitForPidExit(pid: number): Promise<void> {
   throw new Error("consumer process did not exit");
 }
 
+async function terminatePid(pid: number): Promise<void> {
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+    throw error;
+  }
+  await waitForPidExit(pid);
+}
+
 describe("PostgreSQL harness signal teardown", () => {
   it("ignores only an ESRCH race while signaling a child", () => {
     const exitedChild = {
@@ -207,13 +217,14 @@ describe("PostgreSQL harness signal teardown", () => {
     killChild(first.child, "SIGKILL");
     await expect(firstCompletion).resolves.toEqual({ code: null, signal: "SIGKILL" });
 
-    const second = await launchSignalProbe();
+    const pid = await consumerPid(first.runId);
+    let second: Awaited<ReturnType<typeof launchSignalProbe>> | undefined;
     let third: Awaited<ReturnType<typeof launchSignalProbe>> | undefined;
+    let recovered = false;
     try {
+      second = await launchSignalProbe();
       await expectResources(first.runId);
-      const pid = await consumerPid(first.runId);
-      process.kill(pid, "SIGTERM");
-      await waitForPidExit(pid);
+      await terminatePid(pid);
 
       const secondCompletion = exited(second.child);
       killChild(second.child, "SIGTERM");
@@ -224,9 +235,21 @@ describe("PostgreSQL harness signal teardown", () => {
       const thirdCompletion = exited(third.child);
       killChild(third.child, "SIGTERM");
       await expect(thirdCompletion).resolves.toEqual({ code: 143, signal: null });
+      recovered = true;
     } finally {
+      await terminatePid(pid);
       if (third && third.child.exitCode === null && third.child.signalCode === null) killChild(third.child, "SIGKILL");
-      if (second.child.exitCode === null && second.child.signalCode === null) killChild(second.child, "SIGKILL");
+      if (second && second.child.exitCode === null && second.child.signalCode === null) killChild(second.child, "SIGKILL");
+      if (!recovered) {
+        const cleanup = await launchSignalProbe();
+        try {
+          await expectNoResources(first.runId);
+        } finally {
+          const cleanupCompletion = exited(cleanup.child);
+          killChild(cleanup.child, "SIGTERM");
+          await cleanupCompletion;
+        }
+      }
     }
   }, 120_000);
 

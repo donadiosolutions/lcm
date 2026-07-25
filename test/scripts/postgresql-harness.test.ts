@@ -23,6 +23,7 @@ import {
   isValidProcessBirthFingerprint,
   isMissingDockerObjectError,
   ownershipLabels,
+  processIdentityEvidenceConsistent,
   readProcessBirthFingerprint,
   readOwnerScopeFingerprint,
   recordAmbiguousConsumerIdentity,
@@ -198,6 +199,18 @@ describe("PostgreSQL harness utilities", () => {
     expect(isValidProcessBirthFingerprint("darwin:Thu Jul 24 21:00:00 2026")).toBe(false);
     expect(isValidProcessBirthFingerprint("win32:2026-02-31T00:00:00.0000000Z")).toBe(false);
     expect(isValidProcessBirthFingerprint("win32:2026-02-28T24:00:00.0000000Z")).toBe(false);
+    expect(processIdentityEvidenceConsistent(
+      `linux:${testBootId}:1`,
+      testOwnerScope,
+    )).toBe(true);
+    expect(processIdentityEvidenceConsistent(
+      "linux:abcdefab-1234-1234-1234-123456789abc:1",
+      testOwnerScope,
+    )).toBe(false);
+    expect(processIdentityEvidenceConsistent(
+      "darwin:Fri Jul 24 21:00:00 2026",
+      testOwnerScope,
+    )).toBe(false);
   });
 
   it("derives and validates every resource name from a random-style run ID", () => {
@@ -556,6 +569,7 @@ describe("PostgreSQL harness utilities", () => {
     }, {
       platform: () => "linux",
       signalProcess,
+      processTreeAlive: () => false,
     });
     const consumer = lifecycle.run("node", ["vitest"], {
       terminateOnStop: true,
@@ -566,6 +580,39 @@ describe("PostgreSQL harness utilities", () => {
     await expect(consumer).resolves.toBeUndefined();
     expect(signalProcess).toHaveBeenCalledWith(-321, "SIGTERM");
     expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it("retains process-group escalation after the leader settles", async () => {
+    let finish!: () => void;
+    const child = { pid: 654, kill: vi.fn() };
+    const signals: Array<number | string> = [];
+    const signalProcess = vi.fn((_pid: number, signal: number | string) => {
+      signals.push(signal);
+      if (signal === "SIGTERM") finish();
+    });
+    const processTreeAlive = vi.fn()
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(false);
+    const lifecycle = createProcessLifecycle((_command, _args, options) => {
+      options.onSpawn(child);
+      return new Promise<void>((resolve) => { finish = resolve; });
+    }, {
+      platform: () => "linux",
+      signalProcess,
+      processTreeAlive,
+      delay: vi.fn().mockResolvedValue(undefined),
+      treeGraceAttempts: 1,
+      treeKillAttempts: 1,
+    });
+    const consumer = lifecycle.run("node", ["vitest"], {
+      terminateOnStop: true,
+      terminateProcessTree: true,
+    });
+
+    await expect(lifecycle.stop()).resolves.toBeUndefined();
+    await expect(consumer).resolves.toBeUndefined();
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
   });
 
   it.each([
@@ -1013,7 +1060,7 @@ describe("PostgreSQL harness utilities", () => {
     };
     const consumer = {
       pid: 101,
-      birth: "darwin:Fri Jul 24 21:00:00 2026",
+      birth: "linux:12345678-1234-1234-1234-123456789abc:101",
       scope: testOwnerScope,
     };
     const records = new Map([

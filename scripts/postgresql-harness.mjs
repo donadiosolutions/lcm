@@ -107,6 +107,16 @@ export function isValidProcessBirthFingerprint(fingerprint) {
   ));
 }
 
+export function processIdentityEvidenceConsistent(birth, scope) {
+  const birthPlatform = typeof birth === "string" ? birth.split(":", 1)[0] : undefined;
+  const scopePlatform = typeof scope === "string" ? scope.split(":", 1)[0] : undefined;
+  if (!birthPlatform || birthPlatform !== scopePlatform) return false;
+  if (birthPlatform !== "linux") return birthPlatform === "darwin" || birthPlatform === "win32";
+  const birthMatch = birth.match(linuxBirthRegex);
+  const scopeMatch = scope.match(linuxScopeRegex);
+  return Boolean(birthMatch && scopeMatch && birthMatch[1] === scopeMatch[2]);
+}
+
 function hashedIdentity(value) {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -458,6 +468,9 @@ export function createProcessLifecycle(processRunner = runProcess, dependencies 
       "/PID", String(pid), "/T", ...(force ? ["/F"] : []),
     ], { windowsHide: true, stdio: "ignore" });
   });
+  const delay = dependencies.delay ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  const treeGraceAttempts = dependencies.treeGraceAttempts ?? 80;
+  const treeKillAttempts = dependencies.treeKillAttempts ?? 80;
 
   const signalEntry = (entry, signal) => {
     if (!entry.processTree || !Number.isSafeInteger(entry.child?.pid) || entry.child.pid <= 0) {
@@ -469,6 +482,43 @@ export function createProcessLifecycle(processRunner = runProcess, dependencies 
       return;
     }
     signalProcess(-entry.child.pid, signal);
+  };
+
+  const processTreeAlive = dependencies.processTreeAlive ?? ((entry) => {
+    if (currentPlatform === "win32") {
+      return entry.child?.exitCode === null && entry.child?.signalCode === null;
+    }
+    try {
+      signalProcess(-entry.child.pid, 0);
+      return true;
+    } catch (error) {
+      return error?.code !== "ESRCH";
+    }
+  });
+
+  const waitForProcessTreeExit = async (entry, attempts) => {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (!processTreeAlive(entry)) return true;
+      await delay(25);
+    }
+    return !processTreeAlive(entry);
+  };
+
+  const terminateProcessTree = async (entry) => {
+    try {
+      signalEntry(entry, "SIGTERM");
+    } catch {
+      // Liveness verification below decides whether escalation is still needed.
+    }
+    if (await waitForProcessTreeExit(entry, treeGraceAttempts)) return;
+    try {
+      signalEntry(entry, "SIGKILL");
+    } catch {
+      // Liveness verification below remains authoritative.
+    }
+    if (!await waitForProcessTreeExit(entry, treeKillAttempts)) {
+      throw new Error("PostgreSQL harness test process tree did not exit");
+    }
   };
 
   const run = (command, args, options) => {
@@ -506,8 +556,13 @@ export function createProcessLifecycle(processRunner = runProcess, dependencies 
 
   const stop = async () => {
     stopping = true;
+    const treeTerminations = [];
     for (const entry of active) {
       if (!entry.terminateOnStop || !entry.child) continue;
+      if (entry.processTree) {
+        treeTerminations.push(terminateProcessTree(entry));
+        continue;
+      }
       try {
         signalEntry(entry, "SIGTERM");
       } catch {
@@ -522,6 +577,7 @@ export function createProcessLifecycle(processRunner = runProcess, dependencies 
       }, 2_000);
       entry.escalation.unref?.();
     }
+    await Promise.all(treeTerminations);
     while (active.size > 0) {
       await Promise.allSettled([...active].map((entry) => entry.operation));
     }
@@ -630,6 +686,7 @@ function requiredOwnership(labels) {
     || !/^[1-9][0-9]*$/u.test(pidText ?? "")
     || !isValidProcessBirthFingerprint(birth)
     || !(linuxScopeRegex.test(scope ?? "") || portableScopeRegex.test(scope ?? ""))
+    || !processIdentityEvidenceConsistent(birth, scope)
     || typeof kind !== "string"
     || kind.length === 0) {
     return undefined;
@@ -755,7 +812,8 @@ function readConsumerOwner(directory, dependencies = {}) {
       || !Number.isSafeInteger(value.pid)
       || value.pid <= 0
       || !isValidProcessBirthFingerprint(value.birth)
-      || !(linuxScopeRegex.test(value.scope ?? "") || portableScopeRegex.test(value.scope ?? ""))) {
+      || !(linuxScopeRegex.test(value.scope ?? "") || portableScopeRegex.test(value.scope ?? ""))
+      || !processIdentityEvidenceConsistent(value.birth, value.scope)) {
       throw new Error("invalid PostgreSQL harness consumer identity evidence");
     }
     return { pid: value.pid, birth: value.birth, scope: value.scope };
@@ -1097,6 +1155,8 @@ export async function cleanupHarnessResources(context, dependencies = {}) {
 
 async function runTests(context, ci, setupDocker = docker, testProcess = runProcess) {
   const env = { ...process.env, ...context.environment };
+  delete env.LCM_TEST_POSTGRES_FORK_PROBE;
+  delete env.LCM_TEST_POSTGRES_FORK_WORKER_PID_FILE;
   const secrets = context.secrets ?? [];
   for (const key of Object.keys(env)) {
     if (key.startsWith("PG") || key === "LCM_POSTGRES_URL" || key === "LCM_POSTGRES_CA_FILE") delete env[key];
