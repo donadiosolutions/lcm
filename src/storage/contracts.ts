@@ -64,8 +64,27 @@ export interface ConversationRepository {
   getOrCreateConversation(sessionId: string, title?: string): Promise<ConversationRecord>;
   markConversationBootstrapped(conversationId: ConversationId): Promise<void>;
   listConversations(): Promise<ConversationRecord[]>;
+  /**
+   * Create one explicit sequence value for replay/import.
+   *
+   * Callers must not run explicit-sequence writes concurrently with
+   * appendMessages for the same conversation.
+   */
   createMessage(input: CreateMessageInput): Promise<MessageRecord>;
+  /**
+   * Atomically create explicit sequence values for replay/import.
+   *
+   * Callers must not run explicit-sequence writes concurrently with
+   * appendMessages for the same conversation.
+   */
   createMessagesBulk(inputs: CreateMessageInput[]): Promise<MessageRecord[]>;
+  /**
+   * Atomically allocate and insert the next contiguous sequence range.
+   *
+   * Concurrent appendMessages calls are serialized per conversation. Callers
+   * must not concurrently mix this allocator with explicit-sequence writes
+   * for the same conversation.
+   */
   appendMessages(
     conversationId: ConversationId,
     inputs: AppendMessageInput[],
@@ -79,6 +98,13 @@ export interface ConversationRepository {
   getMessageParts(messageId: MessageId): Promise<MessagePartRecord[]>;
   getMessageCount(conversationId: ConversationId): Promise<number>;
   getMessageCountBySessionId(sessionId: string): Promise<number>;
+  /**
+   * Return the highest sequence, preserving the legacy value 0 when empty.
+   *
+   * Because a non-empty conversation whose first message has seq 0 also
+   * returns 0, use getMessageCount when testing whether a conversation is
+   * empty.
+   */
   getMaxSeq(conversationId: ConversationId): Promise<number>;
   deleteMessages(messageIds: MessageId[]): Promise<number>;
 }

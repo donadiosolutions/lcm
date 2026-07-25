@@ -261,13 +261,23 @@ nondeterministic.
 `appendMessages` allocates a whole batch while holding a row lock on the owning
 conversation. The first appended message uses sequence `0`; later batches use
 `MAX(seq) + 1` and receive a contiguous range. Explicit-sequence single and
-bulk creation remain available for replay and import. Bulk message creation,
-part insertion, and multi-message deletion are atomic operations: they either
-commit completely or leave no partial rows. When called inside a repository
-transaction they join that transaction instead of opening a nested one.
+bulk creation remain available for replay and import. These two write modes
+may be used sequentially, but callers must not run append allocation and
+explicit-sequence creation concurrently for the same conversation: the row
+lock coordinates append allocators, while replay/import deliberately supplies
+its own sequence values. Concurrent append-only calls remain safe. Bulk
+message creation, part insertion, and multi-message deletion are atomic
+operations: they either commit completely or leave no partial rows. When
+called inside a repository transaction they join that transaction instead of
+opening a nested one.
 Only serialization failures (`40001`) and deadlocks (`40P01`) are retried, with
 at most three attempts; a commit whose outcome is uncertain is never replayed
 automatically.
+
+`getMaxSeq` preserves SQLite's legacy return value of `0` for an empty
+conversation. A conversation containing only sequence `0` has the same
+maximum, so `0` is not an emptiness signal; callers must use `getMessageCount`
+when they need to distinguish those states.
 
 Message deletion retains the SQLite summary-protection rule. A message
 referenced by `summary_messages` is skipped, while an eligible message is

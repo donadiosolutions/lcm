@@ -384,6 +384,14 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     );
   }
 
+  /**
+   * Allocate a contiguous range under the owning conversation's row lock.
+   *
+   * The lock serializes concurrent appendMessages calls. Explicit-sequence
+   * createMessage/createMessagesBulk calls intentionally remain available for
+   * replay and import, but callers must not run those operations concurrently
+   * with appendMessages for this same conversation.
+   */
   async appendMessages(
     conversationId: ConversationId,
     inputs: AppendMessageInput[],
@@ -622,6 +630,11 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     return this.count(result.rows[0], operation);
   }
 
+  /**
+   * Preserve SQLite's legacy 0 for both an empty conversation and a maximum
+   * sequence of 0. Callers that need an emptiness test must use
+   * getMessageCount instead.
+   */
   async getMaxSeq(conversationId: ConversationId): Promise<number> {
     const operation = "getMaxSeq";
     safeInputInteger(conversationId, this.projectId, operation, "conversation_id");

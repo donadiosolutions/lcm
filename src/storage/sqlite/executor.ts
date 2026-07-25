@@ -129,12 +129,22 @@ export class SqliteExecutor {
       this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
       return result;
     } catch (error) {
+      let rolledBack = false;
       try {
         this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
-        this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        rolledBack = true;
       } catch {
         this.failedTokens.add(token);
         this.poison();
+      }
+      if (rolledBack) {
+        try {
+          this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        } catch {
+          // ROLLBACK TO already restored the operation boundary. A failed
+          // RELEASE leaves only savepoint cleanup for the outer transaction,
+          // which SQLite can safely discard on COMMIT or ROLLBACK.
+        }
       }
       throw normalizeStorageError(error, {
         backend: "sqlite",

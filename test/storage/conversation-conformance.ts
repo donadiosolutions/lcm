@@ -137,6 +137,8 @@ export async function exerciseConversationRepositoryConformance(
   expect(await repository.getMessageCountBySessionId("session-a")).toBe(6);
   expect(await repository.getMessageCountBySessionId("missing")).toBe(0);
   expect(await repository.getMaxSeq(first.conversationId)).toBe(4);
+  expect(await repository.getMessageCount(split.conversationId)).toBe(1);
+  expect(await repository.getMaxSeq(split.conversationId)).toBe(0);
   expect(await repository.getMaxSeq(second.conversationId)).toBe(0);
 
   return { first, second, messages, third, appended };

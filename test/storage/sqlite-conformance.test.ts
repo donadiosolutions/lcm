@@ -912,6 +912,56 @@ describe("SQLite storage backend conformance", () => {
       .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
   });
 
+  it("keeps the outer transaction usable when savepoint release fails after rollback", async () => {
+    const calls: string[] = [];
+    const onPoison = vi.fn();
+    const database = {
+      exec: (sql: string): void => {
+        calls.push(sql);
+        if (sql.startsWith("RELEASE SAVEPOINT")) {
+          throw new Error("savepoint release /secret/path");
+        }
+      },
+    } as unknown as DatabaseSync;
+    const executor = new SqliteExecutor(database, "safe-project", onPoison);
+
+    await expect(executor.transaction(async (token) => {
+      const failure = await executor.runAtomicScoped(
+        token,
+        "conversations",
+        "createMessagesBulk",
+        () => { throw new Error("batch failure /secret/path"); },
+      ).catch((error: unknown) => error);
+      expect(failure).toMatchObject({
+        code: "STORAGE_OPERATION_FAILED",
+        domain: "conversations",
+        operation: "createMessagesBulk",
+      });
+      expect(JSON.stringify(failure)).not.toContain("/secret/");
+      await expect(executor.runScoped(
+        token,
+        "conversations",
+        "listConversations",
+        () => "still usable",
+      )).resolves.toBe("still usable");
+      return "caught";
+    })).resolves.toBe("caught");
+
+    expect(calls).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT lcm_atomic_0",
+      "ROLLBACK TO SAVEPOINT lcm_atomic_0",
+      "RELEASE SAVEPOINT lcm_atomic_0",
+      "COMMIT",
+    ]);
+    expect(onPoison).not.toHaveBeenCalled();
+    await expect(executor.run(
+      "conversations",
+      "listConversations",
+      () => "open",
+    )).resolves.toBe("open");
+  });
+
   it("rejects atomic roots and every invalid scoped-atomic transaction context", async () => {
     const firstDatabase = { exec: vi.fn() } as unknown as DatabaseSync;
     const secondDatabase = { exec: vi.fn() } as unknown as DatabaseSync;
