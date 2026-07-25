@@ -64,6 +64,14 @@ function parseJsonArray(stdout: string, description: string): unknown[] {
   return parsed;
 }
 
+function lcmPluginIdentifier(candidate: unknown): string | undefined {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
+  const id = (candidate as Record<string, unknown>).id;
+  if (typeof id !== "string") return undefined;
+  const separator = id.lastIndexOf("@");
+  return (separator > 0 ? id.slice(0, separator) : id) === "lcm" ? id : undefined;
+}
+
 function marketplaceRepositories(stdout: string): Map<string, string> {
   const repositories = new Map<string, string>();
   for (const candidate of parseJsonArray(stdout, "Claude marketplace list")) {
@@ -133,13 +141,7 @@ export function migrateClaudeMarketplacePlugins(
     throw new Error("Could not list installed Claude plugins");
   }
   const listedPlugins = parseJsonArray(list.stdout, "Claude plugin list");
-  const hasPotentialLcmPlugin = listedPlugins.some((candidate) => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
-    const id = (candidate as Record<string, unknown>).id;
-    if (typeof id !== "string") return false;
-    const separator = id.lastIndexOf("@");
-    return (separator > 0 ? id.slice(0, separator) : id) === "lcm";
-  });
+  const hasPotentialLcmPlugin = listedPlugins.some((candidate) => lcmPluginIdentifier(candidate) !== undefined);
   if (!hasPotentialLcmPlugin) return;
   const marketplaces = deps.spawnSync("claude", ["plugin", "marketplace", "list", "--json"], { encoding: "utf-8", cwd });
   if (marketplaces.status !== 0) {
@@ -165,9 +167,11 @@ export function migrateClaudeMarketplacePlugins(
   }
   const verify = deps.spawnSync("claude", ["plugin", "list", "--json"], { encoding: "utf-8", cwd });
   if (verify.status !== 0) throw new Error("Could not verify Claude Marketplace plugin removal");
-  const remaining = parseInstalledClaudePlugins(verify.stdout, marketplaces.stdout);
-  if (remaining.length > 0) {
-    throw new Error(`Claude Marketplace plugin remains installed: ${remaining[0].identifier}`);
+  const remaining = parseJsonArray(verify.stdout, "Claude plugin list")
+    .map(lcmPluginIdentifier)
+    .find((identifier) => identifier !== undefined);
+  if (remaining) {
+    throw new Error(`Claude Marketplace plugin remains installed: ${remaining}`);
   }
 }
 

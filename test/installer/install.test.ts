@@ -113,10 +113,23 @@ describe("mergeClaudeSettings", () => {
   it("preserves a malformed command prefix that only shares a managed suffix", () => {
     const result = mergeClaudeSettings({
       hooks: {
-        SessionStart: [{ hooks: [{ type: "command", command: " restore" }] }],
+        SessionStart: [{ hooks: [
+          { type: "command", command: " restore" },
+          { type: "command", command: '" restore' },
+        ] }],
       },
     }, binary);
     expect(result.hooks.SessionStart[0].hooks[0].command).toBe(" restore");
+    expect(result.hooks.SessionStart[0].hooks[1].command).toBe('" restore');
+  });
+
+  it("preserves a command when executable extraction returns no match", () => {
+    const result = mergeClaudeSettings({
+      hooks: {
+        SessionStart: [{ hooks: [{ type: "command", command: '" restore' }] }],
+      },
+    }, binary);
+    expect(result.hooks.SessionStart[0].hooks[0].command).toBe('" restore');
   });
 
   it("recognizes escaped Windows-style absolute LCM hook paths", () => {
@@ -308,6 +321,16 @@ describe("Claude Marketplace migration", () => {
         .mockReturnValueOnce({ status: 0, stdout: "" })
         .mockReturnValueOnce({ status: 0, stdout: plugin }) as any,
     }, "/work")).toThrow("remains installed");
+    expect(() => migrateClaudeMarketplacePlugins({
+      spawnSync: vi.fn()
+        .mockReturnValueOnce({ status: 0, stdout: plugin })
+        .mockReturnValueOnce({ status: 0, stdout: marketplaces })
+        .mockReturnValueOnce({ status: 0, stdout: "" })
+        .mockReturnValueOnce({
+          status: 0,
+          stdout: JSON.stringify([{ id: "lcm@unknown", repository: "someone/lcm" }]),
+        }) as any,
+    }, "/work")).toThrow("Claude Marketplace plugin remains installed: lcm@unknown");
     expect(() => migrateClaudeMarketplacePlugins({
       spawnSync: vi.fn()
         .mockReturnValueOnce({ status: 0, stdout: plugin })

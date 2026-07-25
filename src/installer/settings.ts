@@ -44,7 +44,8 @@ function isManagedCommand(value: unknown, command: string): boolean {
   const suffix = ` ${command}`;
   if (!trimmed.endsWith(suffix)) return false;
   const executable = trimmed.slice(0, -suffix.length).trimEnd();
-  const executableMatch = /(?:"((?:[^"\\]|\\.)+)"|'([^']+)'|(\S+))$/.exec(executable)!;
+  const executableMatch = /(?:"((?:[^"\\]|\\.)+)"|'([^']+)'|([^"'\s]+))$/.exec(executable);
+  if (!executableMatch) return false;
   const executablePath = (executableMatch[1] ?? executableMatch[2] ?? executableMatch[3])
     .replaceAll('\\"', '"')
     .replaceAll("\\\\", "\\");

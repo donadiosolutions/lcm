@@ -7,7 +7,11 @@ import { LCM_MARKERS } from "./constants.js";
 import { generateContent } from "./template-service.js";
 import { findAgent, AGENTS } from "./registry.js";
 import { CODEX_CONFIG_PATH, LEGACY_CODEX_HOOKS_PATHS, hasCodexHooks, installCodexHooks, removeCodexHooks } from "./codex-hooks.js";
-import { mergeClaudeSettings, removeManagedClaudeSettings } from "../installer/settings.js";
+import {
+  canonicalHookCommand,
+  removeManagedClaudeSettings,
+  REQUIRED_HOOKS,
+} from "../installer/settings.js";
 import { packageExecutable } from "../runtime-root.js";
 
 export interface InstallResult {
@@ -170,8 +174,25 @@ function hasClaudeHooks(filePath: string): boolean {
   if (!existsSync(filePath)) return false;
   try {
     const existing = readJsonObject(filePath);
-    const merged = mergeClaudeSettings(existing, packageExecutable(import.meta.url, 3));
-    return JSON.stringify(existing.hooks) === JSON.stringify(merged.hooks);
+    const hooks = existing.hooks;
+    if (hooks === null || typeof hooks !== "object" || Array.isArray(hooks)) return false;
+    const runtimePath = packageExecutable(import.meta.url, 3);
+    return REQUIRED_HOOKS.every(({ event, command }) => {
+      const entries = (hooks as Record<string, unknown>)[event];
+      if (!Array.isArray(entries)) return false;
+      const expected = canonicalHookCommand(runtimePath, command);
+      return entries.some((entry) => {
+        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
+        const commands = (entry as Record<string, unknown>).hooks;
+        return Array.isArray(commands) && commands.some((hook) =>
+          hook !== null
+          && typeof hook === "object"
+          && !Array.isArray(hook)
+          && (hook as Record<string, unknown>).type === "command"
+          && (hook as Record<string, unknown>).command === expected
+        );
+      });
+    });
   } catch {
     return false;
   }
