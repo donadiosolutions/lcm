@@ -315,17 +315,25 @@ describe("Claude Marketplace migration", () => {
     const plugins = JSON.stringify([
       { id: "lcm@current", scope: "user" },
       { id: "lcm@legacy", scope: "project", projectPath: "/work/p" },
+      { id: "lcm@mixed-current", scope: "user" },
+      { id: "lcm@mixed-legacy", scope: "user" },
       { id: "lcm@unrelated", scope: "user", installPath: "/tmp/lossless-claude/lcm" },
+      { id: "lcm@lookalike", scope: "user" },
       { id: "other@current", scope: "user" },
     ]);
     const marketplaces = JSON.stringify([
       { name: "current", source: "github", repo: "donadiosolutions/lcm" },
       { name: "legacy", source: "github", repo: "lossless-claude/lcm" },
+      { name: "mixed-current", source: "github", repo: "GitHub:DonadioSolutions/LCM" },
+      { name: "mixed-legacy", source: "github", repo: "HTTPS://GITHUB.COM/Lossless-Claude/LCM.GIT" },
       { name: "unrelated", source: "github", repo: "someone/lcm" },
+      { name: "lookalike", source: "github", repo: "DonadioSolutions/LCM-extra" },
     ]);
     expect(parseInstalledClaudePlugins(plugins, marketplaces)).toEqual([
       { identifier: "lcm@current", repository: "donadiosolutions/lcm", scope: "user", cwd: undefined },
       { identifier: "lcm@legacy", repository: "lossless-claude/lcm", scope: "project", cwd: "/work/p" },
+      { identifier: "lcm@mixed-current", repository: "donadiosolutions/lcm", scope: "user", cwd: undefined },
+      { identifier: "lcm@mixed-legacy", repository: "lossless-claude/lcm", scope: "user", cwd: undefined },
     ]);
   });
 
@@ -387,6 +395,10 @@ describe("Claude Marketplace migration", () => {
       { id: "lcm@y", source: { repo: "git@github.com:donadiosolutions/lcm.git" } },
       { id: "lcm@z", source: { repo: 42 } },
       { id: "lcm@direct", source: "github:donadiosolutions/lcm" },
+      { id: "lcm@mixed", repository: "GitHub:DonadioSolutions/LCM" },
+      { id: "lcm@legacy-mixed", repo: "git@GitHub.com:Lossless-Claude/LCM.GIT" },
+      { id: "lcm@lookalike", repository: "DonadioSolutions/LCM-extra" },
+      { id: "lcm@unknown-owner", repository: "someone/LCM" },
       { id: "lcm@missing" },
       { id: "lcm" },
       { id: 1 },
@@ -397,6 +409,8 @@ describe("Claude Marketplace migration", () => {
       { identifier: "lcm@x", repository: "lossless-claude/lcm", scope: "user", cwd: undefined },
       { identifier: "lcm@y", repository: "donadiosolutions/lcm", scope: "user", cwd: undefined },
       { identifier: "lcm@direct", repository: "donadiosolutions/lcm", scope: "user", cwd: undefined },
+      { identifier: "lcm@mixed", repository: "donadiosolutions/lcm", scope: "user", cwd: undefined },
+      { identifier: "lcm@legacy-mixed", repository: "lossless-claude/lcm", scope: "user", cwd: undefined },
     ]);
     expect(() => parseInstalledClaudePlugins(JSON.stringify([
       { id: "lcm@x", repository: "donadiosolutions/lcm", scope: "workspace" },

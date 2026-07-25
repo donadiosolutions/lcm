@@ -45,11 +45,12 @@ export interface InstalledClaudePlugin {
 
 function normalizeRepository(value: string): string | undefined {
   const normalized = value.trim()
-    .replace(/^github:/, "")
-    .replace(/^https?:\/\/github\.com\//, "")
-    .replace(/^git@github\.com:/, "")
-    .replace(/\.git$/, "")
-    .replace(/^\/+|\/+$/g, "");
+    .replace(/^github:/i, "")
+    .replace(/^https?:\/\/github\.com\//i, "")
+    .replace(/^git@github\.com:/i, "")
+    .replace(/\.git$/i, "")
+    .replace(/^\/+|\/+$/g, "")
+    .toLowerCase();
   return CLAUDE_PLUGIN_REPOSITORIES.has(normalized) ? normalized : undefined;
 }
 

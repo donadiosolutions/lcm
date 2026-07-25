@@ -7,7 +7,9 @@ argument: "[phase]"
 
 # lcm Dogfood — Live Self-Test Suite
 
-Comprehensive self-test for the lcm system in a live Claude Code session. Covers all 9 CLI commands, 4 hooks, 8 MCP tools, and resilience scenarios across 39 checks in 10 phases.
+Comprehensive self-test for the lcm system in a live Claude Code session. Covers
+the CLI, all 6 native Claude hooks, 8 MCP checks, and resilience scenarios
+across 39 checks in 10 phases.
 
 **Arguments:** `all` (default), `health`, `import`, `compact`, `promote`, `sensitive`, `pipeline`, `hooks`, `mcp`, `resilience`, `debug`
 
@@ -42,24 +44,26 @@ Consult `references/checks.md` for detailed pass/fail criteria for each check.
 
 ## Key Commands
 
-All CLI checks use `node dist/bin/lcm.js <subcommand>`. If `lcm` is on PATH, use that instead.
+All CLI checks use the npm-installed `lcm <subcommand>` executable.
 
 ### Hook Verification
 
-Hooks are registered in `.claude-plugin/plugin.json`, NOT `~/.claude/settings.json`. Verify all 4:
+Hooks are registered natively in `~/.claude/settings.json`. Verify all 6:
 - `SessionStart` → `lcm restore`
 - `UserPromptSubmit` → `lcm user-prompt`
 - `PreCompact` → `lcm compact --hook`
 - `SessionEnd` → `lcm session-end`
+- `PostToolUse` → `lcm post-tool`
+- `Stop` → `lcm session-snapshot`
 
 For live hook testing, pipe JSON to stdin:
 ```bash
-echo '{}' | node dist/bin/lcm.js restore
+echo '{}' | lcm restore
 ```
 
 The UserPromptSubmit hook requires `prompt` and `cwd` fields:
 ```bash
-node -e 'console.log(JSON.stringify({prompt:"test query",cwd:process.cwd()}))' | node dist/bin/lcm.js user-prompt
+node -e 'console.log(JSON.stringify({prompt:"test query",cwd:process.cwd()}))' | lcm user-prompt
 ```
 
 ### MCP Tool Testing
@@ -93,8 +97,8 @@ For ⚠️ KNOWN items, reference the bug number from `references/known-issues.m
 ### Scripts
 
 Utility scripts for checks that require custom logic:
-- **`scripts/prompt-search-test.js`** — Test the daemon `/prompt-search` endpoint directly. Usage: `node scripts/prompt-search-test.js "query" [cwd]`
-- **`scripts/db-integrity.js`** — Check PRAGMA integrity_check on all project databases. Usage: `node scripts/db-integrity.js`
+- **`.agents/skills/lcm-dogfood/scripts/prompt-search-test.js`** — Test the daemon `/prompt-search` endpoint directly. Usage: `node .agents/skills/lcm-dogfood/scripts/prompt-search-test.js "query" [cwd]`
+- **`.agents/skills/lcm-dogfood/scripts/db-integrity.js`** — Check PRAGMA integrity_check on all project databases. Usage: `node .agents/skills/lcm-dogfood/scripts/db-integrity.js`
 
 ### Reference Files
 

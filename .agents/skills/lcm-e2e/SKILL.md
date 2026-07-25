@@ -15,7 +15,8 @@ user-invocable: true
 
 ## Task
 
-Run the E2E validation checklist from `.claude-plugin/skills/lcm-e2e/checklist.md`.
+Run the E2E validation checklist from
+`.agents/skills/lcm-e2e/checklist.md`.
 
 **Arguments:** `$ARGUMENTS`
 
@@ -31,7 +32,7 @@ Run the E2E validation checklist from `.claude-plugin/skills/lcm-e2e/checklist.m
 
 ## Steps
 
-1. Read the checklist: `.claude-plugin/skills/lcm-e2e/checklist.md`
+1. Read the checklist: `.agents/skills/lcm-e2e/checklist.md`
 2. Determine which flows to run based on arguments
 3. For each step in each flow:
    a. Print the step description
