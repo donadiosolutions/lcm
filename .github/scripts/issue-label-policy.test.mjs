@@ -12,6 +12,7 @@ import {
   buildDuplicateSearchQuery,
   buildOutputSchema,
   computeLabelChanges,
+  discoverDuplicateCandidateNumbers,
   duplicateCommentBody,
   fetchDuplicateCandidates,
   findDuplicateCommentTarget,
@@ -292,6 +293,28 @@ test("reconciles managed labels while preserving unmanaged labels", () => {
   assert.throws(
     () => computeLabelChanges([], { ...validResult.issues[0], topics: ["unknown"] }, config),
     /unmanaged label/,
+  );
+});
+
+test("reconciles managed labels case-insensitively with configured canonical spelling", () => {
+  const current = ["BUG", "Security", "P3-LOW", "Bug-adjacent"];
+  const result = computeLabelChanges(current, validResult.issues[0], config);
+  assert.deepEqual(result, {
+    add: ["p1-high"],
+    remove: ["P3-LOW"],
+    final: ["Bug-adjacent", "bug", "security", "p1-high"],
+  });
+  assert.deepEqual(
+    computeLabelChanges(
+      ["Bug", "P1-HIGH", "human-owned"],
+      { ...validResult.issues[0], topics: [] },
+      config,
+    ),
+    {
+      add: [],
+      remove: [],
+      final: ["human-owned", "bug", "p1-high"],
+    },
   );
 });
 
@@ -581,6 +604,112 @@ test("bounds authoritative discovery reads independently of caller input", async
     ),
     /discovery candidates must be a positive integer/,
   );
+});
+
+test("paginates hybrid search past ineligible early hits within strict bounds", async () => {
+  const calls = [];
+  const pages = new Map([
+    [1, [
+      {
+        number: sourceIssue.number,
+        created_at: sourceIssue.createdAt,
+      },
+      {
+        number: 99,
+        created_at: "2026-07-26T12:00:00Z",
+      },
+    ]],
+    [2, [
+      {
+        number: openCandidate.number,
+        created_at: openCandidate.createdAt,
+      },
+      {
+        number: closedCandidate.number,
+        created_at: closedCandidate.createdAt,
+      },
+    ]],
+  ]);
+  const github = {
+    request: async (route, parameters) => {
+      calls.push({ route, parameters });
+      return { data: { items: pages.get(parameters.page) ?? [] } };
+    },
+  };
+
+  const candidates = await discoverDuplicateCandidateNumbers(
+    github,
+    { ...sourceIssue, created_at: sourceIssue.createdAt },
+    "repo:example/repository is:issue compaction",
+    null,
+    { perPage: 2, maxPages: 3, maxCandidates: 2 },
+  );
+
+  assert.deepEqual(candidates, [openCandidate.number, closedCandidate.number]);
+  assert.deepEqual(
+    calls.map(({ parameters }) => parameters.page),
+    [1, 2],
+  );
+  assert.ok(calls.every(({ parameters }) =>
+    parameters.per_page === 2
+    && parameters.search_type === "hybrid"
+    && parameters.advanced_search === true));
+});
+
+test("bounds hybrid search page reads and collected candidate count", async () => {
+  const pages = [];
+  const github = {
+    request: async (_route, parameters) => {
+      pages.push(parameters.page);
+      return {
+        data: {
+          items: [
+            {
+              number: 100 + parameters.page,
+              created_at: "2026-07-26T12:00:00Z",
+            },
+          ],
+        },
+      };
+    },
+  };
+  assert.deepEqual(
+    await discoverDuplicateCandidateNumbers(
+      github,
+      { ...sourceIssue, created_at: sourceIssue.createdAt },
+      "repo:example/repository is:issue compaction",
+      null,
+      { perPage: 1, maxPages: 2, maxCandidates: 1 },
+    ),
+    [],
+  );
+  assert.deepEqual(pages, [1, 2]);
+
+  let reads = 0;
+  const eligibleGithub = {
+    request: async () => {
+      reads += 1;
+      return {
+        data: {
+          items: [
+            { number: 7, created_at: "2026-07-17T12:00:00Z" },
+            { number: 6, created_at: "2026-07-16T12:00:00Z" },
+          ],
+        },
+      };
+    },
+  };
+  assert.deepEqual(
+    await discoverDuplicateCandidateNumbers(
+      eligibleGithub,
+      { ...sourceIssue, created_at: sourceIssue.createdAt },
+      "repo:example/repository is:issue compaction",
+      null,
+      { perPage: 2, maxPages: 3, maxCandidates: 1 },
+    ),
+    [7],
+  );
+  assert.equal(reads, 1);
 });
 
 test("validates all live candidate fingerprints and state evidence", () => {

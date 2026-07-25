@@ -427,11 +427,11 @@ jobs:
               buildDuplicatePrompt,
               buildDuplicateSchema,
               buildDuplicateSearchQuery,
+              discoverDuplicateCandidateNumbers,
               fetchDuplicateCandidates,
               findDuplicateCommentTarget,
               includesLabelIgnoreCase,
               issueContentFingerprint,
-              prioritizeMarkedDuplicateCandidate,
               requiresDuplicateTriage,
             } = await import(policyUrl);
 
@@ -479,46 +479,18 @@ jobs:
                 );
                 const queryPrefix =
                   `repo:${context.repo.owner}/${context.repo.repo} is:issue`;
-                let searchItems = [];
+                let selectedCandidateNumbers = [];
                 if (query !== queryPrefix) {
-                  const { data: searchResult } = await github.request(
-                    "GET /search/issues",
-                    {
-                      q: query,
-                      advanced_search: true,
-                      search_type: "hybrid",
-                      per_page: 20,
-                      headers: {
-                        "X-GitHub-Api-Version": "2026-03-10",
-                      },
-                    },
-                  );
-                  searchItems = searchResult.items;
+                  selectedCandidateNumbers =
+                    await discoverDuplicateCandidateNumbers(
+                      github,
+                      source,
+                      query,
+                      markedCanonical,
+                    );
+                } else if (markedCanonical !== null) {
+                  selectedCandidateNumbers = [markedCanonical];
                 }
-
-                const sourceCreatedAt = source.created_at;
-                const sourceTimestamp = Date.parse(sourceCreatedAt);
-                const selectedCandidateNumbers =
-                  prioritizeMarkedDuplicateCandidate(
-                    searchItems
-                      .filter((candidate) => {
-                        if (
-                          candidate.pull_request
-                          || candidate.number === issueNumber
-                        ) {
-                          return false;
-                        }
-                        const candidateTimestamp = Date.parse(candidate.created_at);
-                        return candidateTimestamp < sourceTimestamp
-                          || (
-                            candidateTimestamp === sourceTimestamp
-                            && candidate.number < issueNumber
-                          );
-                      })
-                      .map((candidate) => candidate.number),
-                    markedCanonical,
-                    { maxCandidates: 21 },
-                  );
                 const candidates = await fetchDuplicateCandidates(
                   github,
                   context.repo,

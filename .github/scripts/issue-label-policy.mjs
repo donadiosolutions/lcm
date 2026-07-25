@@ -312,28 +312,124 @@ export function parseAndValidateClassification(output, config, expectedIssueNumb
 export const validateClassificationResult = parseAndValidateClassification;
 
 export function computeLabelChanges(currentLabels, classification, config) {
-  const managed = new Set(managedLabelNames(config));
+  const managed = new Map(
+    managedLabelNames(config).map((label) => [label.toLowerCase(), label]),
+  );
   if (!Array.isArray(currentLabels)) throw new TypeError("Current labels must be an array");
-  const desired = new Set(
+  const desired = new Map(
     MANAGED_LABEL_GROUPS.flatMap((group) => {
       if (!classification || !Array.isArray(classification[group])) {
         throw new TypeError(`Classification ${group} must be an array`);
       }
       return classification[group];
-    }),
+    }).map((label) => [label.toLowerCase(), label]),
   );
-  for (const label of desired) {
-    if (!managed.has(label)) throw new Error(`Classification contains unmanaged label ${JSON.stringify(label)}`);
+  for (const [normalizedLabel, label] of desired) {
+    if (!managed.has(normalizedLabel)) {
+      throw new Error(`Classification contains unmanaged label ${JSON.stringify(label)}`);
+    }
+    desired.set(normalizedLabel, managed.get(normalizedLabel));
   }
 
-  const current = new Set(currentLabels);
+  const currentManaged = new Set(
+    currentLabels
+      .map((label) => label.toLowerCase())
+      .filter((label) => managed.has(label)),
+  );
   return {
-    add: [...desired].filter((label) => !current.has(label)),
-    remove: [...current].filter((label) => managed.has(label) && !desired.has(label)),
-    final: [...current].filter((label) => !managed.has(label) || desired.has(label)).concat(
-      [...desired].filter((label) => !current.has(label)),
-    ),
+    add: [...desired]
+      .filter(([normalizedLabel]) => !currentManaged.has(normalizedLabel))
+      .map(([, label]) => label),
+    remove: currentLabels.filter((label) => {
+      const normalizedLabel = label.toLowerCase();
+      return managed.has(normalizedLabel) && !desired.has(normalizedLabel);
+    }),
+    final: currentLabels
+      .filter((label) => !managed.has(label.toLowerCase()))
+      .concat(
+        [...desired.values()],
+      ),
   };
+}
+
+export async function discoverDuplicateCandidateNumbers(
+  github,
+  source,
+  query,
+  markedCanonical,
+  {
+    perPage = 20,
+    maxPages = 3,
+    maxCandidates = 21,
+  } = {},
+) {
+  assertPlainObject(github, "GitHub client");
+  assertPlainObject(source, "Source issue");
+  const sourceNumber = assertPositiveIssueNumber(source.number, "Source issue number");
+  const sourceTimestamp = parseTimestamp(
+    source.created_at,
+    `Source creation time for issue #${sourceNumber}`,
+  );
+  if (typeof query !== "string" || query.length === 0) {
+    throw new TypeError("Duplicate search query must be a non-empty string");
+  }
+  if (!Number.isSafeInteger(perPage) || perPage <= 0 || perPage > 100) {
+    throw new TypeError("Duplicate search page size must be an integer from 1 to 100");
+  }
+  if (!Number.isSafeInteger(maxPages) || maxPages <= 0) {
+    throw new TypeError("Maximum duplicate search pages must be a positive integer");
+  }
+  if (!Number.isSafeInteger(maxCandidates) || maxCandidates <= 0) {
+    throw new TypeError("Maximum duplicate candidates must be a positive integer");
+  }
+
+  const candidateNumbers = [];
+  const seen = new Set();
+  for (let page = 1; page <= maxPages && candidateNumbers.length < maxCandidates; page += 1) {
+    const { data } = await github.request("GET /search/issues", {
+      q: query,
+      advanced_search: true,
+      search_type: "hybrid",
+      per_page: perPage,
+      page,
+      headers: {
+        "X-GitHub-Api-Version": "2026-03-10",
+      },
+    });
+    if (!data || !Array.isArray(data.items)) {
+      throw new TypeError("Duplicate search response items must be an array");
+    }
+    for (const candidate of data.items) {
+      if (
+        candidate.pull_request
+        || candidate.number === sourceNumber
+        || seen.has(candidate.number)
+      ) {
+        continue;
+      }
+      const candidateTimestamp = Date.parse(candidate.created_at);
+      if (
+        !Number.isFinite(candidateTimestamp)
+        || candidateTimestamp > sourceTimestamp
+        || (
+          candidateTimestamp === sourceTimestamp
+          && candidate.number >= sourceNumber
+        )
+      ) {
+        continue;
+      }
+      assertPositiveIssueNumber(candidate.number, "Duplicate search result number");
+      seen.add(candidate.number);
+      candidateNumbers.push(candidate.number);
+      if (candidateNumbers.length === maxCandidates) break;
+    }
+    if (data.items.length < perPage) break;
+  }
+  return prioritizeMarkedDuplicateCandidate(
+    candidateNumbers,
+    markedCanonical,
+    { maxCandidates },
+  );
 }
 
 export function reconcileLabels(currentLabels, classification, config) {
