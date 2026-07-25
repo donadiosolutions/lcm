@@ -43,18 +43,63 @@ const initScript = join(repositoryRoot, "test", "postgresql", "init.sh");
 const cachedRunInitScript = join(repositoryRoot, "test", "postgresql", "cached-run-init.sh");
 const bootIdPattern = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const bootIdRegex = new RegExp(`^${bootIdPattern}$`, "u");
-const linuxBirthRegex = new RegExp(`^linux:(${bootIdPattern}):`, "u");
+const linuxBirthRegex = new RegExp(`^linux:(${bootIdPattern}):([1-9][0-9]*)$`, "u");
 const darwinDayPattern = "(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)";
 const darwinMonthPattern = "(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)";
 const dateDayPattern = "(?:0[1-9]|[12][0-9]|3[01])";
 const timePattern = "(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]";
-const processBirthPattern = new RegExp(
-  `^(?:linux:${bootIdPattern}:[1-9][0-9]*`
-  + `|darwin:${darwinDayPattern} ${darwinMonthPattern} (?: [1-9]|[12][0-9]|3[01]) ${timePattern} [0-9]{4}`
-  + `|win32:[0-9]{4}-(?:0[1-9]|1[0-2])-${dateDayPattern}T${timePattern}\\.[0-9]{7}Z)$`,
+const darwinBirthRegex = new RegExp(
+  `^darwin:(${darwinDayPattern}) (${darwinMonthPattern}) ( [1-9]|[12][0-9]|3[01])`
+  + ` ((?:[01][0-9]|2[0-3])):([0-5][0-9]):([0-5][0-9]) ([1-9][0-9]{3})$`,
+  "u",
+);
+const windowsBirthRegex = new RegExp(
+  `^win32:([1-9][0-9]{3})-(0[1-9]|1[0-2])-(${dateDayPattern})`
+  + `T((?:[01][0-9]|2[0-3])):([0-5][0-9]):([0-5][0-9])\\.[0-9]{7}Z$`,
   "u",
 );
 const consumerOwnerFile = "consumer-owner.json";
+const darwinMonths = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const darwinDays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function validUtcCalendar(year, month, day, hour, minute, second, expectedWeekday) {
+  const observed = new Date(0);
+  observed.setUTCFullYear(year, month, day);
+  observed.setUTCHours(hour, minute, second, 0);
+  return observed.getUTCFullYear() === year
+    && observed.getUTCMonth() === month
+    && observed.getUTCDate() === day
+    && observed.getUTCHours() === hour
+    && observed.getUTCMinutes() === minute
+    && observed.getUTCSeconds() === second
+    && (expectedWeekday === undefined || observed.getUTCDay() === expectedWeekday);
+}
+
+export function isValidProcessBirthFingerprint(fingerprint) {
+  if (typeof fingerprint !== "string") return false;
+  if (linuxBirthRegex.test(fingerprint)) return true;
+  const darwinMatch = fingerprint.match(darwinBirthRegex);
+  if (darwinMatch) {
+    return validUtcCalendar(
+      Number(darwinMatch[7]),
+      darwinMonths.indexOf(darwinMatch[2]),
+      Number(darwinMatch[3]),
+      Number(darwinMatch[4]),
+      Number(darwinMatch[5]),
+      Number(darwinMatch[6]),
+      darwinDays.indexOf(darwinMatch[1]),
+    );
+  }
+  const windowsMatch = fingerprint.match(windowsBirthRegex);
+  return Boolean(windowsMatch && validUtcCalendar(
+    Number(windowsMatch[1]),
+    Number(windowsMatch[2]) - 1,
+    Number(windowsMatch[3]),
+    Number(windowsMatch[4]),
+    Number(windowsMatch[5]),
+    Number(windowsMatch[6]),
+  ));
+}
 
 export function createRunNames(runId) {
   const short = runId.slice(0, 20);
@@ -140,7 +185,7 @@ export function readProcessBirthFingerprint(pid, dependencies = {}) {
     throw new Error("unsupported PostgreSQL harness process identity evidence", { cause: error });
   }
   const fingerprint = `${currentPlatform}:${observed}`;
-  if (!observed || !processBirthPattern.test(fingerprint)) {
+  if (!observed || !isValidProcessBirthFingerprint(fingerprint)) {
     throw new Error("unsupported PostgreSQL harness process identity evidence");
   }
   return fingerprint;
@@ -155,13 +200,20 @@ export function createOwnerIdentity(pid = process.pid, dependencies = {}) {
 
 export function recordConsumerIdentity(path, pid, dependencies = {}) {
   const createIdentity = dependencies.createIdentity ?? createOwnerIdentity;
-  const writeFile = dependencies.writeFile ?? writeFileSync;
   let record;
   try {
     record = { version: 1, ...createIdentity(pid) };
   } catch {
-    record = { version: 1, ambiguous: true };
+    return recordAmbiguousConsumerIdentity(path, dependencies);
   }
+  const writeFile = dependencies.writeFile ?? writeFileSync;
+  writeFile(path, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  return record;
+}
+
+export function recordAmbiguousConsumerIdentity(path, dependencies = {}) {
+  const writeFile = dependencies.writeFile ?? writeFileSync;
+  const record = { version: 1, ambiguous: true };
   writeFile(path, `${JSON.stringify(record)}\n`, { mode: 0o600 });
   return record;
 }
@@ -498,7 +550,7 @@ function requiredOwnership(labels) {
   if (labels[OWNER_SCHEMA_LABEL] !== OWNER_SCHEMA_VERSION
     || !/^[0-9a-f]{32}$/u.test(runId ?? "")
     || !/^[1-9][0-9]*$/u.test(pidText ?? "")
-    || !processBirthPattern.test(birth ?? "")
+    || !isValidProcessBirthFingerprint(birth)
     || typeof kind !== "string"
     || kind.length === 0) {
     return undefined;
@@ -623,7 +675,7 @@ function readConsumerOwner(directory, dependencies = {}) {
     if (value?.version !== 1
       || !Number.isSafeInteger(value.pid)
       || value.pid <= 0
-      || !processBirthPattern.test(value.birth ?? "")) {
+      || !isValidProcessBirthFingerprint(value.birth)) {
       throw new Error("invalid PostgreSQL harness consumer identity evidence");
     }
     return { pid: value.pid, birth: value.birth };
@@ -943,6 +995,7 @@ async function runTests(context, ci, setupDocker = docker, testProcess = runProc
         "run", "--config", join(repositoryRoot, "vitest.postgresql.config.ts"),
       ];
     try {
+      recordAmbiguousConsumerIdentity(consumerPath);
       return await runSanitizedProcess(process.execPath, testArguments, {
         cwd: repositoryRoot,
         env,

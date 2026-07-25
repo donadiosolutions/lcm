@@ -19,9 +19,11 @@ import {
   createRunNames,
   discoverHarnessRuns,
   harnessErrorDetails,
+  isValidProcessBirthFingerprint,
   isMissingDockerObjectError,
   ownershipLabels,
   readProcessBirthFingerprint,
+  recordAmbiguousConsumerIdentity,
   recordConsumerIdentity,
   reclaimProvenOrphans,
   removeLabeled,
@@ -120,6 +122,21 @@ describe("PostgreSQL harness utilities", () => {
       createIdentity: () => ({ pid: 42, birth: "darwin:Fri Jul 24 21:00:00 2026" }),
       writeFile: vi.fn(),
     })).toEqual({ version: 1, pid: 42, birth: "darwin:Fri Jul 24 21:00:00 2026" });
+
+    expect(recordAmbiguousConsumerIdentity("/private/consumer-owner.json", {
+      writeFile,
+    })).toEqual({ version: 1, ambiguous: true });
+  });
+
+  it("rejects calendar-impossible process birth fingerprints", () => {
+    expect(isValidProcessBirthFingerprint(
+      "linux:12345678-1234-1234-1234-123456789abc:1",
+    )).toBe(true);
+    expect(isValidProcessBirthFingerprint("darwin:Fri Jul 24 21:00:00 2026")).toBe(true);
+    expect(isValidProcessBirthFingerprint("win32:2024-02-29T00:00:00.0000000Z")).toBe(true);
+    expect(isValidProcessBirthFingerprint("darwin:Thu Jul 24 21:00:00 2026")).toBe(false);
+    expect(isValidProcessBirthFingerprint("win32:2026-02-31T00:00:00.0000000Z")).toBe(false);
+    expect(isValidProcessBirthFingerprint("win32:2026-02-28T24:00:00.0000000Z")).toBe(false);
   });
 
   it("derives and validates every resource name from a random-style run ID", () => {
