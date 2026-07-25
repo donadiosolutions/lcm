@@ -162,7 +162,7 @@ jobs:
             );
             if (missingLabels.length > 0) {
               throw new Error(
-                `Managed labels do not exist in the repository: ${missingLabels.join(", ")}`,
+                `Required triage labels do not exist in the repository: ${missingLabels.join(", ")}`,
               );
             }
 
@@ -411,6 +411,7 @@ jobs:
               buildDuplicatePrompt,
               buildDuplicateSchema,
               buildDuplicateSearchQuery,
+              fetchDuplicateCandidates,
               includesLabelIgnoreCase,
               issueContentFingerprint,
               requiresDuplicateTriage,
@@ -467,7 +468,7 @@ jobs:
 
               const sourceCreatedAt = source.created_at;
               const sourceTimestamp = Date.parse(sourceCreatedAt);
-              const candidates = searchItems
+              const selectedCandidateNumbers = searchItems
                 .filter((candidate) => {
                   if (candidate.pull_request || candidate.number === issueNumber) {
                     return false;
@@ -480,15 +481,13 @@ jobs:
                     );
                 })
                 .slice(0, 8)
-                .map((candidate) => ({
-                  number: candidate.number,
-                  title: candidate.title,
-                  body: candidate.body ?? "",
-                  state: candidate.state,
-                  stateReason: candidate.state_reason ?? "",
-                  createdAt: candidate.created_at,
-                  fingerprint: issueContentFingerprint(candidate),
-                }));
+                .map((candidate) => candidate.number);
+              const candidates = await fetchDuplicateCandidates(
+                github,
+                context.repo,
+                source,
+                selectedCandidateNumbers,
+              );
 
               duplicateIssues.push({
                 source: {

@@ -12,6 +12,7 @@ import {
   buildOutputSchema,
   computeLabelChanges,
   duplicateCommentBody,
+  fetchDuplicateCandidates,
   findDuplicateCommentTarget,
   includesLabelIgnoreCase,
   issueContentFingerprint,
@@ -323,6 +324,99 @@ test("fingerprints only issue title and body deterministically", () => {
   assert.throws(() => issueContentFingerprint(null), /must be an object/);
 });
 
+test("fetches bounded authoritative duplicate candidate records", async () => {
+  const authoritative = {
+    ...openCandidate,
+    created_at: openCandidate.createdAt,
+    body: `${openCandidate.body} Full record details.`,
+  };
+  const calls = [];
+  const github = {
+    rest: {
+      issues: {
+        get: async (parameters) => {
+          calls.push(parameters);
+          return { data: authoritative };
+        },
+      },
+    },
+  };
+  const repo = { owner: "example", repo: "repository" };
+  const candidates = await fetchDuplicateCandidates(
+    github,
+    repo,
+    { ...sourceIssue, created_at: sourceIssue.createdAt },
+    [openCandidate.number, closedCandidate.number],
+    { maxCandidates: 1 },
+  );
+
+  assert.deepEqual(calls, [{
+    ...repo,
+    issue_number: openCandidate.number,
+  }]);
+  assert.deepEqual(candidates, [{
+    number: openCandidate.number,
+    title: authoritative.title,
+    body: authoritative.body,
+    state: authoritative.state,
+    stateReason: "",
+    createdAt: authoritative.created_at,
+    fingerprint: issueContentFingerprint(authoritative),
+  }]);
+});
+
+test("rejects non-issue and non-older authoritative duplicate candidates", async () => {
+  const source = { ...sourceIssue, created_at: sourceIssue.createdAt };
+  const repo = { owner: "example", repo: "repository" };
+  const githubReturning = (candidate) => ({
+    rest: {
+      issues: {
+        get: async () => ({ data: candidate }),
+      },
+    },
+  });
+
+  await assert.rejects(
+    fetchDuplicateCandidates(
+      githubReturning({
+        ...openCandidate,
+        number: 11,
+        created_at: openCandidate.createdAt,
+      }),
+      repo,
+      source,
+      [openCandidate.number],
+    ),
+    /received issue #11/,
+  );
+  await assert.rejects(
+    fetchDuplicateCandidates(
+      githubReturning({
+        ...openCandidate,
+        created_at: openCandidate.createdAt,
+        pull_request: {},
+      }),
+      repo,
+      source,
+      [openCandidate.number],
+    ),
+    /pull request/,
+  );
+  await assert.rejects(
+    fetchDuplicateCandidates(
+      githubReturning({
+        ...openCandidate,
+        number: 99,
+        created_at: "2026-07-26T12:00:00Z",
+      }),
+      repo,
+      source,
+      [99],
+    ),
+    /must be older/,
+  );
+});
+
 test("builds bounded repository-scoped duplicate search queries", () => {
   const query = buildDuplicateSearchQuery(
     "donadiosolutions",
@@ -557,6 +651,11 @@ test("creates and recognizes only trusted automated duplicate markers", () => {
   };
   assert.equal(findDuplicateCommentTarget([spoofed]), null);
   assert.equal(findDuplicateCommentTarget([spoofed, trusted]), 12);
+  assert.equal(findDuplicateCommentTarget([trusted, trusted]), 12);
+  assert.equal(findDuplicateCommentTarget([{
+    body: "<!-- codex-duplicate-issue:canonical=#12-->\nDuplicate of #12.",
+    user: { login: "github-actions[bot]", type: "Bot" },
+  }]), null);
   assert.throws(
     () => findDuplicateCommentTarget([
       trusted,

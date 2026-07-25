@@ -17,6 +17,15 @@ const GROUP_CARDINALITY = Object.freeze({
 
 const RESERVED_OPERATIONAL_LABELS = new Set(["needs-codex-triage"]);
 const DUPLICATE_COMMENT_MARKER_PREFIX = "<!-- codex-duplicate-issue:canonical=#";
+const DUPLICATE_COMMENT_MARKER_SUFFIX = " -->";
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function duplicateCommentMarker(issueNumber) {
+  return `${DUPLICATE_COMMENT_MARKER_PREFIX}${issueNumber}${DUPLICATE_COMMENT_MARKER_SUFFIX}`;
+}
 
 function assertPlainObject(value, name) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -358,6 +367,77 @@ export function issueContentFingerprint(issue) {
   return createHash("sha256").update(content).digest("hex");
 }
 
+export async function fetchDuplicateCandidates(
+  github,
+  repo,
+  source,
+  candidateNumbers,
+  { maxCandidates = 8 } = {},
+) {
+  assertPlainObject(github, "GitHub client");
+  assertPlainObject(repo, "Repository");
+  assertPlainObject(source, "Source issue");
+  const sourceNumber = assertPositiveIssueNumber(source.number, "Source issue number");
+  const sourceTimestamp = parseTimestamp(
+    source.created_at,
+    `Source creation time for issue #${sourceNumber}`,
+  );
+  if (!Array.isArray(candidateNumbers)) {
+    throw new TypeError("Duplicate candidate numbers must be an array");
+  }
+  if (!Number.isSafeInteger(maxCandidates) || maxCandidates <= 0) {
+    throw new TypeError("Maximum duplicate candidates must be a positive integer");
+  }
+
+  return Promise.all(
+    candidateNumbers.slice(0, maxCandidates).map(async (value, index) => {
+      const candidateNumber = assertPositiveIssueNumber(
+        value,
+        `Duplicate candidate number at index ${index}`,
+      );
+      const { data: candidate } = await github.rest.issues.get({
+        ...repo,
+        issue_number: candidateNumber,
+      });
+      if (candidate.number !== candidateNumber) {
+        throw new Error(
+          `Requested duplicate candidate #${candidateNumber}, received issue #${candidate.number}`,
+        );
+      }
+      if (candidate.pull_request) {
+        throw new Error(`Duplicate candidate #${candidateNumber} is a pull request`);
+      }
+      if (candidate.number === sourceNumber) {
+        throw new Error(`Issue #${sourceNumber} cannot be its own duplicate candidate`);
+      }
+      const candidateTimestamp = parseTimestamp(
+        candidate.created_at,
+        `Creation time for candidate #${candidate.number}`,
+      );
+      if (
+        candidateTimestamp > sourceTimestamp
+        || (
+          candidateTimestamp === sourceTimestamp
+          && candidate.number >= sourceNumber
+        )
+      ) {
+        throw new Error(
+          `Duplicate candidate #${candidate.number} must be older than issue #${sourceNumber}`,
+        );
+      }
+      return {
+        number: candidate.number,
+        title: candidate.title,
+        body: candidate.body ?? "",
+        state: candidate.state,
+        stateReason: candidate.state_reason ?? "",
+        createdAt: candidate.created_at,
+        fingerprint: issueContentFingerprint(candidate),
+      };
+    }),
+  );
+}
+
 function searchTerms(value) {
   return String(value ?? "")
     .normalize("NFKC")
@@ -684,7 +764,7 @@ export function duplicateCommentBody(canonicalIssueNumber) {
     canonicalIssueNumber,
     "Canonical issue number",
   );
-  return `${DUPLICATE_COMMENT_MARKER_PREFIX}${issueNumber} -->\nDuplicate of #${issueNumber}.`;
+  return `${duplicateCommentMarker(issueNumber)}\nDuplicate of #${issueNumber}.`;
 }
 
 export function findDuplicateCommentTarget(
@@ -695,7 +775,10 @@ export function findDuplicateCommentTarget(
   if (typeof botLogin !== "string" || botLogin.length === 0) {
     throw new TypeError("Bot login must be a non-empty string");
   }
-  const markerPattern = /<!-- codex-duplicate-issue:canonical=#([1-9]\d*) -->/gu;
+  const markerPattern = new RegExp(
+    `${escapeRegExp(DUPLICATE_COMMENT_MARKER_PREFIX)}([1-9]\\d*)${escapeRegExp(DUPLICATE_COMMENT_MARKER_SUFFIX)}`,
+    "gu",
+  );
   const targets = new Set();
   for (const comment of comments) {
     if (
