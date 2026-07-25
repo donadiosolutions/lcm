@@ -18,6 +18,7 @@ import {
   issueContentFingerprint,
   loadManagedLabelConfig,
   managedLabelNames,
+  missingLabelsIgnoreCase,
   parseAndValidateClassification,
   parseAndValidateDuplicateResult,
   prioritizeMarkedDuplicateCandidate,
@@ -26,6 +27,7 @@ import {
   resolveDuplicateCanonicalTarget,
   requiresDuplicateTriage,
   validateClassificationResult,
+  validateLiveDuplicateCandidates,
   validateManagedLabelConfig,
 } from "./issue-label-policy.mjs";
 
@@ -81,11 +83,15 @@ const candidateSets = [{
       number: openCandidate.number,
       fingerprint: issueContentFingerprint(openCandidate),
       createdAt: openCandidate.createdAt,
+      state: openCandidate.state,
+      stateReason: openCandidate.stateReason,
     },
     {
       number: closedCandidate.number,
       fingerprint: issueContentFingerprint(closedCandidate),
       createdAt: closedCandidate.createdAt,
+      state: closedCandidate.state,
+      stateReason: closedCandidate.stateReason,
     },
   ],
 }];
@@ -122,6 +128,17 @@ test("matches GitHub label names case-insensitively", () => {
   assert.equal(includesLabelIgnoreCase([null], "needs-codex-triage"), false);
   assert.throws(() => includesLabelIgnoreCase(null, "label"), /Labels must be an array/);
   assert.throws(() => includesLabelIgnoreCase([], null), /Expected label must be a string/);
+  assert.deepEqual(
+    missingLabelsIgnoreCase(
+      ["bug", "duplicate", "p1-high"],
+      ["BUG", "Duplicate", "p1-high"],
+    ),
+    [],
+  );
+  assert.deepEqual(
+    missingLabelsIgnoreCase(["bug", "duplicate"], ["BUG"]),
+    ["duplicate"],
+  );
 });
 
 test("gates duplicate triage on the reconciled live bug label", () => {
@@ -427,6 +444,76 @@ test("rejects non-issue and non-older authoritative duplicate candidates", async
   );
 });
 
+test("filters duplicate-labeled candidates and rejects marked duplicate chains", async () => {
+  const source = { ...sourceIssue, created_at: sourceIssue.createdAt };
+  const candidate = {
+    ...openCandidate,
+    created_at: openCandidate.createdAt,
+    labels: [{ name: "Duplicate" }],
+  };
+  const github = {
+    rest: {
+      issues: {
+        get: async () => ({ data: candidate }),
+      },
+    },
+  };
+  const repo = { owner: "example", repo: "repository" };
+
+  assert.deepEqual(
+    await fetchDuplicateCandidates(
+      github,
+      repo,
+      source,
+      [candidate.number],
+    ),
+    [],
+  );
+  await assert.rejects(
+    fetchDuplicateCandidates(
+      github,
+      repo,
+      source,
+      [candidate.number],
+      { rejectDuplicateIssueNumbers: [candidate.number] },
+    ),
+    /already labeled duplicate/,
+  );
+});
+
+test("validates all live candidate fingerprints and state evidence", () => {
+  const evidence = candidateSets[0].candidates;
+  const live = [
+    {
+      ...openCandidate,
+      fingerprint: issueContentFingerprint(openCandidate),
+    },
+    {
+      ...closedCandidate,
+      fingerprint: issueContentFingerprint(closedCandidate),
+    },
+  ];
+  assert.equal(validateLiveDuplicateCandidates(live, evidence), live);
+  assert.throws(
+    () => validateLiveDuplicateCandidates(
+      [{ ...live[0], state: "closed" }, live[1]],
+      evidence,
+    ),
+    /Candidate #12 changed/,
+  );
+  assert.throws(
+    () => validateLiveDuplicateCandidates(
+      [live[0], { ...live[1], stateReason: "not_planned" }],
+      evidence,
+    ),
+    /Candidate #8 changed/,
+  );
+  assert.throws(
+    () => validateLiveDuplicateCandidates([live[0]], evidence),
+    /does not match/,
+  );
+});
+
 test("builds bounded repository-scoped duplicate search queries", () => {
   const query = buildDuplicateSearchQuery(
     "donadiosolutions",
@@ -531,6 +618,8 @@ test("rejects malformed, self, duplicate, and newer duplicate candidates", () =>
         number: 42,
         fingerprint: issueContentFingerprint(sourceIssue),
         createdAt: "2026-07-20T12:00:00Z",
+        state: "open",
+        stateReason: "",
       }],
     }]),
     /own duplicate candidate/,
@@ -549,6 +638,8 @@ test("rejects malformed, self, duplicate, and newer duplicate candidates", () =>
         number: 99,
         fingerprint: issueContentFingerprint(openCandidate),
         createdAt: "2026-07-26T12:00:00Z",
+        state: "open",
+        stateReason: "",
       }],
     }]),
     /must be older/,

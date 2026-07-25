@@ -140,6 +140,7 @@ jobs:
               buildClassificationPrompt,
               buildOutputSchema,
               loadManagedLabelConfig,
+              missingLabelsIgnoreCase,
             } = await import(policyUrl);
 
             const configPath = join(
@@ -153,12 +154,13 @@ jobs:
               github.rest.issues.listLabelsForRepo,
               { ...context.repo, per_page: 100 },
             );
-            const repositoryLabelMap = new Map(
-              repositoryLabels.map((label) => [label.name, label]),
+            const repositoryLabelNames = repositoryLabels.map(
+              (label) => label.name,
             );
             const requiredLabels = [...managedNames, process.env.DUPLICATE_LABEL];
-            const missingLabels = requiredLabels.filter(
-              (name) => !repositoryLabelMap.has(name),
+            const missingLabels = missingLabelsIgnoreCase(
+              requiredLabels,
+              repositoryLabelNames,
             );
             if (missingLabels.length > 0) {
               throw new Error(
@@ -508,6 +510,11 @@ jobs:
                   context.repo,
                   source,
                   selectedCandidateNumbers,
+                  {
+                    duplicateLabel: process.env.DUPLICATE_LABEL,
+                    rejectDuplicateIssueNumbers:
+                      markedCanonical === null ? [] : [markedCanonical],
+                  },
                 );
 
                 duplicateIssues.push({
@@ -528,6 +535,8 @@ jobs:
                     number: candidate.number,
                     fingerprint: candidate.fingerprint,
                     createdAt: candidate.createdAt,
+                    state: candidate.state,
+                    stateReason: candidate.stateReason,
                   })),
                 });
                 core.info(
@@ -610,6 +619,7 @@ jobs:
               removeIssueLabelIfPresent,
               resolveDuplicateCanonicalTarget,
               requiresDuplicateTriage,
+              validateLiveDuplicateCandidates,
             } = await import(policyUrl);
 
             const evidence = JSON.parse(process.env.DUPLICATE_EVIDENCE);
@@ -677,39 +687,6 @@ jobs:
                   decision.duplicateOf,
                   markedCanonical,
                 );
-                if (canonicalNumber === null) {
-                  await removeIssueLabelIfPresent(
-                    github,
-                    context.repo,
-                    issueNumber,
-                    process.env.QUEUE_LABEL,
-                  );
-                  core.info(`No high-confidence duplicate found for bug #${issueNumber}.`);
-                  continue;
-                }
-
-                const canonicalEvidence = candidateSet.candidates.find(
-                  (candidate) => candidate.number === canonicalNumber,
-                );
-                if (!canonicalEvidence) {
-                  throw new Error(
-                    `Canonical issue #${canonicalNumber} was not validated during duplicate collection`,
-                  );
-                }
-                const [canonical] = await fetchDuplicateCandidates(
-                  github,
-                  context.repo,
-                  source,
-                  [canonicalNumber],
-                );
-                if (
-                  canonical.fingerprint !== canonicalEvidence.fingerprint
-                ) {
-                  throw new Error(
-                    `Canonical issue #${canonicalNumber} changed after duplicate collection`,
-                  );
-                }
-
                 if (source.state !== "open" && markedCanonical === null) {
                   await removeIssueLabelIfPresent(
                     github,
@@ -721,6 +698,68 @@ jobs:
                     `Preserved human closure of #${issueNumber} without automated duplicate actions.`,
                   );
                   continue;
+                }
+
+                const candidateNumbers = candidateSet.candidates.map(
+                  (candidate) => candidate.number,
+                );
+                const liveCandidates = await fetchDuplicateCandidates(
+                  github,
+                  context.repo,
+                  source,
+                  candidateNumbers,
+                  {
+                    duplicateLabel: process.env.DUPLICATE_LABEL,
+                    rejectDuplicateIssueNumbers: candidateNumbers,
+                  },
+                );
+                validateLiveDuplicateCandidates(
+                  liveCandidates,
+                  candidateSet.candidates,
+                );
+
+                if (source.state !== "open") {
+                  if (
+                    markedCanonical !== null
+                    && !includesLabelIgnoreCase(
+                      sourceLabels,
+                      process.env.DUPLICATE_LABEL,
+                    )
+                  ) {
+                    throw new Error(
+                      `Closed marked duplicate #${issueNumber} is missing the ${process.env.DUPLICATE_LABEL} label`,
+                    );
+                  }
+                  await removeIssueLabelIfPresent(
+                    github,
+                    context.repo,
+                    issueNumber,
+                    process.env.QUEUE_LABEL,
+                  );
+                  core.info(
+                    `Preserved existing closure of marked duplicate #${issueNumber}.`,
+                  );
+                  continue;
+                }
+
+                if (canonicalNumber === null) {
+                  await removeIssueLabelIfPresent(
+                    github,
+                    context.repo,
+                    issueNumber,
+                    process.env.QUEUE_LABEL,
+                  );
+                  core.info(`No high-confidence duplicate found for bug #${issueNumber}.`);
+                  continue;
+                }
+
+                const canonical = liveCandidates.find(
+                  (candidate) => candidate.number === canonicalNumber,
+                );
+                if (!canonical) {
+                  throw new Error(
+                    `Canonical issue #${canonicalNumber} was not validated during duplicate collection`,
+                  );
                 }
 
                 if (!includesLabelIgnoreCase(sourceLabels, process.env.DUPLICATE_LABEL)) {

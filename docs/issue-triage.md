@@ -69,7 +69,10 @@ appropriate managed priority.
 For each reconciled bug, the workflow uses GitHub's authenticated hybrid issue
 search to collect at most eight older issue candidates from both open and
 closed history. Pull requests, the source issue, and newer issues are excluded.
-Candidate titles and bodies are bounded before they reach Codex.
+Issues already carrying the `duplicate` label are also excluded using their
+authoritative live labels; a previously marked canonical that later receives
+that label fails closed instead of creating a duplicate chain. Candidate
+titles and bodies are bounded before they reach Codex.
 
 The second Codex request is intentionally conservative. A candidate is a
 duplicate only when it reports the same underlying defect. Related symptoms,
@@ -84,19 +87,23 @@ For a high-confidence duplicate, the workflow:
 3. Closes the duplicate as **not planned**.
 4. Removes `needs-codex-triage` last.
 
-Issue title and body fingerprints are checked again immediately before these
-writes. Edited or unverifiable issues fail closed and remain queued. The link
-comment contains a hidden workflow marker, so a retry cannot create duplicate
-comments. If a partial run created that marker but did not finish closing the
-issue, a retry refetches and validates the recorded canonical target and
-finishes the marked closure even when the new model result is empty, provided
-the source issue still has the live `bug` label. Removing `bug` before
-application always dequeues the source without duplicate actions, even when a
-trusted marker exists.
+Every collected candidate's title/body fingerprint, state, state reason, and
+live labels are checked again immediately before duplicate writes. Changed,
+newly duplicate-labeled, or unverifiable candidates fail closed and leave the
+source queued, preserving the evidence behind open-canonical preference. The
+link comment contains a hidden workflow marker, so a retry cannot create
+duplicate comments. If a partial run created that marker but did not finish
+closing the issue, a retry refetches and validates the recorded canonical
+target and finishes the marked closure even when the new model result is empty,
+provided the source issue remains open and still has the live `bug` label.
+Removing `bug` before application always dequeues the source without duplicate
+actions, even when a trusted marker exists.
 Conflicting or stale automated markers fail safely and leave the issue queued.
 If a person closes the issue before application and no workflow marker exists,
 the workflow preserves that closure without adding its own duplicate link or
-label.
+label. A closed issue with a coherent trusted marker is dequeued after marker
+and canonical validation, but is never closed again, preserving its existing
+closure reason.
 
 ## Security and credentials
 

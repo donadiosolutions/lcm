@@ -115,6 +115,18 @@ export function includesLabelIgnoreCase(labels, expectedLabel) {
   );
 }
 
+export function missingLabelsIgnoreCase(requiredLabels, existingLabels) {
+  if (!Array.isArray(requiredLabels)) {
+    throw new TypeError("Required labels must be an array");
+  }
+  if (!Array.isArray(existingLabels)) {
+    throw new TypeError("Existing labels must be an array");
+  }
+  return requiredLabels.filter(
+    (label) => !includesLabelIgnoreCase(existingLabels, label),
+  );
+}
+
 export function managedLabelNames(config) {
   const valid = validateManagedLabelConfig(config);
   return MANAGED_LABEL_GROUPS.flatMap((group) => valid[group]);
@@ -375,7 +387,11 @@ export async function fetchDuplicateCandidates(
   repo,
   source,
   candidateNumbers,
-  { maxCandidates = 8 } = {},
+  {
+    duplicateLabel = "duplicate",
+    maxCandidates = 8,
+    rejectDuplicateIssueNumbers = [],
+  } = {},
 ) {
   assertPlainObject(github, "GitHub client");
   assertPlainObject(repo, "Repository");
@@ -391,8 +407,21 @@ export async function fetchDuplicateCandidates(
   if (!Number.isSafeInteger(maxCandidates) || maxCandidates <= 0) {
     throw new TypeError("Maximum duplicate candidates must be a positive integer");
   }
+  if (typeof duplicateLabel !== "string" || duplicateLabel.length === 0) {
+    throw new TypeError("Duplicate label must be a non-empty string");
+  }
+  if (!Array.isArray(rejectDuplicateIssueNumbers)) {
+    throw new TypeError("Rejected duplicate issue numbers must be an array");
+  }
+  const rejectedDuplicates = new Set(
+    rejectDuplicateIssueNumbers.map((value, index) =>
+      assertPositiveIssueNumber(
+        value,
+        `Rejected duplicate issue number at index ${index}`,
+      )),
+  );
 
-  return Promise.all(
+  const candidates = await Promise.all(
     candidateNumbers.slice(0, maxCandidates).map(async (value, index) => {
       const candidateNumber = assertPositiveIssueNumber(
         value,
@@ -412,6 +441,17 @@ export async function fetchDuplicateCandidates(
       }
       if (candidate.number === sourceNumber) {
         throw new Error(`Issue #${sourceNumber} cannot be its own duplicate candidate`);
+      }
+      const candidateLabels = (candidate.labels ?? []).map((label) =>
+        typeof label === "string" ? label : label.name,
+      );
+      if (includesLabelIgnoreCase(candidateLabels, duplicateLabel)) {
+        if (rejectedDuplicates.has(candidateNumber)) {
+          throw new Error(
+            `Duplicate candidate #${candidateNumber} is already labeled ${duplicateLabel}`,
+          );
+        }
+        return null;
       }
       const candidateTimestamp = parseTimestamp(
         candidate.created_at,
@@ -439,6 +479,7 @@ export async function fetchDuplicateCandidates(
       };
     }),
   );
+  return candidates.filter((candidate) => candidate !== null);
 }
 
 function searchTerms(value) {
@@ -533,7 +574,7 @@ function validateDuplicateCandidateSets(candidateSets) {
       );
       assertExactKeys(
         candidate,
-        ["number", "fingerprint", "createdAt"],
+        ["number", "fingerprint", "createdAt", "state", "stateReason"],
         `Candidate at index ${candidateIndex} for issue #${issueNumber}`,
       );
       const number = assertPositiveIssueNumber(
@@ -552,6 +593,16 @@ function validateDuplicateCandidateSets(candidateSets) {
           `Fingerprint for candidate #${number} of issue #${issueNumber} is invalid`,
         );
       }
+      if (candidate.state !== "open" && candidate.state !== "closed") {
+        throw new TypeError(
+          `State for candidate #${number} of issue #${issueNumber} is invalid`,
+        );
+      }
+      if (typeof candidate.stateReason !== "string") {
+        throw new TypeError(
+          `State reason for candidate #${number} of issue #${issueNumber} must be a string`,
+        );
+      }
       const candidateTimestamp = parseTimestamp(
         candidate.createdAt,
         `Creation time for candidate #${number} of issue #${issueNumber}`,
@@ -568,6 +619,8 @@ function validateDuplicateCandidateSets(candidateSets) {
         number,
         fingerprint: candidate.fingerprint,
         createdAt: candidate.createdAt,
+        state: candidate.state,
+        stateReason: candidate.stateReason,
       });
     });
 
@@ -578,6 +631,42 @@ function validateDuplicateCandidateSets(candidateSets) {
       candidates: Object.freeze(candidates),
     });
   });
+}
+
+export function validateLiveDuplicateCandidates(
+  liveCandidates,
+  evidenceCandidates,
+) {
+  if (!Array.isArray(liveCandidates) || !Array.isArray(evidenceCandidates)) {
+    throw new TypeError("Live and evidence candidates must be arrays");
+  }
+  const liveByNumber = new Map(
+    liveCandidates.map((candidate) => [candidate.number, candidate]),
+  );
+  if (
+    liveCandidates.length !== evidenceCandidates.length
+    || liveByNumber.size !== liveCandidates.length
+  ) {
+    throw new Error("Live duplicate candidate set does not match collected evidence");
+  }
+  for (const evidence of evidenceCandidates) {
+    const live = liveByNumber.get(evidence.number);
+    if (!live) {
+      throw new Error(
+        `Candidate #${evidence.number} is missing from live duplicate evidence`,
+      );
+    }
+    if (
+      live.fingerprint !== evidence.fingerprint
+      || live.state !== evidence.state
+      || live.stateReason !== evidence.stateReason
+    ) {
+      throw new Error(
+        `Candidate #${evidence.number} changed after duplicate collection`,
+      );
+    }
+  }
+  return liveCandidates;
 }
 
 export function buildDuplicateSchema(candidateSets) {
