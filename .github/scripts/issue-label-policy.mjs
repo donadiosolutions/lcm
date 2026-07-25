@@ -700,7 +700,7 @@ export function buildDuplicateSchema(candidateSets) {
             duplicateOf: {
               type: "array",
               minItems: 0,
-              maxItems: 1,
+              maxItems: candidateNumbers.length > 0 ? 1 : 0,
               items: duplicateItems,
             },
           },

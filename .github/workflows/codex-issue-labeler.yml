@@ -382,7 +382,7 @@ jobs:
 
   collect-duplicates:
     needs: apply-labels
-    if: ${{ needs.apply-labels.outputs.has_bugs == 'true' }}
+    if: ${{ needs.apply-labels.result == 'success' && needs.apply-labels.outputs.has_bugs == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

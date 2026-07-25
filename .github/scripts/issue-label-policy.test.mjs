@@ -599,6 +599,15 @@ test("builds a strict supported duplicate schema", () => {
     noCandidates.properties.issues.items.properties.duplicateOf.items,
     { type: "integer" },
   );
+  assert.equal(
+    noCandidates.properties.issues.items.properties.duplicateOf.minItems,
+    0,
+  );
+  assert.equal(
+    noCandidates.properties.issues.items.properties.duplicateOf.maxItems,
+    0,
+  );
+  assert.equal(JSON.stringify(noCandidates).includes('"uniqueItems":'), false);
 });
 
 test("rejects malformed, self, duplicate, and newer duplicate candidates", () => {
