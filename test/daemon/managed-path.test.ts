@@ -92,6 +92,48 @@ describe("managed daemon executable path", () => {
     )).toBe(`/home/alice/.npm-packages/bin:${SYSTEMD_DAEMON_PATH}`);
   });
 
+  it("recovers the trusted npm global bin from the packaged runtime", () => {
+    expect(managedDaemonPath(
+      "/usr/bin/node",
+      ["/home/alice/.npm-global/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs", "daemon", "start"],
+      "/work/project",
+      "/home/alice",
+    )).toBe(`/home/alice/.npm-global/bin:${SYSTEMD_DAEMON_PATH}`);
+    expect(managedDaemonPath(
+      "/usr/bin/node",
+      ["/home/alice/.npm-global/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs", "daemon", "start"],
+      "/home/alice",
+      "/home/alice",
+    )).toBe(`/home/alice/.npm-global/bin:${SYSTEMD_DAEMON_PATH}`);
+  });
+
+  it("does not derive npm bins for unrelated or project-contained packages", () => {
+    expect(managedDaemonPath(
+      "/usr/bin/node",
+      ["/home/alice/.npm-global/lib/node_modules/other-package/dist/lcm.mjs", "daemon", "start"],
+      "/work/project",
+      "/home/alice",
+    )).toBe(SYSTEMD_DAEMON_PATH);
+    expect(managedDaemonPath(
+      "/usr/bin/node",
+      ["/work/project/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs", "daemon", "start"],
+      "/work/project",
+      "/home/alice",
+    )).toBe(SYSTEMD_DAEMON_PATH);
+    expect(managedDaemonPath(
+      "/usr/bin/node",
+      ["/work/project/.npm-global/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs", "daemon", "start"],
+      "/work/project",
+      "/home/alice",
+    )).toBe(SYSTEMD_DAEMON_PATH);
+    expect(managedDaemonPath(
+      "/usr/bin/node",
+      ["/home/alice/.npm:shadow/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs", "daemon", "start"],
+      "/work/project",
+      "/home/alice",
+    )).toBe(SYSTEMD_DAEMON_PATH);
+  });
+
   it("preserves the bundled Codex Node runtime beside a plugin entrypoint", () => {
     expect(managedDaemonPath(
       "/opt/codex-desktop/resources/node-runtime/bin/node",

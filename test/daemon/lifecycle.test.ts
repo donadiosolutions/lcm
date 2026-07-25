@@ -613,6 +613,73 @@ describe("ensureDaemon", () => {
     },
   );
 
+  it.each([
+    {
+      platform: "linux" as const,
+      reported: "/home/alice/.npm-global/bin/lcm",
+      expected: "/home/alice/.npm-global/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs",
+      canonical: "/home/alice/.npm-global/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs",
+    },
+    {
+      platform: "darwin" as const,
+      reported: "/opt/homebrew/bin/lcm",
+      expected: "/opt/homebrew/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs",
+      canonical: "/opt/homebrew/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs",
+    },
+    {
+      platform: "win32" as const,
+      reported: "C:\\Users\\Alice\\AppData\\Roaming\\npm\\lcm.cmd",
+      expected: "c:\\users\\alice\\appdata\\roaming\\npm\\node_modules\\@donadiosolutions\\lcm\\dist\\lcm.mjs",
+      canonical: "C:\\Users\\Alice\\AppData\\Roaming\\npm\\node_modules\\@donadiosolutions\\lcm\\dist\\lcm.mjs",
+    },
+  ])(
+    "reuses a $platform daemon when npm shim and runtime entrypoints resolve identically",
+    async ({ platform, reported, expected, canonical }): Promise<void> => {
+      const tempDir = mkdtempSync(join(tmpdir(), `lcm-lifecycle-${platform}-symlink-entrypoint-`));
+      tempDirs.push(tempDir);
+      const pidFile = join(tempDir, "daemon.pid");
+      writeFileSync(pidFile, "200");
+      writeFileSync(join(tempDir, "daemon.token"), "local-token");
+      const fetchMock = vi.fn(async (url: string): Promise<Response> => url.endsWith("/health")
+        ? {
+            ok: true,
+            json: async () => ({
+              status: "ok",
+              version: "1.4.1",
+              storageBackend: "sqlite",
+              pid: 200,
+              entrypoint: reported,
+            }),
+          } as Response
+        : { ok: true, json: async () => ({}) } as Response);
+      const realpathMock = vi.fn((path: string): string => {
+        if (path === reported || path === expected) return canonical;
+        throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      });
+      const killMock = vi.fn();
+
+      const result = await ensureDaemon({
+        port: 19999,
+        pidFilePath: pidFile,
+        spawnTimeoutMs: 100,
+        expectedVersion: "1.4.1",
+        expectedStorageBackend: "sqlite",
+        expectedEntrypoint: expected,
+        _platform: platform,
+        _fetchOverride: fetchMock as FetchOverride,
+        _realpathOverride: realpathMock,
+        _killOverride: killMock,
+        _isProcessAliveOverride: (): boolean => true,
+        _listeningPortsOverride: (): number[] => [19999],
+      });
+
+      expect(result).toMatchObject({ connected: true, spawned: false, pid: 200 });
+      expect(realpathMock).toHaveBeenCalledWith(reported);
+      expect(realpathMock).toHaveBeenCalledWith(expected);
+      expect(killMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("fails closed when a legacy Linux daemon entrypoint cannot be read", async (): Promise<void> => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-unreadable-entrypoint-"));
     tempDirs.push(tempDir);

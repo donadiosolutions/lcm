@@ -638,6 +638,10 @@ describe('error handling', () => {
         JSON.stringify(mergeClaudeSettings({ theme: 'dark' }, join(process.cwd(), 'dist', 'lcm.mjs'))),
       );
       const settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
+      settings.mcpServers = {
+        lcm: { command: '/opt/npm/bin/lcm', args: ['mcp'] },
+        unrelated: { command: 'other' },
+      };
       settings.hooks.SessionStart.unshift({
         matcher: 'unrelated',
         hooks: [{ type: 'command', command: '/usr/local/bin/other restore' }],
@@ -666,6 +670,10 @@ describe('error handling', () => {
             matcher: 'unrelated',
             hooks: [{ type: 'command', command: '/usr/local/bin/other restore' }],
           }],
+        },
+        mcpServers: {
+          lcm: { command: '/opt/npm/bin/lcm', args: ['mcp'] },
+          unrelated: { command: 'other' },
         },
       });
       expect(removeConnector('claude-code', 'hook', tmpDir)).toBe(false);

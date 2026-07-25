@@ -39,6 +39,8 @@ describe("package.json", () => {
     expect(source).toContain('join(root, "dist", "lcm.mjs")');
     expect(source).not.toContain('join(root, "lcm.mjs")');
     expect(source).not.toContain("mcp.mjs");
+    expect(source).toContain('startsWith("#!/usr/bin/env node\\n")');
+    expect(source).toContain("chmod(output, 0o755)");
   });
 
   it("pins every direct dependency and development dependency exactly", () => {

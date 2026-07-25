@@ -1,7 +1,7 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
-import { join, dirname, win32 } from "node:path";
+import { join, dirname, posix, win32 } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
 import { managedDaemonPath, SYSTEMD_DAEMON_PATH } from "./managed-path.js";
 import { PKG_VERSION } from "./version.js";
@@ -45,6 +45,8 @@ export type EnsureDaemonOptions = {
   _setTimeoutOverride?: SetTimeoutFn;
   _clearTimeoutOverride?: ClearTimeoutFn;
   _isProcessAliveOverride?: (pid: number) => boolean;
+  /** @internal Deterministic executable-canonicalization seam for lifecycle tests. */
+  _realpathOverride?: (path: string) => string;
   /** @internal Deterministic listener-ownership seam for lifecycle tests. */
   _listeningPortsOverride?: (pid: number) => number[];
 };
@@ -264,15 +266,33 @@ function processEntrypointMatches(
   expectedEntrypoint: string | undefined,
   platform: NodeJS.Platform,
   procRoot = "/proc",
+  realpath: (path: string) => string = realpathSync,
 ): boolean {
   if (expectedEntrypoint === undefined) return true;
-  if (typeof health.entrypoint === "string") return health.entrypoint === expectedEntrypoint;
+  const pathApi = platform === "win32" ? win32 : posix;
+  const normalize = (path: string): string => {
+    let canonical = path;
+    if (pathApi.isAbsolute(path)) {
+      try {
+        canonical = realpath(path);
+      } catch {
+        // Legacy or remote health paths may no longer exist. Preserve the
+        // direct normalized comparison instead of treating resolution failure
+        // as evidence that two different paths are equivalent.
+      }
+    }
+    const normalized = pathApi.normalize(canonical);
+    return platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  const matches = (actual: string): boolean =>
+    actual === expectedEntrypoint || normalize(actual) === normalize(expectedEntrypoint);
+  if (typeof health.entrypoint === "string") return matches(health.entrypoint);
   if (platform !== "linux" || health.pid === undefined) return false;
   try {
     const args = readFileSync(join(procRoot, String(health.pid), "cmdline"), "utf-8")
       .split("\0")
       .filter((arg) => arg.length > 0);
-    return args.includes(expectedEntrypoint);
+    return args.some(matches);
   } catch {
     return false;
   }
@@ -821,6 +841,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
   const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
+  const realpath = opts._realpathOverride ?? realpathSync;
   const deadline = monotonicNow() + opts.spawnTimeoutMs;
   const isAlive = opts._isProcessAliveOverride ?? isProcessAlive;
   const killProcess = opts._killOverride ?? ((pid, signal) => {
@@ -926,7 +947,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (health === null || !endpointIdentityMatches(health)) return null;
     if (!healthVersionMatches(health, expectedVersion)) return null;
     if (!healthStorageBackendMatches(health, expectedStorageBackend)) return null;
-    if (!processEntrypointMatches(health, expectedEntrypoint, platform, procRoot)) return null;
+    if (!processEntrypointMatches(health, expectedEntrypoint, platform, procRoot, realpath)) return null;
     if (!access.alreadyVerified) {
       const accessTimeoutMs = access.deadline - monotonicNow();
       if (accessTimeoutMs <= 0) return null;
@@ -1008,7 +1029,13 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const identityMatches = endpointIdentityMatches(health);
     const versionMatches = healthVersionMatches(health, expectedVersion);
     const storageBackendMatches = healthStorageBackendMatches(health, expectedStorageBackend);
-    const entrypointMatches = processEntrypointMatches(health, expectedEntrypoint, platform, procRoot);
+    const entrypointMatches = processEntrypointMatches(
+      health,
+      expectedEntrypoint,
+      platform,
+      procRoot,
+      realpath,
+    );
     const hasAccess = identityMatches && (versionMatches || !storageBackendMatches || !entrypointMatches) && initialAccessDeadline
       ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, initialAccessDeadline, health.storageBackend ?? expectedStorageBackend)
       : false;
@@ -1070,7 +1097,13 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           const retryIdentityMatches = endpointIdentityMatches(retry);
           const retryVersionMatches = healthVersionMatches(retry, expectedVersion);
           const retryStorageBackendMatches = healthStorageBackendMatches(retry, expectedStorageBackend);
-          const retryEntrypointMatches = processEntrypointMatches(retry, expectedEntrypoint, platform, procRoot);
+          const retryEntrypointMatches = processEntrypointMatches(
+            retry,
+            expectedEntrypoint,
+            platform,
+            procRoot,
+            realpath,
+          );
           const retryHasAccess = retryIdentityMatches
             && (retryVersionMatches || !retryStorageBackendMatches || !retryEntrypointMatches)
             && retryAccessDeadline

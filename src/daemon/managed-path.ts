@@ -1,4 +1,4 @@
-import { delimiter, dirname, isAbsolute, relative, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 
 export const SYSTEMD_DAEMON_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -14,7 +14,7 @@ function isWithin(directory: string, root: string): boolean {
 }
 
 function homeScopedInstallationRoot(directory: string): string | undefined {
-  const match = /^(.*)\/(?:\.nvm|\.npm-packages|\.volta|\.asdf|\.codex|\.claude)(?:\/|$)/.exec(directory);
+  const match = /^(.*)\/(?:\.nvm|\.npm-global|\.npm-packages|\.volta|\.asdf|\.codex|\.claude)(?:\/|$)/.exec(directory);
   return match?.[1] || undefined;
 }
 
@@ -40,6 +40,13 @@ function isTrustedInstallationDir(
   return true;
 }
 
+function npmGlobalBinForEntrypoint(path: string): string | undefined {
+  const marker = `${sep}lib${sep}node_modules${sep}@donadiosolutions${sep}lcm${sep}`;
+  const markerIndex = path.indexOf(marker);
+  if (markerIndex <= 0) return undefined;
+  return join(path.slice(0, markerIndex), "bin");
+}
+
 function trustedExecutableDirs(
   spawnCommand: string,
   spawnArgs: readonly string[],
@@ -50,6 +57,8 @@ function trustedExecutableDirs(
   const executables: Array<{ path: string; entrypoint: boolean }> = [];
   if (firstArg && isAbsolute(firstArg)) {
     executables.push({ path: firstArg, entrypoint: true });
+    const npmGlobalBin = npmGlobalBinForEntrypoint(firstArg);
+    if (npmGlobalBin) executables.push({ path: join(npmGlobalBin, "lcm"), entrypoint: true });
     if (isAbsolute(spawnCommand)) executables.push({ path: spawnCommand, entrypoint: false });
   } else if (firstArg === "daemon" && isAbsolute(spawnCommand)) {
     executables.push({ path: spawnCommand, entrypoint: true });

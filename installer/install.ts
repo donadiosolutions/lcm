@@ -211,6 +211,7 @@ const defaultDeps: ServiceDeps = {
   existsSync,
   chmodSync,
   lstatSync,
+  rmSync,
   atomicWritePrivateFile,
   promptUser: readlinePrompt,
 };
@@ -228,6 +229,21 @@ function safeConfigExists(deps: ServiceDeps, path: string): boolean {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
+}
+
+function readMergedClaudeSettings(
+  deps: Pick<ServiceDeps, "existsSync" | "readFileSync">,
+  settingsPath: string,
+  lcmBin: string,
+): Record<string, unknown> {
+  if (!deps.existsSync(settingsPath)) return mergeClaudeSettings({}, lcmBin);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(deps.readFileSync(settingsPath, "utf-8"));
+  } catch {
+    throw new Error(`Refusing to modify malformed Claude settings: ${settingsPath}`);
+  }
+  return mergeClaudeSettings(parsed, lcmBin);
 }
 
 export interface ResolveBinaryDeps {
@@ -410,18 +426,7 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   }
 
   // Validate settings before making any migration or installation changes.
-  let initialSettings: Record<string, unknown> = {};
-  if (deps.existsSync(settingsPath)) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(deps.readFileSync(settingsPath, "utf-8"));
-    } catch {
-      throw new Error(`Refusing to modify malformed Claude settings: ${settingsPath}`);
-    }
-    initialSettings = mergeClaudeSettings(parsed, lcmBin);
-  } else {
-    initialSettings = mergeClaudeSettings({}, lcmBin);
-  }
+  readMergedClaudeSettings(deps, settingsPath, lcmBin);
 
   migrateClaudeMarketplacePlugins(deps, deps.cwd ?? process.cwd());
 
@@ -460,7 +465,7 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   });
 
   // Register the npm-owned MCP server directly in Claude settings.
-  const merged: any = initialSettings;
+  const merged: any = readMergedClaudeSettings(deps, settingsPath, lcmBin);
   const mcpServers = merged.mcpServers;
   mcpServers["lcm"] = { command: process.execPath, args: [lcmBin, "mcp"] };
   (merged as any).mcpServers = mcpServers;
@@ -473,6 +478,8 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   const claudeTemplates = join(packageRootFor(import.meta.url, 2), "dist", "src", "connectors", "templates", "claude");
   const commandsSrc = deps.commandsSourceDir ?? join(claudeTemplates, "commands");
   const commandsDst = join(homedir(), ".claude", "commands");
+  const retiredDogfoodCommand = join(commandsDst, "lcm-dogfood.md");
+  (deps.rmSync ?? rmSync)(retiredDogfoodCommand, { force: true });
   copyMarkdownFiles(deps, commandsSrc, commandsDst);
   if (deps.existsSync(commandsSrc)) {
     console.log(`Installed slash commands to ${commandsDst}`);

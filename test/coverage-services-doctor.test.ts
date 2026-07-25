@@ -1201,17 +1201,21 @@ describe("doctor service coverage", () => {
 
     vi.resetModules();
     vi.doMock("../src/generated-patterns.js", () => ({ GITLEAKS_PATTERNS: [{}] }));
+    let syncDate: string | undefined = "2026-01-01";
     vi.doMock("../src/scrub.js", async (importOriginal) => {
       const original = await importOriginal<typeof import("../src/scrub.js")>();
       return {
         ...original,
-        readGitleaksSyncDate: () => "2026-01-01",
+        readGitleaksSyncDate: () => syncDate,
         ScrubEngine: { loadProjectPatterns: vi.fn().mockResolvedValue([]) },
       };
     });
-    const noSyncDate = await import("../src/doctor/doctor.js");
-    expect((await noSyncDate.runDoctor(makeDeps())).find((result) => result.name === "secret-detection")?.message)
+    const syncDateDoctor = await import("../src/doctor/doctor.js");
+    expect((await syncDateDoctor.runDoctor(makeDeps())).find((result) => result.name === "secret-detection")?.message)
       .toContain("synced 2026-01-01");
+    syncDate = undefined;
+    expect((await syncDateDoctor.runDoctor(makeDeps())).find((result) => result.name === "secret-detection")?.message)
+      .not.toContain("(synced ");
     rmSync(root, { recursive: true, force: true });
   });
 });

@@ -1,11 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { readFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { GITLEAKS_PATTERNS } from "./generated-patterns.js";
+import { packageAsset, packageRootFor } from "./runtime-root.js";
 import { validateRegex } from "./store/regex-safety.js";
 
-const _thisDir = dirname(fileURLToPath(import.meta.url));
+const _packageRoot = packageRootFor(import.meta.url, 2);
 
 /**
  * Reads the sync date from the generated-patterns.js header comment.
@@ -13,7 +13,12 @@ const _thisDir = dirname(fileURLToPath(import.meta.url));
  */
 export function readGitleaksSyncDate(): string | null {
   try {
-    const genFile = join(_thisDir, "generated-patterns.js");
+    const genFile = packageAsset(
+      import.meta.url,
+      _packageRoot,
+      "dist/src/generated-patterns.js",
+      "src/generated-patterns.ts",
+    );
     if (!existsSync(genFile)) return null;
     const header = readFileSync(genFile, "utf-8").slice(0, 500);
     const match = header.match(/\/\/ Updated: (\d{4}-\d{2}-\d{2})/);

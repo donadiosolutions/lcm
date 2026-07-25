@@ -9,7 +9,7 @@ import { findAgent, AGENTS } from "./registry.js";
 import { CODEX_CONFIG_PATH, LEGACY_CODEX_HOOKS_PATHS, hasCodexHooks, installCodexHooks, removeCodexHooks } from "./codex-hooks.js";
 import {
   canonicalHookCommand,
-  removeManagedClaudeSettings,
+  removeManagedClaudeHooks,
   REQUIRED_HOOKS,
 } from "../installer/settings.js";
 import { packageExecutable } from "../runtime-root.js";
@@ -164,7 +164,7 @@ function removeClaudeHooks(filePath: string): boolean {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
-  const cleaned = removeManagedClaudeSettings(existing);
+  const cleaned = removeManagedClaudeHooks(existing);
   if (JSON.stringify(existing) === JSON.stringify(cleaned)) return false;
   writeFileSync(filePath, JSON.stringify(cleaned, null, 2) + "\n");
   return true;

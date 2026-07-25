@@ -28,6 +28,7 @@ function makeDeps(overrides: Partial<ServiceDeps> = {}): ServiceDeps {
     writeFileSync: vi.fn(),
     mkdirSync: vi.fn(),
     existsSync: vi.fn().mockReturnValue(false),
+    rmSync: vi.fn(),
     promptUser: vi.fn().mockResolvedValue("1"), // default: option 1
     ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
     runDoctor: vi.fn().mockResolvedValue([]),
@@ -523,7 +524,7 @@ describe("install", () => {
       return ["one.md", "ignore.txt", "two.md"];
     });
     const settingsPath = join(homedir(), ".claude", "settings.json");
-    let settingsReads = 0;
+    const retiredCommand = join(homedir(), ".claude", "commands", "lcm-dogfood.md");
     const deps = makeDeps({
       existsSync: vi.fn((path: string) =>
         path.endsWith("config.json")
@@ -532,7 +533,7 @@ describe("install", () => {
         || path === settingsPath),
       readFileSync: vi.fn((path: string) => {
         if (path.endsWith("package.json")) return JSON.stringify({ version: "1.4.0" });
-        if (path === settingsPath) return settingsReads++ === 0 ? "{}" : "null";
+        if (path === settingsPath) return "{}";
         return "{}";
       }),
       readdirSync: readdirSync as any,
@@ -543,10 +544,44 @@ describe("install", () => {
     });
 
     await install(deps);
-    expect(rmSync).not.toHaveBeenCalled();
+    expect(rmSync).toHaveBeenCalledOnce();
+    expect(rmSync).toHaveBeenCalledWith(retiredCommand, { force: true });
     expect(copyFileSync).toHaveBeenCalledTimes(4);
     const settingsWrite = vi.mocked(deps.writeFileSync).mock.calls.filter(([path]) => path === settingsPath).at(-1);
     expect(JSON.parse(settingsWrite![1]).mcpServers.lcm).toBeDefined();
+  });
+
+  it("re-reads Claude settings after Marketplace migration before writing native settings", async () => {
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    const plugin = JSON.stringify([{ id: "lcm@legacy", scope: "user" }]);
+    const marketplaces = JSON.stringify([{ name: "legacy", repo: "lossless-claude/lcm" }]);
+    let settings = JSON.stringify({ theme: "before" });
+    let spawnCall = 0;
+    const deps = makeDeps({
+      existsSync: vi.fn((path: string) => path === settingsPath || path.endsWith("config.json")),
+      readFileSync: vi.fn((path: string) => path === settingsPath ? settings : "{}"),
+      writeFileSync: vi.fn((path: string, data: string) => {
+        if (path === settingsPath) settings = data;
+      }),
+      spawnSync: vi.fn(() => {
+        spawnCall += 1;
+        if (spawnCall === 1) return { status: 0, stdout: plugin };
+        if (spawnCall === 2) return { status: 0, stdout: marketplaces };
+        if (spawnCall === 3) {
+          settings = JSON.stringify({ theme: "after", pluginCleanup: true });
+          return { status: 0, stdout: "" };
+        }
+        return { status: 0, stdout: "[]" };
+      }) as any,
+    });
+
+    await install(deps);
+
+    expect(JSON.parse(settings)).toEqual(expect.objectContaining({
+      theme: "after",
+      pluginCleanup: true,
+      mcpServers: expect.objectContaining({ lcm: expect.any(Object) }),
+    }));
   });
 
   it("preserves a valid MCP server map", async () => {

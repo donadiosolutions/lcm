@@ -47,4 +47,18 @@ describe("runtime package layout", () => {
     expect(packageAsset(`file://${root}/dist/lcm.mjs`, root, "dist/data", "src/data"))
       .toBe(join(root, "dist/data"));
   });
+
+  it("resolves generated scrub metadata beside compiled package sources", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-layout-scrub-"));
+    cleanup.push(root);
+    mkdirSync(join(root, "dist", "src"), { recursive: true });
+    writeFileSync(join(root, "dist", "src", "generated-patterns.js"), "// Updated: 2026-07-25");
+
+    expect(packageAsset(
+      `file://${root}/dist/lcm.mjs`,
+      root,
+      "dist/src/generated-patterns.js",
+      "src/generated-patterns.ts",
+    )).toBe(join(root, "dist/src/generated-patterns.js"));
+  });
 });

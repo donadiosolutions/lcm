@@ -104,7 +104,7 @@ export function mergeClaudeSettings(existing: unknown, runtimePath: string, node
   return settings;
 }
 
-export function removeManagedClaudeSettings(existing: unknown): any {
+export function removeManagedClaudeHooks(existing: unknown): any {
   const settings = asSettingsObject(existing);
   if (settings.hooks !== undefined) {
     if (settings.hooks === null || typeof settings.hooks !== "object" || Array.isArray(settings.hooks)) {
@@ -125,6 +125,11 @@ export function removeManagedClaudeSettings(existing: unknown): any {
     }
     if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
   }
+  return settings;
+}
+
+export function removeManagedClaudeSettings(existing: unknown): any {
+  const settings = removeManagedClaudeHooks(existing);
   if (settings.mcpServers !== undefined) {
     if (settings.mcpServers === null || typeof settings.mcpServers !== "object" || Array.isArray(settings.mcpServers)) {
       throw new Error("Claude settings mcpServers must be a JSON object");

@@ -1,4 +1,4 @@
-import { chmod, mkdir } from "node:fs/promises";
+import { chmod, mkdir, readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
@@ -23,4 +23,8 @@ await build({
     js: 'import { createRequire as __lcmCreateRequire } from "node:module"; const require = __lcmCreateRequire(import.meta.url);',
   },
 });
+const generated = await readFile(output, "utf8");
+if (!generated.startsWith("#!/usr/bin/env node\n")) {
+  throw new Error("Generated runtime is missing the Node.js shebang");
+}
 await chmod(output, 0o755);
