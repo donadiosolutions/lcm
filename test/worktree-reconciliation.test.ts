@@ -223,7 +223,7 @@ describe("worktree reconciliation", () => {
   });
 
   it("transactionally merges complete state, archives sources, and folds aliases", () => {
-    const { main, linked } = makeRepository(home);
+    const { linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(linked)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);

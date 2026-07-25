@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import {
   extractCodexSessionMeta,
   findAllCodexTranscripts,
