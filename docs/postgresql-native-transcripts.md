@@ -45,7 +45,12 @@ Each accepted JSONL record must decode as valid UTF-8 and contain a JSON object
 or array. LCM rejects malformed JSON, scalar JSON, U+0000, binary or invalid
 UTF-8 input, records larger than 10 MiB, and JSON nested beyond the exported
 `NATIVE_TRANSCRIPT_MAX_JSON_DEPTH` limit of 100 before a PostgreSQL repository
-operation begins.
+operation begins. It also rejects JSON number spellings whose exact decimal
+value would change when represented as a JavaScript `number`, including unsafe
+integers, over-precise decimals, numeric overflow or underflow, and unsafe
+exponents. Lone UTF-16 high or low surrogate code units in string keys or
+values are rejected; valid surrogate pairs and literal Unicode remain
+supported.
 
 ## Data stored remotely
 
@@ -60,6 +65,14 @@ For every accepted record, PostgreSQL retains:
 - the scrubber version, sanitized-content SHA-256 digest, and deterministic
   ingest key; and
 - any exact link from the native record to its derived LCM message.
+
+`observedAt` is the client-originated time when local ingestion observes the
+sanitized native record. The #86 PostgreSQL repository validates that value and
+writes it into both `observed_at` and `ingested_at`. For this staged repository,
+`ingestedAt` is therefore the durable acceptance time carried from that local
+observation, not PostgreSQL `statement_timestamp()`. The two columns use one
+clock, so a remote server clock that leads or lags the client cannot reject the
+record.
 
 The native JSON is immutable. The repository provides reads by transcript ID,
 native session, source order, and linked message, but no payload update or
@@ -81,12 +94,22 @@ queryable without a message link.
 ## Local scrubbing and residual risk
 
 LCM recursively scrubs every string key and value using the bundled Gitleaks
-rules, built-in patterns, global `security.sensitivePatterns`, and the
-project's `sensitive-patterns.txt`. The scrubber rejects an invalid custom
-pattern, a collision between keys after redaction, and any residual match from
-the effective pattern set. It then canonicalizes the sanitized JSON and hashes
-that canonical form. The scrubber version binds the pipeline version to the
-effective-pattern digest so a pattern change is observable.
+rules and built-in patterns plus the effective global and project patterns
+supplied by the embedded caller. The staged programmatic API does not load
+configuration or project files implicitly. Before calling
+`createNativeTranscriptScrubber()` or `runNativeTranscriptBackfill()`, load
+global `security.sensitivePatterns` into `globalPatterns` and the project's
+`sensitive-patterns.txt` into `projectPatterns`. Both arrays are required:
+omitting either value or passing a non-array fails before source, quarantine,
+resolver, or repository access. Pass an explicit empty array when that scope
+has no configured custom patterns; bundled Gitleaks and native rules still
+apply.
+
+The scrubber rejects an invalid custom pattern, a collision between keys after
+redaction, and any residual match from the effective pattern set. It then
+canonicalizes the sanitized JSON and hashes that canonical form. The scrubber
+version binds the pipeline version to the effective-pattern digest so a pattern
+change is observable.
 
 This boundary substantially reduces accidental secret transmission, but
 pattern-based redaction cannot identify every sensitive value. An
@@ -155,8 +178,8 @@ skipped.
 
 ## Local quarantine
 
-Unsafe records are not stored remotely. LCM writes only metadata to the
-project's private local SQLite quarantine store:
+Unsafe records are not stored remotely. LCM writes only metadata to a private
+local SQLite quarantine store scoped to the project and transcript client:
 
 - client-root-relative source locator;
 - source ordinal;
@@ -165,18 +188,27 @@ project's private local SQLite quarantine store:
 - quarantine timestamp.
 
 The original or partially scrubbed payload is never copied into quarantine.
-Embedded callers use `openLocalTranscriptQuarantine()` and the resulting
-repository's list/get operations to inspect these metadata records. By default,
-`localTranscriptQuarantinePath()` resolves the store to
-`~/.lcm/transcript-quarantine/<sha256-project-id>.db`; LCM creates the
-directory with mode `0700` and the database file with mode `0600`. The store is
-not synchronized to PostgreSQL.
+Embedded callers pass the backfill format's validated `clientName` to
+`openLocalTranscriptQuarantine(projectId, format.clientName)` and use the
+resulting repository's list/get operations to inspect these metadata records.
+By default, `localTranscriptQuarantinePath(projectId, format.clientName)`
+resolves the store to
+`~/.lcm/transcript-quarantine/<sha256-project-id>/<sha256-client-name>.db`.
+LCM creates private directories with mode `0700` and the database file with
+mode `0600`. Separate Claude and Codex stores prevent identical locator,
+ordinal, reason, and digest metadata from deduplicating across clients without
+adding a client identifier—or any payload—to quarantine rows. The stores are
+not synchronized to PostgreSQL. Backfill rejects a quarantine repository whose
+client namespace does not match the selected transcript format before opening
+the source or contacting the destination repository.
 
 Reason codes are bounded to `invalid-utf8`, `binary-input`,
 `record-too-large`, `malformed-json`, `non-container-json`, `nul-character`,
 `redacted-key-collision`, `residual-secret`, and `nesting-too-deep`. Correct
 the source or active sensitive patterns, then rerun the explicit backfill—the
-source transcript remains read-only.
+source transcript remains read-only. Lossy numeric spellings and lone Unicode
+surrogates use `malformed-json`; their source bytes remain local and only the
+normal metadata fields are quarantined.
 
 ## PostgreSQL privileges
 
@@ -194,14 +226,20 @@ Replace `lcm_runtime` with the existing restricted runtime role. The script
 grants only:
 
 - `USAGE` on the `lcm` schema;
-- `SELECT` and column-limited `INSERT` on `native_transcripts`;
+- column-limited `SELECT` on `conversations` columns `project_id`,
+  `conversation_id`, `session_id`, `session_id_sha256`, and `created_at`, plus
+  `messages` columns `project_id`, `conversation_id`, `message_id`, `seq`,
+  `role`, and `content`, which are the exact fields used by one-statement
+  native-session message linking;
+- `SELECT` and column-limited `INSERT` on `native_transcripts`, including the
+  validated equal `observed_at` and `ingested_at` values;
 - `SELECT` and column-limited `INSERT` on `transcript_messages`; and
 - `SELECT`, column-limited `INSERT`, and checkpoint-field-only `UPDATE` on
   `ingest_checkpoints`.
 
 It grants no payload update, `DELETE`, `TRUNCATE`, sequence privilege, or
-privilege on unrelated repository tables. Conversation and identity
-repositories require their separate reviewed grant scripts.
+privilege on unrelated repository tables. Broader conversation operations and
+identity repositories require their separate reviewed grant scripts.
 
 ## Staged rollout and rollback
 

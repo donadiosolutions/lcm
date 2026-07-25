@@ -10,6 +10,25 @@ BEGIN;
 
 GRANT USAGE ON SCHEMA lcm TO :"lcm_runtime_role";
 
+GRANT SELECT (
+  project_id,
+  conversation_id,
+  session_id,
+  session_id_sha256,
+  created_at
+)
+ON TABLE lcm.conversations TO :"lcm_runtime_role";
+
+GRANT SELECT (
+  project_id,
+  conversation_id,
+  message_id,
+  seq,
+  role,
+  content
+)
+ON TABLE lcm.messages TO :"lcm_runtime_role";
+
 GRANT SELECT ON TABLE lcm.native_transcripts TO :"lcm_runtime_role";
 GRANT INSERT (
   project_id,
@@ -21,6 +40,7 @@ GRANT INSERT (
   source_locator,
   source_ordinal,
   observed_at,
+  ingested_at,
   scrubber_version,
   content_sha256,
   ingest_key,

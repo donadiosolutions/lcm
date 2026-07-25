@@ -183,7 +183,10 @@ does not add row-level security.
   sequence. Its global allocation is stronger than per-resource monotonicity:
   deleting a released or expired lease row does not reset the allocator, so a
   later lease cannot receive a previously generated token.
-- Timestamps use `timestamptz` and default to `statement_timestamp()`. Checks
+- Timestamps use `timestamptz` and default to `statement_timestamp()`. The #86
+  native-transcript repository deliberately supplies both `observed_at` and
+  `ingested_at` from the same validated client-originated observation time, so
+  their ordering check never compares client and PostgreSQL wall clocks. Checks
   reject reversed lifecycle ranges. Counters, ordinals, token counts, byte
   counts and depths are nonnegative; step costs are finite and nonnegative;
   fencing tokens and event versions are strictly positive.
@@ -684,12 +687,16 @@ message cascade, so the runtime receives no direct `DELETE` on
 Applying these grants permits direct repository use and conformance testing
 only; daemon and CLI routing remain staged behind #224 and #92.
 
-The transcript script grants `SELECT` plus column-limited `INSERT` on
-`native_transcripts` and `transcript_messages`. It grants `SELECT`,
-column-limited `INSERT`, and `UPDATE` only for checkpoint position, cumulative
-accounting, checkpoint payload, and update time on `ingest_checkpoints`.
-PostgreSQL-generated transcript IDs, ingested timestamps, and native-session
-digest columns remain unwritable. The script grants no payload update,
+The transcript script grants column-limited `SELECT` on the exact conversation
+and message fields needed for native-session linkage, plus `SELECT` and
+column-limited `INSERT` on `native_transcripts` and `transcript_messages`. It
+grants `SELECT`, column-limited `INSERT`, and `UPDATE` only for checkpoint
+position, cumulative accounting, checkpoint payload, and update time on
+`ingest_checkpoints`.
+PostgreSQL-generated transcript IDs and native-session digest columns remain
+unwritable. Transcript inserts may supply `ingested_at` only so the repository
+can persist the same validated value as `observed_at`; later timestamp updates
+remain forbidden. The script grants no payload update,
 `DELETE`, `TRUNCATE`, sequence privilege, or access to an unrelated domain
 table. Matching ingest-key retries are therefore handled through readback,
 while a conflicting immutable record fails closed. See

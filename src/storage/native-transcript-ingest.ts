@@ -13,14 +13,15 @@ import { GITLEAKS_PATTERNS } from "../generated-patterns.js";
 import { NATIVE_PATTERNS, ScrubEngine } from "../scrub.js";
 import type { MessageRole } from "../store/conversation-store.js";
 import type {
-  ConversationRepository,
+  CreateNativeTranscriptInput,
+  CreateNativeTranscriptMessageLinkInput,
   JsonObject,
   JsonValue,
   NativeTranscriptCheckpointRecord,
+  NativeTranscriptMessageSnapshotRepository,
   NativeTranscriptRepository,
 } from "./contracts.js";
 import { NATIVE_TRANSCRIPT_MAX_JSON_DEPTH } from "./contracts.js";
-export { NATIVE_TRANSCRIPT_MAX_JSON_DEPTH } from "./contracts.js";
 import type {
   LocalTranscriptQuarantineRepository,
   TranscriptQuarantineReason,
@@ -86,8 +87,8 @@ export interface NativeTranscriptScrubber {
 }
 
 export interface NativeTranscriptScrubberOptions {
-  readonly globalPatterns?: readonly string[];
-  readonly projectPatterns?: readonly string[];
+  readonly globalPatterns: readonly string[];
+  readonly projectPatterns: readonly string[];
   readonly pipelineVersion?: string;
 }
 
@@ -114,8 +115,10 @@ function assertNoNul(value: string): void {
 }
 
 function scrubString(engine: ScrubEngine, value: string): string {
+  assertUnicodeScalarValue(value);
   assertNoNul(value);
   const scrubbed = engine.scrub(value);
+  assertUnicodeScalarValue(scrubbed);
   assertNoNul(scrubbed);
   if (engine.scrub(scrubbed) !== scrubbed) {
     throw new NativeTranscriptRecordError("residual-secret");
@@ -146,10 +149,18 @@ function scrubJsonValue(engine: ScrubEngine, value: JsonValue): JsonValue {
 }
 
 export function createNativeTranscriptScrubber(
-  options: NativeTranscriptScrubberOptions = {},
+  options: NativeTranscriptScrubberOptions,
 ): NativeTranscriptScrubber {
-  const globalPatterns = [...(options.globalPatterns ?? [])];
-  const projectPatterns = [...(options.projectPatterns ?? [])];
+  if (
+    !Array.isArray(options?.globalPatterns)
+    || !Array.isArray(options.projectPatterns)
+    || options.globalPatterns.some((pattern) => typeof pattern !== "string")
+    || options.projectPatterns.some((pattern) => typeof pattern !== "string")
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const globalPatterns = [...options.globalPatterns];
+  const projectPatterns = [...options.projectPatterns];
   const pipelineVersion =
     options.pipelineVersion ?? NATIVE_TRANSCRIPT_SCRUB_PIPELINE_VERSION;
   if (pipelineVersion.trim().length === 0 || pipelineVersion.includes("\0")) {
@@ -255,7 +266,9 @@ export interface NativeTranscriptJsonlReadOptions {
   readonly maxRecordBytes?: number;
   /** Reports consumed record or blank-line boundaries without payload data. */
   readonly onProgress?: (progress: {
+    readonly startByteOffset: number;
     readonly endByteOffset: number;
+    readonly rangeSha256: string;
     readonly prefixSha256: string;
   }) => void;
 }
@@ -278,9 +291,99 @@ function ingestKey(
   ]));
 }
 
+const JSON_NUMBER_TOKEN_PATTERN =
+  /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/uy;
+
+type CanonicalDecimal = {
+  readonly negative: boolean;
+  readonly coefficient: string;
+  readonly exponent: number;
+};
+
+function canonicalDecimal(token: string): CanonicalDecimal | null {
+  let cursor = token.startsWith("-") ? 1 : 0;
+  const negative = cursor === 1;
+  const exponentMarker = token.slice(cursor).search(/[eE]/u);
+  const significandEnd = exponentMarker < 0
+    ? token.length
+    : cursor + exponentMarker;
+  const significand = token.slice(cursor, significandEnd);
+  const decimalPoint = significand.indexOf(".");
+  const fractionalLength = decimalPoint < 0
+    ? 0
+    : significand.length - decimalPoint - 1;
+  let coefficient = significand.replace(".", "").replace(/^0+/u, "");
+  if (coefficient.length === 0) {
+    return { negative: false, coefficient: "0", exponent: 0 };
+  }
+  let coefficientEnd = coefficient.length;
+  while (
+    coefficientEnd > 0 &&
+    coefficient.charCodeAt(coefficientEnd - 1) === 0x30
+  ) {
+    coefficientEnd -= 1;
+  }
+  const trailingZeroCount = coefficient.length - coefficientEnd;
+  coefficient = coefficient.slice(0, coefficientEnd);
+  let explicitExponent = 0;
+  if (exponentMarker >= 0) {
+    const exponentText = token.slice(significandEnd + 1);
+    const unsignedExponent = exponentText.replace(/^[+-]/u, "")
+      .replace(/^0+/u, "");
+    if (unsignedExponent.length > 16) return null;
+    explicitExponent = Number(exponentText);
+    if (!Number.isSafeInteger(explicitExponent)) return null;
+  }
+  const exponent =
+    explicitExponent - fractionalLength + trailingZeroCount;
+  return { negative, coefficient, exponent };
+}
+
+function assertLosslessJsonNumbers(text: string): void {
+  let inString = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index]!;
+    if (inString) {
+      if (character === "\\") {
+        index += 1;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      continue;
+    }
+    if (character !== "-" && (character < "0" || character > "9")) {
+      continue;
+    }
+    JSON_NUMBER_TOKEN_PATTERN.lastIndex = index;
+    const match = JSON_NUMBER_TOKEN_PATTERN.exec(text);
+    if (!match) continue;
+    const token = match[0];
+    const parsed = Number(token);
+    const originalDecimal = canonicalDecimal(token);
+    const roundTrippedDecimal = Number.isFinite(parsed)
+      ? canonicalDecimal(parsed.toString())
+      : null;
+    if (
+      !originalDecimal
+      || !roundTrippedDecimal
+      || originalDecimal.negative !== roundTrippedDecimal.negative
+      || originalDecimal.coefficient !== roundTrippedDecimal.coefficient
+      || originalDecimal.exponent !== roundTrippedDecimal.exponent
+    ) {
+      throw new NativeTranscriptRecordError("malformed-json");
+    }
+    index = JSON_NUMBER_TOKEN_PATTERN.lastIndex - 1;
+  }
+}
+
 function parsedContainer(text: string): JsonObject | JsonValue[] {
   let parsed: JsonValue;
   try {
+    assertLosslessJsonNumbers(text);
     parsed = JSON.parse(text) as JsonValue;
   } catch {
     throw new NativeTranscriptRecordError("malformed-json");
@@ -291,6 +394,21 @@ function parsedContainer(text: string): JsonObject | JsonValue[] {
   return parsed as JsonObject | JsonValue[];
 }
 
+function assertUnicodeScalarValue(value: string): void {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!Number.isInteger(next) || next < 0xdc00 || next > 0xdfff) {
+        throw new NativeTranscriptRecordError("malformed-json");
+      }
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      throw new NativeTranscriptRecordError("malformed-json");
+    }
+  }
+}
+
 function assertJsonTreeSafe(root: JsonObject | JsonValue[]): void {
   const pending: Array<{ value: JsonValue; depth: number }> = [{
     value: root,
@@ -298,11 +416,8 @@ function assertJsonTreeSafe(root: JsonObject | JsonValue[]): void {
   }];
   while (pending.length > 0) {
     const candidate = pending.pop()!;
-    if (
-      typeof candidate.value === "number"
-      && !Number.isFinite(candidate.value)
-    ) {
-      throw new NativeTranscriptRecordError("malformed-json");
+    if (typeof candidate.value === "string") {
+      assertUnicodeScalarValue(candidate.value);
     }
     if (
       candidate.value === null
@@ -315,7 +430,10 @@ function assertJsonTreeSafe(root: JsonObject | JsonValue[]): void {
     }
     const children = Array.isArray(candidate.value)
       ? candidate.value
-      : Object.values(candidate.value);
+      : Object.entries(candidate.value).map(([key, value]) => {
+          assertUnicodeScalarValue(key);
+          return value;
+        });
     for (const value of children) {
       pending.push({ value, depth: candidate.depth + 1 });
     }
@@ -415,12 +533,21 @@ export async function* readNativeTranscriptJsonl(
   let accumulator = newAccumulator();
   let sourceOrdinal = 0;
   let byteOffset = 0;
+  let recordStartByteOffset = 0;
 
   const finishRecord = (
     endByteOffset: number,
+    terminatedByNewline: boolean,
   ): NativeTranscriptReadOutcome | null => {
     const prefixSha256 = prefixHash.copy().digest("hex");
-    options.onProgress?.({ endByteOffset, prefixSha256 });
+    const rangeHash = accumulator.rawHash.copy();
+    if (terminatedByNewline) rangeHash.update(Uint8Array.of(0x0a));
+    options.onProgress?.({
+      startByteOffset: recordStartByteOffset,
+      endByteOffset,
+      rangeSha256: rangeHash.digest("hex"),
+      prefixSha256,
+    });
     if (accumulator.oversized) {
       const outcome = quarantineOutcome(
         sourceOrdinal,
@@ -498,8 +625,9 @@ export async function* readNativeTranscriptJsonl(
       prefixHash.update(segment);
       prefixHash.update(Uint8Array.of(0x0a));
       byteOffset += segment.byteLength + 1;
-      const outcome = finishRecord(byteOffset);
+      const outcome = finishRecord(byteOffset, true);
       accumulator = newAccumulator();
+      recordStartByteOffset = byteOffset;
       if (outcome) yield outcome;
       start = index + 1;
     }
@@ -509,7 +637,7 @@ export async function* readNativeTranscriptJsonl(
     byteOffset += remainder.byteLength;
   }
   if (accumulator.byteLength > 0) {
-    const outcome = finishRecord(byteOffset);
+    const outcome = finishRecord(byteOffset, false);
     if (outcome) yield outcome;
   }
 }
@@ -521,10 +649,19 @@ export interface NativeTranscriptSourceMetadata {
   readonly changedAtMs: number;
 }
 
+export interface NativeTranscriptByteRangeDigest {
+  readonly startByteOffset: number;
+  readonly endByteOffset: number;
+  readonly rangeSha256: string;
+}
+
 export interface NativeTranscriptSourceSnapshot {
   readonly metadata: NativeTranscriptSourceMetadata;
   digestPrefix(byteLength: number): Promise<string>;
   stream(): AsyncIterable<Uint8Array>;
+  assertByteRangesUnchanged(
+    ranges: readonly NativeTranscriptByteRangeDigest[],
+  ): Promise<void>;
   assertUnchanged(): Promise<void>;
   close(): Promise<void>;
 }
@@ -625,6 +762,8 @@ export function createFileNativeTranscriptSource(
     readonly _beforeStreamForTesting?: () => void;
     /** @internal Deterministic mid-stream mutation seam. */
     readonly _afterChunkForTesting?: (chunkOrdinal: number) => void;
+    /** @internal Simulates filesystem change-cookie coalescing. */
+    readonly _forceMetadataUnchangedForTesting?: boolean;
   } = {},
 ): NativeTranscriptByteSource {
   assertSourceLocator(sourceLocator);
@@ -653,6 +792,7 @@ export function createFileNativeTranscriptSource(
       };
       const assertUnchanged = (): void => {
         assertOpen();
+        if (options._forceMetadataUnchangedForTesting) return;
         const current = fstatSync(opened.fd, { bigint: true });
         const descriptorChanged =
           current.dev !== opened.device
@@ -683,6 +823,48 @@ export function createFileNativeTranscriptSource(
       const snapshot: NativeTranscriptSourceSnapshot = {
         metadata,
         assertUnchanged: async (): Promise<void> => assertUnchanged(),
+        assertByteRangesUnchanged: async (
+          ranges,
+        ): Promise<void> => {
+          assertOpen();
+          let previousEnd: number | undefined;
+          const buffer = Buffer.allocUnsafe(chunkBytes);
+          for (const range of ranges) {
+            assertSafeNonnegative(range.startByteOffset);
+            assertSafeNonnegative(range.endByteOffset);
+            if (
+              range.endByteOffset <= range.startByteOffset
+              || range.endByteOffset > opened.sizeBytes
+              || !DIGEST_PATTERN.test(range.rangeSha256)
+              || (
+                previousEnd !== undefined
+                && range.startByteOffset !== previousEnd
+              )
+            ) {
+              throw new NativeTranscriptConfigurationError("invalid-input");
+            }
+            const hash = createHash("sha256");
+            let position = range.startByteOffset;
+            while (position < range.endByteOffset) {
+              const bytesRead = readSync(
+                opened.fd,
+                buffer,
+                0,
+                Math.min(buffer.byteLength, range.endByteOffset - position),
+                position,
+              );
+              if (bytesRead === 0) {
+                throw new NativeTranscriptSourceChangedError();
+              }
+              hash.update(buffer.subarray(0, bytesRead));
+              position += bytesRead;
+            }
+            if (hash.digest("hex") !== range.rangeSha256) {
+              throw new NativeTranscriptSourceChangedError();
+            }
+            previousEnd = range.endByteOffset;
+          }
+        },
         digestPrefix: async (byteLength: number): Promise<string> => {
           assertOpen();
           assertSafeNonnegative(byteLength);
@@ -755,7 +937,6 @@ export function createFileNativeTranscriptSource(
 }
 
 export interface NativeTranscriptMessageCandidate {
-  readonly sessionSequence: number;
   readonly role: MessageRole;
   readonly content: string;
   readonly sourceOrdinal: number;
@@ -849,9 +1030,12 @@ function codexText(value: JsonValue | undefined): string {
  */
 export function createNativeTranscriptMessageMapper():
   NativeTranscriptMessageMapper {
-  let sessionSequence = 0;
   return {
-    map: (format, payload): readonly NativeTranscriptMessageCandidate[] => {
+    map: (
+      format,
+      payload,
+      sourceOrdinal,
+    ): readonly NativeTranscriptMessageCandidate[] => {
       const root = object(payload);
       if (!root) return [];
       let role: JsonValue | undefined;
@@ -877,12 +1061,10 @@ export function createNativeTranscriptMessageMapper():
       }
       if (content.trim().length === 0) return [];
       const candidate: NativeTranscriptMessageCandidate = {
-        sessionSequence,
         role,
         content,
-        sourceOrdinal: 0,
+        sourceOrdinal,
       };
-      sessionSequence += 1;
       return [candidate];
     },
   };
@@ -915,7 +1097,7 @@ export interface ExactNativeTranscriptMessageResolver {
  * deterministic and fails closed on inconsistent repository data.
  */
 export function createExactNativeTranscriptMessageResolver(
-  conversations: ConversationRepository,
+  messages: NativeTranscriptMessageSnapshotRepository,
 ): ExactNativeTranscriptMessageResolver {
   type ResolvedMessage = {
     readonly conversationId: number;
@@ -927,41 +1109,41 @@ export function createExactNativeTranscriptMessageResolver(
   const loadSnapshot = async (
     nativeSessionId: string,
   ): Promise<readonly ResolvedMessage[] | null> => {
-    const sessionConversations = (await conversations.listConversations())
-      .filter((conversation) => conversation.sessionId === nativeSessionId)
-      .sort((left, right) =>
-        left.createdAt.getTime() - right.createdAt.getTime()
-        || left.conversationId - right.conversationId
-      );
-    if (sessionConversations.length === 0) return null;
-
+    const rows = await messages.getNativeTranscriptMessageSnapshot(
+      nativeSessionId,
+    );
+    if (rows.length === 0) return null;
     const seenConversationIds = new Set<number>();
     const sessionMessages: ResolvedMessage[] = [];
-    for (const conversation of sessionConversations) {
+    let currentConversationId: number | undefined;
+    let expectedMessageSequence = 0;
+    for (const message of rows) {
       if (
-        seenConversationIds.has(conversation.conversationId)
-        || !Number.isFinite(conversation.createdAt.getTime())
+        !Number.isSafeInteger(message.conversationId)
+        || message.conversationId < 0
+        || !Number.isSafeInteger(message.messageId)
+        || message.messageId < 0
+        || !Number.isSafeInteger(message.messageSequence)
+        || message.messageSequence < 0
+        || !isMessageRole(message.role)
+        || message.content.includes("\0")
       ) {
         return null;
       }
-      seenConversationIds.add(conversation.conversationId);
-      const messages = await conversations.getMessages(
-        conversation.conversationId,
-      );
-      if (
-        messages.some((message, index) =>
-          message.conversationId !== conversation.conversationId
-          || message.seq !== index
-        )
-      ) {
-        return null;
+      if (message.conversationId !== currentConversationId) {
+        if (seenConversationIds.has(message.conversationId)) return null;
+        seenConversationIds.add(message.conversationId);
+        currentConversationId = message.conversationId;
+        expectedMessageSequence = 0;
       }
-      sessionMessages.push(...messages.map((message) => ({
+      if (message.messageSequence !== expectedMessageSequence) return null;
+      expectedMessageSequence += 1;
+      sessionMessages.push({
         conversationId: message.conversationId,
         messageId: message.messageId,
         role: message.role,
         content: message.content,
-      })));
+      });
     }
     return sessionMessages;
   };
@@ -1059,8 +1241,8 @@ export interface NativeTranscriptBackfillOptions {
   readonly format: NativeTranscriptFormat;
   readonly nativeSessionId: string;
   readonly sourceLocator: string;
-  readonly globalPatterns?: readonly string[];
-  readonly projectPatterns?: readonly string[];
+  readonly globalPatterns: readonly string[];
+  readonly projectPatterns: readonly string[];
   readonly pipelineVersion?: string;
   readonly messageMapper?: NativeTranscriptMessageMapper;
   readonly messageResolver: ExactNativeTranscriptMessageResolver;
@@ -1093,16 +1275,12 @@ function assertMetadata(
 
 async function messageLinks(
   record: PreparedNativeTranscriptRecord,
-  format: NativeTranscriptFormat,
-  mapper: NativeTranscriptMessageMapper,
+  candidates: readonly (
+    NativeTranscriptMessageCandidate & { readonly sessionSequence: number }
+  )[],
   resolver: ExactNativeTranscriptMessageResolver,
-): Promise<Array<{
-  conversationId: number;
-  messageId: number;
-  sourceOrdinal: number;
-}>> {
-  const candidates = mappedMessageCandidates(record, format, mapper);
-  const links = [];
+): Promise<CreateNativeTranscriptMessageLinkInput[]> {
+  const links: CreateNativeTranscriptMessageLinkInput[] = [];
   for (const candidate of candidates) {
     const resolved = await resolver.resolveExact({
       nativeSessionId: record.nativeSessionId,
@@ -1126,14 +1304,23 @@ function mappedMessageCandidates(
   record: PreparedNativeTranscriptRecord,
   format: NativeTranscriptFormat,
   mapper: NativeTranscriptMessageMapper,
-): readonly NativeTranscriptMessageCandidate[] {
+  startingSessionSequence: number,
+): {
+  readonly candidates: readonly (
+    NativeTranscriptMessageCandidate & { readonly sessionSequence: number }
+  )[];
+  readonly nextSessionSequence: number;
+} {
   const candidates = mapper.map(
     format,
     cloneNativePayload(record.nativePayload),
     record.sourceOrdinal,
   );
-  for (const candidate of candidates) {
-    assertSafeNonnegative(candidate.sessionSequence);
+  const sequenced = candidates.map((candidate, index) => ({
+    ...candidate,
+    sessionSequence: startingSessionSequence + index,
+  }));
+  for (const candidate of sequenced) {
     assertSafeNonnegative(candidate.sourceOrdinal);
     if (
       !isMessageRole(candidate.role)
@@ -1143,7 +1330,10 @@ function mappedMessageCandidates(
       throw new NativeTranscriptConfigurationError("invalid-input");
     }
   }
-  return candidates;
+  return {
+    candidates: sequenced,
+    nextSessionSequence: startingSessionSequence + sequenced.length,
+  };
 }
 
 export async function runNativeTranscriptBackfill(
@@ -1151,6 +1341,9 @@ export async function runNativeTranscriptBackfill(
 ): Promise<NativeTranscriptBackfillResult> {
   assertNonemptyText(options.machineId);
   assertFormat(options.format);
+  if (options.quarantine.clientName !== options.format.clientName) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
   assertNonemptyText(options.nativeSessionId);
   assertSourceLocator(options.sourceLocator);
   const batchSize =
@@ -1176,157 +1369,187 @@ export async function runNativeTranscriptBackfill(
     options.messageMapper ?? createNativeTranscriptMessageMapper();
   const snapshot = await options.source.openSnapshot();
   try {
-  const metadata = assertMetadata(snapshot.metadata);
-  await snapshot.assertUnchanged();
-  const previous = await options.repository.getCheckpoint({
-    machineId: options.machineId,
-    clientName: options.format.clientName,
-    sourceLocator: options.sourceLocator,
-  });
-  let expectedCheckpoint: NativeTranscriptCheckpointRecord | null = previous;
-  const candidateOffset = previous
-    ? resumableByteOffset(previous.checkpoint, metadata)
-    : null;
-  let prefixMatches = false;
-  if (candidateOffset !== null) {
+    const metadata = assertMetadata(snapshot.metadata);
     await snapshot.assertUnchanged();
-    prefixMatches = await snapshot.digestPrefix(candidateOffset)
-      === previous?.checkpoint.prefixSha256;
-    await snapshot.assertUnchanged();
-  }
-  const resumedFromByteOffset =
-    prefixMatches && candidateOffset !== null ? candidateOffset : 0;
-  const rescanned = previous !== null && resumedFromByteOffset === 0;
-  let importedCount = 0;
-  let skippedCount = 0;
-  let quarantinedCount = 0;
-  let batch: NativeTranscriptReadOutcome[] = [];
-  let committedByteOffset = resumedFromByteOffset;
-  let lastSourceOrdinal =
-    resumedFromByteOffset > 0 && previous ? previous.lastSourceOrdinal : 0;
-  const progressState: {
-    latest?: {
-      readonly endByteOffset: number;
-      readonly prefixSha256: string;
-    };
-  } = {};
+    const previous = await options.repository.getCheckpoint({
+      machineId: options.machineId,
+      clientName: options.format.clientName,
+      sourceLocator: options.sourceLocator,
+    });
+    let expectedCheckpoint: NativeTranscriptCheckpointRecord | null = previous;
+    const candidateOffset = previous
+      ? resumableByteOffset(previous.checkpoint, metadata)
+      : null;
+    let prefixMatches = false;
+    if (candidateOffset !== null) {
+      await snapshot.assertUnchanged();
+      prefixMatches = await snapshot.digestPrefix(candidateOffset)
+        === previous?.checkpoint.prefixSha256;
+      await snapshot.assertUnchanged();
+    }
+    const resumedFromByteOffset =
+      prefixMatches && candidateOffset !== null ? candidateOffset : 0;
+    const rescanned = previous !== null && resumedFromByteOffset === 0;
+    let importedCount = 0;
+    let skippedCount = 0;
+    let quarantinedCount = 0;
+    let batch: NativeTranscriptReadOutcome[] = [];
+    let uncommittedRanges: NativeTranscriptByteRangeDigest[] = [];
+    let committedByteOffset = resumedFromByteOffset;
+    let nextSessionSequence = 0;
+    let lastSourceOrdinal =
+      resumedFromByteOffset > 0 && previous ? previous.lastSourceOrdinal : 0;
+    const progressState: {
+      latest?: {
+        readonly endByteOffset: number;
+        readonly prefixSha256: string;
+      };
+    } = {};
 
-  const flush = async (): Promise<void> => {
-    if (batch.length === 0) return;
-    const last = batch.at(-1)!;
-    const validRecords = batch.filter(
-      (outcome): outcome is PreparedNativeTranscriptRecord =>
-        outcome.kind === "record",
-    );
-    const quarantinedRecords = batch.filter(
-      (outcome): outcome is QuarantinedNativeTranscriptRecord =>
-        outcome.kind === "quarantine",
-    );
-    await snapshot.assertUnchanged();
-    const records = [];
-    for (const record of validRecords) {
-      records.push({
-        formatName: record.formatName,
-        formatVersion: record.formatVersion,
-        nativeSessionId: record.nativeSessionId,
-        sourceOrdinal: record.sourceOrdinal,
-        observedAt: record.observedAt,
-        scrubberVersion: record.scrubberVersion,
-        contentSha256: record.contentSha256,
-        ingestKey: record.ingestKey,
-        nativePayload: record.nativePayload,
-        messageLinks: await messageLinks(
+    const assertUncommittedSourceUnchanged = async (): Promise<void> => {
+      await snapshot.assertUnchanged();
+      await snapshot.assertByteRangesUnchanged(uncommittedRanges);
+      await snapshot.assertUnchanged();
+    };
+
+    const flush = async (): Promise<void> => {
+      if (batch.length === 0) return;
+      const last = batch.at(-1)!;
+      const validRecords = batch.filter(
+        (outcome): outcome is PreparedNativeTranscriptRecord =>
+          outcome.kind === "record",
+      );
+      const quarantinedRecords = batch.filter(
+        (outcome): outcome is QuarantinedNativeTranscriptRecord =>
+          outcome.kind === "quarantine",
+      );
+      await assertUncommittedSourceUnchanged();
+      const records: CreateNativeTranscriptInput[] = [];
+      for (const record of validRecords) {
+        const mapped = mappedMessageCandidates(
           record,
           options.format,
           mapper,
-          options.messageResolver,
-        ),
-      });
-    }
-    await snapshot.assertUnchanged();
-    for (const record of quarantinedRecords) {
-      await options.quarantine.quarantine({
-        sourceLocator: options.sourceLocator,
-        sourceOrdinal: record.sourceOrdinal,
-        reason: record.reason,
-        contentSha256: record.contentSha256,
-        quarantinedAt: record.quarantinedAt,
-      });
-    }
-    await snapshot.assertUnchanged();
-    const result = await options.repository.ingestBatch({
-      machineId: options.machineId,
-      clientName: options.format.clientName,
-      sourceLocator: options.sourceLocator,
-      expectedCheckpoint,
-      records,
-      checkpoint: {
-        lastSourceOrdinal: last.sourceOrdinal,
-        checkpoint: checkpointJson(last, metadata),
-      },
-      quarantinedCount: quarantinedRecords.length,
-    });
-    importedCount += result.importedCount;
-    skippedCount += result.skippedCount;
-    quarantinedCount += result.quarantinedCount;
-    expectedCheckpoint = result.checkpoint;
-    committedByteOffset = last.endByteOffset;
-    batch = [];
-  };
-
-  const outcomes = readNativeTranscriptJsonl({
-    bytes: snapshot.stream(),
-    format: options.format,
-    nativeSessionId: options.nativeSessionId,
-    sourceLocator: options.sourceLocator,
-    scrubber,
-    clock: options.clock,
-    maxRecordBytes: options.maxRecordBytes,
-    onProgress: (progress) => {
-      progressState.latest = progress;
-    },
-  });
-  for await (const outcome of outcomes) {
-    if (outcome.endByteOffset <= resumedFromByteOffset) {
-      if (outcome.kind === "record") {
-        mappedMessageCandidates(outcome, options.format, mapper);
+          nextSessionSequence,
+        );
+        nextSessionSequence = mapped.nextSessionSequence;
+        records.push({
+          formatName: record.formatName,
+          formatVersion: record.formatVersion,
+          nativeSessionId: record.nativeSessionId,
+          sourceOrdinal: record.sourceOrdinal,
+          observedAt: record.observedAt,
+          scrubberVersion: record.scrubberVersion,
+          contentSha256: record.contentSha256,
+          ingestKey: record.ingestKey,
+          nativePayload: record.nativePayload,
+          messageLinks: await messageLinks(
+            record,
+            mapped.candidates,
+            options.messageResolver,
+          ),
+        });
       }
-      continue;
-    }
-    lastSourceOrdinal = outcome.sourceOrdinal;
-    batch.push(outcome);
-    if (batch.length === batchSize) await flush();
-  }
-  await flush();
-  const latestProgress = progressState.latest;
-  if (
-    latestProgress
-    && latestProgress.endByteOffset > committedByteOffset
-  ) {
-    await snapshot.assertUnchanged();
-    const result = await options.repository.ingestBatch({
-      machineId: options.machineId,
-      clientName: options.format.clientName,
+      await assertUncommittedSourceUnchanged();
+      for (const record of quarantinedRecords) {
+        await options.quarantine.quarantine({
+          sourceLocator: options.sourceLocator,
+          sourceOrdinal: record.sourceOrdinal,
+          reason: record.reason,
+          contentSha256: record.contentSha256,
+          quarantinedAt: record.quarantinedAt,
+        });
+      }
+      await assertUncommittedSourceUnchanged();
+      const result = await options.repository.ingestBatch({
+        machineId: options.machineId,
+        clientName: options.format.clientName,
+        sourceLocator: options.sourceLocator,
+        expectedCheckpoint,
+        records,
+        checkpoint: {
+          lastSourceOrdinal: last.sourceOrdinal,
+          checkpoint: checkpointJson(last, metadata),
+        },
+        quarantinedCount: quarantinedRecords.length,
+      });
+      importedCount += result.importedCount;
+      skippedCount += result.skippedCount;
+      quarantinedCount += result.quarantinedCount;
+      expectedCheckpoint = result.checkpoint;
+      committedByteOffset = last.endByteOffset;
+      batch = [];
+      uncommittedRanges = [];
+    };
+
+    const outcomes = readNativeTranscriptJsonl({
+      bytes: snapshot.stream(),
+      format: options.format,
+      nativeSessionId: options.nativeSessionId,
       sourceLocator: options.sourceLocator,
-      expectedCheckpoint,
-      records: [],
-      checkpoint: {
-        lastSourceOrdinal,
-        checkpoint: checkpointJson(latestProgress, metadata),
+      scrubber,
+      clock: options.clock,
+      maxRecordBytes: options.maxRecordBytes,
+      onProgress: (progress) => {
+        progressState.latest = progress;
+        uncommittedRanges.push({
+          startByteOffset: progress.startByteOffset,
+          endByteOffset: progress.endByteOffset,
+          rangeSha256: progress.rangeSha256,
+        });
       },
-      quarantinedCount: 0,
     });
-    importedCount += result.importedCount;
-    skippedCount += result.skippedCount;
-    quarantinedCount += result.quarantinedCount;
-  }
-  return {
-    importedCount,
-    skippedCount,
-    quarantinedCount,
-    resumedFromByteOffset,
-    rescanned,
-  };
+    for await (const outcome of outcomes) {
+      if (outcome.endByteOffset <= resumedFromByteOffset) {
+        if (outcome.kind === "record") {
+          const mapped = mappedMessageCandidates(
+            outcome,
+            options.format,
+            mapper,
+            nextSessionSequence,
+          );
+          nextSessionSequence = mapped.nextSessionSequence;
+        }
+        continue;
+      }
+      lastSourceOrdinal = outcome.sourceOrdinal;
+      batch.push(outcome);
+      if (batch.length === batchSize) await flush();
+    }
+    await flush();
+    const latestProgress = progressState.latest;
+    if (
+      latestProgress
+      && latestProgress.endByteOffset > committedByteOffset
+    ) {
+      await assertUncommittedSourceUnchanged();
+      const result = await options.repository.ingestBatch({
+        machineId: options.machineId,
+        clientName: options.format.clientName,
+        sourceLocator: options.sourceLocator,
+        expectedCheckpoint,
+        records: [],
+        checkpoint: {
+          lastSourceOrdinal,
+          checkpoint: checkpointJson(latestProgress, metadata),
+        },
+        quarantinedCount: 0,
+      });
+      importedCount += result.importedCount;
+      skippedCount += result.skippedCount;
+      quarantinedCount += result.quarantinedCount;
+      uncommittedRanges = [];
+    }
+    if (uncommittedRanges.length > 0) {
+      await assertUncommittedSourceUnchanged();
+    }
+    return {
+      importedCount,
+      skippedCount,
+      quarantinedCount,
+      resumedFromByteOffset,
+      rescanned,
+    };
   } finally {
     await snapshot.close();
   }

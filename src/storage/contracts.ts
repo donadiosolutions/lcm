@@ -208,6 +208,26 @@ export interface NativeTranscriptBatchResult {
   readonly checkpoint: NativeTranscriptCheckpointRecord;
 }
 
+export interface NativeTranscriptSessionMessageRecord {
+  readonly conversationId: number;
+  readonly messageId: number;
+  readonly messageSequence: number;
+  readonly role: MessageRole;
+  readonly content: string;
+}
+
+/**
+ * Narrow #86 destination-link snapshot seam.
+ *
+ * Backends must filter by the exact native session server-side and return the
+ * complete ordered result from one database statement or transaction snapshot.
+ */
+export interface NativeTranscriptMessageSnapshotRepository {
+  getNativeTranscriptMessageSnapshot(
+    nativeSessionId: string,
+  ): Promise<readonly NativeTranscriptSessionMessageRecord[]>;
+}
+
 export interface NativeTranscriptRepository {
   ingestBatch(
     input: NativeTranscriptBatchInput,

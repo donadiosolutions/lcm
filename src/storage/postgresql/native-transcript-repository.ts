@@ -11,8 +11,10 @@ import {
   type NativeTranscriptCheckpointKey,
   type NativeTranscriptCheckpointRecord,
   type NativeTranscriptMessageLinkRecord,
+  type NativeTranscriptMessageSnapshotRepository,
   type NativeTranscriptRecord,
   type NativeTranscriptRepository,
+  type NativeTranscriptSessionMessageRecord,
 } from "../contracts.js";
 import { StorageOperationError } from "../errors.js";
 import type {
@@ -128,6 +130,18 @@ type LinkRow = QueryResultRow & {
   conversation_id: unknown;
   message_id: unknown;
   source_ordinal: unknown;
+};
+
+type SessionMessageRow = QueryResultRow & {
+  conversation_id: unknown;
+  message_id: unknown;
+  message_sequence: unknown;
+  role: unknown;
+  content: unknown;
+};
+
+type TransactionIsolationRow = QueryResultRow & {
+  transaction_isolation: unknown;
 };
 
 export class PostgreSqlNativeTranscriptDataError extends StorageOperationError {
@@ -259,7 +273,7 @@ function uuid(
   if (!UUIDV7_PATTERN.test(candidate)) {
     throw new PostgreSqlNativeTranscriptDataError(projectId, operation, field);
   }
-  return candidate;
+  return candidate.toLowerCase();
 }
 
 function digest(
@@ -393,6 +407,26 @@ function boolean(
 ): boolean {
   if (typeof value !== "boolean") {
     throw new PostgreSqlNativeTranscriptDataError(projectId, operation, field);
+  }
+  return value;
+}
+
+function messageRole(
+  value: unknown,
+  projectId: string,
+  operation: string,
+): NativeTranscriptSessionMessageRecord["role"] {
+  if (
+    value !== "system"
+    && value !== "user"
+    && value !== "assistant"
+    && value !== "tool"
+  ) {
+    throw new PostgreSqlNativeTranscriptDataError(
+      projectId,
+      operation,
+      "role",
+    );
   }
   return value;
 }
@@ -692,34 +726,43 @@ function reconcilesCommittedCheckpoint(
 type CheckpointLockDisposition = "advance" | "matching-retry";
 
 export class PostgreSqlNativeTranscriptRepository
-implements NativeTranscriptRepository {
+implements
+  NativeTranscriptMessageSnapshotRepository,
+  NativeTranscriptRepository {
+  private readonly projectId: string;
+
   constructor(
     private readonly executor: RepositoryExecutor,
-    private readonly projectId: string,
+    projectId: string,
   ) {
-    uuid(projectId, projectId, "construct", "project_id");
+    this.projectId = uuid(
+      projectId,
+      projectId,
+      "construct",
+      "project_id",
+    );
   }
 
   async ingestBatch(
     input: NativeTranscriptBatchInput,
   ): Promise<NativeTranscriptBatchResult> {
     const operation = "ingestBatch";
-    this.validateBatch(input, operation);
+    const batch = this.validateBatch(input, operation);
     let candidate: NativeTranscriptBatchResult | undefined;
     try {
       return await this.atomic(operation, async (transaction) => {
         const disposition = await this.lockCheckpoint(
           transaction,
-          input,
+          batch,
           operation,
         );
         let importedCount = 0;
         let skippedCount = 0;
-        for (const record of input.records) {
+        for (const record of batch.records) {
           if (disposition === "matching-retry") {
             await this.assertExactTranscript(
               transaction,
-              input,
+              batch,
               record,
               operation,
             );
@@ -728,7 +771,7 @@ implements NativeTranscriptRepository {
           }
           const inserted = await this.insertTranscript(
             transaction,
-            input,
+            batch,
             record,
             operation,
           );
@@ -746,7 +789,7 @@ implements NativeTranscriptRepository {
         }
         const checkpoint = await this.advanceCheckpoint(
           transaction,
-          input,
+          batch,
           importedCount,
           skippedCount,
           operation,
@@ -754,20 +797,20 @@ implements NativeTranscriptRepository {
         candidate = {
           importedCount,
           skippedCount,
-          quarantinedCount: input.quarantinedCount,
+          quarantinedCount: batch.quarantinedCount,
           checkpoint,
         };
         return candidate;
       });
     } catch (error) {
       if (error instanceof PostgreSqlCommitOutcomeUnknownError && candidate) {
-        const reconciled = await this.getCheckpoint(input).catch(() => null);
+        const reconciled = await this.getCheckpoint(batch).catch(() => null);
         if (
           reconciled
           && reconcilesCommittedCheckpoint(reconciled, candidate.checkpoint)
         ) {
           const exactRecords = await this.verifyExactRecords(
-            input,
+            batch,
             operation,
           ).then(
             () => true,
@@ -784,13 +827,18 @@ implements NativeTranscriptRepository {
 
   async getById(transcriptId: string): Promise<NativeTranscriptRecord | null> {
     const operation = "getById";
-    uuid(transcriptId, this.projectId, operation, "transcript_id");
+    const canonicalTranscriptId = uuid(
+      transcriptId,
+      this.projectId,
+      operation,
+      "transcript_id",
+    );
     const rows = await this.readTranscripts(operation, {
       text: `SELECT ${TRANSCRIPT_COLUMNS}
              FROM lcm.native_transcripts AS transcript
              WHERE transcript.project_id = $1
                AND transcript.transcript_id = $2`,
-      values: [this.projectId, transcriptId],
+      values: [this.projectId, canonicalTranscriptId],
     });
     return rows[0] ?? null;
   }
@@ -822,7 +870,7 @@ implements NativeTranscriptRepository {
     input: NativeTranscriptCheckpointKey,
   ): Promise<NativeTranscriptRecord[]> {
     const operation = "listBySource";
-    this.validateKey(input, operation);
+    const key = this.validateKey(input, operation);
     return this.readTranscripts(operation, {
       text: `SELECT ${TRANSCRIPT_COLUMNS}
              FROM lcm.native_transcripts AS transcript
@@ -833,9 +881,9 @@ implements NativeTranscriptRepository {
              ORDER BY transcript.source_ordinal, transcript.transcript_id`,
       values: [
         this.projectId,
-        input.machineId,
-        input.clientName,
-        input.sourceLocator,
+        key.machineId,
+        key.clientName,
+        key.sourceLocator,
       ],
     });
   }
@@ -875,7 +923,7 @@ implements NativeTranscriptRepository {
     input: NativeTranscriptCheckpointKey,
   ): Promise<NativeTranscriptCheckpointRecord | null> {
     const operation = "getCheckpoint";
-    this.validateKey(input, operation);
+    const key = this.validateKey(input, operation);
     return this.read(operation, async (executor) => {
       const result = await executor.query<CheckpointRow>({
         text: `SELECT project_id, machine_id, client_name, source_locator,
@@ -888,13 +936,75 @@ implements NativeTranscriptRepository {
                  AND source_locator = $4`,
         values: [
           this.projectId,
-          input.machineId,
-          input.clientName,
-          input.sourceLocator,
+          key.machineId,
+          key.clientName,
+          key.sourceLocator,
         ],
       }, this.context(operation));
       const row = result.rows[0];
       return row ? checkpointFromRow(row, this.projectId, operation) : null;
+    });
+  }
+
+  async getNativeTranscriptMessageSnapshot(
+    nativeSessionId: string,
+  ): Promise<readonly NativeTranscriptSessionMessageRecord[]> {
+    const operation = "getNativeTranscriptMessageSnapshot";
+    nonemptyString(
+      nativeSessionId,
+      this.projectId,
+      operation,
+      "native_session_id",
+      true,
+    );
+    return this.read(operation, async (executor) => {
+      const result = await executor.query<SessionMessageRow>({
+        text: `SELECT conversation.conversation_id,
+                      message.message_id,
+                      message.seq AS message_sequence,
+                      message.role,
+                      message.content
+               FROM lcm.conversations AS conversation
+               INNER JOIN lcm.messages AS message
+                 ON message.project_id = conversation.project_id
+                AND message.conversation_id = conversation.conversation_id
+               WHERE conversation.project_id = $1
+                 AND conversation.session_id_sha256 =
+                   public.digest($2, 'sha256')
+                 AND conversation.session_id = $2
+               ORDER BY conversation.created_at,
+                        conversation.conversation_id,
+                        message.seq,
+                        message.message_id`,
+        values: [this.projectId, nativeSessionId],
+      }, this.context(operation));
+      return result.rows.map((row) => ({
+        conversationId: nonnegativeInteger(
+          row.conversation_id,
+          this.projectId,
+          operation,
+          "conversation_id",
+        ),
+        messageId: nonnegativeInteger(
+          row.message_id,
+          this.projectId,
+          operation,
+          "message_id",
+        ),
+        messageSequence: nonnegativeInteger(
+          row.message_sequence,
+          this.projectId,
+          operation,
+          "message_sequence",
+        ),
+        role: messageRole(row.role, this.projectId, operation),
+        content: string(
+          row.content,
+          this.projectId,
+          operation,
+          "content",
+        ),
+      }));
     });
   }
 
@@ -996,12 +1106,12 @@ implements NativeTranscriptRepository {
       text: `INSERT INTO lcm.native_transcripts (
                project_id, machine_id, client_name, format_name,
                format_version, native_session_id, source_locator,
-               source_ordinal, observed_at, scrubber_version, content_sha256,
-               ingest_key, native_payload
+               source_ordinal, observed_at, ingested_at, scrubber_version,
+               content_sha256, ingest_key, native_payload
              )
              VALUES (
-               $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-               $13::pg_catalog.jsonb
+               $1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11,
+               $12, $13::pg_catalog.jsonb
              )
              ON CONFLICT (project_id, machine_id, ingest_key) DO NOTHING
              RETURNING transcript_id, project_id, machine_id, client_name,
@@ -1189,8 +1299,13 @@ implements NativeTranscriptRepository {
   private validateKey(
     input: NativeTranscriptCheckpointKey,
     operation: string,
-  ): void {
-    uuid(input.machineId, this.projectId, operation, "machine_id");
+  ): NativeTranscriptCheckpointKey {
+    const machineId = uuid(
+      input.machineId,
+      this.projectId,
+      operation,
+      "machine_id",
+    );
     nonemptyString(
       input.clientName,
       this.projectId,
@@ -1204,16 +1319,20 @@ implements NativeTranscriptRepository {
       operation,
       "source_locator",
     );
+    return { ...input, machineId };
   }
 
   private validateBatch(
     input: NativeTranscriptBatchInput,
     operation: string,
-  ): void {
-    this.validateKey(input, operation);
-    if (input.expectedCheckpoint !== null) {
-      this.validateExpectedCheckpoint(input, operation);
-    }
+  ): NativeTranscriptBatchInput {
+    const key = this.validateKey(input, operation);
+    const expectedCheckpoint = input.expectedCheckpoint === null
+      ? null
+      : this.validateExpectedCheckpoint(
+          { ...input, ...key },
+          operation,
+        );
     nonnegativeInteger(
       input.quarantinedCount,
       this.projectId,
@@ -1235,15 +1354,26 @@ implements NativeTranscriptRepository {
     for (const record of input.records) {
       this.validateRecord(record, operation);
     }
+    return { ...input, ...key, expectedCheckpoint };
   }
 
   private validateExpectedCheckpoint(
     input: NativeTranscriptBatchInput,
     operation: string,
-  ): void {
+  ): NativeTranscriptCheckpointRecord {
     const expected = input.expectedCheckpoint!;
-    uuid(expected.projectId, this.projectId, operation, "expected_project_id");
-    uuid(expected.machineId, this.projectId, operation, "expected_machine_id");
+    const projectId = uuid(
+      expected.projectId,
+      this.projectId,
+      operation,
+      "expected_project_id",
+    );
+    const machineId = uuid(
+      expected.machineId,
+      this.projectId,
+      operation,
+      "expected_machine_id",
+    );
     nonemptyString(
       expected.clientName,
       this.projectId,
@@ -1294,8 +1424,8 @@ implements NativeTranscriptRepository {
       "expected_updated_at",
     );
     if (
-      expected.projectId !== this.projectId
-      || expected.machineId !== input.machineId
+      projectId !== this.projectId
+      || machineId !== input.machineId
       || expected.clientName !== input.clientName
       || expected.sourceLocator !== input.sourceLocator
     ) {
@@ -1305,6 +1435,7 @@ implements NativeTranscriptRepository {
         "expected_checkpoint_key",
       );
     }
+    return { ...expected, projectId, machineId };
   }
 
   private validateRecord(
@@ -1397,9 +1528,34 @@ implements NativeTranscriptRepository {
   ): Promise<T> {
     const root = this.rootExecutor();
     return root
-      ? root.transaction(callback, this.context(operation))
-      : this.scopedSerialized(operation, (executor) =>
-          executor.savepoint(callback, this.context(operation)));
+      ? root.transaction(async (transaction) => {
+          await transaction.query({
+            text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+          }, this.context(operation));
+          return callback(transaction);
+        }, this.context(operation))
+      : this.scopedSerialized(operation, async (executor) => {
+          await this.assertScopedReadCommitted(executor, operation);
+          return executor.savepoint(callback, this.context(operation));
+        });
+  }
+
+  private async assertScopedReadCommitted(
+    executor: PostgreSqlQueryExecutor,
+    operation: string,
+  ): Promise<void> {
+    const result = await executor.query<TransactionIsolationRow>({
+      text: `SELECT pg_catalog.current_setting(
+                      'transaction_isolation'
+                    ) AS transaction_isolation`,
+    }, this.context(operation));
+    if (result.rows[0]?.transaction_isolation !== "read committed") {
+      throw new PostgreSqlNativeTranscriptDataError(
+        this.projectId,
+        operation,
+        "transaction_isolation",
+      );
+    }
   }
 
   private read<T>(

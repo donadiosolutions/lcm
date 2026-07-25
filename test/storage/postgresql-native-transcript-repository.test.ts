@@ -162,6 +162,12 @@ function executor(
 function successfulQuery(
   config: QueryConfig<unknown[]>,
 ): QueryResult<QueryResultRow> {
+  if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+    return result([]);
+  }
+  if (config.text.includes("transaction_isolation")) {
+    return result([{ transaction_isolation: "read committed" }]);
+  }
   if (config.text.includes("INSERT INTO lcm.ingest_checkpoints")) {
     return result([initialCheckpointRow]);
   }
@@ -244,6 +250,11 @@ describe("PostgreSQL native transcript repository", () => {
       operation: "ingestBatch",
       projectId,
     });
+    expect(db.query.mock.calls.slice(0, 2).map(([config]) => config.text))
+      .toEqual([
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        expect.stringContaining("INSERT INTO lcm.ingest_checkpoints"),
+      ]);
     for (const [config, options] of db.query.mock.calls) {
       expect(options).toMatchObject({
         domain: "native-transcripts",
@@ -257,6 +268,165 @@ describe("PostgreSQL native transcript repository", () => {
     )?.[0];
     expect(sessionQuery).toMatchObject({ values: [projectId, "session-a"] });
     expect(sessionQuery.text).toContain("AND transcript.native_session_id = $2");
+    const transcriptInsert = db.query.mock.calls.find(
+      ([config]) => config.text.includes("INSERT INTO lcm.native_transcripts"),
+    )?.[0];
+    expect(transcriptInsert?.text).toContain(
+      "source_ordinal, observed_at, ingested_at, scrubber_version",
+    );
+    expect(transcriptInsert?.text).toContain("$7, $8, $9, $9, $10");
+  });
+
+  it("canonicalizes caller UUIDs across readback and multi-batch checkpoints", async () => {
+    const upperProjectId = projectId.toUpperCase();
+    const upperMachineId = machineId.toUpperCase();
+    const secondCheckpointRow = {
+      ...checkpointRow,
+      last_source_ordinal: "4",
+      imported_count: "2",
+      quarantined_count: "4",
+      checkpoint: {
+        byteOffset: 84,
+        prefixSha256: "d".repeat(64),
+      },
+    };
+    let updateCount = 0;
+    const db = executor((config) => {
+      if (config.text.includes("INSERT INTO lcm.ingest_checkpoints")) {
+        return result(updateCount === 0 ? [initialCheckpointRow] : []);
+      }
+      if (config.text.includes("FOR UPDATE")) {
+        return result([checkpointRow]);
+      }
+      if (
+        config.text.includes("FROM lcm.native_transcripts AS transcript")
+        && config.text.includes("exact_match")
+      ) {
+        return result([{ ...transcriptRow, exact_match: true }]);
+      }
+      if (config.text.includes("UPDATE lcm.ingest_checkpoints")) {
+        updateCount += 1;
+        return result([
+          updateCount === 1 ? checkpointRow : secondCheckpointRow,
+        ]);
+      }
+      return successfulQuery(config);
+    });
+    const repository = new PostgreSqlNativeTranscriptRepository(
+      db,
+      upperProjectId,
+    );
+    const upperBatch = { ...batch, machineId: upperMachineId };
+    const first = await repository.ingestBatch(upperBatch);
+    expect(first.checkpoint).toMatchObject({
+      projectId,
+      machineId,
+    });
+    const secondBatch: NativeTranscriptBatchInput = {
+      ...upperBatch,
+      expectedCheckpoint: {
+        ...first.checkpoint,
+        projectId: upperProjectId,
+        machineId: upperMachineId,
+      },
+      records: [{
+        ...upperBatch.records[0]!,
+        sourceOrdinal: 4,
+        ingestKey: "c".repeat(64),
+      }],
+      checkpoint: {
+        lastSourceOrdinal: 4,
+        checkpoint: {
+          byteOffset: 84,
+          prefixSha256: "d".repeat(64),
+        },
+      },
+    };
+    await expect(repository.ingestBatch(secondBatch)).resolves.toMatchObject({
+      importedCount: 1,
+      skippedCount: 0,
+      checkpoint: {
+        projectId,
+        machineId,
+        lastSourceOrdinal: 4,
+        importedCount: 2,
+      },
+    });
+    await expect(repository.getById(transcriptId.toUpperCase()))
+      .resolves.toMatchObject({ transcriptId, projectId, machineId });
+    await expect(repository.listBySource(upperBatch)).resolves.toHaveLength(1);
+    await expect(repository.getCheckpoint(upperBatch)).resolves.toMatchObject({
+      projectId,
+      machineId,
+    });
+    for (const [config, options] of db.query.mock.calls) {
+      expect(config.values ?? []).not.toContain(upperProjectId);
+      expect(config.values ?? []).not.toContain(upperMachineId);
+      expect(config.values ?? []).not.toContain(transcriptId.toUpperCase());
+      expect(options).toMatchObject({ projectId });
+    }
+  });
+
+  it("loads one server-filtered exact session message snapshot", async () => {
+    const rows = [{
+      conversation_id: "41",
+      message_id: 51n,
+      message_sequence: "0",
+      role: "user",
+      content: "first",
+    }, {
+      conversation_id: 42,
+      message_id: "52",
+      message_sequence: 0n,
+      role: "assistant",
+      content: "second",
+    }];
+    const db = executor((config) =>
+      config.text.includes("FROM lcm.conversations AS conversation")
+        ? result(rows)
+        : successfulQuery(config));
+    const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
+    await expect(repository.getNativeTranscriptMessageSnapshot("session-a"))
+      .resolves.toEqual([
+        {
+          conversationId: 41,
+          messageId: 51,
+          messageSequence: 0,
+          role: "user",
+          content: "first",
+        },
+        {
+          conversationId: 42,
+          messageId: 52,
+          messageSequence: 0,
+          role: "assistant",
+          content: "second",
+        },
+      ]);
+    expect(db.query).toHaveBeenCalledTimes(1);
+    const query = db.query.mock.calls[0]?.[0];
+    expect(query.values).toEqual([projectId, "session-a"]);
+    expect(query.text).toContain("conversation.session_id_sha256");
+    expect(query.text).toContain("conversation.session_id = $2");
+    expect(query.text).toContain("ORDER BY conversation.created_at");
+
+    for (const [field, value] of [
+      ["conversation_id", "-1"],
+      ["message_id", "-1"],
+      ["message_sequence", "-1"],
+      ["role", "developer"],
+      ["content", "bad\0content"],
+    ] as const) {
+      const malformed = executor(() =>
+        result([{ ...rows[0], [field]: value }]));
+      await expect(
+        new PostgreSqlNativeTranscriptRepository(malformed, projectId)
+          .getNativeTranscriptMessageSnapshot("session-a"),
+      ).rejects.toMatchObject({
+        name: "PostgreSqlNativeTranscriptDataError",
+        field,
+      });
+    }
   });
 
   it("preserves nested own special JSON keys on write and row normalization", async () => {
@@ -512,7 +682,7 @@ describe("PostgreSQL native transcript repository", () => {
     ).rejects.toMatchObject({
       name: "PostgreSqlNativeTranscriptCheckpointConflictError",
     });
-    expect(unexpectedCreation.query).toHaveBeenCalledTimes(1);
+    expect(unexpectedCreation.query).toHaveBeenCalledTimes(2);
   });
 
   it("rebases matching stale retries without admitting new records", async () => {
@@ -682,6 +852,33 @@ describe("PostgreSQL native transcript repository", () => {
       code: "STORAGE_TRANSACTION_SCOPE",
       domain: "native-transcripts",
     });
+  });
+
+  it("fails a supplied stronger-isolation scope before checkpoint access", async () => {
+    for (const rows of [
+      [],
+      [{ transaction_isolation: "repeatable read" }],
+      [{ transaction_isolation: "READ COMMITTED" }],
+    ]) {
+      const query = vi.fn((config: QueryConfig<unknown[]>) =>
+        config.text.includes("transaction_isolation")
+          ? result(rows)
+          : (() => {
+              throw new Error(
+                `unexpected checkpoint access: ${config.text}`,
+              );
+            })());
+      const repository = new PostgreSqlNativeTranscriptRepository(
+        scopedExecutor(query),
+        projectId,
+      );
+      await expect(repository.ingestBatch(batch)).rejects.toMatchObject({
+        name: "PostgreSqlNativeTranscriptDataError",
+        field: "transaction_isolation",
+        operation: "ingestBatch",
+      });
+      expect(query).toHaveBeenCalledTimes(1);
+    }
   });
 
   it("returns null for absent point reads and fails closed on malformed rows", async () => {

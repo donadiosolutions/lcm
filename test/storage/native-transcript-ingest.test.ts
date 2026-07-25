@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   lstatSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   renameSync,
@@ -8,6 +9,7 @@ import {
   statSync,
   symlinkSync,
   truncateSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -16,12 +18,15 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
-  ConversationRepository,
   JsonObject,
   NativeTranscriptBatchInput,
   NativeTranscriptBatchResult,
   NativeTranscriptCheckpointRecord,
   NativeTranscriptRepository,
+  NativeTranscriptSessionMessageRecord,
+} from "../../src/storage/contracts.js";
+import {
+  NATIVE_TRANSCRIPT_MAX_JSON_DEPTH,
 } from "../../src/storage/contracts.js";
 import {
   localTranscriptQuarantinePath,
@@ -39,16 +44,34 @@ import {
   createNativeTranscriptScrubber,
   NativeTranscriptConfigurationError,
   NativeTranscriptLinkError,
-  NATIVE_TRANSCRIPT_MAX_JSON_DEPTH,
   NativeTranscriptSourceChangedError,
   readNativeTranscriptJsonl,
-  runNativeTranscriptBackfill,
+  runNativeTranscriptBackfill as runNativeTranscriptBackfillCore,
   SUPPORTED_NATIVE_TRANSCRIPT_FORMATS,
   type NativeTranscriptByteSource,
   type NativeTranscriptReadOutcome,
 } from "../../src/storage/native-transcript-ingest.js";
 
 const temporaryDirectories: string[] = [];
+
+type NativeTranscriptBackfillOptions =
+  Parameters<typeof runNativeTranscriptBackfillCore>[0];
+
+function runNativeTranscriptBackfill(
+  options: Omit<
+    NativeTranscriptBackfillOptions,
+    "globalPatterns" | "projectPatterns"
+  > & Partial<Pick<
+    NativeTranscriptBackfillOptions,
+    "globalPatterns" | "projectPatterns"
+  >>,
+): ReturnType<typeof runNativeTranscriptBackfillCore> {
+  return runNativeTranscriptBackfillCore({
+    globalPatterns: [],
+    projectPatterns: [],
+    ...options,
+  });
+}
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
@@ -79,7 +102,10 @@ async function collect(
     format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
     nativeSessionId: "session-1",
     sourceLocator: "sessions/session.jsonl",
-    scrubber: createNativeTranscriptScrubber(),
+    scrubber: createNativeTranscriptScrubber({
+      globalPatterns: [],
+      projectPatterns: [],
+    }),
     clock: () => new Date("2026-07-25T12:00:00.000Z"),
     ...overrides,
   }));
@@ -104,6 +130,11 @@ function mutateAfterCtimeTick(
     Atomics.wait(waitState, 0, 0, 10);
   } while (Date.now() < deadline);
   throw new Error("filesystem did not expose a new ctime change cookie");
+}
+
+function forceDistinctMtime(path: string): void {
+  const distinctTime = new Date(statSync(path).mtimeMs + 2_000);
+  utimesSync(path, distinctTime, distinctTime);
 }
 
 function nestedJson(
@@ -131,6 +162,18 @@ function source(content: string): NativeTranscriptByteSource {
       stream: () => byteChunks(bytes.subarray(0, 3), bytes.subarray(3)),
       digestPrefix: async (length: number) =>
         digest(bytes.subarray(0, length)),
+      assertByteRangesUnchanged: vi.fn(async (ranges) => {
+        for (const range of ranges) {
+          if (
+            digest(bytes.subarray(
+              range.startByteOffset,
+              range.endByteOffset,
+            )) !== range.rangeSha256
+          ) {
+            throw new NativeTranscriptSourceChangedError();
+          }
+        }
+      }),
       assertUnchanged: vi.fn(async () => undefined),
       close: vi.fn(async () => undefined),
     })),
@@ -201,6 +244,7 @@ describe("native transcript scrub and JSONL reader", () => {
   it("scrubs nested keys and values and canonicalizes object keys", () => {
     const scrubber = createNativeTranscriptScrubber({
       globalPatterns: ["canary_[0-9]+"],
+      projectPatterns: [],
       pipelineVersion: "pipeline/v2",
     });
     const scrubbed = scrubber.scrubJson({
@@ -222,16 +266,40 @@ describe("native transcript scrub and JSONL reader", () => {
   });
 
   it("rejects invalid scrubber configuration before use", () => {
+    expect(() => createNativeTranscriptScrubber(undefined as never))
+      .toThrowError(NativeTranscriptConfigurationError);
+    expect(() => createNativeTranscriptScrubber({
+      globalPatterns: [],
+    } as never)).toThrowError(NativeTranscriptConfigurationError);
+    expect(() => createNativeTranscriptScrubber({
+      globalPatterns: [42],
+      projectPatterns: [],
+    } as never)).toThrowError(NativeTranscriptConfigurationError);
+    expect(() => createNativeTranscriptScrubber({
+      globalPatterns: [],
+      projectPatterns: [42],
+    } as never)).toThrowError(NativeTranscriptConfigurationError);
     expect(() =>
-      createNativeTranscriptScrubber({ globalPatterns: ["["] }))
+      createNativeTranscriptScrubber({
+        globalPatterns: ["["],
+        projectPatterns: [],
+      }))
       .toThrowError(NativeTranscriptConfigurationError);
     expect(() =>
-      createNativeTranscriptScrubber({ pipelineVersion: "" }))
+      createNativeTranscriptScrubber({
+        globalPatterns: [],
+        projectPatterns: [],
+        pipelineVersion: "",
+      }))
       .toThrowError(
         expect.objectContaining({ code: "invalid-input" }),
       );
     expect(() =>
-      createNativeTranscriptScrubber({ pipelineVersion: "x\0y" }))
+      createNativeTranscriptScrubber({
+        globalPatterns: [],
+        projectPatterns: [],
+        pipelineVersion: "x\0y",
+      }))
       .toThrowError(NativeTranscriptConfigurationError);
   });
 
@@ -259,10 +327,40 @@ describe("native transcript scrub and JSONL reader", () => {
     expect(records[1]?.prefixSha256).toBe(digest(first + second));
   });
 
+  it("reports exact raw byte ranges for records and blank checkpoint spans", async () => {
+    const content = "\n{}\r\n \t\n[]";
+    const progress: Array<{
+      startByteOffset: number;
+      endByteOffset: number;
+      rangeSha256: string;
+    }> = [];
+    const outcomes = await collect(byteChunks(content), {
+      onProgress: (entry) => progress.push(entry),
+    });
+    expect(outcomes).toHaveLength(2);
+    const spans = ["\n", "{}\r\n", " \t\n", "[]"];
+    let startByteOffset = 0;
+    expect(progress.map((entry) => ({
+      startByteOffset: entry.startByteOffset,
+      endByteOffset: entry.endByteOffset,
+      rangeSha256: entry.rangeSha256,
+    }))).toEqual(spans.map((span) => {
+      const endByteOffset = startByteOffset + Buffer.byteLength(span);
+      const entry = {
+        startByteOffset,
+        endByteOffset,
+        rangeSha256: digest(span),
+      };
+      startByteOffset = endByteOffset;
+      return entry;
+    }));
+  });
+
   it("quarantines malformed, scalar, NUL, binary, invalid UTF-8, and oversized records", async () => {
     const invalidUtf8 = Uint8Array.of(0xff, 0x0a);
     const outcomes = await collect(byteChunks(
       '{"bad":}\n',
+      '{"value":-x}\n',
       '42\n',
       '{"value":"\\u0000"}\n',
       Uint8Array.of(0x7b, 0x00, 0x7d, 0x0a),
@@ -273,6 +371,7 @@ describe("native transcript scrub and JSONL reader", () => {
     expect(outcomes.map((outcome) =>
       outcome.kind === "quarantine" ? outcome.reason : "record"))
       .toEqual([
+        "malformed-json",
         "malformed-json",
         "non-container-json",
         "nul-character",
@@ -316,6 +415,77 @@ describe("native transcript scrub and JSONL reader", () => {
     );
   });
 
+  it("quarantines lossy decimal tokens while preserving exact JSON spellings", async () => {
+    const outcomes = await collect(byteChunks([
+      '{"value":9007199254740993}',
+      '{"value":0.10000000000000001}',
+      '{"value":1.23456789012345678}',
+      '{"value":1e-4000}',
+      '{"value":1e9007199254740992}',
+      '{"value":1e99999999999999999}',
+      `{"value":1${"0".repeat(20_000)}}`,
+      '{"values":[0.1,1.0,1e3,-0,-0e99999999999999999],"text":"9007199254740993"}',
+    ].join("\n")));
+    expect(outcomes.slice(0, 7).every((outcome) =>
+      outcome.kind === "quarantine"
+      && outcome.reason === "malformed-json"
+    )).toBe(true);
+    const accepted = outcomes[7];
+    expect(accepted).toMatchObject({
+      kind: "record",
+      nativePayload: {
+        values: [0.1, 1, 1_000, -0, -0],
+        text: "9007199254740993",
+      },
+    });
+    if (accepted?.kind !== "record") throw new Error("expected record");
+    const values = accepted.nativePayload.values;
+    expect(
+      Array.isArray(values)
+      && Object.is(values[3], -0)
+      && Object.is(values[4], -0),
+    ).toBe(true);
+    expect(canonicalNativeTranscriptJson(accepted.nativePayload)).toBe(
+      '{"text":"9007199254740993","values":[0.1,1,1000,0,0]}',
+    );
+  });
+
+  it("quarantines lone surrogate code units in string keys and values", async () => {
+    const outcomes = await collect(byteChunks([
+      '{"value":"\\ud800"}',
+      '{"value":"\\udc00"}',
+      '{"\\ud800":"value"}',
+      '{"\\udc00":"value"}',
+      '{"literal":"😀","escaped":"\\ud83d\\ude00","key\\ud83d\\ude00":"ok"}',
+    ].join("\n")));
+    expect(outcomes.slice(0, 4)).toEqual([
+      expect.objectContaining({
+        kind: "quarantine",
+        reason: "malformed-json",
+      }),
+      expect.objectContaining({
+        kind: "quarantine",
+        reason: "malformed-json",
+      }),
+      expect.objectContaining({
+        kind: "quarantine",
+        reason: "malformed-json",
+      }),
+      expect.objectContaining({
+        kind: "quarantine",
+        reason: "malformed-json",
+      }),
+    ]);
+    expect(outcomes[4]).toMatchObject({
+      kind: "record",
+      nativePayload: {
+        literal: "😀",
+        escaped: "😀",
+        "key😀": "ok",
+      },
+    });
+  });
+
   it("bounds array, object, and mixed JSON nesting before recursive scrubbing", async () => {
     for (const kind of ["array", "object", "mixed"] as const) {
       const outcomes = await collect(byteChunks(
@@ -342,6 +512,7 @@ describe("native transcript scrub and JSONL reader", () => {
     ), {
       scrubber: createNativeTranscriptScrubber({
         globalPatterns: ["secret[0-9]"],
+        projectPatterns: [],
       }),
     });
     expect(collision[0]).toMatchObject({
@@ -352,6 +523,7 @@ describe("native transcript scrub and JSONL reader", () => {
     const residual = await collect(byteChunks('{"value":"secret"}\n'), {
       scrubber: createNativeTranscriptScrubber({
         globalPatterns: ["secret", "RED"],
+        projectPatterns: [],
       }),
     });
     expect(residual[0]).toMatchObject({
@@ -364,6 +536,7 @@ describe("native transcript scrub and JSONL reader", () => {
     ), {
       scrubber: createNativeTranscriptScrubber({
         globalPatterns: ["(?:__proto__|secret)"],
+        projectPatterns: [],
       }),
     });
     expect(specialCollision[0]).toMatchObject({
@@ -396,7 +569,10 @@ describe("native transcript scrub and JSONL reader", () => {
       format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
       nativeSessionId: "session",
       sourceLocator: "session.jsonl",
-      scrubber: createNativeTranscriptScrubber(),
+      scrubber: createNativeTranscriptScrubber({
+        globalPatterns: [],
+        projectPatterns: [],
+      }),
     };
     await expect(Array.fromAsync(readNativeTranscriptJsonl({
       ...base,
@@ -449,10 +625,9 @@ describe("native transcript scrub and JSONL reader", () => {
         ],
       },
     }, 9)).toEqual([{
-      sessionSequence: 0,
       role: "user",
       content: "one\ntwo",
-      sourceOrdinal: 0,
+      sourceOrdinal: 9,
     }]);
     expect(claude.map(CLAUDE_NATIVE_TRANSCRIPT_FORMAT, {
       message: { role: "developer", content: "ignored" },
@@ -470,9 +645,9 @@ describe("native transcript scrub and JSONL reader", () => {
     expect(claude.map(CLAUDE_NATIVE_TRANSCRIPT_FORMAT, {
       message: { role: "system", content: "system" },
     }, 11)[0]).toMatchObject({
-      sessionSequence: 1,
       role: "system",
       content: "system",
+      sourceOrdinal: 11,
     });
 
     const codex = createNativeTranscriptMessageMapper();
@@ -492,9 +667,9 @@ describe("native transcript scrub and JSONL reader", () => {
         content: " direct ",
       },
     }, 1)[0]).toMatchObject({
-      sessionSequence: 0,
       role: "user",
       content: "direct",
+      sourceOrdinal: 1,
     });
     expect(codex.map(CODEX_NATIVE_TRANSCRIPT_FORMAT, {
       type: "response_item",
@@ -515,10 +690,9 @@ describe("native transcript scrub and JSONL reader", () => {
         ],
       },
     }, 1)).toEqual([{
-      sessionSequence: 1,
       role: "assistant",
       content: "answer",
-      sourceOrdinal: 0,
+      sourceOrdinal: 1,
     }]);
     expect(codex.map(CODEX_NATIVE_TRANSCRIPT_FORMAT, {
       type: "response_item",
@@ -553,6 +727,43 @@ describe("filesystem native transcript source", () => {
       digest(Buffer.from(content).subarray(0, 10)),
     );
     expect(await snapshot.digestPrefix(0)).toBe(digest(""));
+    await snapshot.assertByteRangesUnchanged([{
+      startByteOffset: 0,
+      endByteOffset: 10,
+      rangeSha256: digest(Buffer.from(content).subarray(0, 10)),
+    }]);
+    for (const ranges of [
+      [{
+        startByteOffset: 1,
+        endByteOffset: 1,
+        rangeSha256: digest(""),
+      }],
+      [{
+        startByteOffset: 0,
+        endByteOffset: metadata.sizeBytes + 1,
+        rangeSha256: digest(content),
+      }],
+      [{
+        startByteOffset: 0,
+        endByteOffset: 1,
+        rangeSha256: "bad",
+      }],
+      [
+        {
+          startByteOffset: 0,
+          endByteOffset: 1,
+          rangeSha256: digest(Buffer.from(content).subarray(0, 1)),
+        },
+        {
+          startByteOffset: 2,
+          endByteOffset: 3,
+          rangeSha256: digest(Buffer.from(content).subarray(2, 3)),
+        },
+      ],
+    ]) {
+      await expect(snapshot.assertByteRangesUnchanged(ranges))
+        .rejects.toThrowError(NativeTranscriptConfigurationError);
+    }
     await expect(snapshot.digestPrefix(metadata.sizeBytes + 1))
       .rejects.toThrowError(NativeTranscriptConfigurationError);
     await snapshot.assertUnchanged();
@@ -660,6 +871,11 @@ describe("filesystem native transcript source", () => {
     await expect(shrinkingSnapshot.digestPrefix(5)).rejects.toThrowError(
       NativeTranscriptSourceChangedError,
     );
+    await expect(shrinkingSnapshot.assertByteRangesUnchanged([{
+      startByteOffset: 0,
+      endByteOffset: 5,
+      rangeSha256: digest("12345"),
+    }])).rejects.toThrowError(NativeTranscriptSourceChangedError);
     await shrinkingSnapshot.close();
   });
 
@@ -667,12 +883,15 @@ describe("filesystem native transcript source", () => {
     const root = temporaryDirectory();
     const path = join(root, "source.jsonl");
     const moved = join(root, "original.jsonl");
+    const temporaryLink = join(root, "source-link.jsonl");
     const original = '{"value":"original"}\n';
     writeFileSync(path, original);
+    const baselineCtimeNs = statSync(path, { bigint: true }).ctimeNs;
     const repo = repository();
     await runNativeTranscriptBackfill({
       repository: repo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -680,6 +899,10 @@ describe("filesystem native transcript source", () => {
       },
       source: createFileNativeTranscriptSource(root, "source.jsonl", {
         _afterSnapshotOpenForTesting: () => {
+          mutateAfterCtimeTick(path, baselineCtimeNs, () => {
+            linkSync(path, temporaryLink);
+            unlinkSync(temporaryLink);
+          });
           renameSync(path, moved);
           writeFileSync(path, '{"value":"replacement"}\n');
         },
@@ -720,6 +943,7 @@ describe("filesystem native transcript source", () => {
     await expect(runNativeTranscriptBackfill({
       repository: prefixRepo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -728,6 +952,7 @@ describe("filesystem native transcript source", () => {
       source: createFileNativeTranscriptSource(root, "source.jsonl", {
         _beforeDigestPrefixForTesting: () => {
           writeFileSync(path, '{"value":"eno"}\n' + second);
+          forceDistinctMtime(path);
         },
       }),
       machineId: "machine",
@@ -743,6 +968,7 @@ describe("filesystem native transcript source", () => {
     await expect(runNativeTranscriptBackfill({
       repository: appendRepo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -766,6 +992,7 @@ describe("filesystem native transcript source", () => {
     await expect(runNativeTranscriptBackfill({
       repository: truncateRepo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -786,13 +1013,11 @@ describe("filesystem native transcript source", () => {
     expect(truncateRepo.batches).toEqual([]);
 
     writeFileSync(path, first + second);
-    const forcedRewriteMtime = new Date(
-      statSync(path).mtimeMs + 2_000,
-    );
     const rewriteRepo = repository();
     await expect(runNativeTranscriptBackfill({
       repository: rewriteRepo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -803,9 +1028,9 @@ describe("filesystem native transcript source", () => {
         _afterChunkForTesting: (ordinal) => {
           if (ordinal === 0) {
             writeFileSync(path, second + first);
-            utimesSync(path, forcedRewriteMtime, forcedRewriteMtime);
           }
         },
+        _forceMetadataUnchangedForTesting: true,
       }),
       machineId: "machine",
       format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
@@ -823,6 +1048,7 @@ describe("filesystem native transcript source", () => {
     await expect(runNativeTranscriptBackfill({
       repository: restoredMtimeRepo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -845,10 +1071,14 @@ describe("filesystem native transcript source", () => {
     expect(restoredMtimeRepo.batches).toEqual([]);
 
     writeFileSync(path, first);
+    const missingBaselineCtimeNs =
+      statSync(path, { bigint: true }).ctimeNs;
+    const temporaryLink = join(root, "missing-link.jsonl");
     const missingLocatorRepo = repository();
     await expect(runNativeTranscriptBackfill({
       repository: missingLocatorRepo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -856,6 +1086,10 @@ describe("filesystem native transcript source", () => {
       },
       source: createFileNativeTranscriptSource(root, "source.jsonl", {
         _beforeStreamForTesting: () => {
+          mutateAfterCtimeTick(path, missingBaselineCtimeNs, () => {
+            linkSync(path, temporaryLink);
+            unlinkSync(temporaryLink);
+          });
           renameSync(path, join(root, "detached.jsonl"));
         },
       }),
@@ -871,55 +1105,27 @@ describe("filesystem native transcript source", () => {
 
 describe("exact native transcript message resolver", () => {
   it("resolves exact messages across every conversation in session-wide order", async () => {
-    const olderConversation = {
-      conversationId: 7,
-      sessionId: "session-1",
-      title: null,
-      bootstrappedAt: null,
-      createdAt: new Date("2026-07-24T12:00:00.000Z"),
-      updatedAt: new Date("2026-07-24T12:00:00.000Z"),
-    };
-    const newerConversation = {
-      ...olderConversation,
-      conversationId: 4,
-      createdAt: new Date("2026-07-25T12:00:00.000Z"),
-      updatedAt: new Date("2026-07-25T12:00:00.000Z"),
-    };
-    const unrelatedConversation = {
-      ...olderConversation,
-      conversationId: 8,
-      sessionId: "other-session",
-    };
-    const olderMessage = {
+    const olderMessage: NativeTranscriptSessionMessageRecord = {
       messageId: 9,
       conversationId: 7,
-      seq: 0,
-      role: "user" as const,
+      messageSequence: 0,
+      role: "user",
       content: "question",
-      tokenCount: 1,
-      createdAt: new Date(),
     };
-    const newerMessage = {
+    const newerMessage: NativeTranscriptSessionMessageRecord = {
       messageId: 10,
       conversationId: 4,
-      seq: 0,
-      role: "assistant" as const,
+      messageSequence: 0,
+      role: "assistant",
       content: "scrubbed",
-      tokenCount: 2,
-      createdAt: new Date(),
     };
-    const listConversations = vi.fn(async () => [
-      newerConversation,
-      unrelatedConversation,
-      olderConversation,
+    const getNativeTranscriptMessageSnapshot = vi.fn(async () => [
+      olderMessage,
+      newerMessage,
     ]);
-    const getMessages = vi.fn(async (conversationId: number) =>
-      conversationId === 7 ? [olderMessage] : [newerMessage]
-    );
     const resolver = createExactNativeTranscriptMessageResolver({
-      listConversations,
-      getMessages,
-    } as unknown as ConversationRepository);
+      getNativeTranscriptMessageSnapshot,
+    });
     const input = {
       nativeSessionId: "session-1",
       sessionSequence: 1,
@@ -930,7 +1136,7 @@ describe("exact native transcript message resolver", () => {
       conversationId: 4,
       messageId: 10,
     });
-    expect(getMessages.mock.calls).toEqual([[7], [4]]);
+    expect(getNativeTranscriptMessageSnapshot).toHaveBeenCalledWith("session-1");
 
     olderMessage.content = "repository-mutated";
     newerMessage.content = "repository-mutated";
@@ -944,33 +1150,25 @@ describe("exact native transcript message resolver", () => {
       ...input,
       content: "different",
     })).resolves.toBeNull();
-    expect(listConversations).toHaveBeenCalledTimes(1);
-    expect(getMessages).toHaveBeenCalledTimes(2);
+    expect(getNativeTranscriptMessageSnapshot).toHaveBeenCalledTimes(1);
 
     const emptyResolver = createExactNativeTranscriptMessageResolver({
-      listConversations: vi.fn(async () => [unrelatedConversation]),
-    } as unknown as ConversationRepository);
+      getNativeTranscriptMessageSnapshot: vi.fn(async () => []),
+    });
     await expect(emptyResolver.resolveExact(input)).resolves.toBeNull();
   });
 
-  it("breaks conversation timestamp ties by ID and rejects inconsistent data", async () => {
-    const createdAt = new Date("2026-07-25T12:00:00.000Z");
-    const conversation = (conversationId: number) => ({
-      conversationId,
-      sessionId: "session-1",
-      title: null,
-      bootstrappedAt: null,
-      createdAt,
-      updatedAt: createdAt,
-    });
-    const message = (conversationId: number, messageId: number, seq = 0) => ({
+  it("rejects inconsistent ordered snapshot rows", async () => {
+    const message = (
+      conversationId: number,
+      messageId: number,
+      messageSequence = 0,
+    ): NativeTranscriptSessionMessageRecord => ({
       messageId,
       conversationId,
-      seq,
+      messageSequence,
       role: "user" as const,
       content: `message-${messageId}`,
-      tokenCount: 1,
-      createdAt,
     });
     const input = {
       nativeSessionId: "session-1",
@@ -978,43 +1176,46 @@ describe("exact native transcript message resolver", () => {
       role: "user" as const,
       content: "message-1",
     };
-    const resolveWith = (
-      listed: ReturnType<typeof conversation>[],
-      messages: ReturnType<typeof message>[],
-    ) => createExactNativeTranscriptMessageResolver({
-      listConversations: vi.fn(async () => listed),
-      getMessages: vi.fn(async (conversationId: number) =>
-        messages.filter((entry) => entry.conversationId === conversationId)
-      ),
-    } as unknown as ConversationRepository).resolveExact(input);
+    const resolveWith = (snapshot: readonly NativeTranscriptSessionMessageRecord[]) =>
+      createExactNativeTranscriptMessageResolver({
+        getNativeTranscriptMessageSnapshot: vi.fn(async () => snapshot),
+      }).resolveExact(input);
 
-    await expect(resolveWith(
-      [conversation(2), conversation(1)],
-      [message(2, 2), message(1, 1)],
-    )).resolves.toEqual({ conversationId: 1, messageId: 1 });
-    await expect(resolveWith(
-      [conversation(1), conversation(1)],
-      [message(1, 1)],
-    )).resolves.toBeNull();
-    await expect(resolveWith([{
-      ...conversation(1),
-      createdAt: new Date(Number.NaN),
-    }], [message(1, 1)])).resolves.toBeNull();
-    await expect(resolveWith(
-      [conversation(1)],
-      [message(2, 1)],
-    )).resolves.toBeNull();
-    await expect(resolveWith(
-      [conversation(1)],
-      [message(1, 1, 1)],
-    )).resolves.toBeNull();
+    await expect(resolveWith([
+      message(1, 1),
+      message(1, 3, 1),
+      message(2, 2),
+    ])).resolves.toEqual({ conversationId: 1, messageId: 1 });
+    await expect(resolveWith([
+      message(1, 1),
+      message(2, 2),
+      message(1, 3, 1),
+    ])).resolves.toBeNull();
+    await expect(resolveWith([
+      { ...message(1, 1), conversationId: -1 },
+    ])).resolves.toBeNull();
+    await expect(resolveWith([
+      { ...message(1, 1), messageId: -1 },
+    ])).resolves.toBeNull();
+    await expect(resolveWith([
+      { ...message(1, 1), messageSequence: -1 },
+    ])).resolves.toBeNull();
+    await expect(resolveWith([
+      { ...message(1, 1), role: "developer" as never },
+    ])).resolves.toBeNull();
+    await expect(resolveWith([
+      { ...message(1, 1), content: "bad\0content" },
+    ])).resolves.toBeNull();
+    await expect(resolveWith([
+      message(1, 1, 1),
+    ])).resolves.toBeNull();
   });
 
-  it("rejects invalid resolver inputs before conversation access", async () => {
-    const listConversations = vi.fn();
+  it("rejects invalid resolver inputs before snapshot access", async () => {
+    const getNativeTranscriptMessageSnapshot = vi.fn();
     const resolver = createExactNativeTranscriptMessageResolver({
-      listConversations,
-    } as unknown as ConversationRepository);
+      getNativeTranscriptMessageSnapshot,
+    });
     const invalidInputs = [
       { sessionSequence: -1 },
       { sessionSequence: 0.5 },
@@ -1032,7 +1233,7 @@ describe("exact native transcript message resolver", () => {
         ...override,
       } as never)).resolves.toBeNull();
     }
-    expect(listConversations).not.toHaveBeenCalled();
+    expect(getNativeTranscriptMessageSnapshot).not.toHaveBeenCalled();
   });
 });
 
@@ -1043,6 +1244,7 @@ describe("native transcript backfill coordinator", () => {
     await expect(runNativeTranscriptBackfill({
       repository: repo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -1058,6 +1260,44 @@ describe("native transcript backfill coordinator", () => {
     })).rejects.toMatchObject({ code: "invalid-patterns" });
     expect(byteSource.openSnapshot).not.toHaveBeenCalled();
     expect(repo.getCheckpoint).not.toHaveBeenCalled();
+
+    await expect(runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "codex",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: byteSource,
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      globalPatterns: [],
+      projectPatterns: [],
+      messageResolver: { resolveExact: vi.fn(async () => null) },
+    })).rejects.toMatchObject({ code: "invalid-input" });
+    expect(byteSource.openSnapshot).not.toHaveBeenCalled();
+
+    await expect(runNativeTranscriptBackfillCore({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: byteSource,
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      messageResolver: { resolveExact: vi.fn(async () => null) },
+    } as never)).rejects.toMatchObject({ code: "invalid-input" });
+    expect(byteSource.openSnapshot).not.toHaveBeenCalled();
   });
 
   it("batches valid records, exact links, and metadata-only quarantines", async () => {
@@ -1074,6 +1314,7 @@ describe("native transcript backfill coordinator", () => {
     const result = await runNativeTranscriptBackfill({
       repository: repo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: quarantined,
         get: vi.fn(),
         list: vi.fn(),
@@ -1091,7 +1332,6 @@ describe("native transcript backfill coordinator", () => {
         map: (_format, payload, sourceOrdinal) =>
           sourceOrdinal === 0
             ? [{
-                sessionSequence: 7,
                 role: "user",
                 content: (payload as JsonObject).message as string,
                 sourceOrdinal: 0,
@@ -1102,7 +1342,7 @@ describe("native transcript backfill coordinator", () => {
         resolveExact: vi.fn(async (input) => {
           expect(input).toEqual({
             nativeSessionId: "session-1",
-            sessionSequence: 7,
+            sessionSequence: 0,
             role: "user",
             content: "[REDACTED]",
           });
@@ -1178,6 +1418,7 @@ describe("native transcript backfill coordinator", () => {
     await runNativeTranscriptBackfill({
       repository: repo,
       quarantine: {
+        clientName: "claude-code",
         quarantine,
         get: vi.fn(),
         list: vi.fn(),
@@ -1219,6 +1460,7 @@ describe("native transcript backfill coordinator", () => {
     }));
     const options = {
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -1304,6 +1546,7 @@ describe("native transcript backfill coordinator", () => {
     await runNativeTranscriptBackfill({
       repository: repo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -1342,6 +1585,7 @@ describe("native transcript backfill coordinator", () => {
     await runNativeTranscriptBackfill({
       repository: quarantinedRepo,
       quarantine: {
+        clientName: "claude-code",
         quarantine,
         get: vi.fn(),
         list: vi.fn(),
@@ -1358,11 +1602,99 @@ describe("native transcript backfill coordinator", () => {
     expect(quarantinedRepo.batches[0]?.records).toHaveLength(1);
   });
 
+  it("verifies an unchanged replay-only prefix without destination writes", async () => {
+    const content = '{"message":{"role":"user","content":"first"}}\n';
+    const previous = checkpoint({
+      version: 1,
+      byteOffset: Buffer.byteLength(content),
+      prefixSha256: digest(content),
+      source: {
+        sizeBytes: Buffer.byteLength(content),
+        modifiedAtMs: 1,
+        changedAtMs: 1,
+      },
+    });
+    const repo = repository(previous);
+    const byteSource = source(content);
+    const result = await runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: byteSource,
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      messageResolver: { resolveExact: vi.fn(async () => null) },
+    });
+    expect(result.resumedFromByteOffset).toBe(Buffer.byteLength(content));
+    expect(repo.batches).toEqual([]);
+    const snapshot = await vi.mocked(byteSource.openSnapshot)
+      .mock.results[0]!.value;
+    expect(snapshot.assertByteRangesUnchanged).toHaveBeenCalledWith([{
+      startByteOffset: 0,
+      endByteOffset: Buffer.byteLength(content),
+      rangeSha256: digest(content),
+    }]);
+  });
+
+  it("owns message sequence per concurrent run when a pure mapper is reused", async () => {
+    const mapper = createNativeTranscriptMessageMapper();
+    const content = [
+      '{"event":"ignored"}',
+      '{"message":{"role":"user","content":"first"}}',
+      '{"message":{"role":"assistant","content":"second"}}',
+    ].join("\n");
+    const run = async (nativeSessionId: string): Promise<number[]> => {
+      const sequences: number[] = [];
+      await runNativeTranscriptBackfill({
+        repository: repository(),
+        quarantine: {
+          clientName: "claude-code",
+          quarantine: vi.fn(),
+          get: vi.fn(),
+          list: vi.fn(),
+          close: vi.fn(),
+        },
+        source: source(content),
+        machineId: "machine",
+        format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+        nativeSessionId,
+        sourceLocator: `${nativeSessionId}.jsonl`,
+        messageMapper: mapper,
+        messageResolver: {
+          resolveExact: vi.fn(async (input) => {
+            sequences.push(input.sessionSequence);
+            return {
+              conversationId: input.sessionSequence + 1,
+              messageId: input.sessionSequence + 1,
+            };
+          }),
+        },
+      });
+      return sequences;
+    };
+
+    const [first, second] = await Promise.all([
+      run("concurrent-1"),
+      run("concurrent-2"),
+    ]);
+    expect(first).toEqual([0, 1]);
+    expect(second).toEqual([0, 1]);
+    await expect(run("reused")).resolves.toEqual([0, 1]);
+  });
+
   it("isolates the immutable repository payload from a malicious mapper", async () => {
     const repo = repository();
     await runNativeTranscriptBackfill({
       repository: repo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -1404,15 +1736,17 @@ describe("native transcript backfill coordinator", () => {
   it("checkpoints blank-only consumed bytes outside record accounting", async () => {
     const repo = repository();
     const content = "\n  \r\n";
+    const byteSource = source(content);
     const result = await runNativeTranscriptBackfill({
       repository: repo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
         close: vi.fn(),
       },
-      source: source(content),
+      source: byteSource,
       machineId: "machine",
       format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
       nativeSessionId: "session-1",
@@ -1438,6 +1772,26 @@ describe("native transcript backfill coordinator", () => {
         },
       },
     });
+    const snapshot = await vi.mocked(byteSource.openSnapshot)
+      .mock.results[0]!.value;
+    const rangeAssertion = vi.mocked(
+      snapshot.assertByteRangesUnchanged,
+    );
+    expect(rangeAssertion).toHaveBeenCalledWith([
+      {
+        startByteOffset: 0,
+        endByteOffset: 1,
+        rangeSha256: digest("\n"),
+      },
+      {
+        startByteOffset: 1,
+        endByteOffset: Buffer.byteLength(content),
+        rangeSha256: digest("  \r\n"),
+      },
+    ]);
+    expect(rangeAssertion.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(repo.ingestBatch).mock.invocationCallOrder[0]!,
+    );
   });
 
   it("aborts exact-link mismatches without committing the batch", async () => {
@@ -1445,6 +1799,7 @@ describe("native transcript backfill coordinator", () => {
     await expect(runNativeTranscriptBackfill({
       repository: repo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -1457,7 +1812,6 @@ describe("native transcript backfill coordinator", () => {
       sourceLocator: "sessions/session.jsonl",
       messageMapper: {
         map: () => [{
-          sessionSequence: 0,
           role: "assistant",
           content: "hello",
           sourceOrdinal: 0,
@@ -1473,6 +1827,7 @@ describe("native transcript backfill coordinator", () => {
     const base = {
       repository: repo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -1492,7 +1847,6 @@ describe("native transcript backfill coordinator", () => {
       ...base,
       messageMapper: {
         map: () => [{
-          sessionSequence: 0,
           role: "user",
           content: "bad\0content",
           sourceOrdinal: 0,
@@ -1503,10 +1857,9 @@ describe("native transcript backfill coordinator", () => {
       ...base,
       messageMapper: {
         map: () => [{
-          sessionSequence: -1,
           role: "user",
           content: "content",
-          sourceOrdinal: 0,
+          sourceOrdinal: -1,
         }],
       },
     })).rejects.toThrowError(NativeTranscriptConfigurationError);
@@ -1514,7 +1867,6 @@ describe("native transcript backfill coordinator", () => {
       ...base,
       messageMapper: {
         map: () => [{
-          sessionSequence: 0,
           role: "developer" as never,
           content: "content",
           sourceOrdinal: 0,
@@ -1528,6 +1880,7 @@ describe("native transcript backfill coordinator", () => {
     const base = {
       repository: repo,
       quarantine: {
+        clientName: "claude-code",
         quarantine: vi.fn(),
         get: vi.fn(),
         list: vi.fn(),
@@ -1605,9 +1958,18 @@ describe("native transcript backfill coordinator", () => {
 describe("local transcript quarantine", () => {
   it("uses an opaque private per-project database and idempotent list/get APIs", async () => {
     const home = temporaryDirectory();
-    const path = localTranscriptQuarantinePath("project/a", home);
+    const path = localTranscriptQuarantinePath(
+      "project/a",
+      "claude-code",
+      home,
+    );
     expect(path).not.toContain("project/a");
-    const repo = openLocalTranscriptQuarantine("project/a", home);
+    expect(path).not.toContain("claude-code");
+    const repo = openLocalTranscriptQuarantine(
+      "project/a",
+      "claude-code",
+      home,
+    );
     const input = {
       sourceLocator: "sessions/session.jsonl",
       sourceOrdinal: 4,
@@ -1620,6 +1982,18 @@ describe("local transcript quarantine", () => {
       ...input,
       quarantinedAt: new Date("2026-07-25T13:00:00.000Z"),
     });
+    const codexPath = localTranscriptQuarantinePath(
+      "project/a",
+      "codex",
+      home,
+    );
+    expect(codexPath).not.toBe(path);
+    const codexRepo = openLocalTranscriptQuarantine(
+      "project/a",
+      "codex",
+      home,
+    );
+    const codexRecord = await codexRepo.quarantine(input);
     await repo.quarantine({
       ...input,
       sourceOrdinal: 5,
@@ -1633,10 +2007,20 @@ describe("local transcript quarantine", () => {
     expect(await repo.list({ reason: "malformed-json", limit: 1 }))
       .toEqual([first]);
     expect(await repo.list()).toHaveLength(2);
+    expect(codexRecord).toMatchObject({
+      quarantineId: 1,
+      sourceLocator: input.sourceLocator,
+      sourceOrdinal: input.sourceOrdinal,
+      reason: input.reason,
+      contentSha256: input.contentSha256,
+    });
+    expect(await codexRepo.list()).toEqual([codexRecord]);
     expect(statSync(join(home, ".lcm", "transcript-quarantine")).mode & 0o777)
       .toBe(0o700);
+    expect(statSync(dirname(path)).mode & 0o777).toBe(0o700);
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(lstatSync(path).isFile()).toBe(true);
+    await codexRepo.close();
     await repo.close();
     await repo.close();
     await expect(repo.list()).rejects.toMatchObject({
@@ -1646,7 +2030,12 @@ describe("local transcript quarantine", () => {
 
   it("rejects invalid metadata, limits, closed access, and symlink leaves", async () => {
     const home = temporaryDirectory();
-    const repo = openLocalTranscriptQuarantine("project", home);
+    expect(() =>
+      localTranscriptQuarantinePath("project", "unknown", home)
+    ).toThrowError(expect.objectContaining({
+      code: "STORAGE_OPERATION_FAILED",
+    }));
+    const repo = openLocalTranscriptQuarantine("project", "codex", home);
     const base = {
       sourceLocator: "source",
       sourceOrdinal: 0,
@@ -1684,15 +2073,20 @@ describe("local transcript quarantine", () => {
       code: "STORAGE_OPERATION_FAILED",
     });
     await repo.close();
-    const path = localTranscriptQuarantinePath("symlink", home);
+    const path = localTranscriptQuarantinePath("symlink", "codex", home);
+    mkdirSync(dirname(path), { recursive: true });
     symlinkSync("/dev/null", path);
-    expect(() => openLocalTranscriptQuarantine("symlink", home))
+    expect(() => openLocalTranscriptQuarantine("symlink", "codex", home))
       .toThrow("symlink");
   });
 
   it("migrates the unreleased quarantine schema without losing metadata", async () => {
     const home = temporaryDirectory();
-    const path = localTranscriptQuarantinePath("legacy-project", home);
+    const path = localTranscriptQuarantinePath(
+      "legacy-project",
+      "claude-code",
+      home,
+    );
     mkdirSync(dirname(path), { recursive: true });
     const legacy = new DatabaseSync(path);
     legacy.exec(`
@@ -1737,6 +2131,7 @@ describe("local transcript quarantine", () => {
 
     const migrated = openLocalTranscriptQuarantine(
       "legacy-project",
+      "claude-code",
       home,
     );
     expect(await migrated.list()).toEqual([
@@ -1760,7 +2155,11 @@ describe("local transcript quarantine", () => {
     ]);
     await migrated.close();
 
-    const reopened = openLocalTranscriptQuarantine("legacy-project", home);
+    const reopened = openLocalTranscriptQuarantine(
+      "legacy-project",
+      "claude-code",
+      home,
+    );
     expect(await reopened.list()).toHaveLength(2);
     await reopened.close();
   });
@@ -1778,6 +2177,7 @@ describe("local transcript quarantine", () => {
     expect(() => new SQLiteLocalTranscriptQuarantineRepository(
       ":memory:migration",
       oldSchemaDb as never,
+      "claude-code",
     )).toThrow("migration failed");
     expect(exec).toHaveBeenCalledWith("BEGIN IMMEDIATE");
     expect(exec).toHaveBeenCalledWith("ROLLBACK");
@@ -1792,6 +2192,7 @@ describe("local transcript quarantine", () => {
     expect(() => new SQLiteLocalTranscriptQuarantineRepository(
       ":memory:rollback-failure",
       rollbackFailureDb as never,
+      "claude-code",
     )).toThrow("original");
   });
 
@@ -1823,6 +2224,7 @@ describe("local transcript quarantine", () => {
     const repo = new SQLiteLocalTranscriptQuarantineRepository(
       ":memory:",
       fakeDb as never,
+      "claude-code",
     );
     await expect(repo.get(1)).rejects.toMatchObject({
       code: "STORAGE_OPERATION_FAILED",
@@ -1848,6 +2250,7 @@ describe("local transcript quarantine", () => {
     const invalidDateRepo = new SQLiteLocalTranscriptQuarantineRepository(
       ":memory:invalid-date",
       invalidDateDb as never,
+      "claude-code",
     );
     await expect(invalidDateRepo.list()).rejects.toMatchObject({
       code: "STORAGE_OPERATION_FAILED",
@@ -1863,6 +2266,7 @@ describe("local transcript quarantine", () => {
     const missingRowRepo = new SQLiteLocalTranscriptQuarantineRepository(
       ":memory:missing",
       missingRowDb as never,
+      "claude-code",
     );
     await expect(missingRowRepo.quarantine({
       sourceLocator: "source",

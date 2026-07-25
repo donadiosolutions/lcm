@@ -412,12 +412,13 @@ role and `PUBLIC` execution is intentionally revoked. The script does not grant
 schema creation, migration-ledger access, table ownership, `TRUNCATE`,
 arbitrary updates, sequence mutation, or access to unrelated domain objects.
 
-The transcript script grants schema `USAGE`; `SELECT` and column-limited
-`INSERT` on `native_transcripts` and `transcript_messages`; and `SELECT`,
-identity-column `INSERT`, and checkpoint-field-only `UPDATE` on
-`ingest_checkpoints`. It does not grant writes to generated transcript fields,
-payload updates, `DELETE`, `TRUNCATE`, sequence or function privileges, or
-access to unrelated repository tables.
+The transcript script grants schema `USAGE`; column-limited `SELECT` on the
+conversation and message fields needed for exact native-session linkage;
+`SELECT` and column-limited `INSERT` on `native_transcripts` and
+`transcript_messages`; and `SELECT`, identity-column `INSERT`, and
+checkpoint-field-only `UPDATE` on `ingest_checkpoints`. It does not grant
+writes to generated transcript fields, payload updates, `DELETE`, `TRUNCATE`,
+sequence or function privileges, or access to unrelated repository tables.
 
 Applying these repository grants does not activate the PostgreSQL backend.
 Daemon/CLI routing remains gated by #224 and the #92 cutover. Re-run migration

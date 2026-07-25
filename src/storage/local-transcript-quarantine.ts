@@ -42,6 +42,7 @@ export interface LocalTranscriptQuarantineListOptions {
 }
 
 export interface LocalTranscriptQuarantineRepository {
+  readonly clientName: "claude-code" | "codex";
   quarantine(
     input: LocalTranscriptQuarantineInput,
   ): Promise<LocalTranscriptQuarantineRecord>;
@@ -110,6 +111,14 @@ function assertSafeNonnegative(value: number, operation: string): number {
 
 function assertText(value: string, operation: string): string {
   if (value.length === 0 || value.includes("\0")) throw fail(operation);
+  return value;
+}
+
+function assertClientName(
+  value: string,
+  operation: string,
+): "claude-code" | "codex" {
+  if (value !== "claude-code" && value !== "codex") throw fail(operation);
   return value;
 }
 
@@ -219,15 +228,20 @@ function ensureQuarantineSchema(db: DatabaseSync): void {
 
 export function localTranscriptQuarantinePath(
   projectId: string,
+  clientName: string,
   homeDir?: string,
 ): string {
   const opaqueProjectId = createHash("sha256")
     .update(assertText(projectId, "path"), "utf8")
     .digest("hex");
+  const opaqueClientName = createHash("sha256")
+    .update(assertClientName(clientName, "path"), "utf8")
+    .digest("hex");
   return join(
     lcmHomeDir(homeDir),
     "transcript-quarantine",
-    `${opaqueProjectId}.db`,
+    opaqueProjectId,
+    `${opaqueClientName}.db`,
   );
 }
 
@@ -238,6 +252,7 @@ implements LocalTranscriptQuarantineRepository {
   constructor(
     private readonly dbPath: string,
     private readonly db: DatabaseSync,
+    readonly clientName: "claude-code" | "codex",
   ) {
     ensureQuarantineSchema(db);
   }
@@ -379,11 +394,24 @@ implements LocalTranscriptQuarantineRepository {
 
 export function openLocalTranscriptQuarantine(
   projectId: string,
+  clientName: string,
   homeDir?: string,
 ): SQLiteLocalTranscriptQuarantineRepository {
-  const dbPath = localTranscriptQuarantinePath(projectId, homeDir);
-  return new SQLiteLocalTranscriptQuarantineRepository(
-    dbPath,
-    getLcmConnection(dbPath),
+  const validatedClientName = assertClientName(clientName, "open");
+  const dbPath = localTranscriptQuarantinePath(
+    projectId,
+    validatedClientName,
+    homeDir,
   );
+  const db = getLcmConnection(dbPath);
+  try {
+    return new SQLiteLocalTranscriptQuarantineRepository(
+      dbPath,
+      db,
+      validatedClientName,
+    );
+  } catch (error) {
+    closeLcmConnection(dbPath, db);
+    throw error;
+  }
 }

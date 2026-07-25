@@ -40,9 +40,12 @@ The PostgreSQL native-transcript repository stores only client-native JSON
 records that passed local decoding, scrubbing, residual-secret validation, and
 canonicalization. Here, “raw transcript” means that sanitized native record and
 its provenance; LCM never sends the verbatim pre-redaction source record to
-PostgreSQL. Failed records produce only bounded metadata in a private
-per-project local quarantine store. Native-transcript daemon and CLI routing is
-not active yet; explicit backfill and adapter use are documented in
+PostgreSQL. Failed records produce only bounded metadata in private local
+quarantine stores separated by project and transcript client. The client
+identity exists only in the opaque database namespace, not in quarantine rows,
+so identical Claude and Codex metadata cannot deduplicate across clients.
+Native-transcript daemon and CLI routing is not active yet; explicit backfill
+and adapter use are documented in
 [PostgreSQL native transcripts](postgresql-native-transcripts.md).
 
 ## Secret redaction
@@ -55,11 +58,21 @@ bundled Gitleaks rules, built-in patterns, global `security.sensitivePatterns`,
 and the project's `sensitive-patterns.txt`. Previously captured passive events
 are scrubbed again before promotion.
 
-PostgreSQL native transcripts apply that effective pattern set recursively to
-every string key and value before repository or network operations. Invalid
-UTF-8, malformed or scalar JSON, oversized records, U+0000, invalid custom
-patterns, redacted-key collisions, residual matches, and JSON nested beyond
-the exported depth limit of 100 are rejected locally.
+For PostgreSQL native transcripts, the staged embedded caller must explicitly
+load and pass both effective custom-pattern arrays: global
+`security.sensitivePatterns` as `globalPatterns` and the project's
+`sensitive-patterns.txt` as `projectPatterns`. The API does not load them
+implicitly; missing or non-array values fail before source or repository
+access, while an explicit empty array means that scope has no configured custom
+rules. LCM applies those arrays plus the bundled rules recursively to every
+string key and value. Invalid UTF-8, malformed or scalar JSON, oversized
+records, U+0000, invalid custom patterns, redacted-key collisions, residual
+matches, and JSON nested beyond the exported depth limit of 100 are rejected
+locally. JSON number spellings that would lose their exact decimal value when
+represented as a JavaScript `number`, and lone UTF-16 surrogate code units in
+string keys or values, are also quarantined locally as `malformed-json`.
+Valid surrogate pairs and literal Unicode remain supported. No source payload
+or parser excerpt is written to quarantine.
 Pattern-based filtering still has residual risk: an organization-specific
 secret that matches no active rule can remain in the sanitized record. Test
 project patterns against representative canaries before backfill and protect

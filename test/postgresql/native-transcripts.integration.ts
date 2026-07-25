@@ -153,9 +153,16 @@ describe("PostgreSQL 18 native transcript repository", () => {
       const privileges = await database.migrator.query<{
         schema_usage: boolean;
         schema_create: boolean;
+        conversation_select: boolean;
+        conversation_session_select: boolean;
+        conversation_title_select: boolean;
+        message_select: boolean;
+        message_content_select: boolean;
+        message_token_count_select: boolean;
         transcript_select: boolean;
         transcript_insert: boolean;
         transcript_payload_insert: boolean;
+        transcript_ingested_insert: boolean;
         transcript_id_insert: boolean;
         transcript_update: boolean;
         transcript_delete: boolean;
@@ -176,6 +183,28 @@ describe("PostgreSQL 18 native transcript repository", () => {
                  has_schema_privilege('lcm_test_runtime', 'lcm', 'CREATE')
                    AS schema_create,
                  has_table_privilege(
+                   'lcm_test_runtime', 'lcm.conversations', 'SELECT'
+                 ) AS conversation_select,
+                 has_column_privilege(
+                   'lcm_test_runtime', 'lcm.conversations',
+                   'session_id', 'SELECT'
+                 ) AS conversation_session_select,
+                 has_column_privilege(
+                   'lcm_test_runtime', 'lcm.conversations',
+                   'title', 'SELECT'
+                 ) AS conversation_title_select,
+                 has_table_privilege(
+                   'lcm_test_runtime', 'lcm.messages', 'SELECT'
+                 ) AS message_select,
+                 has_column_privilege(
+                   'lcm_test_runtime', 'lcm.messages',
+                   'content', 'SELECT'
+                 ) AS message_content_select,
+                 has_column_privilege(
+                   'lcm_test_runtime', 'lcm.messages',
+                   'token_count', 'SELECT'
+                 ) AS message_token_count_select,
+                 has_table_privilege(
                    'lcm_test_runtime', 'lcm.native_transcripts', 'SELECT'
                  ) AS transcript_select,
                  has_table_privilege(
@@ -185,6 +214,10 @@ describe("PostgreSQL 18 native transcript repository", () => {
                    'lcm_test_runtime', 'lcm.native_transcripts',
                    'native_payload', 'INSERT'
                  ) AS transcript_payload_insert,
+                 has_column_privilege(
+                   'lcm_test_runtime', 'lcm.native_transcripts',
+                   'ingested_at', 'INSERT'
+                 ) AS transcript_ingested_insert,
                  has_column_privilege(
                    'lcm_test_runtime', 'lcm.native_transcripts',
                    'transcript_id', 'INSERT'
@@ -236,9 +269,16 @@ describe("PostgreSQL 18 native transcript repository", () => {
       expect(privileges.rows[0]).toEqual({
         schema_usage: true,
         schema_create: false,
+        conversation_select: false,
+        conversation_session_select: true,
+        conversation_title_select: false,
+        message_select: false,
+        message_content_select: true,
+        message_token_count_select: false,
         transcript_select: true,
         transcript_insert: false,
         transcript_payload_insert: true,
+        transcript_ingested_insert: true,
         transcript_id_insert: false,
         transcript_update: false,
         transcript_delete: false,
@@ -332,6 +372,7 @@ describe("PostgreSQL 18 native transcript repository", () => {
       expect(stored).toMatchObject({
         sourceOrdinal: 4,
         observedAt: new Date("2026-01-01T00:00:00.000Z"),
+        ingestedAt: new Date("2026-01-01T00:00:00.000Z"),
         scrubberVersion: "scrubber-v1",
         nativePayload: specialPayload,
         messageLinks: [{
@@ -350,6 +391,14 @@ describe("PostgreSQL 18 native transcript repository", () => {
         firstResult.checkpoint.checkpoint,
         "__proto__",
       )).toBe(true);
+      await expect(repository.getNativeTranscriptMessageSnapshot(
+        `session:Native transcript round trip`,
+      )).resolves.toEqual([expect.objectContaining({
+        conversationId: scope.conversationId,
+        messageId: scope.messageId,
+        messageSequence: 0,
+        role: "user",
+      })]);
       await expect(repository.listByNativeSession({
         nativeSessionId: "native-session",
       })).resolves.toHaveLength(1);
@@ -526,6 +575,53 @@ describe("PostgreSQL 18 native transcript repository", () => {
       await expect(first.listBySource(rollback)).resolves.toEqual([]);
       await expect(first.getCheckpoint(rollback)).resolves.toBeNull();
     });
+  });
+
+  it("converges identical concurrency when sessions default to repeatable read", async () => {
+    await withPostgreSqlTestDatabase(
+      "native-transcript-repeatable-default",
+      async (database) => {
+        await grantTranscriptRuntimePrivileges(database);
+        const scope = await createScope(
+          database,
+          "Native transcript repeatable default",
+        );
+        await expect(database.runtime.query<{
+          transaction_isolation: string;
+        }>({
+          text: `SELECT pg_catalog.current_setting(
+                          'transaction_isolation'
+                        ) AS transaction_isolation`,
+        }, {
+          domain: "native-transcripts",
+          operation: "verifyRepeatableDefault",
+        })).resolves.toMatchObject({
+          rows: [{ transaction_isolation: "repeatable read" }],
+        });
+        const first = new PostgreSqlNativeTranscriptRepository(
+          database.runtime,
+          scope.projectId,
+        );
+        const second = new PostgreSqlNativeTranscriptRepository(
+          database.runtime,
+          scope.projectId,
+        );
+        const concurrent = input(
+          scope,
+          "repeatable/concurrent.jsonl",
+          "repeatable-concurrent",
+        );
+        const results = await Promise.all([
+          first.ingestBatch(concurrent),
+          second.ingestBatch(concurrent),
+        ]);
+        expect(results).toEqual(expect.arrayContaining([
+          expect.objectContaining({ importedCount: 1, skippedCount: 0 }),
+          expect.objectContaining({ importedCount: 0, skippedCount: 1 }),
+        ]));
+      },
+      { defaultTransactionIsolation: "REPEATABLE READ" },
+    );
   });
 
   it("rejects cross-project links without retaining the transcript or checkpoint", async () => {

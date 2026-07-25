@@ -1796,6 +1796,20 @@ export async function runPostgreSqlMigrations(
                                     ANY (
                                       ARRAY[
                                         'project_id',
+                                        'conversation_id',
+                                        'session_id',
+                                        'session_id_sha256',
+                                        'created_at'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'SELECT'
+                                )
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
                                         'session_id',
                                         'title'
                                       ]::pg_catalog.text[]
@@ -1816,18 +1830,38 @@ export async function runPostgreSqlMigrations(
                             )
                             OR (
                               relation.relname OPERATOR(pg_catalog.=) 'messages'
-                              AND attribute.attname OPERATOR(pg_catalog.=)
-                                ANY (
-                                  ARRAY[
-                                    'project_id',
-                                    'conversation_id',
-                                    'seq',
-                                    'role',
-                                    'content',
-                                    'token_count'
-                                  ]::pg_catalog.text[]
+                              AND (
+                                (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'conversation_id',
+                                        'message_id',
+                                        'seq',
+                                        'role',
+                                        'content'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'SELECT'
                                 )
-                              AND privilege.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'conversation_id',
+                                        'seq',
+                                        'role',
+                                        'content',
+                                        'token_count'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'INSERT'
+                                )
+                              )
                             )
                             OR (
                               relation.relname OPERATOR(pg_catalog.=) 'message_parts'
@@ -1865,6 +1899,7 @@ export async function runPostgreSqlMigrations(
                                     'source_locator',
                                     'source_ordinal',
                                     'observed_at',
+                                    'ingested_at',
                                     'scrubber_version',
                                     'content_sha256',
                                     'ingest_key',
