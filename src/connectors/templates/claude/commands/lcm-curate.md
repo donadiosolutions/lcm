@@ -16,12 +16,6 @@ Run the following commands sequentially via Bash. Always use `--verbose` on `imp
 lcm import --verbose && lcm compact && lcm promote --verbose
 ```
 
-If `lcm` is not on PATH (marketplace install), use the plugin-relative binary instead:
-
-```bash
-node "${CLAUDE_PLUGIN_ROOT}/lcm.mjs" import --verbose && node "${CLAUDE_PLUGIN_ROOT}/lcm.mjs" compact && node "${CLAUDE_PLUGIN_ROOT}/lcm.mjs" promote --verbose
-```
-
 ### Options
 
 Pass user-specified flags through to the commands that support them:

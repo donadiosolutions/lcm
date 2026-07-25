@@ -8,9 +8,6 @@ paths:
   - bin
   - installer
   - scripts
-  - .claude-plugin
-  - lcm.mjs
-  - mcp.mjs
 
 paths-ignore:
   - dist

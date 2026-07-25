@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { installConnector, removeConnector, listConnectors } from '../../src/connectors/installer.js';
 import { LCM_MARKERS } from '../../src/connectors/constants.js';
 import { AGENTS } from '../../src/connectors/registry.js';
+import { mergeClaudeSettings } from '../../src/installer/settings.js';
 
 let tmpDir: string;
 
@@ -620,10 +621,81 @@ describe('error handling', () => {
     expect(() => installConnector('zed', 'skill', tmpDir)).toThrow('does not support connector type');
   });
 
-  it('returns manual instructions for hook type', () => {
-    const result = installConnector('claude-code', 'hook', tmpDir);
-    expect(result.manual).toBeDefined();
-    expect(result.manual).toContain('Hook connectors');
+  it('routes Claude hook installation through the guarded npm installer', () => {
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      const settingsPath = join(tmpDir, '.claude', 'settings.json');
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(settingsPath, JSON.stringify({ theme: 'dark' }));
+      const result = installConnector('claude-code', 'hook', tmpDir);
+      expect(result.path).toBe('');
+      expect(result.requiresRestart).toBe(false);
+      expect(result.manual).toContain('lcm install');
+      expect(JSON.parse(readFileSync(settingsPath, 'utf8'))).toEqual({ theme: 'dark' });
+      writeFileSync(
+        settingsPath,
+        JSON.stringify(mergeClaudeSettings({ theme: 'dark' }, join(process.cwd(), 'dist', 'lcm.mjs'))),
+      );
+      expect(listConnectors(tmpDir)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentId: 'claude-code', type: 'hook', path: settingsPath }),
+      ]));
+      expect(removeConnector('claude-code', 'hook', tmpDir)).toBe(true);
+      expect(JSON.parse(readFileSync(settingsPath, 'utf8'))).toEqual({ theme: 'dark' });
+      expect(removeConnector('claude-code', 'hook', tmpDir)).toBe(false);
+      rmSync(settingsPath);
+      expect(removeConnector('claude-code', 'hook', tmpDir)).toBe(false);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it('fails closed for malformed Claude settings and unsupported native hook agents', () => {
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      const settingsPath = join(tmpDir, '.claude', 'settings.json');
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(settingsPath, 'null');
+      expect(installConnector('claude-code', 'hook', tmpDir).manual).toContain('lcm install');
+      expect(listConnectors(tmpDir).some((entry) => entry.agentId === 'claude-code' && entry.type === 'hook')).toBe(false);
+      expect(() => removeConnector('claude-code', 'hook', tmpDir)).toThrow('must contain a JSON object');
+
+      const codex = AGENTS.find((candidate) => candidate.id === 'codex')!;
+      const originalId = codex.id;
+      codex.id = 'codex-other';
+      try {
+        expect(() => installConnector('Codex', 'hook', tmpDir)).toThrow('Native hook installation is not implemented');
+      } finally {
+        codex.id = originalId;
+      }
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it('still routes Claude hook installation when its legacy configured path is absent', () => {
+    const agent = AGENTS.find((candidate) => candidate.id === 'claude-code')!;
+    const original = agent.configPaths.hook;
+    delete agent.configPaths.hook;
+    try {
+      expect(installConnector('claude-code', 'hook', tmpDir).manual).toContain('lcm install');
+    } finally {
+      agent.configPaths.hook = original;
+    }
+  });
+
+  it('uses overwrite rules mode when an agent writeMode is nullish', () => {
+    const agent = AGENTS.find((candidate) => candidate.id === 'gemini-cli')!;
+    const original = agent.writeMode;
+    agent.writeMode = null as never;
+    try {
+      expect(installConnector('gemini-cli', 'rules', tmpDir).success).toBe(true);
+    } finally {
+      agent.writeMode = original;
+    }
   });
 
   it('throws when a supported connector has no configured non-MCP path', () => {

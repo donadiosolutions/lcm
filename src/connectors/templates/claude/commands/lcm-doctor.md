@@ -20,4 +20,6 @@ End with one of:
 - *All checks passed — Long Context Manager (LCM) is healthy.*
 - *N check(s) need attention — see Fix section above.*
 
-If `lcm_doctor` is unavailable, run `lcm doctor` via Bash and display the output verbatim. If `lcm` is not on PATH (marketplace install), first try to install it by running `node "${CLAUDE_PLUGIN_ROOT}/lcm.mjs" install`, then retry `lcm doctor`. If `lcm` is still unavailable, run `node "${CLAUDE_PLUGIN_ROOT}/lcm.mjs" doctor` instead.
+If `lcm_doctor` is unavailable, run `lcm doctor` via Bash and display the
+output verbatim. If `lcm` is unavailable, instruct the user to install the
+published npm package and rerun `lcm install`.

@@ -6,20 +6,38 @@ LCM requires Node.js 22.12.0 or newer.
 
 ### Claude Code
 
-Install the `lcm` binary and add the plugin:
+Install LCM from npm and configure its native Claude Code integration:
 
 ```bash
-npm install -g @donadiosolutions/lcm  # provides the `lcm` command
-claude plugin add github:donadiosolutions/lcm
+npm install -g @donadiosolutions/lcm@latest
 lcm install
+lcm doctor
 ```
 
-`lcm install` is the Claude Code setup path. It writes config, registers hooks, installs slash commands, registers MCP, and verifies the daemon.
+`lcm install` is the Claude Code setup path. It writes the six native hooks to
+`~/.claude/settings.json`, registers the npm-owned MCP server, installs slash
+commands and skills, and verifies the daemon. The operation is idempotent, so
+rerun it after updating the npm package.
 
-The plugin's hook and MCP entrypoints are committed, reproducible bundles. They
-never run `npm install`, package lifecycle scripts, or a TypeScript build from
-the plugin cache. Install the npm package explicitly when you want the global
-`lcm` command; plugin hooks themselves use the reviewed bundled entrypoints.
+LCM no longer supports direct Claude Marketplace installation. During
+installation, LCM detects recognized current and legacy LCM Marketplace
+installations, removes them from their installed scopes while preserving their
+data, and verifies that they are gone before writing the native integration.
+Unknown or unrelated plugins are left unchanged. If automatic removal fails,
+the installer stops before registering hooks so the two integrations cannot
+run simultaneously.
+
+To update:
+
+```bash
+npm install -g @donadiosolutions/lcm@latest
+lcm install
+lcm doctor
+```
+
+The hook commands and MCP server use absolute paths into the installed npm
+package. `lcm doctor` validates the native configuration and managed daemon;
+repair or reinstall with `lcm install`.
 
 When the setup wizard's **Custom server** summarizer is selected, both the
 OpenAI-compatible server URL and model name are required. The wizard retries an
@@ -75,7 +93,7 @@ export LCM_FRESH_TAIL_COUNT=32
 export LCM_INCREMENTAL_MAX_DEPTH=-1
 ```
 
-Restart Claude Code.
+Restart Claude Code after installing or repairing the native integration.
 
 ## Connector scope
 
@@ -343,8 +361,8 @@ debugging.
 The managed systemd service receives a trusted executable path rather than the
 launching shell's `PATH`. It prepends the exact absolute launcher and runtime
 directories to a fixed set of system directories when those directories are
-outside the current project. Known global Node installations and bundled Codex
-or Claude plugin-cache/runtime directories remain valid trust anchors only when
+outside the current project. Known global Node installations and the bundled
+Codex runtime remain valid trust anchors only when
 they are also outside the current project containment boundary. Canonical
 per-user installations remain trusted when the command runs directly from the
 user's home directory; similarly named directories rooted in a checkout do not. LCM
@@ -769,21 +787,10 @@ sqlite3 ~/.lcm/projects/<hash>/db.sqlite ".backup /tmp/lcm-backup.sqlite"
 In multi-agent Claude Code setups, each agent uses the same LCM database but
 has its own conversation segments associated with its session ID. A session
 may have multiple segments; LCM selects the newest one for get-or-create
-operations. The plugin config applies globally; per-agent overrides use
-environment variables set in the agent's config.
+operations. The native hook configuration applies globally; per-agent
+overrides use environment variables set in the agent's config.
 
 ## Disabling LCM
 
-To fall back to Claude Code's built-in compaction:
-
-```json
-{
-  "plugins": {
-    "slots": {
-      "contextEngine": "legacy"
-    }
-  }
-}
-```
-
-Or set `LCM_ENABLED=false` to disable the plugin while keeping it registered.
+Set `LCM_ENABLED=false` to disable LCM while keeping its native hooks
+registered. Run `lcm uninstall` to remove the native Claude integration.

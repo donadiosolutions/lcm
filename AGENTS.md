@@ -44,28 +44,13 @@ Rebuild and verify the package:
 
 ```bash
 git checkout main && git fetch origin main && git reset --hard origin/main
-npm run build && chmod +x dist/bin/lcm.js && npm link
+npm run build && npm link
+lcm install         # sync native Claude hooks, MCP, commands, and skills
 lcm doctor          # must show 0 failures
 npm test            # must pass
 ```
 
-Then sync the global Claude plugin cache so Claude Code picks up updated hooks
-and commands:
-
-```bash
-# Find the cached plugin directory (version and owner may vary)
-LEGACY_SLUG="$(printf '%s-%s' lossless claude)"
-LCM_PLUGIN_SLUG="lcm"
-CACHE=$(ls -d ~/.claude/plugins/cache/*/"$LCM_PLUGIN_SLUG"/*/ ~/.claude/plugins/cache/"$LCM_PLUGIN_SLUG"/lcm/*/ ~/.claude/plugins/cache/*/"$LEGACY_SLUG"/*/ ~/.claude/plugins/cache/"$LEGACY_SLUG"/lcm/*/ 2>/dev/null | sort -V | tail -1)
-if [ -n "$CACHE" ]; then
-  rm -rf "$CACHE" && mkdir -p "$CACHE"
-  cp .claude-plugin/plugin.json "$CACHE/"
-  cp -r .claude-plugin/commands "$CACHE/"
-  cp -r .claude-plugin/hooks "$CACHE/"
-fi
-```
-
-Then run `/reload-plugins` inside Claude Code to apply the changes.
+Restart Claude Code after `lcm install` updates the native integration.
 
 ### Codex Workflow
 
@@ -75,7 +60,7 @@ Rebuild and verify the package:
 
 ```bash
 git checkout main && git fetch origin main && git reset --hard origin/main
-npm run build && chmod +x dist/bin/lcm.js && npm link
+npm run build && npm link
 lcm doctor          # must show 0 failures
 npm test            # must pass
 ```
@@ -88,7 +73,7 @@ lcm connectors install codex
 lcm connectors doctor codex
 ```
 
-If anything fails, fix it before starting the next feature. A broken local env wastes time on every subsequent session (stale dist, wrong binary, hook errors, mismatched plugin cache).
+If anything fails, fix it before starting the next feature. A broken local env wastes time on every subsequent session (stale dist, wrong binary, hook errors, or mismatched native connector state).
 
 ## Documentation Requirements
 

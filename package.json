@@ -11,13 +11,12 @@
     ".": "./dist/src/memory/index.js"
   },
   "bin": {
-    "lcm": "dist/bin/lcm.js"
+    "lcm": "dist/lcm.mjs"
   },
   "license": "MIT",
-  "author": "Pedro Almeida (https://github.com/ipedro)",
+  "author": "Donadio Solutions (https://github.com/donadiosolutions)",
   "keywords": [
     "claude-code",
-    "claude-code-plugin",
     "context-management",
     "llm",
     "summarization",
@@ -26,21 +25,15 @@
   ],
   "files": [
     "dist/",
-    "mcp.mjs",
-    "lcm.mjs",
-    ".claude-plugin/",
-    "!.claude-plugin/commands/lcm-dogfood.md",
-    "!.claude-plugin/skills/lcm-dogfood/",
-    "!.claude-plugin/skills/lcm-e2e/",
     "docs/",
     "README.md",
+    "ACKNOWLEDGMENTS.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
-    "postbuild": "mkdir -p dist/src/prompts && cp -r src/prompts/*.yaml dist/src/prompts/ && mkdir -p dist/src/connectors/templates && cp -r src/connectors/templates/. dist/src/connectors/templates/ && mkdir -p dist/src/storage/postgresql/migrations && cp src/storage/postgresql/migrations/*.sql dist/src/storage/postgresql/migrations/ && cp installer/setup.sh dist/installer/setup.sh && npm run build:plugin-bundles",
-    "build:plugin-bundles": "node scripts/build-plugin-bundles.mjs",
-    "check:plugin-bundles": "node scripts/build-plugin-bundles.mjs --check",
+    "postbuild": "mkdir -p dist/src/prompts && cp -r src/prompts/*.yaml dist/src/prompts/ && mkdir -p dist/src/connectors/templates && cp -r src/connectors/templates/. dist/src/connectors/templates/ && mkdir -p dist/src/storage/postgresql/migrations && cp src/storage/postgresql/migrations/*.sql dist/src/storage/postgresql/migrations/ && cp installer/setup.sh dist/installer/setup.sh && npm run build:runtime",
+    "build:runtime": "node scripts/build-runtime.mjs",
     "prepublishOnly": "npm run build",
     "changeset": "changeset",
     "lint": "eslint .",
@@ -52,25 +45,25 @@
     "version-packages": "node scripts/version-packages.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@modelcontextprotocol/sdk": "1.29.0",
     "@sinclair/typebox": "0.34.51",
     "commander": "15.0.0",
     "js-yaml": "5.2.1",
     "pg": "8.22.0",
-    "safe-regex": "^2.1.1"
+    "safe-regex": "2.1.1"
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "0.111.0",
-    "@changesets/cli": "^2.30.0",
-    "@types/js-yaml": "^4.0.9",
+    "@changesets/cli": "2.31.0",
+    "@types/js-yaml": "4.0.9",
     "@types/node": "22.20.1",
     "@types/pg": "8.20.0",
-    "@types/safe-regex": "^1.1.6",
+    "@types/safe-regex": "1.1.6",
     "@vitest/coverage-v8": "4.1.10",
     "esbuild": "0.28.1",
     "eslint": "10.7.0",
     "openai": "6.46.0",
-    "typescript": "^6.0.3",
+    "typescript": "6.0.3",
     "typescript-eslint": "8.63.0",
     "vitest": "4.1.10"
   },

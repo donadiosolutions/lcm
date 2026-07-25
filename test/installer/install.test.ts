@@ -5,6 +5,9 @@ import {
   install,
   ensureLcmMd,
   REQUIRED_HOOKS,
+  parseInstalledClaudePlugins,
+  migrateClaudeMarketplacePlugins,
+  canonicalHookCommand,
   type ServiceDeps,
 } from "../../installer/install.js";
 import { homedir } from "node:os";
@@ -14,7 +17,7 @@ import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonCo
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-function makeSpawn(status = 0, stdout = "") {
+function makeSpawn(status = 0, stdout = "[]") {
   return vi.fn().mockReturnValue({ status, stdout, stderr: "", pid: 1, output: [], signal: null });
 }
 
@@ -28,6 +31,7 @@ function makeDeps(overrides: Partial<ServiceDeps> = {}): ServiceDeps {
     promptUser: vi.fn().mockResolvedValue("1"), // default: option 1
     ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
     runDoctor: vi.fn().mockResolvedValue([]),
+    binaryPath: "/opt/npm/bin/lcm",
     ...overrides,
   };
 }
@@ -35,27 +39,98 @@ function makeDeps(overrides: Partial<ServiceDeps> = {}): ServiceDeps {
 // ─── mergeClaudeSettings ────────────────────────────────────────────────────
 
 describe("mergeClaudeSettings", () => {
-  it("removes managed hooks and mcpServers from empty settings", () => {
-    const r = mergeClaudeSettings({});
-    expect(r).toEqual({});
+  const binary = "/opt/npm/bin/lcm";
+
+  it("installs exactly six absolute native hooks", () => {
+    const result = mergeClaudeSettings({}, binary);
+    expect(Object.keys(result.hooks)).toHaveLength(6);
+    for (const { event, command } of REQUIRED_HOOKS) {
+      expect(result.hooks[event]).toEqual([{
+        matcher: "",
+        hooks: [{ type: "command", command: canonicalHookCommand(binary, command) }],
+      }]);
+    }
   });
 
-  it("removes all 4 required hooks when already present", () => {
+  it("generates a Windows-safe Node plus runtime hook command", () => {
+    expect(canonicalHookCommand(
+      "C:\\Users\\test\\AppData\\Roaming\\npm\\node_modules\\@donadiosolutions\\lcm\\dist\\lcm.mjs",
+      "restore",
+      "C:\\Program Files\\nodejs\\node.exe",
+      "win32",
+    )).toBe(
+      '"C:\\Program Files\\nodejs\\node.exe" '
+      + '"C:\\Users\\test\\AppData\\Roaming\\npm\\node_modules\\@donadiosolutions\\lcm\\dist\\lcm.mjs" restore',
+    );
+  });
+
+  it("quotes platform-specific path characters and rejects a relative Node executable", () => {
+    expect(canonicalHookCommand("/opt/npm/it's/lcm.mjs", "restore", "/opt/node's/bin/node"))
+      .toContain("'\\''");
+    expect(canonicalHookCommand(
+      'C:\\npm\\"quoted"\\lcm.mjs',
+      "restore",
+      'C:\\node\\"quoted"\\node.exe',
+      "win32",
+    )).toContain('""quoted""');
+    expect(() => canonicalHookCommand(binary, "restore", "node"))
+      .toThrow("Node executable path must be absolute");
+  });
+
+  it("replaces legacy hooks while preserving MCP and unrelated hooks", () => {
     const existing = {
       hooks: {
         PreCompact: [{ matcher: "", hooks: [{ type: "command", command: "lcm compact --hook" }] }],
-        SessionStart: [{ matcher: "", hooks: [{ type: "command", command: "lcm restore" }] }],
-        SessionEnd: [{ matcher: "", hooks: [{ type: "command", command: "lcm session-end" }] }],
-        UserPromptSubmit: [{ matcher: "", hooks: [{ type: "command", command: "lcm user-prompt" }] }],
+        PostToolUse: [{ matcher: "custom", hooks: [{ type: "command", command: "other" }] }],
       },
-      mcpServers: {
-        lcm: { command: "lcm", args: ["mcp"] },
-      },
+      mcpServers: { lcm: { command: binary, args: ["mcp"] } },
     };
-    const r = mergeClaudeSettings(existing);
-    expect(r.hooks).toBeUndefined();
-    // mcpServers.lcm is now owned by settings.json and preserved
-    expect(r.mcpServers).toEqual({ lcm: { command: "lcm", args: ["mcp"] } });
+    const r = mergeClaudeSettings(existing, binary);
+    expect(r.hooks.PreCompact).toHaveLength(1);
+    expect(r.hooks.PostToolUse[0].hooks[0].command).toBe("other");
+    expect(r.hooks.PostToolUse).toHaveLength(2);
+    expect(r.mcpServers).toEqual({ lcm: { command: binary, args: ["mcp"] } });
+  });
+
+  it("replaces stale absolute LCM hooks without removing unrelated absolute commands", () => {
+    const result = mergeClaudeSettings({
+      hooks: {
+        PreCompact: [{
+          matcher: "",
+          hooks: [
+            { type: "command", command: 'node "/old/plugin/lcm.mjs" compact --hook' },
+            { type: "command", command: "/opt/tools/snapshot compact --hook" },
+          ],
+        }],
+      },
+    }, binary);
+    expect(result.hooks.PreCompact[0].hooks).toEqual([
+      { type: "command", command: "/opt/tools/snapshot compact --hook" },
+    ]);
+    expect(result.hooks.PreCompact[1].hooks[0].command).toBe(canonicalHookCommand(binary, "compact --hook"));
+  });
+
+  it("preserves a malformed command prefix that only shares a managed suffix", () => {
+    const result = mergeClaudeSettings({
+      hooks: {
+        SessionStart: [{ hooks: [{ type: "command", command: " restore" }] }],
+      },
+    }, binary);
+    expect(result.hooks.SessionStart[0].hooks[0].command).toBe(" restore");
+  });
+
+  it("recognizes escaped Windows-style absolute LCM hook paths", () => {
+    const result = mergeClaudeSettings({
+      hooks: {
+        SessionStart: [{
+          hooks: [{ type: "command", command: '"C:\\\\npm\\\\lcm" restore' }],
+        }],
+      },
+    }, binary);
+    expect(result.hooks.SessionStart).toEqual([{
+      matcher: "",
+      hooks: [{ type: "command", command: canonicalHookCommand(binary, "restore") }],
+    }]);
   });
 
   it("REQUIRED_HOOKS contains exactly 6 expected events", () => {
@@ -64,113 +139,40 @@ describe("mergeClaudeSettings", () => {
     ]);
   });
 
-  it("removes any of the 5 hooks if already present", () => {
-    const existing = {
-      hooks: {
-        PreCompact: [{ matcher: "", hooks: [{ type: "command", command: "lcm compact --hook" }] }],
-        SessionStart: [{ matcher: "", hooks: [{ type: "command", command: "lcm restore" }] }],
-        SessionEnd: [{ matcher: "", hooks: [{ type: "command", command: "lcm session-end" }] }],
-        UserPromptSubmit: [{ matcher: "", hooks: [{ type: "command", command: "lcm user-prompt" }] }],
-        Stop: [{ matcher: "", hooks: [{ type: "command", command: "lcm session-snapshot" }] }],
-      },
-    };
-    const r = mergeClaudeSettings(existing);
-    expect(r.hooks).toBeUndefined();
-  });
-
-  it("preserves unrelated hooks", () => {
-    const r = mergeClaudeSettings({ hooks: { PreCompact: [{ matcher: "", hooks: [{ type: "command", command: "other" }] }] } });
-    expect(r.hooks.PreCompact).toHaveLength(1);
-    expect(r.hooks.PreCompact[0].hooks[0].command).toBe("other");
-  });
-
-  it("removes managed hooks without leaving duplicates behind", () => {
-    const r = mergeClaudeSettings({ hooks: { PreCompact: [{ matcher: "", hooks: [{ type: "command", command: "lcm compact --hook" }] }] } });
-    expect(r.hooks).toBeUndefined();
-  });
-
-  it("removes only matching managed sub-hooks from a mixed entry", () => {
-    const r = mergeClaudeSettings({
-      hooks: {
-        PreCompact: [{
-          matcher: "",
-          hooks: [
-            { type: "command", command: "other" },
-            { type: "command", command: "lcm compact --hook" },
-          ],
-        }],
-      },
-    });
-
-    expect(r.hooks.PreCompact).toEqual([{
-      matcher: "",
-      hooks: [{ type: "command", command: "other" }],
-    }]);
-  });
-
-  it("migrates legacy hooks to lcm before removing them", () => {
+  it("removes legacy MCP and is idempotent", () => {
     const legacyServerName = legacyLcmMcpServerName();
     const existing = {
-      hooks: {
-        PreCompact: [{ matcher: "", hooks: [{ type: "command", command: legacyLcmCommand("lcm compact") }] }],
-        SessionStart: [{ matcher: "", hooks: [{ type: "command", command: legacyLcmCommand("lcm restore") }] }],
-        PostToolUse: [{ matcher: "", hooks: [{ type: "command", command: "other" }] }],
-      },
-      mcpServers: {
-        [legacyServerName]: { command: legacyServerName, args: ["mcp"] },
-        other: { command: "other", args: ["mcp"] },
-      }
+      mcpServers: { [legacyServerName]: {}, other: {} },
     };
-    const result = mergeClaudeSettings(existing);
-    for (const { event, command } of REQUIRED_HOOKS) {
-      const entries = result.hooks?.[event] ?? [];
-      const commands = entries.flatMap((e: any) => e.hooks.map((h: any) => h.command));
-      expect(commands).not.toContain(command);
-      expect(commands).not.toContain(legacyLcmCommand(command));
-    }
-    expect(result.hooks?.PostToolUse).toEqual([{ matcher: "", hooks: [{ type: "command", command: "other" }] }]);
+    const result = mergeClaudeSettings(existing, binary);
     expect(result.mcpServers[legacyServerName]).toBeUndefined();
-    expect(result.mcpServers["lcm"]).toBeUndefined();
-    expect(result.mcpServers.other).toEqual({ command: "other", args: ["mcp"] });
+    expect(mergeClaudeSettings(result, binary)).toEqual(result);
   });
 
-  it("normalizes malformed settings containers", () => {
-    expect(mergeClaudeSettings({ hooks: [], mcpServers: "invalid" })).toEqual({});
-    expect(mergeClaudeSettings({ hooks: null, mcpServers: [] })).toEqual({});
+  it("fails closed for malformed settings and non-absolute paths", () => {
+    expect(() => mergeClaudeSettings({ hooks: [] }, binary)).toThrow("hooks must be");
+    expect(() => mergeClaudeSettings({}, "lcm")).toThrow("must be absolute");
+    expect(() => mergeClaudeSettings({ hooks: { Stop: "invalid" } }, binary)).toThrow("hooks.Stop must be an array");
+    expect(() => mergeClaudeSettings({ hooks: { Stop: [{ hooks: "invalid" }] } }, binary)).toThrow("entry hooks must be an array");
+    expect(() => mergeClaudeSettings({ mcpServers: [] }, binary)).toThrow("mcpServers must be a JSON object");
   });
 
-  it("preserves malformed hook events and entries without hooks", () => {
+  it("preserves custom and malformed unrelated hook entries", () => {
     const result = mergeClaudeSettings({
       hooks: {
-        InvalidEvent: "invalid",
-        PreCompact: [{ matcher: "missing-hooks" }],
+        Stop: [
+          null,
+          "custom",
+          { matcher: "metadata-only" },
+          { matcher: "", label: "keep", hooks: [{ command: "lcm session-snapshot" }] },
+        ],
       },
-    });
-
-    expect(result.hooks).toEqual({
-      InvalidEvent: "invalid",
-      PreCompact: [{ matcher: "missing-hooks" }],
-    });
-  });
-
-  it("deduplicates migrated commands and commandless hooks", () => {
-    const legacy = legacyLcmCommand("lcm compact");
-    const result = mergeClaudeSettings({
-      hooks: {
-        Custom: [{
-          hooks: [
-            { type: "command", command: legacy },
-            { type: "command", command: "lcm compact --hook" },
-            { type: "prompt" },
-            { type: "prompt", prompt: "duplicate commandless hook" },
-          ],
-        }],
-      },
-    });
-
-    expect(result.hooks.Custom[0].hooks).toEqual([
-      { type: "command", command: "lcm compact --hook" },
-      { type: "prompt" },
+    }, binary);
+    expect(result.hooks.Stop.slice(0, 4)).toEqual([
+      null,
+      "custom",
+      { matcher: "metadata-only" },
+      { matcher: "", label: "keep", hooks: [] },
     ]);
   });
 });
@@ -211,6 +213,146 @@ describe("resolveBinaryPath", () => {
       spawnSync: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from("/bin/lcm") }),
       existsSync: vi.fn().mockImplementation((path: string) => path === "/opt/homebrew/bin/lcm"),
     })).toBe("/opt/homebrew/bin/lcm");
+  });
+});
+
+describe("Claude Marketplace migration", () => {
+  it("ignores only a missing Claude executable and blocks other list failures", () => {
+    const missing = vi.fn().mockReturnValue({
+      status: null,
+      stdout: "",
+      error: Object.assign(new Error("missing"), { code: "ENOENT" }),
+    });
+    expect(() => migrateClaudeMarketplacePlugins({ spawnSync: missing as any }, "/work")).not.toThrow();
+
+    const failed = vi.fn().mockReturnValue({ status: 2, stdout: "", stderr: "broken" });
+    expect(() => migrateClaudeMarketplacePlugins({ spawnSync: failed as any }, "/work"))
+      .toThrow("Could not list installed Claude plugins");
+  });
+
+  it("does not query marketplaces when no possible LCM plugin is installed", () => {
+    const spawnSync = vi.fn().mockReturnValue({
+      status: 0,
+      stdout: JSON.stringify([null, [], {}, { id: 42 }, { id: "other@marketplace" }]),
+    });
+    migrateClaudeMarketplacePlugins({ spawnSync: spawnSync as any }, "/work");
+    expect(spawnSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks an unverified LCM marketplace and supports an unqualified verified id", () => {
+    const unverified = vi.fn()
+      .mockReturnValueOnce({ status: 0, stdout: JSON.stringify([{ id: "lcm@unknown" }]) })
+      .mockReturnValueOnce({ status: 0, stdout: JSON.stringify([{ name: "unknown", repo: "someone/lcm" }]) });
+    expect(() => migrateClaudeMarketplacePlugins({ spawnSync: unverified as any }, "/work"))
+      .toThrow("could not be verified");
+    expect(unverified).toHaveBeenCalledTimes(2);
+
+    const verified = vi.fn()
+      .mockReturnValueOnce({ status: 0, stdout: JSON.stringify([{ id: "lcm", repository: "donadiosolutions/lcm" }]) })
+      .mockReturnValueOnce({ status: 0, stdout: "[]" })
+      .mockReturnValueOnce({ status: 0, stdout: "" })
+      .mockReturnValueOnce({ status: 0, stdout: "[]" });
+    migrateClaudeMarketplacePlugins({ spawnSync: verified as any }, "/work");
+    expect(verified).toHaveBeenCalledTimes(4);
+  });
+
+  it("parses only allowlisted repositories with scope and cwd", () => {
+    const plugins = JSON.stringify([
+      { id: "lcm@current", scope: "user" },
+      { id: "lcm@legacy", scope: "project", projectPath: "/work/p" },
+      { id: "lcm@unrelated", scope: "user", installPath: "/tmp/lossless-claude/lcm" },
+      { id: "other@current", scope: "user" },
+    ]);
+    const marketplaces = JSON.stringify([
+      { name: "current", source: "github", repo: "donadiosolutions/lcm" },
+      { name: "legacy", source: "github", repo: "lossless-claude/lcm" },
+      { name: "unrelated", source: "github", repo: "someone/lcm" },
+    ]);
+    expect(parseInstalledClaudePlugins(plugins, marketplaces)).toEqual([
+      { identifier: "lcm@current", repository: "donadiosolutions/lcm", scope: "user", cwd: undefined },
+      { identifier: "lcm@legacy", repository: "lossless-claude/lcm", scope: "project", cwd: "/work/p" },
+    ]);
+  });
+
+  it("uninstalls recognized plugins in scope and re-queries", () => {
+    const plugin = JSON.stringify([{ id: "lcm@current", scope: "local", projectPath: "/work/p" }]);
+    const marketplaces = JSON.stringify([{ name: "current", source: "github", repo: "donadiosolutions/lcm" }]);
+    const spawnSync = vi.fn()
+      .mockReturnValueOnce({ status: 0, stdout: plugin })
+      .mockReturnValueOnce({ status: 0, stdout: marketplaces })
+      .mockReturnValueOnce({ status: 0, stdout: "" })
+      .mockReturnValueOnce({ status: 0, stdout: "[]" });
+    migrateClaudeMarketplacePlugins({ spawnSync: spawnSync as any }, "/work/default");
+    expect(spawnSync).toHaveBeenNthCalledWith(3, "claude", [
+      "plugin", "uninstall", "lcm@current",
+      "--scope", "local", "--yes", "--keep-data",
+    ], expect.objectContaining({ cwd: "/work/p" }));
+    expect(spawnSync).toHaveBeenCalledTimes(4);
+  });
+
+  it("fails closed on malformed output, uninstall failure, and a remaining plugin", () => {
+    expect(() => parseInstalledClaudePlugins("{")).toThrow("malformed JSON");
+    expect(() => parseInstalledClaudePlugins("{}")).toThrow("unsupported shape");
+    const plugin = JSON.stringify([{ id: "lcm@legacy", scope: "user" }]);
+    const marketplaces = JSON.stringify([{ name: "legacy", source: "github", repo: "lossless-claude/lcm" }]);
+    expect(() => migrateClaudeMarketplacePlugins({
+      spawnSync: vi.fn()
+        .mockReturnValueOnce({ status: 0, stdout: plugin })
+        .mockReturnValueOnce({ status: 0, stdout: marketplaces })
+        .mockReturnValueOnce({ status: 1, stdout: "" }) as any,
+    }, "/work")).toThrow("Could not uninstall");
+    expect(() => migrateClaudeMarketplacePlugins({
+      spawnSync: vi.fn()
+        .mockReturnValueOnce({ status: 0, stdout: plugin })
+        .mockReturnValueOnce({ status: 0, stdout: marketplaces })
+        .mockReturnValueOnce({ status: 0, stdout: "" })
+        .mockReturnValueOnce({ status: 0, stdout: plugin }) as any,
+    }, "/work")).toThrow("remains installed");
+    expect(() => migrateClaudeMarketplacePlugins({
+      spawnSync: vi.fn()
+        .mockReturnValueOnce({ status: 0, stdout: plugin })
+        .mockReturnValueOnce({ status: 1, stdout: "" }) as any,
+    }, "/work")).toThrow("Could not verify configured");
+  });
+
+  it("covers explicit repository shapes, default scope, cwd, and unsupported scopes", () => {
+    expect(parseInstalledClaudePlugins(JSON.stringify([
+      { id: "lcm", repository: "github:donadiosolutions/lcm", cwd: "/cwd" },
+      { id: "lcm@x", repo: "https://github.com/lossless-claude/lcm.git" },
+      { id: "lcm@y", source: { repo: "git@github.com:donadiosolutions/lcm.git" } },
+      { id: "lcm@z", source: { repo: 42 } },
+      { id: "lcm@direct", source: "github:donadiosolutions/lcm" },
+      { id: "lcm@missing" },
+      { id: "lcm" },
+      { id: 1 },
+      null,
+      [],
+    ]))).toEqual([
+      { identifier: "lcm", repository: "donadiosolutions/lcm", scope: "user", cwd: "/cwd" },
+      { identifier: "lcm@x", repository: "lossless-claude/lcm", scope: "user", cwd: undefined },
+      { identifier: "lcm@y", repository: "donadiosolutions/lcm", scope: "user", cwd: undefined },
+      { identifier: "lcm@direct", repository: "donadiosolutions/lcm", scope: "user", cwd: undefined },
+    ]);
+    expect(() => parseInstalledClaudePlugins(JSON.stringify([
+      { id: "lcm@x", repository: "donadiosolutions/lcm", scope: "workspace" },
+    ]))).toThrow("unsupported scope");
+    expect(() => parseInstalledClaudePlugins("[]", "{}")).toThrow("marketplace list returned an unsupported shape");
+    expect(parseInstalledClaudePlugins("[]", JSON.stringify([
+      null, [], {}, { name: "missing-repo" }, { repo: "missing-name" },
+      { name: "other", repo: "someone/else" },
+    ]))).toEqual([]);
+  });
+
+  it("rejects a failed post-uninstall plugin query", () => {
+    const plugin = JSON.stringify([{ id: "lcm@legacy", scope: "user" }]);
+    const marketplaces = JSON.stringify([{ name: "legacy", repo: "lossless-claude/lcm" }]);
+    expect(() => migrateClaudeMarketplacePlugins({
+      spawnSync: vi.fn()
+        .mockReturnValueOnce({ status: 0, stdout: plugin })
+        .mockReturnValueOnce({ status: 0, stdout: marketplaces })
+        .mockReturnValueOnce({ status: 0, stdout: "" })
+        .mockReturnValueOnce({ status: 1, stdout: "" }) as any,
+    }, "/work")).toThrow("Could not verify Claude Marketplace plugin removal");
   });
 });
 
@@ -316,6 +458,20 @@ describe("install", () => {
     expect(deps.runDoctor).not.toHaveBeenCalled();
   });
 
+  it("fails before mutation for a relative executable or malformed Claude settings", async () => {
+    const relative = makeDeps({ binaryPath: "lcm" });
+    await expect(install(relative)).rejects.toThrow("absolute npm-installed");
+    expect(relative.runDoctor).not.toHaveBeenCalled();
+
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    const malformed = makeDeps({
+      existsSync: vi.fn((path: string) => path === settingsPath),
+      readFileSync: vi.fn((path: string) => path === settingsPath ? "{" : "{}"),
+    });
+    await expect(install(malformed)).rejects.toThrow("Refusing to modify malformed Claude settings");
+    expect(malformed.runDoctor).not.toHaveBeenCalled();
+  });
+
   it("ignores config chmod failures and reports doctor failures", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const deps = makeDeps({
@@ -330,7 +486,7 @@ describe("install", () => {
     errorSpy.mockRestore();
   });
 
-  it("clears stale cache directories, copies only markdown commands, and repairs malformed MCP settings", async () => {
+  it("copies only markdown commands and installs the native MCP settings", async () => {
     const rmSync = vi.fn();
     const copyFileSync = vi.fn();
     const readdirSync = vi.fn((path: string, options?: { withFileTypes?: boolean }) => {
@@ -347,7 +503,7 @@ describe("install", () => {
     let settingsReads = 0;
     const deps = makeDeps({
       existsSync: vi.fn((path: string) =>
-        path.endsWith("config.json") || path.includes("plugins/cache") || path.endsWith(".claude-plugin/commands") || path === settingsPath),
+        path.endsWith("config.json") || path === "/templates/commands" || path === settingsPath),
       readFileSync: vi.fn((path: string) => {
         if (path.endsWith("package.json")) return JSON.stringify({ version: "1.4.0" });
         if (path === settingsPath) return settingsReads++ === 0 ? "{}" : "null";
@@ -356,16 +512,17 @@ describe("install", () => {
       readdirSync: readdirSync as any,
       rmSync: rmSync as any,
       copyFileSync: copyFileSync as any,
+      commandsSourceDir: "/templates/commands",
     });
 
     await install(deps);
-    expect(rmSync).toHaveBeenCalledWith(expect.stringContaining("1.3.0"), { recursive: true, force: true });
+    expect(rmSync).not.toHaveBeenCalled();
     expect(copyFileSync).toHaveBeenCalledTimes(2);
     const settingsWrite = vi.mocked(deps.writeFileSync).mock.calls.filter(([path]) => path === settingsPath).at(-1);
     expect(JSON.parse(settingsWrite![1]).mcpServers.lcm).toBeDefined();
   });
 
-  it("preserves a valid MCP server map and ignores cache inspection failures", async () => {
+  it("preserves a valid MCP server map", async () => {
     const settingsPath = join(homedir(), ".claude", "settings.json");
     const deps = makeDeps({
       existsSync: vi.fn((path: string) => path.endsWith("config.json") || path.includes("plugins/cache") || path === settingsPath),
@@ -396,7 +553,11 @@ describe("install", () => {
       fs.writeFileSync(join(commandsSourceDir, "ignore.txt"), "ignore");
 
       const deps: ServiceDeps = {
-        spawnSync: makeSpawn(1, ""),
+        spawnSync: vi.fn().mockReturnValue({
+          status: null,
+          stdout: "",
+          error: Object.assign(new Error("missing"), { code: "ENOENT" }),
+        }) as ServiceDeps["spawnSync"],
         readFileSync: (path, encoding) => path.endsWith("package.json")
           ? JSON.stringify({ version: "1.4.0" })
           : fs.readFileSync(path, encoding as BufferEncoding) as string,
@@ -407,10 +568,11 @@ describe("install", () => {
         ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
         runDoctor: vi.fn().mockResolvedValue([]),
         commandsSourceDir,
+        binaryPath: "/opt/npm/bin/lcm",
       };
 
       await install(deps);
-      expect(fs.existsSync(join(cacheDir, "1.3.0"))).toBe(false);
+      expect(fs.existsSync(join(cacheDir, "1.3.0"))).toBe(true);
       expect(fs.existsSync(join(cacheDir, "1.4.0"))).toBe(true);
       expect(fs.readFileSync(join(commandsDestDir, "command.md"), "utf-8")).toBe("command");
       await install(deps);
@@ -716,6 +878,17 @@ describe("ensureLcmMd", () => {
     const { deps, written } = makeDepsForLcm(existing);
     expect(ensureLcmMd(deps, CONTENT, "/home").claudeMdPatched).toBe(true);
     expect(written.get("/home/.claude/CLAUDE.md")).toContain(BLOCK);
+  });
+
+  it("handles marker and non-marker files without trailing newlines", () => {
+    const noMarker = makeDepsForLcm("single line");
+    expect(ensureLcmMd(noMarker.deps, CONTENT, "/home").claudeMdPatched).toBe(true);
+
+    const markerAtEof = makeDepsForLcm(
+      "before\n<!-- lcm:start -->\n@old.md\n<!-- lcm:end -->",
+    );
+    expect(ensureLcmMd(markerAtEof.deps, CONTENT, "/home").claudeMdPatched).toBe(true);
+    expect(markerAtEof.written.get("/home/.claude/CLAUDE.md")).toContain(BLOCK);
   });
 
   it("does not rewrite CLAUDE.md when managed block is already correct", () => {

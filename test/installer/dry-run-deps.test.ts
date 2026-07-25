@@ -68,11 +68,11 @@ describe("DryRunServiceDeps", () => {
 
   // ── spawnSync — command -v special case ───────────────────────────────────
 
-  it("spawnSync for 'command -v lcm' returns bare binary name without printing", () => {
+  it("spawnSync for 'command -v lcm' returns an absolute binary path without printing", () => {
     const deps = new DryRunServiceDeps();
     const result = deps.spawnSync("sh", ["-c", "command -v lcm"]);
     expect(result.status).toBe(0);
-    expect(result.stdout).toBe("lcm");
+    expect(result.stdout).toBe("/usr/local/bin/lcm");
     // Should NOT print a [dry-run] line — it's a read-like operation
     expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("[dry-run] would run: sh"));
   });

@@ -99,18 +99,27 @@ flowchart TD
 
 ### Claude Code
 
-Install the `lcm` binary first:
+Install LCM from npm, then configure the native Claude Code integration:
 
 ```bash
-npm install -g @donadiosolutions/lcm  # provides the `lcm` command
-```
-
-```bash
-claude plugin add github:donadiosolutions/lcm
+npm install -g @donadiosolutions/lcm@latest
 lcm install
+lcm doctor
 ```
 
-`lcm install` writes config, registers hooks, installs slash commands, registers MCP, and verifies the daemon.
+`lcm install` writes the native Claude Code hooks and MCP configuration,
+installs slash commands and skills, and verifies the daemon. If it finds a
+recognized LCM Marketplace installation from the current or legacy upstream
+repository, it removes that installation first to prevent duplicate hooks.
+LCM no longer supports direct installation from the Claude Marketplace.
+
+Update LCM through npm and rerun the idempotent installer:
+
+```bash
+npm install -g @donadiosolutions/lcm@latest
+lcm install
+lcm doctor
+```
 
 ### VS Code (GitHub Copilot)
 
@@ -173,14 +182,19 @@ See [`docs/vscode-codex.md`](docs/vscode-codex.md) for the current VS Code/Codex
 
 ## Hooks
 
-Claude Code uses plugin-managed hooks. All Claude Code hooks auto-heal: each validates that all required entries remain registered and repairs missing entries before continuing. Codex uses native hooks from `~/.codex/hooks.json`.
+Claude Code uses npm-managed native hooks in `~/.claude/settings.json`. All
+Claude Code hooks auto-heal: each validates that all required entries remain
+registered and repairs missing entries before continuing. Codex uses native
+hooks from `~/.codex/hooks.json`.
 
 | Hook | Command | Purpose |
 |---|---|---|
 | `PreCompact` | `lcm compact --hook` | Intercepts compaction and writes DAG summaries |
 | `SessionStart` | `lcm restore` | Restores project context, recent summaries, and promoted memory |
-| `SessionEnd` | `lcm session-end` | Ingests the completed Claude transcript |
 | `UserPromptSubmit` | `lcm user-prompt` | Searches memory and injects prompt-time hints |
+| `PostToolUse` | `lcm post-tool` | Captures passive-learning signals from tool use |
+| `Stop` | `lcm session-snapshot` | Ingests transcript deltas during the session |
+| `SessionEnd` | `lcm session-end` | Ingests the completed Claude transcript |
 
 ```mermaid
 flowchart LR
@@ -318,7 +332,7 @@ All environment variables are optional. The default summarizer mode is `auto`.
 | `LCM_MAX_EXPAND_TOKENS` | `4000` | Token cap for DAG expansion via `lcm_expand` |
 | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File size (tokens) above which content is extracted to disk |
 | `LCM_AUTOCOMPACT_DISABLED` | `false` | Set to `true` to disable automatic compaction after each turn |
-| `LCM_ENABLED` | `true` | Set to `false` to disable the plugin while keeping it registered |
+| `LCM_ENABLED` | `true` | Set to `false` to disable LCM while keeping its native integration installed |
 
 `auto` resolves per caller:
 
@@ -418,19 +432,10 @@ If you configure an external summarizer (`claude-process`, `anthropic`, `openai`
 
 Add project-specific patterns with `lcm sensitive add "MY_PATTERN"`. See [docs/privacy.md](docs/privacy.md) for full details.
 
-## Technical Notes
-
-- Claude Code integration is hook-first.
-- The daemon is shared; the memory backend is client-agnostic. SQLite remains
-  the default, with secure PostgreSQL configuration staged for repository
-  support.
-- The repo carries the original lossless-claw lineage; the current runtime is Claude Code oriented.
-
 ## Acknowledgments
 
-This project is a maintained fork in the original LCM lineage, which itself stands on the shoulders of [lossless-claw](https://github.com/Martian-Engineering/lossless-claw), the original implementation by [Martian Engineering](https://martian.engineering). This fork keeps the DAG-based compaction architecture, the LCM memory model, and the foundational design decisions.
-
-The underlying theory comes from the [LCM paper](https://papers.voltropy.com/LCM) by [Voltropy](https://x.com/Voltropy).
+See [`ACKNOWLEDGMENTS.md`](ACKNOWLEDGMENTS.md) for project lineage and prior
+work.
 
 ## License
 

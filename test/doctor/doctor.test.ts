@@ -57,6 +57,12 @@ function minimalDeps(overrides: Partial<Parameters<typeof runDoctor>[0]> = {}) {
     mkdirSync: vi.fn(),
     spawnSync: vi.fn(() => ({ status: 0, stdout: "", stderr: "" })),
     fetch: vi.fn().mockResolvedValue({ ok: false }),
+    _testMcpHandshake: vi.fn().mockResolvedValue({
+      name: "mcp-handshake-lcm",
+      category: "MCP Servers",
+      status: "pass",
+      message: "lcm: 7/7 tools",
+    }),
     homedir: "/tmp/test-home",
     platform: "darwin",
     ...overrides,

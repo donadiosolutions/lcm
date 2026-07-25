@@ -131,10 +131,8 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Verify committed plugin bundles
-        run: |
-          npm run check:plugin-bundles
-          git diff --exit-code -- lcm.mjs mcp.mjs
+      - name: Verify build leaves tracked sources unchanged
+        run: git diff --exit-code
 
       - name: Collect release pull requests
         id: notes
@@ -559,10 +557,8 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Verify committed plugin bundles
-        run: |
-          npm run check:plugin-bundles
-          git diff --exit-code -- lcm.mjs mcp.mjs
+      - name: Verify build leaves tracked sources unchanged
+        run: git diff --exit-code
 
       - name: Pack verified npm artifact
         run: |

@@ -77,30 +77,12 @@ These three tools **chain** from broad to deep:
 
 ## Binary Resolution
 
-If `lcm` is not on PATH, first try to install it by running:
+If `lcm` is not on PATH, install or update the npm package and repair the
+native Claude integration:
 
 ```bash
-LEGACY_SLUG="$(printf '%s-%s' lossless claude)"
-LCM_PLUGIN_SLUG="lcm"
-LCM_DIR=$(ls -d ~/.claude/plugins/cache/*/"$LCM_PLUGIN_SLUG"/*/ ~/.claude/plugins/cache/"$LCM_PLUGIN_SLUG"/lcm/*/ ~/.claude/plugins/cache/*/"$LEGACY_SLUG"/*/ ~/.claude/plugins/cache/"$LEGACY_SLUG"/lcm/*/ 2>/dev/null | sort -V | tail -1)
-[ -n "$LCM_DIR" ] && [ -f "${LCM_DIR}lcm.mjs" ] || {
-  echo "LCM plugin bundle not found; reinstall the lcm plugin before continuing." >&2
-  exit 1
-}
-node "${LCM_DIR}lcm.mjs" install
-```
-
-If install succeeds, `lcm` should now be available on PATH. If it is still not available, use the bundled binary directly:
-
-```bash
-LEGACY_SLUG="$(printf '%s-%s' lossless claude)"
-LCM_PLUGIN_SLUG="lcm"
-LCM_DIR=$(ls -d ~/.claude/plugins/cache/*/"$LCM_PLUGIN_SLUG"/*/ ~/.claude/plugins/cache/"$LCM_PLUGIN_SLUG"/lcm/*/ ~/.claude/plugins/cache/*/"$LEGACY_SLUG"/*/ ~/.claude/plugins/cache/"$LEGACY_SLUG"/lcm/*/ 2>/dev/null | sort -V | tail -1)
-[ -n "$LCM_DIR" ] && [ -f "${LCM_DIR}lcm.mjs" ] || {
-  echo "LCM plugin bundle not found; reinstall the lcm plugin before continuing." >&2
-  exit 1
-}
-node "${LCM_DIR}lcm.mjs"
+npm install -g @donadiosolutions/lcm@latest
+lcm install
 ```
 
 ## Error Self-Healing

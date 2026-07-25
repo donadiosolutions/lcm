@@ -33,7 +33,7 @@ The script handles everything end-to-end:
 | 0 | Checkout main, pull, verify clean |
 | 1 | Guard: abort if tag or npm version already exists |
 | 2 | Create `release/vX.Y.Z` branch from main |
-| 3 | Bump all 3 version files, add `CHANGELOG.md` entry, verify versions match |
+| 3 | Bump the package version, add `CHANGELOG.md` entry, and verify it |
 | 4 | Commit and push |
 | 5 | Open PR targeting `main` |
 | 6 | Wait for CI (skips gracefully if no CI configured) |
@@ -62,8 +62,8 @@ to npm.
 - **Step 8 is idempotent** for a valid one-sided tag by pushing the local copy or fetching the remote copy; when both copies exist, their signed tag object and expected commit must match exactly
 - **Release PRs target `main`**
 - **Use `--merge`** (not squash) so the version bump SHA is preserved on main
-- **All 3 version files must match**: `package.json`, `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`
-  - Note: marketplace.json stores version at `.plugins[0].version`, not root
+- **`package.json` is the package version source of truth**; generated runtime
+  and native connector resources carry no independent release version
 - **CHANGELOG.md must include the release version block** before `publish.yml` creates the draft
 - **The tag-triggered run never publishes npm**; it must leave an action-created
   draft, and a maintainer must publish that draft to trigger npm

@@ -139,18 +139,15 @@ tag_peeled_from_refs() {
 commit_json_version() {
   local commit="$1"
   local path="$2"
-  local selector="$3"
   git show "$commit:$path" | node -e '
     let input = "";
-    const selector = process.argv[1];
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", (chunk) => { input += chunk; });
     process.stdin.on("end", () => {
       const parsed = JSON.parse(input);
-      const version = selector === "marketplace" ? parsed.plugins?.[0]?.version : parsed.version;
-      process.stdout.write(String(version ?? ""));
+      process.stdout.write(String(parsed.version ?? ""));
     });
-  ' "$selector"
+  '
 }
 
 # Validate origin points at the canonical repo (not a fork)
@@ -256,22 +253,6 @@ if run_step 3; then
   npm version "$VERSION" --no-git-tag-version --silent
   ok "package.json → $VERSION"
 
-  node -e "
-  const fs = require('fs');
-  const p = '.claude-plugin/plugin.json';
-  const s = fs.readFileSync(p, 'utf8');
-  fs.writeFileSync(p, s.replace(/\"version\":\s*\"[^\"]*\"/, '\"version\": \"$VERSION\"'));
-  "
-  ok "plugin.json → $VERSION"
-
-  node -e "
-  const fs = require('fs');
-  const p = '.claude-plugin/marketplace.json';
-  const s = fs.readFileSync(p, 'utf8');
-  fs.writeFileSync(p, s.replace(/\"version\":\s*\"[^\"]*\"/, '\"version\": \"$VERSION\"'));
-  "
-  ok "marketplace.json → $VERSION"
-
   VERSION="$VERSION" node <<'NODE'
   const fs = require('fs');
   const p = 'CHANGELOG.md';
@@ -310,11 +291,9 @@ NODE
   ok "CHANGELOG.md includes $VERSION release block."
 
   V1=$(node -p "require('./package.json').version")
-  V2=$(node -p "require('./.claude-plugin/plugin.json').version")
-  V3=$(node -p "require('./.claude-plugin/marketplace.json').plugins[0].version")
-  [[ "$V1" != "$VERSION" || "$V2" != "$VERSION" || "$V3" != "$VERSION" ]] && \
-    err "Version mismatch after bump! package.json=$V1  plugin.json=$V2  marketplace.json=$V3"
-  ok "All three files verified at $VERSION."
+  [[ "$V1" != "$VERSION" ]] && \
+    err "Version mismatch after bump! package.json=$V1"
+  ok "package.json verified at $VERSION."
 else
   step "Step 3 — Bump version files and changelog"; skip
 fi
@@ -322,7 +301,7 @@ fi
 # ─── STEP 4: Commit and push ─────────────────────────────────────────────────
 if run_step 4; then
   step "Step 4 — Commit and push"
-  git add package.json package-lock.json .claude-plugin/plugin.json .claude-plugin/marketplace.json CHANGELOG.md
+  git add package.json package-lock.json CHANGELOG.md
   if git diff --cached --quiet; then
     ok "No staged changes to commit; skipping git commit."
   else
@@ -418,14 +397,10 @@ if run_step 8; then
     err "Failed to fetch origin/main before creating $TAG."
   git merge-base --is-ancestor "$MERGE_SHA" origin/main || \
     err "Merge commit $MERGE_SHA is not reachable from origin/main; refusing to tag it."
-  MERGED_PACKAGE_VERSION=$(commit_json_version "$MERGE_SHA" "package.json" "root") || \
+  MERGED_PACKAGE_VERSION=$(commit_json_version "$MERGE_SHA" "package.json") || \
     err "Could not read package.json version from merge commit $MERGE_SHA."
-  MERGED_PLUGIN_VERSION=$(commit_json_version "$MERGE_SHA" ".claude-plugin/plugin.json" "root") || \
-    err "Could not read .claude-plugin/plugin.json version from merge commit $MERGE_SHA."
-  MERGED_MARKETPLACE_VERSION=$(commit_json_version "$MERGE_SHA" ".claude-plugin/marketplace.json" "marketplace") || \
-    err "Could not read .claude-plugin/marketplace.json version from merge commit $MERGE_SHA."
-  [[ "$MERGED_PACKAGE_VERSION" == "$VERSION" && "$MERGED_PLUGIN_VERSION" == "$VERSION" && "$MERGED_MARKETPLACE_VERSION" == "$VERSION" ]] || \
-    err "Merge commit $MERGE_SHA has inconsistent release versions (package=$MERGED_PACKAGE_VERSION, plugin=$MERGED_PLUGIN_VERSION, marketplace=$MERGED_MARKETPLACE_VERSION; expected $VERSION); refusing to create $TAG."
+  [[ "$MERGED_PACKAGE_VERSION" == "$VERSION" ]] || \
+    err "Merge commit $MERGE_SHA has an inconsistent package version (package=$MERGED_PACKAGE_VERSION; expected $VERSION); refusing to create $TAG."
   MERGED_CHANGELOG=$(git show "$MERGE_SHA:CHANGELOG.md") || \
     err "Could not read CHANGELOG.md from merge commit $MERGE_SHA."
   CHANGELOG_BLOCK=$(printf '%s\n' "$MERGED_CHANGELOG" | awk -v version="$VERSION" '

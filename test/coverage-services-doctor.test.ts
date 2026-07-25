@@ -991,7 +991,7 @@ describe("doctor service coverage", () => {
       writeError: new Error("cannot write"),
       exists: (path) => !path.endsWith("lcm.md"),
     }));
-    expect(results.find((result) => result.name === "hooks")?.message).toContain("Duplicate");
+    expect(results.find((result) => result.name === "hooks")?.message).toContain("Could not manage native Claude Code hooks");
     expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("fail");
     expect(results.find((result) => result.name === "lcm-md")?.status).toBe("fail");
 
@@ -1007,7 +1007,7 @@ describe("doctor service coverage", () => {
     results = await runDoctor(makeDeps({
       readError: (path) => path.endsWith("settings.json") || path.endsWith("lcm.md") ? new Error("cannot read") : undefined,
     }));
-    expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("warn");
+    expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("fail");
     expect(results.find((result) => result.name === "lcm-md")?.status).toBe("warn");
   });
 
@@ -1105,7 +1105,7 @@ describe("doctor service coverage", () => {
     const hooks: Record<string, unknown[]> = {};
     for (const { event, command } of REQUIRED_HOOKS) hooks[event] = [{ hooks: [{ command }] }];
     let results = await runDoctor(makeDeps({ settings: { hooks }, writeError: "plain write failure" }));
-    expect(results.find((result) => result.name === "hooks")?.message).toContain("entries");
+    expect(results.find((result) => result.name === "hooks")?.message).toContain("Could not manage native Claude Code hooks");
 
     results = await runDoctor(makeDeps({ claudeMd: "no reference" }));
     expect(results.find((result) => result.name === "lcm-md")?.message).toContain("added @lcm.md");

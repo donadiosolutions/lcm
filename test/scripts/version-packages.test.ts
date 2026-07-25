@@ -72,7 +72,7 @@ describe("version-packages", () => {
     );
   });
 
-  it("runs the planned transition before versioning and manifest synchronization", () => {
+  it("runs the planned transition before versioning and lockfile synchronization", () => {
     const execute = vi.fn();
     runVersionPackages({
       channel: "beta",
@@ -92,7 +92,7 @@ describe("version-packages", () => {
       "/repo/node_modules/@changesets/cli/bin.js",
       "version",
     ]);
-    expect(execute.mock.calls[2][1][0]).toMatch(/scripts\/sync-plugin-version\.mjs$/u);
+    expect(execute.mock.calls[2][1][0]).toMatch(/scripts\/sync-package-version\.mjs$/u);
   });
 
   it("uses the active beta without re-entering prerelease mode", () => {

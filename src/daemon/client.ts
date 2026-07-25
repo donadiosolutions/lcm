@@ -17,6 +17,7 @@ export type DaemonHealth = {
   storageBackend: StorageBackend;
   uptime: number;
   pid: number;
+  entrypoint?: string;
   storage?: {
     status: string;
     error?: {

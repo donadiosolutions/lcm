@@ -10,7 +10,7 @@ Inspect recent Claude Code transcripts for historical lcm issues.
 
 ## Instructions
 
-Run `lcm diagnose` via Bash and display the output verbatim. If `lcm` is not on PATH (marketplace install), use `node "${CLAUDE_PLUGIN_ROOT}/lcm.mjs" diagnose` instead.
+Run `lcm diagnose` via Bash and display the output verbatim.
 
 If the user asks for a wider scan, use:
 - `lcm diagnose --all`

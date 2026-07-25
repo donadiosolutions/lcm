@@ -30,11 +30,11 @@ function makeDeps(existsResult = true, overrides: Partial<TeardownDeps> = {}): T
 // ─── removeClaudeSettings ───────────────────────────────────────────────────
 
 describe("removeClaudeSettings", () => {
-  it("normalizes malformed settings containers", () => {
-    expect(removeClaudeSettings({ hooks: [], mcpServers: "invalid" })).toEqual({
-      hooks: {},
-      mcpServers: {},
-    });
+  it("fails closed for malformed settings containers", () => {
+    expect(() => removeClaudeSettings({ hooks: [], mcpServers: "invalid" })).toThrow("hooks must be");
+    expect(() => removeClaudeSettings({ hooks: { Stop: "invalid" } })).toThrow("hooks.Stop must be an array");
+    expect(() => removeClaudeSettings({ hooks: { Stop: [{ hooks: "invalid" }] } })).toThrow("entry hooks must be an array");
+    expect(() => removeClaudeSettings({ mcpServers: [] })).toThrow("mcpServers must be a JSON object");
   });
 
   it("preserves non-array events and entries without hook arrays", () => {
@@ -63,7 +63,7 @@ describe("removeClaudeSettings", () => {
     });
     expect(r.hooks.PreCompact).toHaveLength(1);
     expect(r.hooks.PreCompact[0].hooks[0].command).toBe("other");
-    expect(r.hooks.SessionStart).toHaveLength(0);
+    expect(r.hooks.SessionStart).toBeUndefined();
     expect(r.mcpServers["lcm"]).toBeUndefined();
     expect(r.mcpServers["other"]).toBeDefined();
   });
@@ -86,11 +86,8 @@ describe("removeClaudeSettings", () => {
       },
       mcpServers: { "lcm": {} },
     });
-    expect(r.hooks.PreCompact).toHaveLength(0);
-    expect(r.hooks.SessionStart).toHaveLength(0);
-    expect(r.hooks.SessionEnd).toHaveLength(0);
-    expect(r.hooks.UserPromptSubmit).toHaveLength(0);
-    expect(r.mcpServers["lcm"]).toBeUndefined();
+    expect(r.hooks).toBeUndefined();
+    expect(r.mcpServers).toBeUndefined();
   });
 
   it("removes entry when any sub-hook matches a lcm command", () => {
@@ -108,7 +105,8 @@ describe("removeClaudeSettings", () => {
       },
       mcpServers: {},
     });
-    expect(r.hooks.PreCompact).toHaveLength(0);
+    expect(r.hooks.PreCompact).toHaveLength(1);
+    expect(r.hooks.PreCompact[0].hooks[0].command).toBe("something-else");
   });
 
   it("removes pre-hook legacy compact commands", () => {
@@ -123,6 +121,26 @@ describe("removeClaudeSettings", () => {
     });
     expect(r.hooks.PreCompact).toHaveLength(1);
     expect(r.hooks.PreCompact[0].hooks[0].command).toBe("other");
+  });
+
+  it("preserves unrelated primitive and metadata-bearing hook entries", () => {
+    const result = removeClaudeSettings({
+      hooks: {
+        Stop: [
+          null,
+          "custom",
+          { matcher: "metadata-only" },
+          { label: "keep", hooks: [{ command: "lcm session-snapshot" }] },
+        ],
+      },
+      mcpServers: { other: {} },
+    });
+    expect(result).toEqual({
+      hooks: {
+        Stop: [null, "custom", { matcher: "metadata-only" }, { label: "keep", hooks: [] }],
+      },
+      mcpServers: { other: {} },
+    });
   });
 });
 
@@ -218,8 +236,7 @@ describe("uninstall", () => {
     );
   });
 
-  it("warns but does not throw when settings.json contains invalid JSON", async () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("stops before removing runtime assets when settings.json contains invalid JSON", async () => {
     const deps: TeardownDeps = {
       spawnSync: makeSpawn(),
       existsSync: vi.fn().mockReturnValue(true),
@@ -227,20 +244,66 @@ describe("uninstall", () => {
       readFileSync: vi.fn().mockReturnValue("not valid json"),
       writeFileSync: vi.fn(),
     };
-    await expect(uninstall(deps)).resolves.not.toThrow();
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("could not update"));
-    warnSpy.mockRestore();
+    await expect(uninstall(deps)).rejects.toThrow("uninstall was stopped before removing runtime assets");
+    expect(deps.rmSync).not.toHaveBeenCalled();
+    expect(deps.spawnSync).not.toHaveBeenCalled();
   });
 
   it("stringifies non-Error settings failures", async () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const deps = makeDeps(true, {
       readFileSync: vi.fn(() => { throw "plain failure"; }),
     });
 
-    await expect(uninstall(deps)).resolves.toBeUndefined();
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("plain failure"));
-    warnSpy.mockRestore();
+    await expect(uninstall(deps)).rejects.toThrow("plain failure");
+  });
+
+  it("warns for Error and primitive CLAUDE.md cleanup failures", async () => {
+    for (const failure of [new Error("claude md error"), "plain claude md error"]) {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      let claudeMdReads = 0;
+      const deps = makeDeps(true, {
+        readFileSync: vi.fn((path: string) => {
+          if (path.endsWith("settings.json")) return "{}";
+          if (path.endsWith("CLAUDE.md")) {
+            claudeMdReads += 1;
+            throw failure;
+          }
+          return "";
+        }),
+      });
+      await uninstall(deps);
+      expect(claudeMdReads).toBe(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(
+        failure instanceof Error ? failure.message : failure,
+      ));
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("writes an empty CLAUDE.md when only the managed block remains", async () => {
+    const deps = makeDeps(true, {
+      readFileSync: vi.fn((path: string) => path.endsWith("CLAUDE.md")
+        ? "<!-- lcm:start -->\n@lcm.md\n<!-- lcm:end -->\n"
+        : "{}"),
+    });
+    await uninstall(deps);
+    expect(deps.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining("CLAUDE.md"),
+      "",
+    );
+  });
+
+  it("preserves content surrounding the removed CLAUDE.md block", async () => {
+    const deps = makeDeps(true, {
+      readFileSync: vi.fn((path: string) => path.endsWith("CLAUDE.md")
+        ? "before\n<!-- lcm:start -->\n@lcm.md\n<!-- lcm:end -->\n"
+        : "{}"),
+    });
+    await uninstall(deps);
+    expect(deps.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining("CLAUDE.md"),
+      "before\n",
+    );
   });
 });
 

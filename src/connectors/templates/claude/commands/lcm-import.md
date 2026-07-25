@@ -16,12 +16,6 @@ Run the following command via Bash:
 lcm import
 ```
 
-If `lcm` is not on PATH (marketplace install), use the plugin-relative binary instead:
-
-```bash
-node "${CLAUDE_PLUGIN_ROOT}/lcm.mjs" import
-```
-
 ### Options
 
 If the user specifies options, append them to the command:

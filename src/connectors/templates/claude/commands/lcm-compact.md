@@ -16,12 +16,6 @@ Run the following command via Bash:
 lcm compact
 ```
 
-If `lcm` is not on PATH (marketplace install), use the plugin-relative binary instead:
-
-```bash
-node "${CLAUDE_PLUGIN_ROOT}/lcm.mjs" compact
-```
-
 ### Options
 
 Pass user-specified flags through to the command:

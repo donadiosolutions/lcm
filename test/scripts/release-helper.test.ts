@@ -24,8 +24,6 @@ interface HarnessOptions {
   mergeSha?: string;
   mergeReachable?: boolean;
   mergedPackageVersion?: string;
-  mergedPluginVersion?: string;
-  mergedMarketplaceVersion?: string;
   npmVersion?: string;
   npmDistTags?: string;
   originUrl?: string;
@@ -124,14 +122,6 @@ if [[ "$1" == "merge-base" && "$2" == "--is-ancestor" ]]; then
 fi
 if [[ "$1" == "show" && "$2" == *:package.json ]]; then
   printf '{"version":"%s"}\n' "$FAKE_MERGED_PACKAGE_VERSION"
-  exit 0
-fi
-if [[ "$1" == "show" && "$2" == *:.claude-plugin/plugin.json ]]; then
-  printf '{"version":"%s"}\n' "$FAKE_MERGED_PLUGIN_VERSION"
-  exit 0
-fi
-if [[ "$1" == "show" && "$2" == *:.claude-plugin/marketplace.json ]]; then
-  printf '{"plugins":[{"version":"%s"}]}\n' "$FAKE_MERGED_MARKETPLACE_VERSION"
   exit 0
 fi
 if [[ "$1" == "show" && "$2" == *:CHANGELOG.md ]]; then
@@ -286,8 +276,6 @@ exit 0
         FAKE_MERGE_REACHABLE: String(options.mergeReachable ?? true),
         FAKE_MERGE_SHA: releaseMergeSha,
         FAKE_MERGED_PACKAGE_VERSION: options.mergedPackageVersion ?? releaseVersion,
-        FAKE_MERGED_PLUGIN_VERSION: options.mergedPluginVersion ?? releaseVersion,
-        FAKE_MERGED_MARKETPLACE_VERSION: options.mergedMarketplaceVersion ?? releaseVersion,
         FAKE_NPM_VERSION: options.npmVersion ?? "",
         FAKE_NPM_DIST_TAGS: options.npmDistTags ?? "",
         FAKE_NPM_PRETAG_CHECKED: npmPreTagChecked,
@@ -521,7 +509,7 @@ describe("manual release helper step 8", () => {
     const result = runRelease({ mergedPackageVersion: "9.9.8" });
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain(`package=9.9.8, plugin=${version}, marketplace=${version}; expected ${version}`);
+    expect(result.stderr).toContain(`package=9.9.8; expected ${version}`);
     expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
     expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
   });
@@ -546,18 +534,6 @@ describe("manual release helper step 8", () => {
     expect(result.stderr).not.toContain("registry-secret-detail-");
     expect(result.stdout).not.toContain("registry-secret-detail-");
     expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
-  });
-
-  it.each([
-    { mergedPluginVersion: "9.9.8" },
-    { mergedMarketplaceVersion: "9.9.8" },
-  ])("refuses inconsistent packaged manifest versions before tagging", (manifestOptions: HarnessOptions) => {
-    const result = runRelease(manifestOptions);
-
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain("has inconsistent release versions");
-    expect(result.calls.some((call: string) => call.startsWith("git|tag|-s|-a|"))).toBe(false);
-    expect(result.calls).not.toContain(`git|push|origin|refs/tags/${tag}`);
   });
 
   it.each([
