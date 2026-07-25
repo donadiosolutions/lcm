@@ -485,6 +485,9 @@ describe("PostgreSQL conversation repository", () => {
     expect(config.text).toContain("$2::pg_catalog.int8[]");
     expect(config.text).toContain("pg_catalog.unnest");
     expect(config.text).toContain("WITH ORDINALITY");
+    expect(config.text).toMatch(
+      /\/\* Data dependency: delete context rows before their messages\. \*\/\s+SELECT COUNT\(\*\) FROM deleted_context/u,
+    );
     expect(config.text).not.toMatch(/\$(?:[3-9]|\d{2,})/u);
     expect((config.values?.[1] as number[])[0]).toBe(1);
     expect((config.values?.[1] as number[]).at(-1)).toBe(65_536);

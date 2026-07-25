@@ -524,6 +524,138 @@ describe("ConversationStore — withTransaction", () => {
     expect(await store.getMessageCount(conv.conversationId)).toBe(0);
   });
 
+  it.each(["retry", "already-clean"] as const)(
+    "preserves the original failure and releases the queue after one rollback %s",
+    async (recovery) => {
+      const raw = makeDb();
+      const statements: string[] = [];
+      let rollbackAttempts = 0;
+      const database = {
+        exec: (sql: string): void => {
+          statements.push(sql);
+          if (sql === "ROLLBACK") {
+            rollbackAttempts += 1;
+            if (rollbackAttempts === 1) {
+              if (recovery === "already-clean") raw.exec(sql);
+              throw new Error("rollback /private/recovery-secret");
+            }
+          }
+          raw.exec(sql);
+        },
+        prepare: (sql: string) => raw.prepare(sql),
+        get isTransaction(): boolean {
+          return raw.isTransaction;
+        },
+      } as unknown as DatabaseSync;
+      const store = makeStore(database);
+      const original = new Error(`original-${recovery}`);
+      let releaseFirst!: () => void;
+      let markFirstEntered!: () => void;
+      const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const firstEntered = new Promise<void>((resolve) => { markFirstEntered = resolve; });
+      const first = store.withTransaction(async () => {
+        markFirstEntered();
+        await firstRelease;
+        throw original;
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await firstEntered;
+      const second = store.withTransaction(() => "queue released");
+      releaseFirst();
+
+      const observed = await first;
+      expect(observed).toBe(original);
+      expect(String(observed)).not.toContain("recovery-secret");
+      await expect(second).resolves.toBe("queue released");
+      expect(statements).toEqual(recovery === "retry"
+        ? [
+            "BEGIN IMMEDIATE",
+            "ROLLBACK",
+            "ROLLBACK",
+            "BEGIN IMMEDIATE",
+            "COMMIT",
+          ]
+        : [
+            "BEGIN IMMEDIATE",
+            "ROLLBACK",
+            "BEGIN IMMEDIATE",
+            "COMMIT",
+          ]);
+    },
+  );
+
+  it("preserves a commit error and fences queued atomic work after persistent rollback failure", async () => {
+    const raw = makeDb();
+    const statements: string[] = [];
+    let prepareCalls = 0;
+    const commitError = new Error("original commit failure");
+    const database = {
+      exec: (sql: string): void => {
+        statements.push(sql);
+        if (sql === "COMMIT") throw commitError;
+        if (sql === "ROLLBACK") {
+          throw new Error("rollback /private/persistent-secret");
+        }
+        raw.exec(sql);
+      },
+      prepare: (sql: string) => {
+        prepareCalls += 1;
+        return raw.prepare(sql);
+      },
+      get isTransaction(): boolean {
+        return raw.isTransaction;
+      },
+    } as unknown as DatabaseSync;
+    const store = makeStore(database);
+    const peer = makeStore(database);
+    const conversation = await store.createConversation({
+      sessionId: "persistent-rollback-failure",
+    });
+    let releaseFirst!: () => void;
+    let markFirstEntered!: () => void;
+    const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const firstEntered = new Promise<void>((resolve) => { markFirstEntered = resolve; });
+    const first = store.withTransaction(async () => {
+      markFirstEntered();
+      await firstRelease;
+      return "commit attempt";
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await firstEntered;
+    const queued = expect(store.withTransaction(() => "must not enter"))
+      .rejects.toThrow("conversation store transaction state is unavailable");
+    releaseFirst();
+
+    const observed = await first;
+    expect(observed).toBe(commitError);
+    expect(String(observed)).not.toContain("persistent-secret");
+    await queued;
+    await expect(store.createMessagesBulk([{
+      conversationId: conversation.conversationId,
+      seq: 0,
+      role: "user",
+      content: "must stay fenced",
+      tokenCount: 1,
+    }])).rejects.toThrow("conversation store transaction state is unavailable");
+    const prepareCallsBeforePeer = prepareCalls;
+    await expect(peer.getConversation(conversation.conversationId))
+      .rejects.toThrow("conversation store transaction state is unavailable");
+    await expect(peer.createConversation({ sessionId: "must-not-write" }))
+      .rejects.toThrow("conversation store transaction state is unavailable");
+    expect(prepareCalls).toBe(prepareCallsBeforePeer);
+    expect(statements).toEqual([
+      "BEGIN IMMEDIATE",
+      "COMMIT",
+      "ROLLBACK",
+      "ROLLBACK",
+    ]);
+    raw.exec("ROLLBACK");
+  });
+
   it("reuses one same-database transaction for every public atomic batch method", async () => {
     const tracked = trackedDatabase(makeDb());
     const store = makeStore(tracked.database);
@@ -807,6 +939,92 @@ describe("ConversationStore — withTransaction", () => {
       "RELEASE SAVEPOINT lcm_conversation_atomic",
       "COMMIT",
     ]);
+  });
+
+  it("allocates distinct FIFO savepoints and resets ordinals for each transaction", async () => {
+    const tracked = trackedDatabase(makeDb());
+    const store = makeStore(tracked.database);
+    const peer = makeStore(tracked.database);
+    const conversation = await store.createConversation({ sessionId: "direct-ordinals" });
+    tracked.statements.length = 0;
+
+    await store.withTransaction(async () => {
+      await Promise.all([
+        peer.createMessagesBulk([{
+          conversationId: conversation.conversationId,
+          seq: 0,
+          role: "user",
+          content: "first transaction a",
+          tokenCount: 1,
+        }]),
+        peer.createMessagesBulk([{
+          conversationId: conversation.conversationId,
+          seq: 1,
+          role: "assistant",
+          content: "first transaction b",
+          tokenCount: 1,
+        }]),
+      ]);
+    });
+    await store.withTransaction(async () => {
+      await Promise.all([
+        peer.createMessagesBulk([{
+          conversationId: conversation.conversationId,
+          seq: 2,
+          role: "user",
+          content: "second transaction a",
+          tokenCount: 1,
+        }]),
+        peer.createMessagesBulk([{
+          conversationId: conversation.conversationId,
+          seq: 3,
+          role: "assistant",
+          content: "second transaction b",
+          tokenCount: 1,
+        }]),
+      ]);
+    });
+
+    expect(tracked.statements.filter(
+      (statement) => statement.startsWith("SAVEPOINT"),
+    )).toEqual([
+      "SAVEPOINT lcm_conversation_atomic_0",
+      "SAVEPOINT lcm_conversation_atomic_1",
+      "SAVEPOINT lcm_conversation_atomic_0",
+      "SAVEPOINT lcm_conversation_atomic_1",
+    ]);
+    expect((await store.getMessages(conversation.conversationId)).map(
+      (message) => message.seq,
+    )).toEqual([0, 1, 2, 3]);
+  });
+
+  it.each([
+    Number.NaN,
+    -1,
+    Number.MAX_SAFE_INTEGER,
+  ])("rejects unsafe transaction-local savepoint ordinal %s before increment", async (ordinal) => {
+    const tracked = trackedDatabase(makeDb());
+    const store = makeStore(tracked.database);
+    const atomicStore = store as unknown as {
+      runDirectAtomic<T>(
+        active: { db: DatabaseSync; token: symbol; atomicOrdinal: number },
+        operation: () => Promise<T> | T,
+      ): Promise<T>;
+    };
+    const active = {
+      db: tracked.database,
+      token: Symbol("unsafe-ordinal"),
+      atomicOrdinal: ordinal,
+    };
+    tracked.statements.length = 0;
+    let operationEntered = false;
+
+    await expect(atomicStore.runDirectAtomic(active, () => {
+      operationEntered = true;
+    })).rejects.toThrow("conversation transaction savepoint ordinal is unavailable");
+    expect(operationEntered).toBe(false);
+    expect(Object.is(active.atomicOrdinal, ordinal)).toBe(true);
+    expect(tracked.statements).toEqual([]);
   });
 
   it("rejects recursive direct atomic scopes without deadlocking", async () => {

@@ -661,7 +661,10 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
                USING deletable
                WHERE message.project_id = $1
                  AND message.message_id = deletable.message_id
-                 AND (SELECT COUNT(*) FROM deleted_context) >= 0
+                 AND (
+                   /* Data dependency: delete context rows before their messages. */
+                   SELECT COUNT(*) FROM deleted_context
+                 ) >= 0
                RETURNING message.message_id
              )
              SELECT COUNT(*) AS count

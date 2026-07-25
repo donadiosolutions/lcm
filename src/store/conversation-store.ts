@@ -154,16 +154,17 @@ interface MaxSeqRow {
 }
 
 const transactionQueues = new WeakMap<DatabaseSync, Promise<void>>();
+const failedDirectDatabases = new WeakSet<DatabaseSync>();
 const activeDirectTransactions = new Set<symbol>();
 const failedDirectTransactions = new Set<symbol>();
 type DirectTransactionContext = {
   db: DatabaseSync;
   token: symbol;
+  atomicOrdinal: number;
 };
 const directTransactionContext = new AsyncLocalStorage<DirectTransactionContext>();
 const directAtomicContext = new AsyncLocalStorage<DirectTransactionContext>();
 const directAtomicTails = new Map<symbol, Promise<void>>();
-let directAtomicOrdinal = 0;
 
 /** @internal SQLite repository seam; not exported from the public store module. */
 export interface ConversationStoreAtomicCore {
@@ -263,6 +264,7 @@ export class ConversationStore {
   // ── Transaction helpers ──────────────────────────────────────────────────
 
   async withTransaction<T>(operation: () => Promise<T> | T): Promise<T> {
+    this.assertDirectTransactionUsable();
     const active = directTransactionContext.getStore();
     if (
       active?.db === this.db
@@ -278,11 +280,12 @@ export class ConversationStore {
     await previous;
     const token = Symbol("conversation-store-transaction");
     try {
+      this.assertDirectTransactionUsable();
       this.db.exec("BEGIN IMMEDIATE");
       activeDirectTransactions.add(token);
       try {
         const result = await directTransactionContext.run(
-          { db: this.db, token },
+          { db: this.db, token, atomicOrdinal: 0 },
           operation,
         );
         let pendingAtomic = directAtomicTails.get(token);
@@ -296,7 +299,7 @@ export class ConversationStore {
         this.db.exec("COMMIT");
         return result;
       } catch (error) {
-        this.db.exec("ROLLBACK");
+        this.recoverDirectTransaction();
         throw error;
       }
     } finally {
@@ -305,6 +308,24 @@ export class ConversationStore {
       release();
       if (transactionQueues.get(this.db) === queued) transactionQueues.delete(this.db);
     }
+  }
+
+  private assertDirectTransactionUsable(): void {
+    if (failedDirectDatabases.has(this.db)) {
+      throw new Error("conversation store transaction state is unavailable");
+    }
+  }
+
+  private recoverDirectTransaction(): void {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        this.db.exec("ROLLBACK");
+        return;
+      } catch {
+        if (this.db.isTransaction === false) return;
+      }
+    }
+    failedDirectDatabases.add(this.db);
   }
 
   private async withAtomicOperation<T>(
@@ -342,7 +363,14 @@ export class ConversationStore {
     active: DirectTransactionContext,
     operation: () => Promise<T> | T,
   ): Promise<T> {
-    const savepoint = `lcm_conversation_atomic_${directAtomicOrdinal++}`;
+    if (
+      !Number.isSafeInteger(active.atomicOrdinal)
+      || active.atomicOrdinal < 0
+      || active.atomicOrdinal >= Number.MAX_SAFE_INTEGER
+    ) {
+      throw new Error("conversation transaction savepoint ordinal is unavailable");
+    }
+    const savepoint = `lcm_conversation_atomic_${active.atomicOrdinal++}`;
     this.db.exec(`SAVEPOINT ${savepoint}`);
     try {
       const result = await directAtomicContext.run(active, operation);
@@ -371,6 +399,7 @@ export class ConversationStore {
   // ── Conversation operations ───────────────────────────────────────────────
 
   async createConversation(input: CreateConversationInput): Promise<ConversationRecord> {
+    this.assertDirectTransactionUsable();
     const result = this.db
       .prepare(`INSERT INTO conversations (session_id, title) VALUES (?, ?)`)
       .run(input.sessionId, input.title ?? null);
@@ -386,6 +415,7 @@ export class ConversationStore {
   }
 
   async getConversation(conversationId: ConversationId): Promise<ConversationRecord | null> {
+    this.assertDirectTransactionUsable();
     const row = this.db
       .prepare(
         `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
@@ -397,6 +427,7 @@ export class ConversationStore {
   }
 
   async getConversationBySessionId(sessionId: string): Promise<ConversationRecord | null> {
+    this.assertDirectTransactionUsable();
     const row = this.db
       .prepare(
         `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
@@ -411,6 +442,7 @@ export class ConversationStore {
   }
 
   async getOrCreateConversation(sessionId: string, title?: string): Promise<ConversationRecord> {
+    this.assertDirectTransactionUsable();
     const existing = await this.getConversationBySessionId(sessionId);
     if (existing) {
       return existing;
@@ -419,6 +451,7 @@ export class ConversationStore {
   }
 
   async markConversationBootstrapped(conversationId: ConversationId): Promise<void> {
+    this.assertDirectTransactionUsable();
     this.db
       .prepare(
         `UPDATE conversations
@@ -430,6 +463,7 @@ export class ConversationStore {
   }
 
   async listConversations(): Promise<ConversationRecord[]> {
+    this.assertDirectTransactionUsable();
     const rows = this.db
       .prepare(
         `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
@@ -443,6 +477,7 @@ export class ConversationStore {
   // ── Message operations ────────────────────────────────────────────────────
 
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
+    this.assertDirectTransactionUsable();
     const result = this.db
       .prepare(
         `INSERT INTO messages (conversation_id, seq, role, content, token_count)
@@ -465,6 +500,7 @@ export class ConversationStore {
   }
 
   async createMessagesBulk(inputs: CreateMessageInput[]): Promise<MessageRecord[]> {
+    this.assertDirectTransactionUsable();
     if (inputs.length === 0) {
       return [];
     }
@@ -472,6 +508,7 @@ export class ConversationStore {
   }
 
   private createMessagesBulkCore(inputs: CreateMessageInput[]): MessageRecord[] {
+    this.assertDirectTransactionUsable();
     if (inputs.length === 0) return [];
     const insertStmt = this.db.prepare(
       `INSERT INTO messages (conversation_id, seq, role, content, token_count)
@@ -505,6 +542,7 @@ export class ConversationStore {
     conversationId: ConversationId,
     inputs: AppendMessageInput[],
   ): Promise<MessageRecord[]> {
+    this.assertDirectTransactionUsable();
     if (inputs.length === 0) {
       return [];
     }
@@ -516,6 +554,7 @@ export class ConversationStore {
     conversationId: ConversationId,
     inputs: AppendMessageInput[],
   ): MessageRecord[] {
+    this.assertDirectTransactionUsable();
     if (inputs.length === 0) return [];
     const row = this.db
       .prepare(
@@ -536,6 +575,7 @@ export class ConversationStore {
     conversationId: ConversationId,
     opts?: { afterSeq?: number; limit?: number },
   ): Promise<MessageRecord[]> {
+    this.assertDirectTransactionUsable();
     const afterSeq = opts?.afterSeq ?? -1;
     const limit = opts?.limit;
 
@@ -564,6 +604,7 @@ export class ConversationStore {
   }
 
   async getLastMessage(conversationId: ConversationId): Promise<MessageRecord | null> {
+    this.assertDirectTransactionUsable();
     const row = this.db
       .prepare(
         `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
@@ -582,6 +623,7 @@ export class ConversationStore {
     role: MessageRole,
     content: string,
   ): Promise<boolean> {
+    this.assertDirectTransactionUsable();
     const row = this.db
       .prepare(
         `SELECT 1 AS count
@@ -599,6 +641,7 @@ export class ConversationStore {
     role: MessageRole,
     content: string,
   ): Promise<number> {
+    this.assertDirectTransactionUsable();
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS count
@@ -611,6 +654,7 @@ export class ConversationStore {
   }
 
   async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
+    this.assertDirectTransactionUsable();
     const row = this.db
       .prepare(
         `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
@@ -624,6 +668,7 @@ export class ConversationStore {
     messageId: MessageId,
     parts: CreateMessagePartInput[],
   ): Promise<void> {
+    this.assertDirectTransactionUsable();
     if (parts.length === 0) {
       return;
     }
@@ -635,6 +680,7 @@ export class ConversationStore {
     messageId: MessageId,
     parts: CreateMessagePartInput[],
   ): void {
+    this.assertDirectTransactionUsable();
     if (parts.length === 0) return;
     const stmt = this.db.prepare(
       `INSERT INTO message_parts (
@@ -670,6 +716,7 @@ export class ConversationStore {
   }
 
   async getMessageParts(messageId: MessageId): Promise<MessagePartRecord[]> {
+    this.assertDirectTransactionUsable();
     const rows = this.db
       .prepare(
         `SELECT
@@ -694,6 +741,7 @@ export class ConversationStore {
   }
 
   async getMessageCount(conversationId: ConversationId): Promise<number> {
+    this.assertDirectTransactionUsable();
     const row = this.db
       .prepare(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?`)
       .get(conversationId) as unknown as CountRow;
@@ -701,6 +749,7 @@ export class ConversationStore {
   }
 
   async getMessageCountBySessionId(sessionId: string): Promise<number> {
+    this.assertDirectTransactionUsable();
     const row = this.db
       .prepare(
         `SELECT COUNT(m.message_id) AS count
@@ -713,6 +762,7 @@ export class ConversationStore {
   }
 
   async getMaxSeq(conversationId: ConversationId): Promise<number> {
+    this.assertDirectTransactionUsable();
     const row = this.db
       .prepare(
         `SELECT COALESCE(MAX(seq), 0) AS max_seq
@@ -731,6 +781,7 @@ export class ConversationStore {
    * breaking the summary DAG. Returns the count of actually deleted messages.
    */
   async deleteMessages(messageIds: MessageId[]): Promise<number> {
+    this.assertDirectTransactionUsable();
     if (messageIds.length === 0) {
       return 0;
     }
@@ -738,6 +789,7 @@ export class ConversationStore {
   }
 
   private deleteMessagesCore(messageIds: MessageId[]): number {
+    this.assertDirectTransactionUsable();
     if (messageIds.length === 0) return 0;
     let deleted = 0;
     for (const messageId of messageIds) {
@@ -768,6 +820,7 @@ export class ConversationStore {
   // ── Search ────────────────────────────────────────────────────────────────
 
   async searchMessages(input: MessageSearchInput): Promise<MessageSearchResult[]> {
+    this.assertDirectTransactionUsable();
     const limit = input.limit ?? 50;
 
     if (input.mode === "full_text") {
