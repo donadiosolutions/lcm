@@ -214,6 +214,6 @@ describe('generateContent dispatch', () => {
   });
 
   it('throws for hook type', () => {
-    expect(() => generateContent(mockAgent, 'hook')).toThrow('Hook connectors are managed by the plugin system');
+    expect(() => generateContent(mockAgent, 'hook')).toThrow('Hook connectors are managed by the structured connector installer');
   });
 });

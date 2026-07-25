@@ -150,7 +150,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Release-run recovery must read the canonical event tag from the workflow's strict `run-name`; do not infer historical tags from `head_branch`, a commit SHA, or another mutable/ref-derived field.
 - Persist manual Changesets beta/stable intent on the single open `changeset-release/main` PR with exactly one internal release-channel label, and fail closed on duplicate PRs or conflicting channel labels.
 - When replacing a generated workflow, update README badges and links to the new workflow filename.
-- Production-path allowlists must cover shipped executable plugin scripts such as `.claude-plugin/`, not only the primary source directories.
+- Production-path allowlists must cover the generated npm runtime and shipped
+  native connector templates, not only the primary source directories.
 - Keep CodeRabbit and Copilot out of required status checks and external-admission authentication. External admission authenticates only Greptile Review, DCO, or CI according to the file classification.
 
 ## What to skip

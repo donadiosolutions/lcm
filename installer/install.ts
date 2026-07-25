@@ -1,13 +1,13 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, copyFileSync, rmSync, chmodSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "node:child_process";
 import { ensureCore } from "../src/bootstrap.js";
 import { lcmHomeDir } from "../src/runtime-paths.js";
-import { legacyLcmSlug } from "../src/legacy-names.js";
 import { atomicWritePrivateFile } from "../src/security-files.js";
-import { packageRootFor } from "../src/runtime-root.js";
-export { REQUIRED_HOOKS, mergeClaudeSettings } from "../src/installer/settings.js";
+import { packageExecutable, packageRootFor } from "../src/runtime-root.js";
+import { mergeClaudeSettings } from "../src/installer/settings.js";
+export { REQUIRED_HOOKS, canonicalHookCommand, hasManagedClaudeSettings, mergeClaudeSettings } from "../src/installer/settings.js";
 
 export interface ServiceDeps {
   spawnSync: (cmd: string, args: string[], opts?: SpawnSyncOptionsWithStringEncoding) => SpawnSyncReturns<string>;
@@ -22,9 +22,181 @@ export interface ServiceDeps {
   copyFileSync?: typeof copyFileSync;
   rmSync?: typeof rmSync;
   commandsSourceDir?: string;
+  skillSourceDir?: string;
+  cwd?: string;
+  binaryPath?: string;
+  dryRun?: boolean;
   promptUser: (question: string) => Promise<string>;
   ensureDaemon?: (opts: { port: number; pidFilePath: string; spawnTimeoutMs: number }) => Promise<{ connected: boolean }>;
   runDoctor?: () => Promise<Array<{ name: string; status: string; category?: string; message?: string }>>;
+}
+
+const CLAUDE_PLUGIN_REPOSITORIES = new Set([
+  "donadiosolutions/lcm",
+  "lossless-claude/lcm",
+]);
+const CLAUDE_PLUGIN_SCOPES = new Set(["user", "project", "local"]);
+
+export interface InstalledClaudePlugin {
+  identifier: string;
+  repository: string;
+  scope: "user" | "project" | "local";
+  cwd?: string;
+}
+
+function normalizeRepository(value: string): string | undefined {
+  const normalized = value.trim()
+    .replace(/^github:/i, "")
+    .replace(/^https?:\/\/github\.com\//i, "")
+    .replace(/^git@github\.com:/i, "")
+    .replace(/\.git$/i, "")
+    .replace(/^\/+|\/+$/g, "")
+    .toLowerCase();
+  return CLAUDE_PLUGIN_REPOSITORIES.has(normalized) ? normalized : undefined;
+}
+
+function parseJsonArray(stdout: string, description: string): unknown[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error(`${description} returned malformed JSON`);
+  }
+  if (!Array.isArray(parsed)) throw new Error(`${description} returned an unsupported shape`);
+  return parsed;
+}
+
+function lcmPluginIdentifier(candidate: unknown): string | undefined {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
+  const id = (candidate as Record<string, unknown>).id;
+  if (typeof id !== "string") return undefined;
+  const separator = id.lastIndexOf("@");
+  return (separator > 0 ? id.slice(0, separator) : id) === "lcm" ? id : undefined;
+}
+
+function marketplaceRepositories(stdout: string): Map<string, string> {
+  const repositories = new Map<string, string>();
+  for (const candidate of parseJsonArray(stdout, "Claude marketplace list")) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const record = candidate as Record<string, unknown>;
+    if (typeof record.name !== "string" || typeof record.repo !== "string") continue;
+    const repository = normalizeRepository(record.repo);
+    if (repository) repositories.set(record.name, repository);
+  }
+  return repositories;
+}
+
+function explicitRepository(record: Record<string, unknown>): string | undefined {
+  if (typeof record.repository === "string") return normalizeRepository(record.repository);
+  if (typeof record.repo === "string") return normalizeRepository(record.repo);
+  if (typeof record.source === "string") return normalizeRepository(record.source);
+  if (record.source && typeof record.source === "object" && !Array.isArray(record.source)) {
+    const repo = (record.source as Record<string, unknown>).repo;
+    if (typeof repo === "string") return normalizeRepository(repo);
+  }
+  return undefined;
+}
+
+export function parseInstalledClaudePlugins(
+  stdout: string,
+  marketplaceStdout: string = "[]",
+): InstalledClaudePlugin[] {
+  const candidates = parseJsonArray(stdout, "Claude plugin list");
+  const marketplaces = marketplaceRepositories(marketplaceStdout);
+
+  const recognized: InstalledClaudePlugin[] = [];
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const record = candidate as Record<string, unknown>;
+    if (typeof record.id !== "string") continue;
+    const separator = record.id.lastIndexOf("@");
+    const pluginName = separator > 0 ? record.id.slice(0, separator) : record.id;
+    const marketplaceName = separator > 0 ? record.id.slice(separator + 1) : undefined;
+    if (pluginName !== "lcm") continue;
+    const repository = explicitRepository(record)
+      ?? (marketplaceName ? marketplaces.get(marketplaceName) : undefined);
+    if (!repository) continue;
+    const scopeValue = typeof record.scope === "string" ? record.scope : "user";
+    if (!CLAUDE_PLUGIN_SCOPES.has(scopeValue)) {
+      throw new Error(`Recognized LCM Claude plugin has unsupported scope: ${scopeValue}`);
+    }
+    recognized.push({
+      identifier: record.id,
+      repository,
+      scope: scopeValue as InstalledClaudePlugin["scope"],
+      cwd: typeof record.cwd === "string"
+        ? record.cwd
+        : typeof record.projectPath === "string" ? record.projectPath : undefined,
+    });
+  }
+  return recognized;
+}
+
+export function migrateClaudeMarketplacePlugins(
+  deps: Pick<ServiceDeps, "spawnSync" | "dryRun">,
+  cwd: string,
+): void {
+  const list = deps.spawnSync("claude", ["plugin", "list", "--json"], { encoding: "utf-8", cwd });
+  // Claude may be absent; npm-native installation still supports Codex-only use.
+  if (list.status !== 0) {
+    if ((list.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return;
+    throw new Error("Could not list installed Claude plugins");
+  }
+  const listedPlugins = parseJsonArray(list.stdout, "Claude plugin list");
+  const hasPotentialLcmPlugin = listedPlugins.some((candidate) => lcmPluginIdentifier(candidate) !== undefined);
+  if (!hasPotentialLcmPlugin) return;
+  const marketplaces = deps.spawnSync("claude", ["plugin", "marketplace", "list", "--json"], { encoding: "utf-8", cwd });
+  if (marketplaces.status !== 0) {
+    throw new Error("Could not verify configured Claude plugin marketplaces");
+  }
+  const installed = parseInstalledClaudePlugins(list.stdout, marketplaces.stdout);
+  for (const plugin of installed) {
+    const pluginCwd = plugin.cwd ?? cwd;
+    if (deps.dryRun) {
+      console.log(
+        `[dry-run] would uninstall Claude Marketplace plugin ${plugin.identifier} `
+        + `(${plugin.scope}, ${plugin.repository}) in ${pluginCwd}`,
+      );
+      continue;
+    }
+    const removal = deps.spawnSync("claude", [
+      "plugin", "uninstall", plugin.identifier,
+      "--scope", plugin.scope,
+      "--yes", "--keep-data",
+    ], { encoding: "utf-8", cwd: pluginCwd });
+    if (removal.status !== 0) {
+      throw new Error(`Could not uninstall Claude Marketplace plugin ${plugin.identifier} (${plugin.scope})`);
+    }
+  }
+  if (installed.length === 0) {
+    throw new Error(
+      "An LCM Claude plugin is installed, but its marketplace repository could not be verified; "
+      + "remove it manually before running lcm install",
+    );
+  }
+  if (deps.dryRun) return;
+  const verify = deps.spawnSync("claude", ["plugin", "list", "--json"], { encoding: "utf-8", cwd });
+  if (verify.status !== 0) throw new Error("Could not verify Claude Marketplace plugin removal");
+  const remaining = parseJsonArray(verify.stdout, "Claude plugin list")
+    .map(lcmPluginIdentifier)
+    .find((identifier) => identifier !== undefined);
+  if (remaining) {
+    throw new Error(`Claude Marketplace plugin remains installed: ${remaining}`);
+  }
+}
+
+function copyMarkdownFiles(
+  deps: ServiceDeps,
+  source: string,
+  destination: string,
+): void {
+  if (!deps.existsSync(source)) return;
+  deps.mkdirSync(destination, { recursive: true });
+  for (const file of (deps.readdirSync ?? readdirSync)(source)) {
+    if (typeof file === "string" && file.endsWith(".md")) {
+      (deps.copyFileSync ?? copyFileSync)(join(source, file), join(destination, file));
+    }
+  }
 }
 
 async function readlinePrompt(question: string): Promise<string> {
@@ -49,6 +221,7 @@ const defaultDeps: ServiceDeps = {
   existsSync,
   chmodSync,
   lstatSync,
+  rmSync,
   atomicWritePrivateFile,
   promptUser: readlinePrompt,
 };
@@ -66,6 +239,21 @@ function safeConfigExists(deps: ServiceDeps, path: string): boolean {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
+}
+
+function readMergedClaudeSettings(
+  deps: Pick<ServiceDeps, "existsSync" | "readFileSync">,
+  settingsPath: string,
+  lcmBin: string,
+): Record<string, unknown> {
+  if (!deps.existsSync(settingsPath)) return mergeClaudeSettings({}, lcmBin);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(deps.readFileSync(settingsPath, "utf-8"));
+  } catch {
+    throw new Error(`Refusing to modify malformed Claude settings: ${settingsPath}`);
+  }
+  return mergeClaudeSettings(parsed, lcmBin);
 }
 
 export interface ResolveBinaryDeps {
@@ -240,25 +428,15 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   deps.mkdirSync(lcDir, { recursive: true, mode: 0o700 });
   deps.chmodSync?.(lcDir, 0o700);
 
-  // Clear plugin cache entries for previous versions so stale/corrupted installs don't persist.
-  try {
-    const pkgJsonPath = join(packageRootFor(import.meta.url, 2), "package.json");
-    const pkgVersion = (JSON.parse(deps.readFileSync(pkgJsonPath, "utf-8")) as { version: string }).version;
-    const cacheDir = join(homedir(), ".claude", "plugins", "cache", legacyLcmSlug(), "lcm");
-    if (deps.existsSync(cacheDir)) {
-      for (const entry of (deps.readdirSync ?? readdirSync)(cacheDir, { withFileTypes: true })) {
-        if (entry.isDirectory() && entry.name !== pkgVersion) {
-          (deps.rmSync ?? rmSync)(join(cacheDir, entry.name), { recursive: true, force: true });
-          console.log(`Cleared plugin cache for v${entry.name}`);
-        }
-      }
-    }
-  } catch {
-    // non-fatal: cache clearing failure shouldn't abort install
-  }
-
   const configPath = join(lcDir, "config.json");
   const settingsPath = join(homedir(), ".claude", "settings.json");
+  const lcmBin = deps.binaryPath ?? packageExecutable(import.meta.url, 2);
+  if (!isAbsolute(lcmBin)) {
+    throw new Error("Could not resolve an absolute npm-installed lcm executable path");
+  }
+
+  // Validate settings before making any migration or installation changes.
+  readMergedClaudeSettings(deps, settingsPath, lcmBin);
 
   // 1-3. Core setup (config + settings cleanup + daemon)
   // ensureCore handles: creating config.json, merging settings.json hooks, and starting daemon
@@ -276,6 +454,8 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     console.log(`Created ${configPath}`);
   }
 
+  migrateClaudeMarketplacePlugins(deps, deps.cwd ?? process.cwd());
+
   // ensureCore will:
   // - Skip config creation (already exists or just created above)
   // - Merge settings.json hooks (remove duplicates, clean old commands)
@@ -287,25 +467,17 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     readFileSync: deps.readFileSync,
     writeFileSync: deps.writeFileSync,
     mkdirSync: deps.mkdirSync,
+    binaryPath: lcmBin,
     ensureDaemon: deps.ensureDaemon ?? (async (opts) => {
       const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
       return ensureDaemon(opts);
     }),
   });
 
-  // Register MCP server directly in settings.json.
-  // plugin.json mcpServers isn't reliably processed for locally-installed plugins
-  // (installPath in installed_plugins.json points to wrong versioned dir).
-  let merged: any = {};
-  if (deps.existsSync(settingsPath)) {
-    try { merged = JSON.parse(deps.readFileSync(settingsPath, "utf-8")); } catch {}
-  }
-  if (typeof merged !== "object" || merged === null) {
-    merged = {};
-  }
-  const mcpServers = (typeof merged.mcpServers === "object" && merged.mcpServers !== null) ? merged.mcpServers : {};
-  const lcmBin = resolveBinaryPath(deps);
-  mcpServers["lcm"] = { command: lcmBin, args: ["mcp"] };
+  // Register the npm-owned MCP server directly in Claude settings.
+  const merged: any = readMergedClaudeSettings(deps, settingsPath, lcmBin);
+  const mcpServers = merged.mcpServers;
+  mcpServers["lcm"] = { command: process.execPath, args: [lcmBin, "mcp"] };
   (merged as any).mcpServers = mcpServers;
 
   deps.mkdirSync(dirname(settingsPath), { recursive: true });
@@ -313,17 +485,19 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   console.log(`Updated ${settingsPath}`);
 
   // 4. Install slash commands to ~/.claude/commands/
-  const commandsSrc = deps.commandsSourceDir ?? join(packageRootFor(import.meta.url, 2), ".claude-plugin", "commands");
+  const claudeTemplates = join(packageRootFor(import.meta.url, 2), "dist", "src", "connectors", "templates", "claude");
+  const commandsSrc = deps.commandsSourceDir ?? join(claudeTemplates, "commands");
   const commandsDst = join(homedir(), ".claude", "commands");
+  const retiredDogfoodCommand = join(commandsDst, "lcm-dogfood.md");
+  (deps.rmSync ?? rmSync)(retiredDogfoodCommand, { force: true });
+  copyMarkdownFiles(deps, commandsSrc, commandsDst);
   if (deps.existsSync(commandsSrc)) {
-    deps.mkdirSync(commandsDst, { recursive: true });
-    for (const file of (deps.readdirSync ?? readdirSync)(commandsSrc)) {
-      if (file.endsWith(".md")) {
-        (deps.copyFileSync ?? copyFileSync)(join(commandsSrc, file), join(commandsDst, file));
-      }
-    }
     console.log(`Installed slash commands to ${commandsDst}`);
   }
+  const skillSrc = deps.skillSourceDir ?? join(claudeTemplates, "skills", "lcm-context");
+  const skillDst = join(homedir(), ".claude", "skills", "lcm-context");
+  copyMarkdownFiles(deps, skillSrc, skillDst);
+  if (deps.existsSync(skillSrc)) console.log(`Installed lcm-context skill to ${skillDst}`);
 
   // 5. Install lcm.md and @lcm.md reference in CLAUDE.md
   const { LCM_MD_CONTENT } = await import("../src/daemon/orientation.js");

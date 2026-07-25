@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { installConnector, removeConnector, listConnectors } from '../../src/connectors/installer.js';
 import { LCM_MARKERS } from '../../src/connectors/constants.js';
 import { AGENTS } from '../../src/connectors/registry.js';
+import { mergeClaudeSettings } from '../../src/installer/settings.js';
 
 let tmpDir: string;
 
@@ -620,10 +621,168 @@ describe('error handling', () => {
     expect(() => installConnector('zed', 'skill', tmpDir)).toThrow('does not support connector type');
   });
 
-  it('returns manual instructions for hook type', () => {
-    const result = installConnector('claude-code', 'hook', tmpDir);
-    expect(result.manual).toBeDefined();
-    expect(result.manual).toContain('Hook connectors');
+  it('routes Claude hook installation through the guarded npm installer', () => {
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      const settingsPath = join(tmpDir, '.claude', 'settings.json');
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(settingsPath, JSON.stringify({ theme: 'dark' }));
+      const result = installConnector('claude-code', 'hook', tmpDir);
+      expect(result.path).toBe('');
+      expect(result.requiresRestart).toBe(false);
+      expect(result.manual).toContain('lcm install');
+      expect(JSON.parse(readFileSync(settingsPath, 'utf8'))).toEqual({ theme: 'dark' });
+      writeFileSync(
+        settingsPath,
+        JSON.stringify(mergeClaudeSettings({ theme: 'dark' }, join(process.cwd(), 'dist', 'lcm.mjs'))),
+      );
+      const settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
+      settings.mcpServers = {
+        lcm: { command: '/opt/npm/bin/lcm', args: ['mcp'] },
+        unrelated: { command: 'other' },
+      };
+      settings.hooks.SessionStart.unshift({
+        matcher: 'unrelated',
+        hooks: [{ type: 'command', command: '/usr/local/bin/other restore' }],
+      });
+      settings.hooks.PreCompact.reverse();
+      writeFileSync(settingsPath, JSON.stringify(settings));
+      expect(listConnectors(tmpDir)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentId: 'claude-code', type: 'hook', path: settingsPath }),
+      ]));
+      settings.hooks.Stop = settings.hooks.Stop.filter((entry: any) =>
+        !entry.hooks?.some((hook: any) => hook.command?.includes('session-snapshot'))
+      );
+      writeFileSync(settingsPath, JSON.stringify(settings));
+      expect(listConnectors(tmpDir).some((entry) =>
+        entry.agentId === 'claude-code' && entry.type === 'hook'
+      )).toBe(false);
+      writeFileSync(
+        settingsPath,
+        JSON.stringify(mergeClaudeSettings(settings, join(process.cwd(), 'dist', 'lcm.mjs'))),
+      );
+      expect(removeConnector('claude-code', 'hook', tmpDir)).toBe(true);
+      expect(JSON.parse(readFileSync(settingsPath, 'utf8'))).toEqual({
+        theme: 'dark',
+        hooks: {
+          SessionStart: [{
+            matcher: 'unrelated',
+            hooks: [{ type: 'command', command: '/usr/local/bin/other restore' }],
+          }],
+        },
+        mcpServers: {
+          lcm: { command: '/opt/npm/bin/lcm', args: ['mcp'] },
+          unrelated: { command: 'other' },
+        },
+      });
+      expect(removeConnector('claude-code', 'hook', tmpDir)).toBe(false);
+      rmSync(settingsPath);
+      expect(removeConnector('claude-code', 'hook', tmpDir)).toBe(false);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it('fails closed for malformed Claude settings and unsupported native hook agents', () => {
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      const settingsPath = join(tmpDir, '.claude', 'settings.json');
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(settingsPath, 'null');
+      expect(installConnector('claude-code', 'hook', tmpDir).manual).toContain('lcm install');
+      expect(listConnectors(tmpDir).some((entry) => entry.agentId === 'claude-code' && entry.type === 'hook')).toBe(false);
+      expect(() => removeConnector('claude-code', 'hook', tmpDir)).toThrow('must contain a JSON object');
+
+      const codex = AGENTS.find((candidate) => candidate.id === 'codex')!;
+      const originalId = codex.id;
+      codex.id = 'codex-other';
+      try {
+        expect(() => installConnector('Codex', 'hook', tmpDir)).toThrow('Native hook installation is not implemented');
+      } finally {
+        codex.id = originalId;
+      }
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it('detects canonical Claude hooks through malformed and unrelated surrounding entries', () => {
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      const settingsPath = join(tmpDir, '.claude', 'settings.json');
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      const runtimePath = join(process.cwd(), 'dist', 'lcm.mjs');
+      const canonical = mergeClaudeSettings({}, runtimePath);
+      const isListed = () => listConnectors(tmpDir).some((entry) =>
+        entry.agentId === 'claude-code' && entry.type === 'hook'
+      );
+
+      for (const hooks of [undefined, null, 'invalid', []]) {
+        writeFileSync(settingsPath, JSON.stringify(hooks === undefined ? {} : { hooks }));
+        expect(isListed()).toBe(false);
+      }
+
+      writeFileSync(settingsPath, JSON.stringify({ hooks: { ...canonical.hooks, PostToolUse: 'invalid' } }));
+      expect(isListed()).toBe(false);
+
+      canonical.hooks.PostToolUse = [
+        null,
+        'unrelated',
+        [],
+        {},
+        { hooks: 'invalid' },
+        {
+          hooks: [
+            null,
+            'unrelated',
+            [],
+            {},
+            { command: 'wrong' },
+            {
+              type: 'prompt',
+              command: canonical.hooks.PostToolUse[0].hooks[0].command,
+            },
+            canonical.hooks.PostToolUse[0].hooks[0],
+          ],
+        },
+      ];
+      writeFileSync(settingsPath, JSON.stringify(canonical));
+      expect(isListed()).toBe(true);
+
+      canonical.hooks.PostToolUse[5].hooks.pop();
+      writeFileSync(settingsPath, JSON.stringify(canonical));
+      expect(isListed()).toBe(false);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it('still routes Claude hook installation when its legacy configured path is absent', () => {
+    const agent = AGENTS.find((candidate) => candidate.id === 'claude-code')!;
+    const original = agent.configPaths.hook;
+    delete agent.configPaths.hook;
+    try {
+      expect(installConnector('claude-code', 'hook', tmpDir).manual).toContain('lcm install');
+    } finally {
+      agent.configPaths.hook = original;
+    }
+  });
+
+  it('uses overwrite rules mode when an agent writeMode is nullish', () => {
+    const agent = AGENTS.find((candidate) => candidate.id === 'gemini-cli')!;
+    const original = agent.writeMode;
+    agent.writeMode = null as never;
+    try {
+      expect(installConnector('gemini-cli', 'rules', tmpDir).success).toBe(true);
+    } finally {
+      agent.writeMode = original;
+    }
   });
 
   it('throws when a supported connector has no configured non-MCP path', () => {

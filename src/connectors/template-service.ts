@@ -58,6 +58,6 @@ export function generateContent(agent: Agent, type: ConnectorType): string {
     case 'rules': return generateRulesContent(agent);
     case 'mcp': return generateMcpContent(agent);
     case 'skill': return generateSkillContent(agent);
-    case 'hook': throw new Error('Hook connectors are managed by the plugin system, not the template service');
+    case 'hook': throw new Error('Hook connectors are managed by the structured connector installer, not the template service');
   }
 }

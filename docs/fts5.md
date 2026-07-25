@@ -1,7 +1,7 @@
 # Optional: enable FTS5 for fast full-text search
 
 Long Context Manager (LCM) works without FTS5 as of the current release. When FTS5 is unavailable in the
-Node runtime that runs the Claude Code gateway, the plugin:
+Node runtime that runs the Claude Code gateway, the native integration:
 
 - keeps persisting messages and summaries
 - falls back from `"full_text"` search to a slower `LIKE`-based search

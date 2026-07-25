@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 export function packageRootFor(moduleUrl: string, compiledParentLevels: number): string {
   const modulePath = fileURLToPath(moduleUrl);
-  if (["lcm.mjs", "mcp.mjs"].includes(basename(modulePath))) return dirname(modulePath);
+  if (basename(modulePath) === "lcm.mjs") return dirname(dirname(modulePath));
   const inDist = modulePath.split(sep).includes("dist");
   const parentLevels = inDist ? compiledParentLevels : compiledParentLevels - 1;
   let root = dirname(modulePath);
@@ -16,12 +16,17 @@ export function packageAsset(moduleUrl: string, root: string, builtPath: string,
   const modulePath = fileURLToPath(moduleUrl);
   const built = join(root, builtPath);
   const source = join(root, sourcePath);
-  if (["lcm.mjs", "mcp.mjs"].includes(basename(modulePath))) return existsSync(built) ? built : source;
+  if (basename(modulePath) === "lcm.mjs") return existsSync(built) ? built : source;
   return modulePath.split(sep).includes("dist") ? built : source;
 }
 
 export function packageEntrypoint(moduleUrl: string, root: string, defaultPath: string): string {
-  return ["lcm.mjs", "mcp.mjs"].includes(basename(fileURLToPath(moduleUrl)))
-    ? join(root, "lcm.mjs")
+  return basename(fileURLToPath(moduleUrl)) === "lcm.mjs"
+    ? join(root, "dist", "lcm.mjs")
     : defaultPath;
+}
+
+export function packageExecutable(moduleUrl: string, compiledParentLevels: number): string {
+  const root = packageRootFor(moduleUrl, compiledParentLevels);
+  return packageEntrypoint(moduleUrl, root, join(root, "dist", "lcm.mjs"));
 }

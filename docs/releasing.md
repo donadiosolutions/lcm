@@ -32,8 +32,8 @@ in `.changeset/pre.json`.
 ## Draft and publication gate
 
 Push a signed annotated tag at the exact version-PR merge commit. The tag
-workflow validates the tag, package and plugin versions, main ancestry,
-changelog, tests, coverage, build, and plugin bundles. It generates a mandatory
+workflow validates the tag, package version, main ancestry, changelog, tests,
+coverage, build, generated npm runtime, and package contents. It generates a mandatory
 Highlights section with Codex and creates a draft GitHub release whose remaining
 non-empty sections are Breaking changes, Features, Fixes, and Extra notes.
 Highlights use the repository's existing `OPENAI_API_KEY` secret, shared with the
@@ -46,7 +46,9 @@ either while editing the draft.
 
 The publication workflow separates trust domains. A read-only preflight without
 npm OIDC permission verifies the release again, runs the complete checks, and
-packs the package. The OIDC-enabled job checks out only trusted workflow tools,
+packs the package, including the generated `dist/lcm.mjs` runtime and native
+connector resources. The generated runtime is a release artifact and is not
+committed to the repository. The OIDC-enabled job checks out only trusted workflow tools,
 downloads that verified tarball with the runner-provided `gh` CLI, revalidates
 the signed tag and npm channel ordering, and publishes the tarball without
 running package scripts.

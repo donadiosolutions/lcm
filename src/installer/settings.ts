@@ -1,72 +1,174 @@
+import { isAbsolute, win32 } from "node:path";
 import { legacyLcmCommand, legacyLcmMcpServerName } from "../legacy-names.js";
 
 export const REQUIRED_HOOKS: { event: string; command: string }[] = [
-  { event: "PostToolUse", command: "lcm post-tool" },
-  { event: "PreCompact", command: "lcm compact --hook" },
-  { event: "SessionStart", command: "lcm restore" },
-  { event: "SessionEnd", command: "lcm session-end" },
-  { event: "UserPromptSubmit", command: "lcm user-prompt" },
-  { event: "Stop", command: "lcm session-snapshot" },
+  { event: "PostToolUse", command: "post-tool" },
+  { event: "PreCompact", command: "compact --hook" },
+  { event: "SessionStart", command: "restore" },
+  { event: "SessionEnd", command: "session-end" },
+  { event: "UserPromptSubmit", command: "user-prompt" },
+  { event: "Stop", command: "session-snapshot" },
 ];
 
-export function mergeClaudeSettings(existing: any): any {
-  const settings = JSON.parse(JSON.stringify(existing));
-  settings.hooks = (settings.hooks && typeof settings.hooks === "object" && !Array.isArray(settings.hooks)) ? settings.hooks : {};
-  settings.mcpServers = (settings.mcpServers && typeof settings.mcpServers === "object" && !Array.isArray(settings.mcpServers)) ? settings.mcpServers : {};
+function quoteCommandPath(path: string, platform: NodeJS.Platform): string {
+  if (platform === "win32") return `"${path.replaceAll('"', '""')}"`;
+  return `'${path.replaceAll("'", "'\\''")}'`;
+}
 
-  // Migrate old hook commands to current form.
-  const OLD_TO_NEW: Record<string, string> = {
-    [legacyLcmCommand("lcm compact")]: "lcm compact --hook",
-    [legacyLcmCommand("lcm restore")]: "lcm restore",
-    [legacyLcmCommand("lcm session-end")]: "lcm session-end",
-    [legacyLcmCommand("lcm user-prompt")]: "lcm user-prompt",
-    // Migrate pre-#90 direct installs that registered without --hook
-    "lcm compact": "lcm compact --hook",
-  };
-  for (const event of Object.keys(settings.hooks)) {
-    if (!Array.isArray(settings.hooks[event])) continue;
-    for (const entry of settings.hooks[event]) {
-      if (!Array.isArray(entry.hooks)) continue;
-      for (const h of entry.hooks) {
-        if (h.command && OLD_TO_NEW[h.command]) {
-          h.command = OLD_TO_NEW[h.command];
-        }
+export function canonicalHookCommand(
+  runtimePath: string,
+  command: string,
+  nodePath = process.execPath,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const pathIsAbsolute = platform === "win32" ? win32.isAbsolute : isAbsolute;
+  if (!pathIsAbsolute(runtimePath)) {
+    throw new Error(`LCM runtime path must be absolute: ${runtimePath}`);
+  }
+  if (!pathIsAbsolute(nodePath)) {
+    throw new Error(`Node executable path must be absolute: ${nodePath}`);
+  }
+  return `${quoteCommandPath(nodePath, platform)} ${quoteCommandPath(runtimePath, platform)} ${command}`;
+}
+
+function isManagedCommand(value: unknown, command: string): boolean {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  const current = `lcm ${command}`;
+  const legacy = legacyLcmCommand(current);
+  if (trimmed === current || trimmed === legacy) return true;
+  if (command === "compact --hook" &&
+      (trimmed === "lcm compact" || trimmed === legacyLcmCommand("lcm compact"))) return true;
+  // Native npm installations quote their absolute executable. Older direct
+  // installations may have used an unquoted absolute executable.
+  const suffix = ` ${command}`;
+  if (!trimmed.endsWith(suffix)) return false;
+  const executable = trimmed.slice(0, -suffix.length).trimEnd();
+  const singleQuotedMatch = /(?:^|\s)'((?:[^']|'\\'')*)'$/.exec(executable);
+  const executableMatch = /(?:^|\s)(?:"((?:\\?""|\\.|[^"\\])+)"|([^"'\s]+))$/.exec(executable);
+  if (!singleQuotedMatch && !executableMatch) return false;
+  const executablePath = singleQuotedMatch
+    ? singleQuotedMatch[1].replaceAll("'\\''", "'")
+    : (executableMatch![1] ?? executableMatch![2])
+      .replaceAll('""', '"')
+      .replaceAll('\\"', '"')
+      .replaceAll("\\\\", "\\");
+  return /(^|[\\/])lcm(?:\.mjs)?$/.test(executablePath);
+}
+
+function asSettingsObject(existing: unknown): Record<string, any> {
+  if (existing === null || typeof existing !== "object" || Array.isArray(existing)) {
+    throw new Error("Claude settings must contain a JSON object");
+  }
+  return structuredClone(existing) as Record<string, any>;
+}
+
+export function hasManagedClaudeSettings(existing: unknown): boolean {
+  const settings = asSettingsObject(existing);
+  if (settings.mcpServers !== undefined &&
+      (settings.mcpServers === null || typeof settings.mcpServers !== "object" || Array.isArray(settings.mcpServers))) {
+    throw new Error("Claude settings mcpServers must be a JSON object");
+  }
+  if (settings.mcpServers?.lcm !== undefined ||
+      settings.mcpServers?.[legacyLcmMcpServerName()] !== undefined) return true;
+
+  if (settings.hooks === undefined) return false;
+  if (settings.hooks === null || typeof settings.hooks !== "object" || Array.isArray(settings.hooks)) {
+    throw new Error("Claude settings hooks must be a JSON object");
+  }
+  for (const { event, command } of REQUIRED_HOOKS) {
+    const entries = settings.hooks[event];
+    if (entries === undefined) continue;
+    if (!Array.isArray(entries)) throw new Error(`Claude settings hooks.${event} must be an array`);
+    for (const entry of entries) {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry) || entry.hooks === undefined) continue;
+      if (!Array.isArray(entry.hooks)) {
+        throw new Error(`Claude settings hooks.${event} entry hooks must be an array`);
       }
-      // Deduplicate commands within each hook entry after migration
-      const seen = new Set<string>();
-      entry.hooks = entry.hooks.filter((h: any) => {
-        const key = h.command ?? '';
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
+      if (entry.hooks.some((hook: any) => isManagedCommand(hook?.command, command))) return true;
     }
   }
-  // Remove legacy MCP server entries
-  delete settings.mcpServers[legacyLcmMcpServerName()];
+  return false;
+}
 
-  // Remove lcm hooks from settings.json — plugin.json owns them.
-  // Having hooks in both causes double-firing.
-  for (const { event, command } of REQUIRED_HOOKS) {
-    if (!Array.isArray(settings.hooks[event])) continue;
-    settings.hooks[event] = settings.hooks[event]
-      .map((entry: any) => {
-        if (!Array.isArray(entry.hooks)) return entry;
-        return {
-          ...entry,
-          hooks: entry.hooks.filter((h: any) => h.command !== command),
-        };
-      })
-      .filter((entry: any) => !Array.isArray(entry.hooks) || entry.hooks.length > 0);
-    if (settings.hooks[event].length === 0) delete settings.hooks[event];
+export function mergeClaudeSettings(existing: unknown, runtimePath: string, nodePath = process.execPath): any {
+  const settings = asSettingsObject(existing);
+  const hooks = settings.hooks === undefined
+    ? {}
+    : settings.hooks;
+  if (hooks === null || typeof hooks !== "object" || Array.isArray(hooks)) {
+    throw new Error("Claude settings hooks must be a JSON object");
   }
-  if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
 
-  // MCP server is now owned by settings.json (written by lcm install / doctor)
-  // Do NOT delete mcpServers["lcm"] here — it's managed separately from hooks
-  // which are plugin-owned. This prevents the auto-heal loop where doctor adds
-  // the MCP entry and hooks cleanup removes it.
-  if (Object.keys(settings.mcpServers).length === 0) delete settings.mcpServers;
+  for (const { event, command } of REQUIRED_HOOKS) {
+    const existingEntries = hooks[event];
+    if (existingEntries !== undefined && !Array.isArray(existingEntries)) {
+      throw new Error(`Claude settings hooks.${event} must be an array`);
+    }
+    const entries: any[] = existingEntries ?? [];
+    const preserved = entries.flatMap((entry: any) => {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return [entry];
+      if (entry.hooks === undefined) return [entry];
+      if (!Array.isArray(entry.hooks)) {
+        throw new Error(`Claude settings hooks.${event} entry hooks must be an array`);
+      }
+      const remaining = entry.hooks.filter((hook: any) => !isManagedCommand(hook?.command, command));
+      if (remaining.length === 0) {
+        const otherKeys = Object.keys(entry).filter((key) => key !== "hooks" && key !== "matcher");
+        return otherKeys.length === 0 ? [] : [{ ...entry, hooks: [] }];
+      }
+      return [{ ...entry, hooks: remaining }];
+    });
+    preserved.push({
+      matcher: "",
+      hooks: [{ type: "command", command: canonicalHookCommand(runtimePath, command, nodePath) }],
+    });
+    hooks[event] = preserved;
+  }
+  settings.hooks = hooks;
 
+  if (settings.mcpServers !== undefined &&
+      (settings.mcpServers === null || typeof settings.mcpServers !== "object" || Array.isArray(settings.mcpServers))) {
+    throw new Error("Claude settings mcpServers must be a JSON object");
+  }
+  settings.mcpServers = settings.mcpServers ?? {};
+  delete settings.mcpServers[legacyLcmMcpServerName()];
+  return settings;
+}
+
+export function removeManagedClaudeHooks(existing: unknown): any {
+  const settings = asSettingsObject(existing);
+  if (settings.hooks !== undefined) {
+    if (settings.hooks === null || typeof settings.hooks !== "object" || Array.isArray(settings.hooks)) {
+      throw new Error("Claude settings hooks must be a JSON object");
+    }
+    for (const { event, command } of REQUIRED_HOOKS) {
+      const entries = settings.hooks[event];
+      if (entries === undefined) continue;
+      if (!Array.isArray(entries)) throw new Error(`Claude settings hooks.${event} must be an array`);
+      settings.hooks[event] = entries.flatMap((entry: any) => {
+        if (entry === null || typeof entry !== "object" || Array.isArray(entry) || entry.hooks === undefined) return [entry];
+        if (!Array.isArray(entry.hooks)) throw new Error(`Claude settings hooks.${event} entry hooks must be an array`);
+        const remaining = entry.hooks.filter((hook: any) => !isManagedCommand(hook?.command, command));
+        if (remaining.length === 0 && Object.keys(entry).every((key) => key === "hooks" || key === "matcher")) return [];
+        return [{ ...entry, hooks: remaining }];
+      });
+      if (settings.hooks[event].length === 0) delete settings.hooks[event];
+    }
+    if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+  }
+  return settings;
+}
+
+export function removeManagedClaudeSettings(existing: unknown): any {
+  const settings = removeManagedClaudeHooks(existing);
+  if (settings.mcpServers !== undefined) {
+    if (settings.mcpServers === null || typeof settings.mcpServers !== "object" || Array.isArray(settings.mcpServers)) {
+      throw new Error("Claude settings mcpServers must be a JSON object");
+    }
+    delete settings.mcpServers.lcm;
+    delete settings.mcpServers[legacyLcmMcpServerName()];
+    if (Object.keys(settings.mcpServers).length === 0) delete settings.mcpServers;
+  }
   return settings;
 }

@@ -35,7 +35,7 @@ describe("connector registry", () => {
       for (const key of Object.keys(agent.configPaths)) {
         expect(agent.supportedTypes, `${agent.id}: configPath "${key}" not in supportedTypes`).toContain(key);
       }
-      // supportedTypes must have a configPath (except hook which is managed by plugin system,
+      // supportedTypes must have a configPath (hook uses the structured native installer,
       // and except mcp when it's the defaultType with no path — means manual configuration)
       for (const type of agent.supportedTypes) {
         if (type === 'hook') continue;

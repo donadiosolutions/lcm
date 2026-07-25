@@ -2,9 +2,8 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join, dirname } from "node:path";
 import { spawnSync, spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import type { CheckResult, DoctorDeps } from "./types.js";
-import { mergeClaudeSettings, REQUIRED_HOOKS, resolveBinaryPath, ensureLcmMd } from "../../installer/install.js";
+import { hasManagedClaudeSettings, mergeClaudeSettings, REQUIRED_HOOKS, ensureLcmMd } from "../../installer/install.js";
 import { NATIVE_PATTERNS, ScrubEngine, readGitleaksSyncDate } from "../scrub.js";
 import { GITLEAKS_PATTERNS } from "../generated-patterns.js";
 import { projectDir } from "../daemon/project.js";
@@ -12,7 +11,7 @@ import { collectEventStats, collectDetailedEventStats } from "../db/events-stats
 import { validateRegex } from "../store/regex-safety.js";
 import { configPath, daemonPidPath } from "../runtime-paths.js";
 import { projectMapPath, validateProjectMap, type ProjectMapValidation } from "../project-map.js";
-import { packageEntrypoint, packageRootFor } from "../runtime-root.js";
+import { packageExecutable, packageRootFor } from "../runtime-root.js";
 import { sanitizeTerminalText } from "../terminal-sanitize.js";
 import { managedDaemonPath } from "../daemon/managed-path.js";
 import {
@@ -255,9 +254,7 @@ function testMcpHandshake(): Promise<CheckResult> {
     const listMsg = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
 
     // Resolve the binary relative to this file so it works outside Claude Code's PATH
-    const root = packageRootFor(import.meta.url, 3);
-    const defaultBin = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "bin", "lcm.js");
-    const binPath = packageEntrypoint(import.meta.url, root, defaultBin);
+    const binPath = packagedRuntimePath();
     const child = spawn(process.execPath, [binPath, "mcp"], { stdio: ["pipe", "pipe", "ignore"] });
     let stdout = "";
     let finished = false;
@@ -394,6 +391,10 @@ function testMcpHandshake(): Promise<CheckResult> {
       stopChildForPipeFailure();
     }
   });
+}
+
+function packagedRuntimePath(): string {
+  return packageExecutable(import.meta.url, 3);
 }
 
 function formatTimeAgo(date: Date): string {
@@ -582,6 +583,8 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   let daemonStorageReady = false;
   let daemonVersion: string | undefined;
   let daemonPid: number | undefined;
+  const runtimePath = packagedRuntimePath();
+  const daemonSpawnArgs = [runtimePath, "daemon", "start", "--foreground"];
   let initialHealthPid: number | undefined;
   try {
     const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
@@ -617,6 +620,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         spawnTimeoutMs: 10000,
         expectedVersion: pkgVersion,
         expectedStorageBackend: config.storageBackend,
+        spawnCommand: process.execPath,
+        spawnArgs: daemonSpawnArgs,
+        expectedEntrypoint: runtimePath,
         enforceUserManagerParent: true,
       });
       if (ensureResult.connected) daemonPid = ensureResult.pid ?? initialHealthPid;
@@ -713,6 +719,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         spawnTimeoutMs: 10000,
         expectedVersion: pkgVersion,
         expectedStorageBackend: config.storageBackend,
+        spawnCommand: process.execPath,
+        spawnArgs: daemonSpawnArgs,
+        expectedEntrypoint: runtimePath,
         enforceUserManagerParent: true,
       });
       if (ensureResult.connected) {
@@ -733,77 +742,100 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
 
   // ── Settings ──
   const settingsPath = join(deps.homedir, ".claude", "settings.json");
-  const readSettings = (): Record<string, unknown> => {
-    const parsed: unknown = JSON.parse(deps.readFileSync(settingsPath, "utf-8"));
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return parsed as Record<string, unknown>;
-  };
-  let settingsData: Record<string, unknown> = {};
-  try {
-    settingsData = readSettings();
-  } catch {}
-
-  // Hooks are owned by plugin.json, not settings.json.
-  // If hooks leaked into settings.json (old installer), clean them up.
-  const hooks = settingsData.hooks as Record<string, unknown[]> | undefined;
-  const duplicateHooks: string[] = [];
-
-  for (const { event, command } of REQUIRED_HOOKS) {
-    const entries = hooks?.[event];
-    const found = Array.isArray(entries) && entries.some((e: any) =>
-      Array.isArray(e?.hooks) && e.hooks.some((h: any) => h.command === command)
-    );
-    if (found) duplicateHooks.push(event);
+  const claudeSettingsExists = deps.existsSync(settingsPath);
+  let settingsData: unknown = {};
+  let settingsError: string | undefined;
+  let claudeSettingsManaged = false;
+  if (claudeSettingsExists) {
+    try {
+      settingsData = JSON.parse(deps.readFileSync(settingsPath, "utf-8"));
+      claudeSettingsManaged = hasManagedClaudeSettings(settingsData);
+    } catch (error) {
+      settingsError = error instanceof Error ? error.message : String(error);
+    }
   }
 
-  if (duplicateHooks.length > 0) {
-    try {
-      settingsData = mergeClaudeSettings(settingsData);
-      deps.writeFileSync(settingsPath, JSON.stringify(settingsData, null, 2));
-      results.push({
-        name: "hooks",
-        category: "Settings",
-        status: "warn",
-        message: `Removed duplicate ${duplicateHooks.join(", ")} from settings.json (plugin.json owns hooks)`,
-        fixApplied: true,
-      });
-    } catch {
-      results.push({
-        name: "hooks",
-        category: "Settings",
-        status: "warn",
-        message: `Duplicate ${duplicateHooks.join(", ")} hook ${duplicateHooks.length === 1 ? "entry" : "entries"} in ${settingsPath} — remove the \`hooks.${duplicateHooks[0]}\` block(s) from that file, then run: lcm install`,
-      });
-    }
-  } else {
+  let currentSettings: Record<string, unknown> | undefined;
+  let lcmBinary: string | undefined;
+  let claudeSettingsCleaned = false;
+  if (!claudeSettingsExists || (!settingsError && !claudeSettingsManaged)) {
     results.push({
       name: "hooks",
       category: "Settings",
       status: "pass",
-      message: REQUIRED_HOOKS.map(h => `${h.event} \u2713`).join("  "),
+      message: "Claude Code integration is not installed",
     });
-  }
-
-  // Re-read settings in case the hooks cleanup branch already modified the file
-  let currentSettings: Record<string, unknown> = {};
-  try { currentSettings = readSettings(); } catch {}
-  const mcpServers = currentSettings.mcpServers as Record<string, unknown> | undefined;
-  // For local installs, settings.json is the canonical source for MCP servers (written by lcm install / doctor);
-  // plugin.json may also declare mcpServers.lcm but is a secondary/optional registration path.
-  if (mcpServers?.["lcm"]) {
-    results.push({ name: "mcp-lcm", category: "Settings", status: "pass", message: "mcpServers.lcm registered in settings.json" });
+  } else if (settingsError) {
+    results.push({
+      name: "hooks",
+      category: "Settings",
+      status: "fail",
+      message: `Could not parse ${settingsPath}: ${settingsError}\n     Fix the JSON, then run: lcm install`,
+    });
   } else {
     try {
-      const merged = mergeClaudeSettings(currentSettings);
-      if (typeof merged.mcpServers !== "object" || merged.mcpServers === null) merged.mcpServers = {};
-      // Use resolveBinaryPath for consistent binary resolution with installer
-      const lcmBinary = resolveBinaryPath(deps);
-      (merged.mcpServers as Record<string, unknown>)["lcm"] = { command: lcmBinary, args: ["mcp"] };
-      deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
-      results.push({ name: "mcp-lcm", category: "Settings", status: "warn", message: "mcpServers.lcm missing from settings.json — re-added automatically", fixApplied: true });
-    } catch {
-      results.push({ name: "mcp-lcm", category: "Settings", status: "fail", message: "mcpServers.lcm missing from settings.json — run: lcm install" });
+      lcmBinary = runtimePath;
+      const merged = mergeClaudeSettings(settingsData, lcmBinary) as Record<string, unknown>;
+      const beforeHooks = (settingsData as Record<string, unknown>)?.hooks;
+      if (JSON.stringify(beforeHooks) === JSON.stringify(merged.hooks)) {
+        if (JSON.stringify(settingsData) !== JSON.stringify(merged)) {
+          deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
+          claudeSettingsCleaned = true;
+        }
+        currentSettings = merged;
+        results.push({
+          name: "hooks",
+          category: "Settings",
+          status: "pass",
+          message: REQUIRED_HOOKS.map(h => `${h.event} \u2713`).join("  "),
+        });
+      } else {
+        deps.mkdirSync(dirname(settingsPath), { recursive: true });
+        deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
+        currentSettings = merged;
+        results.push({
+          name: "hooks",
+          category: "Settings",
+          status: "warn",
+          message: "Native Claude Code hooks were missing or stale — repaired automatically",
+          fixApplied: true,
+        });
+      }
+    } catch (error) {
+      results.push({
+        name: "hooks",
+        category: "Settings",
+        status: "fail",
+        message: `Could not manage native Claude Code hooks: ${error instanceof Error ? error.message : error}\n     Fix: lcm install`,
+      });
     }
+  }
+
+  const expectedMcp = lcmBinary
+    ? { command: process.execPath, args: [lcmBinary, "mcp"] }
+    : undefined;
+  const mcpServers = currentSettings?.mcpServers as Record<string, unknown> | undefined;
+  if (!claudeSettingsExists || (!settingsError && !claudeSettingsManaged)) {
+    results.push({ name: "mcp-lcm", category: "Settings", status: "pass", message: "Claude Code integration is not installed" });
+  } else if (expectedMcp && JSON.stringify(mcpServers?.lcm) === JSON.stringify(expectedMcp)) {
+    results.push(claudeSettingsCleaned
+      ? { name: "mcp-lcm", category: "Settings", status: "warn", message: "Removed the legacy lossless-claude MCP registration", fixApplied: true }
+      : { name: "mcp-lcm", category: "Settings", status: "pass", message: "mcpServers.lcm uses the npm-installed runtime" });
+  } else if (currentSettings && expectedMcp) {
+    try {
+      const merged = mergeClaudeSettings(currentSettings, lcmBinary!);
+      if (merged.mcpServers === null || typeof merged.mcpServers !== "object" || Array.isArray(merged.mcpServers)) {
+        merged.mcpServers = {};
+      }
+      merged.mcpServers.lcm = expectedMcp;
+      deps.mkdirSync(dirname(settingsPath), { recursive: true });
+      deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
+      results.push({ name: "mcp-lcm", category: "Settings", status: "warn", message: "mcpServers.lcm was missing or stale — repaired automatically", fixApplied: true });
+    } catch {
+      results.push({ name: "mcp-lcm", category: "Settings", status: "fail", message: "mcpServers.lcm could not be repaired — run: lcm install" });
+    }
+  } else {
+    results.push({ name: "mcp-lcm", category: "Settings", status: "fail", message: "mcpServers.lcm could not be validated — run: lcm install" });
   }
 
   // ── lcm.md (Claude Code memory guidance file) ──
@@ -827,7 +859,11 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     ? (() => { try { return deps.readFileSync(lcmMdPath, "utf-8") !== LCM_MD_CONTENT; } catch { return true; } })()
     : false;
 
-  if (lcmMdExists && claudeMdHasRef && !lcmMdStale) {
+  if (!claudeSettingsExists || (!settingsError && !claudeSettingsManaged)) {
+    results.push({ name: "lcm-md", category: "Settings", status: "pass", message: "Claude Code integration is not installed" });
+  } else if (settingsError) {
+    results.push({ name: "lcm-md", category: "Settings", status: "fail", message: "lcm.md could not be validated because Claude settings are malformed" });
+  } else if (lcmMdExists && claudeMdHasRef && !lcmMdStale) {
     results.push({ name: "lcm-md", category: "Settings", status: "pass", message: "~/.claude/lcm.md installed and referenced in CLAUDE.md" });
   } else {
     try {

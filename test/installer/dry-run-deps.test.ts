@@ -25,6 +25,14 @@ describe("DryRunServiceDeps", () => {
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining(`[dry-run] would write: ${path}`));
   });
 
+  it("copyFileSync previews the source and destination", () => {
+    const deps = new DryRunServiceDeps();
+    deps.copyFileSync("/templates/source.md", "/commands/destination.md");
+    expect(logSpy).toHaveBeenCalledWith(
+      "[dry-run] would copy: /templates/source.md -> /commands/destination.md",
+    );
+  });
+
   // ── mkdirSync ─────────────────────────────────────────────────────────────
 
   it("mkdirSync prints [dry-run] would create when dir does not exist", () => {
@@ -68,13 +76,34 @@ describe("DryRunServiceDeps", () => {
 
   // ── spawnSync — command -v special case ───────────────────────────────────
 
-  it("spawnSync for 'command -v lcm' returns bare binary name without printing", () => {
+  it("spawnSync for 'command -v lcm' returns an absolute binary path without printing", () => {
     const deps = new DryRunServiceDeps();
     const result = deps.spawnSync("sh", ["-c", "command -v lcm"]);
     expect(result.status).toBe(0);
-    expect(result.stdout).toBe("lcm");
+    expect(result.stdout).toBe("/usr/local/bin/lcm");
     // Should NOT print a [dry-run] line — it's a read-like operation
     expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("[dry-run] would run: sh"));
+  });
+
+  it("runs both Claude plugin inventory commands read-only and simulates near-matches", () => {
+    const deps = new DryRunServiceDeps();
+
+    deps.spawnSync("claude", ["plugin", "list", "--json"], { encoding: "utf-8" });
+    deps.spawnSync("claude", ["plugin", "marketplace", "list", "--json"], { encoding: "utf-8" });
+
+    expect(logSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[dry-run] would run: claude plugin list"),
+    );
+    expect(logSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[dry-run] would run: claude plugin marketplace list"),
+    );
+
+    expect(deps.spawnSync("claude", ["config", "list"]).status).toBe(0);
+    expect(deps.spawnSync("claude", ["plugin", "status"]).status).toBe(0);
+    expect(deps.spawnSync("claude", ["plugin", "marketplace", "status"]).status).toBe(0);
+    expect(logSpy).toHaveBeenCalledWith("[dry-run] would run: claude config list");
+    expect(logSpy).toHaveBeenCalledWith("[dry-run] would run: claude plugin status");
+    expect(logSpy).toHaveBeenCalledWith("[dry-run] would run: claude plugin marketplace status");
   });
 
   // ── spawnSync — setup.sh special case ────────────────────────────────────

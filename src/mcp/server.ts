@@ -8,7 +8,7 @@ import { loadDaemonConfig, type ResolvedStorageConfig } from "../daemon/config.j
 import { ensureDaemon } from "../daemon/lifecycle.js";
 import { configPath as defaultConfigPath, daemonPidPath } from "../runtime-paths.js";
 import { PKG_VERSION } from "../daemon/version.js";
-import { packageRootFor } from "../runtime-root.js";
+import { packageExecutable } from "../runtime-root.js";
 import { lcmGrepTool } from "./tools/lcm-grep.js";
 import { lcmExpandTool } from "./tools/lcm-expand.js";
 import { lcmDescribeTool } from "./tools/lcm-describe.js";
@@ -137,6 +137,7 @@ export type DaemonRequestOpts = {
   storage: ResolvedStorageConfig;
   spawnCommand?: string;
   spawnArgs?: string[];
+  expectedEntrypoint?: string;
   expectedVersion?: string;
   _ensureDaemon?: typeof ensureDaemon;
 };
@@ -194,6 +195,7 @@ export async function handleDaemonRequest(
         expectedStorageBackend: opts.storage.backend,
         spawnCommand: opts.spawnCommand,
         spawnArgs: foregroundDaemonStartArgs(opts.spawnArgs),
+        expectedEntrypoint: opts.expectedEntrypoint,
         enforceUserManagerParent: true,
       })
         .catch(() => { /* non-fatal */ })
@@ -216,13 +218,14 @@ export async function startMcpServer(): Promise<void> {
   const port = config.daemon.port;
   const pidFilePath = daemonPidPath();
 
-  const lcmBin = join(packageRootFor(import.meta.url, 3), "lcm.mjs");
+  const lcmBin = packageExecutable(import.meta.url, 3);
   const daemon = await ensureDaemon({
     port, pidFilePath, spawnTimeoutMs: 10000,
     expectedVersion: PKG_VERSION,
     expectedStorageBackend: config.storage.backend,
     spawnCommand: process.execPath,
     spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
+    expectedEntrypoint: lcmBin,
     enforceUserManagerParent: true,
   });
   if (!daemon.connected) {
@@ -276,6 +279,7 @@ export async function startMcpServer(): Promise<void> {
       port, pidFilePath,
       spawnCommand: process.execPath,
       spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
+      expectedEntrypoint: lcmBin,
       expectedVersion: PKG_VERSION,
       storage: requestConfig.storage,
     });

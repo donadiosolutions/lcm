@@ -19,6 +19,8 @@ const fakeZeroExit = (): SpawnSyncReturns<string> => ({
 });
 
 export class DryRunServiceDeps implements ServiceDeps, TeardownDeps {
+  readonly dryRun = true;
+
   // ── intercepted ───────────────────────────────────────────────────────────
 
   writeFileSync(path: string, _data: string): void {
@@ -53,9 +55,13 @@ export class DryRunServiceDeps implements ServiceDeps, TeardownDeps {
 
     // Special case 2: binary resolution — return canned result, no output printed
     if (cmd === "sh" && args[0] === "-c" && typeof args[1] === "string" && args[1].startsWith("command -v")) {
-      return { ...fakeZeroExit(), stdout: "lcm" };
+      return { ...fakeZeroExit(), stdout: "/usr/local/bin/lcm" };
     }
 
+    if (cmd === "claude" && args[0] === "plugin" &&
+        (args[1] === "list" || (args[1] === "marketplace" && args[2] === "list"))) {
+      return realSpawnSync(cmd, args, opts) as SpawnSyncReturns<string>;
+    }
     // All other commands: print and fake
     console.log(`[dry-run] would run: ${cmd} ${args.join(" ")}`);
     return fakeZeroExit();

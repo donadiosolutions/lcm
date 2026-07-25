@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "n
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { mergeClaudeSettings } from "./installer/settings.js";
+import { packageExecutable } from "./runtime-root.js";
 import { daemonConfigForPersistence, loadDaemonConfig } from "./daemon/config.js";
 import {
   configPath as defaultConfigPath,
@@ -18,12 +19,16 @@ export interface EnsureCoreDeps {
   writeFileSync: (path: string, data: string) => void;
   mkdirSync: (path: string, opts?: { recursive: boolean }) => void;
   chmodSync?: (path: string, mode: number) => void;
+  binaryPath?: string;
   ensureDaemon: (opts: {
     port: number;
     pidFilePath: string;
     spawnTimeoutMs: number;
     expectedStorageBackend?: "sqlite" | "postgresql";
+    expectedEntrypoint?: string;
     enforceUserManagerParent?: boolean;
+    spawnCommand?: string;
+    spawnArgs?: string[];
   }) => Promise<{ connected: boolean }>;
 }
 
@@ -37,6 +42,7 @@ function defaultDeps(): EnsureCoreDeps {
     writeFileSync,
     mkdirSync,
     chmodSync: chmodSync,
+    binaryPath: packageExecutable(import.meta.url, 2),
     ensureDaemon: async (opts) => {
       const { ensureDaemon } = await import("./daemon/lifecycle.js");
       return ensureDaemon(opts);
@@ -47,6 +53,7 @@ function defaultDeps(): EnsureCoreDeps {
 export type VerifiedCoreEndpoint = { connected: boolean; port: number };
 
 export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): Promise<VerifiedCoreEndpoint> {
+  const binaryPath = deps.binaryPath ?? packageExecutable(import.meta.url, 2);
   if (deps.configPath === defaultConfigPath()) {
     migrateLegacyHomeIfNeeded();
   }
@@ -65,7 +72,7 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
   if (deps.existsSync(deps.settingsPath)) {
     try {
       const existing = JSON.parse(deps.readFileSync(deps.settingsPath, "utf-8"));
-      const merged = mergeClaudeSettings(existing);
+      const merged = mergeClaudeSettings(existing, binaryPath);
       if (JSON.stringify(existing) !== JSON.stringify(merged)) {
         deps.mkdirSync(dirname(deps.settingsPath), { recursive: true });
         deps.writeFileSync(deps.settingsPath, JSON.stringify(merged, null, 2));
@@ -81,6 +88,9 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
     pidFilePath: join(dirname(deps.configPath), "daemon.pid"),
     spawnTimeoutMs: 5000,
     expectedStorageBackend: config.storage.backend,
+    expectedEntrypoint: binaryPath,
+    spawnCommand: process.execPath,
+    spawnArgs: [binaryPath, "daemon", "start", "--foreground"],
     enforceUserManagerParent: true,
   });
   return { connected: result.connected, port: config.daemon.port };

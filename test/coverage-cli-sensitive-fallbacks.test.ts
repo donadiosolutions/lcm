@@ -30,9 +30,14 @@ vi.mock("../src/scrub.js", () => ({
 import { handleSensitive } from "../src/sensitive.js";
 
 describe("sensitive configuration fallbacks", () => {
-  it("lists an empty normalized security section and displays a sync date", async () => {
+  it.each([
+    ["available", "2026-07-18", "(synced 2026-07-18)"],
+    ["unavailable", null, "patterns\n"],
+  ] as const)("lists an empty normalized security section when metadata is %s", async (_state, syncDate, expected) => {
+    mocks.readSyncDate.mockReturnValueOnce(syncDate);
     const result = await handleSensitive(["list"], "/isolated/project", "/isolated/config.json");
-    expect(result.stdout).toContain("(synced 2026-07-18)");
+    expect(result.stdout).toContain(expected);
+    if (syncDate === null) expect(result.stdout).not.toContain("(synced ");
     expect(result.stdout).toContain("Global patterns (config.json):\n  (none)");
   });
 

@@ -4,7 +4,9 @@ import pkg from "../package.json";
 
 describe("package.json", () => {
   it("has correct name", () => expect(pkg.name).toBe("@donadiosolutions/lcm"));
-  it("has bin entry", () => expect(pkg.bin).toHaveProperty("lcm"));
+  it("uses the generated npm runtime as its executable", () => {
+    expect(pkg.bin).toHaveProperty("lcm", "dist/lcm.mjs");
+  });
   it("has anthropic sdk as optional peer dep", () => expect(pkg.peerDependencies).toHaveProperty("@anthropic-ai/sdk"));
   it("has mcp sdk", () => expect(pkg.dependencies).toHaveProperty("@modelcontextprotocol/sdk"));
   it("does not have pi-ai", () => expect(pkg.dependencies).not.toHaveProperty("@mariozechner/pi-ai"));
@@ -18,54 +20,34 @@ describe("package.json", () => {
     expect(pkg.scripts).toHaveProperty("prepublishOnly", "npm run build");
   });
 
-  it("ships mcp.mjs as a fallback MCP entrypoint", () => {
-    expect(pkg.files).toContain("mcp.mjs");
-  });
-
-  it("uses exact, reproducible plugin bundle tooling", () => {
+  it("uses exact, reproducible runtime bundle tooling", () => {
     expect(pkg.devDependencies.esbuild).toBe("0.28.1");
-    expect(pkg.scripts).toHaveProperty("check:plugin-bundles");
+    expect(pkg.scripts).toHaveProperty("build:runtime", "node scripts/build-runtime.mjs");
+    expect(pkg.scripts).not.toHaveProperty("check:plugin-bundles");
   });
 
-  it("excludes destructive dogfood and E2E helpers from the package allowlist", () => {
-    expect(pkg.files).toContain("!.claude-plugin/commands/lcm-dogfood.md");
-    expect(pkg.files).toContain("!.claude-plugin/skills/lcm-dogfood/");
-    expect(pkg.files).toContain("!.claude-plugin/skills/lcm-e2e/");
+  it("ships acknowledgments and npm-owned assets without Marketplace files", () => {
+    expect(pkg.files).toContain("dist/");
+    expect(pkg.files).toContain("ACKNOWLEDGMENTS.md");
+    expect(pkg.files).not.toContain("lcm.mjs");
+    expect(pkg.files).not.toContain("mcp.mjs");
+    expect(pkg.files).not.toContain(".claude-plugin/");
   });
 
-  it("fails closed when no plugin cache bundle can be resolved", () => {
-    const skill = readFileSync(new URL("../.claude-plugin/skills/lcm-context/SKILL.md", import.meta.url), "utf8");
-    expect(skill).toContain('[ -n "$LCM_DIR" ] && [ -f "${LCM_DIR}lcm.mjs" ]');
-    expect(skill).not.toMatch(/node "\$\(ls -d/);
+  it("generates only the dist runtime bundle", () => {
+    const source = readFileSync(new URL("../scripts/build-runtime.mjs", import.meta.url), "utf8");
+    expect(source).toContain('join(root, "dist", "lcm.mjs")');
+    expect(source).not.toContain('join(root, "lcm.mjs")');
+    expect(source).not.toContain("mcp.mjs");
+    expect(source).toContain('startsWith("#!/usr/bin/env node\\n")');
+    expect(source).toContain("chmod(output, 0o755)");
   });
 
-  it("keeps dogfood diagnostics single-line even though the helper is not shipped", () => {
-    const helper = readFileSync(new URL("../.claude-plugin/skills/lcm-dogfood/scripts/prompt-search-test.js", import.meta.url), "utf8");
-    expect(helper.match(/replace\(\/\[\\r\\n\]\/g, " "\)/g)).toHaveLength(2);
-    expect(helper).toContain('req.on("error", () => console.log("Request failed"))');
-  });
-
-  it("ships inert plugin bundles without runtime package installation", () => {
-    for (const entrypoint of ["lcm.mjs", "mcp.mjs"]) {
-      const source = readFileSync(new URL(`../${entrypoint}`, import.meta.url), "utf8");
-      expect(source).not.toContain("npm install --silent");
-      expect(source).not.toContain("npm run build --silent");
-      expect(source).not.toContain("execSync(");
-    }
-  });
-
-  it("tree-shakes migration-only definition inventories from the CLI bundle", () => {
-    const migrationSource = readFileSync(
-      new URL("../src/storage/postgresql/migrations.ts", import.meta.url),
-      "utf8",
-    );
-    const cliBundle = readFileSync(new URL("../lcm.mjs", import.meta.url), "utf8");
-    for (const inventoryIdentity of [
-      "session_ingest_log_identity_lookup_idx",
-      "transcript_messages_project_id_transcript_id_source_ordinal_key",
-    ]) {
-      expect(migrationSource).toContain(inventoryIdentity);
-      expect(cliBundle).not.toContain(inventoryIdentity);
+  it("pins every direct dependency and development dependency exactly", () => {
+    for (const dependencies of [pkg.dependencies, pkg.devDependencies]) {
+      for (const version of Object.values(dependencies)) {
+        expect(version).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
+      }
     }
   });
 });

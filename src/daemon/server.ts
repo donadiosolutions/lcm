@@ -169,6 +169,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       storageBackend: config.storage.backend,
       uptime: Math.floor((Date.now() - startTime) / 1000),
       pid: process.pid,
+      entrypoint: process.argv[1],
       ...(healthy ? {} : {
         storage: {
           status: storageHealth.status,

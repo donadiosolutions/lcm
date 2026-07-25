@@ -2,41 +2,21 @@ import { readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { REQUIRED_HOOKS } from "./install.js";
+import { removeManagedClaudeSettings } from "../src/installer/settings.js";
 import {
   legacyLaunchdPlistName,
-  legacyLcmCommand,
-  legacyLcmMcpServerName,
   legacyLcmSlug,
   legacySystemdServiceName,
 } from "../src/legacy-names.js";
 
 export function removeClaudeSettings(existing: any): any {
-  const settings = JSON.parse(JSON.stringify(existing));
-  settings.hooks = (settings.hooks && typeof settings.hooks === "object" && !Array.isArray(settings.hooks)) ? settings.hooks : {};
-  settings.mcpServers = (settings.mcpServers && typeof settings.mcpServers === "object" && !Array.isArray(settings.mcpServers)) ? settings.mcpServers : {};
-
-  const LC_COMMANDS = new Set(REQUIRED_HOOKS.map(h => h.command));
-  // Also remove legacy command names.
-  for (const { command } of REQUIRED_HOOKS) {
-    LC_COMMANDS.add(legacyLcmCommand(command));
-  }
-  LC_COMMANDS.add(legacyLcmCommand("lcm compact"));
-  for (const event of Object.keys(settings.hooks)) {
-    if (!Array.isArray(settings.hooks[event])) continue;
-    settings.hooks[event] = settings.hooks[event].filter(
-      (entry: any) => !(Array.isArray(entry.hooks) && entry.hooks.some((h: any) => LC_COMMANDS.has(h.command)))
-    );
-  }
-  delete settings.mcpServers["lcm"];
-  delete settings.mcpServers[legacyLcmMcpServerName()];
-  return settings;
+  return removeManagedClaudeSettings(existing);
 }
 
 export interface TeardownDeps {
   spawnSync: (cmd: string, args: string[], opts?: any) => SpawnSyncReturns<string>;
   existsSync: (path: string) => boolean;
-  rmSync: (path: string) => void;
+  rmSync: (path: string, options?: { recursive?: boolean; force?: boolean }) => void;
   readFileSync: (path: string, encoding: string) => string;
   writeFileSync: (path: string, data: string) => void;
 }
@@ -92,10 +72,9 @@ export function teardownDaemonService(deps: TeardownDeps = defaultDeps): void {
 }
 
 export async function uninstall(deps: TeardownDeps = defaultDeps): Promise<void> {
-  // 1. Stop and remove the daemon service
-  teardownDaemonService(deps);
-
-  // 2. Remove lcm and legacy entries from ~/.claude/settings.json
+  // Validate and remove runtime-facing Claude settings before deleting the
+  // daemon or packaged assets. A malformed/unwritable settings file must leave
+  // the installation intact rather than creating dangling active hooks.
   const settingsPath = join(homedir(), ".claude", "settings.json");
   if (deps.existsSync(settingsPath)) {
     try {
@@ -103,7 +82,40 @@ export async function uninstall(deps: TeardownDeps = defaultDeps): Promise<void>
       deps.writeFileSync(settingsPath, JSON.stringify(removeClaudeSettings(existing), null, 2));
       console.log(`Removed lcm from ${settingsPath}`);
     } catch (err) {
-      console.warn(`Warning: could not update ${settingsPath}: ${err instanceof Error ? err.message : err}`);
+      throw new Error(
+        `Could not update ${settingsPath}; uninstall was stopped before removing runtime assets: `
+        + `${err instanceof Error ? err.message : err}`,
+      );
+    }
+  }
+
+  teardownDaemonService(deps);
+
+  const claudeHome = join(homedir(), ".claude");
+  const commandNames = [
+    "lcm-compact.md", "lcm-curate.md", "lcm-diagnose.md", "lcm-doctor.md",
+    "lcm-import.md", "lcm-promote.md", "lcm-sensitive.md", "lcm-stats.md",
+    "lcm-status.md",
+  ];
+  for (const name of commandNames) {
+    const path = join(claudeHome, "commands", name);
+    if (deps.existsSync(path)) deps.rmSync(path, { force: true });
+  }
+  const skillPath = join(claudeHome, "skills", "lcm-context");
+  if (deps.existsSync(skillPath)) deps.rmSync(skillPath, { recursive: true, force: true });
+  const lcmMdPath = join(claudeHome, "lcm.md");
+  if (deps.existsSync(lcmMdPath)) deps.rmSync(lcmMdPath, { force: true });
+
+  const claudeMdPath = join(claudeHome, "CLAUDE.md");
+  if (deps.existsSync(claudeMdPath)) {
+    try {
+      const existing = deps.readFileSync(claudeMdPath, "utf-8");
+      const updated = existing
+        .replace(/^[ \t]*<!--\s*lcm:start\s*-->[\s\S]*?^[ \t]*<!--\s*lcm:end\s*-->[ \t]*(?:\r?\n)?/m, "")
+        .trimEnd();
+      if (updated !== existing.trimEnd()) deps.writeFileSync(claudeMdPath, updated ? `${updated}\n` : "");
+    } catch (err) {
+      console.warn(`Warning: could not update ${claudeMdPath}: ${err instanceof Error ? err.message : err}`);
     }
   }
 

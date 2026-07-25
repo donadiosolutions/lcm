@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
-import { REQUIRED_HOOKS, mergeClaudeSettings } from "../../installer/install.js";
+import { join, dirname, isAbsolute } from "node:path";
+import { mergeClaudeSettings } from "../installer/settings.js";
 import { lcmPath } from "../runtime-paths.js";
 
 export interface AutoHealDeps {
@@ -12,6 +12,8 @@ export interface AutoHealDeps {
   appendFileSync: (path: string, data: string) => void;
   settingsPath: string;
   logPath: string;
+  binaryPath: string;
+  nodePath?: string;
 }
 
 function defaultDeps(): AutoHealDeps {
@@ -23,55 +25,18 @@ function defaultDeps(): AutoHealDeps {
     appendFileSync,
     settingsPath: join(homedir(), ".claude", "settings.json"),
     logPath: lcmPath("auto-heal.log"),
+    binaryPath: isAbsolute(process.argv[1] ?? "") ? process.argv[1] : "",
   };
-}
-
-function hasHookCommand(entries: any[], command: string): boolean {
-  return entries.some((entry: any) =>
-    Array.isArray(entry.hooks) && entry.hooks.some((h: any) => h.command === command)
-  );
 }
 
 export function validateAndFixHooks(deps: AutoHealDeps = defaultDeps()): void {
   try {
     if (!deps.existsSync(deps.settingsPath)) return;
 
-    const settings: any = JSON.parse(deps.readFileSync(deps.settingsPath, "utf-8"));
-
-    // Hooks are owned by plugin.json — if they leaked into settings.json
-    // (from old installer or manual edits), remove them to prevent double-firing.
-    const hooks = settings.hooks ?? {};
-
-    // Migration: rewrite "lcm compact" (without --hook) → append "--hook".
-    // Only exact match "lcm compact" on PreCompact event to avoid changing semantics
-    // for user-custom variants like "lcm compact --all" where --hook would make --all a no-op.
-    let rewritten = false;
-    for (const event of Object.keys(hooks)) {
-      if (!Array.isArray(hooks[event])) continue;
-      for (const entry of hooks[event]) {
-        if (!Array.isArray(entry.hooks)) continue;
-        for (const h of entry.hooks) {
-          if (typeof h.command === "string") {
-            const trimmed = h.command.trim();
-            // Only rewrite the exact legacy duplicate "lcm compact" command on PreCompact,
-            // to avoid changing semantics for user-custom variants like "lcm compact --all".
-            if (event === "PreCompact" && trimmed === "lcm compact") {
-              h.command = "lcm compact --hook";
-              rewritten = true;
-            }
-          }
-        }
-      }
-    }
-
-    const hasDuplicates = REQUIRED_HOOKS.some(({ event, command }) => {
-      const entries = hooks[event];
-      return Array.isArray(entries) && hasHookCommand(entries, command);
-    });
-    if (!hasDuplicates && !rewritten) return;
-
-    // Clean up: remove lcm hooks from settings.json (MCP config is preserved)
-    const merged = mergeClaudeSettings(settings);
+    if (!deps.binaryPath) throw new Error("cannot resolve absolute LCM executable for hook repair");
+    const settings: unknown = JSON.parse(deps.readFileSync(deps.settingsPath, "utf-8"));
+    const merged = mergeClaudeSettings(settings, deps.binaryPath, deps.nodePath);
+    if (JSON.stringify(settings) === JSON.stringify(merged)) return;
     deps.mkdirSync(dirname(deps.settingsPath), { recursive: true });
     deps.writeFileSync(deps.settingsPath, JSON.stringify(merged, null, 2));
   } catch (err) {

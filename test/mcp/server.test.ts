@@ -162,24 +162,25 @@ describe("startMcpServer", () => {
     );
   });
 
-  it("passes explicit spawnCommand and spawnArgs pointing to lcm.mjs", async () => {
+  it("uses the packaged runtime for daemon spawning and identity", async () => {
     ensureDaemonMcpMock.mockClear();
     const { startMcpServer } = await import("../../src/mcp/server.js");
 
     await startMcpServer();
 
-    expect(ensureDaemonMcpMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        spawnCommand: process.execPath,
-        spawnArgs: expect.arrayContaining([
-          expect.stringContaining("lcm.mjs"),
-          "daemon",
-          "start",
-          "--foreground",
-        ]),
-        enforceUserManagerParent: true,
-      }),
-    );
+    const call = ensureDaemonMcpMock.mock.calls.at(-1)?.[0];
+    expect(call).toEqual(expect.objectContaining({
+      spawnCommand: process.execPath,
+      spawnArgs: [
+        expect.stringContaining("dist/lcm.mjs"),
+        "daemon",
+        "start",
+        "--foreground",
+      ],
+      expectedEntrypoint: expect.stringContaining("dist/lcm.mjs"),
+      enforceUserManagerParent: true,
+    }));
+    expect(call.spawnArgs[0]).toBe(call.expectedEntrypoint);
   });
 });
 

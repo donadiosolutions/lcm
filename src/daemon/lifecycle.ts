@@ -1,7 +1,7 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
-import { join, dirname, win32 } from "node:path";
+import { join, dirname, posix, win32 } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
 import { managedDaemonPath, SYSTEMD_DAEMON_PATH } from "./managed-path.js";
 import { PKG_VERSION } from "./version.js";
@@ -27,6 +27,7 @@ export type EnsureDaemonOptions = {
   spawnTimeoutMs: number;
   expectedVersion?: string;
   expectedStorageBackend?: StorageBackend;
+  expectedEntrypoint?: string;
   enforceUserManagerParent?: boolean;
   spawnCommand?: string;
   spawnArgs?: string[];
@@ -44,6 +45,8 @@ export type EnsureDaemonOptions = {
   _setTimeoutOverride?: SetTimeoutFn;
   _clearTimeoutOverride?: ClearTimeoutFn;
   _isProcessAliveOverride?: (pid: number) => boolean;
+  /** @internal Deterministic executable-canonicalization seam for lifecycle tests. */
+  _realpathOverride?: (path: string) => string;
   /** @internal Deterministic listener-ownership seam for lifecycle tests. */
   _listeningPortsOverride?: (pid: number) => number[];
 };
@@ -78,6 +81,7 @@ type HealthResponse = {
   storageBackend?: StorageBackend;
   uptime?: number;
   pid?: number;
+  entrypoint?: string;
   httpStatus?: number;
   storage?: {
     status?: string;
@@ -254,6 +258,43 @@ function readProcessCommand(pid: number, procRoot = "/proc"): string | null {
     return readFileSync(join(procRoot, String(pid), "cmdline"), "utf-8").replace(/\0/g, " ").trim();
   } catch {
     return null;
+  }
+}
+
+function processEntrypointMatches(
+  health: HealthResponse,
+  expectedEntrypoint: string | undefined,
+  platform: NodeJS.Platform,
+  procRoot = "/proc",
+  realpath: (path: string) => string = realpathSync,
+): boolean {
+  if (expectedEntrypoint === undefined) return true;
+  const pathApi = platform === "win32" ? win32 : posix;
+  const normalize = (path: string): string => {
+    let canonical = path;
+    if (pathApi.isAbsolute(path)) {
+      try {
+        canonical = realpath(path);
+      } catch {
+        // Legacy or remote health paths may no longer exist. Preserve the
+        // direct normalized comparison instead of treating resolution failure
+        // as evidence that two different paths are equivalent.
+      }
+    }
+    const normalized = pathApi.normalize(canonical);
+    return platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  const matches = (actual: string): boolean =>
+    actual === expectedEntrypoint || normalize(actual) === normalize(expectedEntrypoint);
+  if (typeof health.entrypoint === "string") return matches(health.entrypoint);
+  if (platform !== "linux" || health.pid === undefined) return false;
+  try {
+    const args = readFileSync(join(procRoot, String(health.pid), "cmdline"), "utf-8")
+      .split("\0")
+      .filter((arg) => arg.length > 0);
+    return args.some(matches);
+  } catch {
+    return false;
   }
 }
 
@@ -800,6 +841,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
   const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
+  const realpath = opts._realpathOverride ?? realpathSync;
   const deadline = monotonicNow() + opts.spawnTimeoutMs;
   const isAlive = opts._isProcessAliveOverride ?? isProcessAlive;
   const killProcess = opts._killOverride ?? ((pid, signal) => {
@@ -808,6 +850,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const enforceParent = opts.enforceUserManagerParent === true && platform === "linux";
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
   const expectedStorageBackend = opts.expectedStorageBackend ?? "sqlite";
+  const expectedEntrypoint = opts.expectedEntrypoint;
   let restartedForParent = false;
 
   if (typeof expectedVersion !== "string" || expectedVersion.length === 0) {
@@ -859,7 +902,9 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   async function terminateAuthenticatedDaemon(health: HealthResponse): Promise<MismatchRepair> {
     const authenticatedPid = health.pid;
     if (authenticatedPid === undefined || !endpointIdentityMatches(health)) return { outcome: "blocked" };
-    if (!isLikelyLcmDaemonProcess(authenticatedPid, procRoot)) return { outcome: "blocked" };
+    if (platform === "linux" && !isLikelyLcmDaemonProcess(authenticatedPid, procRoot)) {
+      return { outcome: "blocked" };
+    }
     await terminatePid(authenticatedPid, { isAlive, killProcess, sleepFn });
     if (isAlive(authenticatedPid)) return { outcome: "blocked" };
     const currentPid = readPidFile(opts.pidFilePath);
@@ -878,10 +923,11 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     identityMatches: boolean,
     versionMatches: boolean,
     storageBackendMatches: boolean,
+    entrypointMatches: boolean,
     hasAccess: boolean,
   ): Promise<MismatchRepair> {
     if (!identityMatches) return { outcome: "none" };
-    if (!storageBackendMatches) {
+    if (!storageBackendMatches || !entrypointMatches) {
       if (!hasAccess) return { outcome: "blocked" };
       return terminateAuthenticatedDaemon(health);
     }
@@ -901,6 +947,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (health === null || !endpointIdentityMatches(health)) return null;
     if (!healthVersionMatches(health, expectedVersion)) return null;
     if (!healthStorageBackendMatches(health, expectedStorageBackend)) return null;
+    if (!processEntrypointMatches(health, expectedEntrypoint, platform, procRoot, realpath)) return null;
     if (!access.alreadyVerified) {
       const accessTimeoutMs = access.deadline - monotonicNow();
       if (accessTimeoutMs <= 0) return null;
@@ -982,7 +1029,14 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const identityMatches = endpointIdentityMatches(health);
     const versionMatches = healthVersionMatches(health, expectedVersion);
     const storageBackendMatches = healthStorageBackendMatches(health, expectedStorageBackend);
-    const hasAccess = identityMatches && (versionMatches || !storageBackendMatches) && initialAccessDeadline
+    const entrypointMatches = processEntrypointMatches(
+      health,
+      expectedEntrypoint,
+      platform,
+      procRoot,
+      realpath,
+    );
+    const hasAccess = identityMatches && (versionMatches || !storageBackendMatches || !entrypointMatches) && initialAccessDeadline
       ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, initialAccessDeadline, health.storageBackend ?? expectedStorageBackend)
       : false;
     const mismatchRepair = await repairMismatchedDaemon(
@@ -990,6 +1044,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       identityMatches,
       versionMatches,
       storageBackendMatches,
+      entrypointMatches,
       hasAccess,
     );
     if (mismatchRepair.outcome === "blocked") {
@@ -1042,7 +1097,16 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           const retryIdentityMatches = endpointIdentityMatches(retry);
           const retryVersionMatches = healthVersionMatches(retry, expectedVersion);
           const retryStorageBackendMatches = healthStorageBackendMatches(retry, expectedStorageBackend);
-          const retryHasAccess = retryIdentityMatches && (retryVersionMatches || !retryStorageBackendMatches) && retryAccessDeadline
+          const retryEntrypointMatches = processEntrypointMatches(
+            retry,
+            expectedEntrypoint,
+            platform,
+            procRoot,
+            realpath,
+          );
+          const retryHasAccess = retryIdentityMatches
+            && (retryVersionMatches || !retryStorageBackendMatches || !retryEntrypointMatches)
+            && retryAccessDeadline
             ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, retryAccessDeadline, retry.storageBackend ?? expectedStorageBackend)
             : false;
           const mismatchRepair = await repairMismatchedDaemon(
@@ -1050,6 +1114,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
             retryIdentityMatches,
             retryVersionMatches,
             retryStorageBackendMatches,
+            retryEntrypointMatches,
             retryHasAccess,
           );
           if (mismatchRepair.outcome === "blocked") {

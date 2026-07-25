@@ -2,6 +2,16 @@
 
 This repository has the shared memory backend needed for VS Code and Codex. Codex now has native hooks plus skill and rules connectors; GitHub Copilot in VS Code remains rules based.
 
+For normal use, install and update the published package through npm:
+
+```bash
+npm install -g @donadiosolutions/lcm@latest
+```
+
+Claude Code uses the same npm package. Run `lcm install` for its native hooks,
+MCP server, commands, and skills; direct Claude Marketplace installation is no
+longer supported.
+
 ## Install from a repo checkout
 
 If you are working from this repository directly instead of the published npm package:
@@ -9,11 +19,11 @@ If you are working from this repository directly instead of the published npm pa
 ```bash
 npm install
 npm run build
-chmod +x dist/bin/lcm.js
 npm link
 ```
 
-If you do not want a global link, run `node dist/bin/lcm.js ...` instead of `lcm ...` in the commands below.
+If you do not want a global link, run `node dist/lcm.mjs ...` instead of
+`lcm ...` in the commands below.
 
 ## Install the VS Code connector
 
@@ -75,12 +85,12 @@ lcm import --provider all
 
 ## Current shortcomings
 
-1. `lcm install` is still Claude-Code-specific. Use `lcm connectors install codex` for Codex and `lcm connectors install github-copilot` for VS Code.
+1. `lcm install` configures Claude Code's npm-owned native integration. Use `lcm connectors install codex` for Codex and `lcm connectors install github-copilot` for VS Code.
 2. GitHub Copilot in VS Code is skill-based today. There is no automatic session restore, turn ingestion, prompt-time search injection, or compaction hook.
 3. The GitHub Copilot connector does not register MCP automatically. The current supported path is instructions/skill guidance plus the `lcm` CLI.
 4. Codex MCP config lives in `.codex/config.toml`, but the connector installer does not edit TOML yet. `lcm connectors install codex --type mcp` only prints manual instructions.
 5. Codex `Stop` hooks are turn-scoped, not final-session hooks. LCM therefore uses rolling snapshots and thresholded compaction instead of marking Codex sessions complete on each `Stop`; the `PreCompact` snapshot hook fills the pre-compaction gap.
-6. The top-level branding and install flow were originally Claude-first, so documentation drift is still a risk whenever new clients are added.
+6. Claude Code and Codex use native integrations, but their setup commands remain different.
 
 ## Improvement candidates
 

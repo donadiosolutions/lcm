@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -708,6 +708,8 @@ describe("doctor service coverage", () => {
     try {
       mkdirSync(join(home, ".lcm"), { recursive: true });
       writeFileSync(join(home, ".lcm", "config.json"), JSON.stringify({ llm: { provider: "auto" } }));
+      mkdirSync(join(home, ".claude"), { recursive: true });
+      writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ mcpServers: { lcm: {} } }));
       mocks.spawnSync.mockReturnValue({ status: 1, stdout: "", stderr: "missing" });
       const results = await runDoctor({
         homedir: home,
@@ -717,6 +719,8 @@ describe("doctor service coverage", () => {
       expect(results.find((result) => result.name === "claude-process")?.status).toBe("fail");
       expect(results.find((result) => result.name === "codex-process")?.status).toBe("fail");
       expect(mocks.spawnSync.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(JSON.parse(readFileSync(join(home, ".claude", "settings.json"), "utf8")).hooks)
+        .toBeDefined();
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -991,12 +995,12 @@ describe("doctor service coverage", () => {
       writeError: new Error("cannot write"),
       exists: (path) => !path.endsWith("lcm.md"),
     }));
-    expect(results.find((result) => result.name === "hooks")?.message).toContain("Duplicate");
+    expect(results.find((result) => result.name === "hooks")?.message).toContain("Could not manage native Claude Code hooks");
     expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("fail");
     expect(results.find((result) => result.name === "lcm-md")?.status).toBe("fail");
 
     results = await runDoctor(makeDeps({
-      settings: {},
+      settings: { mcpServers: { lcm: {} } },
       claudeMd: "no managed block",
       lcmMd: "stale",
       readError: (path) => path.endsWith("CLAUDE.md") ? new Error("cannot read claude") : undefined,
@@ -1007,8 +1011,8 @@ describe("doctor service coverage", () => {
     results = await runDoctor(makeDeps({
       readError: (path) => path.endsWith("settings.json") || path.endsWith("lcm.md") ? new Error("cannot read") : undefined,
     }));
-    expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("warn");
-    expect(results.find((result) => result.name === "lcm-md")?.status).toBe("warn");
+    expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("fail");
+    expect(results.find((result) => result.name === "lcm-md")?.status).toBe("fail");
   });
 
   it("covers passive-learning detailed boundaries", async () => {
@@ -1103,9 +1107,9 @@ describe("doctor service coverage", () => {
 
   it("covers multiple duplicate hook repair failure and lcm.md patch-only/non-Error repair paths", async () => {
     const hooks: Record<string, unknown[]> = {};
-    for (const { event, command } of REQUIRED_HOOKS) hooks[event] = [{ hooks: [{ command }] }];
+    for (const { event, command } of REQUIRED_HOOKS) hooks[event] = [{ hooks: [{ command: `lcm ${command}` }] }];
     let results = await runDoctor(makeDeps({ settings: { hooks }, writeError: "plain write failure" }));
-    expect(results.find((result) => result.name === "hooks")?.message).toContain("entries");
+    expect(results.find((result) => result.name === "hooks")?.message).toContain("Could not manage native Claude Code hooks");
 
     results = await runDoctor(makeDeps({ claudeMd: "no reference" }));
     expect(results.find((result) => result.name === "lcm-md")?.message).toContain("added @lcm.md");
@@ -1194,24 +1198,28 @@ describe("doctor service coverage", () => {
     validation = { ok: true, fixApplied: false, warnings: [], errors: [], path: mapPath, map: { one: {} } };
     expect((await isolated.runDoctor(makeDeps())).find((result) => result.name === "project-map")?.message).toContain("1 mapped project");
     validation = { ok: true, fixApplied: false, warnings: [], errors: [], path: mapPath, map: { one: {}, two: {} } };
-    const finalResults = await isolated.runDoctor(makeDeps({ settings: {} }));
+    const finalResults = await isolated.runDoctor(makeDeps({ settings: { mcpServers: { lcm: {} } } }));
     expect(finalResults.find((result) => result.name === "project-map")?.message).toContain("2 mapped projects");
     expect(finalResults.find((result) => result.name === "secret-detection")?.status).toBe("fail");
     expect(finalResults.find((result) => result.name === "mcp-lcm")?.status).toBe("warn");
 
     vi.resetModules();
     vi.doMock("../src/generated-patterns.js", () => ({ GITLEAKS_PATTERNS: [{}] }));
+    let syncDate: string | undefined = "2026-01-01";
     vi.doMock("../src/scrub.js", async (importOriginal) => {
       const original = await importOriginal<typeof import("../src/scrub.js")>();
       return {
         ...original,
-        readGitleaksSyncDate: () => "2026-01-01",
+        readGitleaksSyncDate: () => syncDate,
         ScrubEngine: { loadProjectPatterns: vi.fn().mockResolvedValue([]) },
       };
     });
-    const noSyncDate = await import("../src/doctor/doctor.js");
-    expect((await noSyncDate.runDoctor(makeDeps())).find((result) => result.name === "secret-detection")?.message)
+    const syncDateDoctor = await import("../src/doctor/doctor.js");
+    expect((await syncDateDoctor.runDoctor(makeDeps())).find((result) => result.name === "secret-detection")?.message)
       .toContain("synced 2026-01-01");
+    syncDate = undefined;
+    expect((await syncDateDoctor.runDoctor(makeDeps())).find((result) => result.name === "secret-detection")?.message)
+      .not.toContain("(synced ");
     rmSync(root, { recursive: true, force: true });
   });
 });

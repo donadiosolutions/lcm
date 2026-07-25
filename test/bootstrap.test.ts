@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EnsureCoreDeps } from "../src/bootstrap.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../src/daemon/config.js";
+import { canonicalHookCommand, mergeClaudeSettings } from "../src/installer/settings.js";
 
 function makeDeps(overrides: Partial<EnsureCoreDeps> = {}): EnsureCoreDeps {
   return {
@@ -13,6 +14,7 @@ function makeDeps(overrides: Partial<EnsureCoreDeps> = {}): EnsureCoreDeps {
     readFileSync: vi.fn().mockReturnValue("{}"),
     writeFileSync: vi.fn(),
     mkdirSync: vi.fn(),
+    binaryPath: "/opt/npm/bin/lcm",
     ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
     ...overrides,
   };
@@ -37,6 +39,15 @@ describe("ensureCore", () => {
     const effective = parseDaemonConfig(configWrite![1], {}, {});
     expect(effective.llm.requestTimeoutMs).toBe(DEFAULT_LLM_REQUEST_TIMEOUT_MS);
     expect(effective.llm.retry).toEqual(DEFAULT_LLM_RETRY_POLICY);
+  });
+
+  it("uses the packaged runtime when no binary path is injected", async () => {
+    const deps = makeDeps({ binaryPath: undefined });
+    const { ensureCore } = await import("../src/bootstrap.js");
+    await ensureCore(deps);
+    expect(deps.ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+      expectedEntrypoint: join(process.cwd(), "dist", "lcm.mjs"),
+    }));
   });
 
   it("skips config.json creation when it already exists", async () => {
@@ -67,7 +78,13 @@ describe("ensureCore", () => {
       .filter((args) => args[0] === deps.settingsPath);
     expect(settingsWrites.length).toBe(1);
     const written = JSON.parse(settingsWrites[0][1]);
-    expect(written.hooks?.PreCompact).toBeUndefined();
+    expect(written.hooks?.PreCompact).toEqual([{
+      matcher: "",
+      hooks: [{
+        type: "command",
+        command: canonicalHookCommand("/opt/npm/bin/lcm", "compact --hook"),
+      }],
+    }]);
   });
 
   it("starts daemon if not running", async () => {
@@ -132,7 +149,7 @@ describe("ensureCore", () => {
   it("does not rewrite unchanged settings and ignores malformed settings", async () => {
     const unchanged = makeDeps({
       existsSync: vi.fn().mockReturnValue(true),
-      readFileSync: vi.fn().mockReturnValue("{}"),
+      readFileSync: vi.fn().mockReturnValue(JSON.stringify(mergeClaudeSettings({}, "/opt/npm/bin/lcm"))),
     });
     const malformed = makeDeps({
       existsSync: vi.fn().mockReturnValue(true),

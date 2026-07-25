@@ -21,11 +21,16 @@ import { install, type ServiceDeps } from "../../installer/install.js";
 describe("install default service boundaries", () => {
   it("uses default daemon and doctor integrations", async () => {
     const deps: ServiceDeps = {
-      spawnSync: vi.fn().mockReturnValue({ status: 1, stdout: "" }),
+      spawnSync: vi.fn().mockReturnValue({
+        status: null,
+        stdout: "",
+        error: Object.assign(new Error("missing"), { code: "ENOENT" }),
+      }),
       readFileSync: vi.fn().mockReturnValue("{}"),
       writeFileSync: vi.fn(),
       mkdirSync: vi.fn(),
       existsSync: vi.fn((path: string) => path.endsWith("config.json")),
+      binaryPath: "/usr/local/bin/lcm",
       promptUser: vi.fn(),
     };
     await install(deps);

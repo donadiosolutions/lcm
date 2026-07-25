@@ -16,12 +16,6 @@ Run the following command via Bash:
 lcm promote
 ```
 
-If `lcm` is not on PATH (marketplace install), use the plugin-relative binary instead:
-
-```bash
-node "${CLAUDE_PLUGIN_ROOT}/lcm.mjs" promote
-```
-
 ### Options
 
 Pass user-specified flags through to the command:

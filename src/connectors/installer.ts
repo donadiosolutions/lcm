@@ -7,6 +7,12 @@ import { LCM_MARKERS } from "./constants.js";
 import { generateContent } from "./template-service.js";
 import { findAgent, AGENTS } from "./registry.js";
 import { CODEX_CONFIG_PATH, LEGACY_CODEX_HOOKS_PATHS, hasCodexHooks, installCodexHooks, removeCodexHooks } from "./codex-hooks.js";
+import {
+  canonicalHookCommand,
+  removeManagedClaudeHooks,
+  REQUIRED_HOOKS,
+} from "../installer/settings.js";
+import { packageExecutable } from "../runtime-root.js";
 
 export interface InstallResult {
   success: boolean;
@@ -142,6 +148,56 @@ function removeMcpJson(filePath: string): boolean {
   return true;
 }
 
+function readJsonObject(filePath: string): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(readFileSync(filePath, "utf-8"));
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${filePath} must contain a JSON object`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function removeClaudeHooks(filePath: string): boolean {
+  let existing: Record<string, unknown>;
+  try {
+    existing = readJsonObject(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  const cleaned = removeManagedClaudeHooks(existing);
+  if (JSON.stringify(existing) === JSON.stringify(cleaned)) return false;
+  writeFileSync(filePath, JSON.stringify(cleaned, null, 2) + "\n");
+  return true;
+}
+
+function hasClaudeHooks(filePath: string): boolean {
+  if (!existsSync(filePath)) return false;
+  try {
+    const existing = readJsonObject(filePath);
+    const hooks = existing.hooks;
+    if (hooks === null || typeof hooks !== "object" || Array.isArray(hooks)) return false;
+    const runtimePath = packageExecutable(import.meta.url, 3);
+    return REQUIRED_HOOKS.every(({ event, command }) => {
+      const entries = (hooks as Record<string, unknown>)[event];
+      if (!Array.isArray(entries)) return false;
+      const expected = canonicalHookCommand(runtimePath, command);
+      return entries.some((entry) => {
+        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
+        const commands = (entry as Record<string, unknown>).hooks;
+        return Array.isArray(commands) && commands.some((hook) =>
+          hook !== null
+          && typeof hook === "object"
+          && !Array.isArray(hook)
+          && (hook as Record<string, unknown>).type === "command"
+          && (hook as Record<string, unknown>).command === expected
+        );
+      });
+    });
+  } catch {
+    return false;
+  }
+}
+
 export function installConnector(agentIdOrName: string, type?: ConnectorType, cwd: string = process.cwd()): InstallResult {
   const agent = findAgent(agentIdOrName);
   if (!agent) throw new Error(`Unknown agent: ${agentIdOrName}`);
@@ -182,12 +238,16 @@ export function installConnector(agentIdOrName: string, type?: ConnectorType, cw
       };
     }
 
-    return {
-      success: true,
-      path: '',
-      requiresRestart: true,
-      manual: 'Hook connectors are managed by the plugin system. Run `lcm install` to set up hooks.',
-    };
+    if (agent.id === 'claude-code') {
+      return {
+        success: true,
+        path: '',
+        requiresRestart: false,
+        manual: "Run `lcm install` to migrate any recognized Marketplace installation and install Claude Code hooks safely.",
+      };
+    }
+
+    throw new Error(`Native hook installation is not implemented for ${agent.name}`);
   }
 
   const configPath = agent.configPaths[connectorType];
@@ -247,6 +307,9 @@ export function removeConnector(agentIdOrName: string, type?: ConnectorType, cwd
   if (connectorType === 'hook' && agent.id === 'codex') {
     return removeCodexHooks(resolvedPath);
   }
+  if (connectorType === 'hook' && agent.id === 'claude-code') {
+    return removeClaudeHooks(resolvedPath);
+  }
 
   if (connectorType === 'mcp') {
     return removeMcpJson(resolvedPath);
@@ -298,6 +361,10 @@ export function listConnectors(cwd: string = process.cwd()): InstalledConnector[
         }
       } else if (type === 'hook' && agent.id === 'codex') {
         if (hasCodexHooks(resolvedPath)) {
+          installed.push({ agentId: agent.id, agentName: agent.name, type, path: resolvedPath });
+        }
+      } else if (type === 'hook' && agent.id === 'claude-code') {
+        if (hasClaudeHooks(resolvedPath)) {
           installed.push({ agentId: agent.id, agentName: agent.name, type, path: resolvedPath });
         }
       } else if (type === 'skill') {

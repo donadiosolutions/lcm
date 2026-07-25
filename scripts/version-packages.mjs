@@ -102,7 +102,7 @@ export function runVersionPackages({
     execute(process.execPath, [changesetCli, ...transition], { cwd });
   }
   execute(process.execPath, [changesetCli, "version"], { cwd });
-  execute(process.execPath, [resolve(SCRIPT_DIR, "sync-plugin-version.mjs")], { cwd });
+  execute(process.execPath, [resolve(SCRIPT_DIR, "sync-package-version.mjs")], { cwd });
 }
 
 const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : undefined;

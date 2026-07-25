@@ -6,19 +6,19 @@ All 39 checks organized by phase. Each check includes the command to run and pas
 
 ### 1.1 Daemon status
 ```bash
-node dist/bin/lcm.js status
+lcm status
 ```
 Pass if: daemon shows "up", project registered for current cwd, port 3737.
 
 ### 1.2 Doctor
 ```bash
-node dist/bin/lcm.js doctor
+lcm doctor
 ```
-Pass if: all checks pass (8 passed, 0 failed). Record any warnings.
+Pass if: all checks pass with 0 failed. Record any warnings.
 
 ### 1.3 Version
 ```bash
-node dist/bin/lcm.js --version
+lcm --version
 ```
 Pass if: prints version string matching package.json.
 
@@ -26,13 +26,13 @@ Pass if: prints version string matching package.json.
 
 ### 2.1 Import session transcripts
 ```bash
-node dist/bin/lcm.js import --all --verbose
+lcm import --all --verbose
 ```
 Pass if: message count > 0, no errors. Use `ctx_execute` — output can be large.
 
 ### 2.2 Status after import
 ```bash
-node dist/bin/lcm.js status
+lcm status
 ```
 Pass if: messages > 0, last ingest timestamp updated.
 
@@ -44,13 +44,13 @@ Pass if: message count unchanged or only current-session messages added (small d
 
 ### 3.1 Compact messages
 ```bash
-node dist/bin/lcm.js compact --all --verbose
+lcm compact --all --verbose
 ```
 Pass if: summaries created, compression ratio reported. Note: calls LLM summarizer, may take minutes. Use 5-minute timeout.
 
 ### 3.2 Status after compact
 ```bash
-node dist/bin/lcm.js status
+lcm status
 ```
 Pass if: summaries > 0.
 
@@ -62,13 +62,13 @@ Pass if: no new summaries created.
 
 ### 4.1 Promote insights
 ```bash
-node dist/bin/lcm.js promote --all --verbose
+lcm promote --all --verbose
 ```
 Pass if: promoted count increments OR "no promotable content" (valid if summaries too short).
 
 ### 4.2 Stats
 ```bash
-node dist/bin/lcm.js stats --verbose
+lcm stats --verbose
 ```
 Pass if: shows messages, summaries, promoted counts, compression ratios. Numbers consistent with previous checks.
 
@@ -76,31 +76,31 @@ Pass if: shows messages, summaries, promoted counts, compression ratios. Numbers
 
 ### 5.1 List patterns
 ```bash
-node dist/bin/lcm.js sensitive list
+lcm sensitive list
 ```
 Pass if: shows 7 built-in patterns.
 
 ### 5.2 Test scrubbing
 ```bash
-node dist/bin/lcm.js sensitive test "my api key is sk-1234567890abcdefghij and password=hunter2"
+lcm sensitive test "my api key is sk-1234567890abcdefghij and password=hunter2"
 ```
 Pass if: both API key and password are `[REDACTED]`.
 
 ### 5.3 Add custom pattern
 ```bash
-node dist/bin/lcm.js sensitive add "DOGFOOD_SECRET_\w+"
+lcm sensitive add "DOGFOOD_SECRET_\w+"
 ```
 Pass if: pattern added.
 
 ### 5.4 Test custom pattern
 ```bash
-node dist/bin/lcm.js sensitive test "the value is DOGFOOD_SECRET_abc123"
+lcm sensitive test "the value is DOGFOOD_SECRET_abc123"
 ```
 Pass if: `DOGFOOD_SECRET_abc123` is `[REDACTED]`.
 
 ### 5.5 Remove custom pattern
 ```bash
-node dist/bin/lcm.js sensitive remove "DOGFOOD_SECRET_\w+"
+lcm sensitive remove "DOGFOOD_SECRET_\w+"
 ```
 Pass if: pattern removed. Run `sensitive list` to confirm.
 
@@ -108,56 +108,61 @@ Pass if: pattern removed. Run `sensitive list` to confirm.
 
 ### 6.1 Curate (import + compact + promote)
 ```bash
-node dist/bin/lcm.js import --all && node dist/bin/lcm.js compact --all && node dist/bin/lcm.js promote --all
+lcm import --all && lcm compact --all && lcm promote --all
 ```
 Pass if: all three stages complete without error.
 
 ### 6.2 Diagnose
 ```bash
-node dist/bin/lcm.js diagnose --verbose
+lcm diagnose --verbose
 ```
 Pass if: no hook failures or ingestion gaps detected.
 
 ## Phase 7: Hook Verification — 6 checks
 
-Hooks are registered in `.claude-plugin/plugin.json`, NOT `~/.claude/settings.json`.
+Hooks are registered natively in `~/.claude/settings.json`.
 
-### 7.1 Hook wiring in plugin.json
-Read `.claude-plugin/plugin.json` and verify all 4 hooks:
+### 7.1 Hook wiring in settings.json
+Read `~/.claude/settings.json` and verify all 6 hooks use the npm-installed
+absolute Node and LCM runtime paths:
 - `SessionStart` → `lcm restore`
 - `UserPromptSubmit` → `lcm user-prompt`
 - `PreCompact` → `lcm compact --hook`
 - `SessionEnd` → `lcm session-end`
+- `PostToolUse` → `lcm post-tool`
+- `Stop` → `lcm session-snapshot`
 
-Pass if: all 4 present with correct commands.
+Pass if: all 6 are present with canonical commands and unrelated hooks remain
+untouched.
 
 ### 7.2 SessionStart live test
 ```bash
-echo '{}' | node dist/bin/lcm.js restore
+echo '{}' | lcm restore
 ```
 Pass if: returns `<memory-orientation>` block.
 
 ### 7.3 UserPromptSubmit live test
 ```bash
-node -e 'console.log(JSON.stringify({prompt:"what changes were made to the summarizer",cwd:process.cwd()}))' | node dist/bin/lcm.js user-prompt
+node -e 'console.log(JSON.stringify({prompt:"what changes were made to the summarizer",cwd:process.cwd()}))' | lcm user-prompt
 ```
 Pass if: returns `<memory-context>` block with hints.
 **Known issue (Bug 1):** Currently only searches promoted store. If empty, record as ⚠️ KNOWN.
 
 ### 7.4 UserPromptSubmit daemon endpoint
 ```bash
-node .claude-plugin/skills/lcm-dogfood/scripts/prompt-search-test.js "summarizer"
+node .agents/skills/lcm-dogfood/scripts/prompt-search-test.js "summarizer"
 ```
 Pass if: returns hints (may be empty — see Bug 1).
 
 ### 7.5 Hook timeout
 ```bash
-time node -e 'console.log(JSON.stringify({prompt:"test",cwd:process.cwd()}))' | node dist/bin/lcm.js user-prompt
+time node -e 'console.log(JSON.stringify({prompt:"test",cwd:process.cwd()}))' | lcm user-prompt
 ```
 Pass if: completes in < 5 seconds.
 
 ### 7.6 SessionEnd wiring (read-only)
-Cannot trigger without ending session. Verify wiring in plugin.json (covered by 7.1).
+Cannot trigger without ending session. Verify native wiring in
+`~/.claude/settings.json` (covered by 7.1).
 
 ## Phase 8: MCP Tools — 8 checks
 
@@ -193,22 +198,22 @@ Pass if: returns metadata. ⚠️ SKIP if no node.
 ```bash
 pkill -f "lcm.*daemon" || true
 sleep 1
-node dist/bin/lcm.js status
+lcm status
 ```
 Pass if: reports daemon down (no crash/hang).
 
 ### 9.2 Auto-recovery
 ```bash
-node dist/bin/lcm.js daemon start --detach
+lcm daemon start --detach
 sleep 2
-node dist/bin/lcm.js status
+lcm status
 ```
 Pass if: daemon back up.
 
 ### 9.3 Graceful degradation
 Kill daemon, then:
 ```bash
-timeout 10 sh -c 'node -e "console.log(JSON.stringify({prompt:\"test\",cwd:process.cwd()}))" | node dist/bin/lcm.js user-prompt'
+timeout 10 sh -c 'node -e "console.log(JSON.stringify({prompt:\"test\",cwd:process.cwd()}))" | lcm user-prompt'
 ```
 Pass if: returns within 10s, no crash. Restart daemon after.
 
@@ -234,6 +239,6 @@ Pass if: at least one db.sqlite file exists.
 
 ### 10.4 DB integrity
 ```bash
-node .claude-plugin/skills/lcm-dogfood/scripts/db-integrity.js
+node .agents/skills/lcm-dogfood/scripts/db-integrity.js
 ```
 Pass if: all DBs report "ok".

@@ -21,7 +21,8 @@ Manage the sensitive patterns used by Long Context Manager (LCM) to redact secre
 
 ## Instructions
 
-Run the appropriate `lcm sensitive` subcommand via Bash based on the user's intent. If `lcm` is not on PATH (marketplace install), replace `lcm` with `node "${CLAUDE_PLUGIN_ROOT}/lcm.mjs"` in all commands below.
+Run the appropriate `lcm sensitive` subcommand via Bash based on the user's
+intent.
 
 ```bash
 lcm sensitive list
