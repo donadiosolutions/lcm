@@ -40,8 +40,9 @@ with a private sentinel recording the run ID, database name, and expected
 runtime role.
 
 Every Docker object carries the random run ID, its resource kind, label-schema
-version, owner PID, and a process-birth fingerprint derived from the Linux boot
-ID and the owner's kernel start time. The PID alone is not ownership evidence:
+version, owner PID, and a process-birth fingerprint. Linux uses the boot ID and
+kernel start time, macOS uses `ps` start time, and Windows uses the PowerShell
+CIM process creation time. A zero-signal process probe is checked first. The PID alone is not ownership evidence:
 the birth fingerprint prevents a recycled PID from making an orphan appear
 live.
 
@@ -63,6 +64,10 @@ SIGKILL without using resource age, broad name matching, or global pruning.
 A running stale database must make its sentinel observable before recovery;
 an exactly owned stopped container can be removed without executing a sentinel
 that Docker cannot expose.
+While local Vitest is active, a private bounded consumer record keeps its PID
+and birth fingerprint with the run. A later harness preserves the run if that
+consumer survived its parent. CI similarly preserves a run while its labeled
+runner or restore container is still running.
 
 A failed ownership or database-sentinel guard intentionally leaves resources
 for inspection. Never delete them by a broad name glob. Inspect the exact

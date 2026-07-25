@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { execFileSync, spawn } from "node:child_process";
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { platform, tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
 import {
   NODE_IMAGE,
   POSTGRES_IMAGE,
@@ -28,7 +28,8 @@ const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const initScript = join(repositoryRoot, "test", "postgresql", "init.sh");
 const cachedRunInitScript = join(repositoryRoot, "test", "postgresql", "cached-run-init.sh");
 const bootIdPattern = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
-const processBirthPattern = new RegExp(`^${bootIdPattern}:[1-9][0-9]*$`, "u");
+const processBirthPattern = /^[^\u0000-\u001f\u007f]{1,160}$/u;
+const consumerOwnerFile = "consumer-owner.json";
 
 export function createRunNames(runId) {
   const short = runId.slice(0, 20);
@@ -60,19 +61,58 @@ function resourceSpec(type, name, runId) {
 export function readProcessBirthFingerprint(pid, dependencies = {}) {
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("invalid PostgreSQL harness owner PID");
   const readFile = dependencies.readFile ?? readFileSync;
-  const bootId = String(readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
-  const stat = String(readFile(`/proc/${pid}/stat`, "utf8")).trim();
-  const closingParenthesis = stat.lastIndexOf(")");
-  if (!(new RegExp(`^${bootIdPattern}$`, "u")).test(bootId)
-    || closingParenthesis < 1) {
+  const currentPlatform = dependencies.platform?.() ?? platform();
+  if (currentPlatform === "linux") {
+    let bootId;
+    try {
+      bootId = String(readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+    } catch (error) {
+      throw new Error("unsupported PostgreSQL harness boot identity evidence", { cause: error });
+    }
+    let stat;
+    try {
+      stat = String(readFile(`/proc/${pid}/stat`, "utf8")).trim();
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        throw Object.assign(new Error("PostgreSQL harness owner PID is absent"), { code: "ESRCH" });
+      }
+      throw new Error("unsupported PostgreSQL harness process identity evidence", { cause: error });
+    }
+    const closingParenthesis = stat.lastIndexOf(")");
+    if (!(new RegExp(`^${bootIdPattern}$`, "u")).test(bootId) || closingParenthesis < 1) {
+      throw new Error("unsupported PostgreSQL harness process identity evidence");
+    }
+    const fieldsAfterCommand = stat.slice(closingParenthesis + 1).trim().split(/\s+/u);
+    const startTime = fieldsAfterCommand[19];
+    if (!/^[1-9][0-9]*$/u.test(startTime ?? "")) {
+      throw new Error("unsupported PostgreSQL harness process identity evidence");
+    }
+    return `linux:${bootId}:${startTime}`;
+  }
+  const execute = dependencies.execFile ?? execFileSync;
+  const command = currentPlatform === "win32" ? "powershell.exe" : "ps";
+  const args = currentPlatform === "win32"
+    ? [
+      "-NoProfile", "-NonInteractive", "-Command",
+      `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}').CreationDate.ToUniversalTime().ToString('O')`,
+    ]
+    : ["-o", "lstart=", "-p", String(pid)];
+  let observed;
+  try {
+    observed = String(execute(command, args, {
+      encoding: "utf8",
+      maxBuffer: 16 * 1024,
+      timeout: 2_000,
+      windowsHide: true,
+    })).trim();
+  } catch (error) {
+    throw new Error("unsupported PostgreSQL harness process identity evidence", { cause: error });
+  }
+  const fingerprint = `${currentPlatform}:${observed}`;
+  if (!observed || !processBirthPattern.test(fingerprint)) {
     throw new Error("unsupported PostgreSQL harness process identity evidence");
   }
-  const fieldsAfterCommand = stat.slice(closingParenthesis + 1).trim().split(/\s+/u);
-  const startTime = fieldsAfterCommand[19];
-  if (!/^[1-9][0-9]*$/u.test(startTime ?? "")) {
-    throw new Error("unsupported PostgreSQL harness process identity evidence");
-  }
-  return `${bootId}:${startTime}`;
+  return fingerprint;
 }
 
 export function createOwnerIdentity(pid = process.pid, dependencies = {}) {
@@ -149,6 +189,12 @@ export function runProcess(command, args, options = {}) {
       env: options.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    try {
+      options.onSpawn?.(child);
+    } catch (error) {
+      child.kill();
+      throw error;
+    }
     const maxCapturedOutputBytes = MAX_CAPTURED_OUTPUT_BYTES;
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
@@ -437,12 +483,63 @@ function shortRunPrefixFromName(name) {
   return name.match(/^lcm-pg-(?:net-|data-|restore-|runner-)?([0-9a-f]{20})$/u)?.[1];
 }
 
+function harnessDirectoryFromRecord(record) {
+  const mounts = (record?.Mounts ?? []).filter((mount) => mount?.Destination === "/run/lcm-harness");
+  if (mounts.length !== 1) return undefined;
+  const mount = mounts[0];
+  if (mount.Type !== "bind" || mount.RW !== false || typeof mount.Source !== "string") return undefined;
+  try {
+    const resolved = realpathSync(mount.Source);
+    const temporaryRoot = realpathSync(tmpdir());
+    if (dirname(resolved) !== temporaryRoot
+      || !/^lcm-postgresql-harness-[A-Za-z0-9_-]+$/u.test(basename(resolved))) return undefined;
+    return resolved;
+  } catch {
+    return undefined;
+  }
+}
+
+function readConsumerOwner(directory, dependencies = {}) {
+  const inspectPath = dependencies.lstat ?? lstatSync;
+  const readFile = dependencies.readFile ?? readFileSync;
+  const path = join(directory, consumerOwnerFile);
+  let status;
+  try {
+    status = inspectPath(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (!status.isFile() || status.isSymbolicLink() || status.size > 1024) {
+    throw new Error("invalid PostgreSQL harness consumer identity evidence");
+  }
+  let value;
+  try {
+    value = JSON.parse(String(readFile(path, "utf8")));
+  } catch (error) {
+    throw new Error("invalid PostgreSQL harness consumer identity evidence", { cause: error });
+  }
+  if (value?.version !== 1
+    || !Number.isSafeInteger(value.pid)
+    || value.pid <= 0
+    || !processBirthPattern.test(value.birth ?? "")) {
+    throw new Error("invalid PostgreSQL harness consumer identity evidence");
+  }
+  return { pid: value.pid, birth: value.birth };
+}
+
 export function classifyOwnerIdentity(owner, dependencies = {}) {
   const readFingerprint = dependencies.readFingerprint ?? readProcessBirthFingerprint;
+  const processProbe = dependencies.processProbe ?? ((pid) => process.kill(pid, 0));
+  try {
+    processProbe(owner.pid);
+  } catch (error) {
+    return error?.code === "ESRCH" ? "stale" : "ambiguous";
+  }
   try {
     return readFingerprint(owner.pid) === owner.birth ? "live" : "stale";
   } catch (error) {
-    return error?.code === "ENOENT" ? "stale" : "ambiguous";
+    return error?.code === "ESRCH" ? "stale" : "ambiguous";
   }
 }
 
@@ -481,7 +578,11 @@ export async function discoverHarnessRuns(dependencies = {}) {
         resources: [],
       };
       run.classification = "ambiguous";
-      run.resources.push({ ...resource, labels });
+      run.resources.push({
+        ...resource,
+        labels,
+        shortRunPrefix: shortRunPrefixFromName(resource.name),
+      });
       runs.set(key, run);
       continue;
     }
@@ -499,12 +600,16 @@ export async function discoverHarnessRuns(dependencies = {}) {
     if (!run.owner || run.owner.pid !== ownership.pid || run.owner.birth !== ownership.birth) {
       run.classification = "ambiguous";
     }
-    if (ownership.kind === "database" && typeof record?.State?.Running !== "boolean") {
+    if (resource.type === "container" && typeof record?.State?.Running !== "boolean") {
       run.classification = "ambiguous";
     }
-    run.resources.push({ ...resource, kind: ownership.kind, labels: expectedLabels });
-    if (ownership.kind === "database") {
-      run.resources.at(-1).running = record.State.Running;
+    const harnessDirectory = ownership.kind === "database"
+      ? (dependencies.resolveHarnessDirectory?.(record) ?? harnessDirectoryFromRecord(record))
+      : undefined;
+    if (ownership.kind === "database" && !harnessDirectory) run.classification = "ambiguous";
+    run.resources.push({ ...resource, kind: ownership.kind, labels: expectedLabels, harnessDirectory });
+    if (resource.type === "container") {
+      run.resources.at(-1).running = record?.State?.Running;
     }
     runs.set(ownership.runId, run);
   }
@@ -519,6 +624,24 @@ export async function discoverHarnessRuns(dependencies = {}) {
   for (const run of runs.values()) {
     if (run.classification !== "ambiguous") {
       run.classification = classifyOwnerIdentity(run.owner, dependencies);
+      if (run.classification === "stale") {
+        const activeWorker = run.resources.some(
+          (resource) => (resource.kind === "runner" || resource.kind === "restore") && resource.running,
+        );
+        if (activeWorker) {
+          run.classification = "live";
+          continue;
+        }
+        const database = run.resources.find((resource) => resource.kind === "database");
+        if (database) {
+          try {
+            const consumer = readConsumerOwner(database.harnessDirectory, dependencies);
+            if (consumer) run.classification = classifyOwnerIdentity(consumer, dependencies);
+          } catch {
+            run.classification = "ambiguous";
+          }
+        }
+      }
     }
   }
   return [...runs.values()];
@@ -632,6 +755,13 @@ export function harnessErrorDetails(error) {
   return String(error?.stderr ?? error?.message ?? error);
 }
 
+function sanitizedHarnessErrorDetails(error, secrets) {
+  const sanitized = sanitizeHarnessText(harnessErrorDetails(error), secrets);
+  return Buffer.byteLength(sanitized) <= MAX_CAPTURED_OUTPUT_BYTES
+    ? sanitized
+    : "PostgreSQL harness diagnostic exceeded the safe capture limit";
+}
+
 export async function cleanupHarnessResources(context, dependencies = {}) {
   const { names, runId, directory, sentinelReady, owner } = context;
   const removeResource = dependencies.removeResource
@@ -672,17 +802,45 @@ export async function cleanupHarnessResources(context, dependencies = {}) {
   }
 }
 
-async function runTests(context, ci, setupDocker = docker) {
+async function runTests(context, ci, setupDocker = docker, testProcess = runProcess) {
   const env = { ...process.env, ...context.environment };
   const secrets = context.secrets ?? [];
   for (const key of Object.keys(env)) {
     if (key.startsWith("PG") || key === "LCM_POSTGRES_URL" || key === "LCM_POSTGRES_CA_FILE") delete env[key];
   }
   if (!ci) {
-    return runSanitizedProcess(process.execPath, [
-      join(repositoryRoot, "node_modules", "vitest", "vitest.mjs"),
-      "run", "--config", join(repositoryRoot, "vitest.postgresql.config.ts"),
-    ], { cwd: repositoryRoot, env, secrets });
+    const consumerPath = join(context.directory, consumerOwnerFile);
+    const testArguments = context.consumerProbe
+      ? ["-e", "setInterval(() => undefined, 1_000)"]
+      : [
+        join(repositoryRoot, "node_modules", "vitest", "vitest.mjs"),
+        "run", "--config", join(repositoryRoot, "vitest.postgresql.config.ts"),
+      ];
+    try {
+      return await runSanitizedProcess(process.execPath, testArguments, {
+        cwd: repositoryRoot,
+        env,
+        secrets,
+        processRunner: testProcess,
+        onSpawn: (child) => {
+          const consumer = createOwnerIdentity(child.pid);
+          writeFileSync(
+            consumerPath,
+            `${JSON.stringify({ version: 1, ...consumer })}\n`,
+            { mode: 0o600 },
+          );
+          if (context.consumerProbe) {
+            process.stderr.write(`PostgreSQL harness consumer probe ready: ${context.runId}\n`);
+          }
+        },
+      });
+    } finally {
+      try {
+        unlinkSync(consumerPath);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
   }
 
   await runSanitizedProcess(process.execPath, [
@@ -716,8 +874,14 @@ async function runTests(context, ci, setupDocker = docker) {
 
 export async function runHarness(options = {}) {
   const ci = options.ci ?? process.env.GITHUB_ACTIONS === "true";
-  await reclaimProvenOrphans();
-  const owner = createOwnerIdentity();
+  let owner;
+  try {
+    await reclaimProvenOrphans();
+    owner = createOwnerIdentity();
+  } catch (error) {
+    process.stderr.write(`PostgreSQL harness startup failed: ${sanitizedHarnessErrorDetails(error, [])}\n`);
+    throw error;
+  }
   const runId = randomBytes(16).toString("hex");
   const names = createRunNames(runId);
   const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-harness-"));
@@ -737,7 +901,7 @@ export async function runHarness(options = {}) {
   const cleanup = () => {
     cleanupPromise ??= cleanupHarnessResources({ names, runId, directory, sentinelReady, owner })
       .catch((error) => {
-        const details = sanitizeHarnessText(harnessErrorDetails(error), secrets);
+        const details = sanitizedHarnessErrorDetails(error, secrets);
         process.stderr.write(`PostgreSQL harness cleanup failed: ${details}\n`);
         throw error;
       });
@@ -876,13 +1040,18 @@ export async function runHarness(options = {}) {
     };
     try {
       if (options.runTests) await options.runTests({ runId, names, directory, environment }, ci);
-      else await runTests({ runId, names, directory, environment, secrets, owner }, ci, setupDocker);
+      else await runTests(
+        { runId, names, directory, environment, secrets, owner, consumerProbe: options.consumerProbe },
+        ci,
+        setupDocker,
+        setupProcess,
+      );
     } catch (error) {
       const logs = await docker(["logs", names.container]).catch(() => ({ stdout: "", stderr: "" }));
       throw Object.assign(error, { stderr: `${error?.stderr ?? ""}\n${logs.stdout}\n${logs.stderr}` });
     }
   } catch (error) {
-    const details = sanitizeHarnessText(harnessErrorDetails(error), secrets);
+    const details = sanitizedHarnessErrorDetails(error, secrets);
     process.stderr.write(`PostgreSQL harness failed: ${details}\n`);
     throw error;
   } finally {
@@ -896,10 +1065,11 @@ export async function runHarness(options = {}) {
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const signalProbe = process.argv.includes("--signal-probe");
+  const consumerProbe = process.argv.includes("--consumer-signal-probe");
   runHarness(signalProbe ? {
     runTests: async ({ runId }) => {
       process.stderr.write(`PostgreSQL harness signal probe ready: ${runId}\n`);
       await new Promise(() => { setInterval(() => undefined, 1_000); });
     },
-  } : {}).catch(() => { process.exitCode = 1; });
+  } : { consumerProbe }).catch(() => { process.exitCode = 1; });
 }

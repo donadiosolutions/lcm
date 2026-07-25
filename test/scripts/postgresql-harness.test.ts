@@ -55,23 +55,43 @@ describe("PostgreSQL harness utilities", () => {
       ? `${bootId}\n`
       : `42 (worker with ) parenthesis) ${statFields.join(" ")}\n`);
 
-    expect(readProcessBirthFingerprint(42, { readFile })).toBe(`${bootId}:98765`);
-    expect(createOwnerIdentity(42, { readFile })).toEqual({ pid: 42, birth: `${bootId}:98765` });
+    expect(readProcessBirthFingerprint(42, { readFile })).toBe(`linux:${bootId}:98765`);
+    expect(createOwnerIdentity(42, { readFile })).toEqual({ pid: 42, birth: `linux:${bootId}:98765` });
     expect(() => readProcessBirthFingerprint(0, { readFile })).toThrow("owner PID");
     expect(() => readProcessBirthFingerprint(42, { readFile: () => "unsupported" }))
       .toThrow("unsupported");
+    expect(readProcessBirthFingerprint(42, {
+      platform: () => "darwin",
+      execFile: vi.fn(() => "Fri Jul 24 21:00:00 2026\n"),
+    })).toBe("darwin:Fri Jul 24 21:00:00 2026");
+    expect(readProcessBirthFingerprint(42, {
+      platform: () => "win32",
+      execFile: vi.fn(() => "2026-07-25T00:00:00.0000000Z\n"),
+    })).toBe("win32:2026-07-25T00:00:00.0000000Z");
+    expect(() => readProcessBirthFingerprint(42, {
+      readFile: (path: string) => {
+        throw Object.assign(new Error(path), { code: "ENOENT" });
+      },
+    })).toThrow("boot identity");
   });
 
   it("classifies only matching process identity as live and fails closed on ambiguous evidence", () => {
     const owner = { pid: 42, birth: "boot:100" };
-    expect(classifyOwnerIdentity(owner, { readFingerprint: () => "boot:100" })).toBe("live");
-    expect(classifyOwnerIdentity(owner, { readFingerprint: () => "boot:200" })).toBe("stale");
+    const processProbe = vi.fn();
+    expect(classifyOwnerIdentity(owner, { processProbe, readFingerprint: () => "boot:100" })).toBe("live");
+    expect(classifyOwnerIdentity(owner, { processProbe, readFingerprint: () => "boot:200" })).toBe("stale");
     expect(classifyOwnerIdentity(owner, {
+      processProbe,
       readFingerprint: () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); },
-    })).toBe("stale");
+    })).toBe("ambiguous");
     expect(classifyOwnerIdentity(owner, {
+      processProbe,
       readFingerprint: () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); },
     })).toBe("ambiguous");
+    expect(classifyOwnerIdentity(owner, {
+      processProbe: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+      readFingerprint: vi.fn(),
+    })).toBe("stale");
   });
 
   it("derives and validates every resource name from a random-style run ID", () => {
@@ -524,6 +544,7 @@ describe("PostgreSQL harness utilities", () => {
 
     const runs = await discoverHarnessRuns({
       dockerRunner,
+      processProbe: vi.fn(),
       readFingerprint: (pid: number) => pid === 41 ? `${bootId}:100` : `${bootId}:999`,
     });
     expect(runs.map((run) => [run.runId, run.classification])).toEqual([
@@ -538,6 +559,7 @@ describe("PostgreSQL harness utilities", () => {
     );
     const inconsistent = await discoverHarnessRuns({
       dockerRunner,
+      processProbe: vi.fn(),
       readFingerprint: () => `${bootId}:100`,
     });
     expect(inconsistent.find((run) => run.runId === liveRunId)?.classification).toBe("ambiguous");
@@ -574,7 +596,11 @@ describe("PostgreSQL harness utilities", () => {
         const labels = records.get(`${type}:${args[2]}`) ?? {};
         return {
           stdout: JSON.stringify([type === "container"
-            ? { Config: { Labels: labels }, State: { Running: true } }
+            ? {
+              Config: { Labels: labels },
+              State: { Running: labels[RESOURCE_KIND_LABEL] === "database" },
+              Mounts: [],
+            }
             : { Labels: labels }]),
           stderr: "",
         };
@@ -589,8 +615,10 @@ describe("PostgreSQL harness utilities", () => {
 
     const runs = await reclaimProvenOrphans({
       dockerRunner,
+      processProbe: vi.fn(),
       readFingerprint: () => `${owner.birth}-reused`,
       verifySentinel,
+      resolveHarnessDirectory: () => "/private/harness",
       delay: vi.fn(),
     });
     expect(runs).toHaveLength(1);
@@ -628,6 +656,7 @@ describe("PostgreSQL harness utilities", () => {
       dockerRunner.mockClear();
       await expect(reclaimProvenOrphans({
         dockerRunner,
+        processProbe: vi.fn(),
         readFingerprint,
         stderr: { write: vi.fn() },
       })).resolves.toBeDefined();
@@ -662,8 +691,10 @@ describe("PostgreSQL harness utilities", () => {
 
     await expect(reclaimProvenOrphans({
       dockerRunner,
+      processProbe: vi.fn(),
       readFingerprint: () => `${owner.birth}-reused`,
       verifySentinel,
+      resolveHarnessDirectory: () => "/private/harness",
     })).resolves.toBeDefined();
     expect(verifySentinel).not.toHaveBeenCalled();
     expect(exists).toBe(false);
@@ -702,6 +733,7 @@ describe("PostgreSQL harness utilities", () => {
 
     const runs = await reclaimProvenOrphans({
       dockerRunner,
+      processProbe: vi.fn(),
       readFingerprint: () => `${owner.birth}-reused`,
       stderr,
     });
@@ -711,6 +743,75 @@ describe("PostgreSQL harness utilities", () => {
       "PostgreSQL harness preserved 1 ambiguous labeled Docker run; manual reconciliation required.\n",
     );
     expect(stderr.write.mock.calls.flat().join(" ")).not.toContain("permission denied");
+  });
+
+  it("taints companions from a malformed canonical name and preserves active workers and consumers", async () => {
+    const runId = "2".repeat(32);
+    const names = createRunNames(runId);
+    const owner = { pid: 100, birth: "linux:boot:100" };
+    const consumer = { pid: 101, birth: "darwin:consumer-start" };
+    const records = new Map([
+      [`network:${names.network}`, { [RUN_LABEL]: "malformed" }],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+    ]);
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        return {
+          stdout: [...records.keys()]
+            .filter((key) => key.startsWith(`${type}:`))
+            .map((key) => key.slice(type.length + 1)).join("\n"),
+          stderr: "",
+        };
+      }
+      const type = args[0];
+      return { stdout: JSON.stringify([{ Labels: records.get(`${type}:${args[2]}`) }]), stderr: "" };
+    });
+    const malformed = await discoverHarnessRuns({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => "reused",
+    });
+    expect(malformed.find((run) => run.runId === runId)?.classification).toBe("ambiguous");
+
+    records.clear();
+    records.set(`container:${names.runner}`, ownershipLabels(runId, "runner", owner));
+    const workerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        return { stdout: args[0] === "container" ? names.runner : "", stderr: "" };
+      }
+      return {
+        stdout: JSON.stringify([{ Config: { Labels: records.get(`container:${names.runner}`) }, State: { Running: true } }]),
+        stderr: "",
+      };
+    });
+    const worker = await discoverHarnessRuns({
+      dockerRunner: workerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => "reused",
+    });
+    expect(worker[0].classification).toBe("live");
+
+    records.clear();
+    records.set(`container:${names.container}`, ownershipLabels(runId, "database", owner));
+    const databaseRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        return { stdout: args[0] === "container" ? names.container : "", stderr: "" };
+      }
+      return {
+        stdout: JSON.stringify([{ Config: { Labels: records.get(`container:${names.container}`) }, State: { Running: true } }]),
+        stderr: "",
+      };
+    });
+    const consumerRun = await discoverHarnessRuns({
+      dockerRunner: databaseRunner,
+      resolveHarnessDirectory: () => "/private/harness",
+      processProbe: vi.fn(),
+      readFingerprint: (pid: number) => pid === consumer.pid ? consumer.birth : "reused",
+      lstat: () => ({ isFile: () => true, isSymbolicLink: () => false, size: 100 }),
+      readFile: () => JSON.stringify({ version: 1, ...consumer }),
+    });
+    expect(consumerRun[0].classification).toBe("live");
   });
 
   it("pins container-mounted and checksummed PostgreSQL files to LF", () => {
