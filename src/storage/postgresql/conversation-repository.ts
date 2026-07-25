@@ -374,6 +374,9 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     }
     return this.shortTransaction(operation, async (transaction) => {
       await transaction.query({
+        text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+      }, this.context(operation));
+      await transaction.query({
         text: `SELECT conversation_id
                FROM lcm.conversations
                WHERE project_id = $1

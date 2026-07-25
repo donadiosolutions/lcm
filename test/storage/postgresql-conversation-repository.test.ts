@@ -235,6 +235,67 @@ describe("PostgreSQL conversation repository", () => {
     });
   });
 
+  it("establishes append isolation before its row lock and snapshot reads", async () => {
+    const order: string[] = [];
+    const db = executor((config) => {
+      if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        order.push("isolation");
+        return result([]);
+      }
+      if (config.text.includes("FOR UPDATE")) {
+        order.push("lock");
+        return result([{ conversation_id: "41" }]);
+      }
+      if (config.text.includes("MAX(seq) AS max_seq")) {
+        order.push("maximum");
+        return result([{ max_seq: null }]);
+      }
+      if (config.text.includes("INSERT INTO lcm.messages")) {
+        order.push("insert");
+        return result([messageRow]);
+      }
+      throw new Error(`unexpected SQL: ${config.text}`);
+    });
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+
+    await expect(repository.appendMessages(41, [{
+      role: "user",
+      content: "append",
+      tokenCount: 1,
+    }])).resolves.toMatchObject([{ seq: 0 }]);
+    expect(order).toEqual(["isolation", "lock", "maximum", "insert"]);
+    expect(db.query.mock.calls[0][0]).toEqual({
+      text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    });
+    expect(db.query.mock.calls[0][0]).not.toHaveProperty("values");
+    expect(db.query.mock.calls[0][1]).toEqual({
+      domain: "conversations",
+      operation: "appendMessages",
+      projectId,
+    });
+  });
+
+  it("fails append before locking when its isolation fence cannot be established", async () => {
+    const db = executor((config) => {
+      if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        throw Object.assign(new Error("isolation unavailable"), { code: "0A000" });
+      }
+      throw new Error(`unexpected SQL after isolation failure: ${config.text}`);
+    });
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+
+    await expect(repository.appendMessages(41, [{
+      role: "user",
+      content: "append",
+      tokenCount: 1,
+    }])).rejects.toMatchObject({ code: "0A000" });
+    expect(db.transaction).toHaveBeenCalledTimes(1);
+    expect(db.query).toHaveBeenCalledOnce();
+    expect(db.query.mock.calls[0][0]).toEqual({
+      text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    });
+  });
+
   it("maps missing rows and false existence without exposing a cause", async () => {
     const db = executor(() => result([]));
     const repository = new PostgreSqlConversationRepository(db, projectId);
@@ -632,6 +693,7 @@ describe("PostgreSQL conversation repository", () => {
 
   it("rejects append sequence overflow before inserting", async () => {
     const db = executor((config) => {
+      if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") return result([]);
       if (config.text.includes("FOR UPDATE")) return result([{ conversation_id: "1" }]);
       if (config.text.includes("MAX(seq)")) {
         return result([{ max_seq: String(Number.MAX_SAFE_INTEGER) }]);
@@ -644,7 +706,7 @@ describe("PostgreSQL conversation repository", () => {
       { role: "user", content: "overflow", tokenCount: 1 },
       { role: "assistant", content: "also overflow", tokenCount: 1 },
     ])).rejects.toMatchObject({ field: "seq" });
-    expect(db.query).toHaveBeenCalledTimes(2);
+    expect(db.query).toHaveBeenCalledTimes(3);
   });
 
   it("retries only serialization failures and deadlocks, at most three attempts", async () => {
@@ -709,6 +771,57 @@ describe("PostgreSQL conversation repository", () => {
       ["isolation"],
       ["isolation"],
       ["isolation", "lock", "lookup"],
+    ]);
+  });
+
+  it("re-establishes READ COMMITTED before every retried append attempt", async () => {
+    const statements: string[][] = [];
+    let attempt = -1;
+    const db = executor((config) => {
+      statements[attempt].push(
+        config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+          ? "isolation"
+          : config.text.includes("FOR UPDATE")
+            ? "lock"
+            : config.text.includes("MAX(seq)")
+              ? "maximum"
+              : "insert",
+      );
+      if (config.text.includes("FOR UPDATE") && attempt === 0) {
+        throw Object.assign(
+          new Error("retry row lock"),
+          { code: "40001" },
+        );
+      }
+      if (config.text.includes("MAX(seq)") && attempt === 1) {
+        throw Object.assign(new Error("retry maximum read"), { code: "40P01" });
+      }
+      if (config.text.includes("FOR UPDATE")) {
+        return result([{ conversation_id: "41" }]);
+      }
+      if (config.text.includes("MAX(seq)")) {
+        return result([{ max_seq: null }]);
+      }
+      return result([messageRow]);
+    });
+    db.transaction.mockImplementation(async (
+      callback: Parameters<PostgreSqlConversationExecutor["transaction"]>[0],
+    ) => {
+      attempt += 1;
+      statements.push([]);
+      return callback(db);
+    });
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+
+    await expect(repository.appendMessages(41, [{
+      role: "user",
+      content: "append",
+      tokenCount: 1,
+    }])).resolves.toMatchObject([{ seq: 0 }]);
+    expect(statements).toEqual([
+      ["isolation", "lock"],
+      ["isolation", "lock", "maximum"],
+      ["isolation", "lock", "maximum", "insert"],
     ]);
   });
 

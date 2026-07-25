@@ -369,6 +369,107 @@ describe("PostgreSQL 18 conversation repository", () => {
     });
   });
 
+  it("refreshes a lock-waiting append snapshot under a REPEATABLE READ default", async () => {
+    await withPostgreSqlTestDatabase("conversation-append-repeatable-read", async (database) => {
+      await grantConversationRuntimePrivileges(database);
+      const projectId = await createProject(database, "Conversation append repeatable read");
+      const repository = new PostgreSqlConversationRepository(database.runtime, projectId);
+      const conversation = await repository.createConversation({
+        sessionId: "append-repeatable-read",
+      });
+      const configured = await database.runtime.query<{
+        default_transaction_isolation: string;
+      }>({
+        text: "SHOW default_transaction_isolation",
+      }, { domain: "conversations", operation: "inspectAppendIsolationDefault" });
+      expect(configured.rows[0]?.default_transaction_isolation).toBe("repeatable read");
+
+      let releaseBlocker!: () => void;
+      let markBlockerHeld!: () => void;
+      const blockerRelease = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+      const blockerHeld = new Promise<void>((resolve) => { markBlockerHeld = resolve; });
+      const blocker = database.migrator.transaction(async (transaction) => {
+        await transaction.query({
+          text: `SELECT conversation_id
+                 FROM lcm.conversations
+                 WHERE project_id = $1
+                   AND conversation_id = $2
+                 FOR UPDATE`,
+          values: [projectId, conversation.conversationId],
+        }, { domain: "conversations", operation: "holdAppendConversationLock" });
+        markBlockerHeld();
+        await blockerRelease;
+      }, { domain: "transaction", operation: "holdAppendConversationLock" });
+      await blockerHeld;
+
+      const pendingAppends = Promise.all([
+        repository.appendMessages(conversation.conversationId, [
+          { role: "user", content: "two-0", tokenCount: 1 },
+          { role: "assistant", content: "two-1", tokenCount: 1 },
+        ]),
+        repository.appendMessages(conversation.conversationId, [
+          { role: "user", content: "three-0", tokenCount: 1 },
+          { role: "assistant", content: "three-1", tokenCount: 1 },
+          { role: "tool", content: "three-2", tokenCount: 1 },
+        ]),
+      ]);
+      let bothBlocked = false;
+      let observedLocks: readonly {
+        readonly pid: number;
+        readonly locktype: string | null;
+        readonly mode: string | null;
+      }[] = [];
+      try {
+        for (let attempt = 0; attempt < 160; attempt += 1) {
+          const locks = await database.migrator.query<{
+            pid: number;
+            locktype: string | null;
+            mode: string | null;
+          }>({
+            text: `SELECT activity.pid,
+                          locks.locktype,
+                          locks.mode
+                   FROM pg_catalog.pg_stat_activity AS activity
+                   LEFT JOIN pg_catalog.pg_locks AS locks
+                     ON locks.pid = activity.pid
+                    AND NOT locks.granted
+                   WHERE activity.datname = pg_catalog.current_database()
+                     AND activity.pid <> pg_catalog.pg_backend_pid()
+                     AND activity.usename = 'lcm_test_runtime'
+                   ORDER BY activity.pid, locks.locktype, locks.mode`,
+          }, { domain: "conversations", operation: "inspectAppendRowLockWaiter" });
+          observedLocks = locks.rows;
+          if (new Set(
+            observedLocks
+              .filter((row) => row.locktype !== null)
+              .map((row) => row.pid),
+          ).size >= 2) {
+            bothBlocked = true;
+            break;
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        releaseBlocker();
+        await blocker;
+      }
+      expect(
+        bothBlocked,
+        `expected two runtime lock waiters; observed ${JSON.stringify(observedLocks)}`,
+      ).toBe(true);
+      const appended = await pendingAppends;
+
+      expect(appended.map((batch) => batch.length).sort()).toEqual([2, 3]);
+      for (const batch of appended) {
+        expect(batch.map((message) => message.seq)).toEqual(
+          Array.from({ length: batch.length }, (_, offset) => batch[0].seq + offset),
+        );
+      }
+      expect((await repository.getMessages(conversation.conversationId))
+        .map((message) => message.seq)).toEqual([0, 1, 2, 3, 4]);
+    }, { defaultTransactionIsolation: "REPEATABLE READ" });
+  });
+
   it("protects summarized messages while deleting eligible context and owned parts", async () => {
     await withPostgreSqlTestDatabase("conversation-protected-delete", async (database) => {
       await grantConversationRuntimePrivileges(database);

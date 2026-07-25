@@ -301,6 +301,10 @@ without claiming that every oversized post-normalization parser token is
 lexically retrievable. The pinned PostgreSQL 18 safe parsed-lexeme maximum is
 2,046 UTF-8 bytes; #89 must implement and test lossless handling at that
 post-normalization boundary before #224 enables PostgreSQL application writes.
+PostgreSQL get-or-create and contiguous-append short transactions establish
+`READ COMMITTED` before their first advisory or row lock on every retry, so a
+stricter database default cannot retain a pre-lock snapshot and overlook the
+winning session segment or newly appended sequence range.
 PostgreSQL `bigint` values are converted to JavaScript numbers only after a
 safe-integer check, so an out-of-range identity, sequence, or count fails
 instead of losing precision. Generated conversation and message identities are
