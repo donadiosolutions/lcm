@@ -875,6 +875,73 @@ describe("PostgreSQL native transcript repository", () => {
     expect(unexpectedCreation.query).toHaveBeenCalledTimes(2);
   });
 
+  it("converges concurrent first-empty checkpoint writers as a retry", async () => {
+    const emptyCheckpoint = {
+      version: 1,
+      byteOffset: 0,
+      prefixSha256: contentSha256,
+      scrubberVersion: `pipeline:${ingestKey}`,
+      source: {
+        sizeBytes: 0,
+        modifiedAtMs: 1,
+        changedAtMs: 1,
+      },
+    };
+    const emptyCheckpointRow = {
+      ...initialCheckpointRow,
+      checkpoint: emptyCheckpoint,
+      updated_at: "2026-01-01T00:00:01.000Z",
+    };
+    const emptyBatch: NativeTranscriptBatchInput = {
+      ...batch,
+      expectedCheckpoint: null,
+      records: [],
+      checkpoint: {
+        lastSourceOrdinal: 0,
+        checkpoint: emptyCheckpoint,
+      },
+      quarantinedCount: 0,
+    };
+    const first = executor((config) => {
+      if (config.text.includes("INSERT INTO lcm.ingest_checkpoints")) {
+        return result([initialCheckpointRow]);
+      }
+      if (config.text.includes("UPDATE lcm.ingest_checkpoints")) {
+        return result([emptyCheckpointRow]);
+      }
+      return successfulQuery(config);
+    });
+    await expect(
+      new PostgreSqlNativeTranscriptRepository(first, projectId)
+        .ingestBatch(emptyBatch),
+    ).resolves.toMatchObject({
+      importedCount: 0,
+      skippedCount: 0,
+      checkpoint: { checkpoint: emptyCheckpoint },
+    });
+
+    const retry = executor((config) => {
+      if (config.text.includes("INSERT INTO lcm.ingest_checkpoints")) {
+        return result([]);
+      }
+      if (config.text.includes("FOR UPDATE")) {
+        return result([emptyCheckpointRow]);
+      }
+      if (config.text.includes("UPDATE lcm.ingest_checkpoints")) {
+        return result([emptyCheckpointRow]);
+      }
+      return successfulQuery(config);
+    });
+    await expect(
+      new PostgreSqlNativeTranscriptRepository(retry, projectId)
+        .ingestBatch(emptyBatch),
+    ).resolves.toMatchObject({
+      importedCount: 0,
+      skippedCount: 0,
+      checkpoint: { checkpoint: emptyCheckpoint },
+    });
+  });
+
   it("rebases matching stale retries without admitting new records", async () => {
     const retryCheckpointRow = {
       ...checkpointRow,

@@ -54,6 +54,10 @@ import {
 } from "../../src/storage/native-transcript-ingest.js";
 
 const temporaryDirectories: string[] = [];
+const DEFAULT_SCRUBBER_VERSION = createNativeTranscriptScrubber({
+  globalPatterns: [],
+  projectPatterns: [],
+}).scrubberVersion;
 
 type NativeTranscriptBackfillOptions =
   Parameters<typeof runNativeTranscriptBackfillCore>[0];
@@ -193,7 +197,10 @@ function checkpoint(
     importedCount: 1,
     skippedCount: 0,
     quarantinedCount: 0,
-    checkpoint: checkpointValue,
+    checkpoint: {
+      scrubberVersion: DEFAULT_SCRUBBER_VERSION,
+      ...checkpointValue,
+    },
     updatedAt: new Date("2026-07-25T12:00:00.000Z"),
   };
 }
@@ -511,6 +518,58 @@ describe("native transcript scrub and JSONL reader", () => {
         "key😀": "ok",
       },
     });
+  });
+
+  it("quarantines duplicate decoded object keys before parsing or scrubbing", async () => {
+    const outcomes = await collect(byteChunks([
+      '{"canary":"first","canary":"second"}',
+      '{"canary":1,"\\u0063anary":2}',
+      '{"outer":{"secret":"first","secret":"second"}}',
+      '[{"nested":1,"\\u006eested":2}]',
+      '{"space" :1,"space":2}',
+      '{"\\x":1}',
+      '{"é":1,"\\u00e9":2}',
+      '{"😀":1,"\\ud83d\\ude00":2}',
+      '{"left":{"same":1},"right":{"same":2}}',
+      '{"same":{"same":1}}',
+      '["same","same","{","]",":"]',
+      '{"quote\\\"key":1,"slash\\\\key":2}',
+    ].join("\n")));
+    expect(outcomes.slice(0, 8)).toEqual([
+      expect.objectContaining({ kind: "quarantine", reason: "malformed-json" }),
+      expect.objectContaining({ kind: "quarantine", reason: "malformed-json" }),
+      expect.objectContaining({ kind: "quarantine", reason: "malformed-json" }),
+      expect.objectContaining({ kind: "quarantine", reason: "malformed-json" }),
+      expect.objectContaining({ kind: "quarantine", reason: "malformed-json" }),
+      expect.objectContaining({ kind: "quarantine", reason: "malformed-json" }),
+      expect.objectContaining({ kind: "quarantine", reason: "malformed-json" }),
+      expect.objectContaining({ kind: "quarantine", reason: "malformed-json" }),
+    ]);
+    expect(outcomes.slice(8)).toEqual([
+      expect.objectContaining({
+        kind: "record",
+        nativePayload: {
+          left: { same: 1 },
+          right: { same: 2 },
+        },
+      }),
+      expect.objectContaining({
+        kind: "record",
+        nativePayload: { same: { same: 1 } },
+      }),
+      expect.objectContaining({
+        kind: "record",
+        nativePayload: ["same", "same", "{", "]", ":"],
+      }),
+      expect.objectContaining({
+        kind: "record",
+        nativePayload: {
+          'quote"key': 1,
+          "slash\\key": 2,
+        },
+      }),
+    ]);
+    expect(JSON.stringify(outcomes.slice(0, 8))).not.toContain("second");
   });
 
   it("bounds array, object, and mixed JSON nesting before recursive scrubbing", async () => {
@@ -1763,6 +1822,7 @@ describe("native transcript backfill coordinator", () => {
           version: 1,
           byteOffset: firstLineBytes,
           prefixSha256: digest('{"first":1}\n'),
+          scrubberVersion: DEFAULT_SCRUBBER_VERSION,
           source: {
             sizeBytes: firstLineBytes,
             modifiedAtMs: 1,
@@ -1797,6 +1857,127 @@ describe("native transcript backfill coordinator", () => {
     });
     expect(malformed.rescanned).toBe(true);
     expect(malformedCheckpoint.batches[0]?.records).toHaveLength(2);
+  });
+
+  it("rescans when the effective scrubber version changes", async () => {
+    const content = '{"first":1}\n{"second":2}\n';
+    const firstLine = '{"first":1}\n';
+    const previous = checkpoint({
+      version: 1,
+      byteOffset: Buffer.byteLength(firstLine),
+      prefixSha256: digest(firstLine),
+      source: {
+        sizeBytes: Buffer.byteLength(firstLine),
+        modifiedAtMs: 1,
+        changedAtMs: 1,
+      },
+    });
+    const run = async (
+      overrides: Pick<
+        NativeTranscriptBackfillOptions,
+        "globalPatterns" | "pipelineVersion"
+      >,
+    ): Promise<ReturnType<typeof repository>> => {
+      const repo = repository(previous);
+      await expect(runNativeTranscriptBackfill({
+        repository: repo,
+        quarantine: {
+          clientName: "claude-code",
+          quarantine: vi.fn(),
+          get: vi.fn(),
+          list: vi.fn(),
+          close: vi.fn(),
+        },
+        source: source(content),
+        machineId: "machine",
+        format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+        nativeSessionId: "session-1",
+        sourceLocator: "sessions/session.jsonl",
+        messageResolver: { resolveExact: vi.fn(async () => null) },
+        ...overrides,
+      })).resolves.toMatchObject({
+        resumedFromByteOffset: 0,
+        rescanned: true,
+      });
+      return repo;
+    };
+
+    const pipelineChanged = await run({
+      globalPatterns: [],
+      pipelineVersion: "pipeline/v2",
+    });
+    const patternsChanged = await run({
+      globalPatterns: ["never-matches"],
+      pipelineVersion: undefined,
+    });
+    expect(pipelineChanged.batches[0]?.records).toHaveLength(2);
+    expect(patternsChanged.batches[0]?.records).toHaveLength(2);
+    expect(
+      pipelineChanged.batches.at(-1)?.checkpoint.checkpoint.scrubberVersion,
+    ).not.toBe(DEFAULT_SCRUBBER_VERSION);
+    expect(
+      patternsChanged.batches.at(-1)?.checkpoint.checkpoint.scrubberVersion,
+    ).not.toBe(DEFAULT_SCRUBBER_VERSION);
+
+    const missingVersion = checkpoint({
+      version: 1,
+      byteOffset: Buffer.byteLength(firstLine),
+      prefixSha256: digest(firstLine),
+      source: {
+        sizeBytes: Buffer.byteLength(firstLine),
+        modifiedAtMs: 1,
+        changedAtMs: 1,
+      },
+    });
+    delete missingVersion.checkpoint.scrubberVersion;
+    const missingRepo = repository(missingVersion);
+    await expect(runNativeTranscriptBackfill({
+      repository: missingRepo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: source(content),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      messageResolver: { resolveExact: vi.fn(async () => null) },
+    })).resolves.toMatchObject({ rescanned: true });
+    expect(missingRepo.batches[0]?.records).toHaveLength(2);
+
+    const wrongTypeVersion = checkpoint({
+      version: 1,
+      byteOffset: Buffer.byteLength(firstLine),
+      prefixSha256: digest(firstLine),
+      scrubberVersion: 42,
+      source: {
+        sizeBytes: Buffer.byteLength(firstLine),
+        modifiedAtMs: 1,
+        changedAtMs: 1,
+      },
+    });
+    const wrongTypeRepo = repository(wrongTypeVersion);
+    await expect(runNativeTranscriptBackfill({
+      repository: wrongTypeRepo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: source(content),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      messageResolver: { resolveExact: vi.fn(async () => null) },
+    })).resolves.toMatchObject({ rescanned: true });
+    expect(wrongTypeRepo.batches[0]?.records).toHaveLength(2);
   });
 
   it("replays prefix messages through the mapper without resolving or rewriting them", async () => {
@@ -2014,6 +2195,94 @@ describe("native transcript backfill coordinator", () => {
     expect(JSON.stringify(stored?.nativePayload)).not.toContain(
       "canary_secret",
     );
+  });
+
+  it("persists new and truncated empty-source checkpoints exactly once", async () => {
+    const run = async (
+      repo: ReturnType<typeof repository>,
+    ): Promise<{
+      readonly repo: ReturnType<typeof repository>;
+      readonly byteSource: NativeTranscriptByteSource;
+      readonly result: NativeTranscriptBackfillResult;
+    }> => {
+      const byteSource = source("");
+      const result = await runNativeTranscriptBackfill({
+        repository: repo,
+        quarantine: {
+          clientName: "claude-code",
+          quarantine: vi.fn(),
+          get: vi.fn(),
+          list: vi.fn(),
+          close: vi.fn(),
+        },
+        source: byteSource,
+        machineId: "machine",
+        format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+        nativeSessionId: "session-1",
+        sourceLocator: "sessions/session.jsonl",
+        messageResolver: { resolveExact: vi.fn(async () => null) },
+      });
+      return { repo, byteSource, result };
+    };
+
+    const created = await run(repository());
+    expect(created.result).toMatchObject({ rescanned: false });
+    expect(created.repo.batches).toHaveLength(1);
+    expect(created.repo.batches[0]).toMatchObject({
+      expectedCheckpoint: null,
+      records: [],
+      checkpoint: {
+        lastSourceOrdinal: 0,
+        checkpoint: {
+          version: 1,
+          byteOffset: 0,
+          prefixSha256: digest(""),
+          scrubberVersion: DEFAULT_SCRUBBER_VERSION,
+          source: {
+            sizeBytes: 0,
+            modifiedAtMs: 123,
+            changedAtMs: 456,
+          },
+        },
+      },
+    });
+    const createdSnapshot = await vi.mocked(created.byteSource.openSnapshot)
+      .mock.results[0]!.value;
+    expect(createdSnapshot.assertByteRangesUnchanged).toHaveBeenCalledWith([]);
+    expect(createdSnapshot.assertUnchanged).toHaveBeenCalled();
+
+    const exactCheckpoint = checkpoint(
+      created.repo.batches[0]!.checkpoint.checkpoint,
+    );
+    const exact = await run(repository(exactCheckpoint));
+    expect(exact.result).toMatchObject({
+      resumedFromByteOffset: 0,
+      rescanned: false,
+    });
+    expect(exact.repo.batches).toHaveLength(0);
+
+    const previous = checkpoint({
+      version: 1,
+      byteOffset: 12,
+      prefixSha256: digest('{"old":1}\n'),
+      source: {
+        sizeBytes: 12,
+        modifiedAtMs: 1,
+        changedAtMs: 1,
+      },
+    });
+    const truncated = await run(repository(previous));
+    expect(truncated.result).toMatchObject({
+      resumedFromByteOffset: 0,
+      rescanned: true,
+    });
+    expect(truncated.repo.batches).toHaveLength(1);
+    expect(truncated.repo.batches[0]?.expectedCheckpoint).toBe(previous);
+    expect(truncated.repo.batches[0]?.checkpoint.checkpoint).toMatchObject({
+      byteOffset: 0,
+      prefixSha256: digest(""),
+      scrubberVersion: DEFAULT_SCRUBBER_VERSION,
+    });
   });
 
   it("checkpoints blank-only consumed bytes outside record accounting", async () => {

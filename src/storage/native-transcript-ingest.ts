@@ -385,9 +385,58 @@ function assertLosslessJsonNumbers(text: string): void {
   }
 }
 
+function assertUniqueJsonObjectKeys(text: string): void {
+  const containers: Array<{
+    readonly kind: "array" | "object";
+    readonly keys?: Set<string>;
+  }> = [];
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index]!;
+    if (character === "{") {
+      containers.push({ kind: "object", keys: new Set() });
+      continue;
+    }
+    if (character === "[") {
+      containers.push({ kind: "array" });
+      continue;
+    }
+    if (character === "}" || character === "]") {
+      containers.pop();
+      continue;
+    }
+    if (character !== '"') continue;
+    const start = index;
+    for (index += 1; index < text.length; index += 1) {
+      if (text[index] === "\\") {
+        index += 1;
+      } else if (text[index] === '"') {
+        break;
+      }
+    }
+    const token = text.slice(start, index + 1);
+    let following = index + 1;
+    while (following < text.length && /\s/u.test(text[following]!)) {
+      following += 1;
+    }
+    const container = containers.at(-1);
+    if (container?.kind !== "object" || text[following] !== ":") continue;
+    let key: unknown;
+    try {
+      key = JSON.parse(token);
+    } catch {
+      throw new NativeTranscriptRecordError("malformed-json");
+    }
+    if (typeof key !== "string" || container.keys!.has(key)) {
+      throw new NativeTranscriptRecordError("malformed-json");
+    }
+    container.keys!.add(key);
+  }
+}
+
 function parsedContainer(text: string): JsonObject | JsonValue[] {
   let parsed: JsonValue;
   try {
+    assertUniqueJsonObjectKeys(text);
     assertLosslessJsonNumbers(text);
     parsed = JSON.parse(text) as JsonValue;
   } catch {
@@ -1224,6 +1273,7 @@ type TranscriptCheckpointJson = JsonObject & {
   version: number;
   byteOffset: number;
   prefixSha256: string;
+  scrubberVersion: string;
   source: JsonObject;
 };
 
@@ -1233,11 +1283,13 @@ function checkpointJson(
     readonly prefixSha256: string;
   },
   metadata: NativeTranscriptSourceMetadata,
+  scrubberVersion: string,
 ): TranscriptCheckpointJson {
   return {
     version: CHECKPOINT_VERSION,
     byteOffset: progress.endByteOffset,
     prefixSha256: progress.prefixSha256,
+    scrubberVersion,
     source: {
       sizeBytes: metadata.sizeBytes,
       modifiedAtMs: metadata.modifiedAtMs,
@@ -1249,10 +1301,12 @@ function checkpointJson(
 function resumableByteOffset(
   checkpoint: JsonObject,
   metadata: NativeTranscriptSourceMetadata,
+  scrubberVersion: string,
 ): number | null {
   const source = checkpoint.source;
   if (
     checkpoint.version !== CHECKPOINT_VERSION
+    || checkpoint.scrubberVersion !== scrubberVersion
     || !Number.isSafeInteger(checkpoint.byteOffset)
     || (checkpoint.byteOffset as number) < 0
     || typeof checkpoint.prefixSha256 !== "string"
@@ -1415,7 +1469,11 @@ export async function runNativeTranscriptBackfill(
     });
     let expectedCheckpoint: NativeTranscriptCheckpointRecord | null = previous;
     const candidateOffset = previous
-      ? resumableByteOffset(previous.checkpoint, metadata)
+      ? resumableByteOffset(
+          previous.checkpoint,
+          metadata,
+          scrubber.scrubberVersion,
+        )
       : null;
     let prefixMatches = false;
     if (candidateOffset !== null) {
@@ -1426,7 +1484,7 @@ export async function runNativeTranscriptBackfill(
     }
     const resumedFromByteOffset =
       prefixMatches && candidateOffset !== null ? candidateOffset : 0;
-    const rescanned = previous !== null && resumedFromByteOffset === 0;
+    const rescanned = previous !== null && !prefixMatches;
     let importedCount = 0;
     let skippedCount = 0;
     let quarantinedCount = 0;
@@ -1577,7 +1635,11 @@ export async function runNativeTranscriptBackfill(
         records,
         checkpoint: {
           lastSourceOrdinal: last.sourceOrdinal,
-          checkpoint: checkpointJson(last, metadata),
+          checkpoint: checkpointJson(
+            last,
+            metadata,
+            scrubber.scrubberVersion,
+          ),
         },
         quarantinedCount: quarantinedRecords.length,
       });
@@ -1647,7 +1709,11 @@ export async function runNativeTranscriptBackfill(
         records: [],
         checkpoint: {
           lastSourceOrdinal,
-          checkpoint: checkpointJson(latestProgress, metadata),
+          checkpoint: checkpointJson(
+            latestProgress,
+            metadata,
+            scrubber.scrubberVersion,
+          ),
         },
         quarantinedCount: 0,
       });
@@ -1655,6 +1721,32 @@ export async function runNativeTranscriptBackfill(
       skippedCount += result.skippedCount;
       quarantinedCount += result.quarantinedCount;
       uncommittedRanges = [];
+    }
+    const emptyCheckpoint = checkpointJson({
+      endByteOffset: 0,
+      prefixSha256: sha256(""),
+    }, metadata, scrubber.scrubberVersion);
+    const emptyCheckpointIsExact =
+      previous?.lastSourceOrdinal === 0
+      && canonicalNativeTranscriptJson(previous.checkpoint)
+        === canonicalNativeTranscriptJson(emptyCheckpoint);
+    if (metadata.sizeBytes === 0 && !emptyCheckpointIsExact) {
+      await assertUncommittedSourceUnchanged();
+      const result = await options.repository.ingestBatch({
+        machineId: options.machineId,
+        clientName: options.format.clientName,
+        sourceLocator: options.sourceLocator,
+        expectedCheckpoint,
+        records: [],
+        checkpoint: {
+          lastSourceOrdinal: 0,
+          checkpoint: emptyCheckpoint,
+        },
+        quarantinedCount: 0,
+      });
+      importedCount += result.importedCount;
+      skippedCount += result.skippedCount;
+      quarantinedCount += result.quarantinedCount;
     }
     return {
       importedCount,

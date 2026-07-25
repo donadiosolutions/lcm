@@ -85,6 +85,21 @@ Programmatic callers use `NativeTranscriptRepository.ingestBatch()`,
 `PostgreSqlNativeTranscriptRepository` explicitly during this staged phase;
 the repository is not part of `ProjectStorage`.
 
+The installed package exposes only this staged adapter through the
+`@donadiosolutions/lcm/storage/native-transcripts` subpath. For example:
+
+```ts
+import {
+  PostgreSqlNativeTranscriptRepository,
+  runNativeTranscriptBackfill,
+} from "@donadiosolutions/lcm/storage/native-transcripts";
+```
+
+The subpath also exports the native-transcript contracts, scrubber and
+format helpers, exact-message resolver, file source, metadata-only local
+quarantine, and transcript-specific errors. Importing it does not select a
+storage backend or activate daemon or CLI ingestion.
+
 Direct `PostgreSqlNativeTranscriptRepository` ingestion applies the same
 Unicode-scalar contract to every string in transcript metadata, checkpoint
 keys and JSON, and sanitized payload JSON. Valid surrogate pairs and literal
@@ -136,15 +151,25 @@ rejected payload.
 Backfill is explicit and processes transactional batches of 100 records by
 default; callers may choose a value from 1 through 1000. A committed checkpoint
 records the completed byte offset, completed-prefix digest, source metadata,
-last source ordinal, and cumulative imported, skipped, and quarantined counts.
+effective scrubber version, last source ordinal, and cumulative imported,
+skipped, and quarantined counts.
 The checkpoint advances only in the same successful destination transaction as
 the corresponding transcript records and links.
 
-When the completed prefix is unchanged, LCM locally replays that verified
-prefix from byte zero only to reconstruct identical-content occurrence
-numbering, suppresses destination writes for checkpointed records, and resumes
-destination work after the completed byte offset. This is not a physical file
-seek.
+When the completed prefix and effective scrubber version are unchanged, LCM
+locally replays that verified prefix from byte zero only to reconstruct
+identical-content occurrence numbering, suppresses destination writes for
+checkpointed records, and resumes destination work after the completed byte
+offset. Missing, malformed, or different scrubber versions force an
+idempotent rescan so changed pipeline or pattern semantics cannot reuse an old
+sanitized prefix. This is not a physical file seek.
+
+A verified empty source persists byte offset `0`, the SHA-256 digest of the
+empty prefix, current source metadata, and the effective scrubber version
+through the same checkpoint compare-and-swap path. Truncating a previously
+checkpointed source to empty therefore replaces the old checkpoint without
+deleting stored transcript rows. Rerunning against an already exact empty
+checkpoint does not write it again.
 
 `createFileNativeTranscriptSource()` binds one backfill to an opened file
 descriptor after verifying that the locator is client-root-relative, the
@@ -215,6 +240,11 @@ the source or active sensitive patterns, then rerun the explicit backfill—the
 source transcript remains read-only. Lossy numeric spellings and lone Unicode
 surrogates use `malformed-json`; their source bytes remain local and only the
 normal metadata fields are quarantined.
+
+Duplicate JSON object member names—including names that become equal after
+JSON escape decoding—also use `malformed-json`. LCM detects them in a bounded
+linear scan before `JSON.parse`, so no earlier member can be silently
+overwritten before local scrubbing.
 
 Each quarantined physical record creates one unresolved session-order
 position. The next safe record that the built-in mapper recognizes as a
