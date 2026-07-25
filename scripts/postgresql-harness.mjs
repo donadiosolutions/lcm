@@ -46,6 +46,7 @@ export const HARNESS_ALLOCATION_MARKER = "PostgreSQL harness allocated run:";
 export const MAX_HARNESS_ALLOCATION_MARKER_LINE_LENGTH =
   HARNESS_ALLOCATION_MARKER.length + 1 + 32;
 export const SIGNAL_CLEANUP_FAILURE_MARKER = "PostgreSQL harness cleanup failed:";
+export const SIGNAL_DIAGNOSTIC_FLUSH_TIMEOUT_MS = 5_000;
 
 export function resolveSignalProbeReadinessTimeout(environment = process.env) {
   const configured = environment.LCM_TEST_POSTGRES_SIGNAL_READY_TIMEOUT_MS;
@@ -66,6 +67,45 @@ export function resolveSignalProbeReadinessTimeout(environment = process.env) {
 
 export function signalCleanupFailed(output) {
   return String(output).includes(SIGNAL_CLEANUP_FAILURE_MARKER);
+}
+
+export function writeHarnessDiagnostic(message, dependencies = {}) {
+  const stream = dependencies.stream ?? process.stderr;
+  const scheduleTimeout = dependencies.scheduleTimeout ?? setTimeout;
+  const cancelTimeout = dependencies.cancelTimeout ?? clearTimeout;
+  const timeoutMs = dependencies.timeoutMs ?? SIGNAL_DIAGNOSTIC_FLUSH_TIMEOUT_MS;
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const onError = () => settle();
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) cancelTimeout(timer);
+      stream.removeListener?.("error", onError);
+      resolve();
+    };
+    stream.once?.("error", onError);
+    try {
+      stream.write(message, (error) => {
+        if (!error) settle();
+      });
+    } catch {
+      settle();
+    }
+    if (!settled) timer = scheduleTimeout(settle, timeoutMs);
+  });
+}
+
+export async function completeSignalExit(signal, teardown, dependencies = {}) {
+  try {
+    await teardown();
+  } catch {
+    // Cleanup failure was reported and flushed by teardown before conventional exit.
+  }
+  dependencies.removeSignalHandlers?.();
+  const exit = dependencies.exit ?? process.exit;
+  exit(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143);
 }
 
 export function createHarnessAllocationMarkerParser(runIds) {
@@ -1378,9 +1418,9 @@ export async function runHarness(options = {}) {
   let sentinelReady = false;
   const cleanup = () => {
     cleanupPromise ??= cleanupHarnessResources({ names, runId, directory, sentinelReady, owner })
-      .catch((error) => {
+      .catch(async (error) => {
         const details = sanitizedHarnessErrorDetails(error, secrets);
-        process.stderr.write(`${SIGNAL_CLEANUP_FAILURE_MARKER} ${details}\n`);
+        await writeHarnessDiagnostic(`${SIGNAL_CLEANUP_FAILURE_MARKER} ${details}\n`);
         throw error;
       });
     return cleanupPromise;
@@ -1402,12 +1442,7 @@ export async function runHarness(options = {}) {
   };
   const onSignal = (signal) => {
     exitSignal ??= signal;
-    signalExitPromise ??= teardown()
-      .catch(() => undefined)
-      .then(() => {
-        removeSignalHandlers();
-        process.exit(exitSignal === "SIGINT" ? 130 : exitSignal === "SIGHUP" ? 129 : 143);
-      });
+    signalExitPromise ??= completeSignalExit(exitSignal, teardown, { removeSignalHandlers });
   };
   const onSigint = () => onSignal("SIGINT");
   const onSigterm = () => onSignal("SIGTERM");

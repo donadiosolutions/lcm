@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
+import { Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_SIGNAL_PROBE_READINESS_TIMEOUT_MS,
@@ -19,9 +20,11 @@ import {
   RESOURCE_KIND_LABEL,
   RUN_LABEL,
   SIGNAL_CLEANUP_FAILURE_MARKER,
+  SIGNAL_DIAGNOSTIC_FLUSH_TIMEOUT_MS,
   auditHarnessRunResources,
   classifyOwnerIdentity,
   cleanupHarnessResources,
+  completeSignalExit,
   createHarnessAllocationMarkerParser,
   createOwnerIdentity,
   createProcessLifecycle,
@@ -46,6 +49,7 @@ import {
   sanitizeHarnessText,
   signalCleanupFailed,
   validateRunNames,
+  writeHarnessDiagnostic,
 } from "../../scripts/postgresql-harness.mjs";
 import { postgresqlVitestCacheDir } from "../../vitest.postgresql.config.js";
 
@@ -86,6 +90,112 @@ describe("PostgreSQL harness utilities", () => {
     expect(signalCleanupFailed("PostgreSQL harness signal probe ready: abc")).toBe(false);
     expect(signalCleanupFailed(`${SIGNAL_CLEANUP_FAILURE_MARKER} sanitized failure`)).toBe(true);
     expect(signalCleanupFailed(new Error(`${SIGNAL_CLEANUP_FAILURE_MARKER} nested`))).toBe(true);
+  });
+
+  it.each([
+    ["SIGINT", 130],
+    ["SIGHUP", 129],
+    ["SIGTERM", 143],
+  ] as const)("waits for a backpressured diagnostic flush before exiting on %s", async (signal, code) => {
+    const stream = new EventEmitter() as EventEmitter & {
+      write(message: string, callback: (error?: Error | null) => void): boolean;
+    };
+    let flush!: () => void;
+    stream.write = vi.fn((_message, callback) => {
+      flush = callback;
+      return false;
+    });
+    const events: string[] = [];
+    const diagnostic = writeHarnessDiagnostic(
+      `${SIGNAL_CLEANUP_FAILURE_MARKER} sanitized failure\n`,
+      { stream },
+    );
+    const completion = completeSignalExit(signal, () => diagnostic, {
+      removeSignalHandlers: () => events.push("remove"),
+      exit: (exitCode: number) => events.push(`exit:${exitCode}`),
+    });
+
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    flush();
+    await completion;
+
+    expect(stream.write).toHaveBeenCalledWith(
+      `${SIGNAL_CLEANUP_FAILURE_MARKER} sanitized failure\n`,
+      expect.any(Function),
+    );
+    expect(events).toEqual(["remove", `exit:${code}`]);
+  });
+
+  it("keeps the error listener until a failed write callback emits its paired stream error", async () => {
+    const errored = new EventEmitter() as EventEmitter & {
+      write(message: string, callback: (error?: Error | null) => void): boolean;
+    };
+    let writeCallback!: (error?: Error | null) => void;
+    errored.write = vi.fn((_message, callback) => {
+      writeCallback = callback;
+      return false;
+    });
+    const exit = vi.fn();
+    const diagnostic = writeHarnessDiagnostic("sanitized\n", { stream: errored });
+    const completion = completeSignalExit("SIGTERM", () => diagnostic, { exit });
+
+    writeCallback(new Error("private write callback failure"));
+    await Promise.resolve();
+    expect(errored.listenerCount("error")).toBe(1);
+    expect(exit).not.toHaveBeenCalled();
+
+    errored.emit("error", new Error("private paired stream failure"));
+    await expect(completion).resolves.toBeUndefined();
+    expect(errored.listenerCount("error")).toBe(0);
+    expect(exit).toHaveBeenCalledWith(143);
+  });
+
+  it("handles a real Writable failed write and synchronous write failure", async () => {
+    const writable = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback(new Error("private real Writable failure"));
+      },
+    });
+    await expect(writeHarnessDiagnostic("sanitized\n", { stream: writable }))
+      .resolves.toBeUndefined();
+    expect(writable.listenerCount("error")).toBe(0);
+
+    const throwing = new EventEmitter() as EventEmitter & {
+      write(message: string, callback: (error?: Error | null) => void): boolean;
+    };
+    throwing.write = vi.fn(() => {
+      throw new Error("private synchronous failure");
+    });
+    await expect(writeHarnessDiagnostic("sanitized\n", { stream: throwing }))
+      .resolves.toBeUndefined();
+    expect(throwing.listenerCount("error")).toBe(0);
+  });
+
+  it("bounds a stalled diagnostic flush without exposing stream failures", async () => {
+    const stream = new EventEmitter() as EventEmitter & {
+      write(message: string, callback: (error?: Error | null) => void): boolean;
+    };
+    stream.write = vi.fn(() => false);
+    let expire!: () => void;
+    const scheduleTimeout = vi.fn((callback: () => void, timeoutMs: number) => {
+      expire = callback;
+      expect(timeoutMs).toBe(SIGNAL_DIAGNOSTIC_FLUSH_TIMEOUT_MS);
+      return 42;
+    });
+    const cancelTimeout = vi.fn();
+    const completion = writeHarnessDiagnostic("sanitized\n", {
+      stream,
+      scheduleTimeout,
+      cancelTimeout,
+    });
+
+    await Promise.resolve();
+    expect(cancelTimeout).not.toHaveBeenCalled();
+    expire();
+    await expect(completion).resolves.toBeUndefined();
+    expect(cancelTimeout).toHaveBeenCalledWith(42);
+    expect(stream.listenerCount("error")).toBe(0);
   });
 
   it("incrementally registers exact allocation markers across arbitrary boundaries", () => {
