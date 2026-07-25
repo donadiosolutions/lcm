@@ -137,6 +137,15 @@ scan detects structured key/value signatures that do not match either string
 in isolation. The scrubber version binds the pipeline version to the
 effective-pattern digest so a pattern change is observable.
 
+Custom patterns are rejected during scrubber construction if they would
+redact a structural key or discriminator required by the built-in Claude or
+Codex mapper. Protected structure includes message/payload/type/role/content
+and text keys, supported message roles, Claude text/tool-result block types,
+and Codex response-item/message/input-text/output-text discriminators.
+Context-dependent patterns are checked against complete representative mapper
+shapes, so rejection occurs before source, quarantine, resolver, or repository
+access.
+
 This boundary substantially reduces accidental secret transmission, but
 pattern-based redaction cannot identify every sensitive value. An
 organization-specific token that matches no active rule can remain in the
@@ -175,6 +184,12 @@ through the same checkpoint compare-and-swap path. Truncating a previously
 checkpointed source to empty therefore replaces the old checkpoint without
 deleting stored transcript rows. Rerunning against an already exact empty
 checkpoint does not write it again.
+
+The verified prefix remains a separate protected byte range for the entire
+run. LCM rehashes it before and after every successful destination call even
+after suffix ranges have committed and been cleared. A same-size rewrite of
+only the replayed prefix therefore cannot hide behind coalesced filesystem
+timestamps.
 
 `createFileNativeTranscriptSource()` binds one backfill to an opened file
 descriptor after verifying that the locator is client-root-relative, the

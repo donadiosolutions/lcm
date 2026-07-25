@@ -311,6 +311,46 @@ describe("native transcript scrub and JSONL reader", () => {
       .toThrowError(NativeTranscriptConfigurationError);
   });
 
+  it("rejects patterns that redact built-in mapper structure", () => {
+    for (const pattern of [
+      "message",
+      "payload",
+      "type",
+      "role",
+      "content",
+      "text",
+      "response_item",
+      "tool_result",
+      "input_text",
+      "output_text",
+      "user",
+      "assistant",
+      "system",
+      '"message"\\s*:',
+      '"type"\\s*:\\s*"response_item"',
+      'role(?=":)',
+    ]) {
+      expect(() => createNativeTranscriptScrubber({
+        globalPatterns: [pattern],
+        projectPatterns: [],
+      })).toThrowError(expect.objectContaining({
+        code: "invalid-patterns",
+      }));
+    }
+    for (const pattern of [
+      "^messages$",
+      "^payloads$",
+      "^response_items$",
+      "^tool_results$",
+      "^contents$",
+    ]) {
+      expect(() => createNativeTranscriptScrubber({
+        globalPatterns: [pattern],
+        projectPatterns: [],
+      })).not.toThrow();
+    }
+  });
+
   it("streams split CRLF/UTF-8 records, skips blanks, and stabilizes duplicate keys", async () => {
     const first = '{"b":"olá","a":1}\r\n';
     const second = '\n{"a":1,"b":"olá"}';
@@ -1385,6 +1425,134 @@ describe("filesystem native transcript source", () => {
     await expect(pending).rejects.toBe(repositoryFailure);
     expect(repo.batches).toHaveLength(1);
   });
+
+  it("fences a replayed prefix mutation before destination access", async () => {
+    const root = temporaryDirectory();
+    const path = join(root, "prefix-before-commit.jsonl");
+    const prefix =
+      '{"message":{"role":"user","content":"first"}}\n';
+    const changedPrefix =
+      '{"message":{"role":"user","content":"tsrif"}}\n';
+    const suffix =
+      '{"message":{"role":"assistant","content":"second"}}\n';
+    writeFileSync(path, prefix + suffix);
+    const repo = repository(checkpoint({
+      version: 1,
+      byteOffset: Buffer.byteLength(prefix),
+      prefixSha256: digest(prefix),
+      source: {
+        sizeBytes: Buffer.byteLength(prefix),
+        modifiedAtMs: 1,
+        changedAtMs: 1,
+      },
+    }));
+    let releaseResolver!: () => void;
+    const resolverGate = new Promise<void>((resolve) => {
+      releaseResolver = resolve;
+    });
+    let markResolverStarted!: () => void;
+    const resolverStarted = new Promise<void>((resolve) => {
+      markResolverStarted = resolve;
+    });
+    const pending = runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: createFileNativeTranscriptSource(
+        root,
+        "prefix-before-commit.jsonl",
+        { _forceMetadataUnchangedForTesting: true },
+      ),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "prefix-before-commit.jsonl",
+      messageResolver: {
+        resolveExact: vi.fn(async () => {
+          markResolverStarted();
+          await resolverGate;
+          return { conversationId: 1, messageId: 2 };
+        }),
+      },
+    });
+    await resolverStarted;
+    writeFileSync(path, changedPrefix + suffix);
+    releaseResolver();
+    await expect(pending).rejects.toThrowError(
+      NativeTranscriptSourceChangedError,
+    );
+    expect(repo.batches).toEqual([]);
+  });
+
+  it("fences a replayed prefix mutation after destination commit", async () => {
+    const root = temporaryDirectory();
+    const path = join(root, "prefix-after-commit.jsonl");
+    const prefix = '{"event":"prefix-a"}\n';
+    const changedPrefix = '{"event":"prefix-b"}\n';
+    const suffix = '{"event":"suffix"}\n';
+    writeFileSync(path, prefix + suffix);
+    const repo = repository(checkpoint({
+      version: 1,
+      byteOffset: Buffer.byteLength(prefix),
+      prefixSha256: digest(prefix),
+      source: {
+        sizeBytes: Buffer.byteLength(prefix),
+        modifiedAtMs: 1,
+        changedAtMs: 1,
+      },
+    }));
+    let releaseCommit!: () => void;
+    const commitGate = new Promise<void>((resolve) => {
+      releaseCommit = resolve;
+    });
+    let markCommitStarted!: () => void;
+    const commitStarted = new Promise<void>((resolve) => {
+      markCommitStarted = resolve;
+    });
+    vi.mocked(repo.ingestBatch).mockImplementationOnce(async (input) => {
+      repo.batches.push(input);
+      markCommitStarted();
+      await commitGate;
+      return {
+        importedCount: input.records.length,
+        skippedCount: 0,
+        quarantinedCount: input.quarantinedCount,
+        checkpoint: checkpoint(input.checkpoint.checkpoint),
+      };
+    });
+    const pending = runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: createFileNativeTranscriptSource(
+        root,
+        "prefix-after-commit.jsonl",
+        { _forceMetadataUnchangedForTesting: true },
+      ),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "prefix-after-commit.jsonl",
+      messageResolver: { resolveExact: vi.fn(async () => null) },
+    });
+    await commitStarted;
+    writeFileSync(path, changedPrefix + suffix);
+    releaseCommit();
+    await expect(pending).rejects.toThrowError(
+      NativeTranscriptSourceChangedError,
+    );
+    expect(repo.batches).toHaveLength(1);
+  });
 });
 
 describe("exact native transcript message resolver", () => {
@@ -1575,11 +1743,13 @@ describe("native transcript backfill coordinator", () => {
   it("validates scrubbers before touching source or destination", async () => {
     const repo = repository();
     const byteSource = source("{}\n");
+    const markerQuarantine = vi.fn();
+    const markerResolver = vi.fn();
     await expect(runNativeTranscriptBackfill({
       repository: repo,
       quarantine: {
         clientName: "claude-code",
-        quarantine: vi.fn(),
+        quarantine: markerQuarantine,
         get: vi.fn(),
         list: vi.fn(),
         close: vi.fn(),
@@ -1594,6 +1764,29 @@ describe("native transcript backfill coordinator", () => {
     })).rejects.toMatchObject({ code: "invalid-patterns" });
     expect(byteSource.openSnapshot).not.toHaveBeenCalled();
     expect(repo.getCheckpoint).not.toHaveBeenCalled();
+
+    await expect(runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: byteSource,
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      globalPatterns: ['"message"\\s*:'],
+      messageResolver: { resolveExact: markerResolver },
+    })).rejects.toMatchObject({ code: "invalid-patterns" });
+    expect(byteSource.openSnapshot).not.toHaveBeenCalled();
+    expect(repo.getCheckpoint).not.toHaveBeenCalled();
+    expect(repo.ingestBatch).not.toHaveBeenCalled();
+    expect(markerQuarantine).not.toHaveBeenCalled();
+    expect(markerResolver).not.toHaveBeenCalled();
 
     await expect(runNativeTranscriptBackfill({
       repository: repo,
@@ -2220,6 +2413,11 @@ describe("native transcript backfill coordinator", () => {
     expect(repo.batches[0]?.expectedCheckpoint).toBe(previous);
     const snapshot = await vi.mocked(byteSource.openSnapshot)
       .mock.results[0]!.value;
+    expect(snapshot.assertByteRangesUnchanged).toHaveBeenCalledWith([{
+      startByteOffset: 0,
+      endByteOffset: Buffer.byteLength(firstLine),
+      rangeSha256: digest(firstLine),
+    }]);
     expect(snapshot.assertByteRangesUnchanged).toHaveBeenCalledWith([{
       startByteOffset: Buffer.byteLength(firstLine),
       endByteOffset: Buffer.byteLength(firstLine + secondLine),

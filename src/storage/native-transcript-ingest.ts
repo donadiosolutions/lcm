@@ -56,6 +56,21 @@ export const NATIVE_TRANSCRIPT_MAX_BATCH_SIZE = 1_000;
 export const NATIVE_TRANSCRIPT_SCRUB_PIPELINE_VERSION =
   "native-json-scrub/v1";
 
+const PROTECTED_NATIVE_TRANSCRIPT_MARKERS = [
+  "message",
+  "payload",
+  "type",
+  "role",
+  "content",
+  "text",
+  "response_item",
+  "tool_result",
+  "input_text",
+  "output_text",
+  "user",
+  "assistant",
+  "system",
+] as const;
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/u;
 const WINDOWS_ABSOLUTE_PATH_PATTERN = /^(?:[a-zA-Z]:|[\\/])/u;
 const CHECKPOINT_VERSION = 1;
@@ -148,6 +163,47 @@ function scrubJsonValue(engine: ScrubEngine, value: JsonValue): JsonValue {
   return result;
 }
 
+function assertMapperMarkersPreserved(engine: ScrubEngine): void {
+  for (const marker of PROTECTED_NATIVE_TRANSCRIPT_MARKERS) {
+    const encodedMarker = JSON.stringify(marker);
+    if (
+      engine.scrub(marker) !== marker
+      || !engine.scrub(`{${encodedMarker}:null}`).includes(encodedMarker)
+      || !engine.scrub(`{"_":${encodedMarker}}`).includes(encodedMarker)
+    ) {
+      throw new NativeTranscriptConfigurationError("invalid-patterns");
+    }
+  }
+  const mapperShapeProbes = [
+    ...["user", "assistant", "system"].map((role) =>
+      JSON.stringify({
+        message: {
+          role,
+          content: [
+            { type: "text", text: "text" },
+            { type: "tool_result", content: "content" },
+          ],
+        },
+      })),
+    ...["user", "assistant"].map((role) =>
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "message",
+          role,
+          content: [
+            { type: "input_text", text: "text" },
+            { type: "output_text", text: "text" },
+            { type: "text", text: "text" },
+          ],
+        },
+      })),
+  ];
+  if (mapperShapeProbes.some((probe) => engine.scrub(probe) !== probe)) {
+    throw new NativeTranscriptConfigurationError("invalid-patterns");
+  }
+}
+
 export function createNativeTranscriptScrubber(
   options: NativeTranscriptScrubberOptions,
 ): NativeTranscriptScrubber {
@@ -170,6 +226,7 @@ export function createNativeTranscriptScrubber(
   if (engine.invalidPatterns.length > 0) {
     throw new NativeTranscriptConfigurationError("invalid-patterns");
   }
+  assertMapperMarkersPreserved(engine);
   const scrubberVersion = `${pipelineVersion}:${effectivePatternDigest(
     globalPatterns,
     projectPatterns,
@@ -1499,6 +1556,14 @@ export async function runNativeTranscriptBackfill(
     let quarantinedCount = 0;
     let batch: NativeTranscriptReadOutcome[] = [];
     let uncommittedRanges: NativeTranscriptByteRangeDigest[] = [];
+    const protectedPrefixRange: NativeTranscriptByteRangeDigest | null =
+      resumedFromByteOffset > 0 && previous
+        ? Object.freeze({
+            startByteOffset: 0,
+            endByteOffset: resumedFromByteOffset,
+            rangeSha256: previous.checkpoint.prefixSha256 as string,
+          })
+        : null;
     let committedByteOffset = resumedFromByteOffset;
     // Source size is a safe integer, each physical record consumes at least
     // one byte, and mapper results are bounded by JavaScript array length.
@@ -1516,6 +1581,9 @@ export async function runNativeTranscriptBackfill(
 
     const assertUncommittedSourceUnchanged = async (): Promise<void> => {
       await snapshot.assertUnchanged();
+      if (protectedPrefixRange) {
+        await snapshot.assertByteRangesUnchanged([protectedPrefixRange]);
+      }
       await snapshot.assertByteRangesUnchanged(uncommittedRanges);
       await snapshot.assertUnchanged();
     };
