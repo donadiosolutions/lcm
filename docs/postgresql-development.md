@@ -39,17 +39,58 @@ runtime roles, and the `pg_trgm`, `unaccent`, `pgcrypto`, and
 with a private sentinel recording the run ID, database name, and expected
 runtime role.
 
+Every Docker object carries the random run ID, its resource kind, label-schema
+version, owner PID, process-birth fingerprint, and hashed client process scope.
+Linux binds the scope to the client machine, boot, and PID namespace; macOS and
+Windows bind it to a hashed machine identity. Linux birth evidence uses the
+boot ID and kernel start time, macOS uses `ps` start time, and Windows uses the
+PowerShell CIM process creation time. A zero-signal process probe is checked
+first; the PID alone is not ownership evidence because the birth fingerprint
+prevents a recycled PID from making an orphan appear live.
+
 Database drops and container cleanup fail closed. Before mutation, guards check
 the generated name prefix, PostgreSQL major version, current role, private
-sentinel, and Docker run label. SIGINT and SIGTERM use the same idempotent
-cleanup path. A failed guard can intentionally leave resources for inspection;
-never delete them by a broad name glob. Inspect the exact label first:
+sentinel, and complete Docker ownership labels. SIGINT, SIGTERM, and SIGHUP use
+the same idempotent cleanup path and retain their conventional exit codes.
+Removal is bounded and retryable, and every attempt reinspects the exact labels
+before issuing an exact-name removal.
+
+Before allocating a new run, the harness inspects labeled resources left by
+earlier runs. It reclaims a set only when every discovered object has a
+versioned, internally consistent owner record and the operating system proves
+that owner exited or that its PID was reused. Live owners are preserved.
+Legacy labels, malformed or incomplete records, inconsistent owners, denied
+`/proc` evidence, and unsupported identity evidence are ambiguous and remain
+untouched. This permits a later run to recover resources after an uncatchable
+SIGKILL without using resource age, broad name matching, or global pruning.
+Resources created from another client machine or a different live Linux PID
+namespace are also ambiguous. This fail-closed rule applies when containers or
+hosts share a Docker socket and when multiple clients use a remote Docker
+context; reconcile those resources from their original client scope.
+A running stale database must make its sentinel observable before recovery;
+an exactly owned stopped container can be removed without executing a sentinel
+that Docker cannot expose.
+While local Vitest is active, a private bounded consumer record keeps its PID,
+birth fingerprint, and process scope with the run. A later harness preserves
+the run if that consumer survived its parent. Graceful harness termination
+signals the complete local Vitest process group, including fork workers, before
+database cleanup. CI similarly preserves a run while its labeled runner or
+restore container is still running.
+
+A failed ownership or database-sentinel guard intentionally leaves resources
+for inspection. Never delete them by a broad name glob. Inspect the exact
+labels first:
 
 ```bash
 docker ps -a --filter label=com.donadiosolutions.lcm.postgresql-test-run
 docker network ls --filter label=com.donadiosolutions.lcm.postgresql-test-run
 docker volume ls --filter label=com.donadiosolutions.lcm.postgresql-test-run
 ```
+
+For an ambiguous resource, inspect its complete labels and verify that the
+recorded PID and birth fingerprint no longer identify a live process before
+manually removing that exact object. If the evidence cannot be established,
+preserve it for reconciliation; elapsed time is never proof of ownership.
 
 ## Add or change a migration
 
@@ -291,9 +332,11 @@ permission failures and must not be worked around by weakening host file modes.
 - `pg_stat_statements` creation denied: extensions are installed by the harness
   administrator before migrations; the migrator is intentionally not a
   superuser.
-- cleanup refusal: inspect the exact run label and sentinel. A refusal indicates
+- cleanup refusal: inspect the exact run ID, schema, kind, PID, birth
+  fingerprint, client process scope, and database sentinel. A refusal indicates
   ownership cannot be proven; preserve the resources until the mismatch is
-  understood.
+  understood. Do not remove resources merely because they are old or share an
+  `lcm-pg-` prefix.
 - pool exhaustion or idle-transaction disconnects: acquisition, statement, and
   idle-transaction bounds are deliberate. Keep tests shorter than their
   transaction idle timeout unless the timeout itself is under test.

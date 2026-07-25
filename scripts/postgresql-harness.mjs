@@ -1,10 +1,25 @@
 #!/usr/bin/env node
-import { randomBytes } from "node:crypto";
-import { chmodSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
+import { execFileSync, spawn } from "node:child_process";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  fstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readlinkSync,
+  readSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { platform, tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
 import {
   NODE_IMAGE,
   POSTGRES_IMAGE,
@@ -16,11 +31,138 @@ import {
 
 export { NODE_IMAGE, POSTGRES_IMAGE };
 export const RUN_LABEL = "com.donadiosolutions.lcm.postgresql-test-run";
+export const OWNER_SCHEMA_LABEL = "com.donadiosolutions.lcm.postgresql-test-owner-schema";
+export const OWNER_PID_LABEL = "com.donadiosolutions.lcm.postgresql-test-owner-pid";
+export const OWNER_BIRTH_LABEL = "com.donadiosolutions.lcm.postgresql-test-owner-birth";
+export const OWNER_SCOPE_LABEL = "com.donadiosolutions.lcm.postgresql-test-owner-scope";
+export const RESOURCE_KIND_LABEL = "com.donadiosolutions.lcm.postgresql-test-resource-kind";
+export const OWNER_SCHEMA_VERSION = "2";
 export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
+export const MAX_DOCKER_REMOVE_ATTEMPTS = 3;
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const initScript = join(repositoryRoot, "test", "postgresql", "init.sh");
 const cachedRunInitScript = join(repositoryRoot, "test", "postgresql", "cached-run-init.sh");
+const bootIdPattern = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const bootIdRegex = new RegExp(`^${bootIdPattern}$`, "u");
+const linuxBirthRegex = new RegExp(`^linux:(${bootIdPattern}):([1-9][0-9]*)$`, "u");
+const darwinDayPattern = "(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)";
+const darwinMonthPattern = "(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)";
+const dateDayPattern = "(?:0[1-9]|[12][0-9]|3[01])";
+const darwinBirthRegex = new RegExp(
+  `^darwin:(${darwinDayPattern}) (${darwinMonthPattern}) ( [1-9]|[12][0-9]|3[01])`
+  + ` ((?:[01][0-9]|2[0-3])):([0-5][0-9]):([0-5][0-9]) ([1-9][0-9]{3})$`,
+  "u",
+);
+const windowsBirthRegex = new RegExp(
+  `^win32:([1-9][0-9]{3})-(0[1-9]|1[0-2])-(${dateDayPattern})`
+  + `T((?:[01][0-9]|2[0-3])):([0-5][0-9]):([0-5][0-9])\\.[0-9]{7}Z$`,
+  "u",
+);
+const linuxScopeRegex = new RegExp(
+  `^linux:([0-9a-f]{64}):(${bootIdPattern}):pid:\\[([1-9][0-9]*)\\]$`,
+  "u",
+);
+const portableScopeRegex = /^(?:darwin|win32):[0-9a-f]{64}$/u;
+const consumerOwnerFile = "consumer-owner.json";
+const darwinMonths = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const darwinDays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function validUtcCalendar(year, month, day, hour, minute, second, expectedWeekday) {
+  const observed = new Date(0);
+  observed.setUTCFullYear(year, month, day);
+  observed.setUTCHours(hour, minute, second, 0);
+  return observed.getUTCFullYear() === year
+    && observed.getUTCMonth() === month
+    && observed.getUTCDate() === day
+    && observed.getUTCHours() === hour
+    && observed.getUTCMinutes() === minute
+    && observed.getUTCSeconds() === second
+    && (expectedWeekday === undefined || observed.getUTCDay() === expectedWeekday);
+}
+
+export function isValidProcessBirthFingerprint(fingerprint) {
+  if (typeof fingerprint !== "string") return false;
+  if (linuxBirthRegex.test(fingerprint)) return true;
+  const darwinMatch = fingerprint.match(darwinBirthRegex);
+  if (darwinMatch) {
+    return validUtcCalendar(
+      Number(darwinMatch[7]),
+      darwinMonths.indexOf(darwinMatch[2]),
+      Number(darwinMatch[3]),
+      Number(darwinMatch[4]),
+      Number(darwinMatch[5]),
+      Number(darwinMatch[6]),
+      darwinDays.indexOf(darwinMatch[1]),
+    );
+  }
+  const windowsMatch = fingerprint.match(windowsBirthRegex);
+  return Boolean(windowsMatch && validUtcCalendar(
+    Number(windowsMatch[1]),
+    Number(windowsMatch[2]) - 1,
+    Number(windowsMatch[3]),
+    Number(windowsMatch[4]),
+    Number(windowsMatch[5]),
+    Number(windowsMatch[6]),
+  ));
+}
+
+export function processIdentityEvidenceConsistent(birth, scope) {
+  const birthPlatform = typeof birth === "string" ? birth.split(":", 1)[0] : undefined;
+  const scopePlatform = typeof scope === "string" ? scope.split(":", 1)[0] : undefined;
+  if (!birthPlatform || birthPlatform !== scopePlatform) return false;
+  if (birthPlatform !== "linux") return birthPlatform === "darwin" || birthPlatform === "win32";
+  const birthMatch = birth.match(linuxBirthRegex);
+  const scopeMatch = scope.match(linuxScopeRegex);
+  return Boolean(birthMatch && scopeMatch && birthMatch[1] === scopeMatch[2]);
+}
+
+function hashedIdentity(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+export function readOwnerScopeFingerprint(dependencies = {}) {
+  const currentPlatform = dependencies.platform?.() ?? platform();
+  const readFile = dependencies.readFile ?? readFileSync;
+  const execute = dependencies.execFile ?? execFileSync;
+  if (currentPlatform === "linux") {
+    const readLink = dependencies.readLink ?? readlinkSync;
+    const machineId = String(readFile("/etc/machine-id", "utf8")).trim();
+    const bootId = String(readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+    const pidNamespace = String(readLink("/proc/self/ns/pid")).trim();
+    if (!/^[0-9a-f]{32}$/u.test(machineId)
+      || !bootIdRegex.test(bootId)
+      || !/^pid:\[[1-9][0-9]*\]$/u.test(pidNamespace)) {
+      throw new Error("unsupported PostgreSQL harness process scope evidence");
+    }
+    return `linux:${hashedIdentity(machineId)}:${bootId}:${pidNamespace}`;
+  }
+  if (currentPlatform !== "darwin" && currentPlatform !== "win32") {
+    throw new Error("unsupported PostgreSQL harness process scope platform");
+  }
+  const command = currentPlatform === "win32" ? "powershell.exe" : "sysctl";
+  const args = currentPlatform === "win32"
+    ? [
+      "-NoProfile", "-NonInteractive", "-Command",
+      "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid",
+    ]
+    : ["-n", "kern.hostuuid"];
+  let machineId;
+  try {
+    machineId = String(execute(command, args, {
+      encoding: "utf8",
+      maxBuffer: 16 * 1024,
+      timeout: 2_000,
+      windowsHide: true,
+    })).trim().toLowerCase();
+  } catch (error) {
+    throw new Error("unsupported PostgreSQL harness process scope evidence", { cause: error });
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(machineId)) {
+    throw new Error("unsupported PostgreSQL harness process scope evidence");
+  }
+  return `${currentPlatform}:${hashedIdentity(machineId)}`;
+}
 
 export function createRunNames(runId) {
   const short = runId.slice(0, 20);
@@ -34,6 +176,125 @@ export function createRunNames(runId) {
     wrongAlias: `lcm-pg-wrong-${short}.test`,
     controlDatabase: `lcm_harness_${short}`,
   };
+}
+
+const resourceSpecs = [
+  { type: "container", key: "restore", kind: "restore" },
+  { type: "container", key: "runner", kind: "runner" },
+  { type: "container", key: "container", kind: "database" },
+  { type: "volume", key: "volume", kind: "data" },
+  { type: "network", key: "network", kind: "network" },
+];
+
+function resourceSpec(type, name, runId) {
+  const names = createRunNames(runId);
+  return resourceSpecs.find((candidate) => candidate.type === type && names[candidate.key] === name);
+}
+
+export function readProcessBirthFingerprint(pid, dependencies = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("invalid PostgreSQL harness owner PID");
+  const readFile = dependencies.readFile ?? readFileSync;
+  const currentPlatform = dependencies.platform?.() ?? platform();
+  if (currentPlatform === "linux") {
+    let bootId;
+    try {
+      bootId = String(readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+    } catch (error) {
+      throw new Error("unsupported PostgreSQL harness boot identity evidence", { cause: error });
+    }
+    let stat;
+    try {
+      stat = String(readFile(`/proc/${pid}/stat`, "utf8")).trim();
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        throw Object.assign(new Error("PostgreSQL harness owner PID is absent"), { code: "ESRCH" });
+      }
+      throw new Error("unsupported PostgreSQL harness process identity evidence", { cause: error });
+    }
+    const closingParenthesis = stat.lastIndexOf(")");
+    if (!bootIdRegex.test(bootId) || closingParenthesis < 1) {
+      throw new Error("unsupported PostgreSQL harness process identity evidence");
+    }
+    const fieldsAfterCommand = stat.slice(closingParenthesis + 1).trim().split(/\s+/u);
+    const startTime = fieldsAfterCommand[19];
+    if (!/^[1-9][0-9]*$/u.test(startTime ?? "")) {
+      throw new Error("unsupported PostgreSQL harness process identity evidence");
+    }
+    return `linux:${bootId}:${startTime}`;
+  }
+  const execute = dependencies.execFile ?? execFileSync;
+  const command = currentPlatform === "win32" ? "powershell.exe" : "ps";
+  const args = currentPlatform === "win32"
+    ? [
+      "-NoProfile", "-NonInteractive", "-Command",
+      `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}').CreationDate.ToUniversalTime().ToString('O')`,
+    ]
+    : ["-o", "lstart=", "-p", String(pid)];
+  let observed;
+  try {
+    observed = String(execute(command, args, {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        LANG: "C",
+        LC_ALL: "C",
+        TZ: "UTC",
+      },
+      maxBuffer: 16 * 1024,
+      timeout: 2_000,
+      windowsHide: true,
+    })).trim();
+  } catch (error) {
+    throw new Error("unsupported PostgreSQL harness process identity evidence", { cause: error });
+  }
+  const fingerprint = `${currentPlatform}:${observed}`;
+  if (!observed || !isValidProcessBirthFingerprint(fingerprint)) {
+    throw new Error("unsupported PostgreSQL harness process identity evidence");
+  }
+  return fingerprint;
+}
+
+export function createOwnerIdentity(pid = process.pid, dependencies = {}) {
+  return {
+    pid,
+    birth: readProcessBirthFingerprint(pid, dependencies),
+    scope: readOwnerScopeFingerprint(dependencies),
+  };
+}
+
+export function recordConsumerIdentity(path, pid, dependencies = {}) {
+  const createIdentity = dependencies.createIdentity ?? createOwnerIdentity;
+  let record;
+  try {
+    record = { version: 1, ...createIdentity(pid) };
+  } catch {
+    return recordAmbiguousConsumerIdentity(path, dependencies);
+  }
+  const writeFile = dependencies.writeFile ?? writeFileSync;
+  writeFile(path, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  return record;
+}
+
+export function recordAmbiguousConsumerIdentity(path, dependencies = {}) {
+  const writeFile = dependencies.writeFile ?? writeFileSync;
+  const record = { version: 1, ambiguous: true };
+  writeFile(path, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  return record;
+}
+
+export function ownershipLabels(runId, kind, owner) {
+  return {
+    [RUN_LABEL]: runId,
+    [OWNER_SCHEMA_LABEL]: OWNER_SCHEMA_VERSION,
+    [OWNER_PID_LABEL]: String(owner.pid),
+    [OWNER_BIRTH_LABEL]: owner.birth,
+    [OWNER_SCOPE_LABEL]: owner.scope,
+    [RESOURCE_KIND_LABEL]: kind,
+  };
+}
+
+function dockerLabelArgs(labels) {
+  return Object.entries(labels).flatMap(([key, value]) => ["--label", `${key}=${value}`]);
 }
 
 export function validateRunNames(names, runId) {
@@ -86,9 +347,20 @@ export function runProcess(command, args, options = {}) {
     const spawnProcess = options.spawnProcess ?? spawn;
     const child = spawnProcess(command, args, {
       cwd: options.cwd,
+      detached: options.detached === true,
       env: options.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    try {
+      options.onSpawn?.(child);
+    } catch (error) {
+      try {
+        child.kill();
+      } catch {
+        // Preserve the setup failure when the child exits before best-effort termination.
+      }
+      throw error;
+    }
     const maxCapturedOutputBytes = MAX_CAPTURED_OUTPUT_BYTES;
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
@@ -186,27 +458,129 @@ export async function runSanitizedProcess(command, args, options = {}) {
   }
 }
 
-export function createProcessLifecycle(processRunner = runProcess) {
+export function createProcessLifecycle(processRunner = runProcess, dependencies = {}) {
   const active = new Set();
   let stopping = false;
+  const currentPlatform = dependencies.platform?.() ?? platform();
+  const signalProcess = dependencies.signalProcess ?? ((pid, signal) => process.kill(pid, signal));
+  const terminateWindowsTree = dependencies.terminateWindowsTree ?? ((pid, force) => {
+    execFileSync("taskkill.exe", [
+      "/PID", String(pid), "/T", ...(force ? ["/F"] : []),
+    ], { windowsHide: true, stdio: "ignore" });
+  });
+  const delay = dependencies.delay ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  const treeGraceAttempts = dependencies.treeGraceAttempts ?? 80;
+  const treeKillAttempts = dependencies.treeKillAttempts ?? 80;
+
+  const signalEntry = (entry, signal) => {
+    if (!entry.processTree || !Number.isSafeInteger(entry.child?.pid) || entry.child.pid <= 0) {
+      entry.child?.kill(signal);
+      return;
+    }
+    if (currentPlatform === "win32") {
+      terminateWindowsTree(entry.child.pid, signal === "SIGKILL");
+      return;
+    }
+    signalProcess(-entry.child.pid, signal);
+  };
+
+  const processTreeAlive = dependencies.processTreeAlive ?? ((entry) => {
+    if (currentPlatform === "win32") {
+      return entry.child?.exitCode === null && entry.child?.signalCode === null;
+    }
+    try {
+      signalProcess(-entry.child.pid, 0);
+      return true;
+    } catch (error) {
+      return error?.code !== "ESRCH";
+    }
+  });
+
+  const waitForProcessTreeExit = async (entry, attempts) => {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (!processTreeAlive(entry)) return true;
+      await delay(25);
+    }
+    return !processTreeAlive(entry);
+  };
+
+  const terminateProcessTree = async (entry) => {
+    try {
+      signalEntry(entry, "SIGTERM");
+    } catch {
+      // Liveness verification below decides whether escalation is still needed.
+    }
+    if (await waitForProcessTreeExit(entry, treeGraceAttempts)) return;
+    try {
+      signalEntry(entry, "SIGKILL");
+    } catch {
+      // Liveness verification below remains authoritative.
+    }
+    if (!await waitForProcessTreeExit(entry, treeKillAttempts)) {
+      throw new Error("PostgreSQL harness test process tree did not exit");
+    }
+  };
 
   const run = (command, args, options) => {
     if (stopping) return Promise.reject(new Error("PostgreSQL harness setup is stopping"));
+    const entry = {
+      operation: undefined,
+      child: undefined,
+      terminateOnStop: options?.terminateOnStop === true,
+      processTree: options?.terminateProcessTree === true,
+      escalation: undefined,
+    };
+    const processOptions = entry.terminateOnStop ? {
+      ...options,
+      detached: entry.processTree && currentPlatform !== "win32",
+      onSpawn: (child) => {
+        entry.child = child;
+        options?.onSpawn?.(child);
+      },
+    } : options;
     let operation;
     try {
-      operation = Promise.resolve(processRunner(command, args, options));
+      operation = Promise.resolve(processRunner(command, args, processOptions));
     } catch (error) {
       operation = Promise.reject(error);
     }
-    active.add(operation);
-    const remove = () => active.delete(operation);
+    entry.operation = operation;
+    active.add(entry);
+    const remove = () => {
+      if (entry.escalation) clearTimeout(entry.escalation);
+      active.delete(entry);
+    };
     void operation.then(remove, remove);
     return operation;
   };
 
   const stop = async () => {
     stopping = true;
-    while (active.size > 0) await Promise.allSettled([...active]);
+    const treeTerminations = [];
+    for (const entry of active) {
+      if (!entry.terminateOnStop || !entry.child) continue;
+      if (entry.processTree) {
+        treeTerminations.push(terminateProcessTree(entry));
+        continue;
+      }
+      try {
+        signalEntry(entry, "SIGTERM");
+      } catch {
+        // The close/error event remains the authoritative settlement signal.
+      }
+      entry.escalation = setTimeout(() => {
+        try {
+          signalEntry(entry, "SIGKILL");
+        } catch {
+          // The child may have exited between settlement and escalation.
+        }
+      }, 2_000);
+      entry.escalation.unref?.();
+    }
+    await Promise.all(treeTerminations);
+    while (active.size > 0) {
+      await Promise.allSettled([...active].map((entry) => entry.operation));
+    }
   };
 
   return { run, stop };
@@ -254,9 +628,13 @@ function generatedUrl(user, password, host, port, database) {
   return `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/${database}`;
 }
 
-async function inspectLabels(type, name, dockerRunner = docker) {
+async function inspectDockerObject(type, name, dockerRunner = docker) {
   const result = await dockerRunner([type, "inspect", name]);
-  const record = JSON.parse(result.stdout)[0];
+  return JSON.parse(result.stdout)[0];
+}
+
+export async function inspectLabels(type, name, dockerRunner = docker) {
+  const record = await inspectDockerObject(type, name, dockerRunner);
   return type === "container" ? record?.Config?.Labels ?? {} : record?.Labels ?? {};
 }
 
@@ -295,6 +673,375 @@ export async function removeLabeled(type, name, runId, dockerRunner = docker) {
     ? ["container", "rm", "--force", name]
     : [type, "rm", name];
   await dockerRunner(args);
+}
+
+function requiredOwnership(labels) {
+  const runId = labels[RUN_LABEL];
+  const pidText = labels[OWNER_PID_LABEL];
+  const birth = labels[OWNER_BIRTH_LABEL];
+  const scope = labels[OWNER_SCOPE_LABEL];
+  const kind = labels[RESOURCE_KIND_LABEL];
+  if (labels[OWNER_SCHEMA_LABEL] !== OWNER_SCHEMA_VERSION
+    || !/^[0-9a-f]{32}$/u.test(runId ?? "")
+    || !/^[1-9][0-9]*$/u.test(pidText ?? "")
+    || !isValidProcessBirthFingerprint(birth)
+    || !(linuxScopeRegex.test(scope ?? "") || portableScopeRegex.test(scope ?? ""))
+    || !processIdentityEvidenceConsistent(birth, scope)
+    || typeof kind !== "string"
+    || kind.length === 0) {
+    return undefined;
+  }
+  const pid = Number(pidText);
+  if (!Number.isSafeInteger(pid)) return undefined;
+  return { runId, pid, birth, scope, kind };
+}
+
+function labelsMatchOwnership(labels, expected) {
+  return Object.entries(expected).every(([key, value]) => labels[key] === String(value));
+}
+
+export async function removeOwnedResource(
+  type,
+  name,
+  expectedLabels,
+  dockerRunner = docker,
+  dependencies = {},
+) {
+  const delay = dependencies.delay ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  let lastError;
+  for (let attempt = 0; attempt < MAX_DOCKER_REMOVE_ATTEMPTS; attempt += 1) {
+    let labels;
+    try {
+      labels = await inspectLabels(type, name, dockerRunner);
+    } catch (error) {
+      if (isMissingDockerObjectError(error, type, name)) return;
+      throw error;
+    }
+    if (!labelsMatchOwnership(labels, expectedLabels)) {
+      throw new Error(`refusing to remove ${type} with changed PostgreSQL harness ownership`);
+    }
+    const args = type === "container"
+      ? ["container", "rm", "--force", name]
+      : [type, "rm", name];
+    try {
+      await dockerRunner(args);
+      return;
+    } catch (error) {
+      if (isMissingDockerObjectError(error, type, name)) return;
+      lastError = error;
+      if (attempt + 1 < MAX_DOCKER_REMOVE_ATTEMPTS) await delay(100 * (attempt + 1));
+    }
+  }
+  throw lastError ?? new Error(`failed to remove PostgreSQL harness ${type}`);
+}
+
+async function listLabeledResources(dockerRunner = docker) {
+  const listed = [];
+  for (const [type, args] of [
+    ["container", ["container", "ls", "--all", "--format", "{{.Names}}", "--filter", `label=${RUN_LABEL}`]],
+    ["network", ["network", "ls", "--format", "{{.Name}}", "--filter", `label=${RUN_LABEL}`]],
+    ["volume", ["volume", "ls", "--format", "{{.Name}}", "--filter", `label=${RUN_LABEL}`]],
+  ]) {
+    const result = await dockerRunner(args);
+    for (const name of result.stdout.split(/\r?\n/u).map((value) => value.trim()).filter(Boolean)) {
+      listed.push({ type, name });
+    }
+  }
+  return listed;
+}
+
+function shortRunPrefixFromName(name) {
+  return name.match(/^lcm-pg-(?:net-|data-|restore-|runner-)?([0-9a-f]{20})$/u)?.[1];
+}
+
+function harnessDirectoryFromRecord(record) {
+  const mounts = (record?.Mounts ?? []).filter((mount) => mount?.Destination === "/run/lcm-harness");
+  if (mounts.length !== 1) return undefined;
+  const mount = mounts[0];
+  if (mount.Type !== "bind" || mount.RW !== false || typeof mount.Source !== "string") return undefined;
+  try {
+    const resolved = realpathSync(mount.Source);
+    const temporaryRoot = realpathSync(tmpdir());
+    if (dirname(resolved) !== temporaryRoot
+      || !/^lcm-postgresql-harness-[A-Za-z0-9_-]+$/u.test(basename(resolved))) return undefined;
+    return resolved;
+  } catch {
+    return undefined;
+  }
+}
+
+function readConsumerOwner(directory, dependencies = {}) {
+  const openFile = dependencies.open ?? openSync;
+  const inspectFile = dependencies.fstat ?? fstatSync;
+  const readFile = dependencies.read ?? readSync;
+  const closeFile = dependencies.close ?? closeSync;
+  const path = join(directory, consumerOwnerFile);
+  let descriptor;
+  try {
+    try {
+      descriptor = openFile(
+        path,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+    } catch (error) {
+      if (error?.code === "ENOENT") return undefined;
+      throw new Error("PostgreSQL harness consumer identity could not be opened securely", { cause: error });
+    }
+    const status = inspectFile(descriptor);
+    const currentPlatform = dependencies.platform?.() ?? platform();
+    if (!status.isFile()
+      || (currentPlatform !== "win32" && (status.mode & 0o077) !== 0)
+      || status.size > 1024) {
+      throw new Error("invalid PostgreSQL harness consumer identity evidence");
+    }
+    const contents = Buffer.alloc(1025);
+    let offset = 0;
+    while (offset < contents.length) {
+      const bytesRead = readFile(descriptor, contents, offset, contents.length - offset, null);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > 1024) throw new Error("invalid PostgreSQL harness consumer identity evidence");
+    let value;
+    try {
+      value = JSON.parse(contents.subarray(0, offset).toString("utf8"));
+    } catch (error) {
+      throw new Error("invalid PostgreSQL harness consumer identity evidence", { cause: error });
+    }
+    if (value?.version !== 1
+      || !Number.isSafeInteger(value.pid)
+      || value.pid <= 0
+      || !isValidProcessBirthFingerprint(value.birth)
+      || !(linuxScopeRegex.test(value.scope ?? "") || portableScopeRegex.test(value.scope ?? ""))
+      || !processIdentityEvidenceConsistent(value.birth, value.scope)) {
+      throw new Error("invalid PostgreSQL harness consumer identity evidence");
+    }
+    return { pid: value.pid, birth: value.birth, scope: value.scope };
+  } finally {
+    if (descriptor !== undefined) closeFile(descriptor);
+  }
+}
+
+function ownerFromPreviousLinuxBoot(owner, dependencies = {}) {
+  const currentPlatform = dependencies.platform?.() ?? platform();
+  const recordedBootId = owner.birth.match(linuxBirthRegex)?.[1];
+  if (currentPlatform !== "linux" || !recordedBootId) return false;
+  try {
+    const readFile = dependencies.readFile ?? readFileSync;
+    const currentBootId = String(readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+    return bootIdRegex.test(currentBootId) && currentBootId !== recordedBootId;
+  } catch {
+    return false;
+  }
+}
+
+export function classifyOwnerIdentity(owner, dependencies = {}) {
+  const readFingerprint = dependencies.readFingerprint ?? readProcessBirthFingerprint;
+  const readScope = dependencies.readScope ?? readOwnerScopeFingerprint;
+  const processProbe = dependencies.processProbe ?? ((pid) => process.kill(pid, 0));
+  let currentScope;
+  try {
+    currentScope = readScope();
+  } catch {
+    return "ambiguous";
+  }
+  if (currentScope !== owner.scope) {
+    const recordedLinux = owner.scope?.match(linuxScopeRegex);
+    const currentLinux = currentScope.match(linuxScopeRegex);
+    if (recordedLinux && currentLinux
+      && recordedLinux[1] === currentLinux[1]
+      && recordedLinux[2] !== currentLinux[2]) {
+      return "stale";
+    }
+    return "ambiguous";
+  }
+  try {
+    processProbe(owner.pid);
+  } catch (error) {
+    return error?.code === "ESRCH" ? "stale" : "ambiguous";
+  }
+  try {
+    return readFingerprint(owner.pid) === owner.birth ? "live" : "stale";
+  } catch (error) {
+    return error?.code === "ESRCH" ? "stale" : "ambiguous";
+  }
+}
+
+export async function discoverHarnessRuns(dependencies = {}) {
+  const dockerRunner = dependencies.dockerRunner ?? docker;
+  const resources = await listLabeledResources(dockerRunner);
+  const runs = new Map();
+  for (const resource of resources) {
+    let record;
+    try {
+      record = await inspectDockerObject(resource.type, resource.name, dockerRunner);
+    } catch (error) {
+      if (isMissingDockerObjectError(error, resource.type, resource.name)) continue;
+      runs.set(`ambiguous:${resource.type}:${resource.name}`, {
+        classification: "ambiguous",
+        resources: [{
+          ...resource,
+          error,
+          shortRunPrefix: shortRunPrefixFromName(resource.name),
+        }],
+      });
+      continue;
+    }
+    const labels = resource.type === "container" ? record?.Config?.Labels ?? {} : record?.Labels ?? {};
+    const ownership = requiredOwnership(labels);
+    const spec = ownership && resourceSpec(resource.type, resource.name, ownership.runId);
+    if (!ownership || !spec || spec.kind !== ownership.kind) {
+      const labeledRunId = /^[0-9a-f]{32}$/u.test(labels[RUN_LABEL] ?? "")
+        ? labels[RUN_LABEL]
+        : undefined;
+      const key = ownership?.runId ?? labeledRunId ?? `ambiguous:${resource.type}:${resource.name}`;
+      const run = runs.get(key) ?? {
+        runId: ownership?.runId ?? labeledRunId,
+        owner: ownership ? { pid: ownership.pid, birth: ownership.birth, scope: ownership.scope } : undefined,
+        classification: "ambiguous",
+        resources: [],
+      };
+      run.classification = "ambiguous";
+      run.resources.push({
+        ...resource,
+        labels,
+        shortRunPrefix: shortRunPrefixFromName(resource.name),
+      });
+      runs.set(key, run);
+      continue;
+    }
+    const expectedLabels = ownershipLabels(
+      ownership.runId,
+      ownership.kind,
+      { pid: ownership.pid, birth: ownership.birth, scope: ownership.scope },
+    );
+    const run = runs.get(ownership.runId) ?? {
+      runId: ownership.runId,
+      owner: { pid: ownership.pid, birth: ownership.birth, scope: ownership.scope },
+      classification: undefined,
+      resources: [],
+    };
+    if (!run.owner
+      || run.owner.pid !== ownership.pid
+      || run.owner.birth !== ownership.birth
+      || run.owner.scope !== ownership.scope) {
+      run.classification = "ambiguous";
+    }
+    if (resource.type === "container" && typeof record?.State?.Running !== "boolean") {
+      run.classification = "ambiguous";
+    }
+    const harnessDirectory = ownership.kind === "database"
+      ? (dependencies.resolveHarnessDirectory?.(record) ?? harnessDirectoryFromRecord(record))
+      : undefined;
+    const resourceEntry = {
+      ...resource,
+      kind: ownership.kind,
+      labels: expectedLabels,
+      harnessDirectory,
+      ...(resource.type === "container" ? { running: record?.State?.Running } : {}),
+    };
+    run.resources.push(resourceEntry);
+    runs.set(ownership.runId, run);
+  }
+  const runIdsByPrefix = new Map();
+  for (const run of runs.values()) {
+    if (!/^[0-9a-f]{32}$/u.test(run.runId ?? "")) continue;
+    const prefix = run.runId.slice(0, 20);
+    const runIds = runIdsByPrefix.get(prefix) ?? new Set();
+    runIds.add(run.runId);
+    runIdsByPrefix.set(prefix, runIds);
+  }
+  for (const runIds of runIdsByPrefix.values()) {
+    if (runIds.size < 2) continue;
+    for (const runId of runIds) {
+      const run = runs.get(runId);
+      if (run) run.classification = "ambiguous";
+    }
+  }
+  const ambiguousPrefixes = [...runs.values()]
+    .filter((run) => run.classification === "ambiguous")
+    .flatMap((run) => run.resources.map((resource) => resource.shortRunPrefix).filter(Boolean));
+  for (const run of runs.values()) {
+    if (run.runId && ambiguousPrefixes.some((prefix) => run.runId.startsWith(prefix))) {
+      run.classification = "ambiguous";
+    }
+  }
+  for (const run of runs.values()) {
+    if (run.classification !== "ambiguous") {
+      run.classification = classifyOwnerIdentity(run.owner, dependencies);
+      if (run.classification === "stale") {
+        const activeWorker = run.resources.some(
+          (resource) => (resource.kind === "runner" || resource.kind === "restore") && resource.running,
+        );
+        if (activeWorker) {
+          run.classification = "live";
+          continue;
+        }
+        const database = run.resources.find((resource) => resource.kind === "database");
+        if (database) {
+          if (!database.harnessDirectory) {
+            run.classification = !database.running && ownerFromPreviousLinuxBoot(run.owner, dependencies)
+              ? "stale"
+              : "ambiguous";
+            continue;
+          }
+          try {
+            const consumer = readConsumerOwner(database.harnessDirectory, dependencies);
+            if (consumer) run.classification = classifyOwnerIdentity(consumer, dependencies);
+          } catch {
+            run.classification = "ambiguous";
+          }
+        }
+      }
+    }
+  }
+  return [...runs.values()];
+}
+
+export async function reclaimProvenOrphans(dependencies = {}) {
+  const dockerRunner = dependencies.dockerRunner ?? docker;
+  const runs = await discoverHarnessRuns({ ...dependencies, dockerRunner });
+  const failures = [];
+  const ambiguousCount = runs.filter((run) => run.classification === "ambiguous").length;
+  if (ambiguousCount > 0) {
+    const stderr = dependencies.stderr ?? process.stderr;
+    stderr.write(
+      `PostgreSQL harness preserved ${ambiguousCount} ambiguous labeled Docker run${ambiguousCount === 1 ? "" : "s"}; manual reconciliation required.\n`,
+    );
+  }
+  for (const run of runs) {
+    if (run.classification !== "stale") continue;
+    const byKind = new Map(run.resources.map((resource) => [resource.kind, resource]));
+    const database = byKind.get("database");
+    if (database?.running) {
+      try {
+        await (dependencies.verifySentinel
+          ? dependencies.verifySentinel(createRunNames(run.runId), run.runId, dockerRunner)
+          : waitForContainerSentinel(createRunNames(run.runId), run.runId, dockerRunner));
+      } catch (error) {
+        failures.push(error);
+        continue;
+      }
+    }
+    for (const kind of ["restore", "runner", "database", "data", "network"]) {
+      const resource = byKind.get(kind);
+      if (!resource) continue;
+      try {
+        await removeOwnedResource(
+          resource.type,
+          resource.name,
+          resource.labels,
+          dockerRunner,
+          dependencies,
+        );
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+  }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, "PostgreSQL harness orphan recovery failed");
+  return runs;
 }
 
 async function waitForPostgreSql(container, database, dockerRunner = docker, username = "lcm_harness_admin") {
@@ -359,10 +1106,21 @@ export function harnessErrorDetails(error) {
   return String(error?.stderr ?? error?.message ?? error);
 }
 
+function sanitizedHarnessErrorDetails(error, secrets) {
+  const sanitized = sanitizeHarnessText(harnessErrorDetails(error), secrets);
+  return Buffer.byteLength(sanitized) <= MAX_CAPTURED_OUTPUT_BYTES
+    ? sanitized
+    : "PostgreSQL harness diagnostic exceeded the safe capture limit";
+}
+
 export async function cleanupHarnessResources(context, dependencies = {}) {
-  const { names, runId, directory, sentinelReady } = context;
+  const { names, runId, directory, sentinelReady, owner } = context;
   const removeResource = dependencies.removeResource
-    ?? ((type, name) => removeLabeled(type, name, runId));
+    ?? ((type, name) => {
+      const spec = resourceSpec(type, name, runId);
+      if (!owner || !spec) return removeLabeled(type, name, runId);
+      return removeOwnedResource(type, name, ownershipLabels(runId, spec.kind, owner));
+    });
   const verifySentinel = dependencies.verifySentinel
     ?? (() => verifyContainerSentinel(names, runId));
   const removeDirectory = dependencies.removeDirectory
@@ -395,17 +1153,63 @@ export async function cleanupHarnessResources(context, dependencies = {}) {
   }
 }
 
-async function runTests(context, ci, setupDocker = docker) {
+async function runTests(context, ci, setupDocker = docker, testProcess = runProcess) {
   const env = { ...process.env, ...context.environment };
+  delete env.LCM_TEST_POSTGRES_FORK_PROBE;
+  delete env.LCM_TEST_POSTGRES_FORK_WORKER_PID_FILE;
   const secrets = context.secrets ?? [];
   for (const key of Object.keys(env)) {
     if (key.startsWith("PG") || key === "LCM_POSTGRES_URL" || key === "LCM_POSTGRES_CA_FILE") delete env[key];
   }
   if (!ci) {
-    return runSanitizedProcess(process.execPath, [
-      join(repositoryRoot, "node_modules", "vitest", "vitest.mjs"),
-      "run", "--config", join(repositoryRoot, "vitest.postgresql.config.ts"),
-    ], { cwd: repositoryRoot, env, secrets });
+    const consumerPath = join(context.directory, consumerOwnerFile);
+    const workerPidPath = join(context.directory, "fork-worker.pid");
+    if (context.forkConsumerProbe) {
+      env.LCM_TEST_POSTGRES_FORK_PROBE = "true";
+      env.LCM_TEST_POSTGRES_FORK_WORKER_PID_FILE = workerPidPath;
+    }
+    const testArguments = context.consumerProbe
+      ? ["-e", "setInterval(() => undefined, 1_000)"]
+      : [
+        join(repositoryRoot, "node_modules", "vitest", "vitest.mjs"),
+        "run", "--config", join(repositoryRoot, "vitest.postgresql.config.ts"),
+      ];
+    try {
+      recordAmbiguousConsumerIdentity(consumerPath);
+      return await runSanitizedProcess(process.execPath, testArguments, {
+        cwd: repositoryRoot,
+        env,
+        secrets,
+        processRunner: testProcess,
+        terminateOnStop: true,
+        terminateProcessTree: true,
+        onSpawn: (child) => {
+          recordConsumerIdentity(consumerPath, child.pid);
+          if (context.forkConsumerProbe) {
+            const readiness = setInterval(() => {
+              try {
+                const workerPid = String(readFileSync(workerPidPath, "utf8")).trim();
+                if (!/^[1-9][0-9]*$/u.test(workerPid)) return;
+                clearInterval(readiness);
+                process.stderr.write(`PostgreSQL harness fork consumer probe ready: ${context.runId}\n`);
+              } catch (error) {
+                if (error?.code !== "ENOENT") clearInterval(readiness);
+              }
+            }, 25);
+            readiness.unref?.();
+            child.once("close", () => clearInterval(readiness));
+          } else if (context.consumerProbe) {
+            process.stderr.write(`PostgreSQL harness consumer probe ready: ${context.runId}\n`);
+          }
+        },
+      });
+    } finally {
+      try {
+        unlinkSync(consumerPath);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
   }
 
   await runSanitizedProcess(process.execPath, [
@@ -420,7 +1224,7 @@ async function runTests(context, ci, setupDocker = docker) {
   }).map(([key, value]) => `${key}=${value}`).join("\n") + "\n", { mode: 0o600 });
   await setupDocker([
     "create", "--name", context.names.runner,
-    "--label", `${RUN_LABEL}=${context.runId}`,
+    ...dockerLabelArgs(ownershipLabels(context.runId, "runner", context.owner)),
     "--network", context.names.network,
     "--env-file", envFile,
     "--volume", `${repositoryRoot}:/workspace:ro`,
@@ -439,6 +1243,14 @@ async function runTests(context, ci, setupDocker = docker) {
 
 export async function runHarness(options = {}) {
   const ci = options.ci ?? process.env.GITHUB_ACTIONS === "true";
+  let owner;
+  try {
+    await reclaimProvenOrphans();
+    owner = createOwnerIdentity();
+  } catch (error) {
+    process.stderr.write(`PostgreSQL harness startup failed: ${sanitizedHarnessErrorDetails(error, [])}\n`);
+    throw error;
+  }
   const runId = randomBytes(16).toString("hex");
   const names = createRunNames(runId);
   const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-harness-"));
@@ -456,9 +1268,9 @@ export async function runHarness(options = {}) {
   let cleanupPromise;
   let sentinelReady = false;
   const cleanup = () => {
-    cleanupPromise ??= cleanupHarnessResources({ names, runId, directory, sentinelReady })
+    cleanupPromise ??= cleanupHarnessResources({ names, runId, directory, sentinelReady, owner })
       .catch((error) => {
-        const details = sanitizeHarnessText(harnessErrorDetails(error), secrets);
+        const details = sanitizedHarnessErrorDetails(error, secrets);
         process.stderr.write(`PostgreSQL harness cleanup failed: ${details}\n`);
         throw error;
       });
@@ -477,6 +1289,7 @@ export async function runHarness(options = {}) {
   const removeSignalHandlers = () => {
     process.removeListener("SIGINT", onSigint);
     process.removeListener("SIGTERM", onSigterm);
+    process.removeListener("SIGHUP", onSighup);
   };
   const onSignal = (signal) => {
     exitSignal ??= signal;
@@ -484,13 +1297,15 @@ export async function runHarness(options = {}) {
       .catch(() => undefined)
       .then(() => {
         removeSignalHandlers();
-        process.exit(exitSignal === "SIGINT" ? 130 : 143);
+        process.exit(exitSignal === "SIGINT" ? 130 : exitSignal === "SIGHUP" ? 129 : 143);
       });
   };
   const onSigint = () => onSignal("SIGINT");
   const onSigterm = () => onSignal("SIGTERM");
+  const onSighup = () => onSignal("SIGHUP");
   process.on("SIGINT", onSigint);
   process.on("SIGTERM", onSigterm);
+  process.on("SIGHUP", onSighup);
 
   try {
     writeFileSync(join(directory, "run-id"), `${runId}\n`, { mode: 0o600 });
@@ -499,8 +1314,16 @@ export async function runHarness(options = {}) {
     writeFileSync(join(directory, "migrator-password"), `${passwords.migrator}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "runtime-password"), `${passwords.runtime}\n`, { mode: 0o600 });
     await writeTlsFixtures(directory, names.alias, setupProcess);
-    await setupDocker(["network", "create", "--label", `${RUN_LABEL}=${runId}`, names.network]);
-    await setupDocker(["volume", "create", "--label", `${RUN_LABEL}=${runId}`, names.volume]);
+    await setupDocker([
+      "network", "create",
+      ...dockerLabelArgs(ownershipLabels(runId, "network", owner)),
+      names.network,
+    ]);
+    await setupDocker([
+      "volume", "create",
+      ...dockerLabelArgs(ownershipLabels(runId, "data", owner)),
+      names.volume,
+    ]);
     const configuredTemplateArchive = String(process.env.LCM_POSTGRES_TEMPLATE_ARCHIVE ?? "").trim();
     const templateArchive = resolveConfiguredTemplateArchive(configuredTemplateArchive);
     const usingCachedTemplate = templateArchive.length > 0;
@@ -508,7 +1331,7 @@ export async function runHarness(options = {}) {
       await validatePostgreSqlTemplateArchive(templateArchive);
       await setupDocker([
         "create", "--name", names.restore,
-        "--label", `${RUN_LABEL}=${runId}`,
+        ...dockerLabelArgs(ownershipLabels(runId, "restore", owner)),
         "--network", "none",
         "--volume", `${names.volume}:/target`,
         "--volume", `${templateArchive}:/cache/postgresql-template.tar:ro`,
@@ -518,12 +1341,17 @@ export async function runHarness(options = {}) {
         "tar --extract --file /cache/postgresql-template.tar --directory /target; chown -R postgres:postgres /target",
       ]);
       await setupDocker(["start", "--attach", names.restore]);
-      await removeLabeled("container", names.restore, runId, setupDocker);
+      await removeOwnedResource(
+        "container",
+        names.restore,
+        ownershipLabels(runId, "restore", owner),
+        setupDocker,
+      );
     }
     const publish = ci ? [] : ["--publish", "127.0.0.1::5432"];
     const containerArgs = [
       "create", "--name", names.container,
-      "--label", `${RUN_LABEL}=${runId}`,
+      ...dockerLabelArgs(ownershipLabels(runId, "database", owner)),
       "--network", names.network,
       "--network-alias", names.alias,
       "--network-alias", names.wrongAlias,
@@ -581,13 +1409,28 @@ export async function runHarness(options = {}) {
     };
     try {
       if (options.runTests) await options.runTests({ runId, names, directory, environment }, ci);
-      else await runTests({ runId, names, directory, environment, secrets }, ci, setupDocker);
+      else await runTests(
+        {
+          runId,
+          names,
+          directory,
+          environment,
+          secrets,
+          owner,
+          consumerProbe: options.consumerProbe,
+          forkConsumerProbe: options.forkConsumerProbe,
+        },
+        // A fork probe uses the normal Vitest command with a fixture-only config include.
+        ci,
+        setupDocker,
+        setupProcess,
+      );
     } catch (error) {
       const logs = await docker(["logs", names.container]).catch(() => ({ stdout: "", stderr: "" }));
       throw Object.assign(error, { stderr: `${error?.stderr ?? ""}\n${logs.stdout}\n${logs.stderr}` });
     }
   } catch (error) {
-    const details = sanitizeHarnessText(harnessErrorDetails(error), secrets);
+    const details = sanitizedHarnessErrorDetails(error, secrets);
     process.stderr.write(`PostgreSQL harness failed: ${details}\n`);
     throw error;
   } finally {
@@ -601,10 +1444,16 @@ export async function runHarness(options = {}) {
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const signalProbe = process.argv.includes("--signal-probe");
+  const consumerProbe = process.argv.includes("--consumer-signal-probe");
+  const forkConsumerProbe = process.argv.includes("--fork-consumer-signal-probe");
   runHarness(signalProbe ? {
     runTests: async ({ runId }) => {
       process.stderr.write(`PostgreSQL harness signal probe ready: ${runId}\n`);
       await new Promise(() => { setInterval(() => undefined, 1_000); });
     },
-  } : {}).catch(() => { process.exitCode = 1; });
+  } : {
+    consumerProbe,
+    forkConsumerProbe,
+    ci: consumerProbe || forkConsumerProbe ? false : undefined,
+  }).catch(() => { process.exitCode = 1; });
 }

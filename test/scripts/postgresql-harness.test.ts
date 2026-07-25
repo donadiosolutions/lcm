@@ -3,15 +3,34 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
   MAX_CAPTURED_OUTPUT_BYTES,
+  MAX_DOCKER_REMOVE_ATTEMPTS,
   NODE_IMAGE,
+  OWNER_BIRTH_LABEL,
+  OWNER_PID_LABEL,
+  OWNER_SCOPE_LABEL,
+  OWNER_SCHEMA_LABEL,
+  OWNER_SCHEMA_VERSION,
   POSTGRES_IMAGE,
+  RESOURCE_KIND_LABEL,
   RUN_LABEL,
+  classifyOwnerIdentity,
   cleanupHarnessResources,
+  createOwnerIdentity,
   createProcessLifecycle,
   createRunNames,
+  discoverHarnessRuns,
   harnessErrorDetails,
+  isValidProcessBirthFingerprint,
   isMissingDockerObjectError,
+  ownershipLabels,
+  processIdentityEvidenceConsistent,
+  readProcessBirthFingerprint,
+  readOwnerScopeFingerprint,
+  recordAmbiguousConsumerIdentity,
+  recordConsumerIdentity,
+  reclaimProvenOrphans,
   removeLabeled,
+  removeOwnedResource,
   resolveConfiguredTemplateArchive,
   runProcess,
   runSanitizedProcess,
@@ -20,11 +39,178 @@ import {
 } from "../../scripts/postgresql-harness.mjs";
 import { postgresqlVitestCacheDir } from "../../vitest.postgresql.config.js";
 
+const testBootId = "12345678-1234-1234-1234-123456789abc";
+const testOwnerScope = `linux:${"a".repeat(64)}:${testBootId}:pid:[4026531836]`;
+
 describe("PostgreSQL harness utilities", () => {
   it("uses exact digest-pinned images and a namespaced label", () => {
     expect(POSTGRES_IMAGE).toMatch(/^postgres:18\.4-bookworm@sha256:[0-9a-f]{64}$/u);
     expect(NODE_IMAGE).toMatch(/^node:22\.20\.0-bookworm-slim@sha256:[0-9a-f]{64}$/u);
     expect(RUN_LABEL).toBe("com.donadiosolutions.lcm.postgresql-test-run");
+    expect(OWNER_SCHEMA_VERSION).toBe("2");
+    expect(new Set([
+      RUN_LABEL,
+      OWNER_SCHEMA_LABEL,
+      OWNER_PID_LABEL,
+      OWNER_BIRTH_LABEL,
+      OWNER_SCOPE_LABEL,
+      RESOURCE_KIND_LABEL,
+    ]).size).toBe(6);
+  });
+
+  it("derives an owner birth fingerprint from boot ID and the Linux process start field", () => {
+    const bootId = "12345678-1234-1234-1234-123456789abc";
+    const statFields = ["S", ...Array.from({ length: 18 }, () => "0"), "98765", "0"];
+    const readFile = vi.fn((path: string) => {
+      if (path.endsWith("machine-id")) return `${"f".repeat(32)}\n`;
+      return path.endsWith("boot_id")
+        ? `${bootId}\n`
+        : `42 (worker with ) parenthesis) ${statFields.join(" ")}\n`;
+    });
+
+    expect(readProcessBirthFingerprint(42, { readFile })).toBe(`linux:${bootId}:98765`);
+    expect(createOwnerIdentity(42, {
+      readFile,
+      readLink: () => "pid:[4026531836]",
+    })).toEqual({
+      pid: 42,
+      birth: `linux:${bootId}:98765`,
+      scope: expect.stringMatching(
+        new RegExp(`^linux:[0-9a-f]{64}:${bootId}:pid:\\[4026531836\\]$`, "u"),
+      ),
+    });
+    expect(() => readProcessBirthFingerprint(0, { readFile })).toThrow("owner PID");
+    expect(() => readProcessBirthFingerprint(42, { readFile: () => "unsupported" }))
+      .toThrow("unsupported");
+    const darwinExec = vi.fn(() => "Fri Jul 24 21:00:00 2026\n");
+    expect(readProcessBirthFingerprint(42, {
+      platform: () => "darwin",
+      execFile: darwinExec,
+    })).toBe("darwin:Fri Jul 24 21:00:00 2026");
+    expect(darwinExec).toHaveBeenCalledWith(
+      "ps",
+      ["-o", "lstart=", "-p", "42"],
+      expect.objectContaining({
+        env: expect.objectContaining({ LANG: "C", LC_ALL: "C", TZ: "UTC" }),
+      }),
+    );
+    expect(readProcessBirthFingerprint(42, {
+      platform: () => "win32",
+      execFile: vi.fn(() => "2026-07-25T00:00:00.0000000Z\n"),
+    })).toBe("win32:2026-07-25T00:00:00.0000000Z");
+    expect(() => readProcessBirthFingerprint(42, {
+      readFile: (path: string) => {
+        throw Object.assign(new Error(path), { code: "ENOENT" });
+      },
+    })).toThrow("boot identity");
+  });
+
+  it("classifies only matching process identity as live and fails closed on ambiguous evidence", () => {
+    const owner = { pid: 42, birth: "boot:100", scope: testOwnerScope };
+    const processProbe = vi.fn();
+    const readScope = () => testOwnerScope;
+    expect(classifyOwnerIdentity(owner, { processProbe, readFingerprint: () => "boot:100", readScope })).toBe("live");
+    expect(classifyOwnerIdentity(owner, { processProbe, readFingerprint: () => "boot:200", readScope })).toBe("stale");
+    expect(classifyOwnerIdentity(owner, {
+      processProbe,
+      readFingerprint: () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); },
+      readScope,
+    })).toBe("ambiguous");
+    expect(classifyOwnerIdentity(owner, {
+      processProbe,
+      readFingerprint: () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); },
+      readScope,
+    })).toBe("ambiguous");
+    expect(classifyOwnerIdentity(owner, {
+      processProbe: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+      readFingerprint: vi.fn(),
+      readScope,
+    })).toBe("stale");
+    expect(classifyOwnerIdentity(owner, {
+      processProbe,
+      readFingerprint: vi.fn(),
+      readScope: () => `linux:${"b".repeat(64)}:${testBootId}:pid:[4026531836]`,
+    })).toBe("ambiguous");
+    expect(classifyOwnerIdentity(owner, {
+      processProbe,
+      readFingerprint: vi.fn(),
+      readScope: () => `linux:${"a".repeat(64)}:${testBootId}:pid:[4026532000]`,
+    })).toBe("ambiguous");
+    expect(classifyOwnerIdentity(owner, {
+      processProbe,
+      readFingerprint: vi.fn(),
+      readScope: () => `linux:${"a".repeat(64)}:abcdefab-1234-1234-1234-123456789abc:pid:[4026532000]`,
+    })).toBe("stale");
+  });
+
+  it("binds Linux ownership to the machine, boot, and PID namespace", () => {
+    expect(readOwnerScopeFingerprint({
+      platform: () => "linux",
+      readFile: (path: string) => path.endsWith("machine-id") ? "f".repeat(32) : testBootId,
+      readLink: () => "pid:[4026531836]",
+    })).toMatch(new RegExp(
+      `^linux:[0-9a-f]{64}:${testBootId}:pid:\\[4026531836\\]$`,
+      "u",
+    ));
+    expect(() => readOwnerScopeFingerprint({
+      platform: () => "freebsd",
+      execFile: vi.fn(),
+    })).toThrow("unsupported PostgreSQL harness process scope platform");
+  });
+
+  it("records explicit ambiguous consumer evidence when birth identity is unavailable", () => {
+    const writeFile = vi.fn();
+    const record = recordConsumerIdentity("/private/consumer-owner.json", 42, {
+      createIdentity: () => { throw new Error("unsupported"); },
+      writeFile,
+    });
+    expect(record).toEqual({ version: 1, ambiguous: true });
+    expect(writeFile).toHaveBeenCalledWith(
+      "/private/consumer-owner.json",
+      `${JSON.stringify(record)}\n`,
+      { mode: 0o600 },
+    );
+
+    expect(recordConsumerIdentity("/private/consumer-owner.json", 42, {
+      createIdentity: () => ({
+        pid: 42,
+        birth: "darwin:Fri Jul 24 21:00:00 2026",
+        scope: `darwin:${"a".repeat(64)}`,
+      }),
+      writeFile: vi.fn(),
+    })).toEqual({
+      version: 1,
+      pid: 42,
+      birth: "darwin:Fri Jul 24 21:00:00 2026",
+      scope: `darwin:${"a".repeat(64)}`,
+    });
+
+    expect(recordAmbiguousConsumerIdentity("/private/consumer-owner.json", {
+      writeFile,
+    })).toEqual({ version: 1, ambiguous: true });
+  });
+
+  it("rejects calendar-impossible process birth fingerprints", () => {
+    expect(isValidProcessBirthFingerprint(
+      "linux:12345678-1234-1234-1234-123456789abc:1",
+    )).toBe(true);
+    expect(isValidProcessBirthFingerprint("darwin:Fri Jul 24 21:00:00 2026")).toBe(true);
+    expect(isValidProcessBirthFingerprint("win32:2024-02-29T00:00:00.0000000Z")).toBe(true);
+    expect(isValidProcessBirthFingerprint("darwin:Thu Jul 24 21:00:00 2026")).toBe(false);
+    expect(isValidProcessBirthFingerprint("win32:2026-02-31T00:00:00.0000000Z")).toBe(false);
+    expect(isValidProcessBirthFingerprint("win32:2026-02-28T24:00:00.0000000Z")).toBe(false);
+    expect(processIdentityEvidenceConsistent(
+      `linux:${testBootId}:1`,
+      testOwnerScope,
+    )).toBe(true);
+    expect(processIdentityEvidenceConsistent(
+      "linux:abcdefab-1234-1234-1234-123456789abc:1",
+      testOwnerScope,
+    )).toBe(false);
+    expect(processIdentityEvidenceConsistent(
+      "darwin:Fri Jul 24 21:00:00 2026",
+      testOwnerScope,
+    )).toBe(false);
   });
 
   it("derives and validates every resource name from a random-style run ID", () => {
@@ -142,6 +328,7 @@ describe("PostgreSQL harness utilities", () => {
     });
     expect(spawnProcess).toHaveBeenCalledWith("docker", ["inspect", "owned"], {
       cwd: undefined,
+      detached: false,
       env: undefined,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -162,9 +349,23 @@ describe("PostgreSQL harness utilities", () => {
     await expect(operation).resolves.toMatchObject({ stdout: "", stderr: "" });
     expect(spawnProcess).toHaveBeenCalledWith("docker", ["start", "--attach", "owned"], {
       cwd: undefined,
+      detached: false,
       env: undefined,
       stdio: ["ignore", "pipe", "pipe"],
     });
+  });
+
+  it("preserves an onSpawn failure when best-effort child termination also fails", async () => {
+    const onSpawnFailure = new Error("consumer registration failed");
+    const child = {
+      kill: vi.fn(() => { throw Object.assign(new Error("already exited"), { code: "ESRCH" }); }),
+    };
+
+    await expect(runProcess("node", ["vitest"], {
+      spawnProcess: () => child,
+      onSpawn: () => { throw onSpawnFailure; },
+    })).rejects.toBe(onSpawnFailure);
+    expect(child.kill).toHaveBeenCalledOnce();
   });
 
   it("bounds stream tails and settles only once across error, close, and kill paths", async () => {
@@ -333,6 +534,87 @@ describe("PostgreSQL harness utilities", () => {
       .rejects.toThrow("setup is stopping");
   });
 
+  it("terminates a tracked test consumer before waiting for setup quiescence", async () => {
+    let finish!: () => void;
+    const child = {
+      kill: vi.fn((signal: string) => {
+        expect(signal).toBe("SIGTERM");
+        finish();
+        return true;
+      }),
+    };
+    const lifecycle = createProcessLifecycle((_command, _args, options) => {
+      options.onSpawn(child);
+      return new Promise<void>((resolve) => { finish = resolve; });
+    });
+    const consumer = lifecycle.run("node", ["vitest"], { terminateOnStop: true });
+
+    await expect(lifecycle.stop()).resolves.toBeUndefined();
+    await expect(consumer).resolves.toBeUndefined();
+    expect(child.kill).toHaveBeenCalledOnce();
+  });
+
+  it("terminates the complete detached consumer process group", async () => {
+    let finish!: () => void;
+    const child = { pid: 321, kill: vi.fn() };
+    const signalProcess = vi.fn((pid: number, signal: string) => {
+      expect(pid).toBe(-321);
+      expect(signal).toBe("SIGTERM");
+      finish();
+    });
+    const lifecycle = createProcessLifecycle((_command, _args, options) => {
+      expect(options.detached).toBe(true);
+      options.onSpawn(child);
+      return new Promise<void>((resolve) => { finish = resolve; });
+    }, {
+      platform: () => "linux",
+      signalProcess,
+      processTreeAlive: () => false,
+    });
+    const consumer = lifecycle.run("node", ["vitest"], {
+      terminateOnStop: true,
+      terminateProcessTree: true,
+    });
+
+    await expect(lifecycle.stop()).resolves.toBeUndefined();
+    await expect(consumer).resolves.toBeUndefined();
+    expect(signalProcess).toHaveBeenCalledWith(-321, "SIGTERM");
+    expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it("retains process-group escalation after the leader settles", async () => {
+    let finish!: () => void;
+    const child = { pid: 654, kill: vi.fn() };
+    const signals: Array<number | string> = [];
+    const signalProcess = vi.fn((_pid: number, signal: number | string) => {
+      signals.push(signal);
+      if (signal === "SIGTERM") finish();
+    });
+    const processTreeAlive = vi.fn()
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(false);
+    const lifecycle = createProcessLifecycle((_command, _args, options) => {
+      options.onSpawn(child);
+      return new Promise<void>((resolve) => { finish = resolve; });
+    }, {
+      platform: () => "linux",
+      signalProcess,
+      processTreeAlive,
+      delay: vi.fn().mockResolvedValue(undefined),
+      treeGraceAttempts: 1,
+      treeKillAttempts: 1,
+    });
+    const consumer = lifecycle.run("node", ["vitest"], {
+      terminateOnStop: true,
+      terminateProcessTree: true,
+    });
+
+    await expect(lifecycle.stop()).resolves.toBeUndefined();
+    await expect(consumer).resolves.toBeUndefined();
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
   it.each([
     ["container", "Error response from daemon: No such container: owned-resource"],
     ["network", "Error response from daemon: network owned-resource not found"],
@@ -394,6 +676,512 @@ describe("PostgreSQL harness utilities", () => {
     const unlabeledRunner = vi.fn().mockResolvedValue({ stdout: JSON.stringify([{ Config: { Labels: {} } }]), stderr: "" });
     await expect(removeLabeled("container", "owned-resource", runId, unlabeledRunner))
       .rejects.toThrow("refusing to remove unlabeled container");
+  });
+
+  it("reinspects exact owner labels before every bounded removal attempt", async () => {
+    const runId = "a".repeat(32);
+    const owner = {
+      pid: 42,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:100",
+      scope: testOwnerScope,
+    };
+    const labels = ownershipLabels(runId, "database", owner);
+    const removalFailure = Object.assign(new Error("resource busy"), {
+      code: 1,
+      stdout: "",
+      stderr: "Error response from daemon: resource busy",
+    });
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "inspect") {
+        return { stdout: JSON.stringify([{ Config: { Labels: labels } }]), stderr: "" };
+      }
+      throw removalFailure;
+    });
+    const delay = vi.fn();
+
+    await expect(removeOwnedResource(
+      "container",
+      createRunNames(runId).container,
+      labels,
+      dockerRunner,
+      { delay },
+    )).rejects.toBe(removalFailure);
+    expect(dockerRunner).toHaveBeenCalledTimes(MAX_DOCKER_REMOVE_ATTEMPTS * 2);
+    expect(delay).toHaveBeenCalledTimes(MAX_DOCKER_REMOVE_ATTEMPTS - 1);
+
+    const changed = { ...labels, [OWNER_PID_LABEL]: "43" };
+    const changedRunner = vi.fn()
+      .mockResolvedValueOnce({ stdout: JSON.stringify([{ Config: { Labels: labels } }]), stderr: "" })
+      .mockRejectedValueOnce(removalFailure)
+      .mockResolvedValueOnce({ stdout: JSON.stringify([{ Config: { Labels: changed } }]), stderr: "" });
+    await expect(removeOwnedResource(
+      "container",
+      createRunNames(runId).container,
+      labels,
+      changedRunner,
+      { delay: vi.fn() },
+    )).rejects.toThrow("changed PostgreSQL harness ownership");
+    expect(changedRunner).toHaveBeenCalledTimes(3);
+  });
+
+  it("discovers live and stale exact runs while preserving malformed or inconsistent labels", async () => {
+    const liveRunId = "a".repeat(32);
+    const staleRunId = "b".repeat(32);
+    const legacyRunId = "c".repeat(32);
+    const bootId = "12345678-1234-1234-1234-123456789abc";
+    const records = new Map([
+      [`network:${createRunNames(liveRunId).network}`, ownershipLabels(
+        liveRunId,
+        "network",
+        { pid: 41, birth: `linux:${bootId}:100`, scope: testOwnerScope },
+      )],
+      [`volume:${createRunNames(staleRunId).volume}`, ownershipLabels(
+        staleRunId,
+        "data",
+        { pid: 42, birth: `linux:${bootId}:200`, scope: testOwnerScope },
+      )],
+      [`volume:${createRunNames(legacyRunId).volume}`, {
+        ...ownershipLabels(legacyRunId, "data", {
+          pid: 43,
+          birth: `linux:${bootId}:400`,
+          scope: testOwnerScope,
+        }),
+        [OWNER_BIRTH_LABEL]: "malformed",
+      }],
+    ]);
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        const names = [...records.keys()]
+          .filter((key) => key.startsWith(`${type}:`))
+          .map((key) => key.slice(type.length + 1));
+        return { stdout: names.join("\n"), stderr: "" };
+      }
+      const type = args[0];
+      const labels = records.get(`${type}:${args[2]}`) ?? {};
+      return {
+        stdout: JSON.stringify([type === "container" ? { Config: { Labels: labels } } : { Labels: labels }]),
+        stderr: "",
+      };
+    });
+
+    const runs = await discoverHarnessRuns({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: (pid: number) => pid === 41 ? `linux:${bootId}:100` : `linux:${bootId}:999`,
+      readScope: () => testOwnerScope,
+    });
+    expect(runs.map((run) => [run.runId, run.classification])).toEqual([
+      [liveRunId, "live"],
+      [staleRunId, "stale"],
+      [legacyRunId, "ambiguous"],
+    ]);
+
+    records.set(
+      `container:${createRunNames(liveRunId).runner}`,
+      ownershipLabels(liveRunId, "runner", {
+        pid: 99,
+        birth: `linux:${bootId}:300`,
+        scope: testOwnerScope,
+      }),
+    );
+    const inconsistent = await discoverHarnessRuns({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `linux:${bootId}:100`,
+      readScope: () => testOwnerScope,
+    });
+    expect(inconsistent.find((run) => run.runId === liveRunId)?.classification).toBe("ambiguous");
+
+    const conflictingRunA = `${"1".repeat(20)}${"a".repeat(12)}`;
+    const conflictingRunB = `${"1".repeat(20)}${"b".repeat(12)}`;
+    records.clear();
+    records.set(
+      `network:${createRunNames(conflictingRunA).network}`,
+      ownershipLabels(conflictingRunA, "network", {
+        pid: 51,
+        birth: `linux:${bootId}:500`,
+        scope: testOwnerScope,
+      }),
+    );
+    records.set(
+      `volume:${createRunNames(conflictingRunB).volume}`,
+      ownershipLabels(conflictingRunB, "data", {
+        pid: 52,
+        birth: `linux:${bootId}:600`,
+        scope: testOwnerScope,
+      }),
+    );
+    const conflicting = await discoverHarnessRuns({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: (pid: number) => `linux:${bootId}:${pid === 51 ? 500 : 999}`,
+      readScope: () => testOwnerScope,
+    });
+    expect(conflicting.map((run) => [run.runId, run.classification])).toEqual([
+      [conflictingRunA, "ambiguous"],
+      [conflictingRunB, "ambiguous"],
+    ]);
+  });
+
+  it("reclaims only a definitively stale, consistently labeled run in teardown order", async () => {
+    const runId = "d".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 77,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:700",
+      scope: testOwnerScope,
+    };
+    const records = new Map([
+      [`container:${names.restore}`, ownershipLabels(runId, "restore", owner)],
+      [`container:${names.runner}`, ownershipLabels(runId, "runner", owner)],
+      [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+      [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
+    ]);
+    const removals: string[] = [];
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        return {
+          stdout: [...records.keys()]
+            .filter((key) => key.startsWith(`${type}:`))
+            .map((key) => key.slice(type.length + 1))
+            .join("\n"),
+          stderr: "",
+        };
+      }
+      if (args[1] === "inspect") {
+        const type = args[0];
+        const labels = records.get(`${type}:${args[2]}`) ?? {};
+        return {
+          stdout: JSON.stringify([type === "container"
+            ? {
+              Config: { Labels: labels },
+              State: { Running: labels[RESOURCE_KIND_LABEL] === "database" },
+              Mounts: [],
+            }
+            : { Labels: labels }]),
+          stderr: "",
+        };
+      }
+      const type = args[0];
+      const name = args.at(-1)!;
+      removals.push(`${type}:${name}`);
+      records.delete(`${type === "container" ? "container" : type}:${name}`);
+      return { stdout: "", stderr: "" };
+    });
+    const verifySentinel = vi.fn();
+
+    const runs = await reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+      verifySentinel,
+      resolveHarnessDirectory: () => "/private/harness",
+      delay: vi.fn(),
+    });
+    expect(runs).toHaveLength(1);
+    expect(verifySentinel).toHaveBeenCalledWith(names, runId, dockerRunner);
+    expect(removals).toEqual([
+      `container:${names.restore}`,
+      `container:${names.runner}`,
+      `container:${names.container}`,
+      `volume:${names.volume}`,
+      `network:${names.network}`,
+    ]);
+  });
+
+  it("does not mutate live, legacy, malformed, unsupported, or permission-ambiguous runs", async () => {
+    const runId = "e".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 88,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:800",
+      scope: testOwnerScope,
+    };
+    const labels = ownershipLabels(runId, "network", owner);
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[0] === "network" && args[1] === "ls") {
+        return { stdout: names.network, stderr: "" };
+      }
+      if (args[1] === "ls") return { stdout: "", stderr: "" };
+      return { stdout: JSON.stringify([{ Labels: labels }]), stderr: "" };
+    });
+
+    for (const readFingerprint of [
+      () => owner.birth,
+      () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); },
+      () => { throw new Error("unsupported"); },
+    ]) {
+      dockerRunner.mockClear();
+      await expect(reclaimProvenOrphans({
+        dockerRunner,
+        processProbe: vi.fn(),
+        readFingerprint,
+        readScope: () => testOwnerScope,
+        stderr: { write: vi.fn() },
+      })).resolves.toBeDefined();
+      expect(dockerRunner.mock.calls.some(([args]) => args[1] === "rm")).toBe(false);
+    }
+  });
+
+  it("reclaims a stopped stale database without bypassing observable running sentinels", async () => {
+    const runId = "f".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 91,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:900",
+      scope: testOwnerScope,
+    };
+    const labels = ownershipLabels(runId, "database", owner);
+    let exists = true;
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[0] === "container" && args[1] === "ls") {
+        return { stdout: exists ? names.container : "", stderr: "" };
+      }
+      if (args[1] === "ls") return { stdout: "", stderr: "" };
+      if (args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify([{ Config: { Labels: labels }, State: { Running: false } }]),
+          stderr: "",
+        };
+      }
+      exists = false;
+      return { stdout: "", stderr: "" };
+    });
+    const verifySentinel = vi.fn(() => { throw new Error("stopped container cannot exec"); });
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+      verifySentinel,
+      resolveHarnessDirectory: () => "/private/harness",
+    })).resolves.toBeDefined();
+    expect(verifySentinel).not.toHaveBeenCalled();
+    expect(exists).toBe(false);
+  });
+
+  it("reclaims a stopped previous-boot database after its temporary directory is gone", async () => {
+    const runId = "0".repeat(32);
+    const names = createRunNames(runId);
+    const oldBoot = "12345678-1234-1234-1234-123456789abc";
+    const currentBoot = "abcdefab-1234-1234-1234-123456789abc";
+    const owner = {
+      pid: 93,
+      birth: `linux:${oldBoot}:900`,
+      scope: `linux:${"a".repeat(64)}:${oldBoot}:pid:[4026531836]`,
+    };
+    const labels = ownershipLabels(runId, "database", owner);
+    let exists = true;
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[0] === "container" && args[1] === "ls") {
+        return { stdout: exists ? names.container : "", stderr: "" };
+      }
+      if (args[1] === "ls") return { stdout: "", stderr: "" };
+      if (args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify([{ Config: { Labels: labels }, State: { Running: false }, Mounts: [] }]),
+          stderr: "",
+        };
+      }
+      exists = false;
+      return { stdout: "", stderr: "" };
+    });
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      platform: () => "linux",
+      processProbe: vi.fn(),
+      readFingerprint: () => "linux:reused:1",
+      readScope: () => `linux:${"a".repeat(64)}:${currentBoot}:pid:[4026531836]`,
+      readFile: () => `${currentBoot}\n`,
+    })).resolves.toBeDefined();
+    expect(exists).toBe(false);
+  });
+
+  it("warns for ambiguous evidence and continues discovering independent stale runs", async () => {
+    const staleRunId = "1".repeat(32);
+    const names = createRunNames(staleRunId);
+    const owner = {
+      pid: 92,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:920",
+      scope: testOwnerScope,
+    };
+    const labels = ownershipLabels(staleRunId, "network", owner);
+    const inspectionFailure = Object.assign(new Error("denied"), {
+      code: 1,
+      stdout: "",
+      stderr: "permission denied",
+    });
+    let staleExists = true;
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[0] === "container" && args[1] === "ls") {
+        return { stdout: "foreign-ambiguous-container", stderr: "" };
+      }
+      if (args[0] === "network" && args[1] === "ls") {
+        return { stdout: staleExists ? names.network : "", stderr: "" };
+      }
+      if (args[1] === "ls") return { stdout: "", stderr: "" };
+      if (args[1] === "inspect" && args[2] === "foreign-ambiguous-container") throw inspectionFailure;
+      if (args[1] === "inspect") {
+        return { stdout: JSON.stringify([{ Labels: labels }]), stderr: "" };
+      }
+      staleExists = false;
+      return { stdout: "", stderr: "" };
+    });
+    const stderr = { write: vi.fn() };
+
+    const runs = await reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+      stderr,
+    });
+    expect(runs.map((run) => run.classification).sort()).toEqual(["ambiguous", "stale"]);
+    expect(staleExists).toBe(false);
+    expect(stderr.write).toHaveBeenCalledWith(
+      "PostgreSQL harness preserved 1 ambiguous labeled Docker run; manual reconciliation required.\n",
+    );
+    expect(stderr.write.mock.calls.flat().join(" ")).not.toContain("permission denied");
+  });
+
+  it("taints companions from a malformed canonical name and preserves active workers and consumers", async () => {
+    const runId = "2".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 100,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:100",
+      scope: testOwnerScope,
+    };
+    const consumer = {
+      pid: 101,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:101",
+      scope: testOwnerScope,
+    };
+    const records = new Map([
+      [`network:${names.network}`, { [RUN_LABEL]: "malformed" }],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+    ]);
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        return {
+          stdout: [...records.keys()]
+            .filter((key) => key.startsWith(`${type}:`))
+            .map((key) => key.slice(type.length + 1)).join("\n"),
+          stderr: "",
+        };
+      }
+      const type = args[0];
+      return { stdout: JSON.stringify([{ Labels: records.get(`${type}:${args[2]}`) }]), stderr: "" };
+    });
+    const malformed = await discoverHarnessRuns({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => "reused",
+      readScope: () => testOwnerScope,
+    });
+    expect(malformed.find((run) => run.runId === runId)?.classification).toBe("ambiguous");
+
+    records.clear();
+    records.set(`container:${names.runner}`, ownershipLabels(runId, "runner", owner));
+    const workerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        return { stdout: args[0] === "container" ? names.runner : "", stderr: "" };
+      }
+      return {
+        stdout: JSON.stringify([{ Config: { Labels: records.get(`container:${names.runner}`) }, State: { Running: true } }]),
+        stderr: "",
+      };
+    });
+    const worker = await discoverHarnessRuns({
+      dockerRunner: workerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => "reused",
+      readScope: () => testOwnerScope,
+    });
+    expect(worker[0].classification).toBe("live");
+
+    records.clear();
+    records.set(`container:${names.container}`, ownershipLabels(runId, "database", owner));
+    const databaseRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        return { stdout: args[0] === "container" ? names.container : "", stderr: "" };
+      }
+      return {
+        stdout: JSON.stringify([{ Config: { Labels: records.get(`container:${names.container}`) }, State: { Running: true } }]),
+        stderr: "",
+      };
+    });
+    let consumerRead = false;
+    const consumerRun = await discoverHarnessRuns({
+      dockerRunner: databaseRunner,
+      resolveHarnessDirectory: () => "/private/harness",
+      processProbe: vi.fn(),
+      readFingerprint: (pid: number) => pid === consumer.pid ? consumer.birth : "reused",
+      readScope: () => testOwnerScope,
+      open: () => 9,
+      fstat: () => ({ isFile: () => true, mode: 0o100600, size: 100 }),
+      read: (_descriptor: number, buffer: Buffer) => {
+        if (consumerRead) return 0;
+        consumerRead = true;
+        const content = Buffer.from(JSON.stringify({ version: 1, ...consumer }));
+        content.copy(buffer);
+        return content.length;
+      },
+      close: vi.fn(),
+    });
+    expect(consumerRun[0].classification).toBe("live");
+
+    const symlinkRefusal = await discoverHarnessRuns({
+      dockerRunner: databaseRunner,
+      resolveHarnessDirectory: () => "/private/harness",
+      processProbe: vi.fn(),
+      readFingerprint: () => "reused",
+      readScope: () => testOwnerScope,
+      open: () => { throw Object.assign(new Error("symlink"), { code: "ELOOP" }); },
+    });
+    expect(symlinkRefusal[0].classification).toBe("ambiguous");
+
+    const close = vi.fn();
+    const permissionRefusal = await discoverHarnessRuns({
+      dockerRunner: databaseRunner,
+      resolveHarnessDirectory: () => "/private/harness",
+      processProbe: vi.fn(),
+      readFingerprint: () => "reused",
+      readScope: () => testOwnerScope,
+      open: () => 10,
+      fstat: () => ({ isFile: () => true, mode: 0o100644, size: 100 }),
+      close,
+    });
+    expect(permissionRefusal[0].classification).toBe("ambiguous");
+    expect(close).toHaveBeenCalledWith(10);
+
+    let windowsRead = false;
+    const windowsConsumer = await discoverHarnessRuns({
+      dockerRunner: databaseRunner,
+      resolveHarnessDirectory: () => "/private/harness",
+      platform: () => "win32",
+      processProbe: vi.fn(),
+      readFingerprint: (pid: number) => pid === consumer.pid ? consumer.birth : "reused",
+      readScope: () => testOwnerScope,
+      open: () => 11,
+      fstat: () => ({ isFile: () => true, mode: 0o100666, size: 100 }),
+      read: (_descriptor: number, buffer: Buffer) => {
+        if (windowsRead) return 0;
+        windowsRead = true;
+        const content = Buffer.from(JSON.stringify({ version: 1, ...consumer }));
+        content.copy(buffer);
+        return content.length;
+      },
+      close: vi.fn(),
+    });
+    expect(windowsConsumer[0].classification).toBe("live");
   });
 
   it("pins container-mounted and checksummed PostgreSQL files to LF", () => {
