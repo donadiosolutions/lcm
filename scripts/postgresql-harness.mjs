@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import {
   chmodSync,
@@ -9,6 +9,7 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  readlinkSync,
   readSync,
   realpathSync,
   rmSync,
@@ -33,8 +34,9 @@ export const RUN_LABEL = "com.donadiosolutions.lcm.postgresql-test-run";
 export const OWNER_SCHEMA_LABEL = "com.donadiosolutions.lcm.postgresql-test-owner-schema";
 export const OWNER_PID_LABEL = "com.donadiosolutions.lcm.postgresql-test-owner-pid";
 export const OWNER_BIRTH_LABEL = "com.donadiosolutions.lcm.postgresql-test-owner-birth";
+export const OWNER_SCOPE_LABEL = "com.donadiosolutions.lcm.postgresql-test-owner-scope";
 export const RESOURCE_KIND_LABEL = "com.donadiosolutions.lcm.postgresql-test-resource-kind";
-export const OWNER_SCHEMA_VERSION = "1";
+export const OWNER_SCHEMA_VERSION = "2";
 export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
 export const MAX_DOCKER_REMOVE_ATTEMPTS = 3;
 
@@ -58,6 +60,11 @@ const windowsBirthRegex = new RegExp(
   + `T((?:[01][0-9]|2[0-3])):([0-5][0-9]):([0-5][0-9])\\.[0-9]{7}Z$`,
   "u",
 );
+const linuxScopeRegex = new RegExp(
+  `^linux:([0-9a-f]{64}):(${bootIdPattern}):pid:\\[([1-9][0-9]*)\\]$`,
+  "u",
+);
+const portableScopeRegex = /^(?:darwin|win32):[0-9a-f]{64}$/u;
 const consumerOwnerFile = "consumer-owner.json";
 const darwinMonths = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const darwinDays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -99,6 +106,50 @@ export function isValidProcessBirthFingerprint(fingerprint) {
     Number(windowsMatch[5]),
     Number(windowsMatch[6]),
   ));
+}
+
+function hashedIdentity(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+export function readOwnerScopeFingerprint(dependencies = {}) {
+  const currentPlatform = dependencies.platform?.() ?? platform();
+  const readFile = dependencies.readFile ?? readFileSync;
+  const execute = dependencies.execFile ?? execFileSync;
+  if (currentPlatform === "linux") {
+    const readLink = dependencies.readLink ?? readlinkSync;
+    const machineId = String(readFile("/etc/machine-id", "utf8")).trim();
+    const bootId = String(readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+    const pidNamespace = String(readLink("/proc/self/ns/pid")).trim();
+    if (!/^[0-9a-f]{32}$/u.test(machineId)
+      || !bootIdRegex.test(bootId)
+      || !/^pid:\[[1-9][0-9]*\]$/u.test(pidNamespace)) {
+      throw new Error("unsupported PostgreSQL harness process scope evidence");
+    }
+    return `linux:${hashedIdentity(machineId)}:${bootId}:${pidNamespace}`;
+  }
+  const command = currentPlatform === "win32" ? "powershell.exe" : "sysctl";
+  const args = currentPlatform === "win32"
+    ? [
+      "-NoProfile", "-NonInteractive", "-Command",
+      "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid",
+    ]
+    : ["-n", "kern.hostuuid"];
+  let machineId;
+  try {
+    machineId = String(execute(command, args, {
+      encoding: "utf8",
+      maxBuffer: 16 * 1024,
+      timeout: 2_000,
+      windowsHide: true,
+    })).trim().toLowerCase();
+  } catch (error) {
+    throw new Error("unsupported PostgreSQL harness process scope evidence", { cause: error });
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(machineId)) {
+    throw new Error("unsupported PostgreSQL harness process scope evidence");
+  }
+  return `${currentPlatform}:${hashedIdentity(machineId)}`;
 }
 
 export function createRunNames(runId) {
@@ -195,6 +246,7 @@ export function createOwnerIdentity(pid = process.pid, dependencies = {}) {
   return {
     pid,
     birth: readProcessBirthFingerprint(pid, dependencies),
+    scope: readOwnerScopeFingerprint(dependencies),
   };
 }
 
@@ -224,6 +276,7 @@ export function ownershipLabels(runId, kind, owner) {
     [OWNER_SCHEMA_LABEL]: OWNER_SCHEMA_VERSION,
     [OWNER_PID_LABEL]: String(owner.pid),
     [OWNER_BIRTH_LABEL]: owner.birth,
+    [OWNER_SCOPE_LABEL]: owner.scope,
     [RESOURCE_KIND_LABEL]: kind,
   };
 }
@@ -546,18 +599,20 @@ function requiredOwnership(labels) {
   const runId = labels[RUN_LABEL];
   const pidText = labels[OWNER_PID_LABEL];
   const birth = labels[OWNER_BIRTH_LABEL];
+  const scope = labels[OWNER_SCOPE_LABEL];
   const kind = labels[RESOURCE_KIND_LABEL];
   if (labels[OWNER_SCHEMA_LABEL] !== OWNER_SCHEMA_VERSION
     || !/^[0-9a-f]{32}$/u.test(runId ?? "")
     || !/^[1-9][0-9]*$/u.test(pidText ?? "")
     || !isValidProcessBirthFingerprint(birth)
+    || !(linuxScopeRegex.test(scope ?? "") || portableScopeRegex.test(scope ?? ""))
     || typeof kind !== "string"
     || kind.length === 0) {
     return undefined;
   }
   const pid = Number(pidText);
   if (!Number.isSafeInteger(pid)) return undefined;
-  return { runId, pid, birth, kind };
+  return { runId, pid, birth, scope, kind };
 }
 
 function labelsMatchOwnership(labels, expected) {
@@ -675,10 +730,11 @@ function readConsumerOwner(directory, dependencies = {}) {
     if (value?.version !== 1
       || !Number.isSafeInteger(value.pid)
       || value.pid <= 0
-      || !isValidProcessBirthFingerprint(value.birth)) {
+      || !isValidProcessBirthFingerprint(value.birth)
+      || !(linuxScopeRegex.test(value.scope ?? "") || portableScopeRegex.test(value.scope ?? ""))) {
       throw new Error("invalid PostgreSQL harness consumer identity evidence");
     }
-    return { pid: value.pid, birth: value.birth };
+    return { pid: value.pid, birth: value.birth, scope: value.scope };
   } finally {
     if (descriptor !== undefined) closeFile(descriptor);
   }
@@ -699,7 +755,24 @@ function ownerFromPreviousLinuxBoot(owner, dependencies = {}) {
 
 export function classifyOwnerIdentity(owner, dependencies = {}) {
   const readFingerprint = dependencies.readFingerprint ?? readProcessBirthFingerprint;
+  const readScope = dependencies.readScope ?? readOwnerScopeFingerprint;
   const processProbe = dependencies.processProbe ?? ((pid) => process.kill(pid, 0));
+  let currentScope;
+  try {
+    currentScope = readScope();
+  } catch {
+    return "ambiguous";
+  }
+  if (currentScope !== owner.scope) {
+    const recordedLinux = owner.scope?.match(linuxScopeRegex);
+    const currentLinux = currentScope.match(linuxScopeRegex);
+    if (recordedLinux && currentLinux
+      && recordedLinux[1] === currentLinux[1]
+      && recordedLinux[2] !== currentLinux[2]) {
+      return "stale";
+    }
+    return "ambiguous";
+  }
   try {
     processProbe(owner.pid);
   } catch (error) {
@@ -742,7 +815,7 @@ export async function discoverHarnessRuns(dependencies = {}) {
       const key = ownership?.runId ?? labeledRunId ?? `ambiguous:${resource.type}:${resource.name}`;
       const run = runs.get(key) ?? {
         runId: ownership?.runId ?? labeledRunId,
-        owner: ownership ? { pid: ownership.pid, birth: ownership.birth } : undefined,
+        owner: ownership ? { pid: ownership.pid, birth: ownership.birth, scope: ownership.scope } : undefined,
         classification: "ambiguous",
         resources: [],
       };
@@ -758,15 +831,18 @@ export async function discoverHarnessRuns(dependencies = {}) {
     const expectedLabels = ownershipLabels(
       ownership.runId,
       ownership.kind,
-      { pid: ownership.pid, birth: ownership.birth },
+      { pid: ownership.pid, birth: ownership.birth, scope: ownership.scope },
     );
     const run = runs.get(ownership.runId) ?? {
       runId: ownership.runId,
-      owner: { pid: ownership.pid, birth: ownership.birth },
+      owner: { pid: ownership.pid, birth: ownership.birth, scope: ownership.scope },
       classification: undefined,
       resources: [],
     };
-    if (!run.owner || run.owner.pid !== ownership.pid || run.owner.birth !== ownership.birth) {
+    if (!run.owner
+      || run.owner.pid !== ownership.pid
+      || run.owner.birth !== ownership.birth
+      || run.owner.scope !== ownership.scope) {
       run.classification = "ambiguous";
     }
     if (resource.type === "container" && typeof record?.State?.Running !== "boolean") {

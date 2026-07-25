@@ -7,6 +7,7 @@ import {
   NODE_IMAGE,
   OWNER_BIRTH_LABEL,
   OWNER_PID_LABEL,
+  OWNER_SCOPE_LABEL,
   OWNER_SCHEMA_LABEL,
   OWNER_SCHEMA_VERSION,
   POSTGRES_IMAGE,
@@ -23,6 +24,7 @@ import {
   isMissingDockerObjectError,
   ownershipLabels,
   readProcessBirthFingerprint,
+  readOwnerScopeFingerprint,
   recordAmbiguousConsumerIdentity,
   recordConsumerIdentity,
   reclaimProvenOrphans,
@@ -36,30 +38,46 @@ import {
 } from "../../scripts/postgresql-harness.mjs";
 import { postgresqlVitestCacheDir } from "../../vitest.postgresql.config.js";
 
+const testBootId = "12345678-1234-1234-1234-123456789abc";
+const testOwnerScope = `linux:${"a".repeat(64)}:${testBootId}:pid:[4026531836]`;
+
 describe("PostgreSQL harness utilities", () => {
   it("uses exact digest-pinned images and a namespaced label", () => {
     expect(POSTGRES_IMAGE).toMatch(/^postgres:18\.4-bookworm@sha256:[0-9a-f]{64}$/u);
     expect(NODE_IMAGE).toMatch(/^node:22\.20\.0-bookworm-slim@sha256:[0-9a-f]{64}$/u);
     expect(RUN_LABEL).toBe("com.donadiosolutions.lcm.postgresql-test-run");
-    expect(OWNER_SCHEMA_VERSION).toBe("1");
+    expect(OWNER_SCHEMA_VERSION).toBe("2");
     expect(new Set([
       RUN_LABEL,
       OWNER_SCHEMA_LABEL,
       OWNER_PID_LABEL,
       OWNER_BIRTH_LABEL,
+      OWNER_SCOPE_LABEL,
       RESOURCE_KIND_LABEL,
-    ]).size).toBe(5);
+    ]).size).toBe(6);
   });
 
   it("derives an owner birth fingerprint from boot ID and the Linux process start field", () => {
     const bootId = "12345678-1234-1234-1234-123456789abc";
     const statFields = ["S", ...Array.from({ length: 18 }, () => "0"), "98765", "0"];
-    const readFile = vi.fn((path: string) => path.endsWith("boot_id")
-      ? `${bootId}\n`
-      : `42 (worker with ) parenthesis) ${statFields.join(" ")}\n`);
+    const readFile = vi.fn((path: string) => {
+      if (path.endsWith("machine-id")) return `${"f".repeat(32)}\n`;
+      return path.endsWith("boot_id")
+        ? `${bootId}\n`
+        : `42 (worker with ) parenthesis) ${statFields.join(" ")}\n`;
+    });
 
     expect(readProcessBirthFingerprint(42, { readFile })).toBe(`linux:${bootId}:98765`);
-    expect(createOwnerIdentity(42, { readFile })).toEqual({ pid: 42, birth: `linux:${bootId}:98765` });
+    expect(createOwnerIdentity(42, {
+      readFile,
+      readLink: () => "pid:[4026531836]",
+    })).toEqual({
+      pid: 42,
+      birth: `linux:${bootId}:98765`,
+      scope: expect.stringMatching(
+        new RegExp(`^linux:[0-9a-f]{64}:${bootId}:pid:\\[4026531836\\]$`, "u"),
+      ),
+    });
     expect(() => readProcessBirthFingerprint(0, { readFile })).toThrow("owner PID");
     expect(() => readProcessBirthFingerprint(42, { readFile: () => "unsupported" }))
       .toThrow("unsupported");
@@ -87,22 +105,52 @@ describe("PostgreSQL harness utilities", () => {
   });
 
   it("classifies only matching process identity as live and fails closed on ambiguous evidence", () => {
-    const owner = { pid: 42, birth: "boot:100" };
+    const owner = { pid: 42, birth: "boot:100", scope: testOwnerScope };
     const processProbe = vi.fn();
-    expect(classifyOwnerIdentity(owner, { processProbe, readFingerprint: () => "boot:100" })).toBe("live");
-    expect(classifyOwnerIdentity(owner, { processProbe, readFingerprint: () => "boot:200" })).toBe("stale");
+    const readScope = () => testOwnerScope;
+    expect(classifyOwnerIdentity(owner, { processProbe, readFingerprint: () => "boot:100", readScope })).toBe("live");
+    expect(classifyOwnerIdentity(owner, { processProbe, readFingerprint: () => "boot:200", readScope })).toBe("stale");
     expect(classifyOwnerIdentity(owner, {
       processProbe,
       readFingerprint: () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); },
+      readScope,
     })).toBe("ambiguous");
     expect(classifyOwnerIdentity(owner, {
       processProbe,
       readFingerprint: () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); },
+      readScope,
     })).toBe("ambiguous");
     expect(classifyOwnerIdentity(owner, {
       processProbe: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
       readFingerprint: vi.fn(),
+      readScope,
     })).toBe("stale");
+    expect(classifyOwnerIdentity(owner, {
+      processProbe,
+      readFingerprint: vi.fn(),
+      readScope: () => `linux:${"b".repeat(64)}:${testBootId}:pid:[4026531836]`,
+    })).toBe("ambiguous");
+    expect(classifyOwnerIdentity(owner, {
+      processProbe,
+      readFingerprint: vi.fn(),
+      readScope: () => `linux:${"a".repeat(64)}:${testBootId}:pid:[4026532000]`,
+    })).toBe("ambiguous");
+    expect(classifyOwnerIdentity(owner, {
+      processProbe,
+      readFingerprint: vi.fn(),
+      readScope: () => `linux:${"a".repeat(64)}:abcdefab-1234-1234-1234-123456789abc:pid:[4026532000]`,
+    })).toBe("stale");
+  });
+
+  it("binds Linux ownership to the machine, boot, and PID namespace", () => {
+    expect(readOwnerScopeFingerprint({
+      platform: () => "linux",
+      readFile: (path: string) => path.endsWith("machine-id") ? "f".repeat(32) : testBootId,
+      readLink: () => "pid:[4026531836]",
+    })).toMatch(new RegExp(
+      `^linux:[0-9a-f]{64}:${testBootId}:pid:\\[4026531836\\]$`,
+      "u",
+    ));
   });
 
   it("records explicit ambiguous consumer evidence when birth identity is unavailable", () => {
@@ -119,9 +167,18 @@ describe("PostgreSQL harness utilities", () => {
     );
 
     expect(recordConsumerIdentity("/private/consumer-owner.json", 42, {
-      createIdentity: () => ({ pid: 42, birth: "darwin:Fri Jul 24 21:00:00 2026" }),
+      createIdentity: () => ({
+        pid: 42,
+        birth: "darwin:Fri Jul 24 21:00:00 2026",
+        scope: `darwin:${"a".repeat(64)}`,
+      }),
       writeFile: vi.fn(),
-    })).toEqual({ version: 1, pid: 42, birth: "darwin:Fri Jul 24 21:00:00 2026" });
+    })).toEqual({
+      version: 1,
+      pid: 42,
+      birth: "darwin:Fri Jul 24 21:00:00 2026",
+      scope: `darwin:${"a".repeat(64)}`,
+    });
 
     expect(recordAmbiguousConsumerIdentity("/private/consumer-owner.json", {
       writeFile,
@@ -546,6 +603,7 @@ describe("PostgreSQL harness utilities", () => {
     const owner = {
       pid: 42,
       birth: "linux:12345678-1234-1234-1234-123456789abc:100",
+      scope: testOwnerScope,
     };
     const labels = ownershipLabels(runId, "database", owner);
     const removalFailure = Object.assign(new Error("resource busy"), {
@@ -595,15 +653,19 @@ describe("PostgreSQL harness utilities", () => {
       [`network:${createRunNames(liveRunId).network}`, ownershipLabels(
         liveRunId,
         "network",
-        { pid: 41, birth: `linux:${bootId}:100` },
+        { pid: 41, birth: `linux:${bootId}:100`, scope: testOwnerScope },
       )],
       [`volume:${createRunNames(staleRunId).volume}`, ownershipLabels(
         staleRunId,
         "data",
-        { pid: 42, birth: `linux:${bootId}:200` },
+        { pid: 42, birth: `linux:${bootId}:200`, scope: testOwnerScope },
       )],
       [`volume:${createRunNames(legacyRunId).volume}`, {
-        ...ownershipLabels(legacyRunId, "data", { pid: 43, birth: `linux:${bootId}:400` }),
+        ...ownershipLabels(legacyRunId, "data", {
+          pid: 43,
+          birth: `linux:${bootId}:400`,
+          scope: testOwnerScope,
+        }),
         [OWNER_BIRTH_LABEL]: "malformed",
       }],
     ]);
@@ -627,6 +689,7 @@ describe("PostgreSQL harness utilities", () => {
       dockerRunner,
       processProbe: vi.fn(),
       readFingerprint: (pid: number) => pid === 41 ? `linux:${bootId}:100` : `linux:${bootId}:999`,
+      readScope: () => testOwnerScope,
     });
     expect(runs.map((run) => [run.runId, run.classification])).toEqual([
       [liveRunId, "live"],
@@ -636,12 +699,17 @@ describe("PostgreSQL harness utilities", () => {
 
     records.set(
       `container:${createRunNames(liveRunId).runner}`,
-      ownershipLabels(liveRunId, "runner", { pid: 99, birth: `linux:${bootId}:300` }),
+      ownershipLabels(liveRunId, "runner", {
+        pid: 99,
+        birth: `linux:${bootId}:300`,
+        scope: testOwnerScope,
+      }),
     );
     const inconsistent = await discoverHarnessRuns({
       dockerRunner,
       processProbe: vi.fn(),
       readFingerprint: () => `linux:${bootId}:100`,
+      readScope: () => testOwnerScope,
     });
     expect(inconsistent.find((run) => run.runId === liveRunId)?.classification).toBe("ambiguous");
   });
@@ -652,6 +720,7 @@ describe("PostgreSQL harness utilities", () => {
     const owner = {
       pid: 77,
       birth: "linux:12345678-1234-1234-1234-123456789abc:700",
+      scope: testOwnerScope,
     };
     const records = new Map([
       [`container:${names.restore}`, ownershipLabels(runId, "restore", owner)],
@@ -698,6 +767,7 @@ describe("PostgreSQL harness utilities", () => {
       dockerRunner,
       processProbe: vi.fn(),
       readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
       verifySentinel,
       resolveHarnessDirectory: () => "/private/harness",
       delay: vi.fn(),
@@ -719,6 +789,7 @@ describe("PostgreSQL harness utilities", () => {
     const owner = {
       pid: 88,
       birth: "linux:12345678-1234-1234-1234-123456789abc:800",
+      scope: testOwnerScope,
     };
     const labels = ownershipLabels(runId, "network", owner);
     const dockerRunner = vi.fn(async (args: string[]) => {
@@ -739,6 +810,7 @@ describe("PostgreSQL harness utilities", () => {
         dockerRunner,
         processProbe: vi.fn(),
         readFingerprint,
+        readScope: () => testOwnerScope,
         stderr: { write: vi.fn() },
       })).resolves.toBeDefined();
       expect(dockerRunner.mock.calls.some(([args]) => args[1] === "rm")).toBe(false);
@@ -751,6 +823,7 @@ describe("PostgreSQL harness utilities", () => {
     const owner = {
       pid: 91,
       birth: "linux:12345678-1234-1234-1234-123456789abc:900",
+      scope: testOwnerScope,
     };
     const labels = ownershipLabels(runId, "database", owner);
     let exists = true;
@@ -774,6 +847,7 @@ describe("PostgreSQL harness utilities", () => {
       dockerRunner,
       processProbe: vi.fn(),
       readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
       verifySentinel,
       resolveHarnessDirectory: () => "/private/harness",
     })).resolves.toBeDefined();
@@ -786,7 +860,11 @@ describe("PostgreSQL harness utilities", () => {
     const names = createRunNames(runId);
     const oldBoot = "12345678-1234-1234-1234-123456789abc";
     const currentBoot = "abcdefab-1234-1234-1234-123456789abc";
-    const owner = { pid: 93, birth: `linux:${oldBoot}:900` };
+    const owner = {
+      pid: 93,
+      birth: `linux:${oldBoot}:900`,
+      scope: `linux:${"a".repeat(64)}:${oldBoot}:pid:[4026531836]`,
+    };
     const labels = ownershipLabels(runId, "database", owner);
     let exists = true;
     const dockerRunner = vi.fn(async (args: string[]) => {
@@ -809,6 +887,7 @@ describe("PostgreSQL harness utilities", () => {
       platform: () => "linux",
       processProbe: vi.fn(),
       readFingerprint: () => "linux:reused:1",
+      readScope: () => `linux:${"a".repeat(64)}:${currentBoot}:pid:[4026531836]`,
       readFile: () => `${currentBoot}\n`,
     })).resolves.toBeDefined();
     expect(exists).toBe(false);
@@ -820,6 +899,7 @@ describe("PostgreSQL harness utilities", () => {
     const owner = {
       pid: 92,
       birth: "linux:12345678-1234-1234-1234-123456789abc:920",
+      scope: testOwnerScope,
     };
     const labels = ownershipLabels(staleRunId, "network", owner);
     const inspectionFailure = Object.assign(new Error("denied"), {
@@ -849,6 +929,7 @@ describe("PostgreSQL harness utilities", () => {
       dockerRunner,
       processProbe: vi.fn(),
       readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
       stderr,
     });
     expect(runs.map((run) => run.classification).sort()).toEqual(["ambiguous", "stale"]);
@@ -862,8 +943,16 @@ describe("PostgreSQL harness utilities", () => {
   it("taints companions from a malformed canonical name and preserves active workers and consumers", async () => {
     const runId = "2".repeat(32);
     const names = createRunNames(runId);
-    const owner = { pid: 100, birth: "linux:12345678-1234-1234-1234-123456789abc:100" };
-    const consumer = { pid: 101, birth: "darwin:Fri Jul 24 21:00:00 2026" };
+    const owner = {
+      pid: 100,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:100",
+      scope: testOwnerScope,
+    };
+    const consumer = {
+      pid: 101,
+      birth: "darwin:Fri Jul 24 21:00:00 2026",
+      scope: testOwnerScope,
+    };
     const records = new Map([
       [`network:${names.network}`, { [RUN_LABEL]: "malformed" }],
       [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
@@ -885,6 +974,7 @@ describe("PostgreSQL harness utilities", () => {
       dockerRunner,
       processProbe: vi.fn(),
       readFingerprint: () => "reused",
+      readScope: () => testOwnerScope,
     });
     expect(malformed.find((run) => run.runId === runId)?.classification).toBe("ambiguous");
 
@@ -903,6 +993,7 @@ describe("PostgreSQL harness utilities", () => {
       dockerRunner: workerRunner,
       processProbe: vi.fn(),
       readFingerprint: () => "reused",
+      readScope: () => testOwnerScope,
     });
     expect(worker[0].classification).toBe("live");
 
@@ -923,6 +1014,7 @@ describe("PostgreSQL harness utilities", () => {
       resolveHarnessDirectory: () => "/private/harness",
       processProbe: vi.fn(),
       readFingerprint: (pid: number) => pid === consumer.pid ? consumer.birth : "reused",
+      readScope: () => testOwnerScope,
       open: () => 9,
       fstat: () => ({ isFile: () => true, mode: 0o100600, size: 100 }),
       read: (_descriptor: number, buffer: Buffer) => {
@@ -941,6 +1033,7 @@ describe("PostgreSQL harness utilities", () => {
       resolveHarnessDirectory: () => "/private/harness",
       processProbe: vi.fn(),
       readFingerprint: () => "reused",
+      readScope: () => testOwnerScope,
       open: () => { throw Object.assign(new Error("symlink"), { code: "ELOOP" }); },
     });
     expect(symlinkRefusal[0].classification).toBe("ambiguous");
@@ -951,6 +1044,7 @@ describe("PostgreSQL harness utilities", () => {
       resolveHarnessDirectory: () => "/private/harness",
       processProbe: vi.fn(),
       readFingerprint: () => "reused",
+      readScope: () => testOwnerScope,
       open: () => 10,
       fstat: () => ({ isFile: () => true, mode: 0o100644, size: 100 }),
       close,
@@ -965,6 +1059,7 @@ describe("PostgreSQL harness utilities", () => {
       platform: () => "win32",
       processProbe: vi.fn(),
       readFingerprint: (pid: number) => pid === consumer.pid ? consumer.birth : "reused",
+      readScope: () => testOwnerScope,
       open: () => 11,
       fstat: () => ({ isFile: () => true, mode: 0o100666, size: 100 }),
       read: (_descriptor: number, buffer: Buffer) => {
