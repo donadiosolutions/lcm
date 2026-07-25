@@ -338,6 +338,7 @@ export function registerProjectCommand(program: Command): void {
     json?: boolean;
     name?: string;
     allowExistingData?: boolean;
+    dryRun?: boolean;
   };
 
   const projectError = (err: unknown, opts: { json?: boolean } = {}): never => {
@@ -359,9 +360,44 @@ export function registerProjectCommand(program: Command): void {
       const { printHelp } = await import("../src/cli-help.js");
       printHelp("project"); exit(0);
     }
-    console.error("Usage: lcm project <create|link|unlink|list|show> [options]");
+    console.error("Usage: lcm project <create|link|unlink|list|show|reconcile-worktrees> [options]");
     exit(1);
   });
+
+  projectCmd
+    .command("reconcile-worktrees [path]")
+    .description("Preview or reconcile local state from linked and deleted Codex worktrees")
+    .option("--dry-run", "Preview without changing local state")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (path: string | undefined, opts: ProjectOptions) => {
+      if (projectHelpRequested(opts)) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("project"); exit(0);
+      }
+      try {
+        const { reconcileWorktrees } = await import("../src/worktree-reconciliation.js");
+        const result = reconcileWorktrees(path ?? process.cwd(), { dryRun: opts.dryRun });
+        if (opts.json) {
+          printJson(result);
+          return;
+        }
+        console.log(`worktree reconciliation: ${result.status}`);
+        console.log(`  canonical: ${sanitizeTerminalText(result.canonical)}`);
+        console.log(`  project: ${result.targetHash}`);
+        console.log(`  sources: ${result.sourceHashes.length}`);
+        if (result.journalPath) {
+          console.log(`  journal: ${sanitizeTerminalText(result.journalPath)}`);
+        }
+        for (const backup of result.backupPaths) {
+          console.log(`  backup: ${sanitizeTerminalText(backup)}`);
+        }
+        if (result.reason) console.log(`  reason: ${sanitizeTerminalText(result.reason)}`);
+      } catch (err) {
+        projectError(err, opts);
+      }
+    });
 
   projectCmd
     .command("list")
@@ -1866,6 +1902,8 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       if (isTTY && !verbose) {
         state.phases[0].status = "done";
         renderer.printSummary();
+        const { printCodexResolutionSummary } = await import("../src/import-summary.js");
+        printCodexResolutionSummary(result);
       } else {
         const { printImportSummary } = await import("../src/import-summary.js");
         if (dryRun) console.log("  [dry-run] No changes written.\n");

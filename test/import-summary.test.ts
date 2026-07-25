@@ -38,6 +38,18 @@ describe("printImportSummary", () => {
     expect(logs.some(l => l.includes("50.0k"))).toBe(true);
   });
 
+  it("reports every Codex reconciliation outcome", () => {
+    capture();
+    printImportSummary(baseResult({
+      reconciled: 2,
+      unresolved: 3,
+      ambiguous: 4,
+    }));
+    expect(logs).toContain("  2 historical Codex sessions reconciled");
+    expect(logs).toContain("  3 Codex sessions unresolved (skipped)");
+    expect(logs).toContain("  4 Codex sessions ambiguous (skipped)");
+  });
+
   it("shows compression stats in replay mode", () => {
     capture();
     printImportSummary(baseResult({ tokensAfter: 2000 }), { replay: true });

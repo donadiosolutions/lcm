@@ -26,6 +26,7 @@ import {
   isStagedPostgreSqlHealth,
   type StagedPostgreSqlHealthResponse,
 } from "../daemon/staged-postgresql.js";
+import { listWorktreeReconciliationJournals } from "../worktree-reconciliation.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -208,6 +209,47 @@ function checkProjectMap(results: CheckResult[], deps: DoctorDeps): void {
       ? "map.json not created yet"
       : `${count} mapped project${count === 1 ? "" : "s"}`,
   });
+}
+
+function checkWorktreeReconciliations(results: CheckResult[], deps: DoctorDeps): void {
+  try {
+    const journals = listWorktreeReconciliationJournals(deps.homedir);
+    const blocked = journals.filter((journal) => journal.phase === "blocked");
+    const partial = journals.filter((journal) =>
+      journal.phase !== "blocked" && journal.phase !== "completed");
+    const completed = journals.filter((journal) => journal.phase === "completed");
+    if (blocked.length > 0) {
+      results.push({
+        name: "worktree-reconciliation",
+        category: "Project Map",
+        status: "fail",
+        message: `${blocked.length} blocked; run lcm project reconcile-worktrees to retry`,
+      });
+    } else if (partial.length > 0) {
+      results.push({
+        name: "worktree-reconciliation",
+        category: "Project Map",
+        status: "warn",
+        message: `${partial.length} partial; run lcm project reconcile-worktrees to resume`,
+      });
+    } else {
+      results.push({
+        name: "worktree-reconciliation",
+        category: "Project Map",
+        status: "pass",
+        message: completed.length > 0
+          ? `${completed.length} completed reconciliation${completed.length === 1 ? "" : "s"}`
+          : "no pending worktree reconciliations",
+      });
+    }
+  } catch (error) {
+    results.push({
+      name: "worktree-reconciliation",
+      category: "Project Map",
+      status: "fail",
+      message: String(error),
+    });
+  }
 }
 
 function daemonProcessPath(deps: DoctorDeps, pid: number | undefined): string | undefined {
@@ -577,6 +619,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
 
   // ── Project path aliases ──
   checkProjectMap(results, deps);
+  checkWorktreeReconciliations(results, deps);
 
   // ── Daemon ──
   let daemonHealthy = false;

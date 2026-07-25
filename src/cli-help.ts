@@ -119,13 +119,14 @@ const HELP: Record<string, CommandHelp> = {
 
   project: {
     summary: "Manage local path aliases and explicit PostgreSQL project identities.",
-    usage: "lcm project <create|link|unlink|list|show> [options]",
+    usage: "lcm project <create|link|unlink|list|show|reconcile-worktrees> [options]",
     options: [
       ["create [path] [--name <name>] [--json]", "Create and bind a PostgreSQL project"],
       ["link <project-id|local-target> [path] [--allow-existing-data] [--json]", "Link a path explicitly"],
       ["unlink [path] [--json]", "Remove a local alias or PostgreSQL binding"],
       ["list [--json]", "List local mappings and, when selected, PostgreSQL projects"],
       ["show [path|local-hash|remote-project-id] [--json]", "Show one uniquely mapped local project and its remote identity"],
+      ["reconcile-worktrees [path] [--dry-run] [--json]", "Preview, retry, or report linked-worktree state consolidation"],
     ],
     examples: [
       ["lcm project create --name lcm", "Create a remote project for the current path"],
@@ -134,8 +135,9 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm project unlink /work/lcm-alias", "Remove an alias without deleting local data"],
       ["lcm project list --json", "Inspect local and remote identities"],
       ["lcm project show <remote-project-uuid>", "Show the unique local mapping for a remote project"],
+      ["lcm project reconcile-worktrees --dry-run", "Preview local worktree state consolidation"],
     ],
-    notes: "Local hashes and SQLite data remain unchanged. A remote UUID show target must have exactly one local binding; unknown or multiply mapped UUIDs fail closed. Rebinding a data-bearing local project requires --allow-existing-data. LCM never infers identity from Git remotes, names, or contents.",
+    notes: "Linked Git worktrees share one local project through their verified Git common directory. Reconciliation preserves source databases and event sidecars under oldprojects and oldevents. A remote UUID show target must have exactly one local binding. Git identity never creates or changes a PostgreSQL UUID; conflicting remote bindings fail closed. Repository URLs are used only as conservative evidence for deleted Codex worktree transcripts. Rebinding a data-bearing local project requires --allow-existing-data.",
   },
 
   postgres: {
@@ -258,13 +260,14 @@ const HELP: Record<string, CommandHelp> = {
     ],
     examples: [
       ["lcm import", "Import current Claude Code project sessions"],
-      ["lcm import --codex", "Import Codex CLI sessions"],
+      ["lcm import --codex", "Import Codex CLI sessions for the current canonical project"],
+      ["lcm import --codex --all", "Import resolved Codex CLI sessions for all local projects"],
       ["lcm import --provider all", "Import Claude Code and Codex CLI sessions"],
       ["lcm import --all", "Import all tracked Claude Code projects"],
       ["lcm import --all --replay", "Import and compact with threaded context"],
       ["lcm import --dry-run", "Preview what would be imported"],
     ],
-    notes: "Claude sessions are read from ~/.claude/projects/. Codex sessions are read from ~/.codex/sessions and ~/.codex/archived_sessions. Already-imported completed sessions are skipped.",
+    notes: "Claude sessions are read from ~/.claude/projects/. Codex sessions are read from ~/.codex/sessions and ~/.codex/archived_sessions. Codex import uses live Git evidence, exact thread ownership, or a unique repository match under an existing ~/.codex/worktrees tombstone; ambiguous and unresolved sessions are reported and skipped. Already-imported completed sessions are skipped.",
   },
 
   promote: {
@@ -487,7 +490,7 @@ const GROUPS = [
       { name: "status [--json]", summary: "Daemon status and project memory stats" },
       { name: "doctor", summary: "Diagnostics: daemon, hooks, MCP, summarizer" },
       { name: "machine <register|show|recover>", summary: "Manage this machine's PostgreSQL identity" },
-      { name: "project <create|link|unlink|list|show>", summary: "Manage local and PostgreSQL project identities" },
+      { name: "project <create|link|unlink|list|show|reconcile-worktrees>", summary: "Manage local and PostgreSQL project identities" },
       { name: "postgres migrate [--json]", summary: "Apply packaged PostgreSQL schema migrations" },
       { name: "mcp", summary: "Start the MCP server (stdio transport)" },
     ],

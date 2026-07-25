@@ -1,6 +1,18 @@
 import type { ImportResult } from "./import.js";
 import { formatNumber, formatRatio } from "./stats.js";
 
+export function printCodexResolutionSummary(result: ImportResult): void {
+  if ((result.reconciled ?? 0) > 0) {
+    console.log(`  ${result.reconciled} historical Codex sessions reconciled`);
+  }
+  if ((result.unresolved ?? 0) > 0) {
+    console.log(`  ${result.unresolved} Codex sessions unresolved (skipped)`);
+  }
+  if ((result.ambiguous ?? 0) > 0) {
+    console.log(`  ${result.ambiguous} Codex sessions ambiguous (skipped)`);
+  }
+}
+
 export function printImportSummary(
   result: ImportResult,
   opts: { replay?: boolean } = {},
@@ -10,6 +22,7 @@ export function printImportSummary(
   console.log(`  ${result.imported} sessions imported (${result.totalMessages} messages${tokenSuffix})`);
   if (result.skippedEmpty > 0) console.log(`  ${result.skippedEmpty} skipped (empty transcript)`);
   if (result.failed > 0) console.log(`  ${result.failed} failed`);
+  printCodexResolutionSummary(result);
 
   if (opts.replay) {
     console.log("  [replay] Sessions compacted sequentially with threaded context.");

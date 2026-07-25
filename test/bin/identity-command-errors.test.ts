@@ -84,7 +84,7 @@ describe("identity command exits", () => {
   it("prints project root usage and exits when no subcommand is provided", async () => {
     const result = await runIdentityCommand("project", []);
 
-    expect(result.stderr).toEqual(["Usage: lcm project <create|link|unlink|list|show> [options]"]);
+    expect(result.stderr).toEqual(["Usage: lcm project <create|link|unlink|list|show|reconcile-worktrees> [options]"]);
     expect(result.thrown?.message).toBe("exit:1");
     expect(exitMock).toHaveBeenCalledWith(1);
   });

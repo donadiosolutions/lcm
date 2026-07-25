@@ -7,6 +7,7 @@ import { atomicWritePrivateFile, ensurePrivateDirectory, readBoundedRegularFile 
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import { resolveStorageIdentityContext } from "../storage/identity-context.js";
 import type { ResolvedStorageConfig } from "./config.js";
+import { ensureWorktreeProjectReconciled } from "../worktree-reconciliation.js";
 
 const MAX_PROJECT_METADATA_BYTES = 1024 * 1024;
 
@@ -30,6 +31,11 @@ export const projectCanonicalPath = (cwd: string): string =>
   projectIdentity(cwd).canonical;
 
 export function projectPaths(cwd: string): ProjectIdentity & { dir: string; dbPath: string; metaPath: string } {
+  const initialIdentity = projectIdentity(cwd);
+  ensureWorktreeProjectReconciled(cwd, initialIdentity);
+  // Reconciliation may atomically replace a legacy worktree hash while this
+  // call is in flight. Resolve again after the commit point before deriving
+  // any storage paths.
   const identity = projectIdentity(cwd);
   const dir = join(lcmHomeDir(), "projects", identity.id);
   return {

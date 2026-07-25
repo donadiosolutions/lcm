@@ -1,13 +1,14 @@
 import { readdirSync, readFileSync, existsSync, lstatSync } from "node:fs";
-import { join, basename } from "node:path";
+import { join, basename, resolve } from "node:path";
 import { homedir } from "node:os";
 import type { DaemonClient } from "./daemon/client.js";
 import { formatNumber, formatRatio } from "./stats.js";
-import { findAllCodexTranscripts, extractCodexSessionCwd } from "./codex-transcript.js";
 import type { ProgressState } from "./cli/progress-state.js";
 import type { TranscriptClient } from "./transcript-provider.js";
 import { lcmHomeDir } from "./runtime-paths.js";
 import { projectId } from "./daemon/project.js";
+import { resolveProjectIdentity } from "./project-map.js";
+import { resolveCodexSessions } from "./codex-project-resolution.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
 
@@ -36,6 +37,9 @@ export interface ImportResult {
   totalMessages: number;
   totalTokens: number;
   tokensAfter: number;
+  reconciled?: number;
+  unresolved?: number;
+  ambiguous?: number;
 }
 
 export function cwdToProjectHash(cwd: string): string {
@@ -272,7 +276,17 @@ export async function importSessions(
   options: ImportOptions = {}
 ): Promise<ImportResult> {
   const provider: ImportProvider = options.provider ?? "claude";
-  const result: ImportResult = { imported: 0, skippedEmpty: 0, failed: 0, totalMessages: 0, totalTokens: 0, tokensAfter: 0 };
+  const result: ImportResult = {
+    imported: 0,
+    skippedEmpty: 0,
+    failed: 0,
+    totalMessages: 0,
+    totalTokens: 0,
+    tokensAfter: 0,
+    reconciled: 0,
+    unresolved: 0,
+    ambiguous: 0,
+  };
 
   // --- Claude Code sessions ---
   if (provider === "claude" || provider === "all") {
@@ -312,14 +326,44 @@ export async function importSessions(
 
   // --- Codex CLI sessions ---
   if (provider === "codex" || provider === "all") {
-    const codexTranscripts = findAllCodexTranscripts(options._codexDir);
-    const codexSessions: SessionEntry[] = codexTranscripts.map(f => ({
-      path: f.path,
-      sessionId: f.sessionId,
-      // Prefer the cwd embedded in the transcript; fall back to process.cwd()
-      cwd: extractCodexSessionCwd(f.path) ?? process.cwd(),
-      client: "codex",
-    }));
+    const current = resolveProjectIdentity(options.cwd ?? process.cwd());
+    const codexSessions: SessionEntry[] = [];
+    for (const session of resolveCodexSessions(options._codexDir)) {
+      let resolution = session.resolution;
+      if (
+        resolution.status === "unresolved"
+        && session.metadata?.cwd !== undefined
+        && resolve(session.metadata.cwd) === resolve(current.canonical)
+      ) {
+        resolution = {
+          status: "resolved",
+          canonical: current.canonical,
+          projectHash: current.id,
+          evidence: "mapped-path",
+        };
+      }
+      if (resolution.status !== "resolved") {
+        if (resolution.status === "ambiguous") result.ambiguous! += 1;
+        else result.unresolved! += 1;
+        if (options.verbose) {
+          console.log(`  \u23ed\ufe0f ${session.sessionId}: ${resolution.reason}`);
+        }
+        continue;
+      }
+      if (!options.all && resolution.projectHash !== current.id) continue;
+      if (
+        resolution.evidence === "thread-owner"
+        || resolution.evidence === "repository-tombstone"
+      ) {
+        result.reconciled! += 1;
+      }
+      codexSessions.push({
+        path: session.path,
+        sessionId: session.metadata?.threadId ?? session.sessionId,
+        cwd: resolution.canonical,
+        client: "codex",
+      });
+    }
 
     await ingestSessionList(client, codexSessions, options, result);
   }

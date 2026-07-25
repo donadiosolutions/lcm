@@ -15,7 +15,17 @@
  * messages use `type: "output_text"` (both carry a `text` string field).
  */
 
-import { readdirSync, readFileSync, existsSync, lstatSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+} from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { estimateTokens } from "./transcript.js";
@@ -39,6 +49,11 @@ interface CodexResponseItemPayload {
 interface CodexSessionMetaPayload {
   id?: string;
   cwd?: string;
+  git?: {
+    commit_hash?: string;
+    repository_url?: string;
+    branch?: string;
+  };
 }
 
 interface CodexLine {
@@ -123,11 +138,39 @@ export function parseCodexTranscript(transcriptPath: string): ParsedMessage[] {
  * Returns undefined if the session_meta line cannot be found/parsed.
  */
 export function extractCodexSessionCwd(transcriptPath: string): string | undefined {
+  return extractCodexSessionMeta(transcriptPath)?.cwd;
+}
+
+export type CodexSessionMetadata = {
+  readonly threadId?: string;
+  readonly cwd?: string;
+  readonly repositoryUrl?: string;
+  readonly commit?: string;
+  readonly branch?: string;
+};
+
+const MAX_CODEX_SESSION_META_PREFIX_BYTES = 256 * 1024;
+
+/**
+ * Read only the bounded transcript prefix needed for session_meta. The record
+ * is emitted at session start, so scanning an unbounded conversation is both
+ * unnecessary and unsafe for import discovery.
+ */
+export function extractCodexSessionMeta(transcriptPath: string): CodexSessionMetadata | undefined {
+  let fd: number | undefined;
   let raw: string;
   try {
-    raw = readFileSync(transcriptPath, "utf-8");
+    fd = openSync(transcriptPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const leaf = fstatSync(fd);
+    if (!leaf.isFile()) return undefined;
+    const size = Math.min(leaf.size, MAX_CODEX_SESSION_META_PREFIX_BYTES);
+    const buffer = Buffer.alloc(size);
+    const bytesRead = readSync(fd, buffer, 0, size, 0);
+    raw = buffer.subarray(0, bytesRead).toString("utf8");
   } catch {
     return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 
   for (const line of raw.split("\n")) {
@@ -137,7 +180,21 @@ export function extractCodexSessionCwd(transcriptPath: string): string | undefin
       const obj = JSON.parse(trimmed) as CodexLine;
       if (obj.type === "session_meta") {
         const meta = obj.payload as CodexSessionMetaPayload | undefined;
-        if (typeof meta?.cwd === "string" && meta.cwd) return meta.cwd;
+        if (!meta || typeof meta !== "object") return undefined;
+        const result: CodexSessionMetadata = {
+          ...(typeof meta.id === "string" && meta.id ? { threadId: meta.id } : {}),
+          ...(typeof meta.cwd === "string" && meta.cwd ? { cwd: meta.cwd } : {}),
+          ...(typeof meta.git?.repository_url === "string" && meta.git.repository_url
+            ? { repositoryUrl: meta.git.repository_url }
+            : {}),
+          ...(typeof meta.git?.commit_hash === "string" && meta.git.commit_hash
+            ? { commit: meta.git.commit_hash }
+            : {}),
+          ...(typeof meta.git?.branch === "string" && meta.git.branch
+            ? { branch: meta.git.branch }
+            : {}),
+        };
+        return Object.keys(result).length > 0 ? result : undefined;
       }
     } catch {
       continue;

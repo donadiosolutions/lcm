@@ -149,7 +149,10 @@ vi.mock("../../src/import.js", () => ({
   }),
 }));
 vi.mock("../../src/codex-transcript.js", () => ({ findAllCodexTranscripts: vi.fn(() => ["codex-session"]) }));
-vi.mock("../../src/import-summary.js", () => ({ printImportSummary: vi.fn() }));
+vi.mock("../../src/import-summary.js", () => ({
+  printImportSummary: vi.fn(),
+  printCodexResolutionSummary: vi.fn(),
+}));
 vi.mock("../../src/portable-knowledge.js", () => ({
   exportKnowledge: vi.fn(async () => { if (state.exportError) throw state.exportError; return state.portableResult; }),
   importKnowledge: vi.fn(async () => { if (state.importKnowledgeError) throw state.importKnowledgeError; return state.portableResult; }),

@@ -5,6 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import {
   parseCodexTranscript,
   extractCodexSessionCwd,
+  extractCodexSessionMeta,
   findCodexSessionFiles,
   findAllCodexTranscripts,
   type CodexSessionFile,
@@ -257,6 +258,61 @@ describe("extractCodexSessionCwd", () => {
       JSON.stringify({ type: "session_meta", payload: { cwd: 42 } }),
     ].join("\n"));
     expect(extractCodexSessionCwd(file)).toBeUndefined();
+  });
+
+  it("extracts bounded thread and Git metadata without reading the conversation", () => {
+    const dir = makeTmpDir();
+    const file = join(dir, "session.jsonl");
+    writeFileSync(file, `${JSON.stringify({
+      type: "session_meta",
+      payload: {
+        id: "thread",
+        cwd: "/workspace",
+        git: {
+          repository_url: "https://example.invalid/repository.git",
+          commit_hash: "abc123",
+          branch: "feature",
+        },
+      },
+    })}\n${"x".repeat(300 * 1024)}`);
+    expect(extractCodexSessionMeta(file)).toEqual({
+      threadId: "thread",
+      cwd: "/workspace",
+      repositoryUrl: "https://example.invalid/repository.git",
+      commit: "abc123",
+      branch: "feature",
+    });
+  });
+
+  it("rejects unsafe leaves and empty or invalid metadata fields", () => {
+    const dir = makeTmpDir();
+    const target = join(dir, "target.jsonl");
+    writeFileSync(target, "{}\n");
+    symlinkSync(target, join(dir, "linked.jsonl"));
+    mkdirSync(join(dir, "directory.jsonl"));
+    expect(extractCodexSessionMeta(join(dir, "linked.jsonl"))).toBeUndefined();
+    expect(extractCodexSessionMeta(join(dir, "directory.jsonl"))).toBeUndefined();
+
+    const invalid = join(dir, "invalid.jsonl");
+    writeFileSync(invalid, [
+      JSON.stringify({
+        type: "session_meta",
+        payload: {
+          id: "",
+          cwd: 42,
+          git: { repository_url: "", commit_hash: 1, branch: "" },
+        },
+      }),
+    ].join("\n"));
+    expect(extractCodexSessionMeta(invalid)).toBeUndefined();
+
+    const nullPayload = join(dir, "null.jsonl");
+    writeFileSync(nullPayload, JSON.stringify({ type: "session_meta", payload: null }));
+    expect(extractCodexSessionMeta(nullPayload)).toBeUndefined();
+
+    const late = join(dir, "late.jsonl");
+    writeFileSync(late, `${" ".repeat(256 * 1024)}\n${makeSessionMeta("late", "/late")}`);
+    expect(extractCodexSessionMeta(late)).toBeUndefined();
   });
 });
 

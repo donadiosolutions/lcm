@@ -1,8 +1,11 @@
 # Machine registration and project identity
 
 LCM keeps SQLite as the zero-configuration storage backend. A local project is
-still identified by the SHA-256 hash of its normalized canonical path, and its
-database and passive-learning sidecar remain under:
+identified by the SHA-256 hash of its normalized canonical path. For a Git
+repository, LCM first resolves the verified Git common directory and uses the
+primary checkout as that canonical path, so linked worktrees share one local
+project. Non-Git directories continue to use their normalized path directly.
+The database and passive-learning sidecar remain under:
 
 ```text
 ~/.lcm/projects/<local-hash>/db.sqlite
@@ -12,8 +15,44 @@ database and passive-learning sidecar remain under:
 PostgreSQL adds an explicit identity layer. A registered machine has a UUIDv7,
 and a local project may be bound to a PostgreSQL project UUIDv7. The binding
 lets two machines—or two unrelated paths—address the same remote project
-without changing either local hash. LCM never infers identity from a Git
-remote, repository name, directory contents, or matching display names.
+without changing either local hash. Git common-directory evidence affects only
+local identity. LCM never creates, selects, or changes a PostgreSQL UUID from a
+Git remote, repository name, directory contents, or matching display names.
+
+## Linked worktrees and reconciliation
+
+On first local storage access after upgrade, LCM checks the current checkout's
+verified Git common directory. If older `map.json` entries treated linked
+worktrees as separate projects, LCM acquires a private cross-process lock and
+merges their complete SQLite graph, promoted memories, ingest and recall
+bookkeeping, redaction counts, instruction cache, passive events and errors,
+and project-sensitive patterns into the primary checkout's local project.
+Exact duplicates are retained once; divergent identity collisions and
+conflicting PostgreSQL UUID bindings stop the operation before the project map
+is published.
+
+Each operation has an atomic journal under `~/.lcm/reconciliations/`. After the
+merged databases pass foreign-key and FTS verification, source project
+directories and event sidecars move to timestamped private backups under
+`~/.lcm/oldprojects/` and `~/.lcm/oldevents/`. LCM then folds live and deleted
+worktree paths into canonical aliases. Source stores are never deleted.
+
+Preview, inspect, or retry manually:
+
+```bash
+lcm project reconcile-worktrees
+lcm project reconcile-worktrees /work/lcm --dry-run
+lcm project reconcile-worktrees --json
+```
+
+`lcm doctor` reports completed, partial, and blocked journals.
+
+For deleted Codex-managed worktrees, reconciliation and import use bounded
+`session_meta`, exact `codex-thread.json` ownership, and the
+`~/.codex/worktrees/<token>` tombstone structure. An exact repository URL is
+accepted only when it identifies one locally verified project; same-remote
+clones are ambiguous and skipped. This repository metadata is historical
+evidence only and never becomes a PostgreSQL binding.
 
 ## Configure PostgreSQL
 
@@ -198,7 +237,8 @@ lcm project link <project-uuid> /work/lcm
 
 ## Map format and migration
 
-`~/.lcm/map.json` remains backward-readable. Legacy entries need no migration:
+`~/.lcm/map.json` remains backward-readable. Legacy non-worktree entries need
+no migration; linked-worktree entries are reconciled automatically:
 
 ```json
 {
@@ -210,11 +250,11 @@ lcm project link <project-uuid> /work/lcm
 }
 ```
 
-`remoteProjectId` is optional and must be a UUIDv7. Existing hashes, canonical
-paths, aliases, SQLite databases, sidecars, backups, and daemon reload behavior
-are unchanged. To bind a migrated project, select the intended remote UUID
-explicitly with `lcm project link`; leaving the field absent preserves purely
-local SQLite behavior.
+`remoteProjectId` is optional and must be a UUIDv7. Reconciliation preserves
+legacy databases and sidecars as backups, then uses the primary checkout hash.
+To bind a migrated project, select the intended remote UUID explicitly with
+`lcm project link`; leaving the field absent preserves purely local SQLite
+behavior.
 
 ## Atomic reconciliation and outages
 

@@ -128,7 +128,7 @@ describe("createCodexProcessSummarizer", () => {
     expect(spawn.mock.calls[0][1]).toContain("gpt-5.4");
   });
 
-  it("passes reasoning effort and enabled fast mode as process-local strict config", async () => {
+  it("passes reasoning effort and enabled fast mode without strictly validating user config", async () => {
     const child = makeChild(0);
     const spawn = vi.fn().mockReturnValue(child);
     const summarizer = createCodexProcessSummarizer({
@@ -151,7 +151,6 @@ describe("createCodexProcessSummarizer", () => {
     expect(args).toEqual([
       "exec",
       "--model", "gpt-5.4",
-      "--strict-config",
       "-c", 'model_reasoning_effort="minimal"',
       "--enable", "fast_mode",
       "-c", 'service_tier="fast"',
@@ -160,6 +159,7 @@ describe("createCodexProcessSummarizer", () => {
       "--sandbox", "read-only",
       "--output-last-message", expect.any(String),
     ]);
+    expect(args).not.toContain("--strict-config");
   });
 
   it("explicitly disables fast mode without inheriting global Codex config", async () => {
