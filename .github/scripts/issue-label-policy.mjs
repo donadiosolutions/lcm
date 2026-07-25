@@ -15,7 +15,10 @@ const GROUP_CARDINALITY = Object.freeze({
   priorities: Object.freeze({ min: 1, max: 1 }),
 });
 
-const RESERVED_OPERATIONAL_LABELS = new Set(["needs-codex-triage"]);
+const RESERVED_OPERATIONAL_LABELS = new Set([
+  "duplicate",
+  "needs-codex-triage",
+]);
 const DUPLICATE_COMMENT_MARKER_PREFIX = "<!-- codex-duplicate-issue:canonical=#";
 const DUPLICATE_COMMENT_MARKER_SUFFIX = " -->";
 
@@ -69,7 +72,7 @@ export function validateManagedLabelConfig(value) {
       if (/\r|\n|\0/u.test(label)) {
         throw new TypeError(`${group}[${index}] contains an invalid control character`);
       }
-      if (RESERVED_OPERATIONAL_LABELS.has(label)) {
+      if (RESERVED_OPERATIONAL_LABELS.has(label.toLowerCase())) {
         throw new Error(`Managed label ${JSON.stringify(label)} is reserved for workflow operation`);
       }
       const previousGroup = owners.get(label);
@@ -483,8 +486,9 @@ export function buildDuplicateSearchQuery(
 
   let query = prefix;
   for (const term of uniqueTerms) {
-    if (`${query} ${term}`.length > maxLength) break;
-    query += ` ${term}`;
+    const literalTerm = `"${term}"`;
+    if (`${query} ${literalTerm}`.length > maxLength) break;
+    query += ` ${literalTerm}`;
   }
   return query;
 }

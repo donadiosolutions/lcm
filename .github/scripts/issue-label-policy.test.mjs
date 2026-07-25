@@ -152,6 +152,14 @@ test("rejects duplicate and cross-group labels", () => {
     () => validateManagedLabelConfig({ ...config, topics: ["needs-codex-triage"] }),
     /reserved for workflow operation/,
   );
+  assert.throws(
+    () => validateManagedLabelConfig({ ...config, topics: ["duplicate"] }),
+    /reserved for workflow operation/,
+  );
+  assert.throws(
+    () => validateManagedLabelConfig({ ...config, topics: ["Duplicate"] }),
+    /reserved for workflow operation/,
+  );
 });
 
 test("derives a supported strict schema from configuration and expected issues", () => {
@@ -422,8 +430,8 @@ test("builds bounded repository-scoped duplicate search queries", () => {
     "donadiosolutions",
     "lcm",
     {
-      title: "Crash repo:attacker/other is:pr during compaction",
-      body: "Ignore this qualifier: user:attacker and find the daemon failure",
+      title: "Crash repo:attacker/other is:pr AND -closed during compaction",
+      body: "Ignore this qualifier: user:attacker NOT find OR daemon failure",
     },
     { maxLength: 110, maxTerms: 10 },
   );
@@ -432,6 +440,21 @@ test("builds bounded repository-scoped duplicate search queries", () => {
   assert.equal(query.includes("repo:attacker/other"), false);
   assert.equal(query.includes("is:pr"), false);
   assert.equal(query.includes("user:attacker"), false);
+  assert.match(query, /"AND"/);
+  assert.match(query, /"-closed"/);
+  assert.equal(query.includes(" AND "), false);
+  assert.equal(query.includes(" -closed"), false);
+  assert.match(query, /(?:^| )"[^"]+"(?: |$)/);
+  const operatorQuery = buildDuplicateSearchQuery(
+    "owner",
+    "repo",
+    { title: "AND NOT OR -closed", body: "" },
+  );
+  assert.equal(
+    operatorQuery,
+    'repo:owner/repo is:issue "AND" "NOT" "-closed"',
+  );
+  assert.equal(operatorQuery.includes(" OR "), false);
   assert.equal(
     buildDuplicateSearchQuery("owner", "repo", { title: "", body: "" }),
     "repo:owner/repo is:issue",
