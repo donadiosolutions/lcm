@@ -390,6 +390,7 @@ export async function fetchDuplicateCandidates(
   {
     duplicateLabel = "duplicate",
     maxCandidates = 8,
+    maxDiscoveryCandidates = 21,
     rejectDuplicateIssueNumbers = [],
   } = {},
 ) {
@@ -407,6 +408,14 @@ export async function fetchDuplicateCandidates(
   if (!Number.isSafeInteger(maxCandidates) || maxCandidates <= 0) {
     throw new TypeError("Maximum duplicate candidates must be a positive integer");
   }
+  if (
+    !Number.isSafeInteger(maxDiscoveryCandidates)
+    || maxDiscoveryCandidates <= 0
+  ) {
+    throw new TypeError(
+      "Maximum duplicate discovery candidates must be a positive integer",
+    );
+  }
   if (typeof duplicateLabel !== "string" || duplicateLabel.length === 0) {
     throw new TypeError("Duplicate label must be a non-empty string");
   }
@@ -421,65 +430,68 @@ export async function fetchDuplicateCandidates(
       )),
   );
 
-  const candidates = await Promise.all(
-    candidateNumbers.slice(0, maxCandidates).map(async (value, index) => {
-      const candidateNumber = assertPositiveIssueNumber(
-        value,
-        `Duplicate candidate number at index ${index}`,
+  const candidates = [];
+  for (
+    const [index, value]
+    of candidateNumbers.slice(0, maxDiscoveryCandidates).entries()
+  ) {
+    if (candidates.length >= maxCandidates) break;
+    const candidateNumber = assertPositiveIssueNumber(
+      value,
+      `Duplicate candidate number at index ${index}`,
+    );
+    const { data: candidate } = await github.rest.issues.get({
+      ...repo,
+      issue_number: candidateNumber,
+    });
+    if (candidate.number !== candidateNumber) {
+      throw new Error(
+        `Requested duplicate candidate #${candidateNumber}, received issue #${candidate.number}`,
       );
-      const { data: candidate } = await github.rest.issues.get({
-        ...repo,
-        issue_number: candidateNumber,
-      });
-      if (candidate.number !== candidateNumber) {
+    }
+    if (candidate.pull_request) {
+      throw new Error(`Duplicate candidate #${candidateNumber} is a pull request`);
+    }
+    if (candidate.number === sourceNumber) {
+      throw new Error(`Issue #${sourceNumber} cannot be its own duplicate candidate`);
+    }
+    const candidateLabels = (candidate.labels ?? []).map((label) =>
+      typeof label === "string" ? label : label.name,
+    );
+    if (includesLabelIgnoreCase(candidateLabels, duplicateLabel)) {
+      if (rejectedDuplicates.has(candidateNumber)) {
         throw new Error(
-          `Requested duplicate candidate #${candidateNumber}, received issue #${candidate.number}`,
+          `Duplicate candidate #${candidateNumber} is already labeled ${duplicateLabel}`,
         );
       }
-      if (candidate.pull_request) {
-        throw new Error(`Duplicate candidate #${candidateNumber} is a pull request`);
-      }
-      if (candidate.number === sourceNumber) {
-        throw new Error(`Issue #${sourceNumber} cannot be its own duplicate candidate`);
-      }
-      const candidateLabels = (candidate.labels ?? []).map((label) =>
-        typeof label === "string" ? label : label.name,
+      continue;
+    }
+    const candidateTimestamp = parseTimestamp(
+      candidate.created_at,
+      `Creation time for candidate #${candidate.number}`,
+    );
+    if (
+      candidateTimestamp > sourceTimestamp
+      || (
+        candidateTimestamp === sourceTimestamp
+        && candidate.number >= sourceNumber
+      )
+    ) {
+      throw new Error(
+        `Duplicate candidate #${candidate.number} must be older than issue #${sourceNumber}`,
       );
-      if (includesLabelIgnoreCase(candidateLabels, duplicateLabel)) {
-        if (rejectedDuplicates.has(candidateNumber)) {
-          throw new Error(
-            `Duplicate candidate #${candidateNumber} is already labeled ${duplicateLabel}`,
-          );
-        }
-        return null;
-      }
-      const candidateTimestamp = parseTimestamp(
-        candidate.created_at,
-        `Creation time for candidate #${candidate.number}`,
-      );
-      if (
-        candidateTimestamp > sourceTimestamp
-        || (
-          candidateTimestamp === sourceTimestamp
-          && candidate.number >= sourceNumber
-        )
-      ) {
-        throw new Error(
-          `Duplicate candidate #${candidate.number} must be older than issue #${sourceNumber}`,
-        );
-      }
-      return {
-        number: candidate.number,
-        title: candidate.title,
-        body: candidate.body ?? "",
-        state: candidate.state,
-        stateReason: candidate.state_reason ?? "",
-        createdAt: candidate.created_at,
-        fingerprint: issueContentFingerprint(candidate),
-      };
-    }),
-  );
-  return candidates.filter((candidate) => candidate !== null);
+    }
+    candidates.push({
+      number: candidate.number,
+      title: candidate.title,
+      body: candidate.body ?? "",
+      state: candidate.state,
+      stateReason: candidate.state_reason ?? "",
+      createdAt: candidate.created_at,
+      fingerprint: issueContentFingerprint(candidate),
+    });
+  }
+  return candidates;
 }
 
 function searchTerms(value) {
@@ -511,8 +523,8 @@ export function buildDuplicateSearchQuery(
   }
   assertPlainObject(issue, "Issue");
 
-  const prefix = `repo:${owner}/${repo} is:issue`;
-  const uniqueTerms = [];
+  let query = `repo:${owner}/${repo} is:issue`;
+  let appendedTerms = 0;
   const seen = new Set();
   for (const term of [
     ...searchTerms(issue.title),
@@ -521,15 +533,11 @@ export function buildDuplicateSearchQuery(
     const normalized = term.toLowerCase();
     if (seen.has(normalized)) continue;
     seen.add(normalized);
-    uniqueTerms.push(term);
-    if (uniqueTerms.length === maxTerms) break;
-  }
-
-  let query = prefix;
-  for (const term of uniqueTerms) {
     const literalTerm = `"${term}"`;
     if (`${query} ${literalTerm}`.length > maxLength) continue;
     query += ` ${literalTerm}`;
+    appendedTerms += 1;
+    if (appendedTerms === maxTerms) break;
   }
   return query;
 }
@@ -672,15 +680,30 @@ export function validateLiveDuplicateCandidates(
 export function buildDuplicateSchema(candidateSets) {
   const valid = validateDuplicateCandidateSets(candidateSets);
   const issueNumbers = valid.map((candidateSet) => candidateSet.issueNumber);
-  const candidateNumbers = [
-    ...new Set(
-      valid.flatMap((candidateSet) =>
-        candidateSet.candidates.map((candidate) => candidate.number)),
-    ),
-  ];
-  const duplicateItems = candidateNumbers.length > 0
-    ? { type: "integer", enum: candidateNumbers }
-    : { type: "integer" };
+  const resultSchemas = valid.map((candidateSet) => {
+    const candidateNumbers = candidateSet.candidates.map(
+      (candidate) => candidate.number,
+    );
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["issueNumber", "duplicateOf"],
+      properties: {
+        issueNumber: {
+          type: "integer",
+          enum: [candidateSet.issueNumber],
+        },
+        duplicateOf: {
+          type: "array",
+          minItems: 0,
+          maxItems: candidateNumbers.length > 0 ? 1 : 0,
+          items: candidateNumbers.length > 0
+            ? { type: "integer", enum: candidateNumbers }
+            : { type: "integer" },
+        },
+      },
+    };
+  });
 
   return {
     type: "object",
@@ -691,20 +714,14 @@ export function buildDuplicateSchema(candidateSets) {
         type: "array",
         minItems: issueNumbers.length,
         maxItems: issueNumbers.length,
-        items: {
-          type: "object",
-          additionalProperties: false,
-          required: ["issueNumber", "duplicateOf"],
-          properties: {
-            issueNumber: { type: "integer", enum: issueNumbers },
-            duplicateOf: {
-              type: "array",
-              minItems: 0,
-              maxItems: candidateNumbers.length > 0 ? 1 : 0,
-              items: duplicateItems,
+        items: resultSchemas.length > 0
+          ? { anyOf: resultSchemas }
+          : {
+              type: "object",
+              additionalProperties: false,
+              required: [],
+              properties: {},
             },
-          },
-        },
       },
     },
   };
@@ -888,7 +905,7 @@ export function resolveDuplicateCanonicalTarget(
 export function prioritizeMarkedDuplicateCandidate(
   candidateNumbers,
   markedCanonical,
-  { maxCandidates = 8 } = {},
+  { maxCandidates = 21 } = {},
 ) {
   if (!Array.isArray(candidateNumbers)) {
     throw new TypeError("Duplicate candidate numbers must be an array");

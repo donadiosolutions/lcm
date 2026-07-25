@@ -517,6 +517,7 @@ jobs:
                       })
                       .map((candidate) => candidate.number),
                     markedCanonical,
+                    { maxCandidates: 21 },
                   );
                 const candidates = await fetchDuplicateCandidates(
                   github,

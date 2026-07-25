@@ -481,6 +481,99 @@ test("filters duplicate-labeled candidates and rejects marked duplicate chains",
   );
 });
 
+test("fills the live candidate bound after filtering an ineligible early hit", async () => {
+  const source = { ...sourceIssue, created_at: sourceIssue.createdAt };
+  const candidatesByNumber = new Map([
+    [openCandidate.number, {
+      ...openCandidate,
+      created_at: openCandidate.createdAt,
+      labels: ["duplicate"],
+    }],
+    [closedCandidate.number, {
+      ...closedCandidate,
+      created_at: closedCandidate.createdAt,
+      labels: [],
+    }],
+  ]);
+  const calls = [];
+  const github = {
+    rest: {
+      issues: {
+        get: async ({ issue_number: issueNumber }) => {
+          calls.push(issueNumber);
+          return { data: candidatesByNumber.get(issueNumber) };
+        },
+      },
+    },
+  };
+
+  const candidates = await fetchDuplicateCandidates(
+    github,
+    { owner: "example", repo: "repository" },
+    source,
+    [openCandidate.number, closedCandidate.number],
+    { maxCandidates: 1 },
+  );
+  assert.deepEqual(calls, [openCandidate.number, closedCandidate.number]);
+  assert.deepEqual(
+    candidates.map((candidate) => candidate.number),
+    [closedCandidate.number],
+  );
+});
+
+test("bounds authoritative discovery reads independently of caller input", async () => {
+  const calls = [];
+  const github = {
+    rest: {
+      issues: {
+        get: async ({ issue_number: issueNumber }) => {
+          calls.push(issueNumber);
+          return {
+            data: {
+              number: issueNumber,
+              title: `Candidate ${issueNumber}`,
+              body: "",
+              state: "open",
+              state_reason: null,
+              created_at: "2026-07-18T12:00:00Z",
+              labels: ["duplicate"],
+            },
+          };
+        },
+      },
+    },
+  };
+  const candidateNumbers = Array.from(
+    { length: 30 },
+    (_, index) => index + 1,
+  );
+  const candidates = await fetchDuplicateCandidates(
+    github,
+    { owner: "example", repo: "repository" },
+    {
+      number: 42,
+      created_at: sourceIssue.createdAt,
+    },
+    candidateNumbers,
+  );
+  assert.deepEqual(candidates, []);
+  assert.equal(calls.length, 21);
+  assert.deepEqual(calls, candidateNumbers.slice(0, 21));
+  await assert.rejects(
+    fetchDuplicateCandidates(
+      github,
+      { owner: "example", repo: "repository" },
+      {
+        number: 42,
+        created_at: sourceIssue.createdAt,
+      },
+      candidateNumbers,
+      { maxDiscoveryCandidates: 0 },
+    ),
+    /discovery candidates must be a positive integer/,
+  );
+});
+
 test("validates all live candidate fingerprints and state evidence", () => {
   const evidence = candidateSets[0].candidates;
   const live = [
@@ -556,6 +649,22 @@ test("builds bounded repository-scoped duplicate search queries", () => {
     ),
     'repo:owner/repo is:issue "later"',
   );
+  const oversizedIdentifiers = Array.from(
+    { length: 4 },
+    (_, index) => `oversized${index}${"x".repeat(60)}`,
+  ).join(" ");
+  assert.equal(
+    buildDuplicateSearchQuery(
+      "owner",
+      "repo",
+      {
+        title: `${oversizedIdentifiers} alpha beta gamma`,
+        body: "",
+      },
+      { maxLength: 64, maxTerms: 2 },
+    ),
+    'repo:owner/repo is:issue "alpha" "beta"',
+  );
   assert.equal(
     buildDuplicateSearchQuery("owner", "repo", { title: "", body: "" }),
     "repo:owner/repo is:issue",
@@ -579,32 +688,65 @@ test("builds bounded repository-scoped duplicate search queries", () => {
 });
 
 test("builds a strict supported duplicate schema", () => {
-  const schema = buildDuplicateSchema(candidateSets);
+  const secondCandidateSet = {
+    issueNumber: 99,
+    sourceFingerprint: issueContentFingerprint({ title: "Second", body: "" }),
+    sourceCreatedAt: "2026-07-25T13:00:00Z",
+    candidates: [{
+      number: 77,
+      fingerprint: issueContentFingerprint({ title: "Older", body: "" }),
+      createdAt: "2026-07-19T12:00:00Z",
+      state: "open",
+      stateReason: "",
+    }],
+  };
+  const schema = buildDuplicateSchema([...candidateSets, secondCandidateSet]);
   assert.equal(JSON.stringify(schema).includes('"uniqueItems":'), false);
-  assert.deepEqual(schema.properties.issues.items.properties.issueNumber.enum, [42]);
+  const [firstBranch, secondBranch] = schema.properties.issues.items.anyOf;
+  assert.deepEqual(firstBranch.properties.issueNumber.enum, [42]);
   assert.deepEqual(
-    schema.properties.issues.items.properties.duplicateOf.items.enum,
+    firstBranch.properties.duplicateOf.items.enum,
     [12, 8],
   );
   assert.equal(
-    schema.properties.issues.items.properties.duplicateOf.maxItems,
+    firstBranch.properties.duplicateOf.maxItems,
     1,
+  );
+  assert.deepEqual(secondBranch.properties.issueNumber.enum, [99]);
+  assert.deepEqual(secondBranch.properties.duplicateOf.items.enum, [77]);
+  assert.equal(
+    firstBranch.properties.duplicateOf.items.enum.includes(77),
+    false,
+  );
+  assert.equal(
+    secondBranch.properties.duplicateOf.items.enum.includes(12),
+    false,
+  );
+  assert.throws(
+    () => parseAndValidateDuplicateResult({
+      issues: [
+        { issueNumber: 42, duplicateOf: [77] },
+        { issueNumber: 99, duplicateOf: [] },
+      ],
+    }, [...candidateSets, secondCandidateSet]),
+    /not an allowed duplicate candidate/,
   );
 
   const noCandidates = buildDuplicateSchema([{
     ...candidateSets[0],
     candidates: [],
   }]);
+  const noCandidateBranch = noCandidates.properties.issues.items.anyOf[0];
   assert.deepEqual(
-    noCandidates.properties.issues.items.properties.duplicateOf.items,
+    noCandidateBranch.properties.duplicateOf.items,
     { type: "integer" },
   );
   assert.equal(
-    noCandidates.properties.issues.items.properties.duplicateOf.minItems,
+    noCandidateBranch.properties.duplicateOf.minItems,
     0,
   );
   assert.equal(
-    noCandidates.properties.issues.items.properties.duplicateOf.maxItems,
+    noCandidateBranch.properties.duplicateOf.maxItems,
     0,
   );
   assert.equal(JSON.stringify(noCandidates).includes('"uniqueItems":'), false);
@@ -837,6 +979,13 @@ test("prioritizes a marked canonical within the candidate bound", () => {
   assert.deepEqual(
     prioritizeMarkedDuplicateCandidate([12, 8], null, { maxCandidates: 1 }),
     [12],
+  );
+  assert.equal(
+    prioritizeMarkedDuplicateCandidate(
+      Array.from({ length: 25 }, (_, index) => index + 1),
+      99,
+    ).length,
+    21,
   );
   assert.throws(
     () => prioritizeMarkedDuplicateCandidate(null, 8),
