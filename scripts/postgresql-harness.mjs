@@ -39,6 +39,75 @@ export const RESOURCE_KIND_LABEL = "com.donadiosolutions.lcm.postgresql-test-res
 export const OWNER_SCHEMA_VERSION = "2";
 export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
 export const MAX_DOCKER_REMOVE_ATTEMPTS = 3;
+export const DEFAULT_SIGNAL_PROBE_READINESS_TIMEOUT_MS = 90_000;
+export const MIN_SIGNAL_PROBE_READINESS_TIMEOUT_MS = 1_000;
+export const MAX_SIGNAL_PROBE_READINESS_TIMEOUT_MS = 300_000;
+export const HARNESS_ALLOCATION_MARKER = "PostgreSQL harness allocated run:";
+export const SIGNAL_CLEANUP_FAILURE_MARKER = "PostgreSQL harness cleanup failed:";
+
+export function resolveSignalProbeReadinessTimeout(environment = process.env) {
+  const configured = environment.LCM_TEST_POSTGRES_SIGNAL_READY_TIMEOUT_MS;
+  if (configured === undefined) return DEFAULT_SIGNAL_PROBE_READINESS_TIMEOUT_MS;
+  if (!/^[1-9][0-9]*$/u.test(configured)) {
+    throw new Error("invalid PostgreSQL signal probe readiness timeout");
+  }
+  const milliseconds = Number(configured);
+  if (
+    !Number.isSafeInteger(milliseconds)
+    || milliseconds < MIN_SIGNAL_PROBE_READINESS_TIMEOUT_MS
+    || milliseconds > MAX_SIGNAL_PROBE_READINESS_TIMEOUT_MS
+  ) {
+    throw new Error("invalid PostgreSQL signal probe readiness timeout");
+  }
+  return milliseconds;
+}
+
+export function signalCleanupFailed(output) {
+  return String(output).includes(SIGNAL_CLEANUP_FAILURE_MARKER);
+}
+
+export function registerHarnessAllocationMarkers(output, runIds) {
+  const matches = String(output).matchAll(
+    /(?:^|\n)PostgreSQL harness allocated run: ([0-9a-f]{32})(?=\n|$)/gu,
+  );
+  for (const match of matches) runIds.add(match[1]);
+}
+
+export async function auditHarnessRunResources(runIds, dockerRunner = docker) {
+  const failures = [];
+  const queries = [
+    ["container", ["ps", "--all", "--quiet"]],
+    ["network", ["network", "ls", "--quiet"]],
+    ["volume", ["volume", "ls", "--quiet"]],
+  ];
+  for (const runId of runIds) {
+    if (!/^[0-9a-f]{32}$/u.test(runId)) {
+      failures.push(new Error("PostgreSQL signal resource audit received an invalid run ID"));
+      continue;
+    }
+    for (const [resourceClass, args] of queries) {
+      try {
+        const { stdout } = await dockerRunner([
+          ...args,
+          "--filter",
+          `label=${RUN_LABEL}=${runId}`,
+        ]);
+        if (String(stdout).trim()) {
+          failures.push(new Error(
+            `PostgreSQL signal resource audit found leaked ${resourceClass} resources for run ${runId}`,
+          ));
+        }
+      } catch {
+        failures.push(new Error(
+          `PostgreSQL signal resource audit could not query ${resourceClass} resources for run ${runId}`,
+        ));
+      }
+    }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "PostgreSQL signal resource audit failed");
+  }
+}
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const initScript = join(repositoryRoot, "test", "postgresql", "init.sh");
@@ -1019,8 +1088,10 @@ export async function reclaimProvenOrphans(dependencies = {}) {
           ? dependencies.verifySentinel(createRunNames(run.runId), run.runId, dockerRunner)
           : waitForContainerSentinel(createRunNames(run.runId), run.runId, dockerRunner));
       } catch (error) {
-        failures.push(error);
-        continue;
+        if (!isMissingDockerObjectError(error, "container", database.name)) {
+          failures.push(error);
+          continue;
+        }
       }
     }
     for (const kind of ["restore", "runner", "database", "data", "network"]) {
@@ -1092,6 +1163,7 @@ async function waitForContainerSentinel(names, runId, dockerRunner = docker) {
       await verifyContainerSentinel(names, runId, dockerRunner);
       return;
     } catch (error) {
+      if (isMissingDockerObjectError(error, "container", names.container)) throw error;
       lastError = error;
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
@@ -1242,16 +1314,19 @@ async function runTests(context, ci, setupDocker = docker, testProcess = runProc
 }
 
 export async function runHarness(options = {}) {
+  resolveSignalProbeReadinessTimeout(process.env);
   const ci = options.ci ?? process.env.GITHUB_ACTIONS === "true";
+  const runId = randomBytes(16).toString("hex");
+  process.stderr.write(`${HARNESS_ALLOCATION_MARKER} ${runId}\n`);
   let owner;
   try {
+    await options.afterRunAllocation?.({ runId });
     await reclaimProvenOrphans();
     owner = createOwnerIdentity();
   } catch (error) {
     process.stderr.write(`PostgreSQL harness startup failed: ${sanitizedHarnessErrorDetails(error, [])}\n`);
     throw error;
   }
-  const runId = randomBytes(16).toString("hex");
   const names = createRunNames(runId);
   const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-harness-"));
   chmodSync(directory, 0o700);
@@ -1271,7 +1346,7 @@ export async function runHarness(options = {}) {
     cleanupPromise ??= cleanupHarnessResources({ names, runId, directory, sentinelReady, owner })
       .catch((error) => {
         const details = sanitizedHarnessErrorDetails(error, secrets);
-        process.stderr.write(`PostgreSQL harness cleanup failed: ${details}\n`);
+        process.stderr.write(`${SIGNAL_CLEANUP_FAILURE_MARKER} ${details}\n`);
         throw error;
       });
     return cleanupPromise;
@@ -1446,7 +1521,12 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const signalProbe = process.argv.includes("--signal-probe");
   const consumerProbe = process.argv.includes("--consumer-signal-probe");
   const forkConsumerProbe = process.argv.includes("--fork-consumer-signal-probe");
-  runHarness(signalProbe ? {
+  const allocationFailureProbe = process.argv.includes("--allocation-failure-probe");
+  runHarness(allocationFailureProbe ? {
+    afterRunAllocation: () => {
+      throw new Error("injected pre-readiness failure");
+    },
+  } : signalProbe ? {
     runTests: async ({ runId }) => {
       process.stderr.write(`PostgreSQL harness signal probe ready: ${runId}\n`);
       await new Promise(() => { setInterval(() => undefined, 1_000); });

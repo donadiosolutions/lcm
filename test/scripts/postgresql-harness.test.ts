@@ -2,8 +2,12 @@ import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
+  DEFAULT_SIGNAL_PROBE_READINESS_TIMEOUT_MS,
+  HARNESS_ALLOCATION_MARKER,
   MAX_CAPTURED_OUTPUT_BYTES,
   MAX_DOCKER_REMOVE_ATTEMPTS,
+  MAX_SIGNAL_PROBE_READINESS_TIMEOUT_MS,
+  MIN_SIGNAL_PROBE_READINESS_TIMEOUT_MS,
   NODE_IMAGE,
   OWNER_BIRTH_LABEL,
   OWNER_PID_LABEL,
@@ -13,6 +17,8 @@ import {
   POSTGRES_IMAGE,
   RESOURCE_KIND_LABEL,
   RUN_LABEL,
+  SIGNAL_CLEANUP_FAILURE_MARKER,
+  auditHarnessRunResources,
   classifyOwnerIdentity,
   cleanupHarnessResources,
   createOwnerIdentity,
@@ -31,10 +37,13 @@ import {
   reclaimProvenOrphans,
   removeLabeled,
   removeOwnedResource,
+  registerHarnessAllocationMarkers,
+  resolveSignalProbeReadinessTimeout,
   resolveConfiguredTemplateArchive,
   runProcess,
   runSanitizedProcess,
   sanitizeHarnessText,
+  signalCleanupFailed,
   validateRunNames,
 } from "../../scripts/postgresql-harness.mjs";
 import { postgresqlVitestCacheDir } from "../../vitest.postgresql.config.js";
@@ -43,6 +52,98 @@ const testBootId = "12345678-1234-1234-1234-123456789abc";
 const testOwnerScope = `linux:${"a".repeat(64)}:${testBootId}:pid:[4026531836]`;
 
 describe("PostgreSQL harness utilities", () => {
+  it("resolves a bounded signal-probe readiness timeout", () => {
+    expect(resolveSignalProbeReadinessTimeout({})).toBe(
+      DEFAULT_SIGNAL_PROBE_READINESS_TIMEOUT_MS,
+    );
+    expect(resolveSignalProbeReadinessTimeout({
+      LCM_TEST_POSTGRES_SIGNAL_READY_TIMEOUT_MS: String(MIN_SIGNAL_PROBE_READINESS_TIMEOUT_MS),
+    })).toBe(MIN_SIGNAL_PROBE_READINESS_TIMEOUT_MS);
+    expect(resolveSignalProbeReadinessTimeout({
+      LCM_TEST_POSTGRES_SIGNAL_READY_TIMEOUT_MS: String(MAX_SIGNAL_PROBE_READINESS_TIMEOUT_MS),
+    })).toBe(MAX_SIGNAL_PROBE_READINESS_TIMEOUT_MS);
+  });
+
+  it.each([
+    "",
+    " ",
+    "0",
+    "0999",
+    "999",
+    "1000.5",
+    "1e3",
+    "+1000",
+    String(MAX_SIGNAL_PROBE_READINESS_TIMEOUT_MS + 1),
+    "9007199254740993",
+  ])("rejects invalid signal-probe readiness timeout %j", (value) => {
+    expect(() => resolveSignalProbeReadinessTimeout({
+      LCM_TEST_POSTGRES_SIGNAL_READY_TIMEOUT_MS: value,
+    })).toThrow("invalid PostgreSQL signal probe readiness timeout");
+  });
+
+  it("exposes a deterministic cleanup-failure marker without changing signal exit conventions", () => {
+    expect(signalCleanupFailed("PostgreSQL harness signal probe ready: abc")).toBe(false);
+    expect(signalCleanupFailed(`${SIGNAL_CLEANUP_FAILURE_MARKER} sanitized failure`)).toBe(true);
+    expect(signalCleanupFailed(new Error(`${SIGNAL_CLEANUP_FAILURE_MARKER} nested`))).toBe(true);
+  });
+
+  it("registers only sanitized allocation markers before readiness", () => {
+    const first = "a".repeat(32);
+    const second = "b".repeat(32);
+    const runIds = new Set<string>();
+
+    registerHarnessAllocationMarkers(
+      `${HARNESS_ALLOCATION_MARKER} ${first}\n`
+      + "PostgreSQL harness startup failed: injected failure\n"
+      + `${HARNESS_ALLOCATION_MARKER} malformed-secret\n`
+      + `${HARNESS_ALLOCATION_MARKER} ${second}\n`,
+      runIds,
+    );
+
+    expect([...runIds]).toEqual([first, second]);
+  });
+
+  it("audits every resource class and run after earlier failures without exposing runner output", async () => {
+    const first = "a".repeat(32);
+    const second = "b".repeat(32);
+    const secret = "private-docker-socket";
+    const calls: string[][] = [];
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      calls.push(args);
+      const runId = args.at(-1)?.split("=").at(-1);
+      const resourceClass = args[0] === "ps" ? "container" : args[0];
+      if (runId === first && resourceClass === "container") {
+        throw new Error(`cannot access ${secret}`);
+      }
+      if (runId === second && resourceClass === "network") {
+        return { stdout: `leaked-id-${secret}`, stderr: "" };
+      }
+      return { stdout: "", stderr: "" };
+    });
+
+    const failure = await auditHarnessRunResources(
+      [first, second],
+      dockerRunner,
+    ).catch((error: unknown) => error);
+
+    expect(calls).toHaveLength(6);
+    expect(calls.map((args) => [
+      args.at(-1)?.endsWith(first) ? first : second,
+      args[0] === "ps" ? "container" : args[0],
+    ])).toEqual([
+      [first, "container"],
+      [first, "network"],
+      [first, "volume"],
+      [second, "container"],
+      [second, "network"],
+      [second, "volume"],
+    ]);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toHaveLength(2);
+    expect(String(failure)).not.toContain(secret);
+    expect((failure as AggregateError).errors.map(String).join("\n")).not.toContain(secret);
+  });
+
   it("uses exact digest-pinned images and a namespaced label", () => {
     expect(POSTGRES_IMAGE).toMatch(/^postgres:18\.4-bookworm@sha256:[0-9a-f]{64}$/u);
     expect(NODE_IMAGE).toMatch(/^node:22\.20\.0-bookworm-slim@sha256:[0-9a-f]{64}$/u);
@@ -891,6 +992,118 @@ describe("PostgreSQL harness utilities", () => {
       `volume:${names.volume}`,
       `network:${names.network}`,
     ]);
+  });
+
+  it("treats an exact container disappearance after discovery as idempotent recovery", async () => {
+    const runId = "9".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 79,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:790",
+      scope: testOwnerScope,
+    };
+    const records = new Map([
+      [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+      [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
+    ]);
+    const missingContainer = Object.assign(new Error("docker failed"), {
+      code: 1,
+      stdout: "",
+      stderr: `Error response from daemon: No such container: ${names.container}`,
+    });
+    const removals: string[] = [];
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        return {
+          stdout: [...records.keys()]
+            .filter((key) => key.startsWith(`${type}:`))
+            .map((key) => key.slice(type.length + 1))
+            .join("\n"),
+          stderr: "",
+        };
+      }
+      if (args[1] === "inspect") {
+        const type = args[0];
+        const labels = records.get(`${type}:${args[2]}`);
+        if (!labels && type === "container" && args[2] === names.container) {
+          throw missingContainer;
+        }
+        return {
+          stdout: JSON.stringify([type === "container"
+            ? { Config: { Labels: labels }, State: { Running: true }, Mounts: [] }
+            : { Labels: labels }]),
+          stderr: "",
+        };
+      }
+      const type = args[0];
+      const name = args.at(-1)!;
+      removals.push(`${type}:${name}`);
+      records.delete(`${type === "container" ? "container" : type}:${name}`);
+      return { stdout: "", stderr: "" };
+    });
+    const verifySentinel = vi.fn(async () => {
+      records.delete(`container:${names.container}`);
+      throw missingContainer;
+    });
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+      verifySentinel,
+      resolveHarnessDirectory: () => "/private/harness",
+    })).resolves.toBeDefined();
+
+    expect(verifySentinel).toHaveBeenCalledOnce();
+    expect(removals).toEqual([
+      `volume:${names.volume}`,
+      `network:${names.network}`,
+    ]);
+    expect(records).toEqual(new Map());
+  });
+
+  it("does not reinterpret a different missing container as the discovered resource disappearing", async () => {
+    const runId = "8".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 78,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:780",
+      scope: testOwnerScope,
+    };
+    const labels = ownershipLabels(runId, "database", owner);
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[0] === "container" && args[1] === "ls") {
+        return { stdout: names.container, stderr: "" };
+      }
+      if (args[1] === "ls") return { stdout: "", stderr: "" };
+      return {
+        stdout: JSON.stringify([{
+          Config: { Labels: labels },
+          State: { Running: true },
+          Mounts: [],
+        }]),
+        stderr: "",
+      };
+    });
+    const sentinelFailure = Object.assign(new Error("docker failed"), {
+      code: 1,
+      stdout: "",
+      stderr: "Error response from daemon: No such container: different-container",
+    });
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+      verifySentinel: vi.fn(async () => { throw sentinelFailure; }),
+      resolveHarnessDirectory: () => "/private/harness",
+    })).rejects.toBe(sentinelFailure);
+
+    expect(dockerRunner.mock.calls.some(([args]) => args[1] === "rm")).toBe(false);
   });
 
   it("does not mutate live, legacy, malformed, unsupported, or permission-ambiguous runs", async () => {

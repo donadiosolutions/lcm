@@ -33,10 +33,24 @@ workspace and `node_modules` are mounted read-only.
 No fixed host port, reusable password, global Docker resource, or developer
 database is used.
 
+Nested signal probes allow 90 seconds for Docker readiness by default so two
+complete local harnesses can run concurrently under CPU and I/O contention.
+Set `LCM_TEST_POSTGRES_SIGNAL_READY_TIMEOUT_MS` only when a slower host needs a
+different readiness budget. The value must be an integer from 1,000 through
+300,000 milliseconds; each signal test derives its total case timeout from
+that readiness budget and the number of nested probes it launches.
+
 The harness never discovers an existing server. A developer-installed
 PostgreSQL instance, the default Unix socket, `localhost:5432`,
 `LCM_POSTGRES_URL`, and every `PG*` environment variable are invalid harness
 inputs and are never test targets.
+
+Run PostgreSQL integration files only through `npm run test:postgresql`.
+Invoking Vitest directly is intentionally unsupported: without the
+harness-generated run identity, database names, roles, connection URLs, and
+certificate fixtures, readiness fails before migration or test-database
+allocation. Supplying ordinary runtime configuration does not opt a direct run
+in; the same ambient-variable guard rejects it.
 
 Each run creates random credentials, a labeled container, network, volume, TLS
 CA and server certificate, and a control database. PostgreSQL accepts host
@@ -46,6 +60,35 @@ runtime roles, and the `pg_trgm`, `unaccent`, `pgcrypto`, and
 `pg_stat_statements` extensions. Every test or worker obtains a fresh database
 with a private sentinel recording the run ID, database name, and expected
 runtime role.
+
+Readiness is ordered to fail before database mutation. The harness first
+validates the cryptographic run ID; derived control-database and test-database
+prefixes; exact administrator, migrator, and runtime principals; internally
+generated URLs; execution-mode host and port; and absolute, distinct
+certificate fixtures. Local connections must use `127.0.0.1` on a random
+non-5432 port. The inner CI runner must use its run-scoped certificate alias on
+port 5432. It then connects with verified TLS and proves the server major
+version, current role, required extensions, usable `pg_stat_statements`, and
+the matching control-database sentinel. Only after that ownership preflight
+may migrations run or a per-test database be created.
+
+Each integration case receives a newly generated database, applies migrations
+and any explicitly reviewed domain grants, exercises its repository, and drops
+only that database during teardown. Creation repeats the control preflight;
+drop repeats environment-drift, generated-name, PostgreSQL-version,
+administrator-role, and per-database-sentinel guards. A guard failure leaves
+the database or Docker object intact for exact-label inspection rather than
+guessing that it belongs to the current run.
+
+Harness diagnostics are deliberately categorical. Treat an environment,
+ownership, extension, TLS, sentinel, or cleanup-preflight error as a failed
+run, even if another test file passed. The two CI matrix entries are independent
+complete runs, and the stable `ci` result is successful only when both pass.
+Failure output is sanitized and bounded: it must not contain credentials,
+connection URLs, SQL parameters, certificate or private-key material, or
+private temporary paths. Use the named preflight stage and the exact owned
+resource labels for investigation; do not add secrets to logs to distinguish
+failures.
 
 Every Docker object carries the random run ID, its resource kind, label-schema
 version, owner PID, process-birth fingerprint, and hashed client process scope.
@@ -61,7 +104,16 @@ the generated name prefix, PostgreSQL major version, current role, private
 sentinel, and complete Docker ownership labels. SIGINT, SIGTERM, and SIGHUP use
 the same idempotent cleanup path and retain their conventional exit codes.
 Removal is bounded and retryable, and every attempt reinspects the exact labels
-before issuing an exact-name removal.
+before issuing an exact-name removal. Immediately after generating a run ID,
+and before any Docker mutation for that run, the harness emits a categorical
+allocation marker containing only the cryptographic run ID. The signal suite
+registers that marker independently of readiness, so a setup or cleanup failure
+before the ready marker remains attributable. Its final audit queries every
+Docker resource class for every registered run ID, retains all failures and
+leaks rather than stopping at the first one, and reports one sanitized
+aggregate. An unaccounted probe or a later leak therefore cannot hide behind an
+earlier inspection failure while still allowing unrelated concurrent worktrees
+to run.
 
 Before allocating a new run, the harness inspects labeled resources left by
 earlier runs. It reclaims a set only when every discovered object has a
@@ -77,7 +129,10 @@ hosts share a Docker socket and when multiple clients use a remote Docker
 context; reconcile those resources from their original client scope.
 A running stale database must make its sentinel observable before recovery;
 an exactly owned stopped container can be removed without executing a sentinel
-that Docker cannot expose.
+that Docker cannot expose. If a sibling cleanup removes the exact discovered
+object during reconciliation, that exact-name disappearance is idempotent;
+companions still pass through ownership reinspection, while different names or
+ambiguous Docker failures remain fatal.
 While local Vitest is active, a private bounded consumer record keeps its PID,
 birth fingerprint, and process scope with the run. A later harness preserves
 the run if that consumer survived its parent. Graceful harness termination
@@ -99,6 +154,40 @@ For an ambiguous resource, inspect its complete labels and verify that the
 recorded PID and birth fingerprint no longer identify a live process before
 manually removing that exact object. If the evidence cannot be established,
 preserve it for reconciliation; elapsed time is never proof of ownership.
+
+## Register a PostgreSQL repository contract
+
+Every PostgreSQL implementation of a `ProjectRepositories` domain must pass a
+backend-neutral contract before that adapter is treated as exposed. The
+compile-time manifest in
+`test/storage/postgresql-conformance-manifest.ts` maps conventional
+`PostgreSql*Repository` exports to their shared contract suite. Exporting a
+recognized adapter without adding its manifest registration and contract is a
+type-check failure; registering a contract for a domain without an exposed
+adapter is also rejected. The dedicated
+`tsconfig.postgresql-conformance.json` project keeps this test-only manifest in
+the existing `npm run typecheck` and CI gate without adding it to the production
+build or public runtime API.
+
+The staged conversation adapter is the current registration. Its PostgreSQL
+integration test invokes the same
+`exerciseConversationRepositoryConformance` suite used by SQLite, then adds
+PostgreSQL-only least-privilege, project-isolation, and transactional checks.
+When implementing the remaining adapters tracked by #86-#91:
+
+1. Put backend-neutral behavior in a shared suite whose input is the matching
+   `ProjectRepositories` interface, not a PostgreSQL concrete class.
+2. Export the PostgreSQL adapter using the conventional name recorded in the
+   manifest, and add its adapter and shared-suite entries in the same change.
+3. Invoke the registered suite from the PostgreSQL integration test, then add
+   only backend-specific security, isolation, concurrency, and failure cases
+   around it.
+4. Keep unimplemented domains absent. A planned schema table or migration does
+   not constitute an adapter registration and must not be reported as contract
+   coverage.
+
+The manifest is an enforcement gate, not daemon/CLI activation.
+`ProjectStorage` routing remains SQLite-only until the later cutover work.
 
 ## Add or change a migration
 
