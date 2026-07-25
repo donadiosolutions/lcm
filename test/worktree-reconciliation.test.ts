@@ -7,6 +7,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -15,6 +16,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runLcmMigrations } from "../src/db/migration.js";
+import {
+  closeLcmConnection,
+  getPoolStats,
+} from "../src/db/connection.js";
 import { clearGitProjectAnchorCache, resolveGitProjectAnchor } from "../src/git-project.js";
 import {
   clearProjectMapCache,
@@ -202,6 +207,7 @@ describe("worktree reconciliation", () => {
   let home: string;
 
   beforeEach(() => {
+    closeLcmConnection();
     home = mkdtempSync(join(tmpdir(), "lcm-worktree-reconcile-"));
     process.env.HOME = home;
     process.env.USERPROFILE = home;
@@ -212,6 +218,7 @@ describe("worktree reconciliation", () => {
   });
 
   afterEach(() => {
+    closeLcmConnection();
     clearProjectMapCache();
     clearGitProjectAnchorCache();
     clearWorktreeReconciliationCache();
@@ -270,6 +277,7 @@ describe("worktree reconciliation", () => {
       "SELECT count FROM redaction_stats WHERE project_id = ? AND category = 'built_in'",
     ).get(targetHash)).toEqual({ count: 4 });
     expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    expect(db.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
     db.close();
 
     const events = new DatabaseSync(
@@ -278,7 +286,9 @@ describe("worktree reconciliation", () => {
     );
     expect(events.prepare("SELECT COUNT(*) AS count FROM events").get()).toEqual({ count: 5 });
     expect(events.prepare("SELECT COUNT(*) AS count FROM error_log").get()).toEqual({ count: 3 });
+    expect(events.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
     events.close();
+    expect(getPoolStats()).toMatchObject({ totalConnections: 0 });
 
     expect(listProjectMapEntries()).toEqual({
       [targetHash]: { canonical, aliases: [linked], remoteProjectId },
@@ -803,6 +813,83 @@ describe("worktree reconciliation", () => {
       join(home, ".lcm", "projects", targetHash, "sensitive-patterns.txt"),
       "utf8",
     )).toBe("");
+  });
+
+  it("creates a missing target pattern file from effective source patterns", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourceDir = join(home, ".lcm", "projects", sourceHash);
+    mkdirSync(sourceDir, { recursive: true });
+    writeFileSync(
+      join(sourceDir, "sensitive-patterns.txt"),
+      "# source heading\n  SOURCE_PATTERN  \n",
+    );
+
+    expect(reconcileWorktrees(linked)).toMatchObject({ status: "completed" });
+    expect(readFileSync(
+      join(home, ".lcm", "projects", targetHash, "sensitive-patterns.txt"),
+      "utf8",
+    )).toBe("SOURCE_PATTERN\n");
+  });
+
+  it("preserves target pattern formatting and deduplicates effective patterns", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const sourceDir = join(home, ".lcm", "projects", sourceHash);
+    mkdirSync(targetDir, { recursive: true });
+    mkdirSync(sourceDir, { recursive: true });
+    const targetPath = join(targetDir, "sensitive-patterns.txt");
+    writeFileSync(targetPath, "# target heading\n  DUPLICATE  ");
+    writeFileSync(
+      join(sourceDir, "sensitive-patterns.txt"),
+      "# source heading\nDUPLICATE\n  NEW_PATTERN  \n\n",
+    );
+
+    expect(reconcileWorktrees(linked)).toMatchObject({ status: "completed" });
+    expect(readFileSync(targetPath, "utf8"))
+      .toBe("# target heading\n  DUPLICATE  \nNEW_PATTERN\n");
+  });
+
+  it("does not rewrite a target pattern file when no effective pattern is added", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const sourceDir = join(home, ".lcm", "projects", sourceHash);
+    mkdirSync(targetDir, { recursive: true });
+    mkdirSync(sourceDir, { recursive: true });
+    const targetPath = join(targetDir, "sensitive-patterns.txt");
+    writeFileSync(targetPath, "# keep formatting\n  SAME_PATTERN  \n");
+    writeFileSync(
+      join(sourceDir, "sensitive-patterns.txt"),
+      "# ignored\nSAME_PATTERN\n\n",
+    );
+    const targetInode = statSync(targetPath).ino;
+
+    expect(reconcileWorktrees(linked)).toMatchObject({ status: "completed" });
+    expect(statSync(targetPath).ino).toBe(targetInode);
+    expect(readFileSync(targetPath, "utf8")).toBe("# keep formatting\n  SAME_PATTERN  \n");
   });
 
   it("fails closed when an already-published map disagrees with an archived journal", () => {

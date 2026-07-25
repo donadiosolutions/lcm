@@ -8,6 +8,7 @@ import {
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { runLcmMigrations } from "./db/migration.js";
 import { getLcmDbFeatures } from "./db/features.js";
+import { closeLcmConnection, getLcmConnection } from "./db/connection.js";
 import { resolveGitProjectAnchor } from "./git-project.js";
 import {
   foldProjectMapEntries,
@@ -399,187 +400,211 @@ function mergeMainDatabase(
   sourceHash: string,
 ): void {
   const source = new DatabaseSync(sourcePath, { readOnly: true });
-  const target = new DatabaseSync(targetPath);
   try {
-    target.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000");
-    runLcmMigrations(target, getLcmDbFeatures(target));
-    target.exec(`
-      CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources (
-        source_hash TEXT PRIMARY KEY,
-        merged_at TEXT NOT NULL DEFAULT (datetime('now'))
-      )
-    `);
-    target.exec("BEGIN IMMEDIATE");
+    const target = getLcmConnection(targetPath);
     try {
-      if (row(
-        target,
-        "SELECT source_hash FROM worktree_reconciliation_sources WHERE source_hash = ?",
-        sourceHash,
-      )) {
-        target.exec("COMMIT");
-        return;
-      }
-      for (const conversation of rows(
-        source,
-        "SELECT * FROM conversations ORDER BY conversation_id",
-      )) {
-        copyConversation(source, target, conversation);
-      }
-      mergeUniqueRows(source, target, "promoted", ["id"], (value) => ({
-        ...value,
-        project_id: targetHash,
-      }));
-      mergeUniqueRows(source, target, "session_ingest_log", ["session_id"]);
-      mergeUniqueRows(
-        source,
-        target,
-        "recall_surfacing",
-        ["memory_id", "session_id", "surfaced_at"],
-        (value) => {
-          const { id: _id, ...rest } = value;
-          return rest;
-        },
-      );
-      mergeInstructionRows(source, target, "session_instructions");
-      mergeInstructionRows(source, target, "session_instruction_cache");
-      if (tableExists(source, "redaction_stats")) {
-        for (const count of rows(source, "SELECT category, count FROM redaction_stats")) {
-          target.prepare(
-            `INSERT INTO redaction_stats(project_id, category, count) VALUES(?, ?, ?)
-             ON CONFLICT(project_id, category) DO UPDATE SET count = count + excluded.count`,
-          ).run(targetHash, count.category, count.count);
-        }
-      }
+      // Read-only source handles must not change a database-wide journal mode,
+      // but they still need the normal wait policy while another process commits.
+      source.exec("PRAGMA busy_timeout = 5000");
+      runLcmMigrations(target, getLcmDbFeatures(target));
       target.exec(`
-        DELETE FROM messages_fts;
-        INSERT INTO messages_fts(rowid, content) SELECT message_id, content FROM messages;
-        DELETE FROM summaries_fts;
-        INSERT INTO summaries_fts(summary_id, content) SELECT summary_id, content FROM summaries;
-        DELETE FROM promoted_fts;
-        INSERT INTO promoted_fts(rowid, content, tags)
-          SELECT rowid, content, tags FROM promoted;
+        CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources (
+          source_hash TEXT PRIMARY KEY,
+          merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
       `);
-      const foreignKeyFailures = target.prepare("PRAGMA foreign_key_check").all();
-      if (foreignKeyFailures.length > 0) {
-        throw new Error("foreign-key verification failed after worktree database merge");
+      target.exec("BEGIN IMMEDIATE");
+      try {
+        if (
+          row(
+            target,
+            "SELECT source_hash FROM worktree_reconciliation_sources WHERE source_hash = ?",
+            sourceHash,
+          )
+        ) {
+          target.exec("COMMIT");
+          return;
+        }
+        for (const conversation of rows(
+          source,
+          "SELECT * FROM conversations ORDER BY conversation_id",
+        )) {
+          copyConversation(source, target, conversation);
+        }
+        mergeUniqueRows(source, target, "promoted", ["id"], (value) => ({
+          ...value,
+          project_id: targetHash,
+        }));
+        mergeUniqueRows(source, target, "session_ingest_log", ["session_id"]);
+        mergeUniqueRows(
+          source,
+          target,
+          "recall_surfacing",
+          ["memory_id", "session_id", "surfaced_at"],
+          (value) => {
+            const { id: _id, ...rest } = value;
+            return rest;
+          },
+        );
+        mergeInstructionRows(source, target, "session_instructions");
+        mergeInstructionRows(source, target, "session_instruction_cache");
+        if (tableExists(source, "redaction_stats")) {
+          for (const count of rows(source, "SELECT category, count FROM redaction_stats")) {
+            target
+              .prepare(
+                `INSERT INTO redaction_stats(project_id, category, count) VALUES(?, ?, ?)
+                 ON CONFLICT(project_id, category) DO UPDATE SET count = count + excluded.count`,
+              )
+              .run(targetHash, count.category, count.count);
+          }
+        }
+        target.exec(`
+          DELETE FROM messages_fts;
+          INSERT INTO messages_fts(rowid, content) SELECT message_id, content FROM messages;
+          DELETE FROM summaries_fts;
+          INSERT INTO summaries_fts(summary_id, content) SELECT summary_id, content FROM summaries;
+          DELETE FROM promoted_fts;
+          INSERT INTO promoted_fts(rowid, content, tags)
+            SELECT rowid, content, tags FROM promoted;
+        `);
+        const foreignKeyFailures = target.prepare("PRAGMA foreign_key_check").all();
+        if (foreignKeyFailures.length > 0) {
+          throw new Error("foreign-key verification failed after worktree database merge");
+        }
+        target
+          .prepare("INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)")
+          .run(sourceHash);
+        target.exec("COMMIT");
+      } catch (error) {
+        target.exec("ROLLBACK");
+        throw error;
       }
-      target.prepare(
-        "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
-      ).run(sourceHash);
-      target.exec("COMMIT");
-    } catch (error) {
-      target.exec("ROLLBACK");
-      throw error;
+    } finally {
+      closeLcmConnection(targetPath, target);
     }
   } finally {
     source.close();
-    target.close();
   }
 }
 
 function mergeEventsDatabase(sourcePath: string, targetPath: string, sourceHash: string): void {
   const source = new DatabaseSync(sourcePath, { readOnly: true });
-  const target = new DatabaseSync(targetPath);
   try {
-    target.exec(`
-      CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS events (
-        event_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
-        seq INTEGER NOT NULL DEFAULT 0, type TEXT NOT NULL, category TEXT NOT NULL,
-        data TEXT NOT NULL, priority INTEGER DEFAULT 3, source_hook TEXT NOT NULL,
-        prev_event_id INTEGER, processed_at TEXT, created_at TEXT DEFAULT (datetime('now'))
-      );
-      CREATE TABLE IF NOT EXISTS error_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, hook TEXT NOT NULL, error TEXT NOT NULL,
-        session_id TEXT, created_at TEXT DEFAULT (datetime('now'))
-      );
-      CREATE INDEX IF NOT EXISTS idx_events_unprocessed ON events(processed_at)
-        WHERE processed_at IS NULL;
-      CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, created_at);
-      CREATE INDEX IF NOT EXISTS idx_events_pattern_lookup
-        ON events(type, category, data, created_at);
-      CREATE INDEX IF NOT EXISTS idx_error_log_created ON error_log(created_at);
-      CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources (
-        source_hash TEXT PRIMARY KEY,
-        merged_at TEXT NOT NULL DEFAULT (datetime('now'))
-      );
-    `);
-    target.exec("BEGIN IMMEDIATE");
+    const target = getLcmConnection(targetPath);
     try {
-      if (row(
-        target,
-        "SELECT source_hash FROM worktree_reconciliation_sources WHERE source_hash = ?",
-        sourceHash,
-      )) {
-        target.exec("COMMIT");
-        return;
-      }
-      const eventMap = new Map<number, number>();
-      for (const sourceEvent of rows(source, "SELECT * FROM events ORDER BY event_id")) {
-        const sourceId = Number(sourceEvent.event_id);
-        const previousSourceId = sourceEvent.prev_event_id === null
-          ? null
-          : Number(sourceEvent.prev_event_id);
-        if (previousSourceId !== null && !eventMap.has(previousSourceId)) {
-          throw new Error(
-            `event ${sourceId} references unknown predecessor ${previousSourceId}`,
-          );
+      // Keep source reads non-mutating while applying the same contention policy
+      // as every other LCM SQLite connection.
+      source.exec("PRAGMA busy_timeout = 5000");
+      target.exec(`
+        CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS events (
+          event_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+          seq INTEGER NOT NULL DEFAULT 0, type TEXT NOT NULL, category TEXT NOT NULL,
+          data TEXT NOT NULL, priority INTEGER DEFAULT 3, source_hook TEXT NOT NULL,
+          prev_event_id INTEGER, processed_at TEXT, created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS error_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, hook TEXT NOT NULL, error TEXT NOT NULL,
+          session_id TEXT, created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_unprocessed ON events(processed_at)
+          WHERE processed_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_events_pattern_lookup
+          ON events(type, category, data, created_at);
+        CREATE INDEX IF NOT EXISTS idx_error_log_created ON error_log(created_at);
+        CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources (
+          source_hash TEXT PRIMARY KEY,
+          merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+      target.exec("BEGIN IMMEDIATE");
+      try {
+        if (
+          row(
+            target,
+            "SELECT source_hash FROM worktree_reconciliation_sources WHERE source_hash = ?",
+            sourceHash,
+          )
+        ) {
+          target.exec("COMMIT");
+          return;
         }
-        const value: SqlRow = {
-          ...sourceEvent,
-          prev_event_id: previousSourceId === null ? null : eventMap.get(previousSourceId)!,
-        };
-        delete value.event_id;
-        const existing = row(
-          target,
-          `SELECT * FROM events
-           WHERE session_id IS ? AND seq IS ? AND type IS ? AND category IS ?
-             AND data IS ? AND priority IS ? AND source_hook IS ?
-             AND prev_event_id IS ? AND processed_at IS ? AND created_at IS ?
-           ORDER BY event_id LIMIT 1`,
-          value.session_id,
-          value.seq,
-          value.type,
-          value.category,
-          value.data,
-          value.priority,
-          value.source_hook,
-          value.prev_event_id,
-          value.processed_at,
-          value.created_at,
-        );
-        const targetId = existing
-          ? Number(existing.event_id)
-          : Number(insertRow(target, "events", value));
-        eventMap.set(sourceId, targetId);
+        const eventMap = new Map<number, number>();
+        for (const sourceEvent of rows(source, "SELECT * FROM events ORDER BY event_id")) {
+          const sourceId = Number(sourceEvent.event_id);
+          const previousSourceId = sourceEvent.prev_event_id === null
+            ? null
+            : Number(sourceEvent.prev_event_id);
+          if (previousSourceId !== null && !eventMap.has(previousSourceId)) {
+            throw new Error(
+              `event ${sourceId} references unknown predecessor ${previousSourceId}`,
+            );
+          }
+          const value: SqlRow = {
+            ...sourceEvent,
+            prev_event_id: previousSourceId === null ? null : eventMap.get(previousSourceId)!,
+          };
+          delete value.event_id;
+          const existing = row(
+            target,
+            `SELECT * FROM events
+             WHERE session_id IS ? AND seq IS ? AND type IS ? AND category IS ?
+               AND data IS ? AND priority IS ? AND source_hook IS ?
+               AND prev_event_id IS ? AND processed_at IS ? AND created_at IS ?
+             ORDER BY event_id LIMIT 1`,
+            value.session_id,
+            value.seq,
+            value.type,
+            value.category,
+            value.data,
+            value.priority,
+            value.source_hook,
+            value.prev_event_id,
+            value.processed_at,
+            value.created_at,
+          );
+          const targetId = existing
+            ? Number(existing.event_id)
+            : Number(insertRow(target, "events", value));
+          eventMap.set(sourceId, targetId);
+        }
+        for (const sourceError of rows(source, "SELECT * FROM error_log ORDER BY id")) {
+          const value = { ...sourceError };
+          delete value.id;
+          const existing = row(
+            target,
+            `SELECT id FROM error_log
+             WHERE hook IS ? AND error IS ? AND session_id IS ? AND created_at IS ?
+             ORDER BY id LIMIT 1`,
+            value.hook,
+            value.error,
+            value.session_id,
+            value.created_at,
+          );
+          if (!existing) insertRow(target, "error_log", value);
+        }
+        target
+          .prepare("INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)")
+          .run(sourceHash);
+        target.exec("COMMIT");
+      } catch (error) {
+        target.exec("ROLLBACK");
+        throw error;
       }
-      for (const sourceError of rows(source, "SELECT * FROM error_log ORDER BY id")) {
-        const value = { ...sourceError };
-        delete value.id;
-        const existing = row(
-          target,
-          `SELECT id FROM error_log
-           WHERE hook IS ? AND error IS ? AND session_id IS ? AND created_at IS ?
-           ORDER BY id LIMIT 1`,
-          value.hook,
-          value.error,
-          value.session_id,
-          value.created_at,
-        );
-        if (!existing) insertRow(target, "error_log", value);
-      }
-      target.prepare(
-        "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
-      ).run(sourceHash);
-      target.exec("COMMIT");
-    } catch (error) {
-      target.exec("ROLLBACK");
-      throw error;
+    } finally {
+      closeLcmConnection(targetPath, target);
     }
   } finally {
     source.close();
-    target.close();
   }
+}
+
+function effectivePatterns(content: string): string[] {
+  return content
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
 }
 
 function mergePatterns(sourceDir: string, targetDir: string): void {
@@ -590,12 +615,19 @@ function mergePatterns(sourceDir: string, targetDir: string): void {
     maxBytes: MAX_PATTERN_BYTES,
   });
   const targetPath = join(targetDir, "sensitive-patterns.txt");
-  const target = isRegularFile(targetPath)
+  const targetExists = isRegularFile(targetPath);
+  const target = targetExists
     ? readBoundedRegularFile(targetPath, { allowedRoot: targetDir, maxBytes: MAX_PATTERN_BYTES })
     : "";
-  const lines = [...new Set([...target.split("\n"), ...source.split("\n")])]
-    .filter((line) => line.length > 0);
-  atomicWritePrivateFile(targetPath, lines.length === 0 ? "" : `${lines.join("\n")}\n`);
+  const targetEffective = new Set(effectivePatterns(target));
+  const additions = [...new Set(effectivePatterns(source))]
+    .filter((pattern) => !targetEffective.has(pattern));
+  if (additions.length === 0) {
+    if (!targetExists) atomicWritePrivateFile(targetPath, "");
+    return;
+  }
+  const separator = target.length === 0 || target.endsWith("\n") ? "" : "\n";
+  atomicWritePrivateFile(targetPath, `${target}${separator}${additions.join("\n")}\n`);
 }
 
 function backupName(hash: string, now: Date): string {
