@@ -434,8 +434,8 @@ describe("PostgreSQL native transcript repository", () => {
       new Date("2026-01-01T00:00:00.000Z"),
     );
     expect(transcriptInsert?.values?.[12]).toBe(JSON.stringify({
-      type: "message",
       nested: { value: "original" },
+      type: "message",
     }));
     const linkInsert = db.query.mock.calls.find(([config]) =>
       config.text.includes("INSERT INTO lcm.transcript_messages"))?.[0];
@@ -802,6 +802,7 @@ describe("PostgreSQL native transcript repository", () => {
   });
 
   it("skips exact ingest-key retries and rejects record or linkage collisions", async () => {
+    let exactMatchQuery: QueryConfig<unknown[]> | undefined;
     const exact = executor((config) => {
       if (config.text.includes("INSERT INTO lcm.native_transcripts")) {
         return result([]);
@@ -810,10 +811,10 @@ describe("PostgreSQL native transcript repository", () => {
         config.text.includes("FROM lcm.native_transcripts AS transcript")
         && config.text.includes("exact_match")
       ) {
+        exactMatchQuery = config;
         return result([{
           ...transcriptRow,
-          source_ordinal: "99",
-          observed_at: "2026-02-01T00:00:00.000Z",
+          observed_at: "2026-01-01T00:00:00.000Z",
           scrubber_version: "first-stored-scrubber",
           exact_match: true,
         }]);
@@ -822,8 +823,41 @@ describe("PostgreSQL native transcript repository", () => {
     });
     await expect(
       new PostgreSqlNativeTranscriptRepository(exact, projectId)
-        .ingestBatch(batch),
+        .ingestBatch({
+          ...batch,
+          records: [{
+            ...batch.records[0],
+            observedAt: new Date("2026-02-01T00:00:00.000Z"),
+            scrubberVersion: "later-scrubber",
+          }],
+        }),
     ).resolves.toMatchObject({ importedCount: 0, skippedCount: 1 });
+    expect(exactMatchQuery?.text).toContain(
+      "AND transcript.source_ordinal = $8",
+    );
+    expect(exactMatchQuery?.text).not.toContain(
+      "transcript.observed_at =",
+    );
+    expect(exactMatchQuery?.text).not.toContain(
+      "transcript.scrubber_version =",
+    );
+    expect(exactMatchQuery?.values).toEqual([
+      projectId,
+      machineId,
+      "codex",
+      "codex-jsonl",
+      "v1",
+      "session-a",
+      "sessions/a.jsonl",
+      3,
+      contentSha256,
+      ingestKey,
+      JSON.stringify({
+        nested: [true, 1, null],
+        text: "hello",
+        type: "message",
+      }),
+    ]);
 
     for (const collisionRow of [
       undefined,
@@ -1489,6 +1523,97 @@ describe("PostgreSQL native transcript repository", () => {
       db,
       "018f22c4-6d2a-4f10-8a4c-6b8d3e5f9020",
     )).toThrow(PostgreSqlNativeTranscriptDataError);
+  });
+
+  it("bounds only linked source ordinals to PostgreSQL int4", async () => {
+    const maxLinkSourceOrdinal = 2_147_483_647;
+    const linked = executor((config) => {
+      if (config.text.includes("INSERT INTO lcm.transcript_messages")) {
+        return result([{
+          ...linkRow,
+          source_ordinal: String(maxLinkSourceOrdinal),
+        }]);
+      }
+      return successfulQuery(config);
+    });
+    await expect(
+      new PostgreSqlNativeTranscriptRepository(linked, projectId)
+        .ingestBatch({
+          ...batch,
+          records: [{
+            ...batch.records[0],
+            messageLinks: [{
+              conversationId: 41,
+              messageId: 51,
+              sourceOrdinal: maxLinkSourceOrdinal,
+            }],
+          }],
+        }),
+    ).resolves.toMatchObject({ importedCount: 1 });
+    const linkInsert = linked.query.mock.calls.find(([config]) =>
+      config.text.includes("INSERT INTO lcm.transcript_messages"))?.[0];
+    expect(linkInsert?.values?.[4]).toBe(maxLinkSourceOrdinal);
+
+    const wideOrdinal = maxLinkSourceOrdinal + 1;
+    const wideTranscriptRow = {
+      ...transcriptRow,
+      source_ordinal: String(wideOrdinal),
+      message_links: [],
+    };
+    const wideCheckpointRow = {
+      ...checkpointRow,
+      last_source_ordinal: String(wideOrdinal),
+    };
+    const unlinked = executor((config) => {
+      if (config.text.includes("INSERT INTO lcm.native_transcripts")) {
+        return result([wideTranscriptRow]);
+      }
+      if (config.text.includes("UPDATE lcm.ingest_checkpoints")) {
+        return result([wideCheckpointRow]);
+      }
+      return successfulQuery(config);
+    });
+    await expect(
+      new PostgreSqlNativeTranscriptRepository(unlinked, projectId)
+        .ingestBatch({
+          ...batch,
+          records: [{
+            ...batch.records[0],
+            sourceOrdinal: wideOrdinal,
+            messageLinks: undefined,
+          }],
+          checkpoint: {
+            ...batch.checkpoint,
+            lastSourceOrdinal: wideOrdinal,
+          },
+        }),
+    ).resolves.toMatchObject({
+      importedCount: 1,
+      checkpoint: { lastSourceOrdinal: wideOrdinal },
+    });
+
+    const rejected = executor(() => {
+      throw new Error("database must not be called");
+    });
+    await expect(
+      new PostgreSqlNativeTranscriptRepository(rejected, projectId)
+        .ingestBatch({
+          ...batch,
+          records: [{
+            ...batch.records[0],
+            messageLinks: [{
+              conversationId: 41,
+              messageId: 51,
+              sourceOrdinal: wideOrdinal,
+            }],
+          }],
+        }),
+    ).rejects.toMatchObject({
+      name: "PostgreSqlNativeTranscriptDataError",
+      field: "link_source_ordinal",
+    });
+    expect(rejected.transaction).not.toHaveBeenCalled();
+    expect(rejected.query).not.toHaveBeenCalled();
   });
 
   it("covers row and reconciliation guards without exposing unsafe data", async () => {

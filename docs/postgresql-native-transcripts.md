@@ -45,12 +45,15 @@ Each accepted JSONL record must decode as valid UTF-8 and contain a JSON object
 or array. LCM rejects malformed JSON, scalar JSON, U+0000, binary or invalid
 UTF-8 input, records larger than 10 MiB, and JSON nested beyond the exported
 `NATIVE_TRANSCRIPT_MAX_JSON_DEPTH` limit of 100 before a PostgreSQL repository
-operation begins. It also rejects JSON number spellings whose exact decimal
-value would change when represented as a JavaScript `number`, including unsafe
-integers, over-precise decimals, numeric overflow or underflow, and unsafe
-exponents. Lone UTF-16 high or low surrogate code units in string keys or
-values are rejected; valid surrogate pairs and literal Unicode remain
-supported.
+operation begins. It rejects every integer-valued token outside JavaScript's
+safe-integer range, even when the value happens to round-trip exactly as a
+`number` and whether it is written as an integer, decimal, or exponent. It also
+rejects non-integer spellings whose canonical decimal value would change,
+over-precise decimals, numeric overflow or underflow, and unsafe exponents.
+Safe-range integers and fractions whose canonical decimal spelling round-trips
+unchanged through JavaScript number formatting remain supported. Lone UTF-16
+high or low surrogate code units in string keys or values are rejected; valid
+surrogate pairs and literal Unicode remain supported.
 
 ## Data stored remotely
 
@@ -77,7 +80,13 @@ record.
 The native JSON is immutable. The repository provides reads by transcript ID,
 native session, source order, and linked message, but no payload update or
 deletion operation. A matching ingest-key retry is counted as skipped; reuse
-of that key for different immutable data fails closed.
+of that key for different immutable data fails closed. Retry identity includes
+the exact original source ordinal, so removing or recovering an earlier
+quarantined record cannot silently reassign the same ingest key to a different
+source position. The originally stored observation time and scrubber version
+remain acceptance metadata: a retry may regenerate `observedAt` or use a newer
+scrubber version and still skip when its stable identity, sanitized content,
+source ordinal, and links are otherwise exact.
 
 Programmatic callers use `NativeTranscriptRepository.ingestBatch()`,
 `getById()`, `listByNativeSession()`, `listBySource()`, `listByMessage()`, and
@@ -115,6 +124,13 @@ message aborts the destination transaction and does not advance the
 checkpoint. Valid client-native events that do not represent messages remain
 queryable without a message link.
 
+The exported `NATIVE_TRANSCRIPT_MAX_LINK_SOURCE_ORDINAL` constant is
+`2_147_483_647`, matching the `integer` column used by exact message links.
+Mapped or direct link ordinals above that value fail before resolver or
+PostgreSQL access. Unlinked transcript source ordinals and checkpoint last
+source ordinals use PostgreSQL `bigint` and may be wider, up to JavaScript's
+nonnegative safe-integer limit.
+
 ## Local scrubbing and residual risk
 
 LCM recursively scrubs every string key and value using the bundled Gitleaks
@@ -136,6 +152,10 @@ with the effective patterns, and only then hashes it. This complete-container
 scan detects structured key/value signatures that do not match either string
 in isolation. The scrubber version binds the pipeline version to the
 effective-pattern digest so a pattern change is observable.
+
+Canonicalization and repository normalization sort object keys recursively, so
+nested object member order does not create a different digest or retry
+identity. Array element order is data and is always preserved.
 
 Custom patterns are rejected during scrubber construction if they would
 redact a structural key or discriminator required by the built-in Claude or
@@ -219,7 +239,9 @@ therefore converge without collapsing legitimate duplicates. The same is true
 for message records whose exact linkage is unchanged. Reordering
 message-producing records can change their required session sequence; when the
 existing message order no longer matches exactly, linkage fails closed and the
-prior checkpoint is preserved.
+prior checkpoint is preserved. A rescan that assigns an existing ingest key to
+a different source ordinal also fails the whole batch; any new records earlier
+in that batch roll back and the prior checkpoint is preserved.
 
 Every destination batch carries the complete expected prior checkpoint as a
 compare-and-swap fence. A concurrent writer that advanced the same source from

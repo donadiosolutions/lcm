@@ -328,6 +328,8 @@ describe("PostgreSQL 18 native transcript repository", () => {
       }`) as NativeTranscriptBatchInput["records"][number]["nativePayload"];
       const specialCheckpoint = JSON.parse(`{
         "__proto__": {"checkpoint": true},
+        "metadata": {"z": {"second": 2, "first": 1}, "a": true},
+        "order": ["z", "a"],
         "byteOffset": 128,
         "prefixSha256": "${"c".repeat(64)}"
       }`) as NativeTranscriptBatchInput["checkpoint"]["checkpoint"];
@@ -350,14 +352,32 @@ describe("PostgreSQL 18 native transcript repository", () => {
         importedCount: 1,
         skippedCount: 0,
       });
-      const retry = {
+      const reorderedPayload = JSON.parse(`{
+        "nested": {
+          "prototype": ["retained"],
+          "constructor": {"name": "safe"},
+          "__proto__": {"polluted": false}
+        },
+        "type": "message"
+      }`) as NativeTranscriptBatchInput["records"][number]["nativePayload"];
+      const reorderedCheckpoint = JSON.parse(`{
+        "prefixSha256": "${"c".repeat(64)}",
+        "byteOffset": 128,
+        "order": ["z", "a"],
+        "metadata": {"a": true, "z": {"first": 1, "second": 2}},
+        "__proto__": {"checkpoint": true}
+      }`) as NativeTranscriptBatchInput["checkpoint"]["checkpoint"];
+      const retry: NativeTranscriptBatchInput = {
         ...first,
-        expectedCheckpoint: firstResult.checkpoint,
+        expectedCheckpoint: {
+          ...firstResult.checkpoint,
+          checkpoint: reorderedCheckpoint,
+        },
         records: [{
           ...first.records[0],
-          sourceOrdinal: 99,
           observedAt: new Date("2026-02-01T00:00:00.000Z"),
           scrubberVersion: "scrubber-v2",
+          nativePayload: reorderedPayload,
         }],
       };
       const retryResult = await repository.ingestBatch(retry);
@@ -365,6 +385,21 @@ describe("PostgreSQL 18 native transcript repository", () => {
         importedCount: 0,
         skippedCount: 1,
       });
+      const checkpointBeforeShiftedRetry = await repository.getCheckpoint(
+        first,
+      );
+      await expect(repository.ingestBatch({
+        ...retry,
+        expectedCheckpoint: checkpointBeforeShiftedRetry,
+        records: [{
+          ...retry.records[0],
+          sourceOrdinal: 99,
+        }],
+      })).rejects.toBeInstanceOf(PostgreSqlNativeTranscriptConflictError);
+      await expect(repository.getCheckpoint(first)).resolves.toEqual(
+        checkpointBeforeShiftedRetry,
+      );
+      await expect(repository.listBySource(first)).resolves.toHaveLength(1);
 
       const stored = await repository.getById(
         (await repository.listBySource(first))[0].transcriptId,
@@ -391,6 +426,9 @@ describe("PostgreSQL 18 native transcript repository", () => {
         firstResult.checkpoint.checkpoint,
         "__proto__",
       )).toBe(true);
+      expect(
+        (firstResult.checkpoint.checkpoint.order as unknown[]),
+      ).toEqual(["z", "a"]);
       await expect(repository.getNativeTranscriptMessageSnapshot(
         `session:Native transcript round trip`,
       )).resolves.toEqual([expect.objectContaining({

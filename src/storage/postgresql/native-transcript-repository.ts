@@ -27,6 +27,7 @@ import { PostgreSqlCommitOutcomeUnknownError } from "./errors.js";
 
 const MIN_SAFE_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+const MAX_INT4 = 2_147_483_647;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const UUIDV7_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -491,12 +492,14 @@ function jsonValue(
         ))) as unknown as JsonValue[];
     }
     const normalized: Record<string, JsonValue> = {};
-    for (const [key, element] of Object.entries(dataObject(
+    const entries = Object.entries(dataObject(
       value,
       projectId,
       operation,
       field,
-    ))) {
+    )).sort(([left], [right]) =>
+      left < right ? -1 : 1);
+    for (const [key, element] of entries) {
       string(key, projectId, operation, field);
       Object.defineProperty(normalized, key, {
         configurable: true,
@@ -1312,13 +1315,14 @@ implements
                       AND transcript.format_version = $5
                       AND transcript.native_session_id = $6
                       AND transcript.source_locator = $7
-                      AND transcript.content_sha256 = $8
-                      AND transcript.native_payload = $10::pg_catalog.jsonb
+                      AND transcript.source_ordinal = $8
+                      AND transcript.content_sha256 = $9
+                      AND transcript.native_payload = $11::pg_catalog.jsonb
                     ) AS exact_match
              FROM lcm.native_transcripts AS transcript
              WHERE transcript.project_id = $1
                AND transcript.machine_id = $2
-               AND transcript.ingest_key = $9`,
+               AND transcript.ingest_key = $10`,
       values: [
         this.projectId,
         batch.machineId,
@@ -1327,6 +1331,7 @@ implements
         input.formatVersion,
         input.nativeSessionId,
         batch.sourceLocator,
+        input.sourceOrdinal,
         input.contentSha256,
         input.ingestKey,
         serializedPayload,
@@ -1717,6 +1722,19 @@ implements
             operation,
             "message_link",
           );
+          const sourceOrdinal = nonnegativeInteger(
+            candidate.sourceOrdinal,
+            this.projectId,
+            operation,
+            "link_source_ordinal",
+          );
+          if (sourceOrdinal > MAX_INT4) {
+            throw new PostgreSqlNativeTranscriptDataError(
+              this.projectId,
+              operation,
+              "link_source_ordinal",
+            );
+          }
           return Object.freeze({
             conversationId: nonnegativeInteger(
               candidate.conversationId,
@@ -1730,12 +1748,7 @@ implements
               operation,
               "message_id",
             ),
-            sourceOrdinal: nonnegativeInteger(
-              candidate.sourceOrdinal,
-              this.projectId,
-              operation,
-              "link_source_ordinal",
-            ),
+            sourceOrdinal,
           });
         }));
     return Object.freeze({

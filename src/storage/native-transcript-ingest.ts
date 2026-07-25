@@ -53,6 +53,7 @@ export const SUPPORTED_NATIVE_TRANSCRIPT_FORMATS = [
 export const NATIVE_TRANSCRIPT_MAX_RECORD_BYTES = 10 * 1024 * 1024;
 export const NATIVE_TRANSCRIPT_DEFAULT_BATCH_SIZE = 100;
 export const NATIVE_TRANSCRIPT_MAX_BATCH_SIZE = 1_000;
+export const NATIVE_TRANSCRIPT_MAX_LINK_SOURCE_ORDINAL = 2_147_483_647;
 export const NATIVE_TRANSCRIPT_SCRUB_PIPELINE_VERSION =
   "native-json-scrub/v1";
 
@@ -441,6 +442,7 @@ function assertLosslessJsonNumbers(text: string): void {
     if (
       !originalDecimal
       || !roundTrippedDecimal
+      || (Number.isInteger(parsed) && !Number.isSafeInteger(parsed))
       || originalDecimal.negative !== roundTrippedDecimal.negative
       || originalDecimal.coefficient !== roundTrippedDecimal.coefficient
       || originalDecimal.exponent !== roundTrippedDecimal.exponent
@@ -1480,6 +1482,8 @@ function mappedMessageCandidates(
   for (const candidate of sequenced) {
     assertSafeNonnegative(candidate.sourceOrdinal);
     if (
+      candidate.sourceOrdinal > NATIVE_TRANSCRIPT_MAX_LINK_SOURCE_ORDINAL
+      ||
       !isMessageRole(candidate.role)
       || typeof candidate.content !== "string"
       || candidate.content.includes("\0")

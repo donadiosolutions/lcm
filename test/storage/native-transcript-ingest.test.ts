@@ -19,6 +19,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   JsonObject,
+  JsonValue,
   NativeTranscriptBatchInput,
   NativeTranscriptBatchResult,
   NativeTranscriptCheckpointRecord,
@@ -47,6 +48,7 @@ import {
   NativeTranscriptSourceChangedError,
   readNativeTranscriptJsonl,
   runNativeTranscriptBackfill as runNativeTranscriptBackfillCore,
+  NATIVE_TRANSCRIPT_MAX_LINK_SOURCE_ORDINAL,
   SUPPORTED_NATIVE_TRANSCRIPT_FORMATS,
   type NativeTranscriptBackfillResult,
   type NativeTranscriptByteSource,
@@ -492,23 +494,39 @@ describe("native transcript scrub and JSONL reader", () => {
   it("quarantines lossy decimal tokens while preserving exact JSON spellings", async () => {
     const outcomes = await collect(byteChunks([
       '{"value":9007199254740993}',
+      '{"value":9007199254740992}',
+      '{"value":-9007199254740992}',
+      '{"value":9007199254740992.0}',
+      '{"value":9007199254740992e0}',
+      '{"value":9.007199254740992e15}',
+      '{"value":1e16}',
       '{"value":0.10000000000000001}',
       '{"value":1.23456789012345678}',
       '{"value":1e-4000}',
       '{"value":1e9007199254740992}',
       '{"value":1e99999999999999999}',
       `{"value":1${"0".repeat(20_000)}}`,
-      '{"values":[0.1,1.0,1e3,-0,-0e99999999999999999],"text":"9007199254740993"}',
+      '{"values":[0.1,1.0,1e3,-0,-0e99999999999999999,9007199254740991,-9007199254740991,4503599627370495.5,1.25e3],"text":"9007199254740993"}',
     ].join("\n")));
-    expect(outcomes.slice(0, 7).every((outcome) =>
+    expect(outcomes.slice(0, 13).every((outcome) =>
       outcome.kind === "quarantine"
       && outcome.reason === "malformed-json"
     )).toBe(true);
-    const accepted = outcomes[7];
+    const accepted = outcomes[13];
     expect(accepted).toMatchObject({
       kind: "record",
       nativePayload: {
-        values: [0.1, 1, 1_000, -0, -0],
+        values: [
+          0.1,
+          1,
+          1_000,
+          -0,
+          -0,
+          Number.MAX_SAFE_INTEGER,
+          Number.MIN_SAFE_INTEGER,
+          4_503_599_627_370_495.5,
+          1_250,
+        ],
         text: "9007199254740993",
       },
     });
@@ -520,7 +538,7 @@ describe("native transcript scrub and JSONL reader", () => {
       && Object.is(values[4], -0),
     ).toBe(true);
     expect(canonicalNativeTranscriptJson(accepted.nativePayload)).toBe(
-      '{"text":"9007199254740993","values":[0.1,1,1000,0,0]}',
+      '{"text":"9007199254740993","values":[0.1,1,1000,0,0,9007199254740991,-9007199254740991,4503599627370495.5,1250]}',
     );
   });
 
@@ -2244,6 +2262,115 @@ describe("native transcript backfill coordinator", () => {
     expect(malformedCheckpoint.batches[0]?.records).toHaveLength(2);
   });
 
+  it("rolls back a new record when rescan recovery shifts an ingest key", async () => {
+    const stored = new Map<string, {
+      readonly sourceOrdinal: number;
+      readonly nativePayload: JsonValue;
+    }>();
+    let currentCheckpoint: NativeTranscriptCheckpointRecord | null = null;
+    const batches: NativeTranscriptBatchInput[] = [];
+    const ingestBatch = vi.fn(async (
+      input: NativeTranscriptBatchInput,
+    ): Promise<NativeTranscriptBatchResult> => {
+      batches.push(input);
+      const next = new Map(stored);
+      for (const record of input.records) {
+        const existing = next.get(record.ingestKey);
+        if (
+          existing
+          && (
+            existing.sourceOrdinal !== record.sourceOrdinal
+            || canonicalNativeTranscriptJson(existing.nativePayload)
+              !== canonicalNativeTranscriptJson(record.nativePayload)
+          )
+        ) {
+          throw new Error("ingest-key provenance conflict");
+        }
+        next.set(record.ingestKey, {
+          sourceOrdinal: record.sourceOrdinal,
+          nativePayload: record.nativePayload,
+        });
+      }
+      const previous = currentCheckpoint;
+      const resultCheckpoint: NativeTranscriptCheckpointRecord = {
+        projectId: "project",
+        machineId: input.machineId,
+        clientName: input.clientName,
+        sourceLocator: input.sourceLocator,
+        lastSourceOrdinal: input.checkpoint.lastSourceOrdinal,
+        importedCount:
+          (previous?.importedCount ?? 0) + input.records.length,
+        skippedCount: previous?.skippedCount ?? 0,
+        quarantinedCount:
+          (previous?.quarantinedCount ?? 0) + input.quarantinedCount,
+        checkpoint: input.checkpoint.checkpoint,
+        updatedAt: new Date("2026-07-25T12:00:00.000Z"),
+      };
+      stored.clear();
+      for (const [key, value] of next) stored.set(key, value);
+      currentCheckpoint = resultCheckpoint;
+      return {
+        importedCount: input.records.length,
+        skippedCount: 0,
+        quarantinedCount: input.quarantinedCount,
+        checkpoint: resultCheckpoint,
+      };
+    });
+    const statefulRepository: NativeTranscriptRepository = {
+      getCheckpoint: vi.fn(async () => currentCheckpoint),
+      ingestBatch,
+      getById: vi.fn(async () => null),
+      listByNativeSession: vi.fn(async () => []),
+      listBySource: vi.fn(async () => []),
+      listByMessage: vi.fn(async () => []),
+    };
+    const quarantine = {
+      clientName: "claude-code",
+      quarantine: vi.fn(),
+      get: vi.fn(),
+      list: vi.fn(),
+      close: vi.fn(),
+    };
+    const common = {
+      repository: statefulRepository,
+      quarantine,
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      messageResolver: { resolveExact: vi.fn(async () => null) },
+    };
+    await expect(runNativeTranscriptBackfill({
+      ...common,
+      source: source('{"bad":}\n{"alsoBad":}\n{"event":"same"}\n'),
+    })).resolves.toMatchObject({
+      importedCount: 1,
+      quarantinedCount: 2,
+    });
+    const checkpointBeforeRecovery = currentCheckpoint;
+    const retained = [...stored.values()][0];
+    expect(retained).toMatchObject({
+      sourceOrdinal: 2,
+      nativePayload: { event: "same" },
+    });
+
+    await expect(runNativeTranscriptBackfill({
+      ...common,
+      source: source('{"event":"new"}\n{"event":"same"}\n'),
+    })).rejects.toThrow("ingest-key provenance conflict");
+    expect(batches).toHaveLength(2);
+    expect(batches[1]?.records.map((record) => ({
+      sourceOrdinal: record.sourceOrdinal,
+      nativePayload: record.nativePayload,
+    }))).toEqual([
+      { sourceOrdinal: 0, nativePayload: { event: "new" } },
+      { sourceOrdinal: 1, nativePayload: { event: "same" } },
+    ]);
+    expect(stored.size).toBe(1);
+    expect([...stored.values()][0]).toEqual(retained);
+    expect(currentCheckpoint).toEqual(checkpointBeforeRecovery);
+  });
+
   it("rescans when the effective scrubber version changes", async () => {
     const content = '{"first":1}\n{"second":2}\n';
     const firstLine = '{"first":1}\n';
@@ -2815,6 +2942,37 @@ describe("native transcript backfill coordinator", () => {
         }],
       },
     })).rejects.toThrowError(NativeTranscriptConfigurationError);
+  });
+
+  it("rejects link ordinals above PostgreSQL int4 before resolution", async () => {
+    const repo = repository();
+    const resolveExact = vi.fn();
+    await expect(runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: source('{"message":"hello"}\n'),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      messageMapper: {
+        map: () => [{
+          role: "user",
+          content: "hello",
+          sourceOrdinal:
+            NATIVE_TRANSCRIPT_MAX_LINK_SOURCE_ORDINAL + 1,
+        }],
+      },
+      messageResolver: { resolveExact },
+    })).rejects.toThrowError(NativeTranscriptConfigurationError);
+    expect(resolveExact).not.toHaveBeenCalled();
+    expect(repo.ingestBatch).not.toHaveBeenCalled();
   });
 
   it("rejects incomplete mapping, unsafe batch, and invalid metadata", async () => {

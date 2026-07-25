@@ -68,11 +68,15 @@ rules. LCM applies those arrays plus the bundled rules recursively to every
 string key and value. Invalid UTF-8, malformed or scalar JSON, oversized
 records, U+0000, invalid custom patterns, redacted-key collisions, residual
 matches, and JSON nested beyond the exported depth limit of 100 are rejected
-locally. JSON number spellings that would lose their exact decimal value when
-represented as a JavaScript `number`, and lone UTF-16 surrogate code units in
-string keys or values, are also quarantined locally as `malformed-json`.
-Valid surrogate pairs and literal Unicode remain supported. No source payload
-or parser excerpt is written to quarantine.
+locally. Integer-valued JSON tokens outside JavaScript's safe-integer range
+are rejected regardless of integer, decimal, or exponent spelling, including
+values that happen to round-trip exactly as a `number`. Other numeric spellings
+that would lose their exact decimal value, and lone UTF-16 surrogate code units
+in string keys or values, are also quarantined locally as `malformed-json`.
+Valid safe integers, fractions whose canonical decimal spelling round-trips
+unchanged through JavaScript number formatting, surrogate pairs, and literal
+Unicode remain supported. No source payload or parser excerpt is written to
+quarantine.
 Pattern-based filtering still has residual risk: an organization-specific
 secret that matches no active rule can remain in the sanitized record. Test
 project patterns against representative canaries before backfill and protect
