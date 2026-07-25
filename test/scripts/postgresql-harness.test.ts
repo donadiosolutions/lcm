@@ -748,6 +748,39 @@ describe("PostgreSQL harness utilities", () => {
     expect(exists).toBe(false);
   });
 
+  it("reclaims a stopped previous-boot database after its temporary directory is gone", async () => {
+    const runId = "0".repeat(32);
+    const names = createRunNames(runId);
+    const oldBoot = "12345678-1234-1234-1234-123456789abc";
+    const currentBoot = "abcdefab-1234-1234-1234-123456789abc";
+    const owner = { pid: 93, birth: `linux:${oldBoot}:900` };
+    const labels = ownershipLabels(runId, "database", owner);
+    let exists = true;
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[0] === "container" && args[1] === "ls") {
+        return { stdout: exists ? names.container : "", stderr: "" };
+      }
+      if (args[1] === "ls") return { stdout: "", stderr: "" };
+      if (args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify([{ Config: { Labels: labels }, State: { Running: false }, Mounts: [] }]),
+          stderr: "",
+        };
+      }
+      exists = false;
+      return { stdout: "", stderr: "" };
+    });
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      platform: () => "linux",
+      processProbe: vi.fn(),
+      readFingerprint: () => "linux:reused:1",
+      readFile: () => `${currentBoot}\n`,
+    })).resolves.toBeDefined();
+    expect(exists).toBe(false);
+  });
+
   it("warns for ambiguous evidence and continues discovering independent stale runs", async () => {
     const staleRunId = "1".repeat(32);
     const names = createRunNames(staleRunId);
@@ -891,6 +924,26 @@ describe("PostgreSQL harness utilities", () => {
     });
     expect(permissionRefusal[0].classification).toBe("ambiguous");
     expect(close).toHaveBeenCalledWith(10);
+
+    let windowsRead = false;
+    const windowsConsumer = await discoverHarnessRuns({
+      dockerRunner: databaseRunner,
+      resolveHarnessDirectory: () => "/private/harness",
+      platform: () => "win32",
+      processProbe: vi.fn(),
+      readFingerprint: (pid: number) => pid === consumer.pid ? consumer.birth : "reused",
+      open: () => 11,
+      fstat: () => ({ isFile: () => true, mode: 0o100666, size: 100 }),
+      read: (_descriptor: number, buffer: Buffer) => {
+        if (windowsRead) return 0;
+        windowsRead = true;
+        const content = Buffer.from(JSON.stringify({ version: 1, ...consumer }));
+        content.copy(buffer);
+        return content.length;
+      },
+      close: vi.fn(),
+    });
+    expect(windowsConsumer[0].classification).toBe("live");
   });
 
   it("pins container-mounted and checksummed PostgreSQL files to LF", () => {

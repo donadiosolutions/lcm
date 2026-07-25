@@ -43,6 +43,7 @@ const initScript = join(repositoryRoot, "test", "postgresql", "init.sh");
 const cachedRunInitScript = join(repositoryRoot, "test", "postgresql", "cached-run-init.sh");
 const bootIdPattern = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const bootIdRegex = new RegExp(`^${bootIdPattern}$`, "u");
+const linuxBirthRegex = new RegExp(`^linux:(${bootIdPattern}):`, "u");
 const processBirthPattern = /^[^\u0000-\u001f\u007f]{1,160}$/u;
 const consumerOwnerFile = "consumer-owner.json";
 
@@ -586,7 +587,10 @@ function readConsumerOwner(directory, dependencies = {}) {
       throw new Error("PostgreSQL harness consumer identity could not be opened securely", { cause: error });
     }
     const status = inspectFile(descriptor);
-    if (!status.isFile() || (status.mode & 0o077) !== 0 || status.size > 1024) {
+    const currentPlatform = dependencies.platform?.() ?? platform();
+    if (!status.isFile()
+      || (currentPlatform !== "win32" && (status.mode & 0o077) !== 0)
+      || status.size > 1024) {
       throw new Error("invalid PostgreSQL harness consumer identity evidence");
     }
     const contents = Buffer.alloc(1025);
@@ -612,6 +616,19 @@ function readConsumerOwner(directory, dependencies = {}) {
     return { pid: value.pid, birth: value.birth };
   } finally {
     if (descriptor !== undefined) closeFile(descriptor);
+  }
+}
+
+function ownerFromPreviousLinuxBoot(owner, dependencies = {}) {
+  const currentPlatform = dependencies.platform?.() ?? platform();
+  const recordedBootId = owner.birth.match(linuxBirthRegex)?.[1];
+  if (currentPlatform !== "linux" || !recordedBootId) return false;
+  try {
+    const readFile = dependencies.readFile ?? readFileSync;
+    const currentBootId = String(readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+    return bootIdRegex.test(currentBootId) && currentBootId !== recordedBootId;
+  } catch {
+    return false;
   }
 }
 
@@ -693,7 +710,6 @@ export async function discoverHarnessRuns(dependencies = {}) {
     const harnessDirectory = ownership.kind === "database"
       ? (dependencies.resolveHarnessDirectory?.(record) ?? harnessDirectoryFromRecord(record))
       : undefined;
-    if (ownership.kind === "database" && !harnessDirectory) run.classification = "ambiguous";
     const resourceEntry = {
       ...resource,
       kind: ownership.kind,
@@ -725,6 +741,12 @@ export async function discoverHarnessRuns(dependencies = {}) {
         }
         const database = run.resources.find((resource) => resource.kind === "database");
         if (database) {
+          if (!database.harnessDirectory) {
+            run.classification = !database.running && ownerFromPreviousLinuxBoot(run.owner, dependencies)
+              ? "stale"
+              : "ambiguous";
+            continue;
+          }
           try {
             const consumer = readConsumerOwner(database.harnessDirectory, dependencies);
             if (consumer) run.classification = classifyOwnerIdentity(consumer, dependencies);
