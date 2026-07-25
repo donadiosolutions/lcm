@@ -76,13 +76,14 @@ export function validateManagedLabelConfig(value) {
       if (RESERVED_OPERATIONAL_LABELS.has(label.toLowerCase())) {
         throw new Error(`Managed label ${JSON.stringify(label)} is reserved for workflow operation`);
       }
-      const previousGroup = owners.get(label);
+      const normalizedLabel = label.toLowerCase();
+      const previousGroup = owners.get(normalizedLabel);
       if (previousGroup) {
         throw new Error(
           `Managed label ${JSON.stringify(label)} appears in both ${previousGroup} and ${group}`,
         );
       }
-      owners.set(label, group);
+      owners.set(normalizedLabel, group);
       return label;
     });
   }

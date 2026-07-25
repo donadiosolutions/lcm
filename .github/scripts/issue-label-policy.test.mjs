@@ -165,7 +165,15 @@ test("rejects duplicate and cross-group labels", () => {
     /appears in both categories and categories/,
   );
   assert.throws(
+    () => validateManagedLabelConfig({ ...config, categories: ["bug", "Bug"] }),
+    /appears in both categories and categories/,
+  );
+  assert.throws(
     () => validateManagedLabelConfig({ ...config, topics: ["bug"] }),
+    /appears in both categories and topics/,
+  );
+  assert.throws(
+    () => validateManagedLabelConfig({ ...config, topics: ["Bug"] }),
     /appears in both categories and topics/,
   );
   assert.throws(
