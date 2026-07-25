@@ -371,7 +371,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     const result = await ensureDaemon({
       port: 13, pidFilePath: pidPath, spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
       _procRoot: root, _uid: 1000, _isProcessAliveOverride: () => true, _fetchOverride: fetchHealthy(20) as never,
-      _listeningPortsOverride: () => [13], expectedVersion: "1",
+      _listeningPortsOverride: () => [13], _monotonicNowOverride: () => 0, expectedVersion: "1",
     });
     expect(result.connected).toBe(true); expect(result.warning).toBeUndefined();
   });

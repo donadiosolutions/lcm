@@ -38,13 +38,18 @@ const policySource = readFileSync(
   new URL("../.github/scripts/external-admission-policy.mjs", import.meta.url),
   "utf8",
 );
+const evaluator = readFileSync(
+  new URL("../.github/scripts/external-admission.sh", import.meta.url),
+  "utf8",
+);
 const documentation = readFileSync(
   new URL("../docs/external-admission.md", import.meta.url),
   "utf8",
 );
 const workflow = loadYaml(source) as ExternalAdmissionWorkflow;
 const job = workflow.jobs["external-admission-evaluator"];
-const evaluator = job.steps.find((step) => step.name === "Evaluate external admission snapshot")?.run ?? "";
+const evaluatorInvocation =
+  job.steps.find((step) => step.name === "Evaluate external admission snapshot")?.run ?? "";
 const completedOrReconcile =
   "${{ (github.event_name == 'repository_dispatch' && github.event.action == 'external-admission-reconcile' && github.event.client_payload.head_sha != '') || github.event.action == 'completed' }}";
 
@@ -71,7 +76,7 @@ describe("external admission workflow", () => {
   it("revokes admission before checking out the trusted workflow revision", () => {
     expect(job.steps.map((step) => step.name)).toEqual([
       "Revoke stale external admission",
-      "Check out trusted admission policy",
+      "Check out trusted admission evaluator",
       "Set up Node.js",
       "Evaluate external admission snapshot",
     ]);
@@ -90,7 +95,8 @@ describe("external admission workflow", () => {
     expect(checkout?.with).toEqual({
       ref: "${{ github.workflow_sha }}",
       "persist-credentials": false,
-      "sparse-checkout": ".github/scripts/external-admission-policy.mjs",
+      "sparse-checkout":
+        ".github/scripts/external-admission.sh\n.github/scripts/external-admission-policy.mjs\n",
       "sparse-checkout-cone-mode": false,
     });
 
@@ -102,9 +108,16 @@ describe("external admission workflow", () => {
     expect(setupNode?.with).toEqual({ "node-version": "22.20.0" });
 
     expect(job.steps[3]?.if).toBe(completedOrReconcile);
+    expect(evaluatorInvocation).toBe("bash .github/scripts/external-admission.sh");
     expect(evaluator).toContain('HEAD_SHA="${EVENT_HEAD_SHA,,}"');
     expect(evaluator).toContain('if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]');
     expect(source).not.toContain("[0-9a-fA-F]");
+  });
+
+  it("keeps inline workflow scripts below actionlint's blocking threshold", () => {
+    for (const step of job.steps) {
+      if (step.run) expect(Buffer.byteLength(step.run, "utf8")).toBeLessThan(4_000);
+    }
   });
 
   it("starts only for Greptile, DCO, exact pull-request CI, or trusted reconciliation", () => {
@@ -187,7 +200,7 @@ describe("external admission workflow", () => {
     expect(policySource).toMatch(/package\(\?:-lock\)\?/u);
     expect(policySource).toContain("vitest");
     expect(policySource).toContain("tsconfig");
-    expect(source).toContain('waiting_description="Waiting for Greptile review and DCO"');
+    expect(evaluator).toContain('waiting_description="Waiting for Greptile review and DCO"');
   });
 
   it("validates successful neutral CI against exact Actions run metadata", () => {
@@ -196,7 +209,7 @@ describe("external admission workflow", () => {
     expect(policySource).toContain('run.event === "pull_request"');
     expect(policySource).toContain('run.path === workflowPath');
     expect(policySource).toContain('run.head_sha === headSha');
-    expect(source).toContain('success_description="CI and DCO passed for coverage-neutral diff"');
+    expect(evaluator).toContain('success_description="CI and DCO passed for coverage-neutral diff"');
   });
 
   it("leaves transient snapshots pending and never polls on a runner", () => {

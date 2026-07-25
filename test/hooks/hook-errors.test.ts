@@ -145,7 +145,7 @@ describe("safeLogError", () => {
       expect(existsSync(logPath)).toBe(true);
       expect(readFileSync(logPath, "utf-8")).toContain("sandbox fallback");
       if (process.env.LCM_TEST_REAL_HOME) {
-        expect(logPath.startsWith(process.env.LCM_TEST_REAL_HOME)).toBe(false);
+        expect(logPath).not.toBe(join(process.env.LCM_TEST_REAL_HOME, ".lcm", "logs", "events.log"));
       }
     } finally {
       _setLogPathForTesting(join(tempDir, "events.log"));

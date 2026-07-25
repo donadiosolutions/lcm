@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearEventScrubberCacheForTesting,
+  _setEventScrubberCacheMaxForTesting,
   scrubExtractedEvents,
 } from "../../src/hooks/event-scrubbing.js";
 import { projectDir } from "../../src/daemon/project.js";
@@ -61,6 +62,7 @@ describe("passive event scrubbing", () => {
   it("bounds the project scrubber cache and evicts the least-recently-used entry", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-event-scrub-lru-"));
     dirs.push(root);
+    _setEventScrubberCacheMaxForTesting(2);
     const engine = { scrub: (text: string) => text } as ScrubEngine;
     const forProject = vi.spyOn(ScrubEngine, "forProject").mockResolvedValue(engine);
     const event = [{
@@ -70,14 +72,22 @@ describe("passive event scrubbing", () => {
       priority: 1 as const,
     }];
 
-    for (let index = 0; index <= 100; index++) {
+    for (let index = 0; index <= 2; index++) {
       await scrubExtractedEvents(event, join(root, `project-${index}`), []);
     }
-    expect(forProject).toHaveBeenCalledTimes(101);
+    expect(forProject).toHaveBeenCalledTimes(3);
 
     await scrubExtractedEvents(event, join(root, "project-0"), []);
-    expect(forProject).toHaveBeenCalledTimes(102);
+    expect(forProject).toHaveBeenCalledTimes(4);
   });
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects invalid test cache capacity %s",
+    (capacity) => {
+      expect(() => _setEventScrubberCacheMaxForTesting(capacity))
+        .toThrow("Event scrubber cache capacity must be a positive safe integer");
+    },
+  );
 
   it("loads default configuration when patterns are not injected", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "lcm-event-default-scrub-"));
