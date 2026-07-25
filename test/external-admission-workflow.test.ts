@@ -185,6 +185,7 @@ describe("external admission workflow", () => {
     expect(evaluator.match(/pull_request_is_eligible/gu)).toHaveLength(4);
     expect(evaluator).toContain("external-admission-policy.mjs classify-files");
     expect(evaluator).toContain("external-admission-policy.mjs select-admission");
+    expect(evaluator).toContain("external-admission-policy.mjs admission-decision");
     expect(evaluator).toContain("external-admission-policy.mjs evaluate-checks");
     expect(evaluator).toContain('changed_file_count="$(jq -r \'.changed_files\'');
     expect(evaluator).toContain('current_changed_file_count="$(jq -r \'.changed_files\'');
@@ -235,6 +236,15 @@ describe("external admission workflow", () => {
     );
     expect(evaluator).toContain(
       'success_description="CI and DCO passed for trusted automated PR"',
+    );
+    expect(evaluator).toContain(
+      'admission_decision_fingerprint="$(admission_decision <<<"$admission_requirement")"',
+    );
+    expect(evaluator).toContain(
+      'current_admission_decision_fingerprint" != "$admission_decision_fingerprint"',
+    );
+    expect(evaluator).toContain(
+      'final_admission_decision_fingerprint" != "$admission_decision_fingerprint"',
     );
   });
 

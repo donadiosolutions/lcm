@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   ADMISSION_CLASSIFICATIONS,
   CHECK_IDENTITIES,
+  admissionDecision,
   classifyPullRequestFiles,
   excludedGreptileAuthorPattern,
   evaluateAdmissionChecks,
@@ -154,6 +155,41 @@ test("selects Greptile or CI from sensitive classification and authoritative ide
     () => selectAdmissionRequirement(human, true, "false", greptileConfig),
     /must be a boolean/u,
   );
+});
+
+test("compares only decision-driving fields across reordered file audits", () => {
+  const requirement = {
+    classification: ADMISSION_CLASSIFICATIONS.greptileExcludedAuthor,
+    greptileRequired: false,
+    excludedAuthorPattern: "dependabot[bot]",
+    sensitiveDiff: true,
+    trustedAutomation: true,
+    auditedPaths: ["package-lock.json", "docs/changelog.md"],
+  };
+  assert.deepEqual(admissionDecision({
+    ...requirement,
+    auditedPaths: [...requirement.auditedPaths].reverse(),
+  }), admissionDecision(requirement));
+
+  for (const changedDecision of [
+    { ...requirement, classification: ADMISSION_CLASSIFICATIONS.greptileRequired },
+    { ...requirement, greptileRequired: true },
+    { ...requirement, excludedAuthorPattern: null },
+  ]) {
+    assert.notDeepEqual(admissionDecision(changedDecision), admissionDecision(requirement));
+  }
+  assert.deepEqual(admissionDecision({
+    classification: ADMISSION_CLASSIFICATIONS.coverageNeutral,
+    greptileRequired: false,
+  }), {
+    classification: ADMISSION_CLASSIFICATIONS.coverageNeutral,
+    greptileRequired: false,
+    excludedAuthorPattern: null,
+  });
+  assert.throws(() => admissionDecision({
+    classification: ADMISSION_CLASSIFICATIONS.coverageNeutral,
+    greptileRequired: "false",
+  }), /greptileRequired/u);
 });
 
 test("matches Greptile excluded-author globs while requiring GitHub Bot type", () => {
@@ -524,6 +560,20 @@ test("exposes the complete policy through its deterministic CLI command seam", (
   ] }] )));
   assert.equal(evaluation.ready, true);
   assert.equal(evaluation.ciRunId, "123");
+  assert.deepEqual(JSON.parse(runPolicyCommand(
+    "admission-decision",
+    [],
+    JSON.stringify({
+      classification: ADMISSION_CLASSIFICATIONS.greptileExcludedAuthor,
+      greptileRequired: false,
+      excludedAuthorPattern: "dependabot[bot]",
+      auditedPaths: ["second", "first"],
+    }),
+  )), {
+    classification: ADMISSION_CLASSIFICATIONS.greptileExcludedAuthor,
+    greptileRequired: false,
+    excludedAuthorPattern: "dependabot[bot]",
+  });
   assert.deepEqual(JSON.parse(runPolicyCommand(
     "select-admission",
     ["true", "false", "greptile.json"],

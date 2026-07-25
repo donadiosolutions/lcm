@@ -55,6 +55,11 @@ function requireNonEmptyString(value, label) {
   return value;
 }
 
+function requireBoolean(value, label) {
+  if (typeof value !== "boolean") throw new TypeError(`${label} must be a boolean`);
+  return value;
+}
+
 function requireObject(value, label) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError(`${label} must be an object`);
@@ -188,6 +193,27 @@ export function selectAdmissionRequirement(
     trustedAutomation,
     greptileRequired,
     excludedAuthorPattern,
+  };
+}
+
+export function admissionDecision(requirement) {
+  const value = requireObject(requirement, "admission requirement");
+  const excludedAuthorPattern = value.excludedAuthorPattern;
+  return {
+    classification: requireNonEmptyString(
+      value.classification,
+      "admission requirement.classification",
+    ),
+    greptileRequired: requireBoolean(
+      value.greptileRequired,
+      "admission requirement.greptileRequired",
+    ),
+    excludedAuthorPattern: excludedAuthorPattern === undefined || excludedAuthorPattern === null
+      ? null
+      : requireNonEmptyString(
+        excludedAuthorPattern,
+        "admission requirement.excludedAuthorPattern",
+      ),
   };
 }
 
@@ -382,6 +408,9 @@ export function runPolicyCommand(command, args, input) {
       changesGreptileExclusionPolicy === "true",
       readGreptileConfig(configPath),
     ));
+  }
+  if (command === "admission-decision" && args.length === 0) {
+    return JSON.stringify(admissionDecision(payload));
   }
   if (command === "evaluate-checks" && args.length === 4) {
     const [headSha, greptileRequired, repository, serverUrl] = args;
