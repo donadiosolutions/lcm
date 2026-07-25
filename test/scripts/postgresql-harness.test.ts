@@ -3,15 +3,28 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
   MAX_CAPTURED_OUTPUT_BYTES,
+  MAX_DOCKER_REMOVE_ATTEMPTS,
   NODE_IMAGE,
+  OWNER_BIRTH_LABEL,
+  OWNER_PID_LABEL,
+  OWNER_SCHEMA_LABEL,
+  OWNER_SCHEMA_VERSION,
   POSTGRES_IMAGE,
+  RESOURCE_KIND_LABEL,
   RUN_LABEL,
+  classifyOwnerIdentity,
   cleanupHarnessResources,
+  createOwnerIdentity,
   createProcessLifecycle,
   createRunNames,
+  discoverHarnessRuns,
   harnessErrorDetails,
   isMissingDockerObjectError,
+  ownershipLabels,
+  readProcessBirthFingerprint,
+  reclaimProvenOrphans,
   removeLabeled,
+  removeOwnedResource,
   resolveConfiguredTemplateArchive,
   runProcess,
   runSanitizedProcess,
@@ -25,6 +38,40 @@ describe("PostgreSQL harness utilities", () => {
     expect(POSTGRES_IMAGE).toMatch(/^postgres:18\.4-bookworm@sha256:[0-9a-f]{64}$/u);
     expect(NODE_IMAGE).toMatch(/^node:22\.20\.0-bookworm-slim@sha256:[0-9a-f]{64}$/u);
     expect(RUN_LABEL).toBe("com.donadiosolutions.lcm.postgresql-test-run");
+    expect(OWNER_SCHEMA_VERSION).toBe("1");
+    expect(new Set([
+      RUN_LABEL,
+      OWNER_SCHEMA_LABEL,
+      OWNER_PID_LABEL,
+      OWNER_BIRTH_LABEL,
+      RESOURCE_KIND_LABEL,
+    ]).size).toBe(5);
+  });
+
+  it("derives an owner birth fingerprint from boot ID and the Linux process start field", () => {
+    const bootId = "12345678-1234-1234-1234-123456789abc";
+    const statFields = ["S", ...Array.from({ length: 18 }, () => "0"), "98765", "0"];
+    const readFile = vi.fn((path: string) => path.endsWith("boot_id")
+      ? `${bootId}\n`
+      : `42 (worker with ) parenthesis) ${statFields.join(" ")}\n`);
+
+    expect(readProcessBirthFingerprint(42, { readFile })).toBe(`${bootId}:98765`);
+    expect(createOwnerIdentity(42, { readFile })).toEqual({ pid: 42, birth: `${bootId}:98765` });
+    expect(() => readProcessBirthFingerprint(0, { readFile })).toThrow("owner PID");
+    expect(() => readProcessBirthFingerprint(42, { readFile: () => "unsupported" }))
+      .toThrow("unsupported");
+  });
+
+  it("classifies only matching process identity as live and fails closed on ambiguous evidence", () => {
+    const owner = { pid: 42, birth: "boot:100" };
+    expect(classifyOwnerIdentity(owner, { readFingerprint: () => "boot:100" })).toBe("live");
+    expect(classifyOwnerIdentity(owner, { readFingerprint: () => "boot:200" })).toBe("stale");
+    expect(classifyOwnerIdentity(owner, {
+      readFingerprint: () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); },
+    })).toBe("stale");
+    expect(classifyOwnerIdentity(owner, {
+      readFingerprint: () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); },
+    })).toBe("ambiguous");
   });
 
   it("derives and validates every resource name from a random-style run ID", () => {
@@ -394,6 +441,276 @@ describe("PostgreSQL harness utilities", () => {
     const unlabeledRunner = vi.fn().mockResolvedValue({ stdout: JSON.stringify([{ Config: { Labels: {} } }]), stderr: "" });
     await expect(removeLabeled("container", "owned-resource", runId, unlabeledRunner))
       .rejects.toThrow("refusing to remove unlabeled container");
+  });
+
+  it("reinspects exact owner labels before every bounded removal attempt", async () => {
+    const runId = "a".repeat(32);
+    const owner = {
+      pid: 42,
+      birth: "12345678-1234-1234-1234-123456789abc:100",
+    };
+    const labels = ownershipLabels(runId, "database", owner);
+    const removalFailure = Object.assign(new Error("resource busy"), {
+      code: 1,
+      stdout: "",
+      stderr: "Error response from daemon: resource busy",
+    });
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "inspect") {
+        return { stdout: JSON.stringify([{ Config: { Labels: labels } }]), stderr: "" };
+      }
+      throw removalFailure;
+    });
+    const delay = vi.fn();
+
+    await expect(removeOwnedResource(
+      "container",
+      createRunNames(runId).container,
+      labels,
+      dockerRunner,
+      { delay },
+    )).rejects.toBe(removalFailure);
+    expect(dockerRunner).toHaveBeenCalledTimes(MAX_DOCKER_REMOVE_ATTEMPTS * 2);
+    expect(delay).toHaveBeenCalledTimes(MAX_DOCKER_REMOVE_ATTEMPTS - 1);
+
+    const changed = { ...labels, [OWNER_PID_LABEL]: "43" };
+    const changedRunner = vi.fn()
+      .mockResolvedValueOnce({ stdout: JSON.stringify([{ Config: { Labels: labels } }]), stderr: "" })
+      .mockRejectedValueOnce(removalFailure)
+      .mockResolvedValueOnce({ stdout: JSON.stringify([{ Config: { Labels: changed } }]), stderr: "" });
+    await expect(removeOwnedResource(
+      "container",
+      createRunNames(runId).container,
+      labels,
+      changedRunner,
+      { delay: vi.fn() },
+    )).rejects.toThrow("changed PostgreSQL harness ownership");
+    expect(changedRunner).toHaveBeenCalledTimes(3);
+  });
+
+  it("discovers live and stale exact runs while preserving malformed or inconsistent labels", async () => {
+    const liveRunId = "a".repeat(32);
+    const staleRunId = "b".repeat(32);
+    const legacyRunId = "c".repeat(32);
+    const bootId = "12345678-1234-1234-1234-123456789abc";
+    const records = new Map([
+      [`network:${createRunNames(liveRunId).network}`, ownershipLabels(
+        liveRunId,
+        "network",
+        { pid: 41, birth: `${bootId}:100` },
+      )],
+      [`volume:${createRunNames(staleRunId).volume}`, ownershipLabels(
+        staleRunId,
+        "data",
+        { pid: 42, birth: `${bootId}:200` },
+      )],
+      [`volume:${createRunNames(legacyRunId).volume}`, { [RUN_LABEL]: legacyRunId }],
+    ]);
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        const names = [...records.keys()]
+          .filter((key) => key.startsWith(`${type}:`))
+          .map((key) => key.slice(type.length + 1));
+        return { stdout: names.join("\n"), stderr: "" };
+      }
+      const type = args[0];
+      const labels = records.get(`${type}:${args[2]}`) ?? {};
+      return {
+        stdout: JSON.stringify([type === "container" ? { Config: { Labels: labels } } : { Labels: labels }]),
+        stderr: "",
+      };
+    });
+
+    const runs = await discoverHarnessRuns({
+      dockerRunner,
+      readFingerprint: (pid: number) => pid === 41 ? `${bootId}:100` : `${bootId}:999`,
+    });
+    expect(runs.map((run) => [run.runId, run.classification])).toEqual([
+      [liveRunId, "live"],
+      [staleRunId, "stale"],
+      [legacyRunId, "ambiguous"],
+    ]);
+
+    records.set(
+      `container:${createRunNames(liveRunId).runner}`,
+      ownershipLabels(liveRunId, "runner", { pid: 99, birth: `${bootId}:300` }),
+    );
+    const inconsistent = await discoverHarnessRuns({
+      dockerRunner,
+      readFingerprint: () => `${bootId}:100`,
+    });
+    expect(inconsistent.find((run) => run.runId === liveRunId)?.classification).toBe("ambiguous");
+  });
+
+  it("reclaims only a definitively stale, consistently labeled run in teardown order", async () => {
+    const runId = "d".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 77,
+      birth: "12345678-1234-1234-1234-123456789abc:700",
+    };
+    const records = new Map([
+      [`container:${names.restore}`, ownershipLabels(runId, "restore", owner)],
+      [`container:${names.runner}`, ownershipLabels(runId, "runner", owner)],
+      [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+      [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
+    ]);
+    const removals: string[] = [];
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        return {
+          stdout: [...records.keys()]
+            .filter((key) => key.startsWith(`${type}:`))
+            .map((key) => key.slice(type.length + 1))
+            .join("\n"),
+          stderr: "",
+        };
+      }
+      if (args[1] === "inspect") {
+        const type = args[0];
+        const labels = records.get(`${type}:${args[2]}`) ?? {};
+        return {
+          stdout: JSON.stringify([type === "container"
+            ? { Config: { Labels: labels }, State: { Running: true } }
+            : { Labels: labels }]),
+          stderr: "",
+        };
+      }
+      const type = args[0];
+      const name = args.at(-1)!;
+      removals.push(`${type}:${name}`);
+      records.delete(`${type === "container" ? "container" : type}:${name}`);
+      return { stdout: "", stderr: "" };
+    });
+    const verifySentinel = vi.fn();
+
+    const runs = await reclaimProvenOrphans({
+      dockerRunner,
+      readFingerprint: () => `${owner.birth}-reused`,
+      verifySentinel,
+      delay: vi.fn(),
+    });
+    expect(runs).toHaveLength(1);
+    expect(verifySentinel).toHaveBeenCalledWith(names, runId, dockerRunner);
+    expect(removals).toEqual([
+      `container:${names.restore}`,
+      `container:${names.runner}`,
+      `container:${names.container}`,
+      `volume:${names.volume}`,
+      `network:${names.network}`,
+    ]);
+  });
+
+  it("does not mutate live, legacy, malformed, unsupported, or permission-ambiguous runs", async () => {
+    const runId = "e".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 88,
+      birth: "12345678-1234-1234-1234-123456789abc:800",
+    };
+    const labels = ownershipLabels(runId, "network", owner);
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[0] === "network" && args[1] === "ls") {
+        return { stdout: names.network, stderr: "" };
+      }
+      if (args[1] === "ls") return { stdout: "", stderr: "" };
+      return { stdout: JSON.stringify([{ Labels: labels }]), stderr: "" };
+    });
+
+    for (const readFingerprint of [
+      () => owner.birth,
+      () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); },
+      () => { throw new Error("unsupported"); },
+    ]) {
+      dockerRunner.mockClear();
+      await expect(reclaimProvenOrphans({
+        dockerRunner,
+        readFingerprint,
+        stderr: { write: vi.fn() },
+      })).resolves.toBeDefined();
+      expect(dockerRunner.mock.calls.some(([args]) => args[1] === "rm")).toBe(false);
+    }
+  });
+
+  it("reclaims a stopped stale database without bypassing observable running sentinels", async () => {
+    const runId = "f".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 91,
+      birth: "12345678-1234-1234-1234-123456789abc:900",
+    };
+    const labels = ownershipLabels(runId, "database", owner);
+    let exists = true;
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[0] === "container" && args[1] === "ls") {
+        return { stdout: exists ? names.container : "", stderr: "" };
+      }
+      if (args[1] === "ls") return { stdout: "", stderr: "" };
+      if (args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify([{ Config: { Labels: labels }, State: { Running: false } }]),
+          stderr: "",
+        };
+      }
+      exists = false;
+      return { stdout: "", stderr: "" };
+    });
+    const verifySentinel = vi.fn(() => { throw new Error("stopped container cannot exec"); });
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      readFingerprint: () => `${owner.birth}-reused`,
+      verifySentinel,
+    })).resolves.toBeDefined();
+    expect(verifySentinel).not.toHaveBeenCalled();
+    expect(exists).toBe(false);
+  });
+
+  it("warns for ambiguous evidence and continues discovering independent stale runs", async () => {
+    const staleRunId = "1".repeat(32);
+    const names = createRunNames(staleRunId);
+    const owner = {
+      pid: 92,
+      birth: "12345678-1234-1234-1234-123456789abc:920",
+    };
+    const labels = ownershipLabels(staleRunId, "network", owner);
+    const inspectionFailure = Object.assign(new Error("denied"), {
+      code: 1,
+      stdout: "",
+      stderr: "permission denied",
+    });
+    let staleExists = true;
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[0] === "container" && args[1] === "ls") {
+        return { stdout: "foreign-ambiguous-container", stderr: "" };
+      }
+      if (args[0] === "network" && args[1] === "ls") {
+        return { stdout: staleExists ? names.network : "", stderr: "" };
+      }
+      if (args[1] === "ls") return { stdout: "", stderr: "" };
+      if (args[1] === "inspect" && args[2] === "foreign-ambiguous-container") throw inspectionFailure;
+      if (args[1] === "inspect") {
+        return { stdout: JSON.stringify([{ Labels: labels }]), stderr: "" };
+      }
+      staleExists = false;
+      return { stdout: "", stderr: "" };
+    });
+    const stderr = { write: vi.fn() };
+
+    const runs = await reclaimProvenOrphans({
+      dockerRunner,
+      readFingerprint: () => `${owner.birth}-reused`,
+      stderr,
+    });
+    expect(runs.map((run) => run.classification).sort()).toEqual(["ambiguous", "stale"]);
+    expect(staleExists).toBe(false);
+    expect(stderr.write).toHaveBeenCalledWith(
+      "PostgreSQL harness preserved 1 ambiguous labeled Docker run; manual reconciliation required.\n",
+    );
+    expect(stderr.write.mock.calls.flat().join(" ")).not.toContain("permission denied");
   });
 
   it("pins container-mounted and checksummed PostgreSQL files to LF", () => {

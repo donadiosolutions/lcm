@@ -9,17 +9,16 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-async function runSignalProbe(signal: "SIGINT" | "SIGTERM"): Promise<void> {
+async function launchSignalProbe(): Promise<{ child: ChildProcess; runId: string }> {
   const child = spawn(process.execPath, ["scripts/postgresql-harness.mjs", "--signal-probe"], {
     cwd: process.cwd(),
     env: process.env,
     stdio: ["ignore", "ignore", "pipe"],
   });
   let stderr = "";
-  let runId: string | undefined;
-  let readyResolve!: () => void;
+  let readyResolve!: (runId: string) => void;
   let readyReject!: (error: Error) => void;
-  const ready = new Promise<void>((resolve, reject) => {
+  const ready = new Promise<string>((resolve, reject) => {
     readyResolve = resolve;
     readyReject = reject;
   });
@@ -27,26 +26,36 @@ async function runSignalProbe(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   child.stderr?.on("data", (chunk) => {
     stderr += String(chunk);
     const match = stderr.match(/PostgreSQL harness signal probe ready: ([0-9a-f]{32})/u);
-    if (match) {
-      runId = match[1];
-      readyResolve();
-    }
+    if (match) readyResolve(match[1]);
   });
   child.once("error", readyReject);
   child.once("exit", (code) => {
-    if (!runId) readyReject(new Error(`signal probe exited before readiness (${code}): ${stderr}`));
+    readyReject(new Error(`signal probe exited before readiness (${code}): ${stderr}`));
   });
   try {
-    await ready;
+    return { child, runId: await ready };
+  } catch (error) {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function runSignalProbe(signal: "SIGHUP" | "SIGINT" | "SIGTERM"): Promise<void> {
+  const { child, runId } = await launchSignalProbe();
+  try {
     const completion = exited(child);
     child.kill(signal);
     await new Promise((resolve) => setTimeout(resolve, 50));
     if (child.exitCode === null && child.signalCode === null) child.kill(signal);
     const exit = await completion;
-    expect(exit).toEqual({ code: signal === "SIGINT" ? 130 : 143, signal: null });
-    await expectNoResources(runId!);
+    expect(exit).toEqual({
+      code: signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143,
+      signal: null,
+    });
+    await expectNoResources(runId);
   } finally {
-    clearTimeout(timeout);
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   }
 }
@@ -69,9 +78,63 @@ async function expectNoResources(runId: string): Promise<void> {
   }
 }
 
+async function expectResources(runId: string): Promise<void> {
+  for (const args of [
+    ["ps", "--all", "--quiet", "--filter", `label=${RUN_LABEL}=${runId}`],
+    ["network", "ls", "--quiet", "--filter", `label=${RUN_LABEL}=${runId}`],
+    ["volume", "ls", "--quiet", "--filter", `label=${RUN_LABEL}=${runId}`],
+  ]) {
+    const { stdout } = await execFileAsync("docker", args);
+    expect(stdout.trim()).not.toBe("");
+  }
+}
+
 describe("PostgreSQL harness signal teardown", () => {
   it("cleans every labeled resource on SIGINT", () => runSignalProbe("SIGINT"), 45_000);
   it("cleans every labeled resource on SIGTERM", () => runSignalProbe("SIGTERM"), 45_000);
+  it("cleans every labeled resource on SIGHUP", () => runSignalProbe("SIGHUP"), 45_000);
+
+  it("reclaims a SIGKILL orphan before the next run allocates resources", async () => {
+    const first = await launchSignalProbe();
+    const firstCompletion = exited(first.child);
+    first.child.kill("SIGKILL");
+    await expect(firstCompletion).resolves.toEqual({ code: null, signal: "SIGKILL" });
+
+    const second = await launchSignalProbe();
+    try {
+      await expectNoResources(first.runId);
+      const secondCompletion = exited(second.child);
+      second.child.kill("SIGTERM");
+      await expect(secondCompletion).resolves.toEqual({ code: 143, signal: null });
+      await expectNoResources(second.runId);
+    } finally {
+      if (second.child.exitCode === null && second.child.signalCode === null) second.child.kill("SIGKILL");
+    }
+  }, 90_000);
+
+  it("preserves a live parallel run while allocating and cleaning another run", async () => {
+    const first = await launchSignalProbe();
+    let second: Awaited<ReturnType<typeof launchSignalProbe>> | undefined;
+    try {
+      second = await launchSignalProbe();
+      await expectResources(first.runId);
+      const secondCompletion = exited(second.child);
+      second.child.kill("SIGTERM");
+      await expect(secondCompletion).resolves.toEqual({ code: 143, signal: null });
+      await expectNoResources(second.runId);
+      await expectResources(first.runId);
+
+      const firstCompletion = exited(first.child);
+      first.child.kill("SIGTERM");
+      await expect(firstCompletion).resolves.toEqual({ code: 143, signal: null });
+      await expectNoResources(first.runId);
+    } finally {
+      if (second && second.child.exitCode === null && second.child.signalCode === null) {
+        second.child.kill("SIGKILL");
+      }
+      if (first.child.exitCode === null && first.child.signalCode === null) first.child.kill("SIGKILL");
+    }
+  }, 90_000);
 
   it("propagates and sanitizes a real Docker inspection failure", async () => {
     const unavailableSocket = "/tmp/lcm-postgresql-harness-unavailable-cleanup.sock";

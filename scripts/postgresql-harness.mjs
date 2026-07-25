@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,11 +16,19 @@ import {
 
 export { NODE_IMAGE, POSTGRES_IMAGE };
 export const RUN_LABEL = "com.donadiosolutions.lcm.postgresql-test-run";
+export const OWNER_SCHEMA_LABEL = "com.donadiosolutions.lcm.postgresql-test-owner-schema";
+export const OWNER_PID_LABEL = "com.donadiosolutions.lcm.postgresql-test-owner-pid";
+export const OWNER_BIRTH_LABEL = "com.donadiosolutions.lcm.postgresql-test-owner-birth";
+export const RESOURCE_KIND_LABEL = "com.donadiosolutions.lcm.postgresql-test-resource-kind";
+export const OWNER_SCHEMA_VERSION = "1";
 export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
+export const MAX_DOCKER_REMOVE_ATTEMPTS = 3;
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const initScript = join(repositoryRoot, "test", "postgresql", "init.sh");
 const cachedRunInitScript = join(repositoryRoot, "test", "postgresql", "cached-run-init.sh");
+const bootIdPattern = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const processBirthPattern = new RegExp(`^${bootIdPattern}:[1-9][0-9]*$`, "u");
 
 export function createRunNames(runId) {
   const short = runId.slice(0, 20);
@@ -34,6 +42,58 @@ export function createRunNames(runId) {
     wrongAlias: `lcm-pg-wrong-${short}.test`,
     controlDatabase: `lcm_harness_${short}`,
   };
+}
+
+const resourceSpecs = [
+  { type: "container", key: "restore", kind: "restore" },
+  { type: "container", key: "runner", kind: "runner" },
+  { type: "container", key: "container", kind: "database" },
+  { type: "volume", key: "volume", kind: "data" },
+  { type: "network", key: "network", kind: "network" },
+];
+
+function resourceSpec(type, name, runId) {
+  const names = createRunNames(runId);
+  return resourceSpecs.find((candidate) => candidate.type === type && names[candidate.key] === name);
+}
+
+export function readProcessBirthFingerprint(pid, dependencies = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("invalid PostgreSQL harness owner PID");
+  const readFile = dependencies.readFile ?? readFileSync;
+  const bootId = String(readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+  const stat = String(readFile(`/proc/${pid}/stat`, "utf8")).trim();
+  const closingParenthesis = stat.lastIndexOf(")");
+  if (!(new RegExp(`^${bootIdPattern}$`, "u")).test(bootId)
+    || closingParenthesis < 1) {
+    throw new Error("unsupported PostgreSQL harness process identity evidence");
+  }
+  const fieldsAfterCommand = stat.slice(closingParenthesis + 1).trim().split(/\s+/u);
+  const startTime = fieldsAfterCommand[19];
+  if (!/^[1-9][0-9]*$/u.test(startTime ?? "")) {
+    throw new Error("unsupported PostgreSQL harness process identity evidence");
+  }
+  return `${bootId}:${startTime}`;
+}
+
+export function createOwnerIdentity(pid = process.pid, dependencies = {}) {
+  return {
+    pid,
+    birth: readProcessBirthFingerprint(pid, dependencies),
+  };
+}
+
+export function ownershipLabels(runId, kind, owner) {
+  return {
+    [RUN_LABEL]: runId,
+    [OWNER_SCHEMA_LABEL]: OWNER_SCHEMA_VERSION,
+    [OWNER_PID_LABEL]: String(owner.pid),
+    [OWNER_BIRTH_LABEL]: owner.birth,
+    [RESOURCE_KIND_LABEL]: kind,
+  };
+}
+
+function dockerLabelArgs(labels) {
+  return Object.entries(labels).flatMap(([key, value]) => ["--label", `${key}=${value}`]);
 }
 
 export function validateRunNames(names, runId) {
@@ -254,9 +314,13 @@ function generatedUrl(user, password, host, port, database) {
   return `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/${database}`;
 }
 
-async function inspectLabels(type, name, dockerRunner = docker) {
+async function inspectDockerObject(type, name, dockerRunner = docker) {
   const result = await dockerRunner([type, "inspect", name]);
-  const record = JSON.parse(result.stdout)[0];
+  return JSON.parse(result.stdout)[0];
+}
+
+export async function inspectLabels(type, name, dockerRunner = docker) {
+  const record = await inspectDockerObject(type, name, dockerRunner);
   return type === "container" ? record?.Config?.Labels ?? {} : record?.Labels ?? {};
 }
 
@@ -295,6 +359,215 @@ export async function removeLabeled(type, name, runId, dockerRunner = docker) {
     ? ["container", "rm", "--force", name]
     : [type, "rm", name];
   await dockerRunner(args);
+}
+
+function requiredOwnership(labels) {
+  const runId = labels[RUN_LABEL];
+  const pidText = labels[OWNER_PID_LABEL];
+  const birth = labels[OWNER_BIRTH_LABEL];
+  const kind = labels[RESOURCE_KIND_LABEL];
+  if (labels[OWNER_SCHEMA_LABEL] !== OWNER_SCHEMA_VERSION
+    || !/^[0-9a-f]{32}$/u.test(runId ?? "")
+    || !/^[1-9][0-9]*$/u.test(pidText ?? "")
+    || !processBirthPattern.test(birth ?? "")
+    || typeof kind !== "string"
+    || kind.length === 0) {
+    return undefined;
+  }
+  const pid = Number(pidText);
+  if (!Number.isSafeInteger(pid)) return undefined;
+  return { runId, pid, birth, kind };
+}
+
+function labelsMatchOwnership(labels, expected) {
+  return Object.entries(expected).every(([key, value]) => labels[key] === String(value));
+}
+
+export async function removeOwnedResource(
+  type,
+  name,
+  expectedLabels,
+  dockerRunner = docker,
+  dependencies = {},
+) {
+  const delay = dependencies.delay ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  let lastError;
+  for (let attempt = 0; attempt < MAX_DOCKER_REMOVE_ATTEMPTS; attempt += 1) {
+    let labels;
+    try {
+      labels = await inspectLabels(type, name, dockerRunner);
+    } catch (error) {
+      if (isMissingDockerObjectError(error, type, name)) return;
+      throw error;
+    }
+    if (!labelsMatchOwnership(labels, expectedLabels)) {
+      throw new Error(`refusing to remove ${type} with changed PostgreSQL harness ownership`);
+    }
+    const args = type === "container"
+      ? ["container", "rm", "--force", name]
+      : [type, "rm", name];
+    try {
+      await dockerRunner(args);
+      return;
+    } catch (error) {
+      if (isMissingDockerObjectError(error, type, name)) return;
+      lastError = error;
+      if (attempt + 1 < MAX_DOCKER_REMOVE_ATTEMPTS) await delay(100 * (attempt + 1));
+    }
+  }
+  throw lastError ?? new Error(`failed to remove PostgreSQL harness ${type}`);
+}
+
+async function listLabeledResources(dockerRunner = docker) {
+  const listed = [];
+  for (const [type, args] of [
+    ["container", ["container", "ls", "--all", "--format", "{{.Names}}", "--filter", `label=${RUN_LABEL}`]],
+    ["network", ["network", "ls", "--format", "{{.Name}}", "--filter", `label=${RUN_LABEL}`]],
+    ["volume", ["volume", "ls", "--format", "{{.Name}}", "--filter", `label=${RUN_LABEL}`]],
+  ]) {
+    const result = await dockerRunner(args);
+    for (const name of result.stdout.split(/\r?\n/u).map((value) => value.trim()).filter(Boolean)) {
+      listed.push({ type, name });
+    }
+  }
+  return listed;
+}
+
+function shortRunPrefixFromName(name) {
+  return name.match(/^lcm-pg-(?:net-|data-|restore-|runner-)?([0-9a-f]{20})$/u)?.[1];
+}
+
+export function classifyOwnerIdentity(owner, dependencies = {}) {
+  const readFingerprint = dependencies.readFingerprint ?? readProcessBirthFingerprint;
+  try {
+    return readFingerprint(owner.pid) === owner.birth ? "live" : "stale";
+  } catch (error) {
+    return error?.code === "ENOENT" ? "stale" : "ambiguous";
+  }
+}
+
+export async function discoverHarnessRuns(dependencies = {}) {
+  const dockerRunner = dependencies.dockerRunner ?? docker;
+  const resources = await listLabeledResources(dockerRunner);
+  const runs = new Map();
+  for (const resource of resources) {
+    let record;
+    try {
+      record = await inspectDockerObject(resource.type, resource.name, dockerRunner);
+    } catch (error) {
+      if (isMissingDockerObjectError(error, resource.type, resource.name)) continue;
+      runs.set(`ambiguous:${resource.type}:${resource.name}`, {
+        classification: "ambiguous",
+        resources: [{
+          ...resource,
+          error,
+          shortRunPrefix: shortRunPrefixFromName(resource.name),
+        }],
+      });
+      continue;
+    }
+    const labels = resource.type === "container" ? record?.Config?.Labels ?? {} : record?.Labels ?? {};
+    const ownership = requiredOwnership(labels);
+    const spec = ownership && resourceSpec(resource.type, resource.name, ownership.runId);
+    if (!ownership || !spec || spec.kind !== ownership.kind) {
+      const labeledRunId = /^[0-9a-f]{32}$/u.test(labels[RUN_LABEL] ?? "")
+        ? labels[RUN_LABEL]
+        : undefined;
+      const key = ownership?.runId ?? labeledRunId ?? `ambiguous:${resource.type}:${resource.name}`;
+      const run = runs.get(key) ?? {
+        runId: ownership?.runId ?? labeledRunId,
+        owner: ownership ? { pid: ownership.pid, birth: ownership.birth } : undefined,
+        classification: "ambiguous",
+        resources: [],
+      };
+      run.classification = "ambiguous";
+      run.resources.push({ ...resource, labels });
+      runs.set(key, run);
+      continue;
+    }
+    const expectedLabels = ownershipLabels(
+      ownership.runId,
+      ownership.kind,
+      { pid: ownership.pid, birth: ownership.birth },
+    );
+    const run = runs.get(ownership.runId) ?? {
+      runId: ownership.runId,
+      owner: { pid: ownership.pid, birth: ownership.birth },
+      classification: undefined,
+      resources: [],
+    };
+    if (!run.owner || run.owner.pid !== ownership.pid || run.owner.birth !== ownership.birth) {
+      run.classification = "ambiguous";
+    }
+    if (ownership.kind === "database" && typeof record?.State?.Running !== "boolean") {
+      run.classification = "ambiguous";
+    }
+    run.resources.push({ ...resource, kind: ownership.kind, labels: expectedLabels });
+    if (ownership.kind === "database") {
+      run.resources.at(-1).running = record.State.Running;
+    }
+    runs.set(ownership.runId, run);
+  }
+  const ambiguousPrefixes = [...runs.values()]
+    .filter((run) => run.classification === "ambiguous")
+    .flatMap((run) => run.resources.map((resource) => resource.shortRunPrefix).filter(Boolean));
+  for (const run of runs.values()) {
+    if (run.runId && ambiguousPrefixes.some((prefix) => run.runId.startsWith(prefix))) {
+      run.classification = "ambiguous";
+    }
+  }
+  for (const run of runs.values()) {
+    if (run.classification !== "ambiguous") {
+      run.classification = classifyOwnerIdentity(run.owner, dependencies);
+    }
+  }
+  return [...runs.values()];
+}
+
+export async function reclaimProvenOrphans(dependencies = {}) {
+  const dockerRunner = dependencies.dockerRunner ?? docker;
+  const runs = await discoverHarnessRuns({ ...dependencies, dockerRunner });
+  const failures = [];
+  const ambiguousCount = runs.filter((run) => run.classification === "ambiguous").length;
+  if (ambiguousCount > 0) {
+    const stderr = dependencies.stderr ?? process.stderr;
+    stderr.write(
+      `PostgreSQL harness preserved ${ambiguousCount} ambiguous labeled Docker run${ambiguousCount === 1 ? "" : "s"}; manual reconciliation required.\n`,
+    );
+  }
+  for (const run of runs) {
+    if (run.classification !== "stale") continue;
+    const byKind = new Map(run.resources.map((resource) => [resource.kind, resource]));
+    const database = byKind.get("database");
+    if (database?.running) {
+      try {
+        await (dependencies.verifySentinel
+          ? dependencies.verifySentinel(createRunNames(run.runId), run.runId, dockerRunner)
+          : verifyContainerSentinel(createRunNames(run.runId), run.runId, dockerRunner));
+      } catch (error) {
+        failures.push(error);
+        continue;
+      }
+    }
+    for (const kind of ["restore", "runner", "database", "data", "network"]) {
+      const resource = byKind.get(kind);
+      if (!resource) continue;
+      try {
+        await removeOwnedResource(
+          resource.type,
+          resource.name,
+          resource.labels,
+          dockerRunner,
+          dependencies,
+        );
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+  }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, "PostgreSQL harness orphan recovery failed");
+  return runs;
 }
 
 async function waitForPostgreSql(container, database, dockerRunner = docker, username = "lcm_harness_admin") {
@@ -360,9 +633,13 @@ export function harnessErrorDetails(error) {
 }
 
 export async function cleanupHarnessResources(context, dependencies = {}) {
-  const { names, runId, directory, sentinelReady } = context;
+  const { names, runId, directory, sentinelReady, owner } = context;
   const removeResource = dependencies.removeResource
-    ?? ((type, name) => removeLabeled(type, name, runId));
+    ?? ((type, name) => {
+      const spec = resourceSpec(type, name, runId);
+      if (!owner || !spec) return removeLabeled(type, name, runId);
+      return removeOwnedResource(type, name, ownershipLabels(runId, spec.kind, owner));
+    });
   const verifySentinel = dependencies.verifySentinel
     ?? (() => verifyContainerSentinel(names, runId));
   const removeDirectory = dependencies.removeDirectory
@@ -420,7 +697,7 @@ async function runTests(context, ci, setupDocker = docker) {
   }).map(([key, value]) => `${key}=${value}`).join("\n") + "\n", { mode: 0o600 });
   await setupDocker([
     "create", "--name", context.names.runner,
-    "--label", `${RUN_LABEL}=${context.runId}`,
+    ...dockerLabelArgs(ownershipLabels(context.runId, "runner", context.owner)),
     "--network", context.names.network,
     "--env-file", envFile,
     "--volume", `${repositoryRoot}:/workspace:ro`,
@@ -439,6 +716,8 @@ async function runTests(context, ci, setupDocker = docker) {
 
 export async function runHarness(options = {}) {
   const ci = options.ci ?? process.env.GITHUB_ACTIONS === "true";
+  await reclaimProvenOrphans();
+  const owner = createOwnerIdentity();
   const runId = randomBytes(16).toString("hex");
   const names = createRunNames(runId);
   const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-harness-"));
@@ -456,7 +735,7 @@ export async function runHarness(options = {}) {
   let cleanupPromise;
   let sentinelReady = false;
   const cleanup = () => {
-    cleanupPromise ??= cleanupHarnessResources({ names, runId, directory, sentinelReady })
+    cleanupPromise ??= cleanupHarnessResources({ names, runId, directory, sentinelReady, owner })
       .catch((error) => {
         const details = sanitizeHarnessText(harnessErrorDetails(error), secrets);
         process.stderr.write(`PostgreSQL harness cleanup failed: ${details}\n`);
@@ -477,6 +756,7 @@ export async function runHarness(options = {}) {
   const removeSignalHandlers = () => {
     process.removeListener("SIGINT", onSigint);
     process.removeListener("SIGTERM", onSigterm);
+    process.removeListener("SIGHUP", onSighup);
   };
   const onSignal = (signal) => {
     exitSignal ??= signal;
@@ -484,13 +764,15 @@ export async function runHarness(options = {}) {
       .catch(() => undefined)
       .then(() => {
         removeSignalHandlers();
-        process.exit(exitSignal === "SIGINT" ? 130 : 143);
+        process.exit(exitSignal === "SIGINT" ? 130 : exitSignal === "SIGHUP" ? 129 : 143);
       });
   };
   const onSigint = () => onSignal("SIGINT");
   const onSigterm = () => onSignal("SIGTERM");
+  const onSighup = () => onSignal("SIGHUP");
   process.on("SIGINT", onSigint);
   process.on("SIGTERM", onSigterm);
+  process.on("SIGHUP", onSighup);
 
   try {
     writeFileSync(join(directory, "run-id"), `${runId}\n`, { mode: 0o600 });
@@ -499,8 +781,16 @@ export async function runHarness(options = {}) {
     writeFileSync(join(directory, "migrator-password"), `${passwords.migrator}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "runtime-password"), `${passwords.runtime}\n`, { mode: 0o600 });
     await writeTlsFixtures(directory, names.alias, setupProcess);
-    await setupDocker(["network", "create", "--label", `${RUN_LABEL}=${runId}`, names.network]);
-    await setupDocker(["volume", "create", "--label", `${RUN_LABEL}=${runId}`, names.volume]);
+    await setupDocker([
+      "network", "create",
+      ...dockerLabelArgs(ownershipLabels(runId, "network", owner)),
+      names.network,
+    ]);
+    await setupDocker([
+      "volume", "create",
+      ...dockerLabelArgs(ownershipLabels(runId, "data", owner)),
+      names.volume,
+    ]);
     const configuredTemplateArchive = String(process.env.LCM_POSTGRES_TEMPLATE_ARCHIVE ?? "").trim();
     const templateArchive = resolveConfiguredTemplateArchive(configuredTemplateArchive);
     const usingCachedTemplate = templateArchive.length > 0;
@@ -508,7 +798,7 @@ export async function runHarness(options = {}) {
       await validatePostgreSqlTemplateArchive(templateArchive);
       await setupDocker([
         "create", "--name", names.restore,
-        "--label", `${RUN_LABEL}=${runId}`,
+        ...dockerLabelArgs(ownershipLabels(runId, "restore", owner)),
         "--network", "none",
         "--volume", `${names.volume}:/target`,
         "--volume", `${templateArchive}:/cache/postgresql-template.tar:ro`,
@@ -518,12 +808,17 @@ export async function runHarness(options = {}) {
         "tar --extract --file /cache/postgresql-template.tar --directory /target; chown -R postgres:postgres /target",
       ]);
       await setupDocker(["start", "--attach", names.restore]);
-      await removeLabeled("container", names.restore, runId, setupDocker);
+      await removeOwnedResource(
+        "container",
+        names.restore,
+        ownershipLabels(runId, "restore", owner),
+        setupDocker,
+      );
     }
     const publish = ci ? [] : ["--publish", "127.0.0.1::5432"];
     const containerArgs = [
       "create", "--name", names.container,
-      "--label", `${RUN_LABEL}=${runId}`,
+      ...dockerLabelArgs(ownershipLabels(runId, "database", owner)),
       "--network", names.network,
       "--network-alias", names.alias,
       "--network-alias", names.wrongAlias,
@@ -581,7 +876,7 @@ export async function runHarness(options = {}) {
     };
     try {
       if (options.runTests) await options.runTests({ runId, names, directory, environment }, ci);
-      else await runTests({ runId, names, directory, environment, secrets }, ci, setupDocker);
+      else await runTests({ runId, names, directory, environment, secrets, owner }, ci, setupDocker);
     } catch (error) {
       const logs = await docker(["logs", names.container]).catch(() => ({ stdout: "", stderr: "" }));
       throw Object.assign(error, { stderr: `${error?.stderr ?? ""}\n${logs.stdout}\n${logs.stderr}` });
