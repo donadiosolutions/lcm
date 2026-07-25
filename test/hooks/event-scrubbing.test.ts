@@ -81,6 +81,14 @@ describe("passive event scrubbing", () => {
     expect(forProject).toHaveBeenCalledTimes(4);
   });
 
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects invalid test cache capacity %s",
+    (capacity) => {
+      expect(() => _setEventScrubberCacheMaxForTesting(capacity))
+        .toThrow("Event scrubber cache capacity must be a positive safe integer");
+    },
+  );
+
   it("loads default configuration when patterns are not injected", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "lcm-event-default-scrub-"));
     dirs.push(cwd);

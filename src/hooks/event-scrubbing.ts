@@ -57,6 +57,9 @@ export function clearEventScrubberCacheForTesting(): void {
 }
 
 export function _setEventScrubberCacheMaxForTesting(maxEntries: number): void {
+  if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
+    throw new RangeError("Event scrubber cache capacity must be a positive safe integer");
+  }
   scrubCache.clear();
   scrubCacheMax = maxEntries;
 }

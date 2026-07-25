@@ -48,6 +48,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Flag PRs adding routes without tests.
 - Never delete legacy parsing fallbacks or defensive handling for non-`Error` thrown values merely to satisfy coverage. Cover those branches with deterministic failure injection while preserving compatibility behavior.
 - Hook command or protocol changes must be searched and aligned across user docs, bundled hook READMEs and skill checklists, installer command registrations, and E2E tests.
+- Test-only numeric capacity and limit seams must reject non-positive, non-integer, and non-finite values before mutating shared state.
 
 ### Search ranking compatibility
 
