@@ -116,6 +116,12 @@ export function readProcessBirthFingerprint(pid, dependencies = {}) {
   try {
     observed = String(execute(command, args, {
       encoding: "utf8",
+      env: {
+        ...process.env,
+        LANG: "C",
+        LC_ALL: "C",
+        TZ: "UTC",
+      },
       maxBuffer: 16 * 1024,
       timeout: 2_000,
       windowsHide: true,

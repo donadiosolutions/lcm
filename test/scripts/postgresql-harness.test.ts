@@ -60,10 +60,18 @@ describe("PostgreSQL harness utilities", () => {
     expect(() => readProcessBirthFingerprint(0, { readFile })).toThrow("owner PID");
     expect(() => readProcessBirthFingerprint(42, { readFile: () => "unsupported" }))
       .toThrow("unsupported");
+    const darwinExec = vi.fn(() => "Fri Jul 24 21:00:00 2026\n");
     expect(readProcessBirthFingerprint(42, {
       platform: () => "darwin",
-      execFile: vi.fn(() => "Fri Jul 24 21:00:00 2026\n"),
+      execFile: darwinExec,
     })).toBe("darwin:Fri Jul 24 21:00:00 2026");
+    expect(darwinExec).toHaveBeenCalledWith(
+      "ps",
+      ["-o", "lstart=", "-p", "42"],
+      expect.objectContaining({
+        env: expect.objectContaining({ LANG: "C", LC_ALL: "C", TZ: "UTC" }),
+      }),
+    );
     expect(readProcessBirthFingerprint(42, {
       platform: () => "win32",
       execFile: vi.fn(() => "2026-07-25T00:00:00.0000000Z\n"),
