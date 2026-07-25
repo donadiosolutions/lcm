@@ -382,7 +382,7 @@ jobs:
 
   collect-duplicates:
     needs: apply-labels
-    if: ${{ needs.apply-labels.result == 'success' && needs.apply-labels.outputs.has_bugs == 'true' }}
+    if: ${{ always() && needs.apply-labels.outputs.has_bugs == 'true' && needs.apply-labels.outputs.bug_issue_numbers != '' && needs.apply-labels.outputs.bug_issue_numbers != '[]' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -564,7 +564,7 @@ jobs:
 
   classify-duplicates:
     needs: [apply-labels, collect-duplicates]
-    if: ${{ always() && needs.apply-labels.result == 'success' && needs.apply-labels.outputs.has_bugs == 'true' && needs.collect-duplicates.outputs.has_issues == 'true' }}
+    if: ${{ always() && needs.apply-labels.outputs.has_bugs == 'true' && needs.collect-duplicates.outputs.has_issues == 'true' && needs.collect-duplicates.outputs.evidence != '' && needs.collect-duplicates.outputs.prompt != '' && needs.collect-duplicates.outputs.schema != '' }}
     runs-on: ubuntu-latest
     permissions: {}
     outputs:
@@ -586,7 +586,7 @@ jobs:
 
   apply-duplicates:
     needs: [apply-labels, collect-duplicates, classify-duplicates]
-    if: ${{ always() && needs.apply-labels.result == 'success' && needs.apply-labels.outputs.has_bugs == 'true' && needs.classify-duplicates.result == 'success' }}
+    if: ${{ always() && needs.apply-labels.outputs.has_bugs == 'true' && needs.collect-duplicates.outputs.has_issues == 'true' && needs.collect-duplicates.outputs.evidence != '' && needs.classify-duplicates.result == 'success' && needs.classify-duplicates.outputs.result != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

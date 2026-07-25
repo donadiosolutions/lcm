@@ -55,11 +55,13 @@ labels case-insensitively:
   issue that Codex has just classified as a bug.
 
 If either stage fails, the affected issue's queue label remains so a later run
-can retry it. Duplicate candidate collection is isolated per issue: valid bugs
-continue through classification and application even when another bug fails
-collection, while the failed bug remains queued and the workflow reports the
-failure. Removing the queue label manually before either duplicate collection
-or an application step cancels subsequent automated changes for that issue.
+can retry it. Label application and duplicate candidate collection are isolated
+per issue: successfully reconciled bugs continue through duplicate
+classification and application even when a sibling issue fails either stage,
+while each failed issue remains queued and the workflow reports the failure.
+Missing or empty stage outputs safely skip downstream work. Removing the queue
+label manually before either duplicate collection or an application step
+cancels subsequent automated changes for that issue.
 
 Codex reconciliation can replace the immediate `p3-low` default with the
 appropriate managed priority.
