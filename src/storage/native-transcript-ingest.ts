@@ -264,6 +264,11 @@ export interface NativeTranscriptJsonlReadOptions {
   readonly clock?: () => Date;
   /** @internal Allows bounded unit tests without allocating ten MiB. */
   readonly maxRecordBytes?: number;
+  /**
+   * Report physical progress only after this absolute byte boundary.
+   * Crossing records are trimmed and rehashed from the boundary.
+   */
+  readonly progressStartByteOffset?: number;
   /** Reports consumed record or blank-line boundaries without payload data. */
   readonly onProgress?: (progress: {
     readonly startByteOffset: number;
@@ -527,6 +532,13 @@ export async function* readNativeTranscriptJsonl(
   if (!Number.isSafeInteger(maxRecordBytes) || maxRecordBytes < 1) {
     throw new NativeTranscriptConfigurationError("invalid-input");
   }
+  const progressStartByteOffset = options.progressStartByteOffset ?? 0;
+  if (
+    !Number.isSafeInteger(progressStartByteOffset)
+    || progressStartByteOffset < 0
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
   const clock = options.clock ?? (() => new Date());
   const prefixHash = createHash("sha256");
   const occurrences = new Map<string, number>();
@@ -534,20 +546,36 @@ export async function* readNativeTranscriptJsonl(
   let sourceOrdinal = 0;
   let byteOffset = 0;
   let recordStartByteOffset = 0;
+  let progressRangeHash = createHash("sha256");
+
+  const trackProgressBytes = (
+    bytes: Uint8Array,
+    startByteOffset: number,
+  ): void => {
+    const relativeStart = Math.max(
+      0,
+      progressStartByteOffset - startByteOffset,
+    );
+    if (relativeStart < bytes.byteLength) {
+      progressRangeHash.update(bytes.subarray(relativeStart));
+    }
+  };
 
   const finishRecord = (
     endByteOffset: number,
-    terminatedByNewline: boolean,
   ): NativeTranscriptReadOutcome | null => {
     const prefixSha256 = prefixHash.copy().digest("hex");
-    const rangeHash = accumulator.rawHash.copy();
-    if (terminatedByNewline) rangeHash.update(Uint8Array.of(0x0a));
-    options.onProgress?.({
-      startByteOffset: recordStartByteOffset,
-      endByteOffset,
-      rangeSha256: rangeHash.digest("hex"),
-      prefixSha256,
-    });
+    if (endByteOffset > progressStartByteOffset) {
+      options.onProgress?.({
+        startByteOffset: Math.max(
+          recordStartByteOffset,
+          progressStartByteOffset,
+        ),
+        endByteOffset,
+        rangeSha256: progressRangeHash.digest("hex"),
+        prefixSha256,
+      });
+    }
     if (accumulator.oversized) {
       const outcome = quarantineOutcome(
         sourceOrdinal,
@@ -621,23 +649,27 @@ export async function* readNativeTranscriptJsonl(
     for (let index = 0; index < chunk.byteLength; index += 1) {
       if (chunk[index] !== 0x0a) continue;
       const segment = chunk.subarray(start, index);
+      trackProgressBytes(segment, byteOffset);
       appendRecordBytes(accumulator, segment, maxRecordBytes);
       prefixHash.update(segment);
+      trackProgressBytes(Uint8Array.of(0x0a), byteOffset + segment.byteLength);
       prefixHash.update(Uint8Array.of(0x0a));
       byteOffset += segment.byteLength + 1;
-      const outcome = finishRecord(byteOffset, true);
+      const outcome = finishRecord(byteOffset);
       accumulator = newAccumulator();
+      progressRangeHash = createHash("sha256");
       recordStartByteOffset = byteOffset;
       if (outcome) yield outcome;
       start = index + 1;
     }
     const remainder = chunk.subarray(start);
+    trackProgressBytes(remainder, byteOffset);
     appendRecordBytes(accumulator, remainder, maxRecordBytes);
     prefixHash.update(remainder);
     byteOffset += remainder.byteLength;
   }
   if (accumulator.byteLength > 0) {
-    const outcome = finishRecord(byteOffset, false);
+    const outcome = finishRecord(byteOffset);
     if (outcome) yield outcome;
   }
 }
@@ -1162,8 +1194,13 @@ export function createExactNativeTranscriptMessageResolver(
       }
       let snapshot = snapshots.get(input.nativeSessionId);
       if (!snapshot) {
-        snapshot = loadSnapshot(input.nativeSessionId);
-        snapshots.set(input.nativeSessionId, snapshot);
+        const loading = loadSnapshot(input.nativeSessionId);
+        const cached = loading.catch((error: unknown) => {
+          snapshots.delete(input.nativeSessionId);
+          throw error;
+        });
+        snapshots.set(input.nativeSessionId, cached);
+        snapshot = cached;
       }
       const sessionMessages = await snapshot;
       if (!sessionMessages) return null;
@@ -1490,6 +1527,7 @@ export async function runNativeTranscriptBackfill(
       scrubber,
       clock: options.clock,
       maxRecordBytes: options.maxRecordBytes,
+      progressStartByteOffset: committedByteOffset,
       onProgress: (progress) => {
         progressState.latest = progress;
         uncommittedRanges.push({
@@ -1539,9 +1577,6 @@ export async function runNativeTranscriptBackfill(
       skippedCount += result.skippedCount;
       quarantinedCount += result.quarantinedCount;
       uncommittedRanges = [];
-    }
-    if (uncommittedRanges.length > 0) {
-      await assertUncommittedSourceUnchanged();
     }
     return {
       importedCount,

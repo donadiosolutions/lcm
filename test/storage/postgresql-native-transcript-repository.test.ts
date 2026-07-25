@@ -858,7 +858,7 @@ describe("PostgreSQL native transcript repository", () => {
     for (const rows of [
       [],
       [{ transaction_isolation: "repeatable read" }],
-      [{ transaction_isolation: "READ COMMITTED" }],
+      [{ transaction_isolation: 42 }],
     ]) {
       const query = vi.fn((config: QueryConfig<unknown[]>) =>
         config.text.includes("transaction_isolation")
@@ -879,6 +879,26 @@ describe("PostgreSQL native transcript repository", () => {
       });
       expect(query).toHaveBeenCalledTimes(1);
     }
+  });
+
+  it("normalizes a supplied read-committed isolation setting", async () => {
+    const query = vi.fn((config: QueryConfig<unknown[]>) =>
+      config.text.includes("transaction_isolation")
+        ? result([{ transaction_isolation: " \tREAD COMMITTED\n" }])
+        : successfulQuery(config));
+    const repository = new PostgreSqlNativeTranscriptRepository(
+      scopedExecutor(query),
+      projectId,
+    );
+    await expect(repository.ingestBatch({
+      ...batch,
+      records: [],
+    })).resolves.toMatchObject({ importedCount: 0 });
+    expect(query.mock.calls[0]?.[0].text).toContain(
+      "transaction_isolation",
+    );
+    expect(query.mock.calls.some(([config]) =>
+      config.text.includes("INSERT INTO lcm.ingest_checkpoints"))).toBe(true);
   });
 
   it("returns null for absent point reads and fails closed on malformed rows", async () => {

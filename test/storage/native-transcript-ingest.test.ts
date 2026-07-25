@@ -160,8 +160,8 @@ function source(content: string): NativeTranscriptByteSource {
         changedAtMs: 456,
       },
       stream: () => byteChunks(bytes.subarray(0, 3), bytes.subarray(3)),
-      digestPrefix: async (length: number) =>
-        digest(bytes.subarray(0, length)),
+      digestPrefix: vi.fn(async (length: number) =>
+        digest(bytes.subarray(0, length))),
       assertByteRangesUnchanged: vi.fn(async (ranges) => {
         for (const range of ranges) {
           if (
@@ -354,6 +354,32 @@ describe("native transcript scrub and JSONL reader", () => {
       startByteOffset = endByteOffset;
       return entry;
     }));
+
+    const trimmedProgress: typeof progress = [];
+    await collect(byteChunks(content), {
+      progressStartByteOffset: 2,
+      onProgress: (entry) => trimmedProgress.push(entry),
+    });
+    expect(trimmedProgress).toEqual([
+      {
+        startByteOffset: 2,
+        endByteOffset: 5,
+        rangeSha256: digest("}\r\n"),
+        prefixSha256: digest("\n{}\r\n"),
+      },
+      {
+        startByteOffset: 5,
+        endByteOffset: 8,
+        rangeSha256: digest(" \t\n"),
+        prefixSha256: digest("\n{}\r\n \t\n"),
+      },
+      {
+        startByteOffset: 8,
+        endByteOffset: 10,
+        rangeSha256: digest("[]"),
+        prefixSha256: digest(content),
+      },
+    ]);
   });
 
   it("quarantines malformed, scalar, NUL, binary, invalid UTF-8, and oversized records", async () => {
@@ -590,6 +616,12 @@ describe("native transcript scrub and JSONL reader", () => {
       ...base,
       maxRecordBytes: 0,
     }))).rejects.toThrowError(NativeTranscriptConfigurationError);
+    for (const progressStartByteOffset of [-1, 0.5]) {
+      await expect(Array.fromAsync(readNativeTranscriptJsonl({
+        ...base,
+        progressStartByteOffset,
+      }))).rejects.toThrowError(NativeTranscriptConfigurationError);
+    }
     await expect(Array.fromAsync(readNativeTranscriptJsonl({
       ...base,
       clock: () => new Date(Number.NaN),
@@ -1132,10 +1164,18 @@ describe("exact native transcript message resolver", () => {
       role: "assistant" as const,
       content: "scrubbed",
     };
-    await expect(resolver.resolveExact(input)).resolves.toEqual({
-      conversationId: 4,
-      messageId: 10,
-    });
+    await expect(Promise.all([
+      resolver.resolveExact(input),
+      resolver.resolveExact({
+        ...input,
+        sessionSequence: 0,
+        role: "user",
+        content: "question",
+      }),
+    ])).resolves.toEqual([
+      { conversationId: 4, messageId: 10 },
+      { conversationId: 7, messageId: 9 },
+    ]);
     expect(getNativeTranscriptMessageSnapshot).toHaveBeenCalledWith("session-1");
 
     olderMessage.content = "repository-mutated";
@@ -1156,6 +1196,48 @@ describe("exact native transcript message resolver", () => {
       getNativeTranscriptMessageSnapshot: vi.fn(async () => []),
     });
     await expect(emptyResolver.resolveExact(input)).resolves.toBeNull();
+  });
+
+  it("shares a failed snapshot load and evicts it before a retry", async () => {
+    let rejectLoad!: (error: Error) => void;
+    const failedLoad = new Promise<readonly NativeTranscriptSessionMessageRecord[]>(
+      (_resolve, reject) => {
+        rejectLoad = reject;
+      },
+    );
+    const recovered: readonly NativeTranscriptSessionMessageRecord[] = [{
+      conversationId: 7,
+      messageId: 9,
+      messageSequence: 0,
+      role: "user",
+      content: "question",
+    }];
+    const getNativeTranscriptMessageSnapshot = vi.fn()
+      .mockImplementationOnce(() => failedLoad)
+      .mockResolvedValue(recovered);
+    const resolver = createExactNativeTranscriptMessageResolver({
+      getNativeTranscriptMessageSnapshot,
+    });
+    const input = {
+      nativeSessionId: "session-1",
+      sessionSequence: 0,
+      role: "user" as const,
+      content: "question",
+    };
+    const first = resolver.resolveExact(input);
+    const concurrent = resolver.resolveExact(input);
+    expect(getNativeTranscriptMessageSnapshot).toHaveBeenCalledTimes(1);
+    const failure = new Error("snapshot failed");
+    const firstRejection = expect(first).rejects.toBe(failure);
+    const concurrentRejection = expect(concurrent).rejects.toBe(failure);
+    rejectLoad(failure);
+    await Promise.all([firstRejection, concurrentRejection]);
+
+    await expect(resolver.resolveExact(input)).resolves.toEqual({
+      conversationId: 7,
+      messageId: 9,
+    });
+    expect(getNativeTranscriptMessageSnapshot).toHaveBeenCalledTimes(2);
   });
 
   it("rejects inconsistent ordered snapshot rows", async () => {
@@ -1543,6 +1625,7 @@ describe("native transcript backfill coordinator", () => {
       conversationId: 4,
       messageId: 9,
     }));
+    const byteSource = source(firstLine + secondLine);
     await runNativeTranscriptBackfill({
       repository: repo,
       quarantine: {
@@ -1552,7 +1635,7 @@ describe("native transcript backfill coordinator", () => {
         list: vi.fn(),
         close: vi.fn(),
       },
-      source: source(firstLine + secondLine),
+      source: byteSource,
       machineId: "machine",
       format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
       nativeSessionId: "session-1",
@@ -1568,6 +1651,13 @@ describe("native transcript backfill coordinator", () => {
     });
     expect(repo.batches[0]?.records).toHaveLength(1);
     expect(repo.batches[0]?.expectedCheckpoint).toBe(previous);
+    const snapshot = await vi.mocked(byteSource.openSnapshot)
+      .mock.results[0]!.value;
+    expect(snapshot.assertByteRangesUnchanged).toHaveBeenCalledWith([{
+      startByteOffset: Buffer.byteLength(firstLine),
+      endByteOffset: Buffer.byteLength(firstLine + secondLine),
+      rangeSha256: digest(secondLine),
+    }]);
 
     const quarantinedPrefix = '{"bad":}\n';
     const quarantinedPrevious = checkpoint({
@@ -1602,7 +1692,7 @@ describe("native transcript backfill coordinator", () => {
     expect(quarantinedRepo.batches[0]?.records).toHaveLength(1);
   });
 
-  it("verifies an unchanged replay-only prefix without destination writes", async () => {
+  it("does not rehash a replay-only committed prefix at flush boundaries", async () => {
     const content = '{"message":{"role":"user","content":"first"}}\n';
     const previous = checkpoint({
       version: 1,
@@ -1636,11 +1726,10 @@ describe("native transcript backfill coordinator", () => {
     expect(repo.batches).toEqual([]);
     const snapshot = await vi.mocked(byteSource.openSnapshot)
       .mock.results[0]!.value;
-    expect(snapshot.assertByteRangesUnchanged).toHaveBeenCalledWith([{
-      startByteOffset: 0,
-      endByteOffset: Buffer.byteLength(content),
-      rangeSha256: digest(content),
-    }]);
+    expect(snapshot.digestPrefix).toHaveBeenCalledWith(
+      Buffer.byteLength(content),
+    );
+    expect(snapshot.assertByteRangesUnchanged).not.toHaveBeenCalled();
   });
 
   it("owns message sequence per concurrent run when a pure mapper is reused", async () => {

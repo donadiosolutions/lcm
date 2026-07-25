@@ -1549,7 +1549,11 @@ implements
                       'transaction_isolation'
                     ) AS transaction_isolation`,
     }, this.context(operation));
-    if (result.rows[0]?.transaction_isolation !== "read committed") {
+    const isolation = result.rows[0]?.transaction_isolation;
+    if (
+      typeof isolation !== "string"
+      || isolation.trim().toLowerCase() !== "read committed"
+    ) {
       throw new PostgreSqlNativeTranscriptDataError(
         this.projectId,
         operation,
