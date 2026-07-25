@@ -712,6 +712,36 @@ describe("PostgreSQL harness utilities", () => {
       readScope: () => testOwnerScope,
     });
     expect(inconsistent.find((run) => run.runId === liveRunId)?.classification).toBe("ambiguous");
+
+    const conflictingRunA = `${"1".repeat(20)}${"a".repeat(12)}`;
+    const conflictingRunB = `${"1".repeat(20)}${"b".repeat(12)}`;
+    records.clear();
+    records.set(
+      `network:${createRunNames(conflictingRunA).network}`,
+      ownershipLabels(conflictingRunA, "network", {
+        pid: 51,
+        birth: `linux:${bootId}:500`,
+        scope: testOwnerScope,
+      }),
+    );
+    records.set(
+      `volume:${createRunNames(conflictingRunB).volume}`,
+      ownershipLabels(conflictingRunB, "data", {
+        pid: 52,
+        birth: `linux:${bootId}:600`,
+        scope: testOwnerScope,
+      }),
+    );
+    const conflicting = await discoverHarnessRuns({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: (pid: number) => `linux:${bootId}:${pid === 51 ? 500 : 999}`,
+      readScope: () => testOwnerScope,
+    });
+    expect(conflicting.map((run) => [run.runId, run.classification])).toEqual([
+      [conflictingRunA, "ambiguous"],
+      [conflictingRunB, "ambiguous"],
+    ]);
   });
 
   it("reclaims only a definitively stale, consistently labeled run in teardown order", async () => {

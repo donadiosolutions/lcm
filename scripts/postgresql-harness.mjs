@@ -49,7 +49,6 @@ const linuxBirthRegex = new RegExp(`^linux:(${bootIdPattern}):([1-9][0-9]*)$`, "
 const darwinDayPattern = "(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)";
 const darwinMonthPattern = "(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)";
 const dateDayPattern = "(?:0[1-9]|[12][0-9]|3[01])";
-const timePattern = "(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]";
 const darwinBirthRegex = new RegExp(
   `^darwin:(${darwinDayPattern}) (${darwinMonthPattern}) ( [1-9]|[12][0-9]|3[01])`
   + ` ((?:[01][0-9]|2[0-3])):([0-5][0-9]):([0-5][0-9]) ([1-9][0-9]{3})$`,
@@ -860,6 +859,21 @@ export async function discoverHarnessRuns(dependencies = {}) {
     };
     run.resources.push(resourceEntry);
     runs.set(ownership.runId, run);
+  }
+  const runIdsByPrefix = new Map();
+  for (const run of runs.values()) {
+    if (!/^[0-9a-f]{32}$/u.test(run.runId ?? "")) continue;
+    const prefix = run.runId.slice(0, 20);
+    const runIds = runIdsByPrefix.get(prefix) ?? new Set();
+    runIds.add(run.runId);
+    runIdsByPrefix.set(prefix, runIds);
+  }
+  for (const runIds of runIdsByPrefix.values()) {
+    if (runIds.size < 2) continue;
+    for (const runId of runIds) {
+      const run = runs.get(runId);
+      if (run) run.classification = "ambiguous";
+    }
   }
   const ambiguousPrefixes = [...runs.values()]
     .filter((run) => run.classification === "ambiguous")
