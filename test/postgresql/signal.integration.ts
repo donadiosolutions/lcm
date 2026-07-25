@@ -16,6 +16,8 @@ import {
 const execFileAsync = promisify(execFile);
 const SIGNAL_PROBE_READINESS_TIMEOUT_MS = resolveSignalProbeReadinessTimeout(process.env);
 const SIGNAL_CASE_CLEANUP_MARGIN_MS = 30_000;
+// The surviving-consumer case can launch first, second, third, and fallback cleanup probes.
+const MAX_SIGNAL_PROBE_FAN_OUT = 4;
 const launchedRunIds = new Set<string>();
 
 function signalCaseTimeout(probeCount: number): number {
@@ -135,7 +137,7 @@ async function expectResources(runId: string): Promise<void> {
 
 afterAll(async () => {
   await auditHarnessRunResources(launchedRunIds, (args) => execFileAsync("docker", args));
-}, signalCaseTimeout(1));
+}, signalCaseTimeout(MAX_SIGNAL_PROBE_FAN_OUT));
 
 async function harnessDirectory(runId: string): Promise<string> {
   const { stdout } = await execFileAsync("docker", ["container", "inspect", createRunNames(runId).container]);
@@ -296,7 +298,7 @@ describe("PostgreSQL harness signal teardown", () => {
         }
       }
     }
-  }, signalCaseTimeout(4));
+  }, signalCaseTimeout(MAX_SIGNAL_PROBE_FAN_OUT));
 
   it("terminates an active local consumer before graceful signal cleanup", async () => {
     const probe = await launchSignalProbe("consumer");
