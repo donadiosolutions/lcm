@@ -1,9 +1,15 @@
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
+import { Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
+  DEFAULT_SIGNAL_PROBE_READINESS_TIMEOUT_MS,
+  HARNESS_ALLOCATION_MARKER,
+  MAX_HARNESS_ALLOCATION_MARKER_LINE_LENGTH,
   MAX_CAPTURED_OUTPUT_BYTES,
   MAX_DOCKER_REMOVE_ATTEMPTS,
+  MAX_SIGNAL_PROBE_READINESS_TIMEOUT_MS,
+  MIN_SIGNAL_PROBE_READINESS_TIMEOUT_MS,
   NODE_IMAGE,
   OWNER_BIRTH_LABEL,
   OWNER_PID_LABEL,
@@ -13,8 +19,13 @@ import {
   POSTGRES_IMAGE,
   RESOURCE_KIND_LABEL,
   RUN_LABEL,
+  SIGNAL_CLEANUP_FAILURE_MARKER,
+  SIGNAL_DIAGNOSTIC_FLUSH_TIMEOUT_MS,
+  auditHarnessRunResources,
   classifyOwnerIdentity,
   cleanupHarnessResources,
+  completeSignalExit,
+  createHarnessAllocationMarkerParser,
   createOwnerIdentity,
   createProcessLifecycle,
   createRunNames,
@@ -31,11 +42,14 @@ import {
   reclaimProvenOrphans,
   removeLabeled,
   removeOwnedResource,
+  resolveSignalProbeReadinessTimeout,
   resolveConfiguredTemplateArchive,
   runProcess,
   runSanitizedProcess,
   sanitizeHarnessText,
+  signalCleanupFailed,
   validateRunNames,
+  writeHarnessDiagnostic,
 } from "../../scripts/postgresql-harness.mjs";
 import { postgresqlVitestCacheDir } from "../../vitest.postgresql.config.js";
 
@@ -43,6 +57,231 @@ const testBootId = "12345678-1234-1234-1234-123456789abc";
 const testOwnerScope = `linux:${"a".repeat(64)}:${testBootId}:pid:[4026531836]`;
 
 describe("PostgreSQL harness utilities", () => {
+  it("resolves a bounded signal-probe readiness timeout", () => {
+    expect(resolveSignalProbeReadinessTimeout({})).toBe(
+      DEFAULT_SIGNAL_PROBE_READINESS_TIMEOUT_MS,
+    );
+    expect(resolveSignalProbeReadinessTimeout({
+      LCM_TEST_POSTGRES_SIGNAL_READY_TIMEOUT_MS: String(MIN_SIGNAL_PROBE_READINESS_TIMEOUT_MS),
+    })).toBe(MIN_SIGNAL_PROBE_READINESS_TIMEOUT_MS);
+    expect(resolveSignalProbeReadinessTimeout({
+      LCM_TEST_POSTGRES_SIGNAL_READY_TIMEOUT_MS: String(MAX_SIGNAL_PROBE_READINESS_TIMEOUT_MS),
+    })).toBe(MAX_SIGNAL_PROBE_READINESS_TIMEOUT_MS);
+  });
+
+  it.each([
+    "",
+    " ",
+    "0",
+    "0999",
+    "999",
+    "1000.5",
+    "1e3",
+    "+1000",
+    String(MAX_SIGNAL_PROBE_READINESS_TIMEOUT_MS + 1),
+    "9007199254740993",
+  ])("rejects invalid signal-probe readiness timeout %j", (value) => {
+    expect(() => resolveSignalProbeReadinessTimeout({
+      LCM_TEST_POSTGRES_SIGNAL_READY_TIMEOUT_MS: value,
+    })).toThrow("invalid PostgreSQL signal probe readiness timeout");
+  });
+
+  it("exposes a deterministic cleanup-failure marker without changing signal exit conventions", () => {
+    expect(signalCleanupFailed("PostgreSQL harness signal probe ready: abc")).toBe(false);
+    expect(signalCleanupFailed(`${SIGNAL_CLEANUP_FAILURE_MARKER} sanitized failure`)).toBe(true);
+    expect(signalCleanupFailed(new Error(`${SIGNAL_CLEANUP_FAILURE_MARKER} nested`))).toBe(true);
+  });
+
+  it.each([
+    ["SIGINT", 130],
+    ["SIGHUP", 129],
+    ["SIGTERM", 143],
+  ] as const)("waits for a backpressured diagnostic flush before exiting on %s", async (signal, code) => {
+    const stream = new EventEmitter() as EventEmitter & {
+      write(message: string, callback: (error?: Error | null) => void): boolean;
+    };
+    let flush!: () => void;
+    stream.write = vi.fn((_message, callback) => {
+      flush = callback;
+      return false;
+    });
+    const events: string[] = [];
+    const diagnostic = writeHarnessDiagnostic(
+      `${SIGNAL_CLEANUP_FAILURE_MARKER} sanitized failure\n`,
+      { stream },
+    );
+    const completion = completeSignalExit(signal, () => diagnostic, {
+      removeSignalHandlers: () => events.push("remove"),
+      exit: (exitCode: number) => events.push(`exit:${exitCode}`),
+    });
+
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    flush();
+    await completion;
+
+    expect(stream.write).toHaveBeenCalledWith(
+      `${SIGNAL_CLEANUP_FAILURE_MARKER} sanitized failure\n`,
+      expect.any(Function),
+    );
+    expect(events).toEqual(["remove", `exit:${code}`]);
+  });
+
+  it("keeps the error listener until a failed write callback emits its paired stream error", async () => {
+    const errored = new EventEmitter() as EventEmitter & {
+      write(message: string, callback: (error?: Error | null) => void): boolean;
+    };
+    let writeCallback!: (error?: Error | null) => void;
+    errored.write = vi.fn((_message, callback) => {
+      writeCallback = callback;
+      return false;
+    });
+    const exit = vi.fn();
+    const diagnostic = writeHarnessDiagnostic("sanitized\n", { stream: errored });
+    const completion = completeSignalExit("SIGTERM", () => diagnostic, { exit });
+
+    writeCallback(new Error("private write callback failure"));
+    await Promise.resolve();
+    expect(errored.listenerCount("error")).toBe(1);
+    expect(exit).not.toHaveBeenCalled();
+
+    errored.emit("error", new Error("private paired stream failure"));
+    await expect(completion).resolves.toBeUndefined();
+    expect(errored.listenerCount("error")).toBe(0);
+    expect(exit).toHaveBeenCalledWith(143);
+  });
+
+  it("handles a real Writable failed write and synchronous write failure", async () => {
+    const writable = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback(new Error("private real Writable failure"));
+      },
+    });
+    await expect(writeHarnessDiagnostic("sanitized\n", { stream: writable }))
+      .resolves.toBeUndefined();
+    expect(writable.listenerCount("error")).toBe(0);
+
+    const throwing = new EventEmitter() as EventEmitter & {
+      write(message: string, callback: (error?: Error | null) => void): boolean;
+    };
+    throwing.write = vi.fn(() => {
+      throw new Error("private synchronous failure");
+    });
+    await expect(writeHarnessDiagnostic("sanitized\n", { stream: throwing }))
+      .resolves.toBeUndefined();
+    expect(throwing.listenerCount("error")).toBe(0);
+  });
+
+  it("bounds a stalled diagnostic flush without exposing stream failures", async () => {
+    const stream = new EventEmitter() as EventEmitter & {
+      write(message: string, callback: (error?: Error | null) => void): boolean;
+    };
+    stream.write = vi.fn(() => false);
+    let expire!: () => void;
+    const scheduleTimeout = vi.fn((callback: () => void, timeoutMs: number) => {
+      expire = callback;
+      expect(timeoutMs).toBe(SIGNAL_DIAGNOSTIC_FLUSH_TIMEOUT_MS);
+      return 42;
+    });
+    const cancelTimeout = vi.fn();
+    const completion = writeHarnessDiagnostic("sanitized\n", {
+      stream,
+      scheduleTimeout,
+      cancelTimeout,
+    });
+
+    await Promise.resolve();
+    expect(cancelTimeout).not.toHaveBeenCalled();
+    expire();
+    await expect(completion).resolves.toBeUndefined();
+    expect(cancelTimeout).toHaveBeenCalledWith(42);
+    expect(stream.listenerCount("error")).toBe(0);
+  });
+
+  it("incrementally registers exact allocation markers across arbitrary boundaries", () => {
+    const first = "a".repeat(32);
+    const second = "b".repeat(32);
+    const runIds = new Set<string>();
+    const parser = createHarnessAllocationMarkerParser(runIds);
+    const firstMarker = `${HARNESS_ALLOCATION_MARKER} ${first}\n`;
+
+    for (const character of firstMarker) parser.write(character);
+    parser.write(
+      "PostgreSQL harness startup failed: injected failure\n"
+      + `${HARNESS_ALLOCATION_MARKER} malformed-secret\n`
+      + `${HARNESS_ALLOCATION_MARKER} ${first}\n`
+      + `${HARNESS_ALLOCATION_MARKER} ${second}`,
+    );
+    parser.end();
+
+    expect([...runIds]).toEqual([first, second]);
+    expect(parser.retainedCharacterCount()).toBe(0);
+  });
+
+  it("keeps allocation parsing bounded across large noisy chunk sequences", () => {
+    const runId = "c".repeat(32);
+    const secret = "private-docker-output";
+    const runIds = new Set<string>();
+    const parser = createHarnessAllocationMarkerParser(runIds);
+
+    parser.write(`${"x".repeat(MAX_HARNESS_ALLOCATION_MARKER_LINE_LENGTH - 1)}😀`);
+    expect(parser.retainedCharacterCount()).toBe(0);
+    for (let index = 0; index < 2_000; index += 1) {
+      parser.write(`${secret}-😀-${index}`);
+      expect(parser.retainedCharacterCount()).toBeLessThanOrEqual(
+        MAX_HARNESS_ALLOCATION_MARKER_LINE_LENGTH,
+      );
+    }
+    parser.write("\nnoise\nPostgreSQL harness allo");
+    parser.write(`cated run: ${runId}\n`);
+    parser.write(`${HARNESS_ALLOCATION_MARKER} ${"d".repeat(31)}z\n`);
+    parser.end();
+
+    expect([...runIds]).toEqual([runId]);
+    expect(parser.retainedCharacterCount()).toBe(0);
+  });
+
+  it("audits every resource class and run after earlier failures without exposing runner output", async () => {
+    const first = "a".repeat(32);
+    const second = "b".repeat(32);
+    const secret = "private-docker-socket";
+    const calls: string[][] = [];
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      calls.push(args);
+      const runId = args.at(-1)?.split("=").at(-1);
+      const resourceClass = args[0] === "ps" ? "container" : args[0];
+      if (runId === first && resourceClass === "container") {
+        throw new Error(`cannot access ${secret}`);
+      }
+      if (runId === second && resourceClass === "network") {
+        return { stdout: `leaked-id-${secret}`, stderr: "" };
+      }
+      return { stdout: "", stderr: "" };
+    });
+
+    const failure = await auditHarnessRunResources(
+      [first, second],
+      dockerRunner,
+    ).catch((error: unknown) => error);
+
+    expect(calls).toHaveLength(6);
+    expect(calls.map((args) => [
+      args.at(-1)?.endsWith(first) ? first : second,
+      args[0] === "ps" ? "container" : args[0],
+    ])).toEqual([
+      [first, "container"],
+      [first, "network"],
+      [first, "volume"],
+      [second, "container"],
+      [second, "network"],
+      [second, "volume"],
+    ]);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toHaveLength(2);
+    expect(String(failure)).not.toContain(secret);
+    expect((failure as AggregateError).errors.map(String).join("\n")).not.toContain(secret);
+  });
+
   it("uses exact digest-pinned images and a namespaced label", () => {
     expect(POSTGRES_IMAGE).toMatch(/^postgres:18\.4-bookworm@sha256:[0-9a-f]{64}$/u);
     expect(NODE_IMAGE).toMatch(/^node:22\.20\.0-bookworm-slim@sha256:[0-9a-f]{64}$/u);
@@ -891,6 +1130,118 @@ describe("PostgreSQL harness utilities", () => {
       `volume:${names.volume}`,
       `network:${names.network}`,
     ]);
+  });
+
+  it("treats an exact container disappearance after discovery as idempotent recovery", async () => {
+    const runId = "9".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 79,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:790",
+      scope: testOwnerScope,
+    };
+    const records = new Map([
+      [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+      [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
+    ]);
+    const missingContainer = Object.assign(new Error("docker failed"), {
+      code: 1,
+      stdout: "",
+      stderr: `Error response from daemon: No such container: ${names.container}`,
+    });
+    const removals: string[] = [];
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        return {
+          stdout: [...records.keys()]
+            .filter((key) => key.startsWith(`${type}:`))
+            .map((key) => key.slice(type.length + 1))
+            .join("\n"),
+          stderr: "",
+        };
+      }
+      if (args[1] === "inspect") {
+        const type = args[0];
+        const labels = records.get(`${type}:${args[2]}`);
+        if (!labels && type === "container" && args[2] === names.container) {
+          throw missingContainer;
+        }
+        return {
+          stdout: JSON.stringify([type === "container"
+            ? { Config: { Labels: labels }, State: { Running: true }, Mounts: [] }
+            : { Labels: labels }]),
+          stderr: "",
+        };
+      }
+      const type = args[0];
+      const name = args.at(-1)!;
+      removals.push(`${type}:${name}`);
+      records.delete(`${type === "container" ? "container" : type}:${name}`);
+      return { stdout: "", stderr: "" };
+    });
+    const verifySentinel = vi.fn(async () => {
+      records.delete(`container:${names.container}`);
+      throw missingContainer;
+    });
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+      verifySentinel,
+      resolveHarnessDirectory: () => "/private/harness",
+    })).resolves.toBeDefined();
+
+    expect(verifySentinel).toHaveBeenCalledOnce();
+    expect(removals).toEqual([
+      `volume:${names.volume}`,
+      `network:${names.network}`,
+    ]);
+    expect(records).toEqual(new Map());
+  });
+
+  it("does not reinterpret a different missing container as the discovered resource disappearing", async () => {
+    const runId = "8".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 78,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:780",
+      scope: testOwnerScope,
+    };
+    const labels = ownershipLabels(runId, "database", owner);
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[0] === "container" && args[1] === "ls") {
+        return { stdout: names.container, stderr: "" };
+      }
+      if (args[1] === "ls") return { stdout: "", stderr: "" };
+      return {
+        stdout: JSON.stringify([{
+          Config: { Labels: labels },
+          State: { Running: true },
+          Mounts: [],
+        }]),
+        stderr: "",
+      };
+    });
+    const sentinelFailure = Object.assign(new Error("docker failed"), {
+      code: 1,
+      stdout: "",
+      stderr: "Error response from daemon: No such container: different-container",
+    });
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+      verifySentinel: vi.fn(async () => { throw sentinelFailure; }),
+      resolveHarnessDirectory: () => "/private/harness",
+    })).rejects.toBe(sentinelFailure);
+
+    expect(dockerRunner.mock.calls.some(([args]) => args[1] === "rm")).toBe(false);
   });
 
   it("does not mutate live, legacy, malformed, unsupported, or permission-ambiguous runs", async () => {
