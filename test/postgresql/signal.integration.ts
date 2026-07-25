@@ -5,8 +5,8 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   RUN_LABEL,
   auditHarnessRunResources,
+  createHarnessAllocationMarkerParser,
   createRunNames,
-  registerHarnessAllocationMarkers,
   removeLabeled,
   resolveSignalProbeReadinessTimeout,
   sanitizeHarnessText,
@@ -37,11 +37,11 @@ type ProbeMode = "harness" | "consumer" | "fork" | "allocation-failure";
 interface SignalProbe {
   readonly child: ChildProcess;
   readonly runId: string;
-  stderr(): string;
+  cleanupFailed(): boolean;
 }
 
 function expectSignalCleanupSucceeded(probe: SignalProbe): void {
-  expect(signalCleanupFailed(probe.stderr())).toBe(false);
+  expect(probe.cleanupFailed()).toBe(false);
 }
 
 async function launchSignalProbe(mode: ProbeMode = "harness"): Promise<SignalProbe> {
@@ -55,7 +55,10 @@ async function launchSignalProbe(mode: ProbeMode = "harness"): Promise<SignalPro
     env: process.env,
     stdio: ["ignore", "ignore", "pipe"],
   });
-  let stderr = "";
+  let readyMarkerTail = "";
+  let cleanupMarkerTail = "";
+  let observedCleanupFailure = false;
+  const allocationParser = createHarnessAllocationMarkerParser(launchedRunIds);
   let readyResolve!: (runId: string) => void;
   let readyReject!: (error: Error) => void;
   const ready = new Promise<string>((resolve, reject) => {
@@ -63,13 +66,18 @@ async function launchSignalProbe(mode: ProbeMode = "harness"): Promise<SignalPro
     readyReject = reject;
   });
   const timeout = setTimeout(
-    () => readyReject(new Error(`signal probe readiness timed out: ${stderr}`)),
+    () => readyReject(new Error("signal probe readiness timed out")),
     SIGNAL_PROBE_READINESS_TIMEOUT_MS,
   );
   child.stderr?.on("data", (chunk) => {
-    stderr += String(chunk);
-    registerHarnessAllocationMarkers(stderr, launchedRunIds);
-    const match = stderr.match(
+    const output = String(chunk);
+    allocationParser.write(output);
+    const readyCandidate = `${readyMarkerTail}${output}`;
+    const cleanupCandidate = `${cleanupMarkerTail}${output}`;
+    readyMarkerTail = readyCandidate.slice(-128);
+    cleanupMarkerTail = cleanupCandidate.slice(-128);
+    observedCleanupFailure ||= signalCleanupFailed(cleanupCandidate);
+    const match = readyCandidate.match(
       mode === "consumer"
         ? /PostgreSQL harness consumer probe ready: ([0-9a-f]{32})/u
         : mode === "fork"
@@ -78,13 +86,14 @@ async function launchSignalProbe(mode: ProbeMode = "harness"): Promise<SignalPro
     );
     if (match) readyResolve(match[1]);
   });
-  child.once("error", readyReject);
+  child.once("error", () => readyReject(new Error("signal probe could not start")));
   child.once("close", (code) => {
-    readyReject(new Error(`signal probe exited before readiness (${code}): ${stderr}`));
+    allocationParser.end();
+    readyReject(new Error(`signal probe exited before readiness (${code})`));
   });
   try {
     const runId = await ready;
-    return { child, runId, stderr: () => stderr };
+    return { child, runId, cleanupFailed: () => observedCleanupFailure };
   } catch (error) {
     if (child.exitCode === null && child.signalCode === null) killChild(child, "SIGKILL");
     throw error;

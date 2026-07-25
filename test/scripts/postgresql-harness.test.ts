@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_SIGNAL_PROBE_READINESS_TIMEOUT_MS,
   HARNESS_ALLOCATION_MARKER,
+  MAX_HARNESS_ALLOCATION_MARKER_LINE_LENGTH,
   MAX_CAPTURED_OUTPUT_BYTES,
   MAX_DOCKER_REMOVE_ATTEMPTS,
   MAX_SIGNAL_PROBE_READINESS_TIMEOUT_MS,
@@ -21,6 +22,7 @@ import {
   auditHarnessRunResources,
   classifyOwnerIdentity,
   cleanupHarnessResources,
+  createHarnessAllocationMarkerParser,
   createOwnerIdentity,
   createProcessLifecycle,
   createRunNames,
@@ -37,7 +39,6 @@ import {
   reclaimProvenOrphans,
   removeLabeled,
   removeOwnedResource,
-  registerHarnessAllocationMarkers,
   resolveSignalProbeReadinessTimeout,
   resolveConfiguredTemplateArchive,
   runProcess,
@@ -87,20 +88,47 @@ describe("PostgreSQL harness utilities", () => {
     expect(signalCleanupFailed(new Error(`${SIGNAL_CLEANUP_FAILURE_MARKER} nested`))).toBe(true);
   });
 
-  it("registers only sanitized allocation markers before readiness", () => {
+  it("incrementally registers exact allocation markers across arbitrary boundaries", () => {
     const first = "a".repeat(32);
     const second = "b".repeat(32);
     const runIds = new Set<string>();
+    const parser = createHarnessAllocationMarkerParser(runIds);
+    const firstMarker = `${HARNESS_ALLOCATION_MARKER} ${first}\n`;
 
-    registerHarnessAllocationMarkers(
-      `${HARNESS_ALLOCATION_MARKER} ${first}\n`
-      + "PostgreSQL harness startup failed: injected failure\n"
+    for (const character of firstMarker) parser.write(character);
+    parser.write(
+      "PostgreSQL harness startup failed: injected failure\n"
       + `${HARNESS_ALLOCATION_MARKER} malformed-secret\n`
-      + `${HARNESS_ALLOCATION_MARKER} ${second}\n`,
-      runIds,
+      + `${HARNESS_ALLOCATION_MARKER} ${first}\n`
+      + `${HARNESS_ALLOCATION_MARKER} ${second}`,
     );
+    parser.end();
 
     expect([...runIds]).toEqual([first, second]);
+    expect(parser.retainedCharacterCount()).toBe(0);
+  });
+
+  it("keeps allocation parsing bounded across large noisy chunk sequences", () => {
+    const runId = "c".repeat(32);
+    const secret = "private-docker-output";
+    const runIds = new Set<string>();
+    const parser = createHarnessAllocationMarkerParser(runIds);
+
+    parser.write(`${"x".repeat(MAX_HARNESS_ALLOCATION_MARKER_LINE_LENGTH - 1)}😀`);
+    expect(parser.retainedCharacterCount()).toBe(0);
+    for (let index = 0; index < 2_000; index += 1) {
+      parser.write(`${secret}-😀-${index}`);
+      expect(parser.retainedCharacterCount()).toBeLessThanOrEqual(
+        MAX_HARNESS_ALLOCATION_MARKER_LINE_LENGTH,
+      );
+    }
+    parser.write("\nnoise\nPostgreSQL harness allo");
+    parser.write(`cated run: ${runId}\n`);
+    parser.write(`${HARNESS_ALLOCATION_MARKER} ${"d".repeat(31)}z\n`);
+    parser.end();
+
+    expect([...runIds]).toEqual([runId]);
+    expect(parser.retainedCharacterCount()).toBe(0);
   });
 
   it("audits every resource class and run after earlier failures without exposing runner output", async () => {

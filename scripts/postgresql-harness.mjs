@@ -43,6 +43,8 @@ export const DEFAULT_SIGNAL_PROBE_READINESS_TIMEOUT_MS = 90_000;
 export const MIN_SIGNAL_PROBE_READINESS_TIMEOUT_MS = 1_000;
 export const MAX_SIGNAL_PROBE_READINESS_TIMEOUT_MS = 300_000;
 export const HARNESS_ALLOCATION_MARKER = "PostgreSQL harness allocated run:";
+export const MAX_HARNESS_ALLOCATION_MARKER_LINE_LENGTH =
+  HARNESS_ALLOCATION_MARKER.length + 1 + 32;
 export const SIGNAL_CLEANUP_FAILURE_MARKER = "PostgreSQL harness cleanup failed:";
 
 export function resolveSignalProbeReadinessTimeout(environment = process.env) {
@@ -66,11 +68,43 @@ export function signalCleanupFailed(output) {
   return String(output).includes(SIGNAL_CLEANUP_FAILURE_MARKER);
 }
 
-export function registerHarnessAllocationMarkers(output, runIds) {
-  const matches = String(output).matchAll(
-    /(?:^|\n)PostgreSQL harness allocated run: ([0-9a-f]{32})(?=\n|$)/gu,
-  );
-  for (const match of matches) runIds.add(match[1]);
+export function createHarnessAllocationMarkerParser(runIds) {
+  const prefix = `${HARNESS_ALLOCATION_MARKER} `;
+  let line = "";
+  let discardingLine = false;
+  const finishLine = () => {
+    if (!discardingLine && line.startsWith(prefix)) {
+      const runId = line.slice(prefix.length);
+      if (/^[0-9a-f]{32}$/u.test(runId)) runIds.add(runId);
+    }
+    line = "";
+    discardingLine = false;
+  };
+  return {
+    write(chunk) {
+      for (const character of String(chunk)) {
+        if (character === "\n") {
+          finishLine();
+        } else if (!discardingLine) {
+          if (
+            line.length + character.length
+            > MAX_HARNESS_ALLOCATION_MARKER_LINE_LENGTH
+          ) {
+            line = "";
+            discardingLine = true;
+          } else {
+            line += character;
+          }
+        }
+      }
+    },
+    end() {
+      if (line || discardingLine) finishLine();
+    },
+    retainedCharacterCount() {
+      return line.length;
+    },
+  };
 }
 
 export async function auditHarnessRunResources(runIds, dockerRunner = docker) {
