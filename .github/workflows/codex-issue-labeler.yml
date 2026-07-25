@@ -157,6 +157,12 @@ jobs:
             const repositoryLabelNames = repositoryLabels.map(
               (label) => label.name,
             );
+            const repositoryLabelMap = new Map(
+              repositoryLabels.map((label) => [
+                label.name.toLowerCase(),
+                label,
+              ]),
+            );
             const requiredLabels = [...managedNames, process.env.DUPLICATE_LABEL];
             const missingLabels = missingLabelsIgnoreCase(
               requiredLabels,
@@ -201,10 +207,17 @@ jobs:
             }
 
             const descriptions = Object.fromEntries(
-              managedNames.map((name) => [
-                name,
-                repositoryLabelMap.get(name).description ?? "",
-              ]),
+              managedNames.map((name) => {
+                const repositoryLabel = repositoryLabelMap.get(
+                  name.toLowerCase(),
+                );
+                if (!repositoryLabel) {
+                  throw new Error(
+                    `Required managed label ${name} is missing from the repository label map`,
+                  );
+                }
+                return [name, repositoryLabel.description ?? ""];
+              }),
             );
             const issueNumbers = issues.map((issue) => issue.number);
             core.setOutput("has_work", "true");
