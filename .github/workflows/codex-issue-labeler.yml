@@ -776,18 +776,18 @@ jobs:
                   );
                 }
 
-                if (!includesLabelIgnoreCase(sourceLabels, process.env.DUPLICATE_LABEL)) {
-                  await github.rest.issues.addLabels({
-                    ...context.repo,
-                    issue_number: issueNumber,
-                    labels: [process.env.DUPLICATE_LABEL],
-                  });
-                }
                 if (markedCanonical === null) {
                   await github.rest.issues.createComment({
                     ...context.repo,
                     issue_number: issueNumber,
                     body: duplicateCommentBody(canonicalNumber),
+                  });
+                }
+                if (!includesLabelIgnoreCase(sourceLabels, process.env.DUPLICATE_LABEL)) {
+                  await github.rest.issues.addLabels({
+                    ...context.repo,
+                    issue_number: issueNumber,
+                    labels: [process.env.DUPLICATE_LABEL],
                   });
                 }
                 await github.rest.issues.update({

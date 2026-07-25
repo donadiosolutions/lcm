@@ -84,8 +84,8 @@ equivalent open issue exists.
 
 For a high-confidence duplicate, the workflow:
 
-1. Adds the existing unmanaged `duplicate` label.
-2. Comments `Duplicate of #N.` to create a visible link and backlink.
+1. Comments `Duplicate of #N.` with a trusted marker to record the canonical.
+2. Adds the existing unmanaged `duplicate` label.
 3. Closes the duplicate as **not planned**.
 4. Removes `needs-codex-triage` last.
 
@@ -96,8 +96,9 @@ source queued, preserving the evidence behind open-canonical preference. The
 link comment contains a hidden workflow marker, so a retry cannot create
 duplicate comments. If a partial run created that marker but did not finish
 closing the issue, a retry refetches and validates the recorded canonical
-target and finishes the marked closure even when the new model result is empty,
-provided the source issue remains open and still has the live `bug` label.
+target, adds any missing duplicate label, and finishes the marked closure even
+when the new model result is empty, provided the source issue remains open and
+still has the live `bug` label.
 Removing `bug` before application always dequeues the source without duplicate
 actions, even when a trusted marker exists.
 Conflicting or stale automated markers fail safely and leave the issue queued.
@@ -106,6 +107,11 @@ the workflow preserves that closure without adding its own duplicate link or
 label. A closed issue with a coherent trusted marker is dequeued after marker
 and canonical validation, but is never closed again, preserving its existing
 closure reason.
+
+The duplicate-classification prompt has a deterministic total serialized-size
+budget below the GitHub Actions job-output limit. It preserves every collected
+source and candidate identity while dynamically truncating only body text, and
+fails closed if fixed metadata alone cannot fit.
 
 ## Security and credentials
 

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -840,6 +841,58 @@ test("builds a bounded injection-resistant duplicate prompt", () => {
   assert.equal(prompt.includes("B".repeat(20)), false);
   assert.equal(prompt.includes("D".repeat(20)), false);
   assert.throws(() => buildDuplicatePrompt(null), /must be an array/);
+});
+
+test("bounds worst-case duplicate prompt serialization without dropping identities", () => {
+  const escapeHeavyBody = '"\\\\\n\t\u0000😀'.repeat(2_000);
+  const issues = Array.from({ length: 10 }, (_, issueIndex) => {
+    const issueNumber = issueIndex + 100;
+    return {
+      source: {
+        number: issueNumber,
+        title: `Source ${issueNumber}`,
+        body: escapeHeavyBody,
+        state: "open",
+        createdAt: "2026-07-25T12:00:00Z",
+      },
+      candidates: Array.from({ length: 8 }, (_, candidateIndex) => ({
+        number: issueNumber * 100 + candidateIndex,
+        title: `Candidate ${issueNumber}-${candidateIndex}`,
+        body: escapeHeavyBody,
+        state: candidateIndex % 2 === 0 ? "open" : "closed",
+        stateReason: candidateIndex % 2 === 0 ? "" : "completed",
+        createdAt: "2026-07-20T12:00:00Z",
+      })),
+    };
+  });
+
+  const prompt = buildDuplicatePrompt(issues);
+  assert.equal(prompt, buildDuplicatePrompt(issues));
+  assert.ok(prompt.length <= 300_000);
+  assert.ok(Buffer.byteLength(prompt, "utf8") <= 300_000);
+  const payloadMarker = "UNTRUSTED BUGS AND CANDIDATES:\n";
+  const payload = JSON.parse(
+    prompt.slice(prompt.indexOf(payloadMarker) + payloadMarker.length),
+  );
+  assert.deepEqual(
+    payload.map((entry) => entry.source.number),
+    issues.map((entry) => entry.source.number),
+  );
+  assert.deepEqual(
+    payload.map((entry) =>
+      entry.candidates.map((candidate) => candidate.number)),
+    issues.map((entry) =>
+      entry.candidates.map((candidate) => candidate.number)),
+  );
+  assert.equal(payload.every((entry) => entry.candidates.length === 8), true);
+  assert.ok(payload[0].source.body.length < 8_000);
+  assert.throws(
+    () => buildDuplicatePrompt([issues[0]], {
+      maxPromptBytes: 100,
+      maxPromptCodeUnits: 100,
+    }),
+    /fixed metadata exceeds/,
+  );
 });
 
 test("parses complete empty and selected duplicate results", () => {
