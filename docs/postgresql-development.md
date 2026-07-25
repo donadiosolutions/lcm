@@ -42,9 +42,9 @@ runtime role.
 Every Docker object carries the random run ID, its resource kind, label-schema
 version, owner PID, and a process-birth fingerprint. Linux uses the boot ID and
 kernel start time, macOS uses `ps` start time, and Windows uses the PowerShell
-CIM process creation time. A zero-signal process probe is checked first. The PID alone is not ownership evidence:
-the birth fingerprint prevents a recycled PID from making an orphan appear
-live.
+CIM process creation time. A zero-signal process probe is checked first; the
+PID alone is not ownership evidence because the birth fingerprint prevents a
+recycled PID from making an orphan appear live.
 
 Database drops and container cleanup fail closed. Before mutation, guards check
 the generated name prefix, PostgreSQL major version, current role, private
