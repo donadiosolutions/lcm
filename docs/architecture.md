@@ -301,7 +301,12 @@ callback that catches the operation failure and commits other work. Deletion
 skips summarized messages, removes eligible message references from active
 context, and relies on the owned-part cascade. Unbounded PostgreSQL batches
 use a constant number of bind parameters and typed set-valued expansion rather
-than one placeholder per input. Issue #85 preserves canonical message content
+than one placeholder per input. Both adapters reject embedded U+0000 before
+database access for every conversation-domain text input: session and title
+values, session lookups, message content writes and exact-content lookups,
+message-part text fields (including metadata), and message search queries where
+supported. Part metadata is checked only for U+0000 and is otherwise preserved
+as opaque text. Issue #85 preserves canonical message content
 without claiming that every oversized post-normalization parser token is
 lexically retrievable. The pinned PostgreSQL 18 safe parsed-lexeme maximum is
 2,046 UTF-8 bytes; #89 must implement and test lossless handling at that
@@ -310,6 +315,16 @@ PostgreSQL get-or-create and contiguous-append short transactions establish
 `READ COMMITTED` before their first advisory or row lock on every retry, so a
 stricter database default cannot retain a pre-lock snapshot and overlook the
 winning session segment or newly appended sequence range.
+When those contention methods join an existing transaction, they verify its
+effective isolation is already `READ COMMITTED` before taking any advisory or
+row lock and fail closed otherwise. Call them from an outer transaction begun
+at `READ COMMITTED`, or use a root repository that creates the short
+transaction itself; PostgreSQL cannot repair a stronger isolation level after
+the outer transaction has already executed a statement. All scoped
+conversation operations share one executor-level FIFO, and mapped writes,
+bootstrap marking, and message-part insertion add operation savepoints, so a
+read cannot observe a transient row and a rollback cannot silently undo another
+method whose promise already resolved.
 PostgreSQL `bigint` values are converted to JavaScript numbers only after a
 safe-integer check, so an out-of-range identity, sequence, part ordinal, or
 count fails instead of losing precision. Message sequence, token-count, and

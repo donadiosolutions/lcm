@@ -108,6 +108,10 @@ type MaxSeqRow = QueryResultRow & {
   max_seq: string | number | bigint | null;
 };
 
+type TransactionIsolationRow = QueryResultRow & {
+  transaction_isolation: unknown;
+};
+
 export class PostgreSqlConversationDataError extends StorageOperationError {
   constructor(
     projectId: string,
@@ -171,6 +175,21 @@ function safeNonnegativeInputInteger(
     throw new PostgreSqlConversationDataError(projectId, operation, field);
   }
   return candidate;
+}
+
+function validateNoNul(
+  value: string | null | undefined,
+  projectId: string,
+  operation: string,
+  field: string,
+): void {
+  if (value?.includes("\0")) {
+    throw new PostgreSqlConversationDataError(
+      projectId,
+      operation,
+      field,
+    );
+  }
 }
 
 function date(value: Date | string): Date {
@@ -276,6 +295,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
 
   async createConversation(input: CreateConversationInput): Promise<ConversationRecord> {
     const operation = "createConversation";
+    this.validateConversationText(input.sessionId, input.title, operation);
     return this.mappedWrite(operation, (transaction) =>
       this.createConversationWith(transaction, input, operation));
   }
@@ -283,21 +303,19 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
   async getConversation(
     conversationId: ConversationId,
   ): Promise<ConversationRecord | null> {
-    return this.getConversationWith(
-      this.executor,
-      conversationId,
-      "getConversation",
-    );
+    const operation = "getConversation";
+    safeInputInteger(conversationId, this.projectId, operation, "conversation_id");
+    return this.serializedRead(operation, (executor) =>
+      this.getConversationWith(executor, conversationId, operation));
   }
 
   async getConversationBySessionId(
     sessionId: string,
   ): Promise<ConversationRecord | null> {
-    return this.getConversationBySessionIdWith(
-      this.executor,
-      sessionId,
-      "getConversationBySessionId",
-    );
+    const operation = "getConversationBySessionId";
+    validateNoNul(sessionId, this.projectId, operation, "session_id");
+    return this.serializedRead(operation, (executor) =>
+      this.getConversationBySessionIdWith(executor, sessionId, operation));
   }
 
   async getOrCreateConversation(
@@ -305,6 +323,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     title?: string,
   ): Promise<ConversationRecord> {
     const operation = "getOrCreateConversation";
+    this.validateConversationText(sessionId, title, operation);
     return this.contentionWrite(operation, async (transaction) => {
       await transaction.query({
         text: `SELECT pg_catalog.pg_advisory_xact_lock(
@@ -337,39 +356,44 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
   async markConversationBootstrapped(
     conversationId: ConversationId,
   ): Promise<void> {
+    const operation = "markConversationBootstrapped";
     safeInputInteger(
       conversationId,
       this.projectId,
-      "markConversationBootstrapped",
+      operation,
       "conversation_id",
     );
-    await this.executor.query({
-      text: `UPDATE lcm.conversations
-             SET bootstrapped_at = COALESCE(
-                   bootstrapped_at,
-                   pg_catalog.statement_timestamp()
-                 ),
-                 updated_at = GREATEST(
-                   updated_at,
-                   pg_catalog.statement_timestamp()
-                 )
-             WHERE project_id = $1
-               AND conversation_id = $2`,
-      values: [this.projectId, conversationId],
-    }, this.context("markConversationBootstrapped"));
+    await this.scopedDirectWrite(operation, async (transaction) => {
+      await transaction.query({
+        text: `UPDATE lcm.conversations
+               SET bootstrapped_at = COALESCE(
+                     bootstrapped_at,
+                     pg_catalog.statement_timestamp()
+                   ),
+                   updated_at = GREATEST(
+                     updated_at,
+                     pg_catalog.statement_timestamp()
+                   )
+               WHERE project_id = $1
+                 AND conversation_id = $2`,
+        values: [this.projectId, conversationId],
+      }, this.context(operation));
+    });
   }
 
   async listConversations(): Promise<ConversationRecord[]> {
     const operation = "listConversations";
-    const result = await this.executor.query<ConversationRow>({
-      text: `SELECT ${CONVERSATION_COLUMNS}
-             FROM lcm.conversations
-             WHERE project_id = $1
-             ORDER BY created_at, conversation_id`,
-      values: [this.projectId],
-    }, this.context(operation));
-    return result.rows.map((row) =>
-      conversationFromRow(row, this.projectId, operation));
+    return this.serializedRead(operation, async (executor) => {
+      const result = await executor.query<ConversationRow>({
+        text: `SELECT ${CONVERSATION_COLUMNS}
+               FROM lcm.conversations
+               WHERE project_id = $1
+               ORDER BY created_at, conversation_id`,
+        values: [this.projectId],
+      }, this.context(operation));
+      return result.rows.map((row) =>
+        conversationFromRow(row, this.projectId, operation));
+    });
   }
 
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
@@ -457,16 +481,19 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     const hasBoundedLimit = options?.limit !== undefined && options.limit >= 0;
     const limit = hasBoundedLimit ? " LIMIT $4" : "";
     if (hasBoundedLimit) values.push(options.limit);
-    const result = await this.executor.query<MessageRow>({
-      text: `SELECT ${MESSAGE_COLUMNS}
+    return this.serializedRead(operation, async (executor) => {
+      const result = await executor.query<MessageRow>({
+        text: `SELECT ${MESSAGE_COLUMNS}
              FROM lcm.messages
              WHERE project_id = $1
                AND conversation_id = $2
                AND seq > $3
              ORDER BY seq, message_id${limit}`,
-      values,
-    }, this.context(operation));
-    return result.rows.map((row) => messageFromRow(row, this.projectId, operation));
+        values,
+      }, this.context(operation));
+      return result.rows.map((row) =>
+        messageFromRow(row, this.projectId, operation));
+    });
   }
 
   async getLastMessage(
@@ -474,17 +501,19 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
   ): Promise<MessageRecord | null> {
     const operation = "getLastMessage";
     safeInputInteger(conversationId, this.projectId, operation, "conversation_id");
-    const result = await this.executor.query<MessageRow>({
-      text: `SELECT ${MESSAGE_COLUMNS}
+    return this.serializedRead(operation, async (executor) => {
+      const result = await executor.query<MessageRow>({
+        text: `SELECT ${MESSAGE_COLUMNS}
              FROM lcm.messages
              WHERE project_id = $1
                AND conversation_id = $2
              ORDER BY seq DESC, message_id DESC
              LIMIT 1`,
-      values: [this.projectId, conversationId],
-    }, this.context(operation));
-    const row = result.rows[0];
-    return row ? messageFromRow(row, this.projectId, operation) : null;
+        values: [this.projectId, conversationId],
+      }, this.context(operation));
+      const row = result.rows[0];
+      return row ? messageFromRow(row, this.projectId, operation) : null;
+    });
   }
 
   async hasMessage(
@@ -494,17 +523,20 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
   ): Promise<boolean> {
     const operation = "hasMessage";
     safeInputInteger(conversationId, this.projectId, operation, "conversation_id");
-    const result = await this.executor.query({
-      text: `SELECT 1
+    validateNoNul(content, this.projectId, operation, "content");
+    return this.serializedRead(operation, async (executor) => {
+      const result = await executor.query({
+        text: `SELECT 1
              FROM lcm.messages
              WHERE project_id = $1
                AND conversation_id = $2
                AND role = $3
                AND content = $4
              LIMIT 1`,
-      values: [this.projectId, conversationId, role, content],
-    }, this.context(operation));
-    return result.rowCount === 1;
+        values: [this.projectId, conversationId, role, content],
+      }, this.context(operation));
+      return result.rowCount === 1;
+    });
   }
 
   async countMessagesByIdentity(
@@ -514,30 +546,35 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
   ): Promise<number> {
     const operation = "countMessagesByIdentity";
     safeInputInteger(conversationId, this.projectId, operation, "conversation_id");
-    const result = await this.executor.query<CountRow>({
-      text: `SELECT COUNT(*) AS count
+    validateNoNul(content, this.projectId, operation, "content");
+    return this.serializedRead(operation, async (executor) => {
+      const result = await executor.query<CountRow>({
+        text: `SELECT COUNT(*) AS count
              FROM lcm.messages
              WHERE project_id = $1
                AND conversation_id = $2
                AND role = $3
                AND content = $4`,
-      values: [this.projectId, conversationId, role, content],
-    }, this.context(operation));
-    return this.count(result.rows[0], operation);
+        values: [this.projectId, conversationId, role, content],
+      }, this.context(operation));
+      return this.count(result.rows[0], operation);
+    });
   }
 
   async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
     const operation = "getMessageById";
     safeInputInteger(messageId, this.projectId, operation, "message_id");
-    const result = await this.executor.query<MessageRow>({
-      text: `SELECT ${MESSAGE_COLUMNS}
+    return this.serializedRead(operation, async (executor) => {
+      const result = await executor.query<MessageRow>({
+        text: `SELECT ${MESSAGE_COLUMNS}
              FROM lcm.messages
              WHERE project_id = $1
                AND message_id = $2`,
-      values: [this.projectId, messageId],
-    }, this.context(operation));
-    const row = result.rows[0];
-    return row ? messageFromRow(row, this.projectId, operation) : null;
+        values: [this.projectId, messageId],
+      }, this.context(operation));
+      const row = result.rows[0];
+      return row ? messageFromRow(row, this.projectId, operation) : null;
+    });
   }
 
   async createMessageParts(
@@ -554,9 +591,11 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
         operation,
         "ordinal",
       );
+      this.validateMessagePartText(part, operation);
     }
-    await this.executor.query({
-      text: `WITH input AS (
+    await this.scopedDirectWrite(operation, async (transaction) => {
+      await transaction.query({
+        text: `WITH input AS (
                SELECT element.input_ordinal,
                       element.payload ->> 'session_id' AS session_id,
                       element.payload ->> 'part_type' AS part_type,
@@ -588,42 +627,49 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
                     input.tool_input, input.tool_output, input.metadata
              FROM input
              ORDER BY input.input_ordinal`,
-      values: [this.projectId, messageId, messagePartInputJson(parts)],
-    }, this.context(operation));
+        values: [this.projectId, messageId, messagePartInputJson(parts)],
+      }, this.context(operation));
+    });
   }
 
   async getMessageParts(messageId: MessageId): Promise<MessagePartRecord[]> {
     const operation = "getMessageParts";
     safeInputInteger(messageId, this.projectId, operation, "message_id");
-    const result = await this.executor.query<MessagePartRow>({
-      text: `SELECT ${MESSAGE_PART_COLUMNS}
+    return this.serializedRead(operation, async (executor) => {
+      const result = await executor.query<MessagePartRow>({
+        text: `SELECT ${MESSAGE_PART_COLUMNS}
              FROM lcm.message_parts
              WHERE project_id = $1
                AND message_id = $2
              ORDER BY ordinal, part_id`,
-      values: [this.projectId, messageId],
-    }, this.context(operation));
-    return result.rows.map((row) =>
-      messagePartFromRow(row, this.projectId, operation));
+        values: [this.projectId, messageId],
+      }, this.context(operation));
+      return result.rows.map((row) =>
+        messagePartFromRow(row, this.projectId, operation));
+    });
   }
 
   async getMessageCount(conversationId: ConversationId): Promise<number> {
     const operation = "getMessageCount";
     safeInputInteger(conversationId, this.projectId, operation, "conversation_id");
-    const result = await this.executor.query<CountRow>({
-      text: `SELECT COUNT(*) AS count
+    return this.serializedRead(operation, async (executor) => {
+      const result = await executor.query<CountRow>({
+        text: `SELECT COUNT(*) AS count
              FROM lcm.messages
              WHERE project_id = $1
                AND conversation_id = $2`,
-      values: [this.projectId, conversationId],
-    }, this.context(operation));
-    return this.count(result.rows[0], operation);
+        values: [this.projectId, conversationId],
+      }, this.context(operation));
+      return this.count(result.rows[0], operation);
+    });
   }
 
   async getMessageCountBySessionId(sessionId: string): Promise<number> {
     const operation = "getMessageCountBySessionId";
-    const result = await this.executor.query<CountRow>({
-      text: `SELECT COUNT(message.message_id) AS count
+    validateNoNul(sessionId, this.projectId, operation, "session_id");
+    return this.serializedRead(operation, async (executor) => {
+      const result = await executor.query<CountRow>({
+        text: `SELECT COUNT(message.message_id) AS count
              FROM lcm.conversations AS conversation
              LEFT JOIN lcm.messages AS message
                ON message.project_id = conversation.project_id
@@ -631,9 +677,10 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
              WHERE conversation.project_id = $1
                AND conversation.session_id_sha256 = public.digest($2, 'sha256')
                AND conversation.session_id = $2`,
-      values: [this.projectId, sessionId],
-    }, this.context(operation));
-    return this.count(result.rows[0], operation);
+        values: [this.projectId, sessionId],
+      }, this.context(operation));
+      return this.count(result.rows[0], operation);
+    });
   }
 
   /**
@@ -644,15 +691,17 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
   async getMaxSeq(conversationId: ConversationId): Promise<number> {
     const operation = "getMaxSeq";
     safeInputInteger(conversationId, this.projectId, operation, "conversation_id");
-    const result = await this.executor.query<MaxSeqRow>({
-      text: `SELECT COALESCE(MAX(seq), 0) AS max_seq
+    return this.serializedRead(operation, async (executor) => {
+      const result = await executor.query<MaxSeqRow>({
+        text: `SELECT COALESCE(MAX(seq), 0) AS max_seq
              FROM lcm.messages
              WHERE project_id = $1
                AND conversation_id = $2`,
-      values: [this.projectId, conversationId],
-    }, this.context(operation));
-    const value = result.rows[0]?.max_seq ?? 0;
-    return safeInteger(value, this.projectId, operation, "max_seq");
+        values: [this.projectId, conversationId],
+      }, this.context(operation));
+      const value = result.rows[0]?.max_seq ?? 0;
+      return safeInteger(value, this.projectId, operation, "max_seq");
+    });
   }
 
   async deleteMessages(messageIds: MessageId[]): Promise<number> {
@@ -742,6 +791,29 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
       operation,
       "token_count",
     );
+    validateNoNul(input.content, this.projectId, operation, "content");
+  }
+
+  private validateConversationText(
+    sessionId: string,
+    title: string | undefined,
+    operation: string,
+  ): void {
+    validateNoNul(sessionId, this.projectId, operation, "session_id");
+    validateNoNul(title, this.projectId, operation, "title");
+  }
+
+  private validateMessagePartText(
+    part: CreateMessagePartInput,
+    operation: string,
+  ): void {
+    validateNoNul(part.sessionId, this.projectId, operation, "session_id");
+    validateNoNul(part.textContent, this.projectId, operation, "text_content");
+    validateNoNul(part.toolCallId, this.projectId, operation, "tool_call_id");
+    validateNoNul(part.toolName, this.projectId, operation, "tool_name");
+    validateNoNul(part.toolInput, this.projectId, operation, "tool_input");
+    validateNoNul(part.toolOutput, this.projectId, operation, "tool_output");
+    validateNoNul(part.metadata, this.projectId, operation, "metadata");
   }
 
   private async createConversationWith(
@@ -880,13 +952,36 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
       : this.scopedAtomic(operation, callback);
   }
 
+  private serializedRead<T>(
+    operation: string,
+    callback: (executor: PostgreSqlQueryExecutor) => Promise<T>,
+  ): Promise<T> {
+    const root = this.rootExecutor();
+    return root
+      ? callback(root)
+      : this.scopedSerialized(operation, callback);
+  }
+
+  private scopedDirectWrite<T>(
+    operation: string,
+    callback: (executor: PostgreSqlQueryExecutor) => Promise<T>,
+  ): Promise<T> {
+    const root = this.rootExecutor();
+    return root
+      ? callback(root)
+      : this.scopedAtomic(operation, callback);
+  }
+
   private contentionWrite<T>(
     operation: string,
     callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
   ): Promise<T> {
     const root = this.rootExecutor();
     if (!root) {
-      return this.scopedAtomic(operation, callback);
+      return this.scopedAtomic(operation, async (transaction) => {
+        await this.assertScopedReadCommitted(transaction, operation);
+        return callback(transaction);
+      });
     }
     return this.shortTransaction(root, operation, async (transaction) => {
       await transaction.query({
@@ -894,6 +989,24 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
       }, this.context(operation));
       return callback(transaction);
     });
+  }
+
+  private async assertScopedReadCommitted(
+    executor: PostgreSqlQueryExecutor,
+    operation: string,
+  ): Promise<void> {
+    const result = await executor.query<TransactionIsolationRow>({
+      text: `SELECT pg_catalog.current_setting(
+                      'transaction_isolation'
+                    ) AS transaction_isolation`,
+    }, this.context(operation));
+    if (result.rows[0]?.transaction_isolation !== "read committed") {
+      throw new PostgreSqlConversationDataError(
+        this.projectId,
+        operation,
+        "transaction_isolation",
+      );
+    }
   }
 
   private rootExecutor(): PostgreSqlConversationExecutor | null {
@@ -907,18 +1020,8 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     operation: string,
     callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
   ): Promise<T> {
-    if (this.executor.transactionScope !== "active") {
-      return Promise.reject(new StorageOperationError(
-        "STORAGE_TRANSACTION_SCOPE",
-        "postgresql",
-        this.projectId,
-        "conversations",
-        operation,
-      ));
-    }
-    const executor = this.executor as PostgreSqlConversationScopedExecutor;
-    const state = this.scopedExecutorState(executor);
-    const execute = state.tail.then(async () => {
+    return this.scopedSerialized(operation, async (executor) => {
+      const state = this.scopedExecutorState(executor);
       // The FIFO guarantees the preceding savepoint has been released, so the
       // bounded ordinal can safely wrap without colliding with an active name.
       state.savepointOrdinal =
@@ -948,6 +1051,24 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
         throw error;
       }
     });
+  }
+
+  private scopedSerialized<T>(
+    operation: string,
+    callback: (executor: PostgreSqlConversationScopedExecutor) => Promise<T>,
+  ): Promise<T> {
+    if (this.executor.transactionScope !== "active") {
+      return Promise.reject(new StorageOperationError(
+        "STORAGE_TRANSACTION_SCOPE",
+        "postgresql",
+        this.projectId,
+        "conversations",
+        operation,
+      ));
+    }
+    const executor = this.executor as PostgreSqlConversationScopedExecutor;
+    const state = this.scopedExecutorState(executor);
+    const execute = state.tail.then(() => callback(executor));
     state.tail = execute.then(() => undefined, () => undefined);
     return execute;
   }

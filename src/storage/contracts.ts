@@ -58,6 +58,10 @@ export interface StorageHealth {
 }
 
 export interface ConversationRepository {
+  /**
+   * Conversation-domain text inputs reject embedded U+0000 before database
+   * access so SQLite and PostgreSQL expose the same text contract.
+   */
   createConversation(input: CreateConversationInput): Promise<ConversationRecord>;
   getConversation(conversationId: ConversationId): Promise<ConversationRecord | null>;
   getConversationBySessionId(sessionId: string): Promise<ConversationRecord | null>;

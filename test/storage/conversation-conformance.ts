@@ -2,6 +2,7 @@ import { expect } from "vitest";
 import type { ConversationRepository } from "../../src/storage/contracts.js";
 import type {
   ConversationRecord,
+  CreateMessagePartInput,
   MessageRecord,
 } from "../../src/store/conversation-store.js";
 
@@ -11,6 +12,15 @@ export interface ConversationRepositoryConformanceFixtures {
   readonly messages: readonly [MessageRecord, MessageRecord];
   readonly third: MessageRecord;
   readonly appended: readonly [MessageRecord, MessageRecord];
+}
+
+async function expectNulRejected(operation: () => Promise<unknown>): Promise<void> {
+  const error = await operation().then(
+    () => undefined,
+    (caught: unknown) => caught,
+  );
+  expect(error).toBeInstanceOf(Error);
+  expect(JSON.stringify(error)).not.toContain("sensitive-nul");
 }
 
 /**
@@ -35,6 +45,15 @@ export async function exerciseConversationRepositoryConformance(
   expect((await repository.getOrCreateConversation("session-a")).conversationId)
     .toBe(first.conversationId);
   expect((await repository.getOrCreateConversation("session-c", "C")).title).toBe("C");
+  const nulText = "sensitive-nul\0suffix";
+  await expectNulRejected(() => repository.createConversation({ sessionId: nulText }));
+  await expectNulRejected(() => repository.createConversation({
+    sessionId: "valid-nul-title",
+    title: nulText,
+  }));
+  await expectNulRejected(() => repository.getConversationBySessionId(nulText));
+  await expectNulRejected(() => repository.getOrCreateConversation(nulText));
+  await expectNulRejected(() => repository.getOrCreateConversation("session-a", nulText));
 
   await repository.markConversationBootstrapped(first.conversationId);
   const firstBootstrap = (await repository.getConversation(first.conversationId))?.bootstrappedAt;
@@ -98,6 +117,39 @@ export async function exerciseConversationRepositoryConformance(
     "user",
     "alpha needle",
   )).toBe(1);
+  await expectNulRejected(() => repository.createMessage({
+    conversationId: first.conversationId,
+    seq: 5,
+    role: "user",
+    content: nulText,
+    tokenCount: 0,
+  }));
+  await expectNulRejected(() => repository.createMessagesBulk([{
+    conversationId: first.conversationId,
+    seq: 5,
+    role: "user",
+    content: "valid NUL bulk prefix",
+    tokenCount: 0,
+  }, {
+    conversationId: first.conversationId,
+    seq: 6,
+    role: "assistant",
+    content: nulText,
+    tokenCount: 0,
+  }]));
+  await expectNulRejected(() => repository.appendMessages(first.conversationId, [{
+    role: "user",
+    content: "valid NUL append prefix",
+    tokenCount: 0,
+  }, {
+    role: "assistant",
+    content: nulText,
+    tokenCount: 0,
+  }]));
+  await expectNulRejected(() => repository.hasMessage(first.conversationId, "user", nulText));
+  await expectNulRejected(() =>
+    repository.countMessagesByIdentity(first.conversationId, "user", nulText));
+  expect(await repository.getMessageCount(first.conversationId)).toBe(5);
   expect((await repository.getMessageById(messages[0].messageId))?.seq).toBe(0);
   expect(await repository.getMessageById(999_999)).toBeNull();
 
@@ -128,6 +180,51 @@ export async function exerciseConversationRepositoryConformance(
     toolName: "shell",
     metadata: opaquePartMetadata,
   }]);
+  const validPart: CreateMessagePartInput = {
+    sessionId: "session-a",
+    partType: "reasoning",
+    ordinal: 2,
+  };
+  const nulParts: readonly CreateMessagePartInput[] = [{
+    sessionId: nulText,
+    partType: "text",
+    ordinal: 3,
+  }, {
+    sessionId: "session-a",
+    partType: "text",
+    ordinal: 3,
+    textContent: nulText,
+  }, {
+    sessionId: "session-a",
+    partType: "tool",
+    ordinal: 3,
+    toolCallId: nulText,
+  }, {
+    sessionId: "session-a",
+    partType: "tool",
+    ordinal: 3,
+    toolName: nulText,
+  }, {
+    sessionId: "session-a",
+    partType: "tool",
+    ordinal: 3,
+    toolInput: nulText,
+  }, {
+    sessionId: "session-a",
+    partType: "tool",
+    ordinal: 3,
+    toolOutput: nulText,
+  }, {
+    sessionId: "session-a",
+    partType: "file",
+    ordinal: 3,
+    metadata: nulText,
+  }];
+  for (const nulPart of nulParts) {
+    await expectNulRejected(() =>
+      repository.createMessageParts(messages[0].messageId, [validPart, nulPart]));
+  }
+  expect(await repository.getMessageParts(messages[0].messageId)).toHaveLength(2);
 
   expect(await repository.getMessageCount(first.conversationId)).toBe(5);
   expect(await repository.getMessageCount(second.conversationId)).toBe(0);
@@ -141,6 +238,7 @@ export async function exerciseConversationRepositoryConformance(
   });
   expect(await repository.getMessageCountBySessionId("session-a")).toBe(6);
   expect(await repository.getMessageCountBySessionId("missing")).toBe(0);
+  await expectNulRejected(() => repository.getMessageCountBySessionId(nulText));
   expect(await repository.getMaxSeq(first.conversationId)).toBe(4);
   expect(await repository.getMessageCount(split.conversationId)).toBe(1);
   expect(await repository.getMaxSeq(split.conversationId)).toBe(0);

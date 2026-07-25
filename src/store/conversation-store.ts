@@ -33,6 +33,29 @@ export type CreateMessageInput = {
 
 export type AppendMessageInput = Omit<CreateMessageInput, "conversationId" | "seq">;
 
+class ConversationInputError extends RangeError {
+  readonly field: string;
+
+  constructor(field: string) {
+    super("conversation text input contains an unsupported NUL character");
+    this.name = "ConversationInputError";
+    this.field = field;
+  }
+
+  toJSON(): Record<string, string> {
+    return { name: this.name, field: this.field, message: this.message };
+  }
+}
+
+function validateConversationText(
+  value: string | null | undefined,
+  field: string,
+): void {
+  if (value?.includes("\0")) {
+    throw new ConversationInputError(field);
+  }
+}
+
 function validateNonNegativeSafeInteger(value: number, field: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new RangeError(`${field} must be a non-negative safe integer`);
@@ -43,19 +66,54 @@ function validateMessageInputs(inputs: readonly CreateMessageInput[]): void {
   for (const input of inputs) {
     validateNonNegativeSafeInteger(input.seq, "message seq");
     validateNonNegativeSafeInteger(input.tokenCount, "message tokenCount");
+    validateConversationText(input.content, "content");
   }
 }
 
 function validateAppendTokenCounts(inputs: readonly AppendMessageInput[]): void {
   for (const input of inputs) {
     validateNonNegativeSafeInteger(input.tokenCount, "message tokenCount");
+    validateConversationText(input.content, "content");
   }
 }
 
-function validateMessagePartOrdinals(parts: readonly CreateMessagePartInput[]): void {
+function validateMessageParts(parts: readonly CreateMessagePartInput[]): void {
   for (const part of parts) {
     validateNonNegativeSafeInteger(part.ordinal, "message part ordinal");
+    validateConversationText(part.sessionId, "session_id");
+    validateConversationText(part.textContent, "text_content");
+    validateConversationText(part.toolCallId, "tool_call_id");
+    validateConversationText(part.toolName, "tool_name");
+    validateConversationText(part.toolInput, "tool_input");
+    validateConversationText(part.toolOutput, "tool_output");
+    validateConversationText(part.metadata, "metadata");
   }
+}
+
+/** @internal SQLite repository preflight; callers must still use the atomic core for writes. */
+export function validateConversationMessageBatch(
+  inputs: readonly CreateMessageInput[],
+): void {
+  validateMessageInputs(inputs);
+}
+
+/** @internal SQLite repository preflight; callers must still use the atomic core for writes. */
+export function validateConversationAppendBatch(
+  inputs: readonly AppendMessageInput[],
+): void {
+  validateAppendTokenCounts(inputs);
+}
+
+/** @internal SQLite repository preflight; callers must still use the atomic core for writes. */
+export function validateConversationPartBatch(
+  parts: readonly CreateMessagePartInput[],
+): void {
+  validateMessageParts(parts);
+}
+
+function validateConversationInput(input: CreateConversationInput): void {
+  validateConversationText(input.sessionId, "session_id");
+  validateConversationText(input.title, "title");
 }
 
 export type MessageRecord = {
@@ -425,6 +483,7 @@ export class ConversationStore {
 
   async createConversation(input: CreateConversationInput): Promise<ConversationRecord> {
     this.assertDirectTransactionUsable();
+    validateConversationInput(input);
     const result = this.db
       .prepare(`INSERT INTO conversations (session_id, title) VALUES (?, ?)`)
       .run(input.sessionId, input.title ?? null);
@@ -453,6 +512,7 @@ export class ConversationStore {
 
   async getConversationBySessionId(sessionId: string): Promise<ConversationRecord | null> {
     this.assertDirectTransactionUsable();
+    validateConversationText(sessionId, "session_id");
     const row = this.db
       .prepare(
         `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
@@ -468,6 +528,7 @@ export class ConversationStore {
 
   async getOrCreateConversation(sessionId: string, title?: string): Promise<ConversationRecord> {
     this.assertDirectTransactionUsable();
+    validateConversationInput({ sessionId, title });
     const existing = await this.getConversationBySessionId(sessionId);
     if (existing) {
       return existing;
@@ -654,6 +715,7 @@ export class ConversationStore {
     content: string,
   ): Promise<boolean> {
     this.assertDirectTransactionUsable();
+    validateConversationText(content, "content");
     const row = this.db
       .prepare(
         `SELECT 1 AS count
@@ -672,6 +734,7 @@ export class ConversationStore {
     content: string,
   ): Promise<number> {
     this.assertDirectTransactionUsable();
+    validateConversationText(content, "content");
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS count
@@ -702,7 +765,7 @@ export class ConversationStore {
     if (parts.length === 0) {
       return;
     }
-    validateMessagePartOrdinals(parts);
+    validateMessageParts(parts);
     return this.withAtomicOperation(() =>
       this.createMessagePartsCore(messageId, parts));
   }
@@ -713,7 +776,7 @@ export class ConversationStore {
   ): void {
     this.assertDirectTransactionUsable();
     if (parts.length === 0) return;
-    validateMessagePartOrdinals(parts);
+    validateMessageParts(parts);
     const stmt = this.db.prepare(
       `INSERT INTO message_parts (
          part_id,
@@ -782,6 +845,7 @@ export class ConversationStore {
 
   async getMessageCountBySessionId(sessionId: string): Promise<number> {
     this.assertDirectTransactionUsable();
+    validateConversationText(sessionId, "session_id");
     const row = this.db
       .prepare(
         `SELECT COUNT(m.message_id) AS count
@@ -853,6 +917,7 @@ export class ConversationStore {
 
   async searchMessages(input: MessageSearchInput): Promise<MessageSearchResult[]> {
     this.assertDirectTransactionUsable();
+    validateConversationText(input.query, "query");
     const limit = input.limit ?? 50;
 
     if (input.mode === "full_text") {

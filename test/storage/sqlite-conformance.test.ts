@@ -69,7 +69,70 @@ describe("SQLite storage backend conformance", () => {
     expect(prepare).not.toHaveBeenCalled();
   });
 
-  it("keeps a scoped transaction usable after invalid conversation batch integers", async () => {
+  it("prevalidates conversation batches before invoking the SQLite executor", async () => {
+    const prepare = vi.fn(() => {
+      throw new Error("invalid batches must not prepare statements");
+    });
+    const db = { prepare } as unknown as DatabaseSync;
+    const stores = createSqliteRepositoryStores(db, { fts5Available: false });
+    const invoke = vi.fn(async (
+      _domain: unknown,
+      _operation: unknown,
+      callback: () => unknown,
+    ) => callback());
+    const repositories = createSqliteRepositories(stores, "safe-project", invoke);
+
+    const bulkFailure = await repositories.conversations.createMessagesBulk([{
+      conversationId: 1,
+      seq: 0,
+      role: "user",
+      content: "valid prefix",
+      tokenCount: 0,
+    }, {
+      conversationId: 1,
+      seq: 1,
+      role: "assistant",
+      content: "private\0bulk",
+      tokenCount: 1,
+    }]).catch((error: unknown) => error);
+    const appendFailure = await repositories.conversations.appendMessages(1, [{
+      role: "user",
+      content: "valid prefix",
+      tokenCount: 0,
+    }, {
+      role: "assistant",
+      content: "invalid suffix",
+      tokenCount: -1,
+    }]).catch((error: unknown) => error);
+    const partFailure = await repositories.conversations.createMessageParts(1, [{
+      sessionId: "safe-session",
+      partType: "text",
+      ordinal: 0,
+    }, {
+      sessionId: "safe-session",
+      partType: "reasoning",
+      ordinal: 1,
+      metadata: "private\0part",
+    }]).catch((error: unknown) => error);
+
+    expect(bulkFailure).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      operation: "createMessagesBulk",
+    });
+    expect(appendFailure).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      operation: "appendMessages",
+    });
+    expect(partFailure).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      operation: "createMessageParts",
+    });
+    expect(JSON.stringify([bulkFailure, partFailure])).not.toContain("private");
+    expect(invoke).not.toHaveBeenCalled();
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it("keeps a scoped transaction usable after invalid conversation batch inputs", async () => {
     const root = createTemporaryDirectory("lcm-storage-invalid-conversation-integers-");
     const identity = projectIdentity(root);
     const factory = new SqliteStorageBackendFactory({
@@ -127,6 +190,23 @@ describe("SQLite storage backend conformance", () => {
           code: "STORAGE_OPERATION_FAILED",
           operation: "appendMessages",
         });
+        const nulFailure = await tx.conversations.appendMessages(
+          conversation.conversationId,
+          [{
+            role: "user",
+            content: "NUL prefix",
+            tokenCount: 0,
+          }, {
+            role: "assistant",
+            content: "private\0NUL suffix",
+            tokenCount: 1,
+          }],
+        ).catch((error: unknown) => error);
+        expect(nulFailure).toMatchObject({
+          code: "STORAGE_OPERATION_FAILED",
+          operation: "appendMessages",
+        });
+        expect(JSON.stringify(nulFailure)).not.toContain("private");
         await expect(tx.conversations.createMessageParts(seed.messageId, [{
           sessionId: "invalid-integers",
           partType: "text",

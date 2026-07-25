@@ -273,8 +273,12 @@ nondeterministic.
 conversation. The first appended message uses sequence `0`; later batches use
 `MAX(seq) + 1` and receive a contiguous range. Append token counts must be
 nonnegative safe integers and are rejected before a transaction starts when
-invalid. Explicit-sequence single and bulk creation remain available for replay
-and import. These two write modes may be used sequentially, but callers must
+invalid. Conversation session/title text, message content, and every
+message-part text field are rejected before transaction or query entry when
+they contain U+0000 (NUL); metadata receives only this check and otherwise
+remains opaque. Explicit-sequence single and bulk creation remain available for
+replay and import. These two write modes may
+be used sequentially, but callers must
 not run append allocation and explicit-sequence creation concurrently for the
 same conversation: the row lock coordinates append allocators, while
 replay/import deliberately supplies its own sequence values. Concurrent
@@ -282,7 +286,15 @@ append-only calls remain safe. Bulk message creation, part insertion, and
 multi-message deletion are atomic
 operations: they either commit completely or leave no partial rows. When
 called inside a repository transaction they join that transaction instead of
-opening a nested one.
+opening a nested one. Every scoped operation uses the same executor-level FIFO;
+mapped writes, bootstrap marking, and part insertion add savepoints so reads
+cannot observe their transient rows and savepoints cannot overlap. Scoped
+get-or-create and append first verify the effective transaction isolation is
+exactly `READ COMMITTED`; missing, malformed, or stronger isolation fails with
+a sanitized storage error before any advisory lock, row lock, or write. Begin
+the outer transaction at `READ COMMITTED`, or call these methods through a root
+repository that creates its own short transaction; a scoped repository cannot
+change isolation after the outer transaction has executed a statement.
 Only serialization failures (`40001`) and deadlocks (`40P01`) are retried, with
 at most three attempts; a commit whose outcome is uncertain is never replayed
 automatically.

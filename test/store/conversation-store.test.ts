@@ -141,6 +141,35 @@ describe("ConversationStore — conversation CRUD", () => {
     expect(first.conversationId).toBe(second.conversationId);
   });
 
+  it("rejects NUL conversation text and session lookups before SQL", async () => {
+    const tracked = trackedDatabase(makeDb());
+    const store = makeStore(tracked.database);
+    const invalid = "private\0conversation";
+    tracked.statements.length = 0;
+    tracked.prepared.length = 0;
+
+    await expect(store.createConversation({ sessionId: invalid }))
+      .rejects.toMatchObject({ field: "session_id" });
+    await expect(store.createConversation({ sessionId: "valid", title: invalid }))
+      .rejects.toMatchObject({ field: "title" });
+    expect(tracked.statements).toEqual([]);
+    expect(tracked.prepared).toEqual([]);
+
+    await store.createConversation({ sessionId: "valid" });
+    tracked.statements.length = 0;
+    tracked.prepared.length = 0;
+    await expect(store.getConversationBySessionId(invalid))
+      .rejects.toMatchObject({ field: "session_id" });
+    await expect(store.getOrCreateConversation(invalid))
+      .rejects.toMatchObject({ field: "session_id" });
+    await expect(store.getOrCreateConversation("valid", invalid))
+      .rejects.toMatchObject({ field: "title" });
+    await expect(store.getMessageCountBySessionId(invalid))
+      .rejects.toMatchObject({ field: "session_id" });
+    expect(tracked.statements).toEqual([]);
+    expect(tracked.prepared).toEqual([]);
+  });
+
   it("markConversationBootstrapped sets bootstrappedAt only once (COALESCE)", async () => {
     const store = makeStore(makeDb());
     const conv = await store.createConversation({ sessionId: "boot-sess" });
@@ -397,6 +426,71 @@ describe("ConversationStore — message operations", () => {
     }]);
   });
 
+  it("rejects NUL message content and exact-content lookups before SQL", async () => {
+    const tracked = trackedDatabase(makeDb());
+    const localStore = makeStore(tracked.database);
+    const conversation = await localStore.createConversation({ sessionId: "nul-message" });
+    const seed = await localStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 0,
+      role: "system",
+      content: "seed",
+      tokenCount: 0,
+    });
+    const invalidContent = "private\0message";
+    tracked.statements.length = 0;
+    tracked.prepared.length = 0;
+
+    const directError = await localStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: invalidContent,
+      tokenCount: 0,
+    }).catch((error: unknown) => error);
+    expect(directError).toMatchObject({
+      name: "ConversationInputError",
+      field: "content",
+    });
+    expect(JSON.stringify(directError)).not.toContain("private");
+    await expect(localStore.createMessagesBulk([{
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: "valid prefix",
+      tokenCount: 0,
+    }, {
+      conversationId: conversation.conversationId,
+      seq: 2,
+      role: "assistant",
+      content: invalidContent,
+      tokenCount: 1,
+    }])).rejects.toMatchObject({ field: "content" });
+    await expect(localStore.appendMessages(conversation.conversationId, [{
+      role: "user",
+      content: "valid prefix",
+      tokenCount: 0,
+    }, {
+      role: "assistant",
+      content: invalidContent,
+      tokenCount: 1,
+    }])).rejects.toMatchObject({ field: "content" });
+    await expect(localStore.hasMessage(
+      conversation.conversationId,
+      "user",
+      invalidContent,
+    )).rejects.toMatchObject({ field: "content" });
+    await expect(localStore.countMessagesByIdentity(
+      conversation.conversationId,
+      "user",
+      invalidContent,
+    )).rejects.toMatchObject({ field: "content" });
+
+    expect(tracked.statements).toEqual([]);
+    expect(tracked.prepared).toEqual([]);
+    expect(await localStore.getMessages(conversation.conversationId)).toEqual([seed]);
+  });
+
   it("keeps an outer transaction usable after a rejected negative append batch", async () => {
     const tracked = trackedDatabase(makeDb());
     const localStore = makeStore(tracked.database);
@@ -475,6 +569,74 @@ describe("ConversationStore — message parts", () => {
     expect(parts[1].toolName).toBeNull();
   });
 
+  it("rejects NUL in every message-part text field before SQL", async () => {
+    const tracked = trackedDatabase(makeDb());
+    const store = makeStore(tracked.database);
+    const conversation = await store.createConversation({ sessionId: "nul-parts" });
+    const message = await store.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 0,
+      role: "assistant",
+      content: "parts",
+      tokenCount: 1,
+    });
+    const invalidParts: readonly [string, CreateMessagePartInput][] = [
+      ["session_id", { sessionId: "bad\0session", partType: "text", ordinal: 1 }],
+      ["text_content", {
+        sessionId: "nul-parts",
+        partType: "text",
+        ordinal: 1,
+        textContent: "bad\0text",
+      }],
+      ["tool_call_id", {
+        sessionId: "nul-parts",
+        partType: "tool",
+        ordinal: 1,
+        toolCallId: "bad\0call",
+      }],
+      ["tool_name", {
+        sessionId: "nul-parts",
+        partType: "tool",
+        ordinal: 1,
+        toolName: "bad\0tool",
+      }],
+      ["tool_input", {
+        sessionId: "nul-parts",
+        partType: "tool",
+        ordinal: 1,
+        toolInput: "bad\0input",
+      }],
+      ["tool_output", {
+        sessionId: "nul-parts",
+        partType: "tool",
+        ordinal: 1,
+        toolOutput: "bad\0output",
+      }],
+      ["metadata", {
+        sessionId: "nul-parts",
+        partType: "file",
+        ordinal: 1,
+        metadata: "bad\0metadata",
+      }],
+    ];
+
+    for (const [field, invalidPart] of invalidParts) {
+      tracked.statements.length = 0;
+      tracked.prepared.length = 0;
+      await expect(store.createMessageParts(message.messageId, [{
+        sessionId: "nul-parts",
+        partType: "reasoning",
+        ordinal: 0,
+      }, invalidPart])).rejects.toMatchObject({
+        name: "ConversationInputError",
+        field,
+      });
+      expect(tracked.statements).toEqual([]);
+      expect(tracked.prepared).toEqual([]);
+    }
+    expect(await store.getMessageParts(message.messageId)).toEqual([]);
+  });
+
   it("createMessageParts with empty array is a no-op", async () => {
     const store = makeStore(makeDb());
     const conv = await store.createConversation({ sessionId: "empty-parts-sess" });
@@ -521,6 +683,29 @@ describe("ConversationStore — deleteMessages", () => {
 // ── searchMessages — regex mode ───────────────────────────────────────────────
 
 describe("ConversationStore — searchMessages regex", () => {
+  it.each(["full_text", "regex"] as const)(
+    "rejects NUL in %s search queries before SQL",
+    async (mode) => {
+      const tracked = trackedDatabase(makeDb());
+      const store = makeStore(tracked.database);
+      tracked.statements.length = 0;
+      tracked.prepared.length = 0;
+
+      const failure = await store.searchMessages({
+        query: "private\0query",
+        mode,
+      }).catch((error: unknown) => error);
+
+      expect(failure).toMatchObject({
+        name: "ConversationInputError",
+        field: "query",
+      });
+      expect(JSON.stringify(failure)).not.toContain("private");
+      expect(tracked.statements).toEqual([]);
+      expect(tracked.prepared).toEqual([]);
+    },
+  );
+
   it("finds messages matching a regex pattern", async () => {
     const store = makeStore(makeDb());
     const conv = await store.createConversation({ sessionId: "search-sess" });

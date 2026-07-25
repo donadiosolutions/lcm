@@ -671,6 +671,9 @@ describe("PostgreSQL conversation repository", () => {
 
   it("reuses an active scope for contention operations without retry or isolation setup", async () => {
     const query = vi.fn((config: QueryConfig<unknown[]>) => {
+      if (config.text.includes("transaction_isolation")) {
+        return result([{ transaction_isolation: "read committed" }]);
+      }
       if (config.text.includes("session_id_sha256")) return result([conversationRow]);
       if (config.text.includes("FOR UPDATE")) {
         return result([{ conversation_id: conversationRow.conversation_id }]);
@@ -697,15 +700,105 @@ describe("PostgreSQL conversation repository", () => {
     expect(statements).not.toContain("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
     expect(statements).toEqual([
       "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("transaction_isolation"),
       expect.stringContaining("pg_advisory_xact_lock"),
       expect.stringContaining("session_id_sha256"),
       "RELEASE SAVEPOINT lcm_conversation_repository_1",
       "SAVEPOINT lcm_conversation_repository_2",
+      expect.stringContaining("transaction_isolation"),
       expect.stringContaining("FOR UPDATE"),
       expect.stringContaining("MAX(seq) AS max_seq"),
       expect.stringContaining("INSERT INTO lcm.messages"),
       "RELEASE SAVEPOINT lcm_conversation_repository_2",
     ]);
+  });
+
+  it("fails scoped contention operations closed before locking under stronger isolation", async () => {
+    const query = vi.fn((config: QueryConfig<unknown[]>) =>
+      config.text.includes("transaction_isolation")
+        ? result([{ transaction_isolation: "repeatable read" }])
+        : result([]));
+    const scoped: PostgreSqlConversationScopedExecutor = {
+      transactionScope: "active",
+      query,
+    };
+    const repository = new PostgreSqlConversationRepository(scoped, projectId);
+
+    for (const [operation, invoke] of [
+      [
+        "getOrCreateConversation",
+        () => repository.getOrCreateConversation("scoped-isolation"),
+      ],
+      [
+        "appendMessages",
+        () => repository.appendMessages(41, [{
+          role: "user",
+          content: "scoped isolation",
+          tokenCount: 1,
+        }]),
+      ],
+    ] as const) {
+      const error = await invoke().catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(PostgreSqlConversationDataError);
+      expect(error).toMatchObject({
+        backend: "postgresql",
+        domain: "conversations",
+        field: "transaction_isolation",
+        operation,
+        projectId,
+      });
+      expect(error).not.toHaveProperty("cause");
+    }
+    expect(query.mock.calls.map(([config]) => config.text)).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("transaction_isolation"),
+      "ROLLBACK TO SAVEPOINT lcm_conversation_repository_1",
+      "RELEASE SAVEPOINT lcm_conversation_repository_1",
+      "SAVEPOINT lcm_conversation_repository_2",
+      expect.stringContaining("transaction_isolation"),
+      "ROLLBACK TO SAVEPOINT lcm_conversation_repository_2",
+      "RELEASE SAVEPOINT lcm_conversation_repository_2",
+    ]);
+    expect(query.mock.calls.some(
+      ([config]) =>
+        config.text.includes("pg_advisory_xact_lock")
+        || config.text.includes("FOR UPDATE"),
+    )).toBe(false);
+  });
+
+  it.each([
+    ["missing", []],
+    ["malformed", [{ transaction_isolation: "READ COMMITTED" }]],
+  ])("fails scoped contention closed for %s isolation state", async (
+    _case,
+    rows,
+  ) => {
+    const query = vi.fn((config: QueryConfig<unknown[]>) =>
+      config.text.includes("transaction_isolation")
+        ? result(rows)
+        : result([]));
+    const repository = new PostgreSqlConversationRepository({
+      transactionScope: "active",
+      query,
+    }, projectId);
+
+    const error = await repository.getOrCreateConversation("isolation-state")
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PostgreSqlConversationDataError);
+    expect(error).toMatchObject({
+      field: "transaction_isolation",
+      operation: "getOrCreateConversation",
+    });
+    expect(error).not.toHaveProperty("cause");
+    expect(query.mock.calls.map(([config]) => config.text)).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("transaction_isolation"),
+      "ROLLBACK TO SAVEPOINT lcm_conversation_repository_1",
+      "RELEASE SAVEPOINT lcm_conversation_repository_1",
+    ]);
+    expect(query.mock.calls.some(
+      ([config]) => config.text.includes("pg_advisory_xact_lock"),
+    )).toBe(false);
   });
 
   it("rejects an unmarked query-only executor before issuing a savepoint", async () => {
@@ -800,6 +893,155 @@ describe("PostgreSQL conversation repository", () => {
       "SAVEPOINT lcm_conversation_repository_1",
       expect.stringContaining("INSERT INTO lcm.messages"),
       "ROLLBACK TO SAVEPOINT lcm_conversation_repository_1",
+    ]);
+  });
+
+  it("serializes bootstrap and part writes behind a failing scoped mapped write", async () => {
+    const unsafeMessage = {
+      ...messageRow,
+      message_id: String(Number.MAX_SAFE_INTEGER + 1),
+    };
+    const statements: string[] = [];
+    let unblockMessageInsert!: () => void;
+    let reportMessageInsert!: () => void;
+    const messageInsertBlocked = new Promise<void>((resolve) => {
+      reportMessageInsert = resolve;
+    });
+    const messageInsertGate = new Promise<void>((resolve) => {
+      unblockMessageInsert = resolve;
+    });
+    let bootstrapped = false;
+    let partCount = 0;
+    let savepointState = { bootstrapped, partCount };
+    const query = vi.fn(async (config: QueryConfig<unknown[]>) => {
+      statements.push(config.text);
+      if (config.text.startsWith("SAVEPOINT")) {
+        savepointState = { bootstrapped, partCount };
+      } else if (config.text.startsWith("ROLLBACK TO SAVEPOINT")) {
+        ({ bootstrapped, partCount } = savepointState);
+      } else if (config.text.includes("INSERT INTO lcm.messages")) {
+        reportMessageInsert();
+        await messageInsertGate;
+        return result([unsafeMessage]);
+      } else if (config.text.includes("UPDATE lcm.conversations")) {
+        bootstrapped = true;
+      } else if (config.text.includes("INSERT INTO lcm.message_parts")) {
+        partCount += 1;
+      }
+      return result([]);
+    });
+    const scoped: PostgreSqlConversationScopedExecutor = {
+      transactionScope: "active",
+      query,
+    };
+    const unsafeRepository = new PostgreSqlConversationRepository(scoped, projectId);
+    const bootstrapRepository = new PostgreSqlConversationRepository(scoped, projectId);
+    const partsRepository = new PostgreSqlConversationRepository(scoped, projectId);
+
+    const unsafe = unsafeRepository.createMessage({
+      conversationId: 41,
+      seq: 0,
+      role: "user",
+      content: "unsafe",
+      tokenCount: 1,
+    });
+    await messageInsertBlocked;
+    const bootstrap = bootstrapRepository.markConversationBootstrapped(41);
+    const parts = partsRepository.createMessageParts(51, [{
+      sessionId: "serialized-direct-writes",
+      partType: "text",
+      ordinal: 0,
+    }]);
+    await Promise.resolve();
+    expect(statements).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("INSERT INTO lcm.messages"),
+    ]);
+
+    unblockMessageInsert();
+    await expect(unsafe).rejects.toMatchObject({ field: "message_id" });
+    await expect(Promise.all([bootstrap, parts])).resolves.toEqual([
+      undefined,
+      undefined,
+    ]);
+    expect(statements).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("INSERT INTO lcm.messages"),
+      "ROLLBACK TO SAVEPOINT lcm_conversation_repository_1",
+      "RELEASE SAVEPOINT lcm_conversation_repository_1",
+      "SAVEPOINT lcm_conversation_repository_2",
+      expect.stringContaining("UPDATE lcm.conversations"),
+      "RELEASE SAVEPOINT lcm_conversation_repository_2",
+      "SAVEPOINT lcm_conversation_repository_3",
+      expect.stringContaining("INSERT INTO lcm.message_parts"),
+      "RELEASE SAVEPOINT lcm_conversation_repository_3",
+    ]);
+    expect({ bootstrapped, partCount }).toEqual({
+      bootstrapped: true,
+      partCount: 1,
+    });
+  });
+
+  it("serializes scoped reads behind rollback of a failing mapped write", async () => {
+    const unsafeMessage = {
+      ...messageRow,
+      message_id: String(Number.MAX_SAFE_INTEGER + 1),
+    };
+    const statements: string[] = [];
+    let unblockMessageInsert!: () => void;
+    let reportMessageInsert!: () => void;
+    const messageInsertBlocked = new Promise<void>((resolve) => {
+      reportMessageInsert = resolve;
+    });
+    const messageInsertGate = new Promise<void>((resolve) => {
+      unblockMessageInsert = resolve;
+    });
+    const query = vi.fn(async (config: QueryConfig<unknown[]>) => {
+      statements.push(config.text);
+      if (config.text.includes("INSERT INTO lcm.messages")) {
+        reportMessageInsert();
+        await messageInsertGate;
+        return result([unsafeMessage]);
+      }
+      if (
+        config.text.includes("SELECT")
+        && config.text.includes("FROM lcm.messages")
+      ) {
+        return result([]);
+      }
+      return result([]);
+    });
+    const scoped: PostgreSqlConversationScopedExecutor = {
+      transactionScope: "active",
+      query,
+    };
+    const writer = new PostgreSqlConversationRepository(scoped, projectId);
+    const reader = new PostgreSqlConversationRepository(scoped, projectId);
+
+    const unsafe = writer.createMessage({
+      conversationId: 41,
+      seq: 0,
+      role: "user",
+      content: "unsafe",
+      tokenCount: 1,
+    });
+    await messageInsertBlocked;
+    const read = reader.getMessageById(51);
+    await Promise.resolve();
+    expect(statements).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("INSERT INTO lcm.messages"),
+    ]);
+
+    unblockMessageInsert();
+    await expect(unsafe).rejects.toMatchObject({ field: "message_id" });
+    await expect(read).resolves.toBeNull();
+    expect(statements).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("INSERT INTO lcm.messages"),
+      "ROLLBACK TO SAVEPOINT lcm_conversation_repository_1",
+      "RELEASE SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("SELECT"),
     ]);
   });
 
@@ -971,6 +1213,162 @@ describe("PostgreSQL conversation repository", () => {
         tokenCount: 1,
       },
     ])).rejects.toMatchObject({ field: "seq" });
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(db.query).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["createMessage", (repository: PostgreSqlConversationRepository) =>
+      repository.createMessage({
+        conversationId: 1,
+        seq: 0,
+        role: "user",
+        content: "before\0after",
+        tokenCount: 1,
+      })],
+    ["createMessagesBulk", (repository: PostgreSqlConversationRepository) =>
+      repository.createMessagesBulk([
+        {
+          conversationId: 1,
+          seq: 0,
+          role: "user",
+          content: "valid",
+          tokenCount: 1,
+        },
+        {
+          conversationId: 1,
+          seq: 1,
+          role: "assistant",
+          content: "before\0after",
+          tokenCount: 1,
+        },
+      ])],
+    ["appendMessages", (repository: PostgreSqlConversationRepository) =>
+      repository.appendMessages(1, [{
+        role: "user",
+        content: "before\0after",
+        tokenCount: 1,
+      }])],
+    ["hasMessage", (repository: PostgreSqlConversationRepository) =>
+      repository.hasMessage(1, "user", "before\0after")],
+    ["countMessagesByIdentity", (repository: PostgreSqlConversationRepository) =>
+      repository.countMessagesByIdentity(1, "user", "before\0after")],
+  ])("rejects NUL message content for %s before transaction or query", async (
+    operation,
+    invoke,
+  ) => {
+    const db = executor(() => {
+      throw new Error("NUL content must not query");
+    });
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+
+    const error = await invoke(repository).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PostgreSqlConversationDataError);
+    expect(error).toMatchObject({
+      field: "content",
+      operation,
+      projectId,
+    });
+    expect(JSON.stringify(error)).not.toContain("before");
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(db.query).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "createConversation session",
+      "createConversation",
+      "session_id",
+      (repository: PostgreSqlConversationRepository) =>
+        repository.createConversation({ sessionId: "before\0after" }),
+    ],
+    [
+      "createConversation title",
+      "createConversation",
+      "title",
+      (repository: PostgreSqlConversationRepository) =>
+        repository.createConversation({
+          sessionId: "valid",
+          title: "before\0after",
+        }),
+    ],
+    [
+      "getConversationBySessionId",
+      "getConversationBySessionId",
+      "session_id",
+      (repository: PostgreSqlConversationRepository) =>
+        repository.getConversationBySessionId("before\0after"),
+    ],
+    [
+      "getOrCreateConversation session",
+      "getOrCreateConversation",
+      "session_id",
+      (repository: PostgreSqlConversationRepository) =>
+        repository.getOrCreateConversation("before\0after"),
+    ],
+    [
+      "getOrCreateConversation title",
+      "getOrCreateConversation",
+      "title",
+      (repository: PostgreSqlConversationRepository) =>
+        repository.getOrCreateConversation("valid", "before\0after"),
+    ],
+    [
+      "getMessageCountBySessionId",
+      "getMessageCountBySessionId",
+      "session_id",
+      (repository: PostgreSqlConversationRepository) =>
+        repository.getMessageCountBySessionId("before\0after"),
+    ],
+  ])("rejects NUL conversation text for %s before transaction or query", async (
+    _case,
+    operation,
+    field,
+    invoke,
+  ) => {
+    const db = executor(() => {
+      throw new Error("NUL conversation text must not query");
+    });
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+
+    const error = await invoke(repository).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PostgreSqlConversationDataError);
+    expect(error).toMatchObject({ field, operation, projectId });
+    expect(JSON.stringify(error)).not.toContain("before");
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(db.query).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["session_id", { sessionId: "before\0after" }],
+    ["text_content", { textContent: "before\0after" }],
+    ["tool_call_id", { toolCallId: "before\0after" }],
+    ["tool_name", { toolName: "before\0after" }],
+    ["tool_input", { toolInput: "before\0after" }],
+    ["tool_output", { toolOutput: "before\0after" }],
+    ["metadata", { metadata: "before\0after" }],
+  ])("rejects NUL message part %s before transaction or query", async (
+    field,
+    override,
+  ) => {
+    const db = executor(() => {
+      throw new Error("NUL message part must not query");
+    });
+    const repository = new PostgreSqlConversationRepository(db, projectId);
+
+    const error = await repository.createMessageParts(1, [{
+      sessionId: "valid",
+      partType: "text",
+      ordinal: 0,
+      ...override,
+    }]).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PostgreSqlConversationDataError);
+    expect(error).toMatchObject({
+      field,
+      operation: "createMessageParts",
+      projectId,
+    });
+    expect(JSON.stringify(error)).not.toContain("before");
     expect(db.transaction).not.toHaveBeenCalled();
     expect(db.query).not.toHaveBeenCalled();
   });
