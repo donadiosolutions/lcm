@@ -768,6 +768,14 @@ test("workflow binds evidence and the required model split", async () => {
   );
   assert.match(
     preflightWorkflow,
+    /permissions:\s*\n\s+contents: read\s*\n\s+steps:/u,
+  );
+  assert.doesNotMatch(
+    preflightWorkflow,
+    /^\s+issues:\s*(?:read|write)\s*$/mu,
+  );
+  assert.match(
+    preflightWorkflow,
     /WRITE_TOKEN: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}[\s\S]*?github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/u,
   );
   assert.match(
@@ -781,6 +789,10 @@ test("workflow binds evidence and the required model split", async () => {
   assert.match(
     preflightWorkflow,
     /github\.rest\.users\.getAuthenticated\(\)[\s\S]*?github\.rest\.repos\.get\(context\.repo\)[\s\S]*?github\.graphql\(TRIAGE_CATALOG_QUERY,[\s\S]*?!catalogResponse\.organization \|\| !catalogResponse\.repository[\s\S]*?fetchRepositoryLabelCatalog\([\s\S]*?resolveLiveTriageCatalog\(/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /Write credential cannot access the organization Issue Fields [\s\S]*?and repository Issue type catalog/u,
   );
   assert.match(
     preflightWorkflow,
