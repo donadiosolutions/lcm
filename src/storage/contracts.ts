@@ -182,6 +182,7 @@ export interface NativeTranscriptCheckpointKey {
 export interface NativeTranscriptCheckpointRecord
   extends NativeTranscriptCheckpointKey {
   readonly projectId: string;
+  readonly revision: number;
   readonly lastSourceOrdinal: number;
   readonly importedCount: number;
   readonly skippedCount: number;

@@ -70,6 +70,7 @@ GRANT INSERT (
         imported_count,
         skipped_count,
         quarantined_count,
+        revision,
         checkpoint,
         updated_at
       )

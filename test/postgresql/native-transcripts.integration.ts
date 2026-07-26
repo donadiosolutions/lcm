@@ -183,6 +183,7 @@ describe("PostgreSQL 18 native transcript repository", () => {
         checkpoint_insert: boolean;
         checkpoint_project_insert: boolean;
         checkpoint_payload_update: boolean;
+        checkpoint_revision_update: boolean;
         checkpoint_project_update: boolean;
         checkpoint_delete: boolean;
       }>({
@@ -266,6 +267,10 @@ describe("PostgreSQL 18 native transcript repository", () => {
                  ) AS checkpoint_payload_update,
                  has_column_privilege(
                    'lcm_test_runtime', 'lcm.ingest_checkpoints',
+                   'revision', 'UPDATE'
+                 ) AS checkpoint_revision_update,
+                 has_column_privilege(
+                   'lcm_test_runtime', 'lcm.ingest_checkpoints',
                    'project_id', 'UPDATE'
                  ) AS checkpoint_project_update,
                  has_table_privilege(
@@ -299,6 +304,7 @@ describe("PostgreSQL 18 native transcript repository", () => {
         checkpoint_insert: false,
         checkpoint_project_insert: true,
         checkpoint_payload_update: true,
+        checkpoint_revision_update: true,
         checkpoint_project_update: false,
         checkpoint_delete: false,
       });
@@ -400,7 +406,7 @@ describe("PostgreSQL 18 native transcript repository", () => {
         expectedCheckpoint: checkpointBeforeShiftedRetry,
         records: [{
           ...retry.records[0],
-          sourceOrdinal: 99,
+          sourceOrdinal: 3,
         }],
       })).rejects.toBeInstanceOf(PostgreSqlNativeTranscriptConflictError);
       await expect(repository.getCheckpoint(first)).resolves.toEqual(
@@ -574,10 +580,121 @@ describe("PostgreSQL 18 native transcript repository", () => {
       ]);
       await expect(first.getCheckpoint(checkpointOnlyBatch)).resolves
         .toMatchObject({
+          revision: 1,
           importedCount: 0,
           skippedCount: 0,
           quarantinedCount: 1,
         });
+
+      const aba = input(
+        scope,
+        "atomicity/checkpoint-aba.jsonl",
+        "checkpoint-aba",
+      );
+      const checkpointA = {
+        byteOffset: 0,
+        prefixSha256: createHash("sha256").update("checkpoint-a").digest("hex"),
+      };
+      const checkpointB = {
+        byteOffset: 2,
+        prefixSha256: createHash("sha256").update("checkpoint-b").digest("hex"),
+      };
+      const firstA = await first.ingestBatch({
+        ...aba,
+        records: [],
+        checkpoint: {
+          lastSourceOrdinal: 0,
+          checkpoint: checkpointA,
+        },
+        quarantinedCount: 0,
+      });
+      expect(firstA.checkpoint).toMatchObject({
+        revision: 1,
+        checkpoint: checkpointA,
+      });
+      const advancedB = await first.ingestBatch({
+        ...aba,
+        expectedCheckpoint: firstA.checkpoint,
+        records: [],
+        checkpoint: {
+          lastSourceOrdinal: 0,
+          checkpoint: checkpointB,
+        },
+        quarantinedCount: 0,
+      });
+      expect(advancedB.checkpoint).toMatchObject({
+        revision: 2,
+        checkpoint: checkpointB,
+      });
+      const returnedA = await first.ingestBatch({
+        ...aba,
+        expectedCheckpoint: advancedB.checkpoint,
+        records: [],
+        checkpoint: {
+          lastSourceOrdinal: 0,
+          checkpoint: checkpointA,
+        },
+        quarantinedCount: 0,
+      });
+      expect(returnedA.checkpoint).toMatchObject({
+        revision: 3,
+        checkpoint: checkpointA,
+      });
+      await expect(first.ingestBatch({
+        ...aba,
+        expectedCheckpoint: firstA.checkpoint,
+        records: [],
+        checkpoint: {
+          lastSourceOrdinal: 0,
+          checkpoint: {
+            byteOffset: 4,
+            prefixSha256: createHash("sha256")
+              .update("stale-advance")
+              .digest("hex"),
+          },
+        },
+        quarantinedCount: 0,
+      })).rejects.toMatchObject({
+        name: "PostgreSqlNativeTranscriptCheckpointConflictError",
+      });
+      await expect(first.ingestBatch({
+        ...aba,
+        expectedCheckpoint: firstA.checkpoint,
+        records: [],
+        checkpoint: {
+          lastSourceOrdinal: 0,
+          checkpoint: checkpointA,
+        },
+        quarantinedCount: 0,
+      })).resolves.toMatchObject({
+        checkpoint: {
+          revision: 3,
+          checkpoint: checkpointA,
+        },
+      });
+      await expect(first.getCheckpoint(aba)).resolves.toMatchObject({
+        revision: 3,
+        checkpoint: checkpointA,
+      });
+
+      const beyondCheckpoint = input(
+        scope,
+        "atomicity/beyond-checkpoint.jsonl",
+        "beyond-checkpoint",
+      );
+      await expect(first.ingestBatch({
+        ...beyondCheckpoint,
+        checkpoint: {
+          ...beyondCheckpoint.checkpoint,
+          lastSourceOrdinal: 3,
+        },
+      })).rejects.toMatchObject({
+        name: "PostgreSqlNativeTranscriptDataError",
+        field: "last_source_ordinal",
+      });
+      await expect(first.getCheckpoint(beyondCheckpoint)).resolves.toBeNull();
+      await expect(first.listBySource(beyondCheckpoint)).resolves.toEqual([]);
+
       const absent = input(
         scope,
         "atomicity/absent.jsonl",
@@ -599,6 +716,10 @@ describe("PostgreSQL 18 native transcript repository", () => {
       const rollback = input(scope, "atomicity/rollback.jsonl", "rollback-a");
       const invalidMessage = {
         ...rollback,
+        checkpoint: {
+          ...rollback.checkpoint,
+          lastSourceOrdinal: 5,
+        },
         records: [
           rollback.records[0],
           {

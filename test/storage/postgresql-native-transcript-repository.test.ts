@@ -90,6 +90,7 @@ const checkpointRow = {
   machine_id: machineId,
   client_name: "codex",
   source_locator: "sessions/a.jsonl",
+  revision: "1",
   last_source_ordinal: "3",
   imported_count: "1",
   skipped_count: 0n,
@@ -100,6 +101,7 @@ const checkpointRow = {
 
 const initialCheckpointRow = {
   ...checkpointRow,
+  revision: "0",
   last_source_ordinal: "0",
   imported_count: "0",
   skipped_count: "0",
@@ -113,6 +115,7 @@ const checkpointRecord: NativeTranscriptCheckpointRecord = {
   machineId,
   clientName: "codex",
   sourceLocator: "sessions/a.jsonl",
+  revision: 1,
   lastSourceOrdinal: 3,
   importedCount: 1,
   skippedCount: 0,
@@ -362,6 +365,7 @@ describe("PostgreSQL native transcript repository", () => {
       messageId: 51,
     })).resolves.toHaveLength(1);
     await expect(repository.getCheckpoint(batch)).resolves.toMatchObject({
+      revision: 1,
       lastSourceOrdinal: 3,
       quarantinedCount: 2,
     });
@@ -454,6 +458,55 @@ describe("PostgreSQL native transcript repository", () => {
     expect(insert?.values?.[12]).toBe(canonicalJson(payload));
   });
 
+  it("rejects records beyond the checkpoint before SQL and permits checkpoint-ahead quarantine progress", async () => {
+    const rejectingDb = executor(() => {
+      throw new Error("database must not be called");
+    });
+    await expect(new PostgreSqlNativeTranscriptRepository(
+      rejectingDb,
+      projectId,
+    ).ingestBatch({
+      ...batch,
+      checkpoint: {
+        ...batch.checkpoint,
+        lastSourceOrdinal: 2,
+      },
+    })).rejects.toMatchObject({
+      name: "PostgreSqlNativeTranscriptDataError",
+      field: "last_source_ordinal",
+    });
+    expect(rejectingDb.transaction).not.toHaveBeenCalled();
+    expect(rejectingDb.query).not.toHaveBeenCalled();
+
+    const checkpointAheadRow = {
+      ...checkpointRow,
+      last_source_ordinal: "4",
+    };
+    const acceptingDb = executor((config) => {
+      if (config.text.includes("UPDATE lcm.ingest_checkpoints")) {
+        return result([checkpointAheadRow]);
+      }
+      return successfulQuery(config);
+    });
+    await expect(new PostgreSqlNativeTranscriptRepository(
+      acceptingDb,
+      projectId,
+    ).ingestBatch({
+      ...batch,
+      checkpoint: {
+        ...batch.checkpoint,
+        lastSourceOrdinal: 4,
+      },
+      quarantinedCount: 1,
+    })).resolves.toMatchObject({
+      importedCount: 1,
+      quarantinedCount: 1,
+      checkpoint: {
+        lastSourceOrdinal: 4,
+      },
+    });
+  });
+
   it("snapshots mutable batches before the transaction and rejects accessors", async () => {
     let releaseTransaction!: () => void;
     const transactionGate = new Promise<void>((resolve) => {
@@ -520,6 +573,7 @@ describe("PostgreSQL native transcript repository", () => {
       byteOffset: 42,
       nested: { value: "original" },
     }));
+    expect(checkpointUpdate?.text).toContain("revision = revision + 1");
 
     const accessor = vi.fn(() => ({ unsafe: true }));
     const accessorPayload = {};
@@ -1046,6 +1100,7 @@ describe("PostgreSQL native transcript repository", () => {
       { ...checkpointRecord, importedCount: 2 },
       { ...checkpointRecord, skippedCount: 1 },
       { ...checkpointRecord, quarantinedCount: 3 },
+      { ...checkpointRecord, revision: 0 },
       { ...checkpointRecord, lastSourceOrdinal: 4 },
       { ...checkpointRecord, checkpoint: { byteOffset: 43 } },
     ]) {
@@ -1086,6 +1141,42 @@ describe("PostgreSQL native transcript repository", () => {
     expect(unexpectedCreation.query).toHaveBeenCalledTimes(2);
   });
 
+  it("uses the durable revision to reject a value-equal ABA checkpoint", async () => {
+    const cycledCheckpointRow = {
+      ...checkpointRow,
+      revision: "3",
+    };
+    const cycled = executor((config) => {
+      if (config.text.includes("INSERT INTO lcm.ingest_checkpoints")) {
+        return result([]);
+      }
+      if (config.text.includes("FOR UPDATE")) {
+        return result([cycledCheckpointRow]);
+      }
+      return successfulQuery(config);
+    });
+    await expect(new PostgreSqlNativeTranscriptRepository(
+      cycled,
+      projectId,
+    ).ingestBatch({
+      ...batch,
+      expectedCheckpoint: checkpointRecord,
+      records: [],
+      checkpoint: {
+        lastSourceOrdinal: 4,
+        checkpoint: {
+          byteOffset: 43,
+          prefixSha256: "d".repeat(64),
+        },
+      },
+      quarantinedCount: 0,
+    })).rejects.toMatchObject({
+      name: "PostgreSqlNativeTranscriptCheckpointConflictError",
+    });
+    expect(cycled.query.mock.calls.some(([config]) =>
+      config.text.includes("UPDATE lcm.ingest_checkpoints"))).toBe(false);
+  });
+
   it("converges concurrent first-empty checkpoint writers as a retry", async () => {
     const emptyCheckpoint = {
       version: 1,
@@ -1100,6 +1191,7 @@ describe("PostgreSQL native transcript repository", () => {
     };
     const emptyCheckpointRow = {
       ...initialCheckpointRow,
+      revision: "1",
       checkpoint: emptyCheckpoint,
       updated_at: "2026-01-01T00:00:01.000Z",
     };
@@ -1161,6 +1253,7 @@ describe("PostgreSQL native transcript repository", () => {
       null,
       checkpointRecord,
       { ...checkpointRecord, importedCount: 99 },
+      { ...checkpointRecord, revision: 0 },
     ]) {
       const matching = executor((config) => {
         if (config.text.includes("INSERT INTO lcm.ingest_checkpoints")) {
@@ -1188,6 +1281,7 @@ describe("PostgreSQL native transcript repository", () => {
         skippedCount: 1,
         quarantinedCount: 2,
         checkpoint: {
+          revision: 1,
           importedCount: 1,
           skippedCount: 0,
           quarantinedCount: 2,
@@ -1236,6 +1330,7 @@ describe("PostgreSQL native transcript repository", () => {
   it("reconciles a committed batch after an uncertain commit outcome", async () => {
     const advancedCheckpointRow = {
       ...checkpointRow,
+      revision: "1",
       skipped_count: "1",
       quarantined_count: "4",
     };
@@ -1416,6 +1511,16 @@ describe("PostgreSQL native transcript repository", () => {
       });
     }
 
+    const malformedCheckpoint = executor(() =>
+      result([{ ...checkpointRow, revision: "-1" }]));
+    await expect(
+      new PostgreSqlNativeTranscriptRepository(malformedCheckpoint, projectId)
+        .getCheckpoint(batch),
+    ).rejects.toMatchObject({
+      name: "PostgreSqlNativeTranscriptDataError",
+      field: "revision",
+    });
+
     const malformedLink = executor(() =>
       result([{ ...transcriptRow, message_links: [null] }]));
     await expect(
@@ -1475,6 +1580,10 @@ describe("PostgreSQL native transcript repository", () => {
       {
         ...batch,
         expectedCheckpoint: { ...checkpointRecord, lastSourceOrdinal: -1 },
+      },
+      {
+        ...batch,
+        expectedCheckpoint: { ...checkpointRecord, revision: -1 },
       },
       {
         ...batch,

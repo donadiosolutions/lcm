@@ -123,6 +123,7 @@ type CheckpointRow = QueryResultRow & {
   machine_id: unknown;
   client_name: unknown;
   source_locator: unknown;
+  revision: unknown;
   last_source_ordinal: unknown;
   imported_count: unknown;
   skipped_count: unknown;
@@ -794,6 +795,12 @@ function checkpointFromRow(
       operation,
       "source_locator",
     ),
+    revision: nonnegativeInteger(
+      row.revision,
+      projectId,
+      operation,
+      "revision",
+    ),
     lastSourceOrdinal: nonnegativeInteger(
       row.last_source_ordinal,
       projectId,
@@ -863,6 +870,7 @@ function sameCheckpoint(
     && actual.machineId === expected.machineId
     && actual.clientName === expected.clientName
     && actual.sourceLocator === expected.sourceLocator
+    && actual.revision === expected.revision
     && actual.lastSourceOrdinal === expected.lastSourceOrdinal
     && actual.importedCount === expected.importedCount
     && actual.skippedCount === expected.skippedCount
@@ -886,6 +894,7 @@ function reconcilesCommittedCheckpoint(
     && actual.machineId === candidate.machineId
     && actual.clientName === candidate.clientName
     && actual.sourceLocator === candidate.sourceLocator
+    && actual.revision >= candidate.revision
     && actual.lastSourceOrdinal === candidate.lastSourceOrdinal
     && sameJson(actual.checkpoint, candidate.checkpoint)
     && actual.importedCount >= candidate.importedCount
@@ -1111,6 +1120,7 @@ implements
     return this.read(operation, async (executor) => {
       const result = await executor.query<CheckpointRow>({
         text: `SELECT project_id, machine_id, client_name, source_locator,
+                      revision,
                       last_source_ordinal, imported_count, skipped_count,
                       quarantined_count, checkpoint, updated_at
                FROM lcm.ingest_checkpoints
@@ -1219,7 +1229,8 @@ implements
              ON CONFLICT (project_id, machine_id, client_name, source_locator)
              DO NOTHING
              RETURNING project_id, machine_id, client_name, source_locator,
-                       last_source_ordinal, imported_count, skipped_count,
+                       revision, last_source_ordinal, imported_count,
+                       skipped_count,
                        quarantined_count, checkpoint, updated_at`,
       values: [
         this.projectId,
@@ -1240,6 +1251,7 @@ implements
     }
     const locked = await executor.query<CheckpointRow>({
       text: `SELECT project_id, machine_id, client_name, source_locator,
+                    revision,
                     last_source_ordinal, imported_count, skipped_count,
                     quarantined_count, checkpoint, updated_at
              FROM lcm.ingest_checkpoints
@@ -1451,13 +1463,15 @@ implements
                  skipped_count = skipped_count + $7,
                  quarantined_count = quarantined_count + $8,
                  checkpoint = $9::pg_catalog.jsonb,
+                 revision = revision + 1,
                  updated_at = statement_timestamp()
              WHERE project_id = $1
                AND machine_id = $2
                AND client_name = $3
                AND source_locator = $4
              RETURNING project_id, machine_id, client_name, source_locator,
-                       last_source_ordinal, imported_count, skipped_count,
+                       revision, last_source_ordinal, imported_count,
+                       skipped_count,
                        quarantined_count, checkpoint, updated_at`,
       values: [
         this.projectId,
@@ -1562,6 +1576,14 @@ implements
       operation,
       "records",
     ).map((record) => this.validateRecord(record, operation)));
+    if (records.some((record) =>
+      record.sourceOrdinal > lastSourceOrdinal)) {
+      throw new PostgreSqlNativeTranscriptDataError(
+        this.projectId,
+        operation,
+        "last_source_ordinal",
+      );
+    }
     return Object.freeze({
       ...key,
       expectedCheckpoint,
@@ -1606,6 +1628,12 @@ implements
       this.projectId,
       operation,
       "expected_source_locator",
+    );
+    const revision = nonnegativeInteger(
+      expected.revision,
+      this.projectId,
+      operation,
+      "expected_revision",
     );
     const lastSourceOrdinal = nonnegativeInteger(
       expected.lastSourceOrdinal,
@@ -1660,6 +1688,7 @@ implements
       machineId,
       clientName,
       sourceLocator,
+      revision,
       lastSourceOrdinal,
       importedCount,
       skippedCount,
