@@ -1848,6 +1848,7 @@ export function reconcileWorktrees(
   const lockWaitMs = opts._lockWaitMs ?? 5_000;
   const retryDelayMs = opts._lockRetryDelayMs ?? 50;
   const deadline = Date.now() + lockWaitMs;
+  let retryWaiter: Int32Array | undefined;
   while (true) {
     try {
       return withPrivateMutationLock(
@@ -1860,7 +1861,7 @@ export function reconcileWorktrees(
         throw error;
       }
       Atomics.wait(
-        new Int32Array(new SharedArrayBuffer(4)),
+        retryWaiter ??= new Int32Array(new SharedArrayBuffer(4)),
         0,
         0,
         Math.min(retryDelayMs, Math.max(1, deadline - Date.now())),

@@ -8,7 +8,23 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const pathBoundary = vi.hoisted(() => ({
+  redirectFrom: "",
+  redirectTo: "",
+}));
+
+vi.mock("node:path", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:path")>();
+  return {
+    ...actual,
+    dirname: (path: string): string => path === pathBoundary.redirectFrom
+      ? pathBoundary.redirectTo
+      : actual.dirname(path),
+  };
+});
+
 import {
   clearGitProjectAnchorCache,
   resolveGitProjectAnchor,
@@ -46,10 +62,14 @@ describe("Git project identity", () => {
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "lcm-git-project-"));
+    pathBoundary.redirectFrom = "";
+    pathBoundary.redirectTo = "";
     clearGitProjectAnchorCache();
   });
 
   afterEach(() => {
+    pathBoundary.redirectFrom = "";
+    pathBoundary.redirectTo = "";
     clearGitProjectAnchorCache();
     rmSync(root, { recursive: true, force: true });
   });
@@ -151,6 +171,18 @@ describe("Git project identity", () => {
     rmSync(join(linked, ".git"));
     expect(resolveGitProjectAnchor(nested)).toBeNull();
     expect(resolveGitProjectAnchor(replacementWorktree)?.canonical).toBe(replacement);
+  });
+
+  it("terminates cached-anchor revalidation when the cached root is no longer an ancestor", () => {
+    const primary = makeRepository(join(root, "primary"));
+    const nested = makeDirectory(join(primary, "nested"));
+    expect(resolveGitProjectAnchor(nested)?.canonical).toBe(primary);
+
+    rmSync(join(primary, ".git"), { recursive: true });
+    pathBoundary.redirectFrom = nested;
+    pathBoundary.redirectTo = makeDirectory(join(root, "unrelated"));
+
+    expect(resolveGitProjectAnchor(nested)).toBeNull();
   });
 
   it("uses an unusual shared Git directory itself as the stable anchor", () => {

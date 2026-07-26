@@ -151,7 +151,9 @@ function revalidateCachedAnchor(
     const anchor = inspectGitMarker(current);
     if (anchor) return anchorsEqual(anchor, cached) ? cached : anchor;
     if (current === cached.worktreeRoot) return undefined;
-    current = dirname(current);
+    const parent = dirname(current);
+    if (parent === current || current === parse(current).root) return undefined;
+    current = parent;
   }
 }
 
