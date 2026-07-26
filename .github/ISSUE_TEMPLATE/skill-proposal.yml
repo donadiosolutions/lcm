@@ -1,5 +1,6 @@
 name: Skill Proposal
 description: Propose a new reusable skill for the org
+type: Feature
 labels: [skill-proposal]
 body:
   - type: input

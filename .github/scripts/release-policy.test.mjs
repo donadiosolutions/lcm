@@ -267,17 +267,30 @@ test("parses changesets and detects invalid package bumps", () => {
   assert.throws(() => parseChangesetDocument(changeset("patch", "")), /must not be empty/u);
 });
 
-test("classifies major changesets before PR labels and fails on conflicting labels", () => {
-  assert.equal(classifyPullRequest(pr(1, ["bug"]), [changeset("major")]), "breaking");
-  assert.equal(classifyPullRequest(pr(2, ["enhancement"])), "features");
-  assert.equal(classifyPullRequest(pr(3, ["bug"])), "fixes");
+test("classifies major changesets and conventional PR titles", () => {
+  assert.equal(classifyPullRequest(pr(1), [changeset("major")]), "breaking");
+  assert.equal(
+    classifyPullRequest(pr(2, [], { title: "feat(triage): add fields" })),
+    "features",
+  );
+  assert.equal(
+    classifyPullRequest(pr(3, [], { title: "fix: repair fields" })),
+    "fixes",
+  );
+  assert.equal(
+    classifyPullRequest(pr(7, [], { title: "feat!: replace API" })),
+    "breaking",
+  );
+  assert.equal(
+    classifyPullRequest(pr(9, [], { title: "refactor(storage)!: replace API" })),
+    "breaking",
+  );
   assert.equal(classifyPullRequest(pr(4)), "extra");
   assert.equal(classifyPullRequest(pr(5, ["no-release-notes"])), undefined);
   assert.equal(
     classifyPullRequest(pr(6, [], { head: { ref: "changeset-release/main" } })),
     undefined,
   );
-  assert.throws(() => classifyPullRequest(pr(7, ["bug", "enhancement"])), /conflicting/u);
   assert.equal(
     classifyPullRequest(
       pr(8, [], { head: { ref: "release/v1.5.0" }, title: "chore: release v1.5.0" }),
@@ -312,10 +325,10 @@ test("classifies major changesets before PR labels and fails on conflicting labe
 
 test("categorizes and deduplicates PRs while preserving every included PR", () => {
   const categorized = categorizeReleasePullRequests([
-    { pr: pr(3, ["bug"]) },
-    { pr: pr(2, ["enhancement"]) },
+    { pr: pr(3, [], { title: "fix: repair startup" }) },
+    { pr: pr(2, [], { title: "feat: add mode" }) },
     { pr: pr(1), changesetContents: [changeset("major", "Break an API.")] },
-    { pr: pr(2, ["enhancement"]) },
+    { pr: pr(2, [], { title: "feat: add mode" }) },
     { pr: pr(4) },
   ]);
   assert.deepEqual(categorized.breaking.map(({ number }) => number), [1]);
@@ -438,7 +451,10 @@ test("paginates every commit-to-PR association lookup", async () => {
 
 test("builds an injection-aware Highlights prompt and validates structured output", () => {
   const categorized = categorizeReleasePullRequests([
-    { pr: pr(1, ["enhancement"]), changesetContents: [changeset("minor", "Add beta releases.")] },
+    {
+      pr: pr(1, [], { title: "feat: add beta releases" }),
+      changesetContents: [changeset("minor", "Add beta releases.")],
+    },
   ]);
   const prompt = buildHighlightsPrompt({
     targetTag: "v1.5.0-beta.0",
@@ -459,7 +475,7 @@ test("builds an injection-aware Highlights prompt and validates structured outpu
 test("renders tag-bound Highlights and omits empty release sections", () => {
   const targetTag = "v1.5.0-beta.2";
   const categorized = categorizeReleasePullRequests([
-    { pr: pr(1, ["enhancement"], { title: "Add [beta] support" }) },
+    { pr: pr(1, [], { title: "feat: add [beta] support" }) },
     { pr: pr(2) },
   ]);
   const notes = renderReleaseNotes({
@@ -474,7 +490,7 @@ test("renders tag-bound Highlights and omits empty release sections", () => {
   assert.match(notes, /## Features/u);
   assert.doesNotMatch(notes, /## Fixes/u);
   assert.match(notes, /## Extra notes/u);
-  assert.ok(notes.includes("Add \\[beta\\] support (#1)"));
+  assert.ok(notes.includes("feat: add \\[beta\\] support (#1)"));
   assertActionCreatedReleaseBody(notes, targetTag);
   assert.throws(() => assertActionCreatedReleaseBody(notes, "v1.5.0-beta.1"), /not created/u);
   assert.throws(

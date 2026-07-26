@@ -14,6 +14,17 @@
 - [ ] Chore / infra / config
 - [ ] Documentation
 
+## Release-note title
+
+<!--
+Use a conventional PR title to select the generated release-note category:
+- fix: ... -> Fixes
+- feat: ... or feature: ... -> Features
+- feat!: ... or type(scope)!: ... -> Breaking changes
+- every other title -> Extra notes
+A major package Changeset also selects Breaking changes.
+-->
+
 ## Testing done
 
 <!-- Describe how you tested. New routes should have tests in test/daemon/routes/. -->

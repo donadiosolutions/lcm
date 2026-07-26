@@ -1,0 +1,54 @@
+{
+  "issueTypes": [
+    "Chore",
+    "Bug",
+    "Feature",
+    "Epic"
+  ],
+  "securityIssueTypes": [
+    "Chore",
+    "Bug"
+  ],
+  "fields": {
+    "priority": {
+      "name": "Priority",
+      "options": [
+        "Urgent",
+        "High",
+        "Medium",
+        "Low"
+      ],
+      "staleExemptOptions": [
+        "Urgent",
+        "High"
+      ]
+    },
+    "securityStatus": {
+      "name": "Security status",
+      "options": [
+        "Triage",
+        "Unaffected",
+        "Affected",
+        "Exploited",
+        "Patched"
+      ]
+    },
+    "securityNature": {
+      "name": "Security nature",
+      "options": [
+        "Administrative",
+        "Transitive",
+        "Direct"
+      ]
+    }
+  },
+  "labels": [
+    "documentation",
+    "question",
+    "research",
+    "dependencies",
+    "github-actions",
+    "release-workflow",
+    "flaky-testing"
+  ]
+}

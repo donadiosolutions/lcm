@@ -146,12 +146,12 @@ export function classifyPullRequest(pr, changesetContents = []) {
   const changesets = changesetContents.map((content) => parseChangesetDocument(content));
   if (changesets.some(({ bump }) => bump === "major")) return "breaking";
 
-  const labels = labelNames(pr);
-  if (labels.has("enhancement") && labels.has("bug")) {
-    throw new Error(`PR #${pr.number} has conflicting enhancement and bug labels`);
-  }
-  if (labels.has("enhancement")) return "features";
-  if (labels.has("bug")) return "fixes";
+  const title = pr.title?.trim() ?? "";
+  const conventional =
+    /^(?<type>[a-z][a-z0-9-]*)(?:\([^)\r\n]+\))?(?<breaking>!)?:\s+/iu.exec(title);
+  if (conventional?.groups?.breaking === "!") return "breaking";
+  if (/^feat(?:ure)?$/iu.test(conventional?.groups?.type ?? "")) return "features";
+  if (/^fix$/iu.test(conventional?.groups?.type ?? "")) return "fixes";
   return "extra";
 }
 

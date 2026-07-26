@@ -1,5 +1,6 @@
 name: Introspection Finding
 description: Actionable finding from agent self-evaluation
+type: Chore
 labels: [introspection]
 body:
   - type: input

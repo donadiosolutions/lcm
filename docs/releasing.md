@@ -81,9 +81,12 @@ contains every change already previewed across its betas. Draft releases are
 ignored until they are manually published.
 
 Every included commit must map to a merged `main` pull request. Major package
-Changesets appear under Breaking changes; otherwise `enhancement` and `bug` PR
-labels select Features and Fixes. All remaining PRs appear under Extra notes.
-The workflow fails instead of substituting commit hashes when a commit has no PR.
+Changesets and any conventional title with a breaking marker, such as `feat!:`
+or `refactor(storage)!:`, appear under Breaking changes. Conventional
+`feat:`/`feature:` titles select Features and `fix:` titles select Fixes;
+scopes such as `feat(cli):` are supported. All remaining PRs appear under
+Extra notes. The workflow fails instead of substituting commit hashes when a
+commit has no PR.
 
 Release publication runs use GitHub's native `queue: max` concurrency mode: up
 to 100 runs wait in one global FIFO queue, so different release tags cannot race
