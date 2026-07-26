@@ -26,6 +26,7 @@ jobs:
         env:
           EXEMPT_LABEL: internal-stale-priority-exempt
         with:
+          github-token: ${{ secrets.CODEX_ISSUE_TRIAGE_WRITE_TOKEN }}
           script: |
             const { join } = await import("node:path");
             const { pathToFileURL } = await import("node:url");

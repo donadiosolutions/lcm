@@ -152,8 +152,27 @@ credential-bearing URL patterns are redacted before issue text enters a model
 prompt.
 
 The OpenAI Platform secret must be named `OPENAI_API_KEY`; GitHub Actions does
-not use a ChatGPT subscription credential. GitHub write permissions remain
-job-local, and checkout never persists credentials.
+not use a ChatGPT subscription credential.
+
+Organization Planning Fields are outside the repository-scoped
+`GITHUB_TOKEN` permission boundary. Configure two fine-grained credentials:
+
+- `CODEX_ISSUE_TRIAGE_READ_TOKEN` is used only by collection jobs. Grant
+  repository Issues read access, organization Issue Fields read access, and
+  read access to Dependabot alerts, code-scanning alerts, secret-scanning
+  alerts, and repository security advisories.
+- `CODEX_ISSUE_TRIAGE_WRITE_TOKEN` is used only by enqueue/application jobs and
+  the Priority-aware stale collector. Grant repository Issues write access and
+  organization Issue Fields read access. It does not need permission to create,
+  update, or delete organization field definitions.
+
+Use fine-grained personal access tokens or GitHub App user/installation tokens
+limited to the `donadiosolutions` organization and `lcm` repository. Never use
+an administrator or classic broad-scope token. Rotate both credentials under
+the repository Actions secrets with the exact names above. The workflow has no
+fallback to `GITHUB_TOKEN`, so a missing credential fails closed before model
+inference or issue mutation. GitHub write permissions remain job-local, and
+checkout never persists credentials.
 
 Use **Actions > Codex issue labeler > Run workflow** to process the current
 queue. An empty queue exits without calling OpenAI. Logs report catalog drift,

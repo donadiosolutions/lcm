@@ -35,6 +35,7 @@ jobs:
         env:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         with:
+          github-token: ${{ secrets.CODEX_ISSUE_TRIAGE_WRITE_TOKEN }}
           script: |
             const { join } = await import("node:path");
             const { pathToFileURL } = await import("node:url");
@@ -155,6 +156,7 @@ jobs:
         id: collect
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
+          github-token: ${{ secrets.CODEX_ISSUE_TRIAGE_READ_TOKEN }}
           script: |
             const { join } = await import("node:path");
             const { pathToFileURL } = await import("node:url");
@@ -321,6 +323,7 @@ jobs:
           CLASSIFICATION_RESULT: ${{ needs.classify.outputs.result }}
           EXPECTED_ISSUE_NUMBERS: ${{ needs.collect.outputs.issue_numbers }}
         with:
+          github-token: ${{ secrets.CODEX_ISSUE_TRIAGE_WRITE_TOKEN }}
           script: |
             const { join } = await import("node:path");
             const { pathToFileURL } = await import("node:url");
@@ -516,6 +519,7 @@ jobs:
         env:
           SECURITY_ISSUE_NUMBERS: ${{ needs.apply-labels.outputs.security_issue_numbers }}
         with:
+          github-token: ${{ secrets.CODEX_ISSUE_TRIAGE_READ_TOKEN }}
           script: |
             const { join } = await import("node:path");
             const { pathToFileURL } = await import("node:url");
@@ -739,6 +743,7 @@ jobs:
           SECURITY_CLASSIFICATION_STATUS: ${{ needs.classify-security.result }}
           SECURITY_RESULT: ${{ needs.classify-security.outputs.result }}
         with:
+          github-token: ${{ secrets.CODEX_ISSUE_TRIAGE_WRITE_TOKEN }}
           script: |
             const { join } = await import("node:path");
             const { pathToFileURL } = await import("node:url");
@@ -921,6 +926,7 @@ jobs:
         env:
           BUG_ISSUE_NUMBERS: ${{ needs.apply-security.outputs.bug_issue_numbers }}
         with:
+          github-token: ${{ secrets.CODEX_ISSUE_TRIAGE_READ_TOKEN }}
           script: |
             const { join } = await import("node:path");
             const { pathToFileURL } = await import("node:url");
@@ -1103,6 +1109,7 @@ jobs:
           DUPLICATE_EVIDENCE: ${{ needs.collect-duplicates.outputs.evidence }}
           DUPLICATE_RESULT: ${{ needs.classify-duplicates.outputs.result }}
         with:
+          github-token: ${{ secrets.CODEX_ISSUE_TRIAGE_WRITE_TOKEN }}
           script: |
             const { join } = await import("node:path");
             const { pathToFileURL } = await import("node:url");

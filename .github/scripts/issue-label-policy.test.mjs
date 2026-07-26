@@ -481,6 +481,26 @@ test("workflow binds evidence and the required model split", async () => {
     new URL("../workflows/codex-issue-labeler.yml", import.meta.url),
     "utf8",
   );
+  assert.equal(
+    (
+      workflow.match(
+        /github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_READ_TOKEN \}\}/gu,
+      ) ?? []
+    ).length,
+    3,
+  );
+  assert.equal(
+    (
+      workflow.match(
+        /github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/gu,
+      ) ?? []
+    ).length,
+    4,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /github-token: \$\{\{ (?:github\.token|secrets\.GITHUB_TOKEN) \}\}/u,
+  );
   assert.match(
     workflow,
     /const sourceCreatedAt = source\.created_at;/u,
@@ -576,6 +596,10 @@ test("workflow binds evidence and the required model split", async () => {
   const staleWorkflow = await readFile(
     new URL("../workflows/stale.yml", import.meta.url),
     "utf8",
+  );
+  assert.match(
+    staleWorkflow,
+    /github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/u,
   );
   assert.match(staleWorkflow, /issueFieldValues\(first: 100\)/u);
   assert.match(
