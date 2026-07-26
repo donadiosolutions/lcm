@@ -690,18 +690,15 @@ jobs:
             async function collectRoute(key, route, variants) {
               for (const variant of variants) {
                 let collectedForState = 0;
-                for (
-                  let page = 1;
-                  page <= SECURITY_API_MAX_PAGES_PER_STATE;
-                  page += 1
-                ) {
-                  try {
-                    const response = await github.request(route, {
-                      ...context.repo,
-                      ...variant,
-                      page,
-                      per_page: SECURITY_API_PER_PAGE,
-                    });
+                try {
+                  const iterator = github.paginate.iterator(route, {
+                    ...context.repo,
+                    ...variant,
+                    per_page: SECURITY_API_PER_PAGE,
+                  });
+                  let pageCount = 0;
+                  for await (const response of iterator) {
+                    pageCount += 1;
                     if (!Array.isArray(response.data)) {
                       throw new Error(`${key} returned a non-array response`);
                     }
@@ -714,21 +711,21 @@ jobs:
                     rawEvidence[key].push(...boundedPage);
                     collectedForState += boundedPage.length;
                     if (
-                      response.data.length < SECURITY_API_PER_PAGE
+                      pageCount >= SECURITY_API_MAX_PAGES_PER_STATE
                       || collectedForState >= SECURITY_API_MAX_RESULTS_PER_STATE
                       || rawEvidence[key].length
                         >= SECURITY_API_MAX_RESULTS_PER_SOURCE
                     ) {
                       break;
                     }
-                  } catch (error) {
-                    const status = Number(error?.status);
-                    if ([403, 404, 422].includes(status)) {
-                      accessIssues.push(`${key} unavailable (${status})`);
-                      return;
-                    }
-                    throw error;
                   }
+                } catch (error) {
+                  const status = Number(error?.status);
+                  if ([403, 404, 422].includes(status)) {
+                    accessIssues.push(`${key} unavailable (${status})`);
+                    return;
+                  }
+                  throw error;
                 }
               }
             }
