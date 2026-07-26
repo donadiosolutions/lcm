@@ -330,6 +330,44 @@ describe("PostgreSQL native transcript repository", () => {
     expect(JSON.stringify(db.query.mock.calls)).not.toContain("unsafe-session");
   });
 
+  it("aggregates message links set-wise across every transcript read", async () => {
+    const db = executor(successfulQuery);
+    const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
+
+    await repository.getById(transcriptId);
+    await repository.listByNativeSession({ nativeSessionId: "session-a" });
+    await repository.listBySource(batch);
+    await repository.listByMessage({ conversationId: 41, messageId: 51 });
+
+    const transcriptReads = db.query.mock.calls
+      .map(([config]) => config as QueryConfig<unknown[]>)
+      .filter(({ text }) =>
+        text.includes("FROM lcm.native_transcripts AS transcript"));
+    expect(transcriptReads).toHaveLength(4);
+    for (const { text, values } of transcriptReads) {
+      expect(text.match(
+        /LEFT JOIN lcm\.transcript_messages AS link/gu,
+      )).toHaveLength(1);
+      expect(text).toContain(
+        "ON link.project_id = transcript.project_id",
+      );
+      expect(text).toContain(
+        "AND link.transcript_id = transcript.transcript_id",
+      );
+      expect(text).toContain(
+        "FILTER (WHERE link.transcript_id IS NOT NULL)",
+      );
+      expect(text).toContain("GROUP BY transcript.transcript_id");
+      expect(text).not.toMatch(
+        /SELECT\s+pg_catalog\.jsonb_agg/gu,
+      );
+      expect(values?.[0]).toBe(projectId);
+    }
+    expect(transcriptReads[3]?.text).toContain(
+      "GROUP BY transcript.transcript_id, selected_link.source_ordinal",
+    );
+  });
+
   it("atomically imports records and exposes every provenance query", async () => {
     const db = executor(successfulQuery);
     const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
@@ -401,8 +439,8 @@ describe("PostgreSQL native transcript repository", () => {
     );
     expect(transcriptInsert?.text).toContain("$7, $8, $9, $9, $10");
     expect(db.query.mock.calls.find(([config]) =>
-      config.text.includes("jsonb_agg"))?.[0].text).toContain(
-        "link.source_ordinal,\n                        link.message_id,\n                        link.conversation_id",
+      config.text.includes("jsonb_agg"))?.[0].text).toMatch(
+        /ORDER BY link\.source_ordinal,\s+link\.message_id,\s+link\.conversation_id/gu,
       );
   });
 
@@ -1015,6 +1053,15 @@ describe("PostgreSQL native transcript repository", () => {
     ).resolves.toMatchObject({ importedCount: 0, skippedCount: 1 });
     expect(exactMatchQuery?.text).toContain(
       "AND transcript.source_ordinal = $8",
+    );
+    expect(exactMatchQuery?.text).toContain(
+      "LEFT JOIN lcm.transcript_messages AS link",
+    );
+    expect(exactMatchQuery?.text).toContain(
+      "GROUP BY transcript.transcript_id",
+    );
+    expect(exactMatchQuery?.text).not.toMatch(
+      /SELECT\s+pg_catalog\.jsonb_agg/gu,
     );
     expect(exactMatchQuery?.text).not.toContain(
       "transcript.observed_at =",

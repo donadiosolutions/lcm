@@ -495,6 +495,133 @@ describe("PostgreSQL 18 native transcript repository", () => {
     });
   });
 
+  it("aggregates ordered links once without multiplying transcript rows", async () => {
+    await withPostgreSqlTestDatabase("native-transcript-link-aggregate", async (database) => {
+      await grantTranscriptRuntimePrivileges(database);
+      const scope = await createScope(database, "Native transcript link aggregate");
+      const repository = new PostgreSqlNativeTranscriptRepository(
+        database.runtime,
+        scope.projectId,
+      );
+      const secondMessage = await database.migrator.query<{
+        message_id: string;
+      }>({
+        text: `INSERT INTO lcm.messages (
+                 project_id, conversation_id, seq, role, content, token_count
+               )
+               VALUES ($1, $2, 1, 'assistant', 'aggregate-second', 1)
+               RETURNING message_id`,
+        values: [scope.projectId, scope.conversationId],
+      }, {
+        domain: "conversations",
+        operation: "createAggregateTestMessage",
+      });
+      const linkedPayload = { type: "message", content: "linked" };
+      const unlinkedPayload = { type: "event", content: "unlinked" };
+      const transcripts = await database.migrator.query<{
+        transcript_id: string;
+        source_ordinal: string;
+      }>({
+        text: `INSERT INTO lcm.native_transcripts (
+                 project_id, machine_id, client_name, format_name,
+                 format_version, native_session_id, source_locator,
+                 source_ordinal, observed_at, scrubber_version,
+                 content_sha256, ingest_key, native_payload
+               )
+               VALUES
+                 (
+                   $1, $2, 'codex', 'codex-jsonl', 'v1',
+                   'aggregate-session', 'aggregate/session.jsonl',
+                   1, '2026-01-01T00:00:00.000Z', 'scrubber-v1',
+                   $3, $4, $5::pg_catalog.jsonb
+                 ),
+                 (
+                   $1, $2, 'codex', 'codex-jsonl', 'v1',
+                   'aggregate-session', 'aggregate/session.jsonl',
+                   2, '2026-01-01T00:00:01.000Z', 'scrubber-v1',
+                   $6, $7, $8::pg_catalog.jsonb
+                 )
+               RETURNING transcript_id, source_ordinal`,
+        values: [
+          scope.projectId,
+          scope.machineId,
+          nativePayloadDigest(linkedPayload),
+          "a".repeat(64),
+          JSON.stringify(linkedPayload),
+          nativePayloadDigest(unlinkedPayload),
+          "b".repeat(64),
+          JSON.stringify(unlinkedPayload),
+        ],
+      }, {
+        domain: "native-transcripts",
+        operation: "createAggregateTestTranscripts",
+      });
+      const linkedTranscriptId = transcripts.rows.find(
+        ({ source_ordinal }) => Number(source_ordinal) === 1,
+      )!.transcript_id;
+      const unlinkedTranscriptId = transcripts.rows.find(
+        ({ source_ordinal }) => Number(source_ordinal) === 2,
+      )!.transcript_id;
+      await database.migrator.query({
+        text: `INSERT INTO lcm.transcript_messages (
+                 project_id, transcript_id, conversation_id,
+                 message_id, source_ordinal
+               )
+               VALUES
+                 ($1, $2, $3, $4, 5),
+                 ($1, $2, $3, $5, 1)`,
+        values: [
+          scope.projectId,
+          linkedTranscriptId,
+          scope.conversationId,
+          scope.messageId,
+          secondMessage.rows[0].message_id,
+        ],
+      }, {
+        domain: "native-transcripts",
+        operation: "createAggregateTestLinks",
+      });
+
+      const sourceRows = await repository.listBySource({
+        machineId: scope.machineId,
+        clientName: "codex",
+        sourceLocator: "aggregate/session.jsonl",
+      });
+      expect(sourceRows).toHaveLength(2);
+      expect(sourceRows.map(({ transcriptId }) => transcriptId)).toEqual([
+        linkedTranscriptId,
+        unlinkedTranscriptId,
+      ]);
+      expect(sourceRows[0].messageLinks.map(({ sourceOrdinal }) =>
+        sourceOrdinal)).toEqual([1, 5]);
+      expect(sourceRows[1].messageLinks).toEqual([]);
+
+      await expect(repository.listByNativeSession({
+        nativeSessionId: "aggregate-session",
+      })).resolves.toHaveLength(2);
+      await expect(repository.getById(unlinkedTranscriptId)).resolves
+        .toMatchObject({ messageLinks: [] });
+      await expect(repository.listByMessage({
+        conversationId: scope.conversationId,
+        messageId: scope.messageId,
+      })).resolves.toEqual([
+        expect.objectContaining({
+          transcriptId: linkedTranscriptId,
+          messageLinks: [
+            expect.objectContaining({
+              messageId: Number(secondMessage.rows[0].message_id),
+              sourceOrdinal: 1,
+            }),
+            expect.objectContaining({
+              messageId: scope.messageId,
+              sourceOrdinal: 5,
+            }),
+          ],
+        }),
+      ]);
+    });
+  });
+
   it("serializes concurrent retries and rolls failed batches back completely", async () => {
     await withPostgreSqlTestDatabase("native-transcript-atomicity", async (database) => {
       await grantTranscriptRuntimePrivileges(database);

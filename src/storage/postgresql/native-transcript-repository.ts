@@ -51,24 +51,25 @@ const TRANSCRIPT_COLUMNS = `
   transcript.ingest_key,
   transcript.native_payload,
   COALESCE(
-    (
-      SELECT pg_catalog.jsonb_agg(
-               pg_catalog.jsonb_build_object(
-                 'transcript_id', link.transcript_id,
-                 'conversation_id', link.conversation_id,
-                 'message_id', link.message_id,
-                 'source_ordinal', link.source_ordinal
-               )
-               ORDER BY link.source_ordinal,
-                        link.message_id,
-                        link.conversation_id
-             )
-      FROM lcm.transcript_messages AS link
-      WHERE link.project_id = transcript.project_id
-        AND link.transcript_id = transcript.transcript_id
-    ),
+    pg_catalog.jsonb_agg(
+      pg_catalog.jsonb_build_object(
+        'transcript_id', link.transcript_id,
+        'conversation_id', link.conversation_id,
+        'message_id', link.message_id,
+        'source_ordinal', link.source_ordinal
+      )
+      ORDER BY link.source_ordinal,
+               link.message_id,
+               link.conversation_id
+    ) FILTER (WHERE link.transcript_id IS NOT NULL),
     '[]'::pg_catalog.jsonb
   ) AS message_links
+`.trim();
+
+const TRANSCRIPT_LINK_JOIN = `
+  LEFT JOIN lcm.transcript_messages AS link
+    ON link.project_id = transcript.project_id
+   AND link.transcript_id = transcript.transcript_id
 `.trim();
 
 type PostgreSqlNativeTranscriptContext = PostgreSqlOperationContext & {
@@ -1029,8 +1030,10 @@ implements
     const rows = await this.readTranscripts(operation, {
       text: `SELECT ${TRANSCRIPT_COLUMNS}
              FROM lcm.native_transcripts AS transcript
+             ${TRANSCRIPT_LINK_JOIN}
              WHERE transcript.project_id = $1
-               AND transcript.transcript_id = $2`,
+               AND transcript.transcript_id = $2
+             GROUP BY transcript.transcript_id`,
       values: [this.projectId, canonicalTranscriptId],
     });
     return rows[0] ?? null;
@@ -1050,10 +1053,12 @@ implements
     return this.readTranscripts(operation, {
       text: `SELECT ${TRANSCRIPT_COLUMNS}
              FROM lcm.native_transcripts AS transcript
+             ${TRANSCRIPT_LINK_JOIN}
              WHERE transcript.project_id = $1
                AND transcript.native_session_id_sha256 =
                    public.digest($2, 'sha256')
                AND transcript.native_session_id = $2
+             GROUP BY transcript.transcript_id
              ORDER BY transcript.observed_at, transcript.transcript_id`,
       values: [this.projectId, nativeSessionId],
     });
@@ -1067,10 +1072,12 @@ implements
     return this.readTranscripts(operation, {
       text: `SELECT ${TRANSCRIPT_COLUMNS}
              FROM lcm.native_transcripts AS transcript
+             ${TRANSCRIPT_LINK_JOIN}
              WHERE transcript.project_id = $1
                AND transcript.machine_id = $2
                AND transcript.client_name = $3
                AND transcript.source_locator = $4
+             GROUP BY transcript.transcript_id
              ORDER BY transcript.source_ordinal, transcript.transcript_id`,
       values: [
         this.projectId,
@@ -1104,9 +1111,11 @@ implements
              INNER JOIN lcm.transcript_messages AS selected_link
                ON selected_link.project_id = transcript.project_id
               AND selected_link.transcript_id = transcript.transcript_id
+             ${TRANSCRIPT_LINK_JOIN}
              WHERE transcript.project_id = $1
                AND selected_link.conversation_id = $2
                AND selected_link.message_id = $3
+             GROUP BY transcript.transcript_id, selected_link.source_ordinal
              ORDER BY selected_link.source_ordinal, transcript.transcript_id`,
       values: [this.projectId, conversationId, messageId],
     });
@@ -1360,9 +1369,11 @@ implements
                       AND transcript.native_payload = $11::pg_catalog.jsonb
                     ) AS exact_match
              FROM lcm.native_transcripts AS transcript
+             ${TRANSCRIPT_LINK_JOIN}
              WHERE transcript.project_id = $1
                AND transcript.machine_id = $2
-               AND transcript.ingest_key = $10`,
+               AND transcript.ingest_key = $10
+             GROUP BY transcript.transcript_id`,
       values: [
         this.projectId,
         batch.machineId,
