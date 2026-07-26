@@ -601,6 +601,47 @@ test("workflow binds evidence and the required model split", async () => {
     staleWorkflow,
     /github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/u,
   );
+  const markerStep = staleWorkflow.slice(
+    staleWorkflow.indexOf(
+      "- name: Mark configured high-priority issues as temporarily exempt",
+    ),
+    staleWorkflow.indexOf("- uses: actions/stale@"),
+  );
+  const staleActionStep = staleWorkflow.slice(
+    staleWorkflow.indexOf("- uses: actions/stale@"),
+    staleWorkflow.indexOf(
+      "- name: Remove temporary Priority exemption markers",
+    ),
+  );
+  const cleanupStep = staleWorkflow.slice(
+    staleWorkflow.indexOf(
+      "- name: Remove temporary Priority exemption markers",
+    ),
+  );
+  assert.match(
+    markerStep,
+    /github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/u,
+  );
+  assert.match(
+    staleActionStep,
+    /repo-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/u,
+  );
+  assert.match(
+    cleanupStep,
+    /github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/u,
+  );
+  assert.equal(
+    (
+      staleWorkflow.match(
+        /\$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/gu,
+      ) ?? []
+    ).length,
+    3,
+  );
+  assert.doesNotMatch(
+    staleWorkflow,
+    /\$\{\{ (?:github\.token|secrets\.GITHUB_TOKEN) \}\}/u,
+  );
   assert.match(staleWorkflow, /issueFieldValues\(first: 100\)/u);
   assert.match(
     staleWorkflow,

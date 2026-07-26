@@ -162,17 +162,22 @@ Organization Planning Fields are outside the repository-scoped
   read access to Dependabot alerts, code-scanning alerts, secret-scanning
   alerts, and repository security advisories.
 - `CODEX_ISSUE_TRIAGE_WRITE_TOKEN` is used only by enqueue/application jobs and
-  the Priority-aware stale collector. Grant repository Issues write access and
-  organization Issue Fields read access. It does not need permission to create,
-  update, or delete organization field definitions.
+  every mutating step in the Priority-aware stale collector: creating and
+  applying temporary exemption markers, running `actions/stale`, and removing
+  those markers during the `always()` cleanup. Grant repository Issues write
+  access and organization Issue Fields read access. It does not need permission
+  to create, update, or delete organization field definitions.
 
 Use fine-grained personal access tokens or GitHub App user/installation tokens
 limited to the `donadiosolutions` organization and `lcm` repository. Never use
 an administrator or classic broad-scope token. Rotate both credentials under
-the repository Actions secrets with the exact names above. The workflow has no
-fallback to `GITHUB_TOKEN`, so a missing credential fails closed before model
-inference or issue mutation. GitHub write permissions remain job-local, and
-checkout never persists credentials.
+the repository Actions secrets with the exact names above. Neither issue triage
+nor any mutating stale step falls back to `GITHUB_TOKEN`. A missing or invalid
+read credential blocks collection and model inference; a missing or invalid
+write credential prevents issue, label, and Planning Field mutation. The stale
+cleanup step uses the same explicit write credential even when it runs under
+`always()`. GitHub write permissions remain job-local, and checkout never
+persists credentials.
 
 Use **Actions > Codex issue labeler > Run workflow** to process the current
 queue. An empty queue exits without calling OpenAI. Logs report catalog drift,
