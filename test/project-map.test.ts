@@ -145,6 +145,25 @@ describe("project map", () => {
       .toBe(normalizeProjectPath(join(homedir(), "identity-plain")));
   });
 
+  it("shows the canonical mapped entry for an explicit linked-worktree path", () => {
+    const primary = makeDir("show-linked-primary");
+    const admin = join(primary, ".git", "worktrees", "linked");
+    mkdirSync(join(primary, ".git", "objects"), { recursive: true });
+    mkdirSync(admin, { recursive: true });
+    writeFileSync(join(primary, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(primary, ".git", "config"), "[core]\nrepositoryformatversion = 0\n");
+    writeFileSync(join(admin, "HEAD"), "ref: refs/heads/linked\n");
+    writeFileSync(join(admin, "commondir"), "../..\n");
+    const linked = makeDir("show-linked-worktree");
+    writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`);
+
+    const identity = resolveProjectIdentity(primary);
+    expect(showProjectMapEntry(linked)).toEqual({
+      hash: identity.id,
+      entry: listProjectMapEntries()[identity.id],
+    });
+  });
+
   it("folds reconciliation entries atomically and rejects stale or conflicting inputs", () => {
     const target = makeDir("fold-target");
     const source = makeDir("fold-source");

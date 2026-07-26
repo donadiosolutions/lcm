@@ -478,6 +478,55 @@ describe("worktree reconciliation", () => {
     expect(existsSync(join(home, ".lcm", "oldmaps"))).toBe(true);
   });
 
+  it("does not reconcile a separate clone merely because it owns an explicit alias", () => {
+    const { main } = makeRepository(home);
+    const clone = join(home, "separate-clone");
+    execFileSync("git", ["clone", "-q", main, clone], { stdio: "ignore" });
+    git(clone, "remote", "set-url", "origin", "https://example.invalid/lcm.git");
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const cloneCanonical = resolveGitProjectAnchor(clone)!.canonical;
+    const cloneHash = hashProjectPath(cloneCanonical);
+    const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
+    const mapPath = projectMapPath();
+    writeFileSync(mapPath, `${JSON.stringify({
+      [cloneHash]: {
+        canonical: cloneCanonical,
+        aliases: [canonical],
+        remoteProjectId,
+      },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const cloneDbPath = join(home, ".lcm", "projects", cloneHash, "db.sqlite");
+    makeDatabase(cloneDbPath, "explicit-clone-alias", "separate clone", cloneHash);
+    const cloneStoreInode = statSync(cloneDbPath).ino;
+    const mapBefore = readFileSync(mapPath, "utf8");
+
+    expect(projectDbPath(main)).toBe(cloneDbPath);
+    expect(readFileSync(mapPath, "utf8")).toBe(mapBefore);
+    expect(statSync(cloneDbPath).ino).toBe(cloneStoreInode);
+    expect(existsSync(join(home, ".lcm", "projects", targetHash))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    expect(listProjectMapEntries()).toEqual({
+      [cloneHash]: {
+        canonical: cloneCanonical,
+        aliases: [canonical],
+        remoteProjectId,
+      },
+    });
+    const cloneStore = new DatabaseSync(cloneDbPath, { readOnly: true });
+    expect(cloneStore.prepare(
+      "SELECT session_id FROM conversations WHERE session_id = 'explicit-clone-alias'",
+    ).get()).toEqual({ session_id: "explicit-clone-alias" });
+    cloneStore.close();
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      targetHash,
+      phase: "completed",
+      sourceHashes: [],
+    }]);
+    expect(listWorktreeReconciliationJournals()[0]).not.toHaveProperty("remoteProjectId");
+  });
+
   it("blocks conflicting remote identities without changing state", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
@@ -2239,7 +2288,7 @@ describe("worktree reconciliation", () => {
       },
     }, null, 2)}\n`);
     clearProjectMapCache();
-    expect(() => reconcileWorktrees(main, { dryRun: true })).toThrow("working directory is not a directory");
+    expect(reconcileWorktrees(main, { dryRun: true }).status).toBe("not-needed");
   });
 
   it("does not cache first-use reconciliation while the Codex catalogue is incomplete", () => {

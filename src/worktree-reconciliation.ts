@@ -1181,9 +1181,8 @@ function discoverSources(
   const matches = new Map<string, ProjectMapEntry>();
   for (const [hash, entry] of Object.entries(map)) {
     let sameRepository = hash === targetHash;
-    for (const path of entryPaths(entry)) {
-      if (!existsSync(path)) continue;
-      const anchor = resolveGitProjectAnchor(path);
+    if (!sameRepository && existsSync(entry.canonical)) {
+      const anchor = resolveGitProjectAnchor(entry.canonical);
       if (anchor?.commonDir === commonDir) sameRepository = true;
     }
     if (sameRepository) {

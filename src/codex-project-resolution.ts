@@ -165,7 +165,14 @@ function buildProjectIndex(codexDir?: string, mapSnapshot?: ProjectMap): CodexPr
   for (const [hash, entry] of Object.entries(map)) {
     for (const path of entryPaths(entry)) {
       if (!isDirectory(path)) continue;
-      const anchor = resolveGitProjectAnchor(path);
+      let anchor: ReturnType<typeof resolveGitProjectAnchor>;
+      try {
+        anchor = resolveGitProjectAnchor(path);
+      } catch {
+        // A stale or malicious mapped Git marker is not project evidence and
+        // must not prevent other verified local projects from importing.
+        continue;
+      }
       if (!anchor) continue;
       const current = byCommonDir.get(anchor.commonDir);
       const remoteUrl = repositoryUrl(anchor.canonical);

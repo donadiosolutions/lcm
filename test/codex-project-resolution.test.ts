@@ -108,6 +108,29 @@ describe("Codex project resolution", () => {
     });
   });
 
+  it("skips malformed mapped Git paths while resolving a valid session", () => {
+    const main = repository(home, "valid-with-bad-map", "https://example.invalid/valid.git");
+    const validHash = resolveProjectIdentity(main).id;
+    const malformed = join(home, "malformed-mapped-git");
+    const outside = join(home, "outside-git-marker");
+    mkdirSync(malformed);
+    mkdirSync(outside);
+    symlinkSync(outside, join(malformed, ".git"));
+    const malformedHash = hashProjectPath(malformed);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [validHash]: { canonical: main, aliases: [] },
+      [malformedHash]: { canonical: malformed, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    transcript(codexDir, "valid-session", main, "https://example.invalid/valid.git");
+
+    expect(resolveCodexSessions(codexDir)[0].resolution).toMatchObject({
+      status: "resolved",
+      canonical: main,
+      evidence: "live-git",
+    });
+  });
+
   it("indexes every mapped Git alias even when it is a separate clone", () => {
     const remote = "https://example.invalid/mapped-alias.git";
     const main = repository(home, "mapped-main", remote);

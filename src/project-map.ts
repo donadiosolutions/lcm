@@ -585,13 +585,13 @@ export function showProjectMapEntry(target?: string): { hash: string; entry: Pro
     }
     return { hash: matches[0][0], entry: matches[0][1] };
   }
-  const matches = findPathMatches(map, target);
-  if (matches.size > 1) throw new Error(`project path maps to multiple hashes: ${target} (${[...matches].join(", ")})`);
+  const matches = findPathMatches(map, targetPath);
+  if (matches.size > 1) throw new Error(`project path maps to multiple hashes: ${targetPath} (${[...matches].join(", ")})`);
   if (matches.size === 1) {
     const hash = [...matches][0];
     return { hash, entry: map[hash] };
   }
-  const canonical = normalizeProjectPath(target);
+  const canonical = normalizeProjectPath(targetPath);
   return { hash: hashProjectPath(canonical), entry: { canonical, aliases: [] }, transient: true };
 }
 
