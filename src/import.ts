@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync, existsSync, lstatSync } from "node:fs";
-import { join, basename, resolve } from "node:path";
+import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import type { DaemonClient } from "./daemon/client.js";
 import { formatNumber, formatRatio } from "./stats.js";
@@ -7,7 +7,7 @@ import type { ProgressState } from "./cli/progress-state.js";
 import type { TranscriptClient } from "./transcript-provider.js";
 import { lcmHomeDir } from "./runtime-paths.js";
 import { projectId } from "./daemon/project.js";
-import { resolveProjectIdentity } from "./project-map.js";
+import { normalizeProjectPath, resolveProjectIdentity } from "./project-map.js";
 import { resolveCodexSessions } from "./codex-project-resolution.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
@@ -333,7 +333,7 @@ export async function importSessions(
       if (
         resolution.status === "unresolved"
         && session.metadata?.cwd !== undefined
-        && resolve(session.metadata.cwd) === resolve(current.canonical)
+        && normalizeProjectPath(session.metadata.cwd) === normalizeProjectPath(current.canonical)
       ) {
         resolution = {
           status: "resolved",

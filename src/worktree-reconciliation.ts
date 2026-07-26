@@ -1019,13 +1019,19 @@ function isProjectPathFence(path: string, hash: string): boolean {
 }
 
 function isEventsPathFence(path: string, hash: string): boolean {
-  const stat = lstatSync(path);
-  if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
-  const marker = join(path, "fence.json");
-  return readBoundedRegularFile(marker, {
-    allowedRoot: path,
-    maxBytes: 1024,
-  }) === sourceFenceContent(hash, "events");
+  try {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+    const marker = join(path, "fence.json");
+    const content = readBoundedRegularFile(marker, {
+      allowedRoot: path,
+      maxBytes: 1024,
+    });
+    JSON.parse(content);
+    return content === sourceFenceContent(hash, "events");
+  } catch {
+    return false;
+  }
 }
 
 function installFilesystemFences(
@@ -1555,7 +1561,7 @@ export function reconcileWorktrees(
           throw new Error("published worktree reconciliation map does not match its journal");
         }
       } else {
-        const folded = foldProjectMapEntriesLocked({
+        foldProjectMapEntriesLocked({
           targetHash,
           canonical,
           sourceHashes: pendingSourceHashes,

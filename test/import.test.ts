@@ -932,6 +932,46 @@ describe("importSessions — provider: codex", () => {
     });
   });
 
+  it("imports a Codex cwd symlink to the current canonical project", async () => {
+    const cwd = makeTmpDir();
+    resolveProjectIdentity(cwd);
+    const symlinkedCwd = join(makeTmpDir(), "current-project-link");
+    symlinkSync(cwd, symlinkedCwd);
+    const codexDir = makeTmpDir();
+    const archived = join(codexDir, "archived_sessions");
+    mkdirSync(archived, { recursive: true });
+    writeFileSync(join(archived, "symlink-cwd.jsonl"), [
+      makeCodexSessionMetaLine("symlink-cwd", symlinkedCwd),
+      makeCodexResponseItemLine("user", "through symlink"),
+    ].join("\n"));
+    const calls: unknown[] = [];
+
+    const result = await importSessions(makeMockClient(async (_path, body) => {
+      calls.push(body);
+      return { ingested: 1, totalTokens: 10 };
+    }), { provider: "codex", cwd, _codexDir: codexDir });
+
+    expect(result.imported).toBe(1);
+    expect(calls[0]).toMatchObject({ cwd });
+  });
+
+  it("does not import a Codex cwd through a broken symlink", async () => {
+    const cwd = makeTmpDir();
+    resolveProjectIdentity(cwd);
+    const codexDir = makeTmpDir();
+    const archived = join(codexDir, "archived_sessions");
+    const brokenCwd = join(codexDir, "broken-cwd");
+    mkdirSync(archived, { recursive: true });
+    symlinkSync(join(codexDir, "missing-target"), brokenCwd);
+    writeFileSync(join(archived, "broken-cwd.jsonl"), makeCodexSessionMetaLine("broken-cwd", brokenCwd));
+
+    const client = makeMockClient(async () => ({ ingested: 1, totalTokens: 10 }));
+    const result = await importSessions(client, { provider: "codex", cwd, _codexDir: codexDir });
+
+    expect(client.post).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ imported: 0, unresolved: 1 });
+  });
+
   it("uses the transcript filename when verified session metadata has no thread ID", async () => {
     const cwd = makeTmpDir();
     resolveProjectIdentity(cwd);

@@ -2091,21 +2091,66 @@ describe("worktree reconciliation", () => {
     })).toThrow("crash before prepared fence marker");
 
     const eventsPath = join(home, ".lcm", "events", `${sourceHash}.db`);
-    expect(existsSync(`${eventsPath}.lcm-fence-pending`)).toBe(true);
     const prepared = `${eventsPath}.lcm-fence-pending`;
-    writeFileSync(join(prepared, "unexpected"), "unexpected");
-    expect(() => reconcileWorktrees(main)).toThrow("invalid prepared events fence");
-    rmSync(join(prepared, "unexpected"));
-    writeFileSync(join(prepared, "fence.json"), "invalid");
-    expect(() => reconcileWorktrees(main)).toThrow("invalid prepared events fence");
-    writeFileSync(
-      join(prepared, "fence.json"),
-      `${JSON.stringify({ version: 1, hash: sourceHash, kind: "events" })}\n`,
-    );
+    expect(existsSync(prepared)).toBe(true);
+    expect(existsSync(join(prepared, "fence.json"))).toBe(false);
     expect(reconcileWorktrees(main).status).toBe("completed");
     expect(statSync(eventsPath).isDirectory()).toBe(true);
     expect(existsSync(join(eventsPath, "fence.json"))).toBe(true);
   });
+
+  it.each(["valid", "unreadable", "malformed", "unexpected-entry"])(
+    "handles a %s prepared events fence marker",
+    (markerState) => {
+      const { main, linked } = makeRepository(home);
+      const canonical = resolveGitProjectAnchor(main)!.canonical;
+      const targetHash = hashProjectPath(canonical);
+      const sourceHash = hashProjectPath(linked);
+      writeFileSync(projectMapPath(), `${JSON.stringify({
+        [targetHash]: { canonical, aliases: [] },
+        [sourceHash]: { canonical: linked, aliases: [] },
+      }, null, 2)}\n`);
+      clearProjectMapCache();
+      makeDatabase(
+        join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+        `prepared-events-${markerState}`,
+        "content",
+        sourceHash,
+      );
+      expect(() => reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event === "after-events-fence-directory-prepared") {
+            throw new Error("crash before prepared fence marker");
+          }
+        },
+      })).toThrow("crash before prepared fence marker");
+      const prepared = join(
+        home,
+        ".lcm",
+        "events",
+        `${sourceHash}.db.lcm-fence-pending`,
+      );
+      if (markerState === "valid") {
+        writeFileSync(
+          join(prepared, "fence.json"),
+          `${JSON.stringify({ version: 1, hash: sourceHash, kind: "events" })}\n`,
+        );
+      } else if (markerState === "unreadable") {
+        mkdirSync(join(prepared, "fence.json"));
+      } else if (markerState === "malformed") {
+        writeFileSync(join(prepared, "fence.json"), "{");
+      } else {
+        writeFileSync(join(prepared, "unexpected"), "unexpected");
+      }
+
+      if (markerState === "valid") {
+        expect(reconcileWorktrees(main).status).toBe("completed");
+      } else {
+        expect(() => reconcileWorktrees(main)).toThrow("invalid prepared events fence");
+        expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+      }
+    },
+  );
 
   it("journals the map backup before publishing the folded project map", () => {
     const { main, linked } = makeRepository(home);
@@ -2609,10 +2654,17 @@ describe("worktree reconciliation", () => {
 
     rmSync(sourceDir, { force: true });
     const eventsPath = join(home, ".lcm", "events", `${sourceHash}.db`);
-    mkdirSync(eventsPath, { recursive: true });
-    writeFileSync(join(eventsPath, "fence.json"), "invalid events fence");
-    writeFileSync(journalPath, JSON.stringify(journal));
-    expect(() => reconcileWorktrees(main)).toThrow("invalid legacy events state path");
+    for (const markerState of ["missing", "unreadable", "malformed"]) {
+      rmSync(eventsPath, { recursive: true, force: true });
+      mkdirSync(eventsPath, { recursive: true });
+      if (markerState === "unreadable") {
+        mkdirSync(join(eventsPath, "fence.json"));
+      } else if (markerState === "malformed") {
+        writeFileSync(join(eventsPath, "fence.json"), "{");
+      }
+      writeFileSync(journalPath, JSON.stringify(journal));
+      expect(() => reconcileWorktrees(main)).toThrow("invalid legacy events state path");
+    }
   });
 
   it("rejects retired paths recreated between archival and fence publication", () => {
