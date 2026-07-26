@@ -409,6 +409,22 @@ function row(db: DatabaseSync, sql: string, ...params: SQLInputValue[]): SqlRow 
   return db.prepare(sql).get(...params) as SqlRow | undefined;
 }
 
+function legacyEventsSchemaVersion(db: DatabaseSync): number {
+  if (!tableExists(db, "schema_version")) return 1;
+  const value = row(db, "SELECT version FROM schema_version")?.version;
+  if (value === undefined) return 1;
+  if (typeof value !== "number") {
+    throw new Error(`legacy events database has invalid schema_version: ${String(value)}`);
+  }
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`legacy events database has invalid schema_version: ${String(value)}`);
+  }
+  if (value < 1) {
+    throw new Error(`legacy events database has invalid schema_version: ${String(value)}`);
+  }
+  return value;
+}
+
 function comparable(value: unknown): string {
   return JSON.stringify(value);
 }
@@ -921,9 +937,7 @@ function mergeEventsDatabase(
             : Number(insertRow(target, "events", value));
           eventMap.set(sourceId, targetId);
         }
-        const sourceSchemaVersion = Number(
-          row(source, "SELECT version FROM schema_version")?.version,
-        );
+        const sourceSchemaVersion = legacyEventsSchemaVersion(source);
         const sourceHasErrorLog = tableExists(source, "error_log");
         if (!sourceHasErrorLog && sourceSchemaVersion !== 1) {
           throw new Error(
@@ -1890,5 +1904,6 @@ export function listWorktreeReconciliationJournals(homeDir?: string): Reconcilia
   if (!existsSync(root)) return [];
   return readdirSync(root, { withFileTypes: true })
     .filter((entry) => entry.isFile() && /^[a-f0-9]{64}\.json$/u.test(entry.name))
-    .map((entry) => readJournal(join(root, entry.name))!);
+    .map((entry) => readJournal(join(root, entry.name)))
+    .filter((journal): journal is ReconciliationJournal => journal !== null);
 }

@@ -14,7 +14,7 @@ import {
 import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runLcmMigrations } from "../src/db/migration.js";
 import {
   closeLcmConnection,
@@ -225,6 +225,35 @@ function makeEventsV1(path: string, sessionId: string): void {
   db.exec(`
     CREATE TABLE schema_version(version INTEGER NOT NULL);
     INSERT INTO schema_version VALUES(1);
+    CREATE TABLE events (
+      event_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+      seq INTEGER NOT NULL DEFAULT 0, type TEXT NOT NULL, category TEXT NOT NULL,
+      data TEXT NOT NULL, priority INTEGER DEFAULT 3, source_hook TEXT NOT NULL,
+      prev_event_id INTEGER, processed_at TEXT, created_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
+  db.prepare(
+    `INSERT INTO events(
+       session_id, seq, type, category, data, priority, source_hook, created_at
+     ) VALUES(?, 1, 'decision', 'legacy', '{}', 1, 'PostToolUse', '2026-01-01')`,
+  ).run(sessionId);
+  db.close();
+}
+
+function makeLegacyEvents(
+  path: string,
+  sessionId: string,
+  schemaVersion: "missing" | "empty" | { readonly value: number | string | null },
+): void {
+  mkdirSync(join(path, ".."), { recursive: true });
+  const db = new DatabaseSync(path);
+  if (schemaVersion !== "missing") {
+    db.exec("CREATE TABLE schema_version(version)");
+    if (schemaVersion !== "empty") {
+      db.prepare("INSERT INTO schema_version VALUES(?)").run(schemaVersion.value);
+    }
+  }
+  db.exec(`
     CREATE TABLE events (
       event_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
       seq INTEGER NOT NULL DEFAULT 0, type TEXT NOT NULL, category TEXT NOT NULL,
@@ -1161,6 +1190,81 @@ describe("worktree reconciliation", () => {
     evidence.close();
   });
 
+  it.each(["missing", "empty"] as const)(
+    "treats a %s schema_version table as legacy events schema v1",
+    (schemaVersion) => {
+      const { main, linked } = makeRepository(home);
+      const canonical = resolveGitProjectAnchor(main)!.canonical;
+      const targetHash = hashProjectPath(canonical);
+      const sourceHash = hashProjectPath(linked);
+      writeFileSync(projectMapPath(), `${JSON.stringify({
+        [targetHash]: { canonical, aliases: [] },
+        [sourceHash]: { canonical: linked, aliases: [] },
+      }, null, 2)}\n`);
+      clearProjectMapCache();
+      const sourceEvents = join(home, ".lcm", "events", `${sourceHash}.db`);
+      makeLegacyEvents(sourceEvents, `legacy-${schemaVersion}`, schemaVersion);
+
+      const result = reconcileWorktrees(main);
+      expect(result.status).toBe("completed");
+      const target = new DatabaseSync(
+        join(home, ".lcm", "events", `${targetHash}.db`),
+        { readOnly: true },
+      );
+      expect(target.prepare("SELECT session_id FROM events").all())
+        .toEqual([{ session_id: `legacy-${schemaVersion}` }]);
+      expect(target.prepare("SELECT COUNT(*) AS count FROM error_log").get())
+        .toEqual({ count: 0 });
+      target.close();
+
+      const sourceBackup = result.backupPaths.find((path) => path.includes("oldevents"))!;
+      const evidence = new DatabaseSync(sourceBackup, { readOnly: true });
+      if (schemaVersion === "missing") {
+        expect(evidence.prepare(
+          "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'schema_version'",
+        ).get()).toBeUndefined();
+      } else {
+        expect(evidence.prepare("SELECT version FROM schema_version").get()).toBeUndefined();
+      }
+      expect(evidence.prepare(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'error_log'",
+      ).get()).toBeUndefined();
+      evidence.close();
+    },
+  );
+
+  it.each([
+    ["non-numeric", "v2"],
+    ["fractional", 1.5],
+    ["non-positive", 0],
+    ["null", null],
+  ] as const)("rejects a %s legacy events schema version without NaN diagnostics", (
+    _label,
+    value,
+  ) => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makeLegacyEvents(
+      join(home, ".lcm", "events", `${sourceHash}.db`),
+      "invalid-version",
+      { value },
+    );
+
+    expect(() => reconcileWorktrees(main)).toThrow(
+      `legacy events database has invalid schema_version: ${String(value)}`,
+    );
+    const journal = listWorktreeReconciliationJournals()[0];
+    expect(journal).toMatchObject({ phase: "blocked" });
+    expect(journal.reason).not.toContain("NaN");
+  });
+
   it("preserves surviving events whose pruned predecessor is no longer present", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
@@ -1791,6 +1895,48 @@ describe("worktree reconciliation", () => {
     }
     writeFileSync(path, "{");
     expect(() => listWorktreeReconciliationJournals()).toThrow(SyntaxError);
+  });
+
+  it("filters a journal removed after directory enumeration", async () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    const path = join(root, `${targetHash}.json`);
+    mkdirSync(root, { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      targetHash,
+      canonical: "/project",
+      sourceHashes: [],
+      aliases: ["/project"],
+      createdAt: "2026-07-25T00:00:00.000Z",
+      updatedAt: "2026-07-25T00:00:00.000Z",
+      phase: "completed",
+      backupPaths: [],
+    }));
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      let removed = false;
+      return {
+        ...actual,
+        readdirSync: ((directory: Parameters<typeof actual.readdirSync>[0], options?: unknown) => {
+          const entries = actual.readdirSync(directory, options as never);
+          if (!removed && String(directory) === root) {
+            removed = true;
+            actual.rmSync(path);
+          }
+          return entries;
+        }) as typeof actual.readdirSync,
+      };
+    });
+    try {
+      const isolated = await import("../src/worktree-reconciliation.js");
+      expect(isolated.listWorktreeReconciliationJournals()).toEqual([]);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
   });
 
   it("accepts a legacy empty database without optional bookkeeping tables", () => {
