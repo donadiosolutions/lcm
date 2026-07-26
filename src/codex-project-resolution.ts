@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   extractCodexSessionMeta,
   findAllCodexTranscripts,
@@ -48,6 +48,7 @@ type CodexProjectIndex = {
   readonly map: ProjectMap;
   readonly projects: VerifiedProject[];
   readonly threadOwners: Map<string, VerifiedProject[]>;
+  readonly threadWorktrees: Map<string, string[]>;
   readonly codexDir: string;
 };
 
@@ -103,7 +104,36 @@ function addThreadOwner(
   owners.set(threadId, current);
 }
 
-function readThreadOwners(project: VerifiedProject, owners: Map<string, VerifiedProject[]>): void {
+function readWorktreePath(metadataDir: string): string | undefined {
+  try {
+    const gitdir = readBoundedRegularFile(join(metadataDir, "gitdir"), {
+      allowedRoot: metadataDir,
+      maxBytes: MAX_CODEX_THREAD_METADATA_BYTES,
+    }).trim();
+    if (!gitdir || gitdir.includes("\n")) return undefined;
+    const resolved = isAbsolute(gitdir) ? resolve(gitdir) : resolve(metadataDir, gitdir);
+    return basename(resolved) === ".git" ? dirname(resolved) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function addThreadWorktree(
+  worktrees: Map<string, string[]>,
+  threadId: string,
+  path: string | undefined,
+): void {
+  if (!path) return;
+  const current = worktrees.get(threadId) ?? [];
+  if (!current.includes(path)) current.push(path);
+  worktrees.set(threadId, current);
+}
+
+function readThreadOwners(
+  project: VerifiedProject,
+  owners: Map<string, VerifiedProject[]>,
+  worktrees: Map<string, string[]>,
+): void {
   const root = join(project.commonDir, "worktrees");
   if (!isDirectory(root)) return;
   for (const entry of readdirSync(root, { withFileTypes: true })) {
@@ -121,6 +151,7 @@ function readThreadOwners(project: VerifiedProject, owners: Map<string, Verified
         && metadata.ownerThreadId
       ) {
         addThreadOwner(owners, metadata.ownerThreadId, project);
+        addThreadWorktree(worktrees, metadata.ownerThreadId, readWorktreePath(join(root, entry.name)));
       }
     } catch {
       // Malformed ownership metadata is never evidence.
@@ -128,8 +159,8 @@ function readThreadOwners(project: VerifiedProject, owners: Map<string, Verified
   }
 }
 
-function buildProjectIndex(codexDir?: string): CodexProjectIndex {
-  const map = listProjectMapEntries();
+function buildProjectIndex(codexDir?: string, mapSnapshot?: ProjectMap): CodexProjectIndex {
+  const map = mapSnapshot ?? listProjectMapEntries();
   const byCommonDir = new Map<string, VerifiedProject>();
   for (const [hash, entry] of Object.entries(map)) {
     for (const path of entryPaths(entry)) {
@@ -147,16 +178,17 @@ function buildProjectIndex(codexDir?: string): CodexProjectIndex {
       if (!current || hash === hashProjectPath(anchor.canonical)) {
         byCommonDir.set(anchor.commonDir, candidate);
       }
-      break;
     }
   }
   const projects = [...byCommonDir.values()];
   const threadOwners = new Map<string, VerifiedProject[]>();
-  for (const project of projects) readThreadOwners(project, threadOwners);
+  const threadWorktrees = new Map<string, string[]>();
+  for (const project of projects) readThreadOwners(project, threadOwners, threadWorktrees);
   return {
     map,
     projects,
     threadOwners,
+    threadWorktrees,
     codexDir: codexDir ?? join(homedir(), ".codex"),
   };
 }
@@ -269,18 +301,33 @@ export function historicalWorktreeEntriesForProject(
   canonical: string,
   commonDir: string,
   codexDir?: string,
+  mapSnapshot?: ProjectMap,
 ): { hashes: string[]; aliases: string[] } {
-  const index = buildProjectIndex(codexDir);
+  const index = buildProjectIndex(codexDir, mapSnapshot);
   const project = index.projects.find(
     (candidate) => candidate.canonical === canonical && candidate.commonDir === commonDir,
   );
-  if (!project?.repositoryUrl) return { hashes: [], aliases: [] };
   const sessions = findAllCodexTranscripts(codexDir);
   const historicalPaths = new Set<string>();
   for (const session of sessions) {
     const metadata = extractCodexSessionMeta(session.path);
+    const threadId = metadata?.threadId ?? session.sessionId;
+    const owners = index.threadOwners.get(threadId) ?? [];
+    if (owners.length > 0) {
+      const owner = uniqueProject(owners, "thread-owner");
+      if (
+        owner.status === "resolved"
+        && owner.projectHash === project?.hash
+      ) {
+        for (const path of index.threadWorktrees.get(threadId) ?? []) {
+          historicalPaths.add(resolve(path));
+        }
+      }
+      continue;
+    }
     if (
-      metadata?.cwd
+      project?.repositoryUrl
+      && metadata?.cwd
       && metadata.repositoryUrl === project.repositoryUrl
       && tombstoneForCwd(metadata.cwd, index.codexDir)
       && index.projects.filter(

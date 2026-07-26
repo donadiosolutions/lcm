@@ -95,6 +95,24 @@ function withProjectMapMutationLock<T>(
   }, observer);
 }
 
+/**
+ * Hold the project-map mutation fence across a coordinated state migration.
+ * The callback receives the single strict snapshot that remains authoritative
+ * until it returns.
+ */
+export function withProjectMapReconciliationLock<T>(
+  callback: (map: ProjectMap, homeDir: string | undefined) => T,
+  homeDir?: string,
+): T {
+  return withProjectMapMutationLock(
+    () => callback(
+      loadProjectMapWithMetadata({ strict: true, reload: true, homeDir }),
+      homeDir,
+    ),
+    homeDir,
+  );
+}
+
 export function projectMapPath(homeDir?: string): string {
   return join(lcmHomeDir(homeDir), "map.json");
 }
@@ -266,13 +284,19 @@ function assertCurrentMapIsWritable(path: string): void {
 function writeProjectMap(
   map: ProjectMap,
   homeDir?: string,
-  opts: { metadataPopulated?: boolean } = {},
+  opts: {
+    metadataPopulated?: boolean;
+    onBackupCreated?: (path: string) => void;
+    onMapPublished?: () => void;
+  } = {},
 ): { path: string; backupPath?: string } {
   const path = projectMapPath(homeDir);
   ensurePrivateDirectory(dirname(path));
   assertCurrentMapIsWritable(path);
   const backupPath = createBackupIfNeeded(path, homeDir);
+  if (backupPath) opts.onBackupCreated?.(backupPath);
   atomicWritePrivateFile(path, prettyMap(map));
+  opts.onMapPublished?.();
   cache = {
     path,
     mtimeMs: statSync(path).mtimeMs,
@@ -516,8 +540,17 @@ export function resolveProjectIdentity(
   return withProjectMapMutationLock(createMissingIdentity);
 }
 
-export function listProjectMapEntries(): ProjectMap {
-  return loadProjectMapWithMetadata({ strict: true, reload: true });
+export function listProjectMapEntries(homeDir?: string): ProjectMap {
+  return loadProjectMapWithMetadata({ strict: true, reload: true, homeDir });
+}
+
+/**
+ * Return the same metadata-enriched view as listProjectMapEntries without
+ * publishing metadata backfill, taking a mutation lock, or creating backups.
+ */
+export function readProjectMapSnapshot(homeDir?: string): ProjectMap {
+  const map = loadProjectMap({ strict: true, reload: true, homeDir });
+  return populateFromExistingProjectMetadata(map, homeDir).map;
 }
 
 export function showProjectMapEntry(target?: string): { hash: string; entry: ProjectMapEntry; transient?: boolean } {
@@ -611,56 +644,85 @@ export function foldProjectMapEntries(opts: {
   readonly canonical: string;
   readonly sourceHashes: readonly string[];
   readonly aliases: readonly string[];
-  readonly expectedRemoteProjectId?: string;
+  readonly expectedRemoteProjectId?: string | null;
+  readonly homeDir?: string;
+  readonly onBackupCreated?: (path: string) => void;
+  readonly onMapPublished?: () => void;
 }): { entry: ProjectMapEntry; backupPath?: string } {
   if (!HASH_RE.test(opts.targetHash)) {
     throw new Error(`invalid reconciliation target hash: ${opts.targetHash}`);
   }
-  return withProjectMapMutationLock(() => {
-    const map = loadProjectMapWithMetadata({ strict: true, reload: true });
-    const sourceHashes = [...new Set([
-      ...(map[opts.targetHash] ? [opts.targetHash] : []),
-      ...opts.sourceHashes,
-    ])];
-    const entries = sourceHashes.map((hash) => {
-      const entry = map[hash];
-      if (!entry) throw new Error(`project reconciliation source disappeared: ${hash}`);
-      return [hash, entry] as const;
-    });
-    const remoteBindings = new Set(
-      entries.flatMap(([, entry]) => entry.remoteProjectId ? [entry.remoteProjectId] : []),
-    );
-    if (remoteBindings.size > 1) {
-      throw new Error(
-        `conflicting PostgreSQL project bindings block worktree reconciliation: ${[...remoteBindings].join(", ")}`,
-      );
-    }
-    const remoteProjectId = [...remoteBindings][0];
-    if (
-      opts.expectedRemoteProjectId !== undefined
-      && remoteProjectId !== opts.expectedRemoteProjectId
-    ) {
-      throw new Error("PostgreSQL project binding changed during worktree reconciliation");
-    }
+  return withProjectMapMutationLock(
+    () => foldProjectMapEntriesLocked(opts),
+    opts.homeDir,
+  );
+}
 
-    const canonical = resolve(opts.canonical);
-    const paths = new Set<string>([
-      ...opts.aliases.map((path) => resolve(path)),
-      ...entries.flatMap(([, entry]) => [
-        resolve(entry.canonical),
-        ...entry.aliases.map((path) => resolve(path)),
-      ]),
-    ]);
-    paths.delete(canonical);
-    for (const [hash] of entries) delete map[hash];
-    map[opts.targetHash] = {
-      canonical,
-      aliases: [...paths].sort(),
-      ...(remoteProjectId ? { remoteProjectId } : {}),
-    };
-    const write = writeProjectMap(map, undefined, { metadataPopulated: true });
-    return { entry: map[opts.targetHash], backupPath: write.backupPath };
+/** Fold entries while the caller holds withProjectMapReconciliationLock. */
+export function foldProjectMapEntriesLocked(opts: {
+  readonly targetHash: string;
+  readonly canonical: string;
+  readonly sourceHashes: readonly string[];
+  readonly aliases: readonly string[];
+  readonly expectedRemoteProjectId?: string | null;
+  readonly homeDir?: string;
+  readonly onBackupCreated?: (path: string) => void;
+  readonly onMapPublished?: () => void;
+}): { entry: ProjectMapEntry; backupPath?: string } {
+  if (!activeProjectMapMutationLocks.has(projectMapMutationLockPath(opts.homeDir))) {
+    throw new Error("project map reconciliation lock is not held");
+  }
+  const map = loadProjectMapWithMetadata({
+    strict: true,
+    reload: true,
+    homeDir: opts.homeDir,
   });
+  const sourceHashes = [...new Set([
+    ...(map[opts.targetHash] ? [opts.targetHash] : []),
+    ...opts.sourceHashes,
+  ])];
+  const entries = sourceHashes.map((hash) => {
+    const entry = map[hash];
+    if (!entry) throw new Error(`project reconciliation source disappeared: ${hash}`);
+    return [hash, entry] as const;
+  });
+  const remoteBindings = new Set(
+    entries.flatMap(([, entry]) => entry.remoteProjectId ? [entry.remoteProjectId] : []),
+  );
+  if (remoteBindings.size > 1) {
+    throw new Error(
+      `conflicting PostgreSQL project bindings block worktree reconciliation: ${[...remoteBindings].join(", ")}`,
+    );
+  }
+  const remoteProjectId = [...remoteBindings][0];
+  if (
+    opts.expectedRemoteProjectId !== undefined
+    && remoteProjectId !== (opts.expectedRemoteProjectId ?? undefined)
+  ) {
+    throw new Error("PostgreSQL project binding changed during worktree reconciliation");
+  }
+
+  const canonical = resolve(opts.canonical);
+  const paths = new Set<string>([
+    ...opts.aliases.map((path) => resolve(path)),
+    ...entries.flatMap(([, entry]) => [
+      resolve(entry.canonical),
+      ...entry.aliases.map((path) => resolve(path)),
+    ]),
+  ]);
+  paths.delete(canonical);
+  for (const [hash] of entries) delete map[hash];
+  map[opts.targetHash] = {
+    canonical,
+    aliases: [...paths].sort(),
+    ...(remoteProjectId ? { remoteProjectId } : {}),
+  };
+  const write = writeProjectMap(map, opts.homeDir, {
+    metadataPopulated: true,
+    onBackupCreated: opts.onBackupCreated,
+    onMapPublished: opts.onMapPublished,
+  });
+  return { entry: map[opts.targetHash], backupPath: write.backupPath };
 }
 
 export function setRemoteProjectBinding(

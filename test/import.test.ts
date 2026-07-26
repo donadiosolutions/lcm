@@ -902,6 +902,36 @@ describe("importSessions — provider: codex", () => {
     expect(result.failed).toBe(0);
   });
 
+  it("imports an active date-partitioned Codex rollout once when archived also", async () => {
+    const cwd = makeTmpDir();
+    resolveProjectIdentity(cwd);
+    const codexDir = makeTmpDir();
+    const sessionId = "rollout-2026-07-25T10-00-00-active";
+    const archived = join(codexDir, "archived_sessions");
+    const active = join(codexDir, "sessions", "2026", "07", "25");
+    mkdirSync(archived, { recursive: true });
+    mkdirSync(active, { recursive: true });
+    const content = [
+      makeCodexSessionMetaLine(sessionId, cwd),
+      makeCodexResponseItemLine("user", "active rollout"),
+    ].join("\n");
+    writeFileSync(join(archived, `${sessionId}.jsonl`), content);
+    writeFileSync(join(active, `${sessionId}.jsonl`), content);
+    const calls: unknown[] = [];
+
+    const result = await importSessions(makeMockClient(async (_path, body) => {
+      calls.push(body);
+      return { ingested: 1, totalTokens: 10 };
+    }), { provider: "codex", cwd, _codexDir: codexDir });
+
+    expect(result.imported).toBe(1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      session_id: sessionId,
+      transcript_path: join(archived, `${sessionId}.jsonl`),
+    });
+  });
+
   it("uses the transcript filename when verified session metadata has no thread ID", async () => {
     const cwd = makeTmpDir();
     resolveProjectIdentity(cwd);

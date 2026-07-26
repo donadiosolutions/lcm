@@ -87,6 +87,40 @@ describe("Git project identity", () => {
     expect(resolveGitProjectAnchor(join(root, "missing"))).toBeNull();
   });
 
+  it("revalidates cached anchors when nearer or changed Git metadata appears", () => {
+    const primary = makeRepository(join(root, "primary"));
+    const linked = makeLinkedWorktree(primary, join(root, "linked"));
+    const nested = makeDirectory(join(linked, "nested"));
+
+    expect(resolveGitProjectAnchor(nested)?.canonical).toBe(primary);
+
+    const nestedRepository = makeRepository(nested);
+    expect(resolveGitProjectAnchor(nested)?.canonical).toBe(nestedRepository);
+
+    rmSync(join(nested, ".git"), { recursive: true });
+    expect(resolveGitProjectAnchor(nested)?.canonical).toBe(primary);
+
+    const replacement = makeRepository(join(root, "replacement"));
+    const replacementWorktree = makeLinkedWorktree(
+      replacement,
+      join(root, "replacement-linked"),
+      "replacement-linked",
+    );
+    writeFileSync(
+      join(linked, ".git"),
+      `gitdir: ${join(replacement, ".git", "worktrees", "replacement-linked")}\n`,
+    );
+    expect(resolveGitProjectAnchor(nested)).toEqual({
+      canonical: replacement,
+      worktreeRoot: linked,
+      commonDir: join(replacement, ".git"),
+    });
+
+    rmSync(join(linked, ".git"));
+    expect(resolveGitProjectAnchor(nested)).toBeNull();
+    expect(resolveGitProjectAnchor(replacementWorktree)?.canonical).toBe(replacement);
+  });
+
   it("uses an unusual shared Git directory itself as the stable anchor", () => {
     const shared = makeDirectory(join(root, "shared.git"));
     makeDirectory(join(shared, "objects"));

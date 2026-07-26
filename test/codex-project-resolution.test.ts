@@ -7,10 +7,16 @@ import {
 } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { clearGitProjectAnchorCache, resolveGitProjectAnchor } from "../src/git-project.js";
-import { clearProjectMapCache, resolveProjectIdentity } from "../src/project-map.js";
+import {
+  addProjectAlias,
+  clearProjectMapCache,
+  hashProjectPath,
+  projectMapPath,
+  resolveProjectIdentity,
+} from "../src/project-map.js";
 import {
   historicalWorktreeEntriesForProject,
   resolveCodexSessions,
@@ -98,6 +104,22 @@ describe("Codex project resolution", () => {
     expect(resolveCodexSessions(codexDir)[0].resolution).toMatchObject({
       status: "resolved",
       canonical: main,
+      evidence: "live-git",
+    });
+  });
+
+  it("indexes every mapped Git alias even when it is a separate clone", () => {
+    const remote = "https://example.invalid/mapped-alias.git";
+    const main = repository(home, "mapped-main", remote);
+    const aliasClone = repository(home, "mapped-alias", remote, false);
+    const projectHash = resolveProjectIdentity(main).id;
+    addProjectAlias(aliasClone, { canonical: main });
+    transcript(codexDir, "mapped-alias", aliasClone, remote);
+
+    expect(resolveCodexSessions(codexDir)[0].resolution).toEqual({
+      status: "resolved",
+      canonical: aliasClone,
+      projectHash,
       evidence: "live-git",
     });
   });
@@ -270,5 +292,99 @@ describe("Codex project resolution", () => {
       anchor.commonDir,
       codexDir,
     )).toEqual({ hashes: [], aliases: [] });
+  });
+
+  it("reconciles a deleted worktree map entry through exact thread ownership without a remote", () => {
+    const main = repository(home, "thread-history-main");
+    const anchor = resolveGitProjectAnchor(main)!;
+    const targetHash = resolveProjectIdentity(main).id;
+    const deleted = join(codexDir, "worktrees", "deleted-token", "lcm");
+    const legacyHash = hashProjectPath(deleted);
+    const metadataDir = join(anchor.commonDir, "worktrees", "deleted-thread-worktree");
+    mkdirSync(metadataDir, { recursive: true });
+    writeFileSync(
+      join(metadataDir, "codex-thread.json"),
+      '{"version":1,"ownerThreadId":"deleted-thread"}\n',
+    );
+    writeFileSync(join(metadataDir, "gitdir"), `${join(deleted, ".git")}\n`);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical: main, aliases: [] },
+      [legacyHash]: { canonical: deleted, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    transcript(codexDir, "deleted-thread", join(codexDir, "worktrees", "other", "lcm"));
+
+    expect(historicalWorktreeEntriesForProject(
+      anchor.canonical,
+      anchor.commonDir,
+      codexDir,
+    )).toEqual({ hashes: [legacyHash], aliases: [deleted] });
+  });
+
+  it("does not fold a deleted path when exact thread ownership is ambiguous", () => {
+    const first = repository(home, "ambiguous-history-first");
+    const second = repository(home, "ambiguous-history-second");
+    const firstAnchor = resolveGitProjectAnchor(first)!;
+    const secondAnchor = resolveGitProjectAnchor(second)!;
+    const targetHash = resolveProjectIdentity(first).id;
+    const deleted = join(codexDir, "worktrees", "ambiguous-token", "lcm");
+    const legacyHash = hashProjectPath(deleted);
+    for (const [anchor, name] of [[firstAnchor, "first"], [secondAnchor, "second"]] as const) {
+      const metadataDir = join(anchor.commonDir, "worktrees", `ambiguous-${name}`);
+      mkdirSync(metadataDir, { recursive: true });
+      writeFileSync(
+        join(metadataDir, "codex-thread.json"),
+        '{"version":1,"ownerThreadId":"ambiguous-history-thread"}\n',
+      );
+      writeFileSync(join(metadataDir, "gitdir"), `${join(deleted, ".git")}\n`);
+    }
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical: first, aliases: [] },
+      [resolveProjectIdentity(second).id]: { canonical: second, aliases: [] },
+      [legacyHash]: { canonical: deleted, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    transcript(codexDir, "ambiguous-history-thread", undefined);
+
+    expect(historicalWorktreeEntriesForProject(
+      firstAnchor.canonical,
+      firstAnchor.commonDir,
+      codexDir,
+    )).toEqual({ hashes: [], aliases: [] });
+  });
+
+  it("fails closed for invalid thread gitdir metadata and uses the transcript filename owner", () => {
+    const main = repository(home, "thread-owner-boundaries");
+    const anchor = resolveGitProjectAnchor(main)!;
+    const root = join(anchor.commonDir, "worktrees");
+    const deleted = join(codexDir, "worktrees", "relative-token", "lcm");
+    const entries: Array<[string, string, string]> = [
+      ["empty", "empty-owner", ""],
+      ["multiline", "multiline-owner", "/tmp/one\n/tmp/two"],
+      ["non-git", "non-git-owner", join(home, "not-a-gitdir")],
+      ["relative", "relative-owner", relative(join(root, "relative"), join(deleted, ".git"))],
+      ["missing", "filename-owner", ""],
+    ];
+    for (const [name, ownerThreadId, gitdir] of entries) {
+      const metadataDir = join(root, name);
+      mkdirSync(metadataDir, { recursive: true });
+      writeFileSync(
+        join(metadataDir, "codex-thread.json"),
+        `${JSON.stringify({ version: 1, ownerThreadId })}\n`,
+      );
+      if (name !== "missing") writeFileSync(join(metadataDir, "gitdir"), `${gitdir}\n`);
+    }
+    for (const [, ownerThreadId] of entries.slice(0, -1)) {
+      transcript(codexDir, ownerThreadId, undefined);
+    }
+    const archived = join(codexDir, "archived_sessions");
+    mkdirSync(archived, { recursive: true });
+    writeFileSync(join(archived, "filename-owner.jsonl"), "");
+
+    expect(historicalWorktreeEntriesForProject(
+      anchor.canonical,
+      anchor.commonDir,
+      codexDir,
+    ).aliases).toEqual([deleted]);
   });
 });

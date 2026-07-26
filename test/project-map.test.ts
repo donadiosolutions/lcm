@@ -7,6 +7,7 @@ import {
   clearRemoteProjectBinding,
   clearProjectMapCache,
   foldProjectMapEntries,
+  foldProjectMapEntriesLocked,
   hashProjectPath,
   listProjectMapEntries,
   normalizeProjectPath,
@@ -158,6 +159,12 @@ describe("project map", () => {
       sourceHashes: [sourceIdentity.id],
       aliases: [source],
     })).toThrow("invalid reconciliation target hash");
+    expect(() => foldProjectMapEntriesLocked({
+      targetHash: targetIdentity.id,
+      canonical: target,
+      sourceHashes: [sourceIdentity.id],
+      aliases: [source],
+    })).toThrow("project map reconciliation lock is not held");
     expect(() => foldProjectMapEntries({
       targetHash: targetIdentity.id,
       canonical: target,
@@ -166,6 +173,13 @@ describe("project map", () => {
     })).toThrow("source disappeared");
 
     setRemoteProjectBinding(remoteProjectId, { hash: targetIdentity.id });
+    expect(() => foldProjectMapEntries({
+      targetHash: targetIdentity.id,
+      canonical: target,
+      sourceHashes: [sourceIdentity.id],
+      aliases: [source],
+      expectedRemoteProjectId: null,
+    })).toThrow("binding changed");
     setRemoteProjectBinding(
       "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
       { hash: sourceIdentity.id },

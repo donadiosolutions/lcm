@@ -27,15 +27,28 @@ worktrees as separate projects, LCM acquires a private cross-process lock and
 merges their complete SQLite graph, promoted memories, ingest and recall
 bookkeeping, redaction counts, instruction cache, passive events and errors,
 and project-sensitive patterns into the primary checkout's local project.
-Exact duplicates are retained once; divergent identity collisions and
-conflicting PostgreSQL UUID bindings stop the operation before the project map
-is published.
+Exact duplicates are retained once. Per-source merge markers make retries and
+later-discovered generations idempotent, so each source generation is applied
+exactly once.
 
-Each operation has an atomic journal under `~/.lcm/reconciliations/`. After the
-merged databases pass foreign-key and FTS verification, source project
-directories and event sidecars move to timestamped private backups under
-`~/.lcm/oldprojects/` and `~/.lcm/oldevents/`. LCM then folds live and deleted
-worktree paths into canonical aliases. Source stores are never deleted.
+Each operation has an atomically replaced journal under
+`~/.lcm/reconciliations/`. The journal records discovery evidence, completed
+merge work, backup locations, aliases, and the last durable phase so an
+interrupted operation resumes instead of repeating committed work. LCM
+permanently fences legacy project and event databases against writes before
+committing their data to the canonical stores. After the merged databases pass
+foreign-key and FTS verification, the legacy project directory and event
+database sidecars move to timestamped private backups under
+`~/.lcm/oldprojects/` and `~/.lcm/oldevents/`. Persistent blocker sentinels
+remain at the retired project and event paths so an older LCM process cannot
+recreate a split store. The project map then folds live and deleted worktree
+paths into canonical aliases. Legacy data remains recoverable in the backups.
+
+Divergent identity collisions, malformed source state, and conflicting
+PostgreSQL UUID bindings fail closed. The journal retains a blocked,
+operator-visible result, and LCM does not publish a partially reconciled map.
+After the conflict is corrected, rerun reconciliation; the durable journal and
+merge markers continue from the verified state.
 
 Preview, inspect, or retry manually:
 
@@ -44,6 +57,11 @@ lcm project reconcile-worktrees
 lcm project reconcile-worktrees /work/lcm --dry-run
 lcm project reconcile-worktrees --json
 ```
+
+`--dry-run` performs no merge, fencing, backup, journal, or project-map
+mutation. It previews the currently discovered sources and status only. A real
+run revalidates that evidence while holding the reconciliation locks and can
+still block if the source state changes or a writer cannot be fenced safely.
 
 `lcm doctor` reports completed, partial, and blocked journals.
 

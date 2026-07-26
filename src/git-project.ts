@@ -120,6 +120,36 @@ function inspectGitMarker(worktreeRoot: string): GitProjectAnchor | null {
   };
 }
 
+function anchorsEqual(left: GitProjectAnchor, right: GitProjectAnchor): boolean {
+  return left.canonical === right.canonical
+    && left.worktreeRoot === right.worktreeRoot
+    && left.commonDir === right.commonDir;
+}
+
+function scanForGitProjectAnchor(start: string): GitProjectAnchor | null {
+  let current = start;
+  for (;;) {
+    const anchor = inspectGitMarker(current);
+    if (anchor) return anchor;
+    const parent = dirname(current);
+    if (parent === current || current === parse(current).root) return null;
+    current = parent;
+  }
+}
+
+function revalidateCachedAnchor(
+  start: string,
+  cached: GitProjectAnchor,
+): GitProjectAnchor | undefined {
+  let current = start;
+  for (;;) {
+    const anchor = inspectGitMarker(current);
+    if (anchor) return anchorsEqual(anchor, cached) ? cached : anchor;
+    if (current === cached.worktreeRoot) return undefined;
+    current = dirname(current);
+  }
+}
+
 /**
  * Resolve a working directory to its shared local Git repository identity.
  *
@@ -137,21 +167,18 @@ export function resolveGitProjectAnchor(cwd: string): GitProjectAnchor | null {
   }
 
   const cached = resolutionCache.get(real);
-  if (cached !== undefined) return cached;
-
-  let current = real;
-  for (;;) {
-    const anchor = inspectGitMarker(current);
-    if (anchor) {
-      resolutionCache.set(real, anchor);
-      return anchor;
+  if (cached !== undefined) {
+    const revalidated = revalidateCachedAnchor(real, cached);
+    if (revalidated !== undefined) {
+      resolutionCache.set(real, revalidated);
+      return revalidated;
     }
-    const parent = dirname(current);
-    if (parent === current || current === parse(current).root) break;
-    current = parent;
   }
 
-  return null;
+  const anchor = scanForGitProjectAnchor(real);
+  if (anchor) resolutionCache.set(real, anchor);
+  else resolutionCache.delete(real);
+  return anchor;
 }
 
 export function clearGitProjectAnchorCache(): void {

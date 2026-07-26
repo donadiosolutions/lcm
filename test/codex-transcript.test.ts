@@ -456,6 +456,43 @@ describe("findAllCodexTranscripts", () => {
     expect(matches[0].path).toBe(join(archived, "dup-session.jsonl"));
   });
 
+  it("collects active date-partitioned rollout transcripts without traversing symlinks", () => {
+    const codexDir = makeTmpDir();
+    const day = join(codexDir, "sessions", "2026", "07", "25");
+    mkdirSync(day, { recursive: true });
+    const rollout = "rollout-2026-07-25T10-00-00-thread.jsonl";
+    writeFileSync(join(day, rollout), "");
+    writeFileSync(join(day, "not-a-rollout.jsonl"), "");
+    mkdirSync(join(day, "rollout-directory.jsonl"));
+    mkdirSync(join(codexDir, "sessions", "2026", "invalid-month"));
+    const outside = join(codexDir, "outside");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "rollout-outside.jsonl"), "");
+    symlinkSync(outside, join(codexDir, "sessions", "2026", "07", "26"));
+
+    expect(findAllCodexTranscripts(codexDir).map((file) => file.sessionId))
+      .toContain(rollout.slice(0, -".jsonl".length));
+    expect(findAllCodexTranscripts(codexDir).map((file) => file.sessionId))
+      .not.toContain("rollout-outside");
+  });
+
+  it("deduplicates an archived transcript that overlaps an active rollout", () => {
+    const codexDir = makeTmpDir();
+    const sessionId = "rollout-2026-07-25T10-00-00-duplicate";
+    const archived = join(codexDir, "archived_sessions");
+    const day = join(codexDir, "sessions", "2026", "07", "25");
+    mkdirSync(archived, { recursive: true });
+    mkdirSync(day, { recursive: true });
+    writeFileSync(join(archived, `${sessionId}.jsonl`), "archived");
+    writeFileSync(join(day, `${sessionId}.jsonl`), "active");
+
+    const matches = findAllCodexTranscripts(codexDir)
+      .filter((file) => file.sessionId === sessionId);
+    expect(matches).toEqual([expect.objectContaining({
+      path: join(archived, `${sessionId}.jsonl`),
+    })]);
+  });
+
   it("sorts collected transcripts by distinct modification times", () => {
     const codexDir = makeTmpDir();
     const archived = join(codexDir, "archived_sessions");

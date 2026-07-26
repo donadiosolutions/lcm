@@ -1,7 +1,8 @@
 /**
  * Parser for Codex CLI session transcript files.
  *
- * Codex stores sessions in ~/.codex/sessions/<session-id>/<session-id>.jsonl
+ * Codex stores active sessions in ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+ * (with an older ~/.codex/sessions/<session-id>/<session-id>.jsonl layout)
  * and archives them in ~/.codex/archived_sessions/<name>.jsonl.
  *
  * Each JSONL line is an event object with a top-level `type` and `payload`:
@@ -214,12 +215,60 @@ export interface CodexSessionFile {
   mtime: number;
 }
 
+function addCodexTranscriptFile(
+  files: CodexSessionFile[],
+  directory: string,
+  name: string,
+): void {
+  try {
+    const path = join(directory, name);
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink() || !stat.isFile()) return;
+    files.push({
+      path,
+      sessionId: basename(name, ".jsonl"),
+      mtime: stat.mtimeMs,
+    });
+  } catch {
+    // Skip a leaf that disappeared or became unreadable during discovery.
+  }
+}
+
+function findDatePartitionedCodexSessionFiles(rootDir: string): CodexSessionFile[] {
+  const files: CodexSessionFile[] = [];
+  const years = /^\d{4}$/u;
+  const monthOrDay = /^\d{2}$/u;
+
+  try {
+    for (const year of readdirSync(rootDir, { withFileTypes: true })) {
+      if (!year.isDirectory() || year.isSymbolicLink() || !years.test(year.name)) continue;
+      const yearDir = join(rootDir, year.name);
+      for (const month of readdirSync(yearDir, { withFileTypes: true })) {
+        if (!month.isDirectory() || month.isSymbolicLink() || !monthOrDay.test(month.name)) continue;
+        const monthDir = join(yearDir, month.name);
+        for (const day of readdirSync(monthDir, { withFileTypes: true })) {
+          if (!day.isDirectory() || day.isSymbolicLink() || !monthOrDay.test(day.name)) continue;
+          const dayDir = join(monthDir, day.name);
+          for (const transcript of readdirSync(dayDir, { withFileTypes: true })) {
+            if (!/^rollout-.+\.jsonl$/u.test(transcript.name)) continue;
+            addCodexTranscriptFile(files, dayDir, transcript.name);
+          }
+        }
+      }
+    }
+  } catch {
+    // Discovery is best-effort; a concurrent removal must not abort import.
+  }
+  return files;
+}
+
 /**
  * Discover Codex transcript files under a root directory.
  *
  * Supported layouts:
  *   - Flat:  <root>/<name>.jsonl         (archived_sessions/)
  *   - Nested: <root>/<id>/<id>.jsonl     (sessions/ layout)
+ *   - Date-partitioned: <root>/YYYY/MM/DD/rollout-*.jsonl (active sessions)
  */
 export function findCodexSessionFiles(rootDir: string): CodexSessionFile[] {
   const files: CodexSessionFile[] = [];
@@ -227,16 +276,9 @@ export function findCodexSessionFiles(rootDir: string): CodexSessionFile[] {
 
   for (const entry of readdirSync(rootDir, { withFileTypes: true })) {
     // Flat layout: rootDir/<name>.jsonl
-    if (entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".jsonl")) {
+    if (entry.name.endsWith(".jsonl")) {
       try {
-        const full = join(rootDir, entry.name);
-        const st = lstatSync(full);
-        if (st.isSymbolicLink()) continue; // skip symlinks
-        files.push({
-          path: full,
-          sessionId: basename(entry.name, ".jsonl"),
-          mtime: st.mtimeMs,
-        });
+        addCodexTranscriptFile(files, rootDir, entry.name);
       } catch {
         // skip unreadable entries
       }
@@ -265,6 +307,7 @@ export function findCodexSessionFiles(rootDir: string): CodexSessionFile[] {
     }
   }
 
+  files.push(...findDatePartitionedCodexSessionFiles(rootDir));
   return files.sort((a, b) => {
     const d = a.mtime - b.mtime;
     if (d !== 0) return d;
@@ -277,7 +320,8 @@ export function findCodexSessionFiles(rootDir: string): CodexSessionFile[] {
  *
  * Searches:
  *   - <codexDir>/archived_sessions/*.jsonl  (flat layout)
- *   - <codexDir>/sessions/<id>/<id>.jsonl   (nested layout)
+ *   - <codexDir>/sessions/<id>/<id>.jsonl   (nested legacy layout)
+ *   - <codexDir>/sessions/YYYY/MM/DD/rollout-*.jsonl (active layout)
  *
  * Defaults to ~/.codex when codexDir is omitted.
  */
