@@ -757,6 +757,10 @@ test("workflow binds evidence and the required model split", async () => {
   );
   assert.match(
     workflow,
+    /if \(\[403, 404, 422\]\.includes\(status\)\) \{[\s\S]*?accessIssues\.push\(`\$\{key\} unavailable \(\$\{status\}\)`\);[\s\S]*?return;[\s\S]*?accessIssues,[\s\S]*?core\.setOutput\("has_work", "true"\)[\s\S]*?buildSecurityClassificationPrompt\(/u,
+  );
+  assert.match(
+    workflow,
     /apply-security:[\s\S]*?if: \$\{\{ always\(\) && needs\.collect-security\.result == 'success' && \(needs\.apply-labels\.outputs\.has_security == 'true' \|\| needs\.apply-labels\.outputs\.has_bugs == 'true'\) \}\}/u,
   );
   assert.match(
@@ -976,6 +980,25 @@ test("workflow binds evidence and the required model split", async () => {
   assert.ok(
     staleWorkflow.indexOf("for (const issueNumber of exempt)")
     > staleWorkflow.indexOf("} while (cursor !== null);"),
+  );
+});
+
+test("documents core read failures separately from security evidence gaps", async () => {
+  const documentation = await readFile(
+    new URL("../../docs/issue-triage.md", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    documentation,
+    /core repository Issues or organization\s+Issue Fields access blocks general collection and Luna inference/u,
+  );
+  assert.match(
+    documentation,
+    /sanitized, bounded, and recorded in `accessIssues`[\s\S]*?Terra may still run[\s\S]*?confidence low[\s\S]*?keeps status at `Triage` and uncertain Security nature unset[\s\S]*?do not by themselves fail the pass or create\s+an endless retry/u,
+  );
+  assert.doesNotMatch(
+    documentation,
+    /missing or\s+invalid read credential blocks collection and model inference/iu,
   );
 });
 

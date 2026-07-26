@@ -84,8 +84,13 @@ code-scanning rule IDs from the issue.
 Only bounded metadata is retained. Raw secrets, secret locations, code
 locations, private-fork data, dismissal or resolution comments, credentials,
 and unrelated alert bodies are never placed in prompts, job outputs, or logs.
-Expected `403`, `404`, and feature-unavailable responses are recorded as
-unavailable evidence instead of failing general triage.
+Expected access denials and unavailable-feature responses from these APIs are
+sanitized, bounded, and recorded in `accessIssues` instead of failing the
+security collector. Terra may still run with the available evidence and those
+explicit evidence gaps. When those gaps leave confidence low, the conservative
+fallback keeps status at `Triage` and uncertain Security nature unset. These
+expected best-effort degradations do not by themselves fail the pass or create
+an endless retry.
 
 Terra returns Security nature and status with independent confidence and
 separate short rationales:
@@ -185,11 +190,15 @@ collected issue is still queued and idempotently re-adds its already-present
 `needs-codex-triage` label. The token is not exposed to Luna, Terra, or
 duplicate-classification jobs, and the preflight emits no outputs. Neither issue
 triage nor any mutating stale step falls back to `GITHUB_TOKEN`. A missing or
-invalid read credential blocks collection and model inference; a missing or
-invalid write credential fails the preflight and blocks model inference as well
-as issue, label, and Planning Field mutation. The stale cleanup step uses the
-same explicit write credential even when it runs under `always()`. GitHub write
-permissions remain job-local, and checkout never persists credentials.
+invalid read credential that prevents core repository Issues or organization
+Issue Fields access blocks general collection and Luna inference. Missing,
+denied, or unavailable Dependabot, code-scanning, secret-scanning, or advisory
+evidence is instead handled by the best-effort security path described above.
+A missing or invalid write credential fails the preflight and blocks model
+inference as well as issue, label, and Planning Field mutation. The stale
+cleanup step uses the same explicit write credential even when it runs under
+`always()`. GitHub write permissions remain job-local, and checkout never
+persists credentials.
 
 Use **Actions > Codex issue labeler > Run workflow** to process the current
 queue. An empty queue exits without calling OpenAI. Logs report catalog drift,
