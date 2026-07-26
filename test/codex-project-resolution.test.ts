@@ -131,6 +131,29 @@ describe("Codex project resolution", () => {
     });
   });
 
+  it("skips malformed live cwd Git metadata without aborting other Codex sessions", () => {
+    const main = repository(home, "valid-live-cwd", "https://example.invalid/live-cwd.git");
+    const malformed = join(home, "malformed-live-cwd");
+    const outside = join(home, "malformed-live-cwd-target");
+    mkdirSync(malformed);
+    mkdirSync(outside);
+    symlinkSync(outside, join(malformed, ".git"));
+    transcript(codexDir, "bad-live-cwd", malformed);
+    transcript(codexDir, "valid-live-cwd", main, "https://example.invalid/live-cwd.git");
+
+    const resolutions = new Map(resolveCodexSessions(codexDir)
+      .map((session) => [session.sessionId, session.resolution]));
+    expect(resolutions.get("bad-live-cwd")).toEqual({
+      status: "unresolved",
+      reason: "session cwd has no live Git, thread-owner, or verified tombstone repository evidence",
+    });
+    expect(resolutions.get("valid-live-cwd")).toMatchObject({
+      status: "resolved",
+      canonical: main,
+      evidence: "live-git",
+    });
+  });
+
   it("indexes every mapped Git alias even when it is a separate clone", () => {
     const remote = "https://example.invalid/mapped-alias.git";
     const main = repository(home, "mapped-main", remote);

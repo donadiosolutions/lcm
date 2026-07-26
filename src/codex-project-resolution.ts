@@ -257,7 +257,12 @@ function resolveSession(
   index: CodexProjectIndex,
 ): CodexProjectResolution {
   if (metadata?.cwd && isResolvableDirectory(metadata.cwd)) {
-    const anchor = resolveGitProjectAnchor(metadata.cwd);
+    let anchor: ReturnType<typeof resolveGitProjectAnchor>;
+    try {
+      anchor = resolveGitProjectAnchor(metadata.cwd);
+    } catch {
+      anchor = null;
+    }
     if (anchor) {
       return uniqueProject(
         index.projects.filter((project) => project.commonDir === anchor.commonDir),

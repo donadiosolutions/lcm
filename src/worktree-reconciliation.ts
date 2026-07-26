@@ -21,6 +21,7 @@ import {
   foldProjectMapEntriesLocked,
   hashProjectPath,
   listProjectMapEntries,
+  projectMapPath,
   readProjectMapSnapshot,
   type ProjectIdentity,
   type ProjectMapEntry,
@@ -46,7 +47,18 @@ const HASH_RE = /^[a-f0-9]{64}$/u;
 const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const MAX_DISCOVERY_ENTRIES = 50_000;
 const SOURCE_FENCE_VERSION = 1;
-const reconciledThisProcess = new Map<string, string>();
+const DEFAULT_SOURCE_BUSY_TIMEOUT_MS = 5_000;
+const RECONCILIATION_CACHE_TTL_MS = 1_000;
+
+type ReconciledProcessCacheEntry = {
+  readonly discoveryFingerprint: string;
+  readonly identityCanonical: string;
+  readonly targetHash: string;
+  readonly stateGuard: string;
+  readonly expiresAt: number;
+};
+
+const reconciledThisProcess = new Map<string, ReconciledProcessCacheEntry>();
 
 type SqlRow = Record<string, SQLInputValue>;
 
@@ -111,6 +123,48 @@ type SourceComponentSnapshot = {
 };
 
 type HistoricalEntriesResolver = typeof historicalWorktreeEntriesForProject;
+
+function normalizeSourceBusyTimeoutMs(value: number | undefined): number {
+  return value !== undefined
+    && Number.isFinite(value)
+    && Number.isInteger(value)
+    && value >= 0
+    ? value
+    : DEFAULT_SOURCE_BUSY_TIMEOUT_MS;
+}
+
+function cacheTtlMs(value: number | undefined): number {
+  return value !== undefined
+    && Number.isFinite(value)
+    && Number.isInteger(value)
+    && value >= 0
+    ? Math.min(value, RECONCILIATION_CACHE_TTL_MS)
+    : RECONCILIATION_CACHE_TTL_MS;
+}
+
+function fileStateGuard(path: string): string | null {
+  try {
+    const stat = lstatSync(path);
+    return [
+      stat.mode,
+      stat.dev,
+      stat.ino,
+      stat.size,
+      stat.mtimeMs,
+      stat.ctimeMs,
+    ].join(":");
+  } catch {
+    return null;
+  }
+}
+
+function reconciliationCacheStateGuard(targetHash: string): string | null {
+  const mapGuard = fileStateGuard(projectMapPath());
+  const journalGuard = fileStateGuard(journalPath(targetHash));
+  return [mapGuard, journalGuard].includes(null)
+    ? null
+    : `${mapGuard!}|${journalGuard!}`;
+}
 
 function reconciliationDir(homeDir?: string): string {
   return join(lcmHomeDir(homeDir), "reconciliations");
@@ -1286,6 +1340,7 @@ export function reconcileWorktrees(
     };
   }
   const journalFile = journalPath(targetHash, opts.homeDir);
+  const sourceBusyTimeoutMs = normalizeSourceBusyTimeoutMs(opts._sourceBusyTimeoutMs);
   if (!opts.dryRun) {
     const fastJournal = readJournal(journalFile);
     const fastMap = listProjectMapEntries(opts.homeDir);
@@ -1489,7 +1544,7 @@ export function reconcileWorktrees(
               targetDbPath,
               targetHash,
               source.hash,
-              opts._sourceBusyTimeoutMs ?? 5_000,
+              sourceBusyTimeoutMs,
               opts._fts5Available,
               () => opts._observer?.(
                 "after-source-fence-commit-before-target-commit",
@@ -1503,7 +1558,7 @@ export function reconcileWorktrees(
               source.eventsPath,
               targetEventsPath,
               source.hash,
-              opts._sourceBusyTimeoutMs ?? 5_000,
+              sourceBusyTimeoutMs,
               () => opts._observer?.(
                 "after-source-fence-commit-before-target-commit",
                 source,
@@ -1671,11 +1726,33 @@ export function reconcileWorktrees(
 export function ensureWorktreeProjectReconciled(
   cwd: string,
   identity: ProjectIdentity,
+  opts: {
+    /** @internal Override the bounded process-cache lifetime for deterministic tests. */
+    readonly _cacheTtlMs?: number;
+    /** @internal Override wall-clock time for deterministic cache tests. */
+    readonly _nowMs?: number;
+    /** @internal Override ~/.codex for deterministic catalogue tests. */
+    readonly _codexDir?: string;
+    /** @internal Bound catalogue walks for deterministic tests. */
+    readonly _maxDiscoveryEntries?: number;
+    /** @internal Observe catalogue walks for deterministic tests. */
+    readonly _discoveryObserver?: (path: string) => void;
+  } = {},
 ): WorktreeReconciliationResult {
-  const before = reconciliationDiscovery(listProjectMapEntries());
+  const now = opts._nowMs ?? Date.now();
+  const ttlMs = cacheTtlMs(opts._cacheTtlMs);
+  const identityCanonical = resolve(identity.canonical);
+  const cached = reconciledThisProcess.get(identity.id);
+  const cacheIdentityMatches = cached?.identityCanonical === identityCanonical;
+  const currentStateGuard = cached
+    ? reconciliationCacheStateGuard(cached.targetHash)
+    : null;
   if (
-    before.complete
-    && reconciledThisProcess.get(identity.id) === fingerprint(before)
+    cached
+    && cacheIdentityMatches
+    && currentStateGuard !== null
+    && currentStateGuard === cached.stateGuard
+    && now < cached.expiresAt
   ) {
     return {
       status: "completed",
@@ -1686,14 +1763,63 @@ export function ensureWorktreeProjectReconciled(
       backupPaths: [],
     };
   }
-  const result = reconcileWorktrees(cwd);
+  const before = reconciliationDiscovery(
+    listProjectMapEntries(),
+    opts._codexDir,
+    opts._maxDiscoveryEntries,
+    opts._discoveryObserver,
+  );
+  if (
+    cached
+    && cacheIdentityMatches
+    && currentStateGuard !== null
+    && currentStateGuard === cached.stateGuard
+    && before.complete
+    && cached.discoveryFingerprint === fingerprint(before)
+  ) {
+    const stateGuard = reconciliationCacheStateGuard(cached.targetHash);
+    if (stateGuard !== null) {
+      reconciledThisProcess.set(identity.id, {
+        ...cached,
+        stateGuard,
+        expiresAt: now + ttlMs,
+      });
+    }
+    return {
+      status: "completed",
+      targetHash: identity.id,
+      canonical: identity.canonical,
+      sourceHashes: [],
+      aliases: [identity.canonical],
+      backupPaths: [],
+    };
+  }
+  const result = reconcileWorktrees(cwd, {
+    _codexDir: opts._codexDir,
+    _maxDiscoveryEntries: opts._maxDiscoveryEntries,
+    _discoveryObserver: opts._discoveryObserver,
+  });
   const publishedDiscovery = result.journalPath
     ? readJournal(result.journalPath)?.discovery
-    : reconciliationDiscovery(listProjectMapEntries());
+    : reconciliationDiscovery(
+        listProjectMapEntries(),
+        opts._codexDir,
+        opts._maxDiscoveryEntries,
+        opts._discoveryObserver,
+      );
   if (publishedDiscovery?.complete) {
-    const publishedFingerprint = fingerprint(publishedDiscovery);
-    reconciledThisProcess.set(identity.id, publishedFingerprint);
-    reconciledThisProcess.set(result.targetHash, publishedFingerprint);
+    const stateGuard = reconciliationCacheStateGuard(result.targetHash);
+    if (stateGuard !== null) {
+      const entry: ReconciledProcessCacheEntry = {
+        discoveryFingerprint: fingerprint(publishedDiscovery),
+        identityCanonical,
+        targetHash: result.targetHash,
+        stateGuard,
+        expiresAt: now + ttlMs,
+      };
+      reconciledThisProcess.set(identity.id, entry);
+      reconciledThisProcess.set(result.targetHash, entry);
+    }
   }
   return result;
 }

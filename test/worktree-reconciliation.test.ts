@@ -1520,6 +1520,39 @@ describe("worktree reconciliation", () => {
     expect(reconcileWorktrees(main, { _sourceBusyTimeoutMs: 50 }).status).toBe("completed");
   });
 
+  it.each([
+    { label: "NaN", value: Number.NaN },
+    { label: "positive infinity", value: Number.POSITIVE_INFINITY },
+    { label: "negative infinity", value: Number.NEGATIVE_INFINITY },
+    { label: "negative", value: -1 },
+    { label: "fractional", value: 1.5 },
+    { label: "zero", value: 0 },
+    { label: "positive integer", value: 25 },
+  ])("sanitizes a $label source busy timeout before applying SQLite PRAGMA", ({
+    label,
+    value,
+  }) => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      `busy-timeout-${label}`,
+      "content",
+      sourceHash,
+    );
+
+    expect(reconcileWorktrees(main, {
+      _sourceBusyTimeoutMs: value,
+    }).status).toBe("completed");
+  });
+
   it("rediscovers mapped sources after a completed no-op journal", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
@@ -2334,6 +2367,207 @@ describe("worktree reconciliation", () => {
     }, null, 2)}\n`);
     clearProjectMapCache();
     expect(reconcileWorktrees(main, { dryRun: true }).status).toBe("not-needed");
+  });
+
+  it("bounds catalogue cache freshness and invalidates on state, identity, and clear", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const identity = { id: targetHash, canonical };
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const codexDir = join(home, ".codex");
+    let catalogueWalks = 0;
+    const discoveryObserver = (path: string) => {
+      if (path === join(codexDir, "worktrees")) catalogueWalks += 1;
+    };
+    const first = ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 0,
+      _codexDir: codexDir,
+      _discoveryObserver: discoveryObserver,
+    });
+    expect(first.status).toBe("not-needed");
+    const afterFirst = catalogueWalks;
+    expect(afterFirst).toBeGreaterThan(0);
+
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 100,
+      _codexDir: codexDir,
+      _discoveryObserver: discoveryObserver,
+    }).status).toBe("completed");
+    expect(catalogueWalks).toBe(afterFirst);
+
+    const journalPath = first.journalPath!;
+    const journal = JSON.parse(readFileSync(journalPath, "utf8"));
+    journal.updatedAt = "2026-07-26T00:00:00.000Z";
+    writeFileSync(journalPath, JSON.stringify(journal));
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 200,
+      _codexDir: codexDir,
+      _discoveryObserver: discoveryObserver,
+    }).status).toBe("not-needed");
+    const afterJournalChange = catalogueWalks;
+    expect(afterJournalChange).toBeGreaterThan(afterFirst);
+
+    const journalBeforeGuardRace = readFileSync(journalPath, "utf8");
+    let removedJournalDuringWalk = false;
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 1_200,
+      _codexDir: codexDir,
+      _discoveryObserver: (path) => {
+        discoveryObserver(path);
+        if (
+          !removedJournalDuringWalk
+          && path === join(codexDir, "worktrees")
+        ) {
+          removedJournalDuringWalk = true;
+          rmSync(journalPath);
+        }
+      },
+    }).status).toBe("completed");
+    expect(existsSync(journalPath)).toBe(false);
+    writeFileSync(journalPath, journalBeforeGuardRace);
+    const afterExpiration = catalogueWalks;
+    expect(afterExpiration).toBeGreaterThan(afterJournalChange);
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 1_201,
+      _codexDir: codexDir,
+      _discoveryObserver: discoveryObserver,
+    }).status).toBe("not-needed");
+    const afterGuardRecovery = catalogueWalks;
+    expect(afterGuardRecovery).toBeGreaterThan(afterExpiration);
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 2_201,
+      _codexDir: codexDir,
+      _discoveryObserver: discoveryObserver,
+    }).status).toBe("completed");
+    const afterStableExpiration = catalogueWalks;
+    expect(afterStableExpiration).toBeGreaterThan(afterGuardRecovery);
+
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [linked] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 2_202,
+      _codexDir: codexDir,
+      _discoveryObserver: discoveryObserver,
+    }).status).toBe("not-needed");
+    const afterMapChange = catalogueWalks;
+    expect(afterMapChange).toBeGreaterThan(afterStableExpiration);
+
+    expect(ensureWorktreeProjectReconciled(main, {
+      id: targetHash,
+      canonical: linked,
+    }, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 2_203,
+      _codexDir: codexDir,
+      _discoveryObserver: discoveryObserver,
+    }).status).toBe("not-needed");
+    const afterIdentityChange = catalogueWalks;
+    expect(afterIdentityChange).toBeGreaterThan(afterMapChange);
+
+    clearWorktreeReconciliationCache();
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 2_204,
+      _codexDir: codexDir,
+      _discoveryObserver: discoveryObserver,
+    }).status).toBe("not-needed");
+    expect(catalogueWalks).toBeGreaterThan(afterIdentityChange);
+  });
+
+  it("observes a late Codex generation after the bounded cache lifetime", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const identity = { id: targetHash, canonical };
+    const codexDir = join(home, ".codex");
+    const tokenDir = join(codexDir, "worktrees", "cache-late-token");
+    const deletedWorktree = join(tokenDir, "lcm");
+    const sourceHash = hashProjectPath(deletedWorktree);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: deletedWorktree, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "cache-late-generation",
+      "late generation",
+      sourceHash,
+    );
+    let catalogueWalks = 0;
+    const discoveryObserver = (path: string) => {
+      if (path === join(codexDir, "worktrees")) catalogueWalks += 1;
+    };
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 0,
+      _codexDir: codexDir,
+      _discoveryObserver: discoveryObserver,
+    }).status).toBe("not-needed");
+    const afterInitial = catalogueWalks;
+    mkdirSync(tokenDir, { recursive: true });
+    const archived = join(codexDir, "archived_sessions");
+    mkdirSync(archived, { recursive: true });
+    writeFileSync(join(archived, "cache-late.jsonl"), `${JSON.stringify({
+      type: "session_meta",
+      payload: {
+        id: "cache-late",
+        cwd: deletedWorktree,
+        git: { repository_url: "https://example.invalid/lcm.git" },
+      },
+    })}\n`);
+
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 999,
+      _codexDir: codexDir,
+      _discoveryObserver: discoveryObserver,
+    }).status).toBe("completed");
+    expect(catalogueWalks).toBe(afterInitial);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 1_000,
+      _codexDir: codexDir,
+      _discoveryObserver: discoveryObserver,
+    })).toMatchObject({
+      status: "completed",
+      sourceHashes: [sourceHash],
+    });
+    const afterLateGeneration = catalogueWalks;
+    expect(afterLateGeneration).toBeGreaterThan(afterInitial);
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 1_001,
+      _codexDir: codexDir,
+      _discoveryObserver: discoveryObserver,
+    }).status).toBe("completed");
+    expect(catalogueWalks).toBe(afterLateGeneration);
+    const target = new DatabaseSync(
+      join(home, ".lcm", "projects", targetHash, "db.sqlite"),
+      { readOnly: true },
+    );
+    expect(target.prepare(
+      "SELECT COUNT(*) AS count FROM worktree_reconciliation_sources",
+    ).get()).toEqual({ count: 1 });
+    expect(target.prepare(
+      "SELECT session_id FROM conversations WHERE session_id = 'cache-late-generation'",
+    ).get()).toEqual({ session_id: "cache-late-generation" });
+    target.close();
   });
 
   it("does not cache first-use reconciliation while the Codex catalogue is incomplete", () => {
