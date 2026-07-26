@@ -206,6 +206,60 @@ function assertNamedGitHubScriptStepsUseExpectedTokens(
   }
 }
 
+function assertExactWorkflowJobPermissions(workflow, expectedPermissions) {
+  const lines = workflow.split("\n");
+  const jobsStart = lines.indexOf("jobs:");
+  assert.notEqual(jobsStart, -1, "Workflow has no jobs section");
+  const jobStarts = lines.flatMap((line, index) => {
+    if (index <= jobsStart) return [];
+    const match = line.match(/^  ([a-zA-Z0-9_-]+):\s*$/u);
+    return match ? [{ index, name: match[1] }] : [];
+  });
+  assert.deepEqual(
+    jobStarts.map(({ name }) => name),
+    Object.keys(expectedPermissions),
+    "Every workflow job must have an exact permission expectation",
+  );
+
+  for (const [jobIndex, { index: jobStart, name }] of jobStarts.entries()) {
+    const jobEnd = jobStarts[jobIndex + 1]?.index ?? lines.length;
+    const jobLines = lines.slice(jobStart, jobEnd);
+    const permissionIndex = jobLines.findIndex(
+      (line) => /^\s{4}permissions:(?: \{\})?$/u.test(line),
+    );
+    assert.notEqual(permissionIndex, -1, `Job ${name} has no permissions`);
+    let actualPermissions = {};
+    if (jobLines[permissionIndex] === "    permissions:") {
+      const entries = [];
+      for (
+        let lineIndex = permissionIndex + 1;
+        lineIndex < jobLines.length;
+        lineIndex += 1
+      ) {
+        const match = jobLines[lineIndex].match(
+          /^\s{6}([a-zA-Z0-9_-]+): ([a-z]+)$/u,
+        );
+        if (!match) break;
+        entries.push([match[1], match[2]]);
+      }
+      actualPermissions = Object.fromEntries(entries);
+    }
+    assert.deepEqual(
+      actualPermissions,
+      expectedPermissions[name],
+      `Unexpected GITHUB_TOKEN permissions for job ${name}`,
+    );
+
+    const jobDefinition = jobLines.join("\n");
+    if (expectedPermissions[name].contents === "read") {
+      assert.match(jobDefinition, /uses: actions\/checkout@/u);
+      assert.match(jobDefinition, /persist-credentials: false/u);
+    } else {
+      assert.doesNotMatch(jobDefinition, /uses: actions\/checkout@/u);
+    }
+  }
+}
+
 const sourceIssue = {
   number: 42,
   title: "Daemon crashes while compacting",
@@ -598,6 +652,19 @@ test("workflow binds evidence and the required model split", async () => {
     new URL("../workflows/codex-issue-labeler.yml", import.meta.url),
     "utf8",
   );
+  assertExactWorkflowJobPermissions(workflow, {
+    enqueue: { contents: "read" },
+    collect: { contents: "read" },
+    "preflight-write": { contents: "read" },
+    classify: {},
+    "apply-labels": { contents: "read" },
+    "collect-security": { contents: "read" },
+    "classify-security": {},
+    "apply-security": { contents: "read" },
+    "collect-duplicates": { contents: "read" },
+    "classify-duplicates": {},
+    "apply-duplicates": { contents: "read" },
+  });
   assertGitHubScriptStepsUseDedicatedTokens(
     workflow,
     [

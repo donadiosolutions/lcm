@@ -23,7 +23,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      issues: write
     steps:
       - name: Checkout trusted workflow code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -140,7 +139,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      issues: read
     outputs:
       has_work: ${{ steps.collect.outputs.has_work }}
       issue_numbers: ${{ steps.collect.outputs.issue_numbers }}
@@ -415,7 +413,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      issues: write
     outputs:
       bug_issue_numbers: ${{ steps.apply.outputs.bug_issue_numbers }}
       has_bugs: ${{ steps.apply.outputs.has_bugs }}
@@ -610,8 +607,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      issues: read
-      security-events: read
     outputs:
       evidence: ${{ steps.collect.outputs.evidence }}
       has_work: ${{ steps.collect.outputs.has_work }}
@@ -833,7 +828,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      issues: write
     outputs:
       bug_issue_numbers: ${{ steps.apply.outputs.bug_issue_numbers }}
       has_bugs: ${{ steps.apply.outputs.has_bugs }}
@@ -1019,7 +1013,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      issues: read
     outputs:
       evidence: ${{ steps.collect.outputs.evidence }}
       has_issues: ${{ steps.collect.outputs.has_issues }}
@@ -1207,7 +1200,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      issues: write
     steps:
       - name: Checkout trusted workflow code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
