@@ -1944,6 +1944,15 @@ export async function runNativeTranscriptBackfill(
           outcome.kind === "quarantine",
       );
       await assertTrackedSourceUnchanged();
+      for (const record of quarantinedRecords) {
+        await config.quarantine.quarantine({
+          sourceLocator: config.sourceLocator,
+          sourceOrdinal: record.sourceOrdinal,
+          reason: record.reason,
+          contentSha256: record.contentSha256,
+          quarantinedAt: record.quarantinedAt,
+        });
+      }
       const records: CreateNativeTranscriptInput[] = [];
       for (const outcome of batch) {
         if (outcome.kind === "quarantine") {
@@ -1979,16 +1988,6 @@ export async function runNativeTranscriptBackfill(
           ingestKey: record.ingestKey,
           nativePayload: record.nativePayload,
           messageLinks: resolvedLinks,
-        });
-      }
-      await assertTrackedSourceUnchanged();
-      for (const record of quarantinedRecords) {
-        await config.quarantine.quarantine({
-          sourceLocator: config.sourceLocator,
-          sourceOrdinal: record.sourceOrdinal,
-          reason: record.reason,
-          contentSha256: record.contentSha256,
-          quarantinedAt: record.quarantinedAt,
         });
       }
       await assertTrackedSourceUnchanged();

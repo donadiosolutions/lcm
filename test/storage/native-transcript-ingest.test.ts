@@ -2746,6 +2746,118 @@ describe("native transcript backfill coordinator", () => {
     expect(duplicate.repo.batches).toHaveLength(1);
   });
 
+  it.each([
+    ["missing", []],
+    ["ambiguous", [0, 1]],
+  ] as const)(
+    "persists private quarantine metadata before a %s destination-link abort",
+    async (_failure, matchingSequences) => {
+      const unsafePayload = "unsafe-payload-must-not-persist";
+      const quarantinedLine = JSON.stringify({
+        message: {
+          role: "user",
+          content: unsafePayload,
+        },
+        canary_secret: "collision-a",
+        "[REDACTED]": "collision-b",
+      });
+      const content = [
+        quarantinedLine,
+        '{"message":{"role":"user","content":"anchor"}}',
+      ].join("\n");
+      const events: string[] = [];
+      const persisted = new Map<string, {
+        readonly quarantineId: number;
+        readonly sourceLocator: string;
+        readonly sourceOrdinal: number;
+        readonly reason: string;
+        readonly contentSha256: string;
+        readonly quarantinedAt: Date;
+      }>();
+      const quarantine = vi.fn(async (input) => {
+        events.push("quarantine");
+        const key = [
+          input.sourceLocator,
+          input.sourceOrdinal,
+          input.reason,
+          input.contentSha256,
+        ].join(":");
+        const existing = persisted.get(key);
+        if (existing) return existing;
+        const stored = {
+          quarantineId: persisted.size + 1,
+          ...input,
+        };
+        persisted.set(key, stored);
+        return stored;
+      });
+      const resolveExact = vi.fn(async (input) => {
+        events.push(`resolve:${input.sessionSequence}`);
+        return matchingSequences.includes(input.sessionSequence)
+          ? {
+              conversationId: 4,
+              messageId: input.sessionSequence + 10,
+            }
+          : null;
+      });
+      const repo = repository();
+      const options = {
+        repository: repo,
+        quarantine: {
+          clientName: "claude-code" as const,
+          quarantine,
+          get: vi.fn(),
+          list: vi.fn(),
+          close: vi.fn(),
+        },
+        source: source(content),
+        machineId: "machine",
+        format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+        nativeSessionId: "session-1",
+        sourceLocator: "sessions/session.jsonl",
+        globalPatterns: ["canary_secret"],
+        projectPatterns: [],
+        batchSize: 2,
+        clock: () => new Date("2026-07-25T12:00:00.000Z"),
+        messageResolver: { resolveExact },
+      };
+
+      await expect(runNativeTranscriptBackfillCore(options)).rejects
+        .toBeInstanceOf(NativeTranscriptLinkError);
+      await expect(runNativeTranscriptBackfillCore(options)).rejects
+        .toBeInstanceOf(NativeTranscriptLinkError);
+
+      expect(events).toEqual([
+        "quarantine",
+        "resolve:0",
+        "resolve:1",
+        "quarantine",
+        "resolve:0",
+        "resolve:1",
+      ]);
+      expect(quarantine).toHaveBeenCalledTimes(2);
+      expect(persisted.size).toBe(1);
+      expect([...persisted.values()]).toEqual([{
+        quarantineId: 1,
+        sourceLocator: "sessions/session.jsonl",
+        sourceOrdinal: 0,
+        reason: "redacted-key-collision",
+        contentSha256: digest(quarantinedLine),
+        quarantinedAt: new Date("2026-07-25T12:00:00.000Z"),
+      }]);
+      expect(JSON.stringify([
+        ...persisted.values(),
+        quarantine.mock.calls,
+      ])).not.toContain(unsafePayload);
+      expect(JSON.stringify([
+        ...persisted.values(),
+        quarantine.mock.calls,
+      ])).not.toContain("collision-a");
+      expect(repo.ingestBatch).not.toHaveBeenCalled();
+      expect(repo.batches).toEqual([]);
+    },
+  );
+
   it("replays a trailing unknown quarantine before an appended anchor", async () => {
     const quarantinedPrefix = '{"bad":}\n';
     const appended =
