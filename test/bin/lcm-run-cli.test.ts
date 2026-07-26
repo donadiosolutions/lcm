@@ -64,6 +64,7 @@ const state = vi.hoisted(() => ({
     current: ["0001_migration_ledger"],
   },
   provisionError: undefined as unknown,
+  reconcileWorktrees: vi.fn(),
 }));
 
 const fakeStdin = vi.hoisted(() => ({
@@ -156,6 +157,9 @@ vi.mock("../../src/import-summary.js", () => ({
 vi.mock("../../src/portable-knowledge.js", () => ({
   exportKnowledge: vi.fn(async () => { if (state.exportError) throw state.exportError; return state.portableResult; }),
   importKnowledge: vi.fn(async () => { if (state.importKnowledgeError) throw state.importKnowledgeError; return state.portableResult; }),
+}));
+vi.mock("../../src/worktree-reconciliation.js", () => ({
+  reconcileWorktrees: state.reconcileWorktrees,
 }));
 vi.mock("../../src/storage/postgresql/provisioning.js", () => ({
   provisionPostgreSql: vi.fn(async () => {
@@ -768,7 +772,10 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(await invoke(["compact", "--all"])).toBeUndefined();
     expect(await invoke(["import", "--all", "--provider", "claude"])).toBeUndefined();
     expect(await invoke(["promote", "--all", "--verbose", "--dry-run"])).toBeUndefined();
+    expect(state.reconcileWorktrees).not.toHaveBeenCalled();
     expect(await invoke(["export", "--all"])).toBeUndefined();
+    expect(state.reconcileWorktrees).toHaveBeenCalledOnce();
+    expect(state.reconcileWorktrees).toHaveBeenCalledWith(process.cwd());
   });
 
   it("renders TTY summaries for compact and import", async () => {

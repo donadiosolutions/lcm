@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, utimesSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, utimesSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { execFileSync } from "node:child_process";
 import { cwdToProjectHash, findSessionFiles, importSessions } from "../src/import.js";
@@ -236,6 +236,7 @@ describe("importSessions", () => {
       rmSync(dir, { recursive: true, force: true });
     }
     dirs.length = 0;
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
 
@@ -1029,6 +1030,56 @@ describe("importSessions — provider: codex", () => {
 
     expect(client.post).not.toHaveBeenCalled();
     expect(result.imported).toBe(0);
+  });
+
+  it("does not create map state when Codex import finds no transcripts", async () => {
+    const home = makeTmpDir();
+    vi.stubEnv("HOME", home);
+    const cwd = makeTmpDir();
+    const codexDir = makeTmpDir();
+    const mapPath = join(homedir(), ".lcm", "map.json");
+    mkdirSync(join(home, ".lcm"), { recursive: true });
+    writeFileSync(mapPath, "{}\n");
+    const before = readFileSync(mapPath, "utf8");
+    const result = await importSessions(makeMockClient(async () => ({ ingested: 1, totalTokens: 1 })), {
+      provider: "codex",
+      cwd,
+      _codexDir: codexDir,
+    });
+
+    expect(result.imported).toBe(0);
+    expect(readFileSync(mapPath, "utf8")).toBe(before);
+    expect(existsSync(join(homedir(), ".lcm", "oldmaps"))).toBe(false);
+    expect(existsSync(join(homedir(), ".lcm", "reconciliations"))).toBe(false);
+  });
+
+  it("does not backfill map state during dry-run Codex import", async () => {
+    const home = makeTmpDir();
+    vi.stubEnv("HOME", home);
+    const cwd = makeTmpDir();
+    const codexDir = makeTmpDir();
+    const archived = join(codexDir, "archived_sessions");
+    mkdirSync(archived, { recursive: true });
+    writeFileSync(join(archived, "dry-run.jsonl"), [
+      makeCodexSessionMetaLine("dry-run", cwd),
+      makeCodexResponseItemLine("user", "dry run"),
+    ].join("\n"));
+
+    const mapPath = join(homedir(), ".lcm", "map.json");
+    mkdirSync(join(home, ".lcm"), { recursive: true });
+    writeFileSync(mapPath, "{}\n");
+    const before = readFileSync(mapPath, "utf8");
+    const result = await importSessions(makeMockClient(async () => ({ ingested: 1, totalTokens: 1 })), {
+      provider: "codex",
+      cwd,
+      dryRun: true,
+      _codexDir: codexDir,
+    });
+
+    expect(result.imported).toBe(1);
+    expect(readFileSync(mapPath, "utf8")).toBe(before);
+    expect(existsSync(join(homedir(), ".lcm", "oldmaps"))).toBe(false);
+    expect(existsSync(join(homedir(), ".lcm", "reconciliations"))).toBe(false);
   });
 
   it("dry-run does not call /ingest for codex sessions", async () => {

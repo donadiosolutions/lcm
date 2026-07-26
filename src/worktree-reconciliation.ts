@@ -4,9 +4,11 @@ import {
   existsSync,
   linkSync,
   lstatSync,
+  mkdtempSync,
   mkdirSync,
   readdirSync,
   renameSync,
+  rmSync,
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -44,6 +46,7 @@ import { historicalWorktreeEntriesForProject } from "./codex-project-resolution.
 
 const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 const MAX_PATTERN_BYTES = 1024 * 1024;
+const MAX_PROJECT_METADATA_BYTES = 1024 * 1024;
 const RECONCILIATION_VERSION = 1;
 const HASH_RE = /^[a-f0-9]{64}$/u;
 const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -483,7 +486,10 @@ function conversationSnapshot(db: DatabaseSync, conversationId: number): unknown
   ).map(({ message_id: _messageId, message_seq, ...part }) => ({ message_seq, ...part }));
   const summaries = rows(
     db,
-    "SELECT * FROM summaries WHERE conversation_id = ? ORDER BY summary_id",
+    `SELECT summary_id, conversation_id, kind, depth, content, token_count,
+            earliest_at, latest_at, descendant_count, descendant_token_count,
+            source_message_token_count, created_at, file_ids
+       FROM summaries WHERE conversation_id = ? ORDER BY summary_id`,
     conversationId,
   ).map(({ conversation_id: _conversationId, ...summary }) => summary);
   const summaryIds = summaries.map((summary) => String(summary.summary_id));
@@ -624,7 +630,6 @@ function mergeUniqueRows(
   identityColumns: readonly string[],
   transform: (row: SqlRow) => SqlRow = (value) => value,
 ): void {
-  if (!tableExists(source, table)) return;
   for (const sourceRow of rows(source, `SELECT * FROM ${table}`)) {
     const value = transform({ ...sourceRow });
     const where = identityColumns.map((column) => `${column} IS ?`).join(" AND ");
@@ -645,7 +650,6 @@ function mergeUniqueRows(
 }
 
 function mergeInstructionRows(source: DatabaseSync, target: DatabaseSync, table: string): void {
-  if (!tableExists(source, table)) return;
   for (const sourceRow of rows(source, `SELECT * FROM ${table}`)) {
     const existing = row(target, `SELECT * FROM ${table} WHERE id = ?`, sourceRow.id);
     if (!existing) {
@@ -698,10 +702,12 @@ function installSourceWriteFence(
          AND sql NOT LIKE 'CREATE VIRTUAL TABLE%'
        ORDER BY name`,
   );
-  for (const [index, table] of tables.entries()) {
+  for (const table of tables) {
     const tableName = String(table.name);
+    const tableDigest = createHash("sha256").update(tableName).digest("hex");
     for (const operation of ["INSERT", "UPDATE", "DELETE"] as const) {
-      const triggerName = `lcm_reconciliation_fence_${index}_${operation.toLowerCase()}`;
+      const triggerName =
+        `lcm_reconciliation_fence_${tableDigest}_${operation.toLowerCase()}`;
       source.exec(
         `CREATE TRIGGER IF NOT EXISTS ${quoteIdentifier(triggerName)}
          BEFORE ${operation} ON ${quoteIdentifier(tableName)}
@@ -709,6 +715,44 @@ function installSourceWriteFence(
            SELECT RAISE(ABORT, 'LCM source retired by worktree reconciliation');
          END`,
       );
+    }
+  }
+}
+
+function withNormalizedMainSnapshot<T>(
+  source: DatabaseSync,
+  targetPath: string,
+  fts5AvailableOverride: boolean | undefined,
+  operation: (
+    normalizedSource: DatabaseSync,
+    features: { readonly fts5Available: boolean },
+  ) => T,
+): T {
+  const snapshotDir = mkdtempSync(
+    join(dirname(targetPath), ".lcm-reconciliation-snapshot-"),
+  );
+  const snapshotPath = join(snapshotDir, "db.sqlite");
+  let snapshot: DatabaseSync | undefined;
+  try {
+    source.prepare("VACUUM INTO ?").run(snapshotPath);
+    snapshot = new DatabaseSync(snapshotPath);
+    for (const trigger of rows(
+      snapshot,
+      `SELECT name FROM sqlite_schema
+         WHERE type = 'trigger' AND name LIKE 'lcm_reconciliation_fence_%'`,
+    )) {
+      snapshot.exec(`DROP TRIGGER ${quoteIdentifier(String(trigger.name))}`);
+    }
+    const features = fts5AvailableOverride === undefined
+      ? getLcmDbFeatures(snapshot)
+      : { fts5Available: fts5AvailableOverride };
+    runLcmMigrations(snapshot, features);
+    return operation(snapshot, features);
+  } finally {
+    try {
+      snapshot?.close();
+    } finally {
+      rmSync(snapshotDir, { recursive: true, force: true });
     }
   }
 }
@@ -755,93 +799,98 @@ function mergeMainDatabase(
     source,
     commitFence,
   ) => {
-    const target = getLcmConnection(targetPath);
-    try {
-      const features = fts5AvailableOverride === undefined
-        ? getLcmDbFeatures(target)
-        : { fts5Available: fts5AvailableOverride };
-      runLcmMigrations(target, features);
-      target.exec(`
-        CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources (
-          source_hash TEXT PRIMARY KEY,
-          merged_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-      `);
-      target.exec("BEGIN IMMEDIATE");
-      try {
-        if (
-          row(
-            target,
-            "SELECT source_hash FROM worktree_reconciliation_sources WHERE source_hash = ?",
-            sourceHash,
-          )
-        ) {
-          commitFence();
-          afterSourceFenceCommit?.();
-          target.exec("COMMIT");
-          return;
-        }
-        for (const conversation of rows(
-          source,
-          "SELECT * FROM conversations ORDER BY conversation_id",
-        )) {
-          copyConversation(source, target, conversation);
-        }
-        mergeUniqueRows(source, target, "promoted", ["id"], (value) => ({
-          ...value,
-          project_id: targetHash,
-        }));
-        mergeUniqueRows(source, target, "session_ingest_log", ["session_id"]);
-        mergeUniqueRows(
-          source,
-          target,
-          "recall_surfacing",
-          ["memory_id", "session_id", "surfaced_at"],
-          (value) => {
-            const { id: _id, ...rest } = value;
-            return rest;
-          },
-        );
-        mergeInstructionRows(source, target, "session_instructions");
-        mergeInstructionRows(source, target, "session_instruction_cache");
-        if (tableExists(source, "redaction_stats")) {
-          for (const count of rows(source, "SELECT category, count FROM redaction_stats")) {
-            target
-              .prepare(
-                `INSERT INTO redaction_stats(project_id, category, count) VALUES(?, ?, ?)
-                 ON CONFLICT(project_id, category) DO UPDATE SET count = count + excluded.count`,
-              )
-              .run(targetHash, count.category, count.count);
-          }
-        }
-        if (features.fts5Available) {
+    commitFence();
+    return withNormalizedMainSnapshot(
+      source,
+      targetPath,
+      fts5AvailableOverride,
+      (normalizedSource, features) => {
+        const target = getLcmConnection(targetPath);
+        try {
+          runLcmMigrations(target, features);
           target.exec(`
-            DELETE FROM messages_fts;
-            INSERT INTO messages_fts(rowid, content) SELECT message_id, content FROM messages;
-            DELETE FROM summaries_fts;
-            INSERT INTO summaries_fts(summary_id, content) SELECT summary_id, content FROM summaries;
-            DELETE FROM promoted_fts;
-            INSERT INTO promoted_fts(rowid, content, tags)
-              SELECT rowid, content, tags FROM promoted;
+            CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources (
+              source_hash TEXT PRIMARY KEY,
+              merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
           `);
+          target.exec("BEGIN IMMEDIATE");
+          try {
+            afterSourceFenceCommit?.();
+            if (
+              row(
+                target,
+                "SELECT source_hash FROM worktree_reconciliation_sources WHERE source_hash = ?",
+                sourceHash,
+              )
+            ) {
+              target.exec("COMMIT");
+              return;
+            }
+            for (const conversation of rows(
+              normalizedSource,
+              "SELECT * FROM conversations ORDER BY conversation_id",
+            )) {
+              copyConversation(normalizedSource, target, conversation);
+            }
+            mergeUniqueRows(normalizedSource, target, "promoted", ["id"], (value) => ({
+              ...value,
+              project_id: targetHash,
+            }));
+            mergeUniqueRows(normalizedSource, target, "session_ingest_log", ["session_id"]);
+            mergeUniqueRows(
+              normalizedSource,
+              target,
+              "recall_surfacing",
+              ["memory_id", "session_id", "surfaced_at"],
+              (value) => {
+                const { id: _id, ...rest } = value;
+                return rest;
+              },
+            );
+            mergeInstructionRows(normalizedSource, target, "session_instructions");
+            mergeInstructionRows(normalizedSource, target, "session_instruction_cache");
+            if (tableExists(normalizedSource, "redaction_stats")) {
+              for (const count of rows(
+                normalizedSource,
+                "SELECT category, count FROM redaction_stats",
+              )) {
+                target
+                  .prepare(
+                    `INSERT INTO redaction_stats(project_id, category, count) VALUES(?, ?, ?)
+                     ON CONFLICT(project_id, category) DO UPDATE SET count = count + excluded.count`,
+                  )
+                  .run(targetHash, count.category, count.count);
+              }
+            }
+            if (features.fts5Available) {
+              target.exec(`
+                DELETE FROM messages_fts;
+                INSERT INTO messages_fts(rowid, content) SELECT message_id, content FROM messages;
+                DELETE FROM summaries_fts;
+                INSERT INTO summaries_fts(summary_id, content) SELECT summary_id, content FROM summaries;
+                DELETE FROM promoted_fts;
+                INSERT INTO promoted_fts(rowid, content, tags)
+                  SELECT rowid, content, tags FROM promoted;
+              `);
+            }
+            const foreignKeyFailures = target.prepare("PRAGMA foreign_key_check").all();
+            if (foreignKeyFailures.length > 0) {
+              throw new Error("foreign-key verification failed after worktree database merge");
+            }
+            target
+              .prepare("INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)")
+              .run(sourceHash);
+            target.exec("COMMIT");
+          } catch (error) {
+            target.exec("ROLLBACK");
+            throw error;
+          }
+        } finally {
+          closeLcmConnection(targetPath, target);
         }
-        const foreignKeyFailures = target.prepare("PRAGMA foreign_key_check").all();
-        if (foreignKeyFailures.length > 0) {
-          throw new Error("foreign-key verification failed after worktree database merge");
-        }
-        target
-          .prepare("INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)")
-          .run(sourceHash);
-        commitFence();
-        afterSourceFenceCommit?.();
-        target.exec("COMMIT");
-      } catch (error) {
-        target.exec("ROLLBACK");
-        throw error;
-      }
-    } finally {
-      closeLcmConnection(targetPath, target);
-    }
+      },
+    );
   });
 }
 
@@ -1037,6 +1086,29 @@ function mergePatterns(
   }
   const separator = target.length === 0 || target.endsWith("\n") ? "" : "\n";
   atomicWritePrivateFile(targetPath, `${target}${separator}${additions.join("\n")}\n`);
+}
+
+function writeCanonicalTargetMetadata(targetDir: string, canonical: string): void {
+  const metaPath = join(targetDir, "meta.json");
+  let metadata: Record<string, unknown> = {};
+  if (existsSync(metaPath)) {
+    if (!isRegularFile(metaPath)) {
+      throw new Error(`invalid canonical project metadata path: ${metaPath}`);
+    }
+    const parsed = JSON.parse(readBoundedRegularFile(metaPath, {
+      allowedRoot: targetDir,
+      maxBytes: MAX_PROJECT_METADATA_BYTES,
+    })) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error(`invalid canonical project metadata: ${metaPath}`);
+    }
+    metadata = parsed as Record<string, unknown>;
+    if (metadata.cwd === canonical) return;
+  }
+  atomicWritePrivateFile(
+    metaPath,
+    `${JSON.stringify({ ...metadata, cwd: canonical }, null, 2)}\n`,
+  );
 }
 
 function sourceComponentSnapshot(
@@ -1641,6 +1713,7 @@ export function reconcileWorktrees(
           opts._observer?.("before-source-patterns-merge", source);
           mergePatterns(source, targetDir, journal.sourceComponents[source.hash]!);
         }
+        writeCanonicalTargetMetadata(targetDir, canonical);
         journal.phase = "merged";
         writeJournal(journalFile, journal);
         opts._observer?.("after-merge-before-archive");

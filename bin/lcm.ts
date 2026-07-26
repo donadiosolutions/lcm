@@ -2054,6 +2054,8 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
 
       const cwds: string[] = [];
       if (all) {
+        const { reconcileWorktrees } = await import("../src/worktree-reconciliation.js");
+        reconcileWorktrees(process.cwd());
         const projectsDir = lcmProjectsDir();
         if (existsSync(projectsDir)) {
           for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {

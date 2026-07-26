@@ -1,11 +1,14 @@
 import {
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,6 +31,7 @@ import {
   addProjectAlias,
   clearRemoteProjectBinding,
   clearProjectMapCache,
+  hashProjectPath,
   listProjectMapEntries,
   projectMapPath,
   removeProjectAlias,
@@ -35,6 +39,8 @@ import {
   setRemoteProjectBinding,
   showProjectMapEntry,
 } from "../src/project-map.js";
+import { clearGitProjectAnchorCache, resolveGitProjectAnchor } from "../src/git-project.js";
+import { clearWorktreeReconciliationCache } from "../src/worktree-reconciliation.js";
 import {
   PostgreSqlIdentityAliasPathConflictError,
   PostgreSqlIdentityConflictError,
@@ -317,6 +323,8 @@ describe("identity service", () => {
     process.env.HOME = home;
     process.env.USERPROFILE = home;
     clearProjectMapCache();
+    clearGitProjectAnchorCache();
+    clearWorktreeReconciliationCache();
     repository = fakeRepository();
     close = vi.fn(async () => undefined);
     deps = {
@@ -327,6 +335,8 @@ describe("identity service", () => {
 
   afterEach(() => {
     clearProjectMapCache();
+    clearGitProjectAnchorCache();
+    clearWorktreeReconciliationCache();
     vi.restoreAllMocks();
     rmSync(home, { recursive: true, force: true });
     if (originalHome === undefined) delete process.env.HOME;
@@ -339,6 +349,22 @@ describe("identity service", () => {
     const path = join(home, name);
     mkdirSync(path, { recursive: true });
     return path;
+  }
+
+  function makeRepository(name: string): { main: string; linked: string } {
+    const main = makeProject(`${name}-main`);
+    const linked = join(home, `${name}-linked`);
+    const git = (cwd: string, ...args: string[]) => {
+      execFileSync("git", args, { cwd, stdio: "ignore" });
+    };
+    git(main, "init", "-q");
+    git(main, "config", "user.email", "test@example.invalid");
+    git(main, "config", "user.name", "LCM Test");
+    writeFileSync(join(main, "README.md"), "test\n");
+    git(main, "add", "README.md");
+    git(main, "commit", "-qm", "initial");
+    git(main, "worktree", "add", "-qb", `${name}-linked`, linked);
+    return { main, linked };
   }
 
   async function register(): Promise<void> {
@@ -1712,6 +1738,79 @@ describe("identity service", () => {
       });
     await expect(repository.resolveProject(MACHINE_ID, linked))
       .resolves.toMatchObject({ projectId: PROJECT_A });
+  });
+
+  it("reconciles a legacy worktree binding before create can duplicate its remote project", async () => {
+    await register();
+    const { main, linked } = makeRepository("legacy-create");
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [sourceHash]: {
+        canonical: linked,
+        aliases: [],
+        remoteProjectId: PROJECT_A,
+      },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    repository.createProject.mockClear();
+    vi.mocked(deps.openSession!).mockClear();
+
+    await expect(createProject(POSTGRESQL_CONFIG, linked, {}, deps))
+      .rejects.toThrow(`already bound to PostgreSQL project ${PROJECT_A}`);
+
+    expect(deps.openSession).not.toHaveBeenCalled();
+    expect(repository.createProject).not.toHaveBeenCalled();
+    expect(listProjectMapEntries()).toEqual({
+      [targetHash]: {
+        canonical,
+        aliases: [linked],
+        remoteProjectId: PROJECT_A,
+      },
+    });
+  });
+
+  it("rejects conflicting legacy worktree bindings before remote link or local mutation", async () => {
+    await register();
+    const { main, linked } = makeRepository("legacy-link-conflict");
+    const secondLinked = join(home, "legacy-link-conflict-second");
+    execFileSync(
+      "git",
+      ["worktree", "add", "-qb", "legacy-link-conflict-second", secondLinked],
+      { cwd: main, stdio: "ignore" },
+    );
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    const secondSourceHash = hashProjectPath(secondLinked);
+    const mapPath = projectMapPath();
+    writeFileSync(mapPath, `${JSON.stringify({
+      [sourceHash]: {
+        canonical: linked,
+        aliases: [],
+        remoteProjectId: PROJECT_A,
+      },
+      [secondSourceHash]: {
+        canonical: secondLinked,
+        aliases: [],
+        remoteProjectId: PROJECT_B,
+      },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const mapBefore = readFileSync(mapPath, "utf8");
+    repository.replaceProjectAliases.mockClear();
+    vi.mocked(deps.openSession!).mockClear();
+
+    await expect(linkProject(POSTGRESQL_CONFIG, PROJECT_A, linked, {}, deps))
+      .rejects.toThrow("conflicting PostgreSQL project bindings");
+
+    expect(deps.openSession).not.toHaveBeenCalled();
+    expect(repository.replaceProjectAliases).not.toHaveBeenCalled();
+    expect(readFileSync(mapPath, "utf8")).toBe(mapBefore);
+    expect(existsSync(join(home, ".lcm", "projects", targetHash))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
   });
 
   it("initial batch binding rolls back every path when one local alias has a foreign owner", async () => {

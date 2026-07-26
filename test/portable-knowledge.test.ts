@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
@@ -13,7 +14,15 @@ import {
   importKnowledge,
   type ExportDocument,
 } from "../src/portable-knowledge.js";
-import { addProjectAlias, clearProjectMapCache } from "../src/project-map.js";
+import {
+  addProjectAlias,
+  clearProjectMapCache,
+  hashProjectPath,
+  listProjectMapEntries,
+  projectMapPath,
+} from "../src/project-map.js";
+import { clearGitProjectAnchorCache, resolveGitProjectAnchor } from "../src/git-project.js";
+import { clearWorktreeReconciliationCache } from "../src/worktree-reconciliation.js";
 import { lcmHomeDir } from "../src/runtime-paths.js";
 import { isLcmConnectionOpen } from "../src/db/connection.js";
 import { ScrubEngine } from "../src/scrub.js";
@@ -30,11 +39,31 @@ function makeTempDir() {
   return d;
 }
 
+function makeRepository(): { main: string; linked: string } {
+  const root = makeTempDir();
+  const main = join(root, "main");
+  const linked = join(root, "linked");
+  mkdirSync(main);
+  const git = (cwd: string, ...args: string[]) => {
+    execFileSync("git", args, { cwd, stdio: "ignore" });
+  };
+  git(main, "init", "-q");
+  git(main, "config", "user.email", "test@example.invalid");
+  git(main, "config", "user.name", "LCM Test");
+  writeFileSync(join(main, "README.md"), "test\n");
+  git(main, "add", "README.md");
+  git(main, "commit", "-qm", "initial");
+  git(main, "worktree", "add", "-qb", "linked", linked);
+  return { main, linked };
+}
+
 beforeEach(() => {
   tempHome = mkdtempSync(join(tmpdir(), "lcm-portable-home-"));
   process.env.HOME = tempHome;
   process.env.USERPROFILE = tempHome;
   clearProjectMapCache();
+  clearGitProjectAnchorCache();
+  clearWorktreeReconciliationCache();
 });
 
 afterEach(() => {
@@ -42,6 +71,8 @@ afterEach(() => {
   vi.unstubAllEnvs();
   for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true });
   clearProjectMapCache();
+  clearGitProjectAnchorCache();
+  clearWorktreeReconciliationCache();
   if (tempHome) rmSync(tempHome, { recursive: true, force: true });
   tempHome = undefined;
   if (originalHome === undefined) delete process.env.HOME;
@@ -218,6 +249,41 @@ describe("portable-knowledge — export", () => {
     expect(result.projectCwd).toBe(realpathSync(canonical));
   });
 
+  it("reconciles and exports promoted knowledge from a legacy linked-worktree store", async () => {
+    const { main, linked } = makeRepository();
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    const baseDir = lcmHomeDir();
+    const outFile = join(makeTempDir(), "legacy-worktree-export.json");
+    seedProject(baseDir, linked, [{
+      content: "Legacy linked-worktree memory",
+      tags: ["decision"],
+    }]);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+
+    const result = await exportKnowledge(linked, {
+      output: outFile,
+      skipScrub: true,
+    });
+
+    expect(result).toEqual({ exported: 1, projectCwd: canonical });
+    const exported: ExportDocument = JSON.parse(readFileSync(outFile, "utf8"));
+    expect(exported.entries).toEqual([
+      expect.objectContaining({ content: "Legacy linked-worktree memory" }),
+    ]);
+    expect(listProjectMapEntries()).toEqual({
+      [targetHash]: { canonical, aliases: [linked] },
+    });
+    expect(JSON.parse(readFileSync(
+      join(baseDir, "projects", targetHash, "meta.json"),
+      "utf8",
+    ))).toMatchObject({ cwd: canonical });
+  });
+
   it("filters by tags", async () => {
     const baseDir = makeTempDir();
     const cwd = makeTempDir();
@@ -360,6 +426,47 @@ describe("portable-knowledge — import", () => {
     expect(existsSync(aliasDbPath)).toBe(false);
   });
 
+  it("reconciles a legacy linked-worktree store before importing portable knowledge", async () => {
+    const { main, linked } = makeRepository();
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    const baseDir = lcmHomeDir();
+    seedProject(baseDir, linked, [{
+      content: "Existing legacy memory",
+      tags: ["existing"],
+    }]);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const doc = makeDoc([{
+      content: "Imported after reconciliation",
+      tags: ["decision"],
+      confidence: 0.9,
+      createdAt: new Date().toISOString(),
+      sessionId: null,
+    }]);
+
+    await expect(importKnowledge(linked, doc)).resolves.toMatchObject({
+      imported: 1,
+      dryRun: false,
+    });
+
+    const targetPath = join(baseDir, "projects", targetHash, "db.sqlite");
+    const target = new DatabaseSync(targetPath, { readOnly: true });
+    const rows = new PromotedStore(target).getAll({ projectId: targetHash });
+    expect(rows.map(({ content }) => content).sort()).toEqual([
+      "Existing legacy memory",
+      "Imported after reconciliation",
+    ]);
+    target.close();
+    expect(existsSync(join(baseDir, "projects", sourceHash, "db.sqlite"))).toBe(false);
+    expect(listProjectMapEntries()).toEqual({
+      [targetHash]: { canonical, aliases: [linked] },
+    });
+  });
+
   it("dry-run returns expected counts without writing", async () => {
     const baseDir = makeTempDir();
     const cwd = makeTempDir();
@@ -384,6 +491,29 @@ describe("portable-knowledge — import", () => {
     const projId = toProjectId(cwd);
     const dbPath = join(baseDir, "projects", projId, "db.sqlite");
     expect(existsSync(dbPath)).toBe(false);
+  });
+
+  it("keeps a legacy worktree import dry-run entirely read-only", async () => {
+    const { main, linked } = makeRepository();
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    const baseDir = lcmHomeDir();
+    seedProject(baseDir, linked, [{ content: "Legacy dry-run memory" }]);
+    const mapPath = projectMapPath();
+    writeFileSync(mapPath, `${JSON.stringify({
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const mapBefore = readFileSync(mapPath, "utf8");
+
+    await expect(importKnowledge(linked, makeDoc([]), { dryRun: true }))
+      .resolves.toMatchObject({ dryRun: true });
+
+    expect(readFileSync(mapPath, "utf8")).toBe(mapBefore);
+    expect(existsSync(join(baseDir, "projects", sourceHash, "db.sqlite"))).toBe(true);
+    expect(existsSync(join(baseDir, "projects", targetHash))).toBe(false);
+    expect(existsSync(join(baseDir, "reconciliations"))).toBe(false);
   });
 
   it("rejects unsupported export versions", async () => {

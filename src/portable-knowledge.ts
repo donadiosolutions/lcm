@@ -29,6 +29,7 @@ import { resolveProjectIdentity } from "./project-map.js";
 import { loadDaemonConfig } from "./daemon/config.js";
 import { configPath } from "./runtime-paths.js";
 import { selectStorageBackend } from "./storage/backend.js";
+import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
 
 export const EXPORT_VERSION = 1;
 
@@ -67,6 +68,7 @@ function defaultBaseDir(): string {
 
 function resolvePortableProject(cwd: string, baseDir: string): { id: string; canonical: string; dir: string; dbPath: string } {
   if (baseDir === defaultBaseDir()) {
+    ensureWorktreeProjectReconciled(cwd);
     const identity = resolveProjectIdentity(cwd);
     const dir = join(baseDir, "projects", identity.id);
     return { id: identity.id, canonical: identity.canonical, dir, dbPath: join(dir, "db.sqlite") };

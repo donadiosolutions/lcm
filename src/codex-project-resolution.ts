@@ -210,7 +210,9 @@ function uniqueProject(
   candidates: readonly VerifiedProject[],
   evidence: "live-git" | "mapped-path" | "thread-owner" | "repository-tombstone",
 ): CodexProjectResolution {
-  const unique = [...new Map(candidates.map((project) => [project.commonDir, project])).values()];
+  // Explicit aliases may be separate clones (and therefore have distinct Git
+  // common directories) but deliberately share one local LCM project hash.
+  const unique = [...new Map(candidates.map((project) => [project.hash, project])).values()];
   if (unique.length === 1) {
     return {
       status: "resolved",
@@ -303,8 +305,11 @@ function resolveSession(
   };
 }
 
-export function resolveCodexSessions(codexDir?: string): CodexResolvedSession[] {
-  const index = buildProjectIndex(codexDir);
+export function resolveCodexSessions(
+  codexDir?: string,
+  mapSnapshot?: ProjectMap,
+): CodexResolvedSession[] {
+  const index = buildProjectIndex(codexDir, mapSnapshot);
   return findAllCodexTranscripts(codexDir).map((session) => {
     const metadata = extractCodexSessionMeta(session.path);
     return {
@@ -348,9 +353,10 @@ export function historicalWorktreeEntriesForProject(
       && metadata?.cwd
       && metadata.repositoryUrl === project.repositoryUrl
       && tombstoneForCwd(metadata.cwd, index.codexDir)
-      && index.projects.filter(
-        (candidate) => candidate.repositoryUrl === metadata.repositoryUrl,
-      ).length === 1
+      && uniqueProject(
+        index.projects.filter((candidate) => candidate.repositoryUrl === metadata.repositoryUrl),
+        "repository-tombstone",
+      ).status === "resolved"
     ) {
       historicalPaths.add(resolve(metadata.cwd));
     }

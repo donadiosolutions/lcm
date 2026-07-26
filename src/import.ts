@@ -7,8 +7,15 @@ import type { ProgressState } from "./cli/progress-state.js";
 import type { TranscriptClient } from "./transcript-provider.js";
 import { lcmHomeDir } from "./runtime-paths.js";
 import { projectId } from "./daemon/project.js";
-import { normalizeProjectPath, resolveProjectIdentity } from "./project-map.js";
+import {
+  hashProjectPath,
+  normalizeProjectIdentityPath,
+  normalizeProjectPath,
+  readProjectMapSnapshot,
+  resolveProjectIdentity,
+} from "./project-map.js";
 import { resolveCodexSessions } from "./codex-project-resolution.js";
+import { findAllCodexTranscripts } from "./codex-transcript.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
 
@@ -177,7 +184,6 @@ async function ingestSessionList(
   const total = sessions.length;
 
   for (const { path, sessionId, cwd, client: clientName } of sessions) {
-    const replayKey = `${clientName}\u0000${projectId(cwd)}`;
     if (options.dryRun) {
       if (options.verbose) {
         const replayNote = options.replay ? " (would compact)" : "";
@@ -187,6 +193,7 @@ async function ingestSessionList(
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
       continue;
     }
+    const replayKey = `${clientName}\u0000${projectId(cwd)}`;
 
     try {
       const res = await client.post<{ ingested: number; totalTokens: number }>('/ingest', {
@@ -326,9 +333,18 @@ export async function importSessions(
 
   // --- Codex CLI sessions ---
   if (provider === "codex" || provider === "all") {
-    const current = resolveProjectIdentity(options.cwd ?? process.cwd());
+    const transcriptFiles = findAllCodexTranscripts(options._codexDir);
+    if (transcriptFiles.length === 0) return result;
+    const requestedCwd = options.cwd ?? process.cwd();
+    const current = options.dryRun
+      ? (() => {
+        const canonical = normalizeProjectIdentityPath(requestedCwd);
+        return { id: hashProjectPath(canonical), canonical };
+      })()
+      : resolveProjectIdentity(requestedCwd);
+    const mapSnapshot = options.dryRun ? readProjectMapSnapshot() : undefined;
     const codexSessions: SessionEntry[] = [];
-    for (const session of resolveCodexSessions(options._codexDir)) {
+    for (const session of resolveCodexSessions(options._codexDir, mapSnapshot)) {
       let resolution = session.resolution;
       if (
         resolution.status === "unresolved"

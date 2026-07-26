@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   cpSync,
@@ -171,6 +172,17 @@ function makeDatabase(path: string, sessionId: string, content: string, projectI
   ).run();
   runLcmMigrations(db);
   db.close();
+}
+
+function removeLegacyMainMetadataColumns(db: DatabaseSync): void {
+  db.exec(`
+    ALTER TABLE conversations DROP COLUMN bootstrapped_at;
+    ALTER TABLE summaries DROP COLUMN earliest_at;
+    ALTER TABLE summaries DROP COLUMN latest_at;
+    ALTER TABLE summaries DROP COLUMN descendant_count;
+    ALTER TABLE summaries DROP COLUMN descendant_token_count;
+    ALTER TABLE summaries DROP COLUMN source_message_token_count;
+  `);
 }
 
 function makeEvents(path: string, sessionId: string): void {
@@ -521,6 +533,237 @@ describe("worktree reconciliation", () => {
       [targetHash]: { canonical, aliases: [linked] },
     });
     expect(existsSync(join(home, ".lcm", "oldmaps"))).toBe(true);
+  });
+
+  it("normalizes a legacy main snapshot with WAL state without migrating source evidence", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetPath = join(home, ".lcm", "projects", targetHash, "db.sqlite");
+    const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    makeDatabase(targetPath, "legacy-duplicate", "same content", targetHash);
+    makeDatabase(sourcePath, "legacy-duplicate", "same content", sourceHash);
+    const targetBefore = new DatabaseSync(targetPath);
+    targetBefore.prepare(
+      "UPDATE conversations SET bootstrapped_at = NULL WHERE session_id = 'legacy-duplicate'",
+    ).run();
+    targetBefore.close();
+    const legacyWriter = new DatabaseSync(sourcePath);
+    legacyWriter.prepare(
+      "UPDATE conversations SET bootstrapped_at = NULL WHERE session_id = 'legacy-duplicate'",
+    ).run();
+    removeLegacyMainMetadataColumns(legacyWriter);
+    expect(legacyWriter.prepare("PRAGMA journal_mode = WAL").get())
+      .toEqual({ journal_mode: "wal" });
+    legacyWriter.exec("PRAGMA wal_autocheckpoint = 0");
+    legacyWriter.prepare(
+      `INSERT INTO conversations(session_id, title, created_at, updated_at)
+       VALUES('wal-only', 'WAL', '2026-01-04', '2026-01-04')`,
+    ).run();
+    expect(existsSync(`${sourcePath}-wal`)).toBe(true);
+
+    let closedWriter = false;
+    const result = reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event === "before-source-main-merge") {
+          expect(existsSync(`${sourcePath}-wal`)).toBe(true);
+        }
+        if (event === "after-merge-before-archive") {
+          legacyWriter.close();
+          closedWriter = true;
+        }
+      },
+    });
+    if (!closedWriter) legacyWriter.close();
+    expect(result.status).toBe("completed");
+
+    const target = new DatabaseSync(targetPath, { readOnly: true });
+    expect(target.prepare(
+      "SELECT session_id FROM conversations ORDER BY session_id",
+    ).all()).toEqual([
+      { session_id: "legacy-duplicate" },
+      { session_id: "wal-only" },
+    ]);
+    expect(target.prepare(
+      "SELECT COUNT(*) AS count FROM conversations WHERE session_id = 'legacy-duplicate'",
+    ).get()).toEqual({ count: 1 });
+    expect(target.prepare(
+      `SELECT bootstrapped_at FROM conversations
+       WHERE session_id = 'legacy-duplicate'`,
+    ).get()).toEqual({ bootstrapped_at: null });
+    expect(target.prepare(
+      `SELECT earliest_at, latest_at, descendant_count,
+              descendant_token_count, source_message_token_count
+         FROM summaries WHERE summary_id = 'summary-legacy-duplicate'`,
+    ).get()).toEqual({
+      earliest_at: "2026-01-01T00:00:00.000Z",
+      latest_at: "2026-01-01T00:00:00.000Z",
+      descendant_count: 0,
+      descendant_token_count: 0,
+      source_message_token_count: 3,
+    });
+    target.close();
+
+    const sourceBackup = result.backupPaths.find((path) => path.includes("oldprojects"))!;
+    const evidence = new DatabaseSync(join(sourceBackup, "db.sqlite"), { readOnly: true });
+    const conversationColumns = evidence.prepare("PRAGMA table_info(conversations)").all()
+      .map((column) => String((column as { name: string }).name));
+    const summaryColumns = evidence.prepare("PRAGMA table_info(summaries)").all()
+      .map((column) => String((column as { name: string }).name));
+    expect(conversationColumns).not.toContain("bootstrapped_at");
+    expect(summaryColumns).not.toContain("earliest_at");
+    expect(summaryColumns).not.toContain("source_message_token_count");
+    evidence.close();
+    expect(readdirSync(join(home, ".lcm", "projects", targetHash))
+      .some((name) => name.startsWith(".lcm-reconciliation-snapshot-"))).toBe(false);
+  });
+
+  it("keeps target and legacy evidence clean when snapshot migration fails, then retries", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetPath = join(home, ".lcm", "projects", targetHash, "db.sqlite");
+    const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    makeDatabase(targetPath, "target-before-failure", "target", targetHash);
+    makeDatabase(sourcePath, "legacy-migration-failure", "source", sourceHash);
+    const legacy = new DatabaseSync(sourcePath);
+    removeLegacyMainMetadataColumns(legacy);
+    legacy.exec(`
+      CREATE TRIGGER reject_legacy_snapshot_migration
+      BEFORE UPDATE ON summaries
+      BEGIN
+        SELECT RAISE(ABORT, 'legacy snapshot migration blocked');
+      END
+    `);
+    legacy.close();
+
+    expect(() => reconcileWorktrees(main)).toThrow("legacy snapshot migration blocked");
+    const unchangedTarget = new DatabaseSync(targetPath, { readOnly: true });
+    expect(unchangedTarget.prepare(
+      "SELECT session_id FROM conversations ORDER BY session_id",
+    ).all()).toEqual([{ session_id: "target-before-failure" }]);
+    expect(unchangedTarget.prepare(
+      `SELECT name FROM sqlite_schema
+       WHERE type = 'table' AND name = 'worktree_reconciliation_sources'`,
+    ).get()).toBeUndefined();
+    unchangedTarget.close();
+    const unchangedSource = new DatabaseSync(sourcePath);
+    expect(unchangedSource.prepare("PRAGMA table_info(conversations)").all()
+      .map((column) => (column as { name: string }).name)).not.toContain("bootstrapped_at");
+    unchangedSource.exec("DROP TRIGGER reject_legacy_snapshot_migration");
+    unchangedSource.close();
+    expect(readdirSync(join(home, ".lcm", "projects", targetHash))
+      .some((name) => name.startsWith(".lcm-reconciliation-snapshot-"))).toBe(false);
+
+    const result = reconcileWorktrees(main);
+    expect(result.status).toBe("completed");
+    const merged = new DatabaseSync(targetPath, { readOnly: true });
+    expect(merged.prepare(
+      "SELECT session_id FROM conversations ORDER BY session_id",
+    ).all()).toEqual([
+      { session_id: "legacy-migration-failure" },
+      { session_id: "target-before-failure" },
+    ]);
+    expect(merged.prepare(
+      `SELECT COUNT(*) AS count FROM worktree_reconciliation_sources
+       WHERE source_hash = ?`,
+    ).get(sourceHash)).toEqual({ count: 1 });
+    merged.close();
+    const sourceBackup = result.backupPaths.find((path) => path.includes("oldprojects"))!;
+    const evidence = new DatabaseSync(join(sourceBackup, "db.sqlite"), { readOnly: true });
+    expect(evidence.prepare("PRAGMA table_info(conversations)").all()
+      .map((column) => (column as { name: string }).name)).not.toContain("bootstrapped_at");
+    evidence.close();
+  });
+
+  it("uses stable per-table fence triggers across schema-drift retries", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    makeDatabase(sourcePath, "schema-drift", "source", sourceHash);
+    const failAfterFence = () => {
+      throw new Error("stop after durable source fence");
+    };
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event === "after-source-fence-commit-before-target-commit") failAfterFence();
+      },
+    })).toThrow("stop after durable source fence");
+    const first = new DatabaseSync(sourcePath);
+    const firstConversationTriggers = first.prepare(
+      `SELECT name FROM sqlite_schema
+       WHERE type = 'trigger' AND tbl_name = 'conversations'
+         AND name LIKE 'lcm_reconciliation_fence_%'
+       ORDER BY name`,
+    ).all();
+    first.exec(`CREATE TABLE "AAA odd table""name" ("value" TEXT)`);
+    first.close();
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event === "after-source-fence-commit-before-target-commit") failAfterFence();
+      },
+    })).toThrow("stop after durable source fence");
+    const second = new DatabaseSync(sourcePath);
+    expect(second.prepare(
+      `SELECT name FROM sqlite_schema
+       WHERE type = 'trigger' AND tbl_name = 'conversations'
+         AND name LIKE 'lcm_reconciliation_fence_%'
+       ORDER BY name`,
+    ).all()).toEqual(firstConversationTriggers);
+    const driftTriggers = second.prepare(
+      `SELECT name FROM sqlite_schema
+       WHERE type = 'trigger' AND tbl_name = 'AAA odd table"name'
+         AND name LIKE 'lcm_reconciliation_fence_%'
+       ORDER BY name`,
+    ).all() as Array<{ name: string }>;
+    expect(driftTriggers).toHaveLength(3);
+    expect(driftTriggers.every(({ name }) =>
+      /^lcm_reconciliation_fence_[a-f0-9]{64}_(delete|insert|update)$/u.test(name),
+    )).toBe(true);
+    expect(() => second.prepare(
+      `INSERT INTO "AAA odd table""name" ("value") VALUES('blocked')`,
+    ).run()).toThrow("LCM source retired by worktree reconciliation");
+    const stableNames = second.prepare(
+      `SELECT name FROM sqlite_schema
+       WHERE type = 'trigger' AND name LIKE 'lcm_reconciliation_fence_%'
+       ORDER BY name`,
+    ).all();
+    second.close();
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event === "after-source-fence-commit-before-target-commit") failAfterFence();
+      },
+    })).toThrow("stop after durable source fence");
+    const third = new DatabaseSync(sourcePath, { readOnly: true });
+    expect(third.prepare(
+      `SELECT name FROM sqlite_schema
+       WHERE type = 'trigger' AND name LIKE 'lcm_reconciliation_fence_%'
+       ORDER BY name`,
+    ).all()).toEqual(stableNames);
+    third.close();
+    expect(reconcileWorktrees(main).status).toBe("completed");
   });
 
   it("does not reconcile a separate clone merely because it owns an explicit alias", () => {
@@ -920,7 +1163,128 @@ describe("worktree reconciliation", () => {
     expect(listProjectMapEntries()).not.toHaveProperty(sourceHash);
     expect(projectDbPath(linked))
       .toBe(join(home, ".lcm", "projects", targetHash, "db.sqlite"));
+    expect(JSON.parse(readFileSync(
+      join(home, ".lcm", "projects", targetHash, "meta.json"),
+      "utf8",
+    ))).toMatchObject({ cwd: canonical });
+    const exportAllCwds = readdirSync(join(home, ".lcm", "projects"), {
+      withFileTypes: true,
+    }).flatMap((entry) => {
+      if (!entry.isDirectory()) return [];
+      const metaPath = join(home, ".lcm", "projects", entry.name, "meta.json");
+      if (!existsSync(metaPath)) return [];
+      return [JSON.parse(readFileSync(metaPath, "utf8")).cwd];
+    });
+    expect(exportAllCwds).toContain(canonical);
   });
+
+  it("preserves safe canonical project metadata while publishing canonical cwd", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    mkdirSync(targetDir, { recursive: true });
+    writeFileSync(join(targetDir, "meta.json"), JSON.stringify({
+      cwd: linked,
+      lastIngest: "2026-07-25T00:00:00.000Z",
+      custom: { retained: true },
+    }));
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "metadata-preservation",
+      "content",
+      sourceHash,
+    );
+
+    expect(reconcileWorktrees(linked).status).toBe("completed");
+    expect(JSON.parse(readFileSync(join(targetDir, "meta.json"), "utf8"))).toEqual({
+      cwd: canonical,
+      lastIngest: "2026-07-25T00:00:00.000Z",
+      custom: { retained: true },
+    });
+  });
+
+  it("does not rewrite already-canonical target metadata", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    mkdirSync(targetDir, { recursive: true });
+    const metaPath = join(targetDir, "meta.json");
+    const metadata = `${JSON.stringify({ cwd: canonical, retained: "exact" })}\n`;
+    writeFileSync(metaPath, metadata);
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "metadata-noop",
+      "content",
+      sourceHash,
+    );
+
+    expect(reconcileWorktrees(linked).status).toBe("completed");
+    expect(readFileSync(metaPath, "utf8")).toBe(metadata);
+  });
+
+  it("rejects a non-file canonical metadata path before map publication", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    mkdirSync(join(targetDir, "meta.json"), { recursive: true });
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "metadata-directory",
+      "content",
+      sourceHash,
+    );
+
+    expect(() => reconcileWorktrees(linked)).toThrow(
+      "invalid canonical project metadata path",
+    );
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+  });
+
+  it.each(["\"invalid\"", "null", "[]"])(
+    "rejects unsafe canonical metadata value %s before map publication",
+    (metadata) => {
+      const { main, linked } = makeRepository(home);
+      const canonical = resolveGitProjectAnchor(main)!.canonical;
+      const targetHash = hashProjectPath(canonical);
+      const sourceHash = hashProjectPath(linked);
+      writeFileSync(projectMapPath(), `${JSON.stringify({
+        [sourceHash]: { canonical: linked, aliases: [] },
+      }, null, 2)}\n`);
+      clearProjectMapCache();
+      const targetDir = join(home, ".lcm", "projects", targetHash);
+      mkdirSync(targetDir, { recursive: true });
+      writeFileSync(join(targetDir, "meta.json"), metadata);
+      makeDatabase(
+        join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+        `metadata-${createHash("sha256").update(metadata).digest("hex").slice(0, 8)}`,
+        "content",
+        sourceHash,
+      );
+
+      expect(() => reconcileWorktrees(linked)).toThrow(
+        "invalid canonical project metadata",
+      );
+      expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+    },
+  );
 
   it("carries a legacy linked-worktree binding to canonical identity before PostgreSQL admission", () => {
     const { main, linked } = makeRepository(home);

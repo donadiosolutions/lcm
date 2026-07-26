@@ -207,6 +207,23 @@ describe("Codex project resolution", () => {
     });
   });
 
+  it("treats explicit alias clones of one mapped project as one tombstone candidate", () => {
+    const remote = "https://example.invalid/alias-tombstone.git";
+    const main = repository(home, "alias-tombstone-main", remote);
+    const aliasClone = repository(home, "alias-tombstone-clone", remote, false);
+    const projectHash = resolveProjectIdentity(main).id;
+    addProjectAlias(aliasClone, { canonical: main });
+    const tombstone = join(codexDir, "worktrees", "token");
+    mkdirSync(tombstone, { recursive: true });
+    transcript(codexDir, "alias-tombstone", join(tombstone, "deleted"), remote);
+
+    expect(resolveCodexSessions(codexDir)[0].resolution).toMatchObject({
+      status: "resolved",
+      projectHash,
+      evidence: "repository-tombstone",
+    });
+  });
+
   it("reports ambiguous same-remote clones and skips unverifiable paths", () => {
     const remote = "https://example.invalid/ambiguous.git";
     const cloneA = repository(home, "clone-a", remote);
