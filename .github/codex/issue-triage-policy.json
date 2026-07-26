@@ -17,6 +17,10 @@
         "High",
         "Medium",
         "Low"
+      ],
+      "staleExemptOptions": [
+        "Urgent",
+        "High"
       ]
     },
     "securityStatus": {

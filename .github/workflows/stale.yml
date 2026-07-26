@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  contents: read
   issues: write
 
 concurrency:
@@ -15,12 +16,33 @@ jobs:
   stale:
     runs-on: ubuntu-latest
     steps:
-      - name: Mark Urgent and High issues as temporarily exempt
+      - name: Checkout trusted workflow code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Mark configured high-priority issues as temporarily exempt
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           EXEMPT_LABEL: internal-stale-priority-exempt
         with:
           script: |
+            const { join } = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const policyUrl = pathToFileURL(
+              join(process.env.GITHUB_WORKSPACE, ".github/scripts/issue-label-policy.mjs"),
+            ).href;
+            const { loadTriagePolicy } = await import(policyUrl);
+            const policy = await loadTriagePolicy(
+              join(
+                process.env.GITHUB_WORKSPACE,
+                ".github/codex/issue-triage-policy.json",
+              ),
+            );
+            const priorityFieldName = policy.fields.priority.name;
+            const staleExemptOptions = new Set(
+              policy.fields.priority.staleExemptOptions,
+            );
             const label = process.env.EXEMPT_LABEL;
             try {
               await github.rest.issues.getLabel({ ...context.repo, name: label });
@@ -103,7 +125,7 @@ jobs:
                   break;
                 }
                 const priorityValues = issue.issueFieldValues.nodes.filter(
-                  (value) => value.field?.name === "Priority",
+                  (value) => value.field?.name === priorityFieldName,
                 );
                 let fieldPageInfo = issue.issueFieldValues.pageInfo;
                 while (fieldPageInfo.hasNextPage) {
@@ -151,18 +173,19 @@ jobs:
                   }
                   priorityValues.push(
                     ...fieldPage.nodes.filter(
-                      (value) => value.field?.name === "Priority",
+                      (value) => value.field?.name === priorityFieldName,
                     ),
                   );
                   fieldPageInfo = fieldPage.pageInfo;
                 }
                 if (priorityValues.length > 1) {
                   throw new Error(
-                    `Issue #${issue.number} has duplicate Priority Planning Field values`,
+                    `Issue #${issue.number} has duplicate `
+                    + `${priorityFieldName} Planning Field values`,
                   );
                 }
                 const priority = priorityValues[0]?.name;
-                if (priority === "Urgent" || priority === "High") {
+                if (staleExemptOptions.has(priority)) {
                   exempt.push(issue.number);
                 }
               }

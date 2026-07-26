@@ -215,10 +215,30 @@ export function validateTriagePolicy(value) {
   const fields = Object.fromEntries(TRIAGE_FIELD_KEYS.map((key) => {
     const field = value.fields[key];
     assertPlainObject(field, `fields.${key}`);
-    assertExactKeys(field, ["name", "options"], `fields.${key}`);
+    assertExactKeys(
+      field,
+      key === "priority"
+        ? ["name", "options", "staleExemptOptions"]
+        : ["name", "options"],
+      `fields.${key}`,
+    );
     const [name] = validateNameList([field.name], `fields.${key}.name`);
     const options = validateNameList(field.options, `fields.${key}.options`);
-    return [key, Object.freeze({ name, options })];
+    if (key !== "priority") {
+      return [key, Object.freeze({ name, options })];
+    }
+    const staleExemptOptions = validateNameList(
+      field.staleExemptOptions,
+      "fields.priority.staleExemptOptions",
+    );
+    for (const option of staleExemptOptions) {
+      if (!options.includes(option)) {
+        throw new Error(
+          `Stale-exempt Priority option ${JSON.stringify(option)} is not enabled`,
+        );
+      }
+    }
+    return [key, Object.freeze({ name, options, staleExemptOptions })];
   }));
   if (!fields.priority.options.includes("Low")) {
     throw new Error("Priority options must include Low");
@@ -399,20 +419,33 @@ export function redactPromptText(value, maximum = 8_000) {
   if (!Number.isSafeInteger(maximum) || maximum < 0) {
     throw new TypeError("Maximum prompt text length must be a non-negative integer");
   }
-  let bounded = String(value ?? "").slice(0, maximum);
+  const input = String(value ?? "");
+  const wasTruncated = input.length > maximum;
+  let bounded = input.slice(0, maximum);
   const finalCodeUnit = bounded.charCodeAt(bounded.length - 1);
   if (finalCodeUnit >= 0xD800 && finalCodeUnit <= 0xDBFF) {
     bounded = bounded.slice(0, -1);
   }
-  return bounded
+  bounded = bounded
     .replace(
       /-----BEGIN [A-Z0-9 ]{0,72}PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]{0,72}PRIVATE KEY-----/gu,
       "[REDACTED]",
     )
     .replace(
-      /\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16})\b/gu,
+      /-----BEGIN [A-Z0-9 ]{0,72}PRIVATE KEY-----[\s\S]*$/gu,
       "[REDACTED]",
     )
+    .replace(
+      /\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16})\b/gu,
+      "[REDACTED]",
+    );
+  if (wasTruncated) {
+    bounded = bounded.replace(
+      /\b(?:github_pat_[A-Za-z0-9_]*|gh[pousr]_[A-Za-z0-9_]*|sk-[A-Za-z0-9_-]*|AKIA[A-Z0-9]*)$/gu,
+      "[REDACTED]",
+    );
+  }
+  return bounded
     .replace(
       /(\bbearer\s+)[A-Za-z0-9._~+/-]{8,}={0,2}/giu,
       "$1[REDACTED]",
@@ -443,6 +476,12 @@ function resolveNamedCatalog(expectedNames, actualEntries, name) {
   return Object.freeze(expectedNames.map((expected) => {
     const entry = byName.get(expected.toLowerCase());
     if (!entry) throw new Error(`${name} is missing ${expected}`);
+    if (entry.name !== expected) {
+      throw new Error(
+        `${name} casing drift: expected ${JSON.stringify(expected)}, `
+        + `found ${JSON.stringify(entry.name)}`,
+      );
+    }
     return Object.freeze({
       id: entry.id,
       name: entry.name,
@@ -482,6 +521,12 @@ export function resolveLiveTriageCatalog(rawCatalog, policy) {
     const expected = valid.fields[key];
     const field = fieldsByName.get(expected.name.toLowerCase());
     if (!field) throw new Error(`Planning fields are missing ${expected.name}`);
+    if (field.name !== expected.name) {
+      throw new Error(
+        `Planning field casing drift: expected ${JSON.stringify(expected.name)}, `
+        + `found ${JSON.stringify(field.name)}`,
+      );
+    }
     if (typeof field.id !== "string" || field.id.length === 0) {
       throw new Error(`Planning field ${expected.name} has no node ID`);
     }

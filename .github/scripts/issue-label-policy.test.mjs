@@ -50,7 +50,11 @@ const policy = {
   issueTypes: ["Chore", "Bug", "Feature", "Epic"],
   securityIssueTypes: ["Chore", "Bug"],
   fields: {
-    priority: { name: "Priority", options: ["Urgent", "High", "Medium", "Low"] },
+    priority: {
+      name: "Priority",
+      options: ["Urgent", "High", "Medium", "Low"],
+      staleExemptOptions: ["Urgent", "High"],
+    },
     securityStatus: {
       name: "Security status",
       options: ["Triage", "Unaffected", "Affected", "Exploited", "Patched"],
@@ -469,8 +473,27 @@ test("workflow binds evidence and the required model split", async () => {
     /while \(fieldPageInfo\.hasNextPage\)[\s\S]*?issueFieldValues\(first: 100, after: \$cursor\)/u,
   );
   assert.match(staleWorkflow, /priorityValues\.length > 1/u);
-  assert.match(staleWorkflow, /value\.field\?\.name === "Priority"/u);
-  assert.match(staleWorkflow, /priority === "Urgent" \|\| priority === "High"/u);
+  assert.match(
+    staleWorkflow,
+    /loadTriagePolicy[\s\S]*?priorityFieldName = policy\.fields\.priority\.name;[\s\S]*?new Set\(\s*policy\.fields\.priority\.staleExemptOptions/u,
+  );
+  assert.match(
+    staleWorkflow,
+    /value\.field\?\.name === priorityFieldName/u,
+  );
+  assert.match(staleWorkflow, /staleExemptOptions\.has\(priority\)/u);
+  assert.doesNotMatch(
+    staleWorkflow,
+    /value\.field\?\.name === "Priority"|priority === "Urgent"|priority === "High"/u,
+  );
+  assert.match(
+    staleWorkflow,
+    /permissions:\s*\n\s+contents: read\s*\n\s+issues: write/u,
+  );
+  assert.match(
+    staleWorkflow,
+    /actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1[\s\S]*?persist-credentials: false/u,
+  );
   assert.match(staleWorkflow, /internal-stale-priority-exempt/u);
   assert.doesNotMatch(staleWorkflow, /p0-critical|p1-high/u);
   assert.match(
@@ -514,10 +537,52 @@ test("rejects malformed issue-triage policies", () => {
       ...policy,
       fields: {
         ...policy.fields,
-        priority: { ...policy.fields.priority, options: ["High"] },
+        priority: {
+          ...policy.fields.priority,
+          options: ["High"],
+          staleExemptOptions: ["High"],
+        },
       },
     }),
     /must include Low/,
+  );
+  assert.throws(
+    () => validateTriagePolicy({
+      ...policy,
+      fields: {
+        ...policy.fields,
+        priority: {
+          ...policy.fields.priority,
+          staleExemptOptions: ["Immediate"],
+        },
+      },
+    }),
+    /not enabled/u,
+  );
+  assert.throws(
+    () => validateTriagePolicy({
+      ...policy,
+      fields: {
+        ...policy.fields,
+        priority: {
+          ...policy.fields.priority,
+          staleExemptOptions: [],
+        },
+      },
+    }),
+    /must not be empty/u,
+  );
+  const priorityWithoutStaleExemptOptions = { ...policy.fields.priority };
+  delete priorityWithoutStaleExemptOptions.staleExemptOptions;
+  assert.throws(
+    () => validateTriagePolicy({
+      ...policy,
+      fields: {
+        ...policy.fields,
+        priority: priorityWithoutStaleExemptOptions,
+      },
+    }),
+    /staleExemptOptions must be an array/u,
   );
   assert.throws(
     () => validateTriagePolicy({
@@ -595,6 +660,46 @@ test("resolves and validates the live Planning Field catalog", () => {
     }, policy),
     /must have a non-empty description/,
   );
+  assert.throws(
+    () => resolveLiveTriageCatalog({
+      ...rawLiveCatalog,
+      issueTypes: rawLiveCatalog.issueTypes.map((entry) =>
+        entry.name === "Bug" ? { ...entry, name: "bug" } : entry),
+    }, policy),
+    /Issue types casing drift/u,
+  );
+  assert.throws(
+    () => resolveLiveTriageCatalog({
+      ...rawLiveCatalog,
+      fields: rawLiveCatalog.fields.map((entry) =>
+        entry.name === "Priority" ? { ...entry, name: "priority" } : entry),
+    }, policy),
+    /Planning field casing drift/u,
+  );
+  assert.throws(
+    () => resolveLiveTriageCatalog({
+      ...rawLiveCatalog,
+      fields: rawLiveCatalog.fields.map((entry) =>
+        entry.name === "Priority"
+          ? {
+              ...entry,
+              options: entry.options.map((option) =>
+                option.name === "High" ? { ...option, name: "high" } : option),
+            }
+          : entry),
+    }, policy),
+    /options casing drift/u,
+  );
+  assert.throws(
+    () => resolveLiveTriageCatalog({
+      ...rawLiveCatalog,
+      labels: rawLiveCatalog.labels.map((entry) =>
+        entry.name === "documentation"
+          ? { ...entry, name: "Documentation" }
+          : entry),
+    }, policy),
+    /Managed labels casing drift/u,
+  );
 });
 
 test("derives a supported strict general schema", () => {
@@ -652,6 +757,34 @@ test("redacts credentials before issue content enters model prompts", () => {
     /user:\[REDACTED\]@example\.com/u,
   );
   assert.equal(redactPromptText(`ab\uD83D`, 3), "ab");
+  const privateKey = [
+    "before",
+    "-----BEGIN PRIVATE KEY-----",
+    "sensitive-key-material".repeat(20),
+    "-----END PRIVATE KEY-----",
+    "after",
+  ].join("\n");
+  const privateKeyBoundary =
+    privateKey.indexOf("sensitive-key-material") + 10;
+  assert.equal(
+    redactPromptText(privateKey, privateKey.length),
+    "before\n[REDACTED]\nafter",
+  );
+  const redactedPrivateKey = redactPromptText(
+    privateKey,
+    privateKeyBoundary,
+  );
+  assert.equal(redactedPrivateKey, "before\n[REDACTED]");
+  assert.doesNotMatch(
+    redactedPrivateKey,
+    /BEGIN PRIVATE KEY|sensitive-key/u,
+  );
+  const boundaryToken = `before github_pat_${"a".repeat(40)} after`;
+  const tokenBoundary = "before github_pat_aaaaa".length;
+  assert.equal(
+    redactPromptText(boundaryToken, tokenBoundary),
+    "before [REDACTED]",
+  );
   assert.throws(() => redactPromptText("text", -1), /non-negative integer/u);
 
   const general = buildClassificationPrompt(

@@ -11,7 +11,9 @@ duplicate check.
 The checked-in source of truth is
 `.github/codex/issue-triage-policy.json`. It declares the exact Issue types,
 Planning Field names and options, security-compatible Issue types, and
-secondary labels the workflow owns.
+secondary labels the workflow owns. The Priority policy also explicitly lists
+`staleExemptOptions`; these must be named Priority options and are the sole
+source of stale exemptions.
 
 The workflow resolves GitHub node IDs and descriptions dynamically. It fails
 before inference if a configured type, field, option, or label is missing,
@@ -135,10 +137,11 @@ Perform the migration in this order:
 
 ## Stale issues
 
-The stale workflow reads the native Priority field before invoking the pinned
-stale action. It temporarily marks open `Urgent` and `High` issues with an
-internal exemption label, then removes those markers in an always-running
-cleanup step. `blocked` issues remain exempt.
+The stale workflow loads the checked-in triage policy and reads its configured
+Priority field before invoking the pinned stale action. It temporarily marks
+open issues whose Priority is listed in `staleExemptOptions`—currently `Urgent`
+and `High`—with an internal exemption label, then removes those markers in an
+always-running cleanup step. `blocked` issues remain exempt.
 
 ## Security and operations
 
