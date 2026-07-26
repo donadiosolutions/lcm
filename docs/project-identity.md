@@ -54,8 +54,9 @@ The instruction cache is a fixed-slot table, so reconciliation arbitrates each
 slot by `updated_at`. Byte-for-byte identical rows are deduplicated. When two
 different valid rows occupy the same slot, LCM retains the row with the newer
 timestamp; an equal timestamp is a divergent collision and blocks the run.
-Malformed timestamps also block reconciliation rather than guessing which
-instruction is current. In every blocked case, the original source project
+Malformed timestamps block reconciliation only when differing rows require
+arbitration; exact byte-identical rows deduplicate without timestamp parsing.
+In every blocked case, the original source project
 and event stores have not been discarded: after a successful reconciliation
 they are archived as recoverable timestamped backups, and before success the
 source stores remain in place for inspection or correction.
