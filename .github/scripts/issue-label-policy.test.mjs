@@ -19,6 +19,7 @@ import {
   discoverDuplicateCandidateNumbers,
   duplicateCommentBody,
   fetchDuplicateCandidates,
+  fetchIssuePlanningMetadata,
   fetchRepositoryLabelCatalog,
   findDuplicateCommentTarget,
   includesLabelIgnoreCase,
@@ -37,6 +38,7 @@ import {
   resolveDuplicateCanonicalTarget,
   requiresDuplicateTriage,
   sanitizeSecurityApiEvidence,
+  SECURITY_API_MAX_RESULTS_PER_SOURCE,
   selectSecurityEvidenceForIssue,
   TRIAGE_CATALOG_QUERY,
   validateClassificationResult,
@@ -243,6 +245,132 @@ test("builds the live label catalog from the complete paginated REST result", as
   assert.doesNotMatch(TRIAGE_CATALOG_QUERY, /labels\s*\(/u);
 });
 
+test("fetches every Planning Field page and rejects ambiguous field values", async () => {
+  const firstPage = {
+    repository: {
+      issue: {
+        id: "issue-42",
+        number: 42,
+        title: "Example",
+        issueType: { id: "type-Bug", name: "Bug" },
+        issueFieldValues: {
+          nodes: [{
+            name: "High",
+            field: { id: "priority", name: "Priority" },
+          }],
+          pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
+        },
+        labels: { nodes: [] },
+      },
+    },
+  };
+  const secondPage = {
+    node: {
+      issueFieldValues: {
+        nodes: [{
+          name: "Triage",
+          field: { id: "security-status", name: "Security status" },
+        }],
+        pageInfo: { hasNextPage: false, endCursor: "cursor-2" },
+      },
+    },
+  };
+  const calls = [];
+  const github = {
+    graphql: async (query, variables) => {
+      calls.push({ query, variables });
+      return calls.length === 1 ? firstPage : secondPage;
+    },
+  };
+  const issue = await fetchIssuePlanningMetadata(
+    github,
+    { owner: "example", repo: "repo" },
+    42,
+  );
+  assert.deepEqual(
+    issue.issueFieldValues.nodes.map((value) => value.field.name),
+    ["Priority", "Security status"],
+  );
+  assert.deepEqual(calls.map(({ variables }) => variables), [
+    { owner: "example", repo: "repo", number: 42 },
+    { issueId: "issue-42", cursor: "cursor-1" },
+  ]);
+  assert.match(
+    calls[0].query,
+    /issueFieldValues\(first: 100\)[\s\S]*?pageInfo/u,
+  );
+  assert.match(calls[1].query, /issueFieldValues\(first: 100, after: \$cursor\)/u);
+
+  await assert.rejects(
+    fetchIssuePlanningMetadata({
+      graphql: async () => ({
+        repository: {
+          issue: {
+            ...firstPage.repository.issue,
+            issueFieldValues: {
+              nodes: [],
+              pageInfo: { hasNextPage: true, endCursor: null },
+            },
+          },
+        },
+      }),
+    }, { owner: "example", repo: "repo" }, 42),
+    /without a cursor/u,
+  );
+  await assert.rejects(
+    fetchIssuePlanningMetadata({
+      graphql: async () => ({
+        repository: {
+          issue: {
+            ...firstPage.repository.issue,
+            id: null,
+          },
+        },
+      }),
+    }, { owner: "example", repo: "repo" }, 42),
+    /has no node ID/u,
+  );
+  await assert.rejects(
+    fetchIssuePlanningMetadata({
+      graphql: async (query) =>
+        query.includes("IssuePlanningMetadata")
+          ? firstPage
+          : { node: null },
+    }, { owner: "example", repo: "repo" }, 42),
+    /Could not read Planning Fields/u,
+  );
+  await assert.rejects(
+    fetchIssuePlanningMetadata({
+      graphql: async (query) =>
+        query.includes("IssuePlanningMetadata")
+          ? firstPage
+          : {
+              node: {
+                issueFieldValues: {
+                  nodes: [{
+                    name: "Low",
+                    field: { id: "other-priority", name: "priority" },
+                  }],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
+            },
+    }, { owner: "example", repo: "repo" }, 42),
+    /duplicate priority Planning Field values/iu,
+  );
+  assert.equal(await fetchIssuePlanningMetadata({
+    graphql: async () => ({ repository: { issue: null } }),
+  }, { owner: "example", repo: "repo" }, 99), null);
+  await assert.rejects(
+    fetchIssuePlanningMetadata({}, { owner: "example", repo: "repo" }, 42),
+    /must provide graphql/u,
+  );
+  await assert.rejects(
+    fetchIssuePlanningMetadata(github, { owner: "example", repo: "repo" }, 0),
+    /positive integer/u,
+  );
+});
+
 test("gates duplicate triage on the reconciled live Issue type", () => {
   assert.equal(requiresDuplicateTriage("BUG"), true);
   assert.equal(requiresDuplicateTriage({ name: "Bug" }), true);
@@ -310,6 +438,26 @@ test("workflow binds evidence and the required model split", async () => {
     5,
   );
   assert.doesNotMatch(workflow, /catalogResponse\.repository\.labels/u);
+  assert.equal(
+    (workflow.match(/fetchIssuePlanningMetadata\(\s*github,\s*context\.repo/gu) ?? [])
+      .length,
+    9,
+  );
+  assert.doesNotMatch(workflow, /github\.graphql\(ISSUE_PLANNING_QUERY/u);
+  assert.doesNotMatch(workflow, /source\.type/u);
+  assert.equal(
+    (workflow.match(/requiresDuplicateTriage\(planningIssue\.issueType\)/gu) ?? [])
+      .length,
+    2,
+  );
+  assert.match(
+    workflow,
+    /const SECURITY_API_PER_PAGE = 50;[\s\S]*?SECURITY_API_MAX_PAGES_PER_STATE = 2;[\s\S]*?SECURITY_API_MAX_RESULTS_PER_STATE[\s\S]*?page <= SECURITY_API_MAX_PAGES_PER_STATE[\s\S]*?page,[\s\S]*?per_page: SECURITY_API_PER_PAGE/u,
+  );
+  assert.match(
+    workflow,
+    /const boundedPage = response\.data\.slice\(0, remaining\);[\s\S]*?collectedForState >= SECURITY_API_MAX_RESULTS_PER_STATE/u,
+  );
 
   const staleWorkflow = await readFile(
     new URL("../workflows/stale.yml", import.meta.url),
@@ -325,6 +473,18 @@ test("workflow binds evidence and the required model split", async () => {
   assert.match(staleWorkflow, /priority === "Urgent" \|\| priority === "High"/u);
   assert.match(staleWorkflow, /internal-stale-priority-exempt/u);
   assert.doesNotMatch(staleWorkflow, /p0-critical|p1-high/u);
+  assert.match(
+    staleWorkflow,
+    /orderBy: \{field: UPDATED_AT, direction: ASC\}[\s\S]*?updatedAt/u,
+  );
+  assert.match(
+    staleWorkflow,
+    /staleThreshold[\s\S]*?if \(updatedAt > staleThreshold\)[\s\S]*?reachedRecentIssues = true/u,
+  );
+  assert.ok(
+    staleWorkflow.indexOf("for (const issueNumber of exempt)")
+    > staleWorkflow.indexOf("} while (cursor !== null);"),
+  );
 });
 
 test("rejects malformed issue-triage policies", () => {
@@ -919,6 +1079,31 @@ test("sanitizes and selects Security and Quality API evidence", () => {
   assert.doesNotMatch(
     serialized,
     /must-not-leak|raw-secret|package-lock\.json|sensitive\/path|sensitive comment|private\/fork/u,
+  );
+  const acrossStates = sanitizeSecurityApiEvidence({
+    dependabot: [
+      ...Array.from({ length: 100 }, (_, index) => ({
+        number: index + 1,
+        state: "open",
+      })),
+      {
+        number: 101,
+        state: "fixed",
+        security_advisory: { ghsa_id: "GHSA-later-state" },
+      },
+    ],
+  });
+  assert.equal(acrossStates.dependabot.length, 101);
+  assert.equal(acrossStates.dependabot.at(-1).state, "fixed");
+  assert.equal(acrossStates.dependabot.at(-1).ghsaId, "GHSA-later-state");
+  assert.equal(
+    sanitizeSecurityApiEvidence({
+      dependabot: Array.from(
+        { length: SECURITY_API_MAX_RESULTS_PER_SOURCE + 1 },
+        (_, index) => ({ number: index + 1, state: "open" }),
+      ),
+    }).dependabot.length,
+    SECURITY_API_MAX_RESULTS_PER_SOURCE,
   );
   const selected = selectSecurityEvidenceForIssue(
     { title: "Fix GHSA-abcd-1234-zzzz", body: "" },

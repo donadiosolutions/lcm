@@ -42,9 +42,9 @@ jobs:
               join(process.env.GITHUB_WORKSPACE, ".github/scripts/issue-label-policy.mjs"),
             ).href;
             const {
-              ISSUE_PLANNING_QUERY,
               SET_ISSUE_FIELDS_MUTATION,
               TRIAGE_CATALOG_QUERY,
+              fetchIssuePlanningMetadata,
               fetchRepositoryLabelCatalog,
               loadTriagePolicy,
               resolveLiveTriageCatalog,
@@ -91,12 +91,11 @@ jobs:
               fields: catalogResponse.organization.issueFields.nodes,
               labels: repositoryLabels,
             }, policy);
-            const planningResponse = await github.graphql(ISSUE_PLANNING_QUERY, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              number: issueNumber,
-            });
-            const issue = planningResponse.repository.issue;
+            const issue = await fetchIssuePlanningMetadata(
+              github,
+              context.repo,
+              issueNumber,
+            );
             if (!issue) throw new Error(`Issue #${issueNumber} does not exist`);
             const currentFields = new Map(
               issue.issueFieldValues.nodes
@@ -157,8 +156,8 @@ jobs:
             const {
               buildClassificationPrompt,
               buildOutputSchema,
-              ISSUE_PLANNING_QUERY,
               TRIAGE_CATALOG_QUERY,
+              fetchIssuePlanningMetadata,
               fetchRepositoryLabelCatalog,
               loadTriagePolicy,
               missingLabelsIgnoreCase,
@@ -229,12 +228,11 @@ jobs:
 
             const issues = [];
             for (const issueNumber of issueNumbers) {
-              const planningResponse = await github.graphql(ISSUE_PLANNING_QUERY, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                number: issueNumber,
-              });
-              const issue = planningResponse.repository.issue;
+              const issue = await fetchIssuePlanningMetadata(
+                github,
+                context.repo,
+                issueNumber,
+              );
               if (!issue) throw new Error(`Queued issue #${issueNumber} does not exist`);
               const fields = Object.fromEntries(
                 issue.issueFieldValues.nodes
@@ -324,8 +322,8 @@ jobs:
             const {
               buildInitialPlanningUpdates,
               computeLabelChanges,
-              ISSUE_PLANNING_QUERY,
               includesLabelIgnoreCase,
+              fetchIssuePlanningMetadata,
               fetchRepositoryLabelCatalog,
               loadTriagePolicy,
               removeIssueLabelIfPresent,
@@ -371,12 +369,11 @@ jobs:
             for (const classification of classifications) {
               const issueNumber = classification.issueNumber;
               try {
-                const planningResponse = await github.graphql(ISSUE_PLANNING_QUERY, {
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  number: issueNumber,
-                });
-                const issue = planningResponse.repository.issue;
+                const issue = await fetchIssuePlanningMetadata(
+                  github,
+                  context.repo,
+                  issueNumber,
+                );
                 if (!issue) throw new Error(`Issue #${issueNumber} does not exist`);
                 const currentLabels = issue.labels.nodes.map((label) => label.name);
 
@@ -428,12 +425,11 @@ jobs:
                   );
                 }
 
-                const reconciledResponse = await github.graphql(ISSUE_PLANNING_QUERY, {
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  number: issueNumber,
-                });
-                const reconciledIssue = reconciledResponse.repository.issue;
+                const reconciledIssue = await fetchIssuePlanningMetadata(
+                  github,
+                  context.repo,
+                  issueNumber,
+                );
                 if (classification.isSecurity) securityIssueNumbers.push(issueNumber);
                 if (requiresDuplicateTriage(reconciledIssue.issueType)) {
                   bugIssueNumbers.push(issueNumber);
@@ -516,12 +512,13 @@ jobs:
             const {
               buildSecurityClassificationPrompt,
               buildSecurityClassificationSchema,
-              ISSUE_PLANNING_QUERY,
               issueContentFingerprint,
+              fetchIssuePlanningMetadata,
               fetchRepositoryLabelCatalog,
               loadTriagePolicy,
               resolveLiveTriageCatalog,
               sanitizeSecurityApiEvidence,
+              SECURITY_API_MAX_RESULTS_PER_SOURCE,
               selectSecurityEvidenceForIssue,
               TRIAGE_CATALOG_QUERY,
             } = await import(policyUrl);
@@ -563,22 +560,52 @@ jobs:
               advisories: [],
             };
             const accessIssues = [];
+            const SECURITY_API_PER_PAGE = 50;
+            const SECURITY_API_MAX_PAGES_PER_STATE = 2;
+            const SECURITY_API_MAX_RESULTS_PER_STATE =
+              SECURITY_API_PER_PAGE * SECURITY_API_MAX_PAGES_PER_STATE;
             async function collectRoute(key, route, variants) {
               for (const variant of variants) {
-                try {
-                  const response = await github.request(route, {
-                    ...context.repo,
-                    ...variant,
-                    per_page: Math.max(1, Math.floor(100 / variants.length)),
-                  });
-                  rawEvidence[key].push(...response.data);
-                } catch (error) {
-                  const status = Number(error?.status);
-                  if ([403, 404, 422].includes(status)) {
-                    accessIssues.push(`${key} unavailable (${status})`);
-                    break;
+                let collectedForState = 0;
+                for (
+                  let page = 1;
+                  page <= SECURITY_API_MAX_PAGES_PER_STATE;
+                  page += 1
+                ) {
+                  try {
+                    const response = await github.request(route, {
+                      ...context.repo,
+                      ...variant,
+                      page,
+                      per_page: SECURITY_API_PER_PAGE,
+                    });
+                    if (!Array.isArray(response.data)) {
+                      throw new Error(`${key} returned a non-array response`);
+                    }
+                    const remaining = Math.min(
+                      SECURITY_API_MAX_RESULTS_PER_STATE - collectedForState,
+                      SECURITY_API_MAX_RESULTS_PER_SOURCE - rawEvidence[key].length,
+                    );
+                    if (remaining <= 0) return;
+                    const boundedPage = response.data.slice(0, remaining);
+                    rawEvidence[key].push(...boundedPage);
+                    collectedForState += boundedPage.length;
+                    if (
+                      response.data.length < SECURITY_API_PER_PAGE
+                      || collectedForState >= SECURITY_API_MAX_RESULTS_PER_STATE
+                      || rawEvidence[key].length
+                        >= SECURITY_API_MAX_RESULTS_PER_SOURCE
+                    ) {
+                      break;
+                    }
+                  } catch (error) {
+                    const status = Number(error?.status);
+                    if ([403, 404, 422].includes(status)) {
+                      accessIssues.push(`${key} unavailable (${status})`);
+                      return;
+                    }
+                    throw error;
                   }
-                  throw error;
                 }
               }
             }
@@ -608,12 +635,11 @@ jobs:
             const issues = [];
             const evidence = [];
             for (const issueNumber of issueNumbers) {
-              const response = await github.graphql(ISSUE_PLANNING_QUERY, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                number: issueNumber,
-              });
-              const issue = response.repository.issue;
+              const issue = await fetchIssuePlanningMetadata(
+                github,
+                context.repo,
+                issueNumber,
+              );
               if (!issue) throw new Error(`Security issue #${issueNumber} does not exist`);
               const fields = Object.fromEntries(
                 issue.issueFieldValues.nodes
@@ -708,9 +734,9 @@ jobs:
             ).href;
             const {
               buildSecurityPlanningUpdates,
+              fetchIssuePlanningMetadata,
               fetchRepositoryLabelCatalog,
               includesLabelIgnoreCase,
-              ISSUE_PLANNING_QUERY,
               issueContentFingerprint,
               loadTriagePolicy,
               parseAndValidateSecurityResult,
@@ -775,12 +801,11 @@ jobs:
               }
               for (const decision of decisions) {
                 try {
-                  const response = await github.graphql(ISSUE_PLANNING_QUERY, {
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    number: decision.issueNumber,
-                  });
-                  const issue = response.repository.issue;
+                  const issue = await fetchIssuePlanningMetadata(
+                    github,
+                    context.repo,
+                    decision.issueNumber,
+                  );
                   if (!issue) throw new Error(`Issue #${decision.issueNumber} does not exist`);
                   const labels = issue.labels.nodes.map((label) => label.name);
                   if (!includesLabelIgnoreCase(labels, process.env.QUEUE_LABEL)) {
@@ -839,12 +864,11 @@ jobs:
                 );
                 continue;
               }
-              const response = await github.graphql(ISSUE_PLANNING_QUERY, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                number: issueNumber,
-              });
-              const issue = response.repository.issue;
+              const issue = await fetchIssuePlanningMetadata(
+                github,
+                context.repo,
+                issueNumber,
+              );
               const labels = issue?.labels.nodes.map((label) => label.name) ?? [];
               if (
                 issue
@@ -896,6 +920,7 @@ jobs:
               buildDuplicateSearchQuery,
               discoverDuplicateCandidateNumbers,
               fetchDuplicateCandidates,
+              fetchIssuePlanningMetadata,
               findDuplicateCommentTarget,
               includesLabelIgnoreCase,
               issueContentFingerprint,
@@ -924,7 +949,15 @@ jobs:
                   );
                   continue;
                 }
-                if (!requiresDuplicateTriage(source.type)) {
+                const planningIssue = await fetchIssuePlanningMetadata(
+                  github,
+                  context.repo,
+                  issueNumber,
+                );
+                if (!planningIssue) {
+                  throw new Error(`Queued bug #${issueNumber} does not exist`);
+                }
+                if (!requiresDuplicateTriage(planningIssue.issueType)) {
                   throw new Error(
                     `Issue #${issueNumber} no longer has Issue type Bug`,
                   );
@@ -1066,6 +1099,7 @@ jobs:
             const {
               duplicateCommentBody,
               fetchDuplicateCandidates,
+              fetchIssuePlanningMetadata,
               findDuplicateCommentTarget,
               includesLabelIgnoreCase,
               issueContentFingerprint,
@@ -1105,7 +1139,15 @@ jobs:
                   );
                   continue;
                 }
-                if (!requiresDuplicateTriage(source.type)) {
+                const planningIssue = await fetchIssuePlanningMetadata(
+                  github,
+                  context.repo,
+                  issueNumber,
+                );
+                if (!planningIssue) {
+                  throw new Error(`Queued bug #${issueNumber} does not exist`);
+                }
+                if (!requiresDuplicateTriage(planningIssue.issueType)) {
                   await removeIssueLabelIfPresent(
                     github,
                     context.repo,

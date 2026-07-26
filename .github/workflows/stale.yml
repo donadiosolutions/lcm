@@ -39,7 +39,10 @@ jobs:
             }
 
             const exempt = [];
+            const staleThreshold =
+              Date.now() - (30 * 24 * 60 * 60 * 1_000);
             let cursor = null;
+            let reachedRecentIssues = false;
             do {
               const response = await github.graphql(
                 `query PriorityExemptIssues(
@@ -52,11 +55,12 @@ jobs:
                       first: 100
                       after: $cursor
                       states: OPEN
-                      orderBy: {field: CREATED_AT, direction: ASC}
+                      orderBy: {field: UPDATED_AT, direction: ASC}
                     ) {
                       nodes {
                         id
                         number
+                        updatedAt
                         issueFieldValues(first: 100) {
                           nodes {
                             ... on IssueFieldSingleSelectValue {
@@ -88,6 +92,16 @@ jobs:
                 },
               );
               for (const issue of response.repository.issues.nodes) {
+                const updatedAt = Date.parse(issue.updatedAt);
+                if (!Number.isFinite(updatedAt)) {
+                  throw new Error(
+                    `Issue #${issue.number} has an invalid updatedAt timestamp`,
+                  );
+                }
+                if (updatedAt > staleThreshold) {
+                  reachedRecentIssues = true;
+                  break;
+                }
                 const priorityValues = issue.issueFieldValues.nodes.filter(
                   (value) => value.field?.name === "Priority",
                 );
@@ -149,17 +163,25 @@ jobs:
                 }
                 const priority = priorityValues[0]?.name;
                 if (priority === "Urgent" || priority === "High") {
-                  await github.rest.issues.addLabels({
-                    ...context.repo,
-                    issue_number: issue.number,
-                    labels: [label],
-                  });
                   exempt.push(issue.number);
                 }
               }
               const pageInfo = response.repository.issues.pageInfo;
-              cursor = pageInfo.hasNextPage ? pageInfo.endCursor : null;
+              if (reachedRecentIssues || !pageInfo.hasNextPage) {
+                cursor = null;
+              } else if (!pageInfo.endCursor) {
+                throw new Error("Open issue pagination has no end cursor");
+              } else {
+                cursor = pageInfo.endCursor;
+              }
             } while (cursor !== null);
+            for (const issueNumber of exempt) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: issueNumber,
+                labels: [label],
+              });
+            }
             core.info(`Temporarily exempted ${exempt.length} high-priority issue(s).`);
 
       - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629 # v10.4.0

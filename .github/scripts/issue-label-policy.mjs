@@ -14,6 +14,8 @@ export const SECURITY_CONFIDENCE = Object.freeze([
   "high",
 ]);
 
+export const SECURITY_API_MAX_RESULTS_PER_SOURCE = 400;
+
 const SECURITY_NATURE_UNKNOWN = "Unknown";
 const SECURITY_STATUS_TRIAGE = "Triage";
 
@@ -64,7 +66,7 @@ export const ISSUE_PLANNING_QUERY = `
           id
           name
         }
-        issueFieldValues(first: 50) {
+        issueFieldValues(first: 100) {
           nodes {
             ... on IssueFieldSingleSelectValue {
               name
@@ -76,10 +78,40 @@ export const ISSUE_PLANNING_QUERY = `
               }
             }
           }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
         }
         labels(first: 100) {
           nodes {
             name
+          }
+        }
+      }
+    }
+  }
+`;
+
+const ISSUE_PLANNING_FIELDS_PAGE_QUERY = `
+  query IssuePlanningFieldValuesPage($issueId: ID!, $cursor: String!) {
+    node(id: $issueId) {
+      ... on Issue {
+        issueFieldValues(first: 100, after: $cursor) {
+          nodes {
+            ... on IssueFieldSingleSelectValue {
+              name
+              field {
+                ... on IssueFieldSingleSelect {
+                  id
+                  name
+                }
+              }
+            }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
           }
         }
       }
@@ -267,6 +299,67 @@ export async function fetchRepositoryLabelCatalog(github, repository) {
       description: label.description,
     });
   }));
+}
+
+export async function fetchIssuePlanningMetadata(github, repository, issueNumber) {
+  if (typeof github?.graphql !== "function") {
+    throw new TypeError("GitHub client must provide graphql");
+  }
+  assertPlainObject(repository, "Repository coordinates");
+  if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
+    throw new TypeError("Issue number must be a positive integer");
+  }
+  const response = await github.graphql(ISSUE_PLANNING_QUERY, {
+    ...repository,
+    number: issueNumber,
+  });
+  const issue = response?.repository?.issue;
+  if (!issue) return null;
+  const initialConnection = issue.issueFieldValues;
+  if (!initialConnection?.pageInfo || !Array.isArray(initialConnection.nodes)) {
+    throw new Error(`Issue #${issueNumber} Planning Field response is incomplete`);
+  }
+  const nodes = [...initialConnection.nodes];
+  let pageInfo = initialConnection.pageInfo;
+  while (pageInfo.hasNextPage) {
+    if (typeof pageInfo.endCursor !== "string" || pageInfo.endCursor.length === 0) {
+      throw new Error(
+        `Issue #${issueNumber} has another Planning Field page without a cursor`,
+      );
+    }
+    if (typeof issue.id !== "string" || issue.id.length === 0) {
+      throw new Error(`Issue #${issueNumber} has no node ID for Planning Field pagination`);
+    }
+    const pageResponse = await github.graphql(
+      ISSUE_PLANNING_FIELDS_PAGE_QUERY,
+      { issueId: issue.id, cursor: pageInfo.endCursor },
+    );
+    const connection = pageResponse?.node?.issueFieldValues;
+    if (!connection?.pageInfo || !Array.isArray(connection.nodes)) {
+      throw new Error(`Could not read Planning Fields for issue #${issueNumber}`);
+    }
+    nodes.push(...connection.nodes);
+    pageInfo = connection.pageInfo;
+  }
+
+  const fieldsByName = new Map();
+  for (const value of nodes) {
+    if (!value?.field?.name) continue;
+    const normalized = value.field.name.toLowerCase();
+    if (fieldsByName.has(normalized)) {
+      throw new Error(
+        `Issue #${issueNumber} has duplicate ${value.field.name} Planning Field values`,
+      );
+    }
+    fieldsByName.set(normalized, value);
+  }
+  return Object.freeze({
+    ...issue,
+    issueFieldValues: Object.freeze({
+      nodes: Object.freeze(nodes),
+      pageInfo: Object.freeze({ ...pageInfo }),
+    }),
+  });
 }
 
 export function managedLabelNames(policy) {
@@ -743,7 +836,10 @@ function boundedString(value, maximum = 512) {
 
 export function sanitizeSecurityApiEvidence(rawEvidence) {
   assertPlainObject(rawEvidence, "Security API evidence");
-  const boundedArray = (value) => Array.isArray(value) ? value.slice(0, 100) : [];
+  const boundedArray = (value) =>
+    Array.isArray(value)
+      ? value.slice(0, SECURITY_API_MAX_RESULTS_PER_SOURCE)
+      : [];
   return Object.freeze({
     dependabot: Object.freeze(boundedArray(rawEvidence.dependabot).map((alert) => ({
       source: "dependabot",
