@@ -135,19 +135,47 @@ Perform the migration in this order:
    and labels.
 2. Preserve existing Planning Field values, then backfill legacy labels:
    `p0-critical` to `Urgent`, `p1-high` to `High`, `p2-medium` to `Medium`,
-   `p3-low` to `Low`, `bug` to `Bug`, `enhancement` to `Feature`, `chore`
-   to `Chore`, and `question` to `Question`. Preserve `Epic` and resolve any
-   conflicting legacy type labels against the reviewed inventory.
+   `p3-low` to `Low`, `bug` to `Bug`, `enhancement` to `Feature`, and `chore`
+   to `Chore`. Preserve `Epic` and resolve any conflicting legacy type labels
+   against the reviewed inventory.
 3. Set `Security status=Triage` on legacy security issues when the field is
    unset, then run the Terra enrichment pass.
 4. Verify complete Issue type and Priority coverage for every open and closed
    issue and verify the intended security fields. Priority must be backfilled
    before the next stale run and before any legacy priority label is removed.
-5. Mark `bug`, `enhancement`, `chore`, `question`, `security`, `p0-critical`,
-   `p1-high`, `p2-medium`, `p3-low`, and every `prj-*` label as deprecated,
-   then delete them only after verification succeeds.
+5. Mark `bug`, `enhancement`, `chore`, `security`, `p0-critical`, `p1-high`,
+   `p2-medium`, `p3-low`, and every `prj-*` label as deprecated, then delete
+   them only after verification succeeds.
 6. Re-enable or allow the next stale run after the verified field backfill and
    label deletion complete.
+
+## Question type follow-up rollout
+
+Installations that completed the original one-time rollout before `Question`
+became a native Issue type must use this narrow follow-up. Do not rerun the
+initial migration above.
+
+1. Snapshot every open and closed issue that still has the `question` label,
+   recording its current Issue type, every Planning Field value, and all
+   labels. Review that inventory and identify any issue that is not actually a
+   focused request for clarification, guidance, support, or an answer based on
+   existing project knowledge.
+2. Create the native `Question` Issue type if it is absent. Verify that it is
+   enabled and that its description states the classification boundary above:
+   investigation or spike work is `Chore` with `research`, behavior changes
+   are `Feature`, and unexpected incorrect behavior is `Bug`.
+3. For each reviewed `question`-labeled issue that meets that boundary, set
+   only its Issue type to `Question`. Preserve its Priority, security fields,
+   other Planning Field values, state, and unrelated labels. Resolve reviewed
+   exceptions individually instead of overwriting their existing Issue type.
+4. Verify every issue from the snapshot against the reviewed mapping, and
+   confirm that no Priority, security field, other Planning Field value, state,
+   or unrelated label changed.
+5. Deprecate and delete the `question` label only after that verification
+   succeeds.
+
+New installations should perform the initial rollout first and then apply this
+follow-up if a legacy `question` label or question-labeled issues exist.
 
 ## Stale issues
 

@@ -1245,6 +1245,35 @@ test("repository policy and Issue Form use native Question without an overlappin
   assert.doesNotMatch(questionForm, /^labels:/mu);
 });
 
+test("documents Question as a non-destructive follow-up to the original migration", async () => {
+  const documentation = await readFile(
+    join(process.cwd(), "docs/issue-triage.md"),
+    "utf8",
+  );
+  const initialStart = documentation.indexOf("## One-time rollout migration");
+  const followupStart = documentation.indexOf("## Question type follow-up rollout");
+  const staleStart = documentation.indexOf("## Stale issues");
+
+  assert.ok(initialStart >= 0);
+  assert.ok(followupStart > initialStart);
+  assert.ok(staleStart > followupStart);
+  assert.doesNotMatch(
+    documentation.slice(initialStart, followupStart),
+    /`question`|`Question`/u,
+  );
+
+  const followup = documentation.slice(followupStart, staleStart);
+  assert.match(followup, /Do not rerun the\s+initial migration above/u);
+  assert.match(
+    followup,
+    /Snapshot every open and closed issue[\s\S]*?Create the native `Question` Issue type[\s\S]*?set\s+only its Issue type to `Question`[\s\S]*?Verify every issue from the snapshot[\s\S]*?delete the `question` label only after that verification\s+succeeds/u,
+  );
+  assert.match(
+    followup,
+    /Preserve its Priority, security fields,\s+other Planning Field values, state, and unrelated labels/u,
+  );
+});
+
 test("builds an injection-resistant field-aware general prompt", () => {
   const prompt = buildClassificationPrompt(
     policy,
