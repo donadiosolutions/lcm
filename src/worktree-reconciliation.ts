@@ -673,7 +673,10 @@ function mergeInstructionRows(source: DatabaseSync, target: DatabaseSync, table:
 
 function instructionCacheTimestamp(value: SQLInputValue): number | null {
   if (typeof value !== "string") return null;
-  const parsed = Date.parse(value);
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/u.test(value)
+    ? `${value.replace(" ", "T")}Z`
+    : value;
+  const parsed = Date.parse(normalized);
   return Number.isFinite(parsed) ? parsed : null;
 }
 

@@ -1555,6 +1555,41 @@ describe("worktree reconciliation", () => {
     merged.close();
   });
 
+  it("treats SQLite-native instruction-cache timestamps as UTC in any process timezone", () => {
+    const originalTimezone = process.env.TZ;
+    process.env.TZ = "America/Sao_Paulo";
+    try {
+      const fixture = makeInstructionCacheReconciliation(
+        home,
+        {
+          content: "sqlite target",
+          contentHash: "sqlite-target-hash",
+          updatedAt: "2026-01-01 00:00:00",
+        },
+        {
+          content: "offset source",
+          contentHash: "offset-source-hash",
+          updatedAt: "2026-01-01T01:30:00+01:00",
+        },
+      );
+
+      expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+      const merged = new DatabaseSync(fixture.targetPath, { readOnly: true });
+      expect(merged.prepare(
+        `SELECT content, content_hash, updated_at
+         FROM session_instruction_cache WHERE id = 2`,
+      ).get()).toEqual({
+        content: "offset source",
+        content_hash: "offset-source-hash",
+        updated_at: "2026-01-01T01:30:00+01:00",
+      });
+      merged.close();
+    } finally {
+      if (originalTimezone === undefined) delete process.env.TZ;
+      else process.env.TZ = originalTimezone;
+    }
+  });
+
   it("fails closed on equal-timestamp instruction-cache divergence", () => {
     const fixture = makeInstructionCacheReconciliation(
       home,
