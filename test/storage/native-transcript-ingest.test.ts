@@ -427,6 +427,143 @@ describe("native transcript scrub and JSONL reader", () => {
     expect(records[1]?.prefixSha256).toBe(digest(first + second));
   });
 
+  it("snapshots reader dependencies before iteration and clones clock dates", async () => {
+    const content = '{"event":"safe"}\n{"bad":}\n';
+    let nextCall = 0;
+    const initialNext = vi.fn(async () => {
+      nextCall += 1;
+      return nextCall === 1
+        ? { done: false as const, value: Buffer.from(content) }
+        : { done: true as const, value: undefined };
+    });
+    const initialReturn = vi.fn(async () => ({
+      done: true as const,
+      value: undefined,
+    }));
+    const initialThrow = vi.fn(async () => ({
+      done: true as const,
+      value: undefined,
+    }));
+    const iterator = {
+      next: initialNext,
+      return: initialReturn,
+      throw: initialThrow,
+    };
+    const initialIteratorFactory = vi.fn(() => iterator);
+    const bytes = {
+      [Symbol.asyncIterator]: initialIteratorFactory,
+    };
+    const initialScrub = vi.fn((payload: JsonObject | JsonValue[]) => payload);
+    const scrubber = {
+      scrubberVersion: "scrubber-initial",
+      scrubJson: initialScrub,
+    };
+    const format = {
+      clientName: "claude-code",
+      formatName: "claude-jsonl",
+      formatVersion: "v1",
+    };
+    const sharedClockDate = new Date("2026-07-25T12:00:00.000Z");
+    const initialClock = vi.fn(() => sharedClockDate);
+    const initialProgress = vi.fn();
+    const mutatedNext = vi.fn(async () => ({
+      done: true as const,
+      value: undefined,
+    }));
+    const mutatedScrub = vi.fn(() => ({ mutated: true }));
+    const mutatedClock = vi.fn(() => new Date(Number.NaN));
+    const mutatedProgress = vi.fn();
+    const mutableOptions: Record<string | symbol, unknown> = {
+      bytes,
+      format,
+      nativeSessionId: "session-initial",
+      sourceLocator: "sessions/initial.jsonl",
+      scrubber,
+      clock: initialClock,
+      maxRecordBytes: 1_024,
+      progressStartByteOffset: 0,
+      onProgress: initialProgress,
+    };
+
+    const reader = readNativeTranscriptJsonl(
+      mutableOptions as unknown as Parameters<
+        typeof readNativeTranscriptJsonl
+      >[0],
+    );
+    expect(initialIteratorFactory).toHaveBeenCalledTimes(1);
+
+    mutableOptions.nativeSessionId = "session-mutated";
+    mutableOptions.sourceLocator = "sessions/mutated.jsonl";
+    mutableOptions.clock = mutatedClock;
+    mutableOptions.maxRecordBytes = 1;
+    mutableOptions.progressStartByteOffset = 10_000;
+    mutableOptions.onProgress = mutatedProgress;
+    Object.assign(format, {
+      clientName: "codex",
+      formatName: "codex-jsonl",
+    });
+    Object.assign(scrubber, {
+      scrubberVersion: "scrubber-mutated",
+      scrubJson: mutatedScrub,
+    });
+    Object.assign(bytes, {
+      [Symbol.asyncIterator]: vi.fn(() => ({
+        next: mutatedNext,
+      })),
+    });
+    Object.assign(iterator, {
+      next: mutatedNext,
+      return: vi.fn(),
+      throw: vi.fn(),
+    });
+
+    const outcomes = await Array.fromAsync(reader);
+    sharedClockDate.setUTCFullYear(2030);
+    expect(outcomes).toHaveLength(2);
+    const record = outcomes[0];
+    const quarantine = outcomes[1];
+    expect(record).toMatchObject({
+      kind: "record",
+      formatName: "claude-jsonl",
+      formatVersion: "v1",
+      nativeSessionId: "session-initial",
+      scrubberVersion: "scrubber-initial",
+      nativePayload: { event: "safe" },
+      observedAt: new Date("2026-07-25T12:00:00.000Z"),
+    });
+    expect(quarantine).toMatchObject({
+      kind: "quarantine",
+      reason: "malformed-json",
+      quarantinedAt: new Date("2026-07-25T12:00:00.000Z"),
+    });
+    if (record?.kind !== "record") throw new Error("expected record");
+    if (quarantine?.kind !== "quarantine") {
+      throw new Error("expected quarantine");
+    }
+    expect(record.observedAt).not.toBe(sharedClockDate);
+    expect(quarantine.quarantinedAt).not.toBe(sharedClockDate);
+    expect(record.observedAt).not.toBe(quarantine.quarantinedAt);
+    expect(record.ingestKey).toBe(digest(JSON.stringify([
+      "claude-code",
+      "claude-jsonl",
+      "v1",
+      "session-initial",
+      "sessions/initial.jsonl",
+      record.contentSha256,
+      1,
+    ])));
+    expect(initialNext).toHaveBeenCalledTimes(2);
+    expect(initialScrub).toHaveBeenCalledTimes(1);
+    expect(initialClock).toHaveBeenCalledTimes(2);
+    expect(initialProgress).toHaveBeenCalledTimes(2);
+    expect(mutatedNext).not.toHaveBeenCalled();
+    expect(mutatedScrub).not.toHaveBeenCalled();
+    expect(mutatedClock).not.toHaveBeenCalled();
+    expect(mutatedProgress).not.toHaveBeenCalled();
+    expect(initialReturn).not.toHaveBeenCalled();
+    expect(initialThrow).not.toHaveBeenCalled();
+  });
+
   it("reports exact raw byte ranges for records and blank checkpoint spans", async () => {
     const content = "\n{}\r\n \t\n[]";
     const progress: Array<{
@@ -542,7 +679,7 @@ describe("native transcript scrub and JSONL reader", () => {
   });
 
   it("quarantines lossy decimal tokens while preserving exact JSON spellings", async () => {
-    const outcomes = await collect(byteChunks([
+    const rejectedTokens = [
       '{"value":9007199254740993}',
       '{"value":9007199254740992}',
       '{"value":-9007199254740992}',
@@ -556,13 +693,20 @@ describe("native transcript scrub and JSONL reader", () => {
       '{"value":1e9007199254740992}',
       '{"value":1e99999999999999999}',
       `{"value":1${"0".repeat(20_000)}}`,
-      '{"values":[0.1,1.0,1e3,-0,-0e99999999999999999,9007199254740991,-9007199254740991,4503599627370495.5,1.25e3],"text":"9007199254740993"}',
+      '{"value":-0}',
+      '{"value":-0.0}',
+      '{"value":-0e3}',
+      '{"value":-0E-99999999999999999}',
+    ];
+    const outcomes = await collect(byteChunks([
+      ...rejectedTokens,
+      '{"values":[0.1,1.0,1e3,0,0e99999999999999999,9007199254740991,-9007199254740991,4503599627370495.5,1.25e3],"text":"9007199254740993"}',
     ].join("\n")));
-    expect(outcomes.slice(0, 13).every((outcome) =>
+    expect(outcomes.slice(0, rejectedTokens.length).every((outcome) =>
       outcome.kind === "quarantine"
       && outcome.reason === "malformed-json"
     )).toBe(true);
-    const accepted = outcomes[13];
+    const accepted = outcomes[rejectedTokens.length];
     expect(accepted).toMatchObject({
       kind: "record",
       nativePayload: {
@@ -570,8 +714,8 @@ describe("native transcript scrub and JSONL reader", () => {
           0.1,
           1,
           1_000,
-          -0,
-          -0,
+          0,
+          0,
           Number.MAX_SAFE_INTEGER,
           Number.MIN_SAFE_INTEGER,
           4_503_599_627_370_495.5,
@@ -581,12 +725,6 @@ describe("native transcript scrub and JSONL reader", () => {
       },
     });
     if (accepted?.kind !== "record") throw new Error("expected record");
-    const values = accepted.nativePayload.values;
-    expect(
-      Array.isArray(values)
-      && Object.is(values[3], -0)
-      && Object.is(values[4], -0),
-    ).toBe(true);
     expect(canonicalNativeTranscriptJson(accepted.nativePayload)).toBe(
       '{"text":"9007199254740993","values":[0.1,1,1000,0,0,9007199254740991,-9007199254740991,4503599627370495.5,1250]}',
     );
@@ -778,6 +916,67 @@ describe("native transcript scrub and JSONL reader", () => {
         projectPatterns: [],
       }),
     };
+    const expectInvalidOptions = async (candidate: unknown): Promise<void> => {
+      await expect(Array.fromAsync(readNativeTranscriptJsonl(
+        candidate as Parameters<typeof readNativeTranscriptJsonl>[0],
+      ))).rejects.toThrowError(NativeTranscriptConfigurationError);
+    };
+    await expectInvalidOptions(null);
+    await expectInvalidOptions(42);
+    await expectInvalidOptions({ ...base, format: null });
+    await expectInvalidOptions({ ...base, format: 42 });
+    await expectInvalidOptions({ ...base, clock: 42 });
+    await expectInvalidOptions({ ...base, onProgress: null });
+    await expectInvalidOptions({ ...base, scrubber: null });
+    await expectInvalidOptions({ ...base, scrubber: 42 });
+    await expectInvalidOptions({
+      ...base,
+      scrubber: { scrubberVersion: "version", scrubJson: 42 },
+    });
+    await expectInvalidOptions({
+      ...base,
+      scrubber: { scrubberVersion: "", scrubJson: vi.fn() },
+    });
+    for (const bytes of [
+      null,
+      42,
+      {},
+      { [Symbol.asyncIterator]: 42 },
+      { [Symbol.asyncIterator]: () => null },
+      { [Symbol.asyncIterator]: () => 42 },
+      { [Symbol.asyncIterator]: () => ({ next: 42 }) },
+      {
+        [Symbol.asyncIterator]: () => ({
+          next: vi.fn(),
+          return: 42,
+        }),
+      },
+      {
+        [Symbol.asyncIterator]: () => ({
+          next: vi.fn(),
+          throw: 42,
+        }),
+      },
+    ]) {
+      await expectInvalidOptions({ ...base, bytes });
+    }
+    const callableIterator = Object.assign(
+      () => undefined,
+      {
+        next: vi.fn(async () => ({
+          done: true as const,
+          value: undefined,
+        })),
+      },
+    );
+    const callableBytes = Object.assign(
+      () => undefined,
+      { [Symbol.asyncIterator]: () => callableIterator },
+    );
+    await expect(Array.fromAsync(readNativeTranscriptJsonl({
+      ...base,
+      bytes: callableBytes,
+    }))).resolves.toEqual([]);
     for (const sourceLocator of [
       "../secret",
       "nested/../secret",
@@ -822,6 +1021,11 @@ describe("native transcript scrub and JSONL reader", () => {
     await expect(Array.fromAsync(readNativeTranscriptJsonl({
       ...base,
       clock: () => new Date(Number.NaN),
+    }))).rejects.toThrowError(NativeTranscriptConfigurationError);
+    await expect(Array.fromAsync(readNativeTranscriptJsonl({
+      ...base,
+      bytes: byteChunks("{}"),
+      clock: (() => "not-a-date") as never,
     }))).rejects.toThrowError(NativeTranscriptConfigurationError);
     await expect(Array.fromAsync(readNativeTranscriptJsonl({
       ...base,

@@ -349,6 +349,116 @@ export interface NativeTranscriptJsonlReadOptions {
   }) => void;
 }
 
+interface NativeTranscriptJsonlReadSnapshot {
+  readonly bytes: AsyncIterable<Uint8Array>;
+  readonly format: NativeTranscriptFormat;
+  readonly nativeSessionId: string;
+  readonly sourceLocator: string;
+  readonly scrubber: NativeTranscriptScrubber;
+  readonly clock: () => Date;
+  readonly maxRecordBytes: number;
+  readonly progressStartByteOffset: number;
+  readonly onProgress: NativeTranscriptJsonlReadOptions["onProgress"];
+}
+
+function snapshotByteIterable(
+  bytes: AsyncIterable<Uint8Array>,
+): AsyncIterable<Uint8Array> {
+  const iteratorFactory = bytes?.[Symbol.asyncIterator];
+  if (
+    bytes === null
+    || (typeof bytes !== "object" && typeof bytes !== "function")
+    || typeof iteratorFactory !== "function"
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const iterator = iteratorFactory.call(bytes);
+  const nextMethod = iterator?.next;
+  const returnMethod = iterator?.return;
+  const throwMethod = iterator?.throw;
+  if (
+    iterator === null
+    || (typeof iterator !== "object" && typeof iterator !== "function")
+    || typeof nextMethod !== "function"
+    || (returnMethod !== undefined && typeof returnMethod !== "function")
+    || (throwMethod !== undefined && typeof throwMethod !== "function")
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const next = nextMethod.bind(iterator);
+  const boundReturn = returnMethod?.bind(iterator);
+  const boundThrow = throwMethod?.bind(iterator);
+  const stableIterator: AsyncIterator<Uint8Array> = {
+    next,
+    ...(boundReturn ? { return: boundReturn } : {}),
+    ...(boundThrow ? { throw: boundThrow } : {}),
+  };
+  Object.freeze(stableIterator);
+  return Object.freeze({
+    [Symbol.asyncIterator]: () => stableIterator,
+  });
+}
+
+function snapshotNativeTranscriptJsonlReadOptions(
+  options: NativeTranscriptJsonlReadOptions,
+): NativeTranscriptJsonlReadSnapshot {
+  if (options === null || typeof options !== "object") {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const callerFormat = options.format;
+  if (callerFormat === null || typeof callerFormat !== "object") {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const format = Object.freeze({
+    clientName: callerFormat.clientName,
+    formatName: callerFormat.formatName,
+    formatVersion: callerFormat.formatVersion,
+  }) as NativeTranscriptFormat;
+  const nativeSessionId = options.nativeSessionId;
+  const sourceLocator = options.sourceLocator;
+  const maxRecordBytes =
+    options.maxRecordBytes ?? NATIVE_TRANSCRIPT_MAX_RECORD_BYTES;
+  const progressStartByteOffset = options.progressStartByteOffset ?? 0;
+  const clock = options.clock ?? (() => new Date());
+  const onProgress = options.onProgress;
+  const callerScrubber = options.scrubber;
+  const callerBytes = options.bytes;
+  assertFormat(format);
+  assertNonemptyText(nativeSessionId);
+  assertSourceLocator(sourceLocator);
+  if (
+    !Number.isSafeInteger(maxRecordBytes)
+    || maxRecordBytes < 1
+    || !Number.isSafeInteger(progressStartByteOffset)
+    || progressStartByteOffset < 0
+    || typeof clock !== "function"
+    || (onProgress !== undefined && typeof onProgress !== "function")
+    || callerScrubber === null
+    || typeof callerScrubber !== "object"
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const scrubJsonMethod = callerScrubber.scrubJson;
+  if (typeof scrubJsonMethod !== "function") {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const scrubberVersion = callerScrubber.scrubberVersion;
+  assertNonemptyText(scrubberVersion);
+  const scrubJson = scrubJsonMethod.bind(callerScrubber);
+  const bytes = snapshotByteIterable(callerBytes);
+  return Object.freeze({
+    bytes,
+    format,
+    nativeSessionId,
+    sourceLocator,
+    scrubber: Object.freeze({ scrubberVersion, scrubJson }),
+    clock,
+    maxRecordBytes,
+    progressStartByteOffset,
+    onProgress,
+  });
+}
+
 function ingestKey(
   format: NativeTranscriptFormat,
   nativeSessionId: string,
@@ -446,6 +556,7 @@ function assertLosslessJsonNumbers(text: string): void {
     if (
       !originalDecimal
       || !roundTrippedDecimal
+      || Object.is(parsed, -0)
       || (Number.isInteger(parsed) && !Number.isSafeInteger(parsed))
       || originalDecimal.negative !== roundTrippedDecimal.negative
       || originalDecimal.coefficient !== roundTrippedDecimal.coefficient
@@ -627,10 +738,7 @@ function quarantineOutcome(
   contentSha256: string,
   clock: () => Date,
 ): QuarantinedNativeTranscriptRecord {
-  const quarantinedAt = clock();
-  if (!Number.isFinite(quarantinedAt.getTime())) {
-    throw new NativeTranscriptConfigurationError("invalid-input");
-  }
+  const quarantinedAt = capturedClockDate(clock);
   return {
     kind: "quarantine",
     sourceOrdinal,
@@ -642,25 +750,38 @@ function quarantineOutcome(
   };
 }
 
-export async function* readNativeTranscriptJsonl(
+function capturedClockDate(clock: () => Date): Date {
+  const clockValue = clock();
+  const captured = clockValue instanceof Date
+    ? new Date(clockValue.getTime())
+    : new Date(Number.NaN);
+  if (!Number.isFinite(captured.getTime())) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  return captured;
+}
+
+async function* failedNativeTranscriptJsonlRead(
+  error: unknown,
+): AsyncGenerator<NativeTranscriptReadOutcome> {
+  throw error;
+}
+
+export function readNativeTranscriptJsonl(
   options: NativeTranscriptJsonlReadOptions,
 ): AsyncGenerator<NativeTranscriptReadOutcome> {
-  assertFormat(options.format);
-  assertNonemptyText(options.nativeSessionId);
-  assertSourceLocator(options.sourceLocator);
-  const maxRecordBytes =
-    options.maxRecordBytes ?? NATIVE_TRANSCRIPT_MAX_RECORD_BYTES;
-  if (!Number.isSafeInteger(maxRecordBytes) || maxRecordBytes < 1) {
-    throw new NativeTranscriptConfigurationError("invalid-input");
+  try {
+    return readNativeTranscriptJsonlSnapshot(
+      snapshotNativeTranscriptJsonlReadOptions(options),
+    );
+  } catch (error) {
+    return failedNativeTranscriptJsonlRead(error);
   }
-  const progressStartByteOffset = options.progressStartByteOffset ?? 0;
-  if (
-    !Number.isSafeInteger(progressStartByteOffset)
-    || progressStartByteOffset < 0
-  ) {
-    throw new NativeTranscriptConfigurationError("invalid-input");
-  }
-  const clock = options.clock ?? (() => new Date());
+}
+
+async function* readNativeTranscriptJsonlSnapshot(
+  config: NativeTranscriptJsonlReadSnapshot,
+): AsyncGenerator<NativeTranscriptReadOutcome> {
   const prefixHash = createHash("sha256");
   const occurrences = new Map<string, number>();
   let accumulator = newAccumulator();
@@ -675,7 +796,7 @@ export async function* readNativeTranscriptJsonl(
   ): void => {
     const relativeStart = Math.max(
       0,
-      progressStartByteOffset - startByteOffset,
+      config.progressStartByteOffset - startByteOffset,
     );
     if (relativeStart < bytes.byteLength) {
       progressRangeHash.update(bytes.subarray(relativeStart));
@@ -686,11 +807,11 @@ export async function* readNativeTranscriptJsonl(
     endByteOffset: number,
   ): NativeTranscriptReadOutcome | null => {
     const prefixSha256 = prefixHash.copy().digest("hex");
-    if (endByteOffset > progressStartByteOffset) {
-      options.onProgress?.({
+    if (endByteOffset > config.progressStartByteOffset) {
+      config.onProgress?.({
         startByteOffset: Math.max(
           recordStartByteOffset,
-          progressStartByteOffset,
+          config.progressStartByteOffset,
         ),
         endByteOffset,
         rangeSha256: progressRangeHash.digest("hex"),
@@ -704,7 +825,7 @@ export async function* readNativeTranscriptJsonl(
         prefixSha256,
         "record-too-large",
         accumulator.rawHash.copy().digest("hex"),
-        clock,
+        config.clock,
       );
       sourceOrdinal += 1;
       return outcome;
@@ -715,31 +836,28 @@ export async function* readNativeTranscriptJsonl(
     try {
       const parsed = parsedContainer(decodeRecord(bytes));
       assertJsonTreeSafe(parsed);
-      const nativePayload = options.scrubber.scrubJson(parsed);
+      const nativePayload = config.scrubber.scrubJson(parsed);
       const contentSha256 = sha256(
         canonicalNativeTranscriptJson(nativePayload),
       );
       const occurrence = (occurrences.get(contentSha256) ?? 0) + 1;
       occurrences.set(contentSha256, occurrence);
-      const observedAt = clock();
-      if (!Number.isFinite(observedAt.getTime())) {
-        throw new NativeTranscriptConfigurationError("invalid-input");
-      }
+      const observedAt = capturedClockDate(config.clock);
       const outcome: PreparedNativeTranscriptRecord = {
         kind: "record",
         sourceOrdinal,
         endByteOffset,
         prefixSha256,
-        formatName: options.format.formatName,
-        formatVersion: options.format.formatVersion,
-        nativeSessionId: options.nativeSessionId,
+        formatName: config.format.formatName,
+        formatVersion: config.format.formatVersion,
+        nativeSessionId: config.nativeSessionId,
         observedAt,
-        scrubberVersion: options.scrubber.scrubberVersion,
+        scrubberVersion: config.scrubber.scrubberVersion,
         contentSha256,
         ingestKey: ingestKey(
-          options.format,
-          options.nativeSessionId,
-          options.sourceLocator,
+          config.format,
+          config.nativeSessionId,
+          config.sourceLocator,
           contentSha256,
           occurrence,
         ),
@@ -755,14 +873,14 @@ export async function* readNativeTranscriptJsonl(
         prefixSha256,
         error.reason,
         rawDigest,
-        clock,
+        config.clock,
       );
       sourceOrdinal += 1;
       return outcome;
     }
   };
 
-  for await (const chunk of options.bytes) {
+  for await (const chunk of config.bytes) {
     if (!(chunk instanceof Uint8Array)) {
       throw new NativeTranscriptConfigurationError("invalid-input");
     }
@@ -771,7 +889,7 @@ export async function* readNativeTranscriptJsonl(
       if (chunk[index] !== 0x0a) continue;
       const segment = chunk.subarray(start, index);
       trackProgressBytes(segment, byteOffset);
-      appendRecordBytes(accumulator, segment, maxRecordBytes);
+      appendRecordBytes(accumulator, segment, config.maxRecordBytes);
       prefixHash.update(segment);
       trackProgressBytes(Uint8Array.of(0x0a), byteOffset + segment.byteLength);
       prefixHash.update(Uint8Array.of(0x0a));
@@ -785,7 +903,7 @@ export async function* readNativeTranscriptJsonl(
     }
     const remainder = chunk.subarray(start);
     trackProgressBytes(remainder, byteOffset);
-    appendRecordBytes(accumulator, remainder, maxRecordBytes);
+    appendRecordBytes(accumulator, remainder, config.maxRecordBytes);
     prefixHash.update(remainder);
     byteOffset += remainder.byteLength;
   }
