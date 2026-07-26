@@ -104,6 +104,162 @@ const rawLiveCatalog = {
 
 const liveCatalog = resolveLiveTriageCatalog(rawLiveCatalog, policy);
 
+function assertGitHubScriptStepsUseDedicatedTokens(workflow, allowedTokens) {
+  const lines = workflow.split("\n");
+  const actionLineIndexes = lines.flatMap((line, index) => (
+    line.includes("actions/github-script@") ? [index] : []
+  ));
+  assert.ok(actionLineIndexes.length > 0);
+
+  for (const actionLineIndex of actionLineIndexes) {
+    let stepStart = actionLineIndex;
+    let stepStartMatch = lines[stepStart].match(/^(\s*)-\s+/u);
+    while (stepStart >= 0 && !stepStartMatch) {
+      stepStart -= 1;
+      stepStartMatch = lines[stepStart]?.match(/^(\s*)-\s+/u);
+    }
+    assert.notEqual(stepStart, -1);
+    const stepIndent = stepStartMatch[1].length;
+
+    let stepEnd = actionLineIndex + 1;
+    while (stepEnd < lines.length) {
+      const possibleStep = lines[stepEnd].match(/^(\s*)-\s+/u);
+      if (possibleStep && possibleStep[1].length === stepIndent) {
+        break;
+      }
+      stepEnd += 1;
+    }
+    const step = lines.slice(stepStart, stepEnd).join("\n");
+    const tokenBindings = [
+      ...step.matchAll(
+        /^\s+github-token: \$\{\{ secrets\.(CODEX_ISSUE_TRIAGE_(?:READ|WRITE)_TOKEN) \}\}\s*$/gmu,
+      ),
+    ];
+    assert.equal(
+      tokenBindings.length,
+      1,
+      `Expected one dedicated github-token binding in:\n${step}`,
+    );
+    assert.ok(
+      allowedTokens.includes(tokenBindings[0][1]),
+      `Unexpected github-token secret in:\n${step}`,
+    );
+    assert.equal(
+      (step.match(/^\s+github-token:/gmu) ?? []).length,
+      1,
+      `Expected exactly one github-token input in:\n${step}`,
+    );
+  }
+}
+
+function assertNamedGitHubScriptStepsUseExpectedTokens(
+  workflow,
+  expectedBindings,
+) {
+  const lines = workflow.split("\n");
+  assert.equal(
+    (workflow.match(/actions\/github-script@/gu) ?? []).length,
+    expectedBindings.length,
+    "Every github-script step must have one named credential expectation",
+  );
+
+  for (const { job, step, token } of expectedBindings) {
+    const jobStart = lines.findIndex((line) => line === `  ${job}:`);
+    assert.notEqual(jobStart, -1, `Missing workflow job ${job}`);
+    let jobEnd = jobStart + 1;
+    while (
+      jobEnd < lines.length
+      && !/^  [a-zA-Z0-9_-]+:\s*$/u.test(lines[jobEnd])
+    ) {
+      jobEnd += 1;
+    }
+
+    const stepStart = lines.findIndex(
+      (line, index) => (
+        index > jobStart
+        && index < jobEnd
+        && line.trim() === `- name: ${step}`
+      ),
+    );
+    assert.notEqual(stepStart, -1, `Missing step ${job} / ${step}`);
+    let stepEnd = stepStart + 1;
+    while (
+      stepEnd < jobEnd
+      && !/^\s{6}-\s+/u.test(lines[stepEnd])
+    ) {
+      stepEnd += 1;
+    }
+    const stepDefinition = lines.slice(stepStart, stepEnd).join("\n");
+    assert.match(
+      stepDefinition,
+      /uses: actions\/github-script@/u,
+      `Expected ${job} / ${step} to use actions/github-script`,
+    );
+    assert.match(
+      stepDefinition,
+      new RegExp(
+        String.raw`github-token: \$\{\{ secrets\.${token} \}\}`,
+        "u",
+      ),
+      `Unexpected token for ${job} / ${step}`,
+    );
+  }
+}
+
+function assertExactWorkflowJobPermissions(workflow, expectedPermissions) {
+  const lines = workflow.split("\n");
+  const jobsStart = lines.indexOf("jobs:");
+  assert.notEqual(jobsStart, -1, "Workflow has no jobs section");
+  const jobStarts = lines.flatMap((line, index) => {
+    if (index <= jobsStart) return [];
+    const match = line.match(/^  ([a-zA-Z0-9_-]+):\s*$/u);
+    return match ? [{ index, name: match[1] }] : [];
+  });
+  assert.deepEqual(
+    jobStarts.map(({ name }) => name),
+    Object.keys(expectedPermissions),
+    "Every workflow job must have an exact permission expectation",
+  );
+
+  for (const [jobIndex, { index: jobStart, name }] of jobStarts.entries()) {
+    const jobEnd = jobStarts[jobIndex + 1]?.index ?? lines.length;
+    const jobLines = lines.slice(jobStart, jobEnd);
+    const permissionIndex = jobLines.findIndex(
+      (line) => /^\s{4}permissions:(?: \{\})?$/u.test(line),
+    );
+    assert.notEqual(permissionIndex, -1, `Job ${name} has no permissions`);
+    let actualPermissions = {};
+    if (jobLines[permissionIndex] === "    permissions:") {
+      const entries = [];
+      for (
+        let lineIndex = permissionIndex + 1;
+        lineIndex < jobLines.length;
+        lineIndex += 1
+      ) {
+        const match = jobLines[lineIndex].match(
+          /^\s{6}([a-zA-Z0-9_-]+): ([a-z]+)$/u,
+        );
+        if (!match) break;
+        entries.push([match[1], match[2]]);
+      }
+      actualPermissions = Object.fromEntries(entries);
+    }
+    assert.deepEqual(
+      actualPermissions,
+      expectedPermissions[name],
+      `Unexpected GITHUB_TOKEN permissions for job ${name}`,
+    );
+
+    const jobDefinition = jobLines.join("\n");
+    if (expectedPermissions[name].contents === "read") {
+      assert.match(jobDefinition, /uses: actions\/checkout@/u);
+      assert.match(jobDefinition, /persist-credentials: false/u);
+    } else {
+      assert.doesNotMatch(jobDefinition, /uses: actions\/checkout@/u);
+    }
+  }
+}
+
 const sourceIssue = {
   number: 42,
   title: "Daemon crashes while compacting",
@@ -476,10 +632,107 @@ test("gates duplicate triage on the reconciled live Issue type", () => {
   assert.equal(requiresDuplicateTriage(null), false);
 });
 
+test("workflow credential guard rejects implicit github-script tokens", () => {
+  assert.throws(
+    () => assertGitHubScriptStepsUseDedicatedTokens(
+      [
+        "steps:",
+        "  - uses: actions/github-script@example",
+        "    with:",
+        "      script: return true",
+      ].join("\n"),
+      ["CODEX_ISSUE_TRIAGE_WRITE_TOKEN"],
+    ),
+    /Expected one dedicated github-token binding/u,
+  );
+});
+
 test("workflow binds evidence and the required model split", async () => {
   const workflow = await readFile(
     new URL("../workflows/codex-issue-labeler.yml", import.meta.url),
     "utf8",
+  );
+  assertExactWorkflowJobPermissions(workflow, {
+    enqueue: { contents: "read" },
+    collect: { contents: "read" },
+    "preflight-write": { contents: "read" },
+    classify: {},
+    "apply-labels": { contents: "read" },
+    "collect-security": { contents: "read" },
+    "classify-security": {},
+    "apply-security": { contents: "read" },
+    "collect-duplicates": { contents: "read" },
+    "classify-duplicates": {},
+    "apply-duplicates": { contents: "read" },
+  });
+  assertGitHubScriptStepsUseDedicatedTokens(
+    workflow,
+    [
+      "CODEX_ISSUE_TRIAGE_READ_TOKEN",
+      "CODEX_ISSUE_TRIAGE_WRITE_TOKEN",
+    ],
+  );
+  assertNamedGitHubScriptStepsUseExpectedTokens(workflow, [
+    {
+      job: "enqueue",
+      step: "Queue issue for Codex triage",
+      token: "CODEX_ISSUE_TRIAGE_WRITE_TOKEN",
+    },
+    {
+      job: "collect",
+      step: "Collect queued issues and Planning Field catalog",
+      token: "CODEX_ISSUE_TRIAGE_READ_TOKEN",
+    },
+    {
+      job: "preflight-write",
+      step: "Validate write credential and perform idempotent queue probe",
+      token: "CODEX_ISSUE_TRIAGE_WRITE_TOKEN",
+    },
+    {
+      job: "apply-labels",
+      step: "Validate and apply classifications",
+      token: "CODEX_ISSUE_TRIAGE_WRITE_TOKEN",
+    },
+    {
+      job: "collect-security",
+      step: "Collect sanitized Security and Quality evidence",
+      token: "CODEX_ISSUE_TRIAGE_READ_TOKEN",
+    },
+    {
+      job: "apply-security",
+      step: "Apply security decisions and route Bugs",
+      token: "CODEX_ISSUE_TRIAGE_WRITE_TOKEN",
+    },
+    {
+      job: "collect-duplicates",
+      step: "Search duplicate candidates for reconciled bugs",
+      token: "CODEX_ISSUE_TRIAGE_READ_TOKEN",
+    },
+    {
+      job: "apply-duplicates",
+      step: "Validate and apply duplicate decisions",
+      token: "CODEX_ISSUE_TRIAGE_WRITE_TOKEN",
+    },
+  ]);
+  assert.equal(
+    (
+      workflow.match(
+        /github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_READ_TOKEN \}\}/gu,
+      ) ?? []
+    ).length,
+    3,
+  );
+  assert.equal(
+    (
+      workflow.match(
+        /github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/gu,
+      ) ?? []
+    ).length,
+    5,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /github-token: \$\{\{ (?:github\.token|secrets\.GITHUB_TOKEN) \}\}/u,
   );
   assert.match(
     workflow,
@@ -501,6 +754,10 @@ test("workflow binds evidence and the required model split", async () => {
   assert.match(
     workflow,
     /collect-security:[\s\S]*?if: \$\{\{ always\(\) && \(needs\.apply-labels\.outputs\.has_security == 'true' \|\| needs\.apply-labels\.outputs\.has_bugs == 'true'\) \}\}/u,
+  );
+  assert.match(
+    workflow,
+    /if \(\[403, 404, 422\]\.includes\(status\)\) \{[\s\S]*?accessIssues\.push\(`\$\{key\} unavailable \(\$\{status\}\)`\);[\s\S]*?return;[\s\S]*?accessIssues,[\s\S]*?core\.setOutput\("has_work", "true"\)[\s\S]*?buildSecurityClassificationPrompt\(/u,
   );
   assert.match(
     workflow,
@@ -533,7 +790,7 @@ test("workflow binds evidence and the required model split", async () => {
   assert.equal(
     (workflow.match(/fetchRepositoryLabelCatalog\(\s*github,\s*context\.repo/gu) ?? [])
       .length,
-    5,
+    6,
   );
   assert.doesNotMatch(workflow, /catalogResponse\.repository\.labels/u);
   assert.equal(
@@ -572,10 +829,116 @@ test("workflow binds evidence and the required model split", async () => {
     workflow,
     /const boundedPage = response\.data\.slice\(0, remaining\);[\s\S]*?collectedForState >= SECURITY_API_MAX_RESULTS_PER_STATE/u,
   );
+  const preflightWorkflow = workflow.slice(
+    workflow.indexOf("  preflight-write:"),
+    workflow.indexOf("  classify:"),
+  );
+  assert.match(
+    preflightWorkflow,
+    /needs: collect[\s\S]*?if: \$\{\{ needs\.collect\.outputs\.has_work == 'true' \}\}/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /permissions:\s*\n\s+contents: read\s*\n\s+steps:/u,
+  );
+  assert.doesNotMatch(
+    preflightWorkflow,
+    /^\s+issues:\s*(?:read|write)\s*$/mu,
+  );
+  assert.match(
+    preflightWorkflow,
+    /WRITE_TOKEN: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}[\s\S]*?github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /ISSUE_NUMBERS: \$\{\{ needs\.collect\.outputs\.issue_numbers \}\}/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /if \(!process\.env\.WRITE_TOKEN\?\.trim\(\)\)[\s\S]*?throw new Error\("CODEX_ISSUE_TRIAGE_WRITE_TOKEN is not configured"\)/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /github\.rest\.users\.getAuthenticated\(\)[\s\S]*?github\.rest\.repos\.get\(context\.repo\)[\s\S]*?github\.graphql\(TRIAGE_CATALOG_QUERY,[\s\S]*?!catalogResponse\.organization \|\| !catalogResponse\.repository[\s\S]*?fetchRepositoryLabelCatalog\([\s\S]*?resolveLiveTriageCatalog\(/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /Write credential cannot access the organization Issue Fields [\s\S]*?and repository Issue type catalog/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /JSON\.parse\(process\.env\.ISSUE_NUMBERS \?\? ""\)[\s\S]*?validateExpectedIssueNumbers\(parsedIssueNumbers\)[\s\S]*?issueNumbers\.length === 0/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /github\.rest\.issues\.get\([\s\S]*?hasQueueLabel[\s\S]*?if \(!hasQueueLabel\)[\s\S]*?left the triage queue before write preflight[\s\S]*?github\.rest\.issues\.addLabels\([\s\S]*?labels: \[queueLabel\][\s\S]*?writeResponse\.data\.some[\s\S]*?if \(!writePreservedQueueLabel\)/u,
+  );
+  assert.ok(
+    preflightWorkflow.indexOf("github.rest.issues.addLabels")
+    > preflightWorkflow.indexOf("if (!hasQueueLabel)"),
+  );
+  assert.doesNotMatch(
+    preflightWorkflow,
+    /OPENAI_API_KEY|openai\/codex-action|core\.setOutput/u,
+  );
+  assert.match(
+    workflow,
+    /classify:\s*\n\s+needs: \[collect, preflight-write\]\s*\n\s+if: \$\{\{ needs\.collect\.outputs\.has_work == 'true' && needs\.preflight-write\.result == 'success' \}\}/u,
+  );
+  assert.match(
+    workflow,
+    /classify-duplicates:\s*\n\s+needs: \[preflight-write, apply-security, collect-duplicates\]\s*\n\s+if: \$\{\{ always\(\) && needs\.preflight-write\.result == 'success'/u,
+  );
+  const modelJobs = [
+    workflow.slice(
+      workflow.indexOf("  classify:"),
+      workflow.indexOf("  apply-labels:"),
+    ),
+    workflow.slice(
+      workflow.indexOf("  classify-security:"),
+      workflow.indexOf("  apply-security:"),
+    ),
+    workflow.slice(
+      workflow.indexOf("  classify-duplicates:"),
+      workflow.indexOf("  apply-duplicates:"),
+    ),
+  ];
+  for (const modelJob of modelJobs) {
+    assert.doesNotMatch(
+      modelJob,
+      /CODEX_ISSUE_TRIAGE_(?:READ|WRITE)_TOKEN|WRITE_TOKEN/u,
+    );
+  }
 
   const staleWorkflow = await readFile(
     new URL("../workflows/stale.yml", import.meta.url),
     "utf8",
+  );
+  assertGitHubScriptStepsUseDedicatedTokens(
+    staleWorkflow,
+    ["CODEX_ISSUE_TRIAGE_WRITE_TOKEN"],
+  );
+  const staleActionStep = staleWorkflow.slice(
+    staleWorkflow.indexOf("- uses: actions/stale@"),
+    staleWorkflow.indexOf(
+      "- name: Remove temporary Priority exemption markers",
+    ),
+  );
+  assert.match(
+    staleActionStep,
+    /repo-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/u,
+  );
+  assert.equal(
+    (
+      staleWorkflow.match(
+        /\$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/gu,
+      ) ?? []
+    ).length,
+    3,
+  );
+  assert.doesNotMatch(
+    staleWorkflow,
+    /\$\{\{ (?:github\.token|secrets\.GITHUB_TOKEN) \}\}/u,
   );
   assert.match(staleWorkflow, /issueFieldValues\(first: 100\)/u);
   assert.match(
@@ -617,6 +980,25 @@ test("workflow binds evidence and the required model split", async () => {
   assert.ok(
     staleWorkflow.indexOf("for (const issueNumber of exempt)")
     > staleWorkflow.indexOf("} while (cursor !== null);"),
+  );
+});
+
+test("documents core read failures separately from security evidence gaps", async () => {
+  const documentation = await readFile(
+    new URL("../../docs/issue-triage.md", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    documentation,
+    /core repository Issues or organization\s+Issue Fields access blocks general collection and Luna inference/u,
+  );
+  assert.match(
+    documentation,
+    /sanitized, bounded, and recorded in `accessIssues`[\s\S]*?Terra may still run[\s\S]*?confidence low[\s\S]*?keeps status at `Triage` and uncertain Security nature unset[\s\S]*?do not by themselves fail the pass or create\s+an endless retry/u,
+  );
+  assert.doesNotMatch(
+    documentation,
+    /missing or\s+invalid read credential blocks collection and model inference/iu,
   );
 });
 

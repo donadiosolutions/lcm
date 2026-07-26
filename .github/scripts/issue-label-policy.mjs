@@ -469,7 +469,7 @@ export function requiresDuplicateTriage(issueType) {
   return typeof name === "string" && name.toLowerCase() === "bug";
 }
 
-function validateExpectedIssueNumbers(issueNumbers) {
+export function validateExpectedIssueNumbers(issueNumbers) {
   if (!Array.isArray(issueNumbers)) {
     throw new TypeError("Expected issue numbers must be an array");
   }

@@ -84,8 +84,13 @@ code-scanning rule IDs from the issue.
 Only bounded metadata is retained. Raw secrets, secret locations, code
 locations, private-fork data, dismissal or resolution comments, credentials,
 and unrelated alert bodies are never placed in prompts, job outputs, or logs.
-Expected `403`, `404`, and feature-unavailable responses are recorded as
-unavailable evidence instead of failing general triage.
+Expected access denials and unavailable-feature responses from these APIs are
+sanitized, bounded, and recorded in `accessIssues` instead of failing the
+security collector. Terra may still run with the available evidence and those
+explicit evidence gaps. When those gaps leave confidence low, the conservative
+fallback keeps status at `Triage` and uncertain Security nature unset. These
+expected best-effort degradations do not by themselves fail the pass or create
+an endless retry.
 
 Terra returns Security nature and status with independent confidence and
 separate short rationales:
@@ -152,8 +157,48 @@ credential-bearing URL patterns are redacted before issue text enters a model
 prompt.
 
 The OpenAI Platform secret must be named `OPENAI_API_KEY`; GitHub Actions does
-not use a ChatGPT subscription credential. GitHub write permissions remain
-job-local, and checkout never persists credentials.
+not use a ChatGPT subscription credential.
+
+Organization Planning Fields are outside the repository-scoped
+`GITHUB_TOKEN` permission boundary. Configure two fine-grained credentials:
+
+- `CODEX_ISSUE_TRIAGE_READ_TOKEN` is used only by collection jobs. Grant
+  repository Issues read access, organization Issue Fields read access, and
+  read access to Dependabot alerts, code-scanning alerts, secret-scanning
+  alerts, and repository security advisories.
+- `CODEX_ISSUE_TRIAGE_WRITE_TOKEN` is used only by the write preflight,
+  enqueue/application jobs, and every mutating step in the Priority-aware stale
+  collector: creating and applying temporary exemption markers, running
+  `actions/stale`, and removing those markers during the `always()` cleanup.
+  Grant repository Issues write access and organization Issue Fields read
+  access. It does not need permission to create, update, or delete organization
+  field definitions.
+
+Store repository-scoped fine-grained personal access tokens, limited to the
+`donadiosolutions` organization and `lcm` repository, in the repository Actions
+secrets with the exact names above. Never store a GitHub App user or installation
+access token as either secret: those credentials are short-lived and require
+per-run minting, which these workflows do not implement. Never use an
+administrator or classic broad-scope token, and rotate the fine-grained tokens
+before they expire.
+
+When queued work exists, a dedicated non-model preflight authenticates the
+write token and validates repository and organization Planning Field catalog
+access before the first Luna classification. To prove repository Issues write
+access without changing the intended label set, it verifies that the first
+collected issue is still queued and idempotently re-adds its already-present
+`needs-codex-triage` label. The token is not exposed to Luna, Terra, or
+duplicate-classification jobs, and the preflight emits no outputs. Neither issue
+triage nor any mutating stale step falls back to `GITHUB_TOKEN`. A missing or
+invalid read credential that prevents core repository Issues or organization
+Issue Fields access blocks general collection and Luna inference. Missing,
+denied, or unavailable Dependabot, code-scanning, secret-scanning, or advisory
+evidence is instead handled by the best-effort security path described above.
+A missing or invalid write credential fails the preflight and blocks model
+inference as well as issue, label, and Planning Field mutation. The stale
+cleanup step uses the same explicit write credential even when it runs under
+`always()`. GitHub write permissions remain job-local, and checkout never
+persists credentials.
 
 Use **Actions > Codex issue labeler > Run workflow** to process the current
 queue. An empty queue exits without calling OpenAI. Logs report catalog drift,
