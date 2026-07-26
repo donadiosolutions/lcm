@@ -41,6 +41,16 @@ const state = vi.hoisted(() => ({
     local: { id: "hash", canonical: "/canonical", aliases: [], remoteProjectId: "remote-id" },
     remote: { projectId: "remote-id", displayName: "Remote", aliases: [] },
   })),
+  reconcileWorktrees: vi.fn(() => ({
+    status: "completed",
+    targetHash: "target-hash",
+    canonical: "/canonical",
+    sourceHashes: ["source-hash"],
+    aliases: ["/canonical", "/alias"],
+    journalPath: "/lcm/reconciliations/target-hash.json",
+    backupPaths: ["/lcm/oldprojects/source"],
+    reason: "completed after retry",
+  })),
   machineRegister: vi.fn(async () => ({
     identity: { version: 1, machineId: "machine-id", displayName: "Workstation", identityKey: "secret" },
     created: true,
@@ -113,6 +123,9 @@ vi.mock("../../src/identity-service.js", () => ({
   showMachine: state.machineShow,
   recoverMachine: state.machineRecover,
 }));
+vi.mock("../../src/worktree-reconciliation.js", () => ({
+  reconcileWorktrees: state.reconcileWorktrees,
+}));
 vi.mock("../../src/config-manager.js", () => ({
   getConfigValue: vi.fn(() => "value"), formatConfigValue: vi.fn((value: unknown) => String(value)),
   normalizeConfigPath: vi.fn((path: string) => path), setConfigValue: vi.fn(() => "stored"),
@@ -147,7 +160,10 @@ vi.mock("../../src/import.js", () => ({
   }),
 }));
 vi.mock("../../src/codex-transcript.js", () => ({ findAllCodexTranscripts: vi.fn(() => ["codex-one"]) }));
-vi.mock("../../src/import-summary.js", () => ({ printImportSummary: vi.fn() }));
+vi.mock("../../src/import-summary.js", () => ({
+  printImportSummary: vi.fn(),
+  printCodexResolutionSummary: vi.fn(),
+}));
 vi.mock("../../src/portable-knowledge.js", () => ({
   exportKnowledge: vi.fn(async () => state.portableResult), importKnowledge: vi.fn(async () => state.portableResult),
 }));
@@ -261,6 +277,7 @@ describe("runCli identity boundaries", () => {
     await expect(projectActions.get("project")!({ help: true })).rejects.toThrow("exit:0");
     await expect(projectActions.get("project")!({})).rejects.toThrow("exit:1");
     await expect(projectActions.get("list")!({ help: true })).rejects.toThrow("exit:0");
+    await expect(projectActions.get("reconcile-worktrees")!(undefined, { help: true })).rejects.toThrow("exit:0");
     await expect(projectActions.get("show")!(undefined, { help: true })).rejects.toThrow("exit:0");
     await expect(projectActions.get("link")!(undefined, undefined, { help: true })).rejects.toThrow("exit:0");
     await expect(projectActions.get("unlink")!(undefined, { help: true })).rejects.toThrow("exit:0");
@@ -295,6 +312,19 @@ describe("runCli identity boundaries", () => {
   });
 
   it("renders every project operation in text and JSON forms", async () => {
+    expect(await invoke(["project", "reconcile-worktrees", "/canonical", "--dry-run"])).toBeUndefined();
+    expect(await invoke(["project", "reconcile-worktrees", "--json"])).toBeUndefined();
+    state.reconcileWorktrees.mockReturnValueOnce({
+      status: "not-needed",
+      targetHash: "target-hash",
+      canonical: "/canonical",
+      sourceHashes: [],
+      aliases: ["/canonical"],
+      journalPath: undefined,
+      backupPaths: [],
+      reason: undefined,
+    });
+    expect(await invoke(["project", "reconcile-worktrees", "/canonical"])).toBeUndefined();
     expect(await invoke(["project", "list"])).toBeUndefined();
     expect(await invoke(["project", "list", "--json"])).toBeUndefined();
     expect(await invoke(["project", "show", "/alias"])).toBeUndefined();
@@ -421,6 +451,8 @@ describe("runCli identity boundaries", () => {
   });
 
   it("reports Error and primitive identity failures in text and JSON", async () => {
+    state.reconcileWorktrees.mockImplementationOnce(() => { throw new Error("reconcile failed"); });
+    expect((await invoke(["project", "reconcile-worktrees"]))?.message).toBe("exit:1");
     state.projectList.mockRejectedValueOnce(new Error("list failed"));
     expect((await invoke(["project", "list"]))?.message).toBe("exit:1");
     state.projectShow.mockRejectedValueOnce("show failed");

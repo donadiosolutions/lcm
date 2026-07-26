@@ -176,6 +176,11 @@ lcm import --codex
 lcm import --provider all
 ```
 
+Codex import defaults to the current canonical project. Add `--all` to consider
+all locally verified projects. LCM conservatively reconciles deleted
+`~/.codex/worktrees/` sessions from exact thread ownership or a unique local
+repository match and reports unresolved or ambiguous sessions without guessing.
+
 If you also want MCP inside Codex, run `lcm connectors install codex --type mcp`. Today that prints the TOML block you must add manually to `.codex/config.toml`.
 
 See [`docs/vscode-codex.md`](docs/vscode-codex.md) for the current VS Code/Codex setup path and remaining limitations.
@@ -307,8 +312,9 @@ lcm mcp                    # start MCP server
 ```
 
 See [Machine registration and project identity](docs/project-identity.md) for
-PostgreSQL pairing, reimage recovery, local aliases, permissions,
-unlink/relink behavior, migration binding, and ambiguity diagnosis.
+linked-worktree consolidation, historical Codex reconciliation, PostgreSQL
+pairing, reimage recovery, local aliases, permissions, unlink/relink behavior,
+migration binding, and ambiguity diagnosis.
 Remote UUID show targets resolve through that local project map: exactly one
 local entry must bind the UUID. Unknown or multiply mapped UUIDs are rejected;
 use `lcm project list --json` and select a local path or hash to diagnose them.

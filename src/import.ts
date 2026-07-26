@@ -3,11 +3,18 @@ import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import type { DaemonClient } from "./daemon/client.js";
 import { formatNumber, formatRatio } from "./stats.js";
-import { findAllCodexTranscripts, extractCodexSessionCwd } from "./codex-transcript.js";
 import type { ProgressState } from "./cli/progress-state.js";
 import type { TranscriptClient } from "./transcript-provider.js";
 import { lcmHomeDir } from "./runtime-paths.js";
 import { projectId } from "./daemon/project.js";
+import {
+  hashProjectPath,
+  normalizeProjectIdentityPath,
+  normalizeProjectPath,
+  readProjectMapSnapshot,
+  resolveProjectIdentity,
+} from "./project-map.js";
+import { resolveCodexSessions } from "./codex-project-resolution.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
 
@@ -36,6 +43,9 @@ export interface ImportResult {
   totalMessages: number;
   totalTokens: number;
   tokensAfter: number;
+  reconciled?: number;
+  unresolved?: number;
+  ambiguous?: number;
 }
 
 export function cwdToProjectHash(cwd: string): string {
@@ -173,7 +183,6 @@ async function ingestSessionList(
   const total = sessions.length;
 
   for (const { path, sessionId, cwd, client: clientName } of sessions) {
-    const replayKey = `${clientName}\u0000${projectId(cwd)}`;
     if (options.dryRun) {
       if (options.verbose) {
         const replayNote = options.replay ? " (would compact)" : "";
@@ -183,6 +192,7 @@ async function ingestSessionList(
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
       continue;
     }
+    const replayKey = `${clientName}\u0000${projectId(cwd)}`;
 
     try {
       const res = await client.post<{ ingested: number; totalTokens: number }>('/ingest', {
@@ -272,7 +282,17 @@ export async function importSessions(
   options: ImportOptions = {}
 ): Promise<ImportResult> {
   const provider: ImportProvider = options.provider ?? "claude";
-  const result: ImportResult = { imported: 0, skippedEmpty: 0, failed: 0, totalMessages: 0, totalTokens: 0, tokensAfter: 0 };
+  const result: ImportResult = {
+    imported: 0,
+    skippedEmpty: 0,
+    failed: 0,
+    totalMessages: 0,
+    totalTokens: 0,
+    tokensAfter: 0,
+    reconciled: 0,
+    unresolved: 0,
+    ambiguous: 0,
+  };
 
   // --- Claude Code sessions ---
   if (provider === "claude" || provider === "all") {
@@ -312,14 +332,57 @@ export async function importSessions(
 
   // --- Codex CLI sessions ---
   if (provider === "codex" || provider === "all") {
-    const codexTranscripts = findAllCodexTranscripts(options._codexDir);
-    const codexSessions: SessionEntry[] = codexTranscripts.map(f => ({
-      path: f.path,
-      sessionId: f.sessionId,
-      // Prefer the cwd embedded in the transcript; fall back to process.cwd()
-      cwd: extractCodexSessionCwd(f.path) ?? process.cwd(),
-      client: "codex",
-    }));
+    // Resolve exactly once against a read-only map snapshot so an empty
+    // Codex catalogue (and dry-run discovery) cannot backfill project state.
+    const resolvedCodexSessions = resolveCodexSessions(
+      options._codexDir,
+      readProjectMapSnapshot(),
+    );
+    if (resolvedCodexSessions.length === 0) return result;
+    const requestedCwd = options.cwd ?? process.cwd();
+    const current = options.dryRun
+      ? (() => {
+        const canonical = normalizeProjectIdentityPath(requestedCwd);
+        return { id: hashProjectPath(canonical), canonical };
+      })()
+      : resolveProjectIdentity(requestedCwd);
+    const codexSessions: SessionEntry[] = [];
+    for (const session of resolvedCodexSessions) {
+      let resolution = session.resolution;
+      if (
+        resolution.status === "unresolved"
+        && session.metadata?.cwd !== undefined
+        && normalizeProjectPath(session.metadata.cwd) === normalizeProjectPath(current.canonical)
+      ) {
+        resolution = {
+          status: "resolved",
+          canonical: current.canonical,
+          projectHash: current.id,
+          evidence: "mapped-path",
+        };
+      }
+      if (resolution.status !== "resolved") {
+        if (resolution.status === "ambiguous") result.ambiguous! += 1;
+        else result.unresolved! += 1;
+        if (options.verbose) {
+          console.log(`  \u23ed\ufe0f ${session.sessionId}: ${resolution.reason}`);
+        }
+        continue;
+      }
+      if (!options.all && resolution.projectHash !== current.id) continue;
+      if (
+        resolution.evidence === "thread-owner"
+        || resolution.evidence === "repository-tombstone"
+      ) {
+        result.reconciled! += 1;
+      }
+      codexSessions.push({
+        path: session.path,
+        sessionId: session.metadata?.threadId ?? session.sessionId,
+        cwd: resolution.canonical,
+        client: "codex",
+      });
+    }
 
     await ingestSessionList(client, codexSessions, options, result);
   }

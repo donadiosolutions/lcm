@@ -1,7 +1,8 @@
 /**
  * Parser for Codex CLI session transcript files.
  *
- * Codex stores sessions in ~/.codex/sessions/<session-id>/<session-id>.jsonl
+ * Codex stores active sessions in ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+ * (with an older ~/.codex/sessions/<session-id>/<session-id>.jsonl layout)
  * and archives them in ~/.codex/archived_sessions/<name>.jsonl.
  *
  * Each JSONL line is an event object with a top-level `type` and `payload`:
@@ -15,7 +16,17 @@
  * messages use `type: "output_text"` (both carry a `text` string field).
  */
 
-import { readdirSync, readFileSync, existsSync, lstatSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+} from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { estimateTokens } from "./transcript.js";
@@ -39,6 +50,11 @@ interface CodexResponseItemPayload {
 interface CodexSessionMetaPayload {
   id?: string;
   cwd?: string;
+  git?: {
+    commit_hash?: string;
+    repository_url?: string;
+    branch?: string;
+  };
 }
 
 interface CodexLine {
@@ -123,11 +139,39 @@ export function parseCodexTranscript(transcriptPath: string): ParsedMessage[] {
  * Returns undefined if the session_meta line cannot be found/parsed.
  */
 export function extractCodexSessionCwd(transcriptPath: string): string | undefined {
+  return extractCodexSessionMeta(transcriptPath)?.cwd;
+}
+
+export type CodexSessionMetadata = {
+  readonly threadId?: string;
+  readonly cwd?: string;
+  readonly repositoryUrl?: string;
+  readonly commit?: string;
+  readonly branch?: string;
+};
+
+const MAX_CODEX_SESSION_META_PREFIX_BYTES = 256 * 1024;
+
+/**
+ * Read only the bounded transcript prefix needed for session_meta. The record
+ * is emitted at session start, so scanning an unbounded conversation is both
+ * unnecessary and unsafe for import discovery.
+ */
+export function extractCodexSessionMeta(transcriptPath: string): CodexSessionMetadata | undefined {
+  let fd: number | undefined;
   let raw: string;
   try {
-    raw = readFileSync(transcriptPath, "utf-8");
+    fd = openSync(transcriptPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const leaf = fstatSync(fd);
+    if (!leaf.isFile()) return undefined;
+    const size = Math.min(leaf.size, MAX_CODEX_SESSION_META_PREFIX_BYTES);
+    const buffer = Buffer.alloc(size);
+    const bytesRead = readSync(fd, buffer, 0, size, 0);
+    raw = buffer.subarray(0, bytesRead).toString("utf8");
   } catch {
     return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 
   for (const line of raw.split("\n")) {
@@ -137,7 +181,21 @@ export function extractCodexSessionCwd(transcriptPath: string): string | undefin
       const obj = JSON.parse(trimmed) as CodexLine;
       if (obj.type === "session_meta") {
         const meta = obj.payload as CodexSessionMetaPayload | undefined;
-        if (typeof meta?.cwd === "string" && meta.cwd) return meta.cwd;
+        if (!meta || typeof meta !== "object") return undefined;
+        const result: CodexSessionMetadata = {
+          ...(typeof meta.id === "string" && meta.id ? { threadId: meta.id } : {}),
+          ...(typeof meta.cwd === "string" && meta.cwd ? { cwd: meta.cwd } : {}),
+          ...(typeof meta.git?.repository_url === "string" && meta.git.repository_url
+            ? { repositoryUrl: meta.git.repository_url }
+            : {}),
+          ...(typeof meta.git?.commit_hash === "string" && meta.git.commit_hash
+            ? { commit: meta.git.commit_hash }
+            : {}),
+          ...(typeof meta.git?.branch === "string" && meta.git.branch
+            ? { branch: meta.git.branch }
+            : {}),
+        };
+        return Object.keys(result).length > 0 ? result : undefined;
       }
     } catch {
       continue;
@@ -157,12 +215,60 @@ export interface CodexSessionFile {
   mtime: number;
 }
 
+function addCodexTranscriptFile(
+  files: CodexSessionFile[],
+  directory: string,
+  name: string,
+): void {
+  try {
+    const path = join(directory, name);
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink() || !stat.isFile()) return;
+    files.push({
+      path,
+      sessionId: basename(name, ".jsonl"),
+      mtime: stat.mtimeMs,
+    });
+  } catch {
+    // Skip a leaf that disappeared or became unreadable during discovery.
+  }
+}
+
+function findDatePartitionedCodexSessionFiles(rootDir: string): CodexSessionFile[] {
+  const files: CodexSessionFile[] = [];
+  const years = /^\d{4}$/u;
+  const monthOrDay = /^\d{2}$/u;
+
+  try {
+    for (const year of readdirSync(rootDir, { withFileTypes: true })) {
+      if (!year.isDirectory() || year.isSymbolicLink() || !years.test(year.name)) continue;
+      const yearDir = join(rootDir, year.name);
+      for (const month of readdirSync(yearDir, { withFileTypes: true })) {
+        if (!month.isDirectory() || month.isSymbolicLink() || !monthOrDay.test(month.name)) continue;
+        const monthDir = join(yearDir, month.name);
+        for (const day of readdirSync(monthDir, { withFileTypes: true })) {
+          if (!day.isDirectory() || day.isSymbolicLink() || !monthOrDay.test(day.name)) continue;
+          const dayDir = join(monthDir, day.name);
+          for (const transcript of readdirSync(dayDir, { withFileTypes: true })) {
+            if (!/^rollout-.+\.jsonl$/u.test(transcript.name)) continue;
+            addCodexTranscriptFile(files, dayDir, transcript.name);
+          }
+        }
+      }
+    }
+  } catch {
+    // Discovery is best-effort; a concurrent removal must not abort import.
+  }
+  return files;
+}
+
 /**
  * Discover Codex transcript files under a root directory.
  *
  * Supported layouts:
  *   - Flat:  <root>/<name>.jsonl         (archived_sessions/)
  *   - Nested: <root>/<id>/<id>.jsonl     (sessions/ layout)
+ *   - Date-partitioned: <root>/YYYY/MM/DD/rollout-*.jsonl (active sessions)
  */
 export function findCodexSessionFiles(rootDir: string): CodexSessionFile[] {
   const files: CodexSessionFile[] = [];
@@ -170,16 +276,9 @@ export function findCodexSessionFiles(rootDir: string): CodexSessionFile[] {
 
   for (const entry of readdirSync(rootDir, { withFileTypes: true })) {
     // Flat layout: rootDir/<name>.jsonl
-    if (entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".jsonl")) {
+    if (entry.name.endsWith(".jsonl")) {
       try {
-        const full = join(rootDir, entry.name);
-        const st = lstatSync(full);
-        if (st.isSymbolicLink()) continue; // skip symlinks
-        files.push({
-          path: full,
-          sessionId: basename(entry.name, ".jsonl"),
-          mtime: st.mtimeMs,
-        });
+        addCodexTranscriptFile(files, rootDir, entry.name);
       } catch {
         // skip unreadable entries
       }
@@ -208,6 +307,7 @@ export function findCodexSessionFiles(rootDir: string): CodexSessionFile[] {
     }
   }
 
+  files.push(...findDatePartitionedCodexSessionFiles(rootDir));
   return files.sort((a, b) => {
     const d = a.mtime - b.mtime;
     if (d !== 0) return d;
@@ -220,7 +320,8 @@ export function findCodexSessionFiles(rootDir: string): CodexSessionFile[] {
  *
  * Searches:
  *   - <codexDir>/archived_sessions/*.jsonl  (flat layout)
- *   - <codexDir>/sessions/<id>/<id>.jsonl   (nested layout)
+ *   - <codexDir>/sessions/<id>/<id>.jsonl   (nested legacy layout)
+ *   - <codexDir>/sessions/YYYY/MM/DD/rollout-*.jsonl (active layout)
  *
  * Defaults to ~/.codex when codexDir is omitted.
  */

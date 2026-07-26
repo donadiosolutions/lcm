@@ -57,6 +57,7 @@ import {
 import { PostgreSqlCommitOutcomeUnknownError } from "./storage/postgresql/errors.js";
 import { PostgreSqlRuntime } from "./storage/postgresql/runtime.js";
 import { quoteShellArgument } from "./shell-quote.js";
+import { reconcileWorktrees } from "./worktree-reconciliation.js";
 
 export interface IdentityRepository {
   registerMachine(identityKey: string, displayName: string): Promise<RegisteredMachine>;
@@ -270,13 +271,17 @@ async function withQueuedRemoteIdentityMutationLock<T>(
   }
 }
 
-function withRemoteProjectIdentityMutationLock<T>(
-  homeDir: string | undefined,
+function withReconciledRemoteProjectIdentityMutationLock<T>(
+  projectPath: string,
+  deps: IdentityServiceDependencies,
   callback: () => Promise<T>,
 ): Promise<T> {
   return withProjectIdentityMutationLock(
-    homeDir,
-    () => withRemoteIdentityMutationLock(homeDir, callback),
+    deps.homeDir,
+    async () => {
+      reconcileWorktrees(projectPath, { homeDir: deps.homeDir });
+      return withRemoteIdentityMutationLock(deps.homeDir, callback);
+    },
   );
 }
 
@@ -708,7 +713,7 @@ export async function createProject(
     options.displayName ?? defaultProjectDisplayName(projectPath),
   );
   const selectedPath = remotePath(projectPath);
-  return withRemoteProjectIdentityMutationLock(deps.homeDir, async () => {
+  return withReconciledRemoteProjectIdentityMutationLock(projectPath, deps, async () => {
     const machine = requireMachineIdentity(deps.homeDir);
     const local = resolveProjectIdentity(projectPath);
     if (local.remoteProjectId) {
@@ -1305,12 +1310,15 @@ export async function linkProject(
   const projectPath = assertProjectDirectory(path);
   const deps = dependencies(dependencyOverrides);
   const remoteProjectId = normalizeUuidV7(target);
-  return remoteProjectId
-    ? withRemoteProjectIdentityMutationLock(
-      deps.homeDir,
+  if (remoteProjectId) {
+    requirePostgreSqlConfig(config);
+    return withReconciledRemoteProjectIdentityMutationLock(
+      projectPath,
+      deps,
       () => linkRemoteProject(config, remoteProjectId, projectPath, options, deps),
-    )
-    : linkLocalAlias(config, target, projectPath, deps);
+    );
+  }
+  return linkLocalAlias(config, target, projectPath, deps);
 }
 
 async function unlinkProjectMutation(

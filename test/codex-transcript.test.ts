@@ -5,6 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import {
   parseCodexTranscript,
   extractCodexSessionCwd,
+  extractCodexSessionMeta,
   findCodexSessionFiles,
   findAllCodexTranscripts,
   type CodexSessionFile,
@@ -258,6 +259,61 @@ describe("extractCodexSessionCwd", () => {
     ].join("\n"));
     expect(extractCodexSessionCwd(file)).toBeUndefined();
   });
+
+  it("extracts bounded thread and Git metadata without reading the conversation", () => {
+    const dir = makeTmpDir();
+    const file = join(dir, "session.jsonl");
+    writeFileSync(file, `${JSON.stringify({
+      type: "session_meta",
+      payload: {
+        id: "thread",
+        cwd: "/workspace",
+        git: {
+          repository_url: "https://example.invalid/repository.git",
+          commit_hash: "abc123",
+          branch: "feature",
+        },
+      },
+    })}\n${"x".repeat(300 * 1024)}`);
+    expect(extractCodexSessionMeta(file)).toEqual({
+      threadId: "thread",
+      cwd: "/workspace",
+      repositoryUrl: "https://example.invalid/repository.git",
+      commit: "abc123",
+      branch: "feature",
+    });
+  });
+
+  it("rejects unsafe leaves and empty or invalid metadata fields", () => {
+    const dir = makeTmpDir();
+    const target = join(dir, "target.jsonl");
+    writeFileSync(target, "{}\n");
+    symlinkSync(target, join(dir, "linked.jsonl"));
+    mkdirSync(join(dir, "directory.jsonl"));
+    expect(extractCodexSessionMeta(join(dir, "linked.jsonl"))).toBeUndefined();
+    expect(extractCodexSessionMeta(join(dir, "directory.jsonl"))).toBeUndefined();
+
+    const invalid = join(dir, "invalid.jsonl");
+    writeFileSync(invalid, [
+      JSON.stringify({
+        type: "session_meta",
+        payload: {
+          id: "",
+          cwd: 42,
+          git: { repository_url: "", commit_hash: 1, branch: "" },
+        },
+      }),
+    ].join("\n"));
+    expect(extractCodexSessionMeta(invalid)).toBeUndefined();
+
+    const nullPayload = join(dir, "null.jsonl");
+    writeFileSync(nullPayload, JSON.stringify({ type: "session_meta", payload: null }));
+    expect(extractCodexSessionMeta(nullPayload)).toBeUndefined();
+
+    const late = join(dir, "late.jsonl");
+    writeFileSync(late, `${" ".repeat(256 * 1024)}\n${makeSessionMeta("late", "/late")}`);
+    expect(extractCodexSessionMeta(late)).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -398,6 +454,43 @@ describe("findAllCodexTranscripts", () => {
     expect(matches).toHaveLength(1);
     // archived_sessions is added first, so it wins
     expect(matches[0].path).toBe(join(archived, "dup-session.jsonl"));
+  });
+
+  it("collects active date-partitioned rollout transcripts without traversing symlinks", () => {
+    const codexDir = makeTmpDir();
+    const day = join(codexDir, "sessions", "2026", "07", "25");
+    mkdirSync(day, { recursive: true });
+    const rollout = "rollout-2026-07-25T10-00-00-thread.jsonl";
+    writeFileSync(join(day, rollout), "");
+    writeFileSync(join(day, "not-a-rollout.jsonl"), "");
+    mkdirSync(join(day, "rollout-directory.jsonl"));
+    mkdirSync(join(codexDir, "sessions", "2026", "invalid-month"));
+    const outside = join(codexDir, "outside");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "rollout-outside.jsonl"), "");
+    symlinkSync(outside, join(codexDir, "sessions", "2026", "07", "26"));
+
+    expect(findAllCodexTranscripts(codexDir).map((file) => file.sessionId))
+      .toContain(rollout.slice(0, -".jsonl".length));
+    expect(findAllCodexTranscripts(codexDir).map((file) => file.sessionId))
+      .not.toContain("rollout-outside");
+  });
+
+  it("deduplicates an archived transcript that overlaps an active rollout", () => {
+    const codexDir = makeTmpDir();
+    const sessionId = "rollout-2026-07-25T10-00-00-duplicate";
+    const archived = join(codexDir, "archived_sessions");
+    const day = join(codexDir, "sessions", "2026", "07", "25");
+    mkdirSync(archived, { recursive: true });
+    mkdirSync(day, { recursive: true });
+    writeFileSync(join(archived, `${sessionId}.jsonl`), "archived");
+    writeFileSync(join(day, `${sessionId}.jsonl`), "active");
+
+    const matches = findAllCodexTranscripts(codexDir)
+      .filter((file) => file.sessionId === sessionId);
+    expect(matches).toEqual([expect.objectContaining({
+      path: join(archived, `${sessionId}.jsonl`),
+    })]);
   });
 
   it("sorts collected transcripts by distinct modification times", () => {

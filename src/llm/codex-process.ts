@@ -67,9 +67,6 @@ function buildArgs(
     args.push("--model", model.trim());
   }
 
-  if (reasoningEffort !== undefined || fastMode === true) {
-    args.push("--strict-config");
-  }
   if (reasoningEffort !== undefined) {
     args.push("-c", `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
   }

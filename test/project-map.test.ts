@@ -6,9 +6,12 @@ import {
   addProjectAlias,
   clearRemoteProjectBinding,
   clearProjectMapCache,
+  foldProjectMapEntries,
+  foldProjectMapEntriesLocked,
   hashProjectPath,
   listProjectMapEntries,
   normalizeProjectPath,
+  normalizeProjectIdentityPath,
   oldMapsDir,
   projectMapPathsForHash,
   projectMapPath,
@@ -24,11 +27,13 @@ import {
 } from "../src/project-map.js";
 import { eventsDbPath } from "../src/db/events-path.js";
 import { projectDbPath, projectId, projectMetaPath } from "../src/daemon/project.js";
+import { clearGitProjectAnchorCache } from "../src/git-project.js";
 
 function resetLcmHome(): void {
   rmSync(join(homedir(), ".lcm"), { recursive: true, force: true });
   mkdirSync(join(homedir(), ".lcm"), { recursive: true });
   clearProjectMapCache();
+  clearGitProjectAnchorCache();
 }
 
 function makeDir(name: string): string {
@@ -53,6 +58,7 @@ describe("project map", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     clearProjectMapCache();
+    clearGitProjectAnchorCache();
     if (tempHome) rmSync(tempHome, { recursive: true, force: true });
     tempHome = undefined;
     if (originalHome === undefined) delete process.env.HOME;
@@ -100,6 +106,147 @@ describe("project map", () => {
     expect(eventsDbPath(alias)).toBe(eventsDbPath(canonical));
   });
 
+  it("resolves linked Git worktrees to the primary checkout without merging separate clones", () => {
+    const primary = makeDir("git-primary");
+    mkdirSync(join(primary, ".git", "worktrees", "linked"), { recursive: true });
+    mkdirSync(join(primary, ".git", "objects"), { recursive: true });
+    writeFileSync(join(primary, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(primary, ".git", "config"), "[core]\nrepositoryformatversion = 0\n");
+    writeFileSync(
+      join(primary, ".git", "worktrees", "linked", "HEAD"),
+      "ref: refs/heads/linked\n",
+    );
+    const linked = makeDir("git-linked");
+    writeFileSync(
+      join(linked, ".git"),
+      `gitdir: ${join(primary, ".git", "worktrees", "linked")}\n`,
+    );
+    writeFileSync(
+      join(primary, ".git", "worktrees", "linked", "commondir"),
+      "../..\n",
+    );
+    const nested = join(linked, "src");
+    mkdirSync(nested);
+    const separate = makeDir("git-separate");
+    mkdirSync(join(separate, ".git"));
+    mkdirSync(join(separate, ".git", "objects"));
+    writeFileSync(join(separate, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(separate, ".git", "config"), "[core]\nrepositoryformatversion = 0\n");
+
+    const primaryIdentity = resolveProjectIdentity(primary);
+    expect(resolveProjectIdentity(linked)).toEqual(primaryIdentity);
+    expect(resolveProjectIdentity(nested)).toEqual(primaryIdentity);
+    expect(projectDbPath(linked)).toBe(projectDbPath(primary));
+    expect(eventsDbPath(nested)).toBe(eventsDbPath(primary));
+    expect(resolveProjectIdentity(separate).id).not.toBe(primaryIdentity.id);
+    expect(listProjectMapEntries()[primaryIdentity.id].canonical).toBe(primary);
+    expect(normalizeProjectIdentityPath(linked)).toBe(primary);
+    expect(normalizeProjectIdentityPath(makeDir("identity-plain")))
+      .toBe(normalizeProjectPath(join(homedir(), "identity-plain")));
+  });
+
+  it("shows the canonical mapped entry for an explicit linked-worktree path", () => {
+    const primary = makeDir("show-linked-primary");
+    const admin = join(primary, ".git", "worktrees", "linked");
+    mkdirSync(join(primary, ".git", "objects"), { recursive: true });
+    mkdirSync(admin, { recursive: true });
+    writeFileSync(join(primary, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(primary, ".git", "config"), "[core]\nrepositoryformatversion = 0\n");
+    writeFileSync(join(admin, "HEAD"), "ref: refs/heads/linked\n");
+    writeFileSync(join(admin, "commondir"), "../..\n");
+    const linked = makeDir("show-linked-worktree");
+    writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`);
+
+    const identity = resolveProjectIdentity(primary);
+    expect(showProjectMapEntry(linked)).toEqual({
+      hash: identity.id,
+      entry: listProjectMapEntries()[identity.id],
+    });
+  });
+
+  it("folds reconciliation entries atomically and rejects stale or conflicting inputs", () => {
+    const target = makeDir("fold-target");
+    const source = makeDir("fold-source");
+    const sourceAlias = makeDir("fold-source-alias");
+    const targetIdentity = resolveProjectIdentity(target);
+    const sourceIdentity = resolveProjectIdentity(source);
+    addProjectAlias(sourceAlias, { hash: sourceIdentity.id });
+
+    expect(() => foldProjectMapEntries({
+      targetHash: "invalid",
+      canonical: target,
+      sourceHashes: [sourceIdentity.id],
+      aliases: [source],
+    })).toThrow("invalid reconciliation target hash");
+    expect(() => foldProjectMapEntriesLocked({
+      targetHash: targetIdentity.id,
+      canonical: target,
+      sourceHashes: [sourceIdentity.id],
+      aliases: [source],
+    })).toThrow("project map reconciliation lock is not held");
+    expect(() => foldProjectMapEntries({
+      targetHash: targetIdentity.id,
+      canonical: target,
+      sourceHashes: ["f".repeat(64)],
+      aliases: [source],
+    })).toThrow("source disappeared");
+
+    setRemoteProjectBinding(remoteProjectId, { hash: targetIdentity.id });
+    expect(() => foldProjectMapEntries({
+      targetHash: targetIdentity.id,
+      canonical: target,
+      sourceHashes: [sourceIdentity.id],
+      aliases: [source],
+      expectedRemoteProjectId: null,
+    })).toThrow("binding changed");
+    setRemoteProjectBinding(
+      "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
+      { hash: sourceIdentity.id },
+    );
+    expect(() => foldProjectMapEntries({
+      targetHash: targetIdentity.id,
+      canonical: target,
+      sourceHashes: [sourceIdentity.id],
+      aliases: [source],
+    })).toThrow("conflicting PostgreSQL");
+
+    clearRemoteProjectBinding(sourceIdentity.id, "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021");
+    expect(() => foldProjectMapEntries({
+      targetHash: targetIdentity.id,
+      canonical: target,
+      sourceHashes: [sourceIdentity.id],
+      aliases: [source],
+      expectedRemoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
+    })).toThrow("binding changed");
+
+    const folded = foldProjectMapEntries({
+      targetHash: targetIdentity.id,
+      canonical: target,
+      sourceHashes: [sourceIdentity.id],
+      aliases: [source, target],
+      expectedRemoteProjectId: remoteProjectId,
+    });
+    expect(folded.entry).toEqual({
+      canonical: target,
+      aliases: [source, sourceAlias].sort(),
+      remoteProjectId,
+    });
+  });
+
+  it("can publish a reconciliation target that did not previously have a map entry", () => {
+    const source = makeDir("fold-new-source");
+    const sourceIdentity = resolveProjectIdentity(source);
+    const target = join(homedir(), "fold-new-target");
+    const targetHash = hashProjectPath(target);
+
+    expect(foldProjectMapEntries({
+      targetHash,
+      canonical: target,
+      sourceHashes: [sourceIdentity.id],
+      aliases: [source],
+    }).entry).toEqual({ canonical: target, aliases: [source] });
+  });
+
   it("evolves legacy entries with an optional remote UUID without changing the local hash", () => {
     const canonical = makeDir("remote-binding");
     const local = resolveProjectIdentity(canonical);
@@ -145,6 +292,11 @@ describe("project map", () => {
     expect(setRemoteProjectBinding(remoteProjectId, {
       hash: local.id,
       alias: canonical,
+    })).toMatchObject({ changed: true });
+    const freshAlias = makeDir("remote-alias-fresh");
+    expect(setRemoteProjectBinding(remoteProjectId, {
+      hash: local.id,
+      alias: freshAlias,
     })).toMatchObject({ changed: true });
     const alias = makeDir("remote-alias-existing");
     addProjectAlias(alias, { hash: local.id });

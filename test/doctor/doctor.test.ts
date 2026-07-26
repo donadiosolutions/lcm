@@ -182,6 +182,76 @@ describe("runDoctor Claude integration ownership", () => {
 });
 
 describe("runDoctor project map checks", () => {
+  it.each([
+    ["blocked", "fail"],
+    ["merged", "warn"],
+    ["completed", "pass"],
+  ] as const)("reports %s worktree reconciliation journals", async (phase, status) => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-reconciliation-"));
+    try {
+      const targetHash = "a".repeat(64);
+      const root = join(home, ".lcm", "reconciliations");
+      mkdirSync(root, { recursive: true });
+      writeFileSync(join(root, `${targetHash}.json`), JSON.stringify({
+        version: 1,
+        targetHash,
+        canonical: "/project",
+        sourceHashes: ["b".repeat(64)],
+        aliases: ["/project"],
+        createdAt: "2026-07-25T00:00:00.000Z",
+        updatedAt: "2026-07-25T00:00:00.000Z",
+        phase,
+        backupPaths: [],
+      }));
+
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        cwd: "/tmp/nonexistent-project-xyz",
+      }));
+      expect(results.find((result) => result.name === "worktree-reconciliation"))
+        .toMatchObject({ status });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reports malformed reconciliation journals and plural completed counts", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-reconciliation-malformed-"));
+    try {
+      const root = join(home, ".lcm", "reconciliations");
+      mkdirSync(root, { recursive: true });
+      writeFileSync(join(root, `${"a".repeat(64)}.json`), "{}");
+      let results = await runDoctor(minimalDeps({
+        homedir: home,
+        cwd: "/tmp/nonexistent-project-xyz",
+      }));
+      expect(results.find((result) => result.name === "worktree-reconciliation"))
+        .toMatchObject({ status: "fail", message: expect.stringContaining("malformed") });
+
+      for (const hash of ["a".repeat(64), "b".repeat(64)]) {
+        writeFileSync(join(root, `${hash}.json`), JSON.stringify({
+          version: 1,
+          targetHash: hash,
+          canonical: "/project",
+          sourceHashes: [],
+          aliases: ["/project"],
+          createdAt: "2026-07-25T00:00:00.000Z",
+          updatedAt: "2026-07-25T00:00:00.000Z",
+          phase: "completed",
+          backupPaths: [],
+        }));
+      }
+      results = await runDoctor(minimalDeps({
+        homedir: home,
+        cwd: "/tmp/nonexistent-project-xyz",
+      }));
+      expect(results.find((result) => result.name === "worktree-reconciliation"))
+        .toMatchObject({ status: "pass", message: "2 completed reconciliations" });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("fails on invalid map JSON", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-invalid-"));
     try {

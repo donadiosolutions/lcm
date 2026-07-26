@@ -418,14 +418,23 @@ passive-learning sidecars, metadata, sensitive-pattern files, and local
 search/promotion routes continue to use the path-derived local hash.
 
 Use `lcm machine register|show|recover` for the private
-`~/.lcm/machine.json`, and `lcm project create|link|unlink|list|show` for
-project identities and aliases. PostgreSQL use fails closed until the machine
+`~/.lcm/machine.json`, and
+`lcm project create|link|unlink|list|show|reconcile-worktrees` for project
+identities and aliases. Verified linked Git worktrees share the primary
+checkout's local SQLite identity and are consolidated on first storage access.
+PostgreSQL use fails closed until the machine
 is registered and the local project is explicitly bound. Hooks retain passive
 events in the local SQLite outbox during identity or PostgreSQL outages.
 
 Manual map edits remain backward-compatible; the daemon reloads valid changes
 without restart, pretty-prints valid non-canonical JSON, and keeps the last
 valid in-memory map during transient invalid saves.
+
+Codex import defaults to the current canonical project. `lcm import --codex
+--all` considers every locally verified project. Deleted managed worktrees are
+reassigned only from exact thread ownership or a unique repository URL under an
+existing `~/.codex/worktrees/<token>` tombstone; unresolved and ambiguous
+sessions are reported and skipped.
 
 See [Machine registration and project identity](project-identity.md) for
 permissions, recovery, pairing, stored-data guards, backup behavior, migration,
@@ -538,10 +547,11 @@ service tier so a global fast tier is not inherited. For Claude, LCM passes
 the fast-mode selection. These controls apply only to the spawned summarizer
 process and do not modify the user's provider configuration.
 
-Codex strict configuration validation is enabled when LCM supplies a reasoning
-effort or enables fast mode. A default-off or explicitly disabled fast mode uses
-only the process-local feature and `default` tier overrides, so unrelated fields
-in the user's Codex configuration do not become fatal to ordinary compactions.
+LCM passes Codex reasoning and fast-mode controls as process-local overrides
+without enabling Codex strict configuration validation. This keeps unrelated,
+forward-compatible fields in the user's Codex configuration from becoming fatal
+to compaction while still applying the requested controls to the spawned
+summarizer.
 
 ```json
 {

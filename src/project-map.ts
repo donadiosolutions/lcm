@@ -22,6 +22,7 @@ import {
   withPrivateMutationLock,
   type PrivateMutationLockObserver,
 } from "./private-mutation-lock.js";
+import { resolveGitProjectAnchor } from "./git-project.js";
 
 export type ProjectMapEntry = {
   canonical: string;
@@ -94,6 +95,24 @@ function withProjectMapMutationLock<T>(
   }, observer);
 }
 
+/**
+ * Hold the project-map mutation fence across a coordinated state migration.
+ * The callback receives the single strict snapshot that remains authoritative
+ * until it returns.
+ */
+export function withProjectMapReconciliationLock<T>(
+  callback: (map: ProjectMap, homeDir: string | undefined) => T,
+  homeDir?: string,
+): T {
+  return withProjectMapMutationLock(
+    () => callback(
+      loadProjectMapWithMetadata({ strict: true, reload: true, homeDir }),
+      homeDir,
+    ),
+    homeDir,
+  );
+}
+
 export function projectMapPath(homeDir?: string): string {
   return join(lcmHomeDir(homeDir), "map.json");
 }
@@ -109,6 +128,11 @@ export function normalizeProjectPath(path: string): string {
   } catch {
     return resolved;
   }
+}
+
+/** Resolve linked Git worktrees to one local repository anchor. */
+export function normalizeProjectIdentityPath(path: string): string {
+  return resolveGitProjectAnchor(path)?.canonical ?? normalizeProjectPath(path);
 }
 
 export function hashProjectPath(path: string): string {
@@ -260,13 +284,19 @@ function assertCurrentMapIsWritable(path: string): void {
 function writeProjectMap(
   map: ProjectMap,
   homeDir?: string,
-  opts: { metadataPopulated?: boolean } = {},
+  opts: {
+    metadataPopulated?: boolean;
+    onBackupCreated?: (path: string) => void;
+    onMapPublished?: () => void;
+  } = {},
 ): { path: string; backupPath?: string } {
   const path = projectMapPath(homeDir);
   ensurePrivateDirectory(dirname(path));
   assertCurrentMapIsWritable(path);
   const backupPath = createBackupIfNeeded(path, homeDir);
+  if (backupPath) opts.onBackupCreated?.(backupPath);
   atomicWritePrivateFile(path, prettyMap(map));
+  opts.onMapPublished?.();
   cache = {
     path,
     mtimeMs: statSync(path).mtimeMs,
@@ -472,8 +502,10 @@ export function resolveProjectIdentity(
   const map = loadProjectMapWithMetadata({
     _beforeMetadataLockForTesting: opts._beforeMetadataLockForTesting,
   });
-  const normalized = normalizeProjectPath(cwd);
-  const existing = identityForMatches(map, cwd, normalized);
+  const gitAnchor = resolveGitProjectAnchor(cwd);
+  const lookupPath = gitAnchor?.canonical ?? cwd;
+  const normalized = gitAnchor?.canonical ?? normalizeProjectPath(cwd);
+  const existing = identityForMatches(map, lookupPath, normalized);
   if (existing) return existing;
 
   opts._beforeMissingEntryLockForTesting?.();
@@ -491,7 +523,7 @@ export function resolveProjectIdentity(
     // between the optimistic read and the locked reload. A genuinely fresh
     // bootstrap has an empty snapshot and follows this same path.
     if (!existsSync(projectMapPath())) current = map;
-    const raced = identityForMatches(current, cwd, normalized);
+    const raced = identityForMatches(current, lookupPath, normalized);
     if (raced) return raced;
     const id = hashProjectPath(normalized);
     current[id] ??= { canonical: normalized, aliases: [] };
@@ -508,13 +540,23 @@ export function resolveProjectIdentity(
   return withProjectMapMutationLock(createMissingIdentity);
 }
 
-export function listProjectMapEntries(): ProjectMap {
-  return loadProjectMapWithMetadata({ strict: true, reload: true });
+export function listProjectMapEntries(homeDir?: string): ProjectMap {
+  return loadProjectMapWithMetadata({ strict: true, reload: true, homeDir });
+}
+
+/**
+ * Return the same metadata-enriched view as listProjectMapEntries without
+ * publishing metadata backfill, taking a mutation lock, or creating backups.
+ */
+export function readProjectMapSnapshot(homeDir?: string): ProjectMap {
+  const map = loadProjectMap({ strict: true, reload: true, homeDir });
+  return populateFromExistingProjectMetadata(map, homeDir).map;
 }
 
 export function showProjectMapEntry(target?: string): { hash: string; entry: ProjectMapEntry; transient?: boolean } {
   const map = loadProjectMapWithMetadata({ strict: true, reload: true });
-  const targetPath = target ?? process.cwd();
+  const requestedPath = target ?? process.cwd();
+  const targetPath = resolveGitProjectAnchor(requestedPath)?.canonical ?? requestedPath;
   if (!target) {
     const matches = findPathMatches(map, targetPath);
     if (matches.size > 1) throw new Error(`project path maps to multiple hashes: ${targetPath} (${[...matches].join(", ")})`);
@@ -543,13 +585,13 @@ export function showProjectMapEntry(target?: string): { hash: string; entry: Pro
     }
     return { hash: matches[0][0], entry: matches[0][1] };
   }
-  const matches = findPathMatches(map, target);
-  if (matches.size > 1) throw new Error(`project path maps to multiple hashes: ${target} (${[...matches].join(", ")})`);
+  const matches = findPathMatches(map, targetPath);
+  if (matches.size > 1) throw new Error(`project path maps to multiple hashes: ${targetPath} (${[...matches].join(", ")})`);
   if (matches.size === 1) {
     const hash = [...matches][0];
     return { hash, entry: map[hash] };
   }
-  const canonical = normalizeProjectPath(target);
+  const canonical = normalizeProjectPath(targetPath);
   return { hash: hashProjectPath(canonical), entry: { canonical, aliases: [] }, transient: true };
 }
 
@@ -590,6 +632,97 @@ export function isProjectHash(value: string): boolean {
 
 export function projectMapEntryHasStoredData(hash: string): boolean {
   return existingProjectHasStoredData(hash);
+}
+
+/**
+ * Atomically replace worktree-scoped entries with a single canonical local
+ * project. Callers must finish and verify all state migration before invoking
+ * this function: map publication is the reconciliation commit point.
+ */
+export function foldProjectMapEntries(opts: {
+  readonly targetHash: string;
+  readonly canonical: string;
+  readonly sourceHashes: readonly string[];
+  readonly aliases: readonly string[];
+  readonly expectedRemoteProjectId?: string | null;
+  readonly homeDir?: string;
+  readonly onBackupCreated?: (path: string) => void;
+  readonly onMapPublished?: () => void;
+}): { entry: ProjectMapEntry; backupPath?: string } {
+  if (!HASH_RE.test(opts.targetHash)) {
+    throw new Error(`invalid reconciliation target hash: ${opts.targetHash}`);
+  }
+  return withProjectMapMutationLock(
+    () => foldProjectMapEntriesLocked(opts),
+    opts.homeDir,
+  );
+}
+
+/** Fold entries while the caller holds withProjectMapReconciliationLock. */
+export function foldProjectMapEntriesLocked(opts: {
+  readonly targetHash: string;
+  readonly canonical: string;
+  readonly sourceHashes: readonly string[];
+  readonly aliases: readonly string[];
+  readonly expectedRemoteProjectId?: string | null;
+  readonly homeDir?: string;
+  readonly onBackupCreated?: (path: string) => void;
+  readonly onMapPublished?: () => void;
+}): { entry: ProjectMapEntry; backupPath?: string } {
+  if (!activeProjectMapMutationLocks.has(projectMapMutationLockPath(opts.homeDir))) {
+    throw new Error("project map reconciliation lock is not held");
+  }
+  const map = loadProjectMapWithMetadata({
+    strict: true,
+    reload: true,
+    homeDir: opts.homeDir,
+  });
+  const sourceHashes = [...new Set([
+    ...(map[opts.targetHash] ? [opts.targetHash] : []),
+    ...opts.sourceHashes,
+  ])];
+  const entries = sourceHashes.map((hash) => {
+    const entry = map[hash];
+    if (!entry) throw new Error(`project reconciliation source disappeared: ${hash}`);
+    return [hash, entry] as const;
+  });
+  const remoteBindings = new Set(
+    entries.flatMap(([, entry]) => entry.remoteProjectId ? [entry.remoteProjectId] : []),
+  );
+  if (remoteBindings.size > 1) {
+    throw new Error(
+      `conflicting PostgreSQL project bindings block worktree reconciliation: ${[...remoteBindings].join(", ")}`,
+    );
+  }
+  const remoteProjectId = [...remoteBindings][0];
+  if (
+    opts.expectedRemoteProjectId !== undefined
+    && remoteProjectId !== (opts.expectedRemoteProjectId ?? undefined)
+  ) {
+    throw new Error("PostgreSQL project binding changed during worktree reconciliation");
+  }
+
+  const canonical = resolve(opts.canonical);
+  const paths = new Set<string>([
+    ...opts.aliases.map((path) => resolve(path)),
+    ...entries.flatMap(([, entry]) => [
+      resolve(entry.canonical),
+      ...entry.aliases.map((path) => resolve(path)),
+    ]),
+  ]);
+  paths.delete(canonical);
+  for (const [hash] of entries) delete map[hash];
+  map[opts.targetHash] = {
+    canonical,
+    aliases: [...paths].sort(),
+    ...(remoteProjectId ? { remoteProjectId } : {}),
+  };
+  const write = writeProjectMap(map, opts.homeDir, {
+    metadataPopulated: true,
+    onBackupCreated: opts.onBackupCreated,
+    onMapPublished: opts.onMapPublished,
+  });
+  return { entry: map[opts.targetHash], backupPath: write.backupPath };
 }
 
 export function setRemoteProjectBinding(
