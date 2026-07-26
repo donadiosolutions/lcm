@@ -1,0 +1,21 @@
+name: Question
+description: Ask for clarification, guidance, or support about LCM
+type: Question
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: What would you like to know?
+      description: Ask one focused question about existing LCM behavior, usage, or operation.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Explain what you are trying to accomplish and include relevant constraints.
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What have you tried?
+      description: Share documentation, commands, or approaches you have already checked.
