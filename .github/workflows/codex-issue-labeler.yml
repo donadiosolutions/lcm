@@ -45,6 +45,7 @@ jobs:
               ISSUE_PLANNING_QUERY,
               SET_ISSUE_FIELDS_MUTATION,
               TRIAGE_CATALOG_QUERY,
+              fetchRepositoryLabelCatalog,
               loadTriagePolicy,
               resolveLiveTriageCatalog,
             } = await import(policyUrl);
@@ -81,10 +82,14 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
             });
+            const repositoryLabels = await fetchRepositoryLabelCatalog(
+              github,
+              context.repo,
+            );
             const liveCatalog = resolveLiveTriageCatalog({
               issueTypes: catalogResponse.repository.issueTypes.nodes,
               fields: catalogResponse.organization.issueFields.nodes,
-              labels: catalogResponse.repository.labels.nodes,
+              labels: repositoryLabels,
             }, policy);
             const planningResponse = await github.graphql(ISSUE_PLANNING_QUERY, {
               owner: context.repo.owner,
@@ -154,6 +159,7 @@ jobs:
               buildOutputSchema,
               ISSUE_PLANNING_QUERY,
               TRIAGE_CATALOG_QUERY,
+              fetchRepositoryLabelCatalog,
               loadTriagePolicy,
               missingLabelsIgnoreCase,
               resolveLiveTriageCatalog,
@@ -165,9 +171,9 @@ jobs:
             );
             const policy = await loadTriagePolicy(configPath);
 
-            const repositoryLabels = await github.paginate(
-              github.rest.issues.listLabelsForRepo,
-              { ...context.repo, per_page: 100 },
+            const repositoryLabels = await fetchRepositoryLabelCatalog(
+              github,
+              context.repo,
             );
             const repositoryLabelNames = repositoryLabels.map(
               (label) => label.name,
@@ -190,7 +196,7 @@ jobs:
             const liveCatalog = resolveLiveTriageCatalog({
               issueTypes: catalogResponse.repository.issueTypes.nodes,
               fields: catalogResponse.organization.issueFields.nodes,
-              labels: catalogResponse.repository.labels.nodes,
+              labels: repositoryLabels,
             }, policy);
 
             const issueNumbers = [];
@@ -320,6 +326,7 @@ jobs:
               computeLabelChanges,
               ISSUE_PLANNING_QUERY,
               includesLabelIgnoreCase,
+              fetchRepositoryLabelCatalog,
               loadTriagePolicy,
               removeIssueLabelIfPresent,
               requiresDuplicateTriage,
@@ -340,10 +347,14 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
             });
+            const repositoryLabels = await fetchRepositoryLabelCatalog(
+              github,
+              context.repo,
+            );
             const liveCatalog = resolveLiveTriageCatalog({
               issueTypes: catalogResponse.repository.issueTypes.nodes,
               fields: catalogResponse.organization.issueFields.nodes,
-              labels: catalogResponse.repository.labels.nodes,
+              labels: repositoryLabels,
             }, policy);
             const expectedIssueNumbers = JSON.parse(
               process.env.EXPECTED_ISSUE_NUMBERS,
@@ -472,7 +483,7 @@ jobs:
 
   collect-security:
     needs: apply-labels
-    if: ${{ always() && needs.apply-labels.result == 'success' }}
+    if: ${{ always() && (needs.apply-labels.outputs.has_security == 'true' || needs.apply-labels.outputs.has_bugs == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -507,6 +518,7 @@ jobs:
               buildSecurityClassificationSchema,
               ISSUE_PLANNING_QUERY,
               issueContentFingerprint,
+              fetchRepositoryLabelCatalog,
               loadTriagePolicy,
               resolveLiveTriageCatalog,
               sanitizeSecurityApiEvidence,
@@ -534,10 +546,14 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
             });
+            const repositoryLabels = await fetchRepositoryLabelCatalog(
+              github,
+              context.repo,
+            );
             const liveCatalog = resolveLiveTriageCatalog({
               issueTypes: catalogResponse.repository.issueTypes.nodes,
               fields: catalogResponse.organization.issueFields.nodes,
-              labels: catalogResponse.repository.labels.nodes,
+              labels: repositoryLabels,
             }, policy);
 
             const rawEvidence = {
@@ -659,7 +675,7 @@ jobs:
 
   apply-security:
     needs: [apply-labels, collect-security, classify-security]
-    if: ${{ always() && needs.apply-labels.result == 'success' && needs.collect-security.result == 'success' }}
+    if: ${{ always() && needs.collect-security.result == 'success' && (needs.apply-labels.outputs.has_security == 'true' || needs.apply-labels.outputs.has_bugs == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -692,6 +708,7 @@ jobs:
             ).href;
             const {
               buildSecurityPlanningUpdates,
+              fetchRepositoryLabelCatalog,
               includesLabelIgnoreCase,
               ISSUE_PLANNING_QUERY,
               issueContentFingerprint,
@@ -714,10 +731,14 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
             });
+            const repositoryLabels = await fetchRepositoryLabelCatalog(
+              github,
+              context.repo,
+            );
             const liveCatalog = resolveLiveTriageCatalog({
               issueTypes: catalogResponse.repository.issueTypes.nodes,
               fields: catalogResponse.organization.issueFields.nodes,
-              labels: catalogResponse.repository.labels.nodes,
+              labels: repositoryLabels,
             }, policy);
             const failures = [];
             const securityIssueNumbers = new Set(
@@ -841,7 +862,7 @@ jobs:
 
   collect-duplicates:
     needs: apply-security
-    if: ${{ always() && needs.apply-security.result == 'success' && needs.apply-security.outputs.has_bugs == 'true' && needs.apply-security.outputs.bug_issue_numbers != '' && needs.apply-security.outputs.bug_issue_numbers != '[]' }}
+    if: ${{ always() && needs.apply-security.outputs.has_bugs == 'true' && needs.apply-security.outputs.bug_issue_numbers != '' && needs.apply-security.outputs.bug_issue_numbers != '[]' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

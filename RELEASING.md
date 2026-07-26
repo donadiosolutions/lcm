@@ -36,11 +36,12 @@ The practical rule is simple: if the change should appear in npm release notes,
 make sure a maintainer gets a `.changeset/*.md` file onto `main`.
 
 Release notes list merged pull requests rather than Changesets commit hashes.
-PRs containing a major package Changeset appear under **Breaking changes**;
-otherwise the `enhancement` and `bug` labels select **Features** and **Fixes**.
-Every other included PR appears under **Extra notes**. Do not combine
-`enhancement` and `bug` on one PR. Generated version PRs are labeled
-`no-release-notes` automatically.
+PRs containing a major package Changeset, or whose conventional title includes
+a breaking marker such as `feat!:` or `refactor(storage)!:`, appear under
+**Breaking changes**. Conventional `feat:`/`feature:` titles select
+**Features**, and `fix:` titles select **Fixes**; scopes such as `feat(cli):`
+are supported. Every other included PR appears under **Extra notes**. Generated
+version PRs are labeled `no-release-notes` automatically.
 
 ## Release flow
 

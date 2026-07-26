@@ -107,6 +107,32 @@ last. Candidate content fingerprints, states, state reasons, labels, and
 timestamps are revalidated before writes. Retries resume a coherent trusted
 marker but reject stale, conflicting, or duplicate-chain evidence.
 
+## One-time rollout migration
+
+The initial rollout requires a one-time operator pass. It is deliberately not
+part of the recurring issue-triage workflow code.
+
+Perform the migration in this order:
+
+1. Prevent the stale workflow from running during migration, and snapshot every
+   open and closed issue with its existing Issue type, Planning Field values,
+   and labels.
+2. Preserve existing Planning Field values, then backfill legacy labels:
+   `p0-critical` to `Urgent`, `p1-high` to `High`, `p2-medium` to `Medium`,
+   `p3-low` to `Low`, `bug` to `Bug`, `enhancement` to `Feature`, and `chore`
+   to `Chore`. Preserve `Epic` and resolve any conflicting legacy type labels
+   against the reviewed inventory.
+3. Set `Security status=Triage` on legacy security issues when the field is
+   unset, then run the Terra enrichment pass.
+4. Verify complete Issue type and Priority coverage for every open and closed
+   issue and verify the intended security fields. Priority must be backfilled
+   before the next stale run and before any legacy priority label is removed.
+5. Mark `bug`, `enhancement`, `chore`, `security`, `p0-critical`, `p1-high`,
+   `p2-medium`, `p3-low`, and every `prj-*` label as deprecated, then delete
+   them only after verification succeeds.
+6. Re-enable or allow the next stale run after the verified field backfill and
+   label deletion complete.
+
 ## Stale issues
 
 The stale workflow reads the native Priority field before invoking the pinned

@@ -19,6 +19,7 @@ import {
   discoverDuplicateCandidateNumbers,
   duplicateCommentBody,
   fetchDuplicateCandidates,
+  fetchRepositoryLabelCatalog,
   findDuplicateCommentTarget,
   includesLabelIgnoreCase,
   issueContentFingerprint,
@@ -37,6 +38,7 @@ import {
   requiresDuplicateTriage,
   sanitizeSecurityApiEvidence,
   selectSecurityEvidenceForIssue,
+  TRIAGE_CATALOG_QUERY,
   validateClassificationResult,
   validateLiveDuplicateCandidates,
   validateTriagePolicy,
@@ -187,6 +189,60 @@ test("matches GitHub label names case-insensitively", () => {
   );
 });
 
+test("builds the live label catalog from the complete paginated REST result", async () => {
+  const listLabelsForRepo = () => {};
+  const calls = [];
+  const github = {
+    rest: { issues: { listLabelsForRepo } },
+    paginate: async (route, parameters) => {
+      calls.push({ route, parameters });
+      return [
+        {
+          node_id: "label-documentation",
+          name: "documentation",
+          description: "Documentation work",
+        },
+        {
+          node_id: "label-dependencies",
+          name: "dependencies",
+          description: "Dependency work",
+        },
+      ];
+    },
+  };
+  assert.deepEqual(
+    await fetchRepositoryLabelCatalog(github, { owner: "example", repo: "repo" }),
+    [
+      {
+        id: "label-documentation",
+        name: "documentation",
+        description: "Documentation work",
+      },
+      {
+        id: "label-dependencies",
+        name: "dependencies",
+        description: "Dependency work",
+      },
+    ],
+  );
+  assert.deepEqual(calls, [{
+    route: listLabelsForRepo,
+    parameters: { owner: "example", repo: "repo", per_page: 100 },
+  }]);
+  await assert.rejects(
+    fetchRepositoryLabelCatalog({
+      ...github,
+      paginate: async () => [{ name: "missing-node-id", description: "Invalid" }],
+    }, { owner: "example", repo: "repo" }),
+    /has no node ID/u,
+  );
+  await assert.rejects(
+    fetchRepositoryLabelCatalog({}, { owner: "example", repo: "repo" }),
+    /must provide paginate/u,
+  );
+  assert.doesNotMatch(TRIAGE_CATALOG_QUERY, /labels\s*\(/u);
+});
+
 test("gates duplicate triage on the reconciled live Issue type", () => {
   assert.equal(requiresDuplicateTriage("BUG"), true);
   assert.equal(requiresDuplicateTriage({ name: "Bug" }), true);
@@ -218,7 +274,15 @@ test("workflow binds evidence and the required model split", async () => {
   assert.equal((workflow.match(/effort: high/gu) ?? []).length, 3);
   assert.match(
     workflow,
-    /apply-security:[\s\S]*?if: \$\{\{ always\(\) && needs\.apply-labels\.result == 'success' && needs\.collect-security\.result == 'success' \}\}/u,
+    /collect-security:[\s\S]*?if: \$\{\{ always\(\) && \(needs\.apply-labels\.outputs\.has_security == 'true' \|\| needs\.apply-labels\.outputs\.has_bugs == 'true'\) \}\}/u,
+  );
+  assert.match(
+    workflow,
+    /apply-security:[\s\S]*?if: \$\{\{ always\(\) && needs\.collect-security\.result == 'success' && \(needs\.apply-labels\.outputs\.has_security == 'true' \|\| needs\.apply-labels\.outputs\.has_bugs == 'true'\) \}\}/u,
+  );
+  assert.match(
+    workflow,
+    /collect-duplicates:[\s\S]*?if: \$\{\{ always\(\) && needs\.apply-security\.outputs\.has_bugs == 'true'/u,
   );
   assert.match(
     workflow,
@@ -234,8 +298,18 @@ test("workflow binds evidence and the required model split", async () => {
   );
   assert.doesNotMatch(
     workflow,
-    /apply-security:[\s\S]*?if: [^\n]*needs\.classify-security\.result == 'success'/u,
+    /(?:collect-security|apply-security):[\s\S]*?if: [^\n]*needs\.apply-labels\.result == 'success'/u,
   );
+  assert.doesNotMatch(
+    workflow,
+    /collect-duplicates:[\s\S]*?if: [^\n]*needs\.apply-security\.result == 'success'/u,
+  );
+  assert.equal(
+    (workflow.match(/fetchRepositoryLabelCatalog\(\s*github,\s*context\.repo/gu) ?? [])
+      .length,
+    5,
+  );
+  assert.doesNotMatch(workflow, /catalogResponse\.repository\.labels/u);
 
   const staleWorkflow = await readFile(
     new URL("../workflows/stale.yml", import.meta.url),
@@ -585,12 +659,31 @@ test("builds initial Planning Field updates with immediate security Triage", () 
       },
     ],
   });
-  assert.equal(
+  assert.deepEqual(
     buildInitialPlanningUpdates(
       { ...validResult.issues[0], issueType: "Feature", isSecurity: false },
       liveCatalog,
-    ).issueFields.length,
-    1,
+    ).issueFields,
+    [
+      {
+        fieldId: "field-securityStatus",
+        delete: true,
+        confidence: "HIGH",
+        rationale: "The general Codex issue-triage pass classified this as non-security.",
+      },
+      {
+        fieldId: "field-securityNature",
+        delete: true,
+        confidence: "HIGH",
+        rationale: "The general Codex issue-triage pass classified this as non-security.",
+      },
+      {
+        fieldId: "field-priority",
+        singleSelectOptionId: "priority-High",
+        confidence: "HIGH",
+        rationale: "Selected by the general Codex issue-triage pass.",
+      },
+    ],
   );
 });
 
@@ -689,6 +782,95 @@ test("builds, parses, and applies conservative security classifications", () => 
       issues: [{ ...output.issues[0], statusRationale: "" }],
     }, policy, [42]),
     /statusRationale must be a non-empty string/,
+  );
+});
+
+test("bounds worst-case security prompts without dropping issue identities", () => {
+  const escapeHeavy = '"\\\\\n\t\u0000😀'.repeat(1_000);
+  const evidenceEntry = {
+    source: escapeHeavy,
+    number: 123,
+    state: escapeHeavy,
+    dependency: escapeHeavy,
+    ecosystem: escapeHeavy,
+    ghsaId: escapeHeavy,
+    cveId: escapeHeavy,
+    severity: escapeHeavy,
+    vulnerableRange: escapeHeavy,
+    firstPatchedVersion: escapeHeavy,
+    dismissedReason: escapeHeavy,
+    createdAt: escapeHeavy,
+    fixedAt: escapeHeavy,
+    htmlUrl: escapeHeavy,
+    ruleId: escapeHeavy,
+    ruleDescription: escapeHeavy,
+    secretType: escapeHeavy,
+    validity: escapeHeavy,
+    publiclyLeaked: true,
+    resolution: escapeHeavy,
+    resolvedAt: escapeHeavy,
+    summary: escapeHeavy,
+    publishedAt: escapeHeavy,
+    closedAt: escapeHeavy,
+  };
+  const issues = Array.from({ length: 10 }, (_, index) => ({
+    issueNumber: index + 100,
+    title: escapeHeavy,
+    body: escapeHeavy,
+    evidence: {
+      dependabot: Array.from({ length: 20 }, () => evidenceEntry),
+      codeScanning: Array.from({ length: 20 }, () => evidenceEntry),
+      secretScanning: Array.from({ length: 20 }, () => evidenceEntry),
+      advisories: Array.from({ length: 20 }, () => evidenceEntry),
+    },
+    accessIssues: Array.from({ length: 8 }, () => escapeHeavy),
+  }));
+  const prompt = buildSecurityClassificationPrompt(policy, liveCatalog, issues);
+  assert.equal(
+    prompt,
+    buildSecurityClassificationPrompt(policy, liveCatalog, issues),
+  );
+  assert.ok(prompt.length <= 300_000);
+  assert.ok(Buffer.byteLength(prompt, "utf8") <= 300_000);
+  const marker = "UNTRUSTED SECURITY ISSUES AND SANITIZED EVIDENCE:\n";
+  const payload = JSON.parse(prompt.slice(prompt.indexOf(marker) + marker.length));
+  assert.deepEqual(
+    payload.map((issue) => issue.issueNumber),
+    issues.map((issue) => issue.issueNumber),
+  );
+  assert.ok(payload.every((issue) =>
+    Object.values(issue.evidence).every((entries) => entries.length <= 20)));
+  assert.ok(
+    payload.reduce(
+      (total, issue) =>
+        total
+        + Object.values(issue.evidence).reduce(
+          (issueTotal, entries) => issueTotal + entries.length,
+          0,
+        ),
+      0,
+    ) < 10 * 4 * 20,
+  );
+  assert.throws(
+    () => buildSecurityClassificationPrompt(policy, liveCatalog, [issues[0]], {
+      maxPromptBytes: 100,
+      maxPromptCodeUnits: 100,
+    }),
+    /fixed metadata exceeds/u,
+  );
+  assert.throws(
+    () => buildSecurityClassificationPrompt(policy, liveCatalog, [issues[0]], {
+      maxEvidencePerSource: -1,
+    }),
+    /non-negative integer/u,
+  );
+  assert.throws(
+    () => buildSecurityClassificationPrompt(
+      policy,
+      liveCatalog,
+      [issues[0], issues[0]],
+    ),
+    /duplicated/u,
   );
 });
 
