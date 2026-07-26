@@ -87,11 +87,17 @@ export const ISSUE_PLANNING_QUERY = `
           nodes {
             name
           }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
         }
       }
     }
   }
 `;
+
+const MAX_ISSUE_METADATA_PAGES = 100;
 
 const ISSUE_PLANNING_FIELDS_PAGE_QUERY = `
   query IssuePlanningFieldValuesPage($issueId: ID!, $cursor: String!) {
@@ -108,6 +114,24 @@ const ISSUE_PLANNING_FIELDS_PAGE_QUERY = `
                 }
               }
             }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    }
+  }
+`;
+
+const ISSUE_LABELS_PAGE_QUERY = `
+  query IssueLabelsPage($issueId: ID!, $cursor: String!) {
+    node(id: $issueId) {
+      ... on Issue {
+        labels(first: 100, after: $cursor) {
+          nodes {
+            name
           }
           pageInfo {
             hasNextPage
@@ -335,35 +359,74 @@ export async function fetchIssuePlanningMetadata(github, repository, issueNumber
   });
   const issue = response?.repository?.issue;
   if (!issue) return null;
-  const initialConnection = issue.issueFieldValues;
-  if (!initialConnection?.pageInfo || !Array.isArray(initialConnection.nodes)) {
-    throw new Error(`Issue #${issueNumber} Planning Field response is incomplete`);
-  }
-  const nodes = [...initialConnection.nodes];
-  let pageInfo = initialConnection.pageInfo;
-  while (pageInfo.hasNextPage) {
-    if (typeof pageInfo.endCursor !== "string" || pageInfo.endCursor.length === 0) {
-      throw new Error(
-        `Issue #${issueNumber} has another Planning Field page without a cursor`,
+  const collectConnection = async (
+    initialConnection,
+    connectionName,
+    displayName,
+    pageQuery,
+  ) => {
+    const validateConnection = (connection) => {
+      if (
+        !connection?.pageInfo
+        || !Array.isArray(connection.nodes)
+        || typeof connection.pageInfo.hasNextPage !== "boolean"
+      ) {
+        throw new Error(`Issue #${issueNumber} ${displayName} response is incomplete`);
+      }
+    };
+    validateConnection(initialConnection);
+    const nodes = [...initialConnection.nodes];
+    let pageInfo = initialConnection.pageInfo;
+    let pageCount = 1;
+    const seenCursors = new Set();
+    while (pageInfo.hasNextPage) {
+      if (pageCount >= MAX_ISSUE_METADATA_PAGES) {
+        throw new Error(
+          `Issue #${issueNumber} ${displayName} exceeds `
+          + `${MAX_ISSUE_METADATA_PAGES} pages`,
+        );
+      }
+      if (typeof pageInfo.endCursor !== "string" || pageInfo.endCursor.length === 0) {
+        throw new Error(
+          `Issue #${issueNumber} has another ${displayName} page without a cursor`,
+        );
+      }
+      if (seenCursors.has(pageInfo.endCursor)) {
+        throw new Error(
+          `Issue #${issueNumber} ${displayName} pagination repeated a cursor`,
+        );
+      }
+      seenCursors.add(pageInfo.endCursor);
+      if (typeof issue.id !== "string" || issue.id.length === 0) {
+        throw new Error(
+          `Issue #${issueNumber} has no node ID for ${displayName} pagination`,
+        );
+      }
+      const pageResponse = await github.graphql(
+        pageQuery,
+        { issueId: issue.id, cursor: pageInfo.endCursor },
       );
+      const connection = pageResponse?.node?.[connectionName];
+      validateConnection(connection);
+      nodes.push(...connection.nodes);
+      pageInfo = connection.pageInfo;
+      pageCount += 1;
     }
-    if (typeof issue.id !== "string" || issue.id.length === 0) {
-      throw new Error(`Issue #${issueNumber} has no node ID for Planning Field pagination`);
-    }
-    const pageResponse = await github.graphql(
-      ISSUE_PLANNING_FIELDS_PAGE_QUERY,
-      { issueId: issue.id, cursor: pageInfo.endCursor },
-    );
-    const connection = pageResponse?.node?.issueFieldValues;
-    if (!connection?.pageInfo || !Array.isArray(connection.nodes)) {
-      throw new Error(`Could not read Planning Fields for issue #${issueNumber}`);
-    }
-    nodes.push(...connection.nodes);
-    pageInfo = connection.pageInfo;
-  }
+    return Object.freeze({
+      nodes: Object.freeze(nodes),
+      pageInfo: Object.freeze({ ...pageInfo }),
+    });
+  };
+
+  const issueFieldValues = await collectConnection(
+    issue.issueFieldValues,
+    "issueFieldValues",
+    "Planning Field",
+    ISSUE_PLANNING_FIELDS_PAGE_QUERY,
+  );
 
   const fieldsByName = new Map();
-  for (const value of nodes) {
+  for (const value of issueFieldValues.nodes) {
     if (!value?.field?.name) continue;
     const normalized = value.field.name.toLowerCase();
     if (fieldsByName.has(normalized)) {
@@ -373,12 +436,27 @@ export async function fetchIssuePlanningMetadata(github, repository, issueNumber
     }
     fieldsByName.set(normalized, value);
   }
+  const labels = await collectConnection(
+    issue.labels,
+    "labels",
+    "label",
+    ISSUE_LABELS_PAGE_QUERY,
+  );
+  const labelNames = new Set();
+  for (const label of labels.nodes) {
+    if (typeof label?.name !== "string" || label.name.length === 0) {
+      throw new Error(`Issue #${issueNumber} has a label without a name`);
+    }
+    const normalized = label.name.toLowerCase();
+    if (labelNames.has(normalized)) {
+      throw new Error(`Issue #${issueNumber} has duplicate label ${label.name}`);
+    }
+    labelNames.add(normalized);
+  }
   return Object.freeze({
     ...issue,
-    issueFieldValues: Object.freeze({
-      nodes: Object.freeze(nodes),
-      pageInfo: Object.freeze({ ...pageInfo }),
-    }),
+    issueFieldValues,
+    labels,
   });
 }
 

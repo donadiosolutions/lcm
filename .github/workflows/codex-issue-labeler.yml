@@ -107,17 +107,25 @@ jobs:
                 (option) => option.name === "Low",
               );
               if (!low) throw new Error("Priority Low is unavailable");
-              await github.graphql(SET_ISSUE_FIELDS_MUTATION, {
-                input: {
-                  issueId: issue.id,
-                  issueFields: [{
-                    fieldId: liveCatalog.fields.priority.id,
-                    singleSelectOptionId: low.id,
-                    confidence: "HIGH",
-                    rationale: "Default while the issue awaits automated triage.",
-                  }],
-                },
-              });
+              try {
+                await github.graphql(SET_ISSUE_FIELDS_MUTATION, {
+                  input: {
+                    issueId: issue.id,
+                    issueFields: [{
+                      fieldId: liveCatalog.fields.priority.id,
+                      singleSelectOptionId: low.id,
+                      confidence: "HIGH",
+                      rationale: "Default while the issue awaits automated triage.",
+                    }],
+                  },
+                });
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                core.warning(
+                  `Could not set default Priority Low for issue #${issueNumber}; `
+                  + `continuing to queue it for triage: ${message}`,
+                );
+              }
             }
 
             await github.rest.issues.addLabels({
@@ -430,6 +438,11 @@ jobs:
                   context.repo,
                   issueNumber,
                 );
+                if (!reconciledIssue) {
+                  throw new Error(
+                    `Issue #${issueNumber} disappeared after classification was applied`,
+                  );
+                }
                 if (classification.isSecurity) securityIssueNumbers.push(issueNumber);
                 if (requiresDuplicateTriage(reconciledIssue.issueType)) {
                   bugIssueNumbers.push(issueNumber);

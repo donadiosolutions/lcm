@@ -264,7 +264,10 @@ test("fetches every Planning Field page and rejects ambiguous field values", asy
           }],
           pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
         },
-        labels: { nodes: [] },
+        labels: {
+          nodes: [{ name: "documentation" }],
+          pageInfo: { hasNextPage: true, endCursor: "label-cursor-1" },
+        },
       },
     },
   };
@@ -279,11 +282,21 @@ test("fetches every Planning Field page and rejects ambiguous field values", asy
       },
     },
   };
+  const labelPage = {
+    node: {
+      labels: {
+        nodes: [{ name: "needs-codex-triage" }],
+        pageInfo: { hasNextPage: false, endCursor: "label-cursor-2" },
+      },
+    },
+  };
   const calls = [];
   const github = {
     graphql: async (query, variables) => {
       calls.push({ query, variables });
-      return calls.length === 1 ? firstPage : secondPage;
+      if (query.includes("IssuePlanningMetadata")) return firstPage;
+      if (query.includes("IssuePlanningFieldValuesPage")) return secondPage;
+      return labelPage;
     },
   };
   const issue = await fetchIssuePlanningMetadata(
@@ -295,15 +308,25 @@ test("fetches every Planning Field page and rejects ambiguous field values", asy
     issue.issueFieldValues.nodes.map((value) => value.field.name),
     ["Priority", "Security status"],
   );
+  assert.deepEqual(
+    issue.labels.nodes.map((label) => label.name),
+    ["documentation", "needs-codex-triage"],
+  );
   assert.deepEqual(calls.map(({ variables }) => variables), [
     { owner: "example", repo: "repo", number: 42 },
     { issueId: "issue-42", cursor: "cursor-1" },
+    { issueId: "issue-42", cursor: "label-cursor-1" },
   ]);
   assert.match(
     calls[0].query,
     /issueFieldValues\(first: 100\)[\s\S]*?pageInfo/u,
   );
+  assert.match(
+    calls[0].query,
+    /labels\(first: 100\)[\s\S]*?pageInfo/u,
+  );
   assert.match(calls[1].query, /issueFieldValues\(first: 100, after: \$cursor\)/u);
+  assert.match(calls[2].query, /labels\(first: 100, after: \$cursor\)/u);
 
   await assert.rejects(
     fetchIssuePlanningMetadata({
@@ -341,7 +364,7 @@ test("fetches every Planning Field page and rejects ambiguous field values", asy
           ? firstPage
           : { node: null },
     }, { owner: "example", repo: "repo" }, 42),
-    /Could not read Planning Fields/u,
+    /Planning Field response is incomplete/u,
   );
   await assert.rejects(
     fetchIssuePlanningMetadata({
@@ -361,6 +384,77 @@ test("fetches every Planning Field page and rejects ambiguous field values", asy
             },
     }, { owner: "example", repo: "repo" }, 42),
     /duplicate priority Planning Field values/iu,
+  );
+  const issueWithoutAdditionalFields = {
+    ...firstPage.repository.issue,
+    issueFieldValues: {
+      nodes: [],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+  };
+  await assert.rejects(
+    fetchIssuePlanningMetadata({
+      graphql: async () => ({
+        repository: {
+          issue: {
+            ...issueWithoutAdditionalFields,
+            labels: {
+              nodes: [],
+              pageInfo: { hasNextPage: true, endCursor: null },
+            },
+          },
+        },
+      }),
+    }, { owner: "example", repo: "repo" }, 42),
+    /another label page without a cursor/u,
+  );
+  await assert.rejects(
+    fetchIssuePlanningMetadata({
+      graphql: async (query) =>
+        query.includes("IssuePlanningMetadata")
+          ? {
+              repository: {
+                issue: {
+                  ...issueWithoutAdditionalFields,
+                  labels: {
+                    nodes: [],
+                    pageInfo: {
+                      hasNextPage: true,
+                      endCursor: "repeated-label-cursor",
+                    },
+                  },
+                },
+              },
+            }
+          : {
+              node: {
+                labels: {
+                  nodes: [],
+                  pageInfo: {
+                    hasNextPage: true,
+                    endCursor: "repeated-label-cursor",
+                  },
+                },
+              },
+            },
+    }, { owner: "example", repo: "repo" }, 42),
+    /label pagination repeated a cursor/u,
+  );
+  await assert.rejects(
+    fetchIssuePlanningMetadata({
+      graphql: async () => ({
+        repository: {
+          issue: {
+            ...issueWithoutAdditionalFields,
+            labels: {
+              nodes: [{ name: "documentation" }, { name: "Documentation" }],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      }),
+    }, { owner: "example", repo: "repo" }, 42),
+    /duplicate label Documentation/u,
   );
   assert.equal(await fetchIssuePlanningMetadata({
     graphql: async () => ({ repository: { issue: null } }),
@@ -453,6 +547,22 @@ test("workflow binds evidence and the required model split", async () => {
     (workflow.match(/requiresDuplicateTriage\(planningIssue\.issueType\)/gu) ?? [])
       .length,
     2,
+  );
+  const enqueueWorkflow = workflow.slice(
+    workflow.indexOf("  enqueue:"),
+    workflow.indexOf("  collect:"),
+  );
+  assert.match(
+    enqueueWorkflow,
+    /try \{\s*await github\.graphql\(SET_ISSUE_FIELDS_MUTATION,[\s\S]*?\} catch \(error\) \{[\s\S]*?Could not set default Priority Low[\s\S]*?continuing to queue it for triage/u,
+  );
+  assert.ok(
+    enqueueWorkflow.indexOf("await github.rest.issues.addLabels")
+    > enqueueWorkflow.indexOf("Could not set default Priority Low"),
+  );
+  assert.match(
+    workflow,
+    /const reconciledIssue = await fetchIssuePlanningMetadata\([\s\S]*?if \(!reconciledIssue\) \{[\s\S]*?disappeared after classification was applied[\s\S]*?requiresDuplicateTriage\(reconciledIssue\.issueType\)/u,
   );
   assert.match(
     workflow,
