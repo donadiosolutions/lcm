@@ -457,8 +457,21 @@ function jsonValue(
   if (
     value === null
     || typeof value === "boolean"
-    || (typeof value === "number" && Number.isFinite(value))
   ) {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (
+      !Number.isFinite(value)
+      || Object.is(value, -0)
+      || (Number.isInteger(value) && !Number.isSafeInteger(value))
+    ) {
+      throw new PostgreSqlNativeTranscriptDataError(
+        projectId,
+        operation,
+        field,
+      );
+    }
     return value;
   }
   if (typeof value === "string") {

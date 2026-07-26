@@ -517,6 +517,59 @@ describe("PostgreSQL native transcript repository", () => {
     })).resolves.toMatchObject({ importedCount: 1 });
   });
 
+  it("rejects lossy JSON numbers and preserves safe numeric values", async () => {
+    const rejectingDb = executor(() => {
+      throw new Error("database must not be called");
+    });
+    const rejectingRepository = new PostgreSqlNativeTranscriptRepository(
+      rejectingDb,
+      projectId,
+    );
+    for (const value of [
+      Number.MAX_SAFE_INTEGER + 1,
+      Number.MIN_SAFE_INTEGER - 1,
+      -0,
+    ]) {
+      await expect(rejectingRepository.ingestBatch({
+        ...batch,
+        records: [{
+          ...batch.records[0]!,
+          nativePayload: { value },
+        }],
+      })).rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
+    }
+    expect(rejectingDb.query).not.toHaveBeenCalled();
+    expect(rejectingDb.transaction).not.toHaveBeenCalled();
+
+    const acceptingDb = executor(successfulQuery);
+    const acceptingRepository = new PostgreSqlNativeTranscriptRepository(
+      acceptingDb,
+      projectId,
+    );
+    await expect(acceptingRepository.ingestBatch({
+      ...batch,
+      records: [{
+        ...batch.records[0]!,
+        nativePayload: {
+          fraction: 0.125,
+          maximumSafeInteger: Number.MAX_SAFE_INTEGER,
+          minimumSafeInteger: Number.MIN_SAFE_INTEGER,
+          negativeFraction: -0.5,
+          zero: 0,
+        },
+      }],
+    })).resolves.toMatchObject({ importedCount: 1 });
+    const transcriptInsert = acceptingDb.query.mock.calls.find(([config]) =>
+      config.text.includes("INSERT INTO lcm.native_transcripts"))?.[0];
+    expect(transcriptInsert?.values?.[12]).toBe(JSON.stringify({
+      fraction: 0.125,
+      maximumSafeInteger: Number.MAX_SAFE_INTEGER,
+      minimumSafeInteger: Number.MIN_SAFE_INTEGER,
+      negativeFraction: -0.5,
+      zero: 0,
+    }));
+  });
+
   it("canonicalizes caller UUIDs across readback and multi-batch checkpoints", async () => {
     const upperProjectId = projectId.toUpperCase();
     const upperMachineId = machineId.toUpperCase();
@@ -1417,6 +1470,13 @@ describe("PostgreSQL native transcript repository", () => {
         records: [{
           ...batch.records[0],
           nativePayload: { bad: Number.POSITIVE_INFINITY },
+        }],
+      },
+      {
+        ...batch,
+        records: [{
+          ...batch.records[0],
+          nativePayload: { bad: 1n as never },
         }],
       },
       {
