@@ -84,6 +84,9 @@ code-scanning rule IDs from the issue.
 Only bounded metadata is retained. Raw secrets, secret locations, code
 locations, private-fork data, dismissal or resolution comments, credentials,
 and unrelated alert bodies are never placed in prompts, job outputs, or logs.
+Collection follows each Security and Quality endpoint's pagination links,
+including cursor-based Dependabot links, and stops after at most two 50-record
+pages per alert state as well as the stricter per-source evidence cap.
 Expected access denials and unavailable-feature responses from these APIs are
 sanitized, bounded, and recorded in `accessIssues` instead of failing the
 security collector. Terra may still run with the available evidence and those

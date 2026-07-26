@@ -823,11 +823,19 @@ test("workflow binds evidence and the required model split", async () => {
   );
   assert.match(
     workflow,
-    /const SECURITY_API_PER_PAGE = 50;[\s\S]*?SECURITY_API_MAX_PAGES_PER_STATE = 2;[\s\S]*?SECURITY_API_MAX_RESULTS_PER_STATE[\s\S]*?page <= SECURITY_API_MAX_PAGES_PER_STATE[\s\S]*?page,[\s\S]*?per_page: SECURITY_API_PER_PAGE/u,
+    /const SECURITY_API_PER_PAGE = 50;[\s\S]*?SECURITY_API_MAX_PAGES_PER_STATE = 2;[\s\S]*?SECURITY_API_MAX_RESULTS_PER_STATE[\s\S]*?github\.paginate\.iterator\(route,[\s\S]*?per_page: SECURITY_API_PER_PAGE[\s\S]*?for await \(const response of iterator\)[\s\S]*?pageCount \+= 1/u,
   );
   assert.match(
     workflow,
-    /const boundedPage = response\.data\.slice\(0, remaining\);[\s\S]*?collectedForState >= SECURITY_API_MAX_RESULTS_PER_STATE/u,
+    /const boundedPage = response\.data\.slice\(0, remaining\);[\s\S]*?pageCount >= SECURITY_API_MAX_PAGES_PER_STATE[\s\S]*?collectedForState >= SECURITY_API_MAX_RESULTS_PER_STATE/u,
+  );
+  const securityCollectorWorkflow = workflow.slice(
+    workflow.indexOf("  collect-security:"),
+    workflow.indexOf("  classify-security:"),
+  );
+  assert.doesNotMatch(
+    securityCollectorWorkflow,
+    /github\.request\(route,[\s\S]*?\bpage,/u,
   );
   const preflightWorkflow = workflow.slice(
     workflow.indexOf("  preflight-write:"),
