@@ -1,4 +1,5 @@
 import type { QueryResultRow } from "pg";
+import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -892,7 +893,12 @@ function reconcilesCommittedCheckpoint(
     && actual.quarantinedCount >= candidate.quarantinedCount;
 }
 
-type CheckpointLockDisposition = "advance" | "matching-retry";
+type CheckpointLockDisposition =
+  | { readonly kind: "advance" }
+  | {
+      readonly kind: "matching-retry";
+      readonly checkpoint: NativeTranscriptCheckpointRecord;
+    };
 
 export class PostgreSqlNativeTranscriptRepository
 implements
@@ -928,7 +934,7 @@ implements
         let importedCount = 0;
         let skippedCount = 0;
         for (const record of batch.records) {
-          if (disposition === "matching-retry") {
+          if (disposition.kind === "matching-retry") {
             await this.assertExactTranscript(
               transaction,
               batch,
@@ -955,6 +961,15 @@ implements
             record.messageLinks,
             operation,
           );
+        }
+        if (disposition.kind === "matching-retry") {
+          candidate = {
+            importedCount,
+            skippedCount,
+            quarantinedCount: batch.quarantinedCount,
+            checkpoint: disposition.checkpoint,
+          };
+          return candidate;
         }
         const checkpoint = await this.advanceCheckpoint(
           transaction,
@@ -1221,7 +1236,7 @@ implements
           operation,
         );
       }
-      return "advance";
+      return { kind: "advance" };
     }
     const locked = await executor.query<CheckpointRow>({
       text: `SELECT project_id, machine_id, client_name, source_locator,
@@ -1249,14 +1264,14 @@ implements
       );
     }
     const actual = checkpointFromRow(row, this.projectId, operation);
+    if (sameCheckpointTarget(actual, input.checkpoint)) {
+      return { kind: "matching-retry", checkpoint: actual };
+    }
     if (
       input.expectedCheckpoint !== null
       && sameCheckpoint(actual, input.expectedCheckpoint)
     ) {
-      return "advance";
-    }
-    if (sameCheckpointTarget(actual, input.checkpoint)) {
-      return "matching-retry";
+      return { kind: "advance" };
     }
     throw new PostgreSqlNativeTranscriptCheckpointConflictError(
       this.projectId,
@@ -1721,6 +1736,16 @@ implements
       this.projectId,
       operation,
     );
+    const actualContentSha256 = createHash("sha256")
+      .update(JSON.stringify(payload))
+      .digest("hex");
+    if (contentSha256 !== actualContentSha256) {
+      throw new PostgreSqlNativeTranscriptDataError(
+        this.projectId,
+        operation,
+        "content_sha256",
+      );
+    }
     const messageLinks = value.messageLinks === undefined
       ? undefined
       : Object.freeze(dataArray(

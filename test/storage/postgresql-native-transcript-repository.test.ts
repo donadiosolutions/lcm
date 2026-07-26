@@ -1,4 +1,5 @@
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
   NATIVE_TRANSCRIPT_MAX_JSON_DEPTH,
@@ -20,8 +21,28 @@ import { PostgreSqlCommitOutcomeUnknownError } from "../../src/storage/postgresq
 const projectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
 const machineId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021";
 const transcriptId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9022";
-const contentSha256 = "a".repeat(64);
 const ingestKey = "b".repeat(64);
+
+function canonicalJson(value: JsonValue): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key]!)}`)
+    .join(",")}}`;
+}
+
+function payloadDigest(value: JsonObject | JsonValue[]): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+const contentSha256 = payloadDigest({
+  type: "message",
+  text: "hello",
+  nested: [true, 1, null],
+});
 
 function nestedContainer(
   depth: number,
@@ -381,6 +402,58 @@ describe("PostgreSQL native transcript repository", () => {
       );
   });
 
+  it("binds content digests to canonical normalized payloads before SQL", async () => {
+    const payload = {
+      zeta: [true, null],
+      alpha: {
+        zulu: 2,
+        bravo: 1,
+      },
+    };
+    const canonicalDigest = payloadDigest(payload);
+    const insertionOrderDigest = createHash("sha256")
+      .update(JSON.stringify(payload))
+      .digest("hex");
+    expect(insertionOrderDigest).not.toBe(canonicalDigest);
+
+    const rejectingDb = executor(() => {
+      throw new Error("database must not be called");
+    });
+    await expect(new PostgreSqlNativeTranscriptRepository(
+      rejectingDb,
+      projectId,
+    ).ingestBatch({
+      ...batch,
+      records: [{
+        ...batch.records[0]!,
+        contentSha256: insertionOrderDigest,
+        nativePayload: payload,
+      }],
+    })).rejects.toMatchObject({
+      name: "PostgreSqlNativeTranscriptDataError",
+      field: "content_sha256",
+    });
+    expect(rejectingDb.transaction).not.toHaveBeenCalled();
+    expect(rejectingDb.query).not.toHaveBeenCalled();
+
+    const acceptingDb = executor(successfulQuery);
+    await expect(new PostgreSqlNativeTranscriptRepository(
+      acceptingDb,
+      projectId,
+    ).ingestBatch({
+      ...batch,
+      records: [{
+        ...batch.records[0]!,
+        contentSha256: canonicalDigest,
+        nativePayload: payload,
+      }],
+    })).resolves.toMatchObject({ importedCount: 1 });
+    const insert = acceptingDb.query.mock.calls.find(([config]) =>
+      config.text.includes("INSERT INTO lcm.native_transcripts"))?.[0];
+    expect(insert?.values?.[10]).toBe(canonicalDigest);
+    expect(insert?.values?.[12]).toBe(canonicalJson(payload));
+  });
+
   it("snapshots mutable batches before the transaction and rejects accessors", async () => {
     let releaseTransaction!: () => void;
     const transactionGate = new Promise<void>((resolve) => {
@@ -410,6 +483,7 @@ describe("PostgreSQL native transcript repository", () => {
       records: [{
         ...batch.records[0]!,
         observedAt,
+        contentSha256: payloadDigest(mutablePayload),
         nativePayload: mutablePayload,
         messageLinks: [mutableLink],
       }],
@@ -505,14 +579,16 @@ describe("PostgreSQL native transcript repository", () => {
     }
     expect(db.transaction).not.toHaveBeenCalled();
 
+    const unicodePayload = {
+      ["key-\ud83d\ude00"]: "value-\ud83d\ude00",
+    };
     await expect(repository.ingestBatch({
       ...batch,
       sourceLocator: "sessions/\ud83d\ude00.jsonl",
       records: [{
         ...batch.records[0]!,
-        nativePayload: {
-          ["key-\ud83d\ude00"]: "value-\ud83d\ude00",
-        },
+        contentSha256: payloadDigest(unicodePayload),
+        nativePayload: unicodePayload,
       }],
     })).resolves.toMatchObject({ importedCount: 1 });
   });
@@ -546,28 +622,24 @@ describe("PostgreSQL native transcript repository", () => {
       acceptingDb,
       projectId,
     );
-    await expect(acceptingRepository.ingestBatch({
-      ...batch,
-      records: [{
-        ...batch.records[0]!,
-        nativePayload: {
-          fraction: 0.125,
-          maximumSafeInteger: Number.MAX_SAFE_INTEGER,
-          minimumSafeInteger: Number.MIN_SAFE_INTEGER,
-          negativeFraction: -0.5,
-          zero: 0,
-        },
-      }],
-    })).resolves.toMatchObject({ importedCount: 1 });
-    const transcriptInsert = acceptingDb.query.mock.calls.find(([config]) =>
-      config.text.includes("INSERT INTO lcm.native_transcripts"))?.[0];
-    expect(transcriptInsert?.values?.[12]).toBe(JSON.stringify({
+    const numericPayload = {
       fraction: 0.125,
       maximumSafeInteger: Number.MAX_SAFE_INTEGER,
       minimumSafeInteger: Number.MIN_SAFE_INTEGER,
       negativeFraction: -0.5,
       zero: 0,
-    }));
+    };
+    await expect(acceptingRepository.ingestBatch({
+      ...batch,
+      records: [{
+        ...batch.records[0]!,
+        contentSha256: payloadDigest(numericPayload),
+        nativePayload: numericPayload,
+      }],
+    })).resolves.toMatchObject({ importedCount: 1 });
+    const transcriptInsert = acceptingDb.query.mock.calls.find(([config]) =>
+      config.text.includes("INSERT INTO lcm.native_transcripts"))?.[0];
+    expect(transcriptInsert?.values?.[12]).toBe(JSON.stringify(numericPayload));
   });
 
   it("canonicalizes caller UUIDs across readback and multi-batch checkpoints", async () => {
@@ -760,6 +832,7 @@ describe("PostgreSQL native transcript repository", () => {
       ...batch,
       records: [{
         ...batch.records[0],
+        contentSha256: payloadDigest(specialPayload),
         nativePayload: specialPayload,
         messageLinks: undefined,
       }],
@@ -813,6 +886,7 @@ describe("PostgreSQL native transcript repository", () => {
         ...batch,
         records: [{
           ...batch.records[0],
+          contentSha256: payloadDigest(exactLimit),
           nativePayload: exactLimit,
           messageLinks: undefined,
         }],
@@ -1077,67 +1151,85 @@ describe("PostgreSQL native transcript repository", () => {
       skippedCount: 0,
       checkpoint: { checkpoint: emptyCheckpoint },
     });
+    expect(retry.query.mock.calls.some(
+      ([config]) => config.text.includes("UPDATE lcm.ingest_checkpoints"),
+    )).toBe(false);
   });
 
-  it("rebases matching stale retries without admitting new records", async () => {
-    const retryCheckpointRow = {
-      ...checkpointRow,
-      skipped_count: "1",
-      quarantined_count: "4",
-    };
-    const matching = executor((config) => {
-      if (config.text.includes("INSERT INTO lcm.ingest_checkpoints")) {
-        return result([]);
-      }
-      if (
-        config.text.includes("FROM lcm.native_transcripts AS transcript")
-        && config.text.includes("exact_match")
-      ) {
-        return result([{ ...transcriptRow, exact_match: true }]);
-      }
-      if (config.text.includes("UPDATE lcm.ingest_checkpoints")) {
-        return result([retryCheckpointRow]);
-      }
-      return successfulQuery(config);
-    });
-    const repository = new PostgreSqlNativeTranscriptRepository(
-      matching,
-      projectId,
-    );
-    await expect(repository.ingestBatch(batch)).resolves.toMatchObject({
-      importedCount: 0,
-      skippedCount: 1,
-      quarantinedCount: 2,
-      checkpoint: {
-        importedCount: 1,
+  it("returns matching checkpoint retries without advancing counts", async () => {
+    for (const expectedCheckpoint of [
+      null,
+      checkpointRecord,
+      { ...checkpointRecord, importedCount: 99 },
+    ]) {
+      const matching = executor((config) => {
+        if (config.text.includes("INSERT INTO lcm.ingest_checkpoints")) {
+          return result([]);
+        }
+        if (
+          config.text.includes("FROM lcm.native_transcripts AS transcript")
+          && config.text.includes("exact_match")
+        ) {
+          return result([{ ...transcriptRow, exact_match: true }]);
+        }
+        if (config.text.includes("UPDATE lcm.ingest_checkpoints")) {
+          throw new Error("matching retry must not advance checkpoint");
+        }
+        return successfulQuery(config);
+      });
+      await expect(new PostgreSqlNativeTranscriptRepository(
+        matching,
+        projectId,
+      ).ingestBatch({
+        ...batch,
+        expectedCheckpoint,
+      })).resolves.toMatchObject({
+        importedCount: 0,
         skippedCount: 1,
-        quarantinedCount: 4,
-      },
-    });
-    expect(matching.query.mock.calls.some(
-      ([config]) => config.text.includes("INSERT INTO lcm.native_transcripts"),
-    )).toBe(false);
+        quarantinedCount: 2,
+        checkpoint: {
+          importedCount: 1,
+          skippedCount: 0,
+          quarantinedCount: 2,
+        },
+      });
+      expect(matching.query.mock.calls.some(
+        ([config]) =>
+          config.text.includes("INSERT INTO lcm.native_transcripts")
+          || config.text.includes("UPDATE lcm.ingest_checkpoints"),
+      )).toBe(false);
+    }
 
     const checkpointOnly = executor((config) => {
       if (config.text.includes("INSERT INTO lcm.ingest_checkpoints")) {
         return result([]);
       }
       if (config.text.includes("UPDATE lcm.ingest_checkpoints")) {
-        return result([retryCheckpointRow]);
+        throw new Error("matching retry must not advance checkpoint");
       }
       return successfulQuery(config);
     });
-    await expect(
-      new PostgreSqlNativeTranscriptRepository(checkpointOnly, projectId)
-        .ingestBatch({ ...batch, records: [] }),
-    ).resolves.toMatchObject({
+    await expect(new PostgreSqlNativeTranscriptRepository(
+      checkpointOnly,
+      projectId,
+    ).ingestBatch({
+      ...batch,
+      expectedCheckpoint: { ...checkpointRecord, quarantinedCount: 99 },
+      records: [],
+    })).resolves.toMatchObject({
       importedCount: 0,
       skippedCount: 0,
       quarantinedCount: 2,
-      checkpoint: { quarantinedCount: 4 },
+      checkpoint: {
+        importedCount: 1,
+        skippedCount: 0,
+        quarantinedCount: 2,
+      },
     });
     expect(checkpointOnly.query.mock.calls.some(
-      ([config]) => config.text.includes("lcm.native_transcripts"),
+      ([config]) =>
+        config.text.includes("lcm.native_transcripts")
+        || config.text.includes("UPDATE lcm.ingest_checkpoints"),
     )).toBe(false);
   });
 
