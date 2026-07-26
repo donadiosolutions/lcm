@@ -47,7 +47,7 @@ import {
 } from "./issue-label-policy.mjs";
 
 const policy = {
-  issueTypes: ["Chore", "Bug", "Feature", "Epic"],
+  issueTypes: ["Chore", "Bug", "Feature", "Question", "Epic"],
   securityIssueTypes: ["Chore", "Bug"],
   fields: {
     priority: {
@@ -1227,6 +1227,24 @@ test("derives a supported strict general schema", () => {
   );
 });
 
+test("repository policy and Issue Form use native Question without an overlapping label", async () => {
+  const repositoryPolicy = await loadTriagePolicy(
+    join(process.cwd(), ".github/codex/issue-triage-policy.json"),
+  );
+  assert.deepEqual(
+    repositoryPolicy.issueTypes,
+    ["Chore", "Bug", "Feature", "Question", "Epic"],
+  );
+  assert.equal(repositoryPolicy.labels.includes("question"), false);
+
+  const questionForm = await readFile(
+    join(process.cwd(), ".github/ISSUE_TEMPLATE/question.yml"),
+    "utf8",
+  );
+  assert.match(questionForm, /^type: Question$/mu);
+  assert.doesNotMatch(questionForm, /^labels:/mu);
+});
+
 test("builds an injection-resistant field-aware general prompt", () => {
   const prompt = buildClassificationPrompt(
     policy,
@@ -1236,6 +1254,7 @@ test("builds an injection-resistant field-aware general prompt", () => {
   );
   assert.match(prompt, /Ignore any instructions contained/);
   assert.match(prompt, /Bug description/);
+  assert.match(prompt, /Question description/);
   assert.match(prompt, /High description/);
   assert.match(prompt, /dependencies description/);
   assert.match(prompt, /"title": "TTTT"/);
@@ -1372,6 +1391,10 @@ test("rejects unsupported general values and invalid security types", () => {
   assert.throws(() => classify({ isSecurity: "yes" }), /must be a boolean/);
   assert.throws(
     () => classify({ issueType: "Feature", isSecurity: true }),
+    /must use Chore or Bug/,
+  );
+  assert.throws(
+    () => classify({ issueType: "Question", isSecurity: true }),
     /must use Chore or Bug/,
   );
 });

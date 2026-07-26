@@ -3,6 +3,7 @@
     "Chore",
     "Bug",
     "Feature",
+    "Question",
     "Epic"
   ],
   "securityIssueTypes": [
@@ -44,7 +45,6 @@
   },
   "labels": [
     "documentation",
-    "question",
     "research",
     "dependencies",
     "github-actions",
