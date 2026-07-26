@@ -161,23 +161,35 @@ Organization Planning Fields are outside the repository-scoped
   repository Issues read access, organization Issue Fields read access, and
   read access to Dependabot alerts, code-scanning alerts, secret-scanning
   alerts, and repository security advisories.
-- `CODEX_ISSUE_TRIAGE_WRITE_TOKEN` is used only by enqueue/application jobs and
-  every mutating step in the Priority-aware stale collector: creating and
-  applying temporary exemption markers, running `actions/stale`, and removing
-  those markers during the `always()` cleanup. Grant repository Issues write
-  access and organization Issue Fields read access. It does not need permission
-  to create, update, or delete organization field definitions.
+- `CODEX_ISSUE_TRIAGE_WRITE_TOKEN` is used only by the write preflight,
+  enqueue/application jobs, and every mutating step in the Priority-aware stale
+  collector: creating and applying temporary exemption markers, running
+  `actions/stale`, and removing those markers during the `always()` cleanup.
+  Grant repository Issues write access and organization Issue Fields read
+  access. It does not need permission to create, update, or delete organization
+  field definitions.
 
-Use fine-grained personal access tokens or GitHub App user/installation tokens
-limited to the `donadiosolutions` organization and `lcm` repository. Never use
-an administrator or classic broad-scope token. Rotate both credentials under
-the repository Actions secrets with the exact names above. Neither issue triage
-nor any mutating stale step falls back to `GITHUB_TOKEN`. A missing or invalid
-read credential blocks collection and model inference; a missing or invalid
-write credential prevents issue, label, and Planning Field mutation. The stale
-cleanup step uses the same explicit write credential even when it runs under
-`always()`. GitHub write permissions remain job-local, and checkout never
-persists credentials.
+Store repository-scoped fine-grained personal access tokens, limited to the
+`donadiosolutions` organization and `lcm` repository, in the repository Actions
+secrets with the exact names above. Never store a GitHub App user or installation
+access token as either secret: those credentials are short-lived and require
+per-run minting, which these workflows do not implement. Never use an
+administrator or classic broad-scope token, and rotate the fine-grained tokens
+before they expire.
+
+When queued work exists, a dedicated non-model preflight authenticates the
+write token and validates repository and organization Planning Field catalog
+access before the first Luna classification. To prove repository Issues write
+access without changing the intended label set, it verifies that the first
+collected issue is still queued and idempotently re-adds its already-present
+`needs-codex-triage` label. The token is not exposed to Luna, Terra, or
+duplicate-classification jobs, and the preflight emits no outputs. Neither issue
+triage nor any mutating stale step falls back to `GITHUB_TOKEN`. A missing or
+invalid read credential blocks collection and model inference; a missing or
+invalid write credential fails the preflight and blocks model inference as well
+as issue, label, and Planning Field mutation. The stale cleanup step uses the
+same explicit write credential even when it runs under `always()`. GitHub write
+permissions remain job-local, and checkout never persists credentials.
 
 Use **Actions > Codex issue labeler > Run workflow** to process the current
 queue. An empty queue exits without calling OpenAI. Logs report catalog drift,

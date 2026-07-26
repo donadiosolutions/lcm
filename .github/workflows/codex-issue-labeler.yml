@@ -273,9 +273,120 @@ jobs:
             );
             core.info(`Prepared ${issues.length} issue(s) for classification.`);
 
-  classify:
+  preflight-write:
     needs: collect
     if: ${{ needs.collect.outputs.has_work == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Checkout trusted workflow code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate write credential and perform idempotent queue probe
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ISSUE_NUMBERS: ${{ needs.collect.outputs.issue_numbers }}
+          WRITE_TOKEN: ${{ secrets.CODEX_ISSUE_TRIAGE_WRITE_TOKEN }}
+        with:
+          github-token: ${{ secrets.CODEX_ISSUE_TRIAGE_WRITE_TOKEN }}
+          script: |
+            if (!process.env.WRITE_TOKEN?.trim()) {
+              throw new Error("CODEX_ISSUE_TRIAGE_WRITE_TOKEN is not configured");
+            }
+
+            const { join } = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const policyUrl = pathToFileURL(
+              join(process.env.GITHUB_WORKSPACE, ".github/scripts/issue-label-policy.mjs"),
+            ).href;
+            const {
+              TRIAGE_CATALOG_QUERY,
+              fetchRepositoryLabelCatalog,
+              loadTriagePolicy,
+              resolveLiveTriageCatalog,
+              validateExpectedIssueNumbers,
+            } = await import(policyUrl);
+            const policy = await loadTriagePolicy(
+              join(
+                process.env.GITHUB_WORKSPACE,
+                ".github/codex/issue-triage-policy.json",
+              ),
+            );
+
+            await github.rest.users.getAuthenticated();
+            await github.rest.repos.get(context.repo);
+            const catalogResponse = await github.graphql(TRIAGE_CATALOG_QUERY, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            if (!catalogResponse.organization || !catalogResponse.repository) {
+              throw new Error(
+                "Write credential cannot access the repository Planning Field catalog",
+              );
+            }
+            const repositoryLabels = await fetchRepositoryLabelCatalog(
+              github,
+              context.repo,
+            );
+            resolveLiveTriageCatalog({
+              issueTypes: catalogResponse.repository.issueTypes.nodes,
+              fields: catalogResponse.organization.issueFields.nodes,
+              labels: repositoryLabels,
+            }, policy);
+
+            let parsedIssueNumbers;
+            try {
+              parsedIssueNumbers = JSON.parse(process.env.ISSUE_NUMBERS ?? "");
+            } catch (error) {
+              throw new Error(
+                "Collected issue numbers are not valid JSON",
+                { cause: error },
+              );
+            }
+            const issueNumbers = validateExpectedIssueNumbers(parsedIssueNumbers);
+            if (issueNumbers.length === 0) {
+              throw new Error("Write preflight requires at least one queued issue");
+            }
+            const probeIssueNumber = issueNumbers[0];
+            const queueLabel = process.env.QUEUE_LABEL;
+            const issueResponse = await github.rest.issues.get({
+              ...context.repo,
+              issue_number: probeIssueNumber,
+            });
+            const hasQueueLabel = issueResponse.data.labels.some((label) => (
+              (typeof label === "string" ? label : label.name)
+                ?.toLowerCase() === queueLabel.toLowerCase()
+            ));
+            if (!hasQueueLabel) {
+              throw new Error(
+                `Issue #${probeIssueNumber} left the triage queue before write preflight`,
+              );
+            }
+            const writeResponse = await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: probeIssueNumber,
+              labels: [queueLabel],
+            });
+            const writePreservedQueueLabel = writeResponse.data.some((label) => (
+              label.name?.toLowerCase() === queueLabel.toLowerCase()
+            ));
+            if (!writePreservedQueueLabel) {
+              throw new Error(
+                `Issue #${probeIssueNumber} lost queue membership during write preflight`,
+              );
+            }
+            core.info(
+              `Write credential and idempotent queue probe succeeded on `
+              + `issue #${probeIssueNumber}.`,
+            );
+
+  classify:
+    needs: [collect, preflight-write]
+    if: ${{ needs.collect.outputs.has_work == 'true' && needs.preflight-write.result == 'success' }}
     runs-on: ubuntu-latest
     permissions: {}
     outputs:
@@ -1069,8 +1180,8 @@ jobs:
             }
 
   classify-duplicates:
-    needs: [apply-security, collect-duplicates]
-    if: ${{ always() && needs.apply-security.outputs.has_bugs == 'true' && needs.collect-duplicates.outputs.has_issues == 'true' && needs.collect-duplicates.outputs.evidence != '' && needs.collect-duplicates.outputs.prompt != '' && needs.collect-duplicates.outputs.schema != '' }}
+    needs: [preflight-write, apply-security, collect-duplicates]
+    if: ${{ always() && needs.preflight-write.result == 'success' && needs.apply-security.outputs.has_bugs == 'true' && needs.collect-duplicates.outputs.has_issues == 'true' && needs.collect-duplicates.outputs.evidence != '' && needs.collect-duplicates.outputs.prompt != '' && needs.collect-duplicates.outputs.schema != '' }}
     runs-on: ubuntu-latest
     permissions: {}
     outputs:

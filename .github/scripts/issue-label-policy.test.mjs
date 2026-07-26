@@ -565,7 +565,7 @@ test("workflow binds evidence and the required model split", async () => {
         /github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/gu,
       ) ?? []
     ).length,
-    4,
+    5,
   );
   assert.doesNotMatch(
     workflow,
@@ -623,7 +623,7 @@ test("workflow binds evidence and the required model split", async () => {
   assert.equal(
     (workflow.match(/fetchRepositoryLabelCatalog\(\s*github,\s*context\.repo/gu) ?? [])
       .length,
-    5,
+    6,
   );
   assert.doesNotMatch(workflow, /catalogResponse\.repository\.labels/u);
   assert.equal(
@@ -662,6 +662,74 @@ test("workflow binds evidence and the required model split", async () => {
     workflow,
     /const boundedPage = response\.data\.slice\(0, remaining\);[\s\S]*?collectedForState >= SECURITY_API_MAX_RESULTS_PER_STATE/u,
   );
+  const preflightWorkflow = workflow.slice(
+    workflow.indexOf("  preflight-write:"),
+    workflow.indexOf("  classify:"),
+  );
+  assert.match(
+    preflightWorkflow,
+    /needs: collect[\s\S]*?if: \$\{\{ needs\.collect\.outputs\.has_work == 'true' \}\}/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /WRITE_TOKEN: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}[\s\S]*?github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /ISSUE_NUMBERS: \$\{\{ needs\.collect\.outputs\.issue_numbers \}\}/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /if \(!process\.env\.WRITE_TOKEN\?\.trim\(\)\)[\s\S]*?throw new Error\("CODEX_ISSUE_TRIAGE_WRITE_TOKEN is not configured"\)/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /github\.rest\.users\.getAuthenticated\(\)[\s\S]*?github\.rest\.repos\.get\(context\.repo\)[\s\S]*?github\.graphql\(TRIAGE_CATALOG_QUERY,[\s\S]*?!catalogResponse\.organization \|\| !catalogResponse\.repository[\s\S]*?fetchRepositoryLabelCatalog\([\s\S]*?resolveLiveTriageCatalog\(/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /JSON\.parse\(process\.env\.ISSUE_NUMBERS \?\? ""\)[\s\S]*?validateExpectedIssueNumbers\(parsedIssueNumbers\)[\s\S]*?issueNumbers\.length === 0/u,
+  );
+  assert.match(
+    preflightWorkflow,
+    /github\.rest\.issues\.get\([\s\S]*?hasQueueLabel[\s\S]*?if \(!hasQueueLabel\)[\s\S]*?left the triage queue before write preflight[\s\S]*?github\.rest\.issues\.addLabels\([\s\S]*?labels: \[queueLabel\][\s\S]*?writeResponse\.data\.some[\s\S]*?if \(!writePreservedQueueLabel\)/u,
+  );
+  assert.ok(
+    preflightWorkflow.indexOf("github.rest.issues.addLabels")
+    > preflightWorkflow.indexOf("if (!hasQueueLabel)"),
+  );
+  assert.doesNotMatch(
+    preflightWorkflow,
+    /OPENAI_API_KEY|openai\/codex-action|core\.setOutput/u,
+  );
+  assert.match(
+    workflow,
+    /classify:\s*\n\s+needs: \[collect, preflight-write\]\s*\n\s+if: \$\{\{ needs\.collect\.outputs\.has_work == 'true' && needs\.preflight-write\.result == 'success' \}\}/u,
+  );
+  assert.match(
+    workflow,
+    /classify-duplicates:\s*\n\s+needs: \[preflight-write, apply-security, collect-duplicates\]\s*\n\s+if: \$\{\{ always\(\) && needs\.preflight-write\.result == 'success'/u,
+  );
+  const modelJobs = [
+    workflow.slice(
+      workflow.indexOf("  classify:"),
+      workflow.indexOf("  apply-labels:"),
+    ),
+    workflow.slice(
+      workflow.indexOf("  classify-security:"),
+      workflow.indexOf("  apply-security:"),
+    ),
+    workflow.slice(
+      workflow.indexOf("  classify-duplicates:"),
+      workflow.indexOf("  apply-duplicates:"),
+    ),
+  ];
+  for (const modelJob of modelJobs) {
+    assert.doesNotMatch(
+      modelJob,
+      /CODEX_ISSUE_TRIAGE_(?:READ|WRITE)_TOKEN|WRITE_TOKEN/u,
+    );
+  }
 
   const staleWorkflow = await readFile(
     new URL("../workflows/stale.yml", import.meta.url),
