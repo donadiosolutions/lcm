@@ -20,6 +20,7 @@ export function projectIdentity(
   cwd: string,
   config?: ResolvedStorageConfig,
 ): ProjectIdentity | StorageIdentityContext {
+  if (config) ensureWorktreeProjectReconciled(cwd);
   const local = resolveProjectIdentity(cwd);
   return config ? resolveStorageIdentityContext(config, local) : local;
 }
@@ -31,8 +32,7 @@ export const projectCanonicalPath = (cwd: string): string =>
   projectIdentity(cwd).canonical;
 
 export function projectPaths(cwd: string): ProjectIdentity & { dir: string; dbPath: string; metaPath: string } {
-  const initialIdentity = projectIdentity(cwd);
-  ensureWorktreeProjectReconciled(cwd, initialIdentity);
+  ensureWorktreeProjectReconciled(cwd);
   // Reconciliation may atomically replace a legacy worktree hash while this
   // call is in flight. Resolve again after the commit point before deriving
   // any storage paths.
@@ -153,5 +153,7 @@ export const ensureProjectDirForIdentity = (identity: ProjectIdentity): string =
 };
 
 /** Ensures the current project dir exists and writes cwd to meta.json. */
-export const ensureProjectDir = (cwd: string): string =>
-  ensureProjectDirForIdentity(resolveProjectIdentity(cwd));
+export const ensureProjectDir = (cwd: string): string => {
+  ensureWorktreeProjectReconciled(cwd);
+  return ensureProjectDirForIdentity(resolveProjectIdentity(cwd));
+};

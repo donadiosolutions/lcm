@@ -34,7 +34,23 @@ import {
   listWorktreeReconciliationJournals,
   reconcileWorktrees,
 } from "../src/worktree-reconciliation.js";
-import { projectDbPath } from "../src/daemon/project.js";
+import { projectDbPath, projectIdentity } from "../src/daemon/project.js";
+import { recoverMachineIdentity } from "../src/machine-identity.js";
+import type { ResolvedStorageConfig } from "../src/daemon/config.js";
+
+const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
+  backend: "postgresql",
+  postgresql: {
+    url: "postgresql://user:secret@db.example/lcm",
+    caFile: "/secure/ca.pem",
+    poolMax: 5,
+    connectionTimeoutMs: 10_000,
+    idleTimeoutMs: 30_000,
+    statementTimeoutMs: 60_000,
+  },
+};
+
+const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 
 function git(cwd: string, ...args: string[]): void {
   execFileSync("git", args, { cwd, stdio: "ignore" });
@@ -877,6 +893,96 @@ describe("worktree reconciliation", () => {
       .toBe(join(home, ".lcm", "projects", targetHash, "db.sqlite"));
   });
 
+  it("carries a legacy linked-worktree binding to canonical identity before PostgreSQL admission", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [sourceHash]: {
+        canonical: linked,
+        aliases: [],
+        remoteProjectId,
+      },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "legacy-postgresql-binding",
+      "bound before admission",
+      sourceHash,
+    );
+    recoverMachineIdentity({
+      version: 1,
+      identityKey: `machine:${"a".repeat(64)}`,
+      machineId: MACHINE_ID,
+      displayName: "Test machine",
+    }, { homeDir: home });
+
+    expect(projectIdentity(linked, POSTGRESQL_STORAGE)).toEqual({
+      id: remoteProjectId,
+      localProjectId: targetHash,
+      canonical,
+      remoteProjectId,
+      machineId: MACHINE_ID,
+    });
+    expect(listProjectMapEntries()).toEqual({
+      [targetHash]: {
+        canonical,
+        aliases: [linked],
+        remoteProjectId,
+      },
+    });
+    const target = new DatabaseSync(
+      join(home, ".lcm", "projects", targetHash, "db.sqlite"),
+      { readOnly: true },
+    );
+    expect(target.prepare(
+      "SELECT session_id FROM conversations WHERE session_id = 'legacy-postgresql-binding'",
+    ).get()).toEqual({ session_id: "legacy-postgresql-binding" });
+    target.close();
+  });
+
+  it("rejects conflicting legacy bindings before PostgreSQL admission mutates project state", () => {
+    const { main, linked } = makeRepository(home);
+    const secondLinked = join(home, "linked-two");
+    git(main, "worktree", "add", "-qb", "linked-two", secondLinked);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    const secondSourceHash = hashProjectPath(secondLinked);
+    const mapPath = projectMapPath();
+    writeFileSync(mapPath, `${JSON.stringify({
+      [sourceHash]: {
+        canonical: linked,
+        aliases: [],
+        remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      },
+      [secondSourceHash]: {
+        canonical: secondLinked,
+        aliases: [],
+        remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
+      },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const mapBefore = readFileSync(mapPath, "utf8");
+    const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    const secondSourcePath = join(home, ".lcm", "projects", secondSourceHash, "db.sqlite");
+    makeDatabase(sourcePath, "conflicting-binding-a", "source a", sourceHash);
+    makeDatabase(secondSourcePath, "conflicting-binding-b", "source b", secondSourceHash);
+
+    expect(() => projectIdentity(linked, POSTGRESQL_STORAGE)).toThrow(
+      "conflicting PostgreSQL project bindings",
+    );
+    expect(readFileSync(mapPath, "utf8")).toBe(mapBefore);
+    expect(existsSync(sourcePath)).toBe(true);
+    expect(existsSync(secondSourcePath)).toBe(true);
+    expect(existsSync(join(home, ".lcm", "projects", targetHash))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
+  });
+
   it("re-resolves storage paths after folding a legacy source-hash alias", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
@@ -1055,7 +1161,7 @@ describe("worktree reconciliation", () => {
     evidence.close();
   });
 
-  it("fails closed instead of severing an unknown event predecessor", () => {
+  it("preserves surviving events whose pruned predecessor is no longer present", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
@@ -1072,19 +1178,78 @@ describe("worktree reconciliation", () => {
     const source = new DatabaseSync(sourceEvents);
     source.prepare(
       `INSERT INTO events(
+         session_id, seq, type, category, data, priority, source_hook, created_at
+       ) VALUES('source', 4, 'decision', 'surviving-parent', '{}', 1,
+         'PostToolUse', '2026-01-04')`,
+    ).run();
+    const survivingParentId = Number(
+      (source.prepare(
+        "SELECT event_id FROM events WHERE session_id = 'source' AND seq = 4",
+      ).get() as { event_id: number }).event_id,
+    );
+    source.prepare(
+      `INSERT INTO events(
          session_id, seq, type, category, data, priority, source_hook,
          prev_event_id, created_at
-       ) VALUES('source', 4, 'decision', 'orphan', '{}', 1, 'PostToolUse',
-         999, '2026-01-04')`,
+       ) VALUES('source', 5, 'decision', 'surviving-child', '{}', 1,
+         'PostToolUse', ?, '2026-01-05')`,
+    ).run(survivingParentId);
+    source.prepare(
+      "DELETE FROM events WHERE session_id = 'source' AND seq = 1",
     ).run();
     source.close();
 
-    expect(() => reconcileWorktrees(linked)).toThrow(
-      "event 4 references unknown predecessor 999",
-    );
+    expect(reconcileWorktrees(linked).status).toBe("completed");
     const target = new DatabaseSync(targetEvents, { readOnly: true });
-    expect(target.prepare("SELECT COUNT(*) AS count FROM events").get()).toEqual({ count: 3 });
+    expect(target.prepare(
+      "SELECT prev_event_id FROM events WHERE session_id = 'source' AND seq = 2",
+    ).get()).toEqual({ prev_event_id: null });
+    expect(target.prepare(
+      `SELECT child.prev_event_id, parent.event_id
+         FROM events child
+         JOIN events parent
+           ON parent.session_id = child.session_id
+          AND parent.seq = 4
+        WHERE child.session_id = 'source' AND child.seq = 5`,
+    ).get()).toEqual(expect.objectContaining({
+      prev_event_id: expect.any(Number),
+      event_id: expect.any(Number),
+    }));
+    const internal = target.prepare(
+      `SELECT child.prev_event_id, parent.event_id
+         FROM events child
+         JOIN events parent
+           ON parent.session_id = child.session_id
+          AND parent.seq = 4
+        WHERE child.session_id = 'source' AND child.seq = 5`,
+    ).get() as { prev_event_id: number; event_id: number };
+    expect(internal.prev_event_id).toBe(internal.event_id);
+    expect(target.prepare("SELECT COUNT(*) AS count FROM events").get()).toEqual({ count: 6 });
     target.close();
+  });
+
+  it("fails closed when a present predecessor has not been mapped yet", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourceEvents = join(home, ".lcm", "events", `${sourceHash}.db`);
+    makeEvents(sourceEvents, "future-predecessor");
+    const source = new DatabaseSync(sourceEvents);
+    source.prepare(
+      "UPDATE events SET prev_event_id = 2 WHERE event_id = 1",
+    ).run();
+    source.close();
+
+    expect(() => reconcileWorktrees(main)).toThrow(
+      "event 1 references an unmapped predecessor 2",
+    );
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
   });
 
   it("archives event WAL and SHM sidecars when resuming after a verified merge", () => {
@@ -1127,6 +1292,259 @@ describe("worktree reconciliation", () => {
       expect.stringMatching(/\.db-shm$/u),
       expect.stringMatching(/\.db-wal$/u),
     ]);
+  });
+
+  it("preserves an archived event database when a hook recreates the retired source", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourceEvents = join(home, ".lcm", "events", `${sourceHash}.db`);
+    makeEvents(sourceEvents, "archived-generation");
+    let recreated = false;
+
+    expect(() => reconcileWorktrees(main, {
+      now: new Date("2026-07-25T12:00:00Z"),
+      _observer: (event, _source, detailPath) => {
+        if (
+          !recreated
+          && event === "after-source-archive-rename"
+          && detailPath?.includes("oldevents")
+          && detailPath.endsWith(".db")
+        ) {
+          recreated = true;
+          makeEvents(sourceEvents, "recreated-generation");
+          throw new Error("crash after event archive before fence publication");
+        }
+      },
+    })).toThrow("crash after event archive before fence publication");
+    const blocked = listWorktreeReconciliationJournals()[0];
+    const backup = blocked.backupPaths.find((path) => path.includes("oldevents"))!;
+    const backupBefore = readFileSync(backup);
+    const backupInode = statSync(backup).ino;
+    expect(blocked).toMatchObject({
+      phase: "blocked",
+      blockedFrom: "merged",
+      backupPaths: [backup],
+    });
+
+    expect(() => reconcileWorktrees(main)).toThrow(
+      "legacy events archive destination is already occupied",
+    );
+    expect(statSync(backup).ino).toBe(backupInode);
+    expect(readFileSync(backup).equals(backupBefore)).toBe(true);
+    expect(statSync(sourceEvents).isFile()).toBe(true);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+    const evidence = new DatabaseSync(backup, { readOnly: true });
+    expect(evidence.prepare(
+      "SELECT session_id FROM events WHERE session_id = 'archived-generation'",
+    ).get()).toEqual({ session_id: "archived-generation" });
+    expect(evidence.prepare(
+      "SELECT session_id FROM events WHERE session_id = 'recreated-generation'",
+    ).get()).toBeUndefined();
+    evidence.close();
+    const target = new DatabaseSync(
+      join(home, ".lcm", "events", `${targetHash}.db`),
+      { readOnly: true },
+    );
+    expect(target.prepare(
+      "SELECT session_id FROM events WHERE session_id = 'archived-generation'",
+    ).get()).toEqual({ session_id: "archived-generation" });
+    expect(target.prepare(
+      "SELECT session_id FROM events WHERE session_id = 'recreated-generation'",
+    ).get()).toBeUndefined();
+    target.close();
+  });
+
+  it.each(["", "-wal", "-shm"])(
+    "never replaces an occupied journaled event backup for sidecar %s",
+    (suffix) => {
+      const { main, linked } = makeRepository(home);
+      const canonical = resolveGitProjectAnchor(main)!.canonical;
+      const targetHash = hashProjectPath(canonical);
+      const sourceHash = hashProjectPath(linked);
+      writeFileSync(projectMapPath(), `${JSON.stringify({
+        [targetHash]: { canonical, aliases: [] },
+        [sourceHash]: { canonical: linked, aliases: [] },
+      }, null, 2)}\n`);
+      clearProjectMapCache();
+      const sourceEvents = join(home, ".lcm", "events", `${sourceHash}.db`);
+      const archiveAt = "2026-07-25T12:00:00.000Z";
+      const destination = join(
+        home,
+        ".lcm",
+        "oldevents",
+        `${sourceHash}-2026-07-25T12-00-00-000Z.db${suffix}`,
+      );
+      mkdirSync(join(sourceEvents, ".."), { recursive: true });
+      mkdirSync(join(destination, ".."), { recursive: true });
+      writeFileSync(`${sourceEvents}${suffix}`, `recreated${suffix}`);
+      writeFileSync(destination, `preserved${suffix}`);
+      const destinationInode = statSync(destination).ino;
+      const reconciliationRoot = join(home, ".lcm", "reconciliations");
+      mkdirSync(reconciliationRoot, { recursive: true });
+      writeFileSync(join(reconciliationRoot, `${targetHash}.json`), JSON.stringify({
+        version: 1,
+        targetHash,
+        canonical,
+        sourceHashes: [sourceHash],
+        pendingSourceHashes: [sourceHash],
+        aliases: [canonical, linked],
+        createdAt: archiveAt,
+        updatedAt: archiveAt,
+        archiveAt,
+        phase: "merged",
+        backupPaths: [destination],
+        sourceComponents: {
+          [sourceHash]: {
+            projectDb: false,
+            eventsDb: suffix === "",
+            patterns: false,
+          },
+        },
+      }));
+
+      expect(() => reconcileWorktrees(main)).toThrow(
+        "legacy events archive destination is already occupied",
+      );
+      expect(statSync(destination).ino).toBe(destinationInode);
+      expect(readFileSync(destination, "utf8")).toBe(`preserved${suffix}`);
+      expect(readFileSync(`${sourceEvents}${suffix}`, "utf8")).toBe(`recreated${suffix}`);
+      expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+    },
+  );
+
+  it.each([
+    {
+      state: "invalid source",
+      expectedError: "invalid legacy events state path",
+    },
+    {
+      state: "invalid destination",
+      expectedError: "legacy events archive destination is already occupied",
+    },
+    {
+      state: "raced destination",
+      expectedError: "legacy events archive destination is already occupied",
+    },
+  ])("fails closed for an $state event sidecar archive", ({
+    state,
+    expectedError,
+  }) => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourceEvents = join(home, ".lcm", "events", `${sourceHash}.db`);
+    const sourceSidecar = `${sourceEvents}-wal`;
+    const archiveAt = "2026-07-25T12:00:00.000Z";
+    const destination = join(
+      home,
+      ".lcm",
+      "oldevents",
+      `${sourceHash}-2026-07-25T12-00-00-000Z.db-wal`,
+    );
+    mkdirSync(join(sourceSidecar, ".."), { recursive: true });
+    mkdirSync(join(destination, ".."), { recursive: true });
+    if (state === "invalid source") mkdirSync(sourceSidecar);
+    else writeFileSync(sourceSidecar, "source wal");
+    if (state === "invalid destination") mkdirSync(destination);
+    const reconciliationRoot = join(home, ".lcm", "reconciliations");
+    mkdirSync(reconciliationRoot, { recursive: true });
+    writeFileSync(join(reconciliationRoot, `${targetHash}.json`), JSON.stringify({
+      version: 1,
+      targetHash,
+      canonical,
+      sourceHashes: [sourceHash],
+      pendingSourceHashes: [sourceHash],
+      aliases: [canonical, linked],
+      createdAt: archiveAt,
+      updatedAt: archiveAt,
+      archiveAt,
+      phase: "merged",
+      backupPaths: [],
+      sourceComponents: {
+        [sourceHash]: { projectDb: false, eventsDb: false, patterns: false },
+      },
+    }));
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event, _source, detailPath) => {
+        if (
+          state === "raced destination"
+          && event === "before-source-archive-rename"
+          && detailPath === destination
+        ) {
+          writeFileSync(destination, "raced backup");
+        }
+      },
+    })).toThrow(expectedError);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+    if (state === "raced destination") {
+      expect(readFileSync(destination, "utf8")).toBe("raced backup");
+      expect(readFileSync(sourceSidecar, "utf8")).toBe("source wal");
+    }
+  });
+
+  it("resumes an event archive interrupted after the exclusive backup link", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourceEvents = join(home, ".lcm", "events", `${sourceHash}.db`);
+    mkdirSync(join(sourceEvents, ".."), { recursive: true });
+    writeFileSync(sourceEvents, "event evidence");
+    const archiveAt = "2026-07-25T12:00:00.000Z";
+    const reconciliationRoot = join(home, ".lcm", "reconciliations");
+    mkdirSync(reconciliationRoot, { recursive: true });
+    writeFileSync(join(reconciliationRoot, `${targetHash}.json`), JSON.stringify({
+      version: 1,
+      targetHash,
+      canonical,
+      sourceHashes: [sourceHash],
+      pendingSourceHashes: [sourceHash],
+      aliases: [canonical, linked],
+      createdAt: archiveAt,
+      updatedAt: archiveAt,
+      archiveAt,
+      phase: "merged",
+      backupPaths: [],
+      sourceComponents: {
+        [sourceHash]: { projectDb: false, eventsDb: true, patterns: false },
+      },
+    }));
+    let interrupted = false;
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (!interrupted && event === "after-source-archive-link") {
+          interrupted = true;
+          throw new Error("crash after exclusive event archive link");
+        }
+      },
+    })).toThrow("crash after exclusive event archive link");
+    const backup = listWorktreeReconciliationJournals()[0].backupPaths
+      .find((path) => path.includes("oldevents"))!;
+    expect(statSync(sourceEvents).ino).toBe(statSync(backup).ino);
+
+    expect(reconcileWorktrees(main).status).toBe("completed");
+    expect(readFileSync(backup, "utf8")).toBe("event evidence");
+    expect(statSync(sourceEvents).isDirectory()).toBe(true);
+    expect(listProjectMapEntries()).not.toHaveProperty(sourceHash);
   });
 
   it("rejects symlink source state and malformed journals", () => {
@@ -2306,6 +2724,10 @@ describe("worktree reconciliation", () => {
     expect(projectDbPath(nonGit)).toBe(
       join(home, ".lcm", "projects", hashProjectPath(nonGit), "db.sqlite"),
     );
+    expect(ensureWorktreeProjectReconciled(nonGit, {
+      id: hashProjectPath(nonGit),
+      canonical: nonGit,
+    }).status).toBe("not-needed");
 
     const { main } = makeRepository(home);
     const codexDir = join(home, ".codex");

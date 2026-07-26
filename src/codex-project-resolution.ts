@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, readdirSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, statSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
@@ -136,7 +136,13 @@ function readThreadOwners(
 ): void {
   const root = join(project.commonDir, "worktrees");
   if (!isDirectory(root)) return;
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
+  let entries: Dirent[] = [];
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    // Optional ownership metadata may disappear while Codex cleans a worktree.
+  }
+  for (const entry of entries) {
     if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
     const metadataPath = join(root, entry.name, "codex-thread.json");
     if (!existsSync(metadataPath)) continue;

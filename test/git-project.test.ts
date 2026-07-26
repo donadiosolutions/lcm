@@ -36,6 +36,11 @@ function makeLinkedWorktree(primary: string, linked: string, name = "linked"): s
   return linked;
 }
 
+function git(cwd: string, ...args: string[]): void {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  if (result.status !== 0) throw new Error(result.stderr || result.stdout);
+}
+
 describe("Git project identity", () => {
   let root: string;
 
@@ -85,6 +90,33 @@ describe("Git project identity", () => {
     makeRepository(plain);
     expect(resolveGitProjectAnchor(plain)?.canonical).toBe(plain);
     expect(resolveGitProjectAnchor(join(root, "missing"))).toBeNull();
+  });
+
+  it("anchors a real submodule at its checkout rather than superproject metadata", () => {
+    const submoduleSource = join(root, "submodule-source");
+    const superproject = join(root, "superproject");
+    makeDirectory(submoduleSource);
+    git(submoduleSource, "init", "-q");
+    git(submoduleSource, "config", "user.email", "test@example.invalid");
+    git(submoduleSource, "config", "user.name", "LCM Test");
+    writeFileSync(join(submoduleSource, "README.md"), "submodule\n");
+    git(submoduleSource, "add", "README.md");
+    git(submoduleSource, "commit", "-qm", "initial");
+    makeDirectory(superproject);
+    git(superproject, "init", "-q");
+    git(superproject, "config", "user.email", "test@example.invalid");
+    git(superproject, "config", "user.name", "LCM Test");
+    writeFileSync(join(superproject, "README.md"), "superproject\n");
+    git(superproject, "add", "README.md");
+    git(superproject, "commit", "-qm", "initial");
+    git(superproject, "-c", "protocol.file.allow=always", "submodule", "add", "../submodule-source", "modules/sub");
+
+    const submodule = join(superproject, "modules", "sub");
+    makeDirectory(join(submodule, "nested"));
+    const anchor = resolveGitProjectAnchor(join(submodule, "nested"));
+    expect(anchor).toMatchObject({ canonical: submodule, worktreeRoot: submodule });
+    expect(anchor?.commonDir).toContain(join(".git", "modules", "modules", "sub"));
+    expect(resolveGitProjectAnchor(superproject)?.canonical).toBe(superproject);
   });
 
   it("revalidates cached anchors when nearer or changed Git metadata appears", () => {

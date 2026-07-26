@@ -2,10 +2,12 @@ import { createHash } from "node:crypto";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import {
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   readdirSync,
   renameSync,
+  unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -872,20 +874,28 @@ function mergeEventsDatabase(
           target.exec("COMMIT");
           return;
         }
+        const sourceEvents = rows(source, "SELECT * FROM events ORDER BY event_id");
+        const sourceEventIds = new Set(sourceEvents.map((event) => Number(event.event_id)));
         const eventMap = new Map<number, number>();
-        for (const sourceEvent of rows(source, "SELECT * FROM events ORDER BY event_id")) {
+        for (const sourceEvent of sourceEvents) {
           const sourceId = Number(sourceEvent.event_id);
           const previousSourceId = sourceEvent.prev_event_id === null
             ? null
             : Number(sourceEvent.prev_event_id);
-          if (previousSourceId !== null && !eventMap.has(previousSourceId)) {
+          if (
+            previousSourceId !== null
+            && sourceEventIds.has(previousSourceId)
+            && !eventMap.has(previousSourceId)
+          ) {
             throw new Error(
-              `event ${sourceId} references unknown predecessor ${previousSourceId}`,
+              `event ${sourceId} references an unmapped predecessor ${previousSourceId}`,
             );
           }
           const value: SqlRow = {
             ...sourceEvent,
-            prev_event_id: previousSourceId === null ? null : eventMap.get(previousSourceId)!,
+            prev_event_id: previousSourceId === null
+              ? null
+              : eventMap.get(previousSourceId) ?? null,
           };
           delete value.event_id;
           const existing = row(
@@ -1136,6 +1146,41 @@ function installFilesystemFences(
   }
 }
 
+function archiveEventFileNoReplace(
+  sourcePath: string,
+  destination: string,
+  recordBackup: (path: string) => void,
+  observe: (event: string, path: string) => void,
+): void {
+  const sourceStat = lstatSync(sourcePath);
+  if (!sourceStat.isFile()) {
+    throw new Error(`invalid legacy events state path: ${sourcePath}`);
+  }
+  if (existsSync(destination)) {
+    const destinationStat = lstatSync(destination);
+    if (
+      !destinationStat.isFile()
+      || `${destinationStat.dev}:${destinationStat.ino}`
+        !== `${sourceStat.dev}:${sourceStat.ino}`
+    ) {
+      throw new Error(`legacy events archive destination is already occupied: ${destination}`);
+    }
+    unlinkSync(sourcePath);
+    observe("after-source-archive-rename", destination);
+    return;
+  }
+  recordBackup(destination);
+  observe("before-source-archive-rename", destination);
+  try {
+    linkSync(sourcePath, destination);
+  } catch {
+    throw new Error(`legacy events archive destination is already occupied: ${destination}`);
+  }
+  observe("after-source-archive-link", destination);
+  unlinkSync(sourcePath);
+  observe("after-source-archive-rename", destination);
+}
+
 function archiveSource(
   source: WorktreeReconciliationSource,
   homeDir: string | undefined,
@@ -1164,20 +1209,24 @@ function archiveSource(
       throw new Error(`invalid legacy events state path: ${source.eventsPath}`);
     }
     ensurePrivateDirectory(eventsRoot);
-    recordBackup(eventsDestination);
-    observeRename("before-source-archive-rename", eventsDestination);
-    renameSync(source.eventsPath, eventsDestination);
-    observeRename("after-source-archive-rename", eventsDestination);
+    archiveEventFileNoReplace(
+      source.eventsPath,
+      eventsDestination,
+      recordBackup,
+      observeRename,
+    );
   }
   for (const suffix of ["-wal", "-shm"]) {
     const sidecar = `${source.eventsPath}${suffix}`;
     if (!existsSync(sidecar)) continue;
     ensurePrivateDirectory(eventsRoot);
     const sidecarDestination = `${eventsDestination}${suffix}`;
-    recordBackup(sidecarDestination);
-    observeRename("before-source-archive-rename", sidecarDestination);
-    renameSync(sidecar, sidecarDestination);
-    observeRename("after-source-archive-rename", sidecarDestination);
+    archiveEventFileNoReplace(
+      sidecar,
+      sidecarDestination,
+      recordBackup,
+      observeRename,
+    );
   }
   installFilesystemFences(source, observeRename);
 }
@@ -1725,7 +1774,7 @@ export function reconcileWorktrees(
 
 export function ensureWorktreeProjectReconciled(
   cwd: string,
-  identity: ProjectIdentity,
+  identity?: ProjectIdentity,
   opts: {
     /** @internal Override the bounded process-cache lifetime for deterministic tests. */
     readonly _cacheTtlMs?: number;
@@ -1739,10 +1788,16 @@ export function ensureWorktreeProjectReconciled(
     readonly _discoveryObserver?: (path: string) => void;
   } = {},
 ): WorktreeReconciliationResult {
+  const anchor = identity ? undefined : resolveGitProjectAnchor(cwd);
+  if (!identity && !anchor) return reconcileWorktrees(cwd);
+  const project = identity ?? {
+    id: hashProjectPath(anchor!.canonical),
+    canonical: anchor!.canonical,
+  };
   const now = opts._nowMs ?? Date.now();
   const ttlMs = cacheTtlMs(opts._cacheTtlMs);
-  const identityCanonical = resolve(identity.canonical);
-  const cached = reconciledThisProcess.get(identity.id);
+  const identityCanonical = resolve(project.canonical);
+  const cached = reconciledThisProcess.get(project.id);
   const cacheIdentityMatches = cached?.identityCanonical === identityCanonical;
   const currentStateGuard = cached
     ? reconciliationCacheStateGuard(cached.targetHash)
@@ -1756,43 +1811,45 @@ export function ensureWorktreeProjectReconciled(
   ) {
     return {
       status: "completed",
-      targetHash: identity.id,
-      canonical: identity.canonical,
+      targetHash: project.id,
+      canonical: project.canonical,
       sourceHashes: [],
-      aliases: [identity.canonical],
+      aliases: [project.canonical],
       backupPaths: [],
     };
   }
-  const before = reconciliationDiscovery(
-    listProjectMapEntries(),
-    opts._codexDir,
-    opts._maxDiscoveryEntries,
-    opts._discoveryObserver,
-  );
-  if (
-    cached
-    && cacheIdentityMatches
-    && currentStateGuard !== null
-    && currentStateGuard === cached.stateGuard
-    && before.complete
-    && cached.discoveryFingerprint === fingerprint(before)
-  ) {
-    const stateGuard = reconciliationCacheStateGuard(cached.targetHash);
-    if (stateGuard !== null) {
-      reconciledThisProcess.set(identity.id, {
-        ...cached,
-        stateGuard,
-        expiresAt: now + ttlMs,
-      });
+  if (identity) {
+    const before = reconciliationDiscovery(
+      listProjectMapEntries(),
+      opts._codexDir,
+      opts._maxDiscoveryEntries,
+      opts._discoveryObserver,
+    );
+    if (
+      cached
+      && cacheIdentityMatches
+      && currentStateGuard !== null
+      && currentStateGuard === cached.stateGuard
+      && before.complete
+      && cached.discoveryFingerprint === fingerprint(before)
+    ) {
+      const stateGuard = reconciliationCacheStateGuard(cached.targetHash);
+      if (stateGuard !== null) {
+        reconciledThisProcess.set(project.id, {
+          ...cached,
+          stateGuard,
+          expiresAt: now + ttlMs,
+        });
+      }
+      return {
+        status: "completed",
+        targetHash: project.id,
+        canonical: project.canonical,
+        sourceHashes: [],
+        aliases: [project.canonical],
+        backupPaths: [],
+      };
     }
-    return {
-      status: "completed",
-      targetHash: identity.id,
-      canonical: identity.canonical,
-      sourceHashes: [],
-      aliases: [identity.canonical],
-      backupPaths: [],
-    };
   }
   const result = reconcileWorktrees(cwd, {
     _codexDir: opts._codexDir,
@@ -1817,7 +1874,7 @@ export function ensureWorktreeProjectReconciled(
         stateGuard,
         expiresAt: now + ttlMs,
       };
-      reconciledThisProcess.set(identity.id, entry);
+      reconciledThisProcess.set(project.id, entry);
       reconciledThisProcess.set(result.targetHash, entry);
     }
   }

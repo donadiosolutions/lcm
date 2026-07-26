@@ -114,7 +114,12 @@ function inspectGitMarker(worktreeRoot: string): GitProjectAnchor | null {
   const commonDir = resolveCommonDir(gitDir);
   validateGitDirectory(gitDir, commonDir);
   return {
-    canonical: canonicalForCommonDir(commonDir),
+    // A normal submodule has a `.git` pointer into the superproject's
+    // `.git/modules/...` directory but no `commondir`. Its checkout—not that
+    // metadata directory—is its independent local project anchor.
+    canonical: stat.isFile() && commonDir === gitDir
+      ? worktreeRoot
+      : canonicalForCommonDir(commonDir),
     worktreeRoot,
     commonDir,
   };
