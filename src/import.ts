@@ -15,7 +15,6 @@ import {
   resolveProjectIdentity,
 } from "./project-map.js";
 import { resolveCodexSessions } from "./codex-project-resolution.js";
-import { findAllCodexTranscripts } from "./codex-transcript.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
 
@@ -333,8 +332,13 @@ export async function importSessions(
 
   // --- Codex CLI sessions ---
   if (provider === "codex" || provider === "all") {
-    const transcriptFiles = findAllCodexTranscripts(options._codexDir);
-    if (transcriptFiles.length === 0) return result;
+    // Resolve exactly once against a read-only map snapshot so an empty
+    // Codex catalogue (and dry-run discovery) cannot backfill project state.
+    const resolvedCodexSessions = resolveCodexSessions(
+      options._codexDir,
+      readProjectMapSnapshot(),
+    );
+    if (resolvedCodexSessions.length === 0) return result;
     const requestedCwd = options.cwd ?? process.cwd();
     const current = options.dryRun
       ? (() => {
@@ -342,9 +346,8 @@ export async function importSessions(
         return { id: hashProjectPath(canonical), canonical };
       })()
       : resolveProjectIdentity(requestedCwd);
-    const mapSnapshot = options.dryRun ? readProjectMapSnapshot() : undefined;
     const codexSessions: SessionEntry[] = [];
-    for (const session of resolveCodexSessions(options._codexDir, mapSnapshot)) {
+    for (const session of resolvedCodexSessions) {
       let resolution = session.resolution;
       if (
         resolution.status === "unresolved"
