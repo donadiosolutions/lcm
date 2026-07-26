@@ -840,9 +840,7 @@ function normalizedLinks(
   links: readonly CreateNativeTranscriptMessageLinkInput[] | undefined,
 ): readonly CreateNativeTranscriptMessageLinkInput[] {
   return [...(links ?? [])].sort((left, right) =>
-    left.sourceOrdinal - right.sourceOrdinal
-    || left.messageId - right.messageId
-    || left.conversationId - right.conversationId);
+    left.sourceOrdinal - right.sourceOrdinal);
 }
 
 function exactLinks(
@@ -1829,6 +1827,28 @@ implements
             sourceOrdinal,
           });
         }));
+    if (messageLinks) {
+      const sourceOrdinals = new Set<number>();
+      const messageIds = new Set<number>();
+      for (const link of messageLinks) {
+        if (sourceOrdinals.has(link.sourceOrdinal)) {
+          throw new PostgreSqlNativeTranscriptDataError(
+            this.projectId,
+            operation,
+            "link_source_ordinal",
+          );
+        }
+        sourceOrdinals.add(link.sourceOrdinal);
+        if (messageIds.has(link.messageId)) {
+          throw new PostgreSqlNativeTranscriptDataError(
+            this.projectId,
+            operation,
+            "message_id",
+          );
+        }
+        messageIds.add(link.messageId);
+      }
+    }
     return Object.freeze({
       formatName,
       formatVersion,

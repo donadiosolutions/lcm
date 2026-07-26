@@ -1,13 +1,14 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { NativeTranscriptBatchInput } from "../../src/storage/contracts.js";
 import {
   canonicalNativeTranscriptJson,
 } from "../../src/storage/native-transcript-ingest.js";
 import {
   PostgreSqlNativeTranscriptConflictError,
+  PostgreSqlNativeTranscriptDataError,
   PostgreSqlNativeTranscriptRepository,
 } from "../../src/storage/postgresql/native-transcript-repository.js";
 import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations.js";
@@ -619,6 +620,142 @@ describe("PostgreSQL 18 native transcript repository", () => {
           ],
         }),
       ]);
+    });
+  });
+
+  it("rejects duplicate link keys before entering a PostgreSQL transaction", async () => {
+    await withPostgreSqlTestDatabase("native-transcript-link-uniqueness", async (database) => {
+      await grantTranscriptRuntimePrivileges(database);
+      const scope = await createScope(database, "Native transcript link uniqueness");
+      const secondMessage = await database.migrator.query<{
+        message_id: string;
+      }>({
+        text: `INSERT INTO lcm.messages (
+                 project_id, conversation_id, seq, role, content, token_count
+               )
+               VALUES ($1, $2, 1, 'assistant', 'unique-second', 1)
+               RETURNING message_id`,
+        values: [scope.projectId, scope.conversationId],
+      }, {
+        domain: "conversations",
+        operation: "createUniqueLinkTestMessage",
+      });
+      const secondMessageId = Number(secondMessage.rows[0].message_id);
+      const repository = new PostgreSqlNativeTranscriptRepository(
+        database.runtime,
+        scope.projectId,
+      );
+      const valid = input(
+        scope,
+        "uniqueness/valid.jsonl",
+        "unique-links",
+      );
+      const validWithTwoLinks: NativeTranscriptBatchInput = {
+        ...valid,
+        records: [{
+          ...valid.records[0],
+          messageLinks: [
+            {
+              conversationId: scope.conversationId,
+              messageId: scope.messageId,
+              sourceOrdinal: 0,
+            },
+            {
+              conversationId: scope.conversationId,
+              messageId: secondMessageId,
+              sourceOrdinal: 1,
+            },
+          ],
+        }],
+      };
+      await expect(repository.ingestBatch(validWithTwoLinks)).resolves
+        .toMatchObject({ importedCount: 1 });
+      await expect(repository.listBySource(validWithTwoLinks)).resolves
+        .toEqual([
+          expect.objectContaining({
+            messageLinks: [
+              expect.objectContaining({
+                messageId: scope.messageId,
+                sourceOrdinal: 0,
+              }),
+              expect.objectContaining({
+                messageId: secondMessageId,
+                sourceOrdinal: 1,
+              }),
+            ],
+          }),
+        ]);
+
+      const duplicateSourceOrdinal = input(
+        scope,
+        "uniqueness/duplicate-source.jsonl",
+        "duplicate-link-source",
+      );
+      const duplicateMessageId = input(
+        scope,
+        "uniqueness/duplicate-message.jsonl",
+        "duplicate-link-message",
+      );
+      for (const [field, invalid] of [
+        [
+          "link_source_ordinal",
+          {
+            ...duplicateSourceOrdinal,
+            records: [{
+              ...duplicateSourceOrdinal.records[0],
+              messageLinks: [
+                {
+                  conversationId: scope.conversationId,
+                  messageId: scope.messageId,
+                  sourceOrdinal: 0,
+                },
+                {
+                  conversationId: scope.conversationId,
+                  messageId: secondMessageId,
+                  sourceOrdinal: 0,
+                },
+              ],
+            }],
+          },
+        ],
+        [
+          "message_id",
+          {
+            ...duplicateMessageId,
+            records: [{
+              ...duplicateMessageId.records[0],
+              messageLinks: [
+                {
+                  conversationId: scope.conversationId,
+                  messageId: scope.messageId,
+                  sourceOrdinal: 0,
+                },
+                {
+                  conversationId: scope.conversationId + 1,
+                  messageId: scope.messageId,
+                  sourceOrdinal: 1,
+                },
+              ],
+            }],
+          },
+        ],
+      ] as const) {
+        const transaction = vi.spyOn(database.runtime, "transaction");
+        const error = await repository.ingestBatch(invalid)
+          .catch((cause: unknown) => cause);
+        expect(error).toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
+        expect(error).toMatchObject({ field });
+        expect(transaction).not.toHaveBeenCalled();
+        transaction.mockRestore();
+      }
+      await expect(repository.getCheckpoint(duplicateSourceOrdinal)).resolves
+        .toBeNull();
+      await expect(repository.listBySource(duplicateSourceOrdinal)).resolves
+        .toEqual([]);
+      await expect(repository.getCheckpoint(duplicateMessageId)).resolves
+        .toBeNull();
+      await expect(repository.listBySource(duplicateMessageId)).resolves
+        .toEqual([]);
     });
   });
 

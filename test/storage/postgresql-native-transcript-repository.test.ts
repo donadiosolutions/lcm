@@ -1924,6 +1924,44 @@ describe("PostgreSQL native transcript repository", () => {
     expect(rejected.query).not.toHaveBeenCalled();
   });
 
+  it("rejects duplicate transcript link keys before transaction entry", async () => {
+    for (const [field, messageLinks] of [
+      [
+        "link_source_ordinal",
+        [
+          { conversationId: 41, messageId: 51, sourceOrdinal: 0 },
+          { conversationId: 41, messageId: 52, sourceOrdinal: 0 },
+        ],
+      ],
+      [
+        "message_id",
+        [
+          { conversationId: 41, messageId: 51, sourceOrdinal: 0 },
+          { conversationId: 42, messageId: 51, sourceOrdinal: 1 },
+        ],
+      ],
+    ] as const) {
+      const db = executor(() => {
+        throw new Error("database must not be called");
+      });
+      await expect(
+        new PostgreSqlNativeTranscriptRepository(db, projectId)
+          .ingestBatch({
+            ...batch,
+            records: [{
+              ...batch.records[0],
+              messageLinks,
+            }],
+          }),
+      ).rejects.toMatchObject({
+        name: "PostgreSqlNativeTranscriptDataError",
+        field,
+      });
+      expect(db.transaction).not.toHaveBeenCalled();
+      expect(db.query).not.toHaveBeenCalled();
+    }
+  });
+
   it("covers row and reconciliation guards without exposing unsafe data", async () => {
     const dataError = new PostgreSqlNativeTranscriptDataError(
       projectId,
@@ -1983,10 +2021,10 @@ describe("PostgreSQL native transcript repository", () => {
 
   it("orders multiple links deterministically and accepts link-free records", async () => {
     const orderedLinks = [
-      { conversationId: 42, messageId: 52, sourceOrdinal: 1 },
-      { conversationId: 43, messageId: 51, sourceOrdinal: 1 },
+      { conversationId: 42, messageId: 54, sourceOrdinal: 3 },
+      { conversationId: 43, messageId: 52, sourceOrdinal: 1 },
       { conversationId: 41, messageId: 51, sourceOrdinal: 0 },
-      { conversationId: 42, messageId: 51, sourceOrdinal: 1 },
+      { conversationId: 42, messageId: 53, sourceOrdinal: 2 },
     ];
     const db = executor(successfulQuery);
     const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
@@ -2003,9 +2041,9 @@ describe("PostgreSQL native transcript repository", () => {
     expect(insertedMessages.map(([config]) => config.values?.slice(2)))
       .toEqual([
         [41, 51, 0],
-        [42, 51, 1],
-        [43, 51, 1],
-        [42, 52, 1],
+        [43, 52, 1],
+        [42, 53, 2],
+        [42, 54, 3],
       ]);
 
     await expect(repository.ingestBatch({
