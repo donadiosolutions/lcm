@@ -1,148 +1,132 @@
 # Automated issue triage
 
-New issues are queued for automated classification by the Codex issue labeler.
-The labeler runs every five minutes, processes the ten queued issues with the
-oldest creation timestamps, and reconciles the labels it owns with the issue's
-title and body. Labels owned by people or other workflows are preserved. After
-label reconciliation, issues whose live labels contain `bug` receive a second
-Codex pass that searches for and closes only high-confidence duplicates.
+New issues are queued for automated classification with native GitHub Issue
+types and organization Planning Fields. The workflow runs every five minutes,
+processes the ten oldest queued issues, and preserves labels it does not own.
+Issues whose live Issue type is **Bug** receive an additional conservative
+duplicate check.
 
-## Add a managed label
+## Classification policy
 
-The single source of truth is
-`.github/codex/managed-issue-labels.json`. To support another label:
+The checked-in source of truth is
+`.github/codex/issue-triage-policy.json`. It declares the exact Issue types,
+Planning Field names and options, security-compatible Issue types, and
+secondary labels the workflow owns.
 
-1. Create the label in the GitHub repository, including a concise description.
-2. Add its name to one array in `managed-issue-labels.json`.
-3. Open a pull request containing that one configuration change.
+The workflow resolves GitHub node IDs and descriptions dynamically. It fails
+before inference if a configured type, field, option, or label is missing,
+disabled, duplicated, or has drifted from the policy. IDs are never checked
+into the repository.
 
-The workflow reads the description from GitHub and derives its model prompt,
-output schema, validation allowlist, and reconciliation rules from the JSON
-file. Do not duplicate the label in the workflow or policy module.
+General classification uses:
 
-The groups have these selection rules:
+- Issue type: `Chore`, `Bug`, `Feature`, or `Epic`
+- Priority: `Urgent`, `High`, `Medium`, or `Low`
+- zero or more configured secondary labels
+- a security-candidate decision
 
-- `categories`: one or more labels
-- `topics`: zero or more labels
-- `projects`: zero or more labels
-- `priorities`: exactly one label
+Security issues may only use the `Chore` or `Bug` Issue type. Issue and field
+descriptions are included in the model prompt and are the authoritative
+decision boundaries.
 
-A label name may appear in only one group. The workflow fails safely if the
-configuration is invalid or a configured label does not exist in GitHub.
+To add a secondary label:
+
+1. Create it in GitHub with a concise, unambiguous description.
+2. Add its name to `labels` in `issue-triage-policy.json`.
+3. Open a pull request containing the policy change.
 
 ## Queue and retry behavior
 
-The issue-opened event creates the `needs-codex-triage` label if necessary,
-checks the issue's current live labels, and adds the queue label together with
-`p3-low` when no managed priority is already present. This single operation
-ensures processors cannot see a newly queued issue without a priority.
+The `issues.opened` handler creates `needs-codex-triage` if necessary and adds
+it to the issue. It also sets `Priority` to `Low` only when Priority is unset.
+Issue Forms may supply an initial Issue type, but scheduled classification
+reconciles it from the complete issue content.
+
 Scheduled and manually dispatched runs share a non-cancelling concurrency
-group, so only one processor runs at a time. A run handles at most ten issues,
-oldest first, including an issue that closed while waiting in the queue; later
-issues remain queued for a subsequent run.
+group. Each structured model result must cover every expected issue exactly
+once and pass local allowlist validation before any write.
 
-The workflow validates the complete label-classification response before
-changing any issue. It then processes each issue independently, adds and
-removes only changed managed labels, and preserves every unmanaged label.
+The workflow applies each issue independently:
 
-After reconciliation, the workflow refetches each issue and checks its live
-labels case-insensitively:
+1. Set Priority and, for a security candidate, `Security status=Triage`.
+2. Set the Issue type.
+3. Reconcile only configured secondary labels.
+4. Run security enrichment when applicable.
+5. Run duplicate detection when the live Issue type is `Bug`.
+6. Remove `needs-codex-triage` last.
 
-- A non-bug is dequeued immediately. It is not searched for duplicate
-  candidates and does not consume a second Codex request.
-- A bug retains `needs-codex-triage` while the duplicate stage runs. This
-  includes an issue whose manual `bug` label survives reconciliation and an
-  issue that Codex has just classified as a bug.
+Removing the queue label manually cancels later automated writes. A failed
+required mutation leaves the issue queued for retry. Missing security evidence
+is different: the security pass deliberately keeps Triage and completes.
 
-If either stage fails, the affected issue's queue label remains so a later run
-can retry it. Label application and duplicate candidate collection are isolated
-per issue: successfully reconciled bugs continue through duplicate
-classification and application even when a sibling issue fails either stage,
-while each failed issue remains queued and the workflow reports the failure.
-Missing or empty stage outputs safely skip downstream work. Removing the queue
-label manually before either duplicate collection or an application step
-cancels subsequent automated changes for that issue.
+## Model routing
 
-Codex reconciliation can replace the immediate `p3-low` default with the
-appropriate managed priority.
+General Issue type, Priority, secondary-label, security-candidate, and
+duplicate decisions use `gpt-5.6-luna` with high reasoning effort.
 
-## Duplicate bug handling
+Security nature and status decisions use `gpt-5.6-terra` with high reasoning
+effort. The dedicated pass runs only after Triage has been recorded.
 
-For each reconciled bug, the workflow uses GitHub's authenticated hybrid issue
-search to collect at most eight older issue candidates from both open and
-closed history. Pull requests, the source issue, and newer issues are excluded.
-Issues already carrying the `duplicate` label are also excluded using their
-authoritative live labels; a previously marked canonical that later receives
-that label fails closed instead of creating a duplicate chain. Candidate
-titles and bodies are bounded before they reach Codex.
+Both classifiers use the pinned Codex Action in read-only mode. Their jobs
+receive generated prompts and strict schemas, but no repository checkout and
+no GitHub write permission. Application jobs run on fresh runners without the
+OpenAI secret.
 
-The second Codex request is intentionally conservative. A candidate is a
-duplicate only when it reports the same underlying defect. Related symptoms,
-components, or goals are not enough. When equivalent open and closed candidates
-exist, Codex must prefer the open issue. A closed issue is eligible only when no
-equivalent open issue exists.
+## Security enrichment
 
-For a high-confidence duplicate, the workflow:
+The collector attempts bounded reads from repository Dependabot, code-scanning,
+secret-scanning, and repository-security-advisory APIs. It matches explicit
+alert URLs, GHSA/CVE identifiers, dependency names, and
+code-scanning rule IDs from the issue.
 
-1. Comments `Duplicate of #N.` with a trusted marker to record the canonical.
-2. Adds the existing unmanaged `duplicate` label.
-3. Closes the duplicate as **not planned**.
-4. Removes `needs-codex-triage` last.
+Only bounded metadata is retained. Raw secrets, secret locations, code
+locations, private-fork data, dismissal or resolution comments, credentials,
+and unrelated alert bodies are never placed in prompts, job outputs, or logs.
+Expected `403`, `404`, and feature-unavailable responses are recorded as
+unavailable evidence instead of failing general triage.
 
-Every collected candidate's title/body fingerprint, state, state reason, and
-live labels are checked again immediately before duplicate writes. Changed,
-newly duplicate-labeled, or unverifiable candidates fail closed and leave the
-source queued, preserving the evidence behind open-canonical preference. The
-link comment contains a hidden workflow marker, so a retry cannot create
-duplicate comments. If a partial run created that marker but did not finish
-closing the issue, a retry refetches and validates the recorded canonical
-target, adds any missing duplicate label, and finishes the marked closure even
-when the new model result is empty, provided the source issue remains open and
-still has the live `bug` label.
-Removing `bug` before application always dequeues the source without duplicate
-actions, even when a trusted marker exists.
-Conflicting or stale automated markers fail safely and leave the issue queued.
-If a person closes the issue before application and no workflow marker exists,
-the workflow preserves that closure without adding its own duplicate link or
-label. A closed issue with a coherent trusted marker is dequeued after marker
-and canonical validation, but is never closed again, preserving its existing
-closure reason.
+Terra returns Security nature and status with independent confidence and
+separate short rationales:
 
-The duplicate-classification prompt has a deterministic total serialized-size
-budget below the GitHub Actions job-output limit. It preserves every collected
-source and candidate identity while dynamically truncating only body text, and
-fails closed if fixed metadata alone cannot fit.
+- Low-confidence or unknown nature is left unset.
+- Low-confidence status remains `Triage`.
+- `Affected` requires supported-version impact evidence.
+- `Exploited` requires credible active-exploitation evidence.
+- `Patched` requires evidence that a fixed project version has been released.
 
-## Security and credentials
+## Duplicate handling
 
-The classifier uses `gpt-5.6-luna` through the official OpenAI Codex Action.
-The repository secret must be named `OPENAI_API_KEY`. An API key uses OpenAI
-Platform API billing; a ChatGPT subscription session or credential is not used
-by GitHub Actions.
+Only issues whose live Issue type is `Bug` enter duplicate detection. The
+workflow rechecks that type before candidate collection and immediately before
+application. It searches bounded older open and closed issues and closes only
+high-confidence duplicates.
 
-The workflow deliberately separates both collection/classification stages from
-their write-capable application stages:
+For a duplicate, it comments `Duplicate of #N.` with a trusted hidden marker,
+adds `duplicate`, closes the source as not planned, and removes the queue label
+last. Candidate content fingerprints, states, state reasons, labels, and
+timestamps are revalidated before writes. Retries resume a coherent trusted
+marker but reject stale, conflicting, or duplicate-chain evidence.
 
-- Collection checks out trusted repository policy code, reads public issue
-  content, bounds it, and fetches live label descriptions without receiving the
-  OpenAI secret.
-- Each classification job receives only its generated prompt and exact JSON
-  Schema. It performs no checkout, has read-only Codex permissions, drops
-  `sudo`, and runs the Codex Action as the final step in its job.
-- Each application job runs on a fresh runner without the OpenAI secret,
-  validates the structured result, and performs least-privilege issue
-  mutations.
+## Stale issues
 
-Source and candidate issue titles and bodies are untrusted model input. The
-generated prompts mark them as data and tell Codex to ignore instructions
-inside them. GitHub label descriptions are repository-maintainer-controlled
-guidance. Rotate `OPENAI_API_KEY` immediately if its exposure is suspected.
+The stale workflow reads the native Priority field before invoking the pinned
+stale action. It temporarily marks open `Urgent` and `High` issues with an
+internal exemption label, then removes those markers in an always-running
+cleanup step. `blocked` issues remain exempt.
 
-## Operations
+## Security and operations
+
+Issue titles, bodies, alert metadata, and candidates are untrusted model input.
+Prompts explicitly forbid following embedded instructions. Collection bounds
+all text and result counts, and known credential, token, private-key, and
+credential-bearing URL patterns are redacted before issue text enters a model
+prompt.
+
+The OpenAI Platform secret must be named `OPENAI_API_KEY`; GitHub Actions does
+not use a ChatGPT subscription credential. GitHub write permissions remain
+job-local, and checkout never persists credentials.
 
 Use **Actions > Codex issue labeler > Run workflow** to process the current
-queue without waiting for the next scheduled run. An empty queue exits without
-calling OpenAI. A queue with no reconciled bugs makes only the label
-classification request. Workflow logs identify configuration errors, malformed
-model output, missing issue results, stale fingerprints, conflicting duplicate
-markers, and per-issue GitHub API failures.
+queue. An empty queue exits without calling OpenAI. Logs report catalog drift,
+malformed model output, unavailable security APIs, stale evidence, and
+per-issue mutation failures without printing sensitive alert content.

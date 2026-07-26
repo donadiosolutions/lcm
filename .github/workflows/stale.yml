@@ -7,10 +7,99 @@ on:
 permissions:
   issues: write
 
+concurrency:
+  group: stale-issues
+  cancel-in-progress: false
+
 jobs:
   stale:
     runs-on: ubuntu-latest
     steps:
+      - name: Mark Urgent and High issues as temporarily exempt
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          EXEMPT_LABEL: internal-stale-priority-exempt
+        with:
+          script: |
+            const label = process.env.EXEMPT_LABEL;
+            try {
+              await github.rest.issues.getLabel({ ...context.repo, name: label });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              try {
+                await github.rest.issues.createLabel({
+                  ...context.repo,
+                  name: label,
+                  color: "EDEDED",
+                  description: "Temporary internal marker for Planning Field-based stale exemption",
+                });
+              } catch (createError) {
+                if (createError.status !== 422) throw createError;
+              }
+            }
+
+            const exempt = [];
+            let cursor = null;
+            do {
+              const response = await github.graphql(
+                `query PriorityExemptIssues(
+                  $owner: String!
+                  $repo: String!
+                  $cursor: String
+                ) {
+                  repository(owner: $owner, name: $repo) {
+                    issues(
+                      first: 100
+                      after: $cursor
+                      states: OPEN
+                      orderBy: {field: CREATED_AT, direction: ASC}
+                    ) {
+                      nodes {
+                        number
+                        issueFieldValues(first: 50) {
+                          nodes {
+                            ... on IssueFieldSingleSelectValue {
+                              name
+                              field {
+                                ... on IssueFieldSingleSelect {
+                                  name
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                    }
+                  }
+                }`,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  cursor,
+                },
+              );
+              for (const issue of response.repository.issues.nodes) {
+                const priority = issue.issueFieldValues.nodes.find(
+                  (value) => value.field?.name === "Priority",
+                )?.name;
+                if (priority === "Urgent" || priority === "High") {
+                  await github.rest.issues.addLabels({
+                    ...context.repo,
+                    issue_number: issue.number,
+                    labels: [label],
+                  });
+                  exempt.push(issue.number);
+                }
+              }
+              const pageInfo = response.repository.issues.pageInfo;
+              cursor = pageInfo.hasNextPage ? pageInfo.endCursor : null;
+            } while (cursor !== null);
+            core.info(`Temporarily exempted ${exempt.length} high-priority issue(s).`);
+
       - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629 # v10.4.0
         with:
           stale-issue-message: >
@@ -19,5 +108,50 @@ jobs:
             activity occurs. Remove the stale label or comment to keep it open.
           days-before-stale: 30
           days-before-close: 14
-          exempt-issue-labels: 'p0-critical,p1-high,blocked'
+          exempt-issue-labels: 'blocked,internal-stale-priority-exempt'
           stale-issue-label: 'stale'
+
+      - name: Remove temporary Priority exemption markers
+        if: ${{ always() }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          EXEMPT_LABEL: internal-stale-priority-exempt
+        with:
+          script: |
+            const failures = [];
+            const markedIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                ...context.repo,
+                state: "all",
+                labels: process.env.EXEMPT_LABEL,
+                per_page: 100,
+              },
+            );
+            for (const issue of markedIssues) {
+              if (issue.pull_request) continue;
+              try {
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number: issue.number,
+                  name: process.env.EXEMPT_LABEL,
+                });
+              } catch (error) {
+                if (error.status !== 404) {
+                  failures.push(`#${issue.number}: ${error.message}`);
+                }
+              }
+            }
+            try {
+              await github.rest.issues.deleteLabel({
+                ...context.repo,
+                name: process.env.EXEMPT_LABEL,
+              });
+            } catch (error) {
+              if (error.status !== 404) {
+                failures.push(`label deletion: ${error.message}`);
+              }
+            }
+            if (failures.length > 0) {
+              core.setFailed(`Failed to remove stale exemption markers: ${failures.join("; ")}`);
+            }

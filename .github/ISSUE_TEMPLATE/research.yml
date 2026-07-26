@@ -1,5 +1,6 @@
 name: Research / Scout
 description: Investigation, spike, or external research
+type: Chore
 labels: [research]
 body:
   - type: textarea

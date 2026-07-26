@@ -41,36 +41,22 @@ jobs:
             const policyUrl = pathToFileURL(
               join(process.env.GITHUB_WORKSPACE, ".github/scripts/issue-label-policy.mjs"),
             ).href;
-            const { loadManagedLabelConfig } = await import(policyUrl);
-            const config = await loadManagedLabelConfig(
+            const {
+              ISSUE_PLANNING_QUERY,
+              SET_ISSUE_FIELDS_MUTATION,
+              TRIAGE_CATALOG_QUERY,
+              loadTriagePolicy,
+              resolveLiveTriageCatalog,
+            } = await import(policyUrl);
+            const policy = await loadTriagePolicy(
               join(
                 process.env.GITHUB_WORKSPACE,
-                ".github/codex/managed-issue-labels.json",
+                ".github/codex/issue-triage-policy.json",
               ),
             );
 
             const label = process.env.QUEUE_LABEL;
             const issueNumber = Number(process.env.ISSUE_NUMBER);
-            const defaultPriority = "p3-low";
-            if (!config.priorities.includes(defaultPriority)) {
-              throw new Error(
-                `Default priority ${defaultPriority} is not configured as a managed priority`,
-              );
-            }
-
-            try {
-              await github.rest.issues.getLabel({
-                ...context.repo,
-                name: defaultPriority,
-              });
-            } catch (error) {
-              if (error.status === 404) {
-                throw new Error(
-                  `Default priority ${defaultPriority} does not exist in the repository`,
-                );
-              }
-              throw error;
-            }
 
             try {
               await github.rest.issues.getLabel({
@@ -91,22 +77,49 @@ jobs:
               }
             }
 
-            const { data: issue } = await github.rest.issues.get({
-              ...context.repo,
-              issue_number: issueNumber,
+            const catalogResponse = await github.graphql(TRIAGE_CATALOG_QUERY, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
             });
-            const currentLabels = issue.labels.map((currentLabel) =>
-              typeof currentLabel === "string" ? currentLabel : currentLabel.name,
+            const liveCatalog = resolveLiveTriageCatalog({
+              issueTypes: catalogResponse.repository.issueTypes.nodes,
+              fields: catalogResponse.organization.issueFields.nodes,
+              labels: catalogResponse.repository.labels.nodes,
+            }, policy);
+            const planningResponse = await github.graphql(ISSUE_PLANNING_QUERY, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              number: issueNumber,
+            });
+            const issue = planningResponse.repository.issue;
+            if (!issue) throw new Error(`Issue #${issueNumber} does not exist`);
+            const currentFields = new Map(
+              issue.issueFieldValues.nodes
+                .filter((value) => value?.field?.name && value?.name)
+                .map((value) => [value.field.name, value.name]),
             );
-            const hasPriority = currentLabels.some((currentLabel) =>
-              config.priorities.includes(currentLabel),
-            );
-            const labels = hasPriority ? [label] : [label, defaultPriority];
+            if (!currentFields.has(liveCatalog.fields.priority.name)) {
+              const low = liveCatalog.fields.priority.options.find(
+                (option) => option.name === "Low",
+              );
+              if (!low) throw new Error("Priority Low is unavailable");
+              await github.graphql(SET_ISSUE_FIELDS_MUTATION, {
+                input: {
+                  issueId: issue.id,
+                  issueFields: [{
+                    fieldId: liveCatalog.fields.priority.id,
+                    singleSelectOptionId: low.id,
+                    confidence: "HIGH",
+                    rationale: "Default while the issue awaits automated triage.",
+                  }],
+                },
+              });
+            }
 
             await github.rest.issues.addLabels({
               ...context.repo,
               issue_number: issueNumber,
-              labels,
+              labels: [label],
             });
 
   collect:
@@ -126,7 +139,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Collect queued issues and label catalog
+      - name: Collect queued issues and Planning Field catalog
         id: collect
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
@@ -139,16 +152,18 @@ jobs:
             const {
               buildClassificationPrompt,
               buildOutputSchema,
-              loadManagedLabelConfig,
+              ISSUE_PLANNING_QUERY,
+              TRIAGE_CATALOG_QUERY,
+              loadTriagePolicy,
               missingLabelsIgnoreCase,
+              resolveLiveTriageCatalog,
             } = await import(policyUrl);
 
             const configPath = join(
               process.env.GITHUB_WORKSPACE,
-              ".github/codex/managed-issue-labels.json",
+              ".github/codex/issue-triage-policy.json",
             );
-            const config = await loadManagedLabelConfig(configPath);
-            const managedNames = Object.values(config).flat();
+            const policy = await loadTriagePolicy(configPath);
 
             const repositoryLabels = await github.paginate(
               github.rest.issues.listLabelsForRepo,
@@ -157,13 +172,7 @@ jobs:
             const repositoryLabelNames = repositoryLabels.map(
               (label) => label.name,
             );
-            const repositoryLabelMap = new Map(
-              repositoryLabels.map((label) => [
-                label.name.toLowerCase(),
-                label,
-              ]),
-            );
-            const requiredLabels = [...managedNames, process.env.DUPLICATE_LABEL];
+            const requiredLabels = [...policy.labels, process.env.DUPLICATE_LABEL];
             const missingLabels = missingLabelsIgnoreCase(
               requiredLabels,
               repositoryLabelNames,
@@ -174,7 +183,17 @@ jobs:
               );
             }
 
-            const issues = [];
+            const catalogResponse = await github.graphql(TRIAGE_CATALOG_QUERY, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const liveCatalog = resolveLiveTriageCatalog({
+              issueTypes: catalogResponse.repository.issueTypes.nodes,
+              fields: catalogResponse.organization.issueFields.nodes,
+              labels: catalogResponse.repository.labels.nodes,
+            }, policy);
+
+            const issueNumbers = [];
             const pages = github.paginate.iterator(
               github.rest.issues.listForRepo,
               {
@@ -189,46 +208,54 @@ jobs:
             for await (const { data: page } of pages) {
               for (const issue of page) {
                 if (issue.pull_request) continue;
-                issues.push({
-                  number: issue.number,
-                  title: issue.title,
-                  body: issue.body ?? "",
-                });
-                if (issues.length === 10) break;
+                issueNumbers.push(issue.number);
+                if (issueNumbers.length === 10) break;
               }
-              if (issues.length === 10) break;
+              if (issueNumbers.length === 10) break;
             }
 
-            if (issues.length === 0) {
+            if (issueNumbers.length === 0) {
               core.info("No queued issues found.");
               core.setOutput("has_work", "false");
               core.setOutput("issue_numbers", "[]");
               return;
             }
 
-            const descriptions = Object.fromEntries(
-              managedNames.map((name) => {
-                const repositoryLabel = repositoryLabelMap.get(
-                  name.toLowerCase(),
-                );
-                if (!repositoryLabel) {
-                  throw new Error(
-                    `Required managed label ${name} is missing from the repository label map`,
-                  );
-                }
-                return [name, repositoryLabel.description ?? ""];
-              }),
-            );
-            const issueNumbers = issues.map((issue) => issue.number);
+            const issues = [];
+            for (const issueNumber of issueNumbers) {
+              const planningResponse = await github.graphql(ISSUE_PLANNING_QUERY, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                number: issueNumber,
+              });
+              const issue = planningResponse.repository.issue;
+              if (!issue) throw new Error(`Queued issue #${issueNumber} does not exist`);
+              const fields = Object.fromEntries(
+                issue.issueFieldValues.nodes
+                  .filter((value) => value?.field?.name && value?.name)
+                  .map((value) => [value.field.name, value.name]),
+              );
+              issues.push({
+                number: issue.number,
+                title: issue.title,
+                body: issue.body ?? "",
+                currentIssueType: issue.issueType?.name ?? null,
+                currentPriority: fields[liveCatalog.fields.priority.name] ?? null,
+                currentSecurityStatus:
+                  fields[liveCatalog.fields.securityStatus.name] ?? null,
+                currentSecurityNature:
+                  fields[liveCatalog.fields.securityNature.name] ?? null,
+              });
+            }
             core.setOutput("has_work", "true");
             core.setOutput("issue_numbers", JSON.stringify(issueNumbers));
             core.setOutput(
               "prompt",
-              buildClassificationPrompt(config, descriptions, issues),
+              buildClassificationPrompt(policy, liveCatalog, issues),
             );
             core.setOutput(
               "schema",
-              JSON.stringify(buildOutputSchema(config, issueNumbers)),
+              JSON.stringify(buildOutputSchema(policy, issueNumbers)),
             );
             core.info(`Prepared ${issues.length} issue(s) for classification.`);
 
@@ -249,7 +276,7 @@ jobs:
           output-schema: ${{ needs.collect.outputs.schema }}
           codex-version: 0.144.6
           model: gpt-5.6-luna
-          effort: low
+          effort: high
           permission-profile: ":read-only"
           safety-strategy: drop-sudo
           # Scheduled runs inherit the actor that last changed the workflow.
@@ -267,6 +294,8 @@ jobs:
     outputs:
       bug_issue_numbers: ${{ steps.apply.outputs.bug_issue_numbers }}
       has_bugs: ${{ steps.apply.outputs.has_bugs }}
+      security_issue_numbers: ${{ steps.apply.outputs.security_issue_numbers }}
+      has_security: ${{ steps.apply.outputs.has_security }}
     steps:
       - name: Checkout trusted workflow code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -287,41 +316,58 @@ jobs:
               join(process.env.GITHUB_WORKSPACE, ".github/scripts/issue-label-policy.mjs"),
             ).href;
             const {
+              buildInitialPlanningUpdates,
               computeLabelChanges,
+              ISSUE_PLANNING_QUERY,
               includesLabelIgnoreCase,
-              loadManagedLabelConfig,
+              loadTriagePolicy,
               removeIssueLabelIfPresent,
               requiresDuplicateTriage,
+              resolveLiveTriageCatalog,
+              SET_ISSUE_FIELDS_MUTATION,
+              TRIAGE_CATALOG_QUERY,
+              UPDATE_ISSUE_TYPE_MUTATION,
               validateClassificationResult,
             } = await import(policyUrl);
 
-            const config = await loadManagedLabelConfig(
+            const policy = await loadTriagePolicy(
               join(
                 process.env.GITHUB_WORKSPACE,
-                ".github/codex/managed-issue-labels.json",
+                ".github/codex/issue-triage-policy.json",
               ),
             );
+            const catalogResponse = await github.graphql(TRIAGE_CATALOG_QUERY, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const liveCatalog = resolveLiveTriageCatalog({
+              issueTypes: catalogResponse.repository.issueTypes.nodes,
+              fields: catalogResponse.organization.issueFields.nodes,
+              labels: catalogResponse.repository.labels.nodes,
+            }, policy);
             const expectedIssueNumbers = JSON.parse(
               process.env.EXPECTED_ISSUE_NUMBERS,
             );
             const classifications = validateClassificationResult(
               process.env.CLASSIFICATION_RESULT,
-              config,
+              policy,
               expectedIssueNumbers,
             );
 
             const bugIssueNumbers = [];
+            const securityIssueNumbers = [];
             const failures = [];
             for (const classification of classifications) {
               const issueNumber = classification.issueNumber;
               try {
-                const { data: issue } = await github.rest.issues.get({
-                  ...context.repo,
-                  issue_number: issueNumber,
+                const planningResponse = await github.graphql(ISSUE_PLANNING_QUERY, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  number: issueNumber,
                 });
-                const currentLabels = issue.labels.map((label) =>
-                  typeof label === "string" ? label : label.name,
-                );
+                const issue = planningResponse.repository.issue;
+                if (!issue) throw new Error(`Issue #${issueNumber} does not exist`);
+                const currentLabels = issue.labels.nodes.map((label) => label.name);
 
                 if (!includesLabelIgnoreCase(currentLabels, process.env.QUEUE_LABEL)) {
                   core.info(
@@ -333,8 +379,27 @@ jobs:
                 const { add, remove } = computeLabelChanges(
                   currentLabels,
                   classification,
-                  config,
+                  policy,
                 );
+
+                const planningUpdates = buildInitialPlanningUpdates(
+                  classification,
+                  liveCatalog,
+                );
+                // For security candidates this atomically records Triage before
+                // any enrichment or secondary mutation.
+                await github.graphql(SET_ISSUE_FIELDS_MUTATION, {
+                  input: {
+                    issueId: issue.id,
+                    issueFields: planningUpdates.issueFields,
+                  },
+                });
+                await github.graphql(UPDATE_ISSUE_TYPE_MUTATION, {
+                  input: {
+                    issueId: issue.id,
+                    issueTypeId: planningUpdates.issueTypeId,
+                  },
+                });
 
                 if (add.length > 0) {
                   await github.rest.issues.addLabels({
@@ -352,19 +417,19 @@ jobs:
                   );
                 }
 
-                const { data: reconciledIssue } = await github.rest.issues.get({
-                  ...context.repo,
-                  issue_number: issueNumber,
+                const reconciledResponse = await github.graphql(ISSUE_PLANNING_QUERY, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  number: issueNumber,
                 });
-                const reconciledLabels = reconciledIssue.labels.map((label) =>
-                  typeof label === "string" ? label : label.name,
-                );
-                if (requiresDuplicateTriage(reconciledLabels)) {
+                const reconciledIssue = reconciledResponse.repository.issue;
+                if (classification.isSecurity) securityIssueNumbers.push(issueNumber);
+                if (requiresDuplicateTriage(reconciledIssue.issueType)) {
                   bugIssueNumbers.push(issueNumber);
                   core.info(
-                    `Reconciled bug #${issueNumber}; retaining ${process.env.QUEUE_LABEL} for duplicate triage.`,
+                    `Reconciled Bug #${issueNumber}; retaining ${process.env.QUEUE_LABEL} for remaining triage.`,
                   );
-                } else {
+                } else if (!classification.isSecurity) {
                   await removeIssueLabelIfPresent(
                     github,
                     context.repo,
@@ -372,7 +437,11 @@ jobs:
                     process.env.QUEUE_LABEL,
                   );
                   core.info(
-                    `Reconciled non-bug #${issueNumber}; duplicate triage is not applicable.`,
+                    `Reconciled non-security, non-Bug #${issueNumber}; triage is complete.`,
+                  );
+                } else {
+                  core.info(
+                    `Reconciled security issue #${issueNumber}; retaining ${process.env.QUEUE_LABEL} for Terra.`,
                   );
                 }
                 core.info(
@@ -387,15 +456,355 @@ jobs:
 
             core.setOutput("bug_issue_numbers", JSON.stringify(bugIssueNumbers));
             core.setOutput("has_bugs", bugIssueNumbers.length > 0 ? "true" : "false");
+            core.setOutput(
+              "security_issue_numbers",
+              JSON.stringify(securityIssueNumbers),
+            );
+            core.setOutput(
+              "has_security",
+              securityIssueNumbers.length > 0 ? "true" : "false",
+            );
             if (failures.length > 0) {
               core.setFailed(
                 `Failed to reconcile ${failures.length} issue(s): ${failures.join("; ")}`,
               );
             }
 
-  collect-duplicates:
+  collect-security:
     needs: apply-labels
-    if: ${{ always() && needs.apply-labels.outputs.has_bugs == 'true' && needs.apply-labels.outputs.bug_issue_numbers != '' && needs.apply-labels.outputs.bug_issue_numbers != '[]' }}
+    if: ${{ always() && needs.apply-labels.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      security-events: read
+    outputs:
+      evidence: ${{ steps.collect.outputs.evidence }}
+      has_work: ${{ steps.collect.outputs.has_work }}
+      issue_numbers: ${{ steps.collect.outputs.issue_numbers }}
+      prompt: ${{ steps.collect.outputs.prompt }}
+      schema: ${{ steps.collect.outputs.schema }}
+    steps:
+      - name: Checkout trusted workflow code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Collect sanitized Security and Quality evidence
+        id: collect
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SECURITY_ISSUE_NUMBERS: ${{ needs.apply-labels.outputs.security_issue_numbers }}
+        with:
+          script: |
+            const { join } = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const policyUrl = pathToFileURL(
+              join(process.env.GITHUB_WORKSPACE, ".github/scripts/issue-label-policy.mjs"),
+            ).href;
+            const {
+              buildSecurityClassificationPrompt,
+              buildSecurityClassificationSchema,
+              ISSUE_PLANNING_QUERY,
+              issueContentFingerprint,
+              loadTriagePolicy,
+              resolveLiveTriageCatalog,
+              sanitizeSecurityApiEvidence,
+              selectSecurityEvidenceForIssue,
+              TRIAGE_CATALOG_QUERY,
+            } = await import(policyUrl);
+
+            const issueNumbers = JSON.parse(
+              process.env.SECURITY_ISSUE_NUMBERS || "[]",
+            );
+            core.setOutput("issue_numbers", JSON.stringify(issueNumbers));
+            if (issueNumbers.length === 0) {
+              core.setOutput("has_work", "false");
+              core.setOutput("evidence", "[]");
+              return;
+            }
+
+            const policy = await loadTriagePolicy(
+              join(
+                process.env.GITHUB_WORKSPACE,
+                ".github/codex/issue-triage-policy.json",
+              ),
+            );
+            const catalogResponse = await github.graphql(TRIAGE_CATALOG_QUERY, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const liveCatalog = resolveLiveTriageCatalog({
+              issueTypes: catalogResponse.repository.issueTypes.nodes,
+              fields: catalogResponse.organization.issueFields.nodes,
+              labels: catalogResponse.repository.labels.nodes,
+            }, policy);
+
+            const rawEvidence = {
+              dependabot: [],
+              codeScanning: [],
+              secretScanning: [],
+              advisories: [],
+            };
+            const accessIssues = [];
+            async function collectRoute(key, route, variants) {
+              for (const variant of variants) {
+                try {
+                  const response = await github.request(route, {
+                    ...context.repo,
+                    ...variant,
+                    per_page: Math.max(1, Math.floor(100 / variants.length)),
+                  });
+                  rawEvidence[key].push(...response.data);
+                } catch (error) {
+                  const status = Number(error?.status);
+                  if ([403, 404, 422].includes(status)) {
+                    accessIssues.push(`${key} unavailable (${status})`);
+                    break;
+                  }
+                  throw error;
+                }
+              }
+            }
+
+            await collectRoute(
+              "dependabot",
+              "GET /repos/{owner}/{repo}/dependabot/alerts",
+              ["open", "dismissed", "fixed", "auto_dismissed"].map((state) => ({ state })),
+            );
+            await collectRoute(
+              "codeScanning",
+              "GET /repos/{owner}/{repo}/code-scanning/alerts",
+              ["open", "dismissed", "fixed"].map((state) => ({ state })),
+            );
+            await collectRoute(
+              "secretScanning",
+              "GET /repos/{owner}/{repo}/secret-scanning/alerts",
+              ["open", "resolved"].map((state) => ({ state })),
+            );
+            await collectRoute(
+              "advisories",
+              "GET /repos/{owner}/{repo}/security-advisories",
+              [{}],
+            );
+            const sanitized = sanitizeSecurityApiEvidence(rawEvidence);
+
+            const issues = [];
+            const evidence = [];
+            for (const issueNumber of issueNumbers) {
+              const response = await github.graphql(ISSUE_PLANNING_QUERY, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                number: issueNumber,
+              });
+              const issue = response.repository.issue;
+              if (!issue) throw new Error(`Security issue #${issueNumber} does not exist`);
+              const fields = Object.fromEntries(
+                issue.issueFieldValues.nodes
+                  .filter((value) => value?.field?.name && value?.name)
+                  .map((value) => [value.field.name, value.name]),
+              );
+              const matched = selectSecurityEvidenceForIssue(issue, sanitized);
+              const entry = {
+                issueNumber,
+                title: issue.title,
+                body: issue.body ?? "",
+                currentSecurityStatus:
+                  fields[liveCatalog.fields.securityStatus.name] ?? "Triage",
+                currentSecurityNature:
+                  fields[liveCatalog.fields.securityNature.name] ?? null,
+                evidence: matched,
+                accessIssues,
+              };
+              issues.push(entry);
+              evidence.push({
+                issueNumber,
+                fingerprint: issueContentFingerprint(issue),
+              });
+            }
+            core.setOutput("has_work", "true");
+            core.setOutput("evidence", JSON.stringify(evidence));
+            core.setOutput(
+              "prompt",
+              buildSecurityClassificationPrompt(policy, liveCatalog, issues),
+            );
+            core.setOutput(
+              "schema",
+              JSON.stringify(
+                buildSecurityClassificationSchema(policy, issueNumbers),
+              ),
+            );
+
+  classify-security:
+    needs: collect-security
+    if: ${{ needs.collect-security.outputs.has_work == 'true' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      result: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - name: Classify security fields with Codex
+        id: codex
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.10
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: ${{ needs.collect-security.outputs.prompt }}
+          output-schema: ${{ needs.collect-security.outputs.schema }}
+          codex-version: 0.144.6
+          model: gpt-5.6-terra
+          effort: high
+          permission-profile: ":read-only"
+          safety-strategy: drop-sudo
+          allow-users: github-merge-queue
+
+  apply-security:
+    needs: [apply-labels, collect-security, classify-security]
+    if: ${{ always() && needs.apply-labels.result == 'success' && needs.collect-security.result == 'success' && (needs.collect-security.outputs.has_work != 'true' || needs.classify-security.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      bug_issue_numbers: ${{ steps.apply.outputs.bug_issue_numbers }}
+      has_bugs: ${{ steps.apply.outputs.has_bugs }}
+    steps:
+      - name: Checkout trusted workflow code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Apply security decisions and route Bugs
+        id: apply
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          BUG_ISSUE_NUMBERS: ${{ needs.apply-labels.outputs.bug_issue_numbers }}
+          SECURITY_EVIDENCE: ${{ needs.collect-security.outputs.evidence }}
+          SECURITY_HAS_WORK: ${{ needs.collect-security.outputs.has_work }}
+          SECURITY_ISSUE_NUMBERS: ${{ needs.collect-security.outputs.issue_numbers }}
+          SECURITY_RESULT: ${{ needs.classify-security.outputs.result }}
+        with:
+          script: |
+            const { join } = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const policyUrl = pathToFileURL(
+              join(process.env.GITHUB_WORKSPACE, ".github/scripts/issue-label-policy.mjs"),
+            ).href;
+            const {
+              buildSecurityPlanningUpdates,
+              includesLabelIgnoreCase,
+              ISSUE_PLANNING_QUERY,
+              issueContentFingerprint,
+              loadTriagePolicy,
+              parseAndValidateSecurityResult,
+              removeIssueLabelIfPresent,
+              requiresDuplicateTriage,
+              resolveLiveTriageCatalog,
+              SET_ISSUE_FIELDS_MUTATION,
+              TRIAGE_CATALOG_QUERY,
+            } = await import(policyUrl);
+
+            const policy = await loadTriagePolicy(
+              join(
+                process.env.GITHUB_WORKSPACE,
+                ".github/codex/issue-triage-policy.json",
+              ),
+            );
+            const catalogResponse = await github.graphql(TRIAGE_CATALOG_QUERY, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const liveCatalog = resolveLiveTriageCatalog({
+              issueTypes: catalogResponse.repository.issueTypes.nodes,
+              fields: catalogResponse.organization.issueFields.nodes,
+              labels: catalogResponse.repository.labels.nodes,
+            }, policy);
+            const failures = [];
+            if (process.env.SECURITY_HAS_WORK === "true") {
+              const issueNumbers = JSON.parse(process.env.SECURITY_ISSUE_NUMBERS);
+              const evidence = JSON.parse(process.env.SECURITY_EVIDENCE);
+              const evidenceByIssue = new Map(
+                evidence.map((entry) => [entry.issueNumber, entry]),
+              );
+              const decisions = parseAndValidateSecurityResult(
+                process.env.SECURITY_RESULT,
+                policy,
+                issueNumbers,
+              );
+              for (const decision of decisions) {
+                try {
+                  const response = await github.graphql(ISSUE_PLANNING_QUERY, {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    number: decision.issueNumber,
+                  });
+                  const issue = response.repository.issue;
+                  if (!issue) throw new Error(`Issue #${decision.issueNumber} does not exist`);
+                  const labels = issue.labels.nodes.map((label) => label.name);
+                  if (!includesLabelIgnoreCase(labels, process.env.QUEUE_LABEL)) {
+                    core.info(
+                      `Skipping #${decision.issueNumber}: security triage was manually cancelled.`,
+                    );
+                    continue;
+                  }
+                  if (
+                    issueContentFingerprint(issue)
+                    !== evidenceByIssue.get(decision.issueNumber)?.fingerprint
+                  ) {
+                    throw new Error(
+                      `Security issue #${decision.issueNumber} changed after evidence collection`,
+                    );
+                  }
+                  if (!policy.securityIssueTypes.includes(issue.issueType?.name)) {
+                    throw new Error(
+                      `Security issue #${decision.issueNumber} no longer has Issue type Chore or Bug`,
+                    );
+                  }
+                  const updates = buildSecurityPlanningUpdates(decision, liveCatalog);
+                  await github.graphql(SET_ISSUE_FIELDS_MUTATION, {
+                    input: { issueId: issue.id, issueFields: updates },
+                  });
+                  if (!requiresDuplicateTriage(issue.issueType)) {
+                    await removeIssueLabelIfPresent(
+                      github,
+                      context.repo,
+                      decision.issueNumber,
+                      process.env.QUEUE_LABEL,
+                    );
+                  }
+                } catch (error) {
+                  const message = error instanceof Error ? error.message : String(error);
+                  failures.push(`#${decision.issueNumber}: ${message}`);
+                  core.error(message);
+                }
+              }
+            }
+
+            const readyBugs = [];
+            for (const issueNumber of JSON.parse(process.env.BUG_ISSUE_NUMBERS || "[]")) {
+              const response = await github.graphql(ISSUE_PLANNING_QUERY, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                number: issueNumber,
+              });
+              const issue = response.repository.issue;
+              const labels = issue?.labels.nodes.map((label) => label.name) ?? [];
+              if (
+                issue
+                && includesLabelIgnoreCase(labels, process.env.QUEUE_LABEL)
+                && requiresDuplicateTriage(issue.issueType)
+              ) {
+                readyBugs.push(issueNumber);
+              }
+            }
+            core.setOutput("bug_issue_numbers", JSON.stringify(readyBugs));
+            core.setOutput("has_bugs", readyBugs.length > 0 ? "true" : "false");
+            if (failures.length > 0) {
+              core.setFailed(`Failed security triage: ${failures.join("; ")}`);
+            }
+
+  collect-duplicates:
+    needs: apply-security
+    if: ${{ always() && needs.apply-security.result == 'success' && needs.apply-security.outputs.has_bugs == 'true' && needs.apply-security.outputs.bug_issue_numbers != '' && needs.apply-security.outputs.bug_issue_numbers != '[]' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -415,7 +824,7 @@ jobs:
         id: collect
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          BUG_ISSUE_NUMBERS: ${{ needs.apply-labels.outputs.bug_issue_numbers }}
+          BUG_ISSUE_NUMBERS: ${{ needs.apply-security.outputs.bug_issue_numbers }}
         with:
           script: |
             const { join } = await import("node:path");
@@ -457,9 +866,9 @@ jobs:
                   );
                   continue;
                 }
-                if (!requiresDuplicateTriage(sourceLabels)) {
+                if (!requiresDuplicateTriage(source.type)) {
                   throw new Error(
-                    `Issue #${issueNumber} no longer has the bug label`,
+                    `Issue #${issueNumber} no longer has Issue type Bug`,
                   );
                 }
                 const sourceCreatedAt = source.created_at;
@@ -550,8 +959,8 @@ jobs:
             }
 
   classify-duplicates:
-    needs: [apply-labels, collect-duplicates]
-    if: ${{ always() && needs.apply-labels.outputs.has_bugs == 'true' && needs.collect-duplicates.outputs.has_issues == 'true' && needs.collect-duplicates.outputs.evidence != '' && needs.collect-duplicates.outputs.prompt != '' && needs.collect-duplicates.outputs.schema != '' }}
+    needs: [apply-security, collect-duplicates]
+    if: ${{ always() && needs.apply-security.outputs.has_bugs == 'true' && needs.collect-duplicates.outputs.has_issues == 'true' && needs.collect-duplicates.outputs.evidence != '' && needs.collect-duplicates.outputs.prompt != '' && needs.collect-duplicates.outputs.schema != '' }}
     runs-on: ubuntu-latest
     permissions: {}
     outputs:
@@ -566,14 +975,14 @@ jobs:
           output-schema: ${{ needs.collect-duplicates.outputs.schema }}
           codex-version: 0.144.6
           model: gpt-5.6-luna
-          effort: low
+          effort: high
           permission-profile: ":read-only"
           safety-strategy: drop-sudo
           allow-users: github-merge-queue
 
   apply-duplicates:
-    needs: [apply-labels, collect-duplicates, classify-duplicates]
-    if: ${{ always() && needs.apply-labels.outputs.has_bugs == 'true' && needs.collect-duplicates.outputs.has_issues == 'true' && needs.collect-duplicates.outputs.evidence != '' && needs.classify-duplicates.result == 'success' && needs.classify-duplicates.outputs.result != '' }}
+    needs: [apply-security, collect-duplicates, classify-duplicates]
+    if: ${{ always() && needs.apply-security.outputs.has_bugs == 'true' && needs.collect-duplicates.outputs.has_issues == 'true' && needs.collect-duplicates.outputs.evidence != '' && needs.classify-duplicates.result == 'success' && needs.classify-duplicates.outputs.result != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -638,7 +1047,7 @@ jobs:
                   );
                   continue;
                 }
-                if (!requiresDuplicateTriage(sourceLabels)) {
+                if (!requiresDuplicateTriage(source.type)) {
                   await removeIssueLabelIfPresent(
                     github,
                     context.repo,
@@ -646,7 +1055,7 @@ jobs:
                     process.env.QUEUE_LABEL,
                   );
                   core.info(
-                    `Dequeued #${issueNumber} without duplicate actions because it is no longer a bug.`,
+                    `Dequeued #${issueNumber} without duplicate actions because it is no longer Issue type Bug.`,
                   );
                   continue;
                 }
