@@ -185,6 +185,85 @@ function removeLegacyMainMetadataColumns(db: DatabaseSync): void {
   `);
 }
 
+type InstructionCacheFixtureRow = {
+  readonly content: string;
+  readonly contentHash: string;
+  readonly updatedAt: string | Uint8Array;
+};
+
+function makeInstructionCacheReconciliation(
+  root: string,
+  targetRow: InstructionCacheFixtureRow,
+  sourceRow: InstructionCacheFixtureRow,
+): {
+  readonly main: string;
+  readonly linked: string;
+  readonly targetPath: string;
+  readonly sourcePath: string;
+} {
+  const { main, linked } = makeRepository(root);
+  const canonical = resolveGitProjectAnchor(main)!.canonical;
+  const targetHash = hashProjectPath(canonical);
+  const sourceHash = hashProjectPath(linked);
+  writeFileSync(projectMapPath(), `${JSON.stringify({
+    [targetHash]: { canonical, aliases: [] },
+    [sourceHash]: { canonical: linked, aliases: [] },
+  }, null, 2)}\n`);
+  clearProjectMapCache();
+  const targetPath = join(root, ".lcm", "projects", targetHash, "db.sqlite");
+  const sourcePath = join(root, ".lcm", "projects", sourceHash, "db.sqlite");
+  makeDatabase(targetPath, "instruction-target", "target", targetHash);
+  makeDatabase(sourcePath, "instruction-source", "source", sourceHash);
+  for (const [path, cacheRow] of [
+    [targetPath, targetRow],
+    [sourcePath, sourceRow],
+  ] as const) {
+    const db = new DatabaseSync(path);
+    db.prepare(
+      `INSERT INTO session_instruction_cache(id, content, content_hash, updated_at)
+       VALUES(2, ?, ?, ?)`,
+    ).run(cacheRow.content, cacheRow.contentHash, cacheRow.updatedAt);
+    db.close();
+  }
+  return { main, linked, targetPath, sourcePath };
+}
+
+function makeLegacyInstructionReconciliation(
+  root: string,
+  targetRow: InstructionCacheFixtureRow | null,
+  sourceRow: InstructionCacheFixtureRow,
+): {
+  readonly main: string;
+  readonly targetPath: string;
+} {
+  const { main, linked } = makeRepository(root);
+  const canonical = resolveGitProjectAnchor(main)!.canonical;
+  const targetHash = hashProjectPath(canonical);
+  const sourceHash = hashProjectPath(linked);
+  writeFileSync(projectMapPath(), `${JSON.stringify({
+    [targetHash]: { canonical, aliases: [] },
+    [sourceHash]: { canonical: linked, aliases: [] },
+  }, null, 2)}\n`);
+  clearProjectMapCache();
+  const targetPath = join(root, ".lcm", "projects", targetHash, "db.sqlite");
+  const sourcePath = join(root, ".lcm", "projects", sourceHash, "db.sqlite");
+  makeDatabase(targetPath, "instruction-target", "target", targetHash);
+  makeDatabase(sourcePath, "instruction-source", "source", sourceHash);
+  for (const [path, instructionRow] of [
+    [targetPath, targetRow],
+    [sourcePath, sourceRow],
+  ] as const) {
+    if (instructionRow === null) continue;
+    const db = new DatabaseSync(path);
+    db.prepare(
+      `INSERT INTO session_instructions(id, content, content_hash, updated_at)
+       VALUES(1, ?, ?, ?)`,
+    ).run(instructionRow.content, instructionRow.contentHash, instructionRow.updatedAt);
+    db.close();
+  }
+  return { main, targetPath };
+}
+
 function makeEvents(path: string, sessionId: string): void {
   mkdirSync(join(path, ".."), { recursive: true });
   const db = new DatabaseSync(path);
@@ -1405,47 +1484,261 @@ describe("worktree reconciliation", () => {
     target.close();
   });
 
-  it("merges equal instruction identities by newest timestamp and rejects divergent content", () => {
-    const { main, linked } = makeRepository(home);
-    const canonical = resolveGitProjectAnchor(main)!.canonical;
-    const targetHash = hashProjectPath(canonical);
-    const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
-      [targetHash]: { canonical, aliases: [] },
-      [sourceHash]: { canonical: linked, aliases: [] },
-    }, null, 2)}\n`);
-    clearProjectMapCache();
-    const targetPath = join(home, ".lcm", "projects", targetHash, "db.sqlite");
-    const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
-    makeDatabase(targetPath, "instruction-target", "target", targetHash);
-    makeDatabase(sourcePath, "instruction-source", "source", sourceHash);
-    const target = new DatabaseSync(targetPath);
-    const source = new DatabaseSync(sourcePath);
-    for (const db of [target, source]) {
-      db.prepare(
-        `INSERT INTO session_instruction_cache(id, content, content_hash, updated_at)
-         VALUES(42, 'same', 'same-hash', ?)`,
-      ).run(db === target ? "2026-01-01" : "2026-02-01");
-      db.prepare(
-        `INSERT INTO session_instruction_cache(id, content, content_hash, updated_at)
-         VALUES(43, 'exact', 'exact-hash', '2026-01-01')`,
-      ).run();
-      db.prepare(
-        `INSERT INTO session_instruction_cache(id, content, content_hash, updated_at)
-         VALUES(44, 'older', 'older-hash', ?)`,
-      ).run(db === target ? "2026-02-01" : "2026-01-01");
-    }
-    target.close();
-    source.close();
+  it.each([
+    {
+      label: "newer source",
+      target: {
+        content: "target",
+        contentHash: "target-hash",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      source: {
+        content: "source",
+        contentHash: "source-hash",
+        updatedAt: "2026-02-01T00:00:00.000Z",
+      },
+      expected: {
+        content: "source",
+        content_hash: "source-hash",
+        updated_at: "2026-02-01T00:00:00.000Z",
+      },
+    },
+    {
+      label: "newer target",
+      target: {
+        content: "target",
+        contentHash: "target-hash",
+        updatedAt: "2026-02-01T00:00:00.000Z",
+      },
+      source: {
+        content: "source",
+        contentHash: "source-hash",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      expected: {
+        content: "target",
+        content_hash: "target-hash",
+        updated_at: "2026-02-01T00:00:00.000Z",
+      },
+    },
+    {
+      label: "exact duplicate",
+      target: {
+        content: "exact",
+        contentHash: "exact-hash",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      source: {
+        content: "exact",
+        contentHash: "exact-hash",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      expected: {
+        content: "exact",
+        content_hash: "exact-hash",
+        updated_at: "2026-01-01T00:00:00.000Z",
+      },
+    },
+  ])("merges a fixed instruction-cache slot with a $label snapshot", ({
+    target,
+    source,
+    expected,
+  }) => {
+    const fixture = makeInstructionCacheReconciliation(home, target, source);
 
-    expect(reconcileWorktrees(linked)).toMatchObject({ status: "completed" });
-    const merged = new DatabaseSync(targetPath, { readOnly: true });
+    expect(reconcileWorktrees(fixture.linked)).toMatchObject({ status: "completed" });
+    const merged = new DatabaseSync(fixture.targetPath, { readOnly: true });
     expect(merged.prepare(
-      "SELECT updated_at FROM session_instruction_cache WHERE id = 42",
-    ).get()).toEqual({ updated_at: "2026-02-01" });
+      `SELECT content, content_hash, updated_at
+       FROM session_instruction_cache WHERE id = 2`,
+    ).get()).toEqual(expected);
+    merged.close();
+  });
+
+  it("treats SQLite-native instruction-cache timestamps as UTC in any process timezone", () => {
+    const originalTimezone = process.env.TZ;
+    process.env.TZ = "America/Sao_Paulo";
+    try {
+      const fixture = makeInstructionCacheReconciliation(
+        home,
+        {
+          content: "sqlite target",
+          contentHash: "sqlite-target-hash",
+          updatedAt: "2026-01-01 00:00:00",
+        },
+        {
+          content: "offset source",
+          contentHash: "offset-source-hash",
+          updatedAt: "2026-01-01T01:30:00+01:00",
+        },
+      );
+
+      expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+      const merged = new DatabaseSync(fixture.targetPath, { readOnly: true });
+      expect(merged.prepare(
+        `SELECT content, content_hash, updated_at
+         FROM session_instruction_cache WHERE id = 2`,
+      ).get()).toEqual({
+        content: "offset source",
+        content_hash: "offset-source-hash",
+        updated_at: "2026-01-01T01:30:00+01:00",
+      });
+      merged.close();
+    } finally {
+      if (originalTimezone === undefined) delete process.env.TZ;
+      else process.env.TZ = originalTimezone;
+    }
+  });
+
+  it("fails closed on equal-timestamp instruction-cache divergence", () => {
+    const fixture = makeInstructionCacheReconciliation(
+      home,
+      {
+        content: "target",
+        contentHash: "target-hash",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      {
+        content: "source",
+        contentHash: "source-hash",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    );
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "divergent session_instruction_cache collision for id 2",
+    );
+    const target = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(target.prepare(
+      "SELECT content FROM session_instruction_cache WHERE id = 2",
+    ).get()).toEqual({ content: "target" });
+    target.close();
+    expect(existsSync(fixture.sourcePath)).toBe(true);
+  });
+
+  it.each([
+    {
+      label: "source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "not-a-timestamp",
+    },
+    {
+      label: "target",
+      targetUpdatedAt: new Uint8Array([1, 2, 3]),
+      sourceUpdatedAt: "2026-01-01T00:00:00.000Z",
+    },
+  ])("fails closed when the $label instruction-cache timestamp is malformed", ({
+    targetUpdatedAt,
+    sourceUpdatedAt,
+  }) => {
+    const fixture = makeInstructionCacheReconciliation(
+      home,
+      {
+        content: "target",
+        contentHash: "target-hash",
+        updatedAt: targetUpdatedAt,
+      },
+      {
+        content: "source",
+        contentHash: "source-hash",
+        updatedAt: sourceUpdatedAt,
+      },
+    );
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "invalid session_instruction_cache updated_at for id 2",
+    );
+    expect(existsSync(fixture.sourcePath)).toBe(true);
+  });
+
+  it("deduplicates an exact cache row without arbitrating its malformed timestamp", () => {
+    const malformed = {
+      content: "legacy exact",
+      contentHash: "legacy-exact-hash",
+      updatedAt: "not-a-timestamp",
+    };
+    const fixture = makeInstructionCacheReconciliation(home, malformed, malformed);
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(target.prepare(
+      "SELECT content, updated_at FROM session_instruction_cache WHERE id = 2",
+    ).get()).toEqual({
+      content: "legacy exact",
+      updated_at: "not-a-timestamp",
+    });
+    target.close();
+  });
+
+  it.each([
+    {
+      label: "source-only row",
+      target: null,
+      source: {
+        content: "source-only",
+        contentHash: "source-only-hash",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      expectedUpdatedAt: "2026-01-01T00:00:00.000Z",
+    },
+    {
+      label: "exact duplicate",
+      target: {
+        content: "exact",
+        contentHash: "exact-hash",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      source: {
+        content: "exact",
+        contentHash: "exact-hash",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      expectedUpdatedAt: "2026-01-01T00:00:00.000Z",
+    },
+    {
+      label: "newer source timestamp",
+      target: {
+        content: "same",
+        contentHash: "same-hash",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      source: {
+        content: "same",
+        contentHash: "same-hash",
+        updatedAt: "2026-02-01T00:00:00.000Z",
+      },
+      expectedUpdatedAt: "2026-02-01T00:00:00.000Z",
+    },
+    {
+      label: "newer target timestamp",
+      target: {
+        content: "same",
+        contentHash: "same-hash",
+        updatedAt: "2026-02-01T00:00:00.000Z",
+      },
+      source: {
+        content: "same",
+        contentHash: "same-hash",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      expectedUpdatedAt: "2026-02-01T00:00:00.000Z",
+    },
+  ])("preserves legacy session-instruction semantics for a $label", ({
+    target,
+    source,
+    expectedUpdatedAt,
+  }) => {
+    const fixture = makeLegacyInstructionReconciliation(home, target, source);
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const merged = new DatabaseSync(fixture.targetPath, { readOnly: true });
     expect(merged.prepare(
-      "SELECT updated_at FROM session_instruction_cache WHERE id = 44",
-    ).get()).toEqual({ updated_at: "2026-02-01" });
+      "SELECT content, content_hash, updated_at FROM session_instructions WHERE id = 1",
+    ).get()).toEqual({
+      content: source.content,
+      content_hash: source.contentHash,
+      updated_at: expectedUpdatedAt,
+    });
     merged.close();
   });
 
@@ -1466,17 +1759,17 @@ describe("worktree reconciliation", () => {
     const target = new DatabaseSync(targetPath);
     const source = new DatabaseSync(sourcePath);
     target.prepare(
-      `INSERT INTO session_instruction_cache(id, content, content_hash)
-       VALUES(42, 'target', 'target-hash')`,
+      `INSERT INTO session_instructions(id, content, content_hash)
+       VALUES(1, 'target', 'target-hash')`,
     ).run();
     source.prepare(
-      `INSERT INTO session_instruction_cache(id, content, content_hash)
-       VALUES(42, 'source', 'source-hash')`,
+      `INSERT INTO session_instructions(id, content, content_hash)
+       VALUES(1, 'source', 'source-hash')`,
     ).run();
     target.close();
     source.close();
     expect(() => reconcileWorktrees(linked)).toThrow(
-      "divergent session_instruction_cache collision",
+      "divergent session_instructions collision",
     );
 
     const sourceDir = join(home, ".lcm", "projects", sourceHash);

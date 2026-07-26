@@ -671,6 +671,49 @@ function mergeInstructionRows(source: DatabaseSync, target: DatabaseSync, table:
   }
 }
 
+function instructionCacheTimestamp(value: SQLInputValue): number | null {
+  if (typeof value !== "string") return null;
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/u.test(value)
+    ? `${value.replace(" ", "T")}Z`
+    : value;
+  const parsed = Date.parse(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function mergeInstructionCacheRows(source: DatabaseSync, target: DatabaseSync): void {
+  const table = "session_instruction_cache";
+  for (const sourceRow of rows(source, `SELECT * FROM ${table}`)) {
+    const existing = row(target, `SELECT * FROM ${table} WHERE id = ?`, sourceRow.id);
+    if (!existing) {
+      insertRow(target, table, sourceRow);
+      continue;
+    }
+    if (rowsEqual([existing], [sourceRow])) continue;
+    const sourceUpdatedAt = instructionCacheTimestamp(sourceRow.updated_at);
+    const targetUpdatedAt = instructionCacheTimestamp(existing.updated_at);
+    if (sourceUpdatedAt === null || targetUpdatedAt === null) {
+      throw new Error(
+        `invalid ${table} updated_at for id ${String(sourceRow.id)}`,
+      );
+    }
+    if (sourceUpdatedAt === targetUpdatedAt) {
+      throw new Error(`divergent ${table} collision for id ${String(sourceRow.id)}`);
+    }
+    if (sourceUpdatedAt > targetUpdatedAt) {
+      target.prepare(
+        `UPDATE ${table}
+         SET content = ?, content_hash = ?, updated_at = ?
+         WHERE id = ?`,
+      ).run(
+        sourceRow.content,
+        sourceRow.content_hash,
+        sourceRow.updated_at,
+        sourceRow.id,
+      );
+    }
+  }
+}
+
 function quoteIdentifier(identifier: string): string {
   return `"${identifier.replaceAll("\"", "\"\"")}"`;
 }
@@ -849,7 +892,7 @@ function mergeMainDatabase(
               },
             );
             mergeInstructionRows(normalizedSource, target, "session_instructions");
-            mergeInstructionRows(normalizedSource, target, "session_instruction_cache");
+            mergeInstructionCacheRows(normalizedSource, target);
             if (tableExists(normalizedSource, "redaction_stats")) {
               for (const count of rows(
                 normalizedSource,
