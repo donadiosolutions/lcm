@@ -104,6 +104,54 @@ const rawLiveCatalog = {
 
 const liveCatalog = resolveLiveTriageCatalog(rawLiveCatalog, policy);
 
+function assertGitHubScriptStepsUseDedicatedTokens(workflow, allowedTokens) {
+  const lines = workflow.split("\n");
+  const actionLineIndexes = lines.flatMap((line, index) => (
+    line.includes("actions/github-script@") ? [index] : []
+  ));
+  assert.ok(actionLineIndexes.length > 0);
+
+  for (const actionLineIndex of actionLineIndexes) {
+    let stepStart = actionLineIndex;
+    let stepStartMatch = lines[stepStart].match(/^(\s*)-\s+/u);
+    while (stepStart >= 0 && !stepStartMatch) {
+      stepStart -= 1;
+      stepStartMatch = lines[stepStart]?.match(/^(\s*)-\s+/u);
+    }
+    assert.notEqual(stepStart, -1);
+    const stepIndent = stepStartMatch[1].length;
+
+    let stepEnd = actionLineIndex + 1;
+    while (stepEnd < lines.length) {
+      const possibleStep = lines[stepEnd].match(/^(\s*)-\s+/u);
+      if (possibleStep && possibleStep[1].length === stepIndent) {
+        break;
+      }
+      stepEnd += 1;
+    }
+    const step = lines.slice(stepStart, stepEnd).join("\n");
+    const tokenBindings = [
+      ...step.matchAll(
+        /^\s+github-token: \$\{\{ secrets\.(CODEX_ISSUE_TRIAGE_(?:READ|WRITE)_TOKEN) \}\}\s*$/gmu,
+      ),
+    ];
+    assert.equal(
+      tokenBindings.length,
+      1,
+      `Expected one dedicated github-token binding in:\n${step}`,
+    );
+    assert.ok(
+      allowedTokens.includes(tokenBindings[0][1]),
+      `Unexpected github-token secret in:\n${step}`,
+    );
+    assert.equal(
+      (step.match(/^\s+github-token:/gmu) ?? []).length,
+      1,
+      `Expected exactly one github-token input in:\n${step}`,
+    );
+  }
+}
+
 const sourceIssue = {
   number: 42,
   title: "Daemon crashes while compacting",
@@ -476,10 +524,32 @@ test("gates duplicate triage on the reconciled live Issue type", () => {
   assert.equal(requiresDuplicateTriage(null), false);
 });
 
+test("workflow credential guard rejects implicit github-script tokens", () => {
+  assert.throws(
+    () => assertGitHubScriptStepsUseDedicatedTokens(
+      [
+        "steps:",
+        "  - uses: actions/github-script@example",
+        "    with:",
+        "      script: return true",
+      ].join("\n"),
+      ["CODEX_ISSUE_TRIAGE_WRITE_TOKEN"],
+    ),
+    /Expected one dedicated github-token binding/u,
+  );
+});
+
 test("workflow binds evidence and the required model split", async () => {
   const workflow = await readFile(
     new URL("../workflows/codex-issue-labeler.yml", import.meta.url),
     "utf8",
+  );
+  assertGitHubScriptStepsUseDedicatedTokens(
+    workflow,
+    [
+      "CODEX_ISSUE_TRIAGE_READ_TOKEN",
+      "CODEX_ISSUE_TRIAGE_WRITE_TOKEN",
+    ],
   );
   assert.equal(
     (
@@ -597,15 +667,9 @@ test("workflow binds evidence and the required model split", async () => {
     new URL("../workflows/stale.yml", import.meta.url),
     "utf8",
   );
-  assert.match(
+  assertGitHubScriptStepsUseDedicatedTokens(
     staleWorkflow,
-    /github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/u,
-  );
-  const markerStep = staleWorkflow.slice(
-    staleWorkflow.indexOf(
-      "- name: Mark configured high-priority issues as temporarily exempt",
-    ),
-    staleWorkflow.indexOf("- uses: actions/stale@"),
+    ["CODEX_ISSUE_TRIAGE_WRITE_TOKEN"],
   );
   const staleActionStep = staleWorkflow.slice(
     staleWorkflow.indexOf("- uses: actions/stale@"),
@@ -613,22 +677,9 @@ test("workflow binds evidence and the required model split", async () => {
       "- name: Remove temporary Priority exemption markers",
     ),
   );
-  const cleanupStep = staleWorkflow.slice(
-    staleWorkflow.indexOf(
-      "- name: Remove temporary Priority exemption markers",
-    ),
-  );
-  assert.match(
-    markerStep,
-    /github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/u,
-  );
   assert.match(
     staleActionStep,
     /repo-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/u,
-  );
-  assert.match(
-    cleanupStep,
-    /github-token: \$\{\{ secrets\.CODEX_ISSUE_TRIAGE_WRITE_TOKEN \}\}/u,
   );
   assert.equal(
     (
