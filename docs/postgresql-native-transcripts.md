@@ -266,6 +266,14 @@ a divergent snapshot cannot regress or overwrite that checkpoint. Identical
 record retries still read back the existing immutable rows and count as
 skipped.
 
+Each checkpoint also carries a durable, monotonically increasing revision.
+Every successful checkpoint mutation increments it atomically, including
+checkpoint-only progress. An identical-target retry that finds its state
+already committed remains read-only and returns the current revision instead
+of incrementing it again. Compare-and-swap equality includes the expected
+revision, so a stale writer fails closed even if intervening updates produce
+the same visible checkpoint values again—the revision prevents an ABA match.
+
 LCM verifies the bound source again after every successful destination
 repository call, including record batches, blank checkpoint-only writes, and
 zero-byte checkpoints. A rewrite or append while the commit is pending
