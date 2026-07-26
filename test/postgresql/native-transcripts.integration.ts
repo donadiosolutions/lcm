@@ -4,6 +4,9 @@ import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { NativeTranscriptBatchInput } from "../../src/storage/contracts.js";
 import {
+  canonicalNativeTranscriptJson,
+} from "../../src/storage/native-transcript-ingest.js";
+import {
   PostgreSqlNativeTranscriptConflictError,
   PostgreSqlNativeTranscriptRepository,
 } from "../../src/storage/postgresql/native-transcript-repository.js";
@@ -15,6 +18,14 @@ import {
 } from "./harness.js";
 
 beforeAll(assertHarnessReady);
+
+function nativePayloadDigest(
+  payload: NativeTranscriptBatchInput["records"][number]["nativePayload"],
+): string {
+  return createHash("sha256")
+    .update(canonicalNativeTranscriptJson(payload))
+    .digest("hex");
+}
 
 async function grantTranscriptRuntimePrivileges(
   database: PostgreSqlTestDatabase,
@@ -105,9 +116,7 @@ function input(
       sourceOrdinal: 4,
       observedAt: new Date("2026-01-01T00:00:00.000Z"),
       scrubberVersion: "scrubber-v1",
-      contentSha256: createHash("sha256")
-        .update(JSON.stringify(payload))
-        .digest("hex"),
+      contentSha256: nativePayloadDigest(payload),
       ingestKey: createHash("sha256").update(ingestKeySeed).digest("hex"),
       nativePayload: payload,
       messageLinks: [{
@@ -337,9 +346,7 @@ describe("PostgreSQL 18 native transcript repository", () => {
         ...base,
         records: [{
           ...base.records[0],
-          contentSha256: createHash("sha256")
-            .update(JSON.stringify(specialPayload))
-            .digest("hex"),
+          contentSha256: nativePayloadDigest(specialPayload),
           nativePayload: specialPayload,
         }],
         checkpoint: {
@@ -447,8 +454,8 @@ describe("PostgreSQL 18 native transcript repository", () => {
       const checkpoint = await repository.getCheckpoint(first);
       expect(checkpoint).toMatchObject({
         importedCount: 1,
-        skippedCount: 1,
-        quarantinedCount: 2,
+        skippedCount: 0,
+        quarantinedCount: 1,
       });
       const changedPrefix = await repository.ingestBatch({
         ...first,
@@ -473,7 +480,7 @@ describe("PostgreSQL 18 native transcript repository", () => {
         expectedCheckpoint: changedPrefix.checkpoint,
         records: [{
           ...first.records[0],
-          contentSha256: "f".repeat(64),
+          contentSha256: nativePayloadDigest({ changed: true }),
           nativePayload: { changed: true },
         }],
       };
@@ -512,8 +519,8 @@ describe("PostgreSQL 18 native transcript repository", () => {
       ]));
       await expect(first.getCheckpoint(concurrent)).resolves.toMatchObject({
         importedCount: 1,
-        skippedCount: 1,
-        quarantinedCount: 2,
+        skippedCount: 0,
+        quarantinedCount: 1,
       });
 
       const divergentA = input(
@@ -569,7 +576,7 @@ describe("PostgreSQL 18 native transcript repository", () => {
         .toMatchObject({
           importedCount: 0,
           skippedCount: 0,
-          quarantinedCount: 2,
+          quarantinedCount: 1,
         });
       const absent = input(
         scope,
