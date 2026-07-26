@@ -245,14 +245,14 @@ If the completed prefix changed—including a reorder—LCM rescans from the
 beginning and relies on deterministic ingest keys to skip records already
 stored. The key includes the client and format, native session,
 client-root-relative locator, sanitized-content digest, and occurrence number
-among identical records. Identical retries and reordered non-message events
-therefore converge without collapsing legitimate duplicates. The same is true
-for message records whose exact linkage is unchanged. Reordering
-message-producing records can change their required session sequence; when the
-existing message order no longer matches exactly, linkage fails closed and the
-prior checkpoint is preserved. A rescan that assigns an existing ingest key to
-a different source ordinal also fails the whole batch; any new records earlier
-in that batch roll back and the prior checkpoint is preserved.
+among identical records. Identical retries therefore converge without
+collapsing legitimate duplicates, but reordering does not: if a rescan assigns
+an existing ingest key to a different exact source ordinal, the whole batch
+fails, any new records earlier in that batch roll back, and the prior
+checkpoint is preserved. Reordering message-producing records can additionally
+change their required session sequence; when the existing message order no
+longer matches exactly, linkage fails closed under the same checkpoint
+boundary.
 
 Every destination batch carries the complete expected prior checkpoint as a
 compare-and-swap fence. A concurrent writer that advanced the same source from
