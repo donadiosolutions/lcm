@@ -245,6 +245,12 @@ function checkpoint(
     quarantinedCount: 0,
     checkpoint: {
       scrubberVersion: DEFAULT_SCRUBBER_VERSION,
+      nativeSessionId: "session-1",
+      format: {
+        clientName: "claude-code",
+        formatName: "claude-jsonl",
+        formatVersion: "v1",
+      },
       ...checkpointValue,
     },
     updatedAt: new Date("2026-07-25T12:00:00.000Z"),
@@ -1154,7 +1160,7 @@ describe("filesystem native transcript source", () => {
 
     writeFileSync(path, first + second);
     const prefixRepo = repository(checkpoint({
-      version: 1,
+      version: 2,
       byteOffset: Buffer.byteLength(first),
       prefixSha256: digest(first),
       source: {
@@ -1668,7 +1674,7 @@ describe("filesystem native transcript source", () => {
       '{"message":{"role":"assistant","content":"second"}}\n';
     writeFileSync(path, prefix + suffix);
     const repo = repository(checkpoint({
-      version: 1,
+      version: 2,
       byteOffset: Buffer.byteLength(prefix),
       prefixSha256: digest(prefix),
       source: {
@@ -1728,7 +1734,7 @@ describe("filesystem native transcript source", () => {
     const suffix = '{"event":"suffix"}\n';
     writeFileSync(path, prefix + suffix);
     const repo = repository(checkpoint({
-      version: 1,
+      version: 2,
       byteOffset: Buffer.byteLength(prefix),
       prefixSha256: digest(prefix),
       source: {
@@ -2369,7 +2375,7 @@ describe("native transcript backfill coordinator", () => {
       checkpoint: { lastSourceOrdinal: 2 },
     });
     expect(repo.batches[1]?.checkpoint.checkpoint).toMatchObject({
-      version: 1,
+      version: 2,
       byteOffset: Buffer.byteLength(content),
       prefixSha256: digest(content),
       source: {
@@ -2541,7 +2547,7 @@ describe("native transcript backfill coordinator", () => {
     const appended =
       '{"message":{"role":"assistant","content":"anchor"}}\n';
     const previous = checkpoint({
-      version: 1,
+      version: 2,
       byteOffset: Buffer.byteLength(quarantinedPrefix),
       prefixSha256: digest(quarantinedPrefix),
       source: {
@@ -2635,7 +2641,7 @@ describe("native transcript backfill coordinator", () => {
     const content = '{"first":1}\n{"second":2}\n';
     const firstLineBytes = Buffer.byteLength('{"first":1}\n');
     const unchanged = repository(checkpoint({
-      version: 1,
+      version: 2,
       byteOffset: firstLineBytes,
       prefixSha256: digest('{"first":1}\n'),
       source: {
@@ -2670,10 +2676,16 @@ describe("native transcript backfill coordinator", () => {
     expect(unchanged.batches[0]?.expectedCheckpoint).toEqual(
       expect.objectContaining({
         checkpoint: {
-          version: 1,
+          version: 2,
           byteOffset: firstLineBytes,
           prefixSha256: digest('{"first":1}\n'),
           scrubberVersion: DEFAULT_SCRUBBER_VERSION,
+          nativeSessionId: "session-1",
+          format: {
+            clientName: "claude-code",
+            formatName: "claude-jsonl",
+            formatVersion: "v1",
+          },
           source: {
             sizeBytes: firstLineBytes,
             modifiedAtMs: 1,
@@ -2684,7 +2696,7 @@ describe("native transcript backfill coordinator", () => {
     );
 
     const changed = repository(checkpoint({
-      version: 1,
+      version: 2,
       byteOffset: firstLineBytes,
       prefixSha256: "0".repeat(64),
       source: {
@@ -2708,6 +2720,89 @@ describe("native transcript backfill coordinator", () => {
     });
     expect(malformed.rescanned).toBe(true);
     expect(malformedCheckpoint.batches[0]?.records).toHaveLength(2);
+  });
+
+  it("rescans when checkpoint session or supported format identity changes", async () => {
+    const content = '{"event":"same"}\n';
+    const sourceMetadata = {
+      sizeBytes: Buffer.byteLength(content),
+      modifiedAtMs: 123,
+      changedAtMs: 456,
+    };
+    const options = {
+      quarantine: {
+        clientName: "claude-code" as const,
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: source(content),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      messageResolver: { resolveExact: vi.fn(async () => null) },
+    };
+    const incompatibleCheckpoints = [
+      checkpoint({
+        version: 1,
+        byteOffset: sourceMetadata.sizeBytes,
+        prefixSha256: digest(content),
+        source: sourceMetadata,
+      }),
+      checkpoint({
+        version: 2,
+        byteOffset: sourceMetadata.sizeBytes,
+        prefixSha256: digest(content),
+        nativeSessionId: "session-before-correction",
+        source: sourceMetadata,
+      }),
+      checkpoint({
+        version: 2,
+        byteOffset: sourceMetadata.sizeBytes,
+        prefixSha256: digest(content),
+        format: {
+          clientName: "codex",
+          formatName: "codex-jsonl",
+          formatVersion: "v1",
+        },
+        source: sourceMetadata,
+      }),
+    ];
+
+    for (const previous of incompatibleCheckpoints) {
+      const repo = repository(previous);
+      await expect(runNativeTranscriptBackfill({
+        ...options,
+        repository: repo,
+      })).resolves.toMatchObject({
+        resumedFromByteOffset: 0,
+        rescanned: true,
+        importedCount: 1,
+      });
+      expect(repo.batches).toHaveLength(1);
+      expect(repo.batches[0]).toMatchObject({
+        expectedCheckpoint: previous,
+        records: [{
+          nativeSessionId: "session-1",
+          formatName: "claude-jsonl",
+          formatVersion: "v1",
+          nativePayload: { event: "same" },
+        }],
+        checkpoint: {
+          checkpoint: {
+            version: 2,
+            nativeSessionId: "session-1",
+            format: {
+              clientName: "claude-code",
+              formatName: "claude-jsonl",
+              formatVersion: "v1",
+            },
+          },
+        },
+      });
+    }
   });
 
   it("rolls back a new record when rescan recovery shifts an ingest key", async () => {
@@ -2823,7 +2918,7 @@ describe("native transcript backfill coordinator", () => {
     const content = '{"first":1}\n{"second":2}\n';
     const firstLine = '{"first":1}\n';
     const previous = checkpoint({
-      version: 1,
+      version: 2,
       byteOffset: Buffer.byteLength(firstLine),
       prefixSha256: digest(firstLine),
       source: {
@@ -2880,7 +2975,7 @@ describe("native transcript backfill coordinator", () => {
     ).not.toBe(DEFAULT_SCRUBBER_VERSION);
 
     const missingVersion = checkpoint({
-      version: 1,
+      version: 2,
       byteOffset: Buffer.byteLength(firstLine),
       prefixSha256: digest(firstLine),
       source: {
@@ -2910,7 +3005,7 @@ describe("native transcript backfill coordinator", () => {
     expect(missingRepo.batches[0]?.records).toHaveLength(2);
 
     const wrongTypeVersion = checkpoint({
-      version: 1,
+      version: 2,
       byteOffset: Buffer.byteLength(firstLine),
       prefixSha256: digest(firstLine),
       scrubberVersion: 42,
@@ -2946,7 +3041,7 @@ describe("native transcript backfill coordinator", () => {
     const secondLine =
       '{"message":{"role":"assistant","content":"second"}}\n';
     const previous = checkpoint({
-      version: 1,
+      version: 2,
       byteOffset: Buffer.byteLength(firstLine),
       prefixSha256: digest(firstLine),
       source: {
@@ -3001,7 +3096,7 @@ describe("native transcript backfill coordinator", () => {
 
     const quarantinedPrefix = '{"bad":}\n';
     const quarantinedPrevious = checkpoint({
-      version: 1,
+      version: 2,
       byteOffset: Buffer.byteLength(quarantinedPrefix),
       prefixSha256: digest(quarantinedPrefix),
       source: {
@@ -3035,7 +3130,7 @@ describe("native transcript backfill coordinator", () => {
   it("does not rehash a replay-only committed prefix at flush boundaries", async () => {
     const content = '{"message":{"role":"user","content":"first"}}\n';
     const previous = checkpoint({
-      version: 1,
+      version: 2,
       byteOffset: Buffer.byteLength(content),
       prefixSha256: digest(content),
       source: {
@@ -3199,10 +3294,16 @@ describe("native transcript backfill coordinator", () => {
       checkpoint: {
         lastSourceOrdinal: 0,
         checkpoint: {
-          version: 1,
+          version: 2,
           byteOffset: 0,
           prefixSha256: digest(""),
           scrubberVersion: DEFAULT_SCRUBBER_VERSION,
+          nativeSessionId: "session-1",
+          format: {
+            clientName: "claude-code",
+            formatName: "claude-jsonl",
+            formatVersion: "v1",
+          },
           source: {
             sizeBytes: 0,
             modifiedAtMs: 123,
@@ -3227,7 +3328,7 @@ describe("native transcript backfill coordinator", () => {
     expect(exact.repo.batches).toHaveLength(0);
 
     const previous = checkpoint({
-      version: 1,
+      version: 2,
       byteOffset: 12,
       prefixSha256: digest('{"old":1}\n'),
       source: {

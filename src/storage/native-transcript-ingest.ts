@@ -74,7 +74,7 @@ const PROTECTED_NATIVE_TRANSCRIPT_MARKERS = [
 ] as const;
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/u;
 const WINDOWS_ABSOLUTE_PATH_PATTERN = /^(?:[a-zA-Z]:|[\\/])/u;
-const CHECKPOINT_VERSION = 1;
+const CHECKPOINT_VERSION = 2;
 
 export class NativeTranscriptConfigurationError extends Error {
   constructor(readonly code: "invalid-patterns" | "invalid-input") {
@@ -1346,8 +1346,20 @@ type TranscriptCheckpointJson = JsonObject & {
   byteOffset: number;
   prefixSha256: string;
   scrubberVersion: string;
+  nativeSessionId: string;
+  format: JsonObject;
   source: JsonObject;
 };
+
+function checkpointFormatIdentity(
+  format: NativeTranscriptFormat,
+): JsonObject {
+  return {
+    clientName: format.clientName,
+    formatName: format.formatName,
+    formatVersion: format.formatVersion,
+  };
+}
 
 function checkpointJson(
   progress: {
@@ -1356,12 +1368,16 @@ function checkpointJson(
   },
   metadata: NativeTranscriptSourceMetadata,
   scrubberVersion: string,
+  nativeSessionId: string,
+  format: NativeTranscriptFormat,
 ): TranscriptCheckpointJson {
   return {
     version: CHECKPOINT_VERSION,
     byteOffset: progress.endByteOffset,
     prefixSha256: progress.prefixSha256,
     scrubberVersion,
+    nativeSessionId,
+    format: checkpointFormatIdentity(format),
     source: {
       sizeBytes: metadata.sizeBytes,
       modifiedAtMs: metadata.modifiedAtMs,
@@ -1374,11 +1390,18 @@ function resumableByteOffset(
   checkpoint: JsonObject,
   metadata: NativeTranscriptSourceMetadata,
   scrubberVersion: string,
+  nativeSessionId: string,
+  format: NativeTranscriptFormat,
 ): number | null {
   const source = checkpoint.source;
+  const storedFormat = checkpoint.format;
   if (
     checkpoint.version !== CHECKPOINT_VERSION
     || checkpoint.scrubberVersion !== scrubberVersion
+    || checkpoint.nativeSessionId !== nativeSessionId
+    || storedFormat === undefined
+    || canonicalNativeTranscriptJson(storedFormat)
+      !== canonicalNativeTranscriptJson(checkpointFormatIdentity(format))
     || !Number.isSafeInteger(checkpoint.byteOffset)
     || (checkpoint.byteOffset as number) < 0
     || typeof checkpoint.prefixSha256 !== "string"
@@ -1677,6 +1700,8 @@ export async function runNativeTranscriptBackfill(
           previous.checkpoint,
           metadata,
           scrubber.scrubberVersion,
+          config.nativeSessionId,
+          config.format,
         )
       : null;
     let prefixMatches = false;
@@ -1861,6 +1886,8 @@ export async function runNativeTranscriptBackfill(
             last,
             metadata,
             scrubber.scrubberVersion,
+            config.nativeSessionId,
+            config.format,
           ),
         },
         quarantinedCount: quarantinedRecords.length,
@@ -1936,6 +1963,8 @@ export async function runNativeTranscriptBackfill(
             latestProgress,
             metadata,
             scrubber.scrubberVersion,
+            config.nativeSessionId,
+            config.format,
           ),
         },
         quarantinedCount: 0,
@@ -1949,7 +1978,7 @@ export async function runNativeTranscriptBackfill(
     const emptyCheckpoint = checkpointJson({
       endByteOffset: 0,
       prefixSha256: sha256(""),
-    }, metadata, scrubber.scrubberVersion);
+    }, metadata, scrubber.scrubberVersion, config.nativeSessionId, config.format);
     const emptyCheckpointIsExact =
       previous?.lastSourceOrdinal === 0
       && canonicalNativeTranscriptJson(previous.checkpoint)
