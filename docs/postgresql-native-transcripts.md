@@ -195,6 +195,12 @@ default; callers may choose a value from 1 through 1000. A committed checkpoint
 records the completed byte offset, completed-prefix digest, source metadata,
 effective scrubber version, last source ordinal, and cumulative imported,
 skipped, and quarantined counts.
+Checkpoint payload version 2 also binds the exact `nativeSessionId` and the
+canonical format identity `{ clientName, formatName, formatVersion }`. A
+legacy version 1 checkpoint, missing or malformed identity, or changed
+session/format identity is not resumed at its saved offset. LCM retains that
+row as the expected compare-and-swap state and performs an idempotent rescan
+from byte zero instead.
 The checkpoint advances only in the same successful destination transaction as
 the corresponding transcript records and links.
 
