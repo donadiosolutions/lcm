@@ -2919,6 +2919,63 @@ describe("worktree reconciliation", () => {
     expect(() => reconcileWorktrees(main, { dryRun: true })).toThrow("ENOTDIR");
   });
 
+  it("isolates malformed foreign Git metadata and invalidates its cached fingerprint on repair", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const identity = { id: targetHash, canonical };
+    const foreign = join(home, "foreign-malformed");
+    const foreignGitTarget = join(home, "foreign-git-target");
+    mkdirSync(foreign);
+    mkdirSync(foreignGitTarget);
+    symlinkSync(foreignGitTarget, join(foreign, ".git"));
+    const foreignHash = hashProjectPath(foreign);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [foreignHash]: { canonical: foreign, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+
+    expect(reconcileWorktrees(main, {
+      _historicalResolver: () => ({ hashes: [], aliases: [] }),
+    }).status).toBe("not-needed");
+    const malformedFingerprint = listWorktreeReconciliationJournals()[0]
+      .discovery!.mapFingerprint;
+
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 10,
+      _nowMs: 0,
+    }).status).toBe("not-needed");
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 10,
+      _nowMs: 20,
+    }).status).toBe("completed");
+    expect(listWorktreeReconciliationJournals()[0].discovery!.mapFingerprint)
+      .toBe(malformedFingerprint);
+
+    rmSync(join(foreign, ".git"));
+    git(foreign, "init", "-q");
+    clearGitProjectAnchorCache();
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 10,
+      _nowMs: 40,
+    }).status).toBe("not-needed");
+    expect(listWorktreeReconciliationJournals()[0].discovery!.mapFingerprint)
+      .not.toBe(malformedFingerprint);
+  });
+
+  it("continues to reject malformed Git metadata for the current project", () => {
+    const current = join(home, "current-malformed");
+    const gitTarget = join(home, "current-git-target");
+    mkdirSync(current);
+    mkdirSync(gitTarget);
+    symlinkSync(gitTarget, join(current, ".git"));
+
+    expect(() => reconcileWorktrees(current)).toThrow(/refusing symlink/u);
+    expect(() => ensureWorktreeProjectReconciled(current)).toThrow(/refusing symlink/u);
+    expect(() => projectIdentity(current)).toThrow(/refusing symlink/u);
+  });
+
   it("fingerprints symlink, file, and missing project-map paths", () => {
     const { main } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;

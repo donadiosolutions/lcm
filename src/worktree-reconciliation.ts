@@ -296,7 +296,12 @@ function mappedPathObservation(path: string): readonly string[] {
     const stat = lstatSync(normalized);
     if (stat.isSymbolicLink()) return [normalized, "symlink"];
     if (!stat.isDirectory()) return [normalized, "non-directory"];
-    const anchor = resolveGitProjectAnchor(normalized);
+    let anchor: ReturnType<typeof resolveGitProjectAnchor>;
+    try {
+      anchor = resolveGitProjectAnchor(normalized);
+    } catch (error) {
+      return [normalized, "git-error", String(error)];
+    }
     return anchor
       ? [normalized, "git", anchor.commonDir, anchor.canonical]
       : [normalized, "directory"];
@@ -1305,7 +1310,12 @@ function discoverSources(
   for (const [hash, entry] of Object.entries(map)) {
     let sameRepository = hash === targetHash;
     if (!sameRepository && existsSync(entry.canonical)) {
-      const anchor = resolveGitProjectAnchor(entry.canonical);
+      let anchor: ReturnType<typeof resolveGitProjectAnchor>;
+      try {
+        anchor = resolveGitProjectAnchor(entry.canonical);
+      } catch {
+        continue;
+      }
       if (anchor?.commonDir === commonDir) sameRepository = true;
     }
     if (sameRepository) {
