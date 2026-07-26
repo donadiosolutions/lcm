@@ -8,7 +8,11 @@
   },
   "main": "dist/src/memory/index.js",
   "exports": {
-    ".": "./dist/src/memory/index.js"
+    ".": "./dist/src/memory/index.js",
+    "./storage/native-transcripts": {
+      "types": "./dist/src/storage/native-transcripts.d.ts",
+      "import": "./dist/src/storage/native-transcripts.js"
+    }
   },
   "bin": {
     "lcm": "dist/lcm.mjs"
@@ -32,7 +36,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "postbuild": "mkdir -p dist/src/prompts && cp -r src/prompts/*.yaml dist/src/prompts/ && mkdir -p dist/src/connectors/templates && cp -r src/connectors/templates/. dist/src/connectors/templates/ && mkdir -p dist/src/storage/postgresql/migrations && cp src/storage/postgresql/migrations/*.sql dist/src/storage/postgresql/migrations/ && cp installer/setup.sh dist/installer/setup.sh && npm run build:runtime",
+    "postbuild": "mkdir -p dist/src/prompts && cp -r src/prompts/*.yaml dist/src/prompts/ && mkdir -p dist/src/connectors/templates && cp -r src/connectors/templates/. dist/src/connectors/templates/ && mkdir -p dist/src/storage/postgresql/migrations && cp src/storage/postgresql/migrations/*.sql dist/src/storage/postgresql/migrations/ && cp installer/setup.sh dist/installer/setup.sh && npm run build:runtime && npm run verify:native-transcript-package",
     "build:runtime": "node scripts/build-runtime.mjs",
     "prepublishOnly": "npm run build",
     "changeset": "changeset",
@@ -42,6 +46,7 @@
     "test:ci": "vitest run --dir test --coverage --coverage.reporter=lcov --coverage.reporter=text --reporter=default --reporter=junit --outputFile=test-report.junit.xml",
     "test:postgresql": "npm run build && node scripts/postgresql-harness.mjs",
     "typecheck": "tsc --noEmit && tsc --project tsconfig.postgresql-conformance.json",
+    "verify:native-transcript-package": "node scripts/verify-native-transcript-package.mjs && tsc --project tsconfig.native-transcript-package.json",
     "version-packages": "node scripts/version-packages.mjs"
   },
   "dependencies": {

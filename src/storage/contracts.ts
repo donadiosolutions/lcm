@@ -26,10 +26,13 @@ import type {
 import type { RecallFeedback, RecallStats } from "../db/recall.js";
 
 export type StorageBackendName = "sqlite" | "postgresql";
+export const NATIVE_TRANSCRIPT_MAX_JSON_DEPTH = 100;
+
 export type StorageDomain =
   | "factory"
   | "identity"
   | "conversations"
+  | "native-transcripts"
   | "summaries"
   | "context"
   | "large-files"
@@ -117,6 +120,131 @@ export interface ConversationRepository {
    */
   getMaxSeq(conversationId: ConversationId): Promise<number>;
   deleteMessages(messageIds: MessageId[]): Promise<number>;
+}
+
+export type JsonPrimitive = boolean | number | string | null;
+export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
+export interface JsonObject {
+  readonly [key: string]: JsonValue;
+}
+
+export interface NativeTranscriptMessageLinkRecord {
+  readonly transcriptId: string;
+  readonly conversationId: number;
+  readonly messageId: number;
+  readonly sourceOrdinal: number;
+}
+
+export interface NativeTranscriptRecord {
+  readonly transcriptId: string;
+  readonly projectId: string;
+  readonly machineId: string;
+  readonly clientName: string;
+  readonly formatName: string;
+  readonly formatVersion: string;
+  readonly nativeSessionId: string;
+  readonly sourceLocator: string;
+  readonly sourceOrdinal: number;
+  readonly observedAt: Date;
+  readonly ingestedAt: Date;
+  readonly scrubberVersion: string;
+  readonly contentSha256: string;
+  readonly ingestKey: string;
+  readonly nativePayload: JsonObject | JsonValue[];
+  readonly messageLinks: readonly NativeTranscriptMessageLinkRecord[];
+}
+
+export interface CreateNativeTranscriptMessageLinkInput {
+  readonly conversationId: number;
+  readonly messageId: number;
+  readonly sourceOrdinal: number;
+}
+
+export interface CreateNativeTranscriptInput {
+  readonly formatName: string;
+  readonly formatVersion: string;
+  readonly nativeSessionId: string;
+  readonly sourceOrdinal: number;
+  readonly observedAt: Date;
+  readonly scrubberVersion: string;
+  readonly contentSha256: string;
+  readonly ingestKey: string;
+  readonly nativePayload: JsonObject | JsonValue[];
+  readonly messageLinks?: readonly CreateNativeTranscriptMessageLinkInput[];
+}
+
+export interface NativeTranscriptCheckpointKey {
+  readonly machineId: string;
+  readonly clientName: string;
+  readonly sourceLocator: string;
+}
+
+export interface NativeTranscriptCheckpointRecord
+  extends NativeTranscriptCheckpointKey {
+  readonly projectId: string;
+  readonly revision: number;
+  readonly lastSourceOrdinal: number;
+  readonly importedCount: number;
+  readonly skippedCount: number;
+  readonly quarantinedCount: number;
+  readonly checkpoint: JsonObject;
+  readonly updatedAt: Date;
+}
+
+export interface NativeTranscriptBatchInput
+  extends NativeTranscriptCheckpointKey {
+  readonly expectedCheckpoint: NativeTranscriptCheckpointRecord | null;
+  readonly records: readonly CreateNativeTranscriptInput[];
+  readonly checkpoint: {
+    readonly lastSourceOrdinal: number;
+    readonly checkpoint: JsonObject;
+  };
+  readonly quarantinedCount: number;
+}
+
+export interface NativeTranscriptBatchResult {
+  readonly importedCount: number;
+  readonly skippedCount: number;
+  readonly quarantinedCount: number;
+  readonly checkpoint: NativeTranscriptCheckpointRecord;
+}
+
+export interface NativeTranscriptSessionMessageRecord {
+  readonly conversationId: number;
+  readonly messageId: number;
+  readonly messageSequence: number;
+  readonly role: MessageRole;
+  readonly content: string;
+}
+
+/**
+ * Narrow #86 destination-link snapshot seam.
+ *
+ * Backends must filter by the exact native session server-side and return the
+ * complete ordered result from one database statement or transaction snapshot.
+ */
+export interface NativeTranscriptMessageSnapshotRepository {
+  getNativeTranscriptMessageSnapshot(
+    nativeSessionId: string,
+  ): Promise<readonly NativeTranscriptSessionMessageRecord[]>;
+}
+
+export interface NativeTranscriptRepository {
+  ingestBatch(
+    input: NativeTranscriptBatchInput,
+  ): Promise<NativeTranscriptBatchResult>;
+  getById(transcriptId: string): Promise<NativeTranscriptRecord | null>;
+  listByNativeSession(input: {
+    readonly nativeSessionId: string;
+  }): Promise<NativeTranscriptRecord[]>;
+  listBySource(input: NativeTranscriptCheckpointKey): Promise<NativeTranscriptRecord[]>;
+  listByMessage(input: {
+    readonly conversationId: number;
+    readonly messageId: number;
+  }): Promise<NativeTranscriptRecord[]>;
+  getCheckpoint(
+    input: NativeTranscriptCheckpointKey,
+  ): Promise<NativeTranscriptCheckpointRecord | null>;
 }
 
 export interface SummaryRepository {

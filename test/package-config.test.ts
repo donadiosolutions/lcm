@@ -7,6 +7,19 @@ describe("package.json", () => {
   it("uses the generated npm runtime as its executable", () => {
     expect(pkg.bin).toHaveProperty("lcm", "dist/lcm.mjs");
   });
+  it("publishes the staged native-transcript API and its declarations", () => {
+    expect(pkg.exports).toHaveProperty("./storage/native-transcripts", {
+      types: "./dist/src/storage/native-transcripts.d.ts",
+      import: "./dist/src/storage/native-transcripts.js",
+    });
+    expect(pkg.scripts).toHaveProperty(
+      "verify:native-transcript-package",
+      "node scripts/verify-native-transcript-package.mjs && tsc --project tsconfig.native-transcript-package.json",
+    );
+    expect(pkg.scripts.postbuild).toContain(
+      "npm run verify:native-transcript-package",
+    );
+  });
   it("has anthropic sdk as optional peer dep", () => expect(pkg.peerDependencies).toHaveProperty("@anthropic-ai/sdk"));
   it("has mcp sdk", () => expect(pkg.dependencies).toHaveProperty("@modelcontextprotocol/sdk"));
   it("does not have pi-ai", () => expect(pkg.dependencies).not.toHaveProperty("@mariozechner/pi-ai"));

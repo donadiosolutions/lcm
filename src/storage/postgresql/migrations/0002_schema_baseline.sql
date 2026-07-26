@@ -611,6 +611,9 @@ CREATE TABLE lcm.ingest_checkpoints (
   imported_count bigint NOT NULL DEFAULT 0 CHECK (imported_count >= 0),
   skipped_count bigint NOT NULL DEFAULT 0 CHECK (skipped_count >= 0),
   quarantined_count bigint NOT NULL DEFAULT 0 CHECK (quarantined_count >= 0),
+  revision bigint NOT NULL DEFAULT 0 CHECK (
+    revision >= 0 AND revision <= 9007199254740991
+  ),
   checkpoint jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(checkpoint) = 'object'),
   updated_at timestamptz NOT NULL DEFAULT statement_timestamp(),
   PRIMARY KEY (project_id, machine_id, client_name, source_locator)

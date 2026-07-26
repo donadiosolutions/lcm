@@ -210,8 +210,11 @@ The PostgreSQL configuration, internal PostgreSQL 18 runtime, and schema
 baseline are available for development and adapter conformance. Machine and
 project identity operations are enabled by #84. The conversation adapter from
 #85 is available for conformance but is not routed through the daemon or CLI.
-The remaining storage/domain repositories in #86-#91 stay staged until the #92
-cutover, so a valid `postgresql` selection starts the managed daemon, but other
+The native-transcript adapter from #86 is available to explicit programmatic
+backfill and conformance; it does not add a daemon route or CLI command. Normal
+transcript activation remains #224, and the remaining storage/domain
+repositories stay staged until the #92 cutover. A valid `postgresql` selection
+therefore starts the managed daemon, but other
 storage-backed routes remain unavailable and return a sanitized `503` until
 those repositories are activated. Managed start/restart recognizes that authenticated staged response
 as daemon readiness; it does not treat PostgreSQL storage as ready and never
@@ -292,15 +295,35 @@ migrations transactionally, and closes its pool before returning. Repeated and
 concurrent invocations converge. It never installs extensions, repairs drift,
 changes ownership, or grants application privileges.
 
-After migration, apply the reviewed
-[`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql)
-as an administrator, substituting the deployment's restricted runtime role:
+After migration, apply only the reviewed scripts required by the repositories
+that this runtime role will use:
+[`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql),
+[`postgresql-runtime-conversation-grants.sql`](postgresql-runtime-conversation-grants.sql),
+and
+[`postgresql-runtime-transcript-grants.sql`](postgresql-runtime-transcript-grants.sql).
+Run them as an administrator, substituting the deployment's restricted runtime
+role:
 
 ```bash
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file docs/postgresql-runtime-identity-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-conversation-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-transcript-grants.sql
 ```
+
+The transcript grant permits immutable inserts, provenance reads, and bounded
+checkpoint updates only; it grants no payload update, deletion, truncation, or
+unrelated table access. Applying it makes the programmatic repository usable,
+not the staged daemon/CLI routes. See
+[PostgreSQL native transcripts](postgresql-native-transcripts.md) before
+running an explicit backfill.
 
 Finally restore `LCM_POSTGRES_URL` to the restricted runtime-role URL, run
 `lcm machine register`, pair projects explicitly, and restart the daemon.

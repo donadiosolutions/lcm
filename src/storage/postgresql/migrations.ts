@@ -22,7 +22,7 @@ const MIGRATION_MANIFEST = [
   {
     id: "0002_schema_baseline",
     filename: "0002_schema_baseline.sql",
-    sha256: "c914eef06f8d8a46ffc03c48377b8583fee6d07b327e7550acab2b70757027ed",
+    sha256: "d371217393adefcfd2f3658960ac015b12746951109daabbc9e06f904d8bf766",
   },
   {
     id: "0003_machine_identity_key",
@@ -257,7 +257,8 @@ const EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES = `
   ingest_checkpoints|client_name ingest_checkpoints|source_locator
   ingest_checkpoints|last_source_ordinal ingest_checkpoints|imported_count
   ingest_checkpoints|skipped_count ingest_checkpoints|quarantined_count
-  ingest_checkpoints|checkpoint ingest_checkpoints|updated_at session_ingest_log|ingest_key
+  ingest_checkpoints|revision ingest_checkpoints|checkpoint ingest_checkpoints|updated_at
+  session_ingest_log|ingest_key
   session_ingest_log|project_id session_ingest_log|session_id
   session_ingest_log|message_count session_ingest_log|completed_at
   session_instructions|instruction_id session_instructions|project_id
@@ -290,6 +291,7 @@ const EXPECTED_BASELINE_CONSTRAINT_NAMES = `
   fenced_leases_project_id_fkey fenced_leases_pkey ingest_checkpoints_client_name_check
   ingest_checkpoints_imported_count_check ingest_checkpoints_checkpoint_check
   ingest_checkpoints_last_source_ordinal_check ingest_checkpoints_quarantined_count_check
+  ingest_checkpoints_revision_check
   ingest_checkpoints_skipped_count_check ingest_checkpoints_source_locator_check
   ingest_checkpoints_machine_id_fkey ingest_checkpoints_project_id_fkey ingest_checkpoints_pkey
   large_files_storage_uri_check large_files_byte_size_check large_files_file_key_check
@@ -412,12 +414,12 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
   const baseline: PostgreSqlSchemaSnapshot = {
     ...expectedBaselineDefinitionInventory(),
     definitionHashes: {
-      columnAcl: "d3d92012f458893ce5bf0ff0d1f72699ba6d8a9ef42d25a62c0ccede9e582f9c",
-      constraint: "51a94179d9b50316b2f221c19bc00caa77d52fb60d050f8b3b7b1aec91311381",
+      columnAcl: "8d4254224cc473b408fb087264254b009d29e6228cb0ac6e74aa0f5e5be7671a",
+      constraint: "ea03d07488ccd0cc51023463169b71f78c23336374545856d506e2df52483207",
       generatedColumn: "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
       identitySequence: "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
       index: "16e10e2a4fc080f52b11315ee2b03d5df258d216f293bb0051b56beb16035374",
-      ordinaryColumn: "9f39c4bd9ddddd74d7af387b59342fa714fffb1f6245b450b64330c7780f30cd",
+      ordinaryColumn: "2cd3bcb84fbd6557dd2e2d26b0ce2bae15ee1c9899bfef1a17ea4e7ad41f4907",
       relationAcl: "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
       table: "5ccf4137ba8c1dbe8462176414b89f30616b26622d9680d77c5e2ae271d2f64d",
       trigger: "229e8dd0e6a1c953dd18b4220da95be28121db72f4fbba199e1d6808c4b7afcc",
@@ -444,7 +446,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       ...baseline,
       definitionHashes: {
         ...baseline.definitionHashes,
-        constraint: "386dc5c566e4a5fcb075b6674ceec67b2ec9e545763497d9ba0001b6777e6a28",
+        constraint: "b73cbde6cfe0b5c7bebcec3e2a8b15f40d021bc8af4381a40cbdf972af2a7a2a",
       },
       migrationId: "0003_machine_identity_key",
     },
@@ -452,7 +454,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       ...baseline,
       definitionHashes: {
         ...baseline.definitionHashes,
-        constraint: "619d530d52ec35db5336cc253eb16f264a64bde67c382a356a3609ea93f804af",
+        constraint: "eeb6605a8e1c078d2ee34a83c7e80539226a9f8e4d6a278f5286d9889dc47256",
       },
       migrationId: "0004_machine_display_name",
     },
@@ -1657,6 +1659,17 @@ export async function runPostgreSqlMigrations(
                          acl_relations.object_identity OPERATOR(pg_catalog.=)
                            ANY (
                              ARRAY[
+                               'table|native_transcripts',
+                               'table|transcript_messages',
+                               'table|ingest_checkpoints'
+                             ]::pg_catalog.text[]
+                           )
+                         AND privilege.privilege_type OPERATOR(pg_catalog.=) 'SELECT'
+                       )
+                       OR (
+                         acl_relations.object_identity OPERATOR(pg_catalog.=)
+                           ANY (
+                             ARRAY[
                                'table|messages',
                                'table|context_items'
                              ]::pg_catalog.text[]
@@ -1785,6 +1798,20 @@ export async function runPostgreSqlMigrations(
                                     ANY (
                                       ARRAY[
                                         'project_id',
+                                        'conversation_id',
+                                        'session_id',
+                                        'session_id_sha256',
+                                        'created_at'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'SELECT'
+                                )
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
                                         'session_id',
                                         'title'
                                       ]::pg_catalog.text[]
@@ -1805,18 +1832,38 @@ export async function runPostgreSqlMigrations(
                             )
                             OR (
                               relation.relname OPERATOR(pg_catalog.=) 'messages'
-                              AND attribute.attname OPERATOR(pg_catalog.=)
-                                ANY (
-                                  ARRAY[
-                                    'project_id',
-                                    'conversation_id',
-                                    'seq',
-                                    'role',
-                                    'content',
-                                    'token_count'
-                                  ]::pg_catalog.text[]
+                              AND (
+                                (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'conversation_id',
+                                        'message_id',
+                                        'seq',
+                                        'role',
+                                        'content'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'SELECT'
                                 )
-                              AND privilege.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'conversation_id',
+                                        'seq',
+                                        'role',
+                                        'content',
+                                        'token_count'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'INSERT'
+                                )
+                              )
                             )
                             OR (
                               relation.relname OPERATOR(pg_catalog.=) 'message_parts'
@@ -1838,6 +1885,82 @@ export async function runPostgreSqlMigrations(
                                   ]::pg_catalog.text[]
                                 )
                               AND privilege.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'native_transcripts'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'project_id',
+                                    'machine_id',
+                                    'client_name',
+                                    'format_name',
+                                    'format_version',
+                                    'native_session_id',
+                                    'source_locator',
+                                    'source_ordinal',
+                                    'observed_at',
+                                    'ingested_at',
+                                    'scrubber_version',
+                                    'content_sha256',
+                                    'ingest_key',
+                                    'native_payload'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type OPERATOR(pg_catalog.=)
+                                'INSERT'
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'transcript_messages'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'project_id',
+                                    'transcript_id',
+                                    'conversation_id',
+                                    'message_id',
+                                    'source_ordinal'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type OPERATOR(pg_catalog.=)
+                                'INSERT'
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'ingest_checkpoints'
+                              AND (
+                                (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'machine_id',
+                                        'client_name',
+                                        'source_locator'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'INSERT'
+                                )
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'last_source_ordinal',
+                                        'imported_count',
+                                        'skipped_count',
+                                        'quarantined_count',
+                                        'revision',
+                                        'checkpoint',
+                                        'updated_at'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'UPDATE'
+                                )
+                              )
                             )
                           ),
                           false

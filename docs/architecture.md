@@ -19,18 +19,21 @@ and hostname validation, sanitized SQLSTATE errors, abort cancellation,
 transactional migrations, extension readiness, and the complete durable schema
 baseline. Machine and project identity operations use that runtime directly.
 The general application storage factory remains staged while the domain
-adapters tracked by #86-#91 implement the remaining shared repository
+adapters tracked by #87-#91 implement the remaining shared repository
 contracts. The PostgreSQL conversation adapter is available to conformance
-tests but is not selected by daemon or CLI composition. With
-PostgreSQL selected, the daemon still opens its loopback listener and exposes
+tests, and the native-transcript adapter is available to explicit
+programmatic backfill and conformance, but neither is selected by normal daemon
+or CLI composition. With PostgreSQL selected, the daemon still opens its
+loopback listener and exposes
 an authenticated `/health` response with HTTP `503`, backend
 `postgresql`, and storage status `unavailable`; storage-backed routes also
 return fixed sanitized `503` responses. Lifecycle admission recognizes this
 staged response as the selected daemon without treating its storage as ready or
 falling back to SQLite. Issue #92 activates PostgreSQL as authoritative after
-the adapter gates pass. The local SQLite hook outbox is not a general cache and
-remains local after that activation. See the
-[PostgreSQL schema reference](postgresql-schema.md) for table ownership,
+the adapter gates pass, while issue #224 owns normal daemon/CLI transcript
+routing. The local SQLite hook outbox and the metadata-only transcript
+quarantine are not general caches and remain local after that activation. See
+the [PostgreSQL schema reference](postgresql-schema.md) for table ownership,
 integrity, indexes, retention, extension policy, and recovery implications.
 
 ## Storage repository architecture
@@ -44,12 +47,20 @@ backend-specific primitive.
 SQLite remains the zero-configuration production default. The reusable
 conformance suite is backend-neutral, and the PostgreSQL conversation adapter
 now implements the same conversation, message, and message-part contract.
-That adapter, the PostgreSQL runtime, migration runner, identity repository,
-and isolated test-database lease are shared foundations; they do not enable
-daemon or CLI routing. Until all PostgreSQL domain adapters and rollout gates
-land, selecting `postgresql` leaves general storage routes explicitly
-unavailable behind the staged loopback daemon rather than falling back to
-SQLite.
+The native-transcript repository adds immutable sanitized client-native
+records, exact message provenance, atomic checkpoint accounting, and
+idempotent ingest-key conflict handling. It intentionally exposes no payload
+update or deletion operation. During this staged phase, embedded backfill code
+receives `NativeTranscriptRepository` explicitly; PostgreSQL callers construct
+`PostgreSqlNativeTranscriptRepository`. The repository is not exposed through
+`ProjectStorage`. That adapter, the PostgreSQL runtime, migration
+runner, identity repository, and isolated test-database lease are shared
+foundations; they do not enable daemon or CLI routing. Until all PostgreSQL
+domain adapters and rollout gates land, selecting `postgresql` leaves general
+storage routes explicitly unavailable behind the staged loopback daemon rather
+than falling back to SQLite. See
+[PostgreSQL native transcripts](postgresql-native-transcripts.md) for the
+local-scrubbing, checkpoint, quarantine, and rollback boundaries.
 
 ### PostgreSQL runtime and migrations
 
@@ -119,7 +130,7 @@ generated state, fully deparsed expression, and resolved collation. Tables must 
 row-level security neither enabled nor forced, and cannot participate in
 inheritance or partition parent/child relationships.
 Effective relation ACLs normalize the owner plus only the exact reviewed
-identity- and conversation-runtime grant shapes. Added `PUBLIC`,
+identity-, conversation-, and native-transcript-runtime grant shapes. Added `PUBLIC`,
 out-of-shape named-role privileges, foreign grantors, or grant options fail
 closed while null and explicit owner-only defaults compare equally. Column ACL
 fingerprints preserve every no-ACL identity and accept only the reviewed

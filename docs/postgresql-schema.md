@@ -8,10 +8,13 @@ application backend. SQLite remains the authoritative production adapter.
 PostgreSQL machine and project identity operations are enabled by issue #84.
 The conversation, message, and message-part adapter added by issue #85 is
 available for repository conformance but is not routed through the daemon or
-CLI. Managed daemons may start with PostgreSQL selected so identity operations
-are available, but storage-backed health, status, statistics, and data routes
-remain fail-closed until the domain repositories in issues #86–#91 pass
-conformance and the cutover work in #92 explicitly enables the backend.
+CLI. The native-transcript adapter added by issue #86 is available to explicit
+programmatic backfill and repository conformance under the same staged
+boundary. Managed daemons may start with PostgreSQL selected so identity
+operations are available, but storage-backed health, status, statistics, and
+data routes remain fail-closed until the remaining domain repositories pass
+conformance, issue #92 enables the backend, and issue #224 activates normal
+daemon/CLI transcript routing.
 
 The design is single-user and multi-machine. Project scoping prevents accidental
 cross-project relationships; it is not a tenant or authorization boundary and
@@ -180,7 +183,10 @@ does not add row-level security.
   sequence. Its global allocation is stronger than per-resource monotonicity:
   deleting a released or expired lease row does not reset the allocator, so a
   later lease cannot receive a previously generated token.
-- Timestamps use `timestamptz` and default to `statement_timestamp()`. Checks
+- Timestamps use `timestamptz` and default to `statement_timestamp()`. The #86
+  native-transcript repository deliberately supplies both `observed_at` and
+  `ingested_at` from the same validated client-originated observation time, so
+  their ordering check never compares client and PostgreSQL wall clocks. Checks
   reject reversed lifecycle ranges. Counters, ordinals, token counts, byte
   counts and depths are nonnegative; step costs are finite and nonnegative;
   fencing tokens and event versions are strictly positive.
@@ -633,7 +639,9 @@ After schema creation, an administrator grants each implemented repository
 only its exact runtime privileges with the reviewed
 [`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql)
 and
-[`postgresql-runtime-conversation-grants.sql`](postgresql-runtime-conversation-grants.sql)
+[`postgresql-runtime-conversation-grants.sql`](postgresql-runtime-conversation-grants.sql),
+and
+[`postgresql-runtime-transcript-grants.sql`](postgresql-runtime-transcript-grants.sql)
 scripts:
 
 ```bash
@@ -644,6 +652,10 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file docs/postgresql-runtime-conversation-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-transcript-grants.sql
 ```
 
 Replace `lcm_runtime` with the deployment's runtime role. The script grants
@@ -675,6 +687,22 @@ message cascade, so the runtime receives no direct `DELETE` on
 Applying these grants permits direct repository use and conformance testing
 only; daemon and CLI routing remain staged behind #224 and #92.
 
+The transcript script grants column-limited `SELECT` on the exact conversation
+and message fields needed for native-session linkage, plus `SELECT` and
+column-limited `INSERT` on `native_transcripts` and `transcript_messages`. It
+grants `SELECT`, column-limited `INSERT`, and `UPDATE` only for checkpoint
+position, cumulative accounting, checkpoint payload, and update time on
+`ingest_checkpoints`.
+PostgreSQL-generated transcript IDs and native-session digest columns remain
+unwritable. Transcript inserts may supply `ingested_at` only so the repository
+can persist the same validated value as `observed_at`; later timestamp updates
+remain forbidden. The script grants no payload update,
+`DELETE`, `TRUNCATE`, sequence privilege, or access to an unrelated domain
+table. Matching ingest-key retries are therefore handled through readback,
+while a conflicting immutable record fails closed. See
+[PostgreSQL native transcripts](postgresql-native-transcripts.md) for the
+sanitized-record and local-quarantine contract.
+
 Migration privilege hardening is likewise confined to LCM-owned objects: it
 does not change ACLs on unknown objects already present in `lcm`. If an
 administrator has granted schema-level `PUBLIC CREATE`, they must remove that
@@ -695,7 +723,9 @@ maintenance must not receive sequence restart or table-truncate authority.
   current versions first; extension binaries and server preload configuration
   are cluster infrastructure, not rows in an application backup.
 - The local `~/.lcm/machine.json`, project map, and SQLite hook outbox are not in
-  a PostgreSQL backup. Preserve them separately. Recover a lost machine file
+  a PostgreSQL backup. The metadata-only native-transcript quarantine under
+  `~/.lcm/transcript-quarantine/` is local too. Preserve these separately.
+  Recover a lost machine file
   with the explicit PostgreSQL machine UUID via `lcm machine recover`; restore
   project bindings explicitly via `lcm project link`. Once #91 exists, replay uses
   `(machine_id, event_id)` and machine sequence uniqueness to avoid duplicate
