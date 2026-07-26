@@ -1455,7 +1455,7 @@ implements
   }
 
   private validateKey(
-    input: NativeTranscriptCheckpointKey,
+    input: unknown,
     operation: string,
   ): NativeTranscriptCheckpointKey {
     const value = dataObject(
@@ -1496,7 +1496,7 @@ implements
       operation,
       "batch",
     );
-    const key = this.validateKey(value as unknown as NativeTranscriptCheckpointKey, operation);
+    const key = this.validateKey(value, operation);
     const expectedCheckpoint = value.expectedCheckpoint === null
       ? null
       : this.validateExpectedCheckpoint(
