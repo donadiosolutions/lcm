@@ -55,8 +55,9 @@ jobs:
                       orderBy: {field: CREATED_AT, direction: ASC}
                     ) {
                       nodes {
+                        id
                         number
-                        issueFieldValues(first: 50) {
+                        issueFieldValues(first: 100) {
                           nodes {
                             ... on IssueFieldSingleSelectValue {
                               name
@@ -66,6 +67,10 @@ jobs:
                                 }
                               }
                             }
+                          }
+                          pageInfo {
+                            hasNextPage
+                            endCursor
                           }
                         }
                       }
@@ -83,9 +88,66 @@ jobs:
                 },
               );
               for (const issue of response.repository.issues.nodes) {
-                const priority = issue.issueFieldValues.nodes.find(
+                const priorityValues = issue.issueFieldValues.nodes.filter(
                   (value) => value.field?.name === "Priority",
-                )?.name;
+                );
+                let fieldPageInfo = issue.issueFieldValues.pageInfo;
+                while (fieldPageInfo.hasNextPage) {
+                  if (!fieldPageInfo.endCursor) {
+                    throw new Error(
+                      `Issue #${issue.number} has another Planning Field page without a cursor`,
+                    );
+                  }
+                  const fieldResponse = await github.graphql(
+                    `query PriorityExemptIssueFields(
+                      $issueId: ID!
+                      $cursor: String
+                    ) {
+                      node(id: $issueId) {
+                        ... on Issue {
+                          issueFieldValues(first: 100, after: $cursor) {
+                            nodes {
+                              ... on IssueFieldSingleSelectValue {
+                                name
+                                field {
+                                  ... on IssueFieldSingleSelect {
+                                    name
+                                  }
+                                }
+                              }
+                            }
+                            pageInfo {
+                              hasNextPage
+                              endCursor
+                            }
+                          }
+                        }
+                      }
+                    }`,
+                    {
+                      issueId: issue.id,
+                      cursor: fieldPageInfo.endCursor,
+                    },
+                  );
+                  const fieldPage = fieldResponse.node?.issueFieldValues;
+                  if (!fieldPage) {
+                    throw new Error(
+                      `Could not read Planning Fields for issue #${issue.number}`,
+                    );
+                  }
+                  priorityValues.push(
+                    ...fieldPage.nodes.filter(
+                      (value) => value.field?.name === "Priority",
+                    ),
+                  );
+                  fieldPageInfo = fieldPage.pageInfo;
+                }
+                if (priorityValues.length > 1) {
+                  throw new Error(
+                    `Issue #${issue.number} has duplicate Priority Planning Field values`,
+                  );
+                }
+                const priority = priorityValues[0]?.name;
                 if (priority === "Urgent" || priority === "High") {
                   await github.rest.issues.addLabels({
                     ...context.repo,

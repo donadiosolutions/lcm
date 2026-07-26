@@ -216,11 +216,37 @@ test("workflow binds evidence and the required model split", async () => {
     /Classify security fields with Codex[\s\S]*?model: gpt-5\.6-terra[\s\S]*?effort: high/u,
   );
   assert.equal((workflow.match(/effort: high/gu) ?? []).length, 3);
+  assert.match(
+    workflow,
+    /apply-security:[\s\S]*?if: \$\{\{ always\(\) && needs\.apply-labels\.result == 'success' && needs\.collect-security\.result == 'success' \}\}/u,
+  );
+  assert.match(
+    workflow,
+    /SECURITY_CLASSIFICATION_STATUS: \$\{\{ needs\.classify-security\.result \}\}[\s\S]*?const securityResult = \(process\.env\.SECURITY_RESULT \|\| ""\)\.trim\(\);[\s\S]*?process\.env\.SECURITY_CLASSIFICATION_STATUS === "success";[\s\S]*?SECURITY_HAS_WORK === "true"[\s\S]*?securityClassificationSucceeded[\s\S]*?securityResult !== ""/u,
+  );
+  assert.match(
+    workflow,
+    /securityIssueNumbers\.has\(issueNumber\)[\s\S]*?!appliedSecurityIssueNumbers\.has\(issueNumber\)[\s\S]*?Keeping security bug/u,
+  );
+  assert.match(
+    workflow,
+    /core\.setFailed\(`Failed security triage:/u,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /apply-security:[\s\S]*?if: [^\n]*needs\.classify-security\.result == 'success'/u,
+  );
 
   const staleWorkflow = await readFile(
     new URL("../workflows/stale.yml", import.meta.url),
     "utf8",
   );
+  assert.match(staleWorkflow, /issueFieldValues\(first: 100\)/u);
+  assert.match(
+    staleWorkflow,
+    /while \(fieldPageInfo\.hasNextPage\)[\s\S]*?issueFieldValues\(first: 100, after: \$cursor\)/u,
+  );
+  assert.match(staleWorkflow, /priorityValues\.length > 1/u);
   assert.match(staleWorkflow, /value\.field\?\.name === "Priority"/u);
   assert.match(staleWorkflow, /priority === "Urgent" \|\| priority === "High"/u);
   assert.match(staleWorkflow, /internal-stale-priority-exempt/u);

@@ -659,7 +659,7 @@ jobs:
 
   apply-security:
     needs: [apply-labels, collect-security, classify-security]
-    if: ${{ always() && needs.apply-labels.result == 'success' && needs.collect-security.result == 'success' && (needs.collect-security.outputs.has_work != 'true' || needs.classify-security.result == 'success') }}
+    if: ${{ always() && needs.apply-labels.result == 'success' && needs.collect-security.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -681,6 +681,7 @@ jobs:
           SECURITY_EVIDENCE: ${{ needs.collect-security.outputs.evidence }}
           SECURITY_HAS_WORK: ${{ needs.collect-security.outputs.has_work }}
           SECURITY_ISSUE_NUMBERS: ${{ needs.collect-security.outputs.issue_numbers }}
+          SECURITY_CLASSIFICATION_STATUS: ${{ needs.classify-security.result }}
           SECURITY_RESULT: ${{ needs.classify-security.outputs.result }}
         with:
           script: |
@@ -719,17 +720,38 @@ jobs:
               labels: catalogResponse.repository.labels.nodes,
             }, policy);
             const failures = [];
-            if (process.env.SECURITY_HAS_WORK === "true") {
-              const issueNumbers = JSON.parse(process.env.SECURITY_ISSUE_NUMBERS);
+            const securityIssueNumbers = new Set(
+              JSON.parse(process.env.SECURITY_ISSUE_NUMBERS || "[]"),
+            );
+            const appliedSecurityIssueNumbers = new Set();
+            const securityResult = (process.env.SECURITY_RESULT || "").trim();
+            const securityClassificationSucceeded =
+              process.env.SECURITY_CLASSIFICATION_STATUS === "success";
+            if (
+              process.env.SECURITY_HAS_WORK === "true"
+              && securityClassificationSucceeded
+              && securityResult !== ""
+            ) {
+              const issueNumbers = [...securityIssueNumbers];
               const evidence = JSON.parse(process.env.SECURITY_EVIDENCE);
               const evidenceByIssue = new Map(
                 evidence.map((entry) => [entry.issueNumber, entry]),
               );
-              const decisions = parseAndValidateSecurityResult(
-                process.env.SECURITY_RESULT,
-                policy,
-                issueNumbers,
-              );
+              let decisions;
+              try {
+                decisions = parseAndValidateSecurityResult(
+                  securityResult,
+                  policy,
+                  issueNumbers,
+                );
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                core.warning(
+                  `Security classification output was unavailable or invalid; `
+                  + `leaving ${issueNumbers.length} security issue(s) queued: ${message}`,
+                );
+                decisions = [];
+              }
               for (const decision of decisions) {
                 try {
                   const response = await github.graphql(ISSUE_PLANNING_QUERY, {
@@ -763,6 +785,7 @@ jobs:
                   await github.graphql(SET_ISSUE_FIELDS_MUTATION, {
                     input: { issueId: issue.id, issueFields: updates },
                   });
+                  appliedSecurityIssueNumbers.add(decision.issueNumber);
                   if (!requiresDuplicateTriage(issue.issueType)) {
                     await removeIssueLabelIfPresent(
                       github,
@@ -777,10 +800,24 @@ jobs:
                   core.error(message);
                 }
               }
+            } else if (process.env.SECURITY_HAS_WORK === "true") {
+              core.warning(
+                `Security classification did not complete successfully; leaving `
+                + `${securityIssueNumbers.size} security issue(s) queued.`,
+              );
             }
 
             const readyBugs = [];
             for (const issueNumber of JSON.parse(process.env.BUG_ISSUE_NUMBERS || "[]")) {
+              if (
+                securityIssueNumbers.has(issueNumber)
+                && !appliedSecurityIssueNumbers.has(issueNumber)
+              ) {
+                core.info(
+                  `Keeping security bug #${issueNumber} queued until security classification succeeds.`,
+                );
+                continue;
+              }
               const response = await github.graphql(ISSUE_PLANNING_QUERY, {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
