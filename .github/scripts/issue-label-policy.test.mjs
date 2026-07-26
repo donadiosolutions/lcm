@@ -152,6 +152,60 @@ function assertGitHubScriptStepsUseDedicatedTokens(workflow, allowedTokens) {
   }
 }
 
+function assertNamedGitHubScriptStepsUseExpectedTokens(
+  workflow,
+  expectedBindings,
+) {
+  const lines = workflow.split("\n");
+  assert.equal(
+    (workflow.match(/actions\/github-script@/gu) ?? []).length,
+    expectedBindings.length,
+    "Every github-script step must have one named credential expectation",
+  );
+
+  for (const { job, step, token } of expectedBindings) {
+    const jobStart = lines.findIndex((line) => line === `  ${job}:`);
+    assert.notEqual(jobStart, -1, `Missing workflow job ${job}`);
+    let jobEnd = jobStart + 1;
+    while (
+      jobEnd < lines.length
+      && !/^  [a-zA-Z0-9_-]+:\s*$/u.test(lines[jobEnd])
+    ) {
+      jobEnd += 1;
+    }
+
+    const stepStart = lines.findIndex(
+      (line, index) => (
+        index > jobStart
+        && index < jobEnd
+        && line.trim() === `- name: ${step}`
+      ),
+    );
+    assert.notEqual(stepStart, -1, `Missing step ${job} / ${step}`);
+    let stepEnd = stepStart + 1;
+    while (
+      stepEnd < jobEnd
+      && !/^\s{6}-\s+/u.test(lines[stepEnd])
+    ) {
+      stepEnd += 1;
+    }
+    const stepDefinition = lines.slice(stepStart, stepEnd).join("\n");
+    assert.match(
+      stepDefinition,
+      /uses: actions\/github-script@/u,
+      `Expected ${job} / ${step} to use actions/github-script`,
+    );
+    assert.match(
+      stepDefinition,
+      new RegExp(
+        String.raw`github-token: \$\{\{ secrets\.${token} \}\}`,
+        "u",
+      ),
+      `Unexpected token for ${job} / ${step}`,
+    );
+  }
+}
+
 const sourceIssue = {
   number: 42,
   title: "Daemon crashes while compacting",
@@ -551,6 +605,48 @@ test("workflow binds evidence and the required model split", async () => {
       "CODEX_ISSUE_TRIAGE_WRITE_TOKEN",
     ],
   );
+  assertNamedGitHubScriptStepsUseExpectedTokens(workflow, [
+    {
+      job: "enqueue",
+      step: "Queue issue for Codex triage",
+      token: "CODEX_ISSUE_TRIAGE_WRITE_TOKEN",
+    },
+    {
+      job: "collect",
+      step: "Collect queued issues and Planning Field catalog",
+      token: "CODEX_ISSUE_TRIAGE_READ_TOKEN",
+    },
+    {
+      job: "preflight-write",
+      step: "Validate write credential and perform idempotent queue probe",
+      token: "CODEX_ISSUE_TRIAGE_WRITE_TOKEN",
+    },
+    {
+      job: "apply-labels",
+      step: "Validate and apply classifications",
+      token: "CODEX_ISSUE_TRIAGE_WRITE_TOKEN",
+    },
+    {
+      job: "collect-security",
+      step: "Collect sanitized Security and Quality evidence",
+      token: "CODEX_ISSUE_TRIAGE_READ_TOKEN",
+    },
+    {
+      job: "apply-security",
+      step: "Apply security decisions and route Bugs",
+      token: "CODEX_ISSUE_TRIAGE_WRITE_TOKEN",
+    },
+    {
+      job: "collect-duplicates",
+      step: "Search duplicate candidates for reconciled bugs",
+      token: "CODEX_ISSUE_TRIAGE_READ_TOKEN",
+    },
+    {
+      job: "apply-duplicates",
+      step: "Validate and apply duplicate decisions",
+      token: "CODEX_ISSUE_TRIAGE_WRITE_TOKEN",
+    },
+  ]);
   assert.equal(
     (
       workflow.match(
