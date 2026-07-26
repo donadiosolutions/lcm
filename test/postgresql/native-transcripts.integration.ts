@@ -496,6 +496,73 @@ describe("PostgreSQL 18 native transcript repository", () => {
     });
   });
 
+  it("validates numeric-looking payload keys against canonical lexical order", async () => {
+    await withPostgreSqlTestDatabase("native-transcript-canonical-numeric-keys", async (database) => {
+      await grantTranscriptRuntimePrivileges(database);
+      const scope = await createScope(database, "Native transcript canonical numeric keys");
+      const repository = new PostgreSqlNativeTranscriptRepository(
+        database.runtime,
+        scope.projectId,
+      );
+      const payload = JSON.parse(`{
+        "2": "two",
+        "10": "ten",
+        "nested": {
+          "2": ["second"],
+          "10": ["tenth"]
+        }
+      }`) as NativeTranscriptBatchInput["records"][number]["nativePayload"];
+      const canonicalDigest = nativePayloadDigest(payload);
+      const enumerationDigest = createHash("sha256")
+        .update(JSON.stringify(payload))
+        .digest("hex");
+      expect(canonicalDigest).not.toBe(enumerationDigest);
+
+      const valid = input(
+        scope,
+        "canonical/numeric-keys.jsonl",
+        "canonical-numeric-keys",
+      );
+      const canonicalBatch: NativeTranscriptBatchInput = {
+        ...valid,
+        records: [{
+          ...valid.records[0],
+          contentSha256: canonicalDigest,
+          nativePayload: payload,
+        }],
+      };
+      await expect(repository.ingestBatch(canonicalBatch)).resolves
+        .toMatchObject({ importedCount: 1 });
+      await expect(repository.listBySource(canonicalBatch)).resolves.toEqual([
+        expect.objectContaining({
+          contentSha256: canonicalDigest,
+          nativePayload: payload,
+        }),
+      ]);
+
+      const invalid = input(
+        scope,
+        "canonical/enumeration-order.jsonl",
+        "enumeration-order",
+      );
+      const transaction = vi.spyOn(database.runtime, "transaction");
+      const error = await repository.ingestBatch({
+        ...invalid,
+        records: [{
+          ...invalid.records[0],
+          contentSha256: enumerationDigest,
+          nativePayload: payload,
+        }],
+      }).catch((cause: unknown) => cause);
+      expect(error).toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
+      expect(error).toMatchObject({ field: "content_sha256" });
+      expect(transaction).not.toHaveBeenCalled();
+      transaction.mockRestore();
+      await expect(repository.getCheckpoint(invalid)).resolves.toBeNull();
+      await expect(repository.listBySource(invalid)).resolves.toEqual([]);
+    });
+  });
+
   it("aggregates ordered links once without multiplying transcript rows", async () => {
     await withPostgreSqlTestDatabase("native-transcript-link-aggregate", async (database) => {
       await grantTranscriptRuntimePrivileges(database);

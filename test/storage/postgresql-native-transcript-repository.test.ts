@@ -8,6 +8,9 @@ import {
   type NativeTranscriptBatchInput,
   type NativeTranscriptCheckpointRecord,
 } from "../../src/storage/contracts.js";
+import {
+  canonicalNativeTranscriptJson,
+} from "../../src/storage/native-transcript-ingest.js";
 import type { PostgreSqlQueryOptions } from "../../src/storage/postgresql/contracts.js";
 import {
   PostgreSqlNativeTranscriptConflictError,
@@ -445,13 +448,22 @@ describe("PostgreSQL native transcript repository", () => {
   });
 
   it("binds content digests to canonical normalized payloads before SQL", async () => {
-    const payload = {
-      zeta: [true, null],
-      alpha: {
-        zulu: 2,
-        bravo: 1,
-      },
-    };
+    const payload = JSON.parse(`{
+      "2": "two",
+      "10": "ten",
+      "zeta": [true, null],
+      "alpha": {
+        "2": "nested-two",
+        "10": "nested-ten",
+        "zulu": 2,
+        "bravo": 1
+      }
+    }`) as JsonObject;
+    const documentedCanonical = canonicalNativeTranscriptJson(payload);
+    expect(canonicalJson(payload)).toBe(documentedCanonical);
+    expect(documentedCanonical).toBe(
+      `{"10":"ten","2":"two","alpha":{"10":"nested-ten","2":"nested-two","bravo":1,"zulu":2},"zeta":[true,null]}`,
+    );
     const canonicalDigest = payloadDigest(payload);
     const insertionOrderDigest = createHash("sha256")
       .update(JSON.stringify(payload))
@@ -493,7 +505,7 @@ describe("PostgreSQL native transcript repository", () => {
     const insert = acceptingDb.query.mock.calls.find(([config]) =>
       config.text.includes("INSERT INTO lcm.native_transcripts"))?.[0];
     expect(insert?.values?.[10]).toBe(canonicalDigest);
-    expect(insert?.values?.[12]).toBe(canonicalJson(payload));
+    expect(JSON.parse(insert?.values?.[12] as string)).toEqual(payload);
   });
 
   it("rejects records beyond the checkpoint before SQL and permits checkpoint-ahead quarantine progress", async () => {

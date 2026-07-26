@@ -571,6 +571,18 @@ function nativePayload(
   return candidate;
 }
 
+function canonicalNativeTranscriptJson(value: JsonValue): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalNativeTranscriptJson).join(",")}]`;
+  }
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) =>
+      `${JSON.stringify(key)}:${canonicalNativeTranscriptJson(value[key])}`)
+    .join(",")}}`;
+}
+
 function boolean(
   value: unknown,
   projectId: string,
@@ -1775,7 +1787,7 @@ implements
       operation,
     );
     const actualContentSha256 = createHash("sha256")
-      .update(JSON.stringify(payload))
+      .update(canonicalNativeTranscriptJson(payload))
       .digest("hex");
     if (contentSha256 !== actualContentSha256) {
       throw new PostgreSqlNativeTranscriptDataError(
