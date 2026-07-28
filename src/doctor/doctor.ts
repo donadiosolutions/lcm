@@ -80,7 +80,7 @@ async function readRecognizedDaemonHealth(
   port: number,
 ): Promise<DoctorDaemonHealth | null> {
   const controller = new AbortController();
-  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let timeout!: ReturnType<typeof setTimeout>;
   const deadline = new Promise<never>((_, reject) => {
     timeout = setTimeout(() => {
       controller.abort();
@@ -102,7 +102,7 @@ async function readRecognizedDaemonHealth(
       deadline,
     ]);
   } finally {
-    if (timeout !== undefined) clearTimeout(timeout);
+    clearTimeout(timeout);
   }
 }
 
