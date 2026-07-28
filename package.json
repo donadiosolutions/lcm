@@ -1,6 +1,6 @@
 {
   "name": "@donadiosolutions/lcm",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Never lose context again. Long Context Manager (LCM) compresses Claude Code sessions into searchable memory — every message preserved, every insight remembered.",
   "type": "module",
   "engines": {
@@ -50,9 +50,12 @@
     "version-packages": "node scripts/version-packages.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.29.0",
+    "@hono/node-server": "2.0.12",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "@sinclair/typebox": "0.34.52",
+    "body-parser": "2.3.0",
     "commander": "15.0.0",
+    "fast-uri": "3.1.4",
     "js-yaml": "5.2.2",
     "pg": "8.22.0",
     "safe-regex": "2.1.1"
