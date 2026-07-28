@@ -28,6 +28,7 @@ interface CiWorkflow {
       name: string;
       needs: string;
       "runs-on": string;
+      steps: WorkflowStep[];
     };
     postgresql: {
       needs: string;
@@ -83,6 +84,14 @@ describe("CI workflow", () => {
     expect(workflow.jobs.core.name).toBe("Core CI");
     expect(workflow.jobs.core.needs).toBe("environment");
     expect(workflow.jobs.core["runs-on"]).toBe("blacksmith-4vcpu-ubuntu-2404");
+    expect(
+      workflow.jobs.core.steps.find(
+        (step) => step.name === "Verify merge queue preserves release ancestry",
+      ),
+    ).toMatchObject({
+      env: { GH_TOKEN: "${{ github.token }}" },
+      run: "node .github/scripts/check-merge-queue-policy.mjs",
+    });
     expect(workflow.jobs.postgresql.needs).toBe("environment");
     expect(workflow.jobs.postgresql["runs-on"]).toBe("blacksmith-4vcpu-ubuntu-2404");
     expect(workflow.jobs.postgresql.strategy.matrix.run).toEqual([1, 2]);

@@ -14,7 +14,7 @@ This document is a living record. **Update it whenever you learn something:**
 
 **When to update:** At the end of every feature cycle (after the implementation PR merges), review this doc against what actually happened. If reality diverged from the doc, fix the doc — not reality.
 
-**How to update:** Create a `docs/TOPIC` branch, push, complete the Copilot review loop, and require a merge-ready Greptile report covering the exact current head. Then set `PR_NUMBER` to the pull request number and queue it for main with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`. Same flow as any other docs change.
+**How to update:** Create a `docs/TOPIC` branch, push, complete the Copilot review loop, and require a merge-ready Greptile report covering the exact current head. Then set `PR_NUMBER` to the pull request number and queue it for main with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --merge`. Same flow as any other docs change.
 
 ## Branch Strategy
 
@@ -27,7 +27,15 @@ feature/docs branches → main (default, protected)
 
 Independent changes may be developed in parallel on isolated branches and worktrees, but the required merge queue serializes landings into `main`. Dependent work must wait for its upstream PR to merge, then fetch and rebase onto the new `main` before it is queued.
 
-The merge queue uses squash merging and an `ALLGREEN` grouping strategy. It builds one entry at a time, with both the minimum and maximum merge-group size set to one, no minimum wait, and a 60-minute check-response timeout. Routine administrator bypasses are prohibited; the existing bypass is reserved for documented emergencies.
+The merge queue uses merge commits and an `ALLGREEN` grouping strategy. It
+builds up to five entries concurrently and merges groups of one to five entries
+after a three-minute minimum wait, with a 60-minute check-response timeout.
+`MERGE` is required because release publication proves that maintenance and
+forward-port commits remain ancestors of `main`; squash or rebase queue methods
+destroy that evidence. CI discovers every active branch merge-queue ruleset
+dynamically and fails if any queue stops using `MERGE`. Routine administrator
+bypasses are prohibited; the existing bypass is reserved for documented
+emergencies.
 
 The required `external-admission` status separates pull-request admission from
 merge-group validation for providers that do not report on synthetic queue
@@ -207,7 +215,7 @@ separate merge-group workflow supplies the required `external-admission` check.
 4. Push and open PR
 5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
 6. Run review loop (see Copilot Review Loop below)
-7. Once the Copilot loop is complete (max 3 rounds — see Review Loop) and Greptile reports the exact current head as merge-ready, set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
+7. Once the Copilot loop is complete (max 3 rounds — see Review Loop) and Greptile reports the exact current head as merge-ready, set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --merge`
 8. Wait for the queued PR to land before starting implementation. Allow up to 65 minutes for GitHub to admit the PR and then 65 minutes for each position in the serialized queue: a PR entering at position 1 gets 65 minutes, while a PR entering at position N gets `N * 65` minutes so every entry ahead can consume the queue's 60-minute check timeout without taking time from this PR. Both waits are finite and fail with check diagnostics if GitHub never admits, removes, or rejects the still-open PR:
 
    ```bash
@@ -393,7 +401,7 @@ separate merge-group workflow supplies the required `external-admission` check.
 1. Push implementation branch, open PR
 2. Request Copilot review (add to reviewers list)
 3. Run review loop (see below)
-4. Once the Copilot loop is complete and Greptile reports the exact current head as merge-ready, set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
+4. Once the Copilot loop is complete and Greptile reports the exact current head as merge-ready, set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --merge`
 5. Wait for the implementation PR to land by calling `wait_for_queued_pr "$PR_NUMBER"` from Phase 2 with the implementation PR number. Do not begin post-merge validation or dependent work until it reports `MERGED`.
 
 ## Copilot Interaction

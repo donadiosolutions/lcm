@@ -3,6 +3,7 @@ import { parseReleaseTag } from "./release-tag-policy.mjs";
 
 export const PACKAGE_NAME = "@donadiosolutions/lcm";
 export const NPM_QUERY_TIMEOUT_MS = 60_000;
+export const NPM_VERIFY_DELAYS_MS = Object.freeze([2_000, 4_000, 8_000, 16_000]);
 
 const FAILURE_SCAN_LIMIT = 8_192;
 const FAILURE_LABEL_LIMIT = 160;
@@ -189,6 +190,100 @@ function highestStableVersion(versions) {
   return stable[0];
 }
 
+class IncompleteNpmReleaseError extends Error {}
+
+function canonicalPublishedVersions(versions, packageName) {
+  const values = typeof versions === "string" ? [versions] : versions;
+  if (!Array.isArray(values)) {
+    throw new Error(`npm returned invalid JSON for ${safeFailureLabel(`${packageName} versions`)}`);
+  }
+  return values.map((version) => {
+    if (typeof version !== "string") {
+      throw new Error(`npm returned invalid JSON for ${safeFailureLabel(`${packageName} versions`)}`);
+    }
+    let parsed;
+    try {
+      parsed = parseReleaseTag(`v${version}`);
+    } catch {
+      throw new Error(`npm returned an unsupported version for ${safeFailureLabel(packageName)}`);
+    }
+    if (parsed.version !== version) {
+      throw new Error(`npm returned a non-canonical version for ${safeFailureLabel(packageName)}`);
+    }
+    return parsed.version;
+  });
+}
+
+function canonicalDistTag(distTags, tagName) {
+  const current = distTags[tagName];
+  if (current === undefined) return undefined;
+  if (typeof current !== "string") {
+    throw new Error(`npm ${tagName} dist-tag must contain a canonical version string`);
+  }
+  let parsed;
+  try {
+    parsed = parseReleaseTag(`v${current}`);
+  } catch {
+    throw new Error(`npm ${tagName} points to an unsupported version`);
+  }
+  if (parsed.version !== current) {
+    throw new Error(`npm ${tagName} must contain a canonical version string`);
+  }
+  return parsed;
+}
+
+function assertCompleteNpmSnapshot({ version, packageName, published, versions, distTags }) {
+  const target = parseReleaseTag(`v${version}`);
+  const publishedVersions = canonicalPublishedVersions(versions, packageName);
+  const latest = canonicalDistTag(distTags, "latest");
+  const beta = canonicalDistTag(distTags, "beta");
+  const incomplete = [];
+
+  if (!published.found) incomplete.push("exact version is not visible");
+  else if (published.output !== version) {
+    throw new Error(`npm returned an unexpected exact-version response for ${packageName}@${version}`);
+  }
+  if (!publishedVersions.includes(version)) incomplete.push("version list is not updated");
+
+  const highestStable = highestStableVersion(publishedVersions);
+  if (!highestStable) {
+    incomplete.push("stable version list is not visible");
+  } else if (!latest) {
+    incomplete.push("latest dist-tag is not visible");
+  } else {
+    if (latest.isBeta) throw new Error("npm latest must point to a canonical stable version");
+    const latestComparison = compareReleaseVersions(latest.version, highestStable);
+    if (latestComparison < 0) incomplete.push("latest dist-tag is older than the version list");
+    else if (latestComparison > 0) incomplete.push("version list is missing the latest release");
+  }
+
+  if (target.isBeta) {
+    if (!beta) incomplete.push("beta dist-tag is not visible");
+    else {
+      if (!beta.isBeta) throw new Error("npm beta must point to a canonical beta version");
+      const betaComparison = compareReleaseVersions(beta.version, version);
+      if (betaComparison < 0) incomplete.push("beta dist-tag is older than the release");
+      else if (betaComparison > 0) {
+        throw new Error("npm beta points to a newer release than the published version");
+      }
+    }
+  } else if (latest) {
+    const latestComparison = compareReleaseVersions(latest.version, version);
+    if (latestComparison < 0) incomplete.push("latest dist-tag is older than the release");
+    else if (latestComparison > 0) {
+      throw new Error("npm latest points to a newer release than the published version");
+    }
+  }
+
+  if (incomplete.length > 0) {
+    throw new IncompleteNpmReleaseError(
+      `npm metadata propagation is incomplete: ${[...new Set(incomplete)].join("; ")}`,
+    );
+  }
+  assertNpmDistTags({ version, versions: publishedVersions, distTags });
+  return { versions: publishedVersions, distTags };
+}
+
 export function assertNpmDistTags({ version, versions, distTags }) {
   const target = parseReleaseTag(`v${version}`);
   const publishedVersions = Array.isArray(versions) ? versions : [versions];
@@ -240,16 +335,13 @@ export function checkNpmReleaseState({
   return { alreadyPublished, distTags };
 }
 
-export function verifyNpmRelease({ version, packageName = PACKAGE_NAME, runNpm = defaultRunNpm }) {
+function readNpmReleaseSnapshot({ version, packageName, runNpm }) {
   parseReleaseTag(`v${version}`);
   const published = npmView(
     ["view", `${packageName}@${version}`, "version"],
     `${packageName}@${version}`,
     runNpm,
   );
-  if (!published.found || published.output !== version) {
-    throw new Error(`${packageName}@${version} was not published with the expected version`);
-  }
   const versionsResult = npmView(
     ["view", packageName, "versions", "--json"],
     `${packageName} versions`,
@@ -265,6 +357,28 @@ export function verifyNpmRelease({ version, packageName = PACKAGE_NAME, runNpm =
   if (distTags === null || typeof distTags !== "object" || Array.isArray(distTags)) {
     throw new Error(`npm returned invalid JSON for ${packageName} dist-tags`);
   }
-  assertNpmDistTags({ version, versions, distTags });
-  return { versions, distTags };
+  return { published, versions, distTags };
+}
+
+export async function verifyNpmRelease({
+  version,
+  packageName = PACKAGE_NAME,
+  runNpm = defaultRunNpm,
+  sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+}) {
+  for (let attempt = 0; attempt <= NPM_VERIFY_DELAYS_MS.length; attempt += 1) {
+    const snapshot = readNpmReleaseSnapshot({ version, packageName, runNpm });
+    try {
+      return assertCompleteNpmSnapshot({ version, packageName, ...snapshot });
+    } catch (error) {
+      if (
+        !(error instanceof IncompleteNpmReleaseError) ||
+        attempt === NPM_VERIFY_DELAYS_MS.length
+      ) {
+        throw error;
+      }
+      await sleep(NPM_VERIFY_DELAYS_MS[attempt]);
+    }
+  }
+  throw new Error("npm release verification exhausted unexpectedly");
 }

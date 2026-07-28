@@ -688,18 +688,12 @@ jobs:
           IS_BETA: ${{ needs.preflight.outputs.is_beta }}
         run: |
           set -Eeuo pipefail
-          mapfile -d '' -t packages < <(
-            find release-artifact -type f -name '*.tgz' -print0
-          )
-          if [[ "${#packages[@]}" -ne 1 ]]; then
-            echo "::error::Expected exactly one verified npm artifact, found ${#packages[@]}"
-            exit 1
-          fi
           if [[ "$IS_BETA" == "true" ]]; then
-            npm publish "$PWD/${packages[0]}" --ignore-scripts --access public --tag beta
+            tag=beta
           else
-            npm publish "$PWD/${packages[0]}" --ignore-scripts --access public --tag latest
+            tag=latest
           fi
+          node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag"
 
       - name: Verify npm package and dist-tags
         env:
@@ -1067,18 +1061,12 @@ jobs:
           IS_BETA: ${{ needs.recover-preflight.outputs.is_beta }}
         run: |
           set -Eeuo pipefail
-          mapfile -d '' -t packages < <(
-            find release-artifact -type f -name '*.tgz' -print0
-          )
-          if [[ "${#packages[@]}" -ne 1 ]]; then
-            echo "::error::Expected exactly one verified npm artifact, found ${#packages[@]}"
-            exit 1
-          fi
           if [[ "$IS_BETA" == "true" ]]; then
-            npm publish "$PWD/${packages[0]}" --ignore-scripts --access public --tag beta
+            tag=beta
           else
-            npm publish "$PWD/${packages[0]}" --ignore-scripts --access public --tag latest
+            tag=latest
           fi
+          node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag"
 
       - name: Verify npm package and dist-tags
         env:
