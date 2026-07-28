@@ -65,6 +65,7 @@ const state = vi.hoisted(() => ({
   },
   provisionError: undefined as unknown,
   reconcileWorktrees: vi.fn(),
+  daemonClientInstances: 0,
 }));
 
 const fakeStdin = vi.hoisted(() => ({
@@ -96,7 +97,14 @@ vi.mock("../../src/runtime-paths.js", async importOriginal => ({
   migrateLegacyHomeIfNeeded: vi.fn(), projectsDir: () => "/lcm/projects",
 }));
 vi.mock("../../src/daemon/client.js", () => ({
-  DaemonClient: class { post = state.post; get = state.get; health = state.health; },
+  DaemonClient: class {
+    post = state.post;
+    get = state.get;
+    health = state.health;
+    constructor() {
+      state.daemonClientInstances++;
+    }
+  },
 }));
 vi.mock("../../src/daemon/config.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/daemon/config.js")>()),
@@ -169,9 +177,10 @@ vi.mock("../../src/storage/postgresql/provisioning.js", () => ({
 }));
 
 const {
-  handleCliError, resolveCompactRequestPolicyOverride, runCli, runMainIfInvoked, shouldRunMain,
+  handleCliError, isDaemonTransportFailure, resolveCompactRequestPolicyOverride, runCli, runMainIfInvoked, shouldRunMain,
   withHookOverrides, writeCliError, writeCliOutput,
 } = await import("../../bin/lcm.js");
+const { batchCompact } = await import("../../src/batch-compact.js");
 
 async function invoke(args: string[]): Promise<Error | undefined> {
   try {
@@ -214,6 +223,7 @@ beforeEach(() => {
     current: ["0001_migration_ledger"],
   };
   state.provisionError = undefined;
+  state.daemonClientInstances = 0;
   state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/project"] };
 });
 
@@ -794,6 +804,7 @@ describe("runCli failure and alternate presentation branches", () => {
     state.post.mockRejectedValueOnce(new Error("promote failed"));
     expect(await invoke(["compact"])).toBeUndefined();
     expect(process.exitCode).toBe(1);
+    expect(state.ensureDaemon).toHaveBeenCalledTimes(1);
     process.exitCode = undefined;
     state.post.mockRejectedValueOnce("promote failed");
     expect(await invoke(["compact"])).toBeUndefined();
@@ -803,6 +814,92 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(await invoke(["promote", "--verbose"])).toBeUndefined();
     state.exportError = new Error("export failed");
     expect(await invoke(["export"])).toBeUndefined();
+  });
+
+  it("retries automatic promotion once after daemon transport recovery with a fresh client", async () => {
+    const transportError = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+    state.batchResult = {
+      compacted: 1,
+      unchanged: 0,
+      skipped: 0,
+      failures: 0,
+      compactedProjects: ["/project"],
+    };
+    state.post
+      .mockRejectedValueOnce(transportError)
+      .mockResolvedValueOnce({ processed: 2, promoted: 2 });
+
+    expect(await invoke(["compact"])).toBeUndefined();
+
+    expect(state.post).toHaveBeenNthCalledWith(1, "/promote", {
+      cwd: "/project",
+      dry_run: false,
+    });
+    expect(state.post).toHaveBeenNthCalledWith(2, "/promote", {
+      cwd: "/project",
+      dry_run: false,
+    });
+    expect(state.ensureDaemon).toHaveBeenCalledTimes(2);
+    expect(state.ensureDaemon).toHaveBeenNthCalledWith(2, {
+      port: 3737,
+      pidFilePath: "/lcm/daemon.pid",
+      spawnTimeoutMs: 10000,
+      expectedStorageBackend: "sqlite",
+      enforceUserManagerParent: true,
+    });
+    expect(state.daemonClientInstances).toBe(2);
+    expect(vi.mocked(batchCompact)).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("gives later projects an independent recovery after a retry still loses transport", async () => {
+    const reset = (): Error => Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+    state.batchResult = {
+      compacted: 2,
+      unchanged: 0,
+      skipped: 0,
+      failures: 0,
+      compactedProjects: ["/one", "/two"],
+    };
+    state.post
+      .mockRejectedValueOnce(reset())
+      .mockRejectedValueOnce(reset())
+      .mockRejectedValueOnce(reset())
+      .mockResolvedValueOnce({ processed: 1, promoted: 1 });
+
+    expect(await invoke(["compact", "--all"])).toBeUndefined();
+
+    expect(state.post).toHaveBeenCalledTimes(4);
+    expect(state.ensureDaemon).toHaveBeenCalledTimes(3);
+    expect(state.daemonClientInstances).toBe(3);
+    expect(vi.mocked(batchCompact)).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("does not retry when daemon recovery cannot reconnect", async () => {
+    state.post.mockRejectedValueOnce(Object.assign(new Error("refused"), { code: "ECONNREFUSED" }));
+    state.ensureDaemon
+      .mockResolvedValueOnce({ connected: true, spawned: false, restartedForParent: false, pid: 42 })
+      .mockResolvedValueOnce({ connected: false, spawned: false, restartedForParent: false, pid: undefined });
+
+    expect(await invoke(["compact"])).toBeUndefined();
+
+    expect(state.post).toHaveBeenCalledOnce();
+    expect(state.ensureDaemon).toHaveBeenCalledTimes(2);
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("recognizes only daemon transport failures, including nested causes", () => {
+    expect(isDaemonTransportFailure(Object.assign(new Error("refused"), { code: "econnrefused" }))).toBe(true);
+    expect(isDaemonTransportFailure(new Error("Daemon request timed out"))).toBe(true);
+    expect(isDaemonTransportFailure(new Error("outer", {
+      cause: Object.assign(new Error("broken pipe"), { code: "EPIPE" }),
+    }))).toBe(true);
+    expect(isDaemonTransportFailure(new Error("HTTP 503"))).toBe(false);
+    expect(isDaemonTransportFailure("socket hang up")).toBe(false);
+    const cycle = Object.assign(new Error("application failure"), { cause: undefined as unknown });
+    cycle.cause = cycle;
+    expect(isDaemonTransportFailure(cycle)).toBe(false);
   });
 
   it("reports portable import dry-run results and import failures", async () => {

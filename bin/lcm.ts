@@ -850,6 +850,35 @@ async function createDaemonClientOrExit(
   return new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
 }
 
+const DAEMON_TRANSPORT_ERROR_CODES = new Set([
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EPIPE",
+  "ETIMEDOUT",
+]);
+
+/** @internal Restrict automatic promotion retries to local daemon transport loss. */
+export function isDaemonTransportFailure(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    seen.add(current);
+    const candidate = current as { code?: unknown; message?: unknown; cause?: unknown };
+    if (
+      typeof candidate.code === "string"
+      && DAEMON_TRANSPORT_ERROR_CODES.has(candidate.code.toUpperCase())
+    ) {
+      return true;
+    }
+    if (candidate.message === "Daemon request timed out") return true;
+    current = candidate.cause;
+  }
+  return false;
+}
+
 /** @internal CLI entry seam; defaults preserve the published executable behavior. */
 export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
   migrateLegacyHomeIfNeeded();
@@ -1100,7 +1129,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         const minTokens = config.compaction.autoCompactMinTokens;
         const cwd = all ? undefined : process.cwd();
         const tokenPath = daemonTokenPath();
-        const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
+        let client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
 
         const { NinjaRenderer } = await import("../src/cli/pipeline-runner.js");
         const { makeProgressState } = await import("../src/cli/progress-state.js");
@@ -1134,10 +1163,23 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
               compactState.currentProject = promoteCwd;
               if (!isTTY || verbose) console.log(`  promoting: ${promoteCwd}...`);
               try {
-                const result = await client.post<{ processed: number; promoted: number }>("/promote", {
-                  cwd: promoteCwd,
-                  dry_run: dryRun,
-                });
+                const promotionBody = { cwd: promoteCwd, dry_run: dryRun };
+                let result: { processed: number; promoted: number };
+                try {
+                  result = await client.post("/promote", promotionBody);
+                } catch (error) {
+                  if (!isDaemonTransportFailure(error)) throw error;
+                  const recovery = await ensureDaemon({
+                    port,
+                    pidFilePath,
+                    spawnTimeoutMs: 10000,
+                    expectedStorageBackend: config.storage.backend,
+                    enforceUserManagerParent: true,
+                  });
+                  if (!recovery.connected) throw error;
+                  client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
+                  result = await client.post("/promote", promotionBody);
+                }
                 totalPromoted += result.promoted;
               } catch (error) {
                 promotionFailures++;

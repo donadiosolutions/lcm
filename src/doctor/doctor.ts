@@ -69,6 +69,7 @@ interface DoctorConfig {
 
 const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start";
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
+const DAEMON_HEALTH_DEADLINE_MS = 2000;
 
 type DoctorDaemonHealth = StagedPostgreSqlHealthResponse & {
   readonly status?: string;
@@ -78,12 +79,31 @@ async function readRecognizedDaemonHealth(
   fetchFn: typeof globalThis.fetch,
   port: number,
 ): Promise<DoctorDaemonHealth | null> {
-  const res = await fetchFn(`http://127.0.0.1:${port}/health`);
-  const health = await res.json() as DoctorDaemonHealth;
-  return (res.ok && health.status === "ok")
-    || isStagedPostgreSqlHealth(res.status, health)
-    ? health
-    : null;
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      controller.abort();
+      reject(new Error("Daemon health check timed out"));
+    }, DAEMON_HEALTH_DEADLINE_MS);
+  });
+  try {
+    return await Promise.race([
+      (async () => {
+        const res = await fetchFn(`http://127.0.0.1:${port}/health`, {
+          signal: controller.signal,
+        });
+        const health = await res.json() as DoctorDaemonHealth;
+        return (res.ok && health.status === "ok")
+          || isStagedPostgreSqlHealth(res.status, health)
+          ? health
+          : null;
+      })(),
+      deadline,
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
 }
 
 export interface DoctorRunOptions {
