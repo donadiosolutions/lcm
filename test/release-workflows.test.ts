@@ -426,7 +426,7 @@ describe("release workflows", () => {
     expect(publish?.run).toContain("mapfile -d '' -t packages");
     expect(publish?.run).toContain("find release-artifact -type f -name '*.tgz' -print0");
     expect(publish?.run).toContain('"${#packages[@]}" -ne 1');
-    expect(publish?.run).toContain('npm publish "${packages[0]}"');
+    expect(publish?.run).toContain('npm publish "$PWD/${packages[0]}"');
 
     const recoveryPreflight = publishWorkflow.jobs["recover-preflight"];
     const recoveryPublish = publishWorkflow.jobs["recover-publish"];
@@ -517,6 +517,7 @@ describe("release workflows", () => {
       "needs.recover-preflight.outputs.already_published != 'true'",
     );
     expect(recoveryPublishStep?.if).toContain("steps.npm.outputs.already_published != 'true'");
+    expect(recoveryPublishStep?.run).toContain('npm publish "$PWD/${packages[0]}"');
   });
 
   it("documents immutable published-release recovery without weakening the trust boundary", () => {
