@@ -48,6 +48,8 @@ concurrency:
       github.event_name == 'workflow_run' &&
         format('workflow-run-{0}', github.run_id) ||
       github.event_name == 'check_run' &&
+        github.event.check_run.check_suite.head_branch != null &&
+        github.event.check_run.check_suite.head_branch != '' &&
         !startsWith(github.event.check_run.check_suite.head_branch, 'gh-readonly-queue/') &&
         ((github.event.check_run.name == 'Greptile Review' && github.event.check_run.app.id == 867647 &&
           github.event.check_run.app.slug == 'greptile-apps') ||
@@ -76,6 +78,8 @@ jobs:
         github.event.workflow_run.path == '.github/workflows/ci.yml' &&
         github.event.workflow_run.repository.full_name == github.repository) ||
       (github.event_name == 'check_run' &&
+        github.event.check_run.check_suite.head_branch != null &&
+        github.event.check_run.check_suite.head_branch != '' &&
         !startsWith(github.event.check_run.check_suite.head_branch, 'gh-readonly-queue/') &&
         ((github.event.check_run.name == 'Greptile Review' && github.event.check_run.app.id == 867647 &&
           github.event.check_run.app.slug == 'greptile-apps') ||
