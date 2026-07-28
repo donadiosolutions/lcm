@@ -342,17 +342,24 @@ jobs:
               }
               return match?.[1];
             };
-            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+            const releaseRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
               ...context.repo,
               workflow_id: "publish.yml",
               event: "release",
               status: "completed",
               per_page: 100,
             });
-            const failedRuns = runs
+            const recoveryRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              ...context.repo,
+              workflow_id: "publish.yml",
+              event: "workflow_dispatch",
+              status: "completed",
+              per_page: 100,
+            });
+            const failedRuns = releaseRuns
               .filter((run) => run.id < currentRunId && run.conclusion !== "success")
               .map((run) => ({ ...run, releaseTag: storedTag(run, true) }));
-            const successfulRuns = runs
+            const successfulRuns = [...releaseRuns, ...recoveryRuns]
               .filter((run) => run.id < currentRunId && run.conclusion === "success")
               .flatMap((run) => {
                 const releaseTag = storedTag(run, false);
@@ -706,6 +713,7 @@ jobs:
       actions: read
       contents: read
     outputs:
+      already_published: ${{ steps.npm.outputs.already_published }}
       artifact_name: ${{ steps.artifact.outputs.name }}
       commit: ${{ steps.tag.outputs.commit }}
       is_beta: ${{ steps.tag.outputs.is_beta }}
@@ -774,10 +782,93 @@ jobs:
             core.setOutput("tag", tag);
             core.setOutput("version", tag.slice(1));
 
+      - name: Enforce earlier publication success
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        with:
+          script: |
+            const currentRunId = Number(context.runId);
+            if (!Number.isSafeInteger(currentRunId)) {
+              throw new Error(`Invalid workflow run id ${context.runId}`);
+            }
+            const currentTag = process.env.RELEASE_TAG;
+            const canonicalTagPattern = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*))?$/;
+            const storedRunNamePattern = new RegExp(`^release-tag:(${canonicalTagPattern.source.slice(1, -1)})$`);
+            if (!canonicalTagPattern.test(currentTag)) {
+              throw new Error(`Current recovery request has unsupported tag ${currentTag}`);
+            }
+            const storedTag = (run, required) => {
+              const match = storedRunNamePattern.exec(run.display_title ?? "");
+              if (!match && required) {
+                throw new Error(
+                  `Failed release run ${run.id} has no canonical tag in its stored run name`,
+                );
+              }
+              return match?.[1];
+            };
+            const releaseRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              ...context.repo,
+              workflow_id: "publish.yml",
+              event: "release",
+              status: "completed",
+              per_page: 100,
+            });
+            const recoveryRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              ...context.repo,
+              workflow_id: "publish.yml",
+              event: "workflow_dispatch",
+              status: "completed",
+              per_page: 100,
+            });
+            const failedRuns = releaseRuns
+              .filter((run) => run.id < currentRunId && run.conclusion !== "success")
+              .map((run) => ({ ...run, releaseTag: storedTag(run, true) }));
+            const successfulRuns = [...releaseRuns, ...recoveryRuns]
+              .filter((run) => run.id < currentRunId && run.conclusion === "success")
+              .flatMap((run) => {
+                const releaseTag = storedTag(run, false);
+                return releaseTag ? [{ ...run, releaseTag }] : [];
+              });
+            const blockingFailures = [];
+            for (const run of failedRuns) {
+              if (run.releaseTag === currentTag) {
+                core.warning(`Ignoring failed earlier attempt ${run.id} for recovery tag ${currentTag}`);
+                continue;
+              }
+              const supersedingRun = successfulRuns.find(
+                (candidate) => candidate.releaseTag === run.releaseTag && candidate.id > run.id,
+              );
+              if (supersedingRun) {
+                core.warning(
+                  `Ignoring failed release run ${run.id}; later run ${supersedingRun.id} succeeded for ${run.releaseTag}`,
+                );
+                continue;
+              }
+              try {
+                const { data: release } = await github.rest.repos.getReleaseByTag({
+                  ...context.repo,
+                  tag: run.releaseTag,
+                });
+                if (release.draft) {
+                  core.warning(`Ignoring withdrawn draft from failed release run ${run.id}`);
+                  continue;
+                }
+              } catch (error) {
+                core.warning(`Could not prove failed release run ${run.id} was withdrawn: ${error.message}`);
+              }
+              blockingFailures.push(run);
+            }
+            if (blockingFailures.length > 0) {
+              throw new Error(
+                `Earlier release runs for other tags failed and must be rerun successfully or withdrawn to draft: ${blockingFailures.map((run) => `${run.id} (${run.releaseTag}/${run.conclusion})`).join(", ")}`,
+              );
+            }
+
       - name: Checkout trusted recovery tools
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.workflow_sha }}
           path: trusted
           persist-credentials: false
           sparse-checkout: .github/scripts
@@ -797,9 +888,10 @@ jobs:
           registry-url: https://registry.npmjs.org/
 
       - name: Check npm release ordering
+        id: npm
         env:
           RELEASE_VERSION: ${{ steps.tag.outputs.version }}
-        run: node ../trusted/.github/scripts/check-npm-release-state.mjs "$RELEASE_VERSION"
+        run: node ../trusted/.github/scripts/check-npm-release-state.mjs "$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Validate tagged package
         env:
@@ -831,9 +923,11 @@ jobs:
           fi
 
       - name: Install dependencies
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
         run: npm ci
 
       - name: Verify trusted publishing prerequisites
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
         run: |
           node --version
           npm --version
@@ -854,27 +948,34 @@ jobs:
           NODE
 
       - name: Type-check
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
         run: npm run typecheck
 
       - name: Run complete coverage suite
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
         run: npm run test:ci
 
       - name: Build
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
         run: npm run build
 
       - name: Verify build leaves tracked sources unchanged
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
         run: git diff --exit-code
 
       - name: Pack verified npm artifact
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
         run: |
           mkdir -p release-artifact
           npm pack --ignore-scripts --pack-destination release-artifact
 
       - name: Name verified npm artifact
         id: artifact
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
         run: printf 'name=npm-recovery-%s-%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Upload verified npm artifact
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.artifact.outputs.name }}
@@ -882,6 +983,12 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
+
+      - name: Verify existing npm package and dist-tags
+        if: ${{ steps.npm.outputs.already_published == 'true' }}
+        env:
+          RELEASE_VERSION: ${{ steps.tag.outputs.version }}
+        run: node ../trusted/.github/scripts/verify-npm-release.mjs "$RELEASE_VERSION"
 
   recover-publish:
     if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -896,7 +1003,7 @@ jobs:
       - name: Checkout trusted recovery tools
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.workflow_sha }}
           path: trusted
           persist-credentials: false
           sparse-checkout: .github/scripts
@@ -906,12 +1013,6 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org/
-
-      - name: Download verified npm artifact
-        env:
-          ARTIFACT_NAME: ${{ needs.recover-preflight.outputs.artifact_name }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir release-artifact
 
       - name: Revalidate signed release tag
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -953,8 +1054,15 @@ jobs:
           RELEASE_VERSION: ${{ needs.recover-preflight.outputs.version }}
         run: node trusted/.github/scripts/check-npm-release-state.mjs "$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Download verified npm artifact
+        if: ${{ needs.recover-preflight.outputs.already_published != 'true' && steps.npm.outputs.already_published != 'true' }}
+        env:
+          ARTIFACT_NAME: ${{ needs.recover-preflight.outputs.artifact_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir release-artifact
+
       - name: Publish to npm
-        if: ${{ steps.npm.outputs.already_published != 'true' }}
+        if: ${{ needs.recover-preflight.outputs.already_published != 'true' && steps.npm.outputs.already_published != 'true' }}
         env:
           IS_BETA: ${{ needs.recover-preflight.outputs.is_beta }}
         run: |

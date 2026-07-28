@@ -61,6 +61,7 @@ interface PublishWorkflow {
 
 const versionSource = readFileSync(new URL("../.github/workflows/version-pr.yml", import.meta.url), "utf8");
 const publishSource = readFileSync(new URL("../.github/workflows/publish.yml", import.meta.url), "utf8");
+const releasingSource = readFileSync(new URL("../RELEASING.md", import.meta.url), "utf8");
 const releaseTagPolicySource = readFileSync(
   new URL("../.github/scripts/release-tag-policy.mjs", import.meta.url),
   "utf8",
@@ -221,7 +222,14 @@ describe("release workflows", () => {
     );
     expect(publicationQueue?.with?.script).toContain('workflow_id: "publish.yml"');
     expect(publicationQueue?.with?.script).toContain('event: "release"');
+    expect(publicationQueue?.with?.script).toContain('event: "workflow_dispatch"');
     expect(publicationQueue?.with?.script).toContain('status: "completed"');
+    expect(publicationQueue?.with?.script).toContain(
+      "const failedRuns = releaseRuns",
+    );
+    expect(publicationQueue?.with?.script).toContain(
+      "const successfulRuns = [...releaseRuns, ...recoveryRuns]",
+    );
     expect(publicationQueue?.with?.script).toContain("run.conclusion !== \"success\"");
     expect(publicationQueue?.with?.script).toContain('run.conclusion === "success"');
     expect(publicationQueue?.with?.script).toContain("run.display_title");
@@ -438,15 +446,89 @@ describe("release workflows", () => {
     expect(
       recoveryPublish.steps.find((step) => step.name === "Checkout trusted recovery tools")?.with
         ?.ref,
-    ).toBe("${{ github.sha }}");
+    ).toBe("${{ github.workflow_sha }}");
+    expect(
+      recoveryPreflight.steps.find((step) => step.name === "Checkout trusted recovery tools")?.with
+        ?.ref,
+    ).toBe("${{ github.workflow_sha }}");
+    const recoveryHistory = recoveryPreflight.steps.find(
+      (step) => step.name === "Enforce earlier publication success",
+    );
+    expect(recoveryHistory?.with?.script).toContain('event: "release"');
+    expect(recoveryHistory?.with?.script).toContain('event: "workflow_dispatch"');
+    expect(recoveryHistory?.with?.script).toContain("const failedRuns = releaseRuns");
+    expect(recoveryHistory?.with?.script).toContain(
+      "const successfulRuns = [...releaseRuns, ...recoveryRuns]",
+    );
+    expect(recoveryHistory?.with?.script).toContain("run.releaseTag === currentTag");
+    expect(recoveryHistory?.with?.script).toContain("for recovery tag");
     expect(recoveryPreflight.outputs?.artifact_name).toBe("${{ steps.artifact.outputs.name }}");
-    expect(
-      recoveryPublish.steps.find((step) => step.name === "Download verified npm artifact")?.env
-        ?.ARTIFACT_NAME,
-    ).toBe("${{ needs.recover-preflight.outputs.artifact_name }}");
-    expect(
-      recoveryPublish.steps.find((step) => step.name === "Publish to npm")?.if,
-    ).toContain("steps.npm.outputs.already_published != 'true'");
+    expect(recoveryPreflight.outputs?.already_published).toBe(
+      "${{ steps.npm.outputs.already_published }}",
+    );
+    const recoveryNpmState = recoveryPreflight.steps.find(
+      (step) => step.name === "Check npm release ordering",
+    );
+    expect(recoveryNpmState?.id).toBe("npm");
+    expect(recoveryNpmState?.run).toContain('>> "$GITHUB_OUTPUT"');
+    const recoveryBuildSteps = [
+      "Install dependencies",
+      "Verify trusted publishing prerequisites",
+      "Type-check",
+      "Run complete coverage suite",
+      "Build",
+      "Verify build leaves tracked sources unchanged",
+      "Pack verified npm artifact",
+      "Name verified npm artifact",
+      "Upload verified npm artifact",
+    ];
+    for (const name of recoveryBuildSteps) {
+      expect(recoveryPreflight.steps.find((step) => step.name === name)?.if).toBe(
+        "${{ steps.npm.outputs.already_published != 'true' }}",
+      );
+    }
+    const existingNpmVerification = recoveryPreflight.steps.find(
+      (step) => step.name === "Verify existing npm package and dist-tags",
+    );
+    expect(existingNpmVerification?.if).toBe(
+      "${{ steps.npm.outputs.already_published == 'true' }}",
+    );
+    expect(existingNpmVerification?.run).toContain("verify-npm-release.mjs");
+    const recoveryNpmGuardIndex = recoveryPublish.steps.findIndex(
+      (step) => step.name === "Recheck npm release ordering",
+    );
+    const recoveryDownloadIndex = recoveryPublish.steps.findIndex(
+      (step) => step.name === "Download verified npm artifact",
+    );
+    expect(recoveryNpmGuardIndex).toBeGreaterThanOrEqual(0);
+    expect(recoveryNpmGuardIndex).toBeLessThan(recoveryDownloadIndex);
+    const recoveryDownload = recoveryPublish.steps[recoveryDownloadIndex];
+    expect(recoveryDownload?.if).toContain(
+      "needs.recover-preflight.outputs.already_published != 'true'",
+    );
+    expect(recoveryDownload?.if).toContain("steps.npm.outputs.already_published != 'true'");
+    expect(recoveryDownload?.env?.ARTIFACT_NAME).toBe(
+      "${{ needs.recover-preflight.outputs.artifact_name }}",
+    );
+    const recoveryPublishStep = recoveryPublish.steps.find(
+      (step) => step.name === "Publish to npm",
+    );
+    expect(recoveryPublishStep?.if).toContain(
+      "needs.recover-preflight.outputs.already_published != 'true'",
+    );
+    expect(recoveryPublishStep?.if).toContain("steps.npm.outputs.already_published != 'true'");
+  });
+
+  it("documents immutable published-release recovery without weakening the trust boundary", () => {
+    expect(releasingSource).toContain("Use the manual immutable-release recovery path only");
+    expect(releasingSource).toContain("gh workflow run publish.yml");
+    expect(releasingSource).toContain("--ref main");
+    expect(releasingSource).toContain("-f tag=v1.4.2");
+    expect(releasingSource).toContain("protected commit that defines the workflow");
+    expect(releasingSource).toContain("checks out or executes tagged package code");
+    expect(releasingSource).toContain("Recovery is idempotent");
+    expect(releasingSource).toContain("without rebuilding, repacking, downloading");
+    expect(releasingSource).toContain("does not create, edit, withdraw, replace, or delete");
   });
 
   it("binds the draft marker to the exact release tag", () => {

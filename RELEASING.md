@@ -160,12 +160,54 @@ Recommended external setup:
 
 When configuring npm trusted publishing, register the GitHub workflow using the exact workflow filename in this repo: `.github/workflows/publish.yml`.
 
-For recovery, rerun a failed tag-triggered draft run with its original event
-payload. When publication preflight or the publish job restores a release to
-draft, fix the failure and manually publish the draft again; an earlier failed
-release run for another tag must either be followed by a successful run for that
-tag or remain withdrawn as a draft before later releases proceed. An earlier
-failed attempt for the same tag is treated as the history of that republished
-draft and does not block its retry. If npm publication itself may have started,
-inspect npm and the workflow run before changing GitHub state. There is no manual
-dispatch path that can bypass the GitHub draft-to-published transition.
+For an ordinary failed publication, rerun the failed release-event workflow with
+its original event payload. When publication preflight or the publish job
+restores a release to draft, fix the failure and manually publish the draft
+again. An earlier failed release run for another tag must either be followed by
+a successful release or recovery run for that tag, or remain withdrawn as a
+draft before later releases proceed. An earlier failed attempt for the same tag
+does not block its retry.
+
+Use the manual immutable-release recovery path only when all of these conditions
+hold:
+
+- the protected workflow-created GitHub Release is already public and immutable,
+  so the workflow cannot restore it to draft;
+- the canonical signed annotated tag still targets the release commit, that
+  commit is reachable from `main`, the package version and changelog match, and
+  the release retains its protected draft marker and Highlights;
+- npm trusted publishing for the `npm-publish` environment is configured, and
+  the requested npm version is either absent or already published with the
+  expected package version and channel-safe dist-tags; and
+- every failed publication for an earlier, different public tag has been
+  recovered successfully or its release has been withdrawn to draft.
+
+Dispatch the workflow from protected `main`, never another ref:
+
+```bash
+gh workflow run publish.yml \
+  --repo donadiosolutions/lcm \
+  --ref main \
+  -f tag=v1.4.2
+```
+
+The read-only recovery preflight checks out trusted helpers from the exact
+protected commit that defines the workflow and checks out the verified tag in a
+separate directory. It builds, tests, and packs that tag before uploading a
+short-lived artifact. The `npm-publish` job receives OIDC permission but never
+checks out or executes tagged package code; it revalidates the tag and npm
+ordering before downloading and publishing the artifact.
+
+Recovery is idempotent. If npm already contains the version, both jobs verify
+the published package and dist-tags without rebuilding, repacking, downloading,
+or republishing it. A successful recovery run supersedes the earlier failed
+release run for that same canonical tag in future publication-history checks.
+Failed recovery runs do not create blockers for unrelated tags, although the
+original unresolved release failure continues to block them.
+
+The recovery path does not create, edit, withdraw, replace, or delete the GitHub
+Release or tag, and it cannot bypass the initial protected
+draft-to-published transition. Any identity, ancestry, history, ordering,
+artifact, or npm-verification failure stops without mutating those immutable
+objects. Inspect npm and the workflow run before retrying; after fixing the
+trusted workflow on `main`, invoke the same command again.
