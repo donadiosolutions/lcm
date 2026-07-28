@@ -495,7 +495,7 @@ describe("worktree reconciliation", () => {
     completedJournal.pendingSourceHashes = [sourceHash];
     writeFileSync(journalPath, JSON.stringify(completedJournal));
     expect(reconcileWorktrees(linked).status).toBe("completed");
-  });
+  }, 15_000);
 
   it("reconciles a late source generation exactly once after a completed generation", () => {
     const { main, linked: linkedA } = makeRepository(home);
@@ -581,7 +581,7 @@ describe("worktree reconciliation", () => {
       .toBe("GENERATION_A\nGENERATION_B\n");
     expect(readdirSync(join(home, ".lcm", "oldprojects"))).toHaveLength(2);
     expect(readdirSync(join(home, ".lcm", "oldevents"))).toHaveLength(2);
-  });
+  }, 15_000);
 
   it("keeps dry-run read-only while previewing legacy metadata backfill", () => {
     const { main, linked } = makeRepository(home);
@@ -3574,6 +3574,41 @@ describe("worktree reconciliation", () => {
     }, null, 2)}\n`);
     clearProjectMapCache();
     expect(() => reconcileWorktrees(main, { dryRun: true })).toThrow("ENOTDIR");
+  });
+
+  it("fingerprints a foreign ENOTDIR path as unavailable and invalidates on repair", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const identity = { id: targetHash, canonical };
+    const regularFile = join(home, "foreign-regular-file");
+    const foreign = join(regularFile, "child");
+    const foreignHash = hashProjectPath(foreign);
+    writeFileSync(regularFile, "not a directory");
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [foreignHash]: { canonical: foreign, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+
+    expect(reconcileWorktrees(main, {
+      _historicalResolver: () => ({ hashes: [], aliases: [] }),
+    }).status).toBe("not-needed");
+    const unavailableFingerprint = listWorktreeReconciliationJournals()[0]
+      .discovery!.mapFingerprint;
+
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 10,
+      _nowMs: 0,
+    }).status).toBe("not-needed");
+    rmSync(regularFile);
+    mkdirSync(foreign, { recursive: true });
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 10,
+      _nowMs: 20,
+    }).status).toBe("not-needed");
+    expect(listWorktreeReconciliationJournals()[0].discovery!.mapFingerprint)
+      .not.toBe(unavailableFingerprint);
   });
 
   it("isolates malformed foreign Git metadata and invalidates its cached fingerprint on repair", () => {

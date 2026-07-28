@@ -89,7 +89,13 @@ describe("Flow 11: MCP transport", { timeout: 60_000 }, () => {
 describe("Flow 12: Doctor", { timeout: 60_000 }, () => {
   it("doctor reports results with non-empty text", async () => {
     const { runDoctor, formatResultsPlain } = await import("../../../src/doctor/doctor.js");
-    const results = await runDoctor();
+    const results = await runDoctor({
+      fetch: vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: async () => ({ status: "unavailable" }),
+      }) as typeof fetch,
+    });
     expect(results).toBeDefined();
     expect(Array.isArray(results)).toBe(true);
     const text = formatResultsPlain(results);

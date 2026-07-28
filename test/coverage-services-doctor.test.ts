@@ -746,7 +746,10 @@ describe("doctor service coverage", () => {
       fixApplied: false,
       message: expect.stringContaining("automatic start skipped because config is invalid"),
     });
-    expect(deps.fetch).toHaveBeenCalledWith(`http://127.0.0.1:${expectedPort}/health`);
+    expect(deps.fetch).toHaveBeenCalledWith(
+      `http://127.0.0.1:${expectedPort}/health`,
+      { signal: expect.any(AbortSignal) },
+    );
     expect(mocks.ensureDaemon).not.toHaveBeenCalled();
   });
 

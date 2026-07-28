@@ -293,7 +293,10 @@ function fingerprint(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
-function mappedPathObservation(path: string): readonly string[] {
+function mappedPathObservation(
+  path: string,
+  tolerateUnavailableParent: boolean,
+): readonly string[] {
   const normalized = resolve(path);
   try {
     const stat = lstatSync(normalized);
@@ -309,14 +312,21 @@ function mappedPathObservation(path: string): readonly string[] {
       ? [normalized, "git", anchor.commonDir, anchor.canonical]
       : [normalized, "directory"];
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
       return [normalized, "missing"];
+    }
+    if (tolerateUnavailableParent && code === "ENOTDIR") {
+      return [normalized, "unavailable", code];
     }
     throw error;
   }
 }
 
-function mapFingerprint(map: Record<string, ProjectMapEntry>): string {
+function mapFingerprint(
+  map: Record<string, ProjectMapEntry>,
+  targetHash: string,
+): string {
   return fingerprint(
     Object.entries(map)
       .sort(([left], [right]) => left.localeCompare(right))
@@ -326,7 +336,7 @@ function mapFingerprint(map: Record<string, ProjectMapEntry>): string {
         [...entry.aliases].map((alias) => resolve(alias)).sort(),
         entry.remoteProjectId ?? null,
         [entry.canonical, ...entry.aliases]
-          .map(mappedPathObservation)
+          .map((path) => mappedPathObservation(path, hash !== targetHash))
           .sort(([left], [right]) => left.localeCompare(right)),
       ]),
   );
@@ -381,13 +391,14 @@ function codexCatalogueFingerprint(
 
 function reconciliationDiscovery(
   map: Record<string, ProjectMapEntry>,
+  targetHash: string,
   codexDir?: string,
   maxEntries?: number,
   observer?: (path: string) => void,
 ): ReconciliationDiscovery {
   const codex = codexCatalogueFingerprint(codexDir, maxEntries, observer);
   return {
-    mapFingerprint: mapFingerprint(map),
+    mapFingerprint: mapFingerprint(map, targetHash),
     codexFingerprint: codex.fingerprint,
     complete: codex.complete,
   };
@@ -1539,6 +1550,7 @@ export function reconcileWorktrees(
         fastJournal.discovery,
         reconciliationDiscovery(
           fastMap,
+          targetHash,
           opts._codexDir,
           opts._maxDiscoveryEntries,
           opts._discoveryObserver,
@@ -1559,6 +1571,7 @@ export function reconcileWorktrees(
     }
     const discovery = reconciliationDiscovery(
       map,
+      targetHash,
       opts._codexDir,
       opts._maxDiscoveryEntries,
       opts._discoveryObserver,
@@ -1823,6 +1836,7 @@ export function reconcileWorktrees(
       journal.phase = "completed";
       const publishedMapDiscovery = reconciliationDiscovery(
         listProjectMapEntries(opts.homeDir),
+        targetHash,
         opts._codexDir,
         opts._maxDiscoveryEntries,
         opts._discoveryObserver,
@@ -1962,6 +1976,7 @@ export function ensureWorktreeProjectReconciled(
   if (identity) {
     const before = reconciliationDiscovery(
       listProjectMapEntries(),
+      project.id,
       opts._codexDir,
       opts._maxDiscoveryEntries,
       opts._discoveryObserver,
@@ -2001,6 +2016,7 @@ export function ensureWorktreeProjectReconciled(
     ? readJournal(result.journalPath)?.discovery
     : reconciliationDiscovery(
         listProjectMapEntries(),
+        result.targetHash,
         opts._codexDir,
         opts._maxDiscoveryEntries,
         opts._discoveryObserver,

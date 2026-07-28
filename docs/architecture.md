@@ -443,9 +443,13 @@ retain legacy success semantics, so a successful no-op response may still
 trigger promotion for that project. Replay mode also admits conversations with
 no leaf work outside the fresh tail when their existing in-context summaries
 meet the manual condensation fanout and token thresholds. If an automatic
-promotion request fails after compaction, the command identifies the affected
-project and exits with status 1 so automation does not mistake the partial run
-for complete success.
+promotion request loses the local daemon transport after compaction, the
+command runs the existing managed-daemon recovery contract, creates a fresh
+client, and retries that project's promotion once. Application errors are not
+retried, compaction is not replayed, and later projects retain independent
+recovery opportunities. If promotion still fails, the command identifies the
+affected project and exits with status 1 so automation does not mistake the
+partial run for complete success.
 
 **Budget-targeted (`compactUntilUnder`):**
 - Runs up to `maxRounds` (default 10) of full sweeps

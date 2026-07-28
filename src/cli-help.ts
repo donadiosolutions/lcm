@@ -98,7 +98,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm doctor --verbose", "Include per-sidecar passive-learning diagnostics"],
       ["lcm doctor --events-max-dbs all", "Remove the passive-learning sidecar scan count limit"],
     ],
-    notes: "Exits with code 1 if any check fails. Integrate into CI or shell startup for early detection.",
+    notes: "The complete daemon health request, including JSON parsing, is limited to two seconds. Exits with code 1 if any check fails. Integrate into CI or shell startup for early detection.",
   },
 
   machine: {
@@ -244,7 +244,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm compact --timeout-ms 300000", "Allow a longer OpenAI or process-provider request"],
       ["lcm compact --retry-max-attempts 4", "Temporarily retry an OpenAI-compatible request"],
     ],
-    notes: "When invoked via the PreCompact hook (piped stdin), runs automatically during Claude Code context compaction. After a successful compact, promote runs automatically to surface new insights to long-term memory. --reasoning-effort overrides llm.reasoningEffort for this invocation without rewriting ~/.lcm/config.json. Supported values are OpenAI Responses: none, minimal, low, medium, high, xhigh; Claude process: low, medium, high, xhigh, max; Codex process: minimal, low, medium, high, xhigh. Stored llm.provider=auto configuration accepts the shared low, medium, high, and xhigh values; invocation overrides under auto validate against the actual resolved process provider. --fast-mode and --no-fast-mode override llm.fastMode for one auto or process-provider invocation without rewriting the file. --timeout-ms overrides JSON for OpenAI, auto, and process providers without rewriting it. Retry flags remain OpenAI-compatible-only.",
+    notes: "When invoked via the PreCompact hook (piped stdin), runs automatically during Claude Code context compaction. After a successful compact, promote runs automatically to surface new insights to long-term memory. If promotion loses the local daemon transport, LCM recovers the managed daemon and retries that project once with a fresh client; application errors are not retried, and compaction is never replayed. --reasoning-effort overrides llm.reasoningEffort for this invocation without rewriting ~/.lcm/config.json. Supported values are OpenAI Responses: none, minimal, low, medium, high, xhigh; Claude process: low, medium, high, xhigh, max; Codex process: minimal, low, medium, high, xhigh. Stored llm.provider=auto configuration accepts the shared low, medium, high, and xhigh values; invocation overrides under auto validate against the actual resolved process provider. --fast-mode and --no-fast-mode override llm.fastMode for one auto or process-provider invocation without rewriting the file. --timeout-ms overrides JSON for OpenAI, auto, and process providers without rewriting it. Retry flags remain OpenAI-compatible-only.",
   },
 
   import: {

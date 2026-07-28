@@ -30,6 +30,7 @@ import {
 import type { ProgressState } from "../src/cli/progress-state.js";
 import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
+import { isDaemonTransportFailure } from "../src/daemon/http-url.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -1100,7 +1101,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         const minTokens = config.compaction.autoCompactMinTokens;
         const cwd = all ? undefined : process.cwd();
         const tokenPath = daemonTokenPath();
-        const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
+        let client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
 
         const { NinjaRenderer } = await import("../src/cli/pipeline-runner.js");
         const { makeProgressState } = await import("../src/cli/progress-state.js");
@@ -1134,10 +1135,23 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
               compactState.currentProject = promoteCwd;
               if (!isTTY || verbose) console.log(`  promoting: ${promoteCwd}...`);
               try {
-                const result = await client.post<{ processed: number; promoted: number }>("/promote", {
-                  cwd: promoteCwd,
-                  dry_run: dryRun,
-                });
+                const promotionBody = { cwd: promoteCwd, dry_run: dryRun };
+                let result: { processed: number; promoted: number };
+                try {
+                  result = await client.post("/promote", promotionBody);
+                } catch (error) {
+                  if (!isDaemonTransportFailure(error)) throw error;
+                  const recovery = await ensureDaemon({
+                    port,
+                    pidFilePath,
+                    spawnTimeoutMs: 10000,
+                    expectedStorageBackend: config.storage.backend,
+                    enforceUserManagerParent: true,
+                  });
+                  if (!recovery.connected) throw error;
+                  client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
+                  result = await client.post("/promote", promotionBody);
+                }
                 totalPromoted += result.promoted;
               } catch (error) {
                 promotionFailures++;
