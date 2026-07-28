@@ -1,5 +1,14 @@
 # @donadiosolutions/lcm
 
+## 1.4.2
+
+### Patch Changes
+
+- Update js-yaml, the MCP SDK and Hono server, body-parser, fast-uri, and
+  brace-expansion to patched versions; exact-pin the direct dependency
+  contract so consumer installations cannot retain the vulnerable runtime
+  dependency paths.
+
 ## 1.4.1
 
 ### Patch Changes
