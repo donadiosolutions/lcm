@@ -8,6 +8,8 @@
   brace-expansion to patched versions; exact-pin the direct dependency
   contract so consumer installations cannot retain the vulnerable runtime
   dependency paths.
+- Preserve the security maintenance release ancestry in the protected main
+  branch before publishing the signed patch tag.
 
 ## 1.4.1
 
