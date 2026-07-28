@@ -8,58 +8,61 @@ import { checkMergeQueuePolicy } from "./check-merge-queue-policy.mjs";
 import { assertMergeQueueUsesMerge } from "./merge-queue-policy.mjs";
 import { publishNpmTarball } from "./publish-npm-tarball.mjs";
 
-const queueRuleset = (mergeMethod = "MERGE", overrides = {}) => ({
-  target: "branch",
-  enforcement: "active",
-  rules: [{ type: "merge_queue", parameters: { merge_method: mergeMethod } }],
+const appliedQueueRule = (mergeMethod = "MERGE", overrides = {}) => ({
+  type: "merge_queue",
+  parameters: { merge_method: mergeMethod },
+  ruleset_id: 42,
   ...overrides,
 });
 
-test("requires every dynamically discovered active branch queue to use MERGE", () => {
+test("requires every queue applied to the authoritative default branch to use MERGE", () => {
   assert.deepEqual(
     assertMergeQueueUsesMerge([
-      queueRuleset(),
-      queueRuleset("SQUASH", { enforcement: "disabled" }),
-      queueRuleset("SQUASH", { target: "tag" }),
+      appliedQueueRule(),
+      { type: "required_signatures", ruleset_id: 42 },
     ]),
     { queueCount: 1 },
   );
-  assert.throws(() => assertMergeQueueUsesMerge([]), /No active branch merge-queue/u);
+  assert.throws(() => assertMergeQueueUsesMerge([]), /No merge-queue rule applies/u);
   assert.throws(
-    () => assertMergeQueueUsesMerge([queueRuleset("SQUASH")]),
-    /must use the MERGE method/u,
+    () => assertMergeQueueUsesMerge([appliedQueueRule("SQUASH")]),
+    /default branch must use MERGE/u,
   );
   assert.throws(
-    () => assertMergeQueueUsesMerge([{ target: "branch", enforcement: "active" }]),
-    /did not include its rules/u,
+    () => assertMergeQueueUsesMerge([null]),
+    /response was malformed/u,
   );
   assert.throws(() => assertMergeQueueUsesMerge(null), /must be an array/u);
 });
 
-test("paginates ruleset discovery and fetches active branch details by returned id", () => {
+test("paginates ruleset inventory and validates only rules applied to the default branch", () => {
   const calls = [];
   const request = (args) => {
     calls.push(args);
     const endpoint = args.at(-1);
+    if (endpoint === "repos/donadiosolutions/lcm") {
+      return { default_branch: "main" };
+    }
     if (endpoint.includes("?includes_parents")) {
       return [
         [
           { id: 42, target: "branch", enforcement: "active", name: "renamable" },
+          { id: 99, target: "branch", enforcement: "active", name: "unrelated squash queue" },
           { id: 44, target: "tag", enforcement: "active" },
         ],
         [{ id: 43, target: "branch", enforcement: "disabled" }],
       ];
     }
-    assert.equal(endpoint, "repos/donadiosolutions/lcm/rulesets/42");
-    return queueRuleset();
+    assert.equal(endpoint, "repos/donadiosolutions/lcm/rules/branches/main");
+    return [appliedQueueRule()];
   };
   assert.deepEqual(
     checkMergeQueuePolicy({ repository: "donadiosolutions/lcm", request }),
     { queueCount: 1 },
   );
-  assert.ok(calls[0].includes("--paginate"));
-  assert.ok(calls[0].includes("--slurp"));
-  assert.equal(calls.length, 2);
+  assert.ok(calls[1].includes("--paginate"));
+  assert.ok(calls[1].includes("--slurp"));
+  assert.equal(calls.length, 3);
 
   assert.throws(
     () => checkMergeQueuePolicy({ repository: "not a repo", request }),
@@ -69,7 +72,10 @@ test("paginates ruleset discovery and fetches active branch details by returned 
     () =>
       checkMergeQueuePolicy({
         repository: "donadiosolutions/lcm",
-        request: () => ({ bad: true }),
+        request: (args) =>
+          args.at(-1) === "repos/donadiosolutions/lcm"
+            ? { default_branch: "main" }
+            : { bad: true },
       }),
     /paginated.*malformed/u,
   );
@@ -77,12 +83,40 @@ test("paginates ruleset discovery and fetches active branch details by returned 
     () =>
       checkMergeQueuePolicy({
         repository: "donadiosolutions/lcm",
-        request: (args) =>
-          args.at(-1).includes("?includes_parents")
-            ? [[{ id: "bad", target: "branch", enforcement: "active" }]]
-            : queueRuleset(),
+        request: (args) => {
+          const endpoint = args.at(-1);
+          if (endpoint === "repos/donadiosolutions/lcm") return { default_branch: "main" };
+          if (endpoint.includes("?includes_parents")) {
+            return [[{ id: "bad", target: "branch", enforcement: "active" }]];
+          }
+          return [appliedQueueRule()];
+        },
       }),
     /invalid identifier/u,
+  );
+  assert.throws(
+    () =>
+      checkMergeQueuePolicy({
+        repository: "donadiosolutions/lcm",
+        request: (args) => {
+          const endpoint = args.at(-1);
+          if (endpoint === "repos/donadiosolutions/lcm") return { default_branch: "main" };
+          if (endpoint.includes("?includes_parents")) return [[{ id: 7, target: "branch", enforcement: "active" }]];
+          return [appliedQueueRule()];
+        },
+      }),
+    /did not match an active branch ruleset/u,
+  );
+  assert.throws(
+    () =>
+      checkMergeQueuePolicy({
+        repository: "donadiosolutions/lcm",
+        request: (args) =>
+          args.at(-1) === "repos/donadiosolutions/lcm"
+            ? { default_branch: "\u0000main" }
+            : [],
+      }),
+    /invalid default branch/u,
   );
 });
 

@@ -148,7 +148,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Follow least privilege in workflow `permissions`; omit `packages: read` unless a step actually reads packages.
 - Set `persist-credentials: false` on checkout steps in read-only workflows.
 - Release-run recovery must read the canonical event tag from the workflow's strict `run-name`; do not infer historical tags from `head_branch`, a commit SHA, or another mutable/ref-derived field.
-- Release ancestry depends on merge commits. Require every active branch merge queue to use `MERGE`, discover applicable rulesets dynamically rather than binding a mutable name or numeric ID, and keep queue commands on `--merge`.
+- Release ancestry depends on merge commits. Require every merge queue authoritatively applied to the repository default branch to use `MERGE`, cross-check applied rules against the complete paginated active-ruleset inventory rather than binding a mutable name or numeric ID, enforce the policy in CI and every trusted release preflight, and keep queue commands on `--merge`.
 - Normal and recovery npm publication must share the trusted tarball helper, require exactly one regular `.tgz`, pass npm an absolute filesystem path, and never invoke npm through a shell.
 - Post-publish registry retries must read a complete exact-version/version-list/dist-tag snapshot each time and retry only incomplete propagation. Malformed or conflicting metadata, authorization failures, and unexpected npm process results fail immediately.
 - Persist manual Changesets beta/stable intent on the single open `changeset-release/main` PR with exactly one internal release-channel label, and fail closed on duplicate PRs or conflicting channel labels.

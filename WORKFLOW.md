@@ -32,10 +32,11 @@ builds up to five entries concurrently and merges groups of one to five entries
 after a three-minute minimum wait, with a 60-minute check-response timeout.
 `MERGE` is required because release publication proves that maintenance and
 forward-port commits remain ancestors of `main`; squash or rebase queue methods
-destroy that evidence. CI discovers every active branch merge-queue ruleset
-dynamically and fails if any queue stops using `MERGE`. Routine administrator
-bypasses are prohibited; the existing bypass is reserved for documented
-emergencies.
+destroy that evidence. CI and each trusted release preflight query GitHub's
+authoritative rules applied to the repository default branch, cross-check them
+against the complete paginated active-ruleset inventory, and fail if an
+applicable queue stops using `MERGE`. Routine administrator bypasses are
+prohibited; the existing bypass is reserved for documented emergencies.
 
 The required `external-admission` status separates pull-request admission from
 merge-group validation for providers that do not report on synthetic queue

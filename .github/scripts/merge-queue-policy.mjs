@@ -1,31 +1,22 @@
-export function assertMergeQueueUsesMerge(rulesets) {
-  if (!Array.isArray(rulesets)) throw new TypeError("Repository rulesets must be an array");
-
-  const queueRules = [];
-  for (const ruleset of rulesets) {
-    if (
-      ruleset === null ||
-      typeof ruleset !== "object" ||
-      Array.isArray(ruleset) ||
-      ruleset.enforcement !== "active" ||
-      ruleset.target !== "branch"
-    ) {
-      continue;
-    }
-    if (!Array.isArray(ruleset.rules)) {
-      throw new Error("An active branch ruleset did not include its rules");
-    }
-    for (const rule of ruleset.rules) {
-      if (rule?.type === "merge_queue") queueRules.push(rule);
-    }
+export function assertMergeQueueUsesMerge(appliedRules) {
+  if (!Array.isArray(appliedRules)) {
+    throw new TypeError("Applied default-branch rules must be an array");
+  }
+  if (
+    appliedRules.some(
+      (rule) => rule === null || typeof rule !== "object" || Array.isArray(rule),
+    )
+  ) {
+    throw new Error("The applied default-branch rules response was malformed");
   }
 
+  const queueRules = appliedRules.filter((rule) => rule.type === "merge_queue");
   if (queueRules.length === 0) {
-    throw new Error("No active branch merge-queue rule protects release ancestry");
+    throw new Error("No merge-queue rule applies to the repository default branch");
   }
   for (const rule of queueRules) {
     if (rule.parameters?.merge_method !== "MERGE") {
-      throw new Error("Every active branch merge queue must use the MERGE method");
+      throw new Error("Every merge queue applied to the default branch must use MERGE");
     }
   }
   return { queueCount: queueRules.length };

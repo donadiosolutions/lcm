@@ -32,8 +32,9 @@ in `.changeset/pre.json`.
 Queue version PRs with merge commits (`gh pr merge PR --auto --merge`). The
 repository merge queue must use `MERGE`, because the release guard verifies
 that the maintenance and forward-port commits remain in `main` ancestry.
-Squash or rebase queue methods remove that evidence, so CI checks every active
-branch merge queue and fails closed if its method drifts.
+Squash or rebase queue methods remove that evidence, so CI and every trusted
+release preflight check GitHub's authoritative rules applied to the default
+branch and fail closed if an applicable queue's method drifts.
 
 ## Draft and publication gate
 

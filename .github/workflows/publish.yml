@@ -118,7 +118,12 @@ jobs:
             else
               printf 'is_beta=false\n'
             fi
-          } >> "$GITHUB_OUTPUT"
+           } >> "$GITHUB_OUTPUT"
+
+      - name: Verify merge queue preserves release ancestry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/check-merge-queue-policy.mjs
 
       - name: Install dependencies
         run: npm ci
@@ -462,6 +467,11 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org/
+
+      - name: Verify merge queue preserves release ancestry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node ../trusted/.github/scripts/check-merge-queue-policy.mjs
 
       - name: Check npm release ordering
         id: npm
@@ -880,6 +890,11 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org/
+
+      - name: Verify merge queue preserves release ancestry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node ../trusted/.github/scripts/check-merge-queue-policy.mjs
 
       - name: Check npm release ordering
         id: npm
