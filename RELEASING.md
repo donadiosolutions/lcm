@@ -60,7 +60,11 @@ version PRs are labeled `no-release-notes` automatically.
      `release-channel:beta` or `release-channel:stable`. Later `main` pushes
      keep using that channel while Changesets updates the same PR. Multiple
      matching PRs or conflicting channel labels stop the workflow.
-3. Review and merge the generated version PR.
+3. Review the generated version PR, wait for every protected-branch check and
+   review to pass on its exact head, then merge it with a merge commit
+   (`gh pr merge PR --merge`). Do not squash or rebase the version PR: the
+   resulting merge commit and its release commits must remain ancestors of
+   `main`.
 4. Create and push a signed annotated tag at that exact merge commit. Supported
    forms are `vX.Y.Z` and `vX.Y.Z-beta.N`; alpha, RC, other prerelease labels,
    build metadata, and numeric leading zeros are rejected.
@@ -73,8 +77,10 @@ version PRs are labeled `no-release-notes` automatically.
    preflight without npm's OIDC permission. It repeats validation and tests and
    packs the exact package tarball. A separate OIDC job downloads that verified
    artifact with the runner-provided `gh` CLI, rechecks the release tag and npm
-   ordering using workflow-revision tools, and publishes it. Betas use
-   `--tag beta`; stable releases use `--tag latest`.
+   ordering using workflow-revision tools, and publishes it. One trusted helper
+   requires exactly one regular `.tgz`, resolves its absolute filesystem path,
+   and invokes npm without a shell. Betas use `--tag beta`; stable releases use
+   `--tag latest`.
 
 GitHub changes the release from draft to public before it emits the
 `release: published` event, so this gate cannot be fully transactional across
@@ -85,7 +91,11 @@ There can therefore be a short public window before that restoration
 completes. If npm was already published before a later step failed,
 republishing the restored draft is safe: the retry detects the existing
 immutable version, skips `npm publish`, and verifies its package version and
-dist-tags.
+dist-tags. Verification reads five complete registry snapshots, waiting 2, 4,
+8, and 16 seconds between attempts. Only incomplete propagation, such as a
+missing exact version, missing list membership, or a valid older channel tag,
+is retried. Malformed, conflicting, authorization, and unexpected process
+results fail immediately.
 
 For beta notes, the previous published release in the same `MAJOR.MINOR` series
 is the comparison base, falling back to the latest stable release for the first

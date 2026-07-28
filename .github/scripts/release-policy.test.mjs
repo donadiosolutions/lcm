@@ -3,6 +3,7 @@ import test from "node:test";
 import { assertVerifiedReleaseTag } from "./release-tag-policy.mjs";
 import {
   NPM_QUERY_TIMEOUT_MS,
+  NPM_VERIFY_DELAYS_MS,
   RELEASE_DRAFT_MARKER,
   assertActionCreatedReleaseBody,
   assertNpmDistTags,
@@ -600,33 +601,56 @@ test("queries npm release state with E404-only missing-package handling", () => 
   );
 });
 
-test("verifies published npm state without environment-sized JSON payloads", () => {
+test("verifies published npm state without environment-sized JSON payloads", async () => {
+  assert.deepEqual(NPM_VERIFY_DELAYS_MS, [2_000, 4_000, 8_000, 16_000]);
   const success = [
     { status: 0, stdout: "1.5.0-beta.2\n", stderr: "" },
     { status: 0, stdout: '["1.4.1","1.5.0-beta.2"]', stderr: "" },
     { status: 0, stdout: '{"latest":"1.4.1","beta":"1.5.0-beta.2"}', stderr: "" },
   ];
   assert.deepEqual(
-    verifyNpmRelease({ version: "1.5.0-beta.2", runNpm: () => success.shift() }),
+    await verifyNpmRelease({ version: "1.5.0-beta.2", runNpm: () => success.shift() }),
     {
       versions: ["1.4.1", "1.5.0-beta.2"],
       distTags: { latest: "1.4.1", beta: "1.5.0-beta.2" },
     },
   );
-  assert.throws(
+  const firstBeta = [
+    { status: 0, stdout: "1.0.0-beta.0\n", stderr: "" },
+    { status: 0, stdout: '["1.0.0-beta.0"]', stderr: "" },
+    { status: 0, stdout: '{"beta":"1.0.0-beta.0"}', stderr: "" },
+  ];
+  assert.deepEqual(
+    await verifyNpmRelease({
+      version: "1.0.0-beta.0",
+      runNpm: () => firstBeta.shift(),
+      sleep: async () => assert.fail("a complete first beta snapshot must not retry"),
+    }),
+    {
+      versions: ["1.0.0-beta.0"],
+      distTags: { beta: "1.0.0-beta.0" },
+    },
+  );
+  await assert.rejects(
     () =>
       verifyNpmRelease({
         version: "1.5.0-beta.2",
-        runNpm: () => ({ status: 1, stdout: "", stderr: "npm error code E404" }),
+        runNpm: (args) =>
+          args[1].includes("@1.5.0-beta.2")
+            ? { status: 1, stdout: "", stderr: "npm error code E404" }
+            : args[2] === "versions"
+              ? { status: 0, stdout: '["1.4.1"]', stderr: "" }
+              : { status: 0, stdout: '{"latest":"1.4.1","beta":"1.5.0-beta.1"}', stderr: "" },
+        sleep: async () => {},
       }),
-    /was not published/u,
+    /exact version is not visible/u,
   );
   const malformed = [
     { status: 0, stdout: "1.5.0-beta.2", stderr: "" },
     { status: 0, stdout: "not-json", stderr: "" },
     { status: 0, stdout: '{"latest":"1.4.1","beta":"1.5.0-beta.2"}', stderr: "" },
   ];
-  assert.throws(
+  await assert.rejects(
     () => verifyNpmRelease({ version: "1.5.0-beta.2", runNpm: () => malformed.shift() }),
     /invalid JSON.*versions/u,
   );
@@ -635,10 +659,70 @@ test("verifies published npm state without environment-sized JSON payloads", () 
     { status: 0, stdout: '["1.4.1","1.5.0-beta.2"]', stderr: "" },
     { status: 0, stdout: "", stderr: "" },
   ];
-  assert.throws(
+  await assert.rejects(
     () => verifyNpmRelease({ version: "1.5.0-beta.2", runNpm: () => emptyDistTags.shift() }),
     /empty response.*dist-tags/u,
   );
+});
+
+test("retries only complete but incompletely propagated npm snapshots", async () => {
+  const snapshots = [
+    [
+      { status: 1, stdout: "", stderr: "npm error code E404" },
+      { status: 0, stdout: '["1.4.1"]', stderr: "" },
+      { status: 0, stdout: '{"latest":"1.4.1","beta":"1.5.0-beta.1"}', stderr: "" },
+    ],
+    [
+      { status: 0, stdout: "1.5.0-beta.2", stderr: "" },
+      { status: 0, stdout: '["1.4.1"]', stderr: "" },
+      { status: 0, stdout: '{"latest":"1.4.1","beta":"1.5.0-beta.1"}', stderr: "" },
+    ],
+    [
+      { status: 0, stdout: "1.5.0-beta.2", stderr: "" },
+      { status: 0, stdout: '["1.4.1","1.5.0-beta.2"]', stderr: "" },
+      { status: 0, stdout: '{"latest":"1.4.1","beta":"1.5.0-beta.1"}', stderr: "" },
+    ],
+    [
+      { status: 0, stdout: "1.5.0-beta.2", stderr: "" },
+      { status: 0, stdout: '["1.4.1","1.5.0-beta.2"]', stderr: "" },
+      { status: 1, stdout: "", stderr: "npm error code E404" },
+    ],
+    [
+      { status: 0, stdout: "1.5.0-beta.2", stderr: "" },
+      { status: 0, stdout: '["1.4.1","1.5.0-beta.2"]', stderr: "" },
+      { status: 0, stdout: '{"latest":"1.4.1","beta":"1.5.0-beta.2"}', stderr: "" },
+    ],
+  ];
+  const results = snapshots.flat();
+  const delays = [];
+  assert.deepEqual(
+    await verifyNpmRelease({
+      version: "1.5.0-beta.2",
+      runNpm: () => results.shift(),
+      sleep: async (delay) => delays.push(delay),
+    }),
+    {
+      versions: ["1.4.1", "1.5.0-beta.2"],
+      distTags: { latest: "1.4.1", beta: "1.5.0-beta.2" },
+    },
+  );
+  assert.deepEqual(delays, [2_000, 4_000, 8_000, 16_000]);
+  assert.equal(results.length, 0);
+
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      verifyNpmRelease({
+        version: "1.5.0-beta.2",
+        runNpm: () => {
+          calls += 1;
+          return { status: 1, stdout: "", stderr: "npm error code E401" };
+        },
+        sleep: async () => assert.fail("authorization failures must not retry"),
+      }),
+    /E401/u,
+  );
+  assert.equal(calls, 1);
 });
 
 test("sanitizes npm subprocess and unexpected registry failures", () => {
@@ -763,6 +847,13 @@ test("enforces monotonic npm channels and a stable latest dist-tag", () => {
       version: "1.5.0-beta.2",
       versions: ["1.4.1", "1.5.0-beta.1", "1.5.0-beta.2"],
       distTags: { latest: "1.4.1", beta: "1.5.0-beta.2" },
+    }),
+  );
+  assert.doesNotThrow(() =>
+    assertNpmDistTags({
+      version: "1.0.0-beta.0",
+      versions: ["1.0.0-beta.0"],
+      distTags: { beta: "1.0.0-beta.0" },
     }),
   );
   assert.doesNotThrow(() =>

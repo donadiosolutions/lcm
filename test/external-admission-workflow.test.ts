@@ -148,6 +148,32 @@ describe("external admission workflow", () => {
     expect(source.match(/github\.event\.client_payload\.head_sha/gu)).toHaveLength(7);
   });
 
+  it("accepts only provider results with a non-empty pull-request suite branch", () => {
+    const nonNullBranchGuard =
+      "github.event.check_run.check_suite.head_branch != null";
+    const nonEmptyBranchGuard =
+      "github.event.check_run.check_suite.head_branch != ''";
+    const queueRefGuard =
+      "!startsWith(github.event.check_run.check_suite.head_branch, 'gh-readonly-queue/')";
+    const acceptsProviderBranch = (branch: string | null) =>
+      branch !== null && branch !== "" && !branch.startsWith("gh-readonly-queue/");
+
+    expect(acceptsProviderBranch(null)).toBe(false);
+    expect(acceptsProviderBranch("")).toBe(false);
+    expect(acceptsProviderBranch("gh-readonly-queue/main/pr-329")).toBe(false);
+    expect(acceptsProviderBranch("fix/release-publication-resilience")).toBe(true);
+    for (const guard of [nonNullBranchGuard, nonEmptyBranchGuard, queueRefGuard]) {
+      expect(job.if).toContain(guard);
+      expect(workflow.concurrency.group).toContain(guard);
+    }
+    expect(source.match(/check_suite\.head_branch != null/gu)).toHaveLength(2);
+    expect(source.match(/check_suite\.head_branch != ''/gu)).toHaveLength(2);
+    expect(source.match(/!startsWith\(github\.event\.check_run\.check_suite\.head_branch/gu)).toHaveLength(
+      2,
+    );
+    expect(source).toContain("must not create a legacy commit status");
+  });
+
   it("isolates rejected CI workflow runs from exact-SHA evaluator concurrency", () => {
     const group = workflow.concurrency.group;
     const canonicalCiConditions = [

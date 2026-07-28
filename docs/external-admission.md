@@ -6,6 +6,14 @@ admission is automatic: authenticated Greptile and DCO `check_run` events and
 canonical pull-request CI `workflow_run` events re-evaluate the exact pull
 request head SHA without polling on a runner.
 
+Provider checks can also report against GitHub's synthetic commits with an
+empty suite branch or a `gh-readonly-queue/` ref. External admission requires
+a non-empty suite branch and rejects the reserved queue prefix before writing
+a legacy commit status because the permissionless
+`external-admission-merge-group.yml` workflow owns the synthetic SHA. Normal
+pull-request provider events remain subject to the complete exact-SHA
+admission policy.
+
 Use repository-dispatch recovery only when an expected provider or CI event was
 delayed or lost. Recovery re-evaluates current GitHub state; it does not bypass,
 replace, or manufacture any required check.

@@ -28,6 +28,7 @@ interface CiWorkflow {
       name: string;
       needs: string;
       "runs-on": string;
+      steps: WorkflowStep[];
     };
     postgresql: {
       needs: string;

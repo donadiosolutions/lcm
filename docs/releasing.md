@@ -29,6 +29,12 @@ channel labels fail closed. When the version PR merges or closes, the lookup no
 longer finds it and automatic runs again follow the prerelease state committed
 in `.changeset/pre.json`.
 
+After every protected-branch check and review passes on the exact version-PR
+head, merge it directly with a merge commit (`gh pr merge PR --merge`). The
+repository does not use a merge queue. Do not squash or rebase version PRs:
+the merge commit and its maintenance and forward-port commits must remain in
+`main` ancestry.
+
 ## Draft and publication gate
 
 Push a signed annotated tag at the exact version-PR merge commit. The tag
@@ -51,7 +57,9 @@ connector resources. The generated runtime is a release artifact and is not
 committed to the repository. The OIDC-enabled job checks out only trusted workflow tools,
 downloads that verified tarball with the runner-provided `gh` CLI, revalidates
 the signed tag and npm channel ordering, and publishes the tarball without
-running package scripts.
+running package scripts. The shared normal/recovery helper accepts exactly one
+regular `.tgz`, resolves it to an absolute filesystem path, and invokes npm
+without a shell.
 
 GitHub makes a release public before sending the `release: published` event, so
 the GitHub-to-npm transition is not fully transactional. A trusted-preflight or
@@ -59,7 +67,12 @@ publish-job failure or cancellation restores the release to draft, although a
 short public window can occur first. If npm publication completed before a
 later failure, publishing the restored draft again remains safe: the workflow
 recognizes the existing immutable package version, skips a duplicate
-publication, and repeats the final package and dist-tag verification.
+publication, and repeats the final package and dist-tag verification. The final
+verification takes five complete metadata snapshots with 2-, 4-, 8-, and
+16-second delays. It retries only incomplete registry propagation: a missing
+exact version, missing version-list membership, or a valid older expected
+dist-tag. Malformed metadata, conflicting/newer tags, authorization failures,
+and unexpected npm process results fail immediately.
 
 Beta packages publish to the `beta` npm dist-tag. Stable packages publish to
 `latest`, and the workflow verifies that `latest` remains the highest stable

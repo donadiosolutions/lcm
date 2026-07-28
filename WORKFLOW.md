@@ -14,7 +14,7 @@ This document is a living record. **Update it whenever you learn something:**
 
 **When to update:** At the end of every feature cycle (after the implementation PR merges), review this doc against what actually happened. If reality diverged from the doc, fix the doc — not reality.
 
-**How to update:** Create a `docs/TOPIC` branch, push, complete the Copilot review loop, and require a merge-ready Greptile report covering the exact current head. Then set `PR_NUMBER` to the pull request number and queue it for main with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`. Same flow as any other docs change.
+**How to update:** Create a `docs/TOPIC` branch, push, complete the Copilot review loop, and require a merge-ready Greptile report covering the exact current head. After every protected-branch check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`. Same flow as any other docs change.
 
 ## Branch Strategy
 
@@ -22,12 +22,18 @@ This document is a living record. **Update it whenever you learn something:**
 feature/docs branches → main (default, protected)
 ```
 
-- **`main`** — Default branch. All PRs target main. Protected: PRs and the merge queue are required; no force push. Pushing a matching stable `vX.Y.Z` or beta `vX.Y.Z-beta.N` tag triggers draft-release creation.
+- **`main`** — Default branch. All PRs target main. Protected: pull requests, required checks, and reviews are required; no force push. Pushing a matching stable `vX.Y.Z` or beta `vX.Y.Z-beta.N` tag triggers draft-release creation.
 - **Feature branches** — `feat/TOPIC`, `docs/TOPIC`, `fix/TOPIC`. Always branch from main and use an isolated worktree for each concurrent change.
 
-Independent changes may be developed in parallel on isolated branches and worktrees, but the required merge queue serializes landings into `main`. Dependent work must wait for its upstream PR to merge, then fetch and rebase onto the new `main` before it is queued.
+Independent changes may be developed in parallel on isolated branches and
+worktrees. Dependent work must wait for its upstream PR to merge, then fetch
+and rebase onto the new `main` before it is merged.
 
-The merge queue uses squash merging and an `ALLGREEN` grouping strategy. It builds one entry at a time, with both the minimum and maximum merge-group size set to one, no minimum wait, and a 60-minute check-response timeout. Routine administrator bypasses are prohibited; the existing bypass is reserved for documented emergencies.
+The repository does not use a merge queue. Merge protected pull requests
+directly with merge commits only after every required exact-head check and
+review passes. Do not squash or rebase PRs: release publication depends on
+maintenance and forward-port commits remaining ancestors of `main`. Routine
+administrator bypasses remain prohibited except for documented emergencies.
 
 The required `external-admission` status separates pull-request admission from
 merge-group validation for providers that do not report on synthetic queue
@@ -207,177 +213,15 @@ separate merge-group workflow supplies the required `external-admission` check.
 4. Push and open PR
 5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
 6. Run review loop (see Copilot Review Loop below)
-7. Once the Copilot loop is complete (max 3 rounds — see Review Loop) and Greptile reports the exact current head as merge-ready, set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
-8. Wait for the queued PR to land before starting implementation. Allow up to 65 minutes for GitHub to admit the PR and then 65 minutes for each position in the serialized queue: a PR entering at position 1 gets 65 minutes, while a PR entering at position N gets `N * 65` minutes so every entry ahead can consume the queue's 60-minute check timeout without taking time from this PR. Both waits are finite and fail with check diagnostics if GitHub never admits, removes, or rejects the still-open PR:
-
-   ```bash
-   PR_NUMBER=123
-
-   show_pr_checks() {
-     local pr_number=$1
-     gh pr checks "$pr_number" --repo donadiosolutions/lcm >&2 || true
-   }
-
-   show_merge_group_checks() {
-     local merge_group_sha=$1
-
-     if [[ -z "$merge_group_sha" ]]; then
-       echo "No synthetic merge-group SHA was observed for this queue attempt." >&2
-       return
-     fi
-
-     echo "Check runs for synthetic merge-group commit $merge_group_sha:" >&2
-     gh api \
-       -H 'Accept: application/vnd.github+json' \
-       "repos/donadiosolutions/lcm/commits/${merge_group_sha}/check-runs?per_page=100" \
-       --jq '.check_runs[] |
-         [.name, "status=" + .status, "conclusion=" + (.conclusion // "pending"),
-          "app=" + (.app.slug // "unknown"), (.details_url // "no-details-url")] |
-         @tsv' >&2 || true
-   }
-
-   show_queue_diagnostics() {
-     local pr_number=$1
-     local merge_group_sha=$2
-     show_pr_checks "$pr_number"
-     show_merge_group_checks "$merge_group_sha"
-   }
-
-   pr_is_merged() {
-     local pr_number=$1
-     [[ $(gh pr view "$pr_number" --repo donadiosolutions/lcm --json state --jq .state 2>/dev/null) == MERGED ]]
-   }
-
-   query_merge_queue_entry() {
-     local pr_number=$1
-     gh api graphql \
-       -f query='query($owner: String!, $name: String!, $number: Int!) {
-         repository(owner: $owner, name: $name) {
-           pullRequest(number: $number) {
-             mergeQueueEntry { position state headCommit { oid } }
-           }
-         }
-       }' \
-       -f owner=donadiosolutions \
-       -f name=lcm \
-       -F number="$pr_number" \
-       --jq '.data.repository.pullRequest.mergeQueueEntry |
-         if . == null then ""
-         else [.position, .state, .headCommit.oid] | @tsv
-         end'
-   }
-
-   wait_for_queued_pr() {
-     local pr_number=$1
-     local admission_deadline=$((SECONDS + 65 * 60))
-     local current_merge_group_sha current_queue_position deadline merge_group_sha=""
-     local queue_entry queue_position queue_state state
-
-     # mergeQueueEntry can be temporarily absent while auto-merge waits for
-     # required checks or GitHub propagates the newly queued entry.
-     while :; do
-       state=$(gh pr view "$pr_number" --repo donadiosolutions/lcm --json state --jq .state)
-       case "$state" in
-         MERGED) return ;;
-         OPEN) ;;
-         *)
-           echo "PR #$pr_number entered unexpected state before queue admission: $state" >&2
-           show_queue_diagnostics "$pr_number" "$merge_group_sha"
-           return 1
-           ;;
-       esac
-
-       if ! queue_entry=$(query_merge_queue_entry "$pr_number"); then
-         if pr_is_merged "$pr_number"; then return; fi
-         echo "Could not query the merge-queue entry for PR #$pr_number." >&2
-         show_queue_diagnostics "$pr_number" "$merge_group_sha"
-         return 1
-       fi
-       IFS=$'\t' read -r queue_position queue_state current_merge_group_sha <<<"$queue_entry"
-       if [[ -n "$current_merge_group_sha" ]]; then
-         merge_group_sha=$current_merge_group_sha
-       fi
-
-       if [[ "$queue_state" == UNMERGEABLE ]]; then
-         if pr_is_merged "$pr_number"; then return; fi
-         echo "PR #$pr_number became unmergeable before queue admission completed; inspect failed checks and requeue it:" >&2
-         show_queue_diagnostics "$pr_number" "$merge_group_sha"
-         return 1
-       fi
-
-       if [[ "$queue_position" =~ ^[1-9][0-9]*$ && -n "$merge_group_sha" ]]; then
-         break
-       fi
-
-       if ((SECONDS >= admission_deadline)); then
-         if pr_is_merged "$pr_number"; then return; fi
-         echo "PR #$pr_number did not enter the merge queue within 65 minutes; inspect required checks and auto-merge state:" >&2
-         show_queue_diagnostics "$pr_number" "$merge_group_sha"
-         return 1
-       fi
-       sleep 15
-     done
-
-     deadline=$((SECONDS + queue_position * 65 * 60))
-     echo "PR #$pr_number entered the merge queue at position $queue_position; waiting up to $((queue_position * 65)) minutes." >&2
-
-     while :; do
-       state=$(gh pr view "$pr_number" --repo donadiosolutions/lcm --json state --jq .state)
-       case "$state" in
-         MERGED) return ;;
-         OPEN)
-           ;;
-         *)
-           echo "PR #$pr_number entered unexpected state while queued: $state" >&2
-           show_queue_diagnostics "$pr_number" "$merge_group_sha"
-           return 1
-           ;;
-       esac
-
-       if ! queue_entry=$(query_merge_queue_entry "$pr_number"); then
-         if pr_is_merged "$pr_number"; then return; fi
-         echo "Could not query the merge-queue entry for PR #$pr_number." >&2
-         show_queue_diagnostics "$pr_number" "$merge_group_sha"
-         return 1
-       fi
-       IFS=$'\t' read -r current_queue_position queue_state current_merge_group_sha <<<"$queue_entry"
-       if [[ -n "$current_merge_group_sha" ]]; then
-         merge_group_sha=$current_merge_group_sha
-       fi
-
-       if [[ -z "$current_queue_position" ]]; then
-         if pr_is_merged "$pr_number"; then return; fi
-         echo "PR #$pr_number is still open but is no longer in the merge queue; inspect failed checks and requeue it:" >&2
-         show_queue_diagnostics "$pr_number" "$merge_group_sha"
-         return 1
-       fi
-
-       if [[ "$queue_state" == UNMERGEABLE ]]; then
-         if pr_is_merged "$pr_number"; then return; fi
-         echo "PR #$pr_number became unmergeable at queue position $current_queue_position; inspect failed checks and requeue it:" >&2
-         show_queue_diagnostics "$pr_number" "$merge_group_sha"
-         return 1
-       fi
-
-       if ((SECONDS >= deadline)); then
-         if pr_is_merged "$pr_number"; then return; fi
-         echo "PR #$pr_number did not merge within its position-$queue_position allowance of $((queue_position * 65)) minutes; inspect failed checks and requeue it:" >&2
-         show_queue_diagnostics "$pr_number" "$merge_group_sha"
-         return 1
-       fi
-       sleep 15
-     done
-   }
-
-   wait_for_queued_pr "$PR_NUMBER"
-   ```
+7. Once the Copilot loop is complete (max 3 rounds — see Review Loop), Greptile reports the exact current head as merge-ready, and every protected-branch check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`.
+8. Confirm `gh pr view "${PR_NUMBER}" --repo donadiosolutions/lcm --json state --jq .state` reports `MERGED` before starting implementation. If the merge command or final state check fails, inspect `gh pr checks "${PR_NUMBER}" --repo donadiosolutions/lcm` and resolve the protected-branch failure without an administrator bypass.
 
 ## Phase 3: Implementation (Sonnet subagents)
 
 1. **Sync first:** `git checkout main && git pull --ff-only origin main` to get latest (including merged specs)
 2. Dispatch `model: sonnet` subagents with `isolation: worktree` for each task in the plan
 3. **Independent tasks** → launch in parallel (e.g., PR A: delete files, PR D: add new module)
-4. **Sequential tasks** → launch the dependent branch only after the upstream PR lands through the queue, then branch from the updated `main`. If a downstream branch already exists on the old upstream tip, enter its isolated worktree, set `OLD_UPSTREAM_TIP` to that commit, and replay only its downstream commits with `git fetch origin main && git rebase --onto origin/main "${OLD_UPSTREAM_TIP}"`. Omitting the branch argument rebases the already checked-out downstream branch without asking Git to check it out in another worktree.
+4. **Sequential tasks** → launch the dependent branch only after the upstream PR merges, then branch from the updated `main`. If a downstream branch already exists on the old upstream tip, enter its isolated worktree, set `OLD_UPSTREAM_TIP` to that commit, and replay only its downstream commits with `git fetch origin main && git rebase --onto origin/main "${OLD_UPSTREAM_TIP}"`. Omitting the branch argument rebases the already checked-out downstream branch without asking Git to check it out in another worktree.
 5. Each subagent: implement code + tests, run `npm test`, commit (do NOT push)
 6. After subagent completes: review the diff, push, open PR, request Copilot review
 
@@ -393,8 +237,8 @@ separate merge-group workflow supplies the required `external-admission` check.
 1. Push implementation branch, open PR
 2. Request Copilot review (add to reviewers list)
 3. Run review loop (see below)
-4. Once the Copilot loop is complete and Greptile reports the exact current head as merge-ready, set `PR_NUMBER` to the pull request number and queue it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --auto --squash`
-5. Wait for the implementation PR to land by calling `wait_for_queued_pr "$PR_NUMBER"` from Phase 2 with the implementation PR number. Do not begin post-merge validation or dependent work until it reports `MERGED`.
+4. Once the Copilot loop is complete, Greptile reports the exact current head as merge-ready, and every protected-branch check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`
+5. Confirm the implementation PR reports `MERGED` before beginning post-merge validation or dependent work.
 
 ## Copilot Interaction
 

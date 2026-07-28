@@ -66,6 +66,10 @@ const releaseTagPolicySource = readFileSync(
   new URL("../.github/scripts/release-tag-policy.mjs", import.meta.url),
   "utf8",
 );
+const publishTarballSource = readFileSync(
+  new URL("../.github/scripts/publish-npm-tarball.mjs", import.meta.url),
+  "utf8",
+);
 const changesetSource = readFileSync(
   new URL("../.changeset/calm-betas-draft.md", import.meta.url),
   "utf8",
@@ -296,8 +300,11 @@ describe("release workflows", () => {
   });
 
   it("publishes beta and stable versions to explicit npm dist-tags", () => {
-    expect(publishSource).toContain('--access public --tag beta');
-    expect(publishSource).toContain('--access public --tag latest');
+    expect(publishSource).toContain("tag=beta");
+    expect(publishSource).toContain("tag=latest");
+    expect(publishTarballSource).toContain('"--access"');
+    expect(publishTarballSource).toContain('"public"');
+    expect(publishTarballSource).toContain('"--tag"');
     expect(publishSource).toContain("assertActionCreatedReleaseBody");
     expect(publishSource.match(/npm run test:ci/gu)).toHaveLength(3);
     const draftNpmState = publishWorkflow.jobs.draft.steps.find(
@@ -423,10 +430,13 @@ describe("release workflows", () => {
       (step) => step.name === "Publish to npm",
     );
     expect(publish?.if).toContain("steps.npm_guard.outputs.already_published != 'true'");
-    expect(publish?.run).toContain("mapfile -d '' -t packages");
-    expect(publish?.run).toContain("find release-artifact -type f -name '*.tgz' -print0");
-    expect(publish?.run).toContain('"${#packages[@]}" -ne 1');
-    expect(publish?.run).toContain('npm publish "$PWD/${packages[0]}"');
+    expect(publish?.run).toContain(
+      'node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag"',
+    );
+    expect(publishTarballSource).toContain("Expected exactly one regular npm tarball");
+    expect(publishTarballSource).toContain('resolve(tarballs[0])');
+    expect(publishTarballSource).toContain('spawnSync("npm"');
+    expect(publishTarballSource).toContain("shell: false");
 
     const recoveryPreflight = publishWorkflow.jobs["recover-preflight"];
     const recoveryPublish = publishWorkflow.jobs["recover-publish"];
@@ -517,7 +527,9 @@ describe("release workflows", () => {
       "needs.recover-preflight.outputs.already_published != 'true'",
     );
     expect(recoveryPublishStep?.if).toContain("steps.npm.outputs.already_published != 'true'");
-    expect(recoveryPublishStep?.run).toContain('npm publish "$PWD/${packages[0]}"');
+    expect(recoveryPublishStep?.run).toContain(
+      'node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag"',
+    );
   });
 
   it("documents immutable published-release recovery without weakening the trust boundary", () => {
