@@ -246,12 +246,13 @@ function assertCompleteNpmSnapshot({ version, packageName, published, versions, 
   if (!publishedVersions.includes(version)) incomplete.push("version list is not updated");
 
   const highestStable = highestStableVersion(publishedVersions);
+  if (latest?.isBeta) throw new Error("npm latest must point to a canonical stable version");
   if (!highestStable) {
-    incomplete.push("stable version list is not visible");
+    if (!target.isBeta) incomplete.push("stable version list is not visible");
+    else if (latest) incomplete.push("version list is missing the latest release");
   } else if (!latest) {
     incomplete.push("latest dist-tag is not visible");
   } else {
-    if (latest.isBeta) throw new Error("npm latest must point to a canonical stable version");
     const latestComparison = compareReleaseVersions(latest.version, highestStable);
     if (latestComparison < 0) incomplete.push("latest dist-tag is older than the version list");
     else if (latestComparison > 0) incomplete.push("version list is missing the latest release");
@@ -292,8 +293,13 @@ export function assertNpmDistTags({ version, versions, distTags }) {
   }
 
   const highestStable = highestStableVersion(publishedVersions);
-  if (!highestStable) throw new Error("npm has no stable release for the latest dist-tag");
-  if (distTags.latest !== highestStable) {
+  if (!highestStable && !target.isBeta) {
+    throw new Error("npm has no stable release for the latest dist-tag");
+  }
+  if (!highestStable && distTags.latest !== undefined) {
+    throw new Error("npm latest must be absent until a stable release exists");
+  }
+  if (highestStable && distTags.latest !== highestStable) {
     throw new Error("npm latest must point to the highest published stable version");
   }
   if (target.isBeta) {

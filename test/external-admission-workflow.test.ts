@@ -148,6 +148,18 @@ describe("external admission workflow", () => {
     expect(source.match(/github\.event\.client_payload\.head_sha/gu)).toHaveLength(7);
   });
 
+  it("rejects provider results on synthetic merge-queue refs before status writes", () => {
+    const queueRefGuard =
+      "!startsWith(github.event.check_run.check_suite.head_branch, 'gh-readonly-queue/')";
+
+    expect(job.if).toContain(queueRefGuard);
+    expect(workflow.concurrency.group).toContain(queueRefGuard);
+    expect(source.match(/!startsWith\(github\.event\.check_run\.check_suite\.head_branch/gu)).toHaveLength(
+      2,
+    );
+    expect(source).toContain("must not create a legacy commit status");
+  });
+
   it("isolates rejected CI workflow runs from exact-SHA evaluator concurrency", () => {
     const group = workflow.concurrency.group;
     const canonicalCiConditions = [

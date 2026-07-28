@@ -48,6 +48,7 @@ concurrency:
       github.event_name == 'workflow_run' &&
         format('workflow-run-{0}', github.run_id) ||
       github.event_name == 'check_run' &&
+        !startsWith(github.event.check_run.check_suite.head_branch, 'gh-readonly-queue/') &&
         ((github.event.check_run.name == 'Greptile Review' && github.event.check_run.app.id == 867647 &&
           github.event.check_run.app.slug == 'greptile-apps') ||
         (github.event.check_run.name == 'DCO' && github.event.check_run.app.id == 1861 &&
@@ -63,7 +64,8 @@ jobs:
     name: external-admission-evaluator
     # CI wake-ups are limited to the canonical pull-request workflow. Push and
     # merge-group runs are owned by their native required checks and the
-    # permissionless external-admission-merge-group workflow.
+    # permissionless external-admission-merge-group workflow. Provider results
+    # on GitHub's reserved queue refs must not create a legacy commit status.
     if: >-
       (github.event_name == 'repository_dispatch' &&
         github.event.action == 'external-admission-reconcile' &&
@@ -74,6 +76,7 @@ jobs:
         github.event.workflow_run.path == '.github/workflows/ci.yml' &&
         github.event.workflow_run.repository.full_name == github.repository) ||
       (github.event_name == 'check_run' &&
+        !startsWith(github.event.check_run.check_suite.head_branch, 'gh-readonly-queue/') &&
         ((github.event.check_run.name == 'Greptile Review' && github.event.check_run.app.id == 867647 &&
           github.event.check_run.app.slug == 'greptile-apps') ||
         (github.event.check_run.name == 'DCO' && github.event.check_run.app.id == 1861 &&

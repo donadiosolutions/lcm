@@ -52,7 +52,7 @@ export function checkMergeQueuePolicy({ repository, request = runGh }) {
 
   const activeBranchRulesetIds = new Set(
     pages
-    .flat()
+      .flat()
       .filter((ruleset) => ruleset?.enforcement === "active" && ruleset?.target === "branch")
       .map((ruleset) => {
         const id = String(ruleset.id);

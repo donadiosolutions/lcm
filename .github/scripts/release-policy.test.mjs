@@ -615,6 +615,22 @@ test("verifies published npm state without environment-sized JSON payloads", asy
       distTags: { latest: "1.4.1", beta: "1.5.0-beta.2" },
     },
   );
+  const firstBeta = [
+    { status: 0, stdout: "1.0.0-beta.0\n", stderr: "" },
+    { status: 0, stdout: '["1.0.0-beta.0"]', stderr: "" },
+    { status: 0, stdout: '{"beta":"1.0.0-beta.0"}', stderr: "" },
+  ];
+  assert.deepEqual(
+    await verifyNpmRelease({
+      version: "1.0.0-beta.0",
+      runNpm: () => firstBeta.shift(),
+      sleep: async () => assert.fail("a complete first beta snapshot must not retry"),
+    }),
+    {
+      versions: ["1.0.0-beta.0"],
+      distTags: { beta: "1.0.0-beta.0" },
+    },
+  );
   await assert.rejects(
     () =>
       verifyNpmRelease({
@@ -831,6 +847,13 @@ test("enforces monotonic npm channels and a stable latest dist-tag", () => {
       version: "1.5.0-beta.2",
       versions: ["1.4.1", "1.5.0-beta.1", "1.5.0-beta.2"],
       distTags: { latest: "1.4.1", beta: "1.5.0-beta.2" },
+    }),
+  );
+  assert.doesNotThrow(() =>
+    assertNpmDistTags({
+      version: "1.0.0-beta.0",
+      versions: ["1.0.0-beta.0"],
+      distTags: { beta: "1.0.0-beta.0" },
     }),
   );
   assert.doesNotThrow(() =>
