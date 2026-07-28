@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,6 +27,10 @@ beforeEach(() => {
   vi.mocked(ensureDaemon).mockResolvedValue({ connected: false });
   mockCollectEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null });
   mockCollectDetailedEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null, projects: [], recentErrors: [] });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 function buildSettingsJson(): string {
@@ -354,6 +358,39 @@ describe("runDoctor project map checks", () => {
 });
 
 describe("runDoctor daemon version mismatch", () => {
+  it.each(["fetch", "json"] as const)(
+    "bounds the complete daemon health %s phase to two seconds",
+    async (phase) => {
+      vi.useFakeTimers();
+      let signal: AbortSignal | undefined;
+      const fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        signal = init?.signal ?? undefined;
+        if (phase === "fetch") {
+          return await new Promise<Response>(() => undefined);
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => await new Promise(() => undefined),
+        } as Response;
+      });
+
+      const pending = runDoctor(minimalDeps({
+        cwd: "/tmp/nonexistent-project-xyz",
+        fetch: fetch as typeof globalThis.fetch,
+      }));
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const results = await pending;
+
+      expect(signal?.aborted).toBe(true);
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "fail",
+      });
+    },
+  );
+
   it("restarts a healthy daemon that is not parented by user systemd", async (): Promise<void> => {
     vi.mocked(ensureDaemon).mockResolvedValueOnce({
       connected: true,
@@ -847,7 +884,10 @@ describe("runDoctor configuration validation", () => {
     }));
 
     expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
-    expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:4545/health");
+    expect(fetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:4545/health",
+      { signal: expect.any(AbortSignal) },
+    );
     expect(ensureDaemon).not.toHaveBeenCalled();
     expect(results.find((result) => result.name === "daemon")?.message).toContain("localhost:4545");
   });
@@ -1025,7 +1065,10 @@ describe("runDoctor configuration validation", () => {
         },
       }));
 
-      expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3737/health");
+      expect(fetch).toHaveBeenCalledWith(
+        "http://127.0.0.1:3737/health",
+        { signal: expect.any(AbortSignal) },
+      );
       expect(ensureDaemon).not.toHaveBeenCalled();
     },
   );
