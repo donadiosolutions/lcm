@@ -118,7 +118,7 @@ jobs:
             else
               printf 'is_beta=false\n'
             fi
-           } >> "$GITHUB_OUTPUT"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Verify merge queue preserves release ancestry
         env:
