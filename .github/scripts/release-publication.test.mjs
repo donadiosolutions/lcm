@@ -1,9 +1,17 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { checkMergeQueuePolicy } from "./check-merge-queue-policy.mjs";
 import { assertMergeQueueUsesMerge } from "./merge-queue-policy.mjs";
 import { publishNpmTarball } from "./publish-npm-tarball.mjs";
@@ -118,6 +126,56 @@ test("paginates ruleset inventory and validates only rules applied to the defaul
       }),
     /invalid default branch/u,
   );
+});
+
+test("relative CLI invocation queries and rejects invalid live policy", () => {
+  const root = mkdtempSync(join(tmpdir(), "lcm-release-policy-cli-"));
+  const bin = join(root, "bin");
+  const calls = join(root, "calls");
+  mkdirSync(bin);
+  writeFileSync(
+    join(bin, "gh"),
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+const endpoint = process.argv.at(-1);
+appendFileSync(process.env.LCM_GH_CALLS, \`\${endpoint}\\n\`);
+if (endpoint === "repos/donadiosolutions/lcm") {
+  console.log('{"default_branch":"main"}');
+} else if (endpoint.includes("?includes_parents")) {
+  console.log('[[{"id":42,"target":"branch","enforcement":"active"}]]');
+} else if (endpoint === "repos/donadiosolutions/lcm/rules/branches/main") {
+  console.log('[{"type":"merge_queue","ruleset_id":42,"parameters":{"merge_method":"SQUASH"}}]');
+} else {
+  process.exitCode = 2;
+}
+`,
+  );
+  chmodSync(join(bin, "gh"), 0o755);
+
+  const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+  const result = spawnSync(
+    process.execPath,
+    [".github/scripts/check-merge-queue-policy.mjs"],
+    {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GITHUB_REPOSITORY: "donadiosolutions/lcm",
+        LCM_GH_CALLS: calls,
+        PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
+      },
+      shell: false,
+    },
+  );
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /default branch must use MERGE/u);
+  assert.deepEqual(readFileSync(calls, "utf8").trim().split("\n"), [
+    "repos/donadiosolutions/lcm",
+    "repos/donadiosolutions/lcm/rulesets?includes_parents=true&per_page=100",
+    "repos/donadiosolutions/lcm/rules/branches/main",
+  ]);
 });
 
 test("publishes exactly one regular tarball through its absolute filesystem path", () => {

@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertMergeQueueUsesMerge } from "./merge-queue-policy.mjs";
 
@@ -79,7 +80,7 @@ export function checkMergeQueuePolicy({ repository, request = runGh }) {
   return assertMergeQueueUsesMerge(appliedRules);
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   const result = checkMergeQueuePolicy({ repository: process.env.GITHUB_REPOSITORY });
   console.log(`Verified ${result.queueCount} default-branch merge queue(s) use MERGE.`);
 }
