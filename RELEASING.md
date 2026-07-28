@@ -60,12 +60,11 @@ version PRs are labeled `no-release-notes` automatically.
      `release-channel:beta` or `release-channel:stable`. Later `main` pushes
      keep using that channel while Changesets updates the same PR. Multiple
      matching PRs or conflicting channel labels stop the workflow.
-3. Review and queue the generated version PR with the repository's required
-   merge-commit method (`gh pr merge PR --auto --merge`). The merge queue must
-   retain `merge_method=MERGE`; squash and rebase methods discard commit
-   ancestry that the release guard intentionally verifies. CI and the tag,
-   publication, and recovery preflights all validate the queue rule GitHub
-   applies to the repository default branch.
+3. Review the generated version PR, wait for every protected-branch check and
+   review to pass on its exact head, then merge it with a merge commit
+   (`gh pr merge PR --merge`). Do not squash or rebase the version PR: the
+   resulting merge commit and its release commits must remain ancestors of
+   `main`.
 4. Create and push a signed annotated tag at that exact merge commit. Supported
    forms are `vX.Y.Z` and `vX.Y.Z-beta.N`; alpha, RC, other prerelease labels,
    build metadata, and numeric leading zeros are rejected.

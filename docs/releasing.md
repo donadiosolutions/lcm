@@ -29,12 +29,11 @@ channel labels fail closed. When the version PR merges or closes, the lookup no
 longer finds it and automatic runs again follow the prerelease state committed
 in `.changeset/pre.json`.
 
-Queue version PRs with merge commits (`gh pr merge PR --auto --merge`). The
-repository merge queue must use `MERGE`, because the release guard verifies
-that the maintenance and forward-port commits remain in `main` ancestry.
-Squash or rebase queue methods remove that evidence, so CI and every trusted
-release preflight check GitHub's authoritative rules applied to the default
-branch and fail closed if an applicable queue's method drifts.
+After every protected-branch check and review passes on the exact version-PR
+head, merge it directly with a merge commit (`gh pr merge PR --merge`). The
+repository does not use a merge queue. Do not squash or rebase version PRs:
+the merge commit and its maintenance and forward-port commits must remain in
+`main` ancestry.
 
 ## Draft and publication gate
 

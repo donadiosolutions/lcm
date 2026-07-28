@@ -299,48 +299,6 @@ describe("release workflows", () => {
     }
   });
 
-  it("checks merge-queue ancestry policy at every trusted release preflight", () => {
-    const checks = [
-      {
-        job: publishWorkflow.jobs.draft,
-        trustedCheckout: "Checkout release tag",
-        command: "node .github/scripts/check-merge-queue-policy.mjs",
-      },
-      {
-        job: publishWorkflow.jobs.preflight,
-        trustedCheckout: "Checkout trusted release tools",
-        command: "node ../trusted/.github/scripts/check-merge-queue-policy.mjs",
-      },
-      {
-        job: publishWorkflow.jobs["recover-preflight"],
-        trustedCheckout: "Checkout trusted recovery tools",
-        command: "node ../trusted/.github/scripts/check-merge-queue-policy.mjs",
-      },
-    ];
-    for (const { job, trustedCheckout, command } of checks) {
-      const checkoutIndex = job.steps.findIndex((step) => step.name === trustedCheckout);
-      const setupIndex = job.steps.findIndex((step) => step.name === "Setup Node");
-      const checkIndex = job.steps.findIndex(
-        (step) => step.name === "Verify merge queue preserves release ancestry",
-      );
-      expect(checkoutIndex).toBeGreaterThanOrEqual(0);
-      expect(setupIndex).toBeGreaterThan(checkoutIndex);
-      expect(checkIndex).toBeGreaterThan(setupIndex);
-      expect(job.steps[checkIndex]).toMatchObject({
-        env: { GH_TOKEN: "${{ github.token }}" },
-        run: command,
-      });
-    }
-    const tagValidationIndex = publishWorkflow.jobs.draft.steps.findIndex(
-      (step) => step.name === "Validate release tag",
-    );
-    const tagCheckIndex = publishWorkflow.jobs.draft.steps.findIndex(
-      (step) => step.name === "Verify merge queue preserves release ancestry",
-    );
-    expect(tagValidationIndex).toBeGreaterThanOrEqual(0);
-    expect(tagCheckIndex).toBeGreaterThan(tagValidationIndex);
-  });
-
   it("publishes beta and stable versions to explicit npm dist-tags", () => {
     expect(publishSource).toContain("tag=beta");
     expect(publishSource).toContain("tag=latest");

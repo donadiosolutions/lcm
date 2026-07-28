@@ -50,11 +50,6 @@ jobs:
       - name: Initialize CI environment
         uses: ./.github/actions/setup-ci
 
-      - name: Verify merge queue preserves release ancestry
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: node .github/scripts/check-merge-queue-policy.mjs
-
       - name: Type-check
         run: npm run typecheck
 
