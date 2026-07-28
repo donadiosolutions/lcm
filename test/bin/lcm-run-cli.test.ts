@@ -177,10 +177,11 @@ vi.mock("../../src/storage/postgresql/provisioning.js", () => ({
 }));
 
 const {
-  handleCliError, isDaemonTransportFailure, resolveCompactRequestPolicyOverride, runCli, runMainIfInvoked, shouldRunMain,
+  handleCliError, resolveCompactRequestPolicyOverride, runCli, runMainIfInvoked, shouldRunMain,
   withHookOverrides, writeCliError, writeCliOutput,
 } = await import("../../bin/lcm.js");
 const { batchCompact } = await import("../../src/batch-compact.js");
+const { isDaemonTransportFailure } = await import("../../src/daemon/http-url.js");
 
 async function invoke(args: string[]): Promise<Error | undefined> {
   try {

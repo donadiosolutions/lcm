@@ -49,6 +49,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Never delete legacy parsing fallbacks or defensive handling for non-`Error` thrown values merely to satisfy coverage. Cover those branches with deterministic failure injection while preserving compatibility behavior.
 - Hook command or protocol changes must be searched and aligned across user docs, bundled hook READMEs and skill checklists, installer command registrations, and E2E tests.
 - Test-only numeric capacity and limit seams must reject non-positive, non-integer, and non-finite values before mutating shared state.
+- Tests that enable fake timers must restore real timers from `afterEach` or a
+  `finally` block so failed assertions cannot leak fake time into later tests.
 
 ### Search ranking compatibility
 
@@ -91,6 +93,11 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Route handlers must catch errors and return structured JSON: `{ error: string, code?: string }`.
 - Flag `res.send(e.message)` or unstructured error responses that leak stack traces.
 - Unhandled promise rejections in route handlers are bugs — flag missing `try/catch` in `async` handlers.
+- HTTP clients that consume `IncomingMessage` bodies must handle `aborted` and
+  `error` as well as `end`, guard against multiple terminal events, and reject
+  partial responses with a structured transport code and preserved cause.
+  Require deterministic tests that deliver a partial body before each terminal
+  failure.
 - Every operation on a closeable factory or repository must reject after close, including retained repository references closed through factory shutdown. Keep `close()` idempotent; best-effort restoration failures must never prevent pool/reference release or registry/cache cleanup. Assert sanitized, cause-free post-close errors and cleanup-failure behavior in tests.
 - User-facing child-process errors must not include raw stdout or stderr; use an allowlisted summary and bound all user-controlled metadata before interpolation.
 - Child-process timeout cleanup must guard `kill()` because the process can exit concurrently or the injected process implementation can throw.

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,6 +27,10 @@ beforeEach(() => {
   vi.mocked(ensureDaemon).mockResolvedValue({ connected: false });
   mockCollectEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null });
   mockCollectDetailedEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null, projects: [], recentErrors: [] });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 function buildSettingsJson(): string {
@@ -384,7 +388,6 @@ describe("runDoctor daemon version mismatch", () => {
       expect(results.find((result) => result.name === "daemon")).toMatchObject({
         status: "fail",
       });
-      vi.useRealTimers();
     },
   );
 

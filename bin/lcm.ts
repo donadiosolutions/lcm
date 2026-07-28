@@ -30,6 +30,7 @@ import {
 import type { ProgressState } from "../src/cli/progress-state.js";
 import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
+import { isDaemonTransportFailure } from "../src/daemon/http-url.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -848,35 +849,6 @@ async function createDaemonClientOrExit(
   }
 
   return new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
-}
-
-const DAEMON_TRANSPORT_ERROR_CODES = new Set([
-  "ECONNABORTED",
-  "ECONNREFUSED",
-  "ECONNRESET",
-  "EHOSTUNREACH",
-  "ENETUNREACH",
-  "EPIPE",
-  "ETIMEDOUT",
-]);
-
-/** @internal Restrict automatic promotion retries to local daemon transport loss. */
-export function isDaemonTransportFailure(error: unknown): boolean {
-  const seen = new Set<unknown>();
-  let current = error;
-  while (typeof current === "object" && current !== null && !seen.has(current)) {
-    seen.add(current);
-    const candidate = current as { code?: unknown; message?: unknown; cause?: unknown };
-    if (
-      typeof candidate.code === "string"
-      && DAEMON_TRANSPORT_ERROR_CODES.has(candidate.code.toUpperCase())
-    ) {
-      return true;
-    }
-    if (candidate.message === "Daemon request timed out") return true;
-    current = candidate.cause;
-  }
-  return false;
 }
 
 /** @internal CLI entry seam; defaults preserve the published executable behavior. */

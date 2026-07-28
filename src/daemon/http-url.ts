@@ -78,6 +78,42 @@ export type DaemonJsonResponse<T> = {
   data: T;
 };
 
+const DAEMON_TRANSPORT_ERROR_CODES = new Set([
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EPIPE",
+  "ETIMEDOUT",
+]);
+
+/** Restrict managed-daemon recovery to local transport loss. */
+export function isDaemonTransportFailure(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    seen.add(current);
+    const candidate = current as { code?: unknown; message?: unknown; cause?: unknown };
+    if (
+      typeof candidate.code === "string"
+      && DAEMON_TRANSPORT_ERROR_CODES.has(candidate.code.toUpperCase())
+    ) {
+      return true;
+    }
+    if (candidate.message === "Daemon request timed out") return true;
+    current = candidate.cause;
+  }
+  return false;
+}
+
+function interruptedDaemonResponse(cause: Error): Error & { code: "ECONNRESET" } {
+  return Object.assign(
+    new Error("Daemon response interrupted", { cause }),
+    { code: "ECONNRESET" as const },
+  );
+}
+
 export async function daemonJsonResponse<T>(
   portValue: unknown,
   path: string,
@@ -100,10 +136,14 @@ export async function daemonJsonResponse<T>(
       headers,
     }, (res) => {
       const chunks: Buffer[] = [];
-      res.on("data", (chunk: Buffer | string) => {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      });
-      res.on("end", () => {
+      let responseSettled = false;
+      const finishResponse = (transportError?: Error): void => {
+        if (responseSettled) return;
+        responseSettled = true;
+        if (transportError !== undefined) {
+          reject(transportError);
+          return;
+        }
         try {
           const statusCode = res.statusCode ?? 500;
           const raw = Buffer.concat(chunks).toString("utf-8");
@@ -112,7 +152,19 @@ export async function daemonJsonResponse<T>(
         } catch (err) {
           reject(err);
         }
+      };
+      res.on("data", (chunk: Buffer | string) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       });
+      res.once("aborted", () => {
+        finishResponse(interruptedDaemonResponse(
+          Object.assign(new Error("Daemon response aborted"), { code: "ECONNRESET" }),
+        ));
+      });
+      res.once("error", (error: Error) => {
+        finishResponse(interruptedDaemonResponse(error));
+      });
+      res.once("end", () => finishResponse());
     });
     req.on("error", reject);
     if (options.timeoutMs !== undefined) {
