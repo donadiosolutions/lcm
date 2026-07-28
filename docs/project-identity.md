@@ -50,6 +50,13 @@ operator-visible result, and LCM does not publish a partially reconciled map.
 After the conflict is corrected, rerun reconciliation; the durable journal and
 merge markers continue from the verified state.
 
+Reconciliation also fingerprints every mapped path so a repaired or remounted
+worktree invalidates a completed discovery result. An `ENOTDIR` observation for
+an unrelated map entry is recorded as stable unavailable evidence instead of
+blocking the requested project. The requested project's own map entry remains
+strict, and `ENOTDIR` there—or any other unexpected filesystem error
+anywhere—still fails closed.
+
 The instruction cache is a fixed-slot table, so reconciliation arbitrates each
 slot by `updated_at`. Byte-for-byte identical rows are deduplicated. When two
 different valid rows occupy the same slot, LCM retains the row with the newer
