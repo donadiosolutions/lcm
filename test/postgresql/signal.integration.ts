@@ -19,6 +19,7 @@ const SIGNAL_CASE_CLEANUP_MARGIN_MS = 30_000;
 // The surviving-consumer case can launch first, second, third, and fallback cleanup probes.
 const MAX_SIGNAL_PROBE_FAN_OUT = 4;
 const launchedRunIds = new Set<string>();
+const itPosixSignal = process.platform === "win32" ? it.skip : it;
 
 function signalCaseTimeout(probeCount: number): number {
   return SIGNAL_PROBE_READINESS_TIMEOUT_MS * probeCount + SIGNAL_CASE_CLEANUP_MARGIN_MS;
@@ -214,11 +215,11 @@ describe("PostgreSQL harness signal teardown", () => {
     expect(() => killChild(deniedChild, "SIGTERM")).toThrow("denied");
   });
 
-  it("cleans every labeled resource on SIGINT", () => runSignalProbe("SIGINT"), signalCaseTimeout(1));
-  it("cleans every labeled resource on SIGTERM", () => runSignalProbe("SIGTERM"), signalCaseTimeout(1));
-  it("cleans every labeled resource on SIGHUP", () => runSignalProbe("SIGHUP"), signalCaseTimeout(1));
+  itPosixSignal("cleans every labeled resource on SIGINT", () => runSignalProbe("SIGINT"), signalCaseTimeout(1));
+  itPosixSignal("cleans every labeled resource on SIGTERM", () => runSignalProbe("SIGTERM"), signalCaseTimeout(1));
+  itPosixSignal("cleans every labeled resource on SIGHUP", () => runSignalProbe("SIGHUP"), signalCaseTimeout(1));
 
-  it("reclaims a SIGKILL orphan before the next run allocates resources", async () => {
+  itPosixSignal("reclaims a SIGKILL orphan before the next run allocates resources", async () => {
     const first = await launchSignalProbe();
     const firstCompletion = exited(first.child);
     killChild(first.child, "SIGKILL");
@@ -237,7 +238,7 @@ describe("PostgreSQL harness signal teardown", () => {
     }
   }, signalCaseTimeout(2));
 
-  it("preserves a live parallel run while allocating and cleaning another run", async () => {
+  itPosixSignal("preserves a live parallel run while allocating and cleaning another run", async () => {
     const first = await launchSignalProbe();
     let second: Awaited<ReturnType<typeof launchSignalProbe>> | undefined;
     try {
@@ -263,7 +264,7 @@ describe("PostgreSQL harness signal teardown", () => {
     }
   }, signalCaseTimeout(2));
 
-  it("preserves a surviving local test consumer until that exact process exits", async () => {
+  itPosixSignal("preserves a surviving local test consumer until that exact process exits", async () => {
     const first = await launchSignalProbe("consumer");
     const firstCompletion = exited(first.child);
     killChild(first.child, "SIGKILL");
@@ -311,7 +312,7 @@ describe("PostgreSQL harness signal teardown", () => {
     }
   }, signalCaseTimeout(MAX_SIGNAL_PROBE_FAN_OUT));
 
-  it("terminates an active local consumer before graceful signal cleanup", async () => {
+  itPosixSignal("terminates an active local consumer before graceful signal cleanup", async () => {
     const probe = await launchSignalProbe("consumer");
     const pid = await consumerPid(probe.runId);
     try {
@@ -326,7 +327,7 @@ describe("PostgreSQL harness signal teardown", () => {
     }
   }, signalCaseTimeout(1));
 
-  it("terminates a persistent Vitest fork worker before cleanup", async () => {
+  itPosixSignal("terminates a persistent Vitest fork worker before cleanup", async () => {
     const probe = await launchSignalProbe("fork");
     const pid = await forkWorkerPid(probe.runId);
     try {

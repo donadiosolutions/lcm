@@ -18,6 +18,7 @@ export function postgresqlVitestCacheDir(
 export default defineConfig({
   cacheDir: postgresqlVitestCacheDir(),
   test: {
+    globalSetup: ["test/setup/runtime-home-global.ts"],
     setupFiles: ["test/setup/isolate-runtime-home.ts"],
     include: process.env.LCM_TEST_POSTGRES_FORK_PROBE === "true"
       ? ["test/postgresql/fixtures/persistent-worker.integration.ts"]
