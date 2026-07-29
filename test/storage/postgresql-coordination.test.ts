@@ -1116,6 +1116,12 @@ describe("PostgreSQL work coordination", () => {
       expect(config.text).toContain("NOT EXISTS");
       expect(config.text).toContain("earlier.machine_sequence <");
       expect(config.text).toContain("event.status = 'claimed'");
+      expect(config.text.match(/pg_catalog\.clock_timestamp\(\)/gu)).toHaveLength(
+        1,
+      );
+      expect(
+        config.text.match(/pg_catalog\.statement_timestamp\(\)/gu),
+      ).toHaveLength(2);
       return result([eventRow]);
     });
     const claims = await db.repository.claimPassiveEvents({

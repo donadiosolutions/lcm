@@ -1439,7 +1439,7 @@ export class PostgreSqlWorkCoordinator {
                  SET status = 'claimed',
                      attempt_count = event.attempt_count + 1,
                      claimed_at = GREATEST(
-                       pg_catalog.statement_timestamp(),
+                       pg_catalog.clock_timestamp(),
                        event.received_at
                      ),
                      claimed_by = $2

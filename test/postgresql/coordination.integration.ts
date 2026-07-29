@@ -1278,6 +1278,104 @@ describe("PostgreSQL 18 cross-machine coordination", () => {
     });
   });
 
+  it("timestamps claims after a table-lock wait before stale recovery", async () => {
+    await withPostgreSqlTestDatabase("coord-claim-lock-clock", async (
+      database,
+    ) => {
+      await grantCoordinationRuntimePrivileges(database);
+      const scope = await createScope(database, "Coordination claim clock");
+      const inboxId = await seedPassiveEvent(database, {
+        projectId: scope.projectId,
+        machineId: scope.machineIds[0],
+        machineSequence: 0n,
+      });
+      const claimerRuntime = runtime(database);
+      const reclaimerRuntime = runtime(database);
+      const claimer = new PostgreSqlCoordinationRepository(
+        claimerRuntime,
+        scope.projectId,
+        scope.machineIds[1],
+      );
+      const reclaimer = new PostgreSqlCoordinationRepository(
+        reclaimerRuntime,
+        scope.projectId,
+        scope.machineIds[2],
+      );
+      await Promise.all([
+        claimer.getCoordinationDiagnostics(),
+        reclaimer.getCoordinationDiagnostics(),
+      ]);
+      let reportLocked!: () => void;
+      let reportLockFailure!: (error: unknown) => void;
+      const tableLocked = new Promise<void>((resolve, reject) => {
+        reportLocked = resolve;
+        reportLockFailure = reject;
+      });
+      const blocker = database.migrator.transaction(async (transaction) => {
+        await transaction.query({
+          text: `LOCK TABLE lcm.passive_event_inbox
+                 IN ACCESS EXCLUSIVE MODE`,
+        }, { domain: "coordination", operation: "holdInboxTable" });
+        reportLocked();
+        await transaction.query({
+          text: "SELECT pg_catalog.pg_sleep(1.25)",
+        }, { domain: "coordination", operation: "holdInboxTable" });
+        const observed = await transaction.query<{ observed_at: Date }>({
+          text: "SELECT pg_catalog.clock_timestamp() AS observed_at",
+        }, { domain: "coordination", operation: "observeInboxUnlock" });
+        return observed.rows[0].observed_at;
+      }, {
+        domain: "coordination",
+        operation: "holdInboxTable",
+        projectId: scope.projectId,
+      }).catch((error: unknown) => {
+        reportLockFailure(error);
+        throw error;
+      });
+      try {
+        await tableLocked;
+        let claimSettled = false;
+        const claim = claimer.claimPassiveEvents({
+          claimOwner: "blocked-claimer",
+          limit: 1,
+          staleClaimMs: 1_000,
+        }).then(
+          (claims) => {
+            claimSettled = true;
+            return claims;
+          },
+          (error: unknown) => {
+            claimSettled = true;
+            throw error;
+          },
+        );
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(claimSettled).toBe(false);
+        const blockedUntil = await blocker;
+        const claims = await claim;
+        expect(claims).toMatchObject([{
+          inboxId,
+          claimedBy: "blocked-claimer",
+          attemptCount: 1,
+        }]);
+        expect(new Date(claims[0].claimedAt).getTime()).toBeGreaterThanOrEqual(
+          blockedUntil.getTime(),
+        );
+        await expect(reclaimer.claimPassiveEvents({
+          claimOwner: "premature-reclaimer",
+          limit: 1,
+          staleClaimMs: 1_000,
+        })).resolves.toEqual([]);
+      } finally {
+        await Promise.allSettled([
+          blocker,
+          claimerRuntime.close(),
+          reclaimerRuntime.close(),
+        ]);
+      }
+    });
+  });
+
   it("claims fair machine heads without duplicates or reordering", async () => {
     await withPostgreSqlTestDatabase("coord-queue", async (database) => {
       await grantCoordinationRuntimePrivileges(database);
