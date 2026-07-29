@@ -39,6 +39,7 @@ export const RESOURCE_KIND_LABEL = "com.donadiosolutions.lcm.postgresql-test-res
 export const OWNER_SCHEMA_VERSION = "2";
 export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
 export const MAX_DOCKER_REMOVE_ATTEMPTS = 3;
+export const ORPHAN_WORKER_STABILITY_DELAY_MS = 250;
 export const HARNESS_CLEANUP_RETRY_DELAYS_MS = Object.freeze([
   250,
   500,
@@ -1220,10 +1221,44 @@ export async function discoverHarnessRuns(dependencies = {}) {
   return [...runs.values()];
 }
 
+async function inspectReclaimableWorkers(run, names, dockerRunner) {
+  const workers = [];
+  for (const [kind, name] of [
+    ["restore", names.restore],
+    ["runner", names.runner],
+  ]) {
+    const expectedLabels = ownershipLabels(run.runId, kind, run.owner);
+    let record;
+    try {
+      record = await inspectDockerObject("container", name, dockerRunner);
+    } catch (error) {
+      if (isMissingDockerObjectError(error, "container", name)) continue;
+      throw error;
+    }
+    const labels = record?.Config?.Labels ?? {};
+    if (!labelsMatchOwnership(labels, expectedLabels)) {
+      throw new Error(`refusing to reclaim ${kind} container with changed PostgreSQL harness ownership`);
+    }
+    if (record?.State?.Running === true) return { live: true, workers: [] };
+    if (record?.State?.Running !== false) {
+      throw new Error(`refusing to reclaim ${kind} container with uncertain state`);
+    }
+    workers.push({
+      type: "container",
+      name,
+      kind,
+      labels: expectedLabels,
+    });
+  }
+  return { live: false, workers };
+}
+
 export async function reclaimProvenOrphans(dependencies = {}) {
   const dockerRunner = dependencies.dockerRunner ?? docker;
   const removeDirectory = dependencies.removeDirectory
     ?? ((path) => rmSync(path, { recursive: true, force: true }));
+  const delay = dependencies.delay
+    ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
   const runs = await discoverHarnessRuns({ ...dependencies, dockerRunner });
   const failures = [];
   const ambiguousCount = runs.filter((run) => run.classification === "ambiguous").length;
@@ -1239,46 +1274,17 @@ export async function reclaimProvenOrphans(dependencies = {}) {
     const byKind = new Map(run.resources.map((resource) => [resource.kind, resource]));
     const names = createRunNames(run.runId);
     const database = byKind.get("database");
-    const workers = [];
-    let activeWorker = false;
-    for (const [kind, name] of [
-      ["restore", names.restore],
-      ["runner", names.runner],
-    ]) {
-      const expectedLabels = ownershipLabels(run.runId, kind, run.owner);
-      let record;
-      try {
-        record = await inspectDockerObject("container", name, dockerRunner);
-      } catch (error) {
-        if (isMissingDockerObjectError(error, "container", name)) continue;
-        runFailures.push(error);
-        break;
+    let workerSnapshot;
+    try {
+      workerSnapshot = await inspectReclaimableWorkers(run, names, dockerRunner);
+      if (!workerSnapshot.live) {
+        await delay(ORPHAN_WORKER_STABILITY_DELAY_MS);
+        workerSnapshot = await inspectReclaimableWorkers(run, names, dockerRunner);
       }
-      const labels = record?.Config?.Labels ?? {};
-      if (!labelsMatchOwnership(labels, expectedLabels)) {
-        runFailures.push(
-          new Error(`refusing to reclaim ${kind} container with changed PostgreSQL harness ownership`),
-        );
-        break;
-      }
-      if (record?.State?.Running === true) {
-        activeWorker = true;
-        break;
-      }
-      if (record?.State?.Running !== false) {
-        runFailures.push(
-          new Error(`refusing to reclaim ${kind} container with uncertain state`),
-        );
-        break;
-      }
-      workers.push({
-        type: "container",
-        name,
-        kind,
-        labels: expectedLabels,
-      });
+    } catch (error) {
+      runFailures.push(error);
     }
-    if (activeWorker) {
+    if (workerSnapshot?.live) {
       run.classification = "live";
       continue;
     }
@@ -1286,7 +1292,7 @@ export async function reclaimProvenOrphans(dependencies = {}) {
       failures.push(...runFailures);
       continue;
     }
-    for (const worker of workers) {
+    for (const worker of workerSnapshot.workers) {
       try {
         await removeOwnedResource(
           worker.type,

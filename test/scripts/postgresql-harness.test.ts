@@ -17,6 +17,7 @@ import {
   OWNER_SCOPE_LABEL,
   OWNER_SCHEMA_LABEL,
   OWNER_SCHEMA_VERSION,
+  ORPHAN_WORKER_STABILITY_DELAY_MS,
   POSTGRES_IMAGE,
   RESOURCE_KIND_LABEL,
   RUN_LABEL,
@@ -1334,6 +1335,166 @@ describe("PostgreSQL harness utilities", () => {
     ]));
   });
 
+  it.each(["restore", "runner"] as const)(
+    "preserves an entire stale run when a missing %s worker appears live during the stability barrier",
+    async (workerKind) => {
+      const runId = workerKind === "restore" ? "a".repeat(32) : "b".repeat(32);
+      const names = createRunNames(runId);
+      const owner = {
+        pid: workerKind === "restore" ? 102 : 103,
+        birth: `linux:12345678-1234-1234-1234-123456789abc:${workerKind === "restore" ? 1020 : 1030}`,
+        scope: testOwnerScope,
+      };
+      const workerName = names[workerKind];
+      const records = new Map([
+        [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
+        [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+        [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
+      ]);
+      const workerInspections = new Map<string, number>();
+      const mutations: string[][] = [];
+      const dockerRunner = vi.fn(async (args: string[]) => {
+        if (args[1] === "ls") {
+          const type = args[0] === "container" ? "container" : args[0];
+          return {
+            stdout: [...records.keys()]
+              .filter((key) => key.startsWith(`${type}:`))
+              .map((key) => key.slice(type.length + 1))
+              .join("\n"),
+            stderr: "",
+          };
+        }
+        if (args[1] === "inspect") {
+          const type = args[0];
+          const name = args[2];
+          const labels = records.get(`${type}:${name}`);
+          if (!labels && type === "container") {
+            workerInspections.set(name, (workerInspections.get(name) ?? 0) + 1);
+            throw missingContainerError(name);
+          }
+          return {
+            stdout: JSON.stringify([type === "container"
+              ? {
+                Config: { Labels: labels },
+                State: { Running: name === names.container || name === workerName },
+                Mounts: [],
+              }
+              : { Labels: labels }]),
+            stderr: "",
+          };
+        }
+        mutations.push(args);
+        throw new Error("a newly live canonical worker must preserve the whole run");
+      });
+      const delay = vi.fn(async () => {
+        records.set(
+          `container:${workerName}`,
+          ownershipLabels(runId, workerKind, owner),
+        );
+      });
+      const verifySentinel = vi.fn();
+      const removeDirectory = vi.fn();
+
+      const runs = await reclaimProvenOrphans({
+        dockerRunner,
+        processProbe: vi.fn(),
+        readFingerprint: () => `${owner.birth}-reused`,
+        readScope: () => testOwnerScope,
+        verifySentinel,
+        resolveHarnessDirectory: () => "/private/harness",
+        removeDirectory,
+        delay,
+      });
+
+      expect(runs).toMatchObject([{ runId, classification: "live" }]);
+      expect(delay).toHaveBeenCalledOnce();
+      expect(delay).toHaveBeenCalledWith(ORPHAN_WORKER_STABILITY_DELAY_MS);
+      expect(workerInspections.get(workerName)).toBe(1);
+      expect(mutations).toEqual([]);
+      expect(verifySentinel).not.toHaveBeenCalled();
+      expect(removeDirectory).not.toHaveBeenCalled();
+      expect(records.has(`container:${names.container}`)).toBe(true);
+      expect(records.has(`volume:${names.volume}`)).toBe(true);
+      expect(records.has(`network:${names.network}`)).toBe(true);
+    },
+  );
+
+  it("requires stable absence of both canonical workers before the first mutation", async () => {
+    const runId = "c".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 104,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:1040",
+      scope: testOwnerScope,
+    };
+    const records = new Map([
+      [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+      [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
+    ]);
+    const events: string[] = [];
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        return {
+          stdout: [...records.keys()]
+            .filter((key) => key.startsWith(`${type}:`))
+            .map((key) => key.slice(type.length + 1))
+            .join("\n"),
+          stderr: "",
+        };
+      }
+      if (args[1] === "inspect") {
+        const type = args[0];
+        const name = args[2];
+        const labels = records.get(`${type}:${name}`);
+        if (!labels && type === "container") {
+          events.push(`missing:${name}`);
+          throw missingContainerError(name);
+        }
+        return {
+          stdout: JSON.stringify([type === "container"
+            ? {
+              Config: { Labels: labels },
+              State: { Running: name === names.container },
+              Mounts: [],
+            }
+            : { Labels: labels }]),
+          stderr: "",
+        };
+      }
+      const type = args[0];
+      const name = args.at(-1)!;
+      events.push(`remove:${type}:${name}`);
+      records.delete(`${type === "container" ? "container" : type}:${name}`);
+      return { stdout: "", stderr: "" };
+    });
+    const delay = vi.fn(async (milliseconds: number) => {
+      events.push(`delay:${milliseconds}`);
+    });
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+      verifySentinel: vi.fn(),
+      resolveHarnessDirectory: () => "/private/harness",
+      removeDirectory: vi.fn(),
+      delay,
+    })).resolves.toBeDefined();
+
+    expect(delay).toHaveBeenCalledOnce();
+    expect(events.slice(0, 5)).toEqual([
+      `missing:${names.restore}`,
+      `missing:${names.runner}`,
+      `delay:${ORPHAN_WORKER_STABILITY_DELAY_MS}`,
+      `missing:${names.restore}`,
+      `missing:${names.runner}`,
+    ]);
+    expect(events[5]).toBe(`remove:container:${names.container}`);
+  });
+
   it("aborts a stale run when worker state becomes uncertain before reclamation", async () => {
     const runId = "4".repeat(32);
     const names = createRunNames(runId);
@@ -1408,7 +1569,7 @@ describe("PostgreSQL harness utilities", () => {
             ? {
               Config: { Labels: labels },
               State: {
-                Running: name === names.container || (name === names.runner && runnerInspections >= 3),
+                Running: name === names.container || (name === names.runner && runnerInspections >= 4),
               },
               Mounts: [],
             }
