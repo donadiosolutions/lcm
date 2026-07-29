@@ -7,7 +7,11 @@ import { mergeClaudeSettings, REQUIRED_HOOKS } from "../../installer/install.js"
 import { legacyLcmMcpServerName } from "../../src/legacy-names.js";
 import { LCM_MD_CONTENT } from "../../src/daemon/orientation.js";
 import { ensureDaemon } from "../../src/daemon/lifecycle.js";
-import { hashProjectPath, normalizeProjectPath } from "../../src/project-map.js";
+import {
+  clearProjectMapCache,
+  hashProjectPath,
+  normalizeProjectPath,
+} from "../../src/project-map.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn().mockResolvedValue({ connected: false }),
@@ -186,6 +190,73 @@ describe("runDoctor Claude integration ownership", () => {
 });
 
 describe("runDoctor project map checks", () => {
+  it("renders blocked reconciliation guidance without retrying through project patterns", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-blocked-reconciliation-"));
+    try {
+      const main = join(home, "main");
+      const linked = join(home, "linked");
+      const commonDir = join(main, ".git");
+      const linkedGitDir = join(commonDir, "worktrees", "linked");
+      mkdirSync(join(commonDir, "objects"), { recursive: true });
+      mkdirSync(linkedGitDir, { recursive: true });
+      mkdirSync(linked);
+      writeFileSync(join(commonDir, "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(commonDir, "config"), "[core]\nrepositoryformatversion = 0\n");
+      writeFileSync(join(linkedGitDir, "HEAD"), "ref: refs/heads/linked\n");
+      writeFileSync(join(linkedGitDir, "commondir"), "../..\n");
+      writeFileSync(join(linked, ".git"), `gitdir: ${linkedGitDir}\n`);
+      const targetHash = hashProjectPath(main);
+      const sourceHash = hashProjectPath(linked);
+      mkdirSync(join(home, ".lcm", "reconciliations"), { recursive: true });
+      writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({
+        [targetHash]: {
+          canonical: main,
+          aliases: [],
+          remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+        },
+        [sourceHash]: {
+          canonical: linked,
+          aliases: [],
+          remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
+        },
+      }));
+      writeFileSync(
+        join(home, ".lcm", "reconciliations", `${targetHash}.json`),
+        JSON.stringify({
+          version: 1,
+          targetHash,
+          canonical: main,
+          sourceHashes: [],
+          pendingSourceHashes: [],
+          aliases: [main],
+          createdAt: "2026-07-25T00:00:00.000Z",
+          updatedAt: "2026-07-25T00:00:00.000Z",
+          phase: "blocked",
+          blockedFrom: "planned",
+          reason: "conflicting PostgreSQL project bindings",
+          backupPaths: [],
+        }),
+      );
+      clearProjectMapCache();
+
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        cwd: main,
+      }));
+
+      expect(results.find((result) => result.name === "worktree-reconciliation"))
+        .toMatchObject({
+          status: "fail",
+          message: expect.stringContaining("reconcile-worktrees"),
+        });
+      expect(results.find((result) => result.name === "user-patterns"))
+        .toBeDefined();
+    } finally {
+      clearProjectMapCache();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     ["blocked", "fail"],
     ["merged", "warn"],

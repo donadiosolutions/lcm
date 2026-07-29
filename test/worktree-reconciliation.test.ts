@@ -1627,6 +1627,71 @@ describe("worktree reconciliation", () => {
       targetUpdatedAt: new Uint8Array([1, 2, 3]),
       sourceUpdatedAt: "2026-01-01T00:00:00.000Z",
     },
+    {
+      label: "calendar-invalid source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-02-30T00:00:00.000Z",
+    },
+    {
+      label: "shorthand source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "0",
+    },
+    {
+      label: "timezone-less ISO source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-02-01T00:00:00",
+    },
+    {
+      label: "zoned SQLite source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-02-01 00:00:00Z",
+    },
+    {
+      label: "fractional SQLite source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-02-01 00:00:00.1",
+    },
+    {
+      label: "out-of-range month source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-13-01T00:00:00Z",
+    },
+    {
+      label: "zero day source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-01-00T00:00:00Z",
+    },
+    {
+      label: "non-leap-year source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2025-02-29T00:00:00Z",
+    },
+    {
+      label: "out-of-range hour source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-01-01T24:00:00Z",
+    },
+    {
+      label: "out-of-range minute source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-01-01T00:60:00Z",
+    },
+    {
+      label: "out-of-range second source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-01-01T00:00:60Z",
+    },
+    {
+      label: "out-of-range zone hour source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-01-01T00:00:00+24:00",
+    },
+    {
+      label: "out-of-range zone minute source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-01-01T00:00:00+00:60",
+    },
   ])("fails closed when the $label instruction-cache timestamp is malformed", ({
     targetUpdatedAt,
     sourceUpdatedAt,
@@ -3609,6 +3674,37 @@ describe("worktree reconciliation", () => {
     }).status).toBe("not-needed");
     expect(listWorktreeReconciliationJournals()[0].discovery!.mapFingerprint)
       .not.toBe(unavailableFingerprint);
+  });
+
+  it("strictly validates ENOTDIR aliases for a related source before merging it", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    const regularFile = join(home, "related-regular-file");
+    const invalidAlias = join(regularFile, "child");
+    writeFileSync(regularFile, "not a directory");
+    const mapBefore = `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [invalidAlias] },
+    }, null, 2)}\n`;
+    writeFileSync(projectMapPath(), mapBefore);
+    clearProjectMapCache();
+    const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    makeDatabase(sourcePath, "related-enotdir", "source", sourceHash);
+
+    expect(() => reconcileWorktrees(main)).toThrow("ENOTDIR");
+
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(mapBefore);
+    expect(existsSync(sourcePath)).toBe(true);
+    expect(existsSync(join(home, ".lcm", "projects", targetHash))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      blockedFrom: "planned",
+      sourceHashes: [],
+    }]);
   });
 
   it("isolates malformed foreign Git metadata and invalidates its cached fingerprint on repair", () => {

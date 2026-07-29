@@ -74,6 +74,11 @@ vi.mock("../../../src/daemon/summarizer.js", () => ({
 }));
 
 vi.mock("../../../src/daemon/project.js", () => ({
+  projectIdentity: (cwd: string, storageConfig: unknown) => {
+    if (state.identityError !== undefined) throw state.identityError;
+    const local = state.paths(cwd);
+    return state.identity(cwd, storageConfig, local);
+  },
   projectPaths: state.paths,
   ensureProjectDirForIdentity: state.ensureProject,
   isSafeTranscriptPath: () => true,
@@ -239,6 +244,7 @@ describe("compact route coverage", () => {
           }
     ));
     state.ensureProject.mockClear();
+    state.ensureProject.mockReturnValue("/tmp/project");
     state.queuedKeys = [];
     state.beforeQueuedWork = undefined;
     state.scrubber.mockClear();
@@ -262,18 +268,18 @@ describe("compact route coverage", () => {
     expect(state.openProject).not.toHaveBeenCalled();
   });
 
-  it("keeps successful SQLite identity ahead of local compaction setup", async () => {
+  it("admits successful SQLite storage ahead of local compaction setup", async () => {
     await expect(call(JSON.stringify({ session_id: "sqlite-order", cwd: "/tmp" })))
       .resolves.toMatchObject({ actionTaken: false });
     expect(state.ensureProject).toHaveBeenCalledOnce();
     expect(state.scrubber).toHaveBeenCalledOnce();
     expect(state.openProject).toHaveBeenCalledOnce();
     expect(state.identity.mock.invocationCallOrder[0])
+      .toBeLessThan(state.openProject.mock.invocationCallOrder[0]);
+    expect(state.openProject.mock.invocationCallOrder[0])
       .toBeLessThan(state.ensureProject.mock.invocationCallOrder[0]);
     expect(state.ensureProject.mock.invocationCallOrder[0])
       .toBeLessThan(state.scrubber.mock.invocationCallOrder[0]);
-    expect(state.scrubber.mock.invocationCallOrder[0])
-      .toBeLessThan(state.openProject.mock.invocationCallOrder[0]);
   });
 
   it("uses one local and remote identity snapshot across queued execution", async () => {
@@ -294,6 +300,7 @@ describe("compact route coverage", () => {
       metaPath: "/lcm/projects/local-hash-b/meta.json",
     };
     state.paths.mockReturnValueOnce(first);
+    state.ensureProject.mockReturnValue(first.dir);
     state.beforeQueuedWork = () => {
       state.paths.mockReturnValue(concurrent);
     };

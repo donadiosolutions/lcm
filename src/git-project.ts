@@ -77,6 +77,20 @@ function canonicalForCommonDir(commonDir: string): string {
     : commonDir;
 }
 
+function hasConfiguredWorktree(commonDir: string): boolean {
+  const config = readGitPointer(join(commonDir, "config"), commonDir, "Git config");
+  let inCore = false;
+  for (const line of config.split(/\r?\n/u)) {
+    const section = /^\s*\[([^\]]+)\]\s*$/u.exec(line);
+    if (section) {
+      inCore = section[1]!.trim().toLowerCase() === "core";
+      continue;
+    }
+    if (inCore && /^\s*worktree\s*=/iu.test(line)) return true;
+  }
+  return false;
+}
+
 function validateGitDirectory(gitDir: string, commonDir: string): void {
   for (const [path, label] of [
     [join(gitDir, "HEAD"), "Git HEAD"],
@@ -115,10 +129,12 @@ function inspectGitMarker(worktreeRoot: string): GitProjectAnchor | null {
   validateGitDirectory(gitDir, commonDir);
   return {
     // A normal submodule has a `.git` pointer into the superproject's
-    // `.git/modules/...` directory but no `commondir`. Its checkout—not that
-    // metadata directory—is its independent local project anchor.
+    // `.git/modules/...` directory, no `commondir`, and an explicit core
+    // worktree. A primary checkout created with `--separate-git-dir` also has
+    // no `commondir`, but its external Git directory must remain the anchor so
+    // linked worktrees derived from it resolve to the same project.
     canonical: stat.isFile() && commonDir === gitDir
-      ? worktreeRoot
+      ? hasConfiguredWorktree(commonDir) ? worktreeRoot : canonicalForCommonDir(commonDir)
       : canonicalForCommonDir(commonDir),
     worktreeRoot,
     commonDir,

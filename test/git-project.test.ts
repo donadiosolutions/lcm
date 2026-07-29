@@ -203,6 +203,30 @@ describe("Git project identity", () => {
     });
   });
 
+  it("uses one external anchor for a separate-git-dir primary and its linked worktree", () => {
+    const primary = makeDirectory(join(root, "separate-primary"));
+    const shared = join(root, "separate-metadata");
+    git(root, "init", "-q", "--separate-git-dir", shared, primary);
+    git(primary, "config", "user.email", "test@example.invalid");
+    git(primary, "config", "user.name", "LCM Test");
+    writeFileSync(join(primary, "README.md"), "separate metadata\n");
+    git(primary, "add", "README.md");
+    git(primary, "commit", "-qm", "initial");
+    const linked = join(root, "separate-linked");
+    git(primary, "worktree", "add", "-q", "-b", "separate-linked", linked);
+
+    expect(resolveGitProjectAnchor(primary)).toEqual({
+      canonical: shared,
+      worktreeRoot: primary,
+      commonDir: shared,
+    });
+    expect(resolveGitProjectAnchor(linked)).toEqual({
+      canonical: shared,
+      worktreeRoot: linked,
+      commonDir: shared,
+    });
+  });
+
   it("rejects malformed, oversized, symlinked, and invalid Git metadata", () => {
     const malformed = makeDirectory(join(root, "malformed"));
     writeFileSync(join(malformed, ".git"), "not-a-gitdir\n");

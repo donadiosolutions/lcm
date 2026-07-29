@@ -15,7 +15,7 @@ export function projectIdentity(cwd: string): ProjectIdentity;
 export function projectIdentity(
   cwd: string,
   config: ResolvedStorageConfig,
-): StorageIdentityContext;
+): StorageIdentityContext & { readonly localProjectId: string };
 export function projectIdentity(
   cwd: string,
   config?: ResolvedStorageConfig,

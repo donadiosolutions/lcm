@@ -2066,11 +2066,11 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       const output: string | undefined = opts.output;
       const all: boolean = opts.all ?? false;
 
-      const cwds: string[] = [];
+      let cwds: string[] = [];
       if (all) {
         const { reconcileWorktrees } = await import("../src/worktree-reconciliation.js");
-        reconcileWorktrees(process.cwd());
         const projectsDir = lcmProjectsDir();
+        const candidates: string[] = [];
         if (existsSync(projectsDir)) {
           for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
             if (!entry.isDirectory()) continue;
@@ -2078,10 +2078,21 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
             if (!existsSync(metaPath)) continue;
             try {
               const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-              if (meta.cwd) cwds.push(meta.cwd);
+              if (typeof meta.cwd === "string" && meta.cwd) candidates.push(meta.cwd);
             } catch { /* skip */ }
           }
         }
+        const reconciled = new Map<string, string>();
+        for (const candidate of candidates) {
+          try {
+            const result = reconcileWorktrees(candidate);
+            reconciled.set(result.targetHash, result.canonical);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            process.stderr.write(`  Warning: could not reconcile ${candidate}: ${message}\n`);
+          }
+        }
+        cwds = [...reconciled.values()];
       } else {
         cwds.push(process.cwd());
       }

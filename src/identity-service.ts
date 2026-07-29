@@ -158,6 +158,8 @@ export interface IdentityServiceDependencies {
   readonly waitForRemoteIdentityLock?: (delayMs: number) => Promise<void>;
   /** @internal Bounded retry override for remote identity lock tests. */
   readonly remoteIdentityLockMaxAttempts?: number;
+  /** @internal Observe the post-lock identity snapshot boundary in tests. */
+  readonly _afterProjectIdentityLock?: () => void;
 }
 
 export class RemoteIdentityConfigurationError extends Error {
@@ -279,6 +281,7 @@ function withReconciledRemoteProjectIdentityMutationLock<T>(
   return withProjectIdentityMutationLock(
     deps.homeDir,
     async () => {
+      deps._afterProjectIdentityLock?.();
       reconcileWorktrees(projectPath, { homeDir: deps.homeDir });
       return withRemoteIdentityMutationLock(deps.homeDir, callback);
     },
@@ -700,6 +703,18 @@ async function createRemoteProject(
   }
 }
 
+function showReconciledLocalProject(
+  target: string,
+  deps: IdentityServiceDependencies,
+): ReturnType<typeof showProjectMapEntry> {
+  const initial = showProjectMapEntry(target);
+  const reconciliationPath = initial.transient ? target : initial.entry.canonical;
+  reconcileWorktrees(reconciliationPath, { homeDir: deps.homeDir });
+  return showProjectMapEntry(initial.transient || !isProjectHash(target)
+    ? target
+    : reconciliationPath);
+}
+
 export async function createProject(
   config: ResolvedStorageConfig,
   path = process.cwd(),
@@ -712,10 +727,13 @@ export async function createProject(
   const displayName = normalizeProjectDisplayName(
     options.displayName ?? defaultProjectDisplayName(projectPath),
   );
-  const selectedPath = remotePath(projectPath);
   return withReconciledRemoteProjectIdentityMutationLock(projectPath, deps, async () => {
+    // Capture the entered lexical path and its resolved PostgreSQL identity
+    // together after both identity locks are held. Resolve the local identity
+    // from that same snapshot so a symlink retarget cannot mix two projects.
+    const selectedPath = remotePath(assertProjectDirectory(projectPath));
     const machine = requireMachineIdentity(deps.homeDir);
-    const local = resolveProjectIdentity(projectPath);
+    const local = resolveProjectIdentity(selectedPath.normalizedPath);
     if (local.remoteProjectId) {
       throw new Error(
         `local project ${local.id} is already bound to PostgreSQL project ${local.remoteProjectId}`,
@@ -1225,8 +1243,8 @@ async function linkLocalAlias(
   readonly remoteAlias?: RemoteProjectAlias;
 }> {
   return withProjectIdentityMutationLock(deps.homeDir, async () => {
-    const targetOptions = isProjectHash(target) ? { hash: target } : { canonical: target };
-    const shown = showProjectMapEntry(target);
+    const shown = showReconciledLocalProject(target, deps);
+    const targetOptions = { hash: shown.hash };
     if (shown.transient) throw new Error(`unknown local project target: ${target}`);
     remoteEntryPaths({
       ...shown.entry,
@@ -1478,7 +1496,7 @@ export async function unlinkProject(
   const projectPath = resolve(path);
   const deps = dependencies(dependencyOverrides);
   return withProjectIdentityMutationLock(deps.homeDir, async () => {
-    const shown = showProjectMapEntry(projectPath);
+    const shown = showReconciledLocalProject(projectPath, deps);
     if (shown.transient || !shown.entry.remoteProjectId) {
       return unlinkProjectMutation(config, projectPath, deps);
     }

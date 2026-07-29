@@ -375,7 +375,6 @@ function releaseMutationLock(
     }
     abandonedMutationLocks.delete(lockPath);
   } catch (releaseError) {
-    if (!callbackFailed) throw releaseError;
     let current: string;
     try {
       current = readBoundedRegularFile(lockPath, {
@@ -385,9 +384,17 @@ function releaseMutationLock(
     } catch (recoveryError) {
       if (isMissingFileError(recoveryError)) {
         abandonedMutationLocks.delete(lockPath);
-        return;
+        if (callbackFailed) return;
+        throw releaseError;
       }
       abandonedMutationLocks.set(lockPath, content);
+      if (!callbackFailed) {
+        throw new AggregateError(
+          [releaseError, recoveryError],
+          `${label} mutation succeeded but lock cleanup could not be recovered`,
+          { cause: releaseError },
+        );
+      }
       throw new AggregateError(
         [callbackError, releaseError, recoveryError],
         `${label} mutation failed and lock cleanup could not be recovered`,
@@ -396,11 +403,21 @@ function releaseMutationLock(
     }
     if (current !== content) {
       abandonedMutationLocks.delete(lockPath);
+      const ownershipError = new Error(
+        `${label} mutation lock ownership changed during release recovery`,
+      );
+      if (!callbackFailed) {
+        throw new AggregateError(
+          [releaseError, ownershipError],
+          `${label} mutation succeeded but lock ownership changed during cleanup`,
+          { cause: releaseError },
+        );
+      }
       throw new AggregateError(
         [
           callbackError,
           releaseError,
-          new Error(`${label} mutation lock ownership changed during release recovery`),
+          ownershipError,
         ],
         `${label} mutation failed and lock cleanup could not be recovered`,
         { cause: callbackError },
@@ -410,6 +427,13 @@ function releaseMutationLock(
       operations.deleteRegularFile(lockPath);
     } catch (recoveryError) {
       abandonedMutationLocks.set(lockPath, content);
+      if (!callbackFailed) {
+        throw new AggregateError(
+          [releaseError, recoveryError],
+          `${label} mutation succeeded but lock cleanup could not be recovered`,
+          { cause: releaseError },
+        );
+      }
       throw new AggregateError(
         [callbackError, releaseError, recoveryError],
         `${label} mutation failed and lock cleanup could not be recovered`,
@@ -417,6 +441,7 @@ function releaseMutationLock(
       );
     }
     abandonedMutationLocks.delete(lockPath);
+    if (!callbackFailed) throw releaseError;
     throw new AggregateError(
       [callbackError, releaseError],
       `${label} mutation failed after lock cleanup initially failed`,
