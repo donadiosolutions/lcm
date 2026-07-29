@@ -123,59 +123,90 @@ last. Candidate content fingerprints, states, state reasons, labels, and
 timestamps are revalidated before writes. Retries resume a coherent trusted
 marker but reject stale, conflicting, or duplicate-chain evidence.
 
-## One-time rollout migration
+## Rollout safety protocol
 
-The initial rollout requires a one-time operator pass. It is deliberately not
-part of the recurring issue-triage workflow code.
+Use this protocol for either migration path below. The issue labeler and stale
+workflow both mutate issue metadata, so they must not overlap an operator
+migration.
 
-Perform the migration in this order:
+1. Pause both the issue-labeler and stale workflows, then wait for every
+   in-flight run of either workflow to reach a terminal state.
+2. Snapshot every open and closed issue in the path's inventory, including its
+   number, state, Issue type, every Planning Field value, and all labels. Record
+   the snapshot time and highest issue number so issues created during the
+   migration can be identified.
+3. Perform the selected migration while both workflows remain paused.
+4. Before final verification, rescan the repository and reconcile every issue
+   created after the snapshot as well as every issue carrying
+   `needs-codex-triage`. Add each one to the reviewed inventory, apply the same
+   migration rules, add the queue label to any newly created issue that does
+   not have it, and retain that label for normal classification after the
+   workflow resumes.
+5. Verify the complete, reconciled inventory. Deprecate and delete the path's
+   legacy labels only after this verification succeeds.
+6. Resume the issue-labeler first and dispatch its catch-up run. Confirm that
+   the queued inventory drains without violating the verified field
+   constraints, then resume the stale workflow.
 
-1. Prevent the stale workflow from running during migration, and snapshot every
-   open and closed issue with its existing Issue type, Planning Field values,
-   and labels.
-2. Preserve existing Planning Field values, then backfill legacy labels:
+## Initial rollout for new installations
+
+An installation that has not completed the Planning Fields migration must use
+this one-time operator path. It is deliberately not part of the recurring
+issue-triage workflow code.
+
+1. Create and enable all configured native Issue types, including `Question`.
+   Verify that the `Question` description states the classification boundary
+   above: investigation or spike work is `Chore` with `research`, behavior
+   changes are `Feature`, and unexpected incorrect behavior is `Bug`.
+2. Review every `question`-labeled issue. Map a focused request for
+   clarification, guidance, support, or an existing-knowledge answer to
+   `Question`; resolve other question-labeled issues individually. A security
+   candidate must retain or receive `Chore` or `Bug` unless it is explicitly
+   reviewed and declassified as non-security before it receives `Question`.
+3. Preserve existing Planning Field values, then backfill legacy labels:
    `p0-critical` to `Urgent`, `p1-high` to `High`, `p2-medium` to `Medium`,
-   `p3-low` to `Low`, `bug` to `Bug`, `enhancement` to `Feature`, and `chore`
-   to `Chore`. Preserve `Epic` and resolve any conflicting legacy type labels
-   against the reviewed inventory.
-3. Set `Security status=Triage` on legacy security issues when the field is
+   `p3-low` to `Low`, `bug` to `Bug`, `enhancement` to `Feature`, `chore` to
+   `Chore`, and the reviewed non-security `question` issues to `Question`.
+   Preserve `Epic` and resolve conflicting legacy type labels against the
+   reviewed inventory.
+4. Set `Security status=Triage` on legacy security issues when the field is
    unset, then run the Terra enrichment pass.
-4. Verify complete Issue type and Priority coverage for every open and closed
-   issue and verify the intended security fields. Priority must be backfilled
-   before the next stale run and before any legacy priority label is removed.
-5. Mark `bug`, `enhancement`, `chore`, `security`, `p0-critical`, `p1-high`,
-   `p2-medium`, `p3-low`, and every `prj-*` label as deprecated, then delete
-   them only after verification succeeds.
-6. Re-enable or allow the next stale run after the verified field backfill and
-   label deletion complete.
+5. Follow the rollout safety protocol's final rescan, then verify complete
+   Issue type and Priority coverage for every open and closed issue and verify
+   the intended security fields. Priority must be backfilled before the stale
+   workflow resumes and before any legacy priority label is removed.
+6. After verification, deprecate and delete `bug`, `enhancement`, `chore`,
+   `question`, `security`, `p0-critical`, `p1-high`, `p2-medium`, `p3-low`, and
+   every `prj-*` label. Resume and catch up the workflows only as specified by
+   the rollout safety protocol.
 
-## Question type follow-up rollout
+## Question follow-up for already-migrated installations
 
-Installations that completed the original one-time rollout before `Question`
-became a native Issue type must use this narrow follow-up. Do not rerun the
-initial migration above.
+An installation that completed the original one-time rollout before
+`Question` became a native Issue type must use this narrow incremental path.
+Do not rerun or rewrite the historical migration.
 
-1. Snapshot every open and closed issue that still has the `question` label,
-   recording its current Issue type, every Planning Field value, and all
-   labels. Review that inventory and identify any issue that is not actually a
-   focused request for clarification, guidance, support, or an answer based on
-   existing project knowledge.
+1. Use the rollout safety protocol to pause both mutating workflows and
+   snapshot every open and closed issue that still has the `question` label.
+   Review the inventory and identify issues outside the focused Question
+   boundary.
 2. Create the native `Question` Issue type if it is absent. Verify that it is
-   enabled and that its description states the classification boundary above:
-   investigation or spike work is `Chore` with `research`, behavior changes
-   are `Feature`, and unexpected incorrect behavior is `Bug`.
+   enabled and that its description states the classification boundary used by
+   the initial path.
 3. For each reviewed `question`-labeled issue that meets that boundary, set
    only its Issue type to `Question`. Preserve its Priority, security fields,
-   other Planning Field values, state, and unrelated labels. Resolve reviewed
-   exceptions individually instead of overwriting their existing Issue type.
-4. Verify every issue from the snapshot against the reviewed mapping, and
-   confirm that no Priority, security field, other Planning Field value, state,
-   or unrelated label changed.
+   other Planning Field values, state, and unrelated labels. A security
+   candidate must retain or receive `Chore` or `Bug` unless it is explicitly
+   reviewed and declassified as non-security before it receives `Question`.
+   Resolve all other reviewed exceptions individually instead of overwriting
+   their existing Issue type.
+4. Perform the protocol's final rescan for queued and newly created issues.
+   Verify every issue in the reconciled inventory against the reviewed mapping
+   and confirm that no Priority, security field, other Planning Field value,
+   state, or unrelated label changed.
 5. Deprecate and delete the `question` label only after that verification
-   succeeds.
-
-New installations should perform the initial rollout first and then apply this
-follow-up if a legacy `question` label or question-labeled issues exist.
+   succeeds. Then resume the issue-labeler, run its catch-up, and resume stale
+   in the order required by the rollout safety protocol.
 
 ## Stale issues
 

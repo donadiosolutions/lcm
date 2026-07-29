@@ -1245,32 +1245,69 @@ test("repository policy and Issue Form use native Question without an overlappin
   assert.doesNotMatch(questionForm, /^labels:/mu);
 });
 
-test("documents Question as a non-destructive follow-up to the original migration", async () => {
+test("documents safe initial and incremental Question migration paths", async () => {
   const documentation = await readFile(
     join(process.cwd(), "docs/issue-triage.md"),
     "utf8",
   );
-  const initialStart = documentation.indexOf("## One-time rollout migration");
-  const followupStart = documentation.indexOf("## Question type follow-up rollout");
+  const protocolStart = documentation.indexOf("## Rollout safety protocol");
+  const initialStart = documentation.indexOf("## Initial rollout for new installations");
+  const followupStart = documentation.indexOf(
+    "## Question follow-up for already-migrated installations",
+  );
   const staleStart = documentation.indexOf("## Stale issues");
 
-  assert.ok(initialStart >= 0);
+  assert.ok(protocolStart >= 0);
+  assert.ok(initialStart > protocolStart);
   assert.ok(followupStart > initialStart);
   assert.ok(staleStart > followupStart);
-  assert.doesNotMatch(
-    documentation.slice(initialStart, followupStart),
-    /`question`|`Question`/u,
+
+  const protocol = documentation.slice(protocolStart, initialStart);
+  const pause = protocol.indexOf("Pause both the issue-labeler and stale workflows");
+  const wait = protocol.indexOf("wait for every\n   in-flight run");
+  const snapshot = protocol.indexOf("Snapshot every open and closed issue");
+  const reconcile = protocol.indexOf("reconcile every issue\n   created after the snapshot");
+  const verify = protocol.indexOf("Verify the complete, reconciled inventory");
+  const remove = protocol.indexOf("delete the path's\n   legacy labels");
+  const resume = protocol.indexOf("Resume the issue-labeler first");
+  const resumeStale = protocol.indexOf("resume the stale workflow");
+  assert.ok(
+    pause >= 0
+    && wait > pause
+    && snapshot > wait
+    && reconcile > snapshot
+    && verify > reconcile
+    && remove > verify
+    && resume > remove
+    && resumeStale > resume,
+  );
+
+  const initial = documentation.slice(initialStart, followupStart);
+  assert.match(
+    initial,
+    /including `Question`[\s\S]*?Review every `question`-labeled issue[\s\S]*?reviewed non-security `question` issues to `Question`[\s\S]*?verify complete\s+Issue type and Priority coverage[\s\S]*?delete[\s\S]*?`question`/u,
+  );
+  assert.match(
+    initial,
+    /security\s+candidate must retain or receive `Chore` or `Bug` unless it is explicitly\s+reviewed and declassified as non-security before it receives `Question`/u,
   );
 
   const followup = documentation.slice(followupStart, staleStart);
-  assert.match(followup, /Do not rerun the\s+initial migration above/u);
   assert.match(
     followup,
-    /Snapshot every open and closed issue[\s\S]*?Create the native `Question` Issue type[\s\S]*?set\s+only its Issue type to `Question`[\s\S]*?Verify every issue from the snapshot[\s\S]*?delete the `question` label only after that verification\s+succeeds/u,
+    /Do not rerun or rewrite the historical migration/u,
+  );
+  assert.match(
+    followup,
+    /pause both mutating workflows[\s\S]*?snapshot every open and closed issue[\s\S]*?Create the native `Question` Issue type[\s\S]*?set\s+only its Issue type to `Question`[\s\S]*?final rescan for queued and newly created issues[\s\S]*?Verify every issue in the reconciled inventory[\s\S]*?delete the `question` label only after that verification\s+succeeds[\s\S]*?resume the issue-labeler[\s\S]*?resume stale/u,
   );
   assert.match(
     followup,
     /Preserve its Priority, security fields,\s+other Planning Field values, state, and unrelated labels/u,
+  );
+  assert.match(
+    followup,
+    /security\s+candidate must retain or receive `Chore` or `Bug` unless it is explicitly\s+reviewed and declassified as non-security before it receives `Question`/u,
   );
 });
 
