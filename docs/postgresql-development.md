@@ -190,7 +190,7 @@ used by SQLite, then add PostgreSQL-only least-privilege, project-isolation,
 concurrency, transactional purge, and rollback checks. The native-transcript
 adapter has its own explicit staged contract because it is not a
 `ProjectRepositories` domain. When implementing the remaining adapters tracked
-by #87 and #89-#91:
+by #87, #89, and #91:
 
 1. Put backend-neutral behavior in a shared suite whose input is the matching
    `ProjectRepositories` interface, not a PostgreSQL concrete class.
@@ -405,6 +405,10 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file=docs/postgresql-runtime-memory-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file=docs/postgresql-runtime-coordination-grants.sql
 ```
 
 Replace `lcm_runtime` with the existing runtime role. The scripts quote the
@@ -435,6 +439,17 @@ columns, project reassignment, unrelated domains, `TRUNCATE`, and sequence
 inspection or mutation remain forbidden. Exact execution of
 `lcm.normalize_search_text(text)` is required for promoted-memory and tag
 generated columns.
+
+The coordination script grants reads and bounded row deletion on fenced
+leases, column-limited lease acquisition/takeover/renewal/release operations,
+and `USAGE` only on the fencing-token identity sequence. Passive-inbox access
+is read plus updates only to claim state, attempt count, claim time, and claim
+owner. It grants no inbox insertion, deletion, payload or terminal-state
+metadata update, `TRUNCATE`, sequence inspection/restart, or unrelated-domain
+access. Exercise the child-crash, independent-pool, final-fence, stale-claim,
+and exact-ACL cases in `coordination.integration.ts` when changing these
+queries. See
+[PostgreSQL cross-machine coordination](postgresql-coordination.md).
 
 Applying these repository grants does not activate the PostgreSQL backend.
 Daemon/CLI routing remains gated by #224 and the #92 cutover. Re-run migration

@@ -1,4 +1,5 @@
 export * from "./client-config.js";
+export * from "./coordination.js";
 export * from "./conversation-repository.js";
 export * from "./contracts.js";
 export * from "./errors.js";

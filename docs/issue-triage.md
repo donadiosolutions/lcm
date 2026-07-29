@@ -90,6 +90,9 @@ code-scanning rule IDs from the issue.
 Only bounded metadata is retained. Raw secrets, secret locations, code
 locations, private-fork data, dismissal or resolution comments, credentials,
 and unrelated alert bodies are never placed in prompts, job outputs, or logs.
+Prompt text is credential-redacted before its size limit is applied, including
+credential-bearing URLs and credential patterns that cross the final truncation
+boundary.
 Collection follows each Security and Quality endpoint's pagination links,
 including cursor-based Dependabot links, and stops after at most two 50-record
 pages per alert state as well as the stricter per-source evidence cap.
@@ -109,6 +112,17 @@ separate short rationales:
 - `Affected` requires supported-version impact evidence.
 - `Exploited` requires credible active-exploitation evidence.
 - `Patched` requires evidence that a fixed project version has been released.
+
+Model rationales are used only to validate the structured classification
+response. They are never copied into GitHub Planning Field metadata. Planning
+Field updates use fixed, server-authored rationale text so issue content and
+private Security and Quality evidence cannot be echoed into repository
+metadata.
+
+An unavailable, empty, or invalid Terra result fails the application job while
+leaving every affected issue on `needs-codex-triage`. The failed run makes a
+scheduled paid retry observable instead of recording an empty successful pass;
+no partial security decisions or duplicate routing proceed.
 
 ## Duplicate handling
 

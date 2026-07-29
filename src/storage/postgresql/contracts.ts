@@ -14,6 +14,7 @@ export interface PostgreSqlOperationContext {
   readonly domain: StorageDomain;
   readonly operation: string;
   readonly projectId?: string;
+  readonly machineId?: string;
 }
 
 export interface PostgreSqlQueryOptions extends PostgreSqlOperationContext {

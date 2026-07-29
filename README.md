@@ -382,7 +382,9 @@ identity is enabled, and the PostgreSQL conversation adapter is available to
 conformance tests. The native-transcript repository from #86 is available for
 explicit backfill and adapter conformance. The promoted-memory, recall,
 redaction-administration, and coordination repositories from #88 are likewise
-available for direct adapter use and shared conformance, but normal daemon/CLI
+available for direct adapter use and shared conformance. Issue #90 extends the
+staged coordination repository with transaction locks, fenced leases,
+passive-inbox claims, cleanup, and diagnostics, but normal daemon/CLI
 activation and the remaining repositories stay staged until #92/#224. Selecting `postgresql`
 therefore starts the daemon with an explicitly unavailable storage factory
 instead of falling back to SQLite. The health endpoint reports `503` and
@@ -398,7 +400,9 @@ plus the separate
 [native-transcript](docs/postgresql-runtime-transcript-grants.sql) grants when
 that repository is used, and the
 [memory and administration](docs/postgresql-runtime-memory-grants.sql) grants
-for the #88 adapters. See
+for the #88 adapters. Direct distributed-coordination callers also apply the
+separate
+[coordination](docs/postgresql-runtime-coordination-grants.sql) grants. See
 [storage backend configuration](docs/configuration.md#storage-backend)
 for operators, the [PostgreSQL schema reference](docs/postgresql-schema.md) for
 the 23-table data and namespace-aware extension contract, and the
@@ -409,6 +413,9 @@ sanitized “raw” records, provenance, checkpoints, quarantine, and rollback.
 The [PostgreSQL memory and administration guide](docs/postgresql-memory-administration.md)
 defines metadata, tag, recall, counter, coordination, and scoped-purge
 semantics.
+The [PostgreSQL cross-machine coordination guide](docs/postgresql-coordination.md)
+defines transaction-lock, fenced-lease, final-write fence, queue-claim,
+cleanup, diagnostic, and crash-recovery semantics.
 
 ## Development
 

@@ -51,19 +51,24 @@ including both `filename` and `previous_filename`, before selecting one of two
 admission paths. The flattened file records must exactly match the pull
 request's authoritative `changed_files` count, so GitHub's file-list cap or an
 incomplete page cannot silently produce a coverage-neutral classification. A
-change to executable `.ts`, `.tsx`, `.mts`, or `.cts` TypeScript under `bin/`,
-`installer/`, or `src/`; trust-sensitive automation under `.github/actions/`,
+change to any file under `bin/`, `installer/`, or `src/` (including shipped
+prompt and connector assets and PostgreSQL migrations); any `.mjs` file under
+`scripts/` at any depth; trust-sensitive automation under `.github/actions/`,
 `.github/codeql/`, `.github/workflows/`, or `.github/scripts/`; trusted root
 `greptile.json`; or key coverage/build configuration (`package.json`, the
 lockfile, Vitest config, or TypeScript config) normally requires authenticated
 `Greptile Review` and DCO successes on the PR's exact head SHA. A sensitive PR
-instead requires authenticated DCO and exact-head canonical CI only when its
-author has the authoritative GitHub `Bot` type, its login explicitly matches
-trusted root `greptile.json` `excludeAuthors`, and neither its current nor
-previous filename is `greptile.json`. That exclusion-policy file is
-non-bypassable and always requires Greptile plus DCO. Exclusion patterns are
-case-insensitive and support `*` and `?`; `[`, `]`, and `!` are literal. The
-same CI-backed path applies to diffs with none of those sensitive paths.
+instead requires authenticated DCO and exact-head canonical CI only for
+authoritative same-repository Dependabot provenance: exact
+`dependabot[bot]` login, GitHub `Bot` type, a non-empty `dependabot/` head ref,
+equal head/base repository names, an explicit trusted-root `greptile.json`
+`excludeAuthors` match, and no current or previous `greptile.json` filename.
+Absent or malformed provenance fails closed. `github-actions[bot]`, including
+the `changeset-release/main` version PR, always requires Greptile for sensitive
+changes. The exclusion-policy file is non-bypassable and always requires
+Greptile plus DCO. Exclusion patterns are case-insensitive and support `*` and
+`?`; `[`, `]`, and `!` are literal. Tests, documentation, Changesets metadata,
+and other coverage-neutral diffs use the CI-backed path.
 Only `pull_request` runs of the canonical CI workflow
 can wake the evaluator; push and synthetic merge-group runs are rejected before
 a runner starts. Every CI-backed path resolves the check's Actions run and requires
@@ -105,10 +110,11 @@ run against the synthetic commit before it may merge.
 
 Greptile is the authenticated review provider for coverable or trust-sensitive
 diffs from normal contributors and must report success on the exact PR head
-before external admission succeeds. A GitHub `Bot` identity explicitly matched
-by trusted `greptile.json` uses exact-head canonical CI plus DCO unless the diff
-changes that config. CodeRabbit reports remain informational and best-effort and
-are not encoded as an admission requirement.
+before external admission succeeds. Only authoritative same-repository
+Dependabot provenance explicitly matched by trusted `greptile.json` uses
+exact-head canonical CI plus DCO unless the diff changes that config.
+CodeRabbit reports remain informational and best-effort and are not encoded as
+an admission requirement.
 
 ### Release Flow
 
@@ -130,7 +136,7 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 | Workflow                             | Trigger                                                                              | Purpose                                                                                 |
 | ------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
-| `external-admission.yml`             | Authenticated Greptile/DCO checks, canonical PR CI lifecycle, default-branch exact-SHA repository dispatch | Statelessly require Greptile+DCO for sensitive human diffs or trusted CI+DCO for neutral and allowlisted bot-authored diffs |
+| `external-admission.yml`             | Authenticated Greptile/DCO checks, canonical PR CI lifecycle, default-branch exact-SHA repository dispatch | Statelessly require Greptile+DCO for sensitive diffs or trusted CI+DCO for neutral and authoritative same-repository Dependabot diffs |
 | `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
 | `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
 | `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |

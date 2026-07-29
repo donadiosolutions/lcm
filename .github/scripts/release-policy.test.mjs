@@ -5,6 +5,7 @@ import {
   NPM_QUERY_TIMEOUT_MS,
   NPM_VERIFY_DELAYS_MS,
   RELEASE_DRAFT_MARKER,
+  RELEASE_RUN_NAME_PREFIX,
   assertActionCreatedReleaseBody,
   assertNpmDistTags,
   assertReleaseCanAdvanceDistTag,
@@ -12,9 +13,11 @@ import {
   buildHighlightsPrompt,
   categorizeReleasePullRequests,
   checkNpmReleaseState,
+  classifyReleaseRunProvenance,
   classifyPullRequest,
   collectReleasePullRequests,
   compareReleaseVersions,
+  enforceEarlierPublicationSuccess,
   parseChangesetDocument,
   parseHighlightsResult,
   parseReleaseTag,
@@ -499,6 +502,173 @@ test("renders tag-bound Highlights and omits empty release sections", () => {
     /not created/u,
   );
   assert.throws(() => renderReleaseNotes({ targetTag, highlights: [], categorized }), /at least one/u);
+});
+
+function publicationHistoryGithub({ releaseRuns = [], recoveryRuns = [], releases = new Map() }) {
+  const listWorkflowRuns = () => {};
+  return {
+    paginate: async (endpoint, parameters) => {
+      assert.equal(endpoint, listWorkflowRuns);
+      assert.equal(parameters.workflow_id, "publish.yml");
+      assert.equal(parameters.status, "completed");
+      assert.equal(parameters.per_page, 100);
+      return parameters.event === "release" ? releaseRuns : recoveryRuns;
+    },
+    rest: {
+      actions: { listWorkflowRuns },
+      repos: {
+        getReleaseByTag: async ({ tag }) => {
+          const release = releases.get(tag);
+          if (release instanceof Error) throw release;
+          if (!release) throw new Error(`Missing release ${tag}`);
+          return { data: release };
+        },
+      },
+    },
+  };
+}
+
+test("classifies canonical, explicit noncanonical, and malformed run provenance", () => {
+  assert.equal(RELEASE_RUN_NAME_PREFIX, "release-tag:");
+  assert.deepEqual(classifyReleaseRunProvenance({
+    id: 1,
+    display_title: "release-tag:v1.5.0-beta.2",
+  }), {
+    kind: "canonical",
+    runId: 1,
+    releaseTag: "v1.5.0-beta.2",
+  });
+  assert.deepEqual(classifyReleaseRunProvenance({
+    id: 2,
+    display_title: "release-tag:not-a-release",
+  }), {
+    kind: "noncanonical",
+    runId: 2,
+    storedTag: "not-a-release",
+  });
+  for (const display_title of [
+    undefined,
+    "",
+    "Publish Package",
+    "release-tag:",
+    "release-tag: v1.5.0",
+    "release-tag:v1.5.0\nforged",
+    `release-tag:${"a".repeat(256)}`,
+  ]) {
+    assert.deepEqual(classifyReleaseRunProvenance({ id: 3, display_title }), {
+      kind: "malformed",
+      runId: 3,
+    });
+  }
+  assert.throws(
+    () => classifyReleaseRunProvenance({ id: Number.MAX_SAFE_INTEGER + 1 }),
+    /valid run id/u,
+  );
+});
+
+test("ignores only explicit noncanonical history and resolved canonical failures", async () => {
+  const warnings = [];
+  const github = publicationHistoryGithub({
+    releaseRuns: [
+      { id: 1, conclusion: "failure", display_title: "release-tag:v1.4.0" },
+      { id: 2, conclusion: "failure", display_title: "release-tag:v1.4.1" },
+      { id: 4, conclusion: "cancelled", display_title: "release-tag:v1.5.0" },
+      { id: 5, conclusion: "failure", display_title: "release-tag:not-a-release" },
+    ],
+    recoveryRuns: [
+      { id: 3, conclusion: "success", display_title: "release-tag:v1.4.1" },
+      { id: 6, conclusion: "success", display_title: "release-tag:also-not-a-release" },
+    ],
+    releases: new Map([["v1.4.0", { draft: true }]]),
+  });
+
+  await assert.doesNotReject(() =>
+    enforceEarlierPublicationSuccess({
+      github,
+      owner: "donadiosolutions",
+      repo: "lcm",
+      currentRunId: 10,
+      currentTag: "v1.5.0",
+      warning: (message) => warnings.push(message),
+    }),
+  );
+  assert.equal(warnings.some((message) => message.includes("preflight-impossible")), true);
+  assert.equal(warnings.some((message) => message.includes("withdrawn draft")), true);
+  assert.equal(warnings.some((message) => message.includes("later run 3 succeeded")), true);
+  assert.equal(warnings.some((message) => message.includes("current tag v1.5.0")), true);
+});
+
+test("fails closed on missing, malformed, and unresolved canonical history", async () => {
+  for (const run of [
+    { id: 1, conclusion: "failure" },
+    { id: 1, conclusion: "failure", display_title: "release-tag:" },
+    { id: 1, conclusion: "success", display_title: "Publish Package" },
+  ]) {
+    const github = publicationHistoryGithub({ releaseRuns: [run] });
+    await assert.rejects(
+      () =>
+        enforceEarlierPublicationSuccess({
+          github,
+          owner: "donadiosolutions",
+          repo: "lcm",
+          currentRunId: 2,
+          currentTag: "v1.5.0",
+        }),
+      /missing or malformed release-tag provenance/u,
+    );
+  }
+
+  const github = publicationHistoryGithub({
+    releaseRuns: [
+      { id: 1, conclusion: "failure", display_title: "release-tag:v1.4.2" },
+    ],
+    releases: new Map([["v1.4.2", { draft: false }]]),
+  });
+  await assert.rejects(
+    () =>
+      enforceEarlierPublicationSuccess({
+        github,
+        owner: "donadiosolutions",
+        repo: "lcm",
+        currentRunId: 2,
+        currentTag: "v1.5.0",
+      }),
+    /Earlier release runs for other tags failed/u,
+  );
+  await assert.rejects(
+    () =>
+      enforceEarlierPublicationSuccess({
+        github,
+        owner: "donadiosolutions",
+        repo: "lcm",
+        currentRunId: 0,
+        currentTag: "v1.5.0",
+      }),
+    /Invalid workflow run id/u,
+  );
+  await assert.rejects(
+    () =>
+      enforceEarlierPublicationSuccess({
+        github,
+        owner: "donadiosolutions",
+        repo: "lcm",
+        currentRunId: 2,
+        currentTag: "not-a-release",
+      }),
+    /Unsupported release tag/u,
+  );
+  await assert.rejects(
+    () =>
+      enforceEarlierPublicationSuccess({
+        github,
+        owner: "donadiosolutions",
+        repo: "lcm",
+        currentRunId: 2,
+        currentTag: "v1.5.0",
+        warning: "invalid",
+      }),
+    /warning must be a function/u,
+  );
 });
 
 test("queries npm release state with E404-only missing-package handling", () => {

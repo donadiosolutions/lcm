@@ -15,15 +15,17 @@ const state = vi.hoisted(() => ({
   closeWatcher: vi.fn(),
   stopProcessor: vi.fn(),
   createFactory: vi.fn(),
+  healthFactory: vi.fn(),
 }));
 
+state.healthFactory.mockImplementation(async () => state.health);
 state.createFactory.mockImplementation(() => ({
   backend: "sqlite",
   capabilities: {},
   projectExists: vi.fn().mockResolvedValue(false),
   openExistingProject: vi.fn().mockResolvedValue(null),
   openProject: vi.fn(),
-  health: vi.fn(async () => state.health),
+  health: state.healthFactory,
   close: state.closeFactory,
 }));
 
@@ -100,6 +102,7 @@ afterEach(() => {
   state.closeWatcher.mockClear();
   state.stopProcessor.mockClear();
   state.createFactory.mockClear();
+  state.healthFactory.mockClear();
   vi.restoreAllMocks();
 });
 
@@ -192,6 +195,73 @@ describe("mocked server states unavailable from Node HTTP", () => {
       expect(JSON.parse(body)).toEqual({ ok: true });
     } finally {
       await daemon.stop(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps public health storage-free and requires valid credentials for full diagnostics", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-server-health-auth-"));
+    const tokenPath = join(dir, "token");
+    ensureAuthToken(tokenPath);
+    const token = readAuthToken(tokenPath)!;
+    state.health = { status: "unavailable", backend: "sqlite" };
+    const daemon = await createDaemon(
+      loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }),
+      { tokenPath },
+    );
+    const request = async (authorization?: string): Promise<{ status: number; body: Record<string, unknown> }> => {
+      let status = 0;
+      let body = "";
+      const req = {
+        method: "GET",
+        url: "/health",
+        headers: authorization === undefined ? {} : { authorization },
+      };
+      const res = {
+        writeHead: (code: number) => { status = code; },
+        end: (value: string) => { body = value; },
+      };
+      await state.listener?.(req, res);
+      return { status, body: JSON.parse(body) as Record<string, unknown> };
+    };
+
+    try {
+      const firstPublic = await request();
+      const secondPublic = await request();
+      expect(firstPublic.status).toBe(200);
+      expect(firstPublic.body).toEqual({
+        status: "ok",
+        version: expect.stringMatching(/^\d+\.\d+\.\d+$/),
+        storageBackend: "sqlite",
+        uptime: expect.any(Number),
+        pid: process.pid,
+      });
+      expect(secondPublic.body).toEqual({
+        status: "ok",
+        version: firstPublic.body.version,
+        storageBackend: "sqlite",
+        uptime: expect.any(Number),
+        pid: process.pid,
+      });
+      expect(state.healthFactory).not.toHaveBeenCalled();
+
+      expect(await request("Bearer invalid")).toEqual({
+        status: 401,
+        body: { error: "unauthorized" },
+      });
+      expect(state.healthFactory).not.toHaveBeenCalled();
+
+      const authenticated = await request(`Bearer ${token}`);
+      expect(authenticated.status).toBe(503);
+      expect(authenticated.body).toMatchObject({
+        status: "unavailable",
+        storageBackend: "sqlite",
+        entrypoint: expect.any(String),
+        storage: { status: "unavailable" },
+      });
+      expect(state.healthFactory).toHaveBeenCalledOnce();
+    } finally {
+      await daemon.stop();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

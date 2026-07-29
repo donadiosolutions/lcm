@@ -302,6 +302,8 @@ that this runtime role will use:
 [`postgresql-runtime-transcript-grants.sql`](postgresql-runtime-transcript-grants.sql),
 and
 [`postgresql-runtime-memory-grants.sql`](postgresql-runtime-memory-grants.sql).
+Direct issue #90 coordination callers additionally use
+[`postgresql-runtime-coordination-grants.sql`](postgresql-runtime-coordination-grants.sql).
 Run them as an administrator, substituting the deployment's restricted runtime
 role:
 
@@ -321,6 +323,10 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file docs/postgresql-runtime-memory-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-coordination-grants.sql
 ```
 
 The transcript grant permits immutable inserts, provenance reads, and bounded
@@ -335,6 +341,14 @@ limited to their six owned mutable-state tables; generated search data is
 removed with promoted memory, while identity, conversations, summaries,
 transcripts, checkpoints, events, and leases are retained. See
 [PostgreSQL memory and administration](postgresql-memory-administration.md).
+The coordination grant permits project-scoped lease reads, bounded deletes,
+column-limited acquisition/renewal/release updates, fencing-sequence `USAGE`,
+and column-limited passive-inbox claims. It grants no inbox insertion,
+completion, deletion, payload update, table truncation, sequence inspection or
+restart, schema mutation, or unrelated-domain access. Applying it exposes only
+the staged programmatic primitives described in
+[PostgreSQL cross-machine coordination](postgresql-coordination.md); it does
+not enable the application backend or start a worker.
 
 Finally restore `LCM_POSTGRES_URL` to the restricted runtime-role URL, run
 `lcm machine register`, pair projects explicitly, and restart the daemon.
@@ -378,7 +392,31 @@ or production PostgreSQL cluster.
 
 ## Daemon safety
 
-The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon requests to loopback HTTP origins and known daemon routes, so a malformed config or caller cannot redirect daemon traffic to another host. Before admitting a daemon for ordinary use, lifecycle checks require the PID file, `/health` PID, installed version, active storage backend, authenticated access, and exact `127.0.0.1` listener ownership to agree. An occupied port with missing or unverifiable identity is rejected rather than trusted. Daemons that predate backend identity are recognized as SQLite-only, so selecting PostgreSQL cannot silently reuse an existing SQLite process. During an explicit restart, the running daemon is authenticated by PID, installed version, listener ownership, and its local token without requiring it to already use the newly selected backend; the replacement must match the new backend. SessionSnapshot skips ingestion when bootstrap cannot verify daemon identity. PostToolUse also ignores payload-provided daemon ports and performs no network I/O.
+The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon
+requests to loopback HTTP origins and known daemon routes, so a malformed config
+or caller cannot redirect daemon traffic to another host. A managed daemon's
+unauthenticated `GET /health` response is a constant-cost, storage-free liveness
+probe containing only status, package version, selected backend, uptime, and
+PID. It does not inspect project databases or expose installation paths.
+Supplying a valid daemon bearer token returns the full storage-backed health
+diagnostic; supplying an invalid credential returns `401`. Embedded and test
+callers that intentionally create a daemon without a token retain the full
+health response.
+
+Before sending the bearer token or admitting a daemon for ordinary use,
+lifecycle checks require the public `/health` PID and installed version, a
+recognized active storage backend, the PID file, process liveness, and exact
+`127.0.0.1` listener ownership to agree. Authenticated full health and
+`/stats/pool` then prove diagnostic access and the entrypoint identity. An
+occupied port with missing or unverifiable identity is rejected rather than
+trusted. Daemons that predate backend identity are recognized as SQLite-only,
+so selecting PostgreSQL cannot silently reuse an existing SQLite process.
+During an explicit restart, the running daemon is authenticated by PID,
+installed version, listener ownership, and its local token without requiring it
+to already use the newly selected backend; the replacement must match the new
+backend. SessionSnapshot skips ingestion when bootstrap cannot verify daemon
+identity. PostToolUse also ignores payload-provided daemon ports and performs no
+network I/O.
 
 Use `lcm daemon start` to start or validate the managed background daemon. Use
 `lcm daemon restart` after configuration changes; it validates the new

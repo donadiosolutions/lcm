@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, renameSync, rmdirSync } from "node:fs";
 import { platform } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, win32 } from "node:path";
 import {
   atomicWritePrivateFileExclusive,
   deleteRegularFile,
@@ -44,6 +44,47 @@ function isMissingFileError(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
 }
 
+function trustedProcessBirthExecutable(
+  currentPlatform: string,
+  systemRoot: string | undefined,
+): string | null {
+  switch (currentPlatform) {
+    case "darwin":
+    case "freebsd":
+    case "netbsd":
+    case "openbsd":
+      return "/bin/ps";
+    case "aix":
+    case "sunos":
+      return "/usr/bin/ps";
+    case "win32":
+      if (
+        systemRoot === undefined
+        || !/^[A-Za-z]:[\\/]/u.test(systemRoot)
+        || !win32.isAbsolute(systemRoot)
+      ) {
+        return null;
+      }
+      return win32.join(
+        systemRoot,
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      );
+    default:
+      return null;
+  }
+}
+
+/** @internal Pure platform seam used by process-birth security tests. */
+export function trustedProcessBirthExecutableForTesting(
+  currentPlatform: string,
+  systemRoot?: string,
+): string | null {
+  return trustedProcessBirthExecutable(currentPlatform, systemRoot);
+}
+
 function processStartTime(
   pid: number,
   observer: PrivateMutationLockObserver,
@@ -66,7 +107,11 @@ function processStartTime(
     }
   }
 
-  const command = currentPlatform.value === "win32" ? "powershell.exe" : "ps";
+  const command = trustedProcessBirthExecutable(
+    currentPlatform.value,
+    process.env.SystemRoot,
+  );
+  if (command === null) return null;
   const args = currentPlatform.value === "win32"
     ? [
       "-NoProfile",

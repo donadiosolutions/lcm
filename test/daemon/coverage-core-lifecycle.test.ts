@@ -405,6 +405,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     const fetch = vi.fn()
       .mockRejectedValueOnce(new Error("initial down"))
       .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1", pid: 20 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1", pid: 20 }) })
       .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
     await expect(ensureDaemon({
       port: 16, pidFilePath: pidPath, spawnTimeoutMs: 1, expectedVersion: "1",

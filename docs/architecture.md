@@ -19,18 +19,20 @@ and hostname validation, sanitized SQLSTATE errors, abort cancellation,
 transactional migrations, extension readiness, and the complete durable schema
 baseline. Machine and project identity operations use that runtime directly.
 The general application storage factory remains staged while the domain
-adapters tracked by #87 and #89-#91 implement the remaining shared repository
+adapters tracked by #87, #89, and #91 implement the remaining shared repository
 contracts. The PostgreSQL conversation adapter is available to conformance
 tests, and the native-transcript adapter is available to explicit
 programmatic backfill and conformance. The promoted-memory, recall,
 redaction-administration, and coordination adapters are available to direct
 programmatic callers and conformance under the same staged boundary. None is
-selected by normal daemon or CLI composition. With PostgreSQL selected, the daemon still opens its
-loopback listener and exposes
-an authenticated `/health` response with HTTP `503`, backend
-`postgresql`, and storage status `unavailable`; storage-backed routes also
-return fixed sanitized `503` responses. Lifecycle admission recognizes this
-staged response as the selected daemon without treating its storage as ready or
+selected by normal daemon or CLI composition. With PostgreSQL selected, the
+daemon still opens its loopback listener. Public `/health` remains a
+storage-free `200` liveness response identifying the selected `postgresql`
+backend. Authenticated `/health` returns HTTP `503`, backend `postgresql`, and
+storage status `unavailable`; authenticated storage-backed routes also return
+fixed sanitized `503` responses. Lifecycle admission verifies the public
+process and listener identity before sending the local token, then recognizes
+the authenticated staged response without treating its storage as ready or
 falling back to SQLite. Issue #92 activates PostgreSQL as authoritative after
 the adapter gates pass, while issue #224 owns normal daemon/CLI transcript
 routing. The local SQLite hook outbox and the metadata-only transcript
@@ -67,7 +69,14 @@ The issue #88 adapters implement the existing `ProjectRepositories` contracts
 for promoted memory, recall, redaction administration, and coordination, but
 remain deliberately absent from the unavailable PostgreSQL storage factory.
 See [PostgreSQL memory and administration](postgresql-memory-administration.md)
-for their metadata, concurrency, purge, and retention contract.
+for their metadata, concurrency, purge, and retention contract. Issue #90
+extends the concrete staged `PostgreSqlCoordinationRepository` with distributed
+work coordination without changing the backend-neutral SQLite contract:
+transaction-scoped advisory locks, database-clock fenced leases,
+same-transaction final fence validation, fair durable inbox claims, bounded cleanup,
+and diagnostics. Long-running model or network work stays outside transactions;
+only the final fence check and protected write share a short transaction. See
+[PostgreSQL cross-machine coordination](postgresql-coordination.md).
 
 ### PostgreSQL runtime and migrations
 

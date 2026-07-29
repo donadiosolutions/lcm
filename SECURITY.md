@@ -73,6 +73,15 @@ the Donadio Solutions GitHub organization:
 
 If you are unsure whether something is in scope, report it privately anyway and make the uncertainty clear.
 
+### Local daemon interface
+
+LCM binds its daemon to loopback, but loopback reachability is not treated as
+authorization. The unauthenticated health endpoint exposes only bounded process
+identity and performs no storage probes. Installation-specific and
+storage-backed diagnostics require the per-user daemon bearer token; other
+daemon routes require the same token. Do not copy, log, publish, or grant other
+users access to the daemon token.
+
 ## Handling Process
 
 After receiving a report, we will make a reasonable effort to:

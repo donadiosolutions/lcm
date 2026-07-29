@@ -8,7 +8,12 @@ import { NATIVE_PATTERNS, ScrubEngine, readGitleaksSyncDate } from "../scrub.js"
 import { GITLEAKS_PATTERNS } from "../generated-patterns.js";
 import { collectEventStats, collectDetailedEventStats } from "../db/events-stats.js";
 import { validateRegex } from "../store/regex-safety.js";
-import { configPath, daemonPidPath, projectsDir } from "../runtime-paths.js";
+import {
+  configPath,
+  daemonPidPath,
+  daemonTokenPath,
+  projectsDir,
+} from "../runtime-paths.js";
 import {
   hashProjectPath,
   normalizeProjectIdentityPath,
@@ -85,7 +90,9 @@ type DoctorDaemonHealth = StagedPostgreSqlHealthResponse & {
 async function readRecognizedDaemonHealth(
   fetchFn: typeof globalThis.fetch,
   port: number,
+  token?: string | null,
 ): Promise<DoctorDaemonHealth | null> {
+  if (token === null) return null;
   const controller = new AbortController();
   let timeout!: ReturnType<typeof setTimeout>;
   const deadline = new Promise<never>((_, reject) => {
@@ -98,6 +105,7 @@ async function readRecognizedDaemonHealth(
     return await Promise.race([
       (async () => {
         const res = await fetchFn(`http://127.0.0.1:${port}/health`, {
+          ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
           signal: controller.signal,
         });
         const health = await res.json() as DoctorDaemonHealth;
@@ -110,6 +118,14 @@ async function readRecognizedDaemonHealth(
     ]);
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+function readDoctorDaemonToken(deps: DoctorDeps): string | null {
+  try {
+    return deps.readFileSync(daemonTokenPath(deps.homedir), "utf-8").trim() || null;
+  } catch {
+    return null;
   }
 }
 
@@ -726,7 +742,11 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       let postRestartStorageReady = false;
       if (ensureResult.connected) {
         try {
-          const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
+          const h = await readRecognizedDaemonHealth(
+            deps.fetch,
+            config.port,
+            readDoctorDaemonToken(deps),
+          );
           if (h) {
             postRestartOk = true;
             postRestartStorageReady = h.status === "ok";
