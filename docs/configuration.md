@@ -414,7 +414,9 @@ PID. It does not inspect project databases or expose installation paths.
 Supplying a valid daemon bearer token returns the full storage-backed health
 diagnostic; supplying an invalid credential returns `401`. Embedded and test
 callers that intentionally create a daemon without a token retain the full
-health response.
+health response. `lcm doctor` treats public health as liveness only and uses the
+authenticated post-validation health result to decide whether passive-learning
+queues can drain.
 
 Before sending the bearer token or admitting a daemon for ordinary use,
 lifecycle checks require the public `/health` PID and installed version, a

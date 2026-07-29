@@ -707,7 +707,6 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
     if (h) {
       daemonHealthy = true;
-      daemonStorageReady = h.status === "ok";
       daemonVersion = h.version;
       initialHealthPid = h.pid;
     }
@@ -757,6 +756,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
           if (h) {
             postRestartOk = true;
             postRestartStorageReady = h.status === "ok";
+            daemonStorageReady = postRestartStorageReady;
             postRestartVersion = h.version;
           }
         } catch { /* non-fatal */ }

@@ -1043,7 +1043,7 @@ describe("runDoctor configuration validation", () => {
     }
   });
 
-  it("recognizes exact staged PostgreSQL health without reporting a daemon start", async () => {
+  it("uses authenticated staged PostgreSQL health for an already-running daemon", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-doctor-postgres-staged-"));
     const caFile = join(dir, "ca.pem");
     writeFileSync(caFile, "test-ca");
@@ -1067,11 +1067,23 @@ describe("runDoctor configuration validation", () => {
         },
       },
     };
-    const fetch = vi.fn().mockResolvedValue({
-      ok: false,
-      status: 503,
-      json: async () => stagedHealth,
-    });
+    const fetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          status: "ok",
+          version: "0.5.0",
+          storageBackend: "postgresql",
+          uptime: 10,
+          pid: 4242,
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        json: async () => stagedHealth,
+      });
     vi.mocked(ensureDaemon).mockResolvedValueOnce({
       connected: true,
       port: 3737,
@@ -1274,10 +1286,28 @@ describe("Passive Learning checks", () => {
   });
 
   it("passes when events exist and low backlog awaits automatic processing", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 3737,
+      spawned: false,
+      pid: 4242,
+      startMethod: "existing",
+    });
     mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, lastCapture: "2026-03-26 10:00:00" });
     const results = await runDoctor(minimalDeps({
       cwd: "/tmp/test-proj",
-      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+      fetch: vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242 }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242 }),
+        }),
+      readFileSync: (path: string) => path.endsWith("daemon.token")
+        ? "doctor-token"
+        : minimalDeps().readFileSync(path),
     }));
     const capture = results.find(r => r.name === "events-capture");
     expect(capture?.status).toBe("pass");
@@ -1307,7 +1337,13 @@ describe("Passive Learning checks", () => {
     });
     const results = await runDoctor(minimalDeps({
       cwd: "/tmp/test-proj",
-      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+      fetch: vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242 }),
+      }),
+      readFileSync: (path: string) => path.endsWith("daemon.token")
+        ? "doctor-token"
+        : minimalDeps().readFileSync(path),
     }));
     const capture = results.find(r => r.name === "events-capture");
     expect(capture?.status).toBe("warn");
@@ -1327,7 +1363,13 @@ describe("Passive Learning checks", () => {
     });
     const results = await runDoctor(minimalDeps({
       cwd: "/tmp/test-proj",
-      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+      fetch: vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242 }),
+      }),
+      readFileSync: (path: string) => path.endsWith("daemon.token")
+        ? "doctor-token"
+        : minimalDeps().readFileSync(path),
     }));
     const capture = results.find(r => r.name === "events-capture");
     expect(capture?.status).toBe("warn");
