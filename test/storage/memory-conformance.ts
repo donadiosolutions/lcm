@@ -58,6 +58,21 @@ export async function exercisePromotedMemoryRepositoryConformance(
     surfacingCount: 0,
     usageCount: 0,
   }]);
+  const signalId = await repository.insert({
+    content: "acted on durable memory",
+    tags: [
+      "signal:memory_used",
+      "signal:memory_used",
+      `memory_id:${memoryId}`,
+      "memory_id:not-the-first-reference",
+    ],
+  });
+  expect(await repository.findStale({
+    staleAfterDays: -1,
+    staleSurfacingWithoutUseLimit: 2,
+    sourceProjectId: "external-project",
+  })).toEqual([]);
+  await repository.deleteById(signalId);
   expect(await repository.findStale({
     staleAfterDays: -1,
     staleSurfacingWithoutUseLimit: 2,
@@ -72,23 +87,44 @@ export async function exercisePromotedMemoryRepositoryConformance(
 
 export async function exerciseRecallRepositoryConformance(
   repository: RecallRepository,
+  promotedMemory?: PromotedMemoryRepository,
 ): Promise<void> {
+  if (promotedMemory) {
+    await promotedMemory.insert({
+      content: "acted on memory-a",
+      tags: [
+        "signal:memory_used",
+        "signal:memory_used",
+        "memory_id:memory-a",
+        "memory_id:memory-b",
+      ],
+    });
+  }
   await repository.logSurfacing(["memory-a", "memory-a", "memory-b"], null);
   await repository.logSurfacing([], "session-a");
   const feedback = await repository.getFeedback(["memory-a", "memory-b"]);
   expect(feedback.get("memory-a")).toMatchObject({
     surfacingCount: 2,
-    usageCount: 0,
+    usageCount: promotedMemory ? 1 : 0,
   });
   expect(feedback.get("memory-a")?.lastSurfacedAt)
     .toMatch(/^\d{4}-\d{2}-\d{2}T/u);
-  expect(feedback.get("memory-b")?.surfacingCount).toBe(1);
+  expect(feedback.get("memory-b")).toMatchObject({
+    surfacingCount: 1,
+    usageCount: 0,
+  });
   expect(await repository.getFeedback([])).toEqual(new Map());
   expect(await repository.getStats()).toMatchObject({
     memoriesSurfaced: 2,
-    memoriesActedUpon: 0,
-    recallPrecision: 0,
-    topRecalled: [],
+    memoriesActedUpon: promotedMemory ? 1 : 0,
+    recallPrecision: promotedMemory ? 50 : 0,
+    topRecalled: promotedMemory
+      ? [{
+          id: "memory-a",
+          content: "(memory not found)",
+          actCount: 1,
+        }]
+      : [],
   });
 }
 

@@ -64,7 +64,10 @@ describe("SQLite storage backend conformance", () => {
       await exercisePromotedMemoryRepositoryConformance(
         storage.promotedMemory,
       );
-      await exerciseRecallRepositoryConformance(storage.recall);
+      await exerciseRecallRepositoryConformance(
+        storage.recall,
+        storage.promotedMemory,
+      );
       await exerciseRedactionAdminRepositoryConformance(
         storage.redactionAdmin,
       );

@@ -312,6 +312,65 @@ describe("PostgreSQL memory repositories", () => {
     ]);
   });
 
+  it("deduplicates preserved usage markers while keeping the first ordered memory reference", async () => {
+    const db = executor((config) => {
+      if (config.text.includes("days_since_created")) return result([]);
+      if (config.text.includes("last_surfaced_at")) {
+        return result([{
+          memory_id: "memory-a",
+          usage_count: "1",
+          surfacing_count: "0",
+          last_surfaced_at: null,
+        }]);
+      }
+      if (config.text.includes("top_recalled")) {
+        return result([{
+          memories_surfaced: "0",
+          memories_acted_upon: "1",
+          top_recalled: [{
+            id: "memory-a",
+            content: "(memory not found)",
+            actCount: "1",
+          }],
+        }]);
+      }
+      return result([]);
+    });
+    const promoted = new PostgreSqlPromotedMemoryRepository(db, projectId);
+    const recall = new PostgreSqlRecallRepository(db, projectId);
+
+    await expect(promoted.findStale({
+      staleAfterDays: 1,
+      staleSurfacingWithoutUseLimit: 2,
+    })).resolves.toEqual([]);
+    await expect(recall.getFeedback(["memory-a"])).resolves.toEqual(new Map([[
+      "memory-a",
+      {
+        usageCount: 1,
+        surfacingCount: 0,
+        lastSurfacedAt: null,
+      },
+    ]]));
+    await expect(recall.getStats()).resolves.toMatchObject({
+      memoriesActedUpon: 1,
+      topRecalled: [{ id: "memory-a", actCount: 1 }],
+    });
+
+    const usageQueries = db.query.mock.calls
+      .map(([config]) => config as QueryConfig<unknown[]>)
+      .filter((config) => config.text.includes("signal:memory_used"));
+    expect(usageQueries).toHaveLength(3);
+    for (const config of usageQueries) {
+      expect(config.text).toContain("AND EXISTS (");
+      expect(config.text).not.toContain(
+        "INNER JOIN lcm.promoted_memory_tags AS marker",
+      );
+      expect(config.text).toMatch(
+        /ORDER BY candidate\.ordinal\s+LIMIT 1/u,
+      );
+    }
+  });
+
   it("implements existing and new ingest paths plus machine-scoped instructions", async () => {
     const db = executor((config) => {
       if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {

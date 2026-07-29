@@ -294,6 +294,7 @@ describe("PostgreSQL 18 memory and administration repositories", () => {
       expect(await promotedRepository.getById(importedMemoryId)).toBeNull();
       await POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE.recall.exercise(
         new PostgreSqlRecallRepository(database.runtime, recallProject),
+        new PostgreSqlPromotedMemoryRepository(database.runtime, recallProject),
       );
       await POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE.redactionAdmin.exercise(
         new PostgreSqlRedactionAdminRepository(
@@ -372,8 +373,10 @@ describe("PostgreSQL 18 memory and administration repositories", () => {
         content: "acted on first memory",
         tags: [
           "signal:memory_used",
+          "signal:memory_used",
           "memoryXid:not-an-exact-prefix",
           `memory_id:${firstMemoryId}`,
+          `memory_id:${secondMemoryId}`,
         ],
       });
       await firstRecall.logSurfacing(
@@ -433,7 +436,7 @@ describe("PostgreSQL 18 memory and administration repositories", () => {
 
       expect(await firstRedaction.purgeProjectState()).toEqual({
         promotedMemories: 2,
-        promotedTags: 8,
+        promotedTags: 10,
         recallSurfacings: 3,
         redactionCounters: 4,
         sessionIngestLogs: 1,

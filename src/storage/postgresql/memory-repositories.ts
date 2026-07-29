@@ -980,10 +980,6 @@ implements PromotedMemoryRepository {
                           AS memory_id,
                         pg_catalog.count(*) AS usage_count
                  FROM lcm.promoted_memories AS signal
-                 INNER JOIN lcm.promoted_memory_tags AS marker
-                   ON marker.project_id = signal.project_id
-                  AND marker.memory_id = signal.memory_id
-                  AND marker.tag = 'signal:memory_used'
                  INNER JOIN LATERAL (
                    SELECT candidate.tag
                    FROM lcm.promoted_memory_tags AS candidate
@@ -996,6 +992,13 @@ implements PromotedMemoryRepository {
                  ) AS reference ON TRUE
                  WHERE signal.project_id = $1
                    AND signal.archived_at IS NULL
+                   AND EXISTS (
+                     SELECT 1
+                     FROM lcm.promoted_memory_tags AS marker
+                     WHERE marker.project_id = signal.project_id
+                       AND marker.memory_id = signal.memory_id
+                       AND marker.tag = 'signal:memory_used'
+                   )
                  GROUP BY pg_catalog.substr(reference.tag, 11)
                ),
                candidates AS (
@@ -1214,10 +1217,6 @@ export class PostgreSqlRecallRepository implements RecallRepository {
                           AS memory_id,
                         pg_catalog.count(*) AS usage_count
                  FROM lcm.promoted_memories AS signal
-                 INNER JOIN lcm.promoted_memory_tags AS marker
-                   ON marker.project_id = signal.project_id
-                  AND marker.memory_id = signal.memory_id
-                  AND marker.tag = 'signal:memory_used'
                  INNER JOIN LATERAL (
                    SELECT candidate.tag
                    FROM lcm.promoted_memory_tags AS candidate
@@ -1233,6 +1232,13 @@ export class PostgreSqlRecallRepository implements RecallRepository {
                      = pg_catalog.substr(reference.tag, 11)
                  WHERE signal.project_id = $1
                    AND signal.archived_at IS NULL
+                   AND EXISTS (
+                     SELECT 1
+                     FROM lcm.promoted_memory_tags AS marker
+                     WHERE marker.project_id = signal.project_id
+                       AND marker.memory_id = signal.memory_id
+                       AND marker.tag = 'signal:memory_used'
+                   )
                  GROUP BY pg_catalog.substr(reference.tag, 11)
                )
                SELECT requested.memory_id,
@@ -1300,10 +1306,6 @@ export class PostgreSqlRecallRepository implements RecallRepository {
                           AS memory_id,
                         pg_catalog.count(*) AS act_count
                  FROM lcm.promoted_memories AS signal
-                 INNER JOIN lcm.promoted_memory_tags AS marker
-                   ON marker.project_id = signal.project_id
-                  AND marker.memory_id = signal.memory_id
-                  AND marker.tag = 'signal:memory_used'
                  INNER JOIN LATERAL (
                    SELECT candidate.tag
                    FROM lcm.promoted_memory_tags AS candidate
@@ -1316,6 +1318,13 @@ export class PostgreSqlRecallRepository implements RecallRepository {
                  ) AS reference ON TRUE
                  WHERE signal.project_id = $1
                    AND signal.archived_at IS NULL
+                   AND EXISTS (
+                     SELECT 1
+                     FROM lcm.promoted_memory_tags AS marker
+                     WHERE marker.project_id = signal.project_id
+                       AND marker.memory_id = signal.memory_id
+                       AND marker.tag = 'signal:memory_used'
+                   )
                  GROUP BY pg_catalog.substr(reference.tag, 11)
                ),
                ranked AS (
