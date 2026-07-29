@@ -1262,32 +1262,125 @@ test("repository policy and Issue Form use native Question without an overlappin
   assert.doesNotMatch(questionForm, /^labels:/mu);
 });
 
-test("documents Question as a non-destructive follow-up to the original migration", async () => {
+test("documents safe initial and incremental Question migration paths", async () => {
   const documentation = await readFile(
     join(process.cwd(), "docs/issue-triage.md"),
     "utf8",
   );
-  const initialStart = documentation.indexOf("## One-time rollout migration");
-  const followupStart = documentation.indexOf("## Question type follow-up rollout");
+  const protocolStart = documentation.indexOf("## Rollout safety protocol");
+  const initialStart = documentation.indexOf("## Initial rollout for new installations");
+  const followupStart = documentation.indexOf(
+    "## Question follow-up for already-migrated installations",
+  );
   const staleStart = documentation.indexOf("## Stale issues");
 
-  assert.ok(initialStart >= 0);
+  assert.ok(protocolStart >= 0);
+  assert.ok(initialStart > protocolStart);
   assert.ok(followupStart > initialStart);
   assert.ok(staleStart > followupStart);
-  assert.doesNotMatch(
-    documentation.slice(initialStart, followupStart),
-    /`question`|`Question`/u,
+
+  const protocol = documentation.slice(protocolStart, initialStart);
+  const pause = protocol.indexOf("Pause both the issue-labeler and stale workflows");
+  const wait = protocol.indexOf("wait for every\n   in-flight run");
+  const snapshot = protocol.indexOf("Snapshot every open and closed issue");
+  const reconcile = protocol.indexOf("reconcile every issue\n   created after the snapshot");
+  const currentLegacyLabels = protocol.indexOf(
+    "every issue currently carrying a legacy label",
+  );
+  const currentQuestionLabels = protocol.indexOf(
+    "includes every issue that currently\n   carries `question`",
+  );
+  const verify = protocol.indexOf("Verify the complete, reconciled inventory");
+  const remove = protocol.indexOf("delete the path's\n   legacy labels");
+  const resume = protocol.indexOf("Resume the issue-labeler first");
+  const replayHighWater = protocol.indexOf(
+    "record a post-resume highest\n   issue number",
+  );
+  const replay = protocol.indexOf(
+    "bounded, paginated replay of every issue\n   created since the snapshot through that high-water mark",
+  );
+  const replayQueue = protocol.indexOf(
+    "idempotently add\n   `needs-codex-triage` to every issue that remains unclassified",
+  );
+  const replayOverlap = protocol.indexOf(
+    "resume may overlap the replay with live `issues.opened` events",
+  );
+  const replayVerify = protocol.indexOf(
+    "Verify that every replayed issue\n   either completes classification or remains queued for retry",
+  );
+  const replayFailClosed = protocol.indexOf(
+    "Keep stale paused and fail closed",
+  );
+  const resumeStale = protocol.indexOf("resume the stale workflow");
+  assert.ok(
+    pause >= 0
+    && wait > pause
+    && snapshot > wait
+    && reconcile > snapshot
+    && currentLegacyLabels > reconcile
+    && currentQuestionLabels > currentLegacyLabels
+    && verify > currentQuestionLabels
+    && remove > verify
+    && resume > remove
+    && replayHighWater > resume
+    && replay > replayHighWater
+    && replayQueue > replay
+    && replayOverlap > replayQueue
+    && replayVerify > replayOverlap
+    && replayFailClosed > replayVerify
+    && resumeStale > replayFailClosed,
+    "The labeler must resume into a bounded, idempotent replay that is verified before stale resumes",
+  );
+
+  const initial = documentation.slice(initialStart, followupStart);
+  const initialHandoff = initial.indexOf(
+    "1. Before creating or changing any Issue type, Planning Field value, or label",
+  );
+  const initialPause = initial.indexOf(
+    "pause both the issue-labeler and stale\n   workflows",
+  );
+  const initialWait = initial.indexOf(
+    "wait for every in-flight run to reach a terminal state",
+  );
+  const initialSnapshot = initial.indexOf(
+    "snapshot every open and closed issue in the repository as this path's\n   inventory",
+  );
+  const initialFirstMutation = initial.indexOf(
+    "2. Create and enable all configured native Issue types",
+  );
+  assert.ok(
+    initialHandoff >= 0
+    && initialPause > initialHandoff
+    && initialWait > initialPause
+    && initialSnapshot > initialWait
+    && initialFirstMutation > initialSnapshot,
+    "The initial rollout must complete its pause, wait, and complete snapshot handoff before metadata mutation",
+  );
+  assert.match(
+    initial,
+    /including `Question`[\s\S]*?Review every `question`-labeled issue[\s\S]*?reviewed non-security `question` issues to `Question`[\s\S]*?verify complete\s+Issue type and Priority coverage[\s\S]*?delete[\s\S]*?`question`/u,
+  );
+  assert.match(
+    initial,
+    /security\s+candidate must retain or receive `Chore` or `Bug` unless it is explicitly\s+reviewed and declassified as non-security before it receives `Question`/u,
   );
 
   const followup = documentation.slice(followupStart, staleStart);
-  assert.match(followup, /Do not rerun the\s+initial migration above/u);
   assert.match(
     followup,
-    /Snapshot every open and closed issue[\s\S]*?Create the native `Question` Issue type[\s\S]*?set\s+only its Issue type to `Question`[\s\S]*?Verify every issue from the snapshot[\s\S]*?delete the `question` label only after that verification\s+succeeds/u,
+    /Do not rerun or rewrite the historical migration/u,
+  );
+  assert.match(
+    followup,
+    /pause both mutating workflows[\s\S]*?snapshot every open and closed issue[\s\S]*?Create the native `Question` Issue type[\s\S]*?set\s+only its Issue type to `Question`[\s\S]*?final rescan for queued and newly created issues and\s+every issue that currently carries `question`[\s\S]*?Add each one to the reviewed\s+inventory and apply the same mapping before verification[\s\S]*?Verify every issue\s+in the reconciled inventory[\s\S]*?delete the `question` label only after that verification\s+succeeds[\s\S]*?issue-labeler resume,[\s\S]*?bounded post-resume replay,[\s\S]*?catch-up,[\s\S]*?verification,[\s\S]*?stale-resume/u,
   );
   assert.match(
     followup,
     /Preserve its Priority, security fields,\s+other Planning Field values, state, and unrelated labels/u,
+  );
+  assert.match(
+    followup,
+    /security\s+candidate must retain or receive `Chore` or `Bug` unless it is explicitly\s+reviewed and declassified as non-security before it receives `Question`/u,
   );
 });
 
