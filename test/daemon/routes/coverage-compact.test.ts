@@ -271,6 +271,16 @@ describe("compact route coverage", () => {
     expect(state.openProject).not.toHaveBeenCalled();
   });
 
+  it("uses a generic message for a non-error PostgreSQL identity failure", async () => {
+    state.identityError = "identity failed";
+
+    await expect(call(JSON.stringify({ session_id: "identity-primitive", cwd: "/tmp" })))
+      .resolves.toEqual({ error: "compact failed" });
+    expect(state.ensureProject).not.toHaveBeenCalled();
+    expect(state.scrubber).not.toHaveBeenCalled();
+    expect(state.openProject).not.toHaveBeenCalled();
+  });
+
   it("admits successful SQLite storage ahead of local compaction setup", async () => {
     await expect(call(JSON.stringify({ session_id: "sqlite-order", cwd: "/tmp" })))
       .resolves.toMatchObject({ actionTaken: false });
