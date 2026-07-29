@@ -154,28 +154,34 @@ An installation that has not completed the Planning Fields migration must use
 this one-time operator path. It is deliberately not part of the recurring
 issue-triage workflow code.
 
-1. Create and enable all configured native Issue types, including `Question`.
+1. Before creating or changing any Issue type, Planning Field value, or label,
+   use the rollout safety protocol to pause both the issue-labeler and stale
+   workflows, wait for every in-flight run to reach a terminal state, and
+   snapshot every open and closed issue in the repository as this path's
+   inventory. Do not proceed until this handoff is complete, and keep both
+   workflows paused through final verification.
+2. Create and enable all configured native Issue types, including `Question`.
    Verify that the `Question` description states the classification boundary
    above: investigation or spike work is `Chore` with `research`, behavior
    changes are `Feature`, and unexpected incorrect behavior is `Bug`.
-2. Review every `question`-labeled issue. Map a focused request for
+3. Review every `question`-labeled issue. Map a focused request for
    clarification, guidance, support, or an existing-knowledge answer to
    `Question`; resolve other question-labeled issues individually. A security
    candidate must retain or receive `Chore` or `Bug` unless it is explicitly
    reviewed and declassified as non-security before it receives `Question`.
-3. Preserve existing Planning Field values, then backfill legacy labels:
+4. Preserve existing Planning Field values, then backfill legacy labels:
    `p0-critical` to `Urgent`, `p1-high` to `High`, `p2-medium` to `Medium`,
    `p3-low` to `Low`, `bug` to `Bug`, `enhancement` to `Feature`, `chore` to
    `Chore`, and the reviewed non-security `question` issues to `Question`.
    Preserve `Epic` and resolve conflicting legacy type labels against the
    reviewed inventory.
-4. Set `Security status=Triage` on legacy security issues when the field is
+5. Set `Security status=Triage` on legacy security issues when the field is
    unset, then run the Terra enrichment pass.
-5. Follow the rollout safety protocol's final rescan, then verify complete
+6. Follow the rollout safety protocol's final rescan, then verify complete
    Issue type and Priority coverage for every open and closed issue and verify
    the intended security fields. Priority must be backfilled before the stale
    workflow resumes and before any legacy priority label is removed.
-6. After verification, deprecate and delete `bug`, `enhancement`, `chore`,
+7. After verification, deprecate and delete `bug`, `enhancement`, `chore`,
    `question`, `security`, `p0-critical`, `p1-high`, `p2-medium`, `p3-low`, and
    every `prj-*` label. Resume and catch up the workflows only as specified by
    the rollout safety protocol.

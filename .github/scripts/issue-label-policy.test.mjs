@@ -1283,6 +1283,29 @@ test("documents safe initial and incremental Question migration paths", async ()
   );
 
   const initial = documentation.slice(initialStart, followupStart);
+  const initialHandoff = initial.indexOf(
+    "1. Before creating or changing any Issue type, Planning Field value, or label",
+  );
+  const initialPause = initial.indexOf(
+    "pause both the issue-labeler and stale\n   workflows",
+  );
+  const initialWait = initial.indexOf(
+    "wait for every in-flight run to reach a terminal state",
+  );
+  const initialSnapshot = initial.indexOf(
+    "snapshot every open and closed issue in the repository as this path's\n   inventory",
+  );
+  const initialFirstMutation = initial.indexOf(
+    "2. Create and enable all configured native Issue types",
+  );
+  assert.ok(
+    initialHandoff >= 0
+    && initialPause > initialHandoff
+    && initialWait > initialPause
+    && initialSnapshot > initialWait
+    && initialFirstMutation > initialSnapshot,
+    "The initial rollout must complete its pause, wait, and complete snapshot handoff before metadata mutation",
+  );
   assert.match(
     initial,
     /including `Question`[\s\S]*?Review every `question`-labeled issue[\s\S]*?reviewed non-security `question` issues to `Question`[\s\S]*?verify complete\s+Issue type and Priority coverage[\s\S]*?delete[\s\S]*?`question`/u,
