@@ -235,6 +235,7 @@ export function createRestoreHandler(
           try {
             const instructionContent = readSessionInstructionFiles(cwd, client);
             if (instructionContent) {
+              instructionsContext = `<project-instructions>\n${instructionContent}\n</project-instructions>`;
               const hash = createHash("sha256").update(instructionContent).digest("hex");
               const existing = await storage.coordination.getSessionInstructions(
                 instructionScope!,
@@ -247,12 +248,11 @@ export function createRestoreHandler(
                   hash,
                 );
               }
-              instructionsContext = `<project-instructions>\n${instructionContent}\n</project-instructions>`;
             } else {
+              instructionsContext = "";
               await storage.coordination.deleteSessionInstructions(
                 instructionScope!,
               );
-              instructionsContext = "";
             }
           } catch { /* non-fatal */ }
         } catch (error) {
