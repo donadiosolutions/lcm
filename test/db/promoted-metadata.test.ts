@@ -28,6 +28,32 @@ function makeDb() {
   return db;
 }
 
+function arrayProxyWithReportedLength(
+  reportedLength: unknown,
+  onElementAccess: () => void,
+): unknown[] {
+  const prototype = Object.create(Array.prototype) as unknown[];
+  Object.defineProperty(prototype, "0", {
+    get: () => {
+      onElementAccess();
+      return "unsafe";
+    },
+  });
+  const target: unknown[] = [];
+  target.length = 1;
+  Object.setPrototypeOf(target, prototype);
+  return new Proxy(target, {
+    getOwnPropertyDescriptor: (array, property) => property === "length"
+      ? {
+          configurable: false,
+          enumerable: false,
+          value: reportedLength,
+          writable: true,
+        }
+      : Reflect.getOwnPropertyDescriptor(array, property),
+  });
+}
+
 describe("promoted memory metadata", () => {
   it("canonicalizes, snapshots, freezes, persists, and updates object metadata", () => {
     const input = {
@@ -213,27 +239,19 @@ describe("promoted memory metadata", () => {
     );
   });
 
-  it("rejects an array proxy with a non-numeric reported length before element access", () => {
+  it.each([
+    undefined,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    -1,
+    -0,
+    1.5,
+    0x1_0000_0000,
+  ])("rejects proxy-reported invalid array length %s before element access", (reportedLength) => {
     let getterCalls = 0;
-    const prototype = Object.create(Array.prototype) as unknown[];
-    Object.defineProperty(prototype, "0", {
-      get: () => {
-        getterCalls += 1;
-        return "unsafe";
-      },
-    });
-    const target: unknown[] = [];
-    target.length = 1;
-    Object.setPrototypeOf(target, prototype);
-    const values = new Proxy(target, {
-      getOwnPropertyDescriptor: (array, property) => property === "length"
-        ? {
-            configurable: false,
-            enumerable: false,
-            value: undefined,
-            writable: true,
-          }
-        : Reflect.getOwnPropertyDescriptor(array, property),
+    const values = arrayProxyWithReportedLength(reportedLength, () => {
+      getterCalls += 1;
     });
 
     let error: unknown;
@@ -248,6 +266,22 @@ describe("promoted memory metadata", () => {
       "metadata must be finite acyclic JSON",
     );
   });
+
+  it.each([0, 1])(
+    "accepts proxy-reported valid array length %i without element access",
+    (reportedLength) => {
+      let getterCalls = 0;
+      const values = arrayProxyWithReportedLength(reportedLength, () => {
+        getterCalls += 1;
+      });
+
+      const normalized = normalizePromotedMetadata({ values });
+
+      expect(getterCalls).toBe(0);
+      expect(Array.isArray(normalized["values"])).toBe(true);
+      expect((normalized["values"] as unknown[]).length).toBe(reportedLength);
+    },
+  );
 
   it("preserves empty, nested, sparse, and non-enumerable array values", () => {
     const sparse: unknown[] = new Array(3);

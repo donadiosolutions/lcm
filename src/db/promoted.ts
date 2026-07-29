@@ -5,6 +5,7 @@ import type { JsonObject, JsonValue } from "../storage/contracts.js";
 // A fresh one-term fallback match clears the default prompt-search minimum of
 // two while still leaving room for recency, affinity, and feedback penalties.
 const FALLBACK_TERM_SCORE = 4;
+const MAX_ARRAY_LENGTH = 0xffff_ffff;
 
 export type PromotedRow = {
   id: string;
@@ -90,7 +91,13 @@ function promotedJsonArray(
   }
 
   const length = descriptors["length"]?.value;
-  if (typeof length !== "number") {
+  if (
+    typeof length !== "number"
+    || !Number.isInteger(length)
+    || Object.is(length, -0)
+    || length < 0
+    || length > MAX_ARRAY_LENGTH
+  ) {
     throw new TypeError("metadata must be finite acyclic JSON");
   }
   const normalized = new Array<JsonValue>(length);
