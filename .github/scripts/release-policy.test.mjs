@@ -512,7 +512,9 @@ function publicationHistoryGithub({ releaseRuns = [], recoveryRuns = [], release
       assert.equal(parameters.workflow_id, "publish.yml");
       assert.equal(parameters.status, "completed");
       assert.equal(parameters.per_page, 100);
-      return parameters.event === "release" ? releaseRuns : recoveryRuns;
+      if (parameters.event === "release") return releaseRuns;
+      if (parameters.event === "workflow_dispatch") return recoveryRuns;
+      throw new Error(`Unsupported publication-history workflow event ${parameters.event}`);
     },
     rest: {
       actions: { listWorkflowRuns },
@@ -527,6 +529,43 @@ function publicationHistoryGithub({ releaseRuns = [], recoveryRuns = [], release
     },
   };
 }
+
+test("publication history fixtures reject unsupported workflow event classes", async () => {
+  const releaseRun = { id: 1 };
+  const recoveryRun = { id: 2 };
+  const github = publicationHistoryGithub({
+    releaseRuns: [releaseRun],
+    recoveryRuns: [recoveryRun],
+  });
+  const parameters = {
+    workflow_id: "publish.yml",
+    status: "completed",
+    per_page: 100,
+  };
+
+  assert.deepEqual(
+    await github.paginate(github.rest.actions.listWorkflowRuns, {
+      ...parameters,
+      event: "release",
+    }),
+    [releaseRun],
+  );
+  assert.deepEqual(
+    await github.paginate(github.rest.actions.listWorkflowRuns, {
+      ...parameters,
+      event: "workflow_dispatch",
+    }),
+    [recoveryRun],
+  );
+  await assert.rejects(
+    () =>
+      github.paginate(github.rest.actions.listWorkflowRuns, {
+        ...parameters,
+        event: "push",
+      }),
+    /Unsupported publication-history workflow event push/u,
+  );
+});
 
 test("classifies canonical, explicit noncanonical, and malformed run provenance", () => {
   assert.equal(RELEASE_RUN_NAME_PREFIX, "release-tag:");
@@ -668,6 +707,26 @@ test("fails closed on missing, malformed, and unresolved canonical history", asy
         warning: "invalid",
       }),
     /warning must be a function/u,
+  );
+});
+
+test("fails closed on malformed recovery-run provenance independently", async () => {
+  const github = publicationHistoryGithub({
+    recoveryRuns: [
+      { id: 1, conclusion: "success", display_title: "Publish Package" },
+    ],
+  });
+
+  await assert.rejects(
+    () =>
+      enforceEarlierPublicationSuccess({
+        github,
+        owner: "donadiosolutions",
+        repo: "lcm",
+        currentRunId: 2,
+        currentTag: "v1.5.0",
+      }),
+    /missing or malformed release-tag provenance/u,
   );
 });
 
