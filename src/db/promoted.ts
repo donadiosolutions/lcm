@@ -71,6 +71,47 @@ function validatedJsonString(value: string): string {
   return value;
 }
 
+function promotedJsonArray(
+  value: unknown[],
+  seen: Set<object>,
+  depth: number,
+): JsonValue[] {
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    throw new TypeError("metadata must not contain symbol keys");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value) as Record<
+    string,
+    PropertyDescriptor
+  >;
+  for (const descriptor of Object.values(descriptors)) {
+    if (!("value" in descriptor)) {
+      throw new TypeError("metadata must not contain accessors");
+    }
+  }
+
+  const length = descriptors["length"]?.value;
+  if (typeof length !== "number") {
+    throw new TypeError("metadata must be finite acyclic JSON");
+  }
+  const normalized = new Array<JsonValue>(length);
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    const index = Number(key);
+    if (
+      !Number.isInteger(index)
+      || index < 0
+      || index >= normalized.length
+      || String(index) !== key
+    ) {
+      continue;
+    }
+    Object.defineProperty(normalized, key, {
+      enumerable: true,
+      value: promotedJsonValue(descriptor.value, seen, depth + 1),
+    });
+  }
+  return Object.freeze(normalized) as JsonValue[];
+}
+
 function promotedJsonValue(
   value: unknown,
   seen = new Set<object>(),
@@ -94,8 +135,7 @@ function promotedJsonValue(
   seen.add(value);
   try {
     if (Array.isArray(value)) {
-      return Object.freeze(value.map((element) =>
-        promotedJsonValue(element, seen, depth + 1))) as JsonValue[];
+      return promotedJsonArray(value, seen, depth);
     }
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) {

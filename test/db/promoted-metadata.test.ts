@@ -163,6 +163,88 @@ describe("promoted memory metadata", () => {
     );
   });
 
+  it("rejects array accessors without invoking their getters", () => {
+    for (const property of ["0", "extra", "hidden"]) {
+      let getterCalls = 0;
+      const values: unknown[] = [];
+      Object.defineProperty(values, property, {
+        enumerable: property !== "hidden",
+        get: () => {
+          getterCalls += 1;
+          return "unsafe";
+        },
+      });
+
+      let error: unknown;
+      try {
+        normalizePromotedMetadata({ values });
+      } catch (caught) {
+        error = caught;
+      }
+      expect(getterCalls).toBe(0);
+      expect(error).toBeInstanceOf(TypeError);
+      expect((error as Error).message).toBe(
+        "metadata must not contain accessors",
+      );
+    }
+  });
+
+  it("rejects symbol-bearing arrays without invoking symbol getters", () => {
+    let getterCalls = 0;
+    const values = ["safe"];
+    Object.defineProperty(values, Symbol("hidden"), {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return "unsafe";
+      },
+    });
+
+    let error: unknown;
+    try {
+      normalizePromotedMetadata({ values });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(getterCalls).toBe(0);
+    expect(error).toBeInstanceOf(TypeError);
+    expect((error as Error).message).toBe(
+      "metadata must not contain symbol keys",
+    );
+  });
+
+  it("preserves empty, nested, sparse, and non-enumerable array values", () => {
+    const sparse: unknown[] = new Array(3);
+    Object.defineProperty(sparse, "1", {
+      enumerable: false,
+      value: { nested: ["value"] },
+    });
+    Object.defineProperty(sparse, "ignored", {
+      enumerable: true,
+      value: "not an array element",
+    });
+
+    const normalized = normalizePromotedMetadata({
+      empty: [],
+      values: [false, 0, "", null, sparse],
+    });
+    expect(normalized).toEqual({
+      empty: [],
+      values: [false, 0, "", null, [
+        ,
+        { nested: ["value"] },
+        ,
+      ]],
+    });
+    const values = normalized["values"];
+    expect(Array.isArray(values)).toBe(true);
+    const normalizedSparse = (values as unknown[])[4] as unknown[];
+    expect(0 in normalizedSparse).toBe(false);
+    expect(1 in normalizedSparse).toBe(true);
+    expect(2 in normalizedSparse).toBe(false);
+    expect(Object.isFrozen(normalizedSparse)).toBe(true);
+  });
+
   it("accepts null-prototype objects, surrogate pairs, and ignores non-enumerable values", () => {
     const value = Object.create(null) as Record<string, unknown>;
     Object.defineProperty(value, "hidden", {

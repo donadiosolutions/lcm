@@ -43,8 +43,14 @@ one explicit project UUID.
   whitespace. PostgreSQL stores them as normalized rows but returns the exact
   original array.
 - Metadata is an object-valued JSON document. Both SQLite and PostgreSQL reject
-  arrays, primitives, malformed persisted JSON, non-finite or unsafe numbers,
-  cycles, accessors, symbol keys, embedded U+0000, and unpaired surrogates.
+  top-level arrays, primitives, malformed persisted JSON, non-finite or unsafe
+  numbers, cycles, accessors, symbol keys, embedded U+0000, and unpaired
+  surrogates.
+  Plain data arrays, including empty, nested, and sparse arrays, remain
+  supported inside the metadata object. Validation inspects an array's own
+  descriptors and symbol keys before reading any element value, so
+  accessor-backed indices or properties and symbol-bearing arrays fail closed
+  without invoking their getters.
   Inputs are copied before asynchronous work so later caller mutation cannot
   alter a pending write.
 - Confidence remains in `[0,1]`, depth is a nonnegative safe integer, and
