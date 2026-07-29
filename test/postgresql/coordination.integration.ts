@@ -4,6 +4,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
+  derivePostgreSqlAdvisoryLockName,
+} from "../../src/storage/postgresql/coordination.js";
+import {
   PostgreSqlCoordinationRepository,
 } from "../../src/storage/postgresql/memory-repositories.js";
 import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations.js";
@@ -617,6 +620,146 @@ describe("PostgreSQL 18 cross-machine coordination", () => {
       } finally {
         await terminateChild(child);
         await contender.close();
+      }
+    });
+  });
+
+  it("isolates concurrent lock timeouts within one live transaction", async () => {
+    await withPostgreSqlTestDatabase("coord-lock-timeout-fifo", async (
+      database,
+    ) => {
+      await grantCoordinationRuntimePrivileges(database);
+      const scope = await createScope(database, "Coordination timeout FIFO");
+      const blocker = runtime(database);
+      const contender = runtime(database);
+      let reportReady!: () => void;
+      let reportFailure!: (error: unknown) => void;
+      const ready = new Promise<void>((resolve, reject) => {
+        reportReady = resolve;
+        reportFailure = reject;
+      });
+      const hold = blocker.transaction(async (transaction) => {
+        await transaction.query({
+          text: `SELECT pg_catalog.pg_advisory_xact_lock(
+                          pg_catalog.hashtextextended(
+                            lock_name,
+                            0
+                          )
+                        )
+                 FROM unnest($1::pg_catalog.text[]) AS candidate(lock_name)`,
+          values: [[
+            derivePostgreSqlAdvisoryLockName(
+              scope.projectId,
+              "timeout-fifo",
+              "first",
+            ),
+            derivePostgreSqlAdvisoryLockName(
+              scope.projectId,
+              "timeout-fifo",
+              "second",
+            ),
+          ]],
+        }, {
+          domain: "coordination",
+          operation: "holdTimeoutFifoLock",
+          projectId: scope.projectId,
+        });
+        reportReady();
+        await transaction.query({
+          text: "SELECT pg_catalog.pg_sleep(0.7)",
+        }, {
+          domain: "coordination",
+          operation: "holdTimeoutFifoLock",
+          projectId: scope.projectId,
+        });
+      }, {
+        domain: "coordination",
+        operation: "holdTimeoutFifoLock",
+        projectId: scope.projectId,
+      }).catch((error: unknown) => {
+        reportFailure(error);
+        throw error;
+      });
+      try {
+        await ready;
+        const outcome = await contender.transaction(async (transaction) => {
+          await transaction.query({
+            text: `SELECT pg_catalog.set_config(
+                            'lock_timeout',
+                            '2s',
+                            true
+                          )`,
+          }, {
+            domain: "coordination",
+            operation: "configurePriorLockTimeout",
+            projectId: scope.projectId,
+          });
+          const first = new PostgreSqlCoordinationRepository(
+            transaction,
+            scope.projectId,
+            scope.machineIds[0],
+          );
+          const second = new PostgreSqlCoordinationRepository(
+            transaction,
+            scope.projectId,
+            scope.machineIds[1],
+          );
+          const attempts = await Promise.allSettled([
+            first.acquireTransactionLock({
+              resourceType: "timeout-fifo",
+              resourceKey: "first",
+              operation: "short-timeout",
+              timeoutMs: 100,
+            }),
+            second.acquireTransactionLock({
+              resourceType: "timeout-fifo",
+              resourceKey: "second",
+              operation: "long-timeout",
+              timeoutMs: 1_000,
+            }),
+          ]);
+          const restored = await transaction.query<{ setting: string }>({
+            text: `SELECT pg_catalog.current_setting(
+                            'lock_timeout'
+                          ) AS setting`,
+          }, {
+            domain: "coordination",
+            operation: "inspectRestoredLockTimeout",
+            projectId: scope.projectId,
+          });
+          return {
+            attempts,
+            restoredSetting: restored.rows[0].setting,
+          };
+        }, {
+          domain: "coordination",
+          operation: "exerciseConcurrentLockTimeouts",
+          projectId: scope.projectId,
+        });
+        expect(outcome.attempts[0]).toMatchObject({
+          status: "rejected",
+          reason: {
+            backend: "postgresql",
+            machineId: scope.machineIds[0],
+            operation: "short-timeout",
+            retryable: true,
+          },
+        });
+        expect(outcome.attempts[1]).toMatchObject({
+          status: "fulfilled",
+          value: {
+            machineId: scope.machineIds[1],
+            operation: "long-timeout",
+          },
+        });
+        expect(outcome.restoredSetting).toBe("2s");
+        await hold;
+      } finally {
+        await Promise.allSettled([
+          hold,
+          blocker.close(),
+          contender.close(),
+        ]);
       }
     });
   });

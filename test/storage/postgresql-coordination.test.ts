@@ -223,6 +223,173 @@ describe("PostgreSQL work coordination", () => {
     expect(db.savepoint).toHaveBeenCalledOnce();
   });
 
+  it("serializes concurrent lock-timeout lifecycles per transaction", async () => {
+    const events: string[] = [];
+    let setting = "7s";
+    let reportFirstLock!: () => void;
+    let releaseFirstLock!: () => void;
+    const firstLockStarted = new Promise<void>((resolve) => {
+      reportFirstLock = resolve;
+    });
+    const firstLockReleased = new Promise<void>((resolve) => {
+      releaseFirstLock = resolve;
+    });
+    const db = scopedExecutor(async (config, options) => {
+      if (config.text.includes("transaction_isolation")) {
+        events.push(`${options.operation}:isolation`);
+        return result([{ transaction_isolation: "read committed" }]);
+      }
+      if (config.text.includes("current_setting('lock_timeout')")) {
+        events.push(`${options.operation}:read:${setting}`);
+        return result([{ setting }]);
+      }
+      if (config.text.includes("set_config")) {
+        setting = String(config.values?.[0]);
+        events.push(`${options.operation}:set:${setting}`);
+        return result([]);
+      }
+      if (config.text.includes("pg_advisory_xact_lock")) {
+        events.push(`${options.operation}:lock:${setting}`);
+        if (options.operation === "first-lock") {
+          reportFirstLock();
+          await firstLockReleased;
+        }
+        return result([]);
+      }
+      throw new Error(`unexpected SQL: ${config.text}`);
+    });
+    const firstRepository = new PostgreSqlWorkCoordinator(
+      db.executor,
+      projectId,
+      machineId,
+    );
+    const secondRepository = new PostgreSqlWorkCoordinator(
+      db.executor,
+      projectId,
+      machineId,
+    );
+    const first = firstRepository.acquireTransactionLock({
+      resourceType: "conversation",
+      resourceKey: "first",
+      operation: "first-lock",
+      timeoutMs: 40,
+    });
+    await firstLockStarted;
+    const second = secondRepository.acquireTransactionLock({
+      resourceType: "conversation",
+      resourceKey: "second",
+      operation: "second-lock",
+      timeoutMs: 900,
+    });
+    await Promise.resolve();
+    expect(events.some((event) => event.startsWith("second-lock:"))).toBe(
+      false,
+    );
+    releaseFirstLock();
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    expect(events).toEqual([
+      "first-lock:isolation",
+      "first-lock:read:7s",
+      "first-lock:set:40ms",
+      "first-lock:lock:40ms",
+      "first-lock:set:7s",
+      "second-lock:isolation",
+      "second-lock:read:7s",
+      "second-lock:set:900ms",
+      "second-lock:lock:900ms",
+      "second-lock:set:7s",
+    ]);
+    expect(setting).toBe("7s");
+  });
+
+  it("cancels queued lock lifecycles without releasing later callers", async () => {
+    let reportFirstLock!: () => void;
+    let releaseFirstLock!: () => void;
+    const firstLockStarted = new Promise<void>((resolve) => {
+      reportFirstLock = resolve;
+    });
+    const firstLockReleased = new Promise<void>((resolve) => {
+      releaseFirstLock = resolve;
+    });
+    const queriedOperations: string[] = [];
+    const db = scopedExecutor(async (config, options) => {
+      queriedOperations.push(options.operation);
+      if (config.text.includes("transaction_isolation")) {
+        return result([{ transaction_isolation: "read committed" }]);
+      }
+      if (config.text.includes("current_setting('lock_timeout')")) {
+        return result([{ setting: "0" }]);
+      }
+      if (
+        config.text.includes("pg_advisory_xact_lock")
+        && options.operation === "first-lock"
+      ) {
+        reportFirstLock();
+        await firstLockReleased;
+        throw new Error("first lock failed");
+      }
+      return result([]);
+    });
+    const repository = new PostgreSqlWorkCoordinator(
+      db.executor,
+      projectId,
+      machineId,
+    );
+    const first = repository.acquireTransactionLock({
+      resourceType: "conversation",
+      resourceKey: "first",
+      operation: "first-lock",
+      timeoutMs: 100,
+    });
+    await firstLockStarted;
+    const cancellation = new AbortController();
+    const cancelled = repository.acquireTransactionLock({
+      resourceType: "conversation",
+      resourceKey: "cancelled",
+      operation: "cancelled-lock",
+      timeoutMs: 100,
+      signal: cancellation.signal,
+    });
+    await Promise.resolve();
+    cancellation.abort();
+    await expect(cancelled).rejects.toMatchObject({
+      machineId,
+      operation: "cancelled-lock",
+      retryable: false,
+    });
+    const later = repository.acquireTransactionLock({
+      resourceType: "conversation",
+      resourceKey: "later",
+      operation: "later-lock",
+      timeoutMs: 100,
+    });
+    await Promise.resolve();
+    expect(queriedOperations).not.toContain("cancelled-lock");
+    expect(queriedOperations).not.toContain("later-lock");
+    releaseFirstLock();
+    await expect(first).rejects.toMatchObject({
+      machineId,
+      operation: "first-lock",
+      retryable: false,
+    });
+    await expect(later).resolves.toMatchObject({ operation: "later-lock" });
+
+    const alreadyCancelled = new AbortController();
+    alreadyCancelled.abort();
+    await expect(repository.acquireTransactionLock({
+      resourceType: "conversation",
+      resourceKey: "already-cancelled",
+      operation: "already-cancelled-lock",
+      timeoutMs: 100,
+      signal: alreadyCancelled.signal,
+    })).rejects.toMatchObject({
+      machineId,
+      operation: "already-cancelled-lock",
+      retryable: false,
+    });
+    expect(queriedOperations).not.toContain("already-cancelled-lock");
+  });
+
   it("requires transaction scope for locks and final fence checks", async () => {
     const { repository } = coordinator(() => result([]));
     await expect(repository.acquireTransactionLock({

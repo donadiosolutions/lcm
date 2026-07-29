@@ -16,6 +16,13 @@ const UUIDV7_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const LOCK_NAMESPACE_PATTERN = /^[a-z][a-z0-9-]*$/u;
 const DECIMAL_BIGINT_PATTERN = /^-?\d+$/u;
+const TRANSACTION_LOCK_WAIT_CANCELLED = Symbol(
+  "transaction-lock-wait-cancelled",
+);
+const transactionLockLifecycleTails = new WeakMap<
+  PostgreSqlTransactionScopeExecutor,
+  Promise<void>
+>();
 
 type CoordinationContext = PostgreSqlOperationContext & {
   readonly domain: "coordination";
@@ -326,6 +333,60 @@ function isRetryableTransactionLockFailure(error: unknown): boolean {
   // makes lock unavailability safe for callers to retry.
   return error instanceof PostgreSqlStorageOperationError
     && error.sqlState === "55P03";
+}
+
+function waitForTransactionLockTurn(
+  predecessor: Promise<void>,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal === undefined) return predecessor;
+  if (signal.aborted) {
+    return Promise.reject(TRANSACTION_LOCK_WAIT_CANCELLED);
+  }
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      reject(TRANSACTION_LOCK_WAIT_CANCELLED);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void predecessor.then(() => {
+      signal.removeEventListener("abort", onAbort);
+      if (signal.aborted) {
+        reject(TRANSACTION_LOCK_WAIT_CANCELLED);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+async function beginSerializedTransactionLockLifecycle(
+  transaction: PostgreSqlTransactionScopeExecutor,
+  signal: AbortSignal | undefined,
+): Promise<() => void> {
+  const predecessor = transactionLockLifecycleTails.get(transaction)
+    ?? Promise.resolve();
+  let release!: () => void;
+  const lifecycle = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = predecessor.then(() => lifecycle);
+  transactionLockLifecycleTails.set(transaction, tail);
+  const finish = (): void => {
+    release();
+    void tail.then(() => {
+      if (transactionLockLifecycleTails.get(transaction) === tail) {
+        transactionLockLifecycleTails.delete(transaction);
+      }
+    });
+  };
+  try {
+    await waitForTransactionLockTurn(predecessor, signal);
+    return finish;
+  } catch (error) {
+    finish();
+    throw error;
+  }
 }
 
 function text(
@@ -790,7 +851,12 @@ export class PostgreSqlWorkCoordinator {
       );
     }
     const transaction = await this.transactionScope(operation);
+    let finishLockLifecycle: (() => void) | undefined;
     try {
+      finishLockLifecycle = await beginSerializedTransactionLockLifecycle(
+        transaction,
+        input.signal,
+      );
       await this.assertReadCommitted(transaction, operation, input.signal);
       const prior = await transaction.query<SettingRow>({
         text: `SELECT pg_catalog.current_setting('lock_timeout') AS setting`,
@@ -863,6 +929,8 @@ export class PostgreSqlWorkCoordinator {
         operation,
         isRetryableTransactionLockFailure(error),
       );
+    } finally {
+      finishLockLifecycle?.();
     }
   }
 
