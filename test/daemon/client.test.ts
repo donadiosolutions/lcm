@@ -117,6 +117,11 @@ describe("DaemonClient", () => {
     try {
       daemon = await createDaemon(loadDaemonConfig("/x", { daemon: { port: 0 } }), { tokenPath });
       const client = new DaemonClient(`http://127.0.0.1:${daemon.address().port}`, tokenPath);
+      await expect(client.health()).resolves.toMatchObject({
+        status: "ok",
+        storageBackend: "sqlite",
+        entrypoint: expect.any(String),
+      });
       const poolStats = await client.get<{ totalConnections: number }>("/stats/pool");
       expect(poolStats.totalConnections).toBeGreaterThanOrEqual(0);
       await expect(client.get<{ totalConnections: number }>("/stats/pool")).resolves.toMatchObject({

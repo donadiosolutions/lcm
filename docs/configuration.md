@@ -378,7 +378,31 @@ or production PostgreSQL cluster.
 
 ## Daemon safety
 
-The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon requests to loopback HTTP origins and known daemon routes, so a malformed config or caller cannot redirect daemon traffic to another host. Before admitting a daemon for ordinary use, lifecycle checks require the PID file, `/health` PID, installed version, active storage backend, authenticated access, and exact `127.0.0.1` listener ownership to agree. An occupied port with missing or unverifiable identity is rejected rather than trusted. Daemons that predate backend identity are recognized as SQLite-only, so selecting PostgreSQL cannot silently reuse an existing SQLite process. During an explicit restart, the running daemon is authenticated by PID, installed version, listener ownership, and its local token without requiring it to already use the newly selected backend; the replacement must match the new backend. SessionSnapshot skips ingestion when bootstrap cannot verify daemon identity. PostToolUse also ignores payload-provided daemon ports and performs no network I/O.
+The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon
+requests to loopback HTTP origins and known daemon routes, so a malformed config
+or caller cannot redirect daemon traffic to another host. A managed daemon's
+unauthenticated `GET /health` response is a constant-cost, storage-free liveness
+probe containing only status, package version, selected backend, uptime, and
+PID. It does not inspect project databases or expose installation paths.
+Supplying a valid daemon bearer token returns the full storage-backed health
+diagnostic; supplying an invalid credential returns `401`. Embedded and test
+callers that intentionally create a daemon without a token retain the full
+health response.
+
+Before sending the bearer token or admitting a daemon for ordinary use,
+lifecycle checks require the public `/health` PID and installed version, a
+recognized active storage backend, the PID file, process liveness, and exact
+`127.0.0.1` listener ownership to agree. Authenticated full health and
+`/stats/pool` then prove diagnostic access and the entrypoint identity. An
+occupied port with missing or unverifiable identity is rejected rather than
+trusted. Daemons that predate backend identity are recognized as SQLite-only,
+so selecting PostgreSQL cannot silently reuse an existing SQLite process.
+During an explicit restart, the running daemon is authenticated by PID,
+installed version, listener ownership, and its local token without requiring it
+to already use the newly selected backend; the replacement must match the new
+backend. SessionSnapshot skips ingestion when bootstrap cannot verify daemon
+identity. PostToolUse also ignores payload-provided daemon ports and performs no
+network I/O.
 
 Use `lcm daemon start` to start or validate the managed background daemon. Use
 `lcm daemon restart` after configuration changes; it validates the new

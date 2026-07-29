@@ -160,7 +160,17 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }, idleTimeoutMs);
   }
 
-  routes.set("GET /health", async (_req, res) => {
+  routes.set("GET /health", async (req, res) => {
+    if (serverToken && req.headers.authorization === undefined) {
+      sendJson(res, 200, {
+        status: "ok",
+        version: PKG_VERSION,
+        storageBackend: config.storage.backend,
+        uptime: Math.floor((Date.now() - startTime) / 1000),
+        pid: process.pid,
+      });
+      return;
+    }
     const storageHealth = await storageFactory.health();
     const healthy = storageHealth.status === "healthy";
     sendJson(res, healthy ? 200 : 503, {
@@ -298,11 +308,13 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     const key = `${req.method} ${req.url?.split("?")[0]}`;
     const handler = routes.get(key);
     if (!handler) { sendJson(res, 404, { error: "not found" }); return; }
-    // Auth: skip for GET /health, require Bearer token for everything else
-    if (serverToken && key !== "GET /health") {
+    // Public health is intentionally storage-free. Supplying credentials opts
+    // into authenticated diagnostics and therefore must fail closed.
+    if (serverToken) {
       const rawAuth = req.headers["authorization"];
       const authHeader = (Array.isArray(rawAuth) ? rawAuth[0] : rawAuth) ?? "";
-      if (authHeader.trim() !== `Bearer ${serverToken}`) {
+      const publicHealth = key === "GET /health" && rawAuth === undefined;
+      if (!publicHealth && authHeader.trim() !== `Bearer ${serverToken}`) {
         sendJson(res, 401, { error: "unauthorized" });
         return;
       }

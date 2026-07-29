@@ -25,12 +25,14 @@ tests, and the native-transcript adapter is available to explicit
 programmatic backfill and conformance. The promoted-memory, recall,
 redaction-administration, and coordination adapters are available to direct
 programmatic callers and conformance under the same staged boundary. None is
-selected by normal daemon or CLI composition. With PostgreSQL selected, the daemon still opens its
-loopback listener and exposes
-an authenticated `/health` response with HTTP `503`, backend
-`postgresql`, and storage status `unavailable`; storage-backed routes also
-return fixed sanitized `503` responses. Lifecycle admission recognizes this
-staged response as the selected daemon without treating its storage as ready or
+selected by normal daemon or CLI composition. With PostgreSQL selected, the
+daemon still opens its loopback listener. Public `/health` remains a
+storage-free `200` liveness response identifying the selected `postgresql`
+backend. Authenticated `/health` returns HTTP `503`, backend `postgresql`, and
+storage status `unavailable`; authenticated storage-backed routes also return
+fixed sanitized `503` responses. Lifecycle admission verifies the public
+process and listener identity before sending the local token, then recognizes
+the authenticated staged response without treating its storage as ready or
 falling back to SQLite. Issue #92 activates PostgreSQL as authoritative after
 the adapter gates pass, while issue #224 owns normal daemon/CLI transcript
 routing. The local SQLite hook outbox and the metadata-only transcript

@@ -53,6 +53,7 @@ describe("daemon server", () => {
     expect(body.status).toBe("ok");
     expect(body.storageBackend).toBe("sqlite");
     expect(typeof body.uptime).toBe("number");
+    expect(body.entrypoint).toBe(process.argv[1]);
   });
 
   it("health endpoint returns version", async () => {
@@ -503,7 +504,7 @@ describe("daemon auth", () => {
     }
   });
 
-  it("allows GET /health without auth", async () => {
+  it("separates public liveness from authenticated health diagnostics", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv2-"));
     const tokenPath = join(dir, "daemon.token");
     ensureAuthToken(tokenPath);
@@ -512,8 +513,88 @@ describe("daemon auth", () => {
     const daemon = await createDaemon(config, { tokenPath });
     const port = daemon.address().port;
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`);
-      expect(res.status).toBe(200);
+      const publicResponse = await fetch(`http://127.0.0.1:${port}/health`);
+      expect(publicResponse.status).toBe(200);
+      expect(await publicResponse.json()).toEqual({
+        status: "ok",
+        version: expect.stringMatching(/^\d+\.\d+\.\d+$/),
+        storageBackend: "sqlite",
+        uptime: expect.any(Number),
+        pid: process.pid,
+      });
+
+      const invalid = await fetch(`http://127.0.0.1:${port}/health`, {
+        headers: { Authorization: "Bearer invalid" },
+      });
+      expect(invalid.status).toBe(401);
+      expect(await invalid.json()).toEqual({ error: "unauthorized" });
+
+      const authenticated = await fetch(`http://127.0.0.1:${port}/health`, {
+        headers: { Authorization: `Bearer ${readAuthToken(tokenPath)}` },
+      });
+      expect(authenticated.status).toBe(200);
+      expect(await authenticated.json()).toMatchObject({
+        status: "ok",
+        storageBackend: "sqlite",
+        entrypoint: expect.any(String),
+      });
+    } finally {
+      await daemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps staged PostgreSQL public health storage-free while preserving authenticated diagnostics", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-postgresql-"));
+    const tokenPath = join(dir, "daemon.token");
+    const caPath = join(dir, "postgres-ca.pem");
+    ensureAuthToken(tokenPath);
+    writeFileSync(
+      caPath,
+      "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n",
+      { mode: 0o600 },
+    );
+    const config = loadDaemonConfig(
+      "/nonexistent",
+      {
+        storage: { backend: "postgresql" },
+        daemon: { port: 0, idleTimeoutMs: 0 },
+      },
+      {
+        LCM_POSTGRES_URL: "postgresql://user:secret@db.example.test/lcm",
+        LCM_POSTGRES_CA_FILE: caPath,
+      },
+    );
+    const daemon = await createDaemon(config, { tokenPath });
+    const port = daemon.address().port;
+    try {
+      const publicResponse = await fetch(`http://127.0.0.1:${port}/health`);
+      expect(publicResponse.status).toBe(200);
+      expect(await publicResponse.json()).toEqual({
+        status: "ok",
+        version: expect.stringMatching(/^\d+\.\d+\.\d+$/),
+        storageBackend: "postgresql",
+        uptime: expect.any(Number),
+        pid: process.pid,
+      });
+
+      const authenticated = await fetch(`http://127.0.0.1:${port}/health`, {
+        headers: { Authorization: `Bearer ${readAuthToken(tokenPath)}` },
+      });
+      expect(authenticated.status).toBe(503);
+      expect(await authenticated.json()).toMatchObject({
+        status: "unavailable",
+        storageBackend: "postgresql",
+        entrypoint: expect.any(String),
+        storage: {
+          status: "unavailable",
+          error: {
+            code: "STORAGE_INITIALIZATION_FAILED",
+            backend: "postgresql",
+            operation: "health",
+          },
+        },
+      });
     } finally {
       await daemon.stop();
       rmSync(dir, { recursive: true, force: true });

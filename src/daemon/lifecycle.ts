@@ -114,6 +114,11 @@ function healthStorageBackendMatches(
   return (health?.storageBackend ?? "sqlite") === expectedStorageBackend;
 }
 
+function recognizedHealthStorageBackend(health: HealthResponse): StorageBackend | null {
+  const backend = health.storageBackend ?? "sqlite";
+  return backend === "sqlite" || backend === "postgresql" ? backend : null;
+}
+
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const STORAGE_BACKEND_AUTH_WARNING = "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
@@ -552,10 +557,14 @@ async function requestDaemonHealth(
   port: number,
   fetchFn: typeof globalThis.fetch,
   signal: AbortSignal,
+  token?: string,
 ): Promise<HealthResponse | null> {
   try {
     const url = `http://127.0.0.1:${port}/health`;
-    const res = await fetchFn(url, { signal });
+    const res = await fetchFn(url, {
+      ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+      signal,
+    });
     if (!res.ok && res.status !== 503) return null;
     const body = await res.json() as unknown;
     if (typeof body !== "object" || body === null || typeof (body as HealthResponse).status !== "string") {
@@ -594,10 +603,11 @@ async function checkDaemonHealth(
   port: number,
   fetchFn: typeof globalThis.fetch,
   deadline: RequestDeadline,
+  token?: string,
 ): Promise<HealthResponse | null> {
   try {
     return await runWithDeadline(
-      (signal: AbortSignal): Promise<HealthResponse | null> => requestDaemonHealth(port, fetchFn, signal),
+      (signal: AbortSignal): Promise<HealthResponse | null> => requestDaemonHealth(port, fetchFn, signal, token),
       deadline,
     );
   } catch {
@@ -607,13 +617,11 @@ async function checkDaemonHealth(
 
 async function checkDaemonAccess(
   port: number,
-  tokenPath: string,
+  token: string,
   fetchFn: typeof globalThis.fetch,
   deadline: RequestDeadline,
   expectedStorageBackend: StorageBackend,
 ): Promise<boolean> {
-  const token = readAuthToken(tokenPath);
-  if (!token) return false;
   const request = async (signal: AbortSignal): Promise<boolean> => {
     const res = await fetchFn(`http://127.0.0.1:${port}/stats/pool`, {
       headers: { Authorization: `Bearer ${token}` },
@@ -632,6 +640,44 @@ async function checkDaemonAccess(
   } catch {
     return false;
   }
+}
+
+function sameHealthIdentity(publicHealth: HealthResponse, authenticatedHealth: HealthResponse): boolean {
+  return publicHealth.pid === authenticatedHealth.pid
+    && publicHealth.version === authenticatedHealth.version
+    && (publicHealth.storageBackend ?? "sqlite") === (authenticatedHealth.storageBackend ?? "sqlite");
+}
+
+async function checkDaemonDiagnostics(
+  port: number,
+  tokenPath: string,
+  fetchFn: typeof globalThis.fetch,
+  remainingDeadline: () => RequestDeadline | null,
+  publicHealth: HealthResponse,
+  expectedStorageBackend: StorageBackend,
+): Promise<HealthResponse | null> {
+  const token = readAuthToken(tokenPath);
+  if (!token) return null;
+  const healthDeadline = remainingDeadline();
+  if (!healthDeadline) return null;
+  const authenticatedHealth = await checkDaemonHealth(port, fetchFn, healthDeadline, token);
+  if (
+    !isRecognizedDaemonHealth(authenticatedHealth)
+    || !sameHealthIdentity(publicHealth, authenticatedHealth)
+  ) {
+    return null;
+  }
+  const accessDeadline = remainingDeadline();
+  if (!accessDeadline) return null;
+  return await checkDaemonAccess(
+    port,
+    token,
+    fetchFn,
+    accessDeadline,
+    expectedStorageBackend,
+  )
+    ? authenticatedHealth
+    : null;
 }
 
 function startViaDetachedSpawn(
@@ -917,7 +963,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       : { outcome: "replacement", pid: currentPid };
   }
 
-  /** Stop backend transitions only after local-token access; retain legacy version-repair behavior. */
+  /** Retain legacy version repair, but never disclose the token to an unexpected public identity. */
   async function repairMismatchedDaemon(
     health: HealthResponse,
     identityMatches: boolean,
@@ -927,13 +973,16 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     hasAccess: boolean,
   ): Promise<MismatchRepair> {
     if (!identityMatches) return { outcome: "none" };
+    if (!storageBackendMatches && !hasAccess) return { outcome: "blocked" };
+    if (!versionMatches) {
+      await terminatePidFileProcess();
+      return { outcome: "terminated" };
+    }
     if (!storageBackendMatches || !entrypointMatches) {
       if (!hasAccess) return { outcome: "blocked" };
       return terminateAuthenticatedDaemon(health);
     }
-    if (versionMatches) return { outcome: "none" };
-    await terminatePidFileProcess();
-    return { outcome: "terminated" };
+    return { outcome: "none" };
   }
 
   async function daemonResult(
@@ -947,17 +996,23 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (health === null || !endpointIdentityMatches(health)) return null;
     if (!healthVersionMatches(health, expectedVersion)) return null;
     if (!healthStorageBackendMatches(health, expectedStorageBackend)) return null;
-    if (!processEntrypointMatches(health, expectedEntrypoint, platform, procRoot, realpath)) return null;
+    let verifiedHealth = health;
     if (!access.alreadyVerified) {
-      const accessTimeoutMs = access.deadline - monotonicNow();
-      if (accessTimeoutMs <= 0) return null;
-      const deadlineOptions = {
-        timeoutMs: accessTimeoutMs,
-        setTimeoutFn,
-        clearTimeoutFn,
-      };
-      if (!await checkDaemonAccess(opts.port, tokenPath, fetchFn, deadlineOptions, expectedStorageBackend)) return null;
+      const authenticated = await checkDaemonDiagnostics(
+        opts.port,
+        tokenPath,
+        fetchFn,
+        (): RequestDeadline | null => {
+          const timeoutMs = access.deadline - monotonicNow();
+          return timeoutMs <= 0 ? null : { timeoutMs, setTimeoutFn, clearTimeoutFn };
+        },
+        health,
+        expectedStorageBackend,
+      );
+      if (!authenticated) return null;
+      verifiedHealth = authenticated;
     }
+    if (!processEntrypointMatches(verifiedHealth, expectedEntrypoint, platform, procRoot, realpath)) return null;
 
     let parent: ParentInspection | undefined;
     if (enforceParent) {
@@ -989,7 +1044,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       spawned,
       // Endpoint identity verification above proves health.pid is the live
       // PID-file process, so it is the authoritative fallback here.
-      pid: parent?.pid ?? health.pid,
+      pid: parent?.pid ?? verifiedHealth.pid,
       parentPid: parent?.parentPid,
       userSystemdPid: parent?.userSystemdPid,
       restartedForParent,
@@ -1025,22 +1080,31 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     ? await checkDaemonHealth(opts.port, fetchFn, initialHealthDeadline)
     : null;
   if (isRecognizedDaemonHealth(health)) {
-    const initialAccessDeadline = remainingRequestDeadline();
     const identityMatches = endpointIdentityMatches(health);
     const versionMatches = healthVersionMatches(health, expectedVersion);
     const storageBackendMatches = healthStorageBackendMatches(health, expectedStorageBackend);
-    const entrypointMatches = processEntrypointMatches(
-      health,
-      expectedEntrypoint,
-      platform,
-      procRoot,
-      realpath,
-    );
-    const hasAccess = identityMatches && (versionMatches || !storageBackendMatches || !entrypointMatches) && initialAccessDeadline
-      ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, initialAccessDeadline, health.storageBackend ?? expectedStorageBackend)
-      : false;
+    const publicStorageBackend = recognizedHealthStorageBackend(health);
+    const authenticatedHealth = identityMatches && versionMatches && publicStorageBackend !== null
+      ? await checkDaemonDiagnostics(
+          opts.port,
+          tokenPath,
+          fetchFn,
+          remainingRequestDeadline,
+          health,
+          publicStorageBackend,
+        )
+      : null;
+    const entrypointMatches = authenticatedHealth !== null
+      && processEntrypointMatches(
+        authenticatedHealth,
+        expectedEntrypoint,
+        platform,
+        procRoot,
+        realpath,
+      );
+    const hasAccess = authenticatedHealth !== null;
     const mismatchRepair = await repairMismatchedDaemon(
-      health,
+      authenticatedHealth ?? health,
       identityMatches,
       versionMatches,
       storageBackendMatches,
@@ -1054,8 +1118,8 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       concurrentReplacementPid = mismatchRepair.pid;
     }
     if (mismatchRepair.outcome === "none") {
-      if (hasAccess) {
-        const accepted = await daemonResult(health, false, "existing", { alreadyVerified: true });
+      if (authenticatedHealth) {
+        const accepted = await daemonResult(authenticatedHealth, false, "existing", { alreadyVerified: true });
         if (accepted) return accepted;
         // A null result here can only be the verified wrong-parent case: health,
         // access, and version were already accepted, while unavailable identity
@@ -1066,8 +1130,8 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         if (endpointIdentityMatches(health)
           && parent.available
           && parent.pid !== undefined
-          && health.pid !== undefined
-          && parent.pid === health.pid
+          && authenticatedHealth.pid !== undefined
+          && parent.pid === authenticatedHealth.pid
           && isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
           await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
           restartedForParent = true;
@@ -1093,24 +1157,33 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           ? await checkDaemonHealth(opts.port, fetchFn, retryHealthDeadline)
           : null;
         if (isRecognizedDaemonHealth(retry)) {
-          const retryAccessDeadline = remainingRequestDeadline();
           const retryIdentityMatches = endpointIdentityMatches(retry);
           const retryVersionMatches = healthVersionMatches(retry, expectedVersion);
           const retryStorageBackendMatches = healthStorageBackendMatches(retry, expectedStorageBackend);
-          const retryEntrypointMatches = processEntrypointMatches(
-            retry,
-            expectedEntrypoint,
-            platform,
-            procRoot,
-            realpath,
-          );
-          const retryHasAccess = retryIdentityMatches
-            && (retryVersionMatches || !retryStorageBackendMatches || !retryEntrypointMatches)
-            && retryAccessDeadline
-            ? await checkDaemonAccess(opts.port, tokenPath, fetchFn, retryAccessDeadline, retry.storageBackend ?? expectedStorageBackend)
-            : false;
+          const retryPublicStorageBackend = recognizedHealthStorageBackend(retry);
+          const authenticatedRetry = retryIdentityMatches
+            && retryVersionMatches
+            && retryPublicStorageBackend !== null
+            ? await checkDaemonDiagnostics(
+                opts.port,
+                tokenPath,
+                fetchFn,
+                remainingRequestDeadline,
+                retry,
+                retryPublicStorageBackend,
+              )
+            : null;
+          const retryEntrypointMatches = authenticatedRetry !== null
+            && processEntrypointMatches(
+              authenticatedRetry,
+              expectedEntrypoint,
+              platform,
+              procRoot,
+              realpath,
+            );
+          const retryHasAccess = authenticatedRetry !== null;
           const mismatchRepair = await repairMismatchedDaemon(
-            retry,
+            authenticatedRetry ?? retry,
             retryIdentityMatches,
             retryVersionMatches,
             retryStorageBackendMatches,
@@ -1124,8 +1197,8 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
             return waitForConcurrentReplacement(mismatchRepair.pid);
           }
           repairedMismatch = mismatchRepair.outcome === "terminated";
-          if (mismatchRepair.outcome === "none" && retryHasAccess) {
-            const accepted = await daemonResult(retry, false, "existing", { alreadyVerified: true });
+          if (mismatchRepair.outcome === "none" && authenticatedRetry) {
+            const accepted = await daemonResult(authenticatedRetry, false, "existing", { alreadyVerified: true });
             if (accepted) {
               return accepted;
             }
@@ -1250,15 +1323,24 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     // The current daemon may legitimately use a different backend during a
     // configured transition. Authenticate it independently; ensureOptions
     // applies expectedStorageBackend to the replacement below.
-    const accessDeadline = remainingVerificationDeadline();
-    if (!accessDeadline || !await checkDaemonAccess(
+    const currentStorageBackend = health.storageBackend ?? "sqlite";
+    if (currentStorageBackend !== "sqlite" && currentStorageBackend !== "postgresql") return false;
+    const authenticatedHealth = await checkDaemonDiagnostics(
       port,
       tokenPath,
       fetchFn,
-      accessDeadline,
-      health.storageBackend ?? "sqlite",
-    )) return false;
-    return true;
+      remainingVerificationDeadline,
+      health,
+      currentStorageBackend,
+    );
+    return authenticatedHealth !== null
+      && processEntrypointMatches(
+        authenticatedHealth,
+        opts.expectedEntrypoint,
+        platform,
+        opts._procRoot ?? "/proc",
+        opts._realpathOverride ?? realpathSync,
+      );
   }
   async function isManaged(pid: number): Promise<boolean> {
     if (_isManagedProcessOverride) return _isManagedProcessOverride(pid);
