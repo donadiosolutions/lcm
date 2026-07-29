@@ -231,7 +231,7 @@ describe("release workflows", () => {
       "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
     );
     expect(trustedPolicy?.with).toMatchObject({
-      ref: "${{ github.event.repository.default_branch }}",
+      ref: "${{ github.workflow_sha }}",
       path: "trusted",
       "persist-credentials": false,
       "sparse-checkout": ".github/scripts",
@@ -504,9 +504,18 @@ describe("release workflows", () => {
     const trustedRecoveryPolicy = recoveryPreflight.steps.find(
       (step) => step.name === "Checkout trusted default-branch recovery policy",
     );
-    expect(trustedRecoveryPolicy?.with?.ref).toBe(
-      "${{ github.event.repository.default_branch }}",
+    expect(trustedRecoveryPolicy?.with?.ref).toBe("${{ github.workflow_sha }}");
+    const trustedReleasePolicy = publishWorkflow.jobs.preflight.steps.find(
+      (step) => step.name === "Checkout trusted default-branch release policy",
     );
+    const trustedPolicyRefs = [trustedReleasePolicy, trustedRecoveryPolicy].map(
+      (step) => step?.with?.ref,
+    );
+    expect(trustedPolicyRefs).toEqual([
+      "${{ github.workflow_sha }}",
+      "${{ github.workflow_sha }}",
+    ]);
+    expect(trustedPolicyRefs.some((ref) => String(ref).includes("default_branch"))).toBe(false);
     expect(trustedRecoveryPolicy?.with?.path).toBe("trusted");
     expect(recoveryPreflight.steps.indexOf(trustedRecoveryPolicy!)).toBe(0);
     const recoveryHistory = recoveryPreflight.steps.find(
