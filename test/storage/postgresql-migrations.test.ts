@@ -1265,18 +1265,17 @@ describe("PostgreSQL migration runner", () => {
       remediation:
         "Restore every missing or changed LCM baseline table, relation ACL, column ACL, index, trigger, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.",
     });
-    expect((failure as PostgreSqlBaselineDefinitionPreflightError).toJSON())
-      .toMatchObject({
-        actualDefinitionGroups: baselineDefinitions === "missing"
-          || baselineDefinitions === "invalid"
-          ? null
-          : expect.any(Array),
+    const serializedFailure =
+      (failure as PostgreSqlBaselineDefinitionPreflightError).toJSON();
+    expect(serializedFailure).toMatchObject({
         baselineApplied,
         driftedDefinitionGroupCount,
         existingObjectCount,
         expectedObjectCount,
         missingObjectCount,
       });
+    expect(serializedFailure).not.toHaveProperty("actualDefinitionGroups");
+    expect(JSON.stringify(serializedFailure)).not.toMatch(/[0-9a-f]{64}/u);
     expect((failure as PostgreSqlBaselineDefinitionPreflightError).remediation)
       .toContain("column ACL");
     const inventoryCall = fake.seam.query.mock.calls.find(([, context]) => (

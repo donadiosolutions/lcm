@@ -761,7 +761,6 @@ export class PostgreSqlBaselineDefinitionPreflightError extends StorageOperation
       existingObjectCount: this.existingObjectCount,
       missingObjectCount: this.missingObjectCount,
       driftedDefinitionGroupCount: this.driftedDefinitionGroupCount,
-      actualDefinitionGroups: this.actualDefinitionGroups,
       remediation: this.remediation,
     };
   }
