@@ -908,11 +908,12 @@ jobs:
                 });
               } catch {
                 const failure = "classification output unavailable or invalid";
-                failures.push(failure);
                 core.error(
                   `Security classification failed closed; leaving `
                   + `${issueNumbers.length} security issue(s) queued.`,
                 );
+                core.setFailed(`Failed security triage: ${failure}`);
+                return;
               }
               for (const decision of decisions) {
                 try {

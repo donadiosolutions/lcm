@@ -770,7 +770,7 @@ test("workflow binds evidence and the required model split", async () => {
   );
   assert.match(
     workflow,
-    /SECURITY_CLASSIFICATION_STATUS: \$\{\{ needs\.classify-security\.result \}\}[\s\S]*?if \(process\.env\.SECURITY_HAS_WORK === "true"\)[\s\S]*?parseSecurityClassificationForApplication\(\{[\s\S]*?classificationStatus: process\.env\.SECURITY_CLASSIFICATION_STATUS,[\s\S]*?output: process\.env\.SECURITY_RESULT,[\s\S]*?catch \{[\s\S]*?failures\.push\(failure\);[\s\S]*?Security classification failed closed/u,
+    /SECURITY_CLASSIFICATION_STATUS: \$\{\{ needs\.classify-security\.result \}\}[\s\S]*?if \(process\.env\.SECURITY_HAS_WORK === "true"\)[\s\S]*?parseSecurityClassificationForApplication\(\{[\s\S]*?classificationStatus: process\.env\.SECURITY_CLASSIFICATION_STATUS,[\s\S]*?output: process\.env\.SECURITY_RESULT,[\s\S]*?catch \{[\s\S]*?Security classification failed closed[\s\S]*?core\.setFailed\(`Failed security triage: \$\{failure\}`\);[\s\S]*?return;[\s\S]*?\}\s*for \(const decision of decisions\)/u,
   );
   assert.doesNotMatch(
     workflow,
@@ -1365,6 +1365,10 @@ test("redacts credentials before issue content enters model prompts", () => {
   assert.equal(
     redactPromptText(boundaryToken, "before [RED".length),
     "before ",
+  );
+  assert.equal(
+    redactPromptText(boundaryToken, "before [REDACTED]".length),
+    "before [REDACTED]",
   );
   assert.equal(
     redactPromptText("literal[truncated", "literal[".length),
