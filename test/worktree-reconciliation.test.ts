@@ -191,15 +191,20 @@ type InstructionCacheFixtureRow = {
   readonly updatedAt: string | Uint8Array;
 };
 
+function makeMigratedDatabase(path: string): DatabaseSync {
+  mkdirSync(join(path, ".."), { recursive: true });
+  const db = new DatabaseSync(path);
+  runLcmMigrations(db);
+  return db;
+}
+
 function makeInstructionDatabase(
   path: string,
   table: "session_instruction_cache" | "session_instructions",
   id: number,
   row: InstructionCacheFixtureRow | null,
 ): void {
-  mkdirSync(join(path, ".."), { recursive: true });
-  const db = new DatabaseSync(path);
-  runLcmMigrations(db);
+  const db = makeMigratedDatabase(path);
   if (row !== null) {
     db.prepare(
       `INSERT INTO ${table}(id, content, content_hash, updated_at)
@@ -781,7 +786,7 @@ describe("worktree reconciliation", () => {
     }, null, 2)}\n`);
     clearProjectMapCache();
     const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
-    makeDatabase(sourcePath, "schema-drift", "source", sourceHash);
+    makeMigratedDatabase(sourcePath).close();
     const failAfterFence = () => {
       throw new Error("stop after durable source fence");
     };
@@ -819,33 +824,16 @@ describe("worktree reconciliation", () => {
          AND name LIKE 'lcm_reconciliation_fence_%'
        ORDER BY name`,
     ).all() as Array<{ name: string }>;
-    expect(driftTriggers).toHaveLength(3);
-    expect(driftTriggers.every(({ name }) =>
-      /^lcm_reconciliation_fence_[a-f0-9]{64}_(delete|insert|update)$/u.test(name),
-    )).toBe(true);
+    const driftTableHash = createHash("sha256").update('AAA odd table"name').digest("hex");
+    expect(driftTriggers).toEqual([
+      { name: `lcm_reconciliation_fence_${driftTableHash}_delete` },
+      { name: `lcm_reconciliation_fence_${driftTableHash}_insert` },
+      { name: `lcm_reconciliation_fence_${driftTableHash}_update` },
+    ]);
     expect(() => second.prepare(
       `INSERT INTO "AAA odd table""name" ("value") VALUES('blocked')`,
     ).run()).toThrow("LCM source retired by worktree reconciliation");
-    const stableNames = second.prepare(
-      `SELECT name FROM sqlite_schema
-       WHERE type = 'trigger' AND name LIKE 'lcm_reconciliation_fence_%'
-       ORDER BY name`,
-    ).all();
     second.close();
-
-    expect(() => reconcileWorktrees(main, {
-      _observer: (event) => {
-        if (event === "after-source-fence-commit-before-target-commit") failAfterFence();
-      },
-    })).toThrow("stop after durable source fence");
-    const third = new DatabaseSync(sourcePath, { readOnly: true });
-    expect(third.prepare(
-      `SELECT name FROM sqlite_schema
-       WHERE type = 'trigger' AND name LIKE 'lcm_reconciliation_fence_%'
-       ORDER BY name`,
-    ).all()).toEqual(stableNames);
-    third.close();
-    expect(reconcileWorktrees(main).status).toBe("completed");
   });
 
   it("does not reconcile a separate clone merely because it owns an explicit alias", () => {

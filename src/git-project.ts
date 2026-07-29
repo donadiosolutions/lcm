@@ -77,8 +77,7 @@ function canonicalForCommonDir(commonDir: string): string {
     : commonDir;
 }
 
-function hasConfiguredWorktree(commonDir: string): boolean {
-  const config = readGitPointer(join(commonDir, "config"), commonDir, "Git config");
+function configHasCoreWorktree(config: string): boolean {
   let inCore = false;
   for (const line of config.split(/\r?\n/u)) {
     const section = /^\s*\[([^\]]+)\]\s*$/u.exec(line);
@@ -89,6 +88,35 @@ function hasConfiguredWorktree(commonDir: string): boolean {
     if (inCore && /^\s*worktree\s*=/iu.test(line)) return true;
   }
   return false;
+}
+
+function configEnablesWorktreeConfig(config: string): boolean {
+  let inExtensions = false;
+  for (const line of config.split(/\r?\n/u)) {
+    const section = /^\s*\[([^\]]+)\]\s*$/u.exec(line);
+    if (section) {
+      inExtensions = section[1]!.trim().toLowerCase() === "extensions";
+      continue;
+    }
+    if (
+      inExtensions
+      && /^\s*worktreeconfig(?:\s*=\s*(?:true|yes|on|1))?\s*$/iu.test(line)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasConfiguredWorktree(gitDir: string): boolean {
+  const config = readGitPointer(join(gitDir, "config"), gitDir, "Git config");
+  if (configHasCoreWorktree(config)) return true;
+  if (!configEnablesWorktreeConfig(config)) return false;
+  const worktreeConfigPath = join(gitDir, "config.worktree");
+  if (!existsSync(worktreeConfigPath)) return false;
+  return configHasCoreWorktree(
+    readGitPointer(worktreeConfigPath, gitDir, "Git worktree config"),
+  );
 }
 
 function validateGitDirectory(gitDir: string, commonDir: string): void {

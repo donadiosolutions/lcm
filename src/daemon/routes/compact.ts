@@ -378,14 +378,14 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
       project = await activeFactory.openProject(admittedIdentity);
       const pid = admittedIdentity.localProjectId;
       const result = await enqueue(pid, async () => {
-        const localProjectDir = ensureProjectDirForIdentity(localIdentity);
-
-        const scrubber = await ScrubEngine.forProject(
-          config.security?.sensitivePatterns ?? [],
-          localProjectDir,
-        );
-
         try {
+          const localProjectDir = ensureProjectDirForIdentity(localIdentity);
+
+          const scrubber = await ScrubEngine.forProject(
+            config.security?.sensitivePatterns ?? [],
+            localProjectDir,
+          );
+
           const conversation = await project.conversations.getOrCreateConversation(session_id);
 
           // Ingest new messages from the transcript into the DB.

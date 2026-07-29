@@ -52,9 +52,10 @@ function makeLinkedWorktree(primary: string, linked: string, name = "linked"): s
   return linked;
 }
 
-function git(cwd: string, ...args: string[]): void {
+function git(cwd: string, ...args: string[]): string {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
   if (result.status !== 0) throw new Error(result.stderr || result.stdout);
+  return result.stdout.trim();
 }
 
 describe("Git project identity", () => {
@@ -137,6 +138,18 @@ describe("Git project identity", () => {
     expect(anchor).toMatchObject({ canonical: submodule, worktreeRoot: submodule });
     expect(anchor?.commonDir).toContain(join(".git", "modules", "modules", "sub"));
     expect(resolveGitProjectAnchor(superproject)?.canonical).toBe(superproject);
+
+    git(submodule, "config", "--unset", "core.worktree");
+    git(submodule, "config", "extensions.worktreeConfig", "true");
+    git(submodule, "config", "--worktree", "core.worktree", submodule);
+    expect(git(submodule, "config", "--show-origin", "--get", "core.worktree"))
+      .toContain("config.worktree");
+    expect(git(submodule, "rev-parse", "--show-toplevel")).toBe(submodule);
+    clearGitProjectAnchorCache();
+    expect(resolveGitProjectAnchor(join(submodule, "nested"))).toMatchObject({
+      canonical: submodule,
+      worktreeRoot: submodule,
+    });
   });
 
   it("revalidates cached anchors when nearer or changed Git metadata appears", () => {
@@ -225,6 +238,10 @@ describe("Git project identity", () => {
       worktreeRoot: linked,
       commonDir: shared,
     });
+
+    git(primary, "config", "extensions.worktreeConfig", "true");
+    clearGitProjectAnchorCache();
+    expect(resolveGitProjectAnchor(primary)?.canonical).toBe(shared);
   });
 
   it("rejects malformed, oversized, symlinked, and invalid Git metadata", () => {

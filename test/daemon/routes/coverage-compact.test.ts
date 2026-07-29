@@ -295,6 +295,44 @@ describe("compact route coverage", () => {
       .toBeLessThan(state.scrubber.mock.invocationCallOrder[0]);
   });
 
+  it.each([
+    [
+      "local project directory",
+      () => state.ensureProject.mockImplementationOnce(() => {
+        throw new Error("local project setup failed");
+      }),
+      "local project setup failed",
+    ],
+    [
+      "scrubber",
+      () => state.scrubber.mockRejectedValueOnce(new Error("scrubber setup failed")),
+      "scrubber setup failed",
+    ],
+  ])("closes shared admitted storage when %s setup fails", async (
+    label,
+    failSetup,
+    expectedError,
+  ) => {
+    const closeProject = vi.fn(async () => undefined);
+    const closeFactory = vi.fn(async () => undefined);
+    const sharedFactory = {
+      openProject: vi.fn(async () => ({ close: closeProject })),
+      close: closeFactory,
+    };
+    failSetup();
+    const output = response();
+
+    await createCompactHandler(config(), sharedFactory as never)(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: `setup-${label}`, cwd: "/tmp" }),
+    );
+
+    expect(output.json()).toEqual({ error: expectedError });
+    expect(closeProject).toHaveBeenCalledOnce();
+    expect(closeFactory).not.toHaveBeenCalled();
+  });
+
   it("uses one local and remote identity snapshot across queued execution", async () => {
     const first = {
       id: "local-hash-a",
