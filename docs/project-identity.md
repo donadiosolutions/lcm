@@ -61,19 +61,23 @@ source proven to belong to that repository remain strict before any source
 merge, archive, or map publication. `ENOTDIR` there—or any other unexpected
 filesystem error anywhere—still fails closed.
 
-The instruction cache is a fixed-slot table, so reconciliation arbitrates each
-slot by `updated_at`. Byte-for-byte identical rows are deduplicated. When two
-different valid rows occupy the same slot, LCM retains the row with the newer
-timestamp; an equal timestamp is a divergent collision and blocks the run.
-Malformed timestamps block reconciliation only when differing rows require
-arbitration; accepted values are SQLite UTC timestamps
-(`YYYY-MM-DD HH:mm:ss`) or complete ISO timestamps with an explicit `Z` or
-numeric offset. Calendar-invalid, shorthand, and timezone-less ISO values fail
-closed. Exact byte-identical rows deduplicate without timestamp parsing.
-In every blocked case, the original source project
-and event stores have not been discarded: after a successful reconciliation
-they are archived as recoverable timestamped backups, and before success the
-source stores remain in place for inspection or correction.
+The instruction cache keys every row by the complete local project, client,
+agent session, verified worktree, and exact working directory scope. SQLite's
+per-machine database path supplies the machine boundary; PostgreSQL includes
+the registered machine UUID in the key. Reconciliation accepts only
+byte-identical rows with the same complete scope. A differing row for the same
+scope is a collision and blocks the run; content is never selected by a
+timestamp or copied between scopes.
+
+The upgrade deliberately discards the old process-global, fixed-slot
+instruction cache because its rows have no trustworthy client, session,
+worktree, or working-directory provenance. The migration validates the legacy
+or current schema before making any change and performs replacement in one
+transaction. Unknown or partial schemas and interrupted replacements leave the
+original database intact. In every blocked reconciliation case, the original
+source project and event stores have not been discarded: after a successful
+reconciliation they are archived as recoverable timestamped backups, and
+before success the source stores remain in place for inspection or correction.
 
 Preview, inspect, or retry manually:
 

@@ -205,6 +205,7 @@ describe("runDoctor project map checks", () => {
       writeFileSync(join(linkedGitDir, "HEAD"), "ref: refs/heads/linked\n");
       writeFileSync(join(linkedGitDir, "commondir"), "../..\n");
       writeFileSync(join(linked, ".git"), `gitdir: ${linkedGitDir}\n`);
+      writeFileSync(join(linkedGitDir, "gitdir"), `${join(linked, ".git")}\n`);
       const targetHash = hashProjectPath(main);
       const sourceHash = hashProjectPath(linked);
       mkdirSync(join(home, ".lcm", "reconciliations"), { recursive: true });

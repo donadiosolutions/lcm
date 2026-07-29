@@ -53,7 +53,10 @@ ON TABLE lcm.session_ingest_log TO :"lcm_runtime_role";
 
 GRANT SELECT, DELETE ON TABLE lcm.session_instructions
 TO :"lcm_runtime_role";
-GRANT INSERT (project_id, machine_id, slot, content, content_hash),
+GRANT INSERT (
+        project_id, machine_id, scope_hash, client_name, session_id,
+        worktree_path, cwd_path, content, content_hash
+      ),
       UPDATE (content, content_hash, updated_at)
 ON TABLE lcm.session_instructions TO :"lcm_runtime_role";
 GRANT USAGE ON SEQUENCE lcm.session_instructions_instruction_id_seq

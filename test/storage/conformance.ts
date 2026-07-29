@@ -199,17 +199,22 @@ export function defineCoreStorageConformance(
     await storage.coordination.recordSessionIngest("session-a", 3);
     expect(await storage.coordination.getSessionIngest("session-a")).toMatchObject({ messageCount: 3 });
     expect(await storage.coordination.getSessionIngest("missing")).toBeNull();
-    expect(await storage.coordination.getSessionInstructions(2, 1)).toBeNull();
-    await storage.coordination.upsertSessionInstructions(1, "legacy", "hash-1");
-    expect(await storage.coordination.getSessionInstructions(2, 1)).toMatchObject({
-      id: 1,
-      content: "legacy",
-      contentHash: "hash-1",
-    });
-    await storage.coordination.upsertSessionInstructions(2, "current", "hash-2");
-    expect(await storage.coordination.getSessionInstructions(2)).toMatchObject({ id: 2, content: "current" });
-    await storage.coordination.deleteSessionInstructions(2);
-    expect(await storage.coordination.getSessionInstructions(2)).toBeNull();
+    const instructionScope = {
+      clientName: "codex",
+      sessionId: "session-a",
+      worktreePath: "/repo/worktree-a",
+      cwdPath: "/repo/worktree-a/src",
+    } as const;
+    expect(await storage.coordination.getSessionInstructions(instructionScope)).toBeNull();
+    await storage.coordination.upsertSessionInstructions(
+      instructionScope,
+      "current",
+      "hash-2",
+    );
+    expect(await storage.coordination.getSessionInstructions(instructionScope))
+      .toMatchObject({ ...instructionScope, content: "current" });
+    await storage.coordination.deleteSessionInstructions(instructionScope);
+    expect(await storage.coordination.getSessionInstructions(instructionScope)).toBeNull();
 
     expect(await storage.lexicalSearch.searchMessages({ query: "needle", mode: "full_text" })).not.toEqual([]);
     expect(await storage.lexicalSearch.searchMessages({ query: "alpha", mode: "regex" })).not.toEqual([]);
@@ -230,7 +235,7 @@ export function defineCoreStorageConformance(
       recallSurfacings: 4,
       redactionCounters: 4,
       sessionIngestLogs: 1,
-      sessionInstructions: 1,
+      sessionInstructions: 0,
     });
     expect(await storage.conversations.getConversation(first.conversationId))
       .toMatchObject({ sessionId: "session-a" });

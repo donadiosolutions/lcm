@@ -13,12 +13,19 @@ import {
   PostgreSqlRecallRepository,
   PostgreSqlRedactionAdminRepository,
 } from "../../src/storage/postgresql/memory-repositories.js";
+import { sessionInstructionsScopeHash } from "../../src/storage/session-instructions.js";
 
 const projectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
 const machineId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9030";
 const memoryId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9040";
 const importedMemoryId = "550e8400-e29b-41d4-a716-446655440000";
 const ingestKey = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9050";
+const instructionScope = {
+  clientName: "codex",
+  sessionId: "session-a",
+  worktreePath: "/repo/worktree-a",
+  cwdPath: "/repo/worktree-a/src",
+} as const;
 
 function result<R extends QueryResultRow>(rows: R[]): QueryResult<R> {
   return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows };
@@ -387,11 +394,17 @@ describe("PostgreSQL memory repositories", () => {
       }
       if (config.text.includes("FROM lcm.session_instructions")) {
         return result([{
-          slot: "2",
+          client_name: instructionScope.clientName,
+          session_id: instructionScope.sessionId,
+          worktree_path: instructionScope.worktreePath,
+          cwd_path: instructionScope.cwdPath,
           content: "rules",
           content_hash: "hash",
           updated_at: "2026-01-04T00:00:00.000Z",
         }]);
+      }
+      if (config.text.includes("INSERT INTO lcm.session_instructions")) {
+        return result([{ instruction_id: "1" }]);
       }
       return result([]);
     });
@@ -411,27 +424,19 @@ describe("PostgreSQL memory repositories", () => {
       .resolves.toBeUndefined();
     await expect(repository.recordSessionIngest("session-new", 1))
       .resolves.toBeUndefined();
-    await expect(repository.getSessionInstructions(2, 1)).resolves.toEqual({
-      id: 2,
+    await expect(repository.getSessionInstructions(instructionScope)).resolves.toEqual({
+      ...instructionScope,
       content: "rules",
       contentHash: "hash",
       updatedAt: "2026-01-04T00:00:00.000Z",
     });
-    await expect(repository.getSessionInstructions(2)).resolves.toEqual({
-      id: 2,
-      content: "rules",
-      contentHash: "hash",
-      updatedAt: "2026-01-04T00:00:00.000Z",
-    });
-    await expect(repository.getSessionInstructions(9)).resolves.toEqual({
-      id: 2,
-      content: "rules",
-      contentHash: "hash",
-      updatedAt: "2026-01-04T00:00:00.000Z",
-    });
-    await expect(repository.upsertSessionInstructions(2, "rules", "hash"))
+    await expect(repository.upsertSessionInstructions(
+      instructionScope,
+      "rules",
+      "hash",
+    ))
       .resolves.toBeUndefined();
-    await expect(repository.deleteSessionInstructions(2))
+    await expect(repository.deleteSessionInstructions(instructionScope))
       .resolves.toBeUndefined();
 
     const calls = db.query.mock.calls.map(([config]) =>
@@ -444,7 +449,17 @@ describe("PostgreSQL memory repositories", () => {
     ))?.values).toEqual([projectId, "session-new", 1]);
     expect(calls.find((config) => config.text.includes(
       "INSERT INTO lcm.session_instructions",
-    ))?.values).toEqual([projectId, machineId, 2, "rules", "hash"]);
+    ))?.values).toEqual([
+      projectId,
+      machineId,
+      sessionInstructionsScopeHash(instructionScope),
+      instructionScope.clientName,
+      instructionScope.sessionId,
+      instructionScope.worktreePath,
+      instructionScope.cwdPath,
+      "rules",
+      "hash",
+    ]);
   });
 
   it("serializes scoped operations and enforces READ COMMITTED ingest writes", async () => {
@@ -556,11 +571,40 @@ describe("PostgreSQL memory repositories", () => {
       }),
       () => coordination.getSessionIngest("bad\0session"),
       () => coordination.recordSessionIngest("session", -1),
-      () => coordination.getSessionInstructions(-1),
-      () => coordination.getSessionInstructions(1, -1),
-      () => coordination.upsertSessionInstructions(1, "bad\0content", "hash"),
-      () => coordination.upsertSessionInstructions(1, "content", "bad\udfff"),
-      () => coordination.deleteSessionInstructions(-1),
+      () => coordination.getSessionInstructions({
+        ...instructionScope,
+        clientName: "other",
+      } as never),
+      () => coordination.getSessionInstructions({
+        ...instructionScope,
+        sessionId: "",
+      }),
+      () => coordination.getSessionInstructions({
+        ...instructionScope,
+        sessionId: "bad\ud800",
+      }),
+      () => coordination.getSessionInstructions({
+        ...instructionScope,
+        sessionId: "bad\udc00",
+      }),
+      () => coordination.getSessionInstructions({
+        ...instructionScope,
+        worktreePath: "",
+      }),
+      () => coordination.upsertSessionInstructions(
+        instructionScope,
+        "bad\0content",
+        "hash",
+      ),
+      () => coordination.upsertSessionInstructions(
+        instructionScope,
+        "content",
+        "bad\udfff",
+      ),
+      () => coordination.deleteSessionInstructions({
+        ...instructionScope,
+        cwdPath: "",
+      }),
     ];
     for (const operation of [...invalidPromoted, ...invalidOther]) {
       await expect(operation()).rejects.toBeInstanceOf(
@@ -798,11 +842,41 @@ describe("PostgreSQL memory repositories", () => {
       field: "completed_at",
     });
 
+    const invalidInstructionClient = executor(() => result([{
+      client_name: "other",
+      session_id: instructionScope.sessionId,
+      worktree_path: instructionScope.worktreePath,
+      cwd_path: instructionScope.cwdPath,
+      content: "rules",
+      content_hash: "hash",
+      updated_at: "2026-01-04T00:00:00.000Z",
+    }]));
+    await expect(new PostgreSqlCoordinationRepository(
+      invalidInstructionClient,
+      projectId,
+      machineId,
+    ).getSessionInstructions(instructionScope)).rejects.toMatchObject({
+      field: "client_name",
+      operation: "getSessionInstructions",
+    });
+
     const noInstructions = executor(() => result([]));
     await expect(new PostgreSqlCoordinationRepository(
       noInstructions,
       projectId,
       machineId,
-    ).getSessionInstructions(1)).resolves.toBeNull();
+    ).getSessionInstructions(instructionScope)).resolves.toBeNull();
+    await expect(new PostgreSqlCoordinationRepository(
+      noInstructions,
+      projectId,
+      machineId,
+    ).upsertSessionInstructions(
+      instructionScope,
+      "collision must not overwrite",
+      "hash",
+    )).rejects.toMatchObject({
+      field: "scope_hash",
+      operation: "upsertSessionInstructions",
+    });
   });
 });

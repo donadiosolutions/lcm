@@ -125,6 +125,10 @@ describe("project map", () => {
       join(primary, ".git", "worktrees", "linked", "commondir"),
       "../..\n",
     );
+    writeFileSync(
+      join(primary, ".git", "worktrees", "linked", "gitdir"),
+      `${join(linked, ".git")}\n`,
+    );
     const nested = join(linked, "src");
     mkdirSync(nested);
     const separate = makeDir("git-separate");
@@ -156,6 +160,7 @@ describe("project map", () => {
     writeFileSync(join(admin, "commondir"), "../..\n");
     const linked = makeDir("show-linked-worktree");
     writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`);
+    writeFileSync(join(admin, "gitdir"), `${join(linked, ".git")}\n`);
 
     const identity = resolveProjectIdentity(primary);
     expect(showProjectMapEntry(linked)).toEqual({

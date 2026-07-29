@@ -16,6 +16,7 @@ import {
   createSqliteRepositories,
   createSqliteRepositoryStores,
 } from "../../src/storage/sqlite/repositories.js";
+import { sessionInstructionsScopeHash } from "../../src/storage/session-instructions.js";
 import { closeLcmConnection, getPoolStats, isLcmConnectionOpen } from "../../src/db/connection.js";
 import { runLcmMigrations } from "../../src/db/migration.js";
 import { createTemporaryDirectory } from "../fixtures/runtime.js";
@@ -252,6 +253,104 @@ describe("SQLite storage backend conformance", () => {
     }
   });
 
+  it("retains exact scope residuals and fails closed on an instruction hash collision", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      runLcmMigrations(db, { fts5Available: false });
+      const scope = {
+        clientName: "codex" as const,
+        sessionId: "target-session",
+        worktreePath: "/repo/target",
+        cwdPath: "/repo/target/src",
+      };
+      db.prepare(
+        `INSERT INTO session_instruction_cache (
+           project_id, scope_hash, client_name, session_id, worktree_path,
+           cwd_path, content, content_hash
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "safe-project",
+        sessionInstructionsScopeHash(scope),
+        "claude",
+        "foreign-session",
+        "/repo/foreign",
+        "/repo/foreign/src",
+        "foreign instructions",
+        "foreign-hash",
+      );
+      const stores = createSqliteRepositoryStores(db, { fts5Available: false });
+      const repositories = createSqliteRepositories(
+        stores,
+        "safe-project",
+        async (_domain, _operation, callback) => await callback(),
+      );
+
+      await expect(repositories.coordination.getSessionInstructions(scope))
+        .resolves.toBeNull();
+      await expect(repositories.coordination.deleteSessionInstructions(scope))
+        .resolves.toBeUndefined();
+      expect(db.prepare(
+        "SELECT content FROM session_instruction_cache",
+      ).get()).toEqual({ content: "foreign instructions" });
+      await expect(repositories.coordination.upsertSessionInstructions(
+        scope,
+        "target instructions",
+        "target-hash",
+      )).rejects.toThrow("instruction-cache scope hash collision");
+      expect(db.prepare(
+        "SELECT content FROM session_instruction_cache",
+      ).get()).toEqual({ content: "foreign instructions" });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("rejects malformed UTF-16 instruction scopes before SQLite binding", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      runLcmMigrations(db, { fts5Available: false });
+      const stores = createSqliteRepositoryStores(db, { fts5Available: false });
+      const repositories = createSqliteRepositories(
+        stores,
+        "safe-project",
+        async (_domain, _operation, callback) => await callback(),
+      );
+      const baseScope = {
+        clientName: "codex" as const,
+        sessionId: "session",
+        worktreePath: "/repo/worktree",
+        cwdPath: "/repo/worktree/src",
+      };
+
+      for (const malformed of [
+        "\ud800",
+        "\ud801",
+        "\udc00",
+        "\udc01",
+      ]) {
+        const candidate = {
+          ...baseScope,
+          sessionId: `session-${malformed}`,
+        };
+        await expect(repositories.coordination.getSessionInstructions(candidate))
+          .rejects.toThrow("instruction-cache sessionId contains malformed UTF-16");
+        await expect(repositories.coordination.upsertSessionInstructions(
+          candidate,
+          "instructions",
+          "hash",
+        )).rejects.toThrow("instruction-cache sessionId contains malformed UTF-16");
+        await expect(repositories.coordination.deleteSessionInstructions(candidate))
+          .rejects.toThrow("instruction-cache sessionId contains malformed UTF-16");
+      }
+
+      expect(db.prepare(
+        "SELECT COUNT(*) AS count FROM session_instruction_cache",
+      ).get()).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
   it("purges all mutable project memory state and its FTS mirror atomically", async () => {
     const root = createTemporaryDirectory("lcm-storage-purge-");
     const factory = new SqliteStorageBackendFactory({
@@ -274,7 +373,12 @@ describe("SQLite storage backend conformance", () => {
         project: 0,
       });
       await storage.coordination.recordSessionIngest("session", 1);
-      await storage.coordination.upsertSessionInstructions(1, "rules", "hash");
+      await storage.coordination.upsertSessionInstructions({
+        clientName: "claude",
+        sessionId: "session-a",
+        worktreePath: "/repo",
+        cwdPath: "/repo",
+      }, "rules", "hash");
       expect(await storage.recall.getFeedback(["missing"])).toEqual(new Map([[
         "missing",
         { usageCount: 0, surfacingCount: 0, lastSurfacedAt: null },

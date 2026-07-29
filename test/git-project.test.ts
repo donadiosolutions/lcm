@@ -49,6 +49,7 @@ function makeLinkedWorktree(primary: string, linked: string, name = "linked"): s
   writeFileSync(join(gitDir, "HEAD"), "ref: refs/heads/linked\n");
   makeDirectory(linked);
   writeFileSync(join(linked, ".git"), `gitdir: ${gitDir}\n`);
+  writeFileSync(join(gitDir, "gitdir"), `${join(linked, ".git")}\n`);
   return linked;
 }
 
@@ -175,6 +176,13 @@ describe("Git project identity", () => {
       join(linked, ".git"),
       `gitdir: ${join(replacement, ".git", "worktrees", "replacement-linked")}\n`,
     );
+    expect(() => resolveGitProjectAnchor(nested)).toThrow(
+      "topology does not point",
+    );
+    writeFileSync(
+      join(replacement, ".git", "worktrees", "replacement-linked", "gitdir"),
+      `${join(linked, ".git")}\n`,
+    );
     expect(resolveGitProjectAnchor(nested)).toEqual({
       canonical: replacement,
       worktreeRoot: linked,
@@ -183,6 +191,10 @@ describe("Git project identity", () => {
 
     rmSync(join(linked, ".git"));
     expect(resolveGitProjectAnchor(nested)).toBeNull();
+    writeFileSync(
+      join(replacement, ".git", "worktrees", "replacement-linked", "gitdir"),
+      `${join(replacementWorktree, ".git")}\n`,
+    );
     expect(resolveGitProjectAnchor(replacementWorktree)?.canonical).toBe(replacement);
   });
 
@@ -208,6 +220,7 @@ describe("Git project identity", () => {
     writeFileSync(join(gitDir, "HEAD"), "ref: refs/heads/one\n");
     const linked = makeDirectory(join(root, "linked"));
     writeFileSync(join(linked, ".git"), `gitdir: ${gitDir}\n`);
+    writeFileSync(join(gitDir, "gitdir"), `${join(linked, ".git")}\n`);
 
     expect(resolveGitProjectAnchor(linked)).toEqual({
       canonical: shared,

@@ -427,11 +427,25 @@ describe("PostgreSQL 18 memory and administration repositories", () => {
       }, { domain: "coordination", operation: "countConcurrentIngestRows" });
       expect(ingestRows.rows[0].count).toBe(1);
 
-      await firstCoordination.upsertSessionInstructions(2, "first", "hash-a");
-      await secondCoordination.upsertSessionInstructions(2, "second", "hash-b");
-      expect(await firstCoordination.getSessionInstructions(2))
+      const instructionScope = {
+        clientName: "codex",
+        sessionId: "shared-session",
+        worktreePath: "/repo/worktree-a",
+        cwdPath: "/repo/worktree-a/src",
+      } as const;
+      await firstCoordination.upsertSessionInstructions(
+        instructionScope,
+        "first",
+        "hash-a",
+      );
+      await secondCoordination.upsertSessionInstructions(
+        instructionScope,
+        "second",
+        "hash-b",
+      );
+      expect(await firstCoordination.getSessionInstructions(instructionScope))
         .toMatchObject({ content: "first" });
-      expect(await secondCoordination.getSessionInstructions(2))
+      expect(await secondCoordination.getSessionInstructions(instructionScope))
         .toMatchObject({ content: "second" });
 
       expect(await firstRedaction.purgeProjectState()).toEqual({
@@ -453,7 +467,7 @@ describe("PostgreSQL 18 memory and administration repositories", () => {
         content: "second project memory",
         metadata: { provenance: { source: "project-b" } },
       });
-      expect(await secondCoordination.getSessionInstructions(2))
+      expect(await secondCoordination.getSessionInstructions(instructionScope))
         .toMatchObject({ content: "second" });
       const residuals = await database.migrator.query<{
         project_count: number;
@@ -530,7 +544,12 @@ describe("PostgreSQL 18 memory and administration repositories", () => {
         project: 0,
       });
       await coordination.recordSessionIngest("session", 1);
-      await coordination.upsertSessionInstructions(1, "rules", "hash");
+      await coordination.upsertSessionInstructions({
+        clientName: "claude",
+        sessionId: "session",
+        worktreePath: "/repo",
+        cwdPath: "/repo",
+      }, "rules", "hash");
       await database.migrator.query({
         text: `REVOKE DELETE ON TABLE lcm.session_instructions
                FROM lcm_test_runtime`,

@@ -12,10 +12,41 @@ const state = vi.hoisted(() => ({
   closed: [] as string[],
   instructionPaths: [] as string[],
   instructionContent: undefined as string | undefined,
-  instructionRow: null as null | { id: number; content: string; contentHash: string; updatedAt: string },
-  instructionUpserts: [] as Array<{ id: number; content: string; hash: string }>,
+  instructionRow: null as null | {
+    clientName: "claude" | "codex";
+    sessionId: string;
+    worktreePath: string;
+    cwdPath: string;
+    content: string;
+    contentHash: string;
+    updatedAt: string;
+  },
+  instructionGets: [] as Array<{
+    clientName: "claude" | "codex";
+    sessionId: string;
+    worktreePath: string;
+    cwdPath: string;
+  }>,
+  instructionUpserts: [] as Array<{
+    scope: {
+      clientName: "claude" | "codex";
+      sessionId: string;
+      worktreePath: string;
+      cwdPath: string;
+    };
+    content: string;
+    hash: string;
+  }>,
+  instructionUpsertError: undefined as unknown,
+  instructionDeletes: 0,
+  instructionDeleteError: undefined as unknown,
   openCount: 0,
   projectExistsCount: 0,
+  anchors: [] as Array<null | {
+    canonical: string;
+    worktreeRoot: string;
+    commonDir: string;
+  }>,
 }));
 
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({
@@ -28,6 +59,9 @@ vi.mock("../../../src/daemon/validate-cwd.js", () => ({
 vi.mock("../../../src/daemon/project.js", () => ({
   projectDbPath: (cwd: string) => `${cwd}/lcm.db`,
   projectIdentity: (cwd: string) => ({ id: "pid", canonical: cwd }),
+}));
+vi.mock("../../../src/git-project.js", () => ({
+  resolveGitProjectAnchor: () => state.anchors.shift() ?? null,
 }));
 vi.mock("../../../src/daemon/orientation.js", () => ({ buildOrientationPrompt: () => "orientation" }));
 vi.mock("../../../src/daemon/content-fence.js", () => ({ fenceContent: (content: string, label: string) => `<${label}>${content}</${label}>` }));
@@ -94,11 +128,28 @@ vi.mock("../../../src/storage/index.js", () => ({
             query === "source passive capture" ? state.passive : state.promoted,
         },
         coordination: {
-          getSessionInstructions: async () => state.instructionRow,
-          upsertSessionInstructions: async (id: number, content: string, hash: string) => {
-            state.instructionUpserts.push({ id, content, hash });
+          getSessionInstructions: async (
+            scope: (typeof state.instructionGets)[number],
+          ) => {
+            state.instructionGets.push(scope);
+            return state.instructionRow;
           },
-          deleteSessionInstructions: async () => undefined,
+          upsertSessionInstructions: async (
+            scope: (typeof state.instructionUpserts)[number]["scope"],
+            content: string,
+            hash: string,
+          ) => {
+            state.instructionUpserts.push({ scope, content, hash });
+            if (state.instructionUpsertError !== undefined) {
+              throw state.instructionUpsertError;
+            }
+          },
+          deleteSessionInstructions: async () => {
+            state.instructionDeletes += 1;
+            if (state.instructionDeleteError !== undefined) {
+              throw state.instructionDeleteError;
+            }
+          },
         },
         close: async () => { state.closed.push("project"); },
       };
@@ -167,14 +218,25 @@ describe("restore route coverage", () => {
     state.instructionPaths = [];
     state.instructionContent = undefined;
     state.instructionRow = null;
+    state.instructionGets = [];
     state.instructionUpserts = [];
+    state.instructionUpsertError = undefined;
+    state.instructionDeletes = 0;
+    state.instructionDeleteError = undefined;
     state.openCount = 0;
     state.projectExistsCount = 0;
+    state.anchors = [];
     justCompactedMap.clear();
   });
 
   it("uses empty-body and absent-cwd branches", async () => {
     expect(await call("")).toEqual({ context: "orientation" });
+    expect(await call(JSON.stringify({ cwd: "/tmp" }))).toEqual({
+      error: "session_id must be a non-empty string",
+    });
+    expect(await call(JSON.stringify({ cwd: "/tmp", session_id: "" }))).toEqual({
+      error: "session_id must be a non-empty string",
+    });
   });
 
   it("bounds instruction framing before reading files with oversized labels", async () => {
@@ -217,9 +279,86 @@ describe("restore route coverage", () => {
   });
 
   it("restores persisted instructions after compaction", async () => {
-    state.instructionRow = { id: 1, content: "persisted rules", contentHash: "hash", updatedAt: "now" };
+    state.instructionRow = {
+      clientName: "claude",
+      sessionId: "s",
+      worktreePath: "/tmp",
+      cwdPath: "/tmp",
+      content: "persisted rules",
+      contentHash: "hash",
+      updatedAt: "now",
+    };
     expect(await call(JSON.stringify({ session_id: "s", cwd: "/tmp", source: "compact" })))
       .toEqual({ context: "orientation\n\n<project-instructions>\npersisted rules\n</project-instructions>" });
+    expect(state.instructionGets).toEqual([{
+      clientName: "claude",
+      sessionId: "s",
+      worktreePath: "/tmp",
+      cwdPath: "/tmp",
+    }]);
+  });
+
+  it("uses the authenticated worktree scope and rejects topology changes before storage", async () => {
+    const anchor = {
+      canonical: "/repo",
+      worktreeRoot: "/repo/worktrees/one",
+      commonDir: "/repo/.git",
+    };
+    state.anchors = [anchor, anchor];
+    await call(JSON.stringify({
+      session_id: "scoped-session",
+      cwd: "/repo/worktrees/one/src",
+      source: "compact",
+      client: "codex",
+    }));
+    expect(state.instructionGets).toEqual([{
+      clientName: "codex",
+      sessionId: "scoped-session",
+      worktreePath: "/repo/worktrees/one",
+      cwdPath: "/repo/worktrees/one/src",
+    }]);
+
+    state.instructionGets = [];
+    state.openCount = 0;
+    state.projectExistsCount = 0;
+    state.anchors = [
+      anchor,
+      { ...anchor, worktreeRoot: "/repo/worktrees/two" },
+    ];
+    expect(await call(JSON.stringify({
+      session_id: "changed-topology",
+      cwd: "/repo/worktrees/one/src",
+      source: "startup",
+    }))).toEqual({ context: "orientation" });
+    expect(state.instructionGets).toEqual([]);
+    expect(state.openCount).toBe(0);
+    expect(state.projectExistsCount).toBe(0);
+  });
+
+  it.each([
+    ["lone high surrogate one", "\ud800"],
+    ["lone high surrogate two", "\ud801"],
+    ["lone low surrogate one", "\udc00"],
+    ["lone low surrogate two", "\udc01"],
+  ])("rejects a %s session identity before storage", async (_label, sessionId) => {
+    expect(await call(JSON.stringify({
+      session_id: sessionId,
+      cwd: "/tmp",
+      client: "claude",
+    }))).toEqual({ context: "orientation" });
+    expect({
+      instructionGets: state.instructionGets,
+      instructionUpserts: state.instructionUpserts,
+      instructionDeletes: state.instructionDeletes,
+      openCount: state.openCount,
+      projectExistsCount: state.projectExistsCount,
+    }).toEqual({
+      instructionGets: [],
+      instructionUpserts: [],
+      instructionDeletes: 0,
+      openCount: 0,
+      projectExistsCount: 0,
+    });
   });
 
   it("captures changed instruction files through coordination repositories", async () => {
@@ -227,17 +366,87 @@ describe("restore route coverage", () => {
     const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp", client: "claude" }));
     expect(body.context).toContain("new rules");
     expect(state.instructionUpserts).toHaveLength(1);
-    expect(state.instructionUpserts[0]?.id).toBe(1);
+    expect(state.instructionUpserts[0]?.scope).toEqual({
+      clientName: "claude",
+      sessionId: "s",
+      worktreePath: "/tmp",
+      cwdPath: "/tmp",
+    });
     expect(state.instructionUpserts[0]?.content).toContain("new rules");
     const currentHash = state.instructionUpserts[0]!.hash;
 
-    state.instructionRow = { id: 1, content: "old rules", contentHash: "old", updatedAt: "now" };
+    state.instructionRow = {
+      clientName: "claude",
+      sessionId: "s",
+      worktreePath: "/tmp",
+      cwdPath: "/tmp",
+      content: "old rules",
+      contentHash: "old",
+      updatedAt: "now",
+    };
     await call(JSON.stringify({ session_id: "s", cwd: "/tmp", client: "claude" }));
     expect(state.instructionUpserts).toHaveLength(2);
 
-    state.instructionRow = { id: 1, content: "new rules", contentHash: currentHash, updatedAt: "now" };
+    state.instructionRow = {
+      clientName: "claude",
+      sessionId: "s",
+      worktreePath: "/tmp",
+      cwdPath: "/tmp",
+      content: "new rules",
+      contentHash: currentHash,
+      updatedAt: "now",
+    };
     await call(JSON.stringify({ session_id: "s", cwd: "/tmp", client: "claude" }));
     expect(state.instructionUpserts).toHaveLength(2);
+  });
+
+  it("returns fresh local instructions when best-effort cache upsert fails", async () => {
+    state.instructionContent = "fresh local rules";
+    state.instructionRow = {
+      clientName: "claude",
+      sessionId: "s",
+      worktreePath: "/tmp",
+      cwdPath: "/tmp",
+      content: "stale cached rules",
+      contentHash: "stale",
+      updatedAt: "now",
+    };
+    state.instructionUpsertError = new Error("upsert failed");
+
+    const body = await call(JSON.stringify({
+      session_id: "s",
+      cwd: "/tmp",
+      client: "claude",
+    }));
+
+    expect(body.context).toContain("fresh local rules");
+    expect(body.context).not.toContain("stale cached rules");
+    expect(state.instructionUpserts).toHaveLength(1);
+    expect(state.instructionRow.content).toBe("stale cached rules");
+  });
+
+  it("clears stale returned instructions when best-effort cache delete fails", async () => {
+    state.instructionRow = {
+      clientName: "claude",
+      sessionId: "s",
+      worktreePath: "/tmp",
+      cwdPath: "/tmp",
+      content: "stale cached rules",
+      contentHash: "stale",
+      updatedAt: "now",
+    };
+    state.instructionDeleteError = new Error("delete failed");
+
+    const body = await call(JSON.stringify({
+      session_id: "s",
+      cwd: "/tmp",
+      client: "claude",
+    }));
+
+    expect(body.context).not.toContain("project-instructions");
+    expect(body.context).not.toContain("stale cached rules");
+    expect(state.instructionDeletes).toBe(1);
+    expect(state.instructionRow.content).toBe("stale cached rules");
   });
 
   it("fences recent summaries and applies default insight thresholds", async () => {

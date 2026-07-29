@@ -343,8 +343,16 @@ export interface SessionIngestRecord {
   completedAt: string;
 }
 
-export interface SessionInstructionsRecord {
-  id: number;
+export type SessionInstructionsClientName = "claude" | "codex";
+
+export interface SessionInstructionsScope {
+  clientName: SessionInstructionsClientName;
+  sessionId: string;
+  worktreePath: string;
+  cwdPath: string;
+}
+
+export interface SessionInstructionsRecord extends SessionInstructionsScope {
   content: string;
   contentHash: string;
   updatedAt: string;
@@ -353,9 +361,13 @@ export interface SessionInstructionsRecord {
 export interface CoordinationRepository {
   getSessionIngest(sessionId: string): Promise<SessionIngestRecord | null>;
   recordSessionIngest(sessionId: string, messageCount: number): Promise<void>;
-  getSessionInstructions(id: number, fallbackLegacyId?: number): Promise<SessionInstructionsRecord | null>;
-  upsertSessionInstructions(id: number, content: string, contentHash: string): Promise<void>;
-  deleteSessionInstructions(id: number): Promise<void>;
+  getSessionInstructions(scope: SessionInstructionsScope): Promise<SessionInstructionsRecord | null>;
+  upsertSessionInstructions(
+    scope: SessionInstructionsScope,
+    content: string,
+    contentHash: string,
+  ): Promise<void>;
+  deleteSessionInstructions(scope: SessionInstructionsScope): Promise<void>;
 }
 
 export interface ProjectRepositories {

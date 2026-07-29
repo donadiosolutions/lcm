@@ -26,6 +26,7 @@ import type {
   StorageDomain,
 } from "../contracts.js";
 import { normalizeStorageError } from "../errors.js";
+import { sessionInstructionsScopeHash } from "../session-instructions.js";
 
 export type RepositoryInvoker = <T>(
   domain: StorageDomain,
@@ -321,31 +322,92 @@ export function createSqliteRepositories(
           "ON CONFLICT(session_id) DO UPDATE SET message_count = excluded.message_count, completed_at = datetime('now')",
         ).run(sessionId, messageCount);
       }),
-      getSessionInstructions: (id, fallbackLegacyId) => invoke("coordination", "getSessionInstructions", () => {
-        const select = (rowId: number): { id: number; content: string; content_hash: string; updated_at: string } | undefined =>
-          db.prepare(
-            "SELECT id, content, content_hash, updated_at FROM session_instruction_cache WHERE id = ?",
-          ).get(rowId) as { id: number; content: string; content_hash: string; updated_at: string } | undefined;
-        const row = select(id) ?? (fallbackLegacyId === undefined ? undefined : select(fallbackLegacyId));
+      getSessionInstructions: (scope) => invoke("coordination", "getSessionInstructions", () => {
+        const scopeHash = sessionInstructionsScopeHash(scope);
+        const row = db.prepare(
+          `SELECT client_name, session_id, worktree_path, cwd_path,
+                  content, content_hash, updated_at
+             FROM session_instruction_cache
+             WHERE project_id = ?
+               AND scope_hash = ?
+               AND client_name = ?
+               AND session_id = ?
+               AND worktree_path = ?
+               AND cwd_path = ?`,
+        ).get(
+          projectId,
+          scopeHash,
+          scope.clientName,
+          scope.sessionId,
+          scope.worktreePath,
+          scope.cwdPath,
+        ) as {
+          client_name: "claude" | "codex";
+          session_id: string;
+          worktree_path: string;
+          cwd_path: string;
+          content: string;
+          content_hash: string;
+          updated_at: string;
+        } | undefined;
         return row ? {
-          id: row.id,
+          clientName: row.client_name,
+          sessionId: row.session_id,
+          worktreePath: row.worktree_path,
+          cwdPath: row.cwd_path,
           content: row.content,
           contentHash: row.content_hash,
           updatedAt: canonicalUtcTimestamp(row.updated_at),
         } : null;
       }),
-      upsertSessionInstructions: (id, content, contentHash) => invoke("coordination", "upsertSessionInstructions", () => {
-        db.prepare(
-          `INSERT INTO session_instruction_cache (id, content, content_hash, updated_at)
-           VALUES (?, ?, ?, datetime('now'))
-           ON CONFLICT(id) DO UPDATE SET
+      upsertSessionInstructions: (scope, content, contentHash) => invoke("coordination", "upsertSessionInstructions", () => {
+        const scopeHash = sessionInstructionsScopeHash(scope);
+        const result = db.prepare(
+          `INSERT INTO session_instruction_cache (
+             project_id, scope_hash, client_name, session_id,
+             worktree_path, cwd_path, content, content_hash, updated_at
+           )
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+           ON CONFLICT(project_id, scope_hash) DO UPDATE SET
              content = excluded.content,
              content_hash = excluded.content_hash,
-             updated_at = excluded.updated_at`,
-        ).run(id, content, contentHash);
+             updated_at = excluded.updated_at
+           WHERE session_instruction_cache.client_name = excluded.client_name
+             AND session_instruction_cache.session_id = excluded.session_id
+             AND session_instruction_cache.worktree_path = excluded.worktree_path
+             AND session_instruction_cache.cwd_path = excluded.cwd_path`,
+        ).run(
+          projectId,
+          scopeHash,
+          scope.clientName,
+          scope.sessionId,
+          scope.worktreePath,
+          scope.cwdPath,
+          content,
+          contentHash,
+        );
+        if (result.changes !== 1) {
+          throw new Error("instruction-cache scope hash collision");
+        }
       }),
-      deleteSessionInstructions: (id) => invoke("coordination", "deleteSessionInstructions", () => {
-        db.prepare("DELETE FROM session_instruction_cache WHERE id = ?").run(id);
+      deleteSessionInstructions: (scope) => invoke("coordination", "deleteSessionInstructions", () => {
+        const scopeHash = sessionInstructionsScopeHash(scope);
+        db.prepare(
+          `DELETE FROM session_instruction_cache
+           WHERE project_id = ?
+             AND scope_hash = ?
+             AND client_name = ?
+             AND session_id = ?
+             AND worktree_path = ?
+             AND cwd_path = ?`,
+        ).run(
+          projectId,
+          scopeHash,
+          scope.clientName,
+          scope.sessionId,
+          scope.worktreePath,
+          scope.cwdPath,
+        );
       }),
     },
   };

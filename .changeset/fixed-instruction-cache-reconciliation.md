@@ -2,4 +2,4 @@
 "@donadiosolutions/lcm": patch
 ---
 
-Reconcile fixed session-instruction cache slots by retaining the snapshot with the newest valid timestamp.
+Isolate restored instruction caches by project, machine, client, session, verified worktree, and exact working directory; authenticate linked-worktree metadata bidirectionally and discard unscoped legacy instruction rows during a transactional upgrade.

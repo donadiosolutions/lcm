@@ -22,7 +22,7 @@ const MIGRATION_MANIFEST = [
   {
     id: "0002_schema_baseline",
     filename: "0002_schema_baseline.sql",
-    sha256: "d371217393adefcfd2f3658960ac015b12746951109daabbc9e06f904d8bf766",
+    sha256: "3f255f3c3a402047313f197c63434742259033cbb0ef590276569eb684d8d260",
   },
   {
     id: "0003_machine_identity_key",
@@ -104,11 +104,18 @@ type PostgreSqlSchemaSnapshotExpectations = {
   readonly identityFunctionNames: readonly string[];
 };
 type BaselineDefinitionInventoryRow = QueryResultRow & {
+  actual_definition_group_counts: unknown;
+  actual_definition_group_hashes: unknown;
   baseline_applied: unknown;
   expected_object_count: unknown;
   existing_object_count: unknown;
   missing_object_count: unknown;
   drifted_definition_group_count: unknown;
+};
+export type PostgreSqlDefinitionGroupFingerprint = {
+  readonly objectKind: string;
+  readonly objectCount: number;
+  readonly definitionSha256: string;
 };
 type IdentityFunctionFingerprintRow = QueryResultRow & {
   baseline_applied: unknown;
@@ -262,7 +269,10 @@ const EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES = `
   session_ingest_log|project_id session_ingest_log|session_id
   session_ingest_log|message_count session_ingest_log|completed_at
   session_instructions|instruction_id session_instructions|project_id
-  session_instructions|machine_id session_instructions|slot session_instructions|content
+  session_instructions|machine_id session_instructions|scope_hash
+  session_instructions|client_name session_instructions|session_id
+  session_instructions|worktree_path session_instructions|cwd_path
+  session_instructions|content
   session_instructions|content_hash session_instructions|updated_at
   passive_event_inbox|inbox_id passive_event_inbox|project_id
   passive_event_inbox|machine_id passive_event_inbox|event_id
@@ -339,9 +349,11 @@ const EXPECTED_BASELINE_CONSTRAINT_NAMES = `
   schema_migrations_checksum_sha256_check schema_migrations_pkey
   session_ingest_log_message_count_check session_ingest_log_ingest_key_check
   session_ingest_log_project_id_fkey session_ingest_log_pkey
-  session_instructions_slot_check session_instructions_machine_id_fkey
+  session_instructions_scope_hash_check session_instructions_client_name_check
+  session_instructions_session_id_check session_instructions_worktree_path_check
+  session_instructions_cwd_path_check session_instructions_machine_id_fkey
   session_instructions_project_id_fkey session_instructions_pkey
-  session_instructions_project_id_machine_id_slot_key summaries_depth_check
+  session_instructions_project_id_machine_id_scope_hash_key summaries_depth_check
   summaries_descendant_count_check summaries_descendant_token_count_check summaries_check
   summaries_kind_check summaries_source_message_token_count_check summaries_token_count_check
   summaries_summary_key_check summaries_project_id_conversation_id_fkey summaries_pkey
@@ -414,12 +426,12 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
   const baseline: PostgreSqlSchemaSnapshot = {
     ...expectedBaselineDefinitionInventory(),
     definitionHashes: {
-      columnAcl: "8d4254224cc473b408fb087264254b009d29e6228cb0ac6e74aa0f5e5be7671a",
-      constraint: "ea03d07488ccd0cc51023463169b71f78c23336374545856d506e2df52483207",
+      columnAcl: "e2581c7c70cbec57d64bb02ac1520fe27336efb326618b36add668cb1431e98c",
+      constraint: "8bb79c117c498a89c920826ff65b88ad615f871ba3e8607e4b00d1d115d9aa1a",
       generatedColumn: "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
       identitySequence: "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
-      index: "16e10e2a4fc080f52b11315ee2b03d5df258d216f293bb0051b56beb16035374",
-      ordinaryColumn: "2cd3bcb84fbd6557dd2e2d26b0ce2bae15ee1c9899bfef1a17ea4e7ad41f4907",
+      index: "6d95eda805e9cd5d0b246daaa763a6919262f64e1129dc93f0ee95291276a7fd",
+      ordinaryColumn: "e0daf9a1d97b62f6baf491c35d3b45d5082336538e44da8651afaa1180e11e8a",
       relationAcl: "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
       table: "5ccf4137ba8c1dbe8462176414b89f30616b26622d9680d77c5e2ae271d2f64d",
       trigger: "229e8dd0e6a1c953dd18b4220da95be28121db72f4fbba199e1d6808c4b7afcc",
@@ -446,7 +458,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       ...baseline,
       definitionHashes: {
         ...baseline.definitionHashes,
-        constraint: "b73cbde6cfe0b5c7bebcec3e2a8b15f40d021bc8af4381a40cbdf972af2a7a2a",
+        constraint: "4698227bc02a8d777955eb41286a4964dda8da82d1561c9a154b67e2a034906f",
       },
       migrationId: "0003_machine_identity_key",
     },
@@ -454,7 +466,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       ...baseline,
       definitionHashes: {
         ...baseline.definitionHashes,
-        constraint: "eeb6605a8e1c078d2ee34a83c7e80539226a9f8e4d6a278f5286d9889dc47256",
+        constraint: "1cf8dc0e9303c7bdd086bcae679edc31493d26f67c81999c8e5b2fba491e0778",
       },
       migrationId: "0004_machine_display_name",
     },
@@ -724,6 +736,8 @@ export class PostgreSqlBaselineDefinitionPreflightError extends StorageOperation
     readonly existingObjectCount: number | null,
     readonly missingObjectCount: number | null,
     readonly driftedDefinitionGroupCount: number | null,
+    readonly actualDefinitionGroups:
+      readonly PostgreSqlDefinitionGroupFingerprint[] | null,
   ) {
     super(
       "STORAGE_INITIALIZATION_FAILED",
@@ -860,6 +874,35 @@ function sanitizeNonnegativeCount(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
     : null;
+}
+
+function sanitizeDefinitionGroupFingerprints(
+  objectKinds: readonly string[],
+  objectCounts: unknown,
+  definitionHashes: unknown,
+): readonly PostgreSqlDefinitionGroupFingerprint[] | null {
+  if (
+    !Array.isArray(objectCounts)
+    || !Array.isArray(definitionHashes)
+    || objectCounts.length !== objectKinds.length
+    || definitionHashes.length !== objectKinds.length
+  ) return null;
+  const fingerprints: PostgreSqlDefinitionGroupFingerprint[] = [];
+  for (let index = 0; index < objectKinds.length; index += 1) {
+    const objectCount = sanitizeNonnegativeCount(objectCounts[index]);
+    const definitionSha256 = definitionHashes[index];
+    if (
+      objectCount === null
+      || typeof definitionSha256 !== "string"
+      || !/^[0-9a-f]{64}$/u.test(definitionSha256)
+    ) return null;
+    fingerprints.push({
+      objectKind: objectKinds[index]!,
+      objectCount,
+      definitionSha256,
+    });
+  }
+  return fingerprints;
 }
 
 export function sanitizePostgreSqlServerEncoding(value: unknown): string | null {
@@ -2122,7 +2165,11 @@ export async function runPostgreSqlMigrations(
                                       ARRAY[
                                         'project_id',
                                         'machine_id',
-                                        'slot',
+                                        'scope_hash',
+                                        'client_name',
+                                        'session_id',
+                                        'worktree_path',
+                                        'cwd_path',
                                         'content',
                                         'content_hash'
                                       ]::pg_catalog.text[]
@@ -2482,6 +2529,20 @@ export async function runPostgreSqlMigrations(
                       $11::pg_catalog.int4 AS expected_object_count,
                       pg_catalog.sum(actual_groups.existing_count)::pg_catalog.int4
                         AS existing_object_count,
+                      pg_catalog.array_agg(
+                        actual_groups.existing_count
+                        ORDER BY pg_catalog.array_position(
+                          $12::pg_catalog.text[],
+                          actual_groups.object_kind
+                        )
+                      ) AS actual_definition_group_counts,
+                      pg_catalog.array_agg(
+                        actual_groups.definition_sha256
+                        ORDER BY pg_catalog.array_position(
+                          $12::pg_catalog.text[],
+                          actual_groups.object_kind
+                        )
+                      ) AS actual_definition_group_hashes,
                       CASE
                         WHEN $1::pg_catalog.bool THEN (
                           $11 - pg_catalog.sum(actual_groups.existing_count)
@@ -2535,6 +2596,11 @@ export async function runPostgreSqlMigrations(
     const driftedDefinitionGroupCount = sanitizeNonnegativeCount(
       baselineDefinitions.rows[0]?.drifted_definition_group_count,
     );
+    const actualDefinitionGroups = sanitizeDefinitionGroupFingerprints(
+      snapshotExpectations.definitionGroupKinds,
+      baselineDefinitions.rows[0]?.actual_definition_group_counts,
+      baselineDefinitions.rows[0]?.actual_definition_group_hashes,
+    );
     if (
       definitionBaselineApplied === null
       || definitionBaselineApplied !== baselineApplied
@@ -2549,6 +2615,7 @@ export async function runPostgreSqlMigrations(
       || driftedDefinitionGroupCount === null
       || driftedDefinitionGroupCount > snapshotExpectations.definitionGroupKinds.length
       || driftedDefinitionGroupCount !== 0
+      || actualDefinitionGroups === null
     ) {
       throw new PostgreSqlBaselineDefinitionPreflightError(
         definitionBaselineApplied,
@@ -2556,6 +2623,7 @@ export async function runPostgreSqlMigrations(
         existingDefinitionObjectCount,
         missingDefinitionObjectCount,
         driftedDefinitionGroupCount,
+        actualDefinitionGroups,
       );
     }
 
