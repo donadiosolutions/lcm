@@ -5,9 +5,10 @@ import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { createDaemon, type DaemonInstance } from "../../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
-import { projectDbPath } from "../../../src/daemon/project.js";
+import { projectDbPath, projectIdentity } from "../../../src/daemon/project.js";
 import { PromotedStore } from "../../../src/db/promoted.js";
 import { closeLcmConnection, getLcmConnection } from "../../../src/db/connection.js";
+import { sessionInstructionsScopeHash } from "../../../src/storage/session-instructions.js";
 
 describe("POST /restore", () => {
   let daemon: DaemonInstance | undefined;
@@ -62,10 +63,27 @@ describe("POST /restore", () => {
       mkdirSync(dirname(dbPath), { recursive: true });
       const db = getLcmConnection(dbPath);
       runLcmMigrations(db);
+      const instructionScope = {
+        clientName: "claude",
+        sessionId: "compact-sess",
+        worktreePath: tmpDir,
+        cwdPath: tmpDir,
+      } as const;
       db.prepare(
-        `INSERT INTO session_instructions (id, content, content_hash, updated_at)
-         VALUES (1, ?, ?, datetime('now'))`,
-      ).run("# ~/.claude/CLAUDE.md\nDo not use emojis.", "abc123hash");
+        `INSERT INTO session_instruction_cache (
+           project_id, scope_hash, client_name, session_id, worktree_path,
+           cwd_path, content, content_hash, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+      ).run(
+        projectIdentity(tmpDir).id,
+        sessionInstructionsScopeHash(instructionScope),
+        instructionScope.clientName,
+        instructionScope.sessionId,
+        instructionScope.worktreePath,
+        instructionScope.cwdPath,
+        "# ~/.claude/CLAUDE.md\nDo not use emojis.",
+        "abc123hash",
+      );
       closeLcmConnection(dbPath);
 
       daemon = await createDaemon(loadDaemonConfig(join(tmpDir, "config.json"), { daemon: { port: 0 } }));
@@ -97,7 +115,10 @@ describe("POST /restore", () => {
       // Verify session_instruction_cache was written to DB
       const dbPath = projectDbPath(tmpDir);
       const db = getLcmConnection(dbPath);
-      const row = db.prepare(`SELECT content, content_hash FROM session_instruction_cache WHERE id = 1`).get() as
+      const row = db.prepare(
+        `SELECT content, content_hash FROM session_instruction_cache
+         WHERE client_name = 'claude' AND session_id = 'startup-sess'`,
+      ).get() as
         | { content: string; content_hash: string }
         | undefined;
       closeLcmConnection(dbPath);
@@ -134,7 +155,7 @@ describe("POST /restore", () => {
 
       const codexCompactResponse = await fetch(`http://127.0.0.1:${port}/restore`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: "codex-compact", cwd: tmpDir, source: "compact", client: "codex" }),
+        body: JSON.stringify({ session_id: "codex-startup", cwd: tmpDir, source: "compact", client: "codex" }),
       });
       expect(codexCompactResponse.status).toBe(200);
       const codexCompactBody = await codexCompactResponse.json() as { context: string };
@@ -155,17 +176,27 @@ describe("POST /restore", () => {
 
       const dbPath = projectDbPath(tmpDir);
       const db = getLcmConnection(dbPath);
-      const rows = db.prepare(`SELECT id, content FROM session_instruction_cache ORDER BY id`).all() as Array<{
-        id: number;
+      const rows = db.prepare(
+        `SELECT client_name, session_id, content
+         FROM session_instruction_cache ORDER BY client_name, session_id`,
+      ).all() as Array<{
+        client_name: "claude" | "codex";
+        session_id: string;
         content: string;
       }>;
       closeLcmConnection(dbPath);
 
       expect(rows).toHaveLength(2);
-      expect(rows[0]).toEqual(expect.objectContaining({ id: 1 }));
+      expect(rows[0]).toEqual(expect.objectContaining({
+        client_name: "claude",
+        session_id: "claude-startup",
+      }));
       expect(rows[0].content).toContain("Use Claude instructions.");
       expect(rows[0].content).not.toContain("Use Codex instructions.");
-      expect(rows[1]).toEqual(expect.objectContaining({ id: 2 }));
+      expect(rows[1]).toEqual(expect.objectContaining({
+        client_name: "codex",
+        session_id: "codex-startup",
+      }));
       expect(rows[1].content).toContain("Use Codex instructions.");
       expect(rows[1].content).toContain("Project Codex override.");
       expect(rows[1].content).not.toContain("Use Claude instructions.");
@@ -211,7 +242,10 @@ describe("POST /restore", () => {
 
       const dbPath = projectDbPath(tmpDir);
       const db1 = getLcmConnection(dbPath);
-      const row1 = db1.prepare(`SELECT updated_at FROM session_instruction_cache WHERE id = 1`).get() as
+      const row1 = db1.prepare(
+        `SELECT updated_at FROM session_instruction_cache
+         WHERE client_name = 'claude' AND session_id = 's-hash-1'`,
+      ).get() as
         | { updated_at: string }
         | undefined;
       closeLcmConnection(dbPath);
@@ -220,11 +254,14 @@ describe("POST /restore", () => {
       // Second startup call with identical content — updated_at should not change
       await fetch(`http://127.0.0.1:${port}/restore`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: "s-hash-2", cwd: tmpDir, source: "startup" }),
+        body: JSON.stringify({ session_id: "s-hash-1", cwd: tmpDir, source: "startup" }),
       });
 
       const db2 = getLcmConnection(dbPath);
-      const row2 = db2.prepare(`SELECT updated_at FROM session_instruction_cache WHERE id = 1`).get() as
+      const row2 = db2.prepare(
+        `SELECT updated_at FROM session_instruction_cache
+         WHERE client_name = 'claude' AND session_id = 's-hash-1'`,
+      ).get() as
         | { updated_at: string }
         | undefined;
       closeLcmConnection(dbPath);

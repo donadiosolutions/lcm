@@ -14,18 +14,20 @@ import { readBoundedRegularFile } from "../../security-files.js";
 import {
   createStorageBackendFactory,
   type ProjectStorage,
+  type SessionInstructionsScope,
+  type StorageIdentityContext,
   type StorageBackendFactory,
 } from "../../storage/index.js";
+import {
+  resolveGitProjectAnchor,
+  type GitProjectAnchor,
+} from "../../git-project.js";
 import {
   closeRouteStorage,
   openExistingProject,
   storageRouteFailureResponse,
 } from "./storage-lifecycle.js";
 const MAX_SESSION_INSTRUCTIONS_BYTES = 1024 * 1024;
-
-function sessionInstructionsId(client: TranscriptClient): number {
-  return client === "codex" ? 2 : 1;
-}
 
 type InstructionPath = { label: string; path: string; allowedRoot: string };
 
@@ -75,6 +77,18 @@ function readSessionInstructionFiles(cwd: string, client: TranscriptClient): str
   return parts.join("\n\n");
 }
 
+function anchorsMatch(
+  left: GitProjectAnchor | null,
+  right: GitProjectAnchor | null,
+): boolean {
+  return left === null
+    ? right === null
+    : right !== null
+      && left.canonical === right.canonical
+      && left.worktreeRoot === right.worktreeRoot
+      && left.commonDir === right.commonDir;
+}
+
 export function createRestoreHandler(
   config: DaemonConfig,
   storageFactory?: StorageBackendFactory,
@@ -87,7 +101,6 @@ export function createRestoreHandler(
       const input = JSON.parse(body || "{}");
       const { session_id, source } = input;
       const client = normalizeTranscriptClient(input.client);
-      const instructionsId = sessionInstructionsId(client);
       let cwd: string | undefined;
       if (input.cwd) {
         try {
@@ -97,10 +110,45 @@ export function createRestoreHandler(
           return;
         }
       }
+      if (
+        cwd
+        && (typeof session_id !== "string" || session_id.length === 0)
+      ) {
+        sendJson(res, 400, { error: "session_id must be a non-empty string" });
+        return;
+      }
       const orientation = buildOrientationPrompt();
+      let storageIdentity: StorageIdentityContext & {
+        readonly localProjectId: string;
+      } | undefined;
+      let storageAdmissionError: unknown;
+      let instructionScope: SessionInstructionsScope | undefined;
+      const resolveRouteIdentity = (): typeof storageIdentity => {
+        if (storageIdentity) return storageIdentity;
+        if (storageAdmissionError !== undefined) throw storageAdmissionError;
+        try {
+          const before = resolveGitProjectAnchor(cwd!);
+          const identity = projectIdentity(cwd!, config.storage);
+          const after = resolveGitProjectAnchor(cwd!);
+          if (!anchorsMatch(before, after)) {
+            throw new Error("Git worktree topology changed during storage admission");
+          }
+          storageIdentity = identity;
+          instructionScope = {
+            clientName: client,
+            sessionId: session_id,
+            worktreePath: after?.worktreeRoot ?? cwd!,
+            cwdPath: cwd!,
+          };
+          return storageIdentity;
+        } catch (error) {
+          storageAdmissionError = error;
+          throw error;
+        }
+      };
       const openProject = async (createIfMissing: boolean): Promise<ProjectStorage | null> => {
         if (project) return project;
-        const identity = projectIdentity(cwd!, config.storage);
+        const identity = resolveRouteIdentity()!;
         activeFactory = storageFactory
           ?? ownedFactory
           ?? (ownedFactory = createStorageBackendFactory(config.storage));
@@ -125,8 +173,7 @@ export function createRestoreHandler(
           const storage = await openProject(!isPostCompact);
           if (storage) {
             const row = await storage.coordination.getSessionInstructions(
-              instructionsId,
-              client === "claude" ? 1 : undefined,
+              instructionScope!,
             );
             if (row) {
               instructionsContext = `<project-instructions>\n${row.content}\n</project-instructions>`;
@@ -189,18 +236,22 @@ export function createRestoreHandler(
             const instructionContent = readSessionInstructionFiles(cwd, client);
             if (instructionContent) {
               const hash = createHash("sha256").update(instructionContent).digest("hex");
-              const existing = await storage.coordination.getSessionInstructions(instructionsId);
+              const existing = await storage.coordination.getSessionInstructions(
+                instructionScope!,
+              );
 
               if (!existing || existing.contentHash !== hash) {
                 await storage.coordination.upsertSessionInstructions(
-                  instructionsId,
+                  instructionScope!,
                   instructionContent,
                   hash,
                 );
               }
               instructionsContext = `<project-instructions>\n${instructionContent}\n</project-instructions>`;
             } else {
-              await storage.coordination.deleteSessionInstructions(instructionsId);
+              await storage.coordination.deleteSessionInstructions(
+                instructionScope!,
+              );
               instructionsContext = "";
             }
           } catch { /* non-fatal */ }

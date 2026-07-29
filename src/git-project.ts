@@ -76,6 +76,110 @@ function resolveCommonDir(gitDir: string): string {
   return existingRealDirectory(resolve(gitDir, relative), "Git common directory");
 }
 
+function parseOnePath(content: string, path: string, label: string): string {
+  const value = content.trim();
+  if (!value || value.includes("\0") || value.includes("\n") || value.includes("\r")) {
+    throw new Error(`invalid ${label} metadata at ${path}: expected one path`);
+  }
+  return value;
+}
+
+function validateWorktreeBackpointer(
+  marker: string,
+  worktreeRoot: string,
+  gitDir: string,
+): void {
+  const backpointerPath = join(gitDir, "gitdir");
+  const backpointer = parseOnePath(
+    readGitPointer(backpointerPath, gitDir, "Git worktree backpointer"),
+    backpointerPath,
+    "Git worktree backpointer",
+  );
+  const backpointerTarget = resolve(gitDir, backpointer);
+  let resolvedBackpointer: string;
+  let resolvedMarker: string;
+  try {
+    const targetStat = lstatSync(backpointerTarget);
+    const markerStat = lstatSync(marker);
+    if (
+      !targetStat.isFile()
+      || !markerStat.isFile()
+    ) {
+      throw new Error("backpointer target or worktree marker is not a regular file");
+    }
+    resolvedBackpointer = realpathSync(backpointerTarget);
+    resolvedMarker = realpathSync(marker);
+  } catch (error) {
+    throw new Error(
+      `invalid Git worktree backpointer metadata at ${backpointerPath}: ${String(error)}`,
+    );
+  }
+  if (
+    resolvedBackpointer !== resolvedMarker
+    || resolvedMarker !== join(worktreeRoot, ".git")
+  ) {
+    throw new Error(
+      `invalid Git worktree backpointer metadata at ${backpointerPath}: topology does not point to ${marker}`,
+    );
+  }
+}
+
+function validateLinkedWorktreeTopology(
+  marker: string,
+  worktreeRoot: string,
+  gitDir: string,
+  commonDir: string,
+): void {
+  const worktreesPath = join(commonDir, "worktrees");
+  const worktreesStat = lstatSync(worktreesPath);
+  if (!worktreesStat.isDirectory() || worktreesStat.isSymbolicLink()) {
+    throw new Error(`invalid Git worktrees directory at ${worktreesPath}`);
+  }
+  const worktreesDir = existingRealDirectory(
+    worktreesPath,
+    "Git worktrees directory",
+  );
+  if (worktreesDir !== worktreesPath) {
+    throw new Error(`invalid Git worktrees directory at ${worktreesPath}`);
+  }
+  if (
+    dirname(gitDir) !== worktreesDir
+    || resolve(worktreesDir, basename(gitDir)) !== gitDir
+  ) {
+    throw new Error(
+      `invalid Git linked-worktree topology: ${gitDir} is not a direct worktree entry under ${commonDir}`,
+    );
+  }
+
+  validateWorktreeBackpointer(
+    marker,
+    worktreeRoot,
+    gitDir,
+  );
+
+  // Re-read all three pointers after the topology check. Each individual read
+  // is descriptor-bound; comparing the resolved relationship a second time
+  // also fails closed when repository-controlled metadata is retargeted
+  // between validation steps.
+  if (parseGitDir(marker, worktreeRoot) !== gitDir) {
+    throw new Error("Git worktree metadata changed during topology validation");
+  }
+  if (resolveCommonDir(gitDir) !== commonDir) {
+    throw new Error("Git common-directory metadata changed during topology validation");
+  }
+  try {
+    validateWorktreeBackpointer(
+      marker,
+      worktreeRoot,
+      gitDir,
+    );
+  } catch (error) {
+    throw new Error(
+      `Git worktree backpointer changed during topology validation: ${String(error)}`,
+    );
+  }
+}
+
 function canonicalForCommonDir(commonDir: string): string {
   // Normal non-bare repositories keep the shared directory at <checkout>/.git.
   // Bare repositories and unusual layouts use the common directory itself as
@@ -165,6 +269,9 @@ function inspectGitMarker(worktreeRoot: string): GitProjectAnchor | null {
   }
 
   const commonDir = resolveCommonDir(gitDir);
+  if (stat.isFile() && commonDir !== gitDir) {
+    validateLinkedWorktreeTopology(marker, worktreeRoot, gitDir, commonDir);
+  }
   validateGitDirectory(gitDir, commonDir);
   return {
     // A normal submodule has a `.git` pointer into the superproject's

@@ -501,6 +501,11 @@ Hook error fallback logs write to `~/.lcm/logs/events.log`.
 LCM keeps `~/.lcm` and its project, event, and temporary directories accessible only to the current user (`0700`). Configuration, metadata, database, token, map, backup, and lock files use private file permissions (`0600`). Existing LCM roots are tightened during startup and installation.
 
 Session restore locks use a SHA-256 digest of the agent session ID under `~/.lcm/tmp`; session IDs are never used as path components. LCM reads restored `AGENTS.md` and `CLAUDE.md` instructions only from regular, non-symlink files inside their expected roots, with a combined 1 MiB limit. Unsafe instruction files are skipped.
+Cached instructions are isolated by local project, machine, client, agent
+session, verified worktree, and exact working directory. A compact/resume
+restore reads only its exact scope; it does not fall back to another session or
+worktree. Upgrades discard legacy fixed-slot instruction rows because they do
+not contain enough provenance to assign safely.
 
 Project-local transcript paths remain supported for normal working directories. A working directory equal to the filesystem root does not authorize every file on the machine; provider-managed Claude and Codex transcript directories remain available in that case.
 
@@ -516,6 +521,11 @@ Use `lcm machine register|show|recover` for the private
 `lcm project create|link|unlink|list|show|reconcile-worktrees` for project
 identities and aliases. Verified linked Git worktrees share the primary
 checkout's local SQLite identity and are consolidated on first storage access.
+LCM accepts linked-worktree metadata only when the checkout `.git` pointer,
+the shared `commondir`, the direct `worktrees/<name>` entry, and that entry's
+`gitdir` backpointer authenticate one another. Missing, symlinked, foreign,
+retargeted, or otherwise inconsistent topology fails before project storage is
+opened.
 PostgreSQL use fails closed until the machine
 is registered and the local project is explicitly bound. Hooks retain passive
 events in the local SQLite outbox during identity or PostgreSQL outages.

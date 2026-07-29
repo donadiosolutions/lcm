@@ -264,14 +264,16 @@ function executor(options: {
           drifted_definition_group_count: "none",
         }] as unknown as R[]);
       }
+      const expectedObjectCount =
+        (config as { values?: unknown[] }).values?.[10] as number;
       return result([{
         baseline_applied: true,
-        expected_object_count: 727,
+        expected_object_count: expectedObjectCount,
         existing_object_count: options.baselineDefinitions === "inconsistent"
-          ? 728
+          ? expectedObjectCount + 1
           : options.baselineDefinitions === "missing-object"
-            ? 726
-            : 727,
+            ? expectedObjectCount - 1
+            : expectedObjectCount,
         missing_object_count: options.baselineDefinitions === "missing-object" ? 1 : 0,
         drifted_definition_group_count:
           options.baselineDefinitions === "drifted"
@@ -384,7 +386,7 @@ describe("PostgreSQL migration runner", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
       expect.objectContaining({ id: "0001_migration_ledger", sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }),
-      expect.objectContaining({ id: "0002_schema_baseline", sha256: "d371217393adefcfd2f3658960ac015b12746951109daabbc9e06f904d8bf766" }),
+      expect.objectContaining({ id: "0002_schema_baseline", sha256: "3f255f3c3a402047313f197c63434742259033cbb0ef590276569eb684d8d260" }),
       expect.objectContaining({ id: "0003_machine_identity_key", sha256: "bdc38d19bde5825eb1d59e9044769cbf9cac52be5c9fe34237f93ec347c3807b" }),
       expect.objectContaining({ id: "0004_machine_display_name", sha256: "f12b4e5493da187e4c8cd4083766010b896961225cadd6fe568e4e99264e3421" }),
     ]);
@@ -400,6 +402,18 @@ describe("PostgreSQL migration runner", () => {
     expect(migrations[1]?.sql).toContain("lcm.fenced_leases_fencing_token_seq");
     expect(migrations[1]?.sql).toContain(
       "WHEN TG_OP OPERATOR(pg_catalog.=) 'UPDATE' THEN OLD.ingest_key",
+    );
+    const conversationsDefinition = /CREATE TABLE lcm\.conversations \(([\s\S]*?)\n\);/u
+      .exec(migrations[1]!.sql)?.[1];
+    const instructionsDefinition = /CREATE TABLE lcm\.session_instructions \(([\s\S]*?)\n\);/u
+      .exec(migrations[1]!.sql)?.[1];
+    expect(conversationsDefinition).toContain("session_id text NOT NULL,");
+    expect(conversationsDefinition).not.toContain("session_id <> ''");
+    expect(instructionsDefinition).toContain(
+      "session_id text NOT NULL CHECK (session_id <> '')",
+    );
+    expect(instructionsDefinition).toContain(
+      "UNIQUE (project_id, machine_id, scope_hash)",
     );
     expect(() => loadPostgreSqlMigrations(() => { throw new Error("missing private path"); }))
       .toThrowError(expect.objectContaining({ operation: "loadMigrations" }));
@@ -1150,8 +1164,8 @@ describe("PostgreSQL migration runner", () => {
       label: "a missing index, trigger, or constraint",
       baselineDefinitions: "missing-object" as const,
       baselineApplied: true,
-      expectedObjectCount: 727,
-      existingObjectCount: 726,
+      expectedObjectCount: 739,
+      existingObjectCount: 738,
       missingObjectCount: 1,
       driftedDefinitionGroupCount: 1,
     },
@@ -1159,8 +1173,8 @@ describe("PostgreSQL migration runner", () => {
       label: "definition drift",
       baselineDefinitions: "drifted" as const,
       baselineApplied: true,
-      expectedObjectCount: 727,
-      existingObjectCount: 727,
+      expectedObjectCount: 739,
+      existingObjectCount: 739,
       missingObjectCount: 0,
       driftedDefinitionGroupCount: 1,
     },
@@ -1186,8 +1200,8 @@ describe("PostgreSQL migration runner", () => {
       label: "contradictory catalog counts",
       baselineDefinitions: "inconsistent" as const,
       baselineApplied: true,
-      expectedObjectCount: 727,
-      existingObjectCount: 728,
+      expectedObjectCount: 739,
+      existingObjectCount: 740,
       missingObjectCount: 0,
       driftedDefinitionGroupCount: 0,
     },
@@ -1285,7 +1299,7 @@ describe("PostgreSQL migration runner", () => {
           "projects|identity_key",
           "session_ingest_log|session_id_sha256",
         ]),
-        727,
+        739,
         [
           "index",
           "trigger",
@@ -1297,7 +1311,7 @@ describe("PostgreSQL migration runner", () => {
           "relation_acl",
           "ordinary_column",
         ],
-        [52, 3, 170, 15, 221, 6, 24, 30, 206],
+        [52, 3, 174, 15, 225, 6, 24, 30, 210],
         [
           expect.any(String),
           expect.any(String),

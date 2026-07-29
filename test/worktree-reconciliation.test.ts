@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runLcmMigrations } from "../src/db/migration.js";
+import { sessionInstructionsScopeHash } from "../src/storage/session-instructions.js";
 import {
   closeLcmConnection,
   getPoolStats,
@@ -139,14 +140,24 @@ function makeDatabase(path: string, sessionId: string, content: string, projectI
   db.prepare(
     "INSERT INTO redaction_stats(project_id, category, count) VALUES(?, 'built_in', 2)",
   ).run(projectId);
+  const instructionScope = {
+    clientName: "codex",
+    sessionId,
+    worktreePath: `/repo/${sessionId}`,
+    cwdPath: `/repo/${sessionId}`,
+  } as const;
   db.prepare(
-    `INSERT INTO session_instruction_cache(id, content, content_hash, updated_at)
-     VALUES(?, ?, ?, '2026-01-02')`,
+    `INSERT INTO session_instruction_cache(
+       project_id, scope_hash, client_name, session_id, worktree_path,
+       cwd_path, content, content_hash, updated_at
+     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, '2026-01-02')`,
   ).run(
-    1_000 + [...sessionId].reduce(
-      (hash, character) => ((hash * 31) + character.charCodeAt(0)) >>> 0,
-      0,
-    ),
+    projectId,
+    sessionInstructionsScopeHash(instructionScope),
+    instructionScope.clientName,
+    instructionScope.sessionId,
+    instructionScope.worktreePath,
+    instructionScope.cwdPath,
     `instructions ${content}`,
     `hash-${sessionId}`,
   );
@@ -198,18 +209,67 @@ function makeMigratedDatabase(path: string): DatabaseSync {
   return db;
 }
 
-function makeInstructionDatabase(
+function makeScopedInstructionDatabase(
   path: string,
-  table: "session_instruction_cache" | "session_instructions",
-  id: number,
+  projectId: string,
+  scope: {
+    readonly clientName: "codex";
+    readonly sessionId: string;
+    readonly worktreePath: string;
+    readonly cwdPath: string;
+  },
+  row: InstructionCacheFixtureRow,
+): void {
+  const db = makeMigratedDatabase(path);
+  db.prepare(
+    `INSERT INTO session_instruction_cache(
+       project_id, scope_hash, client_name, session_id, worktree_path,
+       cwd_path, content, content_hash, updated_at
+     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    projectId,
+    sessionInstructionsScopeHash(scope),
+    scope.clientName,
+    scope.sessionId,
+    scope.worktreePath,
+    scope.cwdPath,
+    row.content,
+    row.contentHash,
+    row.updatedAt,
+  );
+  db.close();
+}
+
+function makeLegacyInstructionDatabase(
+  path: string,
   row: InstructionCacheFixtureRow | null,
 ): void {
   const db = makeMigratedDatabase(path);
   if (row !== null) {
-    db.prepare(
-      `INSERT INTO ${table}(id, content, content_hash, updated_at)
-       VALUES(?, ?, ?, ?)`,
-    ).run(id, row.content, row.contentHash, row.updatedAt);
+    db.exec(`
+      DROP TABLE session_instruction_cache;
+      CREATE TABLE session_instruction_cache (
+        id INTEGER PRIMARY KEY,
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE session_instructions (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    for (const table of [
+      "session_instruction_cache",
+      "session_instructions",
+    ] as const) {
+      db.prepare(
+        `INSERT INTO ${table}(id, content, content_hash, updated_at)
+         VALUES(1, ?, ?, ?)`,
+      ).run(row.content, row.contentHash, row.updatedAt);
+    }
   }
   db.close();
 }
@@ -235,11 +295,22 @@ function makeInstructionCacheReconciliation(
   clearProjectMapCache();
   const targetPath = join(root, ".lcm", "projects", targetHash, "db.sqlite");
   const sourcePath = join(root, ".lcm", "projects", sourceHash, "db.sqlite");
-  for (const [path, cacheRow] of [
-    [targetPath, targetRow],
-    [sourcePath, sourceRow],
+  const instructionScope = {
+    clientName: "codex",
+    sessionId: "shared-cache-scope",
+    worktreePath: linked,
+    cwdPath: linked,
+  } as const;
+  for (const [path, projectId, cacheRow] of [
+    [targetPath, targetHash, targetRow],
+    [sourcePath, sourceHash, sourceRow],
   ] as const) {
-    makeInstructionDatabase(path, "session_instruction_cache", 2, cacheRow);
+    makeScopedInstructionDatabase(
+      path,
+      projectId,
+      instructionScope,
+      cacheRow,
+    );
   }
   return { main, linked, targetPath, sourcePath };
 }
@@ -267,7 +338,7 @@ function makeLegacyInstructionReconciliation(
     [targetPath, targetRow],
     [sourcePath, sourceRow],
   ] as const) {
-    makeInstructionDatabase(path, "session_instructions", 1, instructionRow);
+    makeLegacyInstructionDatabase(path, instructionRow);
   }
   return { main, targetPath };
 }
@@ -1530,23 +1601,29 @@ describe("worktree reconciliation", () => {
         updated_at: "2026-01-01T00:00:00.000Z",
       },
     },
-  ])("merges a fixed instruction-cache slot with a $label snapshot", ({
+  ])("rejects a scoped instruction-cache divergence or deduplicates the $label case", ({
     target,
     source,
     expected,
   }) => {
     const fixture = makeInstructionCacheReconciliation(home, target, source);
 
+    if (target.content !== source.content) {
+      expect(() => reconcileWorktrees(fixture.linked)).toThrow(
+        "divergent session_instruction_cache collision",
+      );
+      return;
+    }
     expect(reconcileWorktrees(fixture.linked)).toMatchObject({ status: "completed" });
     const merged = new DatabaseSync(fixture.targetPath, { readOnly: true });
     expect(merged.prepare(
       `SELECT content, content_hash, updated_at
-       FROM session_instruction_cache WHERE id = 2`,
+       FROM session_instruction_cache WHERE session_id = 'shared-cache-scope'`,
     ).get()).toEqual(expected);
     merged.close();
   });
 
-  it("treats SQLite-native instruction-cache timestamps as UTC in any process timezone", () => {
+  it("does not arbitrate scoped cache content by timestamps or process timezone", () => {
     const originalTimezone = process.env.TZ;
     process.env.TZ = "America/Sao_Paulo";
     try {
@@ -1564,24 +1641,16 @@ describe("worktree reconciliation", () => {
         },
       );
 
-      expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
-      const merged = new DatabaseSync(fixture.targetPath, { readOnly: true });
-      expect(merged.prepare(
-        `SELECT content, content_hash, updated_at
-         FROM session_instruction_cache WHERE id = 2`,
-      ).get()).toEqual({
-        content: "offset source",
-        content_hash: "offset-source-hash",
-        updated_at: "2026-01-01T01:30:00+01:00",
-      });
-      merged.close();
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "divergent session_instruction_cache collision",
+      );
     } finally {
       if (originalTimezone === undefined) delete process.env.TZ;
       else process.env.TZ = originalTimezone;
     }
   });
 
-  it("fails closed on equal-timestamp instruction-cache divergence", () => {
+  it("fails closed on instruction-cache divergence", () => {
     const fixture = makeInstructionCacheReconciliation(
       home,
       {
@@ -1597,14 +1666,67 @@ describe("worktree reconciliation", () => {
     );
 
     expect(() => reconcileWorktrees(fixture.main)).toThrow(
-      "divergent session_instruction_cache collision for id 2",
+      "divergent session_instruction_cache collision",
     );
     const target = new DatabaseSync(fixture.targetPath, { readOnly: true });
     expect(target.prepare(
-      "SELECT content FROM session_instruction_cache WHERE id = 2",
+      "SELECT content FROM session_instruction_cache WHERE session_id = 'shared-cache-scope'",
     ).get()).toEqual({ content: "target" });
     target.close();
     expect(existsSync(fixture.sourcePath)).toBe(true);
+  });
+
+  it("fails closed when a digest candidate matches different scope residuals", () => {
+    const exact = {
+      content: "same",
+      contentHash: "same-hash",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const fixture = makeInstructionCacheReconciliation(home, exact, exact);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.prepare(
+      `UPDATE session_instruction_cache
+       SET client_name = 'claude'
+       WHERE session_id = 'shared-cache-scope'`,
+    ).run();
+    source.close();
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "divergent session_instruction_cache collision",
+    );
+    expect(existsSync(fixture.sourcePath)).toBe(true);
+  });
+
+  it("moves a source-only cache row into the canonical project without broadening scope", () => {
+    const exact = {
+      content: "source only",
+      contentHash: "source-only-hash",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const fixture = makeInstructionCacheReconciliation(home, exact, exact);
+    const target = new DatabaseSync(fixture.targetPath);
+    target.prepare(
+      "DELETE FROM session_instruction_cache WHERE session_id = 'shared-cache-scope'",
+    ).run();
+    target.close();
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const merged = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(merged.prepare(
+      `SELECT project_id, client_name, session_id, worktree_path, cwd_path,
+              content, content_hash
+       FROM session_instruction_cache
+       WHERE session_id = 'shared-cache-scope'`,
+    ).get()).toEqual({
+      project_id: hashProjectPath(resolveGitProjectAnchor(fixture.main)!.canonical),
+      client_name: "codex",
+      session_id: "shared-cache-scope",
+      worktree_path: fixture.linked,
+      cwd_path: fixture.linked,
+      content: "source only",
+      content_hash: "source-only-hash",
+    });
+    merged.close();
   });
 
   it.each([
@@ -1683,7 +1805,7 @@ describe("worktree reconciliation", () => {
       targetUpdatedAt: "2026-01-01T00:00:00.000Z",
       sourceUpdatedAt: "2026-01-01T00:00:00+00:60",
     },
-  ])("fails closed when the $label instruction-cache timestamp is malformed", ({
+  ])("rejects divergent cache rows independently of $label timestamp syntax", ({
     targetUpdatedAt,
     sourceUpdatedAt,
   }) => {
@@ -1702,12 +1824,12 @@ describe("worktree reconciliation", () => {
     );
 
     expect(() => reconcileWorktrees(fixture.main)).toThrow(
-      "invalid session_instruction_cache updated_at for id 2",
+      "divergent session_instruction_cache collision",
     );
     expect(existsSync(fixture.sourcePath)).toBe(true);
   });
 
-  it("fails closed if a runtime cannot parse an otherwise valid cache timestamp", () => {
+  it("never delegates cache ownership to Date.parse", () => {
     const fixture = makeInstructionCacheReconciliation(
       home,
       {
@@ -1724,8 +1846,9 @@ describe("worktree reconciliation", () => {
     const parse = vi.spyOn(Date, "parse").mockReturnValue(Number.NaN);
     try {
       expect(() => reconcileWorktrees(fixture.main)).toThrow(
-        "invalid session_instruction_cache updated_at for id 2",
+        "divergent session_instruction_cache collision",
       );
+      expect(parse).not.toHaveBeenCalled();
     } finally {
       parse.mockRestore();
     }
@@ -1743,7 +1866,8 @@ describe("worktree reconciliation", () => {
     expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
     const target = new DatabaseSync(fixture.targetPath, { readOnly: true });
     expect(target.prepare(
-      "SELECT content, updated_at FROM session_instruction_cache WHERE id = 2",
+      `SELECT content, updated_at FROM session_instruction_cache
+       WHERE session_id = 'shared-cache-scope'`,
     ).get()).toEqual({
       content: "legacy exact",
       updated_at: "not-a-timestamp",
@@ -1804,26 +1928,26 @@ describe("worktree reconciliation", () => {
       },
       expectedUpdatedAt: "2026-02-01T00:00:00.000Z",
     },
-  ])("preserves legacy session-instruction semantics for a $label", ({
+  ])("discards unscoped legacy instruction caches for a $label", ({
     target,
     source,
-    expectedUpdatedAt,
   }) => {
     const fixture = makeLegacyInstructionReconciliation(home, target, source);
 
     expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
     const merged = new DatabaseSync(fixture.targetPath, { readOnly: true });
     expect(merged.prepare(
-      "SELECT content, content_hash, updated_at FROM session_instructions WHERE id = 1",
-    ).get()).toEqual({
-      content: source.content,
-      content_hash: source.contentHash,
-      updated_at: expectedUpdatedAt,
-    });
+      `SELECT 1 FROM sqlite_schema
+       WHERE type = 'table' AND name = 'session_instructions'`,
+    ).get()).toBeUndefined();
+    expect(merged.prepare(
+      `SELECT COUNT(*) AS count FROM session_instruction_cache
+       WHERE content IN (?, ?)`,
+    ).get(source.content, target?.content ?? source.content)).toEqual({ count: 0 });
     merged.close();
   });
 
-  it("fails closed on divergent instruction identities and invalid foreign keys", () => {
+  it("fails closed on invalid foreign keys", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
@@ -1837,25 +1961,6 @@ describe("worktree reconciliation", () => {
     const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
     makeDatabase(targetPath, "instruction-target", "target", targetHash);
     makeDatabase(sourcePath, "instruction-source", "source", sourceHash);
-    const target = new DatabaseSync(targetPath);
-    const source = new DatabaseSync(sourcePath);
-    target.prepare(
-      `INSERT INTO session_instructions(id, content, content_hash)
-       VALUES(1, 'target', 'target-hash')`,
-    ).run();
-    source.prepare(
-      `INSERT INTO session_instructions(id, content, content_hash)
-       VALUES(1, 'source', 'source-hash')`,
-    ).run();
-    target.close();
-    source.close();
-    expect(() => reconcileWorktrees(linked)).toThrow(
-      "divergent session_instructions collision",
-    );
-
-    const sourceDir = join(home, ".lcm", "projects", sourceHash);
-    rmSync(sourceDir, { recursive: true, force: true });
-    makeDatabase(sourcePath, "foreign-source", "source", sourceHash);
     const invalid = new DatabaseSync(targetPath);
     invalid.exec("PRAGMA foreign_keys = OFF");
     invalid.prepare(

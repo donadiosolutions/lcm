@@ -26,6 +26,246 @@ type SummaryParentEdgeRow = {
   parent_summary_id: string;
 };
 
+type InstructionCacheMigrationStage =
+  | "after-begin"
+  | "after-drop"
+  | "after-create";
+
+type SqliteColumnInfo = {
+  cid: number;
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: string | null;
+  pk: number;
+};
+
+type SqliteSchemaObject = {
+  type: string;
+  name: string;
+  tbl_name: string;
+  sql: string | null;
+};
+
+type InstructionCacheSchema = "missing" | "legacy" | "current";
+
+const LEGACY_SESSION_INSTRUCTIONS_SQL = `
+  CREATE TABLE session_instructions (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )
+`;
+
+const LEGACY_INSTRUCTION_CACHE_SQL = `
+  CREATE TABLE session_instruction_cache (
+    id INTEGER PRIMARY KEY,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )
+`;
+
+const CURRENT_INSTRUCTION_CACHE_SQL = `
+  CREATE TABLE session_instruction_cache (
+    project_id TEXT NOT NULL,
+    scope_hash TEXT NOT NULL CHECK (
+      length(scope_hash) = 64
+      AND scope_hash NOT GLOB '*[^a-f0-9]*'
+    ),
+    client_name TEXT NOT NULL CHECK (client_name IN ('claude', 'codex')),
+    session_id TEXT NOT NULL CHECK (session_id <> ''),
+    worktree_path TEXT NOT NULL CHECK (worktree_path <> ''),
+    cwd_path TEXT NOT NULL CHECK (cwd_path <> ''),
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (project_id, scope_hash)
+  )
+`;
+
+const LEGACY_INSTRUCTION_COLUMNS = [
+  ["id", "INTEGER", 0, 1],
+  ["content", "TEXT", 1, 0],
+  ["content_hash", "TEXT", 1, 0],
+  ["updated_at", "TEXT", 1, 0],
+] as const;
+
+const CURRENT_INSTRUCTION_COLUMNS = [
+  ["project_id", "TEXT", 1, 1],
+  ["scope_hash", "TEXT", 1, 2],
+  ["client_name", "TEXT", 1, 0],
+  ["session_id", "TEXT", 1, 0],
+  ["worktree_path", "TEXT", 1, 0],
+  ["cwd_path", "TEXT", 1, 0],
+  ["content", "TEXT", 1, 0],
+  ["content_hash", "TEXT", 1, 0],
+  ["updated_at", "TEXT", 1, 0],
+] as const;
+
+function instructionColumnsMatch(
+  actual: SqliteColumnInfo[],
+  expected: readonly (readonly [string, string, number, number])[],
+): boolean {
+  return actual.length === expected.length
+    && actual.every((column, index) => {
+      const wanted = expected[index]!;
+      return column.cid === index
+        && column.name === wanted[0]
+        && column.type.toUpperCase() === wanted[1]
+        && column.notnull === wanted[2]
+        && column.pk === wanted[3]
+        && (
+          column.name !== "updated_at"
+          || column.dflt_value === "datetime('now')"
+        );
+    });
+}
+
+function instructionTableColumns(
+  db: DatabaseSync,
+  table: string,
+): {
+  columns: SqliteColumnInfo[];
+  sql: string;
+  auxiliaryObjects: SqliteSchemaObject[];
+} | null {
+  const relation = db.prepare(
+    "SELECT type, sql FROM sqlite_schema WHERE name = ?",
+  ).get(table) as { type?: string; sql?: string } | undefined;
+  if (!relation) return null;
+  if (relation.type !== "table") {
+    throw new Error(`unsupported ${table} schema: expected a table`);
+  }
+  return {
+    columns: db.prepare(`PRAGMA table_info(${table})`).all() as SqliteColumnInfo[],
+    sql: relation.sql as string,
+    auxiliaryObjects: db.prepare(
+      `SELECT type, name, tbl_name, sql
+         FROM sqlite_schema
+         WHERE tbl_name = ? AND name <> ?
+         ORDER BY type, name`,
+    ).all(table, table) as SqliteSchemaObject[],
+  };
+}
+
+function normalizedSql(sql: string): string {
+  return sql.replace(/\s+/gu, " ").trim().toLowerCase();
+}
+
+function hasNoAuxiliaryInstructionObjects(
+  auxiliaryObjects: SqliteSchemaObject[],
+): boolean {
+  return auxiliaryObjects.length === 0;
+}
+
+function hasOnlyCurrentInstructionAutoindex(
+  auxiliaryObjects: SqliteSchemaObject[],
+): boolean {
+  return JSON.stringify(auxiliaryObjects) === JSON.stringify([{
+    type: "index",
+    name: "sqlite_autoindex_session_instruction_cache_1",
+    tbl_name: "session_instruction_cache",
+    sql: null,
+  }]);
+}
+
+function unexpectedInstructionSchemaReferences(
+  db: DatabaseSync,
+): SqliteSchemaObject[] {
+  return (db.prepare(
+    `SELECT type, name, tbl_name, sql
+       FROM sqlite_schema
+       WHERE sql IS NOT NULL
+         AND name NOT IN ('session_instructions', 'session_instruction_cache')
+       ORDER BY type, name`,
+  ).all() as SqliteSchemaObject[]).filter(({ sql }) => (
+    /\bsession_(?:instructions|instruction_cache)\b/iu.test(sql as string)
+  ));
+}
+
+function inspectInstructionCacheSchema(db: DatabaseSync): {
+  cache: InstructionCacheSchema;
+  hasLegacySource: boolean;
+} {
+  const cache = instructionTableColumns(db, "session_instruction_cache");
+  const legacySource = instructionTableColumns(db, "session_instructions");
+  if (unexpectedInstructionSchemaReferences(db).length > 0) {
+    throw new Error(
+      "unsupported instruction-cache schema dependencies; database was not modified",
+    );
+  }
+  if (
+    legacySource
+    && (
+      !instructionColumnsMatch(legacySource.columns, LEGACY_INSTRUCTION_COLUMNS)
+      || normalizedSql(legacySource.sql)
+        !== normalizedSql(LEGACY_SESSION_INSTRUCTIONS_SQL)
+      || !hasNoAuxiliaryInstructionObjects(legacySource.auxiliaryObjects)
+    )
+  ) {
+    throw new Error("unsupported session_instructions schema; database was not modified");
+  }
+  if (!cache) {
+    return { cache: "missing", hasLegacySource: legacySource !== null };
+  }
+  if (
+    instructionColumnsMatch(cache.columns, LEGACY_INSTRUCTION_COLUMNS)
+    && normalizedSql(cache.sql) === normalizedSql(LEGACY_INSTRUCTION_CACHE_SQL)
+    && hasNoAuxiliaryInstructionObjects(cache.auxiliaryObjects)
+  ) {
+    if (!legacySource) {
+      throw new Error(
+        "unsupported partial legacy instruction-cache schema; database was not modified",
+      );
+    }
+    return { cache: "legacy", hasLegacySource: true };
+  }
+  if (
+    instructionColumnsMatch(cache.columns, CURRENT_INSTRUCTION_COLUMNS)
+    && normalizedSql(cache.sql) === normalizedSql(CURRENT_INSTRUCTION_CACHE_SQL)
+    && hasOnlyCurrentInstructionAutoindex(cache.auxiliaryObjects)
+  ) {
+    if (legacySource) {
+      throw new Error(
+        "unsupported ambiguous instruction-cache schema; database was not modified",
+      );
+    }
+    return { cache: "current", hasLegacySource: false };
+  }
+  throw new Error("unsupported session_instruction_cache schema; database was not modified");
+}
+
+function migrateInstructionCache(
+  db: DatabaseSync,
+  observer?: (stage: InstructionCacheMigrationStage) => void,
+): void {
+  // Preflight runs before any other migration statement so unknown, partial,
+  // or ambiguous cache schemas leave the complete original database intact.
+  const schema = inspectInstructionCacheSchema(db);
+  if (schema.cache === "current" && !schema.hasLegacySource) return;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    observer?.("after-begin");
+    if (schema.cache === "legacy") {
+      db.exec("DROP TABLE session_instruction_cache");
+    }
+    if (schema.hasLegacySource) {
+      db.exec("DROP TABLE session_instructions");
+    }
+    observer?.("after-drop");
+    if (schema.cache !== "current") {
+      db.exec(CURRENT_INSTRUCTION_CACHE_SQL);
+    }
+    observer?.("after-create");
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 function ensureSummaryDepthColumn(db: DatabaseSync): void {
   const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
   const hasDepth = summaryColumns.some((col) => col.name === "depth");
@@ -345,8 +585,15 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
 
 export function runLcmMigrations(
   db: DatabaseSync,
-  options?: { fts5Available?: boolean },
+  options?: {
+    fts5Available?: boolean;
+    /** @internal Deterministic rollback seam for cache-migration tests. */
+    _instructionCacheMigrationObserver?: (
+      stage: InstructionCacheMigrationStage,
+    ) => void;
+  },
 ): void {
+  migrateInstructionCache(db, options?._instructionCacheMigrationObserver);
   db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
       conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -506,26 +753,6 @@ export function runLcmMigrations(
       );
     `);
   }
-
-  // Session instructions (CLAUDE.md captured on startup)
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS session_instructions (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      content TEXT NOT NULL,
-      content_hash TEXT NOT NULL,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-  `);
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS session_instruction_cache (
-      id INTEGER PRIMARY KEY,
-      content TEXT NOT NULL,
-      content_hash TEXT NOT NULL,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    INSERT OR IGNORE INTO session_instruction_cache (id, content, content_hash, updated_at)
-      SELECT id, content, content_hash, updated_at FROM session_instructions WHERE id = 1;
-  `);
 
   // Promoted memories (cross-session, agent-stored)
   db.exec(`

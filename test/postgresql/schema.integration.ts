@@ -2200,15 +2200,20 @@ describe("PostgreSQL schema baseline", () => {
         values: [scope.projectId, memory.rows[0]?.memory_id, longTag],
       }, { domain: "factory", operation: "lookupLongPromotedTag" }))
         .resolves.toMatchObject({ rows: [{ ordinal: 6 }] });
+      const instructionScopeHash = "f".repeat(64);
       await database.migrator.query({
-        text: `INSERT INTO lcm.session_instructions(project_id,slot,content,content_hash)
-               VALUES($1,1,'instructions','hash-1')`,
-        values: [scope.projectId],
+        text: `INSERT INTO lcm.session_instructions(
+                 project_id, machine_id, scope_hash, client_name, session_id,
+                 worktree_path, cwd_path, content, content_hash
+               )
+               VALUES($1,$2,$3,'codex','session-a','/repo/worktree','/repo/worktree/src',
+                      'instructions','hash-1')`,
+        values: [scope.projectId, scope.machineId, instructionScopeHash],
       }, { domain: "factory", operation: "seedInstructionMatrix" });
       await expect(database.migrator.query<{ content_hash: string }>({
         text: `SELECT content_hash FROM lcm.session_instructions
-               WHERE project_id = $1 AND slot = 1`,
-        values: [scope.projectId],
+               WHERE project_id = $1 AND machine_id = $2 AND scope_hash = $3`,
+        values: [scope.projectId, scope.machineId, instructionScopeHash],
       }, { domain: "factory", operation: "readInstructionContractHash" }))
         .resolves.toMatchObject({ rows: [{ content_hash: "hash-1" }] });
       const eventId = "6ba7b810-9dad-41d1-80b4-00c04fd430c8";
@@ -2458,7 +2463,12 @@ describe("PostgreSQL schema baseline", () => {
         { operation: "summaryDescendantCount", text: "INSERT INTO lcm.summaries(project_id,conversation_id,kind,content,token_count,descendant_count) VALUES($1,$2,'leaf','s',0,-1)", values: [scope.projectId, scope.conversationId] },
         { operation: "summaryDescendantTokens", text: "INSERT INTO lcm.summaries(project_id,conversation_id,kind,content,token_count,descendant_token_count) VALUES($1,$2,'leaf','s',0,-1)", values: [scope.projectId, scope.conversationId] },
         { operation: "summarySourceTokens", text: "INSERT INTO lcm.summaries(project_id,conversation_id,kind,content,token_count,source_message_token_count) VALUES($1,$2,'leaf','s',0,-1)", values: [scope.projectId, scope.conversationId] },
-        { operation: "instructionUnique", text: "INSERT INTO lcm.session_instructions(project_id,slot,content,content_hash) VALUES($1,1,'duplicate',$2)", values: [scope.projectId, hashB] },
+        { operation: "instructionUnique", text: "INSERT INTO lcm.session_instructions(project_id,machine_id,scope_hash,client_name,session_id,worktree_path,cwd_path,content,content_hash) VALUES($1,$2,$3,'codex','session-a','/repo/worktree','/repo/worktree/src','duplicate',$4)", values: [scope.projectId, scope.machineId, "f".repeat(64), hashB] },
+        { operation: "instructionScopeHash", text: "INSERT INTO lcm.session_instructions(project_id,machine_id,scope_hash,client_name,session_id,worktree_path,cwd_path,content,content_hash) VALUES($1,$2,'bad','codex','session-b','/repo/worktree','/repo/worktree/src','bad',$3)", values: [scope.projectId, scope.machineId, hashB] },
+        { operation: "instructionClient", text: "INSERT INTO lcm.session_instructions(project_id,machine_id,scope_hash,client_name,session_id,worktree_path,cwd_path,content,content_hash) VALUES($1,$2,$3,'other','session-c','/repo/worktree','/repo/worktree/src','bad',$4)", values: [scope.projectId, scope.machineId, "e".repeat(64), hashB] },
+        { operation: "instructionSession", text: "INSERT INTO lcm.session_instructions(project_id,machine_id,scope_hash,client_name,session_id,worktree_path,cwd_path,content,content_hash) VALUES($1,$2,$3,'codex','','/repo/worktree','/repo/worktree/src','bad',$4)", values: [scope.projectId, scope.machineId, "d".repeat(64), hashB] },
+        { operation: "instructionWorktree", text: "INSERT INTO lcm.session_instructions(project_id,machine_id,scope_hash,client_name,session_id,worktree_path,cwd_path,content,content_hash) VALUES($1,$2,$3,'codex','session-d','','/repo/worktree/src','bad',$4)", values: [scope.projectId, scope.machineId, "c".repeat(64), hashB] },
+        { operation: "instructionCwd", text: "INSERT INTO lcm.session_instructions(project_id,machine_id,scope_hash,client_name,session_id,worktree_path,cwd_path,content,content_hash) VALUES($1,$2,$3,'codex','session-e','/repo/worktree','','bad',$4)", values: [scope.projectId, scope.machineId, "b".repeat(64), hashB] },
         { operation: "inboxStatus", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload,status) VALUES($1,$2,uuidv7(),1,1,'e','{}','unknown')", values: [scope.projectId, scope.machineId] },
         { operation: "inboxStatusTime", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload,status) VALUES($1,$2,uuidv7(),1,1,'e','{}','claimed')", values: [scope.projectId, scope.machineId] },
         { operation: "inboxAppliedEquivalence", text: "INSERT INTO lcm.passive_event_inbox(project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload,applied_at) VALUES($1,$2,uuidv7(),1,3,'e','{}',now())", values: [scope.projectId, scope.machineId] },

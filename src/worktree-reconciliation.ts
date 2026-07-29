@@ -678,113 +678,21 @@ function mergeUniqueRows(
   }
 }
 
-function mergeInstructionRows(source: DatabaseSync, target: DatabaseSync, table: string): void {
-  for (const sourceRow of rows(source, `SELECT * FROM ${table}`)) {
-    const existing = row(target, `SELECT * FROM ${table} WHERE id = ?`, sourceRow.id);
-    if (!existing) {
-      insertRow(target, table, sourceRow);
-      continue;
-    }
-    if (rowsEqual([existing], [sourceRow])) continue;
-    if (
-      sourceRow.content !== existing.content
-      || sourceRow.content_hash !== existing.content_hash
-    ) {
-      throw new Error(`divergent ${table} collision for id ${String(sourceRow.id)}`);
-    }
-    if (String(sourceRow.updated_at) > String(existing.updated_at)) {
-      target.prepare(
-        `UPDATE ${table} SET updated_at = ? WHERE id = ?`,
-      ).run(sourceRow.updated_at, sourceRow.id);
-    }
-  }
-}
-
-function instructionCacheTimestamp(value: SQLInputValue): number | null {
-  if (typeof value !== "string") return null;
-  const match = /^(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})(?<separator>[T ])(?<hour>\d{2}):(?<minute>\d{2}):(?<second>\d{2})(?<fraction>\.\d{1,3})?(?<zone>Z|[+-]\d{2}:\d{2})?$/u
-    .exec(value);
-  if (!match?.groups) return null;
-  const {
-    year,
-    month,
-    day,
-    separator,
-    hour,
-    minute,
-    second,
-    fraction,
-    zone,
-  } = match.groups;
-  if (
-    (separator === " " && (fraction !== undefined || zone !== undefined))
-    || (separator === "T" && zone === undefined)
-  ) {
-    return null;
-  }
-  const numericYear = Number(year);
-  const numericMonth = Number(month);
-  const numericDay = Number(day);
-  const numericHour = Number(hour);
-  const numericMinute = Number(minute);
-  const numericSecond = Number(second);
-  const calendar = new Date(0);
-  calendar.setUTCFullYear(numericYear, numericMonth - 1, numericDay);
-  calendar.setUTCHours(numericHour, numericMinute, numericSecond, 0);
-  if (
-    calendar.getUTCFullYear() !== numericYear
-    || calendar.getUTCMonth() !== numericMonth - 1
-    || calendar.getUTCDate() !== numericDay
-    || calendar.getUTCHours() !== numericHour
-    || calendar.getUTCMinutes() !== numericMinute
-    || calendar.getUTCSeconds() !== numericSecond
-  ) {
-    return null;
-  }
-  if (zone && zone !== "Z") {
-    const zoneHour = Number(zone.slice(1, 3));
-    const zoneMinute = Number(zone.slice(4, 6));
-    if (zoneHour > 23 || zoneMinute > 59) return null;
-  }
-  const normalized = separator === " "
-    ? `${value.replace(" ", "T")}Z`
-    : value;
-  const parsed = Date.parse(normalized);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function mergeInstructionCacheRows(source: DatabaseSync, target: DatabaseSync): void {
-  const table = "session_instruction_cache";
-  for (const sourceRow of rows(source, `SELECT * FROM ${table}`)) {
-    const existing = row(target, `SELECT * FROM ${table} WHERE id = ?`, sourceRow.id);
-    if (!existing) {
-      insertRow(target, table, sourceRow);
-      continue;
-    }
-    if (rowsEqual([existing], [sourceRow])) continue;
-    const sourceUpdatedAt = instructionCacheTimestamp(sourceRow.updated_at);
-    const targetUpdatedAt = instructionCacheTimestamp(existing.updated_at);
-    if (sourceUpdatedAt === null || targetUpdatedAt === null) {
-      throw new Error(
-        `invalid ${table} updated_at for id ${String(sourceRow.id)}`,
-      );
-    }
-    if (sourceUpdatedAt === targetUpdatedAt) {
-      throw new Error(`divergent ${table} collision for id ${String(sourceRow.id)}`);
-    }
-    if (sourceUpdatedAt > targetUpdatedAt) {
-      target.prepare(
-        `UPDATE ${table}
-         SET content = ?, content_hash = ?, updated_at = ?
-         WHERE id = ?`,
-      ).run(
-        sourceRow.content,
-        sourceRow.content_hash,
-        sourceRow.updated_at,
-        sourceRow.id,
-      );
-    }
-  }
+function mergeInstructionCacheRows(
+  source: DatabaseSync,
+  target: DatabaseSync,
+  targetHash: string,
+): void {
+  mergeUniqueRows(
+    source,
+    target,
+    "session_instruction_cache",
+    [
+      "project_id",
+      "scope_hash",
+    ],
+    (value) => ({ ...value, project_id: targetHash }),
+  );
 }
 
 function quoteIdentifier(identifier: string): string {
@@ -964,8 +872,7 @@ function mergeMainDatabase(
                 return rest;
               },
             );
-            mergeInstructionRows(normalizedSource, target, "session_instructions");
-            mergeInstructionCacheRows(normalizedSource, target);
+            mergeInstructionCacheRows(normalizedSource, target, targetHash);
             if (tableExists(normalizedSource, "redaction_stats")) {
               for (const count of rows(
                 normalizedSource,

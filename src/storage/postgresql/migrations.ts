@@ -22,7 +22,7 @@ const MIGRATION_MANIFEST = [
   {
     id: "0002_schema_baseline",
     filename: "0002_schema_baseline.sql",
-    sha256: "d371217393adefcfd2f3658960ac015b12746951109daabbc9e06f904d8bf766",
+    sha256: "3f255f3c3a402047313f197c63434742259033cbb0ef590276569eb684d8d260",
   },
   {
     id: "0003_machine_identity_key",
@@ -262,7 +262,10 @@ const EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES = `
   session_ingest_log|project_id session_ingest_log|session_id
   session_ingest_log|message_count session_ingest_log|completed_at
   session_instructions|instruction_id session_instructions|project_id
-  session_instructions|machine_id session_instructions|slot session_instructions|content
+  session_instructions|machine_id session_instructions|scope_hash
+  session_instructions|client_name session_instructions|session_id
+  session_instructions|worktree_path session_instructions|cwd_path
+  session_instructions|content
   session_instructions|content_hash session_instructions|updated_at
   passive_event_inbox|inbox_id passive_event_inbox|project_id
   passive_event_inbox|machine_id passive_event_inbox|event_id
@@ -339,9 +342,11 @@ const EXPECTED_BASELINE_CONSTRAINT_NAMES = `
   schema_migrations_checksum_sha256_check schema_migrations_pkey
   session_ingest_log_message_count_check session_ingest_log_ingest_key_check
   session_ingest_log_project_id_fkey session_ingest_log_pkey
-  session_instructions_slot_check session_instructions_machine_id_fkey
+  session_instructions_scope_hash_check session_instructions_client_name_check
+  session_instructions_session_id_check session_instructions_worktree_path_check
+  session_instructions_cwd_path_check session_instructions_machine_id_fkey
   session_instructions_project_id_fkey session_instructions_pkey
-  session_instructions_project_id_machine_id_slot_key summaries_depth_check
+  session_instructions_project_id_machine_id_scope_hash_key summaries_depth_check
   summaries_descendant_count_check summaries_descendant_token_count_check summaries_check
   summaries_kind_check summaries_source_message_token_count_check summaries_token_count_check
   summaries_summary_key_check summaries_project_id_conversation_id_fkey summaries_pkey
@@ -2122,7 +2127,11 @@ export async function runPostgreSqlMigrations(
                                       ARRAY[
                                         'project_id',
                                         'machine_id',
-                                        'slot',
+                                        'scope_hash',
+                                        'client_name',
+                                        'session_id',
+                                        'worktree_path',
+                                        'cwd_path',
                                         'content',
                                         'content_hash'
                                       ]::pg_catalog.text[]

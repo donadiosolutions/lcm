@@ -14,10 +14,12 @@ import type {
   RedactionPurgeResult,
   SessionIngestRecord,
   SessionInstructionsRecord,
+  SessionInstructionsScope,
   StorageDomain,
 } from "../contracts.js";
 import type { RecallFeedback, RecallStats } from "../../db/recall.js";
 import { StorageOperationError } from "../errors.js";
+import { sessionInstructionsScopeHash } from "../session-instructions.js";
 import type {
   PostgreSqlOperationContext,
   PostgreSqlQueryExecutor,
@@ -123,7 +125,10 @@ type SessionIngestRow = QueryResultRow & {
 };
 
 type SessionInstructionsRow = QueryResultRow & {
-  slot: unknown;
+  client_name: unknown;
+  session_id: unknown;
+  worktree_path: unknown;
+  cwd_path: unknown;
   content: unknown;
   content_hash: unknown;
   updated_at: unknown;
@@ -1899,49 +1904,32 @@ implements CoordinationRepository {
   }
 
   async getSessionInstructions(
-    id: number,
-    fallbackLegacyId?: number,
+    scope: SessionInstructionsScope,
   ): Promise<SessionInstructionsRecord | null> {
     const operation = "getSessionInstructions";
-    const slot = nonnegativeInteger(
-      id,
-      this.access.projectId,
-      "coordination",
-      operation,
-      "slot",
-    );
-    const fallbackSlot = fallbackLegacyId === undefined
-      ? null
-      : nonnegativeInteger(
-          fallbackLegacyId,
-          this.access.projectId,
-          "coordination",
-          operation,
-          "fallback_slot",
-        );
+    const normalizedScope = this.normalizeInstructionScope(scope, operation);
+    const scopeHash = sessionInstructionsScopeHash(normalizedScope);
     return this.access.read(operation, async (executor) => {
       const result = await executor.query<SessionInstructionsRow>({
-        text: `SELECT slot, content, content_hash, updated_at
+        text: `SELECT client_name, session_id, worktree_path, cwd_path,
+                      content, content_hash, updated_at
                FROM lcm.session_instructions
                WHERE project_id = $1
-                 AND (
-                   (machine_id = $2 AND slot = $3)
-                   OR (
-                     $4::pg_catalog.int4 IS NOT NULL
-                     AND machine_id IS NULL
-                     AND slot = $4
-                   )
-                 )
-               ORDER BY CASE
-                 WHEN machine_id = $2 AND slot = $3 THEN 0
-                 ELSE 1
-               END
+                 AND machine_id = $2
+                 AND scope_hash = $3
+                 AND client_name = $4
+                 AND session_id = $5
+                 AND worktree_path = $6
+                 AND cwd_path = $7
                LIMIT 1`,
         values: [
           this.access.projectId,
           this.machineId,
-          slot,
-          fallbackSlot,
+          scopeHash,
+          normalizedScope.clientName,
+          normalizedScope.sessionId,
+          normalizedScope.worktreePath,
+          normalizedScope.cwdPath,
         ],
       }, this.access.context(operation));
       const row = result.rows[0];
@@ -1950,18 +1938,13 @@ implements CoordinationRepository {
   }
 
   async upsertSessionInstructions(
-    id: number,
+    scope: SessionInstructionsScope,
     content: string,
     contentHash: string,
   ): Promise<void> {
     const operation = "upsertSessionInstructions";
-    const slot = nonnegativeInteger(
-      id,
-      this.access.projectId,
-      "coordination",
-      operation,
-      "slot",
-    );
+    const normalizedScope = this.normalizeInstructionScope(scope, operation);
+    const scopeHash = sessionInstructionsScopeHash(normalizedScope);
     const normalizedContent = string(
       content,
       this.access.projectId,
@@ -1977,44 +1960,136 @@ implements CoordinationRepository {
       "content_hash",
     );
     await this.access.atomic(operation, async (executor) => {
-      await executor.query({
+      const result = await executor.query<{ instruction_id: unknown }>({
         text: `INSERT INTO lcm.session_instructions (
-                 project_id, machine_id, slot, content, content_hash
+                 project_id, machine_id, scope_hash, client_name, session_id,
+                 worktree_path, cwd_path, content, content_hash
                )
-               VALUES ($1, $2, $3, $4, $5)
-               ON CONFLICT (project_id, machine_id, slot) DO UPDATE
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               ON CONFLICT (project_id, machine_id, scope_hash) DO UPDATE
                SET content = EXCLUDED.content,
                    content_hash = EXCLUDED.content_hash,
-                   updated_at = statement_timestamp()`,
+                   updated_at = statement_timestamp()
+               WHERE lcm.session_instructions.client_name = EXCLUDED.client_name
+                 AND lcm.session_instructions.session_id = EXCLUDED.session_id
+                 AND lcm.session_instructions.worktree_path = EXCLUDED.worktree_path
+                 AND lcm.session_instructions.cwd_path = EXCLUDED.cwd_path
+               RETURNING instruction_id`,
         values: [
           this.access.projectId,
           this.machineId,
-          slot,
+          scopeHash,
+          normalizedScope.clientName,
+          normalizedScope.sessionId,
+          normalizedScope.worktreePath,
+          normalizedScope.cwdPath,
           normalizedContent,
           normalizedContentHash,
         ],
       }, this.access.context(operation));
+      if (!result.rows[0]) {
+        return dataError(
+          this.access.projectId,
+          "coordination",
+          operation,
+          "scope_hash",
+        );
+      }
     });
   }
 
-  async deleteSessionInstructions(id: number): Promise<void> {
+  async deleteSessionInstructions(scope: SessionInstructionsScope): Promise<void> {
     const operation = "deleteSessionInstructions";
-    const slot = nonnegativeInteger(
-      id,
-      this.access.projectId,
-      "coordination",
-      operation,
-      "slot",
-    );
+    const normalizedScope = this.normalizeInstructionScope(scope, operation);
+    const scopeHash = sessionInstructionsScopeHash(normalizedScope);
     await this.access.atomic(operation, async (executor) => {
       await executor.query({
         text: `DELETE FROM lcm.session_instructions
                WHERE project_id = $1
                  AND machine_id = $2
-                 AND slot = $3`,
-        values: [this.access.projectId, this.machineId, slot],
+                 AND scope_hash = $3
+                 AND client_name = $4
+                 AND session_id = $5
+                 AND worktree_path = $6
+                 AND cwd_path = $7`,
+        values: [
+          this.access.projectId,
+          this.machineId,
+          scopeHash,
+          normalizedScope.clientName,
+          normalizedScope.sessionId,
+          normalizedScope.worktreePath,
+          normalizedScope.cwdPath,
+        ],
       }, this.access.context(operation));
     });
+  }
+
+  private normalizeInstructionScope(
+    scope: SessionInstructionsScope,
+    operation: string,
+  ): SessionInstructionsScope {
+    const clientName = string(
+      scope.clientName,
+      this.access.projectId,
+      "coordination",
+      operation,
+      "client_name",
+    );
+    if (clientName !== "claude" && clientName !== "codex") {
+      return dataError(
+        this.access.projectId,
+        "coordination",
+        operation,
+        "client_name",
+      );
+    }
+    const sessionId = string(
+      scope.sessionId,
+      this.access.projectId,
+      "coordination",
+      operation,
+      "session_id",
+    );
+    const worktreePath = string(
+      scope.worktreePath,
+      this.access.projectId,
+      "coordination",
+      operation,
+      "worktree_path",
+    );
+    const cwdPath = string(
+      scope.cwdPath,
+      this.access.projectId,
+      "coordination",
+      operation,
+      "cwd_path",
+    );
+    if (sessionId.length === 0) {
+      return dataError(
+        this.access.projectId,
+        "coordination",
+        operation,
+        "session_id",
+      );
+    }
+    if (worktreePath.length === 0) {
+      return dataError(
+        this.access.projectId,
+        "coordination",
+        operation,
+        "worktree_path",
+      );
+    }
+    if (cwdPath.length === 0) {
+      return dataError(
+        this.access.projectId,
+        "coordination",
+        operation,
+        "cwd_path",
+      );
+    }
+    return { clientName, sessionId, worktreePath, cwdPath };
   }
 
   private sessionIngestFromRow(
@@ -2057,13 +2132,43 @@ implements CoordinationRepository {
     row: SessionInstructionsRow,
     operation: string,
   ): SessionInstructionsRecord {
-    return {
-      id: nonnegativeInteger(
-        row.slot,
+    const clientName = string(
+      row.client_name,
+      this.access.projectId,
+      "coordination",
+      operation,
+      "client_name",
+    );
+    if (clientName !== "claude" && clientName !== "codex") {
+      return dataError(
         this.access.projectId,
         "coordination",
         operation,
-        "slot",
+        "client_name",
+      );
+    }
+    return {
+      clientName,
+      sessionId: string(
+        row.session_id,
+        this.access.projectId,
+        "coordination",
+        operation,
+        "session_id",
+      ),
+      worktreePath: string(
+        row.worktree_path,
+        this.access.projectId,
+        "coordination",
+        operation,
+        "worktree_path",
+      ),
+      cwdPath: string(
+        row.cwd_path,
+        this.access.projectId,
+        "coordination",
+        operation,
+        "cwd_path",
       ),
       content: string(
         row.content,

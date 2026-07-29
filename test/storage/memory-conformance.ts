@@ -165,6 +165,12 @@ export async function exerciseRedactionAdminRepositoryConformance(
 export async function exerciseCoordinationRepositoryConformance(
   repository: CoordinationRepository,
 ): Promise<void> {
+  const instructionScope = {
+    clientName: "codex",
+    sessionId: "session-a",
+    worktreePath: "/repo/worktree-a",
+    cwdPath: "/repo/worktree-a/src",
+  } as const;
   expect(await repository.getSessionIngest("missing")).toBeNull();
   await repository.recordSessionIngest("session-a", 2);
   await repository.recordSessionIngest("session-a", 3);
@@ -172,13 +178,25 @@ export async function exerciseCoordinationRepositoryConformance(
     sessionId: "session-a",
     messageCount: 3,
   });
-  expect(await repository.getSessionInstructions(2, 1)).toBeNull();
-  await repository.upsertSessionInstructions(2, "current", "hash-2");
-  expect(await repository.getSessionInstructions(2)).toMatchObject({
-    id: 2,
+  expect(await repository.getSessionInstructions(instructionScope)).toBeNull();
+  await repository.upsertSessionInstructions(
+    instructionScope,
+    "current",
+    "hash-2",
+  );
+  expect(await repository.getSessionInstructions(instructionScope)).toMatchObject({
+    ...instructionScope,
     content: "current",
     contentHash: "hash-2",
   });
-  await repository.deleteSessionInstructions(2);
-  expect(await repository.getSessionInstructions(2)).toBeNull();
+  for (const changed of [
+    { ...instructionScope, clientName: "claude" as const },
+    { ...instructionScope, sessionId: "session-b" },
+    { ...instructionScope, worktreePath: "/repo/worktree-b" },
+    { ...instructionScope, cwdPath: "/repo/worktree-a/test" },
+  ]) {
+    expect(await repository.getSessionInstructions(changed)).toBeNull();
+  }
+  await repository.deleteSessionInstructions(instructionScope);
+  expect(await repository.getSessionInstructions(instructionScope)).toBeNull();
 }
