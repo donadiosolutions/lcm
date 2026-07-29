@@ -37,6 +37,8 @@ const RETRYABLE_DRIVER_MESSAGES = new Set([
 type PostgreSqlDriverError = Error & { code?: unknown };
 
 export class PostgreSqlStorageOperationError extends StorageOperationError {
+  readonly machineId: string | undefined;
+
   constructor(
     code: "STORAGE_INITIALIZATION_FAILED" | "STORAGE_OPERATION_FAILED",
     context: PostgreSqlOperationContext,
@@ -44,10 +46,17 @@ export class PostgreSqlStorageOperationError extends StorageOperationError {
     retryable: boolean,
   ) {
     super(code, "postgresql", context.projectId, context.domain, context.operation, { retryable });
+    this.machineId = context.machineId;
   }
 
   override toJSON(): Record<string, unknown> {
-    return { ...super.toJSON(), sqlState: this.sqlState };
+    return {
+      ...super.toJSON(),
+      sqlState: this.sqlState,
+      ...(this.machineId === undefined
+        ? {}
+        : { machineId: this.machineId }),
+    };
   }
 }
 
@@ -57,6 +66,8 @@ export class PostgreSqlStorageOperationError extends StorageOperationError {
  * read before retrying a non-idempotent operation.
  */
 export class PostgreSqlCommitOutcomeUnknownError extends StorageOperationError {
+  readonly machineId: string | undefined;
+
   constructor(context: PostgreSqlOperationContext) {
     super(
       "STORAGE_OPERATION_FAILED",
@@ -66,6 +77,16 @@ export class PostgreSqlCommitOutcomeUnknownError extends StorageOperationError {
       context.operation,
     );
     this.name = "PostgreSqlCommitOutcomeUnknownError";
+    this.machineId = context.machineId;
+  }
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      ...(this.machineId === undefined
+        ? {}
+        : { machineId: this.machineId }),
+    };
   }
 }
 

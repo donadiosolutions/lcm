@@ -4,6 +4,7 @@ import {
   isPostgreSqlConnectionError,
   isRetryablePostgreSqlError,
   normalizePostgreSqlError,
+  PostgreSqlCommitOutcomeUnknownError,
 } from "../../src/storage/postgresql/errors.js";
 
 describe("PostgreSQL error normalization", () => {
@@ -76,6 +77,7 @@ describe("PostgreSQL error normalization", () => {
     const driver = Object.assign(new Error("password=sensitive values=[secret]"), { code: "40001", detail: "private" });
     const normalized = normalizePostgreSqlError(driver, {
       projectId: "project",
+      machineId: "machine",
       domain: "sessions",
       operation: "write",
     }, "STORAGE_INITIALIZATION_FAILED");
@@ -83,18 +85,41 @@ describe("PostgreSQL error normalization", () => {
       code: "STORAGE_INITIALIZATION_FAILED",
       backend: "postgresql",
       projectId: "project",
+      machineId: "machine",
       domain: "sessions",
       operation: "write",
       retryable: true,
       sqlState: "40001",
     });
-    expect(normalized.toJSON()).toMatchObject({ sqlState: "40001" });
+    expect(normalized.toJSON()).toMatchObject({
+      sqlState: "40001",
+      machineId: "machine",
+    });
     expect(JSON.stringify(normalized)).not.toContain("sensitive");
-    expect(normalizePostgreSqlError(new Error("failure"), { domain: "factory", operation: "query" }))
+    const withoutMachine = normalizePostgreSqlError(
+      new Error("failure"),
+      { domain: "factory", operation: "query" },
+    );
+    expect(withoutMachine)
       .toMatchObject({ code: "STORAGE_OPERATION_FAILED", retryable: false, sqlState: null });
+    expect(withoutMachine.toJSON()).not.toHaveProperty("machineId");
     expect(normalizePostgreSqlError(
       Object.assign(new Error("failure"), { code: "bad-state" }),
       { domain: "factory", operation: "query" },
     )).toMatchObject({ sqlState: null });
+  });
+
+  it("serializes optional machine context for ambiguous commits", () => {
+    expect(new PostgreSqlCommitOutcomeUnknownError({
+      projectId: "project",
+      machineId: "machine",
+      domain: "transaction",
+      operation: "commit",
+    }).toJSON()).toMatchObject({ machineId: "machine" });
+    expect(new PostgreSqlCommitOutcomeUnknownError({
+      projectId: "project",
+      domain: "transaction",
+      operation: "commit",
+    }).toJSON()).not.toHaveProperty("machineId");
   });
 });
