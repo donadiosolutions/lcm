@@ -60,6 +60,14 @@ import { postgresqlVitestCacheDir } from "../../vitest.postgresql.config.js";
 const testBootId = "12345678-1234-1234-1234-123456789abc";
 const testOwnerScope = `linux:${"a".repeat(64)}:${testBootId}:pid:[4026531836]`;
 
+function missingContainerError(name: string) {
+  return Object.assign(new Error("docker failed"), {
+    code: 1,
+    stdout: "",
+    stderr: `Error response from daemon: No such container: ${name}`,
+  });
+}
+
 describe("PostgreSQL harness utilities", () => {
   it("resolves a bounded signal-probe readiness timeout", () => {
     expect(resolveSignalProbeReadinessTimeout({})).toBe(
@@ -885,20 +893,17 @@ describe("PostgreSQL harness utilities", () => {
   });
 
   it("retains process-group escalation after the leader settles", async () => {
-    let finish!: () => void;
     const child = { pid: 654, kill: vi.fn() };
     const signals: Array<number | string> = [];
+    let alive = true;
     const signalProcess = vi.fn((_pid: number, signal: number | string) => {
       signals.push(signal);
-      if (signal === "SIGTERM") finish();
+      if (signal === "SIGKILL") alive = false;
     });
-    const processTreeAlive = vi.fn()
-      .mockReturnValueOnce(true)
-      .mockReturnValueOnce(true)
-      .mockReturnValueOnce(false);
+    const processTreeAlive = vi.fn(() => alive);
     const lifecycle = createProcessLifecycle((_command, _args, options) => {
       options.onSpawn(child);
-      return new Promise<void>((resolve) => { finish = resolve; });
+      return Promise.resolve();
     }, {
       platform: () => "linux",
       signalProcess,
@@ -912,8 +917,8 @@ describe("PostgreSQL harness utilities", () => {
       terminateProcessTree: true,
     });
 
-    await expect(lifecycle.stop()).resolves.toBeUndefined();
     await expect(consumer).resolves.toBeUndefined();
+    await expect(lifecycle.stop()).resolves.toBeUndefined();
     expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
   });
 
@@ -1196,6 +1201,310 @@ describe("PostgreSQL harness utilities", () => {
       `network:${names.network}`,
     ]);
     expect(removeDirectory).toHaveBeenCalledWith("/private/harness");
+    expect(dockerRunner.mock.calls).toContainEqual([[
+      "container", "rm", names.restore,
+    ]]);
+    expect(dockerRunner.mock.calls).toContainEqual([[
+      "container", "rm", names.runner,
+    ]]);
+  });
+
+  it("preserves an entire stale run when a worker starts after discovery", async () => {
+    const runId = "3".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 73,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:730",
+      scope: testOwnerScope,
+    };
+    const records = new Map([
+      [`container:${names.runner}`, ownershipLabels(runId, "runner", owner)],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+      [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
+    ]);
+    let runnerInspections = 0;
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        return {
+          stdout: [...records.keys()]
+            .filter((key) => key.startsWith(`${type}:`))
+            .map((key) => key.slice(type.length + 1))
+            .join("\n"),
+          stderr: "",
+        };
+      }
+      if (args[1] === "inspect") {
+        const type = args[0];
+        const name = args[2];
+        const labels = records.get(`${type}:${name}`);
+        if (!labels) throw missingContainerError(name);
+        if (name === names.runner) runnerInspections += 1;
+        return {
+          stdout: JSON.stringify([type === "container"
+            ? {
+              Config: { Labels: labels },
+              State: { Running: runnerInspections > 1 },
+            }
+            : { Labels: labels }]),
+          stderr: "",
+        };
+      }
+      throw new Error("reclamation must not mutate a restarted run");
+    });
+
+    const runs = await reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+    });
+
+    expect(runs).toMatchObject([{ runId, classification: "live" }]);
+    expect(dockerRunner.mock.calls.some(([args]) => args[1] === "rm")).toBe(false);
+    expect(records.size).toBe(3);
+  });
+
+  it("preserves a stale run when an initially unlisted canonical worker is running", async () => {
+    const runId = "2".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 72,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:720",
+      scope: testOwnerScope,
+    };
+    const records = new Map([
+      [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
+      [`container:${names.runner}`, ownershipLabels(runId, "runner", owner)],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+      [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
+    ]);
+    const mutationCalls: string[][] = [];
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[0] === "container" && args[1] === "ls") {
+        return { stdout: names.container, stderr: "" };
+      }
+      if (args[0] === "volume" && args[1] === "ls") {
+        return { stdout: names.volume, stderr: "" };
+      }
+      if (args[0] === "network" && args[1] === "ls") {
+        return { stdout: names.network, stderr: "" };
+      }
+      if (args[1] === "inspect") {
+        const type = args[0];
+        const name = args[2];
+        const labels = records.get(`${type}:${name}`);
+        if (!labels) throw missingContainerError(name);
+        return {
+          stdout: JSON.stringify([type === "container"
+            ? {
+              Config: { Labels: labels },
+              State: { Running: name === names.runner || name === names.container },
+              Mounts: [],
+            }
+            : { Labels: labels }]),
+          stderr: "",
+        };
+      }
+      mutationCalls.push(args);
+      throw new Error("a live canonical worker must preserve the whole run");
+    });
+    const verifySentinel = vi.fn();
+    const removeDirectory = vi.fn();
+
+    const runs = await reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+      verifySentinel,
+      resolveHarnessDirectory: () => "/private/harness",
+      removeDirectory,
+    });
+
+    expect(runs).toMatchObject([{ runId, classification: "live" }]);
+    expect(mutationCalls).toEqual([]);
+    expect(verifySentinel).not.toHaveBeenCalled();
+    expect(removeDirectory).not.toHaveBeenCalled();
+    expect(records).toEqual(new Map([
+      [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
+      [`container:${names.runner}`, ownershipLabels(runId, "runner", owner)],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+      [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
+    ]));
+  });
+
+  it("aborts a stale run when worker state becomes uncertain before reclamation", async () => {
+    const runId = "4".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 74,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:740",
+      scope: testOwnerScope,
+    };
+    const labels = ownershipLabels(runId, "restore", owner);
+    let inspections = 0;
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[0] === "container" && args[1] === "ls") {
+        return { stdout: names.restore, stderr: "" };
+      }
+      if (args[1] === "ls") return { stdout: "", stderr: "" };
+      if (args[1] === "inspect") {
+        inspections += 1;
+        return {
+          stdout: JSON.stringify([{
+            Config: { Labels: labels },
+            State: inspections === 1 ? { Running: false } : {},
+          }]),
+          stderr: "",
+        };
+      }
+      throw new Error("uncertain worker state must not be removed");
+    });
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+    })).rejects.toThrow("restore container with uncertain state");
+    expect(dockerRunner.mock.calls.some(([args]) => args[1] === "rm")).toBe(false);
+  });
+
+  it("rechecks stopped worker state at removal and never force-removes a restart race", async () => {
+    const runId = "5".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 75,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:750",
+      scope: testOwnerScope,
+    };
+    const records = new Map([
+      [`container:${names.runner}`, ownershipLabels(runId, "runner", owner)],
+      [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+      [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
+    ]);
+    let runnerInspections = 0;
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        return {
+          stdout: [...records.keys()]
+            .filter((key) => key.startsWith(`${type}:`))
+            .map((key) => key.slice(type.length + 1))
+            .join("\n"),
+          stderr: "",
+        };
+      }
+      if (args[1] === "inspect") {
+        const type = args[0];
+        const name = args[2];
+        const labels = records.get(`${type}:${name}`);
+        if (!labels) throw missingContainerError(name);
+        if (name === names.runner) runnerInspections += 1;
+        return {
+          stdout: JSON.stringify([type === "container"
+            ? {
+              Config: { Labels: labels },
+              State: {
+                Running: name === names.container || (name === names.runner && runnerInspections >= 3),
+              },
+              Mounts: [],
+            }
+            : { Labels: labels }]),
+          stderr: "",
+        };
+      }
+      throw new Error("active worker must not be removed");
+    });
+    const removeDirectory = vi.fn();
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+      verifySentinel: vi.fn(),
+      resolveHarnessDirectory: () => "/private/harness",
+      removeDirectory,
+    })).rejects.toThrow(`active PostgreSQL harness container ${names.runner}`);
+    expect(dockerRunner.mock.calls.some(([args]) => args[1] === "rm")).toBe(false);
+    expect(removeDirectory).not.toHaveBeenCalled();
+    expect(records.has(`container:${names.container}`)).toBe(true);
+    expect(records.has(`volume:${names.volume}`)).toBe(true);
+    expect(records.has(`network:${names.network}`)).toBe(true);
+  });
+
+  it("preserves all companion resources when stopped worker removal fails", async () => {
+    const runId = "1".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 71,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:710",
+      scope: testOwnerScope,
+    };
+    const records = new Map([
+      [`container:${names.runner}`, ownershipLabels(runId, "runner", owner)],
+      [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+      [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
+    ]);
+    const removalFailure = new Error("runner removal failed");
+    let runnerRemovalAttempts = 0;
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        return {
+          stdout: [...records.keys()]
+            .filter((key) => key.startsWith(`${type}:`))
+            .map((key) => key.slice(type.length + 1))
+            .join("\n"),
+          stderr: "",
+        };
+      }
+      if (args[1] === "inspect") {
+        const type = args[0];
+        const name = args[2];
+        const labels = records.get(`${type}:${name}`);
+        if (!labels) throw missingContainerError(name);
+        return {
+          stdout: JSON.stringify([type === "container"
+            ? {
+              Config: { Labels: labels },
+              State: { Running: name === names.container },
+              Mounts: [],
+            }
+            : { Labels: labels }]),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "rm" && args[2] === names.runner) {
+        runnerRemovalAttempts += 1;
+        throw removalFailure;
+      }
+      throw new Error("worker failure must preserve database and companion resources");
+    });
+    const verifySentinel = vi.fn();
+    const removeDirectory = vi.fn();
+
+    await expect(reclaimProvenOrphans({
+      dockerRunner,
+      processProbe: vi.fn(),
+      readFingerprint: () => `${owner.birth}-reused`,
+      readScope: () => testOwnerScope,
+      verifySentinel,
+      resolveHarnessDirectory: () => "/private/harness",
+      removeDirectory,
+      delay: vi.fn(),
+    })).rejects.toBe(removalFailure);
+
+    expect(runnerRemovalAttempts).toBe(MAX_DOCKER_REMOVE_ATTEMPTS);
+    expect(verifySentinel).not.toHaveBeenCalled();
+    expect(removeDirectory).not.toHaveBeenCalled();
+    expect(records.has(`container:${names.container}`)).toBe(true);
+    expect(records.has(`volume:${names.volume}`)).toBe(true);
+    expect(records.has(`network:${names.network}`)).toBe(true);
   });
 
   it("treats an exact container disappearance after discovery as idempotent recovery", async () => {
@@ -1231,8 +1540,8 @@ describe("PostgreSQL harness utilities", () => {
       if (args[1] === "inspect") {
         const type = args[0];
         const labels = records.get(`${type}:${args[2]}`);
-        if (!labels && type === "container" && args[2] === names.container) {
-          throw missingContainer;
+        if (!labels && type === "container") {
+          throw args[2] === names.container ? missingContainer : missingContainerError(args[2]);
         }
         return {
           stdout: JSON.stringify([type === "container"
@@ -1286,6 +1595,9 @@ describe("PostgreSQL harness utilities", () => {
         return { stdout: names.container, stderr: "" };
       }
       if (args[1] === "ls") return { stdout: "", stderr: "" };
+      if (args[1] === "inspect" && args[2] !== names.container) {
+        throw missingContainerError(args[2]);
+      }
       return {
         stdout: JSON.stringify([{
           Config: { Labels: labels },
@@ -1366,6 +1678,7 @@ describe("PostgreSQL harness utilities", () => {
       }
       if (args[1] === "ls") return { stdout: "", stderr: "" };
       if (args[1] === "inspect") {
+        if (args[2] !== names.container) throw missingContainerError(args[2]);
         return {
           stdout: JSON.stringify([{ Config: { Labels: labels }, State: { Running: false } }]),
           stderr: "",
@@ -1407,6 +1720,7 @@ describe("PostgreSQL harness utilities", () => {
       }
       if (args[1] === "ls") return { stdout: "", stderr: "" };
       if (args[1] === "inspect") {
+        if (args[2] !== names.container) throw missingContainerError(args[2]);
         return {
           stdout: JSON.stringify([{
             Config: { Labels: labels },
@@ -1461,7 +1775,8 @@ describe("PostgreSQL harness utilities", () => {
       }
       if (args[1] === "inspect") {
         const type = args[0];
-        const labels = records.get(`${type}:${args[2]}`) ?? {};
+        const labels = records.get(`${type}:${args[2]}`);
+        if (!labels && type === "container") throw missingContainerError(args[2]);
         return {
           stdout: JSON.stringify([type === "container"
             ? { Config: { Labels: labels }, State: { Running: true }, Mounts: [] }
@@ -1516,6 +1831,7 @@ describe("PostgreSQL harness utilities", () => {
       }
       if (args[1] === "ls") return { stdout: "", stderr: "" };
       if (args[1] === "inspect") {
+        if (args[2] !== names.container) throw missingContainerError(args[2]);
         return {
           stdout: JSON.stringify([{ Config: { Labels: labels }, State: { Running: false }, Mounts: [] }]),
           stderr: "",
@@ -1560,6 +1876,9 @@ describe("PostgreSQL harness utilities", () => {
       }
       if (args[1] === "ls") return { stdout: "", stderr: "" };
       if (args[1] === "inspect" && args[2] === "foreign-ambiguous-container") throw inspectionFailure;
+      if (args[0] === "container" && args[1] === "inspect") {
+        throw missingContainerError(args[2]);
+      }
       if (args[1] === "inspect") {
         return { stdout: JSON.stringify([{ Labels: labels }]), stderr: "" };
       }

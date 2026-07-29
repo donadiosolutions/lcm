@@ -748,7 +748,9 @@ export function createProcessLifecycle(processRunner = runProcess, dependencies 
     active.add(entry);
     const remove = () => {
       if (entry.escalation) clearTimeout(entry.escalation);
-      active.delete(entry);
+      if (!entry.processTree || !entry.child || !processTreeAlive(entry)) {
+        active.delete(entry);
+      }
     };
     void operation.then(remove, remove);
     return operation;
@@ -756,8 +758,9 @@ export function createProcessLifecycle(processRunner = runProcess, dependencies 
 
   const stop = async () => {
     stopping = true;
+    const stoppingEntries = [...active];
     const treeTerminations = [];
-    for (const entry of active) {
+    for (const entry of stoppingEntries) {
       if (!entry.terminateOnStop || !entry.child) continue;
       if (entry.processTree) {
         treeTerminations.push(terminateProcessTree(entry));
@@ -778,8 +781,13 @@ export function createProcessLifecycle(processRunner = runProcess, dependencies 
       entry.escalation.unref?.();
     }
     await Promise.all(treeTerminations);
-    while (active.size > 0) {
-      await Promise.allSettled([...active].map((entry) => entry.operation));
+    await Promise.allSettled(stoppingEntries.map((entry) => entry.operation));
+    for (const entry of stoppingEntries) {
+      if (entry.escalation) clearTimeout(entry.escalation);
+      if (entry.processTree && entry.child && processTreeAlive(entry)) {
+        throw new Error("PostgreSQL harness test process tree remained live after settlement");
+      }
+      active.delete(entry);
     }
   };
 
@@ -910,18 +918,32 @@ export async function removeOwnedResource(
   const delay = dependencies.delay ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
   let lastError;
   for (let attempt = 0; attempt < MAX_DOCKER_REMOVE_ATTEMPTS; attempt += 1) {
-    let labels;
+    let record;
     try {
-      labels = await inspectLabels(type, name, dockerRunner);
+      record = await inspectDockerObject(type, name, dockerRunner);
     } catch (error) {
       if (isMissingDockerObjectError(error, type, name)) return;
       throw error;
     }
+    const labels = type === "container" ? record?.Config?.Labels ?? {} : record?.Labels ?? {};
     if (!labelsMatchOwnership(labels, expectedLabels)) {
       throw new Error(`refusing to remove ${type} with changed PostgreSQL harness ownership`);
     }
+    if (type === "container" && dependencies.requireStoppedContainer === true) {
+      if (record?.State?.Running === true) {
+        throw new Error(`refusing to reclaim active PostgreSQL harness container ${name}`);
+      }
+      if (record?.State?.Running !== false) {
+        throw new Error(`refusing to reclaim PostgreSQL harness container ${name} with uncertain state`);
+      }
+    }
     const args = type === "container"
-      ? ["container", "rm", "--force", name]
+      ? [
+        "container",
+        "rm",
+        ...(dependencies.requireStoppedContainer === true ? [] : ["--force"]),
+        name,
+      ]
       : [type, "rm", name];
     try {
       await dockerRunner(args);
@@ -1215,13 +1237,79 @@ export async function reclaimProvenOrphans(dependencies = {}) {
     if (run.classification !== "stale") continue;
     const runFailures = [];
     const byKind = new Map(run.resources.map((resource) => [resource.kind, resource]));
+    const names = createRunNames(run.runId);
     const database = byKind.get("database");
+    const workers = [];
+    let activeWorker = false;
+    for (const [kind, name] of [
+      ["restore", names.restore],
+      ["runner", names.runner],
+    ]) {
+      const expectedLabels = ownershipLabels(run.runId, kind, run.owner);
+      let record;
+      try {
+        record = await inspectDockerObject("container", name, dockerRunner);
+      } catch (error) {
+        if (isMissingDockerObjectError(error, "container", name)) continue;
+        runFailures.push(error);
+        break;
+      }
+      const labels = record?.Config?.Labels ?? {};
+      if (!labelsMatchOwnership(labels, expectedLabels)) {
+        runFailures.push(
+          new Error(`refusing to reclaim ${kind} container with changed PostgreSQL harness ownership`),
+        );
+        break;
+      }
+      if (record?.State?.Running === true) {
+        activeWorker = true;
+        break;
+      }
+      if (record?.State?.Running !== false) {
+        runFailures.push(
+          new Error(`refusing to reclaim ${kind} container with uncertain state`),
+        );
+        break;
+      }
+      workers.push({
+        type: "container",
+        name,
+        kind,
+        labels: expectedLabels,
+      });
+    }
+    if (activeWorker) {
+      run.classification = "live";
+      continue;
+    }
+    if (runFailures.length > 0) {
+      failures.push(...runFailures);
+      continue;
+    }
+    for (const worker of workers) {
+      try {
+        await removeOwnedResource(
+          worker.type,
+          worker.name,
+          worker.labels,
+          dockerRunner,
+          { ...dependencies, requireStoppedContainer: true },
+        );
+      } catch (error) {
+        runFailures.push(error);
+        break;
+      }
+    }
+    if (runFailures.length > 0) {
+      failures.push(...runFailures);
+      continue;
+    }
     let databaseAbsent = false;
     if (database?.running) {
       try {
         await (dependencies.verifySentinel
-          ? dependencies.verifySentinel(createRunNames(run.runId), run.runId, dockerRunner)
-          : waitForContainerSentinel(createRunNames(run.runId), run.runId, dockerRunner));
+          ? dependencies.verifySentinel(names, run.runId, dockerRunner)
+          : waitForContainerSentinel(names, run.runId, dockerRunner));
       } catch (error) {
         if (!isMissingDockerObjectError(error, "container", database.name)) {
           runFailures.push(error);
@@ -1231,7 +1319,7 @@ export async function reclaimProvenOrphans(dependencies = {}) {
         databaseAbsent = true;
       }
     }
-    for (const kind of ["restore", "runner", "database", "data", "network"]) {
+    for (const kind of ["database", "data", "network"]) {
       const resource = byKind.get(kind);
       if (!resource) continue;
       if (kind === "database" && databaseAbsent) continue;
@@ -1421,6 +1509,8 @@ async function runTests(context, ci, setupDocker = docker, testProcess = runProc
   const env = { ...process.env, ...context.environment };
   delete env.LCM_TEST_POSTGRES_FORK_PROBE;
   delete env.LCM_TEST_POSTGRES_FORK_WORKER_PID_FILE;
+  delete env.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT;
+  if (!ci) env.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT = context.directory;
   const secrets = context.secrets ?? [];
   for (const key of Object.keys(env)) {
     if (key.startsWith("PG") || key === "LCM_POSTGRES_URL" || key === "LCM_POSTGRES_CA_FILE") delete env[key];
