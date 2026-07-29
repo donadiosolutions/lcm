@@ -213,6 +213,42 @@ describe("promoted memory metadata", () => {
     );
   });
 
+  it("rejects an array proxy with a non-numeric reported length before element access", () => {
+    let getterCalls = 0;
+    const prototype = Object.create(Array.prototype) as unknown[];
+    Object.defineProperty(prototype, "0", {
+      get: () => {
+        getterCalls += 1;
+        return "unsafe";
+      },
+    });
+    const target: unknown[] = [];
+    target.length = 1;
+    Object.setPrototypeOf(target, prototype);
+    const values = new Proxy(target, {
+      getOwnPropertyDescriptor: (array, property) => property === "length"
+        ? {
+            configurable: false,
+            enumerable: false,
+            value: undefined,
+            writable: true,
+          }
+        : Reflect.getOwnPropertyDescriptor(array, property),
+    });
+
+    let error: unknown;
+    try {
+      normalizePromotedMetadata({ values });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(getterCalls).toBe(0);
+    expect(error).toBeInstanceOf(TypeError);
+    expect((error as Error).message).toBe(
+      "metadata must be finite acyclic JSON",
+    );
+  });
+
   it("preserves empty, nested, sparse, and non-enumerable array values", () => {
     const sparse: unknown[] = new Array(3);
     Object.defineProperty(sparse, "1", {
