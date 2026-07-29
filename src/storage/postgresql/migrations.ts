@@ -1683,6 +1683,18 @@ export async function runPostgreSqlMigrations(
                        )
                        OR (
                          acl_relations.object_identity OPERATOR(pg_catalog.=)
+                           'table|fenced_leases'
+                         AND privilege.privilege_type OPERATOR(pg_catalog.=)
+                           ANY (ARRAY['SELECT', 'DELETE']::pg_catalog.text[])
+                       )
+                       OR (
+                         acl_relations.object_identity OPERATOR(pg_catalog.=)
+                           'table|passive_event_inbox'
+                         AND privilege.privilege_type OPERATOR(pg_catalog.=)
+                           'SELECT'
+                       )
+                       OR (
+                         acl_relations.object_identity OPERATOR(pg_catalog.=)
                            ANY (
                              ARRAY[
                                'table|messages',
@@ -1708,6 +1720,7 @@ export async function runPostgreSqlMigrations(
                              ARRAY[
                                'sequence|conversations_conversation_id_seq',
                                'sequence|messages_message_id_seq',
+                               'sequence|fenced_leases_fencing_token_seq',
                                'sequence|recall_surfacing_surfacing_id_seq',
                                'sequence|session_instructions_instruction_id_seq'
                              ]::pg_catalog.text[]
@@ -2130,6 +2143,60 @@ export async function runPostgreSqlMigrations(
                                     OPERATOR(pg_catalog.=) 'UPDATE'
                                 )
                               )
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'fenced_leases'
+                              AND (
+                                (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'resource_type',
+                                        'resource_key',
+                                        'owner_machine_id',
+                                        'owner_process_id',
+                                        'operation',
+                                        'expires_at'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'INSERT'
+                                )
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'owner_machine_id',
+                                        'owner_process_id',
+                                        'operation',
+                                        'fencing_token',
+                                        'acquired_at',
+                                        'renewed_at',
+                                        'expires_at',
+                                        'released_at'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'UPDATE'
+                                )
+                              )
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'passive_event_inbox'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'status',
+                                    'attempt_count',
+                                    'claimed_at',
+                                    'claimed_by'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type
+                                OPERATOR(pg_catalog.=) 'UPDATE'
                             )
                           ),
                           false

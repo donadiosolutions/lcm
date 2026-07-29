@@ -23,6 +23,7 @@ import {
   PostgreSqlCommitOutcomeUnknownError,
   PostgreSqlStorageOperationError,
 } from "./errors.js";
+import { derivePostgreSqlAdvisoryLockName } from "./coordination.js";
 
 const MAX_SHORT_TRANSACTION_ATTEMPTS = 3;
 const SHORT_TRANSACTION_RETRY_SQLSTATES = new Set(["40001", "40P01"]);
@@ -325,17 +326,17 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
       await transaction.query({
         text: `SELECT pg_catalog.pg_advisory_xact_lock(
                         pg_catalog.hashtextextended(
-                            $1::pg_catalog.uuid::pg_catalog.text
-                            OPERATOR(pg_catalog.||) ':conversation:'
-                            OPERATOR(pg_catalog.||)
-                              pg_catalog.encode(
-                                public.digest($2::pg_catalog.text, 'sha256'),
-                                'hex'
-                              ),
+                            $1::pg_catalog.text,
                           0
                         )
                       )`,
-        values: [this.projectId, sessionId],
+        values: [
+          derivePostgreSqlAdvisoryLockName(
+            this.projectId,
+            "conversation",
+            sessionId,
+          ),
+        ],
       }, this.context(operation));
       const existing = await this.getConversationBySessionIdWith(
         transaction,

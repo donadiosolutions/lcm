@@ -23,6 +23,10 @@ import type {
   PostgreSqlQueryExecutor,
   PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
+import {
+  derivePostgreSqlAdvisoryLockName,
+  PostgreSqlWorkCoordinator,
+} from "./coordination.js";
 
 const MIN_SAFE_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
@@ -1490,12 +1494,16 @@ implements RedactionAdminRepository {
       await executor.query({
         text: `SELECT pg_catalog.pg_advisory_xact_lock(
                         pg_catalog.hashtextextended(
-                          $1::pg_catalog.uuid::pg_catalog.text
-                            OPERATOR(pg_catalog.||) ':redaction-counters',
+                          $1::pg_catalog.text,
                           0
                         )
                       )`,
-        values: [this.access.projectId],
+        values: [
+          derivePostgreSqlAdvisoryLockName(
+            this.access.projectId,
+            "redaction-counters",
+          ),
+        ],
       }, this.access.context(operation));
       const current = await this.readCounts(executor, operation);
       const projected = {
@@ -1763,22 +1771,34 @@ implements RedactionAdminRepository {
 }
 
 export class PostgreSqlCoordinationRepository
+extends PostgreSqlWorkCoordinator
 implements CoordinationRepository {
   private readonly access: RepositoryAccess;
-  private readonly machineId: string;
 
   constructor(
     executor: RepositoryExecutor,
     projectId: string,
     machineId: string,
   ) {
-    this.access = new RepositoryAccess(executor, projectId, "coordination");
-    this.machineId = uuidV7(
+    const normalizedProjectId = uuidV7(
+      projectId,
+      projectId,
+      "coordination",
+      "construct",
+      "project_id",
+    );
+    const normalizedMachineId = uuidV7(
       machineId,
-      this.access.projectId,
+      normalizedProjectId,
       "coordination",
       "construct",
       "machine_id",
+    );
+    super(executor, normalizedProjectId, normalizedMachineId);
+    this.access = new RepositoryAccess(
+      executor,
+      normalizedProjectId,
+      "coordination",
     );
   }
 
@@ -1832,17 +1852,17 @@ implements CoordinationRepository {
       await executor.query({
         text: `SELECT pg_catalog.pg_advisory_xact_lock(
                         pg_catalog.hashtextextended(
-                          $1::pg_catalog.uuid::pg_catalog.text
-                            OPERATOR(pg_catalog.||) ':session-ingest:'
-                            OPERATOR(pg_catalog.||)
-                              pg_catalog.encode(
-                                public.digest($2, 'sha256'),
-                                'hex'
-                              ),
+                          $1::pg_catalog.text,
                           0
                         )
                       )`,
-        values: [this.access.projectId, normalizedSessionId],
+        values: [
+          derivePostgreSqlAdvisoryLockName(
+            this.access.projectId,
+            "session-ingest",
+            normalizedSessionId,
+          ),
+        ],
       }, this.access.context(operation));
       const existing = await executor.query<SessionIngestRow>({
         text: `SELECT ingest_key, session_id, message_count, completed_at

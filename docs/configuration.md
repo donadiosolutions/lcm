@@ -302,6 +302,8 @@ that this runtime role will use:
 [`postgresql-runtime-transcript-grants.sql`](postgresql-runtime-transcript-grants.sql),
 and
 [`postgresql-runtime-memory-grants.sql`](postgresql-runtime-memory-grants.sql).
+Direct issue #90 coordination callers additionally use
+[`postgresql-runtime-coordination-grants.sql`](postgresql-runtime-coordination-grants.sql).
 Run them as an administrator, substituting the deployment's restricted runtime
 role:
 
@@ -321,6 +323,10 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file docs/postgresql-runtime-memory-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-coordination-grants.sql
 ```
 
 The transcript grant permits immutable inserts, provenance reads, and bounded
@@ -335,6 +341,14 @@ limited to their six owned mutable-state tables; generated search data is
 removed with promoted memory, while identity, conversations, summaries,
 transcripts, checkpoints, events, and leases are retained. See
 [PostgreSQL memory and administration](postgresql-memory-administration.md).
+The coordination grant permits project-scoped lease reads, bounded deletes,
+column-limited acquisition/renewal/release updates, fencing-sequence `USAGE`,
+and column-limited passive-inbox claims. It grants no inbox insertion,
+completion, deletion, payload update, table truncation, sequence inspection or
+restart, schema mutation, or unrelated-domain access. Applying it exposes only
+the staged programmatic primitives described in
+[PostgreSQL cross-machine coordination](postgresql-coordination.md); it does
+not enable the application backend or start a worker.
 
 Finally restore `LCM_POSTGRES_URL` to the restricted runtime-role URL, run
 `lcm machine register`, pair projects explicitly, and restart the daemon.

@@ -1,6 +1,7 @@
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import type { PostgreSqlQueryOptions } from "../../src/storage/postgresql/contracts.js";
+import { derivePostgreSqlAdvisoryLockName } from "../../src/storage/postgresql/coordination.js";
 import {
   PostgreSqlConversationDataError,
   type PostgreSqlConversationExecutor,
@@ -212,7 +213,16 @@ describe("PostgreSQL conversation repository", () => {
     const advisoryLock = db.query.mock.calls.find(
       ([config]) => config.text.includes("pg_advisory_xact_lock"),
     )?.[0];
-    expect(advisoryLock?.text).toContain("$1::pg_catalog.uuid::pg_catalog.text");
+    expect(advisoryLock).toMatchObject({
+      values: [
+        derivePostgreSqlAdvisoryLockName(
+          projectId,
+          "conversation",
+          "session-a",
+        ),
+      ],
+    });
+    expect(advisoryLock?.text).toContain("$1::pg_catalog.text");
     const paginated = db.query.mock.calls.find(
       ([config]) => config.text.includes("LIMIT $4"),
     )?.[0];
@@ -251,7 +261,13 @@ describe("PostgreSQL conversation repository", () => {
       text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
     });
     expect(db.query.mock.calls[1][0]).toMatchObject({
-      values: [projectId, "new-session"],
+      values: [
+        derivePostgreSqlAdvisoryLockName(
+          projectId,
+          "conversation",
+          "new-session",
+        ),
+      ],
     });
   });
 
