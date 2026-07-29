@@ -161,7 +161,7 @@ function validateLinkedWorktreeTopology(
   // is descriptor-bound; comparing the resolved relationship a second time
   // also fails closed when repository-controlled metadata is retargeted
   // between validation steps.
-  if (parseGitDir(marker, worktreeRoot) !== gitDir) {
+  if (parseGitDir(marker, worktreeRoot).gitDir !== gitDir) {
     throw new Error("Git worktree metadata changed during topology validation");
   }
   if (resolveCommonDir(gitDir) !== commonDir) {

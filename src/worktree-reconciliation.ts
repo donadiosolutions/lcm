@@ -683,6 +683,9 @@ function mergeInstructionCacheRows(
   target: DatabaseSync,
   targetHash: string,
 ): void {
+  // The scoped cache schema supersedes the legacy timestamp merge policy:
+  // timestamps cannot authorize overwriting the same project/scope identity.
+  // Exact duplicates deduplicate; any residual difference fails closed.
   mergeUniqueRows(
     source,
     target,
