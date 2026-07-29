@@ -39,17 +39,34 @@ function check(identity, overrides = {}) {
   };
 }
 
+function pullRequest({
+  login = "dependabot[bot]",
+  type = "Bot",
+  headRef = "dependabot/npm_and_yarn/runtime-dependencies",
+  headRepository = REPOSITORY,
+  baseRepository = REPOSITORY,
+} = {}) {
+  return {
+    user: { login, type },
+    head: { ref: headRef, repo: { full_name: headRepository } },
+    base: { ref: "main", repo: { full_name: baseRepository } },
+  };
+}
+
 test("classifies every coverable and trust-sensitive path family", () => {
   for (const path of [
     "bin/lcm.ts",
-    "bin/nested/tool.ts",
-    "bin/ui.tsx",
+    "bin/lcm",
+    "bin/nested/tool.js",
     "installer/install.ts",
-    "installer/loader.cts",
+    "installer/setup.sh",
     "src/index.ts",
-    "src/index.mts",
-    "src/component.tsx",
-    "src/storage/backend.ts",
+    "src/index.js",
+    "src/prompts/system.yaml",
+    "src/connectors/templates/base.md",
+    "src/storage/postgresql/migrations/001_initial.sql",
+    "scripts/build-runtime.mjs",
+    "scripts/release/channel/select.mjs",
     ".github/codeql/security-extended.yml",
     ".github/workflows/ci.yml",
     ".github/actions/setup/action.yml",
@@ -73,51 +90,67 @@ test("keeps documentation, tests, and unrelated metadata coverage-neutral", () =
     "test/daemon/config.test.ts",
     ".changeset/example.md",
     ".github/copilot-instructions.md",
-    "src/index.js",
-    "src/index.jsx",
-    "src/index.mjs",
-    "src/index.cjs",
+    "scripts/update-gitleaks-patterns.ts",
+    "scripts/harvest-themes.sh",
+    "scripts/release/channel/select.js",
     "nested/src/index.ts",
   ]) {
     assert.equal(requiresGreptileForPath(path), false, path);
   }
 });
 
-test("trusts only exact GitHub bot identities used by repository automation", () => {
+test("trusts only authoritative same-repository Dependabot provenance", () => {
   const greptileConfig = {
-    excludeAuthors: ["dependabot[bot]", "github-actions[bot]"],
+    excludeAuthors: ["dependabot[bot]", "github-actions[bot]", "*"],
   };
-  for (const login of ["dependabot[bot]", "github-actions[bot]"]) {
-    assert.equal(
-      isTrustedAutomationPullRequest({ user: { login, type: "Bot" } }, greptileConfig),
-      true,
-      login,
-    );
-  }
-  for (const user of [
-    { login: "dependabot[bot]", type: "User" },
-    { login: "github-actions[bot]", type: "User" },
-    { login: "renovate[bot]", type: "Bot" },
-    { login: "bcdonadio", type: "User" },
+  assert.equal(
+    isTrustedAutomationPullRequest(pullRequest(), greptileConfig),
+    true,
+  );
+  for (const candidate of [
+    pullRequest({ login: "github-actions[bot]", headRef: "changeset-release/main" }),
+    pullRequest({ login: "renovate[bot]", headRef: "dependabot/npm_and_yarn/dependencies" }),
+    pullRequest({ login: "Dependabot[bot]" }),
+    pullRequest({ type: "User" }),
+    pullRequest({ headRef: "changeset-release/main" }),
+    pullRequest({ headRef: "dependabot/" }),
+    pullRequest({ headRef: "dependabot/npm and yarn/runtime" }),
+    pullRequest({ headRepository: "attacker/lcm" }),
+    pullRequest({ baseRepository: "other/lcm" }),
   ]) {
     assert.equal(
-      isTrustedAutomationPullRequest({ user }, greptileConfig),
+      isTrustedAutomationPullRequest(candidate, greptileConfig),
       false,
-      JSON.stringify(user),
+      JSON.stringify(candidate),
     );
   }
-  for (const pullRequest of [undefined, null, [], {}, { user: {} }]) {
+  for (const malformedPullRequest of [
+    undefined,
+    null,
+    [],
+    {},
+    { user: {} },
+    { ...pullRequest(), head: undefined },
+    { ...pullRequest(), head: { ref: "", repo: { full_name: REPOSITORY } } },
+    { ...pullRequest(), head: { ref: "dependabot/npm", repo: {} } },
+    { ...pullRequest(), base: undefined },
+    { ...pullRequest(), base: { ref: "main", repo: { full_name: "invalid" } } },
+  ]) {
     assert.throws(
-      () => isTrustedAutomationPullRequest(pullRequest, greptileConfig),
-      /pull request|user/u,
-      String(pullRequest),
+      () => isTrustedAutomationPullRequest(malformedPullRequest, greptileConfig),
+      /pull request|user|head|base|repository/u,
+      JSON.stringify(malformedPullRequest),
     );
   }
 });
 
 test("selects Greptile or CI from sensitive classification and authoritative identity", () => {
-  const human = { user: { login: "bcdonadio", type: "User" } };
-  const dependabot = { user: { login: "dependabot[bot]", type: "Bot" } };
+  const human = pullRequest({
+    login: "bcdonadio",
+    type: "User",
+    headRef: "fix/security-boundary",
+  });
+  const dependabot = pullRequest();
   const greptileConfig = { excludeAuthors: ["dependabot[bot]"] };
   assert.deepEqual(selectAdmissionRequirement(human, true, false, greptileConfig), {
     classification: ADMISSION_CLASSIFICATIONS.greptileRequired,
@@ -155,6 +188,29 @@ test("selects Greptile or CI from sensitive classification and authoritative ide
     () => selectAdmissionRequirement(human, true, "false", greptileConfig),
     /must be a boolean/u,
   );
+});
+
+test("requires Greptile for changeset release automation and invalid Dependabot provenance", () => {
+  const greptileConfig = {
+    excludeAuthors: ["dependabot[bot]", "github-actions[bot]", "*"],
+  };
+  for (const candidate of [
+    pullRequest({ login: "github-actions[bot]", headRef: "changeset-release/main" }),
+    pullRequest({ headRef: "changeset-release/main" }),
+    pullRequest({ headRepository: "attacker/lcm" }),
+  ]) {
+    const requirement = selectAdmissionRequirement(
+      candidate,
+      true,
+      false,
+      greptileConfig,
+    );
+    assert.equal(requirement.classification, ADMISSION_CLASSIFICATIONS.greptileRequired);
+    assert.equal(requirement.sensitiveDiff, true);
+    assert.equal(requirement.trustedAutomation, false);
+    assert.equal(requirement.greptileRequired, true);
+    assert.equal(typeof requirement.excludedAuthorPattern, "string");
+  }
 });
 
 test("compares only decision-driving fields across reordered file audits", () => {
@@ -202,9 +258,11 @@ test("matches Greptile excluded-author globs while requiring GitHub Bot type", (
   assert.equal(excludedGreptileAuthorPattern("DEPENDABOT[BOT]", {
     excludeAuthors: ["dependabot[bot]"],
   }), "dependabot[bot]");
-  assert.equal(isTrustedAutomationPullRequest({
-    user: { login: "release-bot", type: "User" },
-  }, { excludeAuthors: ["*-bot"] }), false);
+  assert.equal(isTrustedAutomationPullRequest(pullRequest({
+    login: "release-bot",
+    type: "User",
+    headRef: "changeset-release/main",
+  }), { excludeAuthors: ["*-bot"] }), false);
 });
 
 test("fails closed when the trusted Greptile configuration is malformed", () => {
@@ -214,6 +272,11 @@ test("fails closed when the trusted Greptile configuration is malformed", () => 
     assert.throws(() => parseGreptileConfig(config), /greptile/u);
     assert.throws(() => selectAdmissionRequirement({
       user: { login: "dependabot[bot]", type: "Bot" },
+      head: {
+        ref: "dependabot/npm_and_yarn/runtime-dependencies",
+        repo: { full_name: REPOSITORY },
+      },
+      base: { repo: { full_name: REPOSITORY } },
     }, true, false, config), /greptile/u);
   }
 });
@@ -229,6 +292,11 @@ test("fails closed when the checked-out Greptile configuration cannot be parsed"
       configPath,
     ], JSON.stringify({
       user: { login: "dependabot[bot]", type: "Bot" },
+      head: {
+        ref: "dependabot/npm_and_yarn/runtime-dependencies",
+        repo: { full_name: REPOSITORY },
+      },
+      base: { repo: { full_name: REPOSITORY } },
     })), /valid JSON/u);
   } finally {
     rmSync(temporaryDirectory, { force: true, recursive: true });
@@ -577,7 +645,7 @@ test("exposes the complete policy through its deterministic CLI command seam", (
   assert.deepEqual(JSON.parse(runPolicyCommand(
     "select-admission",
     ["true", "false", "greptile.json"],
-    JSON.stringify({ user: { login: "dependabot[bot]", type: "Bot" } }),
+    JSON.stringify(pullRequest()),
   )), {
     classification: ADMISSION_CLASSIFICATIONS.greptileExcludedAuthor,
     sensitiveDiff: true,

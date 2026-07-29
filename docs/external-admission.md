@@ -71,10 +71,12 @@ and the `external-admission` status on `HEAD_SHA`.
 - **Success:** one fresh and final exact-SHA snapshot proves authenticated
   Greptile plus DCO success for sensitive changes from normal contributors, or
   authenticated canonical CI plus DCO success for either coverage-neutral
-  changes or sensitive changes authored by an authoritative GitHub `Bot` whose
-  login is explicitly excluded by trusted root `greptile.json`. The CI check
-  must resolve to a successful canonical pull-request workflow run for the same
-  repository and head SHA.
+  changes or sensitive same-repository Dependabot changes. The Dependabot
+  exception requires the exact `dependabot[bot]` login, GitHub `Bot` type, a
+  non-empty `dependabot/` head ref, equal authoritative head/base repository
+  names, and an explicit match in trusted root `greptile.json`. The CI check
+  must resolve to a successful canonical pull-request workflow run for the
+  same repository and head SHA.
 - **Failure:** a required check is terminally unsuccessful, CI provenance is
   invalid, or evaluation encounters an API or policy error. Inspect the linked
   workflow run before retrying.
@@ -84,11 +86,15 @@ and the `external-admission` status on `HEAD_SHA`.
 The repository-root [`greptile.json`](../greptile.json) lists authors that
 Greptile itself excludes from review. External admission reads that file only
 from the trusted workflow revision, never from the pull request head. The
-current configuration excludes `dependabot[bot]` and `github-actions[bot]`.
+current configuration excludes only `dependabot[bot]`.
 
-An excluded login bypasses Greptile only when GitHub identifies the
-authoritative pull-request author as type `Bot`. A human account with a matching
-login remains on the Greptile path.
+An excluded login bypasses Greptile only for authoritative same-repository
+Dependabot provenance: the pull-request author must have the exact
+`dependabot[bot]` login and GitHub type `Bot`, the head ref must start with
+`dependabot/` and contain a suffix, and the authoritative head and base
+repository names must match exactly. A human account, a different bot,
+cross-repository head, non-Dependabot branch, or absent/malformed provenance
+remains on the Greptile path or fails evaluation closed.
 
 Because it controls this exception, changing `greptile.json` is itself a
 non-bypassable trust-sensitive diff. It requires authenticated Greptile Review
@@ -96,11 +102,20 @@ plus DCO on the exact PR head for every author, including an author excluded by
 the current trusted configuration. This also applies when `greptile.json` is a
 rename's `previous_filename`.
 
-For another coverable or trust-sensitive diff, an excluded GitHub Bot follows
-the exact-head canonical CI plus DCO path. Other authors require authenticated
-Greptile Review plus DCO. The evaluator re-reads the current PR identity,
-changed-file classification, and trusted configuration before it posts
-success.
+For another coverable or trust-sensitive diff, qualifying Dependabot
+provenance follows the exact-head canonical CI plus DCO path. Other authors
+require authenticated Greptile Review plus DCO. In particular,
+`github-actions[bot]` and the `changeset-release/main` version PR always require
+Greptile for sensitive changes. The evaluator re-reads the current PR
+identity, changed-file classification, and trusted configuration before it
+posts success.
+
+Sensitive paths include every file below `bin/`, `installer/`, and `src/`
+(including shipped prompt and connector assets and PostgreSQL migrations);
+every `.mjs` file below `scripts/` at any depth; trust-sensitive `.github`
+automation; `greptile.json`; package manifests and lockfiles; and Vitest or
+TypeScript configuration. Tests, documentation, Changesets metadata, and other
+paths remain coverage-neutral unless a rename's previous path is sensitive.
 
 Author matching is case-insensitive. The supported Greptile-compatible glob
 syntax is `*` and `?`; `[`, `]`, and `!` are literal characters, so

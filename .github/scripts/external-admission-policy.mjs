@@ -35,7 +35,8 @@ const WAITING_CI_RUN_STATES = new Set([
 ]);
 
 const GREPTILE_REQUIRED_PATHS = [
-  /^(?:bin|installer|src)\/.+\.(?:[cm]?ts|tsx)$/u,
+  /^(?:bin|installer|src)\/.+/u,
+  /^scripts\/.+\.mjs$/u,
   /^\.github\/(?:actions|codeql|workflows|scripts)\/.+/u,
   /^package(?:-lock)?\.json$/u,
   /^greptile\.json$/u,
@@ -53,6 +54,14 @@ function requireNonEmptyString(value, label) {
     throw new TypeError(`${label} must be a non-empty string`);
   }
   return value;
+}
+
+function requireRepositoryFullName(value, label) {
+  const repository = requireNonEmptyString(value, label);
+  if (!/^[^/\s]+\/[^/\s]+$/u.test(repository)) {
+    throw new TypeError(`${label} must be an owner/repository name`);
+  }
+  return repository;
 }
 
 function requireBoolean(value, label) {
@@ -160,7 +169,21 @@ export function isTrustedAutomationPullRequest(pullRequest, greptileConfig) {
   }
   const login = requireNonEmptyString(pullRequest.user?.login, "pull request user login");
   const type = requireNonEmptyString(pullRequest.user?.type, "pull request user type");
-  return type === "Bot"
+  const headRef = requireNonEmptyString(pullRequest.head?.ref, "pull request head ref");
+  const headRepository = requireRepositoryFullName(
+    pullRequest.head?.repo?.full_name,
+    "pull request head repository",
+  );
+  const baseRepository = requireRepositoryFullName(
+    pullRequest.base?.repo?.full_name,
+    "pull request base repository",
+  );
+  return login === "dependabot[bot]"
+    && type === "Bot"
+    && headRef.startsWith("dependabot/")
+    && headRef.length > "dependabot/".length
+    && !/\s/u.test(headRef)
+    && headRepository === baseRepository
     && excludedGreptileAuthorPattern(login, greptileConfig) !== undefined;
 }
 
