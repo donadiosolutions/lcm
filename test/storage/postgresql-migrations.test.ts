@@ -436,7 +436,8 @@ describe("PostgreSQL migration runner", () => {
   });
 
   it("pins the complete latest PostgreSQL 18 definition inventory", () => {
-    const snapshot = loadPostgreSqlSchemaSnapshots().at(-1)!;
+    const snapshots = loadPostgreSqlSchemaSnapshots();
+    const snapshot = snapshots.at(-1)!;
 
     expect(getPostgreSqlSchemaSnapshotExpectations(snapshot)).toMatchObject({
       definitionGroupCounts: [52, 3, 174, 15, 225, 6, 24, 30, 210],
@@ -453,6 +454,26 @@ describe("PostgreSQL migration runner", () => {
       ],
       definitionObjectCount: 739,
     });
+    expect(snapshots.map(({ migrationId, definitionHashes }) => ({
+      migrationId,
+      constraintSha256: definitionHashes.constraint,
+    }))).toEqual([
+      {
+        migrationId: "0002_schema_baseline",
+        constraintSha256:
+          "8bb79c117c498a89c920826ff65b88ad615f871ba3e8607e4b00d1d115d9aa1a",
+      },
+      {
+        migrationId: "0003_machine_identity_key",
+        constraintSha256:
+          "4698227bc02a8d777955eb41286a4964dda8da82d1561c9a154b67e2a034906f",
+      },
+      {
+        migrationId: "0004_machine_display_name",
+        constraintSha256:
+          "1cf8dc0e9303c7bdd086bcae679edc31493d26f67c81999c8e5b2fba491e0778",
+      },
+    ]);
   });
 
   it.each([

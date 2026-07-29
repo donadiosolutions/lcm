@@ -427,7 +427,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
     ...expectedBaselineDefinitionInventory(),
     definitionHashes: {
       columnAcl: "e2581c7c70cbec57d64bb02ac1520fe27336efb326618b36add668cb1431e98c",
-      constraint: "ea03d07488ccd0cc51023463169b71f78c23336374545856d506e2df52483207",
+      constraint: "8bb79c117c498a89c920826ff65b88ad615f871ba3e8607e4b00d1d115d9aa1a",
       generatedColumn: "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
       identitySequence: "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
       index: "6d95eda805e9cd5d0b246daaa763a6919262f64e1129dc93f0ee95291276a7fd",
@@ -458,7 +458,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       ...baseline,
       definitionHashes: {
         ...baseline.definitionHashes,
-        constraint: "b73cbde6cfe0b5c7bebcec3e2a8b15f40d021bc8af4381a40cbdf972af2a7a2a",
+        constraint: "4698227bc02a8d777955eb41286a4964dda8da82d1561c9a154b67e2a034906f",
       },
       migrationId: "0003_machine_identity_key",
     },

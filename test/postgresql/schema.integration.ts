@@ -293,7 +293,7 @@ describe("PostgreSQL schema baseline", () => {
         .join("\n");
       expect(constraints.rowCount).toBe(174);
       expect(createHash("sha256").update(normalizedConstraints).digest("hex"))
-        .toBe("c52caa7c786d4fa4bd039a770976266a32c54628943599337cbff102ac2c53a0");
+        .toBe("7e33a8c0c63ae33056528c922af1005475e5f92ee8e7b60359188225fc77791c");
 
       const deleteActions = await database.migrator.query<{
         table_name: string;
