@@ -690,10 +690,17 @@ describe("project map", () => {
     })).toMatchObject({ changed: true });
 
     writeOwner("windows-birth", "c".repeat(32), Date.now());
-    expect(() => setRemoteProjectBinding(remoteProjectId, {
-      canonical,
-      _lockObserverForTesting: portableObserver("win32", "windows-birth"),
-    })).toThrow(`owned by live PID ${process.pid}`);
+    const previousSystemRoot = process.env.SystemRoot;
+    process.env.SystemRoot = "C:\\Windows";
+    try {
+      expect(() => setRemoteProjectBinding(remoteProjectId, {
+        canonical,
+        _lockObserverForTesting: portableObserver("win32", "windows-birth"),
+      })).toThrow(`owned by live PID ${process.pid}`);
+    } finally {
+      if (previousSystemRoot === undefined) delete process.env.SystemRoot;
+      else process.env.SystemRoot = previousSystemRoot;
+    }
     rmSync(lockPath);
 
     writeOwner(null, "d".repeat(32), Date.now());

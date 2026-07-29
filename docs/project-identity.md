@@ -315,6 +315,12 @@ remain live regardless of age. Malformed, symlinked, and non-regular locks
 always fail closed. A concurrent rebind or entry removal also fails closed; it
 is never overwritten by a stale unlink.
 
+Process-birth inspection never searches `PATH` or the current directory for
+system helpers. LCM invokes the platform's fixed absolute `ps` path, or
+PowerShell beneath a drive-absolute Windows `SystemRoot`. Missing helpers,
+unsupported platforms, and missing or relative `SystemRoot` values make a live
+owner ambiguous and keep the lock in place.
+
 Remote project create, link, and unlink operations also share a cross-domain
 identity lock with machine recovery. Project operations take the project lock
 first and the cross-domain lock second; recovery takes only the cross-domain
