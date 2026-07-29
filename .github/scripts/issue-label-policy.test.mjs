@@ -1366,6 +1366,10 @@ test("redacts credentials before issue content enters model prompts", () => {
     redactPromptText(boundaryToken, "before [RED".length),
     "before ",
   );
+  assert.equal(
+    redactPromptText("literal[truncated", "literal[".length),
+    "literal[",
+  );
   assert.throws(() => redactPromptText("text", -1), /non-negative integer/u);
 
   const general = buildClassificationPrompt(
