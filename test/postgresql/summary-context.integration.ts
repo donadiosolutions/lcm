@@ -230,30 +230,35 @@ async function waitForRuntimeLockWaiters(
   queryFragment: string,
   minimum: number,
 ): Promise<void> {
+  const observer = new PostgreSqlRuntime(settings(database.adminUrl));
   let observed: readonly {
     readonly pid: number;
     readonly wait_event: string | null;
     readonly query: string;
   }[] = [];
-  for (let attempt = 0; attempt < 160; attempt += 1) {
-    const result = await database.migrator.query<{
-      pid: number;
-      wait_event: string | null;
-      query: string;
-    }>({
-      text: `SELECT pid, wait_event, query
-             FROM pg_catalog.pg_stat_activity
-             WHERE datname = pg_catalog.current_database()
-               AND usename = 'lcm_test_runtime'
-               AND state = 'active'
-               AND wait_event_type = 'Lock'
-               AND query LIKE $1
-             ORDER BY pid`,
-      values: [`%${queryFragment}%`],
-    }, { domain: "summaries", operation: "waitForSummaryContextLockWaiters" });
-    observed = result.rows;
-    if (observed.length >= minimum) return;
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  try {
+    for (let attempt = 0; attempt < 160; attempt += 1) {
+      const result = await observer.query<{
+        pid: number;
+        wait_event: string | null;
+        query: string;
+      }>({
+        text: `SELECT pid, wait_event, query
+               FROM pg_catalog.pg_stat_activity
+               WHERE datname = pg_catalog.current_database()
+                 AND usename = 'lcm_test_runtime'
+                 AND state = 'active'
+                 AND wait_event_type = 'Lock'
+                 AND query LIKE $1
+               ORDER BY pid`,
+        values: [`%${queryFragment}%`],
+      }, { domain: "summaries", operation: "waitForSummaryContextLockWaiters" });
+      observed = result.rows;
+      if (observed.length >= minimum) return;
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    }
+  } finally {
+    await observer.close();
   }
   throw new Error(
     `expected ${minimum} runtime lock waiters for ${queryFragment}; observed ${
@@ -266,6 +271,7 @@ async function waitForSharedAdvisoryLockWaiters(
   database: PostgreSqlTestDatabase,
   minimum: number,
 ): Promise<void> {
+  const observer = new PostgreSqlRuntime(settings(database.adminUrl));
   let observed: readonly {
     readonly classid: number;
     readonly objid: number;
@@ -273,66 +279,70 @@ async function waitForSharedAdvisoryLockWaiters(
     readonly waiter_count: number;
     readonly blocking_pids: number[];
   }[] = [];
-  for (let attempt = 0; attempt < 160; attempt += 1) {
-    const result = await database.migrator.query<{
-      classid: number;
-      objid: number;
-      objsubid: number;
-      waiter_pid: number;
-      blocking_pids: number[];
-    }>({
-      text: `SELECT DISTINCT pending.classid,
-                             pending.objid,
-                             pending.objsubid,
-                             activity.pid::pg_catalog.int4 AS waiter_pid,
-                             pg_catalog.pg_blocking_pids(activity.pid)
-                               AS blocking_pids
-             FROM pg_catalog.pg_stat_activity AS activity
-             INNER JOIN pg_catalog.pg_locks AS pending
-               ON pending.pid = activity.pid
-              AND pending.locktype = 'advisory'
-              AND NOT pending.granted
-             WHERE activity.datname = pg_catalog.current_database()
-               AND activity.usename = 'lcm_test_runtime'
-               AND activity.state = 'active'
-               AND activity.wait_event_type = 'Lock'
-             ORDER BY pending.classid, pending.objid, pending.objsubid,
-                      waiter_pid`,
-    }, { domain: "summaries", operation: "waitForSharedAdvisoryLockWaiters" });
-    const byIdentity = new Map<string, {
-      classid: number;
-      objid: number;
-      objsubid: number;
-      waiter_pids: number[];
-      blocking_pids: number[];
-    }>();
-    for (const row of result.rows) {
-      const identity = `${row.classid}:${row.objid}:${row.objsubid}`;
-      const aggregate = byIdentity.get(identity) ?? {
+  try {
+    for (let attempt = 0; attempt < 160; attempt += 1) {
+      const result = await observer.query<{
+        classid: number;
+        objid: number;
+        objsubid: number;
+        waiter_pid: number;
+        blocking_pids: number[];
+      }>({
+        text: `SELECT DISTINCT pending.classid,
+                               pending.objid,
+                               pending.objsubid,
+                               activity.pid::pg_catalog.int4 AS waiter_pid,
+                               pg_catalog.pg_blocking_pids(activity.pid)
+                                 AS blocking_pids
+               FROM pg_catalog.pg_stat_activity AS activity
+               INNER JOIN pg_catalog.pg_locks AS pending
+                 ON pending.pid = activity.pid
+                AND pending.locktype = 'advisory'
+                AND NOT pending.granted
+               WHERE activity.datname = pg_catalog.current_database()
+                 AND activity.usename = 'lcm_test_runtime'
+                 AND activity.state = 'active'
+                 AND activity.wait_event_type = 'Lock'
+               ORDER BY pending.classid, pending.objid, pending.objsubid,
+                        waiter_pid`,
+      }, { domain: "summaries", operation: "waitForSharedAdvisoryLockWaiters" });
+      const byIdentity = new Map<string, {
+        classid: number;
+        objid: number;
+        objsubid: number;
+        waiter_pids: number[];
+        blocking_pids: number[];
+      }>();
+      for (const row of result.rows) {
+        const identity = `${row.classid}:${row.objid}:${row.objsubid}`;
+        const aggregate = byIdentity.get(identity) ?? {
+          classid: row.classid,
+          objid: row.objid,
+          objsubid: row.objsubid,
+          waiter_pids: [],
+          blocking_pids: [],
+        };
+        aggregate.waiter_pids.push(row.waiter_pid);
+        aggregate.blocking_pids.push(...row.blocking_pids);
+        byIdentity.set(identity, aggregate);
+      }
+      observed = [...byIdentity.values()].map((row) => ({
         classid: row.classid,
         objid: row.objid,
         objsubid: row.objsubid,
-        waiter_pids: [],
-        blocking_pids: [],
-      };
-      aggregate.waiter_pids.push(row.waiter_pid);
-      aggregate.blocking_pids.push(...row.blocking_pids);
-      byIdentity.set(identity, aggregate);
+        waiter_count: new Set(row.waiter_pids).size,
+        blocking_pids: [...new Set(row.blocking_pids)].sort((left, right) => (
+          left - right
+        )),
+      }));
+      if (observed.some((row) => (
+        row.waiter_count >= minimum
+        && new Set(row.blocking_pids).size >= 1
+      ))) return;
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
     }
-    observed = [...byIdentity.values()].map((row) => ({
-      classid: row.classid,
-      objid: row.objid,
-      objsubid: row.objsubid,
-      waiter_count: new Set(row.waiter_pids).size,
-      blocking_pids: [...new Set(row.blocking_pids)].sort((left, right) => (
-        left - right
-      )),
-    }));
-    if (observed.some((row) => (
-      row.waiter_count >= minimum
-      && new Set(row.blocking_pids).size >= 1
-    ))) return;
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  } finally {
+    await observer.close();
   }
   throw new Error(
     `expected ${minimum} waiters for one advisory lock identity; observed ${
@@ -521,39 +531,20 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
                    'lcm.normalize_search_text(text)',
                    'EXECUTE'
                  ) AS normalize_execute,
-                 EXISTS (
-                   SELECT 1
-                   FROM pg_catalog.pg_proc AS procedure
-                   CROSS JOIN LATERAL pg_catalog.aclexplode(
-                     COALESCE(
-                       procedure.proacl,
-                       pg_catalog.acldefault('f', procedure.proowner)
-                     )
-                   ) AS privilege
-                   WHERE procedure.oid =
-                     'lcm.normalize_search_text(text)'::pg_catalog.regprocedure
-                     AND privilege.grantee = 0
-                     AND privilege.privilege_type = 'EXECUTE'
+                 has_function_privilege(
+                   'public',
+                   'lcm.normalize_search_text(text)',
+                   'EXECUTE'
                  ) AS normalize_public_execute,
                  has_function_privilege(
                    'lcm_test_runtime',
                    'lcm.enforce_summary_parent_dag_integrity()',
                    'EXECUTE'
                  ) AS cycle_execute,
-                 EXISTS (
-                   SELECT 1
-                   FROM pg_catalog.pg_proc AS procedure
-                   CROSS JOIN LATERAL pg_catalog.aclexplode(
-                     COALESCE(
-                       procedure.proacl,
-                       pg_catalog.acldefault('f', procedure.proowner)
-                     )
-                   ) AS privilege
-                   WHERE procedure.oid =
-                     'lcm.enforce_summary_parent_dag_integrity()'
-                       ::pg_catalog.regprocedure
-                     AND privilege.grantee = 0
-                     AND privilege.privilege_type = 'EXECUTE'
+                 has_function_privilege(
+                   'public',
+                   'lcm.enforce_summary_parent_dag_integrity()',
+                   'EXECUTE'
                  ) AS cycle_public_execute,
                  EXISTS (
                    SELECT 1
