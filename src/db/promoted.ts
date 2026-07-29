@@ -318,43 +318,39 @@ export class PromotedStore {
       | undefined;
     if (!row) return;
 
-    if (fields.content !== undefined) {
-      const newTags = fields.tags !== undefined ? JSON.stringify(fields.tags) : row.tags;
-      if (!this.fts5Available) {
+    // One update can touch the authoritative row more than once and replace
+    // its FTS mirror. Keep every field in one composable operation savepoint so
+    // a late metadata failure cannot retain tags, confidence, or FTS changes.
+    this.withFtsSavepoint(() => {
+      if (fields.content !== undefined) {
+        const newTags = fields.tags !== undefined ? JSON.stringify(fields.tags) : row.tags;
         this.db.prepare(
           "UPDATE promoted SET content = ?, confidence = COALESCE(?, confidence), tags = ?, metadata = COALESCE(?, metadata) WHERE id = ?"
         ).run(fields.content, fields.confidence ?? null, newTags, serializedMetadata ?? null, id);
+        if (this.fts5Available) {
+          this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
+          this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
+            row.rowid,
+            fields.content,
+            newTags,
+          );
+        }
         return;
       }
-      this.withFtsSavepoint(() => {
-        this.db.prepare(
-          "UPDATE promoted SET content = ?, confidence = COALESCE(?, confidence), tags = ?, metadata = COALESCE(?, metadata) WHERE id = ?"
-        ).run(fields.content!, fields.confidence ?? null, newTags, serializedMetadata ?? null, id);
-        this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
-        this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
-          row.rowid,
-          fields.content!,
-          newTags,
-        );
-      });
-    } else {
+
       if (fields.confidence !== undefined) {
         this.db.prepare("UPDATE promoted SET confidence = ? WHERE id = ?").run(fields.confidence, id);
       }
       if (fields.tags !== undefined) {
         const newTags = JSON.stringify(fields.tags);
-        if (!this.fts5Available) {
-          this.db.prepare("UPDATE promoted SET tags = ? WHERE id = ?").run(newTags, id);
-        } else {
-          this.withFtsSavepoint(() => {
-            this.db.prepare("UPDATE promoted SET tags = ? WHERE id = ?").run(newTags, id);
+        this.db.prepare("UPDATE promoted SET tags = ? WHERE id = ?").run(newTags, id);
+        if (this.fts5Available) {
             this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
             this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
               row.rowid,
               row.content,
               newTags,
             );
-          });
         }
       }
       if (serializedMetadata !== undefined) {
@@ -363,7 +359,7 @@ export class PromotedStore {
           id,
         );
       }
-    }
+    });
   }
 
   private withFtsSavepoint(operation: () => void): void {

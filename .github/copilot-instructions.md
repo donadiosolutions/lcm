@@ -61,6 +61,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 
 - Any operation that modifies more than one table must be wrapped in `BEGIN`/`COMMIT`.
 - Flag multi-table writes without transactions — they risk partial writes on crash.
+- Multi-field `PromotedStore.update()` writes (including tags/FTS followed by metadata) must share one operation-level transaction or savepoint. Require deterministic late-field failure tests that prove the base row and search mirror both roll back.
 - Keep checkpoint/count reads, slices derived from those checkpoints, and their inserts in the same repository transaction; otherwise concurrent ingestion can invalidate sequence allocation before the write begins.
 - Transaction context is global across SQLite project executors: reject nested transactions and ordinary repository calls on any project while a transaction callback is active, preventing lock inversion and partial cross-project commits. These transaction-contract errors take precedence over poisoned-handle errors. If transaction rollback fails, preserve the original sanitized operation error while poisoning queued access and evicting the exact pooled handle generation.
 - For transaction-scoped atomic savepoints, poison the executor only when `ROLLBACK TO SAVEPOINT` fails. Once rollback succeeds, a later `RELEASE SAVEPOINT` cleanup failure stays sanitized but must not fence the outer transaction because the operation's writes were already undone.

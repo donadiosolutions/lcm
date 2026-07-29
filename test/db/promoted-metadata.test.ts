@@ -80,6 +80,42 @@ describe("promoted memory metadata", () => {
     });
   });
 
+  it.each([
+    { fts5Available: true, label: "FTS" },
+    { fts5Available: false, label: "fallback" },
+  ])("rolls back tags, metadata, and $label search state after a late metadata failure", ({
+    fts5Available,
+  }) => {
+    const db = makeDb();
+    const store = new PromotedStore(db, fts5Available);
+    const id = store.insert({
+      content: "atomic rollback target",
+      tags: ["original"],
+      projectId: "project",
+      metadata: { source: "original" },
+    });
+    db.exec(`CREATE TRIGGER reject_promoted_metadata
+      BEFORE UPDATE OF metadata ON promoted
+      WHEN NEW.metadata <> OLD.metadata
+      BEGIN SELECT RAISE(ABORT, 'metadata rejected'); END`);
+
+    store.transaction(() => {
+      expect(() => store.update(id, {
+        tags: ["partial"],
+        metadata: { source: "rejected" },
+      })).toThrow("metadata rejected");
+      db.prepare("UPDATE promoted SET confidence = ? WHERE id = ?").run(0.75, id);
+    });
+
+    expect(store.getById(id)).toMatchObject({
+      confidence: 0.75,
+      tags: '["original"]',
+      metadata: '{"source":"original"}',
+    });
+    expect(store.search("atomic rollback", 10, ["original"])).toMatchObject([{ id }]);
+    expect(store.search("atomic rollback", 10, ["partial"])).toEqual([]);
+  });
+
   it("rejects non-object, non-finite, cyclic, exotic, accessor, and unsafe text", () => {
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;
