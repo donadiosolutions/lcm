@@ -1167,6 +1167,12 @@ describe("runDoctor configuration validation", () => {
       pid: 4242,
       startMethod: "existing",
     });
+    mockCollectEventStats.mockReturnValue({
+      captured: 100,
+      unprocessed: 5,
+      errors: 0,
+      lastCapture: "2026-03-26 10:00:00",
+    });
 
     const results = await runDoctor(minimalDeps({
       fetch,
@@ -1185,6 +1191,16 @@ describe("runDoctor configuration validation", () => {
       status: "pass",
       message: "localhost:3737 (up)",
     });
+    expect(results.find((result) => result.name === "events-capture")).toMatchObject({
+      status: "warn",
+      message: expect.stringContaining("storage readiness could not be authenticated"),
+    });
+    expect(results.find((result) => result.name === "events-capture")?.message)
+      .toContain("restore access to the daemon token and authenticated diagnostics");
+    expect(results.find((result) => result.name === "events-capture")?.message)
+      .not.toContain("storage is unavailable");
+    expect(results.find((result) => result.name === "events-capture")?.message)
+      .not.toContain("queued for automatic daemon processing");
   });
 
   it("does not send an authenticated health request when the daemon token is empty", async () => {
@@ -1206,8 +1222,14 @@ describe("runDoctor configuration validation", () => {
       pid: 4242,
       startMethod: "existing",
     });
+    mockCollectEventStats.mockReturnValue({
+      captured: 100,
+      unprocessed: 5,
+      errors: 0,
+      lastCapture: "2026-03-26 10:00:00",
+    });
 
-    await runDoctor(minimalDeps({
+    const results = await runDoctor(minimalDeps({
       fetch,
       readFileSync: (path: string) => {
         if (path.endsWith("daemon.token")) return " \n";
@@ -1220,6 +1242,16 @@ describe("runDoctor configuration validation", () => {
       "http://127.0.0.1:3737/health",
       { signal: expect.any(AbortSignal) },
     );
+    expect(results.find((result) => result.name === "events-capture")).toMatchObject({
+      status: "warn",
+      message: expect.stringContaining("storage readiness could not be authenticated"),
+    });
+    expect(results.find((result) => result.name === "events-capture")?.message)
+      .toContain("restore access to the daemon token and authenticated diagnostics");
+    expect(results.find((result) => result.name === "events-capture")?.message)
+      .not.toContain("storage is unavailable");
+    expect(results.find((result) => result.name === "events-capture")?.message)
+      .not.toContain("queued for automatic daemon processing");
   });
 
   it.each([0, 65536, 4545.5, "4545"])(
