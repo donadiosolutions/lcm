@@ -136,8 +136,9 @@ describe("Git project identity", () => {
     const submodule = join(superproject, "modules", "sub");
     makeDirectory(join(submodule, "nested"));
     const anchor = resolveGitProjectAnchor(join(submodule, "nested"));
+    if (!anchor) throw new Error("expected submodule Git project anchor");
     expect(anchor).toMatchObject({ canonical: submodule, worktreeRoot: submodule });
-    expect(anchor?.commonDir).toContain(join(".git", "modules", "modules", "sub"));
+    expect(anchor.commonDir).toContain(join(".git", "modules", "modules", "sub"));
     expect(resolveGitProjectAnchor(superproject)?.canonical).toBe(superproject);
 
     git(submodule, "config", "--unset", "core.worktree");
@@ -151,6 +152,69 @@ describe("Git project identity", () => {
       canonical: submodule,
       worktreeRoot: submodule,
     });
+
+    const commonConfigPath = join(anchor.commonDir, "config");
+    const writeWorktreeConfig = (line: string): void => {
+      writeFileSync(
+        commonConfigPath,
+        `[core]\nrepositoryformatversion = 0\n[extensions]\n${line}\n`,
+      );
+      clearGitProjectAnchorCache();
+    };
+    const configuredWorktreeBool = (): string => git(
+      submodule,
+      "config",
+      "--file",
+      commonConfigPath,
+      "--bool",
+      "--get",
+      "extensions.worktreeConfig",
+    );
+    const expectSubmoduleAnchor = (): void => {
+      expect(resolveGitProjectAnchor(join(submodule, "nested"))).toMatchObject({
+        canonical: submodule,
+        worktreeRoot: submodule,
+      });
+    };
+    const expectMetadataAnchor = (): void => {
+      expect(resolveGitProjectAnchor(join(submodule, "nested"))).toMatchObject({
+        canonical: anchor.commonDir,
+        worktreeRoot: submodule,
+      });
+    };
+
+    for (const line of [
+      "worktreeConfig = true # enabled",
+      "worktreeConfig = true#enabled",
+      "worktreeConfig = true ; enabled",
+      "worktreeConfig = true;enabled",
+      "worktreeConfig",
+      "worktreeConfig = yes;enabled",
+      "worktreeConfig = on # enabled",
+      "worktreeConfig = 1;enabled",
+    ]) {
+      writeWorktreeConfig(line);
+      expect(configuredWorktreeBool()).toBe("true");
+      expectSubmoduleAnchor();
+    }
+
+    for (const line of [
+      "worktreeConfig = false # disabled",
+      "worktreeConfig = off;disabled",
+    ]) {
+      writeWorktreeConfig(line);
+      expect(configuredWorktreeBool()).toBe("false");
+      expectMetadataAnchor();
+    }
+
+    for (const line of [
+      "worktreeConfig = true trailing",
+      "worktreeConfig # enabled",
+    ]) {
+      writeWorktreeConfig(line);
+      expect(configuredWorktreeBool).toThrow();
+      expectMetadataAnchor();
+    }
   });
 
   it("revalidates cached anchors when nearer or changed Git metadata appears", () => {
