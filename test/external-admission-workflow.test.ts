@@ -237,20 +237,21 @@ describe("external admission workflow", () => {
     expect(policySource).toContain("pull request file audit count does not match changed_files");
   });
 
-  it("requires Greptile for sensitive human PRs and trusted CI for exact automation identities", () => {
+  it("requires Greptile for sensitive paths and limits CI-backed exceptions to Dependabot", () => {
     expect(policySource).toContain("file.previous_filename");
     expect(policySource).toMatch(/bin\|installer\|src/u);
-    expect(policySource).toContain("[cm]?ts|tsx");
+    expect(policySource).toContain("scripts");
+    expect(policySource).toContain("\\.mjs");
     expect(policySource).toMatch(/actions\|codeql\|workflows\|scripts/u);
     expect(policySource).toMatch(/package\(\?:-lock\)\?/u);
     expect(policySource).toContain("vitest");
     expect(policySource).toContain("tsconfig");
     expect(evaluator).toContain('waiting_description="Waiting for Greptile review and DCO"');
-    expect(greptileConfig.excludeAuthors).toEqual([
-      "dependabot[bot]",
-      "github-actions[bot]",
-    ]);
+    expect(greptileConfig.excludeAuthors).toEqual(["dependabot[bot]"]);
+    expect(policySource).toContain('login === "dependabot[bot]"');
     expect(policySource).toContain('type === "Bot"');
+    expect(policySource).toContain('headRef.startsWith("dependabot/")');
+    expect(policySource).toContain("headRepository === baseRepository");
     expect(policySource).toContain("excludedGreptileAuthorPattern");
     expect(policySource).toContain("greptile exclusion-policy change");
     expect(evaluator.match(/select_admission_requirement/gu)).toHaveLength(4);
