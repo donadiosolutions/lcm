@@ -497,18 +497,20 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
         "large_files.exploration_summary:INSERT:false",
       ]));
 
-      const boundary = await database.migrator.query<{
+      const schemaAndSequenceBoundary = await database.migrator.query<{
         schema_usage: boolean;
         schema_create: boolean;
         any_sequence: boolean;
-        normalize_execute: boolean;
-        normalize_public_execute: boolean;
-        cycle_execute: boolean;
-        cycle_public_execute: boolean;
-        owns_relation: boolean;
-        any_truncate: boolean;
       }>({
-        text: `SELECT
+        text: `WITH lcm_sequences(sequence_oid) AS MATERIALIZED (
+                 SELECT sequence.oid
+                 FROM pg_catalog.pg_class AS sequence
+                 INNER JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid = sequence.relnamespace
+                 WHERE namespace.nspname = 'lcm'
+                   AND sequence.relkind = 'S'
+               )
+               SELECT
                  has_schema_privilege(
                    'lcm_test_runtime', 'lcm', 'USAGE'
                  ) AS schema_usage,
@@ -517,15 +519,28 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
                  ) AS schema_create,
                  EXISTS (
                    SELECT 1
-                   FROM pg_catalog.pg_class AS sequence
-                   INNER JOIN pg_catalog.pg_namespace AS namespace
-                     ON namespace.oid = sequence.relnamespace
-                   WHERE namespace.nspname = 'lcm'
-                     AND sequence.relkind = 'S'
-                     AND has_sequence_privilege(
-                       'lcm_test_runtime', sequence.oid, 'USAGE'
-                     )
-                 ) AS any_sequence,
+                   FROM lcm_sequences AS sequence
+                   WHERE has_sequence_privilege(
+                     'lcm_test_runtime', sequence.sequence_oid, 'USAGE'
+                   )
+                 ) AS any_sequence`,
+      }, {
+        domain: "summaries",
+        operation: "inspectSummarySchemaAndSequenceBoundary",
+      });
+      expect(schemaAndSequenceBoundary.rows[0]).toEqual({
+        schema_usage: true,
+        schema_create: false,
+        any_sequence: false,
+      });
+
+      const functionBoundary = await database.migrator.query<{
+        normalize_execute: boolean;
+        normalize_public_execute: boolean;
+        cycle_execute: boolean;
+        cycle_public_execute: boolean;
+      }>({
+        text: `SELECT
                  has_function_privilege(
                    'lcm_test_runtime',
                    'lcm.normalize_search_text(text)',
@@ -545,7 +560,23 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
                    'public',
                    'lcm.enforce_summary_parent_dag_integrity()',
                    'EXECUTE'
-                 ) AS cycle_public_execute,
+                 ) AS cycle_public_execute`,
+      }, {
+        domain: "summaries",
+        operation: "inspectSummaryFunctionBoundary",
+      });
+      expect(functionBoundary.rows[0]).toEqual({
+        normalize_execute: true,
+        normalize_public_execute: false,
+        cycle_execute: false,
+        cycle_public_execute: false,
+      });
+
+      const relationBoundary = await database.migrator.query<{
+        owns_relation: boolean;
+        any_truncate: boolean;
+      }>({
+        text: `SELECT
                  EXISTS (
                    SELECT 1
                    FROM pg_catalog.pg_class AS relation
@@ -568,15 +599,11 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
                      )
                  ) AS any_truncate`,
         values: [[...SUMMARY_CONTEXT_TABLES]],
-      }, { domain: "summaries", operation: "inspectSummaryPrivilegeBoundary" });
-      expect(boundary.rows[0]).toEqual({
-        schema_usage: true,
-        schema_create: false,
-        any_sequence: false,
-        normalize_execute: true,
-        normalize_public_execute: false,
-        cycle_execute: false,
-        cycle_public_execute: false,
+      }, {
+        domain: "summaries",
+        operation: "inspectSummaryRelationBoundary",
+      });
+      expect(relationBoundary.rows[0]).toEqual({
         owns_relation: false,
         any_truncate: false,
       });
