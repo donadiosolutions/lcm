@@ -6,6 +6,7 @@ import {
   POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
 } from "../../src/storage/postgresql/runtime.js";
 import {
+  PostgreSqlBaselineDefinitionPreflightError,
   REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
   runPostgreSqlMigrations,
 } from "../../src/storage/postgresql/migrations.js";
@@ -338,7 +339,18 @@ export async function assertHarnessReady(): Promise<void> {
   const migrator = runtimeFor(env.LCM_TEST_POSTGRES_MIGRATOR_URL);
   const runtime = runtimeFor(env.LCM_TEST_POSTGRES_RUNTIME_URL);
   try {
-    await runPostgreSqlMigrations(migrator);
+    try {
+      await runPostgreSqlMigrations(migrator);
+    } catch (error) {
+      if (error instanceof PostgreSqlBaselineDefinitionPreflightError) {
+        process.stderr.write(
+          `PostgreSQL baseline definition fingerprints: ${
+            JSON.stringify(error.actualDefinitionGroups)
+          }\n`,
+        );
+      }
+      throw error;
+    }
     const [migratorHealth, runtimeHealth] = await Promise.all([migrator.health(), runtime.health()]);
     if (migratorHealth.status !== "healthy" || migratorHealth.role !== "lcm_test_migrator") {
       throw new Error("PostgreSQL harness migrator readiness failed");

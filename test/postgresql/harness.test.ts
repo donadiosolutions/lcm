@@ -150,7 +150,10 @@ vi.mock("../../src/storage/postgresql/runtime.js", () => ({
 }));
 
 import { REQUIRED_POSTGRESQL_EXTENSIONS } from "../../src/storage/postgresql/extensions.js";
-import { REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION } from "../../src/storage/postgresql/migrations.js";
+import {
+  PostgreSqlBaselineDefinitionPreflightError,
+  REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
+} from "../../src/storage/postgresql/migrations.js";
 import {
   assertHarnessReady,
   createPostgreSqlTestDatabase,
@@ -304,6 +307,45 @@ describe("PostgreSQL test database lease", () => {
     expect(mocks.operations).toContain("harnessPgStatStatementsPreflight");
     expect(mocks.events.indexOf("migrations"))
       .toBeGreaterThan(mocks.events.indexOf("query:harnessPgStatStatementsPreflight"));
+  });
+
+  it("prints credential-free catalog fingerprints only for baseline definition drift", async () => {
+    const fingerprints = [{
+      objectKind: "index",
+      objectCount: 52,
+      definitionSha256: "a".repeat(64),
+    }];
+    mocks.runMigrations.mockRejectedValueOnce(
+      new PostgreSqlBaselineDefinitionPreflightError(
+        true,
+        739,
+        739,
+        0,
+        1,
+        fingerprints,
+      ),
+    );
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    await expect(assertHarnessReady()).rejects.toBeInstanceOf(
+      PostgreSqlBaselineDefinitionPreflightError,
+    );
+
+    expect(write).toHaveBeenCalledWith(
+      `PostgreSQL baseline definition fingerprints: ${JSON.stringify(fingerprints)}\n`,
+    );
+    expect(write.mock.calls.flat().join("")).not.toMatch(/secret|password|postgresql:\/\//u);
+    write.mockRestore();
+  });
+
+  it("does not print migration diagnostics for unrelated readiness failures", async () => {
+    mocks.runMigrations.mockRejectedValueOnce(new Error("injected migration failure"));
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    await expect(assertHarnessReady()).rejects.toThrow("injected migration failure");
+
+    expect(write).not.toHaveBeenCalled();
+    write.mockRestore();
   });
 
   it.each([

@@ -104,11 +104,18 @@ type PostgreSqlSchemaSnapshotExpectations = {
   readonly identityFunctionNames: readonly string[];
 };
 type BaselineDefinitionInventoryRow = QueryResultRow & {
+  actual_definition_group_counts: unknown;
+  actual_definition_group_hashes: unknown;
   baseline_applied: unknown;
   expected_object_count: unknown;
   existing_object_count: unknown;
   missing_object_count: unknown;
   drifted_definition_group_count: unknown;
+};
+export type PostgreSqlDefinitionGroupFingerprint = {
+  readonly objectKind: string;
+  readonly objectCount: number;
+  readonly definitionSha256: string;
 };
 type IdentityFunctionFingerprintRow = QueryResultRow & {
   baseline_applied: unknown;
@@ -729,6 +736,8 @@ export class PostgreSqlBaselineDefinitionPreflightError extends StorageOperation
     readonly existingObjectCount: number | null,
     readonly missingObjectCount: number | null,
     readonly driftedDefinitionGroupCount: number | null,
+    readonly actualDefinitionGroups:
+      readonly PostgreSqlDefinitionGroupFingerprint[] | null,
   ) {
     super(
       "STORAGE_INITIALIZATION_FAILED",
@@ -752,6 +761,7 @@ export class PostgreSqlBaselineDefinitionPreflightError extends StorageOperation
       existingObjectCount: this.existingObjectCount,
       missingObjectCount: this.missingObjectCount,
       driftedDefinitionGroupCount: this.driftedDefinitionGroupCount,
+      actualDefinitionGroups: this.actualDefinitionGroups,
       remediation: this.remediation,
     };
   }
@@ -865,6 +875,35 @@ function sanitizeNonnegativeCount(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
     : null;
+}
+
+function sanitizeDefinitionGroupFingerprints(
+  objectKinds: readonly string[],
+  objectCounts: unknown,
+  definitionHashes: unknown,
+): readonly PostgreSqlDefinitionGroupFingerprint[] | null {
+  if (
+    !Array.isArray(objectCounts)
+    || !Array.isArray(definitionHashes)
+    || objectCounts.length !== objectKinds.length
+    || definitionHashes.length !== objectKinds.length
+  ) return null;
+  const fingerprints: PostgreSqlDefinitionGroupFingerprint[] = [];
+  for (let index = 0; index < objectKinds.length; index += 1) {
+    const objectCount = sanitizeNonnegativeCount(objectCounts[index]);
+    const definitionSha256 = definitionHashes[index];
+    if (
+      objectCount === null
+      || typeof definitionSha256 !== "string"
+      || !/^[0-9a-f]{64}$/u.test(definitionSha256)
+    ) return null;
+    fingerprints.push({
+      objectKind: objectKinds[index]!,
+      objectCount,
+      definitionSha256,
+    });
+  }
+  return fingerprints;
 }
 
 export function sanitizePostgreSqlServerEncoding(value: unknown): string | null {
@@ -2491,6 +2530,20 @@ export async function runPostgreSqlMigrations(
                       $11::pg_catalog.int4 AS expected_object_count,
                       pg_catalog.sum(actual_groups.existing_count)::pg_catalog.int4
                         AS existing_object_count,
+                      pg_catalog.array_agg(
+                        actual_groups.existing_count
+                        ORDER BY pg_catalog.array_position(
+                          $12::pg_catalog.text[],
+                          actual_groups.object_kind
+                        )
+                      ) AS actual_definition_group_counts,
+                      pg_catalog.array_agg(
+                        actual_groups.definition_sha256
+                        ORDER BY pg_catalog.array_position(
+                          $12::pg_catalog.text[],
+                          actual_groups.object_kind
+                        )
+                      ) AS actual_definition_group_hashes,
                       CASE
                         WHEN $1::pg_catalog.bool THEN (
                           $11 - pg_catalog.sum(actual_groups.existing_count)
@@ -2544,6 +2597,11 @@ export async function runPostgreSqlMigrations(
     const driftedDefinitionGroupCount = sanitizeNonnegativeCount(
       baselineDefinitions.rows[0]?.drifted_definition_group_count,
     );
+    const actualDefinitionGroups = sanitizeDefinitionGroupFingerprints(
+      snapshotExpectations.definitionGroupKinds,
+      baselineDefinitions.rows[0]?.actual_definition_group_counts,
+      baselineDefinitions.rows[0]?.actual_definition_group_hashes,
+    );
     if (
       definitionBaselineApplied === null
       || definitionBaselineApplied !== baselineApplied
@@ -2558,6 +2616,7 @@ export async function runPostgreSqlMigrations(
       || driftedDefinitionGroupCount === null
       || driftedDefinitionGroupCount > snapshotExpectations.definitionGroupKinds.length
       || driftedDefinitionGroupCount !== 0
+      || actualDefinitionGroups === null
     ) {
       throw new PostgreSqlBaselineDefinitionPreflightError(
         definitionBaselineApplied,
@@ -2565,6 +2624,7 @@ export async function runPostgreSqlMigrations(
         existingDefinitionObjectCount,
         missingDefinitionObjectCount,
         driftedDefinitionGroupCount,
+        actualDefinitionGroups,
       );
     }
 

@@ -266,7 +266,21 @@ function executor(options: {
       }
       const expectedObjectCount =
         (config as { values?: unknown[] }).values?.[10] as number;
+      const definitionGroupCounts =
+        (config as { values?: unknown[] }).values?.[12] as number[];
+      const definitionGroupHashes =
+        (config as { values?: unknown[] }).values?.[13] as string[];
+      const actualDefinitionGroupCounts = [...definitionGroupCounts];
+      const actualDefinitionGroupHashes = [...definitionGroupHashes];
+      if (options.baselineDefinitions === "missing-object") {
+        actualDefinitionGroupCounts[0] = actualDefinitionGroupCounts[0]! - 1;
+        actualDefinitionGroupHashes[0] = "f".repeat(64);
+      } else if (options.baselineDefinitions === "drifted") {
+        actualDefinitionGroupHashes[0] = "f".repeat(64);
+      }
       return result([{
+        actual_definition_group_counts: actualDefinitionGroupCounts,
+        actual_definition_group_hashes: actualDefinitionGroupHashes,
         baseline_applied: true,
         expected_object_count: expectedObjectCount,
         existing_object_count: options.baselineDefinitions === "inconsistent"
@@ -1229,6 +1243,19 @@ describe("PostgreSQL migration runner", () => {
       .catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PostgreSqlBaselineDefinitionPreflightError);
     expect(failure).toMatchObject({
+      actualDefinitionGroups: baselineDefinitions === "missing"
+        || baselineDefinitions === "invalid"
+        ? null
+        : expect.arrayContaining([
+          expect.objectContaining({
+            objectKind: "index",
+            objectCount: baselineDefinitions === "missing-object" ? 51 : 52,
+            definitionSha256: baselineDefinitions === "missing-object"
+              || baselineDefinitions === "drifted"
+              ? "f".repeat(64)
+              : expect.stringMatching(/^[0-9a-f]{64}$/u),
+          }),
+        ]),
       baselineApplied,
       driftedDefinitionGroupCount,
       existingObjectCount,
@@ -1240,6 +1267,10 @@ describe("PostgreSQL migration runner", () => {
     });
     expect((failure as PostgreSqlBaselineDefinitionPreflightError).toJSON())
       .toMatchObject({
+        actualDefinitionGroups: baselineDefinitions === "missing"
+          || baselineDefinitions === "invalid"
+          ? null
+          : expect.any(Array),
         baselineApplied,
         driftedDefinitionGroupCount,
         existingObjectCount,
