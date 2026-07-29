@@ -169,8 +169,12 @@ describe("PostgreSQL work coordination", () => {
         domain: "coordination",
         operation: "compact",
         projectId,
-        signal,
       });
+      if (config.values?.[0] === "2s") {
+        expect(options).not.toHaveProperty("signal");
+      } else {
+        expect(options.signal).toBe(signal);
+      }
       if (config.text.includes("transaction_isolation")) {
         return result([{ transaction_isolation: "READ COMMITTED" }]);
       }
@@ -215,6 +219,7 @@ describe("PostgreSQL work coordination", () => {
       /pg_advisory_lock\(/u,
     );
     expect(db.query.mock.calls[4][0]).toMatchObject({ values: ["2s"] });
+    expect(db.savepoint).toHaveBeenCalledOnce();
   });
 
   it("requires transaction scope for locks and final fence checks", async () => {
@@ -400,14 +405,99 @@ describe("PostgreSQL work coordination", () => {
     });
     expect(JSON.stringify(error)).not.toContain("secret-resource");
     expect(JSON.stringify(error)).not.toContain("driver detail");
+    expect(db.query.mock.calls.at(-1)?.[0]).toMatchObject({ values: ["0"] });
+  });
+
+  it("preserves lock failures when timeout restoration also fails", async () => {
+    const lockFailure = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      projectId,
+      "coordination",
+      "compact",
+      { retryable: true },
+    );
+    const db = scopedExecutor((config) => {
+      if (config.text.includes("transaction_isolation")) {
+        return result([{ transaction_isolation: "read committed" }]);
+      }
+      if (config.text.includes("current_setting('lock_timeout')")) {
+        return result([{ setting: "3s" }]);
+      }
+      if (config.text.includes("pg_advisory_xact_lock")) throw lockFailure;
+      if (config.values?.[0] === "3s") {
+        throw new Error("restore detail");
+      }
+      return result([]);
+    });
+    const repository = new PostgreSqlWorkCoordinator(
+      db.executor,
+      projectId,
+      machineId,
+    );
+    await expect(repository.acquireTransactionLock({
+      resourceType: "conversation",
+      resourceKey: "secret-resource",
+      operation: "compact",
+      timeoutMs: 100,
+    })).rejects.toMatchObject({
+      machineId,
+      retryable: true,
+    });
+    expect(db.query.mock.calls.at(-1)?.[0]).toMatchObject({ values: ["3s"] });
+  });
+
+  it("sanitizes timeout restoration failures after lock acquisition", async () => {
+    const db = scopedExecutor((config) => {
+      if (config.text.includes("transaction_isolation")) {
+        return result([{ transaction_isolation: "read committed" }]);
+      }
+      if (config.text.includes("current_setting('lock_timeout')")) {
+        return result([{ setting: "4s" }]);
+      }
+      if (config.values?.[0] === "4s") {
+        throw new StorageOperationError(
+          "STORAGE_OPERATION_FAILED",
+          "postgresql",
+          projectId,
+          "coordination",
+          "compact",
+          { retryable: true },
+        );
+      }
+      return result([]);
+    });
+    const repository = new PostgreSqlWorkCoordinator(
+      db.executor,
+      projectId,
+      machineId,
+    );
+    await expect(repository.acquireTransactionLock({
+      resourceType: "conversation",
+      resourceKey: "secret-resource",
+      operation: "compact",
+      timeoutMs: 100,
+    })).rejects.toMatchObject({
+      machineId,
+      retryable: true,
+    });
+    expect(db.query.mock.calls.at(-1)?.[0]).toMatchObject({ values: ["4s"] });
   });
 
   it("acquires, renews, and releases exact bigint fenced leases", async () => {
-    const db = coordinator((config) => {
+    const db = coordinator((config, options) => {
       if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
         return result([]);
       }
+      if (config.text.includes("SELECT 1 AS locked")) {
+        return options.operation === "acquireLease"
+          ? result([])
+          : result([{ locked: 1 }]);
+      }
       if (config.text.includes("INSERT INTO lcm.fenced_leases")) {
+        return result([leaseRow]);
+      }
+      if (config.text.includes("SET acquired_at")) {
         return result([leaseRow]);
       }
       if (config.text.includes("SET renewed_at")) {
@@ -449,7 +539,7 @@ describe("PostgreSQL work coordination", () => {
     const acquireQuery = db.query.mock.calls.find(
       ([config]) => config.text.includes("INSERT INTO lcm.fenced_leases"),
     )?.[0];
-    expect(acquireQuery.text).toContain("fencing_token = DEFAULT");
+    expect(acquireQuery.text).toContain("DO NOTHING");
     expect(acquireQuery.text).toContain("statement_timestamp()");
     expect(acquireQuery.values).toEqual([
       projectId,
@@ -482,16 +572,128 @@ describe("PostgreSQL work coordination", () => {
     expect(db.transaction).toHaveBeenCalledTimes(3);
   });
 
-  it("returns null when acquire, renew, or release loses ownership", async () => {
+  it("takes over only after locking an existing lease row", async () => {
+    const db = coordinator((config) => {
+      if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        return result([]);
+      }
+      if (config.text.includes("SELECT 1 AS locked")) {
+        return result([{ locked: 1 }]);
+      }
+      if (config.text.includes("SET owner_machine_id")) {
+        return result([leaseRow]);
+      }
+      throw new Error(`unexpected SQL: ${config.text}`);
+    });
+    await expect(db.repository.acquireLease({
+      resourceType: "conversation",
+      resourceKey: "41",
+      processId: "worker-1",
+      operation: "compact",
+      ttlMs: 60_000,
+    })).resolves.toMatchObject({ fencingToken: 9007199254740993n });
+    expect(db.query.mock.calls[1][0].text).toContain("FOR UPDATE");
+    expect(db.query.mock.calls[2][0].text).toContain(
+      "expires_at <= pg_catalog.statement_timestamp()",
+    );
+    expect(db.query.mock.calls[2][0].text).toContain(
+      "fencing_token = DEFAULT",
+    );
+  });
+
+  it("fails closed for malformed lease acquisition write shapes", async () => {
+    const input = {
+      resourceType: "conversation",
+      resourceKey: "41",
+      processId: "worker-1",
+      operation: "compact",
+      ttlMs: 60_000,
+    };
+    const duplicateInsert = coordinator((config) => {
+      if (config.text.includes("SELECT 1 AS locked")) return result([]);
+      if (config.text.includes("INSERT INTO lcm.fenced_leases")) {
+        return result([leaseRow, leaseRow]);
+      }
+      return result([]);
+    });
+    await expect(
+      duplicateInsert.repository.acquireLease(input),
+    ).rejects.toMatchObject({ field: "inserted_lease" });
+
+    const missingRefresh = coordinator((config) => {
+      if (config.text.includes("SELECT 1 AS locked")) return result([]);
+      if (config.text.includes("INSERT INTO lcm.fenced_leases")) {
+        return result([leaseRow]);
+      }
+      return result([]);
+    });
+    await expect(
+      missingRefresh.repository.acquireLease(input),
+    ).rejects.toMatchObject({ field: "inserted_lease" });
+
+    const duplicateTakeover = coordinator((config) => {
+      if (config.text.includes("SELECT 1 AS locked")) {
+        return result([{ locked: 1 }]);
+      }
+      if (config.text.includes("SET owner_machine_id")) {
+        return result([leaseRow, leaseRow]);
+      }
+      return result([]);
+    });
+    await expect(
+      duplicateTakeover.repository.acquireLease(input),
+    ).rejects.toMatchObject({ field: "lease" });
+
+    const activeLease = coordinator((config) =>
+      config.text.includes("SELECT 1 AS locked")
+        ? result([{ locked: 1 }])
+        : result([]));
+    await expect(
+      activeLease.repository.acquireLease(input),
+    ).resolves.toBeNull();
+  });
+
+  it("fails closed if an exact lease lock returns duplicate rows", async () => {
     const db = coordinator((config) =>
       config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
         ? result([])
-        : result([]));
+        : result([{ locked: 1 }, { locked: 1 }]));
+    await expect(db.repository.acquireLease({
+      resourceType: "conversation",
+      resourceKey: "41",
+      processId: "worker-1",
+      operation: "compact",
+      ttlMs: 60_000,
+    })).rejects.toMatchObject({ field: "lease_lock", machineId });
+  });
+
+  it("returns null when acquire, renew, or release loses ownership", async () => {
+    let renewalLockAttempts = 0;
+    const db = coordinator((config, options) => {
+      if (
+        config.text.includes("SELECT 1 AS locked")
+        && options.operation === "renewLease"
+      ) {
+        renewalLockAttempts += 1;
+        return renewalLockAttempts === 1
+          ? result([])
+          : result([{ locked: 1 }]);
+      }
+      return result([]);
+    });
     await expect(db.repository.acquireLease({
       resourceType: "summary",
       resourceKey: "s1",
       processId: "worker",
       operation: "promote",
+      ttlMs: 1,
+    })).resolves.toBeNull();
+    await expect(db.repository.renewLease({
+      resourceType: "summary",
+      resourceKey: "s1",
+      processId: "worker",
+      operation: "promote",
+      fencingToken: 1n,
       ttlMs: 1,
     })).resolves.toBeNull();
     await expect(db.repository.renewLease({
@@ -547,6 +749,9 @@ describe("PostgreSQL work coordination", () => {
       if (config.text.includes("transaction_isolation")) {
         return result([{ transaction_isolation: "read committed" }]);
       }
+      if (config.text.includes("SELECT 1 AS locked")) {
+        return result([{ locked: 1 }]);
+      }
       return result([{
         fencing_token: "9007199254740993",
         validated_at: "2026-07-29T10:00:02.000Z",
@@ -575,6 +780,10 @@ describe("PostgreSQL work coordination", () => {
       validatedAt: "2026-07-29T10:00:02.000Z",
     });
     expect(db.query.mock.calls[1][0].text).toContain("FOR UPDATE");
+    expect(db.query.mock.calls[2][0].text).toContain(
+      "statement_timestamp() AS validated_at",
+    );
+    expect(db.query.mock.calls[2][0].text).toContain("FOR UPDATE");
     expect(db.savepoint).not.toHaveBeenCalled();
   });
 
@@ -583,7 +792,9 @@ describe("PostgreSQL work coordination", () => {
       const db = scopedExecutor((config) =>
         config.text.includes("transaction_isolation")
           ? result([{ transaction_isolation: "read committed" }])
-          : result(rows));
+          : config.text.includes("SELECT 1 AS locked")
+            ? result([{ locked: 1 }])
+            : result(rows));
       const repository = new PostgreSqlWorkCoordinator(
         db.executor,
         projectId,
@@ -597,6 +808,21 @@ describe("PostgreSQL work coordination", () => {
         fencingToken: 1n,
       })).rejects.toBeInstanceOf(PostgreSqlLeaseFenceError);
     }
+    const missing = scopedExecutor((config) =>
+      config.text.includes("transaction_isolation")
+        ? result([{ transaction_isolation: "read committed" }])
+        : result([]));
+    await expect(new PostgreSqlWorkCoordinator(
+      missing.executor,
+      projectId,
+      machineId,
+    ).assertLeaseFence({
+      resourceType: "conversation",
+      resourceKey: "41",
+      processId: "worker-1",
+      operation: "compact",
+      fencingToken: 1n,
+    })).rejects.toBeInstanceOf(PostgreSqlLeaseFenceError);
   });
 
   it("lists active, expired, and released lease diagnostics", async () => {
@@ -786,11 +1012,13 @@ describe("PostgreSQL work coordination", () => {
     expect(db.query.mock.calls[0][0]).toMatchObject({ values: [projectId] });
   });
 
-  it("fails closed when diagnostics return no aggregate row", async () => {
-    const db = coordinator(() => result([]));
-    await expect(
-      db.repository.getCoordinationDiagnostics(),
-    ).rejects.toMatchObject({ field: "diagnostics" });
+  it("fails closed unless diagnostics return exactly one aggregate row", async () => {
+    for (const rows of [[], [{}, {}]]) {
+      const db = coordinator(() => result(rows));
+      await expect(
+        db.repository.getCoordinationDiagnostics(),
+      ).rejects.toMatchObject({ field: "diagnostics" });
+    }
   });
 
   it("uses the active savepoint for composable lease work", async () => {
@@ -799,6 +1027,9 @@ describe("PostgreSQL work coordination", () => {
         return result([{ transaction_isolation: "read committed" }]);
       }
       if (config.text.includes("INSERT INTO lcm.fenced_leases")) {
+        return result([leaseRow]);
+      }
+      if (config.text.includes("SET acquired_at")) {
         return result([leaseRow]);
       }
       return result([]);

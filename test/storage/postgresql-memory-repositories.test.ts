@@ -2,6 +2,9 @@ import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import type { PostgreSqlQueryOptions } from "../../src/storage/postgresql/contracts.js";
 import {
+  PostgreSqlCoordinationDataError,
+} from "../../src/storage/postgresql/coordination.js";
+import {
   PostgreSqlCoordinationRepository,
   PostgreSqlMemoryDataError,
   type PostgreSqlMemoryExecutor,
@@ -577,12 +580,22 @@ describe("PostgreSQL memory repositories", () => {
       db,
       projectId,
       "not-a-uuid",
-    )).toThrow(PostgreSqlMemoryDataError);
+    )).toThrow(PostgreSqlCoordinationDataError);
     expect(() => new PostgreSqlCoordinationRepository(
       db,
       projectId,
       importedMemoryId,
-    )).toThrow(PostgreSqlMemoryDataError);
+    )).toThrow(PostgreSqlCoordinationDataError);
+    expect(() => new PostgreSqlCoordinationRepository(
+      db,
+      "not-a-uuid",
+      machineId,
+    )).toThrow(PostgreSqlCoordinationDataError);
+    expect(() => new PostgreSqlCoordinationRepository(
+      db,
+      importedMemoryId,
+      machineId,
+    )).toThrow(PostgreSqlCoordinationDataError);
   });
 
   it("fails closed for malformed persisted rows and unsafe bigint values", async () => {

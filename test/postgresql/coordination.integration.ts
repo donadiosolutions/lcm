@@ -2,7 +2,6 @@ import { fork, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { once } from "node:events";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   PostgreSqlCoordinationRepository,
@@ -192,10 +191,62 @@ async function waitForCrashFixture(
 }
 
 async function terminateChild(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const exited = once(child, "exit");
-  child.kill("SIGKILL");
-  await exited;
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const settle = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      child.off("exit", onExit);
+      child.off("error", onError);
+      callback();
+    };
+    const onExit = (): void => {
+      settle(resolve);
+    };
+    const onError = (error: Error & { code?: string }): void => {
+      if (
+        error.code === "ESRCH"
+        || child.exitCode !== null
+        || child.signalCode !== null
+      ) {
+        settle(resolve);
+      } else {
+        settle(() => reject(error));
+      }
+    };
+    child.once("exit", onExit);
+    child.once("error", onError);
+    if (child.exitCode !== null || child.signalCode !== null) {
+      settle(resolve);
+      return;
+    }
+    try {
+      const signaled = child.kill("SIGKILL");
+      if (
+        !signaled
+        && (child.exitCode !== null || child.signalCode !== null)
+      ) {
+        settle(resolve);
+      } else if (!signaled) {
+        setImmediate(() => settle(resolve));
+      }
+    } catch (error) {
+      if (
+        (
+          typeof error === "object"
+          && error !== null
+          && "code" in error
+          && error.code === "ESRCH"
+        )
+        || child.exitCode !== null
+        || child.signalCode !== null
+      ) {
+        settle(resolve);
+      } else {
+        settle(() => reject(error));
+      }
+    }
+  });
 }
 
 describe("PostgreSQL 18 cross-machine coordination", () => {
@@ -421,6 +472,52 @@ describe("PostgreSQL 18 cross-machine coordination", () => {
         expect(JSON.stringify(cancellationError)).not.toContain(
           "shared-resource",
         );
+
+        await expect(contender.transaction(async (transaction) => {
+          await transaction.query({
+            text: `SELECT pg_catalog.set_config(
+                            'lock_timeout',
+                            $1::pg_catalog.text,
+                            true
+                          )`,
+            values: ["3s"],
+          }, {
+            domain: "coordination",
+            operation: "setRecoverableLockTimeout",
+            projectId: scope.projectId,
+          });
+          const scoped = new PostgreSqlCoordinationRepository(
+            transaction,
+            scope.projectId,
+            scope.machineIds[1],
+          );
+          const recoverableError = await scoped.acquireTransactionLock({
+            resourceType: "crash-fixture",
+            resourceKey: "shared-resource",
+            operation: "recoverable-timeout",
+            timeoutMs: 75,
+          }).catch((error: unknown) => error);
+          expect(recoverableError).toMatchObject({
+            backend: "postgresql",
+            projectId: scope.projectId,
+            machineId: scope.machineIds[1],
+            operation: "recoverable-timeout",
+          });
+          const restored = await transaction.query<{ setting: string }>({
+            text: `SELECT pg_catalog.current_setting(
+                            'lock_timeout'
+                          ) AS setting`,
+          }, {
+            domain: "coordination",
+            operation: "inspectRestoredLockTimeout",
+            projectId: scope.projectId,
+          });
+          expect(restored.rows[0].setting).toBe("3s");
+        }, {
+          domain: "coordination",
+          operation: "recoverAfterLockTimeout",
+          projectId: scope.projectId,
+        })).resolves.toBeUndefined();
 
         await expect(contender.transaction(async (transaction) => {
           const scoped = new PostgreSqlCoordinationRepository(
@@ -816,6 +913,221 @@ describe("PostgreSQL 18 cross-machine coordination", () => {
         await Promise.allSettled([
           firstRuntime.close(),
           secondRuntime.close(),
+        ]);
+      }
+    });
+  });
+
+  it("evaluates lease clocks only after blocking database waits", async () => {
+    await withPostgreSqlTestDatabase("coord-lease-lock-clock", async (
+      database,
+    ) => {
+      await grantCoordinationRuntimePrivileges(database);
+      const scope = await createScope(database, "Coordination lock clock");
+      const ownerRuntime = runtime(database);
+      const fenceRuntime = runtime(database);
+      const takeoverRuntime = runtime(database);
+      const blockerRuntime = runtime(database);
+      const owner = new PostgreSqlCoordinationRepository(
+        ownerRuntime,
+        scope.projectId,
+        scope.machineIds[0],
+      );
+      const takeover = new PostgreSqlCoordinationRepository(
+        takeoverRuntime,
+        scope.projectId,
+        scope.machineIds[1],
+      );
+      try {
+        let reportInserted!: () => void;
+        let reportInsertFailure!: (error: unknown) => void;
+        const conflictingRowInserted = new Promise<void>((resolve, reject) => {
+          reportInserted = resolve;
+          reportInsertFailure = reject;
+        });
+        let beforeRollback!: Date;
+        const conflictingInsert = blockerRuntime.transaction(async (
+          transaction,
+        ) => {
+          await transaction.query({
+            text: `INSERT INTO lcm.fenced_leases (
+                     project_id,
+                     resource_type,
+                     resource_key,
+                     owner_machine_id,
+                     owner_process_id,
+                     operation,
+                     expires_at
+                   )
+                   VALUES (
+                     $1, 'conversation', 'insert-clock', $2,
+                     'blocker', 'compact',
+                     pg_catalog.statement_timestamp() + interval '1 second'
+                   )`,
+            values: [scope.projectId, scope.machineIds[2]],
+          }, {
+            domain: "coordination",
+            operation: "holdConflictingLeaseInsert",
+            projectId: scope.projectId,
+          });
+          reportInserted();
+          await transaction.query({
+            text: "SELECT pg_catalog.pg_sleep(0.25)",
+          }, {
+            domain: "coordination",
+            operation: "holdConflictingLeaseInsert",
+            projectId: scope.projectId,
+          });
+          const observed = await transaction.query<{ observed_at: Date }>({
+            text: "SELECT pg_catalog.clock_timestamp() AS observed_at",
+          }, {
+            domain: "coordination",
+            operation: "observeLeaseInsertRollback",
+            projectId: scope.projectId,
+          });
+          beforeRollback = observed.rows[0].observed_at;
+          throw new Error("roll back the conflicting lease fixture");
+        }, {
+          domain: "coordination",
+          operation: "holdConflictingLeaseInsert",
+          projectId: scope.projectId,
+        }).catch((error: unknown) => {
+          reportInsertFailure(error);
+        });
+        await conflictingRowInserted;
+        const delayedAcquisition = takeover.acquireLease({
+          resourceType: "conversation",
+          resourceKey: "insert-clock",
+          processId: "successor",
+          operation: "compact",
+          ttlMs: 1_000,
+        });
+        await conflictingInsert;
+        const insertedAfterWait = await delayedAcquisition;
+        expect(insertedAfterWait).not.toBeNull();
+        expect(new Date(insertedAfterWait!.acquiredAt).getTime())
+          .toBeGreaterThanOrEqual(beforeRollback.getTime());
+        expect(
+          new Date(insertedAfterWait!.expiresAt).getTime()
+            - new Date(insertedAfterWait!.acquiredAt).getTime(),
+        ).toBe(1_000);
+
+        const lease = await owner.acquireLease({
+          resourceType: "conversation",
+          resourceKey: "lock-clock",
+          processId: "owner",
+          operation: "compact",
+          ttlMs: 2_000,
+        });
+        expect(lease).not.toBeNull();
+
+        let reportLocked!: () => void;
+        let reportLockFailure!: (error: unknown) => void;
+        const rowLocked = new Promise<void>((resolve, reject) => {
+          reportLocked = resolve;
+          reportLockFailure = reject;
+        });
+        const blocker = blockerRuntime.transaction(async (transaction) => {
+          await transaction.query({
+            text: `SELECT 1
+                   FROM lcm.fenced_leases
+                   WHERE project_id = $1
+                     AND resource_type = 'conversation'
+                     AND resource_key = 'lock-clock'
+                   FOR UPDATE`,
+            values: [scope.projectId],
+          }, {
+            domain: "coordination",
+            operation: "holdLeasePastExpiry",
+            projectId: scope.projectId,
+          });
+          reportLocked();
+          await transaction.query({
+            text: "SELECT pg_catalog.pg_sleep(2.2)",
+          }, {
+            domain: "coordination",
+            operation: "holdLeasePastExpiry",
+            projectId: scope.projectId,
+          });
+        }, {
+          domain: "coordination",
+          operation: "holdLeasePastExpiry",
+          projectId: scope.projectId,
+        }).catch((error: unknown) => {
+          reportLockFailure(error);
+          throw error;
+        });
+        await rowLocked;
+        const started = await database.migrator.query<{ observed_at: Date }>({
+          text: "SELECT pg_catalog.clock_timestamp() AS observed_at",
+        }, { domain: "coordination", operation: "inspectPreExpiryStart" });
+        expect(started.rows[0].observed_at.getTime()).toBeLessThan(
+          new Date(lease!.expiresAt).getTime(),
+        );
+
+        const renewal = owner.renewLease({
+          resourceType: "conversation",
+          resourceKey: "lock-clock",
+          processId: "owner",
+          operation: "compact",
+          fencingToken: lease!.fencingToken,
+          ttlMs: 2_000,
+        });
+        const fence = fenceRuntime.transaction(async (transaction) => {
+          const scoped = new PostgreSqlCoordinationRepository(
+            transaction,
+            scope.projectId,
+            scope.machineIds[0],
+          );
+          return scoped.assertLeaseFence({
+            resourceType: "conversation",
+            resourceKey: "lock-clock",
+            processId: "owner",
+            operation: "compact",
+            fencingToken: lease!.fencingToken,
+          });
+        }, {
+          domain: "coordination",
+          operation: "validateFenceAfterLockWait",
+          projectId: scope.projectId,
+        }).then(
+          (value) => ({ succeeded: true as const, value }),
+          (error: unknown) => ({ succeeded: false as const, error }),
+        );
+        const successor = takeover.acquireLease({
+          resourceType: "conversation",
+          resourceKey: "lock-clock",
+          processId: "successor",
+          operation: "compact",
+          ttlMs: 2_000,
+        });
+
+        await blocker;
+        await expect(renewal).resolves.toBeNull();
+        const fenceOutcome = await fence;
+        expect(fenceOutcome.succeeded).toBe(false);
+        if (fenceOutcome.succeeded) {
+          throw new Error("expired fence unexpectedly remained valid");
+        }
+        expect(fenceOutcome.error).toMatchObject({
+          backend: "postgresql",
+          projectId: scope.projectId,
+          operation: "assertLeaseFence",
+        });
+        await expect(successor).resolves.toMatchObject({
+          machineId: scope.machineIds[1],
+          fencingToken: expect.any(BigInt),
+        });
+        const successorLease = await successor;
+        expect(successorLease!.fencingToken).toBeGreaterThan(
+          lease!.fencingToken,
+        );
+      } finally {
+        await Promise.allSettled([
+          ownerRuntime.close(),
+          fenceRuntime.close(),
+          takeoverRuntime.close(),
+          blockerRuntime.close(),
         ]);
       }
     });

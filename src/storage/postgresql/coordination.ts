@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { QueryResultRow } from "pg";
+import type { QueryResult, QueryResultRow } from "pg";
 import type { JsonObject } from "../contracts.js";
 import { StorageOperationError } from "../errors.js";
 import type {
@@ -797,6 +797,7 @@ export class PostgreSqlWorkCoordinator {
         namespace,
         normalizedResource.resourceKey,
       );
+      let acquisitionFailure: { readonly error: unknown } | undefined;
       await transaction.query({
         text: `SELECT pg_catalog.set_config(
                         'lock_timeout',
@@ -805,20 +806,37 @@ export class PostgreSqlWorkCoordinator {
                       )`,
         values: [`${timeoutMs}ms`],
       }, this.queryOptions(operation, input.signal));
-      await transaction.query({
-        text: `SELECT pg_catalog.pg_advisory_xact_lock(
-                        pg_catalog.hashtextextended($1::pg_catalog.text, 0)
-                      )`,
-        values: [lockName],
-      }, this.queryOptions(operation, input.signal));
-      await transaction.query({
-        text: `SELECT pg_catalog.set_config(
-                        'lock_timeout',
-                        $1::pg_catalog.text,
-                        true
-                      )`,
-        values: [previousSetting],
-      }, this.queryOptions(operation, input.signal));
+      try {
+        await transaction.savepoint(async (savepoint) => {
+          await savepoint.query({
+            text: `SELECT pg_catalog.pg_advisory_xact_lock(
+                            pg_catalog.hashtextextended(
+                              $1::pg_catalog.text,
+                              0
+                            )
+                          )`,
+            values: [lockName],
+          }, this.queryOptions(operation, input.signal));
+        }, this.queryOptions(operation, input.signal));
+      } catch (error) {
+        acquisitionFailure = { error };
+      } finally {
+        try {
+          await transaction.query({
+            text: `SELECT pg_catalog.set_config(
+                            'lock_timeout',
+                            $1::pg_catalog.text,
+                            true
+                          )`,
+            values: [previousSetting],
+          }, this.queryOptions(operation));
+        } catch (error) {
+          acquisitionFailure ??= { error };
+        }
+      }
+      if (acquisitionFailure !== undefined) {
+        throw acquisitionFailure.error;
+      }
       return {
         projectId: this.projectId,
         machineId: this.machineId,
@@ -844,48 +862,126 @@ export class PostgreSqlWorkCoordinator {
     const operation = "acquireLease";
     const normalized = this.acquireLeaseInput(input, operation);
     return this.atomic(operation, input.signal, async (executor) => {
-      const result = await executor.query<LeaseRow>({
-        text: `INSERT INTO lcm.fenced_leases (
-                 project_id,
-                 resource_type,
-                 resource_key,
-                 owner_machine_id,
-                 owner_process_id,
-                 operation,
-                 expires_at
-               )
-               VALUES (
-                 $1, $2, $3, $4, $5, $6,
-                 pg_catalog.statement_timestamp()
-                   + $7::pg_catalog.float8 * interval '1 millisecond'
-               )
-               ON CONFLICT (project_id, resource_type, resource_key) DO UPDATE
-               SET owner_machine_id = EXCLUDED.owner_machine_id,
-                   owner_process_id = EXCLUDED.owner_process_id,
-                   operation = EXCLUDED.operation,
-                   fencing_token = DEFAULT,
-                   acquired_at = pg_catalog.statement_timestamp(),
-                   renewed_at = pg_catalog.statement_timestamp(),
-                   expires_at = pg_catalog.statement_timestamp()
-                     + $7::pg_catalog.float8 * interval '1 millisecond',
-                   released_at = NULL
-               WHERE fenced_leases.released_at IS NOT NULL
-                  OR fenced_leases.expires_at
-                       <= pg_catalog.statement_timestamp()
-               RETURNING project_id, resource_type, resource_key,
-                         owner_machine_id, owner_process_id, operation,
-                         fencing_token, acquired_at, renewed_at, expires_at,
-                         released_at`,
-        values: [
+      const locked = await this.lockLeaseRow(
+        executor,
+        normalized,
+        operation,
+        input.signal,
+      );
+      const values = [
+        this.projectId,
+        normalized.resourceType,
+        normalized.resourceKey,
+        this.machineId,
+        normalized.processId,
+        normalized.operation,
+        normalized.ttlMs,
+      ];
+      let result: QueryResult<LeaseRow>;
+      if (locked) {
+        result = await executor.query<LeaseRow>({
+          text: `UPDATE lcm.fenced_leases
+                 SET owner_machine_id = $4,
+                     owner_process_id = $5,
+                     operation = $6,
+                     fencing_token = DEFAULT,
+                     acquired_at = pg_catalog.statement_timestamp(),
+                     renewed_at = pg_catalog.statement_timestamp(),
+                     expires_at = pg_catalog.statement_timestamp()
+                       + $7::pg_catalog.float8 * interval '1 millisecond',
+                     released_at = NULL
+                 WHERE project_id = $1
+                   AND resource_type = $2
+                   AND resource_key = $3
+                   AND (
+                     released_at IS NOT NULL
+                     OR expires_at <= pg_catalog.statement_timestamp()
+                   )
+                 RETURNING project_id, resource_type, resource_key,
+                           owner_machine_id, owner_process_id, operation,
+                           fencing_token, acquired_at, renewed_at, expires_at,
+                           released_at`,
+          values,
+        }, this.queryOptions(operation, input.signal));
+      } else {
+        const inserted = await executor.query<{
+          fencing_token: unknown;
+        }>({
+          text: `INSERT INTO lcm.fenced_leases (
+                   project_id,
+                   resource_type,
+                   resource_key,
+                   owner_machine_id,
+                   owner_process_id,
+                   operation,
+                   expires_at
+                 )
+                 VALUES (
+                   $1, $2, $3, $4, $5, $6,
+                   pg_catalog.statement_timestamp()
+                     + $7::pg_catalog.float8 * interval '1 millisecond'
+                 )
+                 ON CONFLICT (
+                   project_id,
+                   resource_type,
+                   resource_key
+                 ) DO NOTHING
+                 RETURNING fencing_token`,
+          values,
+        }, this.queryOptions(operation, input.signal));
+        if (inserted.rows.length === 0) return null;
+        if (inserted.rows.length !== 1) {
+          return coordinationError(
+            this.projectId,
+            operation,
+            "inserted_lease",
+            this.machineId,
+          );
+        }
+        const fencingToken = exactBigInt(
+          inserted.rows[0]?.fencing_token,
           this.projectId,
-          normalized.resourceType,
-          normalized.resourceKey,
+          operation,
+          "fencing_token",
+          1n,
           this.machineId,
-          normalized.processId,
-          normalized.operation,
-          normalized.ttlMs,
-        ],
-      }, this.queryOptions(operation, input.signal));
+        );
+        result = await executor.query<LeaseRow>({
+          text: `UPDATE lcm.fenced_leases
+                 SET acquired_at = pg_catalog.statement_timestamp(),
+                     renewed_at = pg_catalog.statement_timestamp(),
+                     expires_at = pg_catalog.statement_timestamp()
+                       + $7::pg_catalog.float8 * interval '1 millisecond'
+                 WHERE project_id = $1
+                   AND resource_type = $2
+                   AND resource_key = $3
+                   AND owner_machine_id = $4
+                   AND owner_process_id = $5
+                   AND operation = $6
+                   AND fencing_token = $8::pg_catalog.int8
+                 RETURNING project_id, resource_type, resource_key,
+                           owner_machine_id, owner_process_id, operation,
+                           fencing_token, acquired_at, renewed_at, expires_at,
+                           released_at`,
+          values: [...values, fencingToken.toString()],
+        }, this.queryOptions(operation, input.signal));
+        if (result.rows.length !== 1) {
+          return coordinationError(
+            this.projectId,
+            operation,
+            "inserted_lease",
+            this.machineId,
+          );
+        }
+      }
+      if (result.rows.length > 1) {
+        return coordinationError(
+          this.projectId,
+          operation,
+          "lease",
+          this.machineId,
+        );
+      }
       const row = result.rows[0];
       return row
         ? leaseFromRow(row, this.projectId, operation, this.machineId)
@@ -906,6 +1002,14 @@ export class PostgreSqlWorkCoordinator {
       this.machineId,
     );
     return this.atomic(operation, input.signal, async (executor) => {
+      if (!await this.lockLeaseRow(
+        executor,
+        normalized,
+        operation,
+        input.signal,
+      )) {
+        return null;
+      }
       const result = await executor.query<LeaseRow>({
         text: `UPDATE lcm.fenced_leases
                SET renewed_at = GREATEST(
@@ -995,6 +1099,19 @@ export class PostgreSqlWorkCoordinator {
     const normalized = this.leaseMutationInput(input, operation);
     const transaction = await this.transactionScope(operation);
     await this.assertReadCommitted(transaction, operation, input.signal);
+    if (!await this.lockLeaseRow(
+      transaction,
+      normalized,
+      operation,
+      input.signal,
+    )) {
+      throw new PostgreSqlLeaseFenceError(
+        this.projectId,
+        this.machineId,
+        normalized.fencingToken,
+        operation,
+      );
+    }
     const result = await transaction.query<{
       fencing_token: unknown;
       validated_at: unknown;
@@ -1024,7 +1141,8 @@ export class PostgreSqlWorkCoordinator {
     }, this.queryOptions(operation, input.signal));
     const row = result.rows[0];
     if (
-      !row
+      result.rows.length !== 1
+      || !row
       || exactBigInt(
         row.fencing_token,
         this.projectId,
@@ -1327,7 +1445,7 @@ export class PostgreSqlWorkCoordinator {
       values: [this.projectId],
     }, this.queryOptions(operation));
     const row = result.rows[0];
-    if (!row) {
+    if (result.rows.length !== 1 || !row) {
       return coordinationError(
         this.projectId,
         operation,
@@ -1495,6 +1613,36 @@ export class PostgreSqlWorkCoordinator {
         this.machineId,
       ),
     };
+  }
+
+  private async lockLeaseRow(
+    executor: PostgreSqlQueryExecutor,
+    lease: PostgreSqlCoordinationResource,
+    operation: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const result = await executor.query({
+      text: `SELECT 1 AS locked
+             FROM lcm.fenced_leases
+             WHERE project_id = $1
+               AND resource_type = $2
+               AND resource_key = $3
+             FOR UPDATE`,
+      values: [
+        this.projectId,
+        lease.resourceType,
+        lease.resourceKey,
+      ],
+    }, this.queryOptions(operation, signal));
+    if (result.rows.length > 1) {
+      return coordinationError(
+        this.projectId,
+        operation,
+        "lease_lock",
+        this.machineId,
+      );
+    }
+    return result.rows.length === 1;
   }
 
   private context(

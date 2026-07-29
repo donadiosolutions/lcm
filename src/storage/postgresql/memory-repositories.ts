@@ -1780,24 +1780,10 @@ implements CoordinationRepository {
     projectId: string,
     machineId: string,
   ) {
-    const normalizedProjectId = uuidV7(
-      projectId,
-      projectId,
-      "coordination",
-      "construct",
-      "project_id",
-    );
-    const normalizedMachineId = uuidV7(
-      machineId,
-      normalizedProjectId,
-      "coordination",
-      "construct",
-      "machine_id",
-    );
-    super(executor, normalizedProjectId, normalizedMachineId);
+    super(executor, projectId, machineId);
     this.access = new RepositoryAccess(
       executor,
-      normalizedProjectId,
+      this.projectId,
       "coordination",
     );
   }

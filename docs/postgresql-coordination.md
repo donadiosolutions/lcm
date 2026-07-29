@@ -93,6 +93,11 @@ Use a lease when work must continue outside a database transaction:
 PostgreSQL `statement_timestamp()` is the authority for acquisition, renewal,
 expiry, release, inspection, takeover, stale-claim recovery, and cleanup.
 Application-host clocks do not decide ownership.
+New acquisitions refresh their database timestamps after any uniqueness wait.
+Time-dependent takeover, renewal, and fence checks first lock the exact lease
+row, then read `statement_timestamp()` in a following statement. Time spent
+waiting on another transaction therefore counts against the lease instead of
+reusing a timestamp captured before the wait.
 
 An expired or released row can be taken over. Takeover replaces the owner,
 allocates a new identity-sequence fencing token with `DEFAULT`, and never
