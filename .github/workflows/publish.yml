@@ -317,88 +317,54 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Enforce earlier publication success
+      - name: Checkout trusted default-branch release policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Validate trusted release provenance
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         with:
           script: |
+            const { join } = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const policyUrl = pathToFileURL(
+              join(
+                process.env.GITHUB_WORKSPACE,
+                "trusted",
+                ".github/scripts/release-policy.mjs",
+              ),
+            ).href;
+            const {
+              assertActionCreatedReleaseBody,
+              enforceEarlierPublicationSuccess,
+              parseReleaseTag,
+            } = await import(policyUrl);
+
             const currentRunId = Number(context.runId);
-            if (!Number.isSafeInteger(currentRunId)) {
-              throw new Error(`Invalid workflow run id ${context.runId}`);
-            }
             const currentTag = process.env.RELEASE_TAG;
-            const canonicalTagPattern = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*))?$/;
-            const storedRunNamePattern = new RegExp(`^release-tag:(${canonicalTagPattern.source.slice(1, -1)})$`);
-            if (!canonicalTagPattern.test(currentTag)) {
-              throw new Error(`Current release event has unsupported tag ${currentTag}`);
-            }
-            const storedTag = (run, required) => {
-              const match = storedRunNamePattern.exec(run.display_title ?? "");
-              if (!match && required) {
-                throw new Error(
-                  `Failed release run ${run.id} has no canonical tag in its stored run name`,
-                );
-              }
-              return match?.[1];
-            };
-            const releaseRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+            parseReleaseTag(currentTag);
+            const { data: release } = await github.rest.repos.getReleaseByTag({
               ...context.repo,
-              workflow_id: "publish.yml",
-              event: "release",
-              status: "completed",
-              per_page: 100,
+              tag: currentTag,
             });
-            const recoveryRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
-              ...context.repo,
-              workflow_id: "publish.yml",
-              event: "workflow_dispatch",
-              status: "completed",
-              per_page: 100,
+            if (release.id !== context.payload.release.id || release.draft) {
+              throw new Error(`Release ${currentTag} is not the currently published event release`);
+            }
+            assertActionCreatedReleaseBody(release.body, currentTag);
+            await enforceEarlierPublicationSuccess({
+              github,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              currentRunId,
+              currentTag,
+              warning: (message) => core.warning(message),
             });
-            const failedRuns = releaseRuns
-              .filter((run) => run.id < currentRunId && run.conclusion !== "success")
-              .map((run) => ({ ...run, releaseTag: storedTag(run, true) }));
-            const successfulRuns = [...releaseRuns, ...recoveryRuns]
-              .filter((run) => run.id < currentRunId && run.conclusion === "success")
-              .flatMap((run) => {
-                const releaseTag = storedTag(run, false);
-                return releaseTag ? [{ ...run, releaseTag }] : [];
-              });
-            const blockingFailures = [];
-            for (const run of failedRuns) {
-              if (run.releaseTag === currentTag) {
-                core.warning(`Ignoring failed earlier attempt ${run.id} for retry tag ${currentTag}`);
-                continue;
-              }
-              const supersedingRun = successfulRuns.find(
-                (candidate) => candidate.releaseTag === run.releaseTag && candidate.id > run.id,
-              );
-              if (supersedingRun) {
-                core.warning(
-                  `Ignoring failed release run ${run.id}; later run ${supersedingRun.id} succeeded for ${run.releaseTag}`,
-                );
-                continue;
-              }
-              try {
-                const { data: release } = await github.rest.repos.getReleaseByTag({
-                  ...context.repo,
-                  tag: run.releaseTag,
-                });
-                if (release.draft) {
-                  core.warning(`Ignoring withdrawn draft from failed release run ${run.id}`);
-                  continue;
-                }
-              } catch (error) {
-                core.warning(`Could not prove failed release run ${run.id} was withdrawn: ${error.message}`);
-              }
-              blockingFailures.push(run);
-            }
-            if (blockingFailures.length > 0) {
-              throw new Error(
-                `Earlier release runs for other tags failed and must be rerun successfully or withdrawn to draft: ${blockingFailures.map((run) => `${run.id} (${run.releaseTag}/${run.conclusion})`).join(", ")}`,
-              );
-            }
 
       - name: Verify signed annotated release tag
         id: tag
@@ -440,14 +406,6 @@ jobs:
             core.setOutput("tag", tag);
             core.setOutput("version", tag.slice(1));
             core.setOutput("is_beta", tag.includes("-beta."));
-
-      - name: Checkout trusted release tools
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: trusted
-          persist-credentials: false
-          sparse-checkout: .github/scripts
 
       - name: Checkout verified release commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -528,16 +486,6 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
-
-      - name: Verify draft workflow marker and Highlights
-        env:
-          RELEASE_BODY: ${{ github.event.release.body }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: |
-          node --input-type=module <<'NODE'
-          import { assertActionCreatedReleaseBody } from "./.github/scripts/release-policy.mjs";
-          assertActionCreatedReleaseBody(process.env.RELEASE_BODY, process.env.RELEASE_TAG);
-          NODE
 
       - name: Verify trusted publishing prerequisites
         run: |
@@ -717,6 +665,14 @@ jobs:
       run:
         working-directory: release
     steps:
+      - name: Checkout trusted default-branch recovery policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
       - name: Verify recovery request and immutable release tag
         id: tag
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -724,9 +680,23 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         with:
           script: |
+            const { join } = await import("node:path");
+            const { pathToFileURL } = await import("node:url");
+            const policyUrl = pathToFileURL(
+              join(
+                process.env.GITHUB_WORKSPACE,
+                "trusted",
+                ".github/scripts/release-policy.mjs",
+              ),
+            ).href;
+            const {
+              assertActionCreatedReleaseBody,
+              enforceEarlierPublicationSuccess,
+              parseReleaseTag,
+            } = await import(policyUrl);
+
             const tag = process.env.RELEASE_TAG;
-            const pattern = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*))?$/;
-            if (!pattern.test(tag)) throw new Error(`Unsupported recovery tag ${tag}`);
+            parseReleaseTag(tag);
 
             const { data: repository } = await github.rest.repos.get(context.repo);
             if (context.ref !== `refs/heads/${repository.default_branch}`) {
@@ -744,14 +714,7 @@ jobs:
             if (release.prerelease !== expectedPrerelease) {
               throw new Error(`Release prerelease state does not match ${tag}`);
             }
-            const marker = `<!-- lcm-release-draft:v1:${tag} -->`;
-            if (
-              typeof release.body !== "string" ||
-              !release.body.includes(marker) ||
-              !/(?:^|\n)## Highlights\r?\n([\s\S]*?)(?=\r?\n## |$)/u.test(release.body)
-            ) {
-              throw new Error(`Release ${tag} is missing the protected draft marker or Highlights`);
-            }
+            assertActionCreatedReleaseBody(release.body, tag);
 
             const { data: ref } = await github.rest.git.getRef({
               ...context.repo,
@@ -771,101 +734,18 @@ jobs:
             ) {
               throw new Error(`Release tag ${tag} failed identity, target, or signature verification`);
             }
+            await enforceEarlierPublicationSuccess({
+              github,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              currentRunId: Number(context.runId),
+              currentTag: tag,
+              warning: (message) => core.warning(message),
+            });
             core.setOutput("commit", annotatedTag.object.sha);
             core.setOutput("is_beta", String(expectedPrerelease));
             core.setOutput("tag", tag);
             core.setOutput("version", tag.slice(1));
-
-      - name: Enforce earlier publication success
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
-        with:
-          script: |
-            const currentRunId = Number(context.runId);
-            if (!Number.isSafeInteger(currentRunId)) {
-              throw new Error(`Invalid workflow run id ${context.runId}`);
-            }
-            const currentTag = process.env.RELEASE_TAG;
-            const canonicalTagPattern = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*))?$/;
-            const storedRunNamePattern = new RegExp(`^release-tag:(${canonicalTagPattern.source.slice(1, -1)})$`);
-            if (!canonicalTagPattern.test(currentTag)) {
-              throw new Error(`Current recovery request has unsupported tag ${currentTag}`);
-            }
-            const storedTag = (run, required) => {
-              const match = storedRunNamePattern.exec(run.display_title ?? "");
-              if (!match && required) {
-                throw new Error(
-                  `Failed release run ${run.id} has no canonical tag in its stored run name`,
-                );
-              }
-              return match?.[1];
-            };
-            const releaseRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
-              ...context.repo,
-              workflow_id: "publish.yml",
-              event: "release",
-              status: "completed",
-              per_page: 100,
-            });
-            const recoveryRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
-              ...context.repo,
-              workflow_id: "publish.yml",
-              event: "workflow_dispatch",
-              status: "completed",
-              per_page: 100,
-            });
-            const failedRuns = releaseRuns
-              .filter((run) => run.id < currentRunId && run.conclusion !== "success")
-              .map((run) => ({ ...run, releaseTag: storedTag(run, true) }));
-            const successfulRuns = [...releaseRuns, ...recoveryRuns]
-              .filter((run) => run.id < currentRunId && run.conclusion === "success")
-              .flatMap((run) => {
-                const releaseTag = storedTag(run, false);
-                return releaseTag ? [{ ...run, releaseTag }] : [];
-              });
-            const blockingFailures = [];
-            for (const run of failedRuns) {
-              if (run.releaseTag === currentTag) {
-                core.warning(`Ignoring failed earlier attempt ${run.id} for recovery tag ${currentTag}`);
-                continue;
-              }
-              const supersedingRun = successfulRuns.find(
-                (candidate) => candidate.releaseTag === run.releaseTag && candidate.id > run.id,
-              );
-              if (supersedingRun) {
-                core.warning(
-                  `Ignoring failed release run ${run.id}; later run ${supersedingRun.id} succeeded for ${run.releaseTag}`,
-                );
-                continue;
-              }
-              try {
-                const { data: release } = await github.rest.repos.getReleaseByTag({
-                  ...context.repo,
-                  tag: run.releaseTag,
-                });
-                if (release.draft) {
-                  core.warning(`Ignoring withdrawn draft from failed release run ${run.id}`);
-                  continue;
-                }
-              } catch (error) {
-                core.warning(`Could not prove failed release run ${run.id} was withdrawn: ${error.message}`);
-              }
-              blockingFailures.push(run);
-            }
-            if (blockingFailures.length > 0) {
-              throw new Error(
-                `Earlier release runs for other tags failed and must be rerun successfully or withdrawn to draft: ${blockingFailures.map((run) => `${run.id} (${run.releaseTag}/${run.conclusion})`).join(", ")}`,
-              );
-            }
-
-      - name: Checkout trusted recovery tools
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: trusted
-          persist-credentials: false
-          sparse-checkout: .github/scripts
 
       - name: Checkout verified release commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { load as loadYaml } from "js-yaml";
+import { createRequire } from "node:module";
 import { PACKAGE_NAME } from "./npm-release-policy.mjs";
 import { parseReleaseTag } from "./release-tag-policy.mjs";
 
@@ -15,8 +15,10 @@ export {
 export { assertVerifiedReleaseTag, parseReleaseTag } from "./release-tag-policy.mjs";
 
 export const RELEASE_DRAFT_MARKER = "<!-- lcm-release-draft:v1:";
+export const RELEASE_RUN_NAME_PREFIX = "release-tag:";
 
 const CHANGESET_PATTERN = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)([\s\S]*)$/u;
+const require = createRequire(import.meta.url);
 const CATEGORY_ORDER = Object.freeze([
   ["breaking", "Breaking changes"],
   ["features", "Features"],
@@ -87,6 +89,7 @@ export function parseChangesetDocument(content, packageName = PACKAGE_NAME) {
 
   let frontmatter;
   try {
+    const { load: loadYaml } = require("js-yaml");
     frontmatter = loadYaml(match[1], { maxAliases: 0 });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -387,5 +390,137 @@ export function assertActionCreatedReleaseBody(body, targetTag) {
   const match = /(?:^|\n)## Highlights\r?\n([\s\S]*?)(?=\r?\n## |$)/u.exec(body);
   if (!match || match[1].trim().length === 0) {
     throw new Error("Release body is missing a non-empty Highlights section");
+  }
+}
+
+function historicalRunId(run) {
+  if (!Number.isSafeInteger(run?.id) || run.id <= 0) {
+    throw new Error("Historical publication run is missing a valid run id");
+  }
+  return run.id;
+}
+
+export function classifyReleaseRunProvenance(run) {
+  const runId = historicalRunId(run);
+  const title = run.display_title;
+  if (typeof title !== "string" || !title.startsWith(RELEASE_RUN_NAME_PREFIX)) {
+    return Object.freeze({ kind: "malformed", runId });
+  }
+
+  const storedTag = title.slice(RELEASE_RUN_NAME_PREFIX.length);
+  if (
+    storedTag.length === 0 ||
+    storedTag.length > 255 ||
+    storedTag !== storedTag.trim() ||
+    /[\0\r\n]/u.test(storedTag)
+  ) {
+    return Object.freeze({ kind: "malformed", runId });
+  }
+
+  try {
+    parseReleaseTag(storedTag);
+    return Object.freeze({ kind: "canonical", runId, releaseTag: storedTag });
+  } catch {
+    return Object.freeze({ kind: "noncanonical", runId, storedTag });
+  }
+}
+
+function classifiedHistoricalRun(run, warning) {
+  const provenance = classifyReleaseRunProvenance(run);
+  if (provenance.kind === "malformed") {
+    throw new Error(
+      `Historical publication run ${provenance.runId} has missing or malformed release-tag provenance`,
+    );
+  }
+  if (provenance.kind === "noncanonical") {
+    warning(
+      `Ignoring preflight-impossible noncanonical publication run ${provenance.runId} ` +
+        `(${provenance.storedTag})`,
+    );
+    return undefined;
+  }
+  return Object.freeze({ ...run, releaseTag: provenance.releaseTag });
+}
+
+export async function enforceEarlierPublicationSuccess({
+  github,
+  owner,
+  repo,
+  currentRunId,
+  currentTag,
+  warning = () => {},
+}) {
+  if (!Number.isSafeInteger(currentRunId) || currentRunId <= 0) {
+    throw new Error(`Invalid workflow run id ${currentRunId}`);
+  }
+  parseReleaseTag(currentTag);
+  if (typeof warning !== "function") throw new TypeError("warning must be a function");
+
+  const releaseRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+    owner,
+    repo,
+    workflow_id: "publish.yml",
+    event: "release",
+    status: "completed",
+    per_page: 100,
+  });
+  const recoveryRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+    owner,
+    repo,
+    workflow_id: "publish.yml",
+    event: "workflow_dispatch",
+    status: "completed",
+    per_page: 100,
+  });
+
+  const failedRuns = releaseRuns
+    .filter((run) => run.id < currentRunId && run.conclusion !== "success")
+    .map((run) => classifiedHistoricalRun(run, warning))
+    .filter(Boolean);
+  const successfulRuns = [...releaseRuns, ...recoveryRuns]
+    .filter((run) => run.id < currentRunId && run.conclusion === "success")
+    .map((run) => classifiedHistoricalRun(run, warning))
+    .filter(Boolean);
+
+  const blockingFailures = [];
+  for (const run of failedRuns) {
+    if (run.releaseTag === currentTag) {
+      warning(`Ignoring failed earlier attempt ${run.id} for current tag ${currentTag}`);
+      continue;
+    }
+    const supersedingRun = successfulRuns.find(
+      (candidate) => candidate.releaseTag === run.releaseTag && candidate.id > run.id,
+    );
+    if (supersedingRun) {
+      warning(
+        `Ignoring failed release run ${run.id}; later run ${supersedingRun.id} ` +
+          `succeeded for ${run.releaseTag}`,
+      );
+      continue;
+    }
+    try {
+      const { data: release } = await github.rest.repos.getReleaseByTag({
+        owner,
+        repo,
+        tag: run.releaseTag,
+      });
+      if (release.draft) {
+        warning(`Ignoring withdrawn draft from failed release run ${run.id}`);
+        continue;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "unknown error";
+      warning(`Could not prove failed release run ${run.id} was withdrawn: ${message}`);
+    }
+    blockingFailures.push(run);
+  }
+
+  if (blockingFailures.length > 0) {
+    throw new Error(
+      "Earlier release runs for other tags failed and must be rerun successfully or withdrawn " +
+        `to draft: ${blockingFailures
+          .map((run) => `${run.id} (${run.releaseTag}/${run.conclusion})`)
+          .join(", ")}`,
+    );
   }
 }

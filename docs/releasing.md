@@ -114,7 +114,46 @@ automatic work from silently overtaking it.
 Each publication workflow run stores its direct event tag in the strict
 `release-tag:TAG` run name. Completed-run recovery policy reads only that stored
 name; it does not infer a tag from a branch or commit SHA. A failed historical
-run without a canonical stored tag therefore fails closed.
+run with a canonical tag remains blocking until it is retried successfully or
+its release is withdrawn to draft. An explicitly noncanonical stored tag is a
+preflight-impossible attempt and is warned about and ignored. Missing or
+malformed stored run provenance fails closed because the workflow cannot safely
+associate it with an immutable release.
+
+## Immutable published-release recovery
+
+Normal npm publication starts from the GitHub `release: published` event. If
+that run restores the release to draft, fix the failure and publish the same
+draft again. Use the manual immutable-release recovery path only when the
+workflow-created GitHub Release is already public and cannot be restored to
+draft, its canonical signed annotated tag and protected marker remain intact,
+and npm trusted publishing is configured for the `npm-publish` environment.
+
+Dispatch recovery from protected `main`, never another ref:
+
+```bash
+gh workflow run publish.yml \
+  --repo donadiosolutions/lcm \
+  --ref main \
+  -f tag=v1.4.2
+```
+
+The read-only recovery preflight first checks out the trusted default-branch
+release policy. It validates the live marker and publication history before
+checking out tagged code or executing any tagged package or npm code. It then
+verifies the immutable tag, ancestry, package version, changelog, npm ordering,
+tests, build, and package artifact. The OIDC job uses only trusted tools and the
+verified tarball; it does not check out or execute tagged package code.
+
+Recovery is idempotent. If npm already contains the version, the workflow
+verifies the package and dist-tags without rebuilding, repacking, downloading,
+or republishing it. A successful recovery supersedes the earlier failed
+canonical run for that tag. Failed recovery runs do not block unrelated tags,
+but the original unresolved release failure continues to do so.
+
+The recovery path does not create, edit, withdraw, replace, or delete the
+GitHub Release or tag. Any identity, ancestry, history, ordering, artifact, or
+npm-verification failure stops without mutating those immutable objects.
 
 The version workflow grants no token permissions by default. Its sole job gets
 only the permissions it needs: Actions read access for the prior-failure guard,

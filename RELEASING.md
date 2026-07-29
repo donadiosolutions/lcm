@@ -74,13 +74,15 @@ version PRs are labeled `no-release-notes` automatically.
 6. Review the draft without removing its workflow marker or Highlights section,
    then manually publish it in GitHub.
 7. The resulting `release: published` event first runs a read-only trusted
-   preflight without npm's OIDC permission. It repeats validation and tests and
-   packs the exact package tarball. A separate OIDC job downloads that verified
-   artifact with the runner-provided `gh` CLI, rechecks the release tag and npm
-   ordering using workflow-revision tools, and publishes it. One trusted helper
-   requires exactly one regular `.tgz`, resolves its absolute filesystem path,
-   and invokes npm without a shell. Betas use `--tag beta`; stable releases use
-   `--tag latest`.
+   preflight without npm's OIDC permission. It checks out the trusted
+   default-branch release policy and validates the live marker and publication
+   history before checking out tagged code or executing any tagged package or
+   npm code. It then repeats validation and tests and packs the exact package
+   tarball. A separate OIDC job downloads that verified artifact with the
+   runner-provided `gh` CLI, rechecks the release tag and npm ordering using
+   trusted tools, and publishes it. One trusted helper requires exactly one
+   regular `.tgz`, resolves its absolute filesystem path, and invokes npm
+   without a shell. Betas use `--tag beta`; stable releases use `--tag latest`.
 
 GitHub changes the release from draft to public before it emits the
 `release: published` event, so this gate cannot be fully transactional across
@@ -176,7 +178,10 @@ restores a release to draft, fix the failure and manually publish the draft
 again. An earlier failed release run for another tag must either be followed by
 a successful release or recovery run for that tag, or remain withdrawn as a
 draft before later releases proceed. An earlier failed attempt for the same tag
-does not block its retry.
+does not block its retry. An explicitly noncanonical stored tag is a
+preflight-impossible attempt and is warned about and ignored. Missing or
+malformed stored run provenance fails closed because the workflow cannot safely
+associate that run with an immutable release.
 
 Use the manual immutable-release recovery path only when all of these conditions
 hold:
@@ -201,12 +206,12 @@ gh workflow run publish.yml \
   -f tag=v1.4.2
 ```
 
-The read-only recovery preflight checks out trusted helpers from the exact
-protected commit that defines the workflow and checks out the verified tag in a
-separate directory. It builds, tests, and packs that tag before uploading a
-short-lived artifact. The `npm-publish` job receives OIDC permission but never
-checks out or executes tagged package code; it revalidates the tag and npm
-ordering before downloading and publishing the artifact.
+The read-only recovery preflight checks out the trusted default-branch release
+policy and validates the live marker and publication history before checking
+out tagged code in a separate directory. It builds, tests, and packs that tag
+before uploading a short-lived artifact. The `npm-publish` job receives OIDC
+permission but never checks out or executes tagged package code; it revalidates
+the tag and npm ordering before downloading and publishing the artifact.
 
 Recovery is idempotent. If npm already contains the version, both jobs verify
 the published package and dist-tags without rebuilding, repacking, downloading,
