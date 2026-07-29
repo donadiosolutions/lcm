@@ -8,11 +8,13 @@ import {
   parseInstalledClaudePlugins,
   migrateClaudeMarketplacePlugins,
   canonicalHookCommand,
+  hasCanonicalClaudeMcpEntry,
   hasManagedClaudeSettings,
+  mergeClaudeMcpEntry,
   type ServiceDeps,
 } from "../../installer/install.js";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { legacyLcmCommand, legacyLcmMcpServerName } from "../../src/legacy-names.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../../src/daemon/config.js";
 import { removeManagedClaudeHooks } from "../../src/installer/settings.js";
@@ -24,10 +26,23 @@ function makeSpawn(status = 0, stdout = "[]") {
 }
 
 function makeDeps(overrides: Partial<ServiceDeps> = {}): ServiceDeps {
+  const {
+    readFileSync: readOverride,
+    writeFileSync: writeOverride,
+    ...remainingOverrides
+  } = overrides;
+  const writtenFiles = new Map<string, string>();
   return {
     spawnSync: makeSpawn(),
-    readFileSync: vi.fn().mockReturnValue("{}"),
-    writeFileSync: vi.fn(),
+    readFileSync: vi.fn((path: string, encoding: string) => {
+      if (readOverride) return readOverride(path, encoding);
+      if (writtenFiles.has(path)) return writtenFiles.get(path)!;
+      return "{}";
+    }),
+    writeFileSync: vi.fn((path: string, data: string) => {
+      writeOverride?.(path, data);
+      writtenFiles.set(path, data);
+    }),
     mkdirSync: vi.fn(),
     existsSync: vi.fn().mockReturnValue(false),
     rmSync: vi.fn(),
@@ -35,7 +50,7 @@ function makeDeps(overrides: Partial<ServiceDeps> = {}): ServiceDeps {
     ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
     runDoctor: vi.fn().mockResolvedValue([]),
     binaryPath: "/opt/npm/bin/lcm",
-    ...overrides,
+    ...remainingOverrides,
   };
 }
 
@@ -260,6 +275,109 @@ describe("mergeClaudeSettings", () => {
       { matcher: "metadata-only" },
       { matcher: "", label: "keep", hooks: [] },
     ]);
+  });
+});
+
+describe("Claude MCP entry ownership", () => {
+  const binary = "/opt/npm/bin/lcm";
+  const node = "/opt/node/bin/node";
+
+  it("owns command and args while preserving valid user and Claude options", () => {
+    const existing = {
+      command: "/old/node",
+      args: ["/old/lcm", "mcp"],
+      env: { LCM_POSTGRES_URL: "configured-elsewhere" },
+      nested: { future: true },
+    };
+
+    const merged = mergeClaudeMcpEntry(existing, binary, node);
+
+    expect(merged).toEqual({
+      type: "stdio",
+      command: node,
+      args: [binary, "mcp"],
+      env: existing.env,
+      nested: { future: true },
+    });
+    expect(existing.command).toBe("/old/node");
+    expect(hasCanonicalClaudeMcpEntry(merged, binary, node)).toBe(true);
+  });
+
+  it("normalizes HTTP and SSE entries to usable stdio without losing safe options", () => {
+    for (const remoteType of ["http", "sse"]) {
+      const existing = {
+        type: remoteType,
+        url: "https://example.invalid/lcm",
+        headers: { Authorization: "Bearer secret" },
+        transport: remoteType,
+        env: { LCM_POSTGRES_URL: "postgresql://configured" },
+        futureOption: { enabled: true },
+      };
+
+      const merged = mergeClaudeMcpEntry(existing, binary, node);
+
+      expect(merged).toEqual({
+        type: "stdio",
+        command: node,
+        args: [binary, "mcp"],
+        env: existing.env,
+        futureOption: { enabled: true },
+      });
+      expect(existing).toEqual(expect.objectContaining({
+        type: remoteType,
+        url: "https://example.invalid/lcm",
+        headers: { Authorization: "Bearer secret" },
+        transport: remoteType,
+      }));
+      expect(hasCanonicalClaudeMcpEntry(merged, binary, node)).toBe(true);
+      expect(hasCanonicalClaudeMcpEntry({
+        ...merged,
+        type: remoteType,
+      }, binary, node)).toBe(false);
+      for (const field of ["url", "headers", "transport"]) {
+        expect(hasCanonicalClaudeMcpEntry({
+          ...merged,
+          [field]: "incompatible",
+        }, binary, node)).toBe(false);
+      }
+    }
+  });
+
+  it("replaces malformed entries and rejects stale owned fields", () => {
+    expect(mergeClaudeMcpEntry(null, binary, node)).toEqual({
+      type: "stdio",
+      command: node,
+      args: [binary, "mcp"],
+    });
+    expect(mergeClaudeMcpEntry([], binary, node)).toEqual({
+      type: "stdio",
+      command: node,
+      args: [binary, "mcp"],
+    });
+    expect(mergeClaudeMcpEntry("invalid", binary, node)).toEqual({
+      type: "stdio",
+      command: node,
+      args: [binary, "mcp"],
+    });
+    expect(hasCanonicalClaudeMcpEntry(null, binary, node)).toBe(false);
+    expect(hasCanonicalClaudeMcpEntry([], binary, node)).toBe(false);
+    expect(hasCanonicalClaudeMcpEntry("invalid", binary, node)).toBe(false);
+    expect(hasCanonicalClaudeMcpEntry({ type: "stdio", command: node, args: "invalid" }, binary, node)).toBe(false);
+    expect(hasCanonicalClaudeMcpEntry({ type: "stdio", command: node, args: [binary] }, binary, node)).toBe(false);
+    expect(hasCanonicalClaudeMcpEntry({ type: "stdio", command: "/stale", args: [binary, "mcp"] }, binary, node)).toBe(false);
+    expect(hasCanonicalClaudeMcpEntry({ type: "stdio", command: node, args: [binary, "other"] }, binary, node)).toBe(false);
+    expect(hasCanonicalClaudeMcpEntry({ command: node, args: [binary, "mcp"] }, binary, node)).toBe(false);
+  });
+
+  it("requires absolute runtime and Node paths", () => {
+    expect(() => mergeClaudeMcpEntry({}, "lcm", node)).toThrow("runtime path must be absolute");
+    expect(() => hasCanonicalClaudeMcpEntry({}, binary, "node")).toThrow("Node executable path must be absolute");
+    expect(hasCanonicalClaudeMcpEntry(
+      { type: "stdio", command: "C:\\node\\node.exe", args: ["C:\\npm\\lcm.mjs", "mcp"], env: {} },
+      "C:\\npm\\lcm.mjs",
+      "C:\\node\\node.exe",
+      "win32",
+    )).toBe(true);
   });
 });
 
@@ -606,6 +724,46 @@ describe("install", () => {
     expect(spawnSync).not.toHaveBeenCalled();
   });
 
+  it("does not inspect or remove Marketplace plugins when native settings cannot be persisted", async () => {
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    const spawnSync = vi.fn();
+    const deps = makeDeps({
+      spawnSync: spawnSync as any,
+      existsSync: vi.fn((path: string) => path.endsWith("config.json")),
+      writeFileSync: vi.fn((path: string) => {
+        if (path === settingsPath) throw new Error("settings write failed");
+      }),
+    });
+
+    await expect(install(deps)).rejects.toThrow("settings write failed");
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it("keeps Marketplace plugins when native settings read-back loses managed fields", async () => {
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    const spawnSync = vi.fn();
+    const deps = makeDeps({
+      spawnSync: spawnSync as any,
+      existsSync: vi.fn((path: string) => path === settingsPath || path.endsWith("config.json")),
+      readFileSync: vi.fn((path: string) => path === settingsPath ? "{}" : "{}"),
+    });
+
+    await expect(install(deps)).rejects.toThrow("did not persist correctly");
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it("keeps Marketplace plugins when native settings read-back is malformed JSON", async () => {
+    const spawnSync = vi.fn();
+    const deps = makeDeps({
+      spawnSync: spawnSync as any,
+      existsSync: vi.fn((path: string) => path.endsWith("config.json")),
+      readFileSync: vi.fn(() => "{"),
+    });
+
+    await expect(install(deps)).rejects.toThrow("Could not verify native Claude settings after writing");
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
   it("persists wizard configuration before uninstalling a recognized Marketplace plugin", async () => {
     const events: string[] = [];
     const plugin = JSON.stringify([{ id: "lcm@legacy", scope: "user" }]);
@@ -623,6 +781,7 @@ describe("install", () => {
       existsSync: vi.fn().mockReturnValue(false),
       writeFileSync: vi.fn((path: string) => {
         if (path.endsWith("config.json")) events.push("config");
+        if (path.endsWith("settings.json")) events.push("native-settings");
       }),
     });
 
@@ -630,6 +789,76 @@ describe("install", () => {
 
     expect(events[0]).toBe("config");
     expect(events.indexOf("uninstall")).toBeGreaterThan(events.indexOf("config"));
+    expect(events.indexOf("uninstall")).toBeGreaterThan(events.indexOf("native-settings"));
+  });
+
+  it("keeps native settings read-only during dry-run and preserves Marketplace ordering", async () => {
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    const nativeSettings = JSON.stringify(mergeClaudeSettings({}, "/opt/npm/bin/lcm"));
+    const events: string[] = [];
+    let previewedSettings: Record<string, any> | undefined;
+    const plugin = JSON.stringify([{ id: "lcm@legacy", scope: "user" }]);
+    const marketplaces = JSON.stringify([{ name: "legacy", repo: "lossless-claude/lcm" }]);
+    const spawnSync = vi.fn((_cmd: string, args: string[]) => {
+      if (args[1] === "list") {
+        events.push("marketplace-scan");
+        return { status: 0, stdout: plugin };
+      }
+      if (args[1] === "marketplace") {
+        events.push("marketplace-verification");
+        return { status: 0, stdout: marketplaces };
+      }
+      events.push("marketplace-uninstall");
+      return { status: 0, stdout: "" };
+    });
+    const deps = makeDeps({
+      dryRun: true,
+      spawnSync: spawnSync as any,
+      existsSync: vi.fn((path: string) =>
+        path === settingsPath || path.endsWith("config.json")),
+      readFileSync: vi.fn((path: string) => {
+        if (path === settingsPath) {
+          events.push("settings-read");
+          return nativeSettings;
+        }
+        return "{}";
+      }),
+      writeFileSync: vi.fn((path: string) => {
+        if (path === settingsPath) events.push("settings-write");
+      }),
+      previewWriteFile: vi.fn((path: string, data: string) => {
+        if (path === settingsPath) {
+          events.push("settings-preview");
+          previewedSettings = JSON.parse(data);
+        }
+      }),
+      mkdirSync: vi.fn((path: string) => {
+        if (path === dirname(settingsPath)) events.push("settings-directory");
+      }),
+    });
+
+    await install(deps);
+
+    expect(events.filter((event) => event === "settings-read")).toHaveLength(4);
+    expect(events.filter((event) => event === "settings-preview")).toHaveLength(1);
+    expect(events).not.toContain("settings-write");
+    expect(events).not.toContain("marketplace-uninstall");
+    expect(previewedSettings?.mcpServers).toEqual({
+      lcm: {
+        type: "stdio",
+        command: process.execPath,
+        args: ["/opt/npm/bin/lcm", "mcp"],
+      },
+    });
+    expect(events.indexOf("marketplace-scan")).toBeGreaterThan(
+      events.indexOf("settings-preview"),
+    );
+    expect(events.indexOf("marketplace-verification")).toBeGreaterThan(
+      events.indexOf("marketplace-scan"),
+    );
+    expect(events.indexOf("settings-directory")).toBeGreaterThan(
+      events.indexOf("marketplace-verification"),
+    );
   });
 
   it("fails before mutation for a relative executable or malformed Claude settings", async () => {
@@ -675,6 +904,7 @@ describe("install", () => {
     });
     const settingsPath = join(homedir(), ".claude", "settings.json");
     const retiredCommand = join(homedir(), ".claude", "commands", "lcm-dogfood.md");
+    let settings = "{}";
     const deps = makeDeps({
       existsSync: vi.fn((path: string) =>
         path.endsWith("config.json")
@@ -683,8 +913,11 @@ describe("install", () => {
         || path === settingsPath),
       readFileSync: vi.fn((path: string) => {
         if (path.endsWith("package.json")) return JSON.stringify({ version: "1.4.0" });
-        if (path === settingsPath) return "{}";
+        if (path === settingsPath) return settings;
         return "{}";
+      }),
+      writeFileSync: vi.fn((path: string, data: string) => {
+        if (path === settingsPath) settings = data;
       }),
       readdirSync: readdirSync as any,
       rmSync: rmSync as any,
@@ -701,7 +934,7 @@ describe("install", () => {
     expect(JSON.parse(settingsWrite![1]).mcpServers.lcm).toBeDefined();
   });
 
-  it("re-reads Claude settings after Marketplace migration before writing native settings", async () => {
+  it("re-reads Claude settings after Marketplace migration before reconciling native settings", async () => {
     const settingsPath = join(homedir(), ".claude", "settings.json");
     const plugin = JSON.stringify([{ id: "lcm@legacy", scope: "user" }]);
     const marketplaces = JSON.stringify([{ name: "legacy", repo: "lossless-claude/lcm" }]);
@@ -734,13 +967,58 @@ describe("install", () => {
     }));
   });
 
+  it("normalizes a remote MCP entry while preserving settings across installation", async () => {
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    let settings = JSON.stringify({
+      theme: "dark",
+      mcpServers: {
+        other: { command: "other" },
+        lcm: {
+          type: "http",
+          url: "https://example.invalid/lcm",
+          headers: { Authorization: "Bearer secret" },
+          transport: "http",
+          env: { LCM_POSTGRES_URL: "postgresql://configured" },
+          futureOption: { enabled: true },
+        },
+      },
+    });
+    const deps = makeDeps({
+      existsSync: vi.fn((path: string) => path === settingsPath || path.endsWith("config.json")),
+      readFileSync: vi.fn((path: string) => path === settingsPath ? settings : "{}"),
+      writeFileSync: vi.fn((path: string, data: string) => {
+        if (path === settingsPath) settings = data;
+      }),
+    });
+
+    await install(deps);
+
+    expect(JSON.parse(settings)).toEqual(expect.objectContaining({
+      theme: "dark",
+      mcpServers: {
+        other: { command: "other" },
+        lcm: {
+          type: "stdio",
+          command: process.execPath,
+          args: ["/opt/npm/bin/lcm", "mcp"],
+          env: { LCM_POSTGRES_URL: "postgresql://configured" },
+          futureOption: { enabled: true },
+        },
+      },
+    }));
+  });
+
   it("preserves a valid MCP server map", async () => {
     const settingsPath = join(homedir(), ".claude", "settings.json");
+    let settings = JSON.stringify({ mcpServers: { other: { command: "other" } } });
     const deps = makeDeps({
       existsSync: vi.fn((path: string) => path.endsWith("config.json") || path.includes("plugins/cache") || path === settingsPath),
       readFileSync: vi.fn((path: string) => path === settingsPath
-        ? JSON.stringify({ mcpServers: { other: { command: "other" } } })
+        ? settings
         : "invalid package json"),
+      writeFileSync: vi.fn((path: string, data: string) => {
+        if (path === settingsPath) settings = data;
+      }),
     });
     await install(deps);
     const settingsWrite = vi.mocked(deps.writeFileSync).mock.calls.filter(([path]) => path === settingsPath).at(-1);

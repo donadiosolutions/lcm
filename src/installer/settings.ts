@@ -63,6 +63,65 @@ function asSettingsObject(existing: unknown): Record<string, any> {
   return structuredClone(existing) as Record<string, any>;
 }
 
+function canonicalClaudeMcpFields(
+  runtimePath: string,
+  nodePath: string,
+  platform: NodeJS.Platform,
+): { type: "stdio"; command: string; args: [string, "mcp"] } {
+  const pathIsAbsolute = platform === "win32" ? win32.isAbsolute : isAbsolute;
+  if (!pathIsAbsolute(runtimePath)) {
+    throw new Error(`LCM runtime path must be absolute: ${runtimePath}`);
+  }
+  if (!pathIsAbsolute(nodePath)) {
+    throw new Error(`Node executable path must be absolute: ${nodePath}`);
+  }
+  return { type: "stdio", command: nodePath, args: [runtimePath, "mcp"] };
+}
+
+const CLAUDE_REMOTE_MCP_FIELDS = ["url", "headers", "transport"] as const;
+
+/**
+ * Merge the fields owned by LCM into a Claude MCP server entry.
+ *
+ * Unknown fields belong to Claude or the user and must survive repairs. Known
+ * remote-transport fields cannot coexist with a stdio command, so they are
+ * removed while type, command, and args are normalized. A malformed entry
+ * cannot be merged safely, so it is replaced with the minimal canonical entry.
+ */
+export function mergeClaudeMcpEntry(
+  existing: unknown,
+  runtimePath: string,
+  nodePath = process.execPath,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, unknown> {
+  const canonical = canonicalClaudeMcpFields(runtimePath, nodePath, platform);
+  if (existing === null || typeof existing !== "object" || Array.isArray(existing)) {
+    return canonical;
+  }
+  const preserved = structuredClone(existing) as Record<string, unknown>;
+  for (const field of CLAUDE_REMOTE_MCP_FIELDS) delete preserved[field];
+  return { ...preserved, ...canonical };
+}
+
+export function hasCanonicalClaudeMcpEntry(
+  existing: unknown,
+  runtimePath: string,
+  nodePath = process.execPath,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (existing === null || typeof existing !== "object" || Array.isArray(existing)) {
+    return false;
+  }
+  const canonical = canonicalClaudeMcpFields(runtimePath, nodePath, platform);
+  const entry = existing as Record<string, unknown>;
+  return entry.type === canonical.type
+    && CLAUDE_REMOTE_MCP_FIELDS.every((field) => !(field in entry))
+    && entry.command === canonical.command
+    && Array.isArray(entry.args)
+    && entry.args.length === canonical.args.length
+    && entry.args.every((value, index) => value === canonical.args[index]);
+}
+
 export function hasManagedClaudeSettings(existing: unknown): boolean {
   const settings = asSettingsObject(existing);
   if (settings.mcpServers !== undefined &&

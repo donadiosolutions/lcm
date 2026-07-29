@@ -27,6 +27,10 @@ export class DryRunServiceDeps implements ServiceDeps, TeardownDeps {
     console.log(`[dry-run] would write: ${path}`);
   }
 
+  previewWriteFile(path: string, _data: string): void {
+    console.log(`[dry-run] would write: ${path}`);
+  }
+
   copyFileSync(source: PathLike, destination: PathLike): void {
     console.log(`[dry-run] would copy: ${source} -> ${destination}`);
   }

@@ -3,7 +3,14 @@ import { homedir, platform } from "node:os";
 import { join, dirname } from "node:path";
 import { spawnSync, spawn } from "node:child_process";
 import type { CheckResult, DoctorDeps } from "./types.js";
-import { hasManagedClaudeSettings, mergeClaudeSettings, REQUIRED_HOOKS, ensureLcmMd } from "../../installer/install.js";
+import {
+  hasCanonicalClaudeMcpEntry,
+  hasManagedClaudeSettings,
+  mergeClaudeMcpEntry,
+  mergeClaudeSettings,
+  REQUIRED_HOOKS,
+  ensureLcmMd,
+} from "../../installer/install.js";
 import { NATIVE_PATTERNS, ScrubEngine, readGitleaksSyncDate } from "../scrub.js";
 import { GITLEAKS_PATTERNS } from "../generated-patterns.js";
 import { projectDir } from "../daemon/project.js";
@@ -889,23 +896,27 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     }
   }
 
-  const expectedMcp = lcmBinary
-    ? { command: process.execPath, args: [lcmBinary, "mcp"] }
-    : undefined;
   const mcpServers = currentSettings?.mcpServers as Record<string, unknown> | undefined;
   if (!claudeSettingsExists || (!settingsError && !claudeSettingsManaged)) {
     results.push({ name: "mcp-lcm", category: "Settings", status: "pass", message: "Claude Code integration is not installed" });
-  } else if (expectedMcp && JSON.stringify(mcpServers?.lcm) === JSON.stringify(expectedMcp)) {
+  } else if (settingsError) {
+    results.push({
+      name: "mcp-lcm",
+      category: "Settings",
+      status: "fail",
+      message: `Could not parse ${settingsPath}: ${settingsError}\n     Fix the JSON, then run: lcm install`,
+    });
+  } else if (lcmBinary && hasCanonicalClaudeMcpEntry(mcpServers?.lcm, lcmBinary)) {
     results.push(claudeSettingsCleaned
       ? { name: "mcp-lcm", category: "Settings", status: "warn", message: "Removed the legacy lossless-claude MCP registration", fixApplied: true }
       : { name: "mcp-lcm", category: "Settings", status: "pass", message: "mcpServers.lcm uses the npm-installed runtime" });
-  } else if (currentSettings && expectedMcp) {
+  } else if (currentSettings && lcmBinary) {
     try {
       const merged = mergeClaudeSettings(currentSettings, lcmBinary!);
       if (merged.mcpServers === null || typeof merged.mcpServers !== "object" || Array.isArray(merged.mcpServers)) {
         merged.mcpServers = {};
       }
-      merged.mcpServers.lcm = expectedMcp;
+      merged.mcpServers.lcm = mergeClaudeMcpEntry(merged.mcpServers.lcm, lcmBinary);
       deps.mkdirSync(dirname(settingsPath), { recursive: true });
       deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
       results.push({ name: "mcp-lcm", category: "Settings", status: "warn", message: "mcpServers.lcm was missing or stale — repaired automatically", fixApplied: true });

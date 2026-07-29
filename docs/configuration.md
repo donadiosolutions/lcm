@@ -20,12 +20,15 @@ commands and skills, and verifies the daemon. The operation is idempotent, so
 rerun it after updating the npm package.
 
 LCM no longer supports direct Claude Marketplace installation. During
-installation, LCM detects recognized current and legacy LCM Marketplace
-installations, removes them from their installed scopes while preserving their
-data, and verifies that they are gone before writing the native integration.
-Unknown or unrelated plugins are left unchanged. If automatic removal fails,
-the installer stops before registering hooks so the two integrations cannot
-run simultaneously.
+installation, LCM writes and reads back its native hook and MCP settings before
+removing any recognized current or legacy LCM Marketplace installation. It
+then removes those plugins from their installed scopes while preserving their
+data, verifies that they are gone, and reconciles the native settings again in
+case Claude changed the file during removal. Unknown or unrelated plugins are
+left unchanged. If the native settings cannot be persisted, the Marketplace
+integration remains untouched. If automatic removal fails after native setup,
+the installer reports the failure and leaves the native settings in place; fix
+the reported Claude plugin error and rerun `lcm install`.
 
 To update:
 
@@ -36,8 +39,18 @@ lcm doctor
 ```
 
 The hook commands and MCP server use absolute paths into the installed npm
-package. `lcm doctor` validates the native configuration and managed daemon;
-repair or reinstall with `lcm install`.
+package. LCM owns the MCP entry's `type`, `command`, and `args`; `env` and any
+other compatible user- or Claude-managed options, sibling MCP servers, and
+unrelated settings are preserved across installation and doctor repair. When
+normalizing an HTTP or SSE entry to `stdio`, LCM removes the incompatible
+`url`, `headers`, and `transport` fields. `lcm doctor` validates the native
+configuration and managed daemon; repair or reinstall with `lcm install`.
+
+The published CLI contains its MCP SDK build graph in `dist/lcm.mjs`. Consumer
+installations therefore do not receive a second external SDK, Express, or AJV
+dependency path from LCM. The exact SDK, `body-parser`, and `fast-uri` versions
+used to build that runtime remain pinned with lockfile integrity in the source
+package.
 
 When the setup wizard's **Custom server** summarizer is selected, both the
 OpenAI-compatible server URL and model name are required. The wizard retries an
@@ -467,10 +480,11 @@ in the same source, while runtime overrides continue to take precedence over
 stored configuration. `lcm config get` and `lcm config set` accept the legacy
 path and report its canonical `dedupCandidateLimit` spelling.
 
-When `lcm doctor` finds that `~/.claude/settings.json` has a malformed or
-non-object JSON root, it treats the file as empty settings and rebuilds the
-managed `mcpServers.lcm` entry instead of crashing. Other fields are preserved
-when the settings root is a valid JSON object.
+When `lcm doctor` finds a malformed `mcpServers.lcm` value inside an otherwise
+valid settings object, it replaces that entry with the minimal managed fields.
+Malformed JSON, a non-object settings root, or a malformed `mcpServers`
+container fails closed and must be corrected before repair. Other fields are
+preserved when the settings root and server map are valid JSON objects.
 
 Hook error fallback logs write to `~/.lcm/logs/events.log`.
 
