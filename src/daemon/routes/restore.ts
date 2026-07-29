@@ -27,6 +27,7 @@ import {
   openExistingProject,
   storageRouteFailureResponse,
 } from "./storage-lifecycle.js";
+import { validateSessionInstructionsScope } from "../../storage/session-instructions.js";
 const MAX_SESSION_INSTRUCTIONS_BYTES = 1024 * 1024;
 
 type InstructionPath = { label: string; path: string; allowedRoot: string };
@@ -124,8 +125,8 @@ export function createRestoreHandler(
       let storageAdmissionError: unknown;
       let instructionScope: SessionInstructionsScope | undefined;
       const resolveRouteIdentity = (): typeof storageIdentity => {
-        if (storageIdentity) return storageIdentity;
         if (storageAdmissionError !== undefined) throw storageAdmissionError;
+        if (storageIdentity) return storageIdentity;
         try {
           const before = resolveGitProjectAnchor(cwd!);
           const identity = projectIdentity(cwd!, config.storage);
@@ -133,13 +134,15 @@ export function createRestoreHandler(
           if (!anchorsMatch(before, after)) {
             throw new Error("Git worktree topology changed during storage admission");
           }
-          storageIdentity = identity;
-          instructionScope = {
+          const candidateInstructionScope = {
             clientName: client,
             sessionId: session_id,
             worktreePath: after?.worktreeRoot ?? cwd!,
             cwdPath: cwd!,
           };
+          validateSessionInstructionsScope(candidateInstructionScope);
+          storageIdentity = identity;
+          instructionScope = candidateInstructionScope;
           return storageIdentity;
         } catch (error) {
           storageAdmissionError = error;

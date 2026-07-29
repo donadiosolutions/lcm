@@ -305,6 +305,52 @@ describe("SQLite storage backend conformance", () => {
     }
   });
 
+  it("rejects malformed UTF-16 instruction scopes before SQLite binding", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      runLcmMigrations(db, { fts5Available: false });
+      const stores = createSqliteRepositoryStores(db, { fts5Available: false });
+      const repositories = createSqliteRepositories(
+        stores,
+        "safe-project",
+        async (_domain, _operation, callback) => await callback(),
+      );
+      const baseScope = {
+        clientName: "codex" as const,
+        sessionId: "session",
+        worktreePath: "/repo/worktree",
+        cwdPath: "/repo/worktree/src",
+      };
+
+      for (const malformed of [
+        "\ud800",
+        "\ud801",
+        "\udc00",
+        "\udc01",
+      ]) {
+        const candidate = {
+          ...baseScope,
+          sessionId: `session-${malformed}`,
+        };
+        await expect(repositories.coordination.getSessionInstructions(candidate))
+          .rejects.toThrow("instruction-cache sessionId contains malformed UTF-16");
+        await expect(repositories.coordination.upsertSessionInstructions(
+          candidate,
+          "instructions",
+          "hash",
+        )).rejects.toThrow("instruction-cache sessionId contains malformed UTF-16");
+        await expect(repositories.coordination.deleteSessionInstructions(candidate))
+          .rejects.toThrow("instruction-cache sessionId contains malformed UTF-16");
+      }
+
+      expect(db.prepare(
+        "SELECT COUNT(*) AS count FROM session_instruction_cache",
+      ).get()).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
   it("purges all mutable project memory state and its FTS mirror atomically", async () => {
     const root = createTemporaryDirectory("lcm-storage-purge-");
     const factory = new SqliteStorageBackendFactory({

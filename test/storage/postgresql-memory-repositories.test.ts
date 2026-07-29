@@ -581,6 +581,14 @@ describe("PostgreSQL memory repositories", () => {
       }),
       () => coordination.getSessionInstructions({
         ...instructionScope,
+        sessionId: "bad\ud800",
+      }),
+      () => coordination.getSessionInstructions({
+        ...instructionScope,
+        sessionId: "bad\udc00",
+      }),
+      () => coordination.getSessionInstructions({
+        ...instructionScope,
         worktreePath: "",
       }),
       () => coordination.upsertSessionInstructions(

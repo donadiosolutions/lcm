@@ -335,6 +335,32 @@ describe("restore route coverage", () => {
     expect(state.projectExistsCount).toBe(0);
   });
 
+  it.each([
+    ["lone high surrogate one", "\ud800"],
+    ["lone high surrogate two", "\ud801"],
+    ["lone low surrogate one", "\udc00"],
+    ["lone low surrogate two", "\udc01"],
+  ])("rejects a %s session identity before storage", async (_label, sessionId) => {
+    expect(await call(JSON.stringify({
+      session_id: sessionId,
+      cwd: "/tmp",
+      client: "claude",
+    }))).toEqual({ context: "orientation" });
+    expect({
+      instructionGets: state.instructionGets,
+      instructionUpserts: state.instructionUpserts,
+      instructionDeletes: state.instructionDeletes,
+      openCount: state.openCount,
+      projectExistsCount: state.projectExistsCount,
+    }).toEqual({
+      instructionGets: [],
+      instructionUpserts: [],
+      instructionDeletes: 0,
+      openCount: 0,
+      projectExistsCount: 0,
+    });
+  });
+
   it("captures changed instruction files through coordination repositories", async () => {
     state.instructionContent = "new rules";
     const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp", client: "claude" }));
