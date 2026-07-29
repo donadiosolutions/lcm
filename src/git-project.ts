@@ -220,7 +220,7 @@ function configEnablesWorktreeConfig(config: string): boolean {
     }
     if (
       inExtensions
-      && /^\s*worktreeconfig(?:\s*=\s*(?:true|yes|on|1))?\s*$/iu.test(line)
+      && /^\s*worktreeconfig(?:\s*=\s*(?:true|yes|on|1)\s*(?:[#;].*)?)?\s*$/iu.test(line)
     ) {
       return true;
     }
