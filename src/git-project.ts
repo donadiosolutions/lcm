@@ -131,7 +131,15 @@ function validateLinkedWorktreeTopology(
   commonDir: string,
 ): void {
   const worktreesPath = join(commonDir, "worktrees");
-  const worktreesStat = lstatSync(worktreesPath);
+  const worktreesStat = (() => {
+    try {
+      return lstatSync(worktreesPath);
+    } catch (error) {
+      throw new Error(
+        `invalid Git worktrees directory at ${worktreesPath}: ${String(error)}`,
+      );
+    }
+  })();
   if (!worktreesStat.isDirectory() || worktreesStat.isSymbolicLink()) {
     throw new Error(`invalid Git worktrees directory at ${worktreesPath}`);
   }

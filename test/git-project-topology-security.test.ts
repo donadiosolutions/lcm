@@ -16,6 +16,23 @@ const readRace = vi.hoisted(() => ({
   mutation: (): void => undefined,
 }));
 
+const filesystemFailure = vi.hoisted(() => ({
+  lstatPath: "",
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    lstatSync: (path: Parameters<typeof actual.lstatSync>[0]) => {
+      if (String(path) === filesystemFailure.lstatPath) {
+        throw new Error("synthetic lstat failure");
+      }
+      return actual.lstatSync(path);
+    },
+  };
+});
+
 vi.mock("../src/security-files.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/security-files.js")>();
   return {
@@ -71,12 +88,14 @@ describe("Git linked-worktree topology authentication", () => {
     readRace.count = 0;
     readRace.mutateAfter = Number.POSITIVE_INFINITY;
     readRace.mutation = (): void => undefined;
+    filesystemFailure.lstatPath = "";
     clearGitProjectAnchorCache();
   });
 
   afterEach(() => {
     readRace.mutateAfter = Number.POSITIVE_INFINITY;
     readRace.mutation = (): void => undefined;
+    filesystemFailure.lstatPath = "";
     clearGitProjectAnchorCache();
     rmSync(root, { recursive: true, force: true });
   });
@@ -156,6 +175,12 @@ describe("Git linked-worktree topology authentication", () => {
     expect(() => resolveGitProjectAnchor(linkedRoot))
       .toThrow("is not a direct worktree entry");
 
+    filesystemFailure.lstatPath = join(commonDir, "worktrees");
+    clearGitProjectAnchorCache();
+    expect(() => resolveGitProjectAnchor(linkedRoot))
+      .toThrow(`invalid Git worktrees directory at ${filesystemFailure.lstatPath}`);
+
+    filesystemFailure.lstatPath = "";
     rmSync(join(commonDir, "worktrees"), { recursive: true });
     const externalWorktrees = directory(join(root, "external-worktrees"));
     const externalGitDir = directory(join(externalWorktrees, "linked"));
