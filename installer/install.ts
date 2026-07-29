@@ -277,9 +277,10 @@ function persistVerifiedNativeClaudeSettings(
   mcpServers.lcm = mergeClaudeMcpEntry(mcpServers.lcm, lcmBin);
   merged.mcpServers = mcpServers;
 
+  if (deps.dryRun) return;
+
   deps.mkdirSync(dirname(settingsPath), { recursive: true });
   deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
-  if (deps.dryRun) return;
 
   let persisted: unknown;
   try {

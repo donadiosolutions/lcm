@@ -884,6 +884,13 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   const mcpServers = currentSettings?.mcpServers as Record<string, unknown> | undefined;
   if (!claudeSettingsExists || (!settingsError && !claudeSettingsManaged)) {
     results.push({ name: "mcp-lcm", category: "Settings", status: "pass", message: "Claude Code integration is not installed" });
+  } else if (settingsError) {
+    results.push({
+      name: "mcp-lcm",
+      category: "Settings",
+      status: "fail",
+      message: `Could not parse ${settingsPath}: ${settingsError}\n     Fix the JSON, then run: lcm install`,
+    });
   } else if (lcmBinary && hasCanonicalClaudeMcpEntry(mcpServers?.lcm, lcmBinary)) {
     results.push(claudeSettingsCleaned
       ? { name: "mcp-lcm", category: "Settings", status: "warn", message: "Removed the legacy lossless-claude MCP registration", fixApplied: true }

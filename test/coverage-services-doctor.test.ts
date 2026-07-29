@@ -100,6 +100,7 @@ function makeDeps(options: {
   config?: unknown;
   configText?: string;
   settings?: unknown;
+  settingsText?: string;
   pkg?: unknown;
   health?: Array<unknown>;
   exists?: (path: string) => boolean;
@@ -120,7 +121,9 @@ function makeDeps(options: {
       const readError = options.readError?.(path);
       if (readError) throw readError;
       if (path.endsWith("config.json")) return options.configText ?? JSON.stringify(options.config ?? {});
-      if (path.endsWith("settings.json")) return JSON.stringify(options.settings ?? { mcpServers: { lcm: {} } });
+      if (path.endsWith("settings.json")) {
+        return options.settingsText ?? JSON.stringify(options.settings ?? { mcpServers: { lcm: {} } });
+      }
       if (path.endsWith("package.json")) return JSON.stringify(options.pkg ?? { version: "1.2.3" });
       if (path.endsWith("CLAUDE.md")) return options.claudeMd ?? "<!-- lcm:start -->\n@lcm.md\n<!-- lcm:end -->";
       if (path.endsWith("lcm.md")) return options.lcmMd ?? LCM_MD_CONTENT;
@@ -1020,6 +1023,17 @@ describe("doctor service coverage", () => {
     }));
     expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("fail");
     expect(results.find((result) => result.name === "lcm-md")?.status).toBe("fail");
+  });
+
+  it("gives matching actionable JSON guidance for malformed Claude settings", async () => {
+    const results = await runDoctor(makeDeps({ settingsText: "{" }));
+    const hooks = results.find((result) => result.name === "hooks");
+    const mcp = results.find((result) => result.name === "mcp-lcm");
+
+    expect(hooks?.status).toBe("fail");
+    expect(mcp?.status).toBe("fail");
+    expect(mcp?.message).toBe(hooks?.message);
+    expect(mcp?.message).toContain("Fix the JSON, then run: lcm install");
   });
 
   it("repairs only MCP fields owned by LCM", async () => {

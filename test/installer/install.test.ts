@@ -14,7 +14,7 @@ import {
   type ServiceDeps,
 } from "../../installer/install.js";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { legacyLcmCommand, legacyLcmMcpServerName } from "../../src/legacy-names.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../../src/daemon/config.js";
 import { removeManagedClaudeHooks } from "../../src/installer/settings.js";
@@ -749,6 +749,60 @@ describe("install", () => {
     expect(events.indexOf("uninstall")).toBeGreaterThan(events.indexOf("native-settings"));
   });
 
+  it("keeps native settings read-only during dry-run and preserves Marketplace ordering", async () => {
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    const nativeSettings = JSON.stringify(mergeClaudeSettings({}, "/opt/npm/bin/lcm"));
+    const events: string[] = [];
+    const plugin = JSON.stringify([{ id: "lcm@legacy", scope: "user" }]);
+    const marketplaces = JSON.stringify([{ name: "legacy", repo: "lossless-claude/lcm" }]);
+    const spawnSync = vi.fn((_cmd: string, args: string[]) => {
+      if (args[1] === "list") {
+        events.push("marketplace-scan");
+        return { status: 0, stdout: plugin };
+      }
+      if (args[1] === "marketplace") {
+        events.push("marketplace-verification");
+        return { status: 0, stdout: marketplaces };
+      }
+      events.push("marketplace-uninstall");
+      return { status: 0, stdout: "" };
+    });
+    const deps = makeDeps({
+      dryRun: true,
+      spawnSync: spawnSync as any,
+      existsSync: vi.fn((path: string) =>
+        path === settingsPath || path.endsWith("config.json")),
+      readFileSync: vi.fn((path: string) => {
+        if (path === settingsPath) {
+          events.push("settings-read");
+          return nativeSettings;
+        }
+        return "{}";
+      }),
+      writeFileSync: vi.fn((path: string) => {
+        if (path === settingsPath) events.push("settings-write");
+      }),
+      mkdirSync: vi.fn((path: string) => {
+        if (path === dirname(settingsPath)) events.push("settings-directory");
+      }),
+    });
+
+    await install(deps);
+
+    expect(events.filter((event) => event === "settings-read")).toHaveLength(4);
+    expect(events).not.toContain("settings-write");
+    expect(events).not.toContain("marketplace-uninstall");
+    expect(events.indexOf("marketplace-scan")).toBeGreaterThan(
+      events.indexOf("settings-read"),
+    );
+    expect(events.indexOf("marketplace-verification")).toBeGreaterThan(
+      events.indexOf("marketplace-scan"),
+    );
+    expect(events.indexOf("settings-directory")).toBeGreaterThan(
+      events.indexOf("marketplace-verification"),
+    );
+  });
+
   it("fails before mutation for a relative executable or malformed Claude settings", async () => {
     const relative = makeDeps({ binaryPath: "lcm" });
     await expect(install(relative)).rejects.toThrow("absolute npm-installed");
@@ -978,7 +1032,7 @@ describe("install with DryRunServiceDeps", () => {
       .filter((s: any) => typeof s === "string" && s.includes("[dry-run]"));
 
     expect(dryRunLines.some((l: string) => l.includes("would write:"))).toBe(true);
-    expect(dryRunLines.some((l: string) => l.includes("settings.json"))).toBe(true);
+    expect(dryRunLines.some((l: string) => l.includes("settings.json"))).toBe(false);
 
     logSpy.mockRestore();
     warnSpy.mockRestore();
